@@ -3,17 +3,17 @@
 
 use std::sync::Arc;
 
-use quil_types::crypto::{BlsConstructor, KeyManager, KeyType};
+use quil_types::crypto::{KeyManager, KeyType};
 use quil_types::error::{QuilError, Result};
 
-/// Default key manager that dispatches to BLS48-581 and Ed448 verifiers.
-pub struct DefaultKeyManager {
-    bls_constructor: Arc<dyn BlsConstructor>,
-}
+/// Default key manager that dispatches signature verification to Ed448 and the
+/// post-quantum Falcon (FN-DSA-512) verifiers. BLS48-581 signatures are retired.
+#[derive(Default)]
+pub struct DefaultKeyManager;
 
 impl DefaultKeyManager {
-    pub fn new(bls_constructor: Arc<dyn BlsConstructor>) -> Self {
-        Self { bls_constructor }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -61,15 +61,13 @@ impl KeyManager for DefaultKeyManager {
                 }
             }
 
-            KeyType::Bls48581G1 | KeyType::Bls48581G2 => {
-                // BLS48-581 verification: public key is G2 (585 bytes),
-                // signature is G1 (74 bytes). Domain is the BLS context.
-                Ok(self.bls_constructor.verify_signature_raw(
-                    public_key,
-                    signature,
-                    message,
-                    domain,
-                ))
+            KeyType::Falcon512 => {
+                // Post-quantum consensus signatures: public key 897 B,
+                // signature 666 B, `domain` → FN-DSA domain-separation context.
+                // Used by the ProverJoin PoP + join signature, and by an
+                // Ed448→Falcon seniority-merge target (which itself uses the
+                // Ed448 arm above — this arm covers a Falcon-keyed merge).
+                Ok(crate::falcon_verify(public_key, signature, message, domain))
             }
 
             other => Err(QuilError::InvalidArgument(format!(
@@ -83,58 +81,42 @@ impl KeyManager for DefaultKeyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::{BlsAggregateOutput, Signer};
+    use quil_types::crypto::Signer;
 
-    // Stub BLS constructor for testing
-    struct StubBlsConstructor {
-        accept: bool,
-    }
-    impl BlsConstructor for StubBlsConstructor {
-        fn new_key(&self) -> Result<(Box<dyn Signer>, Vec<u8>)> { Err(QuilError::Internal("key generation not supported in stub".into())) }
-        fn from_bytes(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn Signer>> { Err(QuilError::Internal("key deserialization not supported in stub".into())) }
-        fn verify_signature_raw(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> bool { self.accept }
-        fn verify_multi_message_signature_raw(&self, _: &[u8], _: &[u8], _: &[&[u8]], _: &[u8]) -> bool { self.accept }
-        fn aggregate(&self, _: &[&[u8]], _: &[&[u8]]) -> Result<BlsAggregateOutput> { Err(QuilError::Internal("BLS aggregation not supported in stub".into())) }
-    }
-
-    fn km(accept_bls: bool) -> DefaultKeyManager {
-        DefaultKeyManager::new(Arc::new(StubBlsConstructor { accept: accept_bls }))
+    fn km(_accept_bls: bool) -> DefaultKeyManager {
+        DefaultKeyManager::new()
     }
 
     #[test]
-    fn bls_g2_dispatches_to_constructor() {
-        let m = km(true);
-        assert!(m.validate_signature(
-            KeyType::Bls48581G2,
-            &[0u8; 585],
-            b"msg",
-            &[0u8; 74],
-            b"domain",
-        ).unwrap());
-    }
-
-    #[test]
-    fn bls_g2_returns_false_when_constructor_rejects() {
+    fn falcon512_dispatches_to_falcon_verify() {
+        // The BLS stub rejects, proving the Falcon path is independent of it.
         let m = km(false);
-        assert!(!m.validate_signature(
-            KeyType::Bls48581G2,
-            &[0u8; 585],
-            b"msg",
-            &[0u8; 74],
-            b"domain",
-        ).unwrap());
+        let signer = crate::FalconSigner::generate();
+        let sig = signer.sign_with_domain(b"consensus", b"global").unwrap();
+        assert!(m
+            .validate_signature(KeyType::Falcon512, signer.public_key(), b"consensus", &sig, b"global")
+            .unwrap());
+        // Wrong domain → false (domain separation), no error.
+        assert!(!m
+            .validate_signature(KeyType::Falcon512, signer.public_key(), b"consensus", &sig, b"other")
+            .unwrap());
+        // Malformed pubkey → false, no panic.
+        assert!(!m
+            .validate_signature(KeyType::Falcon512, &[0u8; 10], b"consensus", &sig, b"global")
+            .unwrap());
     }
 
     #[test]
-    fn bls_g1_also_dispatches_to_constructor() {
-        let m = km(true);
-        assert!(m.validate_signature(
-            KeyType::Bls48581G1,
-            &[0u8; 585],
-            b"msg",
-            &[0u8; 74],
-            b"",
-        ).unwrap());
+    fn bls_key_types_are_now_rejected() {
+        // BLS48-581 signatures are retired; the key manager rejects both G1/G2
+        // key types (they fall through to the unsupported-key-type error).
+        let m = km(false);
+        for kt in [KeyType::Bls48581G1, KeyType::Bls48581G2] {
+            assert!(
+                m.validate_signature(kt, &[0u8; 585], b"msg", &[0u8; 74], b"domain").is_err(),
+                "BLS key type {kt:?} must be rejected (retired)"
+            );
+        }
     }
 
     #[test]

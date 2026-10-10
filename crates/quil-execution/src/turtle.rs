@@ -15,10 +15,10 @@
 //!
 //! prover:Prover a rdfs:Class .
 //! prover:PublicKey a rdfs:Property ;
-//!   rdfs:domain qcl:ByteArray ;
-//!   qcl:size 585 ;
-//!   qcl:order 0 ;
-//!   rdfs:range prover:Prover .
+//! rdfs:domain qcl:ByteArray ;
+//! qcl:size 585 ;
+//! qcl:order 0 ;
+//! rdfs:range prover:Prover .
 //! ```
 //!
 //! Output type [`ParsedSchema`] gives the same surface Go's
@@ -28,9 +28,9 @@
 //! - No support for blank nodes, lists, or RDF reification.
 //! - No URI resolution against `BASE`.
 //! - Comments must be on their own line or at end of line; Turtle's
-//!   in-statement `#` form inside literal strings is not handled.
+//! in-statement `#` form inside literal strings is not handled.
 //! - Namespace prefixes are looked up by exact key; the trailing
-//!   slash quirk Go's parser handles is replicated here.
+//! slash quirk Go's parser handles is replicated here.
 
 use quil_types::error::{QuilError, Result};
 use std::collections::HashMap;

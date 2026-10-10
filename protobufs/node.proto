@@ -58,6 +58,18 @@ message ShardAllocationInfo {
   uint64 join_confirm_frame_number = 4;
   uint64 leave_frame_number = 5;
   uint64 last_active_frame_number = 6;
+  // The storage epoch this allocation was last confirmed for (the highest
+  // epoch it has registered leaf roots for). Data-shard (non-empty filter)
+  // Active allocations are epoch-bound: an `epoch` older than the current
+  // epoch means the prover missed its per-epoch re-confirm and reads as
+  // effectively ExpiredEpoch. `0` is the genesis/grandfather sentinel.
+  uint64 epoch = 7;
+  // The frame at which a leave was confirmed. With epoch-aligned lifecycle a
+  // leave confirmed in epoch E+1 departs at the E+2 boundary
+  // (DeactivationEpoch = epoch_for_frame(leave_confirm_frame_number)+1); the
+  // client needs this to distinguish Leaving (serving notice) from a departed
+  // allocation.
+  uint64 leave_confirm_frame_number = 8;
 }
 
 message NodeInfoResponse {
@@ -72,6 +84,13 @@ message NodeInfoResponse {
   uint64 last_global_head_frame = 9;
   bool reachable = 10;
   repeated ShardAllocationInfo shard_allocations = 11;
+  // The epoch the node is currently in (epoch_for_frame(last_global_head_frame)).
+  // Provided so clients don't have to assume an epoch length.
+  uint64 current_epoch = 12;
+  // Number of frames per epoch (720 mainnet / 60 testnet; a node consensus
+  // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
+  // this rather than hardcoding a value.
+  uint64 epoch_length_frames = 13;
 }
 
 message WorkerInfo {
@@ -80,6 +99,71 @@ message WorkerInfo {
   uint64 available_storage = 3;
   uint64 total_storage = 4;
   bool manually_managed = 5;
+  // Absent on older nodes and worker implementations without local telemetry.
+  WorkerExecution execution = 6;
+}
+
+// Local engine observations; independent of allocation and remote shard data.
+// Three conditions are separate and none implies another: an active
+// allocation (the prover registry assigns the filter to this worker), a
+// running consensus host (`state`), and advancing app frames
+// (`materialized_frame`, `last_advance_unix_ms`). A worker can be running
+// with no frame materialized, and can recover data (`recovery`) in any state.
+message WorkerExecution {
+  // Consensus host startup: "starting", "running" (the host started; frames
+  // need not advance), "blocked" (startup failed, see `blocker`) or "stopped".
+  string state = 1;
+  string blocker = 2;
+  optional uint64 materialized_frame = 3;
+  // When `materialized_frame` last increased; 0 when it has not since the
+  // engine started.
+  uint64 last_advance_unix_ms = 4;
+  uint64 observed_unix_ms = 5;
+  // Archive recovery of the shard's data. Absent before the first recovery
+  // attempt and on older nodes.
+  ShardRecovery recovery = 6;
+}
+
+// Archive recovery of a worker's shard data, independent of `state`.
+message ShardRecovery {
+  // "waiting_for_permit" (queued: a node recovers a few shards at a time),
+  // "replaying_frames" (fetching and executing certified frames),
+  // "fetching_checkpoint" (reading and validating an archive's latest frame),
+  // "installing_leaves" (downloading the shard's authenticated tree data),
+  // "installing_checkpoint" (the engine adopts the installed checkpoint), or
+  // "idle" (no attempt running; see the last outcome and error).
+  string phase = 1;
+  uint64 phase_since_unix_ms = 2;
+  // Leaves of the tree being installed, for one forest phase (0-3): the
+  // counts restart with each phase, sub-shard and rebase onto local commits,
+  // and an interrupted download resumes with fewer planned leaves.
+  uint32 tree_phase = 3;
+  uint64 installed_leaves = 4;
+  uint64 planned_leaves = 5;
+  uint64 leaves_observed_unix_ms = 6;
+  // Each finished attempt sets its outcome or its error; neither clears the
+  // other, so compare their times.
+  string last_outcome = 7;
+  uint64 last_outcome_unix_ms = 8;
+  string last_error = 9;
+  uint64 last_error_unix_ms = 10;
+  // The archive the current or last attempt read from most recently. Each
+  // attempt picks the next known archive, passing over one that failed a
+  // recovery read in the last two minutes while another is known.
+  string source = 11;
+  // Attempts finished since the engine started, and how many of the latest
+  // failed in a row.
+  uint32 attempts = 12;
+  uint32 consecutive_failures = 13;
+  // The current or last attempt: when it started, how long it waited for a
+  // recovery permit, how long it ran after that (0 while it runs), and the
+  // leaves it installed. Installed leaves are durable: a retry keeps them
+  // and downloads only the rest, so a failed attempt with installed leaves
+  // still made progress.
+  uint64 attempt_started_unix_ms = 14;
+  uint64 permit_wait_ms = 15;
+  uint64 attempt_ms = 16;
+  uint64 attempt_installed_leaves = 17;
 }
 
 message WorkerInfoResponse {
@@ -169,12 +253,6 @@ message Coin {
   AccountRef owner = 3;
 }
 
-message LegacyCoin {
-  Coin coin = 1;
-  uint64 frame_number = 2;
-  bytes address = 3;
-}
-
 message MaterializedTransaction {
   bytes address = 1;
   bytes raw_balance = 2;
@@ -216,17 +294,6 @@ message GetMetricsResponse {
   bytes metrics = 1;
 }
 
-message GetTokensByAccountRequest {
-  bytes address = 1;
-  bytes domain = 2;
-}
-
-message GetTokensByAccountResponse {
-  repeated LegacyCoin legacy_coins = 1;
-  repeated MaterializedTransaction transactions = 2;
-  repeated MaterializedPendingTransaction pending_transactions = 3;
-}
-
 message GetVertexDataRequest {
   bytes address = 1;  // 64-byte vertex ID (32-byte app address + 32-byte data address)
   bool full_data = 2; // When true, return serialized tree in raw_data
@@ -244,6 +311,7 @@ message GetVertexDataResponse {
   bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
   bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
   bytes raw_data = 6;     // Serialized VectorCommitmentTree when full_data requested
+  optional bool present = 7; // Distinguishes absent storage from an occupied empty blob.
 }
 
 message GetHyperedgeDataRequest {
@@ -269,6 +337,13 @@ message CreateTraversalProofResponse {
   bytes proof = 1;  // serialized TraversalProof (via ToBytes())
 }
 
+// A shard cursor from this node's committed GLOBAL state, independent of peer metadata.
+message GlobalAppFrameHead {
+  uint64 frame = 1;
+  uint64 global_frame = 2;
+  uint64 generation = 3;
+}
+
 message ShardRewardInfo {
   bytes filter = 1;
   uint32 active_provers = 2;
@@ -277,6 +352,11 @@ message ShardRewardInfo {
   bytes estimated_reward = 5;
   bool is_allocated = 6;
   uint64 data_shards = 7;
+  uint64 materialized_frame = 8;
+  uint64 latest_frame = 9;
+  // Absent on older servers; false means ring/reward are unavailable.
+  optional bool ring_known = 10;
+  GlobalAppFrameHead global_head = 11;
 }
 
 message GetShardInfoRequest {
@@ -289,6 +369,30 @@ message GetShardInfoResponse {
   bytes pomw_basis = 3;
   bytes world_state_bytes = 4;
   uint64 frame_number = 5;
+}
+
+// Advisory budget for one standalone QUIL operation, not a reservation or a
+// promise of inclusion. The node must have the execution venue's pricing state.
+message GetTokenFeeQuoteRequest {
+  bytes application = 1;
+  uint64 max_payload_bytes = 2;
+  // Quote the global execution venue (the global frame materializer) rather
+  // than the venue currently executing the application's transactions. Reward
+  // mints always execute there, whatever the QUIL shard's coverage.
+  bool global_venue = 3;
+}
+message GetTokenFeeQuoteResponse {
+  bytes application = 1;
+  bytes network = 2;
+  uint64 observed_frame = 3;
+  bool global_execution = 4;
+  uint64 difficulty = 5;
+  uint64 world_state_bytes = 6;
+  uint64 fee_multiplier_vote = 7;
+  uint64 max_payload_bytes = 8;
+  // Unsigned, exactly 16-byte big-endian QUIL base units. This is a budget,
+  // not an authorization to spend; pricing may change before inclusion.
+  bytes fee_budget = 9;
 }
 
 message RequestJoinRequest {
@@ -326,19 +430,47 @@ service NodeService {
   rpc GetNodeInfo(GetNodeInfoRequest) returns (NodeInfoResponse);
   rpc GetWorkerInfo(GetWorkerInfoRequest) returns (WorkerInfoResponse);
   rpc Send(SendRequest) returns (SendResponse);
-  rpc GetTokensByAccount(GetTokensByAccountRequest)
-    returns (GetTokensByAccountResponse);
   rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
   rpc GetVertexData(GetVertexDataRequest) returns (GetVertexDataResponse);
   rpc GetHyperedgeData(GetHyperedgeDataRequest) returns (GetHyperedgeDataResponse);
   rpc CreateTraversalProof(CreateTraversalProofRequest)
     returns (CreateTraversalProofResponse);
   rpc GetShardInfo(GetShardInfoRequest) returns (GetShardInfoResponse);
+  rpc GetTokenFeeQuote(GetTokenFeeQuoteRequest) returns (GetTokenFeeQuoteResponse);
   rpc RequestJoin(RequestJoinRequest) returns (RequestJoinResponse);
   rpc SetManuallyManaged(SetManuallyManagedRequest) returns (SetManuallyManagedResponse);
   rpc GetLatestFrame(quilibrium.node.global.pb.GetGlobalFrameRequest)
     returns (quilibrium.node.global.pb.GlobalFrameResponse);
   rpc SubmitMessage(SubmitMessageRequest) returns (SubmitMessageResponse);
+  // QCT3 wallet witnesses and paginated discovery.
+  rpc GetCoinWitnesses(GetCoinWitnessesRequest)
+    returns (GetCoinWitnessesResponse);
+  rpc ListEscrows(ListCoinsRequest) returns (ListEscrowsResponse);
+  rpc ListCoins(ListCoinsRequest) returns (ListCoinsResponse);
+  rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
+  rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
+  rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
+}
+
+message GetProverRewardWitnessRequest {
+  bytes domain = 1;               // token domain (QUIL for the reward mint)
+  bytes owner_prover_address = 2; // poseidon(prover Falcon pubkey)
+}
+message GetMintAuthorizationWitnessRequest {
+  bytes receipt = 1; // 32-byte authorization identity derived from the original mint
+}
+message GetMintAuthorizationWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2; // bounded membership witness; caller checks authorization fields
+  uint64 cited_frame = 3;
+  bytes global_root = 4; // root in the cited canonical global header
+}
+message GetProverRewardWitnessResponse {
+  bool found = 1;
+  bytes forest_proof = 2;  // quil_forest MembershipProof bytes
+  bytes value = 3;         // claimable reward Balance, 16-byte LE u128
+  uint64 cited_frame = 4;  // global frame whose prover_tree_commitment is the reward root
+  bytes reward_root = 5;   // checked 32-byte QUIL root; empty for unavailable/legacy providers
 }
 
 message ConnectivityTestRequest {
@@ -381,7 +513,18 @@ message SetHaltedRequest {
 message SetHaltedResponse {
 }
 
+message GetAppFeeSnapshotRequest { bytes application = 1; }
+message GetAppFeeSnapshotResponse {
+  bytes application = 1;
+  uint64 frame_number = 2;
+  uint64 global_frame_number = 3;
+  uint64 difficulty = 4;
+  uint64 world_state_bytes = 5;
+  uint64 fee_multiplier_vote = 6;
+}
+
 service DataIPCService {
+  rpc GetAppFeeSnapshot(GetAppFeeSnapshotRequest) returns (GetAppFeeSnapshotResponse);
   rpc Respawn(RespawnRequest) returns (RespawnResponse);
   rpc CreateJoinProof(CreateJoinProofRequest) returns (CreateJoinProofResponse);
   // SetHalted broadcasts the master's coverage-halt verdict to a
@@ -389,4 +532,93 @@ service DataIPCService {
   // local engine so prove_next_state and consensus-message handlers
   // short-circuit while halted. Idempotent — same value is a no-op.
   rpc SetHalted(SetHaltedRequest) returns (SetHaltedResponse);
+  // PrepareStorageConfirm asks the standalone worker bound to `filter` to
+  // encode the next epoch's replicas from its own store and return their leaf
+  // roots for the master's ProverConfirm. Only that worker holds the shard's
+  // data and proves from those replicas.
+  rpc PrepareStorageConfirm(PrepareStorageConfirmRequest) returns (PrepareStorageConfirmResponse);
+  // A shard consensus message a committee member sent the master directly,
+  // for the shard this worker runs. `from` is the sender's committee key.
+  rpc DeliverShardConsensus(DeliverShardConsensusRequest) returns (DeliverShardConsensusResponse);
+}
+
+message DeliverShardConsensusRequest {
+  bytes filter = 1;
+  uint64 channel = 2;
+  bytes data = 3;
+  bytes from = 4;
+}
+
+message DeliverShardConsensusResponse {
+  // The worker runs this shard's engine and handed it the message.
+  bool accepted = 1;
+}
+
+message PrepareStorageConfirmRequest {
+  bytes filter = 1;
+  uint64 frame_number = 2;
+  // Shards a recorded split or merge creates from `filter` when it applies
+  // next epoch. The worker also encodes and returns their leaves from its
+  // own store, so its prover is registered for the shard it then holds.
+  repeated bytes targets = 3;
+}
+
+message PrepareStorageConfirmResponse {
+  repeated quilibrium.node.global.pb.ConfirmLeafRoots leaf_roots = 1;
+}
+
+// QCT3 token suite. The serving node chooses its network context.
+message GetCoinWitnessesRequest {
+  bytes domain = 1; // Exactly 32 bytes; no implicit token domain.
+  repeated bytes addresses = 2; // Unique 32-byte coin addresses.
+}
+message CoinWitness {
+  bytes address = 1;
+  bool found = 2;
+  repeated bytes siblings = 3;
+  repeated bool right = 4;
+}
+message GetCoinWitnessesResponse {
+  bytes network = 1; // 32-byte network identifier selected by the node.
+  bytes root_record = 2; // Canonical QCT3RT record, including context and depth.
+  repeated CoinWitness witnesses = 3;
+}
+
+// Empty snapshot_id and after start a scan; continuation must repeat snapshot_id.
+message ListCoinsRequest {
+  bytes domain = 1;
+  bytes snapshot_id = 2;
+  bytes after = 3;
+}
+message ConfidentialCoin {
+  bytes address = 1;
+  uint64 frame_number = 2;
+  bytes owner = 3;
+  bytes commitment = 4;
+  bytes memo = 5;
+  // Leaf index in the application's coin accumulator; part of the coin's
+  // committed content address.
+  uint64 position = 6;
+}
+message ListCoinsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  bytes root_record = 3;
+  repeated ConfidentialCoin coins = 4;
+  bytes cursor = 5;
+  bool has_more = 6;
+}
+
+// Snapshot enumeration of public encrypted records; consumption is checked
+// separately and the server never receives the wallet's recovery keys.
+message Escrow {
+  bytes address = 1;
+  bytes raw_data = 2;
+}
+message ListEscrowsResponse {
+  bytes network = 1;
+  bytes snapshot_id = 2;
+  repeated Escrow escrows = 3;
+  bytes cursor = 4;
+  bool has_more = 5;
 }

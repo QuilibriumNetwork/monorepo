@@ -15,6 +15,7 @@ test-utils = []
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-hypergraph = { path = "../quil-hypergraph" }
+quil-forest = { path = "../quil-forest" }
 quil-crypto = { path = "../quil-crypto" }
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
 prost = "0.13"
@@ -30,6 +31,7 @@ tokio = { version = "1", features = ["sync", "time", "rt"] }
 tokio-util = "0.7"
 
 [dev-dependencies]
+quil-forest = { path = "../quil-forest" }
 quil-tries = { path = "../quil-tries" }
 quil-execution = { path = "../quil-execution" }
 sha3 = "0.10"

@@ -4,16 +4,16 @@
 //! sites with subtly different rules:
 //!
 //! - `LocalShardInfoProvider::get_shard_info` (server-side RPC) read
-//!   `registry.current_frame()`, falling back to a clock-store load,
-//!   falling back to `last_received_frame`. Each iteration of the
-//!   resolution rule introduced a new bug.
+//! `registry.current_frame()`, falling back to a clock-store load,
+//! falling back to `last_received_frame`. Each iteration of the
+//! resolution rule introduced a new bug.
 //! - `NodeRpcServer::get_node_info` re-implemented the same idiom
-//!   with slightly different semantics.
+//! with slightly different semantics.
 //! - `prover_registry::current_frame()` only advanced when the
-//!   materializer called `process_state_transition` — stale on
-//!   observer nodes.
+//! materializer called `process_state_transition` — stale on
+//! observer nodes.
 //! - The frame-receive sites in `main.rs` used a mix of plain `store`
-//!   (which could regress) and `fetch_max` (which can't).
+//! (which could regress) and `fetch_max` (which can't).
 //!
 //! `CurrentFrame` collapses all of these into one shared atomic
 //! triple. Every site that needs "the current frame" reads
@@ -48,6 +48,15 @@ pub struct CurrentFrame {
     /// against an archive snapshot. The gate the lifecycle's
     /// `tree_synced` reads. Updated by `verify()`.
     verified: AtomicU64,
+    /// Latest HotStuff CONSENSUS RANK observed (NOT the frame number —
+    /// rank and frame differ by the genesis offset). The message
+    /// collector is keyed by consensus rank: the leader collects via
+    /// `collect_for_rank(rank)`, so messages must be tagged with the
+    /// rank, not the frame number. Updated by `observe_rank()` from the
+    /// consensus incorporate/finalize hooks. Without this, the submit
+    /// handler tagged messages with the (larger) frame number and the
+    /// leader's `collect_for_rank` never saw them → empty frames.
+    rank: AtomicU64,
 }
 
 impl CurrentFrame {
@@ -86,6 +95,22 @@ impl CurrentFrame {
         }
         self.observed.fetch_max(frame_number, Ordering::Relaxed);
         self.verified.fetch_max(frame_number, Ordering::Relaxed);
+    }
+
+    /// Record the latest HotStuff consensus rank (monotonic). Called
+    /// from the consensus incorporate/finalize hooks. This is the rank
+    /// space the message collector is keyed by.
+    pub fn observe_rank(&self, rank: u64) {
+        if rank == 0 {
+            return;
+        }
+        self.rank.fetch_max(rank, Ordering::Relaxed);
+    }
+
+    /// The latest consensus rank seen. Use this — NOT `effective()` —
+    /// to tag messages for the rank-keyed message collector.
+    pub fn effective_rank(&self) -> u64 {
+        self.rank.load(Ordering::Relaxed)
     }
 
     /// The freshest frame this node has any evidence of.

@@ -1,4 +1,4 @@
-//! Diagnostic that opens a migrated RocksDB store and dumps the
+//! Diagnostic that opens a stopped, migrated RocksDB store read-only and dumps the
 //! global-shard prover registry: how many provers, who's "active",
 //! and what their seniorities (= committee weights) look like.
 //!
@@ -10,6 +10,10 @@
 //! Run:
 //!   cargo run --release -p quil-store --example inspect_committee -- \
 //!     /path/to/store
+//!
+//! Stop the node using this store before running this diagnostic. Registry
+//! reads require a consistent snapshot; RocksDB secondary mode does not support
+//! snapshot iterators. This opens the existing store without copying it.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -25,26 +29,13 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Open as a secondary reader so we can inspect while the node
-    // holds the primary lock. catch_up_with_primary pulls in any
-    // recent writes.
     let primary = Path::new(&args[1]);
-    let scratch = std::env::temp_dir().join(format!(
-        "inspect-committee-{}",
-        std::process::id(),
-    ));
-    std::fs::create_dir_all(&scratch).expect("scratch dir");
-    let mut opts = rocksdb::Options::default();
-    opts.set_max_open_files(64);
-    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch)
-        .expect("open RocksDB as secondary");
-    let _ = db.try_catch_up_with_primary();
-    let db_arc = Arc::new(db);
-
-    let hg_store = Arc::new(RocksHypergraphStore::new(db_arc));
+    let db = quil_store::RocksDb::open_for_read_only(primary)
+        .expect("open stopped RocksDB read-only");
+    let hg_store = Arc::new(RocksHypergraphStore::new(db.inner()));
 
     let mut reg = InMemoryProverRegistry::new();
-    reg.refresh(&hg_store);
+    reg.refresh(hg_store.as_ref()).expect("read prover registry snapshot");
 
     println!("provers_visited={}", reg.provers_visited());
     println!("unknown_vertex_count (registry-level): n/a (private)");
@@ -53,7 +44,9 @@ fn main() {
     // Global shard = empty filter.
     // Use the inherent method (returns Vec<&ProverInfo>); the trait
     // returns owned Vec<ProverInfo> with QuilResult — either works.
-    let active = reg.get_active_provers(&[]);
+    // Diagnostic snapshot at frame 0 (the empty/global filter is exempt from
+    // epoch obligations, so Active-byte allocations show regardless of frame).
+    let active = reg.get_active_provers(&[], 0);
     println!("active provers under global filter: {}", active.len());
     let mut total_weight: u64 = 0;
     for (i, p) in active.iter().enumerate() {

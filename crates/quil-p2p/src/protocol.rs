@@ -258,4 +258,64 @@ mod tests {
         assert!(prune.control.as_ref().unwrap().prune.len() == 1);
         assert_eq!(prune.control.as_ref().unwrap().prune[0].backoff, 60);
     }
+
+    // -- Stage-7 wire-sanity guards ----------------------------------------
+    // Lock the on-wire contract so future edits can't silently drift it away
+    // from Go / other BlossomSub peers. (`test_varint_roundtrip` and
+    // `test_rpc_roundtrip` above already cover the LEB128 + prost decode path;
+    // these pin the protocol id, byte-identical framing, and message id.)
+
+    /// The negotiated protocol id string must be exactly `/blossomsub/2.1.0`
+    /// on mainnet (network 0); other networks suffix `-network-N`.
+    #[test]
+    fn wire_sanity_protocol_id_is_blossomsub_2_1_0() {
+        assert_eq!(PROTOCOL_ID, "/blossomsub/2.1.0");
+        assert_eq!(protocol_id_for_network(0), "/blossomsub/2.1.0");
+        assert_eq!(crate::BLOSSOMSUB_PROTOCOL_V2_1, "/blossomsub/2.1.0");
+        assert_eq!(protocol_id_for_network(7), "/blossomsub/2.1.0-network-7");
+    }
+
+    /// A publish RPC round-trips byte-identically: `encode_rpc` produces a
+    /// LEB128 length prefix + prost body, and `decode_rpc` → `encode_rpc`
+    /// reproduces the exact same bytes.
+    #[test]
+    fn wire_sanity_publish_rpc_round_trips_byte_identically() {
+        let msg = pb::Message {
+            from: vec![0xAA; 38],
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            seqno: 7u64.to_be_bytes().to_vec(),
+            bitmask: vec![0xC0],
+            signature: vec![0x11; 64],
+            key: Vec::new(),
+        };
+        let rpc = publish_rpc(vec![msg]);
+        let encoded = encode_rpc(&rpc);
+
+        // The LEB128 length prefix must exactly describe the prost body.
+        let (body_len, prefix_len) = decode_varint(&encoded).unwrap();
+        assert_eq!(prefix_len as u64 + body_len, encoded.len() as u64);
+
+        // Decode → re-encode must be byte-identical (stable canonical framing).
+        let (decoded, consumed) = decode_rpc(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        let re_encoded = encode_rpc(&decoded);
+        assert_eq!(re_encoded, encoded, "re-encode must be byte-identical");
+    }
+
+    /// BlossomSub message id = `[0x01] ++ SHA256(data)` (33 bytes, leading
+    /// `0x01`). This is the dedup key; drift corrupts IHAVE/IWANT gossip.
+    #[test]
+    fn wire_sanity_message_id_is_0x01_sha256() {
+        use sha2::{Digest, Sha256};
+        let data = b"quilibrium wire-sanity payload";
+        let id = crate::node::message_id(data);
+
+        let mut expected = Vec::with_capacity(33);
+        expected.push(0x01);
+        expected.extend_from_slice(&Sha256::digest(data));
+
+        assert_eq!(id, expected);
+        assert_eq!(id.len(), 33);
+        assert_eq!(id[0], 0x01);
+    }
 }

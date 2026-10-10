@@ -2,7 +2,7 @@
 //! per Quilibrium's KeyType enum:
 //!
 //! - `Secp256k1Sha256`: ECDSA-secp256k1 with SHA-256 pre-hash (the
-//!   standard Bitcoin-style ECDSA).
+//! standard Bitcoin-style ECDSA).
 //! - `Secp256k1Sha3`: same curve, but pre-hash with SHA3-256.
 //!
 //! Both produce 64-byte fixed-length raw signatures (r || s, big

@@ -27,6 +27,8 @@ use quil_types::error::{QuilError, Result};
 use crate::provers::lifecycle::{LifecycleAction, ProverLifecycle};
 use crate::worker::WorkerManager;
 use crate::prover_message_transport::ProverMessageTransport;
+use crate::message_collector::{MessageCollector, SubmitOutcome};
+use crate::current_frame::CurrentFrame;
 
 /// End-to-end submission pipeline for prover lifecycle actions.
 ///
@@ -63,7 +65,54 @@ pub struct ProverPipeline {
     /// `GLOBAL_PROVER` and to fetch the latest frame header for VDF
     /// challenge derivation in [`Self::submit_join`].
     pub transport: Arc<dyn ProverMessageTransport>,
+    /// Live hypergraph CRDT — read by the storage-attestation confirm hook
+    /// (`submit_confirm`) to partition each confirmed shard's committed
+    /// subtree into PoRep leaves. Required for data-shard confirmations.
+    pub hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Replica store the confirm hook persists per-leaf SDR replicas into
+    /// (keyed by `(epoch, leaf_id)`), so the per-frame producer can later
+    /// answer openings. Required for data-shard confirmations.
+    pub replica_store: Option<quil_store::replica_store::ReplicaStore>,
+    /// Per-shard storage: the hypergraph and replica store of the worker that
+    /// holds and attests a shard, when it is not the node's own (a thread
+    /// worker opens its own database). Confirmation must encode the same data
+    /// into the same replica store the attesting worker proves from, or the
+    /// registered leaf roots diverge from its attestations once the shard's
+    /// data changes and every storage frame is rejected.
+    pub storage_for_filter: Option<std::sync::Arc<
+        dyn Fn(&[u8]) -> Option<(std::sync::Arc<quil_hypergraph::HypergraphCrdt>, quil_store::replica_store::ReplicaStore)>
+            + Send + Sync,
+    >>,
+    /// Leaf roots prepared by the standalone (cluster-mode) worker serving a
+    /// filter, from its own store: `Ok(None)` when no such worker serves it.
+    /// Called from a blocking task. Without it the master encoded from its
+    /// own store, which lacks the shard's data, and the worker's attestations
+    /// were rejected for leaves it could never prove.
+    pub remote_storage_confirm: Option<RemoteStorageConfirm>,
+    /// Splits and merges this node has recorded but not applied. A confirm in
+    /// the epoch before one applies also registers the shards it creates from
+    /// the confirmed ones (see `pre_registration_targets`).
+    pub pending_shard_changes: Option<std::sync::Arc<
+        dyn Fn() -> Vec<quil_types::store::PendingShardChange> + Send + Sync,
+    >>,
+    /// Local global-message collector, for LOOPBACK of ops this node generates
+    /// for ITSELF (ShardSplit/ShardMerge from the coverage orchestrator, which
+    /// runs on the frame producer). A producer must include its own generated op
+    /// in the frame it builds; the network publish only reaches OTHER nodes, so
+    /// on a single-archive network (no other archive to accept, gossipsub won't
+    /// self-loopback) the op would otherwise never land. Loop it into the same
+    /// collector the gRPC/gossip ingest feeds. `None` disables loopback (tests).
+    pub local_message_collector: Option<Arc<MessageCollector>>,
+    /// Current-frame tracker, used to tag looped-back ops with the CONSENSUS RANK
+    /// (`effective_rank()`) exactly as the gRPC ingest does (grpc.rs:400) so the
+    /// leader's `collect_for_rank` picks them up. `None` disables loopback.
+    pub current_frame: Option<Arc<CurrentFrame>>,
 }
+
+pub type RemoteStorageConfirm = std::sync::Arc<
+    dyn Fn(&[u8], &[Vec<u8>], u64) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
+        + Send + Sync,
+>;
 
 /// Hard ceiling on lifecycle submissions that do NOT perform VDF
 /// compute (confirms, rejects, leaves, seniority merge). Each of
@@ -74,11 +123,124 @@ pub struct ProverPipeline {
 /// or stuck publish can't silently wedge a dispatch forever.
 const NON_VDF_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What a confirm encodes, per confirmed filter: the filter, from its own
+/// storage, then the shards a split or merge applying at `epoch` creates from
+/// it (see `pre_registration_targets`). A merge target two confirmed sources
+/// share is encoded once, from the first.
+fn confirm_encoding_plan(
+    filters: &[Vec<u8>],
+    changes: &[quil_types::store::PendingShardChange],
+    epoch: u64,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut claimed: Vec<Vec<u8>> = filters.to_vec();
+    filters
+        .iter()
+        .map(|filter| {
+            let targets: Vec<Vec<u8>> = if filter.is_empty() {
+                Vec::new()
+            } else {
+                quil_execution::global_intrinsic::leaf_root_registration::pre_registration_targets(
+                    changes,
+                    std::slice::from_ref(filter),
+                    epoch,
+                )
+                .into_iter()
+                .filter(|target| !claimed.contains(target))
+                .collect()
+            };
+            claimed.extend(targets.iter().cloned());
+            (filter.clone(), targets)
+        })
+        .collect()
+}
+
 impl ProverPipeline {
+    fn dispatch_confirmation(
+        self: &Arc<Self>, filters: Vec<Vec<u8>>, frame_number: u64,
+        needs_storage: bool, prune_replicas: bool,
+    ) {
+        let Some(attempt) = self.lifecycle.submission_attempts.begin(&filters, frame_number) else {
+            tracing::info!(frame = frame_number, filters = filters.len(), needs_storage,
+                "confirmation dispatch skipped: an attempt for this filter/epoch is already recorded");
+            return;
+        };
+        tracing::info!(frame = frame_number, filters = filters.len(), needs_storage, prune_replicas,
+            "dispatching prover confirmation");
+        let me = self.clone();
+        tokio::spawn(async move {
+            // Limit expensive preparation independently from network timeouts.
+            // Keep the reservation inside the blocking task: cancelling its
+            // waiter cannot start a second encoder while the first still runs.
+            let (roots, attempt) = if needs_storage {
+                static ENCODERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+                let Ok(permit) = ENCODERS.acquire().await else { return; };
+                let encoder = me.clone();
+                let encoded_filters = filters.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let roots = encoder.storage_confirm_leaf_roots(&encoded_filters, frame_number);
+                    (roots, attempt)
+                }).await;
+                match prepared {
+                    Ok((Ok(roots), attempt)) => (roots, attempt),
+                    Ok((Err(e), _attempt)) => {
+                        warn!(frame = frame_number, %e, "confirmation preparation failed; retrying on next cycle");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(frame = frame_number, %e, "confirmation preparation task failed");
+                        return;
+                    }
+                }
+            } else {
+                (Vec::new(), attempt)
+            };
+            match tokio::time::timeout(
+                NON_VDF_SUBMIT_TIMEOUT,
+                me.submit_confirm(filters, frame_number, roots),
+            ).await {
+                Ok(Ok(())) => {
+                    attempt.published(me.current_frame.as_ref().map(|f| f.effective()).unwrap_or(frame_number));
+                    if prune_replicas {
+                        if let Some(store) = me.replica_store.as_ref() {
+                            // Keep current and next epoch replicas. Publication
+                            // alone is not an on-chain registration acknowledgement.
+                            let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+                            if let Err(e) = store.evict_below_epoch(current_epoch) {
+                                warn!(frame = frame_number, %e, "replica cleanup failed");
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => warn!(frame = frame_number, %e, "confirmation submission failed"),
+                Err(_) => warn!(frame = frame_number, "confirmation submission timed out"),
+            }
+        });
+    }
+
     /// Dispatch a lifecycle action. Non-blocking: spawns a tokio task
     /// to handle the (slow) VDF + sign + submit work so the caller's
     /// frame-processing loop continues.
     pub fn dispatch(self: &Arc<Self>, action: LifecycleAction) {
+        // Confirmations acquire the same reservation inside their preparation
+        // helper, where ownership also follows blocking encoders. Other shard
+        // operations reserve before spawning so another evaluation cannot race.
+        let mut reservation = match &action {
+            LifecycleAction::ProposeJoin { filters, frame_number, .. }
+            | LifecycleAction::RejectJoins { filters, frame_number }
+            | LifecycleAction::ProposeLeave { filters, frame_number }
+            | LifecycleAction::RejectLeaves { filters, frame_number } => {
+                match self.lifecycle.submission_attempts.begin(filters, *frame_number) {
+                    Some(attempt) => Some(attempt),
+                    None => {
+                        info!(frame = *frame_number, filters = filters.len(),
+                            "shard submission deferred: another operation owns a filter");
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
         match action {
             LifecycleAction::Noop => {}
             LifecycleAction::ProposeJoin { filters, worker_ids, frame_number } => {
@@ -97,59 +259,77 @@ impl ProverPipeline {
                 // permanently stuck.
                 const SUBMIT_JOIN_TIMEOUT: std::time::Duration =
                     std::time::Duration::from_secs(90);
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                // TODO
+                // Chunk the filters so no single ProverJoin exceeds the
+                // decoder's `MAX_FILTERS` (100) / `MAX_PROOF_LEN` (51600 =
+                // 100*516) ceiling — a >100-shard node would otherwise emit one
+                // over-cap message the archive silently drops at decode. Each
+                // chunk is an independent, valid join (one prover key, a subset
+                // of shards) that the archive processes additively; `submit_join`
+                // marks all `worker_ids` pending on each, which is idempotent.
+                // Today there are ~49 shards ⇒ a single chunk, byte-identical to
+                // the pre-chunking behaviour. Each chunk gets its own VDF-bounded
+                // timeout since chunk N's proofs are independent of chunk N-1's.
+                const MAX_FILTERS_PER_JOIN: usize = 100;
                 tokio::spawn(async move {
-                    let outcome = tokio::time::timeout(
-                        SUBMIT_JOIN_TIMEOUT,
-                        me.submit_join(filters, &worker_ids, frame_number),
-                    ).await;
-                    me.lifecycle.set_proof_in_progress(false);
-                    match outcome {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ProposeJoin submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = SUBMIT_JOIN_TIMEOUT.as_secs(),
-                                "ProposeJoin submission timed out — clearing proof_in_progress",
-                            );
+                    let chunks: Vec<Vec<Vec<u8>>> = if filters.is_empty() {
+                        vec![Vec::new()]
+                    } else {
+                        filters
+                            .chunks(MAX_FILTERS_PER_JOIN)
+                            .map(|c| c.to_vec())
+                            .collect()
+                    };
+                    let chunk_count = chunks.len();
+                    let mut attempt = reservation.take().expect("join reservation acquired");
+                    for (idx, chunk) in chunks.into_iter().enumerate() {
+                        let submitted_filters = chunk.clone();
+                        match tokio::time::timeout(
+                            SUBMIT_JOIN_TIMEOUT,
+                            me.submit_join(chunk, &worker_ids, frame_number),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                let published = me.current_frame.as_ref()
+                                    .map(|f| f.effective()).unwrap_or(frame_number);
+                                attempt.published_subset(&submitted_filters, published);
+                            }
+                            Ok(Err(e)) => {
+                                warn!(frame = frame_number, chunk = idx, chunk_count, %e, "ProposeJoin submission failed");
+                                break;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    frame = frame_number,
+                                    chunk = idx,
+                                    chunk_count,
+                                    timeout_s = SUBMIT_JOIN_TIMEOUT.as_secs(),
+                                    "ProposeJoin submission timed out — clearing proof_in_progress",
+                                );
+                                break;
+                            }
                         }
                     }
+                    me.lifecycle.set_proof_in_progress(false);
                 });
             }
             LifecycleAction::ConfirmJoins { filters, frame_number } => {
-                let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_confirm(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ConfirmJoins submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ConfirmJoins submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.dispatch_confirmation(filters, frame_number, true, false);
             }
             LifecycleAction::RejectJoins { filters, frame_number } => {
                 let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_reject(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "RejectJoins submission failed");
                         }
@@ -165,13 +345,17 @@ impl ProverPipeline {
             }
             LifecycleAction::ProposeLeave { filters, frame_number } => {
                 let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_leave(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "ProposeLeave submission failed");
                         }
@@ -186,36 +370,24 @@ impl ProverPipeline {
                 });
             }
             LifecycleAction::ConfirmLeaves { filters, frame_number } => {
-                let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
-                tokio::spawn(async move {
-                    match tokio::time::timeout(
-                        NON_VDF_SUBMIT_TIMEOUT,
-                        me.submit_confirm(filters, frame_number),
-                    ).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            warn!(frame = frame_number, %e, "ConfirmLeaves submission failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                frame = frame_number,
-                                timeout_s = NON_VDF_SUBMIT_TIMEOUT.as_secs(),
-                                "ConfirmLeaves submission timed out",
-                            );
-                        }
-                    }
-                });
+                self.dispatch_confirmation(filters, frame_number, false, false);
+            }
+            LifecycleAction::ReconfirmEpoch { filters, frame_number } => {
+                self.dispatch_confirmation(filters, frame_number, true, true);
             }
             LifecycleAction::RejectLeaves { filters, frame_number } => {
                 let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                // TODO
+                let attempt = reservation.take().expect("shard reservation acquired");
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
                         me.submit_reject(filters, frame_number),
                     ).await {
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            attempt.published(me.current_frame.as_ref()
+                                .map(|f| f.effective()).unwrap_or(frame_number));
+                        }
                         Ok(Err(e)) => {
                             warn!(frame = frame_number, %e, "RejectLeaves submission failed");
                         }
@@ -231,7 +403,7 @@ impl ProverPipeline {
             }
             LifecycleAction::ProposeSeniorityMerge { frame_number } => {
                 let me = self.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/559
+                // TODO
                 tokio::spawn(async move {
                     match tokio::time::timeout(
                         NON_VDF_SUBMIT_TIMEOUT,
@@ -262,7 +434,7 @@ impl ProverPipeline {
 
     fn bls_signer(&self) -> Result<Box<dyn Signer>> {
         self.key_manager
-            .get_signer(quil_types::crypto::KeyType::Bls48581G1)
+            .get_signer(quil_types::crypto::KeyType::Falcon512)
             .map_err(|e| QuilError::Internal(format!("no BLS signer: {e}")))
     }
 
@@ -283,89 +455,48 @@ impl ProverPipeline {
         info!(
             filter_count = filters.len(),
             lifecycle_frame,
-            "building ProverJoin (fetching latest frame for VDF challenge)"
+            "building ProverJoin"
         );
 
         let header = self.transport.latest_global_frame_header().await?;
-        let output = header.output.clone();
         let frame_number = header.frame_number;
-        let difficulty = header.difficulty;
 
-        // Compute VDF multi-proof in parallel — one proof per filter.
-        let challenge: [u8; 32] = {
-            use sha3::{Digest, Sha3_256};
-            Sha3_256::digest(&output).into()
+        // VDF proof-of-sequential-work is no longer required to join.
+        // The `proof` field is retained in the wire format (empty here)
+        // purely so historical joins still decode; new joins carry none.
+        let all_proofs: Vec<u8> = Vec::new();
+
+        // Seniority merge targets: our own + enrolled Ed448 seeds. The join op
+        // itself only carries the BLS prover key, so the ONLY way the join can
+        // factor in our libp2p peer-id(s)' premainnet seniority is to attach
+        // them as merge targets — each Ed448 seed signs our BLS pubkey under
+        // the `PROVER_JOIN_MERGE` domain (the same domain `verify_prover_join`
+        // checks and `invoke_join` derives peer-ids from). Without this the
+        // prover joins at seniority 0 regardless of what its peer-id earned,
+        // and only a later `ProverSeniorityMerge` could raise it. A seed whose
+        // peer-id has no premainnet seniority contributes 0 — harmless. This is
+        // the same seed set used for `submit_seniority_merge` (own key first,
+        // then `multisig_prover_enrollment_paths`).
+        let merge_targets: Vec<quil_execution::global_intrinsic::SeniorityMerge> = {
+            let mut mts =
+                Vec::with_capacity(self.multisig_ed448_seeds.len());
+            for seed in &self.multisig_ed448_seeds {
+                let helper_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
+                let helper_signer =
+                    quil_crypto::Ed448Signer::from_bytes(seed, &helper_pubkey)?;
+                let helper_sig = <quil_crypto::Ed448Signer as Signer>::sign_with_domain(
+                    &helper_signer,
+                    &self.bls_pubkey,
+                    b"PROVER_JOIN_MERGE",
+                )?;
+                mts.push(quil_execution::global_intrinsic::SeniorityMerge {
+                    signature: helper_sig,
+                    key_type: quil_types::crypto::KeyType::Ed448 as u32,
+                    prover_public_key: helper_pubkey,
+                });
+            }
+            mts
         };
-        let ids: Vec<Vec<u8>> = filters.iter().enumerate().map(|(i, f)| {
-            let mut id = Vec::new();
-            id.extend_from_slice(&self.prover_address);
-            id.extend_from_slice(f);
-            id.extend_from_slice(&(i as u32).to_be_bytes());
-            id
-        }).collect();
-
-        let num_filters = filters.len();
-        let mut handles = Vec::with_capacity(num_filters);
-        for i in 0..num_filters {
-            let fp = self.frame_prover.clone();
-            let all_ids = ids.clone();
-            let ch = challenge;
-            handles.push(tokio::task::spawn_blocking(move || {
-                let refs: Vec<&[u8]> = all_ids.iter().map(|v| v.as_slice()).collect();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fp.calculate_multi_proof(&ch, difficulty, &refs, i as u32)
-                }));
-                (i, result)
-            }));
-        }
-        let mut results: Vec<Option<Vec<u8>>> = vec![None; num_filters];
-        for handle in handles {
-            match handle.await {
-                Ok((i, Ok(Ok(p)))) => results[i] = Some(p),
-                Ok((i, Ok(Err(e)))) => {
-                    return Err(QuilError::Internal(format!(
-                        "VDF proof {} failed: {}", i, e
-                    )));
-                }
-                Ok((i, Err(_panic))) => {
-                    return Err(QuilError::Internal(format!(
-                        "VDF proof {} panicked", i
-                    )));
-                }
-                Err(e) => {
-                    return Err(QuilError::Internal(format!(
-                        "VDF task join error: {}", e
-                    )));
-                }
-            }
-        }
-        let mut all_proofs = Vec::with_capacity(num_filters * 516);
-        for r in results {
-            all_proofs.extend_from_slice(&r.unwrap());
-        }
-
-        // Self-verify before submitting — catches a class of key/VDF bugs
-        // before the message reaches the network.
-        {
-            let refs_for_verify: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
-            let solutions: Vec<Vec<u8>> = (0..num_filters)
-                .map(|i| all_proofs[i * 516..(i + 1) * 516].to_vec())
-                .collect();
-            let sol_refs: Vec<&[u8]> = solutions.iter().map(|s| s.as_slice()).collect();
-            match self.frame_prover.verify_multi_proof(&challenge, difficulty, &refs_for_verify, &sol_refs) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(QuilError::Internal(
-                        "ProverJoin self-verify failed".into(),
-                    ));
-                }
-                Err(e) => {
-                    return Err(QuilError::Internal(format!(
-                        "ProverJoin self-verify error: {}", e
-                    )));
-                }
-            }
-        }
 
         // Build + sign. Go signs the full ProverJoin canonical bytes
         // with signature=nil, then fills in the signature:
@@ -376,7 +507,7 @@ impl ProverPipeline {
             frame_number,
             public_key_signature_bls48581: None,
             delegate_address: self.delegate_address.clone(),
-            merge_targets: vec![],
+            merge_targets: merge_targets.clone(),
             proof: all_proofs.clone(),
         };
         let join_message = unsigned.to_canonical_bytes()?;
@@ -394,7 +525,7 @@ impl ProverPipeline {
                 pop_signature,
             }),
             delegate_address: self.delegate_address.clone(),
-            merge_targets: vec![],
+            merge_targets,
             proof: all_proofs,
         };
         let bytes = signed.to_canonical_bytes()?;
@@ -429,12 +560,24 @@ impl ProverPipeline {
         Ok(())
     }
 
-    async fn submit_confirm(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
-        // Go: sign(concat(filters) || u64(frame_number), PROVER_CONFIRM_domain).
-        // See global_prover_confirm.go:302-325.
-        let mut msg = Vec::new();
-        for f in &filters { msg.extend_from_slice(f); }
-        msg.extend_from_slice(&frame_number.to_be_bytes());
+    async fn submit_confirm(
+        &self,
+        filters: Vec<Vec<u8>>,
+        frame_number: u64,
+        leaf_roots: Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
+    ) -> Result<()> {
+        // Storage-attestation confirm hook (PoRep): at/after activation,
+        // partition each confirmed shard, SDR-encode + persist this prover's
+        // per-leaf replicas, and fold the registered leaf roots into the
+        // confirm. The signature covers `confirm_signing_message`, which
+        // appends the leaf-root set — byte-identical to the legacy
+        // concat(filters)||frame message when the set is empty (pre-activation
+        // / deps absent), so default Go-parity is preserved.
+        let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &filters,
+            frame_number,
+            &leaf_roots,
+        );
 
         let signer = self.bls_signer()?;
         let domain = Self::domain(b"PROVER_CONFIRM")?;
@@ -448,12 +591,80 @@ impl ProverPipeline {
                 address: self.prover_address.to_vec(),
             }),
             filters: filters.clone(),
+            leaf_roots,
         };
         let bytes = confirm.to_canonical_bytes()?;
 
-        info!(frame = frame_number, filter_count = filters.len(), "submitting ProverConfirm");
+        info!(frame = frame_number, filter_count = filters.len(), leaf_roots = confirm.leaf_roots.len(),
+            leaf_entries = confirm.leaf_roots.iter().map(|g| g.entries.len()).sum::<usize>(),
+            "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
         self.publish_prover_message(bytes).await
+    }
+
+    /// Partition committed shard data into PoRep leaves, encode and persist the
+    /// next epoch's replicas, and return their roots. Preparation errors abort
+    /// submission so the lifecycle can retry. Global confirms need no replicas.
+    fn storage_confirm_leaf_roots(
+        &self,
+        filters: &[Vec<u8>],
+        frame_number: u64,
+    ) -> Result<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>> {
+        let (Some(crdt), Some(replica_store)) =
+            (self.hypergraph.as_ref(), self.replica_store.as_ref())
+        else {
+            if filters.iter().all(Vec::is_empty) {
+                return Ok(Vec::new());
+            }
+            return Err(QuilError::Internal("storage confirmation requires hypergraph and replica store".into()));
+        };
+        // Epoch-aligned: a confirm in epoch E encodes + registers leaf roots for
+        // the NEXT epoch E+1 (the `next` slot). The prover encodes ahead so that
+        // when it becomes active next epoch it is already proving against an
+        // on-chain registration. The per-frame proving path
+        // (`storage_vote_openings`) reads replica@CURRENT-epoch, which this same
+        // store wrote one epoch earlier — so encode-ahead lines up exactly.
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+        // Shards a split or merge applying next epoch creates from a confirmed
+        // shard are registered too, encoded from that shard's storage: its
+        // holder is on one of them once the change applies.
+        let changes = match self.pending_shard_changes.as_ref() {
+            Some(pending) if frame_number >= quil_execution::global_intrinsic::leaf_root_registration::pre_registration_frame() => pending(),
+            _ => Vec::new(),
+        };
+        let mut roots = Vec::with_capacity(filters.len());
+        for (filter, targets) in confirm_encoding_plan(filters, &changes, epoch) {
+            let filter = &filter;
+            let worker = if filter.is_empty() {
+                None
+            } else {
+                self.storage_for_filter.as_ref().and_then(|resolve| resolve(filter))
+            };
+            if worker.is_none() && !filter.is_empty() {
+                if let Some(remote) = self.remote_storage_confirm.as_ref() {
+                    if let Some(prepared) = remote(filter, &targets, frame_number)? {
+                        roots.extend(prepared);
+                        continue;
+                    }
+                }
+            }
+            let (filter_crdt, filter_replicas) = match worker.as_ref() {
+                Some((worker_crdt, worker_replicas)) => (worker_crdt.as_ref(), worker_replicas),
+                None => (crdt.as_ref(), replica_store),
+            };
+            let encoded: Vec<Vec<u8>> = std::iter::once(filter.clone()).chain(targets).collect();
+            roots.extend(crate::app_shard_metadata::compute_storage_confirm(
+                filter_crdt,
+                filter_replicas,
+                &encoded,
+                &self.prover_address,
+                epoch,
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                &quil_crypto::sdr::SdrParams::default(),
+            )?);
+        }
+        Ok(roots)
+
     }
 
     async fn submit_reject(&self, filters: Vec<Vec<u8>>, frame_number: u64) -> Result<()> {
@@ -516,7 +727,7 @@ impl ProverPipeline {
             "submitting ShardSplit"
         );
         crate::metrics::inc_shard_splits_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message_local_first(bytes).await
     }
 
     /// Submit a `ShardMerge` proposal for the given shard list →
@@ -552,7 +763,7 @@ impl ProverPipeline {
             "submitting ShardMerge"
         );
         crate::metrics::inc_shard_merges_submitted();
-        self.publish_prover_message(bytes).await
+        self.publish_prover_message_local_first(bytes).await
     }
 
     /// Submit a `ProverSeniorityMerge` to raise on-chain seniority.
@@ -650,7 +861,7 @@ impl ProverPipeline {
     /// configured transport. The transport is responsible for the
     /// gRPC fan-out + pubsub publish (production) or in-memory
     /// broadcast (tests).
-    async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+    fn build_prover_bundle(&self, inner_bytes: Vec<u8>) -> Result<Vec<u8>> {
         let req = CanonicalMessageRequest::wrap(inner_bytes)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -660,7 +871,78 @@ impl ProverPipeline {
             requests: vec![Some(req)],
             timestamp: now_ms,
         };
-        let bundle_bytes = bundle.to_canonical_bytes()?;
+        bundle.to_canonical_bytes()
+    }
+
+    async fn publish_prover_message(&self, inner_bytes: Vec<u8>) -> Result<()> {
+        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
         self.transport.publish_prover_bundle(bundle_bytes).await
+    }
+
+    /// Loop a self-generated op into the LOCAL mempool (the same collector the
+    /// gRPC/gossip ingest feeds), tagged with the current consensus rank exactly
+    /// like the gRPC ingest (grpc.rs:400). Returns true if the op is now in the
+    /// local mempool (freshly Accepted, or already present as a Duplicate).
+    fn loopback_to_local_mempool(&self, bundle_bytes: &[u8]) -> bool {
+        match (&self.local_message_collector, &self.current_frame) {
+            (Some(mc), Some(cf)) => matches!(
+                mc.add_message_outcome(cf.effective_rank(), bundle_bytes.to_vec()),
+                SubmitOutcome::Accepted | SubmitOutcome::Duplicate
+            ),
+            _ => false,
+        }
+    }
+
+    /// Publish a self-generated op LOCAL-FIRST: add it to this node's own mempool
+    /// (so a frame PRODUCER includes its own op) AND best-effort publish to remote
+    /// paths. Succeeds if EITHER path delivered — so a single-archive producer
+    /// (where the remote publish has no acceptor and gossipsub won't self-loop)
+    /// still submits its op instead of failing with "no archive accepted". Used
+    /// for ShardSplit/ShardMerge, which the coverage orchestrator generates on
+    /// the frame producer itself.
+    async fn publish_prover_message_local_first(&self, inner_bytes: Vec<u8>) -> Result<()> {
+        let bundle_bytes = self.build_prover_bundle(inner_bytes)?;
+        let looped = self.loopback_to_local_mempool(&bundle_bytes);
+        let published = self.transport.publish_prover_bundle(bundle_bytes).await;
+        if looped || published.is_ok() {
+            if looped {
+                debug!("prover op looped back into local mempool (producer self-inclusion)");
+            }
+            Ok(())
+        } else {
+            published
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirm_encoding_plan;
+    use quil_types::store::{PendingShardChange, ShardChangeKind};
+
+    fn change(kind: ShardChangeKind, parent: u8, children: &[u8]) -> PendingShardChange {
+        PendingShardChange {
+            kind,
+            parent: vec![parent],
+            children: children.iter().map(|c| vec![*c]).collect(),
+            effective_epoch: 8,
+            proposed_frame: 0,
+        }
+    }
+
+    #[test]
+    fn a_confirm_encodes_the_shards_a_change_creates_from_each_filter_once() {
+        let changes = vec![change(ShardChangeKind::Split, 1, &[10, 11]), change(ShardChangeKind::Merge, 2, &[20, 21])];
+        assert_eq!(
+            confirm_encoding_plan(&[vec![1], vec![20], vec![21], vec![]], &changes, 8),
+            vec![
+                (vec![1], vec![vec![10], vec![11]]),
+                (vec![20], vec![vec![2]]),
+                (vec![21], vec![]),
+                (vec![], vec![]),
+            ],
+            "each split child from the parent's storage; a shared merge target once",
+        );
+        assert_eq!(confirm_encoding_plan(&[vec![1]], &changes, 9), vec![(vec![1], vec![])], "only a change applying next epoch");
     }
 }

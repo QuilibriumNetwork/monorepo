@@ -12,10 +12,17 @@ quil-crypto = { path = "../quil-crypto" }
 quil-store = { path = "../quil-store" }
 quil-tries = { path = "../quil-tries" }
 quil-hypergraph = { path = "../quil-hypergraph" }
+# Forest: hash-Merkle requests_root on migrated nodes.
+quil-forest = { path = "../quil-forest" }
+quil-forest-migrate = { path = "../quil-forest-migrate" }
 quil-keys = { path = "../quil-keys" }
 quil-p2p = { path = "../quil-p2p" }
 quil-consensus = { path = "../quil-consensus" }
-quil-execution = { path = "../quil-execution" }
+# Commonware simplex consensus backend. Provides the three seam
+# traits (GlobalProposer/FrameSink/FrameFinalizer) implemented in cw_global_seams.rs.
+quil-cw-consensus = { path = "../quil-cw-consensus" }
+# Shard sizing reads the coin accumulator (`shard_info::committed_deliveries`).
+quil-execution = { path = "../quil-execution", features = ["confidential-tokens"] }
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7"
 tracing = "0.1"
@@ -36,12 +43,14 @@ rand = "0.8"
 ed448-rust = { path = "../ed448-rust" }
 vdf = { path = "../vdf" }
 metrics = "0.24"
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 libc = "0.2"
 http = "1"
 async-trait = "0.1"
+bs58 = "0.5"
 
 [dev-dependencies]
+quil-store = { path = "../quil-store", features = ["test-utils"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }

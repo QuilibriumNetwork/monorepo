@@ -247,7 +247,10 @@ impl ExecutionDag {
         let mut c = 0;
         expect_tp(read_u32(data, &mut c)?, TYPE_EXECUTION_DAG, "ExecutionDAG")?;
         let n = read_u32(data, &mut c)? as usize;
-        let mut operations = Vec::with_capacity(n);
+        // Cap the pre-allocation against remaining bytes so an attacker-chosen
+        // count can't drive a huge `Vec::with_capacity` (alloc-bomb). A hint cap,
+        // not a hard reject — the loop still validates each entry.
+        let mut operations = Vec::with_capacity(n.min(data.len().saturating_sub(c) / 4));
         for _ in 0..n {
             let key = read_lp(data, &mut c)?;
             let node = read_lp(data, &mut c)?;

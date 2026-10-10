@@ -20,6 +20,10 @@ pub const HYPERGRAPH_SHARD: u8 = 0x09;
 pub const SHARD: u8 = 0x0A;
 pub const INBOX: u8 = 0x0B;
 pub const CONSENSUS: u8 = 0x0C;
+/// Per-member SDR storage replicas for proof-of-storage attestation, keyed
+/// `[STORAGE_REPLICA][epoch:u64 BE][leaf_id]` (epoch-first so dropping a stale
+/// epoch is a single `delete_range`). Rust-only (no Go counterpart).
+pub const STORAGE_REPLICA: u8 = 0x0D;
 /// Sub-discriminators under CONSENSUS — match Go's
 /// `node/store/constants.go:178-179`. The Rust consensus store
 /// historically wrote these at top-level prefixes 0x01/0x02 which
@@ -35,6 +39,26 @@ pub const CONSENSUS_LIVENESS: u8 = 0x01;
 /// already advanced past). Go has no equivalent record, so 0x02 under
 /// CONSENSUS is unused by a migrated Go store.
 pub const CONSENSUS_MATERIALIZED_CURSOR: u8 = 0x02;
+/// Rust-node-only: highest GLOBAL frame whose `requests` have been
+/// materialized into the hypergraph CRDT (reward balances + prover/shard
+/// state). Unlike [`CONSENSUS_MATERIALIZED_CURSOR`] this is a SINGLE global
+/// key (no filter) and is written ATOMICALLY inside the CRDT commit's own
+/// RocksTxn batch — so the durable cursor can never diverge from the CRDT
+/// frontier. On restart the materializer re-materializes only the
+/// un-committed tail `[cursor+1 ..= clock_head]`, which is the only safe
+/// window given reward minting is additive (no per-frame idempotency).
+/// Go has no equivalent record, so 0x03 under CONSENSUS is unused by a
+/// migrated Go store.
+pub const CONSENSUS_GLOBAL_MATERIALIZED_CURSOR: u8 = 0x03;
+/// Local, resumable audit of a committee session's outgoing history.
+pub const CONSENSUS_HISTORY_RECOVERY: u8 = 0x04;
+/// Local GLOBAL execution identity, distinct from a consensus certificate.
+pub const CONSENSUS_GLOBAL_EXECUTION_CHECKPOINT: u8 = 0x05;
+/// Present from before frame mutations until all materializer stages finish.
+pub const CONSENSUS_GLOBAL_EXECUTION_PENDING: u8 = 0x06;
+/// `[CONSENSUS, 0x07]` → 8-byte BE GLOBAL frame: this store discarded its
+/// application-shard frame history at the committee-handoff flag day.
+pub const CONSENSUS_APP_HISTORY_DISCARDED: u8 = 0x07;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -56,6 +80,11 @@ pub const CLOCK_COMPACTION: u8 = 0x05;
 pub const CLOCK_PEER_SENIORITY: u8 = 0x06;
 pub const CLOCK_APP_CERTIFIED_STATE: u8 = 0x07;
 pub const CLOCK_GLOBAL_FRAME_REQUEST: u8 = 0x08;
+/// Rust-node-only: per-frame MATERIALIZATION outcomes (one per request bundle).
+/// Not a Go concept; keyed like the frame itself so it prunes with the frame.
+// 0x09 is the existing certified-state namespace. Older Rust outcome writers
+// reused it and could overwrite certification records at the same number.
+pub const CLOCK_GLOBAL_FRAME_OUTCOMES: u8 = 0xF2;
 pub const CLOCK_GLOBAL_CERTIFIED_STATE: u8 = 0x09;
 pub const CLOCK_SHARD_CERTIFIED_STATE: u8 = 0x0A;
 pub const CLOCK_QUORUM_CERTIFICATE: u8 = 0x0B;
@@ -66,6 +95,19 @@ pub const CLOCK_GLOBAL_FRAME_CANDIDATE: u8 = 0x0F;
 /// Per-frame-candidate request bundles. Mirrors Go's
 /// `CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE` (`node/store/constants.go:75`).
 pub const CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE: u8 = 0xF8;
+/// Per-shard-frame fee total (QUIL base units) recorded at materialization;
+/// carried by the next frame header for the shard's provers.
+pub const CLOCK_SHARD_FRAME_FEE_TOTAL: u8 = 0xF7;
+/// Per-shard-frame settlement relay entries recorded at materialization.
+pub const CLOCK_SHARD_FRAME_SETTLEMENTS: u8 = 0xF6;
+/// Per-shard-frame digest of the shard's accumulator report at that frame
+/// (empty for a shard holding no coins), recorded at materialization.
+pub const CLOCK_SHARD_FRAME_ACCUMULATOR: u8 = 0xF5;
+/// A shard's accumulator report bytes, stored once per distinct digest.
+pub const CLOCK_SHARD_ACCUMULATOR_REPORT: u8 = 0xF4;
+/// Per-shard-frame spend entries recorded at materialization; later headers
+/// relay them for the global commit.
+pub const CLOCK_SHARD_FRAME_SPENDS: u8 = 0xF3;
 
 pub const INDEX_EARLIEST: u8 = 0x10;
 pub const INDEX_LATEST: u8 = 0x20;
@@ -115,7 +157,7 @@ pub const HG_VERTEX_DATA_PREFIX: u8 = 0x30;
 // `quil_tries::serialize_node_solo`). Go's on-disk node bytes are
 // never read by Rust — the migration is the only point of contact.
 //
-// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key]            → solo-node bytes
+// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key] → solo-node bytes
 // [0x34, set_byte, phase_byte, l1(1), l2(32), path_i32_BE × depth] → by-key pointer
 //
 // `set_byte` and `phase_byte` are the same single-byte encoding as
@@ -198,6 +240,62 @@ pub fn clock_global_frame_request_key(frame_number: u64, request_index: u16) -> 
     key
 }
 
+/// [0x00, 0xF7, filter, frame_number BE]
+pub fn clock_shard_frame_fee_total_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_FEE_TOTAL);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+/// [0x00, 0xF6, filter, frame_number BE]
+pub fn clock_shard_frame_settlements_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_SETTLEMENTS);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_frame_accumulator_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_ACCUMULATOR);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_frame_spends_key(filter: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10 + filter.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_FRAME_SPENDS);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
+pub fn clock_shard_accumulator_report_key(filter: &[u8], digest: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + filter.len() + digest.len());
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_SHARD_ACCUMULATOR_REPORT);
+    key.extend_from_slice(filter);
+    key.extend_from_slice(digest);
+    key
+}
+
+/// Per-frame materialization outcomes: [0x00, 0xF2, frame_number(8 BE)].
+pub fn clock_global_frame_outcomes_key(frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_GLOBAL_FRAME_OUTCOMES);
+    key.extend_from_slice(&frame_number.to_be_bytes());
+    key
+}
+
 /// [0x00, 0x20]
 pub fn clock_global_latest_index() -> Vec<u8> {
     vec![CLOCK_FRAME, INDEX_LATEST | CLOCK_GLOBAL_FRAME]
@@ -222,6 +320,18 @@ pub fn clock_global_frame_candidate_key(frame_number: u64, selector: &[u8]) -> V
 pub fn clock_global_frame_candidate_latest_index() -> Vec<u8> {
     vec![CLOCK_FRAME, INDEX_LATEST | CLOCK_GLOBAL_FRAME_CANDIDATE]
 }
+
+/// Staged application-shard frames. Only `commit_shard_clock_frame` reads
+/// them; no execution plan does, so their cleanup is declared disjoint.
+pub const CLOCK_SHARD_STAGED_PREFIXES: &[[u8; 2]] = &[[CLOCK_FRAME, CLOCK_SHARD_STAGED]];
+
+/// GLOBAL candidate headers and request bodies. Execution does not read these;
+/// writes confined to them do not invalidate an execution plan that never
+/// touched them.
+pub const GLOBAL_CANDIDATE_PREFIXES: &[[u8; 2]] = &[
+    [CLOCK_FRAME, CLOCK_GLOBAL_FRAME_CANDIDATE],
+    [CLOCK_FRAME, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE],
+];
 
 /// Go's `clockGlobalFrameRequestCandidateKey`:
 /// `[0x00, 0xF8, selector, frame_number(8 BE), request_index(2 BE)]`.
@@ -615,6 +725,127 @@ pub fn hypergraph_vertex_data_key(
 }
 
 // -----------------------------------------------------------------------
+// Versioned (MVCC) blob keyspace
+//
+// The forest is version-addressable but the blob KV historically was not, which
+// let an incremental sync diff the forest at a pinned version while fetching the
+// LATEST blob → a race. The v2 keyspace carries the per-`(shard,phase)` commit
+// version (NON-inverted, big-endian) as an 8-byte SUFFIX so a reverse-seek to
+// `vk_prefix ‖ V` lands on the latest write with version ≤ V (MVCC read). The
+// version is fixed-width, so `vk = key[shard_prefix .. len-8]` recovers it
+// regardless of vertex-key length. Distinct prefix byte (0x31) from the legacy
+// unversioned keyspace (0x30) so the two coexist during migration.
+// -----------------------------------------------------------------------
+pub const HG_VERTEX_DATA_V2: u8 = 0x31;
+/// `root_hash → (version, global_frame)` index — written atomically with the
+/// forest+blobs so any committed root resolves to the local version that serves it.
+pub const HG_ROOT_VERSION: u8 = 0x35;
+/// `app_root → [(prefix, sub_root, version)]` manifest for split apps, so a
+/// sync-by-hash of an aggregate app root can be broken into per-sub-shard syncs.
+pub const HG_APP_MANIFEST: u8 = 0x36;
+
+/// `[0x31][set][phase][l1(3)][l2(32)]` — scan prefix for all versioned blobs of a shard.
+pub fn hypergraph_vertex_data_v2_shard_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + 3 + 32);
+    k.push(HG_VERTEX_DATA_V2);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(&shard_key.l1);
+    k.extend_from_slice(&shard_key.l2);
+    k
+}
+
+/// `…shard_prefix ‖ vertex_key` — the per-vertex prefix a version suffix appends to.
+pub fn hypergraph_vertex_data_v2_vk_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_shard_prefix(set_type, phase_type, shard_key);
+    k.extend_from_slice(vertex_key);
+    k
+}
+
+/// The shard holding every prover, allocation and leaf-root registration.
+pub fn prover_registry_shard() -> quil_types::store::ShardKey {
+    quil_types::store::ShardKey { l1: [0; 3], l2: [0xff; 32] }
+}
+
+/// Every key prefix a prover registry scan reads: the fixed vertex rows of
+/// the prover shard's add and remove phases, legacy and versioned. Stores
+/// watch these so a registry scan can be reused while none was written.
+pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
+    prover_registry_row_prefixes().into_iter().map(|(_, prefix)| prefix).collect()
+}
+
+/// [`prover_registry_key_prefixes`] with each prefix's phase. A row's
+/// 32-byte vertex address follows its prefix (then, versioned, its version).
+pub fn prover_registry_row_prefixes() -> Vec<(&'static str, Vec<u8>)> {
+    let shard = prover_registry_shard();
+    let mut prefixes = Vec::new();
+    for phase in ["adds", "removes"] {
+        for mut prefix in [
+            hypergraph_vertex_data_prefix("vertex", phase, &shard),
+            hypergraph_vertex_data_v2_shard_prefix("vertex", phase, &shard),
+        ] {
+            prefix.extend_from_slice(&shard.l2);
+            prefixes.push((phase, prefix));
+        }
+    }
+    prefixes
+}
+
+/// `…vk_prefix ‖ version_be(8)` — the full MVCC key for one vertex at one version.
+pub fn hypergraph_vertex_data_v2_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+    version: u64,
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_vk_prefix(set_type, phase_type, shard_key, vertex_key);
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+/// `[0x35][set][phase][l1(3)][l2(32)][root_hash(32)]` — root→version index key.
+pub fn hypergraph_root_version_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_id: &[u8],
+    root_hash: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + shard_id.len() + root_hash.len());
+    k.push(HG_ROOT_VERSION);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(shard_id);
+    k.extend_from_slice(root_hash);
+    k
+}
+
+/// `[0x36][set][phase][app(32)][app_root(32)]` — split-app manifest key.
+pub fn hypergraph_app_manifest_key(
+    set_type: &str,
+    phase_type: &str,
+    app_address: &[u8],
+    app_root: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + app_address.len() + app_root.len());
+    k.push(HG_APP_MANIFEST);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(app_address);
+    k.extend_from_slice(app_root);
+    k
+}
+
+// -----------------------------------------------------------------------
 // Per-node lazy tree backend key builders.
 //
 // `node_key` is whatever bytes the in-memory tree uses as the node's
@@ -713,6 +944,65 @@ pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
     k.push(CONSENSUS_MATERIALIZED_CURSOR);
     k.extend_from_slice(filter);
     k
+}
+
+/// Key for the single GLOBAL "highest materialized frame" cursor. Value is
+/// an 8-byte big-endian `u64`. There is exactly ONE such key (no filter) —
+/// it tracks the global materializer's CRDT frontier and is staged into the
+/// CRDT commit's own batch. See [`CONSENSUS_GLOBAL_MATERIALIZED_CURSOR`].
+pub fn global_materialized_cursor_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_MATERIALIZED_CURSOR]
+}
+
+pub fn app_history_discarded_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_APP_HISTORY_DISCARDED]
+}
+
+/// The key ranges that hold application-shard frame chains (as opposed to
+/// application state and GLOBAL frames), each `[start, end)`:
+/// - clock: shard frames, staged shard frames, prover-trie and total-distance
+///   rows, app and shard certified states, and the shard earliest, latest,
+///   certified-latest and parent indexes;
+/// - per-frame relay records: spends, accumulator reports and digests,
+///   settlements and fee totals (`0xF3..0xF8`; GLOBAL outcomes are `0xF2`,
+///   GLOBAL request candidates `0xF8`);
+/// - consensus: per-filter legacy state and liveness (a GLOBAL row has no
+///   filter and is kept), application materialized cursors and history
+///   recovery progress.
+pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let clock = |from: u8, to: u8| (vec![CLOCK_FRAME, from], vec![CLOCK_FRAME, to]);
+    vec![
+        clock(CLOCK_SHARD_FRAME, CLOCK_SHARD_FRAME + 1),
+        clock(CLOCK_SHARD_STAGED, CLOCK_SHARD_STAGED + 1),
+        clock(CLOCK_SHARD_FRAME_FRECENCY, CLOCK_SHARD_FRAME_FRECENCY + 1),
+        clock(CLOCK_TOTAL_DISTANCE, CLOCK_TOTAL_DISTANCE + 1),
+        clock(CLOCK_APP_CERTIFIED_STATE, CLOCK_APP_CERTIFIED_STATE + 1),
+        clock(CLOCK_SHARD_CERTIFIED_STATE, CLOCK_SHARD_CERTIFIED_STATE + 1),
+        clock(INDEX_EARLIEST | CLOCK_SHARD_FRAME, (INDEX_EARLIEST | CLOCK_SHARD_FRAME) + 1),
+        clock(INDEX_LATEST | CLOCK_SHARD_FRAME, (INDEX_LATEST | CLOCK_SHARD_FRAME) + 1),
+        clock(INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE, (INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE) + 1),
+        clock(INDEX_PARENT | CLOCK_SHARD_FRAME, (INDEX_PARENT | CLOCK_SHARD_FRAME) + 1),
+        clock(CLOCK_SHARD_FRAME_SPENDS, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE),
+        (vec![CONSENSUS, CONSENSUS_STATE, 0x00], vec![CONSENSUS, CONSENSUS_LIVENESS]),
+        (vec![CONSENSUS, CONSENSUS_LIVENESS, 0x00], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR]),
+        (vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1]),
+        (vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY], vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1]),
+    ]
+}
+
+pub fn global_execution_checkpoint_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_EXECUTION_CHECKPOINT]
+}
+
+pub fn global_execution_pending_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_EXECUTION_PENDING]
+}
+
+pub fn app_history_recovery_key(filter: &[u8], session: &[u8; 32]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY];
+    key.extend_from_slice(filter);
+    key.extend_from_slice(session);
+    key
 }
 
 // -----------------------------------------------------------------------

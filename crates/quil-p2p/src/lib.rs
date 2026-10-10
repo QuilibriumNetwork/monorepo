@@ -1,27 +1,35 @@
-pub mod behaviour;
-pub mod blossomsub;
-#[cfg(test)]
-pub mod test_harness;
-pub mod bitmask;
+pub mod blossomsub_behaviour;
+pub mod direct;
 pub mod ed448_identity;
+pub mod falcon_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod handler;
+pub mod metrics;
 pub mod node;
 pub mod onion;
 pub mod peer_authenticator;
 pub mod peer_info;
+pub mod pqnoise;
+pub mod pqnoise_transport;
 pub mod protocol;
-mod scoring;
 pub mod signer_registry;
 pub mod tls_debug;
 
-pub use behaviour::ValidationResult;
-pub use bitmask::slice_bitmask;
+// The BlossomSub behaviour + event + validation-result surface come from the
+// `blossomsub_behaviour` bridge over stock `libp2p::gossipsub`.
+pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
+pub use libp2p::identity::Keypair;
 pub use libp2p::PeerId;
-pub use ed448_identity::Ed448Identity;
+pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
+pub use falcon_identity::{
+    falcon_identity_self_check, generate_falcon_signing_key, peer_id_base58_from_falcon_pubkey,
+    peer_id_from_falcon_pubkey,
+};
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
+pub use direct::{DirectOutcome, DirectStatsSnapshot};
+pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
@@ -29,7 +37,7 @@ pub use peer_info::{
     peek_key_registry_timestamp, peek_peer_info_timestamp,
     CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
     InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
-    PEER_INFO_TYPE,
+    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID,
 };
 pub use signer_registry::{SignerEntry, SignerRegistry};
 
@@ -82,6 +90,16 @@ pub mod params {
     /// clustering (a couple of legitimate co-located peers) through
     /// without bias; 1 is the strictest setting.
     pub const MESH_PEERS_PER_SUBNET: usize = 2;
+    /// Hard cap on the total bytes of message payloads held in the
+    /// IHAVE/IWANT message cache (`MessageCache`). The cache retains
+    /// `HISTORY_LENGTH` (24) windows × `HEARTBEAT_INTERVAL` (700ms) ≈ 17s
+    /// of *subscribed* traffic, cloning each message's full payload. Under
+    /// a catch-up flood of large consensus frames that window alone reached
+    /// 14+ GB (jeprof: dominant stack through `on_connection_handler_event`
+    /// → `handle_rpc` → `mcache.put`). Window-count bounding does not bound
+    /// bytes; this does. 512 MiB is far more than gossip recovery needs
+    /// while keeping the cache from driving OOM.
+    pub const MCACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 }
 
 /// Runtime-configurable BlossomSub parameters. Behaviour holds an
@@ -117,6 +135,10 @@ pub struct BlossomsubParams {
     /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
     /// `0` disables the check.
     pub mesh_peers_per_subnet: usize,
+    /// Hard byte cap on the IHAVE/IWANT message cache. See
+    /// [`params::MCACHE_MAX_BYTES`]. Bounds memory under catch-up floods
+    /// that window-count history alone cannot.
+    pub mcache_max_bytes: usize,
 }
 
 impl Default for BlossomsubParams {
@@ -140,6 +162,7 @@ impl Default for BlossomsubParams {
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
             max_idont_want_messages: 5000,
             mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
+            mcache_max_bytes: params::MCACHE_MAX_BYTES,
         }
     }
 }
@@ -198,6 +221,9 @@ impl BlossomsubParams {
             // post-build if they need to. Default protects against
             // single-/24 eclipse on every node.
             mesh_peers_per_subnet: d.mesh_peers_per_subnet,
+            // No P2PConfig field yet — defaults to a 512 MiB ceiling,
+            // tunable via `set_params` post-build.
+            mcache_max_bytes: d.mcache_max_bytes,
         }
     }
 }

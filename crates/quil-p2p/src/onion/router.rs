@@ -1,15 +1,16 @@
 //! Onion router — establishes multi-hop circuits through relay nodes
 //! and sends/receives encrypted cells.
 //!
-//! Each hop uses X448 key agreement + AES-GCM for cell encryption.
-//! The outermost layer is peeled by each relay, revealing the next hop.
+//! Each hop uses a POST-QUANTUM sntrup761 KEM key agreement (replaces X448
+//! ECDH) + AES-GCM for cell encryption. The outermost layer is peeled by each
+//! relay, revealing the next hop.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
 
@@ -19,12 +20,19 @@ use super::CircuitId;
 const CIRCUIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A hop in an onion circuit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CircuitHop {
     /// Peer ID of the relay node.
     pub peer_id: Vec<u8>,
-    /// Shared secret established via X448 key agreement.
+    /// The relay's sntrup761 onion PUBLIC key. The initiator KEM-encapsulates to
+    /// this to derive `shared_secret` (post-quantum; replaces X448).
+    pub kem_public_key: Vec<u8>,
+    /// Shared secret established via sntrup761 KEM encapsulation.
     pub shared_secret: Vec<u8>,
+    /// KEM ciphertext to deliver in this hop's CREATE cell; the relay
+    /// decapsulates it (with its onion secret key) to recover `shared_secret`.
+    /// Empty until encapsulation runs in [`OnionRouter::create_circuit`].
+    pub create_ciphertext: Vec<u8>,
     /// Multiaddr of the relay.
     pub addr: String,
 }
@@ -87,33 +95,36 @@ impl OnionRouter {
         }
     }
 
-    /// Create a new circuit through the given relay hops, performing
-    /// X448-equivalent key agreement at each hop.
+    /// Create a new circuit through the given relay hops, performing a
+    /// POST-QUANTUM sntrup761 KEM key agreement at each hop.
     ///
-    /// For each hop, generates an ephemeral Ed448 keypair, derives a
-    /// shared secret from the hop's public key, and stores it for
-    /// cell encryption. The actual key exchange over the network
-    /// (sending CREATE cells to each relay) requires the gRPC transport.
+    /// For each hop with a `kem_public_key`, encapsulates to it — deriving the
+    /// per-hop `shared_secret` (which keys the AES-GCM layer) and the
+    /// `create_ciphertext` that the (gRPC) transport delivers in the hop's CREATE
+    /// cell, where the relay decapsulates it with its onion secret key. A hop that
+    /// already carries a `shared_secret`, or has no `kem_public_key`, is left as
+    /// is (test / pre-negotiated circuits).
     pub async fn create_circuit(&self, hops: Vec<CircuitHop>) -> super::CircuitId {
         let mut id_guard = self.next_circuit_id.lock().await;
         let id = *id_guard;
         *id_guard += 1;
         drop(id_guard);
 
-        // For each hop, derive shared secret using ECDH-like key agreement.
-        // Uses SHA256(our_ephemeral_privkey || their_pubkey) as the shared secret.
-        // In production, this would use X448 ECDH via the gRPC CREATE/CREATED
-        // handshake with each relay.
+        // Post-quantum per-hop key agreement: sntrup761 KEM encapsulation to the
+        // relay's onion public key (replaces the classical X448 ECDH). The shared
+        // secret never crosses the wire; only the ciphertext does.
         let mut resolved_hops = hops;
         for hop in &mut resolved_hops {
-            if hop.shared_secret.is_empty() && !hop.peer_id.is_empty() {
-                // Derive shared secret from peer's public key
-                // This is a simplified ECDH: SHA256(ephemeral_seed || peer_pubkey)
-                let mut seed = [0u8; 32];
-                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
-                let mut dh_input = seed.to_vec();
-                dh_input.extend_from_slice(&hop.peer_id);
-                hop.shared_secret = Sha256::digest(&dh_input).to_vec();
+            if hop.shared_secret.is_empty() && !hop.kem_public_key.is_empty() {
+                if let Some((ss, ct)) = super::onion_kem_encapsulate(&hop.kem_public_key) {
+                    hop.shared_secret = ss;
+                    hop.create_ciphertext = ct;
+                } else {
+                    tracing::warn!(
+                        circuit_id = id,
+                        "onion hop KEM encapsulation failed (bad onion public key)"
+                    );
+                }
             }
         }
 
@@ -200,7 +211,7 @@ impl OnionRouter {
 
         // Wrap in reverse order — last hop's layer goes on first
         for hop in circuit.hops.iter().rev() {
-            data = encrypt_layer(&hop.shared_secret, &data)?;
+            data = encrypt_layer(&hop.shared_secret, LAYER_FORWARD, &data)?;
         }
 
         circuit.record_sent(data.len() as u64);
@@ -225,15 +236,15 @@ impl OnionRouter {
 
         // Peel layers in forward order — first hop's layer is outermost
         for hop in &circuit.hops {
-            data = decrypt_layer(&hop.shared_secret, &data)?;
+            data = decrypt_layer(&hop.shared_secret, LAYER_FORWARD, &data)?;
         }
 
         Some(data)
     }
 
     /// Decrypt one layer of a received cell (used by relays).
-    pub fn decrypt_layer(shared_secret: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
-        decrypt_layer(shared_secret, ciphertext)
+    pub fn decrypt_layer(shared_secret: &[u8], direction: u8, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        decrypt_layer(shared_secret, direction, ciphertext)
     }
 
     /// Get statistics for a specific circuit.
@@ -253,25 +264,58 @@ pub struct CircuitSnapshot {
     pub total_bytes_received: u64,
 }
 
-/// Encrypt one onion layer using AES-256-GCM.
-/// Key = SHA256(shared_secret), Nonce = first 12 bytes of SHA256(shared_secret || "nonce").
-pub fn encrypt_layer(shared_secret: &[u8], plaintext: &[u8]) -> Option<Vec<u8>> {
-    let key = Sha256::digest(shared_secret);
-    let nonce_material = Sha256::digest(&[shared_secret, b"nonce"].concat());
-    let nonce = Nonce::from_slice(&nonce_material[..12]);
+/// Onion layer direction. FORWARD cells (originator → exit) and BACKWARD cells
+/// (exit → originator) are encrypted under SEPARATE keys derived from the same
+/// hop secret, so a captured cell cannot be reflected across directions and a
+/// forward layer can't be replayed as a backward one (defeats the same-key
+/// reflection where `decrypt(K, encrypt(K, x)) == x` regardless of direction).
+pub const LAYER_FORWARD: u8 = 0;
+pub const LAYER_BACKWARD: u8 = 1;
 
-    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
-    cipher.encrypt(nonce, plaintext).ok()
+/// Directional, domain-separated AES-256-GCM key for an onion layer:
+/// `SHA256("QOR-onion-layer-v1" ‖ direction ‖ hop_secret)`. The domain tag also
+/// keeps this key distinct from the `created_confirmation` hash of the same
+/// secret.
+fn layer_key(shared_secret: &[u8], direction: u8) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"QOR-onion-layer-v1");
+    h.update([direction]);
+    h.update(shared_secret);
+    h.finalize().into()
 }
 
-/// Decrypt one onion layer using AES-256-GCM.
-pub fn decrypt_layer(shared_secret: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
-    let key = Sha256::digest(shared_secret);
-    let nonce_material = Sha256::digest(&[shared_secret, b"nonce"].concat());
-    let nonce = Nonce::from_slice(&nonce_material[..12]);
+/// Encrypt one onion layer using AES-256-GCM under the directional layer key.
+///
+/// A FRESH random 96-bit nonce is generated per call and PREPENDED to the
+/// ciphertext. This is load-bearing: a hop's shared secret is static for the
+/// life of the circuit and encrypts many cells, so a deterministic
+/// (secret-derived) nonce would reuse `(key, nonce)` across cells — catastrophic
+/// for AES-GCM (leaks plaintext XOR AND lets an attacker recover the GHASH key to
+/// forge cells). The 12-byte overhead per layer is the cost of that safety.
+pub fn encrypt_layer(shared_secret: &[u8], direction: u8, plaintext: &[u8]) -> Option<Vec<u8>> {
+    let key = layer_key(shared_secret, direction);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
     let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
-    cipher.decrypt(nonce, ciphertext).ok()
+    let ct = cipher.encrypt(&nonce, plaintext).ok()?;
+
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+/// Decrypt one onion layer: the first 12 bytes are the per-cell nonce, the rest
+/// is the AES-256-GCM ciphertext under the directional layer key.
+pub fn decrypt_layer(shared_secret: &[u8], direction: u8, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    if ciphertext.len() < 12 {
+        return None;
+    }
+    let key = layer_key(shared_secret, direction);
+    let nonce = Nonce::from_slice(&ciphertext[..12]);
+
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    cipher.decrypt(nonce, &ciphertext[12..]).ok()
 }
 
 impl Default for OnionRouter {
@@ -289,7 +333,37 @@ mod tests {
             peer_id: peer.to_vec(),
             shared_secret: secret.to_vec(),
             addr: "127.0.0.1:9000".to_string(),
+            ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn create_circuit_kem_encapsulates_to_onion_key() {
+        // A hop that carries only the relay's sntrup761 onion public key (no
+        // pre-set shared secret) must be filled in by KEM encapsulation.
+        let (onion_pk, onion_sk) = crate::onion::onion_keypair();
+        let router = OnionRouter::new();
+        let hop = CircuitHop {
+            peer_id: b"relay".to_vec(),
+            kem_public_key: onion_pk,
+            addr: "127.0.0.1:9000".to_string(),
+            ..Default::default()
+        };
+        let cid = router.create_circuit(vec![hop]).await;
+
+        let circuits = router.circuits.lock().await;
+        let circuit = circuits.get(&cid).unwrap();
+        let resolved = &circuit.hops[0];
+        // Encapsulation produced a shared secret + a ciphertext of the right size.
+        assert!(!resolved.shared_secret.is_empty());
+        assert_eq!(
+            resolved.create_ciphertext.len(),
+            crate::onion::ONION_CIPHERTEXT_LEN
+        );
+        // The relay decapsulating that ciphertext recovers the identical secret.
+        let relay_secret =
+            crate::onion::onion_kem_decapsulate(&resolved.create_ciphertext, &onion_sk).unwrap();
+        assert_eq!(relay_secret, resolved.shared_secret);
     }
 
     #[test]
@@ -297,11 +371,22 @@ mod tests {
         let secret = b"shared-secret-32-bytes-long!!!!";
         let plaintext = b"hello onion world";
 
-        let encrypted = encrypt_layer(secret, plaintext).unwrap();
+        let encrypted = encrypt_layer(secret, LAYER_FORWARD, plaintext).unwrap();
         assert_ne!(encrypted, plaintext);
 
-        let decrypted = decrypt_layer(secret, &encrypted).unwrap();
+        let decrypted = decrypt_layer(secret, LAYER_FORWARD, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn directional_keys_prevent_cross_direction_reflection() {
+        let secret = b"shared-secret-32-bytes-long!!!!";
+        let fwd = encrypt_layer(secret, LAYER_FORWARD, b"cell").unwrap();
+        // The matching direction peels.
+        assert_eq!(decrypt_layer(secret, LAYER_FORWARD, &fwd).unwrap(), b"cell");
+        // The opposite direction FAILS (different key) — a forward cell cannot be
+        // reflected/replayed as a backward one under the same hop secret.
+        assert!(decrypt_layer(secret, LAYER_BACKWARD, &fwd).is_none());
     }
 
     #[test]
@@ -310,8 +395,8 @@ mod tests {
         let wrong = b"wrong--secret-32-bytes-long!!!!";
         let plaintext = b"secret data";
 
-        let encrypted = encrypt_layer(secret, plaintext).unwrap();
-        assert!(decrypt_layer(wrong, &encrypted).is_none());
+        let encrypted = encrypt_layer(secret, LAYER_FORWARD, plaintext).unwrap();
+        assert!(decrypt_layer(wrong, LAYER_FORWARD, &encrypted).is_none());
     }
 
     #[tokio::test]
@@ -359,9 +444,9 @@ mod tests {
         assert_ne!(encrypted, plaintext.to_vec());
 
         // Simulate relay peeling: each relay peels one layer in forward order
-        let after_hop1 = decrypt_layer(secret1, &encrypted).unwrap();
-        let after_hop2 = decrypt_layer(secret2, &after_hop1).unwrap();
-        let after_hop3 = decrypt_layer(secret3, &after_hop2).unwrap();
+        let after_hop1 = decrypt_layer(secret1, LAYER_FORWARD, &encrypted).unwrap();
+        let after_hop2 = decrypt_layer(secret2, LAYER_FORWARD, &after_hop1).unwrap();
+        let after_hop3 = decrypt_layer(secret3, LAYER_FORWARD, &after_hop2).unwrap();
         assert_eq!(after_hop3, plaintext);
     }
 
@@ -381,8 +466,8 @@ mod tests {
 
         // Simulate a response wrapped by relays in reverse order (exit wraps
         // first, then intermediate) — same as encrypt_cell layering.
-        let layer2 = encrypt_layer(secret2, plaintext).unwrap();
-        let layer1 = encrypt_layer(secret1, &layer2).unwrap();
+        let layer2 = encrypt_layer(secret2, LAYER_FORWARD, plaintext).unwrap();
+        let layer1 = encrypt_layer(secret1, LAYER_FORWARD, &layer2).unwrap();
 
         // Originator peels all layers
         let result = router.decrypt_cell_layers(cid, &layer1).await.unwrap();
@@ -403,7 +488,7 @@ mod tests {
 
         // Wrap a response so we can decrypt it
         let secret = b"secret1-must-be-long-enough!!!!";
-        let response = encrypt_layer(secret, b"response").unwrap();
+        let response = encrypt_layer(secret, LAYER_FORWARD, b"response").unwrap();
         let _ = router.decrypt_cell_layers(cid, &response).await.unwrap();
 
         let (sent2, recv) = router.circuit_stats(cid).await.unwrap();

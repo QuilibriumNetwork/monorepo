@@ -250,3 +250,127 @@ mod tests {
         assert!(!verify_traversal_proof(&RejectAll, &root, &proof).unwrap());
     }
 }
+
+/// Parse a `TraversalProof` from Go's raw wire format. The format is
+/// *not* the canonical-bytes form with a type tag — it's the binary
+/// layout written by `types/tries/lazy_proof_tree.go::TraversalProof::
+/// ToBytes` and read by `FromBytes:1527-1645`:
+///
+/// ```text
+/// u32 multiproof_len
+/// [multiproof_len bytes] (inner: u32 d_len, [d], u32 proof_len, [proof])
+/// u32 sub_proofs_count
+/// for each subproof:
+/// u32 commits_count
+/// {u32 commit_len, [commit_len bytes]} × commits_count
+/// u32 ys_count
+/// {u32 y_len, [y_len bytes]} × ys_count
+/// u32 paths_count
+/// {u32 path_len, u64 × path_len} × paths_count
+/// ```
+///
+/// The inner multiproof is a pair `(d, proof)` where `d` is the
+/// multi-commitment. See `bls48581/bls48581.go::Multiproof::FromBytes`.
+pub fn parse_traversal_proof(data: &[u8]) -> Result<TraversalProof> {
+    let mut c = 0usize;
+
+    // Outer u32 multiproof length
+    let mp_len = read_go_u32(data, &mut c)? as usize;
+    let mp_bytes = read_go_bytes(data, &mut c, mp_len)?;
+
+    // Inner multiproof: u32 d_len, [d], u32 proof_len, [proof]
+    let mut mc = 0usize;
+    let d_len = read_go_u32(mp_bytes, &mut mc)? as usize;
+    let multicommitment = read_go_bytes(mp_bytes, &mut mc, d_len)?.to_vec();
+    let proof_len = read_go_u32(mp_bytes, &mut mc)? as usize;
+    let proof = read_go_bytes(mp_bytes, &mut mc, proof_len)?.to_vec();
+
+    // Subproofs.
+    // Every `Vec::with_capacity` below is pre-sized from an attacker-controlled
+    // u32 count. Cap each hint against the remaining bytes (each entry needs at
+    // least a 4-byte length prefix, u64 elements 8 bytes) so a bogus count can't
+    // drive a multi-GB allocation → OOM/abort before the per-entry read even
+    // runs. `.min(..)` is a HINT cap only: the loop still reads and bounds-checks
+    // each real entry, so legit proofs are never rejected. (These hand-rolled
+    // `read_go_*` parsers never moved to the bounded `canonical_cursor` helpers.)
+    let sp_count = read_go_u32(data, &mut c)? as usize;
+    let mut sub_proofs = Vec::with_capacity(sp_count.min(data.len().saturating_sub(c) / 4));
+
+    for _ in 0..sp_count {
+        let commits_count = read_go_u32(data, &mut c)? as usize;
+        let mut commits = Vec::with_capacity(commits_count.min(data.len().saturating_sub(c) / 4));
+        for _ in 0..commits_count {
+            let l = read_go_u32(data, &mut c)? as usize;
+            commits.push(read_go_bytes(data, &mut c, l)?.to_vec());
+        }
+
+        let ys_count = read_go_u32(data, &mut c)? as usize;
+        let mut ys = Vec::with_capacity(ys_count.min(data.len().saturating_sub(c) / 4));
+        for _ in 0..ys_count {
+            let l = read_go_u32(data, &mut c)? as usize;
+            ys.push(read_go_bytes(data, &mut c, l)?.to_vec());
+        }
+
+        let paths_count = read_go_u32(data, &mut c)? as usize;
+        let mut paths = Vec::with_capacity(paths_count.min(data.len().saturating_sub(c) / 4));
+        for _ in 0..paths_count {
+            let plen = read_go_u32(data, &mut c)? as usize;
+            let mut path = Vec::with_capacity(plen.min(data.len().saturating_sub(c) / 8));
+            for _ in 0..plen {
+                path.push(read_go_u64(data, &mut c)?);
+            }
+            paths.push(path);
+        }
+
+        sub_proofs.push(TraversalSubProof { commits, ys, paths });
+    }
+
+    // Structural validation: at least one subproof with ys data.
+    if sub_proofs.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "pomw: traversal proof has no subproofs".into(),
+        ));
+    }
+    if !sub_proofs.iter().any(|sp| !sp.ys.is_empty()) {
+        return Err(QuilError::InvalidArgument(
+            "pomw: traversal proof has no ys data".into(),
+        ));
+    }
+
+    Ok(TraversalProof { multicommitment, proof, sub_proofs })
+}
+
+pub(crate) fn read_go_u32(data: &[u8], c: &mut usize) -> Result<u32> {
+    if *c + 4 > data.len() {
+        return Err(QuilError::InvalidArgument(
+            "pomw: EOF reading u32".into(),
+        ));
+    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&data[*c..*c + 4]);
+    *c += 4;
+    Ok(u32::from_be_bytes(b))
+}
+
+fn read_go_u64(data: &[u8], c: &mut usize) -> Result<u64> {
+    if *c + 8 > data.len() {
+        return Err(QuilError::InvalidArgument(
+            "pomw: EOF reading u64".into(),
+        ));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[*c..*c + 8]);
+    *c += 8;
+    Ok(u64::from_be_bytes(b))
+}
+
+pub(crate) fn read_go_bytes<'a>(data: &'a [u8], c: &mut usize, len: usize) -> Result<&'a [u8]> {
+    if *c + len > data.len() {
+        return Err(QuilError::InvalidArgument(
+            "pomw: EOF reading bytes".into(),
+        ));
+    }
+    let out = &data[*c..*c + len];
+    *c += len;
+    Ok(out)
+}

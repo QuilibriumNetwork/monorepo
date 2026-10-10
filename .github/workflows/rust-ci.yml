@@ -2,7 +2,10 @@ name: rust-ci
 
 on:
   push:
-    branches: [develop]
+    # Development moves between `develop`, versioned release branches, and
+    # their milestone branches.  Keep CI on every branch that can be a PR
+    # base so regressions are attributed to the push that introduced them.
+    branches: [develop, 'develop-*', 'v[0-9]*']
   pull_request:
 
 concurrency:
@@ -15,6 +18,9 @@ env:
   # different fingerprints and target/ grows unboundedly.
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: short
+  # Use the runner image's installed formulae; refresh dependencies separately.
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_UPGRADE: "1"
 
 jobs:
   # -----------------------------------------------------------------
@@ -31,7 +37,8 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       # Toolchain channel is read from rust-toolchain.toml at the repo
       # root. Update that file, not this workflow, to bump Rust.
@@ -39,16 +46,18 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          # Check artifacts must not win the immutable test-cache key race.
+          shared-key: rust-check
           cache-on-failure: true
 
-      # channelwasm excluded: doesn't compile on native targets currently.
-      # Re-include once fixed.
       - name: cargo check --workspace
-        run: cargo check --workspace --locked --exclude channelwasm
+        run: cargo check --workspace --locked
 
   # -----------------------------------------------------------------
   # test — `cargo nextest run` against the whole workspace.
@@ -64,29 +73,30 @@ jobs:
       - name: Pull LFS files
         run: git lfs pull
 
-      - uses: ./.github/actions/setup-native-deps
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-test
 
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
 
-      # channelwasm excluded: see comment in build job above.
-      #
-      # The list of temporarily-skipped failing tests lives in
-      # .nextest.toml `default-filter` (e2e_consensus binary +
-      # 8 individually-named tests). Keep that list in one place rather
-      # than splitting between YAML and config.
+      # .nextest.toml gives the multi-node consensus e2e tests exclusive
+      # scheduling slots so they aren't starved by parallel tests on the
+      # 4-vCPU runner (it no longer skips any tests).
       - name: cargo nextest run --workspace
-        run: cargo nextest run --workspace --locked --no-fail-fast --exclude channelwasm --config-file .nextest.toml
+        run: cargo nextest run --workspace --locked --no-fail-fast --config-file .nextest.toml
 
   # ------------------------------------------------------------------
   # release-build — verify `node/build.sh` succeeds on every supported
@@ -127,9 +137,12 @@ jobs:
         with:
           # Don't let the action set RUSTFLAGS
           rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
 
       - uses: Swatinem/rust-cache@v2
         with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
           # Per-target cache key — release target/ dirs don't overlap
           # with the debug target/ used by build+test, and the three
           # release targets don't overlap with each other.

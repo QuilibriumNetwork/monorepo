@@ -4,9 +4,9 @@
 //!
 //! Mirrors the Go node's gate at `global_consensus_engine.go`:
 //! - join proposals block while any shard is halted (so a struggling
-//!   shard doesn't get flooded with new joiners before recovery)
+//! shard doesn't get flooded with new joiners before recovery)
 //! - archive-node eviction skips entirely while any halt is active
-//!   (otherwise evictions would cascade during the halt window)
+//! (otherwise evictions would cascade during the halt window)
 
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -47,9 +47,11 @@ impl HaltState {
         Self::default()
     }
 
-    /// `true` iff at least one shard is currently halted. This is the
-    /// gate used by `ProverLifecycle::join_proposal_ready` and the
-    /// eviction scheduler.
+    /// `true` iff at least one shard is currently halted. Gates the
+    /// LEAVE/swap proposal path (coverage view is unreliable while halted),
+    /// `coverage_publish` (reward-proof submission), and worker production
+    /// drain. It does NOT gate JOINs — a halted shard must still be able to
+    /// attract joiners to recover.
     pub fn any_halted(&self) -> bool {
         !self.halted_shards.read().unwrap().is_empty()
     }

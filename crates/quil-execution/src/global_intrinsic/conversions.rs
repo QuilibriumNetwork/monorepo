@@ -9,9 +9,10 @@ use super::addressed_signature::AddressedSignature;
 use super::prover_filter_ops::{ProverLeave, ProverPause, ProverResume};
 use super::prover_join::ProverJoin;
 use super::prover_ops::{
-    ProverConfirm, ProverReject,
-    ProverUpdate,
+    ProverConfirm, ProverKick, ProverReject, ProverSeniorityMerge, ProverUpdate, ShardMerge,
+    ShardSplit,
 };
+use super::consensus_types::AltShardUpdate;
 use super::seniority_merge::SeniorityMerge;
 use super::frame_header::FrameHeader;
 use super::sig_with_pop::SignatureWithPop;
@@ -84,6 +85,154 @@ pub fn seniority_merge_to_proto(s: &SeniorityMerge) -> pb::SeniorityMerge {
         signature: s.signature.clone(),
         key_type: s.key_type,
         prover_public_key: s.prover_public_key.clone(),
+    }
+}
+
+// =====================================================================
+// ProverSeniorityMerge ↔ proto::ProverSeniorityMerge (the OUTER request,
+// 0x031A; its `merge_targets` are the inner SeniorityMerge records above).
+// =====================================================================
+
+pub fn prover_seniority_merge_from_proto(pb: &pb::ProverSeniorityMerge) -> ProverSeniorityMerge {
+    ProverSeniorityMerge {
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+        merge_targets: pb.merge_targets.iter().map(seniority_merge_from_proto).collect(),
+    }
+}
+
+pub fn prover_seniority_merge_to_proto(s: &ProverSeniorityMerge) -> pb::ProverSeniorityMerge {
+    pb::ProverSeniorityMerge {
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+        merge_targets: s.merge_targets.iter().map(seniority_merge_to_proto).collect(),
+    }
+}
+
+// =====================================================================
+// ProverKick ↔ proto::ProverKick (traversal_proof is a nested proto,
+// stored raw-prost in the canonical form).
+// =====================================================================
+
+pub fn prover_kick_from_proto(pb: &pb::ProverKick) -> ProverKick {
+    ProverKick {
+        frame_number: pb.frame_number,
+        kicked_prover_public_key: pb.kicked_prover_public_key.clone(),
+        conflicting_frame_1: pb.conflicting_frame_1.clone(),
+        conflicting_frame_2: pb.conflicting_frame_2.clone(),
+        commitment: pb.commitment.clone(),
+        proof: pb.proof.clone(),
+        traversal_proof: pb
+            .traversal_proof
+            .as_ref()
+            .map(prost::Message::encode_to_vec)
+            .unwrap_or_default(),
+    }
+}
+
+pub fn prover_kick_to_proto(k: &ProverKick) -> pb::ProverKick {
+    pb::ProverKick {
+        frame_number: k.frame_number,
+        kicked_prover_public_key: k.kicked_prover_public_key.clone(),
+        conflicting_frame_1: k.conflicting_frame_1.clone(),
+        conflicting_frame_2: k.conflicting_frame_2.clone(),
+        commitment: k.commitment.clone(),
+        proof: k.proof.clone(),
+        traversal_proof: if k.traversal_proof.is_empty() {
+            None
+        } else {
+            prost::Message::decode(k.traversal_proof.as_slice()).ok()
+        },
+    }
+}
+
+// =====================================================================
+// ShardSplit ↔ proto::ShardSplit
+// =====================================================================
+
+pub fn shard_split_from_proto(pb: &pb::ShardSplit) -> ShardSplit {
+    ShardSplit {
+        shard_address: pb.shard_address.clone(),
+        proposed_shards: pb.proposed_shards.clone(),
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+    }
+}
+
+pub fn shard_split_to_proto(s: &ShardSplit) -> pb::ShardSplit {
+    pb::ShardSplit {
+        shard_address: s.shard_address.clone(),
+        proposed_shards: s.proposed_shards.clone(),
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+    }
+}
+
+// =====================================================================
+// ShardMerge ↔ proto::ShardMerge
+// =====================================================================
+
+pub fn shard_merge_from_proto(pb: &pb::ShardMerge) -> ShardMerge {
+    ShardMerge {
+        shard_addresses: pb.shard_addresses.clone(),
+        parent_address: pb.parent_address.clone(),
+        frame_number: pb.frame_number,
+        public_key_signature_bls48581: pb
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_from_proto),
+    }
+}
+
+pub fn shard_merge_to_proto(s: &ShardMerge) -> pb::ShardMerge {
+    pb::ShardMerge {
+        shard_addresses: s.shard_addresses.clone(),
+        parent_address: s.parent_address.clone(),
+        frame_number: s.frame_number,
+        public_key_signature_bls48581: s
+            .public_key_signature_bls48581
+            .as_ref()
+            .map(addressed_sig_to_proto),
+    }
+}
+
+// =====================================================================
+// AltShardUpdate ↔ proto::AltShardUpdate (flat 1:1 field copy)
+// =====================================================================
+
+pub fn alt_shard_update_from_proto(p: &pb::AltShardUpdate) -> AltShardUpdate {
+    AltShardUpdate {
+        public_key: p.public_key.clone(),
+        frame_number: p.frame_number,
+        vertex_adds_root: p.vertex_adds_root.clone(),
+        vertex_removes_root: p.vertex_removes_root.clone(),
+        hyperedge_adds_root: p.hyperedge_adds_root.clone(),
+        hyperedge_removes_root: p.hyperedge_removes_root.clone(),
+        signature: p.signature.clone(),
+    }
+}
+
+pub fn alt_shard_update_to_proto(a: &AltShardUpdate) -> pb::AltShardUpdate {
+    pb::AltShardUpdate {
+        public_key: a.public_key.clone(),
+        frame_number: a.frame_number,
+        vertex_adds_root: a.vertex_adds_root.clone(),
+        vertex_removes_root: a.vertex_removes_root.clone(),
+        hyperedge_adds_root: a.hyperedge_adds_root.clone(),
+        hyperedge_removes_root: a.hyperedge_removes_root.clone(),
+        signature: a.signature.clone(),
     }
 }
 
@@ -210,6 +359,7 @@ pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
             .as_ref()
             .map(addressed_sig_from_proto),
         filters: pb.filters.clone(),
+        leaf_roots: pb.leaf_roots.iter().map(confirm_leaf_roots_from_proto).collect(),
     }
 }
 
@@ -222,6 +372,41 @@ pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
             .as_ref()
             .map(addressed_sig_to_proto),
         filters: c.filters.clone(),
+        leaf_roots: c.leaf_roots.iter().map(confirm_leaf_roots_to_proto).collect(),
+    }
+}
+
+pub fn confirm_leaf_roots_from_proto(
+    pb: &pb::ConfirmLeafRoots,
+) -> super::leaf_root_registration::ConfirmLeafRoots {
+    super::leaf_root_registration::ConfirmLeafRoots {
+        filter: pb.filter.clone(),
+        entries: pb
+            .entries
+            .iter()
+            .map(|e| super::leaf_root_registration::LeafRootEntry {
+                prefix: e.prefix.clone(),
+                leaf_root: e.leaf_root.clone(),
+                num_blocks: e.num_blocks,
+            })
+            .collect(),
+    }
+}
+
+pub fn confirm_leaf_roots_to_proto(
+    c: &super::leaf_root_registration::ConfirmLeafRoots,
+) -> pb::ConfirmLeafRoots {
+    pb::ConfirmLeafRoots {
+        filter: c.filter.clone(),
+        entries: c
+            .entries
+            .iter()
+            .map(|e| pb::LeafRootEntry {
+                prefix: e.prefix.clone(),
+                leaf_root: e.leaf_root.clone(),
+                num_blocks: e.num_blocks,
+            })
+            .collect(),
     }
 }
 
@@ -283,14 +468,14 @@ mod tests {
 
     fn sample_addr_sig() -> AddressedSignature {
         AddressedSignature {
-            signature: vec![0xAAu8; 74],
+            signature: vec![0xAAu8; 666],
             address: vec![0xBBu8; 32],
         }
     }
 
     fn sample_pb_addr_sig() -> keys_pb::Bls48581AddressedSignature {
         keys_pb::Bls48581AddressedSignature {
-            signature: vec![0xAAu8; 74],
+            signature: vec![0xAAu8; 666],
             address: vec![0xBBu8; 32],
         }
     }
@@ -310,11 +495,11 @@ mod tests {
             frame_number: 42,
             public_key_signature_bls48581: Some(
                 keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: Some(keys_pb::Bls48581g2PublicKey {
-                        key_value: vec![0xBBu8; 585],
+                        key_value: vec![0xBBu8; 897],
                     }),
-                    pop_signature: vec![0xCCu8; 74],
+                    pop_signature: vec![0xCCu8; 666],
                 },
             ),
             delegate_address: vec![0xDDu8; 32],
@@ -373,6 +558,7 @@ mod tests {
             frame_number: 50,
             public_key_signature_bls48581: Some(sample_pb_addr_sig()),
             filters: vec![vec![0x55u8; 16], vec![0x66u8; 24]],
+            leaf_roots: vec![],
         };
         let c = prover_confirm_from_proto(&pb);
         let back = prover_confirm_to_proto(&c);
@@ -410,9 +596,9 @@ mod tests {
             frame_number: 0xCAFE,
             public_key_signature_bls48581: Some(
                 keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 74],
+                    signature: vec![0xAAu8; 666],
                     public_key: None,
-                    pop_signature: vec![0xBBu8; 74],
+                    pop_signature: vec![0xBBu8; 666],
                 },
             ),
             delegate_address: vec![0xDDu8; 32],
@@ -439,6 +625,17 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
         .public_key_signature_bls48581
         .as_ref()
         .and_then(|sig_pb| {
+            // CW finalization cert: a simplex-finalized shard frame
+            // carries its magic-prefixed cert opaquely in the proto `signature`
+            // field (pk/bitmask empty). Pass it through verbatim — it is not a
+            // BLS aggregate and must NOT be re-wrapped as one.
+            if sig_pb.public_key.is_none()
+                && sig_pb
+                    .signature
+                    .starts_with(quil_cw_consensus::app_cert::CW_CERT_MAGIC)
+            {
+                return Some(sig_pb.signature.clone());
+            }
             // Convert proto aggregate sig → canonical aggregate sig → bytes.
             let pk = sig_pb.public_key.as_ref().and_then(|p| {
                 if p.key_value.is_empty() {
@@ -471,6 +668,13 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
         prover: pb.prover.clone(),
         fee_multiplier_vote: pb.fee_multiplier_vote as i64,
         public_key_signature_bls48581: agg_bytes,
+        storage_attestation_root: pb.storage_attestation_root.clone(),
+        global_frame_number: pb.global_frame_number,
+        storage_attestation: pb.storage_attestation.clone(),
+        fee_total: pb.fee_total.clone(),
+        settlements: pb.settlements.clone(),
+        accumulator: pb.accumulator.clone(),
+        spends: pb.spends.clone(),
     }
 }
 
@@ -480,6 +684,18 @@ pub fn frame_header_from_proto(pb: &pb::FrameHeader) -> FrameHeader {
 pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
     let sig_pb = if h.public_key_signature_bls48581.is_empty() {
         None
+    } else if h
+        .public_key_signature_bls48581
+        .starts_with(quil_cw_consensus::app_cert::CW_CERT_MAGIC)
+    {
+        // CW finalization cert: opaque blob, not a BLS aggregate.
+        // Carry it raw in the proto `signature` field; pk/bitmask stay empty so
+        // `frame_header_from_proto` recognizes and passes it through untouched.
+        Some(keys_pb::Bls48581AggregateSignature {
+            signature: h.public_key_signature_bls48581.clone(),
+            public_key: None,
+            bitmask: Vec::new(),
+        })
     } else {
         // Canonical sig bytes decode → split into signature/pubkey/bitmask
         // for the proto. If decoding fails, treat as no signature.
@@ -511,5 +727,12 @@ pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
         prover: h.prover.clone(),
         fee_multiplier_vote: h.fee_multiplier_vote as u64,
         public_key_signature_bls48581: sig_pb,
+        storage_attestation_root: h.storage_attestation_root.clone(),
+        global_frame_number: h.global_frame_number,
+        storage_attestation: h.storage_attestation.clone(),
+        fee_total: h.fee_total.clone(),
+        settlements: h.settlements.clone(),
+        accumulator: h.accumulator.clone(),
+        spends: h.spends.clone(),
     }
 }

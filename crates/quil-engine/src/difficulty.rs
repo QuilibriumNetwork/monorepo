@@ -254,13 +254,13 @@ mod tests {
     ///
     /// In practice the half-life clamp (2h) plus the `MIN_DIFFICULTY`
     /// floor (50_000) make this benign:
-    ///   - A 1800-frame halt at 10s/frame ≈ 5h of stall, 2.5 half-lives.
-    ///     Difficulty drops by ~2^2.5 ≈ 5.66× per cycle.
-    ///   - The drop is symmetric: everyone gets the lower difficulty,
-    ///     not just the attacker.
-    ///   - Even an infinite halt clamps to `MIN_DIFFICULTY = 50_000`,
-    ///     which is the protocol's hard floor — not exploitable as
-    ///     "free" compute.
+    /// - A 1800-frame halt at 10s/frame ≈ 5h of stall, 2.5 half-lives.
+    /// Difficulty drops by ~2^2.5 ≈ 5.66× per cycle.
+    /// - The drop is symmetric: everyone gets the lower difficulty,
+    /// not just the attacker.
+    /// - Even an infinite halt clamps to `MIN_DIFFICULTY = 50_000`,
+    /// which is the protocol's hard floor — not exploitable as
+    /// "free" compute.
     /// This test pins those properties so any future ASERT tweak that
     /// removes the floor or amplifies the post-halt drop will fail
     /// loudly.

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use prost::Message;
 
@@ -160,11 +159,11 @@ fn increment_prefix(prefix: &[u8]) -> Vec<u8> {
 
 /// RocksDB-backed key registry store.
 pub struct RocksKeyStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksKeyStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 
@@ -631,7 +630,7 @@ mod tests {
         let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
         // Leak so the directory persists while db is open.
         std::mem::forget(tmp);
-        RocksKeyStore::new(Arc::new(db))
+        RocksKeyStore::new(quil_forest::CoordinatedDb::new(db))
     }
 
     fn make_txn(store: &RocksKeyStore) -> Box<dyn store::Transaction> {

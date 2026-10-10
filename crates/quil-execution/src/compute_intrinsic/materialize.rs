@@ -8,7 +8,7 @@
 //! records the request layout in materialize and lets external
 //! executors consume it).
 
-use quil_types::crypto::{BulletproofProver, KeyManager};
+use quil_types::crypto::KeyManager;
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::CircuitCompiler;
 
@@ -90,7 +90,7 @@ pub fn build_compute_configuration_metadata_tree(
 ) -> Result<quil_tries::VectorCommitmentTree> {
     use num_bigint::BigInt;
     let mut tree = quil_tries::VectorCommitmentTree::new();
-    tree.insert(&[0u8 << 2], &config.read_public_key, &[], &BigInt::from(57))?;
+    tree.insert(&[0u8 << 2], &config.read_public_key, &[], &BigInt::from(config.read_public_key.len()))?;
     tree.insert(&[1u8 << 2], &config.write_public_key, &[], &BigInt::from(57))?;
     Ok(tree)
 }
@@ -110,8 +110,13 @@ pub fn materialize_compute_deploy_init(
     frame_number: u64,
     inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
 ) -> Result<[u8; 32]> {
-    let mut config_tree = build_compute_configuration_metadata_tree(config)?;
-    let config_commit = config_tree.commit(inclusion_prover);
+    let config_tree = build_compute_configuration_metadata_tree(config)?;
+    // Compute-app domain = poseidon(COMPUTE ‖ SHA-512(config content)). Retired
+    // from the KZG commit (poseidon(COMPUTE ‖ config_tree.commit)) to a hash of the
+    // config's flat leaves — PQ-safe, no BLS48-581. Mirrors the coin-address
+    // content-hash decision; changes the derived domain for NEW compute deploys
+    // (fork, aligned with the forest/Falcon flag day).
+    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
 
     let base = crate::domains::COMPUTE;
     let mut preimage = Vec::with_capacity(base.len() + config_commit.len());
@@ -198,7 +203,7 @@ pub fn materialize_compute_update(
             .map_err(|e| QuilError::Internal(format!("compute update: rdf insert: {e}")))?;
     }
 
-    let _ = outer.commit(inclusion_prover);
+    // Node commitments retired to non-KZG (forest-irrelevant); serialize as-is.
     let out_blob = quil_tries::serialize_go_tree(outer.root.as_ref())
         .map_err(|e| QuilError::Internal(format!("compute update: serialize: {e}")))?;
     state.set(address, &metadata_addr, &va_disc, frame_number, out_blob)?;
@@ -221,8 +226,8 @@ pub fn materialize_compute_update(
 /// - index 1: serialized DAG (op→deps map)
 /// - index 2: serialized stages (topological levels)
 /// - indices 3+: per-operation metadata (Application + identifier +
-///   stage + read/write sets — read/write sets are empty for
-///   intrinsic contexts, matching Go's `TODO(2.2)` behaviour)
+/// stage + read/write sets — read/write sets are empty for
+/// intrinsic contexts, matching Go's `TODO(2.2)` behaviour)
 ///
 /// The vertex address is `poseidon(domain || rendezvous)` and the
 /// value written to `state.set` is the serialized indexed tree (the
@@ -419,12 +424,12 @@ fn serialize_finalize_state_changes(changes: &[Vec<u8>]) -> Result<Vec<u8>> {
 /// are written:
 ///
 /// 1. **Results vertex** at `poseidon(rendezvous || "RESULTS_CODE_FINALIZE")`:
-///    a tree with index 0 = rendezvous (32 bytes), index 1 = serialized
-///    results, index 2 = serialized state-change summary.
+/// a tree with index 0 = rendezvous (32 bytes), index 1 = serialized
+/// results, index 2 = serialized state-change summary.
 /// 2. **State-changes vertex** at
-///    `poseidon(rendezvous || "STATE_CHANGES_CODE_FINALIZE")`: a tree
-///    keyed by uint16 BE index, value = canonical-bytes
-///    StateTransition.
+/// `poseidon(rendezvous || "STATE_CHANGES_CODE_FINALIZE")`: a tree
+/// keyed by uint16 BE index, value = canonical-bytes
+/// StateTransition.
 pub fn materialize_code_finalize(
     state: &HypergraphState,
     finalize: &CodeFinalize,
@@ -507,9 +512,8 @@ pub fn materialize_code_execute_verified(
     state: &HypergraphState,
     execute: &CodeExecute,
     frame_number: u64,
-    bp: &dyn BulletproofProver,
 ) -> Result<[u8; 32]> {
-    verify_code_execute(execute, bp)?;
+    verify_code_execute(execute)?;
     materialize_code_execute(state, execute, frame_number)
 }
 

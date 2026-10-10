@@ -141,6 +141,16 @@ pub enum ProverStatus {
     Leaving = 4,
     Rejected = 5,
     Kicked = 6,
+    /// Superseded by a reassignment — the prover was moved OFF this filter onto
+    /// another shard, but the allocation slot is retained (not deleted) so it can
+    /// be flipped back to Active if the shard is ever re-formed (split→lose
+    /// coverage→merge back). A hard delete tombstones the `allocation_address`
+    /// permanently (see `HypergraphCrdt::get_vertex_data` — the removes-phase
+    /// tombstone gates the read and no `add_vertex` clears it), making the slot
+    /// unrepresentable forever; `Historic` is the reversible representation of
+    /// "not on this shard right now." Excluded from committees; NOT terminal.
+    /// Allocation trie byte 6 (bytes 4=Rejected, 5=Kicked already taken).
+    Historic = 7,
 }
 
 /// Allocation info for a prover on a specific shard. Mirrors
@@ -160,6 +170,17 @@ pub struct ProverAllocationInfo {
     pub leave_confirm_frame_number: u64,
     pub leave_reject_frame_number: u64,
     pub last_active_frame_number: u64,
+    /// The storage epoch this allocation was last confirmed for. A data-shard
+    /// (non-empty filter) Active allocation whose `epoch` is older than the
+    /// current epoch is read as [`EffectiveStatus::ExpiredEpoch`]. `0` is the
+    /// genesis/grandfather sentinel.
+    pub epoch: u64,
+    /// The reward-ring index this allocation is LOCKED into, computed at
+    /// confirmation (and recomputed only on a membership change — a higher prover
+    /// leaving/evicting shifts survivors up). Read during materialization instead
+    /// of re-sorting by live seniority, which is what keeps the prover-tree root
+    /// deterministic across nodes.
+    pub ring: u8,
     /// The 32-byte vertex address (last 32 bytes of the 64-byte
     /// hypergraph key).
     pub vertex_address: Vec<u8>,
@@ -172,6 +193,220 @@ pub struct ProverAllocationInfo {
 /// are effectively left. Mirrors Go's
 /// `worker_allocator.go::PENDING_FILTER_GRACE_FRAMES`.
 pub const ALLOCATION_GRACE_FRAMES: u64 = 720;
+
+/// Frames per storage epoch. At each epoch boundary a data-shard prover must
+/// re-encode its replicas and re-confirm its allocation (carrying fresh leaf
+/// roots). An Active data-shard allocation whose recorded `epoch` is older than
+/// the current epoch stops counting for coverage/reward (read-side expiry, hard
+/// boundary). Aligned with the 360..720 confirm window and the 720-frame grace.
+pub const EPOCH_LENGTH_FRAMES: u64 = 720;
+
+/// Test/testnet override for the epoch length. `0` = use the
+/// `EPOCH_LENGTH_FRAMES` mainnet default. Mirrors the
+/// `set_confirm_window_frames` testnet pattern — production never sets it, so
+/// all mainnet nodes agree on 720. Lets e2e/integration harnesses exercise the
+/// full epoch-aligned join→confirm→activate pipeline in a handful of frames
+/// instead of 720+.
+static EPOCH_LENGTH_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Override the epoch length (frames per storage epoch) for tests/testnet.
+/// `0` restores the mainnet `EPOCH_LENGTH_FRAMES` default. CONSENSUS PARAMETER —
+/// only call this in test/testnet bootstrap, never on mainnet.
+pub fn set_epoch_length_frames(frames: u64) {
+    EPOCH_LENGTH_OVERRIDE.store(frames, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The effective epoch length (override if set, else the mainnet default).
+#[inline]
+pub fn epoch_length_frames() -> u64 {
+    let o = EPOCH_LENGTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o == 0 { EPOCH_LENGTH_FRAMES } else { o }
+}
+
+/// Epoch length for testnet/devnet (`network != 0`): a short epoch so the
+/// epoch-aligned join→confirm(E+1)→activate(E+2) lifecycle plays out in
+/// minutes instead of hours. The whole pipeline (`epoch_for_frame`,
+/// `validate_confirm_timing`, lifecycle confirm/leave emission, materialize,
+/// `effective_status`) reads `epoch_length_frames()`, so setting this once at
+/// startup auto-scales every timing rule consistently.
+pub const TESTNET_EPOCH_LENGTH_FRAMES: u64 = 60;
+
+/// Pin the process-global epoch length from the network id at node startup.
+/// Mainnet (`network == 0`) keeps the 720-frame default; every other network
+/// uses the short testnet epoch. CONSENSUS PARAMETER — all nodes on a network
+/// share the network id, so they all derive the SAME epoch length (fork-proof).
+/// Must be called by BOTH the master and each worker process before any frame
+/// is evaluated.
+pub fn init_epoch_length_for_network(network: u8) {
+    if network == 0 {
+        set_epoch_length_frames(0); // mainnet default 720
+    } else {
+        set_epoch_length_frames(TESTNET_EPOCH_LENGTH_FRAMES);
+    }
+}
+
+/// Network policy for globally authorized app-committee sessions (committee
+/// handoff). `None` keeps the legacy registry-derived committees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitteeHandoffPolicy {
+    /// First global frame whose maintenance pass authorizes sessions.
+    pub activation_frame: u64,
+    /// Bound into every session ID, and through it every signing namespace.
+    pub chain_id: [u8; 32],
+    /// How shards with legacy-certified history enter sessions.
+    pub legacy_history: LegacyHistory,
+    /// From this GLOBAL frame, a session's membership successor is scheduled
+    /// only at an epoch boundary (the first session pass of an epoch): the
+    /// eligible set changes mid-epoch (late re-confirms, leave rejects) wait
+    /// for the next boundary, as the epoch-aligned lifecycle intends.
+    pub membership_boundary_frame: u64,
+    /// From this GLOBAL frame a shard's FIRST session is also authorized only
+    /// at the first session pass of an epoch, so a mid-epoch pass decides
+    /// nothing and skips its prover scan.
+    pub first_session_boundary_frame: u64,
+}
+
+/// What a network with legacy app history does with it at activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyHistory {
+    /// Generation zero: GLOBAL records legacy tips from `LEGACY_TIP_LEAD`
+    /// frames before activation, and each legacy committee seals its shard
+    /// into its first session in place.
+    Migrate,
+    /// Flag day: at activation every node discards the legacy app frame
+    /// chains (members and archives alike) and keeps the application state;
+    /// every shard's first session starts at frame 0 over that state. No tips
+    /// are recorded and no legacy frame is accepted from activation on.
+    Discard,
+}
+
+/// Mainnet's committee-handoff activation: the GLOBAL frame whose maintenance
+/// pass authorizes the first sessions, an epoch boundary (1197 × 720). Owner
+/// decision 2026-10-05: a flag day that discards legacy app history.
+pub const MAINNET_COMMITTEE_HANDOFF_FRAME: u64 = 861_840;
+
+/// Mainnet's first frame of epoch-boundary membership successors (epoch
+/// 1198). Owner decision 2026-10-06: after activation, every eligible-set
+/// change re-sealed every shard its prover sat on, every 8 frames, so no
+/// first session produced a frame.
+pub const MAINNET_MEMBERSHIP_BOUNDARY_FRAME: u64 = 862_560;
+
+/// Mainnet's first frame of epoch-boundary first sessions (epoch 1200).
+/// Owner decision 2026-10-06: with membership frozen mid-epoch, a pass still
+/// scanned the whole prover shard every 8 frames only to learn whether a
+/// shard without a session had gained members.
+pub const MAINNET_FIRST_SESSION_BOUNDARY_FRAME: u64 = 864_000;
+
+static COMMITTEE_HANDOFF_POLICY: std::sync::RwLock<Option<CommitteeHandoffPolicy>> =
+    std::sync::RwLock::new(None);
+
+/// CONSENSUS PARAMETER — every node materializing global frames must install
+/// the same value before evaluating any frame. Tests and network bootstrap only.
+pub fn set_committee_handoff_policy(policy: Option<CommitteeHandoffPolicy>) {
+    *COMMITTEE_HANDOFF_POLICY.write().unwrap_or_else(|e| e.into_inner()) = policy;
+}
+
+pub fn committee_handoff_policy() -> Option<CommitteeHandoffPolicy> {
+    *COMMITTEE_HANDOFF_POLICY.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether committee sessions govern GLOBAL frame `frame`: a policy is
+/// installed and `frame` is at or past its activation. Before activation a
+/// network with a policy still runs its legacy committees.
+pub fn committee_handoff_active(frame: u64) -> bool {
+    committee_handoff_policy().is_some_and(|policy| frame >= policy.activation_frame)
+}
+
+/// Chain identifier sessions bind on `network`: a fixed label and the network id.
+pub fn committee_handoff_chain_id(network: u8) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    let label = b"quil/app-handoff/chain/v1";
+    id[..label.len()].copy_from_slice(label);
+    id[31] = network;
+    id
+}
+
+/// Pin the committee-handoff policy from the network id at node startup, like
+/// [`init_epoch_length_for_network`]. Mainnet (`network == 0`) activates at
+/// [`MAINNET_COMMITTEE_HANDOFF_FRAME`] and discards its legacy app history
+/// there; the environment cannot change either. Other networks opt in with
+/// `QUIL_COMMITTEE_HANDOFF_FRAME` (the activation frame, `0` for a network
+/// started from an empty genesis), env-gated like
+/// `QUIL_UNIFIED_TREE_CUTOVER_FRAME`: every node of that network must set the
+/// same value. A network with legacy app history migrates it in place through
+/// generation zero, and must set a frame at least `LEGACY_TIP_LEAD` after its
+/// nodes adopt this release, so every live shard has a recorded tip first;
+/// `QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY=1` selects mainnet's flag day
+/// instead.
+pub fn init_committee_handoff_for_network(network: u8) {
+    set_committee_handoff_policy(committee_handoff_policy_for_network(network, |name| std::env::var(name).ok()));
+}
+
+fn committee_handoff_policy_for_network(
+    network: u8,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<CommitteeHandoffPolicy> {
+    if network == 0 {
+        return Some(CommitteeHandoffPolicy {
+            activation_frame: MAINNET_COMMITTEE_HANDOFF_FRAME,
+            chain_id: committee_handoff_chain_id(network),
+            legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: MAINNET_MEMBERSHIP_BOUNDARY_FRAME,
+            first_session_boundary_frame: MAINNET_FIRST_SESSION_BOUNDARY_FRAME,
+        });
+    }
+    let activation_frame = env("QUIL_COMMITTEE_HANDOFF_FRAME")?.parse::<u64>().ok()?;
+    let discard = env("QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY").is_some_and(|value| value == "1");
+    let membership_boundary_frame = env("QUIL_COMMITTEE_MEMBERSHIP_BOUNDARY_FRAME")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(activation_frame);
+    let first_session_boundary_frame = env("QUIL_COMMITTEE_FIRST_SESSION_BOUNDARY_FRAME")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    Some(CommitteeHandoffPolicy {
+        activation_frame,
+        chain_id: committee_handoff_chain_id(network),
+        legacy_history: if discard { LegacyHistory::Discard } else { LegacyHistory::Migrate },
+        membership_boundary_frame,
+        first_session_boundary_frame,
+    })
+}
+
+/// The storage epoch a frame belongs to.
+#[inline]
+pub fn epoch_for_frame(frame_number: u64) -> u64 {
+    frame_number / epoch_length_frames()
+}
+
+/// PoRep block polynomial size (KZG evaluation-domain size per replica block).
+/// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
+/// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
+/// the producer encodes and the verifier opens against this exact domain, so it
+/// is a pinned consensus constant. The `SdrParams` (DRSample degree 6,
+/// expander 8, 11 layers, 32-byte nodes) come from `SdrParams::default()`.
+pub const STORAGE_BLOCK_POLY_SIZE: u64 = 64;
+
+/// Per-frame storage-audit sample SIZE (absolute count, not a rate). The global
+/// frame audits ≈ this many openings each frame, drawn unpredictably from the
+/// beacon ρ_N: the caller sets the `is_audited` threshold to
+/// `STORAGE_AUDIT_SAMPLE / T` where `T` is the frame's total auditable
+/// population, so the expected audited count stays ≈ this constant regardless of
+/// scale (cost ≈ 1024 · 0.56 ms ≈ 0.57 s/frame — independent of M·N). A fixed
+/// RATE would instead grow with T and defeat the cost-decoupling. A junk-replica
+/// cheater is caught within ≈ `T / STORAGE_AUDIT_SAMPLE` frames; the rate is the
+/// security knob (seniority-only penalty ⇒ it must beat extract-before-catch).
+/// 1024 is the low-safe end of the design's 1–2k range; raise toward 2048 at the
+/// fork for more aggressive auditing.
+pub const STORAGE_AUDIT_SAMPLE: u64 = 1024;
+
+/// Number of independent ρ_N-derived block challenges a member opens per covered
+/// leaf, per frame. Each query samples a distinct (block, point), so per-leaf
+/// retrievability is ≈ `1 − (1−ε)^q`. 2 balances payload (each opening is
+/// ~48 B proof + ~32 B value) against retrievability; a consensus parameter
+/// pinned at the storage fork. Producer and verifier derive the same indices
+/// from ρ_N, so this only affects how many openings are carried + audited.
+pub const STORAGE_QUERIES_PER_LEAF: u32 = 2;
 
 /// The effective state of an allocation at a given frame, with the
 /// 720-frame grace window applied. Prefer this over reading
@@ -194,8 +429,16 @@ pub enum EffectiveStatus {
     /// Status byte = Leaving but past `leave_frame + 720`. Treated
     /// as implicitly left.
     ExpiredLeaving,
+    /// Status byte = Active on a data shard, but the allocation's recorded
+    /// `epoch` is older than the current epoch — the prover failed to re-confirm
+    /// (re-register its leaf roots) for this epoch, so it no longer counts.
+    ExpiredEpoch,
     Rejected,
     Kicked,
+    /// Superseded by a reassignment (see [`ProverStatus::Historic`]). Excluded
+    /// from committees, but NOT terminal — reversible back to Active if the shard
+    /// is re-formed.
+    Historic,
     Unknown,
 }
 
@@ -218,14 +461,22 @@ impl EffectiveStatus {
         matches!(self, Self::Joining | Self::Active)
     }
 
-    /// True for Joining/Leaving allocations whose grace window has
-    /// elapsed without a Confirm/Reject landing on chain.
+    /// True for allocations the protocol implicitly treats as expired without
+    /// an on-chain status change: Joining/Leaving past their grace window, or an
+    /// Active data-shard allocation that wasn't re-confirmed this epoch.
     pub fn is_expired(self) -> bool {
-        matches!(self, Self::ExpiredJoining | Self::ExpiredLeaving)
+        matches!(
+            self,
+            Self::ExpiredJoining | Self::ExpiredLeaving | Self::ExpiredEpoch
+        )
     }
 
     /// True for terminal end-states the registry will never
     /// transition out of.
+    ///
+    /// NOTE: `ExpiredEpoch` is deliberately NOT terminal — a stale-epoch
+    /// allocation becomes live again the moment the prover re-confirms it for
+    /// the current epoch (the raw status byte is still Active on chain).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -239,21 +490,80 @@ impl ProverAllocationInfo {
     /// effective state at `current_frame`. Applies the 720-frame
     /// grace window for Joining/Leaving.
     pub fn effective_status(&self, current_frame: u64) -> EffectiveStatus {
+        let current_epoch = epoch_for_frame(current_frame);
         match self.status {
             ProverStatus::Joining => {
+                // Epoch-aligned: a join proposed in epoch E must be confirmed in
+                // EXACTLY epoch E+1 (the chain rejects confirms outside that
+                // slot). The raw `Joining` byte means "proposed, not yet
+                // confirmed" — once confirmed the byte flips to Active and the
+                // deferred-activation logic below takes over. So a Joining byte
+                // that has slipped past its confirm epoch (current_epoch >
+                // join_epoch + 1) is implicitly rejected. `join_frame_number==0`
+                // is the genesis/test sentinel (no expiry).
                 if self.join_frame_number > 0
-                    && current_frame > self.join_frame_number + ALLOCATION_GRACE_FRAMES
+                    && current_epoch > epoch_for_frame(self.join_frame_number) + 1
                 {
                     EffectiveStatus::ExpiredJoining
                 } else {
                     EffectiveStatus::Joining
                 }
             }
-            ProverStatus::Active => EffectiveStatus::Active,
+            ProverStatus::Active => {
+                // The global/empty filter stores no shard data and is exempt
+                // from epoch obligations entirely.
+                if self.confirmation_filter.is_empty() {
+                    return EffectiveStatus::Active;
+                }
+                // Deferred activation (epoch-aligned lifecycle): a fresh join
+                // confirmed in epoch E+1 flips its byte to Active but does NOT
+                // join the committee until the next epoch boundary E+2, so the
+                // committee stays FROZEN for the duration of E+1. Until then the
+                // allocation reads as `Joining` (Pending folded into Joining).
+                // `ActivationEpoch = epoch_for_frame(JoinConfirmFrameNumber)+1`.
+                // The `join_confirm > 0` guard keeps genesis / legacy / test
+                // fixtures (which leave it zero) on the always-active path — they
+                // have no deferred activation.
+                if self.join_confirm_frame_number > 0 {
+                    let activation_epoch =
+                        epoch_for_frame(self.join_confirm_frame_number) + 1;
+                    if current_epoch < activation_epoch {
+                        return EffectiveStatus::Joining;
+                    }
+                }
+                // Epoch re-confirm obligation. `epoch` records the HIGHEST epoch
+                // this allocation has registered leaf roots for (the `next`
+                // slot of the two-slot registration). An Active prover re-confirms
+                // each epoch X for X+1, so a current member always satisfies
+                // `epoch >= current_epoch`. A stale recorded epoch means the
+                // prover missed its re-confirm and stops counting until it renews
+                // (recoverable, not terminal).
+                if self.epoch >= current_epoch {
+                    EffectiveStatus::Active
+                } else {
+                    EffectiveStatus::ExpiredEpoch
+                }
+            }
             ProverStatus::Paused => EffectiveStatus::Paused,
             ProverStatus::Leaving => {
-                if self.leave_frame_number > 0
-                    && current_frame > self.leave_frame_number + ALLOCATION_GRACE_FRAMES
+                // Epoch-aligned departure. A leave proposed in epoch E is
+                // confirmed in EXACTLY E+1; the prover keeps SERVING NOTICE
+                // (still proving, still counted for coverage as `Leaving`)
+                // through the rest of that epoch and departs at the E+2 boundary
+                // — `DeactivationEpoch = epoch_for_frame(LeaveConfirmFrameNumber)+1`.
+                // This keeps the committee frozen: a departing member stays in
+                // it until the boundary. A leave that never confirmed in its E+1
+                // slot is implicitly departed (ExpiredLeaving).
+                if self.leave_confirm_frame_number > 0 {
+                    let deactivation_epoch =
+                        epoch_for_frame(self.leave_confirm_frame_number) + 1;
+                    if current_epoch < deactivation_epoch {
+                        EffectiveStatus::Leaving
+                    } else {
+                        EffectiveStatus::ExpiredLeaving
+                    }
+                } else if self.leave_frame_number > 0
+                    && current_epoch > epoch_for_frame(self.leave_frame_number) + 1
                 {
                     EffectiveStatus::ExpiredLeaving
                 } else {
@@ -262,6 +572,10 @@ impl ProverAllocationInfo {
             }
             ProverStatus::Rejected => EffectiveStatus::Rejected,
             ProverStatus::Kicked => EffectiveStatus::Kicked,
+            // Superseded by a reassignment — no grace/epoch semantics; the byte
+            // maps straight through. Reversible (a later reassignment flips it
+            // back to Active), so it is intentionally NOT in `is_terminal`.
+            ProverStatus::Historic => EffectiveStatus::Historic,
             ProverStatus::Unknown => EffectiveStatus::Unknown,
         }
     }
@@ -320,12 +634,126 @@ pub struct ProverShardSummary {
     pub total_size: u64,
 }
 
+/// Frame at which the eviction inactivity/grace clock starts ticking.
+/// The network is not considered "available for participation" before
+/// this frame, so a prover accrues NO inactivity prior to it: effective
+/// inactivity is measured from `max(last_active_frame_number,
+/// EVICTION_INACTIVITY_START_FRAME)`. This keeps anyone from being
+/// counted (or surfaced as eviction-pending) for downtime that predates
+/// the network being live for eviction purposes. Shared by the consensus
+/// eviction path (`find_eviction_candidates`) and the explorer
+/// eviction-risk display so they agree exactly.
+pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
+
+/// Minimum number of effectively-active provers a shard needs to run its
+/// app-shard consensus (form a committee and reach quorum). A shard with
+/// FEWER than this many active provers is under a coverage halt and cannot
+/// produce a shard frame at all, so its provers physically CANNOT submit a
+/// shard proof — they must NOT be evicted for inactivity. Evicting them is a
+/// death spiral (too few provers → no frames → everyone evicted → zero
+/// provers) and punishes provers for a shortfall that isn't their fault.
+///
+/// This mirrors the coverage monitor's `halt_threshold` (a shard with
+/// `active_count <= 3` is halt-risk), but is a FIXED consensus constant, not
+/// the per-node coverage config: eviction is consensus-state-mutating, so
+/// every archive must apply the identical exemption or their prover roots
+/// diverge. The eviction path derives each shard's active-prover census from
+/// committed registry state (not the live coverage monitor) so the exemption
+/// is deterministic across the fleet.
+pub const MIN_SHARD_CONSENSUS_PROVERS: u64 = 4;
+
+/// Registry inputs for one lifecycle evaluation. Membership lists use the
+/// same raw allocation statuses as `get_provers_by_status`; this is planning
+/// information, not committee authorization or storage-proof eligibility.
+#[derive(Debug, Clone)]
+pub struct ProverLifecycleView {
+    pub prover: Option<ProverInfo>,
+    pub summaries: Vec<ProverShardSummary>,
+    pub members: HashMap<Vec<u8>, LifecycleMembers>,
+    pub reward_rings: HashMap<Vec<u8>, crate::reward_ring::RewardRingEstimate>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LifecycleMembers {
+    pub active: Vec<Vec<u8>>,
+    pub leaving: Vec<Vec<u8>>,
+}
+
 /// Manages the prover trie: state transitions, lookups, eviction.
 pub trait ProverRegistry: Send + Sync {
+    /// Identify a supported registry implementation before reconstructing an
+    /// isolated execution context. Custom registries must opt in explicitly.
+    fn as_any(&self) -> Option<&dyn std::any::Any> { None }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;
-    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8]) -> Result<Vec<u8>>;
-    fn get_ordered_provers(&self, input: &[u8; 32], filter: &[u8]) -> Result<Vec<Vec<u8>>>;
-    fn get_active_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
+    /// Capture the inputs used by lifecycle planning. Concurrent production
+    /// registries must override this to capture all fields under one read lock.
+    /// The compatibility implementation retains sequential getter semantics
+    /// for immutable/test registries; it does not promise atomicity.
+    fn get_lifecycle_view(&self, address: &[u8], frame: u64) -> Result<ProverLifecycleView> {
+        let prover = self.get_prover_info(address)?;
+        let summaries = self.get_prover_shard_summaries(frame)?;
+        let filters: std::collections::BTreeSet<_> = prover.iter()
+            .flat_map(|p| p.allocations.iter())
+            .map(|a| a.confirmation_filter.clone())
+            .chain(summaries.iter().map(|s| s.filter.clone()))
+            .filter(|f| !f.is_empty()).collect();
+        let mut members = HashMap::new();
+        let mut reward_rings = HashMap::new();
+        for filter in filters {
+            if let Some(estimate) = self.get_reward_ring_estimate(address, &filter, frame)? {
+                reward_rings.insert(filter.clone(), estimate);
+            }
+            let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
+                .into_iter().map(|p| p.address).collect();
+            let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
+                .into_iter().map(|p| p.address).collect();
+            members.insert(filter, LifecycleMembers { active, leaving });
+        }
+        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+    }
+    /// A current or explicitly projected reward position. Concurrent
+    /// registries override this to read committee and allocations atomically.
+    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
+        -> Result<Option<crate::reward_ring::RewardRingEstimate>> {
+        let committee = self.get_active_provers(filter, frame)?;
+        let all = self.get_provers(filter)?;
+        Ok(crate::reward_ring::estimate_reward_ring(
+            &committee.iter().collect::<Vec<_>>(), &all.iter().collect::<Vec<_>>(),
+            address, filter, frame))
+    }
+    /// A member's registered storage leaf root for `leaf_id`, as
+    /// `(leaf_root, num_blocks, epoch)`, or `None` if not registered. `leaf_id`
+    /// is the opening's `shard_id`. Default `None` (registries that don't track
+    /// storage attestation); the real registry overrides it.
+    fn get_leaf_root(
+        &self,
+        _member: &[u8],
+        _leaf_id: &[u8],
+        _epoch: u64,
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(None)
+    }
+    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> Result<Vec<u8>>;
+    fn get_ordered_provers(
+        &self,
+        input: &[u8; 32],
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<Vec<Vec<u8>>>;
+    /// The epoch-aligned committee under `filter` as of `frame_number` — the
+    /// same `effective_status` view the rest of the node uses. Includes `Active`
+    /// and `Leaving`-within-grace (a departing member stays in the frozen
+    /// committee until the E+2 boundary); excludes `Joining` (incl.
+    /// deferred-activation — a just-confirmed prover that is pre-E+2 and not yet
+    /// running its consensus loop), `ExpiredEpoch` (storage-stale), `Leaving`
+    /// past grace, and terminal allocations. An empty-committee floor re-admits
+    /// demoted-but-raw-`Active` allocations (deferred / stale-epoch) if the
+    /// strict set would leave a non-empty filter with no members (see
+    /// `committee_eligible`). The empty/global filter is exempt from the epoch
+    /// checks, so GLOBAL consensus is unaffected. `frame_number` is the frame
+    /// whose committee is being evaluated (produced/validated), so all nodes
+    /// agree by construction.
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>>;
     fn get_prover_count(&self, filter: &[u8]) -> Result<usize>;
     fn get_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
     fn get_provers_by_status(
@@ -355,7 +783,10 @@ pub trait ProverRegistry: Send + Sync {
     /// test stubs don't need to special-case "any filter" semantics.
     /// Production overrides to walk the per-prover cache directly.
     fn get_all_active_app_shard_provers(&self) -> Result<Vec<ProverInfo>> {
-        self.get_active_provers(&[])
+        // Test-stub fallback only (production overrides this to walk the
+        // per-prover rollup). Stubs ignore the frame arg, so the value is
+        // immaterial here.
+        self.get_active_provers(&[], 0)
     }
     /// Per-filter prover count grouped by allocation status, with the
     /// 720-frame grace check applied so expired Joining/Leaving
@@ -463,6 +894,8 @@ pub trait RewardIssuance: Send + Sync {
 /// Shard detail for info queries.
 #[derive(Debug, Clone)]
 pub struct ShardDetail {
+    /// Whether the reward position is established or explicitly projected.
+    pub ring_known: bool,
     pub filter: Vec<u8>,
     pub shard_size: BigInt,
     pub active_provers: u32,
@@ -470,14 +903,22 @@ pub struct ShardDetail {
     pub estimated_reward: BigInt,
     pub is_allocated: bool,
     pub data_shards: u64,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 /// Provides shard-level info.
 pub trait ShardInfoProvider: Send + Sync {
+    /// One committed GLOBAL cursor per filter, from a single snapshot.
+    /// Missing coverage/session data stays unavailable; zero is a real cursor.
+    fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {
+        Ok(vec![None; filters.len()])
+    }
+
     fn get_shard_info(
         &self,
         include_all: bool,
-    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64)>;
+    ) -> Result<(Vec<ShardDetail>, u64, BigInt, u64, BigInt)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,4 +931,355 @@ pub trait GlobalFrameValidator: Send + Sync {
 
 pub trait AppFrameValidator: Send + Sync {
     fn validate(&self, frame: &proto::global::AppShardFrame) -> Result<bool>;
+}
+
+#[cfg(test)]
+pub(crate) mod epoch_tests {
+    use super::*;
+
+    /// The epoch length is process-global, and one test overrides it. Every
+    /// test that reads it — which is every test computing a frame from
+    /// `EPOCH_LENGTH_FRAMES` — takes this first, so the override is never in
+    /// force while another test assumes the default.
+    static EPOCH_LENGTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
+        EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn active_alloc(filter: Vec<u8>, epoch: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Active,
+            confirmation_filter: filter,
+            rejection_filter: Vec::new(),
+            join_frame_number: 0,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            epoch,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    // A frame in epoch `e` (storage attestation is always-on, so any epoch works).
+    fn frame_in_epoch(e: u64) -> u64 {
+        e * EPOCH_LENGTH_FRAMES + 1
+    }
+
+    #[test]
+    fn stale_epoch_data_shard_is_expired_always_on() {
+        let _guard = epoch_length_guard();
+        // No activation gate: a stale-epoch data shard is ExpiredEpoch the moment
+        // the current frame crosses into a later epoch than the one it recorded.
+        let a = active_alloc(vec![0xAB; 32], 0); // epoch 0 < epoch_for_frame(1000)=1
+        assert_eq!(a.effective_status(1000), EffectiveStatus::ExpiredEpoch);
+        // ...but within epoch 0 (frame < 720) it's still Active — the epoch check
+        // itself is the natural gate, no fork-height needed.
+        assert_eq!(a.effective_status(700), EffectiveStatus::Active);
+    }
+
+    #[test]
+    fn data_shard_active_with_current_epoch_stays_active() {
+        let _guard = epoch_length_guard();
+        let e = epoch_for_frame(frame_in_epoch(3));
+        let a = active_alloc(vec![0xAB; 32], e);
+        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Active);
+    }
+
+    #[test]
+    fn data_shard_active_with_stale_epoch_is_expired() {
+        let _guard = epoch_length_guard();
+        let cur = frame_in_epoch(5);
+        let stale = epoch_for_frame(cur) - 1;
+        let a = active_alloc(vec![0xAB; 32], stale);
+        assert_eq!(a.effective_status(cur), EffectiveStatus::ExpiredEpoch);
+        assert!(a.effective_status(cur).is_expired());
+        // ExpiredEpoch is recoverable, not terminal.
+        assert!(!a.effective_status(cur).is_terminal());
+        // And it no longer counts as allocated/live.
+        assert!(!a.effective_status(cur).is_allocated());
+    }
+
+    #[test]
+    fn global_empty_filter_is_exempt_from_epoch_expiry() {
+        let _guard = epoch_length_guard();
+        let cur = frame_in_epoch(9);
+        // Empty filter (global prover), stale epoch 0 — still Active.
+        let a = active_alloc(Vec::new(), 0);
+        assert_eq!(a.effective_status(cur), EffectiveStatus::Active);
+    }
+
+    #[test]
+    fn epoch_expiry_inert_within_genesis_epoch() {
+        let _guard = epoch_length_guard();
+        // Within epoch 0 (frame < EPOCH_LENGTH_FRAMES) a stale-epoch data-shard
+        // allocation is NOT expired — there is no later epoch to be stale
+        // against yet, so the always-on check naturally holds off until the
+        // first epoch boundary.
+        let a = active_alloc(vec![0xAB; 32], 0);
+        let pre = EPOCH_LENGTH_FRAMES - 1;
+        assert_eq!(a.effective_status(pre), EffectiveStatus::Active);
+    }
+
+    // Build a confirmed-join allocation: byte Active, with the confirm frame
+    // and the registered (next-slot) epoch set explicitly.
+    fn confirmed_alloc(
+        filter: Vec<u8>,
+        join_confirm_frame_number: u64,
+        epoch: u64,
+    ) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Active,
+            confirmation_filter: filter,
+            join_confirm_frame_number,
+            epoch,
+            ..active_alloc(Vec::new(), 0)
+        }
+    }
+
+    #[test]
+    fn fresh_join_is_pending_until_activation_epoch() {
+        let _guard = epoch_length_guard();
+        // Join proposed in epoch 2 (frame 2*720+10), confirmed in EXACTLY epoch 3
+        // (frame 3*720+5), registers for its first active epoch 4.
+        let join_confirm = 3 * EPOCH_LENGTH_FRAMES + 5; // epoch 3
+        let a = confirmed_alloc(vec![0xAB; 32], join_confirm, 4);
+        // During the confirm epoch (E+1 = 3) the byte is Active but the prover
+        // is NOT yet in the committee — reads as Joining (deferred activation).
+        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Joining);
+        // It owns the slot (is_live) but is not yet a committee member — the
+        // lifecycle `active` bucket (which excludes Joining), not is_allocated,
+        // is what gates committee/coverage counting.
+        assert!(a.effective_status(frame_in_epoch(3)).is_live());
+        // At the activation boundary E+2 = 4, it becomes Active.
+        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::Active);
+        // If it then fails to re-confirm, epoch 5 reads ExpiredEpoch.
+        assert_eq!(a.effective_status(frame_in_epoch(5)), EffectiveStatus::ExpiredEpoch);
+    }
+
+    #[test]
+    fn leave_confirmed_serves_notice_then_departs() {
+        let _guard = epoch_length_guard();
+        // Leave confirmed in epoch 3 → departs at the E+2 = 4 boundary.
+        let mut a = active_alloc(vec![0xAB; 32], 4);
+        a.status = ProverStatus::Leaving;
+        a.leave_confirm_frame_number = 3 * EPOCH_LENGTH_FRAMES + 5; // epoch 3
+        // Serving notice through the rest of epoch 3 — still counted as Leaving
+        // (live coverage), keeps the committee frozen.
+        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Leaving);
+        assert!(a.effective_status(frame_in_epoch(3)).is_live());
+        // Departs at epoch 4.
+        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::ExpiredLeaving);
+        assert!(a.effective_status(frame_in_epoch(4)).is_terminal());
+    }
+
+    #[test]
+    fn join_not_confirmed_in_next_epoch_expires() {
+        let _guard = epoch_length_guard();
+        // Joining byte, proposed epoch 2, never confirmed. By epoch 4 (past the
+        // E+1=3 confirm slot) it is implicitly rejected.
+        let mut a = active_alloc(vec![0xAB; 32], 0);
+        a.status = ProverStatus::Joining;
+        a.join_frame_number = 2 * EPOCH_LENGTH_FRAMES + 10; // epoch 2
+        // Still valid through its confirm epoch (3).
+        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Joining);
+        // Past it → ExpiredJoining.
+        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::ExpiredJoining);
+    }
+
+    #[test]
+    fn reconfirm_ahead_does_not_demote_active_member() {
+        let _guard = epoch_length_guard();
+        // An established member re-confirms in epoch 5 for epoch 6 (registers
+        // ahead, epoch field = 6). It must stay Active for the rest of epoch 5,
+        // NOT demote to Joining — this is what the two-slot {current,next}
+        // registration buys. join_confirm is old (activation in the past).
+        let a = confirmed_alloc(vec![0xCD; 32], EPOCH_LENGTH_FRAMES + 1 /* epoch 1 */, 6);
+        assert_eq!(a.effective_status(frame_in_epoch(5)), EffectiveStatus::Active);
+        assert_eq!(a.effective_status(frame_in_epoch(6)), EffectiveStatus::Active);
+    }
+
+    #[test]
+    fn reconfirm_restores_active() {
+        let _guard = epoch_length_guard();
+        let cur = frame_in_epoch(7);
+        let cur_epoch = epoch_for_frame(cur);
+        // Stale → expired.
+        assert_eq!(
+            active_alloc(vec![1, 2, 3], cur_epoch - 1).effective_status(cur),
+            EffectiveStatus::ExpiredEpoch
+        );
+        // Re-confirmed for the current epoch → Active again.
+        assert_eq!(
+            active_alloc(vec![1, 2, 3], cur_epoch).effective_status(cur),
+            EffectiveStatus::Active
+        );
+    }
+
+    // ---- Additional lifecycle coverage --------------------------------
+
+    /// Leave PROPOSED but never confirmed: the `leave_confirm == 0` implicit-
+    /// expiry branch (symmetric to `join_not_confirmed_in_next_epoch_expires`).
+    /// Serves notice through its E+1 slot, then departs as ExpiredLeaving.
+    #[test]
+    fn leave_proposed_never_confirmed_expires_after_e_plus_1() {
+        let _guard = epoch_length_guard();
+        let leaving = |leave_frame: u64| ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: leave_frame,
+            leave_confirm_frame_number: 0, // never confirmed
+            ..active_alloc(vec![0xAB; 32], 0)
+        };
+        // Leave proposed in epoch 2.
+        let a = leaving(frame_in_epoch(2));
+        // Epoch 2 (proposal epoch) and epoch 3 (the E+1 notice slot) → still Leaving.
+        assert_eq!(a.effective_status(frame_in_epoch(2)), EffectiveStatus::Leaving);
+        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Leaving);
+        assert!(a.is_live(frame_in_epoch(3)));
+        // Epoch 4 (past E+1) → ExpiredLeaving + terminal, no longer live.
+        assert_eq!(
+            a.effective_status(frame_in_epoch(4)),
+            EffectiveStatus::ExpiredLeaving
+        );
+        assert!(a.effective_status(frame_in_epoch(4)).is_terminal());
+        assert!(!a.is_live(frame_in_epoch(4)));
+    }
+
+    /// Activation/expiry transitions land EXACTLY on the epoch boundary frame
+    /// (`N * EPOCH_LENGTH_FRAMES`), not one frame early or late. Guards the
+    /// `frame / epoch_length` division at the boundary.
+    #[test]
+    fn effective_status_flips_exactly_at_epoch_boundary() {
+        let _guard = epoch_length_guard();
+        // A confirmed join: byte Active, confirmed in epoch 2 → ActivationEpoch 3.
+        // `epoch` set high so the re-confirm check never expires it.
+        let a = ProverAllocationInfo {
+            join_confirm_frame_number: frame_in_epoch(2),
+            ..active_alloc(vec![0xCD; 32], 100)
+        };
+        let boundary = 3 * EPOCH_LENGTH_FRAMES; // first frame of epoch 3
+        // One frame BEFORE the boundary (last frame of epoch 2) → still deferred.
+        assert_eq!(
+            a.effective_status(boundary - 1),
+            EffectiveStatus::Joining,
+            "last frame of epoch 2 is pre-activation"
+        );
+        // Exactly ON the boundary → Active.
+        assert_eq!(
+            a.effective_status(boundary),
+            EffectiveStatus::Active,
+            "activation lands on the epoch-3 boundary frame"
+        );
+    }
+
+    /// `join_frame_number == 0` is the genesis/test sentinel: a Joining byte
+    /// never expires regardless of how far the chain advances.
+    #[test]
+    fn joining_zero_frame_sentinel_never_expires() {
+        let _guard = epoch_length_guard();
+        let a = ProverAllocationInfo {
+            status: ProverStatus::Joining,
+            join_frame_number: 0,
+            ..active_alloc(vec![0x11; 32], 0)
+        };
+        assert_eq!(a.effective_status(frame_in_epoch(50)), EffectiveStatus::Joining);
+    }
+
+    /// `join_confirm_frame_number == 0` (genesis/legacy) means NO deferred
+    /// activation — the allocation is governed purely by the epoch re-confirm
+    /// check, not read as a pending Joining.
+    #[test]
+    fn active_with_zero_join_confirm_is_not_deferred() {
+        let _guard = epoch_length_guard();
+        // Stale recorded epoch → ExpiredEpoch (NOT deferred Joining).
+        assert_eq!(
+            active_alloc(vec![0x22; 32], 1).effective_status(frame_in_epoch(5)),
+            EffectiveStatus::ExpiredEpoch
+        );
+        // Current recorded epoch → Active.
+        assert_eq!(
+            active_alloc(vec![0x22; 32], 5).effective_status(frame_in_epoch(5)),
+            EffectiveStatus::Active
+        );
+    }
+
+    /// Direct assertions on the `EffectiveStatus` helper predicates for the
+    /// three Expired* variants (previously only inferred via bucketing).
+    #[test]
+    fn expired_variant_helper_predicates() {
+        let _guard = epoch_length_guard();
+        // ExpiredJoining: terminal, expired, not allocated/live.
+        let ej = EffectiveStatus::ExpiredJoining;
+        assert!(ej.is_terminal() && ej.is_expired() && !ej.is_allocated() && !ej.is_live());
+        // ExpiredLeaving: terminal, expired.
+        let el = EffectiveStatus::ExpiredLeaving;
+        assert!(el.is_terminal() && el.is_expired() && !el.is_allocated() && !el.is_live());
+        // ExpiredEpoch: expired + recoverable (NOT terminal), not counting now.
+        let ee = EffectiveStatus::ExpiredEpoch;
+        assert!(ee.is_expired() && !ee.is_terminal() && !ee.is_allocated() && !ee.is_live());
+    }
+
+    /// Epoch-length override recomputes boundaries and round-trips back to the
+    /// 720 default. Serialized via a process-global mutex so it never races the
+    /// other unit tests reading the default.
+    #[test]
+    fn epoch_length_override_recomputes_and_restores() {
+        let _guard = epoch_length_guard();
+        set_epoch_length_frames(16);
+        assert_eq!(epoch_length_frames(), 16);
+        assert_eq!(epoch_for_frame(16), 1);
+        assert_eq!(epoch_for_frame(15), 0);
+        // A data-shard alloc recorded for epoch 0 is stale at frame 16 (epoch 1).
+        assert_eq!(
+            active_alloc(vec![0x33; 32], 0).effective_status(16),
+            EffectiveStatus::ExpiredEpoch
+        );
+        // Restore default.
+        set_epoch_length_frames(0);
+        assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
+        assert_eq!(epoch_for_frame(720), 1);
+    }
+}
+
+#[cfg(test)]
+mod committee_handoff_policy_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_activates_its_flag_day_whatever_the_environment_says() {
+        let env = |name: &str| match name {
+            "QUIL_COMMITTEE_HANDOFF_FRAME" => Some("5".to_string()),
+            "QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY" => Some("0".to_string()),
+            _ => None,
+        };
+        let mainnet = committee_handoff_policy_for_network(0, env).unwrap();
+        assert_eq!(mainnet.activation_frame, 861_840);
+        assert_eq!(mainnet.activation_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.legacy_history, LegacyHistory::Discard);
+        assert_eq!(mainnet.membership_boundary_frame, 862_560);
+        assert_eq!(mainnet.membership_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.first_session_boundary_frame, 864_000);
+        assert_eq!(mainnet.first_session_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(mainnet.chain_id, committee_handoff_chain_id(0));
+
+        assert_eq!(committee_handoff_policy_for_network(1, |_| None), None, "other networks opt in");
+        let testnet = committee_handoff_policy_for_network(1, env).unwrap();
+        assert_eq!((testnet.activation_frame, testnet.legacy_history), (5, LegacyHistory::Migrate));
+        assert_eq!(testnet.membership_boundary_frame, 5, "on from activation unless set");
+        let drill = committee_handoff_policy_for_network(1, |name| match name {
+            "QUIL_COMMITTEE_HANDOFF_FRAME" => Some("9".to_string()),
+            "QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY" => Some("1".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((drill.activation_frame, drill.legacy_history), (9, LegacyHistory::Discard));
+        assert_ne!(drill.chain_id, mainnet.chain_id);
+    }
 }

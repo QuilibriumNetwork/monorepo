@@ -1,1 +1,0 @@
-# Pallas and Pasta curve

@@ -41,10 +41,10 @@ pub fn prover_update_domain() -> Result<[u8; 32]> {
 /// 2. `PublicKeySignatureBLS48581.Address` must be 32 bytes.
 /// 3. `DelegateAddress` must be 32 bytes.
 /// 4. The prover vertex must exist at `(GLOBAL_INTRINSIC_ADDRESS,
-///    Address)` under `vertex_adds`.
+/// Address)` under `vertex_adds`.
 /// 5. `poseidon(prover.PublicKey) == Address` (address binds to pubkey).
 /// 6. BLS48-581 G1 signature verifies over `DelegateAddress` with
-///    domain `PROVER_UPDATE`.
+/// domain `PROVER_UPDATE`.
 pub fn validate_prover_update(
     op: &ProverUpdate,
     state: &HypergraphState,
@@ -113,7 +113,7 @@ pub fn validate_prover_update(
     // BLS signature over DelegateAddress with PROVER_UPDATE domain.
     let domain_bytes = prover_update_domain()?;
     let valid = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &op.delegate_address,
         &sig.signature,
@@ -133,9 +133,9 @@ pub fn validate_prover_update(
 ///
 /// Steps:
 /// 1. Decode prover address from the addressed signature; compute the
-///    reward address `poseidon(QUIL_TOKEN || proverAddress)`.
+/// reward address `poseidon(QUIL_TOKEN || proverAddress)`.
 /// 2. Load the prover vertex; confirm `poseidon(PublicKey) ==
-///    proverAddress` (defense-in-depth).
+/// proverAddress` (defense-in-depth).
 /// 3. Load (or create) the reward vertex.
 /// 4. Write the new `DelegateAddress` field on the reward vertex.
 /// 5. Persist the updated reward vertex back to the hypergraph state.

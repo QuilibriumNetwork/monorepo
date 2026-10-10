@@ -4,21 +4,21 @@
 //! The scheme works around Go's x509 lacking native Ed448 support:
 //!
 //! 1. Derive an Ed25519 seed deterministically:
-//!      `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
+//! `ed25519_seed = SHA256(ed448_seed || "tls-cert-derivation")[..32]`
 //! 2. Generate an Ed25519 keypair from that seed.
 //! 3. Cross-sign the Ed25519 public key with the Ed448 private key:
-//!      `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
+//! `xsign = ed448_priv.sign("tls-cert-derivation" || ed25519_pub)`
 //! 4. Self-sign an x509 cert with the Ed25519 key, embedding
-//!      `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
-//!    cert's single SAN DNS name.
+//! `hex(ed448_pub || xsign)` (171 bytes hex => 342 chars) as the
+//! cert's single SAN DNS name.
 //!
 //! On the receiving side, peers parse the DNS name back into the Ed448 pubkey
 //! + signature, verify the cross-sig, and re-derive the libp2p peer ID.
 
 use ed25519_dalek::SigningKey;
-use ed448_rust::{PrivateKey as Ed448PrivateKey, PublicKey as Ed448PublicKey};
 use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ED25519,
+    date_time_ymd, BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    IsCa, KeyPair, SanType, SerialNumber, PKCS_ED25519,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -45,12 +45,21 @@ pub struct QuilTlsCert {
     pub xsign_hex: String,
 }
 
-/// Build a Quilibrium TLS certificate for the given Ed448 seed (57 bytes,
-/// matching `ed448::SeedSize`).
-pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTlsError> {
-    // 1. Derive Ed25519 seed.
+/// Build a Quilibrium TLS certificate bound to the node's FALCON network
+/// identity. `falcon_signing_key` is the 1281-byte q-prover-key signing key;
+/// `falcon_pubkey` is its 897-byte public key. The Ed25519 cert key is derived
+/// from the Falcon signing key and cross-signed by it (proof of possession);
+/// the SAN carries `hex(falcon_pub_897 || xsign_666)`.
+pub fn build_quil_tls_cert(falcon_signing_key: &[u8]) -> Result<QuilTlsCert, QuilTlsError> {
+    use quil_types::crypto::Signer as _;
+
+    let falcon_pubkey = quil_crypto::falcon_public_from_signing_key(falcon_signing_key)
+        .ok_or_else(|| QuilTlsError::Ed448("falcon signing key decode".into()))?;
+    let falcon_pubkey = falcon_pubkey.as_slice();
+
+    // 1. Derive Ed25519 cert seed from the Falcon signing key.
     let mut hasher = Sha256::new();
-    hasher.update(ed448_seed);
+    hasher.update(falcon_signing_key);
     hasher.update(TLS_CERT_DERIVATION_CTX);
     let digest = hasher.finalize();
     let mut ed25519_seed = [0u8; 32];
@@ -60,20 +69,20 @@ pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTls
     let signing_key = SigningKey::from_bytes(&ed25519_seed);
     let ed25519_pub = signing_key.verifying_key().to_bytes();
 
-    // 3. Cross-sign with Ed448.
-    let ed448_priv = Ed448PrivateKey::from(*ed448_seed);
-    let ed448_pub = Ed448PublicKey::try_from(&ed448_priv)
-        .map_err(|e| QuilTlsError::Ed448(format!("derive pub: {:?}", e)))?;
+    // 3. Cross-sign the Ed25519 pubkey with the Falcon identity key (empty
+    //    domain — matches `falcon_verify(.., &[])` on the receiving side).
     let mut to_sign = Vec::with_capacity(TLS_CERT_DERIVATION_CTX.len() + ed25519_pub.len());
     to_sign.extend_from_slice(TLS_CERT_DERIVATION_CTX);
     to_sign.extend_from_slice(&ed25519_pub);
-    let xsign = ed448_priv
-        .sign(&to_sign, None)
-        .map_err(|e| QuilTlsError::Ed448(format!("sign: {:?}", e)))?;
+    let falcon_signer =
+        quil_crypto::FalconSigner::from_bytes(falcon_signing_key, falcon_pubkey);
+    let xsign = falcon_signer
+        .sign_with_domain(&to_sign, &[])
+        .map_err(|e| QuilTlsError::Ed448(format!("falcon sign: {:?}", e)))?;
 
-    // 4. Build the SAN string: hex(ed448_pub || xsign)
-    let mut san_buf = Vec::with_capacity(57 + 114);
-    san_buf.extend_from_slice(&ed448_pub.as_byte());
+    // 4. Build the SAN string: hex(falcon_pub || xsign)
+    let mut san_buf = Vec::with_capacity(897 + 666);
+    san_buf.extend_from_slice(falcon_pubkey);
     san_buf.extend_from_slice(&xsign);
     let xsign_hex = hex::encode(&san_buf);
 
@@ -113,17 +122,111 @@ pub fn build_quil_tls_cert(ed448_seed: &[u8; 57]) -> Result<QuilTlsCert, QuilTls
     })
 }
 
+/// SAN / TLS domain name for the master↔worker channel cert. The master (client)
+/// sets this as the TLS domain so it matches the worker (server) leaf cert's SAN.
+pub const WORKER_CHANNEL_SAN: &str = "quil-worker";
+
+/// Deterministic mTLS materials for the master↔worker (cluster) channel.
+pub struct WorkerChannelTls {
+    /// The CA (trust anchor) both sides trust. PEM.
+    pub ca_cert_pem: String,
+    /// The end-entity (leaf) cert both sides PRESENT, signed by the CA. PEM.
+    pub leaf_cert_pem: String,
+    /// The leaf's private key. PEM.
+    pub leaf_key_pem: String,
+}
+
+fn dwc_seed(falcon_signing_key: &[u8], ctx: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(falcon_signing_key);
+    hasher.update(ctx);
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest[..32]);
+    seed
+}
+
+/// `(KeyPair, pkcs8_v2_der)` for a deterministic ed25519 key from `seed`.
+fn dwc_keypair(seed: &[u8; 32]) -> Result<(KeyPair, Vec<u8>), QuilTlsError> {
+    let ed_pub = SigningKey::from_bytes(seed).verifying_key().to_bytes();
+    let pkcs8 = ed25519_pkcs8_v2(seed, &ed_pub);
+    let kp = KeyPair::from_der(&pkcs8)
+        .map_err(|e| QuilTlsError::Rcgen(format!("KeyPair::from_der: {}", e)))?;
+    Ok((kp, pkcs8))
+}
+
+/// Build FULLY-DETERMINISTIC mTLS materials for the master↔worker channel from
+/// the node's Falcon key alone. The master and every worker process run the SAME
+/// node key, so each derives byte-identical CA + leaf: each trusts the CA and
+/// presents the CA-signed leaf. Only a process holding the node's Falcon key can
+/// complete the handshake, closing the previously plaintext/unauthenticated
+/// channel. Uses tonic-native mTLS (the xsign machinery isn't reused: `quil-engine`,
+/// which owns both endpoints, cannot depend on `quil-rpc` — that would cycle).
+///
+/// A CA + leaf (not one self-signed cert) is required: webpki rejects a single
+/// CA-marked cert used as BOTH trust anchor and end-entity (`CaUsedAsEndEntity`).
+/// Determinism needs fixed keys + serials + validity (rcgen otherwise varies).
+pub fn build_worker_channel_cert(
+    falcon_signing_key: &[u8],
+) -> Result<WorkerChannelTls, QuilTlsError> {
+    // CA (trust anchor).
+    let (ca_kp, _) = dwc_keypair(&dwc_seed(falcon_signing_key, b"quil-dwc-ca-v1"))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.alg = &PKCS_ED25519;
+    ca_params.key_pair = Some(ca_kp);
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::OrganizationName, "quil-worker-channel-ca");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    ca_params.serial_number = Some(SerialNumber::from(1u64));
+    ca_params.not_before = date_time_ymd(2020, 1, 1);
+    ca_params.not_after = date_time_ymd(2100, 1, 1);
+    let ca = Certificate::from_params(ca_params)
+        .map_err(|e| QuilTlsError::Rcgen(format!("ca from_params: {}", e)))?;
+    let ca_cert_pem = ca
+        .serialize_pem()
+        .map_err(|e| QuilTlsError::Rcgen(format!("ca serialize_pem: {}", e)))?;
+
+    // Leaf (identity), signed by the CA.
+    let (leaf_kp, leaf_pkcs8) = dwc_keypair(&dwc_seed(falcon_signing_key, b"quil-dwc-leaf-v1"))?;
+    let leaf_key_pem = pkcs8_der_to_pem("PRIVATE KEY", &leaf_pkcs8);
+    let mut leaf_params = CertificateParams::default();
+    leaf_params.alg = &PKCS_ED25519;
+    leaf_params.key_pair = Some(leaf_kp);
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params
+        .distinguished_name
+        .push(DnType::OrganizationName, "quil-worker-channel");
+    leaf_params.subject_alt_names = vec![SanType::DnsName(WORKER_CHANNEL_SAN.to_string())];
+    leaf_params.is_ca = IsCa::ExplicitNoCa;
+    leaf_params.serial_number = Some(SerialNumber::from(2u64));
+    leaf_params.not_before = date_time_ymd(2020, 1, 1);
+    leaf_params.not_after = date_time_ymd(2100, 1, 1);
+    let leaf = Certificate::from_params(leaf_params)
+        .map_err(|e| QuilTlsError::Rcgen(format!("leaf from_params: {}", e)))?;
+    let leaf_cert_pem = leaf
+        .serialize_pem_with_signer(&ca)
+        .map_err(|e| QuilTlsError::Rcgen(format!("leaf serialize_pem_with_signer: {}", e)))?;
+
+    Ok(WorkerChannelTls {
+        ca_cert_pem,
+        leaf_cert_pem,
+        leaf_key_pem: leaf_key_pem.to_string(),
+    })
+}
+
 /// Encode an Ed25519 PKCS#8 v2 blob (private + public keys) in the exact
 /// shape that *ring* — and therefore rcgen 0.11 — expects.
 ///
 /// Structure:
 /// ```text
-/// SEQUENCE                      (0x30 0x53)
-///   INTEGER 1                   (0x02 0x01 0x01)
-///   AlgorithmIdentifier         (0x30 0x05 0x06 0x03 0x2b 0x65 0x70)  -- 1.3.101.112
-///   OCTET STRING wrapping
-///     OCTET STRING(seed[32])    (0x04 0x22 0x04 0x20 || seed)
-///   [1] BIT STRING(pubkey[32])  (0xa1 0x23 0x03 0x21 0x00 || pubkey)
+/// SEQUENCE (0x30 0x53)
+///   INTEGER 1 (0x02 0x01 0x01)
+///   AlgorithmIdentifier (0x30 0x05 0x06 0x03 0x2b 0x65 0x70)  -- 1.3.101.112
+/// OCTET STRING wrapping
+///     OCTET STRING(seed[32]) (0x04 0x22 0x04 0x20 || seed)
+///   [1] BIT STRING(pubkey[32]) (0xa1 0x23 0x03 0x21 0x00 || pubkey)
 /// ```
 fn ed25519_pkcs8_v2(seed: &[u8; 32], public_key: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(85);
@@ -175,12 +278,12 @@ use rustls::{ServerConfig, SignatureScheme};
 ///
 /// 1. Parse the presented end-entity cert.
 /// 2. Extract the cert's Ed25519 public key from its
-///    `SubjectPublicKeyInfo`.
+/// `SubjectPublicKeyInfo`.
 /// 3. Pull the single SAN DNS name and decode it as
-///    `hex(ed448_pub_57 || xsign_114)`.
+/// `hex(ed448_pub_57 || xsign_114)`.
 /// 4. Verify the Ed448 signature `xsign` over the message
-///    `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
-///    public key.
+/// `b"tls-cert-derivation" || ed25519_pub` under the SAN's Ed448
+/// public key.
 ///
 /// Any failure rejects the handshake. Per-peer authorization
 /// (membership in prover/signer registries, whitelist, etc.) is still
@@ -190,12 +293,51 @@ use rustls::{ServerConfig, SignatureScheme};
 /// Requires a client cert (mandatory auth) so downstream code can
 /// always rely on `TlsConnectInfo::peer_certs()` being populated.
 #[derive(Debug)]
-pub struct XsignClientCertVerifier;
+pub struct XsignClientCertVerifier {
+    /// Signature-verification algorithms from the installed crypto provider,
+    /// used to perform the real TLS `CertificateVerify` proof-of-possession
+    /// check in `verify_tls1x_signature`.
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl Default for XsignClientCertVerifier {
+    /// Build a verifier wired to the ring crypto provider's signature
+    /// algorithms (matching the provider installed by
+    /// `build_quil_server_tls_config`).
+    fn default() -> Self {
+        Self {
+            supported: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+}
+
+/// Memoized results of [`XsignClientCertVerifier::verify_xsign`], keyed by
+/// SHA-256 of the presented cert DER → the SAN-derived Ed448 pubkey. A peer
+/// presents the IDENTICAL cert on every handshake, and the xsign scheme has
+/// no expiry, so the (slow, vendored-pure-Rust) Ed448 *verify* — plus the
+/// x509 parse — should run once per distinct peer cert, not once per
+/// connection. A tampered cert hashes differently → cache miss → full
+/// verify → reject, so caching is sound. Bounded; cleared wholesale on
+/// overflow (crude but keeps it from growing unbounded as prover identities
+/// churn). The verify is deterministic, so a re-fill is cheap correctness-wise.
+static XSIGN_VERIFY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+> = std::sync::OnceLock::new();
+const XSIGN_VERIFY_CACHE_CAP: usize = 8192;
 
 impl XsignClientCertVerifier {
     /// Stand-alone validation routine, exposed for tests. Returns the
     /// SAN-derived Ed448 public key on success.
     pub fn verify_xsign(cert_der: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        let cert_hash: [u8; 32] = Sha256::digest(cert_der).into();
+        let cache = XSIGN_VERIFY_CACHE
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Some(pk) = cache.lock().unwrap().get(&cert_hash) {
+            return Ok(pk.clone());
+        }
+
         let (_, cert) = x509_parser::parse_x509_certificate(cert_der)
             .map_err(|e| rustls::Error::General(format!("parse client cert: {e}")))?;
 
@@ -233,29 +375,33 @@ impl XsignClientCertVerifier {
 
         let blob = hex::decode(dns)
             .map_err(|e| rustls::Error::General(format!("decode SAN hex: {e}")))?;
-        // 57-byte Ed448 pubkey || 114-byte Ed448 signature
-        if blob.len() != 57 + 114 {
+        // 897-byte Falcon pubkey || 666-byte Falcon signature
+        if blob.len() != 897 + 666 {
             return Err(rustls::Error::General(format!(
                 "client cert SAN xsign blob has wrong length: {}",
                 blob.len()
             )));
         }
-        let ed448_pub_bytes: [u8; 57] = blob[..57]
-            .try_into()
-            .map_err(|_| rustls::Error::General("ed448 pubkey slice".into()))?;
-        let xsign = &blob[57..];
-
-        let ed448_pub = ed448_rust::PublicKey::from(ed448_pub_bytes);
+        let falcon_pub = &blob[..897];
+        let xsign = &blob[897..];
 
         let mut signed = Vec::with_capacity(TLS_CERT_DERIVATION_CTX.len() + ed25519_pub.len());
         signed.extend_from_slice(TLS_CERT_DERIVATION_CTX);
         signed.extend_from_slice(ed25519_pub);
 
-        ed448_pub
-            .verify(&signed, xsign, None)
-            .map_err(|e| rustls::Error::General(format!("xsign verify failed: {e:?}")))?;
+        if !quil_crypto::falcon_verify(falcon_pub, xsign, &signed, &[]) {
+            return Err(rustls::Error::General("xsign verify failed".into()));
+        }
 
-        Ok(blob[..57].to_vec())
+        let pubkey = falcon_pub.to_vec();
+        {
+            let mut c = cache.lock().unwrap();
+            if c.len() >= XSIGN_VERIFY_CACHE_CAP {
+                c.clear();
+            }
+            c.insert(cert_hash, pubkey.clone());
+        }
+        Ok(pubkey)
     }
 }
 
@@ -284,24 +430,25 @@ impl ClientCertVerifier for XsignClientCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // The cert's Ed25519 key is verified by rustls itself when
-        // checking the handshake signature against the presented cert.
-        // We only assert; the cryptographic check is the standard TLS
-        // one performed by the rustls crypto provider.
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        // This callback IS the TLS proof-of-possession check: when a custom
+        // verifier is installed there is no separate built-in step. Verify the
+        // client's CertificateVerify signature against the cert's Ed25519 key,
+        // proving the live peer holds the cert's private half (Go's
+        // crypto/tls enforces this unconditionally; xsign alone does not).
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -321,13 +468,13 @@ pub type AcceptAnyClientCert = XsignClientCertVerifier;
 /// client to present one (verified permissively — trust is at the
 /// application layer via the peer-auth interceptor).
 pub fn build_quil_server_tls_config(
-    ed448_seed: &[u8; 57],
+    falcon_signing_key: &[u8],
 ) -> Result<Arc<ServerConfig>, QuilTlsError> {
     // SAFETY: install the default rustls crypto provider once; errors
     // just mean another provider is already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let tls_cert = build_quil_tls_cert(ed448_seed)?;
+    let tls_cert = build_quil_tls_cert(falcon_signing_key)?;
     let cert_chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut tls_cert.cert_pem.as_bytes())
             .filter_map(|r| r.ok())
@@ -342,7 +489,7 @@ pub fn build_quil_server_tls_config(
     .map_err(|e| QuilTlsError::Rcgen(format!("parse key pem: {}", e)))?
     .ok_or_else(|| QuilTlsError::Rcgen("no private key in pem".into()))?;
 
-    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(XsignClientCertVerifier);
+    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(XsignClientCertVerifier::default());
 
     let mut config = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -363,8 +510,102 @@ mod tests {
     // XsignClientCertVerifier — accepts good certs, rejects tampered
     // =================================================================
 
-    fn cert_der_from_seed(seed: &[u8; 57]) -> Vec<u8> {
-        let tls = build_quil_tls_cert(seed).unwrap();
+    /// A fresh Falcon-512 signing key — the node identity
+    /// `build_quil_tls_cert` binds the cert to.
+    fn falcon_signing_key() -> Vec<u8> {
+        use quil_types::crypto::Signer as _;
+        quil_crypto::FalconSigner::generate().private_key().to_vec()
+    }
+
+    #[test]
+    fn worker_channel_cert_is_deterministic() {
+        let k1 = falcon_signing_key();
+        let a = build_worker_channel_cert(&k1).unwrap();
+        let b = build_worker_channel_cert(&k1).unwrap();
+        assert_eq!(a.ca_cert_pem, b.ca_cert_pem, "same node key MUST yield a byte-identical CA (master and every worker derive it independently)");
+        assert_eq!(a.leaf_cert_pem, b.leaf_cert_pem);
+        assert_eq!(a.leaf_key_pem, b.leaf_key_pem);
+        let k2 = falcon_signing_key();
+        let c = build_worker_channel_cert(&k2).unwrap();
+        assert_ne!(a.ca_cert_pem, c.ca_cert_pem, "different node keys must yield different CAs");
+    }
+
+    /// Real in-process mTLS handshake (no cluster mode needed): a client bearing
+    /// the SAME node key is accepted; a client from a DIFFERENT node key is
+    /// rejected — i.e. only node-key holders can join the worker channel.
+    #[tokio::test]
+    async fn worker_channel_mtls_accepts_same_key_rejects_other() {
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        // Building a rustls config directly (rather than via
+        // `build_quil_server_tls_config`, which does this itself) needs the
+        // process-level provider installed first — rustls has no default when
+        // the crate is built with `default-features = false`.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let parse = |cert_pem: &str, key_pem: &str| {
+            let cert = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .unwrap()
+                .unwrap();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+            (cert, key)
+        };
+
+        let node = falcon_signing_key();
+        let tls = build_worker_channel_cert(&node).unwrap();
+        let (ca, _) = parse(&tls.ca_cert_pem, &tls.leaf_key_pem);
+        let (leaf, leaf_key) = parse(&tls.leaf_cert_pem, &tls.leaf_key_pem);
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.clone()).unwrap();
+        let roots = Arc::new(roots);
+        let verifier = rustls::server::WebPkiClientVerifier::builder(roots.clone())
+            .build()
+            .unwrap();
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![leaf.clone()], leaf_key.clone_key())
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let make_client = |ccert: rustls::pki_types::CertificateDer<'static>,
+                           ckey: rustls::pki_types::PrivateKeyDer<'static>| {
+            let cfg = rustls::ClientConfig::builder()
+                .with_root_certificates((*roots).clone())
+                .with_client_auth_cert(vec![ccert], ckey)
+                .unwrap();
+            TlsConnector::from(Arc::new(cfg))
+        };
+        let sni = rustls::pki_types::ServerName::try_from(WORKER_CHANNEL_SAN).unwrap();
+
+        // Same node key → handshake succeeds both sides.
+        let (cio, sio) = tokio::io::duplex(16 * 1024);
+        let conn = make_client(leaf.clone(), leaf_key.clone_key());
+        let (sr, cr) = tokio::join!(acceptor.accept(sio), conn.connect(sni.clone(), cio));
+        assert!(
+            sr.is_ok() && cr.is_ok(),
+            "matching-key mTLS must succeed: server={:?} client={:?}",
+            sr.err(),
+            cr.err()
+        );
+
+        // Different node key → server REJECTS the client leaf (chains to a
+        // different CA, which the server does not trust).
+        let other = falcon_signing_key();
+        let otls = build_worker_channel_cert(&other).unwrap();
+        let (oleaf, oleaf_key) = parse(&otls.leaf_cert_pem, &otls.leaf_key_pem);
+        let (cio2, sio2) = tokio::io::duplex(16 * 1024);
+        let conn2 = make_client(oleaf, oleaf_key);
+        let (sr2, _cr2) = tokio::join!(acceptor.accept(sio2), conn2.connect(sni, cio2));
+        assert!(
+            sr2.is_err(),
+            "a client cert from a DIFFERENT node key must be rejected by the worker server",
+        );
+    }
+
+    fn cert_der_from_key(falcon_sk: &[u8]) -> Vec<u8> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
         let pem = tls.cert_pem.clone();
         let mut reader = pem.as_bytes();
         let cert = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
@@ -373,11 +614,11 @@ mod tests {
 
     #[test]
     fn xsign_verifier_accepts_well_formed_cert() {
-        let seed = [0x71u8; 57];
-        let der = cert_der_from_seed(&seed);
+        let sk = falcon_signing_key();
+        let der = cert_der_from_key(&sk);
         let pubkey = XsignClientCertVerifier::verify_xsign(&der)
             .expect("xsign verify must accept a freshly-built cert");
-        assert_eq!(pubkey.len(), 57);
+        assert_eq!(pubkey.len(), quil_crypto::FALCON_PUBLIC_KEY_LEN);
     }
 
     #[test]
@@ -390,8 +631,8 @@ mod tests {
     fn xsign_verifier_rejects_tampered_san() {
         // Take a real cert, flip a bit in the xsign signature half of
         // the SAN, and confirm verification fails.
-        let seed = [0x55u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         // Mutate the SAN string (still valid hex of valid length) by
         // flipping the last hex digit. This corrupts the signature
         // while keeping the encoding parseable.
@@ -403,7 +644,7 @@ mod tests {
         // the rcgen flow from scratch since the existing helper
         // computes its own SAN.
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&seed);
+        hasher.update(&sk);
         hasher.update(TLS_CERT_DERIVATION_CTX);
         let digest = hasher.finalize();
         let mut ed25519_seed = [0u8; 32];
@@ -437,29 +678,30 @@ mod tests {
     // =================================================================
 
     #[test]
-    fn build_cert_from_known_seed() {
-        let seed = [0x42u8; 57];
-        let tls = build_quil_tls_cert(&seed).expect("build cert");
+    fn build_cert_from_generated_key() {
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).expect("build cert");
         assert!(tls.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(tls.key_pem.contains("BEGIN PRIVATE KEY"));
-        // xsign is hex(57 + 114) = 342 chars
-        assert_eq!(tls.xsign_hex.len(), (57 + 114) * 2);
+        // xsign is hex(897 + 666) chars
+        assert_eq!(
+            tls.xsign_hex.len(),
+            (quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN) * 2
+        );
     }
 
     #[test]
-    fn build_cert_from_zero_seed() {
-        let seed = [0u8; 57];
-        let tls = build_quil_tls_cert(&seed).expect("build cert");
-        assert!(tls.cert_pem.contains("BEGIN CERTIFICATE"));
-        assert!(tls.cert_pem.contains("END CERTIFICATE"));
-        assert!(tls.key_pem.contains("BEGIN PRIVATE KEY"));
-        assert!(tls.key_pem.contains("END PRIVATE KEY"));
+    fn build_cert_rejects_malformed_signing_key() {
+        // An all-zero buffer of the right length is not a decodable
+        // Falcon signing key, and neither is a legacy 57-byte Ed448 seed.
+        assert!(build_quil_tls_cert(&[0u8; quil_crypto::FALCON_SIGNING_KEY_LEN]).is_err());
+        assert!(build_quil_tls_cert(&[0x42u8; 57]).is_err());
     }
 
     #[test]
     fn build_cert_xsign_is_valid_hex() {
-        let seed = [0x17u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         // Every character must be a valid hex digit.
         for c in tls.xsign_hex.chars() {
             assert!(
@@ -470,83 +712,77 @@ mod tests {
         }
         // Round-trip decodes cleanly.
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
-        assert_eq!(decoded.len(), 57 + 114);
+        assert_eq!(
+            decoded.len(),
+            quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN
+        );
     }
 
     #[test]
-    fn build_cert_xsign_starts_with_ed448_pubkey() {
-        // The first 57 bytes of the xsign blob are the Ed448 public key
-        // derived from the seed. Compute it independently and compare.
-        let seed = [0x99u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+    fn build_cert_xsign_starts_with_falcon_pubkey() {
+        // The first 897 bytes of the xsign blob are the Falcon public key
+        // recomputed from the signing key. Compute it independently and
+        // compare.
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
 
-        let priv_key = Ed448PrivateKey::from(seed);
-        let pub_key = Ed448PublicKey::try_from(&priv_key).unwrap();
-        assert_eq!(&decoded[..57], pub_key.as_byte());
+        let pub_key = quil_crypto::falcon_public_from_signing_key(&sk).unwrap();
+        assert_eq!(&decoded[..quil_crypto::FALCON_PUBLIC_KEY_LEN], &pub_key[..]);
     }
 
     #[test]
-    fn build_cert_xsign_signature_portion_has_ed448_sig_length() {
-        // The last 114 bytes of xsign are the Ed448 signature over
-        // `"tls-cert-derivation" || ed25519_pub`. We don't verify the
-        // signature directly (that's a property of ed448-rust, not
-        // our TLS cert code), but we lock down the length and the
-        // split point between pub key and signature.
-        let seed = [0x33u8; 57];
-        let tls = build_quil_tls_cert(&seed).unwrap();
+    fn build_cert_xsign_signature_portion_verifies() {
+        // The last 666 bytes of xsign are the Falcon signature over
+        // `"tls-cert-derivation" || ed25519_pub` (empty domain). Recompute
+        // the derived Ed25519 pubkey and verify the cross-signature the
+        // same way `verify_xsign` does.
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
         let decoded = hex::decode(&tls.xsign_hex).unwrap();
-        assert_eq!(decoded.len(), 57 + 114);
-        let signature = &decoded[57..];
-        assert_eq!(signature.len(), 114);
-        // Sanity: the signature must not be all zero (a degenerate
-        // ed448 sig would be suspicious).
-        assert!(!signature.iter().all(|&b| b == 0));
-    }
+        let (falcon_pub, signature) = decoded.split_at(quil_crypto::FALCON_PUBLIC_KEY_LEN);
+        assert_eq!(signature.len(), quil_crypto::FALCON_SIGNATURE_LEN);
 
-    #[test]
-    fn build_cert_xsign_is_deterministic_for_same_seed() {
-        // Extracted as its own property: the xsign_hex output is a
-        // deterministic function of the seed alone. This is a stronger
-        // claim than `same_seed_produces_same_xsign_but_different_cert`
-        // below because it verifies the determinism across multiple
-        // invocations, not just two.
-        let seed = [0x55u8; 57];
-        let results: Vec<String> = (0..5)
-            .map(|_| build_quil_tls_cert(&seed).unwrap().xsign_hex)
-            .collect();
-        // All 5 outputs must be identical.
-        for r in &results[1..] {
-            assert_eq!(r, &results[0]);
-        }
+        let mut hasher = Sha256::new();
+        hasher.update(&sk);
+        hasher.update(TLS_CERT_DERIVATION_CTX);
+        let digest = hasher.finalize();
+        let mut ed25519_seed = [0u8; 32];
+        ed25519_seed.copy_from_slice(&digest[..32]);
+        let ed25519_pub = SigningKey::from_bytes(&ed25519_seed)
+            .verifying_key()
+            .to_bytes();
+        let mut signed = Vec::new();
+        signed.extend_from_slice(TLS_CERT_DERIVATION_CTX);
+        signed.extend_from_slice(&ed25519_pub);
+        assert!(quil_crypto::falcon_verify(falcon_pub, signature, &signed, &[]));
     }
 
     // =================================================================
-    // Deterministic derivation
+    // Derivation properties
     // =================================================================
 
     #[test]
-    fn same_seed_produces_same_xsign_but_different_cert() {
-        // The `xsign_hex` is deterministic from the seed (SHA-256
-        // derivation + Ed25519 key + Ed448 sig). The x509 cert body
-        // may include a randomly-generated serial number and
-        // timestamps, so cert_pem can differ between calls while
-        // xsign_hex stays identical.
-        let seed = [0xABu8; 57];
-        let a = build_quil_tls_cert(&seed).unwrap();
-        let b = build_quil_tls_cert(&seed).unwrap();
-        assert_eq!(a.xsign_hex, b.xsign_hex);
+    fn same_key_produces_same_key_pem_and_pubkey_half() {
+        // The derived Ed25519 key (and so key_pem) and the Falcon-pubkey
+        // half of the xsign blob are deterministic functions of the
+        // signing key. The signature half is NOT deterministic (Falcon
+        // signing is randomized), and the x509 cert body may include a
+        // randomly-generated serial number and timestamps.
+        let sk = falcon_signing_key();
+        let a = build_quil_tls_cert(&sk).unwrap();
+        let b = build_quil_tls_cert(&sk).unwrap();
         assert_eq!(a.key_pem, b.key_pem);
-        // cert_pem structure contains the SAN which contains xsign_hex;
-        // both certs should include it.
+        let pub_hex_len = quil_crypto::FALCON_PUBLIC_KEY_LEN * 2;
+        assert_eq!(a.xsign_hex[..pub_hex_len], b.xsign_hex[..pub_hex_len]);
         assert!(a.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(b.cert_pem.contains("BEGIN CERTIFICATE"));
     }
 
     #[test]
-    fn different_seeds_produce_different_xsign() {
-        let a = build_quil_tls_cert(&[0x01u8; 57]).unwrap();
-        let b = build_quil_tls_cert(&[0x02u8; 57]).unwrap();
+    fn different_keys_produce_different_xsign() {
+        let a = build_quil_tls_cert(&falcon_signing_key()).unwrap();
+        let b = build_quil_tls_cert(&falcon_signing_key()).unwrap();
         assert_ne!(a.xsign_hex, b.xsign_hex);
         assert_ne!(a.key_pem, b.key_pem);
     }
@@ -700,5 +936,203 @@ mod tests {
         let msg2 = format!("{}", err2);
         assert!(msg2.contains("rcgen"));
         assert!(msg2.contains("build failed"));
+    }
+
+    // =================================================================
+    // Proof-of-possession regression test — END-TO-END HANDSHAKE
+    //
+    // `verify_xsign` proves the presented cert is genuine (the Ed448
+    // identity authorized its Ed25519 cert key) but NOT that the live peer
+    // holds the cert's private key. That second guarantee is the TLS
+    // `CertificateVerify` check, which rustls routes through
+    // `verify_tls1x_signature`. `XsignClientCertVerifier` now performs that
+    // check (it previously stubbed those callbacks to `Ok(assertion())`,
+    // which let a client present a public cert it did not own — signing
+    // CertificateVerify with a different key — and still authenticate).
+    //
+    // This repro covers the acceptor direction (`build_quil_server_tls_config`
+    // / `XsignClientCertVerifier`); the client direction is covered in
+    // `archive_client.rs`. The test drives a real TLS 1.3 handshake through
+    // the actual production construction and asserts the handshake FAILS for a
+    // forged (non-possessing) client. It failed before possession was enforced
+    // (the handshake succeeded, demonstrating the bypass); it now guards
+    // against that regression.
+    // =================================================================
+
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn cert_chain_from_key(falcon_sk: &[u8]) -> Vec<CertificateDer<'static>> {
+        vec![CertificateDer::from(cert_der_from_key(falcon_sk))]
+    }
+
+    /// Load the Ed25519 signing key derived from `falcon_sk`. Pairing this
+    /// with a *different* key's cert chain (via `CertifiedKey::new`, which —
+    /// unlike `from_der` — does not check the key matches the cert) is the
+    /// forgery: present someone else's cert, sign with your own key.
+    fn signing_key_from_key(falcon_sk: &[u8]) -> Arc<dyn rustls::sign::SigningKey> {
+        let tls = build_quil_tls_cert(falcon_sk).unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        rustls::crypto::ring::sign::any_supported_type(&key).unwrap()
+    }
+
+    /// Client resolver presenting `victim`'s cert chain but signing with the
+    /// attacker's key — a client that does NOT possess the cert's key.
+    #[derive(Debug)]
+    struct ForgedClientIdentity(Arc<rustls::sign::CertifiedKey>);
+    impl rustls::client::ResolvesClientCert for ForgedClientIdentity {
+        fn resolve(
+            &self,
+            _root_hint_subjects: &[&[u8]],
+            _sigschemes: &[SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(self.0.clone())
+        }
+        fn has_certs(&self) -> bool {
+            true
+        }
+    }
+
+    /// Proper client-side server-cert verifier for the test client. This
+    /// branch has no client-side xsign verifier, so we implement one inline,
+    /// mirroring Go's client `VerifyPeerCertificate`: verify the server's
+    /// xsign cross-signature on its cert AND verify the handshake signature
+    /// (real proof-of-possession) via rustls' standard webpki path. With a
+    /// fully-correct verifier on the client, the handshake completing in the
+    /// forged test is unambiguously the *server* accepting a non-possessing
+    /// client — not a pushover client rubber-stamping the server.
+    #[derive(Debug)]
+    struct XsignServerVerifier {
+        supported: rustls::crypto::WebPkiSupportedAlgorithms,
+    }
+    impl XsignServerVerifier {
+        fn new() -> Self {
+            Self {
+                supported: rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms,
+            }
+        }
+    }
+    impl rustls::client::danger::ServerCertVerifier for XsignServerVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            // Genuine cert check: the server must present a valid xsign cert.
+            XsignClientCertVerifier::verify_xsign(end_entity.as_ref())?;
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            // Real proof-of-possession: the server must hold its cert's key.
+            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.supported.supported_schemes()
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptor_completes_handshake_with_forged_client_signature() {
+        // Production server, built exactly as the node does.
+        let acceptor =
+            TlsAcceptor::from(build_quil_server_tls_config(&falcon_signing_key()).unwrap());
+
+        // Attacker: victim's public cert + attacker's own (different) key.
+        let forged = Arc::new(rustls::sign::CertifiedKey::new(
+            cert_chain_from_key(&falcon_signing_key()),
+            signing_key_from_key(&falcon_signing_key()),
+        ));
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))
+            .with_client_cert_resolver(Arc::new(ForgedClientIdentity(forged)));
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        // Setup guard: the attacker's client side must complete. In TLS 1.3
+        // the client finishes its flight before the server validates the
+        // client cert, so this is Ok before and after the fix — ensuring the
+        // handshake actually reached the client-auth stage.
+        assert!(
+            client_res.is_ok(),
+            "handshake did not reach the client-auth stage: {:?}",
+            client_res.err(),
+        );
+        assert!(
+            server_res.is_err(),
+            "VULNERABILITY: TlsAcceptor (build_quil_server_tls_config) completed the \
+             handshake with a client that presented the victim's cert but signed \
+             CertificateVerify with a different key — proof-of-possession is not \
+             enforced, so the peer identity is spoofable by cert replay",
+        );
+    }
+
+    /// Positive control: the SAME server must SUCCEED for a legitimate client
+    /// that actually possesses its cert's key. Proves the forged test fails
+    /// specifically because possession is missing — not because of ALPN, the
+    /// duplex transport, or some other setup detail. Passes before and after
+    /// the fix (all possession is legitimate).
+    #[tokio::test]
+    async fn acceptor_completes_handshake_with_legitimate_client() {
+        let acceptor =
+            TlsAcceptor::from(build_quil_server_tls_config(&falcon_signing_key()).unwrap());
+
+        // Legit client: presents its own cert signed with its own key.
+        let sk = falcon_signing_key();
+        let tls = build_quil_tls_cert(&sk).unwrap();
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+                .unwrap()
+                .unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))
+            .with_client_auth_cert(cert_chain_from_key(&sk), key)
+            .unwrap();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_io),
+            connector.connect(server_name, client_io),
+        );
+
+        // Nobody rejects here, so both sides must complete.
+        assert!(
+            client_res.is_ok(),
+            "legitimate handshake must succeed (client side): {:?}",
+            client_res.err(),
+        );
+        assert!(
+            server_res.is_ok(),
+            "legitimate handshake must succeed (server side): {:?}",
+            server_res.err(),
+        );
     }
 }
