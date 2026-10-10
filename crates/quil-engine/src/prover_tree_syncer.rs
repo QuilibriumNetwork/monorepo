@@ -231,7 +231,10 @@ where
     let mut remote: Option<AppShardFrame> = None;
     let mut failure = None;
     for probe in 0..TIP_PROBES {
-        if probe > 0 && remote.as_ref().map_or(0, height).max(height(&local)) >= committed {
+        // The local head satisfying GLOBAL is not evidence that this archive
+        // is current. Keep the bounded rotation going until a peer reaches
+        // both the known local lineage and the committed checkpoint.
+        if probe > 0 && remote.as_ref().is_some_and(|frame| height(frame) >= height(&local).max(committed)) {
             break;
         }
         match syncer.get_app_shard_frame(filter, 0).await {
@@ -680,6 +683,58 @@ mod tests {
         let missing = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(150),
             |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap_err();
         assert!(missing.to_string().contains("missing shard frame 141"), "{missing}");
+    }
+
+    /// Rotate across peer responses even when the local head already covers
+    /// GLOBAL. A stale/absent first response must not hide a newer peer head.
+    struct RotatingArchive {
+        tips: Mutex<std::collections::VecDeque<Option<u64>>>,
+        calls: Arc<Mutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for RotatingArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, _: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            self.calls.lock().unwrap().push(number);
+            Ok(if number == 0 { self.tips.lock().unwrap().pop_front().flatten().map(frame) }
+                else { Some(frame(number)) })
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+    }
+
+    #[tokio::test]
+    async fn replay_probes_past_stale_peer_when_local_head_covers_global() {
+        for first in [Some(83), None] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let archive = RotatingArchive { tips: Mutex::new([first, Some(134)].into()), calls: calls.clone() };
+            let replayed = Arc::new(Mutex::new(Vec::new()));
+            let installed = replayed.clone();
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127),
+                move |frame, _| {
+                    let height = frame.header.unwrap().frame_number;
+                    installed.lock().unwrap().push(height);
+                    async move { Ok(height) }
+                }).await.unwrap();
+            assert_eq!(result, ShardReplay { materialized: 134, archive_tip: Some(134), target: 134 });
+            assert_eq!(*replayed.lock().unwrap(), [131, 132, 133, 134]);
+            assert_eq!(*calls.lock().unwrap(), [0, 0, 131, 132, 133]);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_tip_rotation_is_bounded_and_stops_at_a_current_peer() {
+        for (tips, expected_calls, expected_tip) in [
+            (vec![Some(83); TIP_PROBES + 1], TIP_PROBES, 83),
+            (vec![Some(130), Some(134)], 1, 130),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let archive = RotatingArchive { tips: Mutex::new(tips.into()), calls: calls.clone() };
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127),
+                |_, _| async { panic!("already materialized through the known target") }).await.unwrap();
+            assert_eq!(result, ShardReplay { materialized: 130, archive_tip: Some(expected_tip), target: 130 });
+            assert_eq!(*calls.lock().unwrap(), vec![0; expected_calls]);
+        }
     }
 
     #[tokio::test]
