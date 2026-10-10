@@ -15,6 +15,7 @@ pub mod consensus_types;
 /// Commonware-simplex consensus seams: real-state impls of the
 /// quil-cw-consensus GlobalProposer/FrameSink/FrameFinalizer traits.
 pub mod cw_app_seams;
+mod closing_certificate;
 pub mod cw_global_seams;
 mod cw_host_supervisor;
 pub mod consensus_wire;
