@@ -29,7 +29,7 @@ use quil_types::error::Result;
 
 use crate::halt_state::HaltState;
 use crate::provers::proposer::{self, ShardDescriptor, Strategy};
-use crate::worker::{WorkerManager, WorkerView};
+use crate::worker::{manually_managed_filters, WorkerManager, WorkerView};
 use crate::worker_allocator::WorkerAllocator;
 
 /// Confirm window for pending joins/leaves (matches Go's 360 frames).
@@ -1078,11 +1078,7 @@ impl ProverLifecycle {
         difficulty: u64,
         world_bytes: &BigInt,
     ) -> Vec<Vec<u8>> {
-        let mm_filters: std::collections::HashSet<Vec<u8>> = workers
-            .iter()
-            .filter(|w| w.manually_managed && !w.filter.is_empty())
-            .map(|w| w.filter.clone())
-            .collect();
+        let mm_filters = manually_managed_filters(workers);
         let bound_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
             .filter(|w| !w.filter.is_empty())
@@ -1964,11 +1960,7 @@ impl ProverLifecycle {
             let (split_away, ready_join_filters): (Vec<Vec<u8>>, Vec<Vec<u8>>) = ready_join_filters
                 .into_iter()
                 .partition(|f| is_split_parent(f, &known_shards) || retired.contains(f));
-            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manual_bound_filters = manually_managed_filters(&workers);
 
             let (manual_ready, auto_ready): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
                 ready_join_filters
@@ -2102,11 +2094,7 @@ impl ProverLifecycle {
             && !(active_filters.is_empty() && expired_epoch_for_orphan_sweep.is_empty())
             && !self.halt_state.any_halted()
         {
-            let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manually_managed_filters = manually_managed_filters(&workers);
             let pending_leave_filters: std::collections::HashSet<Vec<u8>> = leaving_filters
                 .iter()
                 .map(|(f, _)| f.clone())
@@ -2315,9 +2303,15 @@ impl ProverLifecycle {
             } else {
                 available_replacements.as_slice()
             };
+            // Exclude operator pins before ranking so score replacements and
+            // halt-risk swaps can only propose leaving auto-managed holdings.
+            let auto_allocated_descriptors: Vec<_> = allocated_descriptors.iter()
+                .filter(|d| !manually_managed_filters.contains(&d.filter))
+                .cloned()
+                .collect();
             let leave_plan = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing_spread(
-                    &allocated_descriptors,
+                    &auto_allocated_descriptors,
                     replacement_descriptors,
                     difficulty,
                     &world_bytes,
@@ -2487,11 +2481,7 @@ impl ProverLifecycle {
             .collect();
 
         if !ready_leave_filters.is_empty() {
-            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manual_bound_filters = manually_managed_filters(&workers);
             // Filters any worker is currently bound to — used to
             // identify orphans (leaves with no worker). Orphans skip
             // the score-driven decide because there's nothing to
