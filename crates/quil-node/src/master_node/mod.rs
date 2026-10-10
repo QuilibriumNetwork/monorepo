@@ -11,6 +11,7 @@ pub(crate) mod frame_pipeline;
 pub(crate) mod grpc;
 pub(crate) mod keys;
 pub(crate) mod message_loop;
+mod shard_sender;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;

@@ -139,6 +139,20 @@ pub(crate) fn gap_fetched_frame_message(filter: &[u8], data: Vec<u8>) -> quil_p2
     }
 }
 
+fn shard_sender_key(
+    keys: &mut super::shard_sender::ShardSenderKeys,
+    peer: &[u8],
+    peer_info_key: Option<Vec<u8>>,
+    global: &Arc<quil_hypergraph::HypergraphCrdt>,
+    filter: &[u8],
+) -> Vec<u8> {
+    keys.resolve(peer, peer_info_key, || {
+        use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+        let view = CommittedView::capture(global).ok()?;
+        handoff::head(&view, filter).ok()?.map(|session| session.members)
+    })
+}
+
 pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) {
     let MessageLoopArgs {
         remote_workers: remote_workers_for_recv,
@@ -243,6 +257,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         // validators' drops are lumped into `router_drops` and we
         // can't distinguish a peer-info flood from a frame flood
         // from per-shard noise.
+        let mut shard_sender_keys = super::shard_sender::ShardSenderKeys::default();
         let mut router_drops_peer_info: u64 = 0;
         let mut router_drops_prover: u64 = 0;
         let mut router_drops_frame: u64 = 0;
@@ -378,6 +393,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         pending_joins = pending,
                         total_allocations = total_allocs,
                         peer_infos = peer_infos_received,
+                        cw_sender_peer_info = shard_sender_keys.peer_info,
+                        cw_sender_session = shard_sender_keys.session,
+                        cw_sender_cached = shard_sender_keys.cached,
+                        cw_sender_unresolved = shard_sender_keys.unresolved,
                         archive_peers = archive_peers_seen.len(),
                         consensus_msgs = consensus_msgs_received,
                         prover_msgs = prover_msgs_received,
@@ -1471,28 +1490,20 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         routed = true;
                                         break;
                                     }
-                                    // Commonware-simplex shard traffic. Split the
-                                    // channel out of the payload byte, and resolve the
-                                    // gossip sender's peer id → its committee Falcon key
-                                    // via PeerInfo (`CanonicalPeerInfo.public_key` is the
-                                    // prover key = the committee member key). The Falcon
-                                    // attestation self-attributes via its embedded signer
-                                    // index, so `from` is advisory for verification — but
-                                    // it must be a valid committee key or the engine drops
-                                    // it; an empty `from` (peer not yet in PeerInfo) is a
-                                    // benign startup transient until the peer's PeerInfo
-                                    // propagates.
+                                    // Resolve the authenticated gossip/direct sender's
+                                    // Falcon identity through PeerInfo or the committed
+                                    // session. Worker vote/certificate verification and
+                                    // session membership checks remain unchanged.
                                     if bm == quil_engine::bitmasks::shard_cw_bitmask(filter).as_slice() {
                                         // A transmission naming another member is dropped
                                         // here, unread.
                                         if let Some((channel, cw_bytes)) =
                                             quil_engine::bitmasks::shard_cw_admit(filter, &received.data, &local_cw_tag)
                                         {
-                                            let from_key = pic_for_recv
-                                                .read()
-                                                .get(&received.from)
-                                                .map(|pi| pi.public_key.clone())
-                                                .unwrap_or_default();
+                                            let peer_info_key = pic_for_recv.read().get(&received.from)
+                                                .map(|info| info.public_key.clone());
+                                            let from_key = shard_sender_key(&mut shard_sender_keys, &received.from,
+                                                peer_info_key, &crdt_for_recv, filter);
                                             tracing::debug!(filter = %hex::encode(filter), channel,
                                                 sender_known = !from_key.is_empty(), bytes = cw_bytes.len(),
                                                 "routing shard CW message to its engine");
@@ -1523,11 +1534,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 quil_engine::bitmasks::shard_cw_split_payload(&received.data)
                                                     .filter(|_| !elsewhere)
                                             {
-                                                let from_key = pic_for_recv
-                                                    .read()
-                                                    .get(&received.from)
-                                                    .map(|pi| pi.public_key.clone())
-                                                    .unwrap_or_default();
+                                                let peer_info_key = pic_for_recv.read().get(&received.from)
+                                                    .map(|info| info.public_key.clone());
+                                                let from_key = shard_sender_key(&mut shard_sender_keys, &received.from,
+                                                    peer_info_key, &crdt_for_recv, &filter);
                                                 let data = cw_bytes.to_vec();
                                                 let topic = bm.to_vec();
                                                 let p2p = p2p_for_recv.clone();
