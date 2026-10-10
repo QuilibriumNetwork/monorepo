@@ -52,6 +52,11 @@ impl SimplexFalconScheme {
         }
     }
 
+    pub(crate) fn verify_nullify(&self, vote: &commonware_consensus::simplex::types::Nullify<Self>) -> bool {
+        self.generic.verify_attestation::<Self, commonware_cryptography::sha256::Digest>(
+            Subject::Nullify { round: vote.round }, &vote.attestation)
+    }
+
     /// Verify a FINALIZATION certificate over `proposal` against this committee.
     /// No rng needed — Falcon verify is deterministic (non‑batchable). Used for
     /// off‑engine cert verification (reward attribution at the global level),

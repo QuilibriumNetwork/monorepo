@@ -254,7 +254,8 @@ where
         ch1.inbound_tx.clone(),
         ch2.inbound_tx.clone(),
     ];
-    let (s0, r0) = (ch0.sender, ch0.receiver);
+    let (s0, r0) = (ch0.sender, crate::nullify_receiver::NullifyReceiver::new(
+        ch0.receiver, scheme.clone(), params.epoch));
     let (s1, r1) = (ch1.sender, ch1.receiver);
     let (s2, r2) = (ch2.sender, ch2.receiver);
 

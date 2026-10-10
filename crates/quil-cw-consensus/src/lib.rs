@@ -47,6 +47,7 @@ pub mod adapters;
 /// from the seams + runtime context (hides the large simplex `Config`).
 pub mod engine_host;
 mod journal_context;
+mod nullify_receiver;
 
 /// Channel-backed commonware-p2p `Sender`/`Receiver` bridging simplex's 3
 /// channels onto the node's `:8340` transport.
