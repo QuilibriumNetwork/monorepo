@@ -968,6 +968,8 @@ pub struct AppSeamFinalizer {
     /// Receives a finalized terminal seal and its certificate (session hosts).
     on_sealed: Option<AppSealedSink>,
     sealed_bodies: Option<Arc<SealedBodies>>,
+    closing_certificate: Option<Arc<crate::closing_certificate::ClosingCertificate>>,
+    seal_persist_error: std::sync::atomic::AtomicBool,
     /// See [`FinalizedRecords`]. `None` for an ephemeral (journal-less) host.
     finalized_records: Option<Arc<FinalizedRecords>>,
     /// The engine's contiguous materialized cursor: bodies and records at or
@@ -993,6 +995,7 @@ impl AppSeamFinalizer {
         filter: Vec<u8>,
     ) -> Self {
         Self { on_notarized, on_finalized, store, filter, on_sealed: None, sealed_bodies: None,
+            closing_certificate: None, seal_persist_error: Default::default(),
             finalized_records: None, materialized: None, delivered: std::sync::atomic::AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()), reported: Default::default() }
     }
@@ -1062,6 +1065,22 @@ impl AppSeamFinalizer {
         }
     }
 
+    fn with_closing_certificate(mut self, record: Arc<crate::closing_certificate::ClosingCertificate>) -> Self {
+        self.closing_certificate = Some(record);
+        self
+    }
+
+    fn replay_closing_certificate(&self) -> std::io::Result<bool> {
+        let Some(record) = self.closing_certificate.as_ref() else { return Ok(false) };
+        let Some(submission) = record.load()? else { return Ok(false) };
+        let digest = digest_from_identity(submission.seal.digest());
+        self.store.seal(digest, submission.seal.encode());
+        self.pending.lock().unwrap().entry(digest)
+            .or_insert((submission.seal.view, submission.certificate));
+        self.retry_pending();
+        Ok(true)
+    }
+
     pub fn with_sealed_sink(mut self, on_sealed: AppSealedSink) -> Self {
         self.on_sealed = Some(on_sealed);
         self
@@ -1119,7 +1138,17 @@ impl AppSeamFinalizer {
             // the sink; elsewhere the reserved encoding can never be delivered.
             let Some(on_sealed) = self.on_sealed.as_ref() else { return false };
             let matches = Seal::decode(&bytes).is_ok_and(|seal| seal.digest() == digest.0);
-            if matches && on_sealed(bytes, cert.clone()) {
+            if !matches { return false; }
+            if let Some(record) = self.closing_certificate.as_ref() {
+                if let Err(error) = record.persist(&bytes, cert) {
+                    if !self.seal_persist_error.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(%error, "closing certificate persistence failed; retaining for retry");
+                    }
+                    return false;
+                }
+                self.seal_persist_error.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            if on_sealed(bytes, cert.clone()) {
                 pending.remove(&digest);
                 return true;
             }
@@ -1461,6 +1490,13 @@ pub fn activate_app_consensus_cw(
     );
     if let Some(host) = session.as_ref() {
         finalizer = finalizer.with_sealed_sink(host.on_sealed.clone());
+        if let Some(directory) = storage_directory.as_ref() {
+            finalizer = finalizer.with_closing_certificate(Arc::new(
+                crate::closing_certificate::ClosingCertificate::new(
+                    directory.with_extension("closing-certificate"), host.session.clone(),
+                ),
+            ));
+        }
     }
     if let Some(bodies) = sealed_bodies.clone() {
         finalizer = finalizer.with_sealed_bodies(bodies);
@@ -1477,6 +1513,12 @@ pub fn activate_app_consensus_cw(
     if replayed > 0 {
         tracing::info!(filter = %hex::encode(&proposer.filter), replayed,
             "delivering app frames finalized before a restart");
+    }
+    if finalizer.replay_closing_certificate()
+        .map_err(|error| quil_types::error::QuilError::Internal(format!("load finalized closing certificate: {error}")))?
+    {
+        tracing::info!(filter = %hex::encode(&proposer.filter),
+            "replaying authenticated closing certificate after restart");
     }
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
@@ -1776,6 +1818,112 @@ mod tests {
         }
         assert!(handle.is_dead());
         handle.shutdown_and_join().await.unwrap();
+    }
+
+    fn closing_test_certificate() -> (Session, Seal, Vec<u8>) {
+        use quil_types::crypto::Signer;
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = Session {
+            chain_id: [1; 32], filter: vec![1; 32], generation: 1, genesis: [2; 32],
+            base_frame: 0, authorization: [3; 32], members: vec![signer.public_key().to_vec()],
+        };
+        let seal = Seal {
+            request: [4; 32], session: session.id().unwrap(), view: 9,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 0, view: 0, digest: session.genesis, state_roots: [[5; 32]; 4], history_root: [6; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &[signer], &seal);
+        (session, seal, certificate)
+    }
+
+    #[test]
+    fn closing_certificate_survives_restart_before_or_after_queue_acceptance() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let digest = digest_from_identity(seal.digest());
+        for (durable, accepted) in [(false, true), (true, false), (true, true)] {
+            let directory = test_directory("closing-certificate-replay");
+            std::fs::create_dir_all(&directory).unwrap();
+            let record = Arc::new(crate::closing_certificate::ClosingCertificate::new(
+                directory.join("certificate"), session.clone(),
+            ));
+            let host = |store: BlockStore, seen: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>, accepted| {
+                let mut finalizer = AppSeamFinalizer::new(
+                    Arc::new(|_| panic!("seal cannot become data")),
+                    Arc::new(|_, _, _, _| panic!("seal cannot become data")), store, session.filter.clone(),
+                ).with_sealed_sink(Arc::new(move |bytes, cert| {
+                    seen.lock().unwrap().push((bytes, cert)); accepted
+                }));
+                if durable { finalizer = finalizer.with_closing_certificate(record.clone()); }
+                finalizer
+            };
+            let store = BlockStore::new();
+            store.seal(digest, seal.encode());
+            let first = host(store, Default::default(), accepted);
+            first.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+            assert_eq!(first.pending.lock().unwrap().is_empty(), accepted);
+            drop(first);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let restarted = host(BlockStore::new(), seen.clone(), true);
+            assert_eq!(restarted.replay_closing_certificate().unwrap(), durable);
+            assert_eq!(seen.lock().unwrap().as_slice(), if durable {
+                vec![(seal.encode(), certificate.clone())]
+            } else { vec![] }.as_slice());
+            assert!(restarted.pending.lock().unwrap().is_empty());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn closing_certificate_replay_requires_the_original_session_and_valid_finalization() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let directory = test_directory("closing-certificate-auth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("certificate");
+        let record = crate::closing_certificate::ClosingCertificate::new(path.clone(), session.clone());
+        assert!(record.persist(&seal.encode(), &[]).is_err(), "notarization/body alone is insufficient");
+        assert!(record.load().unwrap().is_none());
+        record.persist(&seal.encode(), &certificate).unwrap();
+        let mut wrong = session;
+        wrong.generation += 1;
+        assert!(crate::closing_certificate::ClosingCertificate::new(path.clone(), wrong).load().is_err());
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(record.load().is_err(), "corrupted finalization must not be replayed");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn closing_certificate_io_failure_retains_pending_delivery_until_durable() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let directory = test_directory("closing-certificate-io");
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocked = directory.join("blocked");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        let record = Arc::new(crate::closing_certificate::ClosingCertificate::new(
+            blocked.join("certificate"), session.clone(),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let store = BlockStore::new();
+        let digest = digest_from_identity(seal.digest());
+        store.seal(digest, seal.encode());
+        let finalizer = AppSeamFinalizer::new(
+            Arc::new(|_| unreachable!()), Arc::new(|_, _, _, _| unreachable!()), store, session.filter,
+        ).with_closing_certificate(record.clone()).with_sealed_sink(Arc::new(move |bytes, cert| {
+            captured.lock().unwrap().push((bytes, cert)); true
+        }));
+        finalizer.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(finalizer.pending.lock().unwrap().contains_key(&digest));
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve");
+        std::fs::remove_file(&blocked).unwrap();
+        finalizer.retry_pending();
+        assert_eq!(*seen.lock().unwrap(), vec![(seal.encode(), certificate)]);
+        assert!(record.load().unwrap().is_some());
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn finalized_test_frame(number: u64) -> AppShardFrame {
