@@ -24,12 +24,12 @@ use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, Supervi
 use commonware_utils::{NZUsize, NZU16};
 
 use crate::adapters::{
-    BlockStore, Digest, FalconAutomaton, FalconRelay, FalconReporter, FrameFinalizer, FrameSink,
-    GlobalProposer,
+    BlockStore, CountingBlocker, Digest, FalconAutomaton, FalconRelay, FalconReporter, FrameFinalizer,
+    FrameSink, GlobalProposer,
 };
 use crate::falcon_base::FalconPublicKey;
 use crate::falcon_simplex::SimplexFalconScheme;
-use crate::p2p_bridge::{build_channel, build_vote_channel, NoopBlocker, Outbound};
+use crate::p2p_bridge::{build_channel, build_vote_channel, Outbound};
 use commonware_p2p::Message;
 use commonware_runtime::{tokio as cw_tokio, Runner as _};
 
@@ -146,7 +146,8 @@ where
     Sk: FrameSink,
     Fin: FrameFinalizer,
 {
-    let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone());
+    let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone())
+        .with_liveness(params.liveness.clone());
     let relay = FalconRelay::new(sink, store.clone());
     let reporter = FalconReporter::new(finalizer, store).with_liveness(params.liveness.clone());
 
@@ -278,7 +279,7 @@ where
             let engine = build_global_engine(
                 context.child("consensus"),
                 scheme,
-                NoopBlocker::<FalconPublicKey>::default(),
+                CountingBlocker::new(params.liveness.clone()),
                 proposer,
                 sink,
                 finalizer,

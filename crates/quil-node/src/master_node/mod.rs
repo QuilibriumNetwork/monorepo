@@ -1267,38 +1267,62 @@ pub(crate) async fn start(
                 endpoints.dedup();
                 async move {
                     let Some(key) = key.as_ref() else { return };
-                    // A slow peer cannot hold every shard's recovery queue.
-                    // Missing/failed requests are retried by the ingest timer.
-                    let fetched = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                        if let Some(addr) = pool.next().await {
+                    // A few of the shard's members, then every archive: an
+                    // archive that executed the GLOBAL frames rewarding this
+                    // frame holds it. The archive used to be appended after
+                    // the members and cut off at six endpoints, so on a shard
+                    // with more members it was never asked, and two archives
+                    // sat on one missing frame each until GLOBAL lost quorum.
+                    // Each endpoint gets its own deadline, so unreachable
+                    // members cannot use up the attempt. Missing/failed
+                    // requests are retried by the ingest timer.
+                    const MEMBERS: usize = 3;
+                    const ARCHIVES: usize = 8;
+                    const PER_ENDPOINT: std::time::Duration = std::time::Duration::from_secs(4);
+                    endpoints.truncate(MEMBERS);
+                    let first = pool.next().await;
+                    let mut archives = pool.get_all().await;
+                    if let Some(first) = first {
+                        if let Some(index) = archives.iter().position(|addr| *addr == first) {
+                            archives.rotate_left(index);
+                        }
+                    }
+                    for addr in archives.into_iter().take(ARCHIVES) {
+                        if !endpoints.contains(&addr) {
                             endpoints.push(addr);
                         }
-                        let mut last = "no endpoint holds the shard".to_string();
-                        for addr in endpoints.iter().take(6) {
-                            let attempt = async {
-                                let mut client = quil_rpc::ArchiveClient::connect_mtls(addr, key).await
-                                    .map_err(|e| e.to_string())?;
-                                client.get_app_shard_frame(filter.clone(), frame_number).await
-                                    .map_err(|e| e.to_string())
-                            };
-                            match attempt.await {
-                                Ok(Some(frame)) => return Ok(Some(frame)),
-                                Ok(None) => last = format!("{addr} does not have the frame"),
-                                Err(error) => last = format!("{addr}: {error}"),
+                    }
+                    let mut failures = Vec::new();
+                    let mut recovered = None;
+                    for addr in &endpoints {
+                        let attempt = tokio::time::timeout(PER_ENDPOINT, async {
+                            let mut client = quil_rpc::ArchiveClient::connect_mtls(addr, key).await
+                                .map_err(|e| e.to_string())?;
+                            client.get_app_shard_frame(filter.clone(), frame_number).await
+                                .map_err(|e| e.to_string())
+                        });
+                        match attempt.await {
+                            Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
+                                h.address == filter && h.frame_number == frame_number) => {
+                                recovered = Some((addr.clone(), frame));
+                                break;
                             }
+                            Ok(Ok(Some(_))) => failures.push(format!("{addr}: served another frame")),
+                            Ok(Ok(None)) => failures.push(format!("{addr}: does not have the frame")),
+                            Ok(Err(error)) => failures.push(format!("{addr}: {error}")),
+                            Err(_) => failures.push(format!("{addr}: timed out")),
                         }
-                        Err(last)
-                    }).await;
-                    match fetched {
-                        Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
-                            h.address == filter && h.frame_number == frame_number) => {
+                    }
+                    match recovered {
+                        Some((source, frame)) => {
                             let data = prost::Message::encode_to_vec(&frame);
-                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %source,
                                 "app-shard gap fetch recovered a missing frame");
                             let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
                         }
-                        _ => tracing::debug!(filter = %hex::encode(&filter), frame = frame_number,
-                            "app-shard gap fetch unavailable; ingest will retry"),
+                        None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            tried = endpoints.len(), ?failures,
+                            "app-shard gap fetch found no endpoint with the frame; ingest will retry"),
                     }
                 }
             }).await;

@@ -294,6 +294,7 @@ pub struct AppEngineHandle {
 impl AppEngineHandle {
     pub fn execution(&self) -> quil_types::proto::node::WorkerExecution { self.execution.snapshot() }
     pub fn execution_state(&self, state: &str, blocker: &str) { self.execution.state(state, blocker); }
+    pub(crate) fn execution_record(&self) -> &crate::worker_execution::SharedWorkerExecution { &self.execution }
     /// A handle for `filter` whose messages arrive on the returned receiver.
     #[cfg(test)]
     pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {
@@ -2180,6 +2181,16 @@ pub struct AppConsensusEngine {
     /// logged ([`Self::log_session_liveness`]).
     session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
     session_liveness_logged: Option<std::time::Instant>,
+    /// Consensus messages received for the running session, per channel, and
+    /// those dropped because the master could not name their author's key
+    /// (no PeerInfo for it): a member whose votes never arrive, or arrive
+    /// unattributed, is invisible to quorum.
+    cw_inbound: [u64; 4],
+    cw_unresolved: u64,
+    /// Attributed to a key that is not one of the session's members (a stale
+    /// or foreign PeerInfo key): Simplex drops such a vote as a signer
+    /// mismatch.
+    cw_nonmember: u64,
     /// Executes an unfinalized selected parent for the running consensus host.
     private_parents: Option<Arc<AppParentExecutor>>,
     /// A finalized terminal seal: `(session id, canonical CommitteeHandoff)`.
@@ -2328,6 +2339,9 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
+            cw_inbound: [0; 4],
+            cw_unresolved: 0,
+            cw_nonmember: 0,
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
@@ -2862,12 +2876,57 @@ impl AppConsensusEngine {
             None => true,
         };
         let genesis = self.first_frame_genesis(anchor)?;
+        // A frame without a certificate of its own is still authenticated by
+        // the certified frame after it (it is final only through it), or by
+        // the digest GLOBAL committed for it: a sealed session's last frame,
+        // or an executed tip. Bootstrap asked every frame for its own
+        // certificate, so a shard whose archive tip or tip predecessor had
+        // none never bootstrapped. Structure and output are checked either way.
+        let committed = |frame: &quil_types::proto::global::AppShardFrame| -> bool {
+            let (Some(global), Some(header)) = (self.global_hypergraph.as_ref(), frame.header.as_ref()) else {
+                return false;
+            };
+            let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+            crate::app_handoff::committed_frame_digest(global, &self.filter, header.frame_number)
+                .ok().flatten() == Some(digest)
+        };
+        let certified = |frame: &quil_types::proto::global::AppShardFrame| {
+            frame.header.as_ref()
+                .and_then(|header| header.public_key_signature_bls48581.as_ref())
+                .is_some_and(|signature| !signature.signature.is_empty())
+        };
+        let linked_from_anchor = |frame: &quil_types::proto::global::AppShardFrame| {
+            frame.header.as_ref().zip(anchor.header.as_ref())
+                .is_some_and(|(parent, child)| crate::frame_validator::app_frame_links_to_child(parent, child))
+        };
+        let linked = |frame: &quil_types::proto::global::AppShardFrame| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_linked_without_storage(frame))) {
+                Ok(result) => result,
+                Err(_) => Err(QuilError::Internal("linked frame validation panicked".into())),
+            }
+        };
         let mut first = true;
         validate_archive_sync_anchor_in(
             &self.filter, self.last_materialized_frame, anchor, predecessor, genesis.as_ref(),
             |frame| {
-                let retained = if std::mem::take(&mut first) { anchor_history } else { predecessor_history };
-                validate_certified_frame(&validator, frame, retained)
+                let is_anchor = std::mem::take(&mut first);
+                let role = if is_anchor { "anchor" } else { "predecessor" };
+                let number = frame.header.as_ref().map_or(0, |header| header.frame_number);
+                let route = bootstrap_frame_route(
+                    is_anchor, certified(frame), certified(anchor), !is_anchor && linked_from_anchor(frame),
+                    || committed(frame),
+                );
+                let result = match route {
+                    BootstrapFrameRoute::Certified => {
+                        let retained = if is_anchor { anchor_history } else { predecessor_history };
+                        validate_certified_frame(&validator, frame, retained)
+                    }
+                    BootstrapFrameRoute::Linked | BootstrapFrameRoute::Committed => linked(frame),
+                    BootstrapFrameRoute::Refused => Err(QuilError::InvalidArgument(
+                        "has no certificate, and neither a certified frame after it nor a GLOBAL checkpoint authenticates it".into(),
+                    )),
+                };
+                result.map_err(|error| QuilError::InvalidArgument(format!("archive sync {role} frame {number}: {error}")))
             },
         )
     }
@@ -3373,6 +3432,14 @@ impl AppConsensusEngine {
                             self.handle_cw_sealed(&seal, cert).await;
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
+                            if let Some(count) = self.cw_inbound.get_mut(channel as usize) {
+                                *count += 1;
+                            }
+                            if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_none() {
+                                self.cw_unresolved += 1;
+                            } else if self.cw_session.as_ref().is_some_and(|session| !session.members.contains(&from)) {
+                                self.cw_nonmember += 1;
+                            }
                             if let Some(h) = self.cw_handle.as_ref() {
                                 if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
                                     // Authorize the block channel like channels 0/1/2:
@@ -3688,8 +3755,13 @@ impl AppConsensusEngine {
     /// recently against the quorum, and whether this member's data is staged.
     /// Views that never move, or voters below quorum, mean too few members are
     /// live or connected; views that move with every one nullified mean
-    /// proposals are declined (`committee session parent unavailable`) or
-    /// refused.
+    /// proposals are declined or refused. `declined` and `refused` count this
+    /// member's own turns and votes by reason, one per view, with the latest
+    /// of each; `current_view` and `best_view` say how many received votes the
+    /// best proposal of a view drew against the quorum. Inbound counts low
+    /// means members' messages do not reach this node; unattributed high means
+    /// they arrive from authors this node has no PeerInfo for, and are dropped;
+    /// `blocked` counts messages consensus discarded as invalid.
     fn log_session_liveness(&mut self) {
         let (Some(liveness), Some(session)) = (self.session_liveness.as_ref(), self.cw_session.as_ref()) else {
             return;
@@ -3699,13 +3771,27 @@ impl AppConsensusEngine {
         }
         self.session_liveness_logged = Some(std::time::Instant::now());
         let seen = liveness.snapshot();
+        let decided = liveness.decisions();
         let members = session.members.len();
+        let tally = |t: quil_cw_consensus::adapters::ViewTally| format!(
+            "view {}: notarize {} ({} proposals), nullify {}, finalize {}",
+            t.view, t.notarize, t.proposals, t.nullify, t.finalize,
+        );
+        let outcome = |o: Option<quil_cw_consensus::adapters::Outcome>| o.map_or_else(String::new, |o| {
+            format!("view {}: {} ({})", o.view, o.reason, o.detail)
+        });
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
             base = session.base_frame, members, quorum = members - members.saturating_sub(1) / 3,
             voters = seen.voters, view = seen.view, notarized = seen.notarized, nullified = seen.nullified,
             finalized = seen.finalized, notarize_votes = seen.notarize_votes, nullify_votes = seen.nullify_votes,
-            finalize_votes = seen.finalize_votes, materialized = self.last_materialized_frame,
+            finalize_votes = seen.finalize_votes, current_view = %tally(seen.current), best_view = %tally(seen.best),
+            proposed = decided.proposed, declined = ?decided.declined, last_declined = %outcome(decided.last_declined),
+            accepted = decided.accepted, refused = ?decided.refused, last_refused = %outcome(decided.last_refused),
+            blocked = seen.blocked, blocked_peers = seen.blocked_peers,
+            materialized = self.last_materialized_frame,
             data_ready = self.data_ready.load(std::sync::atomic::Ordering::Acquire),
+            inbound_by_channel = ?self.cw_inbound, inbound_unattributed = self.cw_unresolved,
+            inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
     }
 
@@ -4049,7 +4135,8 @@ impl AppConsensusEngine {
                                 "predecessor outgoing history recovery is still in progress".into()));
                         }
                         Err(error) => warn!(
-                            filter = hex::encode(&session.filter), generation = source.generation, %error,
+                            filter = hex::encode(&session.filter), session_generation = session.generation,
+                            predecessor_generation = source.generation, through = checkpoint.frame, %error,
                             "predecessor outgoing history could not be recovered from certified headers",
                         ),
                     }
@@ -4060,7 +4147,7 @@ impl AppConsensusEngine {
             // records can, accepted only against the sealed history root.
             if let Some(fetch) = self.outgoing_history_source.as_ref() {
                 if let Err(error) = crate::app_handoff::recover_sealed_history(global, &shard, session, fetch).await {
-                    warn!(filter = hex::encode(&session.filter), generation = session.generation, %error,
+                    warn!(filter = hex::encode(&session.filter), session_generation = session.generation, %error,
                         "predecessor outgoing history could not be recovered from an archive");
                 }
             }
@@ -4476,6 +4563,9 @@ impl AppConsensusEngine {
                 });
                 let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
                 self.session_liveness = Some(liveness.clone());
+                self.cw_inbound = [0; 4];
+                self.cw_unresolved = 0;
+                self.cw_nonmember = 0;
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
                     read_parent: source.reader(),
@@ -5650,6 +5740,38 @@ impl AppConsensusEngine {
     }
 }
 
+/// How bootstrap authenticates one of its two frames.
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapFrameRoute {
+    /// Its own committee certificate.
+    Certified,
+    /// The predecessor of a certified anchor that links to it: final through it.
+    Linked,
+    /// Its output hashes to the digest GLOBAL committed for it.
+    Committed,
+    Refused,
+}
+
+/// A certificate first; then, for the predecessor, the certified anchor's
+/// link; then GLOBAL's committed digest (asked only when needed).
+fn bootstrap_frame_route(
+    is_anchor: bool,
+    certified: bool,
+    anchor_certified: bool,
+    linked_from_anchor: bool,
+    committed: impl FnOnce() -> bool,
+) -> BootstrapFrameRoute {
+    if certified {
+        BootstrapFrameRoute::Certified
+    } else if !is_anchor && anchor_certified && linked_from_anchor {
+        BootstrapFrameRoute::Linked
+    } else if committed() {
+        BootstrapFrameRoute::Committed
+    } else {
+        BootstrapFrameRoute::Refused
+    }
+}
+
 /// Verify the structural relation between an archive anchor N and its required
 /// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
 /// keeping this portion pure makes the fail-closed bootstrap boundary testable.
@@ -6137,9 +6259,9 @@ pub(crate) fn build_requests_root_check(
     // the leader's `state_roots` build).
     let filter_for_verify = filter;
     Arc::new(
-        move |frame: &quil_types::proto::global::AppShardFrame| -> bool {
+        move |frame: &quil_types::proto::global::AppShardFrame| -> std::result::Result<(), crate::cw_app_seams::CheckRefusal> {
             let Some(header) = frame.header.as_ref() else {
-                return false;
+                return Err(("block has no header", String::new()));
             };
             // A retiring shard finalizes only empty frames near its flip
             // (crate::shard_drain).
@@ -6148,7 +6270,7 @@ pub(crate) fn build_requests_root_check(
             {
                 tracing::warn!(frame = header.frame_number, anchor = header.global_frame_number,
                     "cw app verify: a retiring shard's proposal carries requests inside its drain");
-                return false;
+                return Err(("requests inside the drain", format!("anchor {}", header.global_frame_number)));
             }
             // (a) Body-root check — always.
             let canonical: Vec<Vec<u8>> = frame
@@ -6160,9 +6282,9 @@ pub(crate) fn build_requests_root_check(
                 })
                 .collect();
             if canonical.len() != frame.requests.len() {
-                return false;
+                return Err(("undecodable request bundle", format!("frame {}", header.frame_number)));
             }
-            let req_ok = match compute_requests_root(
+            match compute_requests_root(
                 &canonical,
                 &app_addr,
                 header.frame_number,
@@ -6170,11 +6292,9 @@ pub(crate) fn build_requests_root_check(
                 Some(incl.as_ref()),
                 hg.has_forest(),
             ) {
-                Ok(r) => r == header.requests_root,
-                Err(_) => false,
-            };
-            if !req_ok {
-                return false;
+                Ok(root) if root == header.requests_root => {}
+                Ok(_) => return Err(("requests root differs from the body", format!("frame {}", header.frame_number))),
+                Err(error) => return Err(("requests root not computable", format!("frame {}: {error}", header.frame_number))),
             }
             // The body is bound to its root: its proofs are what this frame
             // will execute if finalized.
@@ -6200,14 +6320,14 @@ pub(crate) fn build_requests_root_check(
                         "cw app verify: not at N-1, cannot validate declared \
                          pre-state (frame-number jump or lag) — nullify",
                     );
-                    return false;
+                    return Err(("not at the parent frame", format!("frame {n}, materialized {mat}")));
                 }
                 if header.state_roots.len() != 4 {
                     tracing::warn!(
                         frame = n, roots = header.state_roots.len(),
                         "cw app verify: header.state_roots not 4 phases — nullify",
                     );
-                    return false;
+                    return Err(("state roots not 4 phases", format!("frame {n}")));
                 }
                 let zero =
                     vec![0u8; if hg.has_forest() { 32 } else { 64 }];
@@ -6240,7 +6360,11 @@ pub(crate) fn build_requests_root_check(
                         if let Some(count) = pre_state_mismatches.as_ref() {
                             count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         }
-                        return false;
+                        let short = |root: &[u8]| hex::encode(&root[..root.len().min(8)]);
+                        return Err(("pre-state root differs", format!(
+                            "frame {n}, phase {s} {p}: declared {}, local {}",
+                            short(&header.state_roots[i]), short(&local),
+                        )));
                     }
                 }
                 // (c) Previous-frame fee total (paid to the shard's
@@ -6258,7 +6382,7 @@ pub(crate) fn build_requests_root_check(
                             "cw app verify: fee_total does not match the locally \
                              materialized previous frame — nullify",
                         );
-                        return false;
+                        return Err(("fee total differs", format!("frame {n}, declared {declared}, local {other:?}")));
                     }
                 }
                 // (d) Settlement relay window: exactly the entries this
@@ -6275,7 +6399,7 @@ pub(crate) fn build_requests_root_check(
                             "cw app verify: settlement relay does not match the locally \
                              materialized window — nullify",
                         );
-                        return false;
+                        return Err(("settlement relay differs", format!("frame {n}")));
                     }
                 }
                 // (e) Accumulator report: exactly what this member's own
@@ -6293,7 +6417,7 @@ pub(crate) fn build_requests_root_check(
                             "cw app verify: accumulator report does not match the locally \
                              materialized shard state — nullify",
                         );
-                        return false;
+                        return Err(("accumulator report differs", format!("frame {n}")));
                     }
                 }
                 // (f) Spend relay: exactly the entries this member
@@ -6310,11 +6434,11 @@ pub(crate) fn build_requests_root_check(
                             "cw app verify: spend relay does not match the locally \
                              materialized window — nullify",
                         );
-                        return false;
+                        return Err(("spend relay differs", format!("frame {n}")));
                     }
                 }
             }
-            true
+            Ok(())
         },
     )
 }
@@ -7891,6 +8015,26 @@ mod tests {
             archive_bootstrap_predecessor_height(&address, &anchor, None),
             Ok(0)
         );
+    }
+
+    /// A frame without a certificate of its own still bootstraps when
+    /// something authenticates it: the predecessor through the certified
+    /// anchor that links to it, either frame through the digest GLOBAL
+    /// committed for it. Nothing else does, and a certificate is never
+    /// required twice over.
+    #[test]
+    fn bootstrap_frames_without_their_own_certificate_are_authenticated_by_link_or_global() {
+        use BootstrapFrameRoute::*;
+        let never = || panic!("GLOBAL is asked only when nothing else authenticates the frame");
+        assert_eq!(bootstrap_frame_route(true, true, true, false, never), Certified);
+        assert_eq!(bootstrap_frame_route(false, true, false, false, never), Certified);
+        assert_eq!(bootstrap_frame_route(false, false, true, true, never), Linked);
+        assert_eq!(bootstrap_frame_route(false, false, true, false, || true), Committed, "the anchor names a session genesis");
+        assert_eq!(bootstrap_frame_route(false, false, false, true, || true), Committed, "an uncertified anchor links nothing");
+        assert_eq!(bootstrap_frame_route(true, false, false, false, || true), Committed, "a sealed session's last frame");
+        assert_eq!(bootstrap_frame_route(true, false, false, false, || false), Refused);
+        assert_eq!(bootstrap_frame_route(false, false, false, true, || false), Refused);
+        assert_eq!(bootstrap_frame_route(true, false, true, true, || false), Refused, "an anchor is never linked");
     }
 
     #[test]

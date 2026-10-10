@@ -220,6 +220,8 @@ impl GlobalFinalizationPipeline {
             }
         }
         state.queued.insert(number, frame);
+        drop(state);
+        self.executor.note_finalized(number);
         true
     }
 

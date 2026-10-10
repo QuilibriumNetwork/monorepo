@@ -223,16 +223,28 @@ pub trait GlobalProposer: Send + Sync + 'static {
         self.verify(context.view, context.parent, digest, bytes)
     }
 
+    /// How long to wait before checking the proposal `bytes`, when something
+    /// it needs is on its way to this node (its GLOBAL anchor, just ahead of
+    /// this node's latest); `None` checks it now. Wrapping proposers forward
+    /// it to the one that knows.
+    fn verify_delay(&self, _context: ProposalContext, _bytes: &[u8]) -> Option<std::time::Duration> {
+        None
+    }
+
     /// [`Self::verify_with_context`], or `Err(delay)` when this node could not
     /// check the proposal yet for a reason of its own that clears (its execution
-    /// was busy). The adapter asks again after `delay` while the view lasts. Each
-    /// attempt is a complete check, so deferring never accepts more.
+    /// was busy, see also [`Self::verify_delay`]). The adapter asks again after
+    /// `delay` while the view lasts. Each attempt is a complete check, so
+    /// deferring never accepts more.
     fn verify_or_defer(
         &self,
         context: ProposalContext,
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> Result<bool, std::time::Duration> {
+        if let Some(delay) = bytes.as_deref().and_then(|bytes| self.verify_delay(context, bytes)) {
+            return Err(delay);
+        }
         Ok(self.verify_with_context(context, digest, bytes))
     }
 }
@@ -286,6 +298,7 @@ pub struct FalconAutomaton<E: Spawner + Clock, Pr: GlobalProposer> {
     context: E,
     proposer: Arc<Pr>,
     store: BlockStore,
+    liveness: Option<Arc<Liveness>>,
 }
 
 impl<E: Spawner + Clock, Pr: GlobalProposer> Clone for FalconAutomaton<E, Pr> {
@@ -294,13 +307,21 @@ impl<E: Spawner + Clock, Pr: GlobalProposer> Clone for FalconAutomaton<E, Pr> {
             context: self.context.child("automaton"),
             proposer: self.proposer.clone(),
             store: self.store.clone(),
+            liveness: self.liveness.clone(),
         }
     }
 }
 
 impl<E: Spawner + Clock, Pr: GlobalProposer> FalconAutomaton<E, Pr> {
     pub fn new(context: E, proposer: Arc<Pr>, store: BlockStore) -> Self {
-        Self { context, proposer, store }
+        Self { context, proposer, store, liveness: None }
+    }
+
+    /// Also count, in `liveness`, how each proposal and vote of this member
+    /// ended, under the reason the proposer noted ([`Liveness::note`]).
+    pub fn with_liveness(mut self, liveness: Option<Arc<Liveness>>) -> Self {
+        self.liveness = liveness;
+        self
     }
 }
 
@@ -315,10 +336,15 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let proposal_context = ProposalContext::from(context);
         let proposer = self.proposer.clone();
         let store = self.store.clone();
+        let liveness = self.liveness.clone();
+        let settle = move |proposed: bool| if let Some(liveness) = liveness.as_ref() {
+            liveness.settle(Step::Propose, proposal_context.view, proposed);
+        };
         self.context.child("propose").spawn(move |ctx| async move {
             if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
                 ctx.sleep(pacing).await;
                 if tx.is_closed() {
+                    settle(false);
                     return;
                 }
             }
@@ -332,6 +358,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                     // them so peer ingress can't substitute a different body later.
                     store.seal(digest, bytes);
                     let _ = tx.send(digest);
+                    settle(true);
                     return;
                 }
                 match proposer.propose_retry() {
@@ -340,7 +367,10 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                         waited += delay;
                     }
                     // drop tx → receiver cancelled → simplex nullifies the view.
-                    _ => return,
+                    _ => {
+                        settle(false);
+                        return;
+                    }
                 }
             }
         });
@@ -356,6 +386,7 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let proposal_context = ProposalContext::from(context);
         let proposer = self.proposer.clone();
         let store = self.store.clone();
+        let liveness = self.liveness.clone();
         self.context.child("verify").spawn(move |ctx| async move {
             // The block bytes travel out-of-band (FrameSink → :8340) and may
             // arrive slightly after the vote-request digest. Poll the store a
@@ -386,6 +417,9 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
                     Err(_) => break false,
                 }
             };
+            if let Some(liveness) = liveness.as_ref() {
+                liveness.settle(Step::Verify, proposal_context.view, ok);
+            }
             // On success, seal the EXACT bytes the application validated, so a
             // racing peer candidate at the same digest can't replace them.
             if ok {
@@ -453,13 +487,21 @@ impl<Sk: FrameSink> Relay for FalconRelay<Sk> {
 // Reporter adapter
 // ---------------------------------------------------------------------------
 
-/// Views over which [`Liveness`] counts distinct voters.
+/// Views over which [`Liveness`] counts distinct voters and keeps tallies.
 const LIVENESS_VIEWS: u64 = 16;
 
+/// Views a noted reason waits for its step to end before it is dropped.
+const NOTE_VIEWS: u64 = 64;
+
+/// Distinct peers [`Liveness`] remembers having blocked.
+const BLOCKED_PEERS: usize = 256;
+
 /// What one consensus instance has seen, for operators: how far its views
-/// advanced, which of them ended in a certificate, and how many members voted
-/// recently. A session that starts but never produces a frame shows here
-/// whether views move, and whether enough members vote to certify any.
+/// advanced, which of them ended in a certificate, how many members voted
+/// recently and for what, and why this member's own turns and votes went as
+/// they did. A session that starts but never produces a frame shows here
+/// whether views move, whether enough members vote for any one proposal, and
+/// why this member declined to propose or voted against a proposal.
 #[derive(Default)]
 pub struct Liveness {
     inner: std::sync::Mutex<LivenessState>,
@@ -468,8 +510,51 @@ pub struct Liveness {
 #[derive(Default)]
 struct LivenessState {
     snapshot: LivenessSnapshot,
-    /// Signers seen per recent view.
-    voters: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>>,
+    /// Votes received per recent view.
+    views: std::collections::BTreeMap<u64, ViewVotes>,
+    /// Why a step that has not ended yet failed; the latest note wins.
+    notes: std::collections::BTreeMap<(Step, u64), (&'static str, String)>,
+    decisions: Decisions,
+    blocked: std::collections::BTreeSet<FalconPublicKey>,
+}
+
+#[derive(Default)]
+struct ViewVotes {
+    /// Signers per proposal digest.
+    notarize: std::collections::BTreeMap<[u8; 32], std::collections::BTreeSet<u32>>,
+    nullify: std::collections::BTreeSet<u32>,
+    finalize: std::collections::BTreeSet<u32>,
+}
+
+impl ViewVotes {
+    fn tally(&self, view: u64) -> ViewTally {
+        ViewTally {
+            view,
+            notarize: self.notarize.values().map(|signers| signers.len()).max().unwrap_or(0),
+            proposals: self.notarize.len(),
+            nullify: self.nullify.len(),
+            finalize: self.finalize.len(),
+        }
+    }
+
+    fn signers(&self) -> impl Iterator<Item = u32> + '_ {
+        self.notarize.values().flatten().chain(&self.nullify).chain(&self.finalize).copied()
+    }
+}
+
+/// Votes received for one view. Each came from its own signer (consensus
+/// drops any other), but its signature is checked only later, in a batch,
+/// once a certificate could form; a bad one blocks its peer ([`Liveness`]
+/// counts those).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewTally {
+    pub view: u64,
+    /// The most signers behind any one proposal.
+    pub notarize: usize,
+    /// Distinct proposals voted for (more than one: a leader equivocated).
+    pub proposals: usize,
+    pub nullify: usize,
+    pub finalize: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -484,18 +569,77 @@ pub struct LivenessSnapshot {
     pub notarize_votes: u64,
     pub nullify_votes: u64,
     pub finalize_votes: u64,
+    /// The highest view with votes.
+    pub current: ViewTally,
+    /// Of the last [`LIVENESS_VIEWS`] views, the one whose best proposal had
+    /// the most notarize votes.
+    pub best: ViewTally,
+    /// Messages consensus discarded as invalid, and from how many peers.
+    pub blocked: u64,
+    pub blocked_peers: usize,
+}
+
+/// One part this member plays in a view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Step {
+    /// Leading the view: building its proposal.
+    Propose,
+    /// Checking the leader's proposal before voting for it.
+    Verify,
+}
+
+/// A step that ended without success, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    pub view: u64,
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+/// How this member's turns and votes ended, one count per view.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Decisions {
+    pub proposed: u64,
+    /// Turns this member led without proposing, by reason.
+    pub declined: std::collections::BTreeMap<&'static str, u64>,
+    pub last_declined: Option<Outcome>,
+    pub accepted: u64,
+    /// Proposals this member refused to vote for, by reason.
+    pub refused: std::collections::BTreeMap<&'static str, u64>,
+    pub last_refused: Option<Outcome>,
 }
 
 impl Liveness {
-    fn vote(&self, view: u64, signer: u32, count: impl FnOnce(&mut LivenessSnapshot)) {
+    fn vote(&self, view: u64, count: impl FnOnce(&mut LivenessSnapshot, &mut ViewVotes)) {
         let Ok(mut state) = self.inner.lock() else { return };
-        count(&mut state.snapshot);
+        let state = &mut *state;
         state.snapshot.view = state.snapshot.view.max(view);
         let floor = state.snapshot.view.saturating_sub(LIVENESS_VIEWS);
-        if view > floor {
-            state.voters.entry(view).or_default().insert(signer);
-        }
-        state.voters.retain(|recent, _| *recent > floor);
+        let mut ignored = ViewVotes::default();
+        let votes = if view > floor { state.views.entry(view).or_default() } else { &mut ignored };
+        count(&mut state.snapshot, votes);
+        state.views.retain(|recent, _| *recent > floor);
+    }
+
+    fn notarize(&self, view: u64, signer: u32, proposal: [u8; 32]) {
+        self.vote(view, |s, votes| {
+            s.notarize_votes += 1;
+            votes.notarize.entry(proposal).or_default().insert(signer);
+        })
+    }
+
+    fn nullify(&self, view: u64, signer: u32) {
+        self.vote(view, |s, votes| {
+            s.nullify_votes += 1;
+            votes.nullify.insert(signer);
+        })
+    }
+
+    fn finalize(&self, view: u64, signer: u32) {
+        self.vote(view, |s, votes| {
+            s.finalize_votes += 1;
+            votes.finalize.insert(signer);
+        })
     }
 
     fn certificate(&self, view: u64, record: impl FnOnce(&mut LivenessSnapshot)) {
@@ -507,8 +651,51 @@ impl Liveness {
     pub fn snapshot(&self) -> LivenessSnapshot {
         let Ok(state) = self.inner.lock() else { return LivenessSnapshot::default() };
         let mut snapshot = state.snapshot;
-        snapshot.voters = state.voters.values().flatten().collect::<std::collections::BTreeSet<_>>().len();
+        snapshot.voters = state.views.values().flat_map(ViewVotes::signers)
+            .collect::<std::collections::BTreeSet<_>>().len();
+        let tallies = || state.views.iter().map(|(view, votes)| votes.tally(*view));
+        snapshot.current = tallies().last().unwrap_or_default();
+        snapshot.best = tallies().max_by_key(|tally| (tally.notarize, tally.view)).unwrap_or_default();
+        snapshot.blocked_peers = state.blocked.len();
         snapshot
+    }
+
+    pub fn decisions(&self) -> Decisions {
+        self.inner.lock().map(|state| state.decisions.clone()).unwrap_or_default()
+    }
+
+    /// Why `step` of `view` has not succeeded (so far): the reason its outcome
+    /// is counted under if it ends without success. A later note replaces it.
+    pub fn note(&self, step: Step, view: u64, reason: &'static str, detail: impl Into<String>) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        let floor = state.snapshot.view.saturating_sub(NOTE_VIEWS);
+        state.notes.retain(|(_, noted), _| *noted > floor);
+        state.notes.insert((step, view), (reason, detail.into()));
+    }
+
+    /// `step` of `view` ended, successfully or under its last note.
+    pub fn settle(&self, step: Step, view: u64, succeeded: bool) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        let (reason, detail) = state.notes.remove(&(step, view)).unwrap_or(("unexplained", String::new()));
+        let decisions = &mut state.decisions;
+        let (done, failed, last) = match step {
+            Step::Propose => (&mut decisions.proposed, &mut decisions.declined, &mut decisions.last_declined),
+            Step::Verify => (&mut decisions.accepted, &mut decisions.refused, &mut decisions.last_refused),
+        };
+        if succeeded {
+            *done += 1;
+        } else {
+            *failed.entry(reason).or_default() += 1;
+            *last = Some(Outcome { view, reason, detail });
+        }
+    }
+
+    fn blocked(&self, peer: FalconPublicKey) {
+        let Ok(mut state) = self.inner.lock() else { return };
+        state.snapshot.blocked += 1;
+        if state.blocked.len() < BLOCKED_PEERS {
+            state.blocked.insert(peer);
+        }
     }
 
     fn observe(&self, activity: &FalconActivity) {
@@ -516,9 +703,9 @@ impl Liveness {
         use commonware_consensus::Viewable as _;
         let signer = |participant: commonware_utils::Participant| usize::from(participant) as u32;
         match activity {
-            Activity::Notarize(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.notarize_votes += 1),
-            Activity::Nullify(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.nullify_votes += 1),
-            Activity::Finalize(vote) => self.vote(vote.view().get(), signer(vote.signer()), |s| s.finalize_votes += 1),
+            Activity::Notarize(vote) => self.notarize(vote.view().get(), signer(vote.signer()), vote.proposal.payload.0),
+            Activity::Nullify(vote) => self.nullify(vote.view().get(), signer(vote.signer())),
+            Activity::Finalize(vote) => self.finalize(vote.view().get(), signer(vote.signer())),
             Activity::Notarization(cert) => {
                 let view = cert.view().get();
                 self.certificate(view, |s| s.notarized = s.notarized.max(view));
@@ -533,6 +720,35 @@ impl Liveness {
             }
             _ => {}
         }
+    }
+}
+
+/// `Blocker` that blocks nobody (as [`crate::p2p_bridge::NoopBlocker`]) but
+/// counts, in [`Liveness`], what consensus discarded: a vote with a bad
+/// signature, from a non-member, or signed by someone other than its sender.
+pub struct CountingBlocker {
+    liveness: Option<Arc<Liveness>>,
+}
+
+impl CountingBlocker {
+    pub fn new(liveness: Option<Arc<Liveness>>) -> Self {
+        Self { liveness }
+    }
+}
+
+impl Clone for CountingBlocker {
+    fn clone(&self) -> Self {
+        Self { liveness: self.liveness.clone() }
+    }
+}
+
+impl commonware_p2p::Blocker for CountingBlocker {
+    type PublicKey = FalconPublicKey;
+    fn block(&mut self, peer: FalconPublicKey) -> Feedback {
+        if let Some(liveness) = self.liveness.as_ref() {
+            liveness.blocked(peer);
+        }
+        Feedback::Ok
     }
 }
 
@@ -652,5 +868,83 @@ mod block_store_seal_tests {
         store.put(block, b"racing replacement".to_vec());
         store.seal(block, validated.clone());
         assert_eq!(store.get_with_verification(&block), Some((validated, true)));
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// A view's tally counts the signers behind its best-supported proposal,
+    /// not the sum over proposals, so a split committee never looks like a
+    /// quorum; votes repeated by one signer count once.
+    #[test]
+    fn view_tallies_count_distinct_signers_behind_one_proposal() {
+        let liveness = Liveness::default();
+        for signer in 0..5 {
+            liveness.notarize(7, signer, [1; 32]);
+        }
+        liveness.notarize(7, 0, [1; 32]);
+        for signer in 5..8 {
+            liveness.notarize(7, signer, [2; 32]);
+        }
+        for signer in 0..3 {
+            liveness.nullify(8, signer);
+        }
+        liveness.finalize(7, 1);
+        let seen = liveness.snapshot();
+        assert_eq!(seen.best, ViewTally { view: 7, notarize: 5, proposals: 2, nullify: 0, finalize: 1 });
+        assert_eq!(seen.current, ViewTally { view: 8, notarize: 0, proposals: 0, nullify: 3, finalize: 0 });
+        assert_eq!(seen.voters, 8);
+        assert_eq!(seen.notarize_votes, 9);
+        // Views older than the window leave the tallies and the voter count:
+        // view 7 drops out, view 8 stays.
+        liveness.nullify(7 + LIVENESS_VIEWS, 9);
+        let seen = liveness.snapshot();
+        assert_eq!(seen.best.notarize, 0);
+        assert_eq!(seen.voters, 4);
+    }
+
+    /// Each step ends once per view under the last reason noted for it, and
+    /// a success forgets the reasons noted before it.
+    #[test]
+    fn outcomes_are_counted_once_per_view_under_their_last_reason() {
+        let liveness = Liveness::default();
+        liveness.note(Step::Propose, 3, "parent unavailable", "not yet");
+        liveness.note(Step::Propose, 3, "leader not ready to build on the parent", "frame 0");
+        liveness.settle(Step::Propose, 3, false);
+        liveness.note(Step::Propose, 4, "parent unavailable", "not yet");
+        liveness.settle(Step::Propose, 4, true);
+        liveness.note(Step::Verify, 4, "pre-state root differs", "phase vertex adds");
+        liveness.settle(Step::Verify, 4, false);
+        liveness.settle(Step::Verify, 5, false);
+        liveness.settle(Step::Verify, 6, true);
+        let decided = liveness.decisions();
+        assert_eq!(decided.proposed, 1);
+        assert_eq!(decided.declined.into_iter().collect::<Vec<_>>(), vec![("leader not ready to build on the parent", 1)]);
+        assert_eq!(decided.last_declined.map(|o| (o.view, o.detail)), Some((3, "frame 0".to_string())));
+        assert_eq!(decided.accepted, 1);
+        assert_eq!(
+            decided.refused.into_iter().collect::<Vec<_>>(),
+            vec![("pre-state root differs", 1), ("unexplained", 1)],
+        );
+        assert_eq!(decided.last_refused.map(|o| o.view), Some(5));
+    }
+
+    #[test]
+    fn blocked_messages_are_counted_with_their_distinct_peers() {
+        use commonware_cryptography::Signer as _;
+        use commonware_math::algebra::Random as _;
+        use commonware_p2p::Blocker as _;
+        let liveness = Arc::new(Liveness::default());
+        let mut blocker = CountingBlocker::new(Some(liveness.clone()));
+        let peers: Vec<_> = (0..2)
+            .map(|_| crate::falcon_base::FalconPrivateKey::random(commonware_utils::test_rng()).public_key())
+            .collect();
+        for peer in [&peers[0], &peers[0], &peers[1]] {
+            blocker.block((*peer).clone());
+        }
+        let seen = liveness.snapshot();
+        assert_eq!((seen.blocked, seen.blocked_peers), (3, 2));
     }
 }

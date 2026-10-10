@@ -53,7 +53,8 @@ pub(crate) enum ShardSyncResult {
     /// `pinned`: the origins' sealed state, verified against their roots;
     /// otherwise the archive's current subtree, unauthenticated.
     Inherited { pinned: bool },
-    NotReady,
+    /// Why nothing usable was installed.
+    NotReady(&'static str),
 }
 
 /// The owning actor authenticates and installs a checkpoint. A recovery task
@@ -111,7 +112,21 @@ pub(crate) enum ShardRecoveryProgress {
     Replayed { materialized: u64, archive_tip: Option<u64>, committed_tip: Option<u64> },
     Anchored { frame: u64 },
     Inherited { pinned: bool },
-    NotReady,
+    NotReady(&'static str),
+}
+
+impl std::fmt::Display for ShardRecoveryProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tip = |tip: &Option<u64>| tip.map_or_else(|| "none".to_string(), |tip| tip.to_string());
+        match self {
+            Self::Replayed { materialized, archive_tip, committed_tip } => write!(f,
+                "replayed to frame {materialized} (archive tip {}, committed tip {})", tip(archive_tip), tip(committed_tip)),
+            Self::Anchored { frame } => write!(f, "installed the archive checkpoint at frame {frame}"),
+            Self::Inherited { pinned: true } => f.write_str("inherited the origins' sealed state"),
+            Self::Inherited { pinned: false } => f.write_str("inherited the covered archive subtree, unpinned"),
+            Self::NotReady(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// Common recovery path for thread and separate-process workers. A saved
@@ -123,7 +138,9 @@ pub(crate) async fn recover_shard_from_latest(
     local: Option<AppShardFrame>,
     target: &dyn ShardRecoveryTarget,
 ) -> Result<ShardRecoveryProgress> {
+    use crate::worker_execution::recovery_phase;
     if let Some(local) = local {
+        recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
         let replay = replay_shard_from_latest(
             syncer, filter, local, target.materialized(), committed_tip, |frame, child| target.replay(frame, child),
@@ -136,14 +153,16 @@ pub(crate) async fn recover_shard_from_latest(
         tracing::warn!(filter = %hex::encode(filter), %error, "origin anchors unavailable; bootstrap unpinned");
         Vec::new()
     });
+    recovery_phase("fetching_checkpoint");
     match sync_shard_from_latest(syncer, filter, None, &anchors, |anchor, predecessor| target.validate(anchor, predecessor)).await? {
         ShardSyncResult::Anchored { anchor, predecessor } => {
             let frame = anchor.header.as_ref().map_or(0, |header| header.frame_number);
+            recovery_phase("installing_checkpoint");
             target.install(anchor, predecessor).await?;
             Ok(ShardRecoveryProgress::Anchored { frame })
         }
         ShardSyncResult::Inherited { pinned } => { target.inherited(); Ok(ShardRecoveryProgress::Inherited { pinned }) }
-        ShardSyncResult::NotReady => Ok(ShardRecoveryProgress::NotReady),
+        ShardSyncResult::NotReady(reason) => Ok(ShardRecoveryProgress::NotReady(reason)),
     }
 }
 
@@ -298,6 +317,7 @@ where
     F: FnOnce(AppShardFrame, Option<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
 {
+    use crate::worker_execution::recovery_phase;
     use quil_types::error::QuilError;
     let remote = syncer.get_app_shard_frame(filter, 0).await?;
     let height = |frame: &AppShardFrame| frame.header.as_ref().map_or(0, |h| h.frame_number);
@@ -312,6 +332,7 @@ where
         // sync verifies; the origins partition the child's range. Without
         // certified origins, or when no archive still resolves them (retention),
         // inherit the covered archive subtree unpinned, as before.
+        recovery_phase("installing_leaves");
         if !origin_anchors.is_empty() {
             let mut pinned = true;
             for (source, roots) in origin_anchors {
@@ -340,7 +361,7 @@ where
             if origin_anchors.iter().any(|(source, _)| source.as_slice() == filter) {
                 tracing::warn!(filter = %hex::encode(filter),
                     "the predecessor's sealed state is not available from the archive; not inheriting unpinned state its successor would refuse");
-                return Ok(ShardSyncResult::NotReady);
+                return Ok(ShardSyncResult::NotReady("the predecessor's sealed state is not available from the archive"));
             }
             tracing::warn!(filter = %hex::encode(filter),
                 "origins' sealed state is not available from the archive; inheriting the covered subtree unpinned");
@@ -350,7 +371,7 @@ where
         }
         return Ok(if syncer.sync_shard_tree(filter, &[]).await? {
             ShardSyncResult::Inherited { pinned: false }
-        } else { ShardSyncResult::NotReady });
+        } else { ShardSyncResult::NotReady("the archive could not supply the covered subtree") });
     };
     let header = anchor.header.as_ref().ok_or_else(|| QuilError::InvalidArgument("archive anchor has no header".into()))?;
     if header.address != filter || header.frame_number == 0
@@ -362,11 +383,12 @@ where
         syncer.get_app_shard_frame(filter, header.frame_number - 1).await?
     } else { None };
     if !validate(anchor.clone(), predecessor.clone()).await? {
-        return Ok(ShardSyncResult::NotReady);
+        return Ok(ShardSyncResult::NotReady("the archive checkpoint failed validation"));
     }
+    recovery_phase("installing_leaves");
     Ok(if syncer.sync_shard_tree(filter, &expected_roots).await? {
         ShardSyncResult::Anchored { anchor, predecessor }
-    } else { ShardSyncResult::NotReady })
+    } else { ShardSyncResult::NotReady("the archive does not hold the checkpoint's state, or its roots differ") })
 }
 
 #[cfg(test)]
@@ -416,7 +438,7 @@ mod tests {
             let mut expected = vec!["fetch 0", "fetch 499", "validate 500"];
             if valid { expected.extend(["sync 244", "install 500"]); }
             assert_eq!(*calls.lock().unwrap(), expected);
-            if !valid { assert_eq!(result.unwrap(), ShardRecoveryProgress::NotReady); }
+            if !valid { assert_eq!(result.unwrap(), ShardRecoveryProgress::NotReady("the archive checkpoint failed validation")); }
             else if !install_ok { assert!(result.is_err()); }
             else { assert_eq!(result.unwrap(), ShardRecoveryProgress::Anchored { frame:500 }); }
             assert_eq!(target.materialized(), if valid && install_ok { 500 } else { 0 });
@@ -551,7 +573,7 @@ mod tests {
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
         let result = sync_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &[],
             |_, _| async { Ok(false) }).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::NotReady));
+        assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 599"]);
     }
 
@@ -614,7 +636,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = FramelessArchive { calls: calls.clone(), refuse: Some(filter.clone()) };
         let result = sync_shard_from_latest(&archive, &filter, None, &anchors, never).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::NotReady));
+        assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), [(5, Some(0x71))], "pinned only");
     }
 
@@ -670,7 +692,7 @@ mod tests {
                 assert_eq!(predecessor.unwrap().header.unwrap().frame_number, 129);
                 Ok(false)
             }).await.unwrap();
-        assert!(matches!(result, ShardSyncResult::NotReady));
+        assert!(matches!(result, ShardSyncResult::NotReady(_)));
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 129"]);
 
         // A malformed source must be refused even if the supplied validator

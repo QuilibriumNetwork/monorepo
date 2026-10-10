@@ -104,12 +104,66 @@ message WorkerInfo {
 }
 
 // Local engine observations; independent of allocation and remote shard data.
+// Three conditions are separate and none implies another: an active
+// allocation (the prover registry assigns the filter to this worker), a
+// running consensus host (`state`), and advancing app frames
+// (`materialized_frame`, `last_advance_unix_ms`). A worker can be running
+// with no frame materialized, and can recover data (`recovery`) in any state.
 message WorkerExecution {
+  // Consensus host startup: "starting", "running" (the host started; frames
+  // need not advance), "blocked" (startup failed, see `blocker`) or "stopped".
   string state = 1;
   string blocker = 2;
   optional uint64 materialized_frame = 3;
+  // When `materialized_frame` last increased; 0 when it has not since the
+  // engine started.
   uint64 last_advance_unix_ms = 4;
   uint64 observed_unix_ms = 5;
+  // Archive recovery of the shard's data. Absent before the first recovery
+  // attempt and on older nodes.
+  ShardRecovery recovery = 6;
+}
+
+// Archive recovery of a worker's shard data, independent of `state`.
+message ShardRecovery {
+  // "waiting_for_permit" (queued: a node recovers a few shards at a time),
+  // "replaying_frames" (fetching and executing certified frames),
+  // "fetching_checkpoint" (reading and validating an archive's latest frame),
+  // "installing_leaves" (downloading the shard's authenticated tree data),
+  // "installing_checkpoint" (the engine adopts the installed checkpoint), or
+  // "idle" (no attempt running; see the last outcome and error).
+  string phase = 1;
+  uint64 phase_since_unix_ms = 2;
+  // Leaves of the tree being installed, for one forest phase (0-3): the
+  // counts restart with each phase, sub-shard and rebase onto local commits,
+  // and an interrupted download resumes with fewer planned leaves.
+  uint32 tree_phase = 3;
+  uint64 installed_leaves = 4;
+  uint64 planned_leaves = 5;
+  uint64 leaves_observed_unix_ms = 6;
+  // Each finished attempt sets its outcome or its error; neither clears the
+  // other, so compare their times.
+  string last_outcome = 7;
+  uint64 last_outcome_unix_ms = 8;
+  string last_error = 9;
+  uint64 last_error_unix_ms = 10;
+  // The archive the current or last attempt read from most recently. Each
+  // attempt picks the next known archive, passing over one that failed a
+  // recovery read in the last two minutes while another is known.
+  string source = 11;
+  // Attempts finished since the engine started, and how many of the latest
+  // failed in a row.
+  uint32 attempts = 12;
+  uint32 consecutive_failures = 13;
+  // The current or last attempt: when it started, how long it waited for a
+  // recovery permit, how long it ran after that (0 while it runs), and the
+  // leaves it installed. Installed leaves are durable: a retry keeps them
+  // and downloads only the rest, so a failed attempt with installed leaves
+  // still made progress.
+  uint64 attempt_started_unix_ms = 14;
+  uint64 permit_wait_ms = 15;
+  uint64 attempt_ms = 16;
+  uint64 attempt_installed_leaves = 17;
 }
 
 message WorkerInfoResponse {

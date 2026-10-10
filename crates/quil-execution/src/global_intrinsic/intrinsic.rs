@@ -2070,9 +2070,9 @@ impl GlobalIntrinsic {
             QuilError::Internal("FrameHeader: clock_store not installed — cannot recompute output".into())
         })?;
         let anchor_output = clock_store
-            .get_global_clock_frame(op.global_frame_number)
+            .get_global_clock_frame_header(op.global_frame_number)
             .ok()
-            .and_then(|f| f.header.map(|h| h.output))
+            .map(|header| header.output)
             .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
                 "FrameHeader: anchored global frame {} unavailable — cannot recompute output",
                 op.global_frame_number
@@ -2149,9 +2149,9 @@ impl GlobalIntrinsic {
             )
         })?;
         let global_output = clock_store
-            .get_global_clock_frame(op.global_frame_number)
+            .get_global_clock_frame_header(op.global_frame_number)
             .ok()
-            .and_then(|f| f.header.map(|h| h.output))
+            .map(|header| header.output)
             .unwrap_or_default();
         let rho_n =
             quil_crypto::porep::derive_storage_beacon(op.global_frame_number, &global_output);
@@ -2352,6 +2352,7 @@ impl GlobalIntrinsic {
         // Materialize-only deps (reward_issuance, hypergraph) are
         // archive-mode extras: when absent, we skip the state
         // mutations but only AFTER the attestation has verified.
+        let mut timing = HeaderTiming::start();
         let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
             "invoke_frame_header: frame_prover not installed — cannot verify attestation".into(),
         ))?;
@@ -2374,10 +2375,12 @@ impl GlobalIntrinsic {
         ).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: frame header attestation invalid: {e}"
         )))?;
+        timing.mark("session");
 
         self.verify_shard_frame_output(op).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: {e}"
         )))?;
+        timing.mark("output");
         super::prover_shard_update::verify_settlement_relay(op)?;
         // A certified header's accumulator report must be canonical and name
         // subtrees its own shard can own; checked by every node, like the relay.
@@ -2385,6 +2388,7 @@ impl GlobalIntrinsic {
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        timing.mark("verify relay/report");
 
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
@@ -2428,7 +2432,9 @@ impl GlobalIntrinsic {
         // AND deterministically reassigns each affected prover's allocation onto
         // the new shard(s) in committed hypergraph state. Runs regardless of the
         // archive-mode reward/hypergraph deps below.
+        timing.mark("session tip");
         self.apply_due_shard_changes(frame_number, state)?;
+        timing.mark("due shard changes");
 
         // Now that verification has passed, gate further state writes
         // on the archive-mode deps.
@@ -2442,10 +2448,12 @@ impl GlobalIntrinsic {
         // Cross-domain settlements the QUIL shard relays become GLOBAL
         // records here, independent of the reward gates below.
         super::prover_shard_update::materialize_settlement_records(op, frame_number, state)?;
+        timing.mark("settlements");
         // The shard's accumulator report joins the application's canonical
         // root, in the same deterministic order.
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
+        timing.mark("report");
         // Then the confidential operations the shard relayed, decided once in
         // this frame's order. The report is processed first so a spend can
         // cite the root it carries.
@@ -2453,6 +2461,7 @@ impl GlobalIntrinsic {
         let committed_fees = crate::token_intrinsic::global_commit::materialize_relay(
             state, frame_number, &op.address, op.frame_number, &op.spends,
         )?;
+        timing.mark("relay");
         #[cfg(not(feature = "confidential-tokens"))]
         let committed_fees = 0u128;
 
@@ -2575,6 +2584,8 @@ impl GlobalIntrinsic {
             Arc::new(StubFrameProver)
         });
 
+        timing.mark("sizes");
+        let participants = participant_indices.len();
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
             frame_number,
@@ -2589,6 +2600,7 @@ impl GlobalIntrinsic {
             committed_fees,
             session,
         )?;
+        timing.mark("rewards/activity");
 
         // PoRep: the ρ_N-sampled possession audit runs LAST — AFTER the
         // coverage credit above — so a cheating member's eviction (Status=4,
@@ -2601,6 +2613,8 @@ impl GlobalIntrinsic {
         // registry), so every archive evicts identically and non-archive nodes
         // inherit it via sync.
         self.audit_storage_attestation(frame_number, op, &bitmask_bytes, state, va_disc)?;
+        timing.mark("storage audit");
+        timing.finish(frame_number, op, participants);
         Ok(())
     }
 
@@ -4113,6 +4127,39 @@ fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
 ///
 /// Degrades CLOSED (returns `true`, "still registered") on a store
 /// error so a read failure never spuriously bypasses the halt-risk gate.
+/// Step durations of one shard header's GLOBAL execution, logged when it is
+/// slow: a frame executes some 20–30 headers, two or three times (proposal
+/// check, publication), and their sum is most of a GLOBAL frame's time.
+struct HeaderTiming {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    steps: Vec<(&'static str, u128)>,
+}
+
+impl HeaderTiming {
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self { started: now, last: now, steps: Vec::new() }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.steps.push((step, now.duration_since(self.last).as_micros()));
+        self.last = now;
+    }
+
+    fn finish(self, frame: u64, op: &super::frame_header::FrameHeader, participants: usize) {
+        let total = self.started.elapsed();
+        if total >= Self::SLOW {
+            tracing::info!(frame, shard = %hex::encode(&op.address), shard_frame = op.frame_number,
+                participants, total_ms = total.as_millis() as u64,
+                steps_us = ?self.steps, "slow GLOBAL shard header execution");
+        }
+    }
+}
+
 /// `cell`'s committed prover scan of `hg`, read on first use.
 fn committed_prover_scan<'c>(
     cell: &'c std::cell::OnceCell<crate::prover_registry::CommittedProverScan>,

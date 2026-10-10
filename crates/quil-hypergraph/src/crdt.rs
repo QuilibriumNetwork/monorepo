@@ -172,6 +172,61 @@ fn sync_data_key(shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result
     Ok(key)
 }
 
+/// The scopes of one shard whose sync installed some chunks but not the
+/// last, as `(phase, bit path)`: a scope is listed from its first partial
+/// chunk until it completes, across restarts.
+fn sync_incomplete_key(shard_id: &[u8]) -> Vec<u8> {
+    let mut key = b"quil/forest-sync/incomplete/v1/".to_vec();
+    key.extend_from_slice(&(shard_id.len() as u16).to_be_bytes());
+    key.extend_from_slice(shard_id);
+    key
+}
+
+fn decode_sync_scopes(mut bytes: &[u8]) -> Vec<(u8, Vec<bool>)> {
+    let mut scopes = Vec::new();
+    while bytes.len() >= 3 {
+        let (phase, len) = (bytes[0], u16::from_be_bytes([bytes[1], bytes[2]]) as usize);
+        let Some(packed) = bytes.get(3..3 + len.div_ceil(8)) else { break };
+        scopes.push((phase, (0..len).map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0).collect()));
+        bytes = &bytes[3 + packed.len()..];
+    }
+    scopes
+}
+
+fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (phase, bits) in scopes {
+        bytes.push(*phase);
+        bytes.extend_from_slice(&(bits.len() as u16).to_be_bytes());
+        for chunk in bits.chunks(8) {
+            bytes.push(chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (u8::from(*bit) << (7 - i))));
+        }
+    }
+    bytes
+}
+
+/// List or unlist `(phase, bit_path)` among `shard_id`'s incomplete scopes
+/// in `txn`. Callers hold the commit lock, so the read is current.
+fn mark_sync_incomplete(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    phase_idx: usize,
+    bit_path: &[bool],
+    incomplete: bool,
+) -> Result<bool> {
+    let key = sync_incomplete_key(shard_id);
+    let mut scopes = txn.get(&key)?.map(|bytes| decode_sync_scopes(&bytes)).unwrap_or_default();
+    let scope = (phase_idx as u8, bit_path.to_vec());
+    let listed = scopes.contains(&scope);
+    match (incomplete, listed) {
+        (true, false) => scopes.push(scope),
+        (false, true) => scopes.retain(|listed| *listed != scope),
+        _ => return Ok(false),
+    }
+    if scopes.is_empty() { txn.delete(&key)?; } else { txn.set(&key, &encode_sync_scopes(&scopes))?; }
+    Ok(true)
+}
+
 /// Expand a UNIFORM 64-way split `depth` into its complete prefix set: depth 0 ⇒
 /// `[[]]` (single shard); depth 1 ⇒ `{[0]..[63]}` (QUIL); etc. Used by the
 /// convenience [`HypergraphCrdt::set_shard_partition`].
@@ -2600,6 +2655,17 @@ impl HypergraphCrdt {
         Ok(ready)
     }
 
+    /// Whether an interrupted sync left a scope of `shard_id` overlapping
+    /// `bit_path` (one path a prefix of the other) partly installed, in any
+    /// phase. Such a subtree holds leaves but not the state it commits to.
+    pub fn sync_incomplete(&self, shard_id: &[u8], bit_path: &[bool]) -> Result<bool> {
+        let txn = self.store.new_transaction(false)?;
+        let scopes = txn.get(&sync_incomplete_key(shard_id))?;
+        txn.abort()?;
+        Ok(scopes.is_some_and(|bytes| decode_sync_scopes(&bytes).iter()
+            .any(|(_, bits)| bits.iter().zip(bit_path).all(|(a, b)| a == b))))
+    }
+
     /// Authenticate and preview a sync before downloading its readable blobs.
     /// Remote reads and reconstruction do not hold the materializer's write
     /// lock. Each later chunk rechecks the local version under that lock.
@@ -2799,6 +2865,9 @@ impl HypergraphCrdt {
         if !plan.repair_existing || final_chunk {
             txn.set(&sync_data_key(&plan.shard_id, plan.phase_idx, &plan.bit_path)?, &[1])?;
         }
+        // Each chunk's blobs match its leaves, but the subtree holds the
+        // state it commits to only once the last chunk is in.
+        mark_sync_incomplete(txn.as_ref(), &plan.shard_id, plan.phase_idx, &plan.bit_path, !final_chunk)?;
         txn.commit()?;
         staged.publish_memory().map_err(|e| QuilError::Internal(format!("publish synced memory tree: {e}")))?;
         self.phase_versions.write().unwrap().insert((plan.shard_id.clone(), plan.phase_idx), version);
@@ -2826,6 +2895,14 @@ impl HypergraphCrdt {
                 && plan.target_root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__")
         {
             return Err(QuilError::ExecutionUnavailable("sync root changed before completion; retry".into()));
+        }
+        // A retry can find nothing left to install (its source already equal
+        // to the partial tree); the scope is complete all the same.
+        let txn = self.store.new_transaction(false)?;
+        if mark_sync_incomplete(txn.as_ref(), &plan.shard_id, plan.phase_idx, &plan.bit_path, false)? {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
         }
         Ok(plan.target_root)
     }

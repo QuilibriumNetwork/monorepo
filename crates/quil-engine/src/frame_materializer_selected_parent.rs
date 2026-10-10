@@ -128,6 +128,9 @@ pub struct GlobalParentExecutor {
     limits: GlobalParentLimits,
     active: Arc<AtomicBool>,
     authenticated: std::sync::Mutex<AuthenticatedAncestors>,
+    /// Highest frame whose certified finalization waits to be published here
+    /// ([`Self::note_finalized`]).
+    finalized: std::sync::atomic::AtomicU64,
 }
 
 /// Ancestors of an earlier preparation, by identity: each linked by parent
@@ -588,7 +591,22 @@ impl GlobalParentExecutor {
             limits,
             active: Arc::new(AtomicBool::new(false)),
             authenticated: Default::default(),
+            finalized: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The finalization pipeline holds `number`'s certified finalization.
+    pub(crate) fn note_finalized(&self, number: u64) {
+        self.finalized.fetch_max(number, Ordering::AcqRel);
+    }
+
+    /// `number` is finalized but not yet published here. Executing it
+    /// privately now, to check or build on a proposal, executes it twice: for
+    /// the proposal and again to publish it, one after the other on this
+    /// node's single execution lease. On mainnet each execution of a frame of
+    /// some 25 shard headers took about 5 s.
+    pub(crate) fn publication_pending(&self, number: u64) -> bool {
+        self.finalized.load(Ordering::Acquire) >= number && self.source.last_materialized_frame() < number
     }
 
     pub(crate) fn prepare(

@@ -552,9 +552,18 @@ pub async fn recover_sealed_history(
         let mut bytes = 0usize;
         let mut next = source.base_frame + 1;
         while next <= checkpoint.frame {
-            let page = fetch(session.filter.clone(), next, checkpoint.frame).await?;
+            let page = fetch(session.filter.clone(), next, checkpoint.frame).await.map_err(|error| match error {
+                QuilError::ExecutionUnavailable(message) => unavailable(format!(
+                    "generation {} outgoing history (frames {}-{}, sealed root {}): {message}",
+                    source.generation, source.base_frame + 1, checkpoint.frame, hex::encode(&checkpoint.history_root[..8]),
+                )),
+                other => other,
+            })?;
             if page.is_empty() {
-                return Err(unavailable(format!("no archive served outgoing records from frame {next}")));
+                return Err(unavailable(format!(
+                    "no archive served generation {}'s outgoing records from frame {next} through {}",
+                    source.generation, checkpoint.frame,
+                )));
             }
             for outgoing in page {
                 if outgoing.frame != next || next > checkpoint.frame {
@@ -757,6 +766,38 @@ pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<Effe
         }
     }
     Ok(EffectiveOrigins { origins, uncertified })
+}
+
+/// The digest (`poseidon(output)`) GLOBAL committed for `filter`'s frame
+/// `number`: the executed tip of the shard's current session or of a
+/// same-filter origin, or the checkpoint an origin sealed or was fenced at.
+/// GLOBAL verified that frame's certificate when it executed or sealed it, so
+/// a frame whose output hashes to this digest is authenticated by committed
+/// state even when it carries no certificate of its own (a frame final only
+/// through a descendant, or a sealed session's last frame).
+pub fn committed_frame_digest(global: &Arc<HypergraphCrdt>, filter: &[u8], number: u64) -> Result<Option<[u8; 32]>> {
+    let view = CommittedView::capture(global)?;
+    let Some(head) = handoff::head(&view, filter)? else { return Ok(None) };
+    let tip_of = |session: &Session| -> Result<Option<[u8; 32]>> {
+        Ok(handoff::session_tip(&view, &session.id()?)?
+            .filter(|tip| tip.frame == number)
+            .map(|tip| tip.digest))
+    };
+    if let Some(digest) = tip_of(&head)? {
+        return Ok(Some(digest));
+    }
+    for (source, checkpoint) in handoff::origins(&view, &head.id()?)? {
+        if source.filter != filter {
+            continue;
+        }
+        if checkpoint.frame == number && checkpoint.frame != source.base_frame {
+            return Ok(Some(checkpoint.digest));
+        }
+        if let Some(digest) = tip_of(&source)? {
+            return Ok(Some(digest));
+        }
+    }
+    Ok(None)
 }
 
 /// The frame GLOBAL has executed `filter`'s current session through: its
@@ -1189,6 +1230,34 @@ mod successor_tests {
         other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&ran, 3)).unwrap();
         let error = successor_state_matches(&global, &other, &clock, &third).unwrap_err();
         assert!(error.to_string().contains("sealed checkpoint"), "other state is still refused: {error}");
+    }
+
+    /// GLOBAL authenticates a frame by the digest it committed for it: the
+    /// checkpoint a predecessor sealed, or an executed tip. A seal at a
+    /// session's base names its genesis, not a frame, and authenticates none.
+    #[test]
+    fn committed_frame_digests_are_sealed_checkpoints_and_executed_tips() {
+        let (global, state) = global_state();
+        let filter = vec![0x07; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), None);
+        handoff::record_session_tip(&state, 4, &source.id().unwrap(),
+            &Checkpoint { frame: 2, view: 3, digest: [0x22; 32], state_roots: [[1; 32]; 4], history_root: [0; 32] }).unwrap();
+        commit(&global, &state, 4);
+        assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), Some([0x22; 32]), "the executed tip");
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: [0x33; 32], state_roots: [[1; 32]; 4], history_root: [0x44; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 5, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 5, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 5);
+        let successor = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.generation, 2);
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), Some([0x33; 32]), "the sealed checkpoint");
+        assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), None, "below the predecessor's tip");
+        assert_eq!(committed_frame_digest(&global, &[0x08; 32], 3).unwrap(), None, "another shard");
     }
 
     #[test]

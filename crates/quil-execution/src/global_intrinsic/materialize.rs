@@ -664,10 +664,36 @@ pub fn materialize_prover_kick_allocation(
 // ProverJoin materialize
 // =====================================================================
 
+/// `poseidon(preimage)`, remembered. A prover's and an allocation's address
+/// hash its ~900-byte Falcon key, about 1.4 ms each, and GLOBAL execution
+/// derives the same ones over and over: every member of every shard header's
+/// committee, and every participant several times. On mainnet that was most
+/// of each header's ~300 ms (2026-10-08). The value is the hash itself, so
+/// remembering it changes nothing but the time.
+fn remembered_poseidon(preimage: Vec<u8>) -> Result<[u8; 32]> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    /// About 1 KB a key: tens of MB at most, cleared when full.
+    const MAX_ENTRIES: usize = 1 << 15;
+    static REMEMBERED: LazyLock<Mutex<HashMap<Vec<u8>, [u8; 32]>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(address) = REMEMBERED.lock().ok().and_then(|cache| cache.get(&preimage).copied()) {
+        return Ok(address);
+    }
+    let address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+    if let Ok(mut cache) = REMEMBERED.lock() {
+        if cache.len() >= MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(preimage, address);
+    }
+    Ok(address)
+}
+
 /// Compute a prover's 32-byte address from their BLS48-581 public key.
 /// `poseidon_hash(public_key) → 32 bytes big-endian`.
 pub fn prover_address_from_pubkey(public_key: &[u8]) -> Result<[u8; 32]> {
-    quil_crypto::poseidon::hash_bytes_to_32(public_key)
+    remembered_poseidon(public_key.to_vec())
 }
 
 /// Compute an allocation's 32-byte address from the prover pubkey and filter.
@@ -677,7 +703,7 @@ pub fn allocation_address(public_key: &[u8], filter: &[u8]) -> Result<[u8; 32]> 
     preimage.extend_from_slice(b"PROVER_ALLOCATION");
     preimage.extend_from_slice(public_key);
     preimage.extend_from_slice(filter);
-    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+    remembered_poseidon(preimage)
 }
 
 /// Create a new prover vertex tree with initial field values.

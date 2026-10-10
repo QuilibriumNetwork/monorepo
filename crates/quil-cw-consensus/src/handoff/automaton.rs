@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use quil_types::error::Result;
 
-use crate::adapters::{digest_from_identity, Digest, GlobalProposer, ProposalContext};
+use crate::adapters::{digest_from_identity, Digest, GlobalProposer, Liveness, ProposalContext, Step};
 
 use super::{Checkpoint, Seal, Session};
 
@@ -40,6 +40,16 @@ pub struct HandoffProposer {
     read_private_parent: Option<ParentReader>,
     /// View whose parent this leader could not read yet, and how often it asked.
     parent_waits: std::sync::Mutex<(u64, u32)>,
+    /// Where this member's reasons for declining and refusing are noted.
+    liveness: Option<Arc<Liveness>>,
+}
+
+/// Why no authorized parent was found: a short reason and its specifics.
+type Unauthorized = (&'static str, String);
+
+/// The first bytes of a digest, in hex.
+fn short(digest: &[u8; 32]) -> String {
+    digest[..4].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A new view opens when its parent is notarized; the leader materializes that
@@ -62,6 +72,7 @@ impl HandoffProposer {
             read_parent,
             read_private_parent: None,
             parent_waits: std::sync::Mutex::new((0, 0)),
+            liveness: None,
         })
     }
 
@@ -70,41 +81,62 @@ impl HandoffProposer {
         self
     }
 
-    fn parent(&self, context: ProposalContext) -> Option<AuthorizedParent> {
-        self.checked_parent(context, &self.read_parent)
+    /// Note in `liveness` why this member declines a turn or refuses a vote.
+    pub fn with_liveness(mut self, liveness: Option<Arc<Liveness>>) -> Self {
+        self.liveness = liveness;
+        self
+    }
+
+    fn note(&self, step: Step, context: ProposalContext, reason: &'static str, detail: String) {
+        if let Some(liveness) = self.liveness.as_ref() {
+            liveness.note(step, context.view, reason, detail);
+        }
     }
 
     /// The committed parent, else, when allowed, a private execution of it.
-    fn parent_or_private(&self, context: ProposalContext, private: bool) -> Option<AuthorizedParent> {
-        self.parent(context).or_else(|| {
-            let reader = self.read_private_parent.as_ref().filter(|_| private)?;
+    fn parent_or_private(&self, context: ProposalContext, private: bool) -> std::result::Result<AuthorizedParent, Unauthorized> {
+        self.checked_parent(context, &self.read_parent).or_else(|(reason, committed)| {
+            let Some(reader) = self.read_private_parent.as_ref().filter(|_| private) else {
+                return Err((reason, committed));
+            };
             self.checked_parent(context, reader)
+                .map_err(|(reason, private)| (reason, format!("{committed}; unfinalized: {private}")))
         })
     }
 
-    fn checked_parent(&self, context: ProposalContext, reader: &ParentReader) -> Option<AuthorizedParent> {
-        if context.epoch != self.session.generation || context.view <= context.parent_view {
-            return None;
+    fn checked_parent(&self, context: ProposalContext, reader: &ParentReader) -> std::result::Result<AuthorizedParent, Unauthorized> {
+        if context.epoch != self.session.generation {
+            return Err(("epoch is not the session's generation",
+                format!("epoch {}, generation {}", context.epoch, self.session.generation)));
         }
-        let parent = (reader)(context).ok()?;
+        if context.view <= context.parent_view {
+            return Err(("view not above its parent's",
+                format!("view {}, parent view {}", context.view, context.parent_view)));
+        }
+        let parent = (reader)(context).map_err(|error| ("parent unavailable", error.to_string()))?;
         let checkpoint = &parent.checkpoint;
-        if checkpoint.view != context.parent_view
-            || checkpoint.digest != context.parent.0
-            || checkpoint.frame < self.session.base_frame
-        {
-            return None;
+        let differs = |what: &str| ("parent differs from the authorized checkpoint", format!(
+            "{what}: checkpoint frame {} view {} {}, selected view {} {}",
+            checkpoint.frame, checkpoint.view, short(&checkpoint.digest),
+            context.parent_view, short(&context.parent.0),
+        ));
+        if checkpoint.view != context.parent_view || checkpoint.digest != context.parent.0 {
+            return Err(differs("selection"));
+        }
+        if checkpoint.frame < self.session.base_frame {
+            return Err(differs("below the session base"));
         }
         if checkpoint.frame == self.session.base_frame {
             // Generation zero's base is the registered legacy tip: a certified
             // frame at its own view, not a virtual genesis at view zero.
             let virtual_genesis = self.session.generation != 0;
             if (virtual_genesis && checkpoint.view != 0) || checkpoint.digest != self.session.genesis {
-                return None;
+                return Err(differs("not the session genesis"));
             }
         } else if checkpoint.view == 0 {
-            return None;
+            return Err(differs("view zero above the base"));
         }
-        Some(parent)
+        Ok(parent)
     }
 }
 
@@ -143,10 +175,14 @@ impl GlobalProposer for HandoffProposer {
             let waits = self.parent_waits.lock().unwrap();
             waits.0 == context.view && waits.1 >= PARENT_WAITS
         };
-        let Some(parent) = self.parent_or_private(context, waited) else {
-            let mut waits = self.parent_waits.lock().unwrap();
-            *waits = if waits.0 == context.view { (context.view, waits.1 + 1) } else { (context.view, 1) };
-            return None;
+        let parent = match self.parent_or_private(context, waited) {
+            Ok(parent) => parent,
+            Err((reason, detail)) => {
+                self.note(Step::Propose, context, reason, detail);
+                let mut waits = self.parent_waits.lock().unwrap();
+                *waits = if waits.0 == context.view { (context.view, waits.1 + 1) } else { (context.view, 1) };
+                return None;
+            }
         };
         *self.parent_waits.lock().unwrap() = (context.view, 0);
         if let Some(request) = parent.closing_request {
@@ -161,9 +197,21 @@ impl GlobalProposer for HandoffProposer {
         let (digest, bytes) = self.inner.propose_with_context(context)?;
         // The data proposer cannot originate a seal outside the authorized path.
         if Seal::is_encoding(&bytes) {
+            self.note(Step::Propose, context, "data proposer built a seal", String::new());
             return None;
         }
         Some((digest, bytes))
+    }
+
+    /// A data frame waits as the data proposer says (its GLOBAL anchor just
+    /// ahead of this node); without this a member that receives the anchor
+    /// moments after the leader refuses the proposal outright. A seal is
+    /// checked at once.
+    fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
+        if Seal::is_encoding(bytes) {
+            return None;
+        }
+        self.inner.verify_delay(context, bytes)
     }
 
     fn verify_with_context(
@@ -175,16 +223,23 @@ impl GlobalProposer for HandoffProposer {
         let Some(bytes) = bytes else {
             tracing::debug!(view = context.view, parent_view = context.parent_view,
                 session = %digest_from_identity(self.session_id), "handoff verify: proposal bytes unavailable");
+            self.note(Step::Verify, context, "block not delivered", String::new());
             return false;
         };
-        let Some(parent) = self.parent_or_private(context, true) else {
-            return false;
+        let parent = match self.parent_or_private(context, true) {
+            Ok(parent) => parent,
+            Err((reason, detail)) => {
+                self.note(Step::Verify, context, reason, detail);
+                return false;
+            }
         };
         if Seal::is_encoding(&bytes) {
             let Some(request) = parent.closing_request else {
+                self.note(Step::Verify, context, "seal while no closing request", String::new());
                 return false;
             };
             let Ok(seal) = Seal::decode(&bytes) else {
+                self.note(Step::Verify, context, "undecodable seal", String::new());
                 return false;
             };
             let valid = seal.request == request
@@ -206,6 +261,11 @@ impl GlobalProposer for HandoffProposer {
                     proposed_history = %digest_from_identity(seal.checkpoint.history_root),
                     local_history = %digest_from_identity(parent.checkpoint.history_root),
                     "handoff verify: seal differs from the authorized local checkpoint");
+                self.note(Step::Verify, context, "seal differs from the local checkpoint", format!(
+                    "proposed frame {} view {}, local frame {} view {}, state roots match {}",
+                    seal.checkpoint.frame, seal.checkpoint.view, parent.checkpoint.frame, parent.checkpoint.view,
+                    seal.checkpoint.state_roots == parent.checkpoint.state_roots,
+                ));
             }
             return valid;
         }

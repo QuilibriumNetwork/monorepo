@@ -290,12 +290,17 @@ pub(crate) fn split_coverage_filter(filter: &[u8]) -> (&[u8], Vec<u32>) {
 
 /// Whether committed data is present in this worker's covered subtree. This
 /// is a presence check, not proof that the state matches a certified frame;
-/// the proposal/verifier pre-state checks enforce that separately.
+/// the proposal/verifier pre-state checks enforce that separately. A subtree
+/// an interrupted download left partly installed holds leaves but not its
+/// state, and does not count until a download of it completes.
 pub(crate) fn has_committed_shard_data(crdt: &HypergraphCrdt, filter: &[u8]) -> bool {
     if crdt.unified_tree() {
         let Some(bits) = crdt.canonical_bits_for_filter(filter) else {
             return false;
         };
+        if crdt.sync_incomplete(&filter[..32], &bits).unwrap_or(true) {
+            return false;
+        }
         // A sync can install a complete subtree without populating write-time
         // size buckets. Decode the wire bit length and packed path before
         // reading the committed forest.
@@ -608,6 +613,48 @@ mod tests {
         assert!(has_committed_shard_data(&reopened, &app));
         assert!(!has_committed_shard_data(&reopened, &sibling_filter));
         assert!(!has_committed_shard_data(&reopened, &filter[..34]), "malformed filter stays gated");
+    }
+
+    #[test]
+    fn a_partly_downloaded_subtree_is_not_staged_until_its_download_completes() {
+        use quil_forest::{SubtreeSyncAnchor, PHASES};
+        let open = || {
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn HypergraphStore> = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+            let crdt = HypergraphCrdt::new(store, Arc::new(StubProver));
+            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+            crdt.set_unified_tree(true);
+            (db, crdt)
+        };
+        let app = [0x72; 32];
+        let bits = vec![true, false, true];
+        let filter = quil_forest::encode_shard_bit_path(&app, &bits);
+        let (source_db, source) = open();
+        for i in 1..=3u8 {
+            let mut address = [i; 32];
+            address[0] = 0xa0 | i;
+            source.add_vertex(&Location { app_address: app, data_address: address }, &[i; 40]).unwrap();
+        }
+        source.commit(1).unwrap();
+        let (version, _) = source.serve_forest_head(&app, 0).unwrap();
+        let source_forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE.to_vec());
+        let reader = source_forest.shard_phase_reader(&app, PHASES[0]);
+        let subtree = source.sub_shard_commitment_for_filter("vertex", "adds", &filter);
+        let pinned = SubtreeSyncAnchor::SubtreeRoot(subtree.as_slice().try_into().unwrap());
+
+        let (_db, target) = open();
+        let mut plan = target.prepare_phase_sync(&reader, version, &app, 0, &bits, Some(pinned)).unwrap();
+        assert_eq!(plan.remaining().len(), 3);
+        let blob = |plan: &quil_hypergraph::crdt::ForestSyncPlan, n: usize| plan.remaining()[..n].iter()
+            .map(|(key, _)| vec![key[0] & 0x0f; 40]).collect::<Vec<_>>();
+        let first = blob(&plan, 1);
+        target.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(target.unified_subtree_leaf_count("vertex", "adds", &app, &bits) > 0, "leaves are installed");
+        assert!(!has_committed_shard_data(&target, &filter), "but the subtree is not staged");
+        let rest = blob(&plan, 2);
+        target.apply_sync_chunk(&mut plan, &rest).unwrap();
+        target.finish_phase_sync(&plan).unwrap();
+        assert!(has_committed_shard_data(&target, &filter));
     }
 
     #[test]

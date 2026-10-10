@@ -5891,6 +5891,7 @@ dependencies = [
  "pqcrypto-traits",
  "quil-types",
  "rand 0.8.5",
+ "rayon",
  "sha2 0.10.9",
  "sha3 0.10.8",
  "tracing",

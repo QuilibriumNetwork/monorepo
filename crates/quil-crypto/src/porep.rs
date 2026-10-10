@@ -226,28 +226,42 @@ pub fn audit_frame_storage_attestations<F>(
 where
     F: Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
 {
+    use rayon::prelude::*;
     use std::collections::HashSet;
     let total = openings.len() as u64;
+    // (a) registry cross-check (cheap, no pairing). `lookup` reads committed
+    // state, so it runs here, in order.
+    let audited: Vec<(&StorageOpening, bool)> = openings
+        .iter()
+        .filter(|o| is_audited(rho_n, &opening_audit_id(o), sample_size, total))
+        .map(|o| {
+            let registry_ok = match lookup(&o.member_id, &o.shard_id) {
+                Some((leaf_root, num_blocks, epoch)) => {
+                    epoch == active_epoch
+                        && o.epoch == active_epoch
+                        && leaf_root == o.leaf_root
+                        && num_blocks == o.num_blocks
+                }
+                None => false,
+            };
+            (o, registry_ok)
+        })
+        .collect();
+    // (b) possession + path (skipped if the registry already failed). Each
+    // opening is its own pairing check, independent of the others, so they run
+    // in parallel: one after another they were most of a shard header's GLOBAL
+    // execution time. The result is the same as checking them in turn.
+    let verified: Vec<bool> = audited
+        .par_iter()
+        .map(|(o, registry_ok)| {
+            *registry_ok && verify_storage_attestation(std::slice::from_ref(*o), 0, rho_n, &[], poly_size)
+        })
+        .collect();
+    // Failed members in opening order, as before: every node kicks the same
+    // members in the same order.
     let mut failed: Vec<Vec<u8>> = Vec::new();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    for o in openings {
-        let id = opening_audit_id(o);
-        if !is_audited(rho_n, &id, sample_size, total) {
-            continue;
-        }
-        // (a) registry cross-check (cheap, no pairing).
-        let registry_ok = match lookup(&o.member_id, &o.shard_id) {
-            Some((leaf_root, num_blocks, epoch)) => {
-                epoch == active_epoch
-                    && o.epoch == active_epoch
-                    && leaf_root == o.leaf_root
-                    && num_blocks == o.num_blocks
-            }
-            None => false,
-        };
-        // (b) possession + path (skip if registry already failed).
-        let ok = registry_ok
-            && verify_storage_attestation(std::slice::from_ref(o), 0, rho_n, &[], poly_size);
+    for ((o, _), ok) in audited.iter().zip(verified) {
         if !ok && seen.insert(o.member_id.clone()) {
             failed.push(o.member_id.clone());
         }
@@ -1481,6 +1495,26 @@ mod tests {
         let failed =
             audit_frame_storage_attestations(&tampered, &rho_n, poly_size, epoch, u64::MAX, &good);
         assert!(failed.contains(&b"m2".to_vec()), "tampered possession must flag m2");
+
+        // Checked in parallel, the result is exactly the one-at-a-time result:
+        // the same members, first failure first.
+        let sequential = |openings: &[StorageOpening], lookup: &dyn Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>| {
+            let mut failed: Vec<Vec<u8>> = Vec::new();
+            for o in openings {
+                let registry_ok = lookup(&o.member_id, &o.shard_id).is_some_and(|(root, blocks, e)| {
+                    e == epoch && o.epoch == epoch && root == o.leaf_root && blocks == o.num_blocks
+                });
+                let ok = registry_ok && verify_storage_attestation(std::slice::from_ref(o), 0, &rho_n, &[], poly_size);
+                if !ok && !failed.contains(&o.member_id) {
+                    failed.push(o.member_id.clone());
+                }
+            }
+            failed
+        };
+        let mixed: Vec<StorageOpening> = tampered.iter().rev().cloned().collect();
+        let parallel = audit_frame_storage_attestations(&mixed, &rho_n, poly_size, epoch, u64::MAX, &good_no_m1);
+        assert_eq!(parallel, sequential(&mixed, &good_no_m1));
+        assert_eq!(parallel.len(), 2, "m1 unregistered and m2 tampered: {parallel:?}");
     }
 
     #[test]

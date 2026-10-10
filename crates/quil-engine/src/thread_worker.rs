@@ -784,13 +784,14 @@ impl ThreadWorkerManager {
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
                                                                         // time rather than all failing busy together.
-                                                                        let _turn = SHARD_RECOVERY_TURNS.acquire().await;
-                                                                        match crate::prover_tree_syncer::recover_shard_from_latest(
-                                                                            syncer.as_ref(), &filter, local, &lb,
-                                                                        ).await {
-                                                                            Ok(progress) => info!(filter = %hex::encode(&filter), ?progress, "archive recovery batch complete"),
-                                                                            Err(error) => warn!(filter = %hex::encode(&filter), %error, "archive recovery failed; will retry"),
-                                                                        }
+                                                                        let attempt = async {
+                                                                            crate::worker_execution::recovery_phase("waiting_for_permit");
+                                                                            let _turn = SHARD_RECOVERY_TURNS.acquire().await;
+                                                                            crate::prover_tree_syncer::recover_shard_from_latest(
+                                                                                syncer.as_ref(), &filter, local, &lb,
+                                                                            ).await
+                                                                        };
+                                                                        let _ = lb.execution_record().recovering(&filter, attempt).await;
                                                                     });
                                                                 }
                                                                 _ => {

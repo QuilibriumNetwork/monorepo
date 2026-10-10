@@ -160,6 +160,13 @@ fn listed_subtree<S: BatchTreeReader>(
 /// source answers each round in a few batched requests.
 const WALK_CHUNK: usize = 256;
 
+/// A subtree the target lacks entirely is listed in bulk instead of walked
+/// when its parent counts at least this many leaves under it. The count is
+/// only a hint (it is not hashed); the listing is checked against the
+/// child's committed hash. An interrupted download keeps the leaves it
+/// installed, in key order, so a retry lists the rest instead of walking it.
+const LIST_MIN_LEAVES: usize = 1024;
+
 /// A source node still to compare against the target's node at its path.
 struct WalkPair {
     s_key: NodeKey,
@@ -228,7 +235,7 @@ pub fn diff_leaves<S: BatchTreeReader, T: BatchTreeReader>(
     let t_key = NodeKey::new(v_t, NibblePath::new(vec![]));
     if let Some(s_node) = source.get_node_option(&s_key)? {
         let t_node = target.get_node_option(&t_key)?;
-        walk(source, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
+        walk(source, v_s, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
     }
     Ok(out)
 }
@@ -239,6 +246,7 @@ pub fn diff_leaves<S: BatchTreeReader, T: BatchTreeReader>(
 /// returned in key order, as a depth-first walk in nibble order visits them.
 fn walk<S: BatchTreeReader, T: BatchTreeReader>(
     source: &S,
+    v_s: Version,
     target: &T,
     pairs: Vec<WalkPair>,
     out: &mut Vec<(KeyHash, OwnedValue)>,
@@ -277,6 +285,14 @@ fn walk<S: BatchTreeReader, T: BatchTreeReader>(
                 if t_match.is_some_and(|(t_hash, _)| *t_hash == s_child.hash) {
                     continue; // identical subtree — transfer nothing below here
                 }
+                let s_key = pair.s_key.gen_child_node_key(s_child.version, nibble);
+                if t_match.is_none() && s_child.leaf_count() >= LIST_MIN_LEAVES {
+                    let bits: Vec<bool> = s_key.nibble_path().bits().collect();
+                    if let Some(listed) = listed_subtree(source, v_s, &bits, s_child.hash)? {
+                        out.extend(listed);
+                        continue;
+                    }
+                }
                 // Target has no child here: descend with an empty target so
                 // every source leaf below transfers. The placeholder key is
                 // never fetched.
@@ -285,7 +301,7 @@ fn walk<S: BatchTreeReader, T: BatchTreeReader>(
                     None => (pair.t_key.gen_child_node_key(pair.t_key.version(), nibble), false),
                 };
                 children.push(ChildRead {
-                    s_key: pair.s_key.gen_child_node_key(s_child.version, nibble),
+                    s_key,
                     hash: s_child.hash,
                     t_key,
                     t_present,
@@ -642,7 +658,7 @@ pub fn diff_leaves_under_prefix<S: BatchTreeReader, T: BatchTreeReader>(
             Some((k, n)) => (k, Some(n)),
             None => (s_key.clone(), None),
         };
-        walk(source, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
+        walk(source, v_s, target, vec![WalkPair { s_key, s_node, t_key, t_node }], &mut out)?;
         return Ok((out, subtree_root));
     }
 
@@ -686,7 +702,7 @@ pub fn diff_leaves_under_prefix<S: BatchTreeReader, T: BatchTreeReader>(
         children.push(ChildRead { s_key: s_child_key, hash: s_child.hash, t_key, t_present });
     }
     let pairs = fetch_children(source, target, children)?;
-    walk(source, target, pairs, &mut out)?;
+    walk(source, v_s, target, pairs, &mut out)?;
     Ok((out, subtree_root))
 }
 
@@ -1101,6 +1117,7 @@ mod tests {
         assert_eq!((rest.len(), listing.listed.get()), (590, 0));
 
         // A listing that drops, alters, adds or reorders a leaf is refused.
+        // (Subtrees of 600 leaves stay below the in-walk listing threshold.)
         let tampers: [fn(&mut Vec<(KeyHash, OwnedValue)>); 4] = [
             |leaves| { leaves.remove(3); },
             |leaves| { leaves[5].1.push(0); },
@@ -1112,5 +1129,35 @@ mod tests {
             let error = diff_leaves_under_prefix(&listing, 0, &empty, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap_err();
             assert!(error.to_string().contains("listed leaves"), "{error}");
         }
+    }
+
+    /// A download interrupted after installing a key-ordered part keeps it:
+    /// the retry walks only the boundary and lists the subtrees the target
+    /// lacks, each checked against its committed hash.
+    #[test]
+    fn a_resumed_download_lists_the_subtrees_it_lacks() {
+        let source = MockTreeStore::new(true);
+        let mut kvs: Vec<(KeyHash, Vec<u8>)> = (0..40_000u64)
+            .map(|i| (KeyHash(<sha2::Sha256 as sha2::Digest>::digest(i.to_be_bytes()).into()), i.to_be_bytes().to_vec()))
+            .collect();
+        let root = commit(&source, 0, kvs.clone());
+        kvs.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        let partial = MockTreeStore::new(true);
+        commit(&partial, 0, kvs[..4_000].to_vec());
+        let honest = |leaves: &mut Vec<(KeyHash, OwnedValue)>| { let _ = leaves; };
+        let (walked, _) = diff_leaves_under_prefix(&source, 0, &partial, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        assert_eq!(walked.len(), 36_000);
+        let listing = Listing { source: &source, leaves: kvs.clone(), tamper: honest, listed: Default::default(), nodes: Default::default() };
+        let (rest, rest_root) = diff_leaves_under_prefix(&listing, 0, &partial, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        assert_eq!(rest, walked, "the same leaves, in key order");
+        assert_eq!(rest_root, root);
+        assert!(listing.listed.get() >= 14, "the untouched top-level subtrees are listed: {}", listing.listed.get());
+        assert!(listing.nodes.get() < 4_000, "only the boundary is walked: {} nodes", listing.nodes.get());
+        assert!(diff_leaves(&listing, 0, &partial, 0).unwrap().len() == 36_000);
+
+        let dropped = |leaves: &mut Vec<(KeyHash, OwnedValue)>| { leaves.pop(); };
+        let listing = Listing { source: &source, leaves: kvs, tamper: dropped, listed: Default::default(), nodes: Default::default() };
+        let error = diff_leaves_under_prefix(&listing, 0, &partial, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap_err();
+        assert!(error.to_string().contains("listed leaves"), "{error}");
     }
 }

@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, age};
+use super::super::local_execution::{local_execution_state, age, recovery};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -790,6 +790,7 @@ fn allocation_detail(a: &AllocationRow) -> Line<'static> {
     } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
     if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
     if local_warning(a) { text += " | Warning: no materialized frames"; }
+    if let Some(r) = execution.recovery.as_ref() { text += &format!(" | {}", recovery(r)); }
     let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
     Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
 }
@@ -1904,6 +1905,12 @@ mod tests {
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
         assert_eq!(local_color(&worker), Color::Yellow);
         assert!(allocation_detail(&worker).to_string().contains("Warning: no materialized frames"));
+        worker.execution.as_mut().unwrap().recovery = Some(quil_types::proto::node::ShardRecovery {
+            phase: "installing_leaves".into(), phase_since_unix_ms: now - 5_000,
+            installed_leaves: 131_072, planned_leaves: 2_517_449, leaves_observed_unix_ms: now, ..Default::default() });
+        let detail = allocation_detail(&worker).to_string();
+        assert!(detail.contains("Warning: no materialized frames") && detail.contains("Recovery: installing_leaves"));
+        assert!(detail.contains("131072/2517449"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
         worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
         m.allocations.push(worker);

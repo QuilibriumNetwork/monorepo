@@ -22,7 +22,7 @@ use commonware_utils::{
     NZUsize,
 };
 use quil_cw_consensus::{
-    adapters::{BlockStore, FrameFinalizer, FrameSink, GlobalProposer, ProposalContext},
+    adapters::{BlockStore, FrameFinalizer, FrameSink, GlobalProposer, Liveness, ProposalContext, Step},
     engine_host::{build_global_engine, GlobalEngineParams},
     falcon_base::{FalconPrivateKey, FalconPublicKey},
     falcon_simplex::SimplexFalconScheme,
@@ -101,6 +101,78 @@ fn reader(state: Arc<Mutex<Option<AuthorizedParent>>>) -> ParentReader {
             .clone()
             .ok_or_else(|| QuilError::ExecutionUnavailable("parent state/history not ready".into()))
     })
+}
+
+/// [`DataProposer`] whose proposals wait for something on its way (a GLOBAL
+/// anchor) while `waiting`.
+struct AnchoredProposer {
+    waiting: std::sync::atomic::AtomicBool,
+}
+
+const ANCHOR_WAIT: Duration = Duration::from_millis(250);
+
+impl GlobalProposer for AnchoredProposer {
+    fn propose(&self, view: u64, parent: Digest) -> Option<(Digest, Vec<u8>)> {
+        DataProposer.propose(view, parent)
+    }
+    fn verify(&self, view: u64, parent: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        DataProposer.verify(view, parent, digest, bytes)
+    }
+    fn verify_delay(&self, _: ProposalContext, _: &[u8]) -> Option<Duration> {
+        self.waiting.load(Ordering::SeqCst).then_some(ANCHOR_WAIT)
+    }
+}
+
+/// A session member that cannot take its turn or vote for a proposal says
+/// why, once per view; and a data proposal waits for what its data proposer
+/// waits for, where the session once refused it outright. A seal is checked
+/// at once.
+#[test]
+fn session_refusals_are_named_and_data_proposals_wait_for_their_anchor() {
+    let (session, _) = session();
+    let parent = genesis(&session);
+    let state = Arc::new(Mutex::new(None));
+    let liveness = Arc::new(Liveness::default());
+    let inner = Arc::new(AnchoredProposer { waiting: true.into() });
+    let proposer = HandoffProposer::new(inner.clone(), session.clone(), reader(state.clone()))
+        .unwrap()
+        .with_liveness(Some(liveness.clone()));
+
+    // No authorized parent yet: the turn is declined and the vote refused.
+    let first = context(&session, &parent, 1);
+    assert!(proposer.propose_with_context(first).is_none());
+    liveness.settle(Step::Propose, 1, false);
+    let (digest, bytes) = DataProposer.propose(1, first.parent).unwrap();
+    assert!(!proposer.verify_with_context(first, digest, Some(bytes)));
+    liveness.settle(Step::Verify, 1, false);
+    // A block that never arrived.
+    *state.lock().unwrap() = Some(parent.clone());
+    let second = context(&session, &parent, 2);
+    assert!(!proposer.verify_with_context(second, digest, None));
+    liveness.settle(Step::Verify, 2, false);
+    // Another epoch's coordinates.
+    let other_epoch = ProposalContext { epoch: session.generation + 1, ..context(&session, &parent, 3) };
+    assert!(!proposer.verify_with_context(other_epoch, digest, Some(vec![1])));
+    liveness.settle(Step::Verify, 3, false);
+    let decided = liveness.decisions();
+    assert_eq!(decided.declined.get("parent unavailable"), Some(&1));
+    assert!(decided.last_declined.unwrap().detail.contains("parent state/history not ready"));
+    assert_eq!(decided.refused.get("parent unavailable"), Some(&1));
+    assert_eq!(decided.refused.get("block not delivered"), Some(&1));
+    assert_eq!(decided.refused.get("epoch is not the session's generation"), Some(&1));
+
+    // A data proposal waits while its anchor is on its way, then is checked.
+    let fourth = context(&session, &parent, 4);
+    let (digest, bytes) = DataProposer.propose(4, fourth.parent).unwrap();
+    assert_eq!(proposer.verify_or_defer(fourth, digest, Some(bytes.clone())), Err(ANCHOR_WAIT));
+    inner.waiting.store(false, Ordering::SeqCst);
+    assert_eq!(proposer.verify_or_defer(fourth, digest, Some(bytes)), Ok(true));
+    // A seal is checked at once (refused here: nothing is closing).
+    inner.waiting.store(true, Ordering::SeqCst);
+    let seal = Seal { request: [8; 32], session: session.id().unwrap(), view: 4, checkpoint: parent.checkpoint.clone() };
+    assert_eq!(proposer.verify_or_defer(fourth, Digest(seal.digest()), Some(seal.encode())), Ok(false));
+    liveness.settle(Step::Verify, 4, false);
+    assert_eq!(liveness.decisions().refused.get("seal while no closing request"), Some(&1));
 }
 
 #[test]

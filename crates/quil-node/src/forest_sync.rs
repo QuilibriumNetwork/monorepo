@@ -265,6 +265,11 @@ async fn sync_phase_data(
     }).await.map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
     let short = hex::encode(&shard_id[..shard_id.len().min(8)]);
     let mut planned = plan.remaining().len();
+    // A worker's recovery reports its progress; other syncs report nothing.
+    let progress = |installed: usize, planned: usize| {
+        quil_engine::worker_execution::recovery_leaves(phase, installed as u64, planned as u64);
+    };
+    progress(0, planned);
     if planned > 0 {
         info!(shard = %short, phase, leaves = planned, walk_secs = started.elapsed().as_secs(),
             "sync phase: installing changed leaves");
@@ -275,6 +280,7 @@ async fn sync_phase_data(
     loop {
         while !plan.remaining().is_empty() {
             let installed = planned.saturating_sub(plan.remaining().len());
+            progress(installed, planned);
             if installed >= next_report {
                 info!(shard = %short, phase, installed, planned, "sync phase: installing");
                 next_report *= 2;
@@ -309,7 +315,10 @@ async fn sync_phase_data(
             }).await.map_err(|e| QuilError::Internal(format!("sync installation task: {e}")))?;
             plan = returned;
             match applied {
-                Ok(()) => staged_since = None,
+                Ok(()) => {
+                    staged_since = None;
+                    quil_engine::worker_execution::recovery_installed(take as u64);
+                }
                 Err(e) if sync_staged_writes(&e) => {
                     let since = *staged_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= STAGED_WRITES_WAIT {
@@ -327,6 +336,7 @@ async fn sync_phase_data(
                 Err(e) => return Err(e),
             }
         }
+        progress(planned, planned);
         let c = crdt.clone();
         let (returned, finished) = tokio::task::spawn_blocking(move || {
             let finished = c.finish_phase_sync(&plan);

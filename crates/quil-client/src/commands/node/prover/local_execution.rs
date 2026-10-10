@@ -1,5 +1,5 @@
 //! Display local worker observations without inferring health from allocation.
-use quil_types::proto::node::WorkerExecution;
+use quil_types::proto::node::{ShardRecovery, WorkerExecution};
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis() as u64
@@ -24,6 +24,28 @@ pub fn detail(s: Option<&WorkerExecution>) -> String {
         s.materialized_frame.map(|h| h.to_string()).unwrap_or_else(|| "unknown".into()),
         if s.last_advance_unix_ms == 0 { "unobserved".into() } else { format!("{} ago", age(s.last_advance_unix_ms)) },
         age(s.observed_unix_ms))
+        + &s.recovery.as_ref().map(|r| format!("; {}", recovery(r))).unwrap_or_default()
+}
+/// Archive recovery, which runs in any execution state: a worker can be
+/// downloading its shard while running or blocked at height 0.
+pub fn recovery(r: &ShardRecovery) -> String {
+    let mut text = format!("Recovery: {} for {}", if r.phase.is_empty() { "unknown" } else { &r.phase }, age(r.phase_since_unix_ms));
+    if !r.source.is_empty() { text += &format!(" from {}", r.source); }
+    if r.planned_leaves > 0 {
+        text += &format!(", leaves {}/{} (phase {}, {} ago)", r.installed_leaves, r.planned_leaves, r.tree_phase, age(r.leaves_observed_unix_ms));
+    }
+    if r.attempt_started_unix_ms > 0 {
+        text += &format!(", attempt {}", r.attempts + u32::from(r.phase != "idle"));
+        if r.consecutive_failures > 0 { text += &format!(" ({} failed in a row)", r.consecutive_failures); }
+        if r.permit_wait_ms >= 1000 { text += &format!(", waited {}s for a permit", r.permit_wait_ms / 1000); }
+        text += &format!(", {} leaves installed in it", r.attempt_installed_leaves);
+    }
+    if r.last_error_unix_ms > r.last_outcome_unix_ms {
+        text += &format!(", last error {} ago: {}", age(r.last_error_unix_ms), r.last_error);
+    } else if r.last_outcome_unix_ms > 0 {
+        text += &format!(", last {} ago: {}", age(r.last_outcome_unix_ms), r.last_outcome);
+    }
+    text
 }
 #[cfg(test)]
 mod tests {
@@ -38,5 +60,16 @@ mod tests {
         assert_eq!(state_at(Some(&old), 1), "stale");
         assert!(detail(None).contains("unknown"));
         assert!(detail(Some(&s)).contains("checkpoint mismatch"));
+        assert!(!detail(Some(&s)).contains("Recovery"));
+        let r = ShardRecovery { phase: "installing_leaves".into(), installed_leaves: 262_144, planned_leaves: 2_517_449,
+            last_outcome: "replayed to frame 3".into(), last_outcome_unix_ms: 5, last_error: "no archive".into(), last_error_unix_ms: 9, ..Default::default() };
+        let text = detail(Some(&WorkerExecution { recovery: Some(r), ..s.clone() }));
+        assert!(text.contains("installing_leaves") && text.contains("262144/2517449") && text.contains("no archive"));
+        let r = ShardRecovery { phase: "idle".into(), source: "192.0.2.1:8340".into(), attempts: 4, consecutive_failures: 3,
+            attempt_started_unix_ms: 1, permit_wait_ms: 31_000, attempt_installed_leaves: 262_144,
+            last_error: "get_vertex_blobs: Timeout expired".into(), last_error_unix_ms: 9, ..Default::default() };
+        let text = recovery(&r);
+        assert!(text.contains("from 192.0.2.1:8340") && text.contains("attempt 4 (3 failed in a row)"), "{text}");
+        assert!(text.contains("waited 31s for a permit") && text.contains("262144 leaves installed in it"), "{text}");
     }
 }

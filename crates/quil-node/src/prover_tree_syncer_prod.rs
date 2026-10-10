@@ -45,6 +45,22 @@ pub struct ProdProverTreeSyncer {
 
 use crate::forest_sync::{is_empty_phase_root, phase_anchor};
 
+/// How long an archive that failed a shard read is passed over while another
+/// is known. Process-wide: every worker of this node reads the same archives.
+const SOURCE_AVOID: std::time::Duration = std::time::Duration::from_secs(120);
+static SOURCE_FAILURES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn source_failed(addr: &str) {
+    SOURCE_FAILURES.lock().unwrap().insert(addr.to_string(), std::time::Instant::now());
+}
+
+fn recently_failed(addr: &str) -> bool {
+    let mut failures = SOURCE_FAILURES.lock().unwrap();
+    failures.retain(|_, at| at.elapsed() < SOURCE_AVOID);
+    failures.contains_key(addr)
+}
+
 impl ProdProverTreeSyncer {
     /// Predecessor outgoing history from this syncer's archive, as the engine
     /// source for a cluster worker (whose archives are discovered through its
@@ -54,8 +70,15 @@ impl ProdProverTreeSyncer {
         Arc::new(move |filter, from, through| {
             let syncer = syncer.clone();
             Box::pin(async move {
+                // Resolving discovers the master's archives on first use.
                 let addr = syncer.resolve_addr().await?;
-                crate::storage_history::outgoing_page_from(&addr, &syncer.falcon_signing_key, filter, from, through).await
+                let endpoints = match syncer.archive_pool.as_ref() {
+                    Some(pool) => pool.get_all().await,
+                    None => vec![addr],
+                };
+                crate::storage_history::outgoing_history_from_endpoints(
+                    &endpoints, &syncer.falcon_signing_key, filter, from, through,
+                ).await
             })
         })
     }
@@ -63,8 +86,24 @@ impl ProdProverTreeSyncer {
     /// Resolve a verified archive. Separate workers must discover one through
     /// their master first: the regular master's tree is not an app-state source.
     async fn resolve_addr(&self) -> Result<String> {
+        let addr = self.pick_addr().await?;
+        quil_engine::worker_execution::recovery_source(&addr);
+        Ok(addr)
+    }
+
+    /// The next archive in rotation, passing over one that failed a shard
+    /// read recently while another is known.
+    async fn pick_addr(&self) -> Result<String> {
         if let Some(pool) = self.archive_pool.as_ref() {
-            if let Some(ep) = pool.next().await {
+            let mut failed = None;
+            for _ in 0..pool.len().await.max(1) {
+                let Some(ep) = pool.next().await else { break };
+                if !recently_failed(&ep) {
+                    return Ok(ep);
+                }
+                failed.get_or_insert(ep);
+            }
+            if let Some(ep) = failed {
                 return Ok(ep);
             }
             if self.discover_archives_from_master {
@@ -83,12 +122,12 @@ impl ProdProverTreeSyncer {
     /// Resolve each committed phase at its retained version, then install its
     /// authenticated leaves and data. The peer may have advanced since the
     /// header was finalized; live-head equality is not required.
-    async fn sync_single_shard(&self, shard_id: Vec<u8>, expected_roots: &[Vec<u8>]) -> Result<bool> {
+    async fn sync_single_shard(&self, addr: &str, shard_id: Vec<u8>, expected_roots: &[Vec<u8>]) -> Result<bool> {
         let expected = std::array::from_fn(|phase| {
             expected_roots.get(phase).map_or(&[][..], Vec::as_slice)
         });
         Ok(crate::forest_sync::sync_shard_phases_verified(
-            &self.resolve_addr().await?,
+            addr,
             &self.falcon_signing_key,
             self.crdt.clone(),
             &shard_id,
@@ -104,8 +143,8 @@ impl ProdProverTreeSyncer {
     /// contribute the zero root, so the aggregate matches `commit_inner`. Any
     /// phase whose aggregate or post-apply root diverges aborts the sync.
     /// Previously only phase 0 was bound; phases 1–3 could be served divergent.
-    async fn sync_split_shard(&self, app: [u8; 32], expected_roots: &[Vec<u8>]) -> Result<bool> {
-        let mut client = ArchiveClient::connect_mtls(&self.resolve_addr().await?, &self.falcon_signing_key)
+    async fn sync_split_shard(&self, addr: &str, app: [u8; 32], expected_roots: &[Vec<u8>]) -> Result<bool> {
+        let mut client = ArchiveClient::connect_mtls(addr, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
@@ -176,6 +215,7 @@ impl ProdProverTreeSyncer {
     /// whole-app root is neither the header commitment nor a required anchor.
     async fn sync_shard_subtree(
         &self,
+        addr: &str,
         filter: &[u8],
         expected_roots: &[Vec<u8>],
     ) -> Result<bool> {
@@ -183,8 +223,7 @@ impl ProdProverTreeSyncer {
             QuilError::InvalidArgument("invalid shard filter for subtree sync".into())
         })?;
         let app = &filter[..32];
-        let addr = self.resolve_addr().await?;
-        let mut client = ArchiveClient::connect_mtls(&addr, &self.falcon_signing_key)
+        let mut client = ArchiveClient::connect_mtls(addr, &self.falcon_signing_key)
             .await
             .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
         let handle = tokio::runtime::Handle::current();
@@ -293,17 +332,51 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
             return Ok(true);
         }
         info!(addr = %self.master_stream_addr, "syncing global prover tree (forest diff)");
-        self.sync_single_shard(vec![0xffu8; 32], expected_roots).await
+        self.sync_single_shard(&self.resolve_addr().await?, vec![0xffu8; 32], expected_roots).await
     }
 
     async fn sync_shard_tree(&self, filter: &[u8], expected_roots: &[Vec<u8>]) -> Result<bool> {
-        let n = filter.len().min(32);
-        let mut l2 = [0u8; 32];
-        l2[..n].copy_from_slice(&filter[..n]);
         // Skip when already caught up (works for single-shard and QUIL split).
         if self.caught_up_to_anchor(filter, expected_roots) {
             return Ok(true);
         }
+        let addr = self.resolve_addr().await?;
+        let synced = self.sync_shard_tree_from(&addr, filter, expected_roots).await;
+        if !matches!(synced, Ok(true)) {
+            // The next attempt starts at another archive when one is known;
+            // what this one installed stays.
+            source_failed(&addr);
+        }
+        synced
+    }
+
+    async fn get_app_shard_frame(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<Option<quil_types::proto::global::AppShardFrame>> {
+        let addr = self.resolve_addr().await?;
+        let fetched = async {
+            let mut client = ArchiveClient::connect_mtls(&addr, &self.falcon_signing_key)
+                .await
+                .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
+            client
+                .get_app_shard_frame(filter.to_vec(), frame_number)
+                .await
+                .map_err(|e| QuilError::Internal(format!("get app-shard frame: {e}")))
+        }.await;
+        if fetched.is_err() {
+            source_failed(&addr);
+        }
+        fetched
+    }
+}
+
+impl ProdProverTreeSyncer {
+    async fn sync_shard_tree_from(&self, addr: &str, filter: &[u8], expected_roots: &[Vec<u8>]) -> Result<bool> {
+        let n = filter.len().min(32);
+        let mut l2 = [0u8; 32];
+        l2[..n].copy_from_slice(&filter[..n]);
         // UNIFIED mode: EVERY app is ONE L3 tree keyed by `l2`, and its four phase
         // roots ARE the header `state_roots`. A shard prover covering a specific
         // prefix (`filter = app ‖ prefix`) pulls ONLY its subtree — authenticated
@@ -313,47 +386,20 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         if self.crdt.unified_tree() {
             let prefix_bytes: Vec<u8> = if filter.len() > 32 { filter[32..].to_vec() } else { Vec::new() };
             if prefix_bytes.is_empty() {
-                info!(
-                    addr = %self.master_stream_addr,
-                    filter = %hex::encode(&filter[..n]),
-                    "syncing app tree (unified, whole tree)"
-                );
-                return self.sync_single_shard(l2.to_vec(), expected_roots).await;
+                info!(%addr, filter = %hex::encode(&filter[..n]), "syncing app tree (unified, whole tree)");
+                return self.sync_single_shard(addr, l2.to_vec(), expected_roots).await;
             }
-            info!(
-                addr = %self.master_stream_addr,
-                filter = %hex::encode(&filter[..n]),
-                "syncing shard subtree (unified, range diff — only this prefix)"
-            );
-            return self.sync_shard_subtree(filter, expected_roots).await;
+            info!(%addr, filter = %hex::encode(filter), "syncing shard subtree (unified, range diff — only this prefix)");
+            return self.sync_shard_subtree(addr, filter, expected_roots).await;
         }
         // QUIL splits 64-way: its state lives in sub-shard trees (app‖prefix),
         // verified as a set via the aggregation binding (all 4 phases).
         if l2 == quil_execution::domains::QUIL_TOKEN {
-            info!(addr = %self.master_stream_addr, "syncing QUIL app (forest diff, 64 sub-shards)");
-            return self.sync_split_shard(l2, expected_roots).await;
+            info!(%addr, "syncing QUIL app (forest diff, 64 sub-shards)");
+            return self.sync_split_shard(addr, l2, expected_roots).await;
         }
-        info!(
-            addr = %self.master_stream_addr,
-            filter = %hex::encode(&filter[..n]),
-            "syncing app-shard tree (forest diff, single-shard)"
-        );
-        self.sync_single_shard(l2.to_vec(), expected_roots).await
-    }
-
-    async fn get_app_shard_frame(
-        &self,
-        filter: &[u8],
-        frame_number: u64,
-    ) -> Result<Option<quil_types::proto::global::AppShardFrame>> {
-        let addr = self.resolve_addr().await?;
-        let mut client = ArchiveClient::connect_mtls(&addr, &self.falcon_signing_key)
-            .await
-            .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
-        client
-            .get_app_shard_frame(filter.to_vec(), frame_number)
-            .await
-            .map_err(|e| QuilError::Internal(format!("get app-shard frame: {e}")))
+        info!(%addr, filter = %hex::encode(&filter[..n]), "syncing app-shard tree (forest diff, single-shard)");
+        self.sync_single_shard(addr, l2.to_vec(), expected_roots).await
     }
 }
 
@@ -386,5 +432,30 @@ mod archive_routing_tests {
         syncer.discover_archives_from_master = false;
         syncer.master_stream_addr = "127.0.0.1:8340".into();
         assert_eq!(syncer.resolve_addr().await.unwrap(), "127.0.0.1:8340");
+    }
+
+    #[tokio::test]
+    async fn a_source_that_failed_is_passed_over_while_another_is_known() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg_store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        let syncer = ProdProverTreeSyncer {
+            master_stream_addr: String::new(), hg_store, crdt,
+            falcon_signing_key: vec![], archive_pool: Some(pool.clone()),
+            discover_archives_from_master: false,
+        };
+        let (slow, other) = ("192.0.2.1:8340", "192.0.2.2:8340");
+        pool.add(slow.into()).await;
+        pool.add(other.into()).await;
+        source_failed(slow);
+        for _ in 0..3 {
+            assert_eq!(syncer.resolve_addr().await.unwrap(), other);
+        }
+        // With every known archive failing, recovery still tries one.
+        source_failed(other);
+        assert!([slow, other].contains(&syncer.resolve_addr().await.unwrap().as_str()));
     }
 }

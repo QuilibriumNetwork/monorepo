@@ -170,42 +170,53 @@ trait VerifiedHeaders: Sync {
     async fn get(&self, number: u64) -> Result<FrameHeader>;
 }
 
+/// How long fetching one historical frame from a peer may take.
+const FRAME_FETCH_BUDGET: Duration = Duration::from_secs(8);
+/// How long preparing one frame's history may take: its GLOBAL anchor and
+/// storage registrations can come from peers, the registrations under their
+/// own 15 s budget, whose errors this leaves visible. One 3 s budget for
+/// fetch, preparation and validation together cut every frame that needed a
+/// peer short, so recovery never progressed. Recovery runs on the engine's
+/// retry tick; the batch still stops after 3 s between frames.
+const FRAME_HISTORY_BUDGET: Duration = Duration::from_secs(17);
+
 #[async_trait::async_trait]
 impl VerifiedHeaders for Headers<'_> {
     async fn get(&self, number: u64) -> Result<FrameHeader> {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let frame = match self.clock.get_shard_clock_frame(self.filter, number, false) {
-                Ok(frame) => frame,
-                Err(QuilError::NotFound(_)) => {
-                    let source = self
-                        .source
-                        .ok_or_else(|| unavailable("no historical frame source"))?;
-                    source(self.filter.to_vec(), number).await.ok_or_else(|| {
-                        unavailable(format!("historical frame {number} unavailable"))
-                    })?
-                }
-                Err(error) => return Err(error),
-            };
-            if frame.encoded_len() > MAX_FRAME_BYTES
-                || frame
-                    .header
-                    .as_ref()
-                    .is_none_or(|h| h.address != self.filter || h.frame_number != number)
-            {
-                return Err(unavailable("wrong or oversized historical frame"));
+        let frame = match self.clock.get_shard_clock_frame(self.filter, number, false) {
+            Ok(frame) => frame,
+            Err(QuilError::NotFound(_)) => {
+                let source = self
+                    .source
+                    .ok_or_else(|| unavailable(format!("no source for historical frame {number}")))?;
+                tokio::time::timeout(FRAME_FETCH_BUDGET, source(self.filter.to_vec(), number))
+                    .await
+                    .map_err(|_| unavailable(format!("fetching historical frame {number} timed out")))?
+                    .ok_or_else(|| unavailable(format!("no peer served historical frame {number}")))?
             }
-            self.validator.prepare_storage_history(&frame).await?;
-            if !crate::app_engine::validate_app_frame_panic_safe(self.validator, &frame, false)? {
-                return Err(QuilError::InvalidSignature(
-                    "historical frame rejected".into(),
-                ));
-            }
-            // Recovery consumes authenticated headers only. Unchecked request
-            // bodies are never installed into the canonical frame store.
-            Ok(frame.header.expect("checked above"))
-        })
-        .await
-        .map_err(|_| unavailable("historical frame validation timed out"))?
+            Err(error) => return Err(error),
+        };
+        if frame.encoded_len() > MAX_FRAME_BYTES
+            || frame
+                .header
+                .as_ref()
+                .is_none_or(|h| h.address != self.filter || h.frame_number != number)
+        {
+            return Err(unavailable(format!("historical frame {number} is the wrong frame or oversized")));
+        }
+        tokio::time::timeout(FRAME_HISTORY_BUDGET, self.validator.prepare_storage_history(&frame))
+            .await
+            .map_err(|_| unavailable(format!("preparing historical frame {number}'s anchor and storage history timed out")))?
+            .map_err(|error| match error {
+                QuilError::ExecutionUnavailable(message) => unavailable(format!("historical frame {number}: {message}")),
+                other => other,
+            })?;
+        if !crate::app_engine::validate_app_frame_panic_safe(self.validator, &frame, false)? {
+            return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
+        }
+        // Recovery consumes authenticated headers only. Unchecked request
+        // bodies are never installed into the canonical frame store.
+        Ok(frame.header.expect("checked above"))
     }
 }
 

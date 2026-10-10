@@ -494,7 +494,7 @@ impl ArchiveAppShardIngest {
                     }
                 }
                 warn!(
-                    address = %hex::encode(&address[..address.len().min(8)]),
+                    address = %hex::encode(address),
                     missing_from = next_needed,
                     buffered_ahead = ahead,
                     "archive app-shard frame gap awaiting recovery"

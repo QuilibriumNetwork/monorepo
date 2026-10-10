@@ -262,8 +262,8 @@ impl AppParentExecutor {
                 return Err(unavailable("selected parent fails proposal validation"));
             }
         }
-        if !(self.canonical_check)(&chain[0]) {
-            return Err(unavailable("selected parent fails proposal validation"));
+        if let Err((reason, detail)) = (self.canonical_check)(&chain[0]) {
+            return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
         }
         let frame = chain.last().expect("a chain holds the selected parent").clone();
         let header = frame
@@ -310,8 +310,8 @@ impl AppParentExecutor {
                     self.leader.shard_drain.clone(),
                     None,
                 );
-                if !check(frame) {
-                    return Err(unavailable("selected parent fails proposal validation"));
+                if let Err((reason, detail)) = check(frame) {
+                    return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
                 }
             }
             let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();

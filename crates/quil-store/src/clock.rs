@@ -147,6 +147,24 @@ impl RocksClockStore {
         Ok(frame)
     }
 
+    /// The canonical global frame's header alone: from the frame cache when
+    /// it holds the frame, else the header key, never its request bundles.
+    pub fn get_global_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader> {
+        let cached = {
+            let cache = self.global_memory.cache.read().unwrap();
+            cache.enabled.then(|| cache.get(frame_number)).flatten()
+        };
+        if let Some(header) = cached.and_then(|frame| frame.header.clone()) {
+            return Ok(header);
+        }
+        let header_bytes = self.db
+            .get(encoding::clock_global_frame_key(frame_number))
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound(format!("global frame {} not found", frame_number)))?;
+        global::GlobalFrameHeader::decode(header_bytes.as_slice())
+            .map_err(|e| QuilError::Serialization(e.to_string()))
+    }
+
     fn read_global_frame(&self, frame_number: u64) -> Result<global::GlobalFrame> {
         // Read header
         let header_key = encoding::clock_global_frame_key(frame_number);
@@ -1265,6 +1283,9 @@ impl store::ClockStore for RocksClockStore {
     fn get_latest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> { self.get_latest_global_frame() }
     fn get_earliest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> { self.get_earliest_global_frame() }
     fn get_global_clock_frame(&self, n: u64) -> Result<proto::global::GlobalFrame> { self.get_global_frame(n) }
+    fn get_global_clock_frame_header(&self, n: u64) -> Result<proto::global::GlobalFrameHeader> {
+        self.get_global_frame_header(n)
+    }
     fn put_global_clock_frame(&self, f: &proto::global::GlobalFrame, t: &dyn store::Transaction) -> Result<()> {
         self.put_global_frame_via_txn(f, t)
     }

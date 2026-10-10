@@ -66,6 +66,15 @@ impl ClockStore for GlobalAnchorView {
         }
         self.inner.get_global_clock_frame(frame_number)
     }
+    fn get_global_clock_frame_header(&self, frame_number: u64) -> Result<proto::global::GlobalFrameHeader> {
+        if frame_number > self.max_frame {
+            return Err(QuilError::NotFound(format!(
+                "GLOBAL frame {frame_number} is above the anchor {}",
+                self.max_frame
+            )));
+        }
+        self.inner.get_global_clock_frame_header(frame_number)
+    }
     fn get_global_clock_frame_outcomes(
         &self,
         frame_number: u64,

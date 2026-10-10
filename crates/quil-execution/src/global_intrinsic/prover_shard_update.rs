@@ -1677,6 +1677,41 @@ mod tests {
     }
 
     #[test]
+    /// Cost of one participant's activity update and its parts, for
+    /// shard-header execution time (mainnet: ~9 ms per participant).
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_participant_activity_update() {
+        let filter = vec![0xAAu8; 35];
+        let state = make_state();
+        let mut prover = fake_prover(1, 1, 0, &filter);
+        prover.public_key = vec![7u8; 897];
+        seed_alloc_blob(&state, &prover, &filter);
+        let n = 200u32;
+        let time = |what: &str, f: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            for _ in 0..n { f(); }
+            eprintln!("{what}: {:?} each", started.elapsed() / n);
+        };
+        time("allocation_address", &mut || { allocation_address(&prover.public_key, &filter).unwrap(); });
+        let alloc_addr = allocation_address(&prover.public_key, &filter).unwrap();
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap().unwrap();
+        time("rebuild tree", &mut || { rebuild_vertex_tree_from_blob(&blob); });
+        let tree = rebuild_vertex_tree_from_blob(&blob);
+        time("serialize tree", &mut || { vertex_tree_to_blob(&tree); });
+        let mut frame = 100u64;
+        time("state.set", &mut || {
+            frame += 1;
+            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc, frame, blob.clone()).unwrap();
+        });
+        time("update_allocation_activity", &mut || {
+            frame += 1;
+            update_allocation_activity(&state, frame, &prover, &filter).unwrap();
+        });
+    }
+
+    #[test]
     fn update_allocation_activity_sets_last_active() {
         let state = make_state();
         let filter = vec![0xAAu8; 32];

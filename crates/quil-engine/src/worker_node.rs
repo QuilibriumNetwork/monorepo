@@ -882,12 +882,9 @@ impl WorkerOnlyNode {
                                                 tokio::select! {
                                                     biased;
                                                     _ = cancel.cancelled() => {},
-                                                    result = crate::prover_tree_syncer::recover_shard_from_latest(
+                                                    _ = target.execution_record().recovering(&filter, crate::prover_tree_syncer::recover_shard_from_latest(
                                                         syncer.as_ref(), &filter, local, &target,
-                                                    ) => match result {
-                                                        Ok(progress) => info!(filter = %hex::encode(&filter), ?progress, "cluster archive recovery batch complete"),
-                                                        Err(error) => warn!(filter = %hex::encode(&filter), %error, "cluster archive recovery failed; will retry"),
-                                                    },
+                                                    )) => {}
                                                 }
                                             });
                                         }

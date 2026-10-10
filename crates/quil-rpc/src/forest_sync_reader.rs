@@ -29,9 +29,13 @@ pub const REMOTE_BATCHES_IN_FLIGHT: usize = 4;
 /// How long a request keeps retrying an archive that answers busy before
 /// the walk gives up on that archive.
 const BUSY_RETRY_FOR: Duration = Duration::from_secs(90);
+/// Times a request is sent again after outrunning its deadline. One slow
+/// answer used to end a whole download attempt, however far it had come.
+const TIMEOUT_RETRIES: usize = 3;
 
 /// Run `request` until it succeeds, retrying an archive that answers busy
-/// (with backoff) and a connection that dropped (at once, a few times).
+/// or too slowly (with backoff) and a connection that dropped (at once, a
+/// few times).
 pub async fn retry_forest_read<T, F, Fut>(request: F) -> std::result::Result<T, ArchiveClientError>
 where
     F: FnMut() -> Fut,
@@ -78,9 +82,16 @@ where
     let started = std::time::Instant::now();
     let mut backoff = Duration::from_millis(200);
     let mut transport_retries = 0;
+    let mut timeouts = 0;
     loop {
         match request().await {
             Err(e) if e.is_busy() && started.elapsed() < busy_for => {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+            Err(e) if e.is_timeout() && timeouts < TIMEOUT_RETRIES => {
+                timeouts += 1;
+                tracing::debug!(timeouts, error = %e, "archive read outran its deadline; sending it again");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
@@ -358,6 +369,27 @@ mod tests {
 
     fn busy() -> ArchiveClientError {
         ArchiveClientError::Rpc(tonic::Status::resource_exhausted("forest read workers busy; retry later"))
+    }
+
+    /// A read that outruns its deadline goes again a bounded number of
+    /// times; an archive that keeps outrunning it fails the request.
+    #[tokio::test]
+    async fn timed_out_reads_are_sent_again_a_few_times() {
+        let timeout = || ArchiveClientError::Rpc(tonic::Status::cancelled("Timeout expired"));
+        assert!(timeout().is_timeout() && !timeout().is_busy() && !timeout().is_transport_failure());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let answered = retry_forest_read(|| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { if n < 2 { Err(timeout()) } else { Ok(n) } }
+        }).await;
+        assert_eq!(answered.unwrap(), 2);
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let failed: std::result::Result<(), _> = retry_forest_read(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(timeout()) }
+        }).await;
+        assert!(failed.unwrap_err().is_timeout());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1 + TIMEOUT_RETRIES);
     }
 
     /// Partial answers are completed from where they stopped, batches come

@@ -125,7 +125,15 @@ pub struct GlobalSeamProposer {
     /// Without it, the vote-time check halts on the fork but the reconcile never
     /// hears about it → permanent stall. `None` in tests / non-archive nodes.
     on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// The view this node is letting a finalized parent publish in, and since
+    /// when ([`Self::yield_to_publication`]), and how long it may.
+    publication_wait: Mutex<Option<(u64, std::time::Instant)>>,
+    publication_priority: std::time::Duration,
 }
+
+/// Longest a proposal or vote waits per view for this node to publish its
+/// finalized parent rather than execute it privately.
+const PUBLICATION_PRIORITY: std::time::Duration = std::time::Duration::from_secs(8);
 
 impl GlobalSeamProposer {
     pub fn new(
@@ -144,6 +152,33 @@ impl GlobalSeamProposer {
             block_store: None,
             selected_execution: None,
             on_prover_fork,
+            publication_wait: Mutex::new(None),
+            publication_priority: PUBLICATION_PRIORITY,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_publication_priority(mut self, priority: std::time::Duration) -> Self {
+        self.publication_priority = priority;
+        self
+    }
+
+    /// Let the finalized parent `number` publish before executing it
+    /// privately for `view`'s proposal: that executes it once instead of twice
+    /// on the single execution lease. At most [`PUBLICATION_PRIORITY`] per
+    /// view, so a finalizer that cannot publish (an application-frame gap)
+    /// never holds a vote or proposal back for long.
+    fn yield_to_publication(&self, executor: &crate::frame_materializer::GlobalParentExecutor, view: u64, number: u64) -> bool {
+        if !executor.publication_pending(number) {
+            return false;
+        }
+        let Ok(mut waiting) = self.publication_wait.lock() else { return false };
+        match *waiting {
+            Some((waited_view, since)) if waited_view == view => since.elapsed() < self.publication_priority,
+            _ => {
+                *waiting = Some((view, std::time::Instant::now()));
+                true
+            }
         }
     }
 
@@ -301,6 +336,9 @@ impl GlobalProposer for GlobalSeamProposer {
         };
         if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return None; }
         let number = self.selected_parent_number(context.parent)?;
+        if self.yield_to_publication(executor, context.view, number) {
+            return None; // retried by `propose_retry`
+        }
         let prepared = match executor.prepare(context, number, self.block_store.as_ref()?, &self.verifier, true) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -353,6 +391,9 @@ impl GlobalProposer for GlobalSeamProposer {
             || frame_digest(header) != Some(digest) || !self.verifier.validate(&frame).unwrap_or(false)
             || !self.verifier.verify_global_requests_root(header, &frame.requests) { return Ok(false); }
         let Some(number) = self.selected_parent_number(context.parent) else { return Ok(false) };
+        if self.yield_to_publication(executor, context.view, number) {
+            return Err(DEFER);
+        }
         let Some(blocks) = self.block_store.as_ref() else { return Ok(false) };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,

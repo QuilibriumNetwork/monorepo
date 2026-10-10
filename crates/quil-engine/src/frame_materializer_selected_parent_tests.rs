@@ -522,6 +522,35 @@ fn a_busy_voter_defers_and_then_votes_on_the_same_proposal() {
     assert!(!rig.executor.busy(), "a vote releases the lease");
 }
 
+/// A finalized parent this node has not published yet is published first:
+/// executing it privately for the proposal executes it twice, one after the
+/// other on the single execution lease. The wait is bounded per view: past it
+/// the voter executes the parent privately and votes, so a finalizer that
+/// cannot publish never costs the vote.
+#[test]
+fn a_voter_lets_its_finalized_parent_publish_before_executing_it_privately() {
+    let rig = Rig::new();
+    let parent = rig.deploy();
+    rig.put(&parent);
+    let expected = Fixture::new(Some(rig.signer.public_key()));
+    expected.source.materialize(&parent).unwrap();
+    let context = rig.context(&parent);
+    let child = state_frame(&expected.source, 2, context.view, context.parent);
+    let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
+
+    assert!(!rig.executor.publication_pending(1), "nothing finalized yet");
+    rig.executor.note_finalized(1);
+    assert!(rig.executor.publication_pending(1));
+    let seam = rig.seam(&parent);
+    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "defers to publication");
+    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "within the view's wait");
+    assert!(!rig.executor.busy(), "deferring takes no lease");
+
+    let impatient = rig.seam(&parent).with_publication_priority(std::time::Duration::ZERO);
+    assert!(impatient.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "the wait starts");
+    assert_eq!(impatient.verify_or_defer(context, id(&child), Some(encoded)), Ok(true), "then it votes");
+}
+
 #[test]
 fn selected_parent_bounds_ancestry_and_releases_admission_on_unwind() {
     let rig = Rig::new();
