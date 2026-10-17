@@ -11,7 +11,7 @@ use quil_types::proto::global;
 /// (see [`DOMAIN_2_1_0`]); at-or-below keep the legacy challenge for byte-exact
 /// verification of the migrated head. `669976` (the first 2.1.0 frame) matches
 /// `FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX`.
-const GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME: u64 = 669975;
+pub const GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME: u64 = 669975;
 
 /// Version-domain prefix mixed into the 2.1.0 global-frame VDF challenge —
 /// `0x02 0x01 0x00` for v2.1.0. Prevents a pre-flag-day frame from being
