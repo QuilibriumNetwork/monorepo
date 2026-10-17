@@ -593,6 +593,81 @@ fn resync_when_already_converged_is_stable() {
     assert_eq!(second, leader_root, "re-sync of a converged follower leaves the root unchanged");
 }
 
+/// Legacy sync could publish the complete tree before downloading its blobs.
+/// Equal roots must therefore trigger a data audit until every leaf is readable.
+#[test]
+fn matching_legacy_roots_repair_missing_empty_and_stale_blobs() {
+    use quil_forest::SubtreeSyncAnchor;
+    use quil_types::store::HypergraphStore;
+
+    for phase in [0, 2] {
+        let add = if phase == 0 { HypergraphCrdt::add_vertex } else { HypergraphCrdt::add_hyperedge };
+        let read = if phase == 0 { HypergraphCrdt::get_vertex_data_checked } else { HypergraphCrdt::get_hyperedge_data_checked };
+        let set = if phase == 0 { "vertex" } else { "hyperedge" };
+        for bad_blob in [None, Some(Vec::new()), Some(b"stale payload".to_vec())] {
+            let location = |key| Location { app_address: GLOBAL_APP, data_address: [key; 32] };
+            let source = fresh_crdt();
+            for key in 1..=3 { add(&source, &location(key), &[key; 48]).unwrap(); }
+            source.commit(1).unwrap();
+            let (source_version, root) = source.serve_forest_head(&GLOBAL_APP, phase).unwrap();
+            let reader = InProcTreeReader { source, shard_id: GLOBAL_APP.to_vec(), phase };
+            let store = Arc::new(MemStore::new());
+            let target = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+            let (_, local_version, _) = target.sync_shard_phase_from(
+                &reader, source_version, &GLOBAL_APP, phase,
+            ).unwrap();
+            assert_eq!(target.current_forest_phase_root(&GLOBAL_APP, phase).unwrap(), root);
+            assert!(!target.sync_data_ready(&GLOBAL_APP, phase, &[]).unwrap());
+            if let Some(blob) = bad_blob {
+                let shard = quil_types::store::ShardKey {
+                    l1: quil_hypergraph::addressing::get_bloom_filter_indices(&GLOBAL_APP, 256, 3),
+                    l2: GLOBAL_APP,
+                };
+                let txn = store.new_transaction(false).unwrap();
+                for key in 1..=3 {
+                    store.save_vertex_underlying_versioned(
+                        txn.as_ref(), set, "adds", &shard, &location(key).to_id(), &blob, local_version,
+                    ).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            for key in 1..=3 {
+                assert_ne!(read(&target, &location(key)).unwrap(), Some(vec![key; 48]));
+            }
+            let mut plan = target.prepare_phase_sync(
+                &reader, source_version, &GLOBAL_APP, phase, &[], Some(SubtreeSyncAnchor::AppRoot(root)),
+            ).unwrap();
+            assert_eq!(plan.remaining().len(), 3, "equal roots must not hide legacy blob holes");
+
+            // A peer's unbound bytes must neither change the head nor mark the
+            // audit complete. A later valid response can resume the same plan.
+            let before = target.serve_forest_head(&GLOBAL_APP, phase);
+            assert!(target.apply_sync_chunk(&mut plan, &[b"wrong peer data".to_vec()]).is_err());
+            assert_eq!(target.serve_forest_head(&GLOBAL_APP, phase), before);
+            assert_eq!(plan.remaining().len(), 3);
+            assert!(!target.sync_data_ready(&GLOBAL_APP, phase, &[]).unwrap());
+            while let Some((key, _)) = plan.remaining().first() {
+                let byte = key[0];
+                target.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+                assert_eq!(read(&target, &location(byte)).unwrap(), Some(vec![byte; 48]));
+                assert_eq!(target.sync_data_ready(&GLOBAL_APP, phase, &[]).unwrap(), plan.remaining().is_empty());
+                assert_eq!(target.current_forest_phase_root(&GLOBAL_APP, phase).unwrap(), root);
+            }
+            assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
+            for key in 1..=3 {
+                assert_eq!(read(&target, &location(key)).unwrap(), Some(vec![key; 48]));
+            }
+            let before = target.serve_forest_head(&GLOBAL_APP, phase);
+            let repeat = target.prepare_phase_sync(
+                &reader, source_version, &GLOBAL_APP, phase, &[], Some(SubtreeSyncAnchor::AppRoot(root)),
+            ).unwrap();
+            assert!(repeat.remaining().is_empty(), "a completed audit must not redownload unchanged leaves");
+            assert_eq!(target.finish_phase_sync(&repeat).unwrap(), root);
+            assert_eq!(target.serve_forest_head(&GLOBAL_APP, phase), before);
+        }
+    }
+}
+
 /// A local commit landing mid-download rebases the sync instead of throwing
 /// the download away: a key the commit created is removed again (GLOBAL), a
 /// key it changed outside the plan goes back to the certified value, and a
