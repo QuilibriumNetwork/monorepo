@@ -8,10 +8,10 @@
 //!
 //! - [`count_bits`] — population count (number of set bits)
 //! - [`has_overlapping_bits`] — detect whether two bitmasks share any
-//!   set bit positions (fast equivocation check)
+//! set bit positions (fast equivocation check)
 //! - [`bit_is_set`] / [`set_bit`] — individual bit access
 //! - [`intersect`] / [`union`] — set operations on equal-length
-//!   bitmasks
+//! bitmasks
 //!
 //! All functions treat missing trailing bytes as zero — e.g. a
 //! length-4 bitmask is equivalent to a length-8 bitmask padded with

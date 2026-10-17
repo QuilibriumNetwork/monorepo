@@ -16,7 +16,7 @@ use num_bigint::BigInt;
 use tempfile::TempDir;
 use tonic::Request;
 
-use quil_crypto::KzgInclusionProver;
+use quil_tries::ShaInclusionProver;
 use quil_rpc::node_service::NodeRpcServer;
 use quil_store::{RocksDb, RocksHypergraphStore};
 use quil_tries::{serialize_go_tree, LazyVectorCommitmentTree, VectorCommitmentTree};
@@ -40,7 +40,7 @@ fn build_and_serialize() -> (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
     for (k, v) in &leaves {
         tree.insert(k, v, &hash_target, &size).unwrap();
     }
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     tree.commit(&prover);
     let bytes = serialize_go_tree(tree.root.as_ref()).unwrap();
     (bytes, leaves)
@@ -250,7 +250,7 @@ async fn get_vertex_data_round_trips_through_real_commit_path() {
     )
     .unwrap();
     let txn = store.new_transaction(false).unwrap();
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.commit().unwrap();
 
@@ -365,7 +365,7 @@ async fn get_vertex_data_not_visible_when_commit_txn_aborted() {
     )
     .unwrap();
     let txn = store.new_transaction(false).unwrap();
-    let prover = KzgInclusionProver;
+    let prover = ShaInclusionProver;
     lazy.commit(txn.as_ref(), &prover).unwrap();
     txn.abort().unwrap(); // drop without committing
 

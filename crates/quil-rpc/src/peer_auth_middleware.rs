@@ -16,14 +16,22 @@
 //! router before interceptors see it). That's why policy enforcement
 //! is pushed to the handler level, where the method is implicit.
 //!
-//! Full mTLS verification (proving the peer actually owns the Ed448
-//! key they claim in the SAN via the `xsign` cross-signature) is
-//! performed at the TLS layer by
+//! Full mTLS verification is performed at the TLS layer by
 //! [`crate::quil_tls::XsignClientCertVerifier`], which rustls invokes
-//! during the handshake. By the time a request reaches this
-//! interceptor the SAN's Ed448 → libp2p PeerID mapping has been
-//! cryptographically vouched for; this interceptor only re-decodes
-//! it from the cert to attach to the request extension.
+//! during the handshake. Two distinct checks run there, and both are
+//! required for the identity to be trustworthy:
+//! 1. **xsign cross-signature** (`verify_xsign`) — proves the cert's
+//! Ed25519 key was authorized by the Ed448 identity named in the
+//! SAN (the cert is internally well-formed). This is static and
+//! replayable on its own.
+//! 2. **proof-of-possession** (`verify_tls1x_signature`) — the TLS
+//! `CertificateVerify` check, proving the live peer on *this*
+//! connection actually holds the cert key's private half. Without
+//! it a public peer cert could be replayed by anyone.
+//! By the time a request reaches this interceptor both checks have
+//! passed, so the SAN's Ed448 → libp2p PeerID mapping is bound to a
+//! live key-holder; this interceptor only re-decodes it from the cert
+//! to attach to the request extension.
 
 use tonic::{Request, Status};
 use tracing::debug;
@@ -43,29 +51,30 @@ pub struct PeerCertInfo {
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPeer {
     pub peer_id: PeerId,
-    pub ed448_public_key: Vec<u8>,
+    pub falcon_public_key: Vec<u8>,
 }
 
-/// Decode the peer's Ed448 public key + libp2p PeerID from an X.509
+/// Decode the peer's Falcon public key + libp2p PeerID from an X.509
 /// cert's SAN DNS name. Returns `None` on any parse failure.
 ///
 /// Matches the encoding written by
 /// [`quil_tls::build_quil_tls_cert`](crate::quil_tls::build_quil_tls_cert):
-/// `hex(ed448_pub_57 || xsign_114)`.
+/// `hex(falcon_pub_897 || xsign_666)`.
 pub fn peer_identity_from_cert(cert_der: &[u8]) -> Option<(Vec<u8>, PeerId)> {
+    const BLOB_LEN: usize =
+        quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN;
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
     let san = cert.subject_alternative_name().ok().flatten()?;
     for name in &san.value.general_names {
         if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
             let Ok(all) = hex::decode(dns) else { continue };
-            if all.len() < 57 {
+            if all.len() != BLOB_LEN {
                 continue;
             }
-            let ed448_pub = all[..57].to_vec();
-            let peer_id_bytes =
-                quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pub);
+            let falcon_pub = all[..quil_crypto::FALCON_PUBLIC_KEY_LEN].to_vec();
+            let peer_id_bytes = quil_p2p::peer_id_from_falcon_pubkey(&falcon_pub);
             if let Ok(peer_id) = PeerId::from_bytes(&peer_id_bytes) {
-                return Some((ed448_pub, peer_id));
+                return Some((falcon_pub, peer_id));
             }
         }
     }
@@ -83,6 +92,25 @@ pub fn peer_identity_from_cert(cert_der: &[u8]) -> Option<(Vec<u8>, PeerId)> {
 /// plaintext calls.
 pub fn peer_auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
     if req.extensions().get::<AuthenticatedPeer>().is_some() {
+        return Ok(req);
+    }
+
+    // PQNoise path (the post-quantum :8340 transport): identity is the
+    // handshake-verified PeerId, surfaced via the custom `Connected` impl as a
+    // `PqConnectInfo` extension — no TLS cert. The signature over the
+    // channel-binding handshake hash IS the proof-of-possession the mTLS
+    // `CertificateVerify` provided. `falcon_public_key` is left empty because no
+    // downstream consumer reads it — the identity gate is on the peer_id.
+    if let Some(pq) = req
+        .extensions()
+        .get::<crate::pqnoise_channel::PqConnectInfo>()
+        .cloned()
+    {
+        debug!(peer_id = %pq.peer_id, "authenticated inbound peer from pqnoise handshake");
+        req.extensions_mut().insert(AuthenticatedPeer {
+            peer_id: pq.peer_id,
+            falcon_public_key: Vec::new(),
+        });
         return Ok(req);
     }
 
@@ -107,7 +135,7 @@ pub fn peer_auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status
             debug!(%peer_id, "authenticated inbound peer from cert");
             req.extensions_mut().insert(AuthenticatedPeer {
                 peer_id,
-                ed448_public_key: pubkey,
+                falcon_public_key: pubkey,
             });
         }
     }
@@ -149,17 +177,27 @@ mod tests {
     fn real_tls_cert_derives_peer_identity() {
         // Build an actual cert via build_quil_tls_cert, then parse the
         // PEM-encoded cert back into DER and feed through the extractor.
-        let seed = [0x42u8; 57];
-        let tls = crate::quil_tls::build_quil_tls_cert(&seed).unwrap();
+        use quil_types::crypto::Signer as _;
+        let signer = quil_crypto::FalconSigner::generate();
+        let tls = crate::quil_tls::build_quil_tls_cert(signer.private_key()).unwrap();
         // tls.cert_pem is PEM — decode to DER.
         let der_blocks: Vec<Vec<u8>> = rustls_pemfile::certs(&mut tls.cert_pem.as_bytes())
             .filter_map(|r| r.ok())
             .map(|c| c.to_vec())
             .collect();
         assert!(!der_blocks.is_empty(), "cert_pem should produce at least one DER block");
-        let (pubkey, _peer_id) = peer_identity_from_cert(&der_blocks[0])
+        let (pubkey, peer_id) = peer_identity_from_cert(&der_blocks[0])
             .expect("cert SAN should decode to a valid peer identity");
-        assert_eq!(pubkey.len(), 57, "Ed448 public key should be 57 bytes");
+        assert_eq!(
+            pubkey,
+            signer.public_key(),
+            "SAN should carry the Falcon public key"
+        );
+        assert_eq!(
+            peer_id.to_bytes(),
+            quil_p2p::peer_id_from_falcon_pubkey(signer.public_key()),
+            "peer id should be Falcon-derived"
+        );
 
         // Now pass through the full interceptor to confirm end-to-end.
         let mut req: Request<()> = Request::new(());
@@ -168,6 +206,9 @@ mod tests {
         });
         let out = peer_auth_interceptor(req).unwrap();
         let ap = out.extensions().get::<AuthenticatedPeer>().expect("auth set");
-        assert_eq!(ap.ed448_public_key.len(), 57);
+        assert_eq!(
+            ap.falcon_public_key.len(),
+            quil_crypto::FALCON_PUBLIC_KEY_LEN
+        );
     }
 }

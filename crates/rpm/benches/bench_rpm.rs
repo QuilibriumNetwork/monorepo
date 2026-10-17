@@ -2,16 +2,16 @@ use curve25519_dalek::Scalar;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn criterion_benchmark(c: &mut Criterion) {
-  let smsize = 100;
+  let smsize: usize = 100;
   let msize = smsize*smsize;
-  let depth = 4;
-  let players = 9;
-  let dealers = 3;
+  let depth: usize = 4;
+  let players: usize = 9;
+  let dealers: usize = 3;
 
   //todo parties should be + 1
-  let is1 = rpm::rpm_generate_initial_shares(msize, depth, dealers, players);
-  let is2 = rpm::rpm_generate_initial_shares(msize, depth, dealers, players);
-  let is3 = rpm::rpm_generate_initial_shares(msize, depth, dealers, players);
+  let is1 = rpm::rpm_generate_initial_shares(msize as u64, depth as u64, dealers as u64, players as u64);
+  let is2 = rpm::rpm_generate_initial_shares(msize as u64, depth as u64, dealers as u64, players as u64);
+  let is3 = rpm::rpm_generate_initial_shares(msize as u64, depth as u64, dealers as u64, players as u64);
   let (m1, r1) = (is1.ms, is1.rs);
   let (m2, r2) = (is2.ms, is2.rs);
   let (m3, r3) = (is3.ms, is3.rs);
@@ -37,7 +37,7 @@ fn criterion_benchmark(c: &mut Criterion) {
           rs[i][2][j] = r3[j][i].clone();
       }
 
-      let cs = rpm::rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), msize, depth, dealers);
+      let cs = rpm::rpm_combine_shares_and_mask(ms[i].clone(), rs[i].clone(), msize as u64, depth as u64, dealers as u64);
       let (m, r, mrm) = (cs.ms, cs.rs, cs.mrms);
       let sp = rpm::rpm_sketch_propose(m.clone(), r.clone());
       let (mcc, rcc) = (sp.mp, sp.rp);
@@ -60,10 +60,10 @@ fn criterion_benchmark(c: &mut Criterion) {
   
   let mut group = c.benchmark_group("rpm");
   group.sample_size(10);
-  group.bench_function(format!("rpm init {}", msize), |b| b.iter(|| black_box(rpm::rpm_generate_initial_shares(msize, depth, 3, 9))));
-  group.bench_function(format!("rpm combine {}", msize), |b| b.iter(|| black_box(rpm::rpm_combine_shares_and_mask(ms[0].clone(), rs[0].clone(), msize, depth, dealers))));
+  group.bench_function(format!("rpm init {}", msize), |b| b.iter(|| black_box(rpm::rpm_generate_initial_shares(msize as u64, depth as u64, 3, 9))));
+  group.bench_function(format!("rpm combine {}", msize), |b| b.iter(|| black_box(rpm::rpm_combine_shares_and_mask(ms[0].clone(), rs[0].clone(), msize as u64, depth as u64, dealers as u64))));
   group.bench_function(format!("rpm sketch propose {}", msize), |b| b.iter(|| black_box(rpm::rpm_sketch_propose(mc[0].clone(), rc[0].clone()))));
-  group.bench_function(format!("rpm sketch verify {}", msize), |b| b.iter(|| black_box(rpm::rpm_sketch_verify(mccs.clone(), rccs.clone(), dealers))));
+  group.bench_function(format!("rpm sketch verify {}", msize), |b| b.iter(|| black_box(rpm::rpm_sketch_verify(mccs.clone(), rccs.clone(), dealers as u64))));
   group.bench_function(format!("rpm permute {}", msize), |b| b.iter(|| black_box(rpm::rpm_permute(xs.clone(), mc[0].clone(), rc[0].clone(), mrmc[0].clone(), 0, vec![1,2,3,4,5,6,7,8,9]))));
 }
 

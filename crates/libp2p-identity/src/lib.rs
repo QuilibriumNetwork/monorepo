@@ -35,11 +35,34 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(unreachable_pub)]
+
+// Quilibrium REQUIRES the Falcon (FN-DSA-512, libp2p `KeyType = 5`) key type:
+// it is the network peer identity (the `q-prover-key`). This fork is only ever
+// built as part of the Quilibrium workspace, where Falcon must always be
+// present — otherwise `KeyType = 5` peer keys silently fail to decode (the
+// match arm below is `#[cfg]`'d out) and the node cannot parse any peer.
+//
+// `falcon` is a DEFAULT feature (see Cargo.toml), so it is on unless a consumer
+// explicitly passes `default-features = false` without re-enabling it. This
+// tripwire converts that mistake — or a feature-unification / patch-resolution
+// slip that drops `falcon` — from a silent, confusing runtime failure into a
+// loud, actionable build failure. Do NOT relax it: if you hit this, add
+// `falcon` back to the `libp2p-identity` dependency's feature list.
+#[cfg(not(feature = "falcon"))]
+compile_error!(
+    "libp2p-identity was built WITHOUT the `falcon` feature, but Quilibrium \
+     mandates the Falcon (KeyType=5) network identity. Enable it on the \
+     `libp2p-identity` dependency (`features = [\"falcon\", ...]`) or keep \
+     default features enabled — do not build with `default-features = false` \
+     unless you re-add `falcon`."
+);
+
 #[cfg(any(
     feature = "ecdsa",
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 mod proto {
@@ -55,6 +78,9 @@ pub mod ed25519;
 
 #[cfg(feature = "ed448")]
 pub mod ed448;
+
+#[cfg(feature = "falcon")]
+pub mod falcon;
 
 #[cfg(all(feature = "rsa", not(target_arch = "wasm32")))]
 pub mod rsa;
@@ -72,6 +98,7 @@ mod peer_id;
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 impl zeroize::Zeroize for proto::PrivateKey {
@@ -85,6 +112,7 @@ impl zeroize::Zeroize for proto::PrivateKey {
     feature = "secp256k1",
     feature = "ed25519",
     feature = "ed448",
+    feature = "falcon",
     feature = "rsa"
 ))]
 impl From<&PublicKey> for proto::PublicKey {
@@ -115,6 +143,11 @@ impl From<&PublicKey> for proto::PublicKey {
                 Type: proto::KeyType::Ed448,
                 Data: key.to_bytes(),
             },
+            #[cfg(feature = "falcon")]
+            keypair::PublicKeyInner::Falcon(key) => proto::PublicKey {
+                Type: proto::KeyType::Falcon,
+                Data: key.to_bytes(),
+            },
         }
     }
 }
@@ -133,6 +166,7 @@ pub enum KeyType {
     Secp256k1,
     Ecdsa,
     Ed448,
+    Falcon,
 }
 
 impl std::fmt::Display for KeyType {
@@ -143,6 +177,7 @@ impl std::fmt::Display for KeyType {
             KeyType::Secp256k1 => f.write_str("Secp256k1"),
             KeyType::Ecdsa => f.write_str("Ecdsa"),
             KeyType::Ed448 => f.write_str("Ed448"),
+            KeyType::Falcon => f.write_str("Falcon"),
         }
     }
 }

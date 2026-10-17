@@ -306,7 +306,12 @@ pub fn verify_ed448(public_key: String, message: String, signature: String) -> S
     }
 
     let pub_arr: [u8; 57] = key_bytes.try_into().unwrap();
-    let pub_key = ed448_rust::PublicKey::from(pub_arr);
+    // `PublicKey::from` panics on a non-point key; this verifies untrusted input,
+    // so fail with an error string instead of crashing.
+    let pub_key = match ed448_rust::PublicKey::try_from(&pub_arr[..]) {
+        Ok(k) => k,
+        Err(_) => return "invalid public key".to_string(),
+    };
     let result = pub_key.verify(&maybe_message.unwrap(), &maybe_signature.unwrap(), None);
 
     match result {

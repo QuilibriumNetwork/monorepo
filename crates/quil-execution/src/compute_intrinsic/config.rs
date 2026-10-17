@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn compute_config_round_trip() {
-        let c = ComputeConfiguration { read_public_key: vec![1u8; 57], write_public_key: vec![2u8; 57], owner_public_key: vec![3u8; 585] };
+        let c = ComputeConfiguration { read_public_key: vec![1u8; 1158], write_public_key: vec![2u8; 57], owner_public_key: vec![3u8; 585] };
         let b = c.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_COMPUTE_CONFIGURATION.to_be_bytes());
         assert_eq!(ComputeConfiguration::from_canonical_bytes(&b).unwrap(), c);

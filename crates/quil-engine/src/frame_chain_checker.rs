@@ -38,7 +38,7 @@ fn global_frame_identity(frame: &GlobalFrame) -> Vec<u8> {
 /// - proposal has no header / no parent_selector
 /// - the proposal claims frame number 0 (genesis is never a child)
 /// - we hit a frame number the store can't resolve and which doesn't
-///   match the finalized state
+/// match the finalized state
 /// - a candidate has a mismatched `frame_number`
 ///
 /// `finalized_state` mirrors Go's `*models.State[*GlobalFrame]` —
@@ -205,6 +205,8 @@ mod tests {
                 parent_selector,
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
+                prover_tree_aux_roots: Vec::new(),
+                world_state_size: 0,
                 requests_root: Vec::new(),
                 prover: Vec::new(),
                 public_key_signature_bls48581: None,

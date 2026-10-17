@@ -4,12 +4,12 @@
 //! Same structural split as `hypergraph_engine.rs` / `global_engine.rs`:
 //!
 //! - [`compute_engine_capabilities`] — 12 protocol IDs (compute v1,
-//!   ratchets, onion, KZG verify, bulletproof range/sum verify,
-//!   SECP256K1/ED25519/ED448/DECAF448/SECP256R1 signature verify).
+//! ratchets, onion, KZG verify, bulletproof range/sum verify,
+//! SECP256K1/ED25519/ED448/DECAF448/SECP256R1 signature verify).
 //! - [`request_is_compute_op`] — boolean predicate for bundle routing.
 //! - [`MessageKindCompute`] — the five compute operation types.
 //! - [`get_cost_from_request`] — per-type cost dispatch matching Go's
-//!   `ComputeExecutionEngine::GetCost` at line 306.
+//! `ComputeExecutionEngine::GetCost` at line 306.
 
 use num_bigint::BigInt;
 use quil_types::error::{QuilError, Result};

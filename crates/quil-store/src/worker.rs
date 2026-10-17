@@ -4,18 +4,17 @@
 //! node restarts.
 //!
 //! Layout:
-//!   * `[WORKER, WORKER_BY_CORE, core_id_be_u64]` → encoded
-//!     `PersistedWorkerInfo`
-//!   * `[WORKER, WORKER_BY_FILTER, filter…]` → 8-byte BE core_id
-//!     (secondary index; lets Go-style lookups by filter resolve
-//!     to the primary record)
+//! * `[WORKER, WORKER_BY_CORE, core_id_be_u64]` → encoded
+//! `PersistedWorkerInfo`
+//! * `[WORKER, WORKER_BY_FILTER, filter…]` → 8-byte BE core_id
+//! (secondary index; lets Go-style lookups by filter resolve
+//! to the primary record)
 //!
 //! Encoding mirrors Go's `encodeWorkerInfo` field order so a
 //! Rust-written record could in principle be read by Go and vice
 //! versa, modulo the listen-multiaddr fields which we don't track
 //! (they're empty strings in the encoding — same on-disk shape).
 
-use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{PersistedWorkerInfo, WorkerStore};
@@ -23,11 +22,11 @@ use quil_types::store::{PersistedWorkerInfo, WorkerStore};
 use crate::encoding::{WORKER, WORKER_BY_CORE, WORKER_BY_FILTER};
 
 pub struct RocksWorkerStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksWorkerStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 }

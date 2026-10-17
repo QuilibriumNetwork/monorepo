@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! [u32 BE type_prefix = 0x011A]
-//! [u32 BE sig_len = 74]    [74 bytes signature]
-//! [u32 BE pubkey_len]      [pubkey canonical bytes if > 0]
+//! [u32 BE sig_len = 74] [74 bytes signature]
+//! [u32 BE pubkey_len] [pubkey canonical bytes if > 0]
 //! [u32 BE pop_sig_len = 74][74 bytes pop_signature]
 //! ```
 
@@ -15,8 +15,8 @@ use crate::canonical_cursor::{put_u32, read_u32, read_bytes};
 
 pub const TYPE_BLS48581_SIG_WITH_POP: u32 = 0x011A;
 
-const SIG_LEN: usize = 74;
-const WRAPPED_PUBKEY_LEN: usize = 589; // 4 type prefix + 585 key
+const SIG_LEN: usize = 666; // Falcon-512 signature
+const WRAPPED_PUBKEY_LEN: usize = 901; // 4 type prefix + 897 Falcon key
 
 /// Mirror of `protobufs.BLS48581SignatureWithProofOfPossession`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -126,7 +126,7 @@ mod tests {
     fn sample_sig_with_pop() -> SignatureWithPop {
         SignatureWithPop {
             signature: vec![0xAAu8; SIG_LEN],
-            public_key: Some(vec![0xBBu8; 585]),
+            public_key: Some(vec![0xBBu8; 897]),
             pop_signature: vec![0xCCu8; SIG_LEN],
         }
     }
@@ -177,7 +177,7 @@ mod tests {
     fn total_envelope_size_with_pubkey() {
         let s = sample_sig_with_pop();
         let bytes = s.to_canonical_bytes().unwrap();
-        // 4 type + (4+74) sig + (4+589) pubkey + (4+74) pop = 753
-        assert_eq!(bytes.len(), 753);
+        // 4 type + (4+666) sig + (4+901) pubkey + (4+666) pop = 2249
+        assert_eq!(bytes.len(), 4 + (4 + SIG_LEN) + (4 + WRAPPED_PUBKEY_LEN) + (4 + SIG_LEN));
     }
 }

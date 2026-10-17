@@ -58,10 +58,9 @@ pub fn get_bloom_filter_indices(data: &[u8], bit_length: usize, k: usize) -> [u8
         return [0u8; 3];
     }
 
-    // size = number of bits needed to represent bitLength
-    // For bitLength=256: size = 9 (since 2^8=256, BigInt(256).BitLen()-1 = 8,
-    // but Go uses big.NewInt(256).BitLen()-1 = 8)
-    // Actually: big.NewInt(256) = 0x100, BitLen() = 9, so size = 9-1 = 8
+    // size = bits needed to index bitLength positions; Go computes
+    // big.NewInt(bitLength).BitLen()-1. For bitLength=256: big.NewInt(256) =
+    // 0x100, BitLen() = 9, so size = 9-1 = 8.
     let size = (bit_length as f64).log2().ceil() as usize; // 8 for 256
 
     let mut hasher = Shake256::default();

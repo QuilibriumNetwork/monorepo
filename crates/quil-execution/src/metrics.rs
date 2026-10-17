@@ -23,21 +23,34 @@ pub fn register_execution_metrics() {
     );
 }
 
-/// Increment the request counter for the given engine type.
+/// Map a routed engine name to a bounded-cardinality `&'static str` label.
 #[inline]
-pub fn inc_execution_requests(engine_type: &'static str) {
-    counter!("execution_requests_total", "engine_type" => engine_type).increment(1);
+pub fn engine_label(name: &str) -> &'static str {
+    match name {
+        "global" => "global",
+        "token" => "token",
+        "compute" => "compute",
+        "hypergraph" => "hypergraph",
+        _ => "unknown",
+    }
 }
 
-/// Record an execution request duration for the given engine type.
+/// Increment the request counter for the given engine type + op
+/// (`validate` / `process` / `commit`).
 #[inline]
-pub fn observe_execution_duration(engine_type: &'static str, seconds: f64) {
-    histogram!("execution_request_duration_seconds", "engine_type" => engine_type)
+pub fn inc_execution_requests(engine_type: &'static str, op: &'static str) {
+    counter!("execution_requests_total", "engine_type" => engine_type, "op" => op).increment(1);
+}
+
+/// Record an execution request duration for the given engine type + op.
+#[inline]
+pub fn observe_execution_duration(engine_type: &'static str, op: &'static str, seconds: f64) {
+    histogram!("execution_request_duration_seconds", "engine_type" => engine_type, "op" => op)
         .record(seconds);
 }
 
-/// Increment the error counter for the given engine type.
+/// Increment the error counter for the given engine type + op.
 #[inline]
-pub fn inc_execution_errors(engine_type: &'static str) {
-    counter!("execution_errors_total", "engine_type" => engine_type).increment(1);
+pub fn inc_execution_errors(engine_type: &'static str, op: &'static str) {
+    counter!("execution_errors_total", "engine_type" => engine_type, "op" => op).increment(1);
 }

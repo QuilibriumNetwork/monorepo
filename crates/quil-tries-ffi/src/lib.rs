@@ -131,27 +131,12 @@ fn delete_recursive(
                                 Some(VectorCommitmentNode::Leaf(leaf))
                             }
                             VectorCommitmentNode::Branch(mut child_branch) => {
-                                // Merge prefixes: parent prefix + child slot nibble + child prefix
-                                // We need the slot index to reconstruct the full prefix.
-                                // Since we already took the child out, we need to find which
-                                // slot it was in. We can compute this from the iterator.
-                                // Actually, we already know: it's not at `idx` (we may have
-                                // removed that). Let's find it properly.
-                                //
-                                // Simpler approach: just keep the branch as-is when
-                                // the sole remaining child is also a branch, with merged prefix.
+                                // Merge prefixes: parent prefix + child slot nibble + child prefix.
+                                // NOTE: the sole child was already taken out of `branch.children`
+                                // above, so `find_sole_slot_index` finds no occupied slot and
+                                // falls back to 0.
                                 let merged_prefix = branch.prefix.clone();
-                                // Find which slot the remaining child was in
-                                // We need to reconstruct — we already took it out.
-                                // Re-scan to find which index had the child.
-                                // Since we already moved it out, this won't work.
-                                // Instead, just put it back and return the branch.
                                 child_branch.prefix = {
-                                    // The remaining child was at some index. We need
-                                    // to figure out which. Since all children are None
-                                    // now (we took the last one), iterate the original
-                                    // state. This is getting complicated — simplify by
-                                    // just returning the branch with one child.
                                     merged_prefix
                                         .into_iter()
                                         .chain(std::iter::once(find_sole_slot_index(&branch.children, idx)))

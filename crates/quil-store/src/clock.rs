@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::collections::BTreeMap;
 
 use prost::Message;
 
@@ -8,14 +9,117 @@ use quil_types::store;
 
 use crate::encoding;
 
+/// Finalized global frames retained by an enabled archive cache.
+pub const GLOBAL_FRAME_CACHE_CAPACITY: usize = 720;
+/// Encoded bytes the cache may retain. A frame carries its request bundles,
+/// and a confidential token operation is about 200 KB, so an entry bound alone
+/// lets a busy epoch hold gigabytes. When the budget binds, the OLDEST frames
+/// go first and fewer than 720 stay resident; the newest frame always stays.
+pub const GLOBAL_FRAME_CACHE_MAX_BYTES: usize = 512 << 20;
+
+#[derive(Default)]
+struct GlobalFrameCache {
+    enabled: bool,
+    generation: u64,
+    /// Frame and its encoded size, which is what `bytes` sums.
+    frames: BTreeMap<u64, (Arc<global::GlobalFrame>, usize)>,
+    bytes: usize,
+    max_bytes: Option<usize>,
+}
+
+impl GlobalFrameCache {
+    fn publish(&mut self, frame: Arc<global::GlobalFrame>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.insert(frame);
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.frames.clear();
+        self.bytes = 0;
+    }
+
+    fn get(&self, frame_number: u64) -> Option<Arc<global::GlobalFrame>> {
+        self.frames.get(&frame_number).map(|(frame, _)| frame.clone())
+    }
+
+    fn insert(&mut self, frame: Arc<global::GlobalFrame>) {
+        if !self.enabled { return; }
+        let Some(header) = frame.header.as_ref() else { return };
+        let size = frame.encoded_len();
+        if let Some((_, replaced)) = self.frames.insert(header.frame_number, (frame, size)) {
+            self.bytes -= replaced;
+        }
+        self.bytes += size;
+        let budget = self.max_bytes.unwrap_or(GLOBAL_FRAME_CACHE_MAX_BYTES);
+        while self.frames.len() > GLOBAL_FRAME_CACHE_CAPACITY
+            || (self.bytes > budget && self.frames.len() > 1)
+        {
+            if let Some((_, (_, evicted))) = self.frames.pop_first() {
+                self.bytes -= evicted;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct GlobalFrameMemory {
+    cache: RwLock<GlobalFrameCache>,
+    // Cache hits take neither lock. Separate heights can load concurrently;
+    // generations prevent a fill racing a commit/reset from caching old data.
+    loads: [Mutex<()>; 32],
+    writes: Mutex<()>,
+}
+
 /// RocksDB-backed clock/frame store.
 pub struct RocksClockStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
+    global_memory: Arc<GlobalFrameMemory>,
+}
+
+struct ClockPublication<'a> {
+    _writes: std::sync::MutexGuard<'a, ()>,
+    cache: std::sync::RwLockWriteGuard<'a, GlobalFrameCache>,
+}
+
+impl store::ExecutionPublicationObserver for ClockPublication<'_> {
+    fn adopt(&mut self) { self.cache.invalidate(); }
 }
 
 impl RocksClockStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
-        Self { db }
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
+        Self { db, global_memory: Arc::new(GlobalFrameMemory::default()) }
+    }
+
+    /// Enable archive retention and restore the latest 720 stored frames.
+    /// Run on a blocking worker at startup. Live commits populate the same
+    /// cache; candidates and aborted transactions never enter it.
+    pub fn warm_global_frame_cache(&self) -> Result<usize> {
+        self.global_memory.cache.write().unwrap().enabled = true;
+        let Some(head) = self.get_latest_frame_number() else { return Ok(0) };
+        // Walk stored headers rather than assuming contiguous heights: a node
+        // recovering a gap should still restore 720 frames when available.
+        let mut numbers = Vec::with_capacity(GLOBAL_FRAME_CACHE_CAPACITY);
+        {
+            let mut it = self.db.raw_iterator();
+            it.seek_for_prev(encoding::clock_global_frame_key(head));
+            while it.valid() && numbers.len() < GLOBAL_FRAME_CACHE_CAPACITY {
+                let Some(key) = it.key() else { break };
+                if key.len() != 10 || !key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME]) {
+                    break;
+                }
+                numbers.push(u64::from_be_bytes(key[2..10].try_into().unwrap()));
+                it.prev();
+            }
+            it.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        }
+        for n in numbers {
+            match self.get_global_frame(n) {
+                Ok(_) | Err(QuilError::NotFound(_)) => {},
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(self.global_memory.cache.read().unwrap().frames.len())
     }
 
     // ---------------------------------------------------------------
@@ -24,10 +128,48 @@ impl RocksClockStore {
 
     /// Get a global frame by frame number.
     pub fn get_global_frame(&self, frame_number: u64) -> Result<global::GlobalFrame> {
+        let (enabled, cached) = {
+            let cache = self.global_memory.cache.read().unwrap();
+            (cache.enabled, cache.get(frame_number))
+        };
+        if !enabled { return self.read_global_frame(frame_number); }
+        if let Some(frame) = cached { return Ok((*frame).clone()); }
+        let _load = self.global_memory.loads[(frame_number % 32) as usize].lock().unwrap();
+        let (generation, cached) = {
+            let cache = self.global_memory.cache.read().unwrap();
+            (cache.generation, cache.get(frame_number))
+        };
+        if let Some(frame) = cached { return Ok((*frame).clone()); }
+        let frame = self.read_global_frame(frame_number)?;
+        let cached = Arc::new(frame.clone());
+        let mut cache = self.global_memory.cache.write().unwrap();
+        if cache.generation == generation { cache.insert(cached); }
+        Ok(frame)
+    }
+
+    /// The canonical global frame's header alone: from the frame cache when
+    /// it holds the frame, else the header key, never its request bundles.
+    pub fn get_global_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader> {
+        let cached = {
+            let cache = self.global_memory.cache.read().unwrap();
+            cache.enabled.then(|| cache.get(frame_number)).flatten()
+        };
+        if let Some(header) = cached.and_then(|frame| frame.header.clone()) {
+            return Ok(header);
+        }
+        let header_bytes = self.db
+            .get(encoding::clock_global_frame_key(frame_number))
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .ok_or_else(|| QuilError::NotFound(format!("global frame {} not found", frame_number)))?;
+        global::GlobalFrameHeader::decode(header_bytes.as_slice())
+            .map_err(|e| QuilError::Serialization(e.to_string()))
+    }
+
+    fn read_global_frame(&self, frame_number: u64) -> Result<global::GlobalFrame> {
         // Read header
         let header_key = encoding::clock_global_frame_key(frame_number);
-        let header_bytes = self
-            .db
+        let snapshot = self.db.snapshot();
+        let header_bytes = snapshot
             .get(&header_key)
             .map_err(|e| QuilError::Store(e.to_string()))?
             .ok_or_else(|| {
@@ -38,7 +180,7 @@ impl RocksClockStore {
             .map_err(|e| QuilError::Serialization(e.to_string()))?;
 
         // Read requests
-        let requests = self.read_frame_requests(frame_number)?;
+        let requests = self.read_frame_requests(&snapshot, frame_number)?;
 
         Ok(global::GlobalFrame {
             header: Some(header),
@@ -83,6 +225,7 @@ impl RocksClockStore {
             if current_earliest.is_none() || frame_number < current_earliest.unwrap() {
                 batch.put(encoding::clock_global_earliest_index(), frame_number.to_be_bytes());
             }
+            rt.global_frames.lock().unwrap().push((self.global_memory.clone(), Arc::new(frame.clone())));
             return Ok(());
         }
 
@@ -117,8 +260,8 @@ impl RocksClockStore {
         // Pre-compute all writes.
         let latest_key = encoding::clock_global_latest_index();
         let earliest_key = encoding::clock_global_earliest_index();
-        let current_latest = self.get_latest_frame_number();
-        let current_earliest = self.get_earliest_frame_number();
+        let current_latest = self.read_u64_index_checked(&latest_key)?;
+        let current_earliest = self.read_u64_index_checked(&earliest_key)?;
         // Mirror the earliest check: if no frames are stored yet, this
         // IS the latest; otherwise compare. The previous form
         // `frame_number > unwrap_or(0)` collapsed "no frames" to "latest
@@ -145,6 +288,7 @@ impl RocksClockStore {
                 if update_earliest {
                     batch.put(&earliest_key, frame_number.to_be_bytes());
                 }
+                rt.global_frames.lock().unwrap().push((self.global_memory.clone(), Arc::new(frame.clone())));
                 return Ok(());
             }
             // Non-Rocks txn (test stub). Fall through to the `set`
@@ -164,6 +308,7 @@ impl RocksClockStore {
             return Ok(());
         }
 
+        let _writes = self.global_memory.writes.lock().unwrap();
         // No caller txn: use a local batch so 2+N+2 writes are atomic.
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(&header_key, &header_bytes);
@@ -180,6 +325,8 @@ impl RocksClockStore {
         self.db
             .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))?;
+        let cached = Arc::new(frame.clone());
+        self.global_memory.cache.write().unwrap().publish(cached);
         Ok(())
     }
 
@@ -205,6 +352,7 @@ impl RocksClockStore {
         min_frame: u64,
         max_frame: u64,
     ) -> Result<()> {
+        let _writes = self.global_memory.writes.lock().unwrap();
         let mut batch = rocksdb::WriteBatch::default();
 
         let start = encoding::clock_global_frame_key(min_frame);
@@ -218,7 +366,12 @@ impl RocksClockStore {
 
         self.db
             .write(batch)
-            .map_err(|e| QuilError::Store(e.to_string()))
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        let mut cache = self.global_memory.cache.write().unwrap();
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.frames.retain(|n, _| *n < min_frame || *n > max_frame);
+        cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -300,6 +453,77 @@ impl RocksClockStore {
         self.read_u64_index(&key)
     }
 
+    /// Scan the global frame-record keyspace and return every internal gap as
+    /// an inclusive `(lo, hi)` missing range. Key-only prefix scan — it does
+    /// NOT decode frame values, so it is cheap even over a full chain. Only
+    /// gaps BETWEEN stored frames are returned (holes left by prior restarts);
+    /// the open range above the highest stored frame is not a "gap" here. An
+    /// empty or fully-contiguous store returns `[]`.
+    pub fn find_global_frame_record_gaps(&self) -> Vec<(u64, u64)> {
+        self.find_global_frame_record_gaps_from(0)
+    }
+
+    /// The gaps between stored frame records at or above `from`: a hole below
+    /// the first record found there is not reported. Key-only.
+    pub fn find_global_frame_record_gaps_from(&self, from: u64) -> Vec<(u64, u64)> {
+        // Frame record key = [CLOCK_FRAME, CLOCK_GLOBAL_FRAME, frame(8 BE)];
+        // take the 2-byte type prefix so the scan covers exactly the frame
+        // records (request/candidate keys use different second bytes).
+        let start = encoding::clock_global_frame_key(from);
+        let prefix = &start[..2];
+        let mut gaps = Vec::new();
+        let mut prev: Option<u64> = None;
+        let mut it = self.db.raw_iterator();
+        it.seek(&start);
+        while let Some(k) = it.key() {
+            if !k.starts_with(prefix) || k.len() < 10 {
+                break;
+            }
+            let n = u64::from_be_bytes(k[2..10].try_into().unwrap());
+            if let Some(p) = prev {
+                if n > p + 1 {
+                    gaps.push((p + 1, n - 1));
+                }
+            }
+            prev = Some(n);
+            it.next();
+        }
+        gaps
+    }
+
+    /// Durable GLOBAL materialization cursor: the highest global frame whose
+    /// `requests` have been committed into the hypergraph CRDT. `None` when
+    /// absent (fresh store → treat as 0). This key is written atomically
+    /// inside the CRDT commit batch (see
+    /// [`crate::encoding::global_materialized_cursor_key`]); the global store
+    /// (clock + hypergraph) shares one RocksDB, so the write staged by the
+    /// hypergraph txn is visible here. Read at startup to seed the
+    /// materializer and drive the crash-gap re-materialize `[cursor+1..=head]`.
+    pub fn get_global_materialized_cursor(&self) -> Option<u64> {
+        let key = encoding::global_materialized_cursor_key();
+        self.read_u64_index(&key)
+    }
+
+    /// Advance the durable global materialized cursor to `frame_number`.
+    /// Normally the cursor is written atomically inside the CRDT commit batch
+    /// (one frame at a time); a state-jump syncs the CRDT state WHOLESALE from
+    /// a peer snapshot (bypassing per-frame materialize), so it uses this to
+    /// move the cursor straight to the synced head — otherwise the startup
+    /// re-materialize would try (and fail) to replay `[old_cursor+1..=synced]`.
+    /// Monotonic: never regresses the cursor (a stale/lower value is ignored),
+    /// mirroring the `update_latest` guard on the frame index.
+    pub fn put_global_materialized_cursor(&self, frame_number: u64) -> Result<()> {
+        if let Some(existing) = self.get_global_materialized_cursor() {
+            if existing >= frame_number {
+                return Ok(());
+            }
+        }
+        let key = encoding::global_materialized_cursor_key();
+        self.db
+            .put(&key, frame_number.to_be_bytes())
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
     fn read_u64_index(&self, key: &[u8]) -> Option<u64> {
         self.db
             .get(key)
@@ -308,7 +532,21 @@ impl RocksClockStore {
             .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap()))
     }
 
-    fn read_frame_requests(&self, frame_number: u64) -> Result<Vec<global::MessageBundle>> {
+    /// Like `read_u64_index` but distinguishes a genuine absence (`Ok(None)`)
+    /// from a DB read error (`Err`). Write paths that decide whether to
+    /// overwrite the latest/earliest cursor MUST use this: swallowing a
+    /// transient read error as `None` makes `update_latest` true and
+    /// overwrites the index with a lower frame number, regressing the cursor.
+    fn read_u64_index_checked(&self, key: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .db
+            .get(key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap())))
+    }
+
+    fn read_frame_requests(&self, snapshot: &rocksdb::Snapshot<'_>, frame_number: u64) -> Result<Vec<global::MessageBundle>> {
         let mut requests = Vec::new();
         let prefix_start = encoding::clock_global_frame_request_key(frame_number, 0);
         let prefix_end = encoding::clock_global_frame_request_key(frame_number, u16::MAX);
@@ -317,7 +555,7 @@ impl RocksClockStore {
         opts.set_iterate_lower_bound(prefix_start);
         opts.set_iterate_upper_bound(prefix_end);
 
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, opts);
+        let iter = snapshot.iterator_opt(rocksdb::IteratorMode::Start, opts);
         for item in iter {
             match item {
                 Ok((_key, value)) => {
@@ -335,8 +573,98 @@ impl RocksClockStore {
     }
 }
 
+#[path = "clock_retention.rs"]
+mod retention;
+pub use retention::{CandidatePrune, StagedFrameCleanup};
+
 #[cfg(test)]
 mod tests {
+    /// Serving cost of application frames without a decoded-frame cache:
+    /// every stored shard frame of a copied store (`QUIL_SERVE_STORE`), read
+    /// and decoded twice (cold, then warm in RocksDB's block cache).
+    /// Recovery tool for a STOPPED localnet store: remove the GLOBAL execution
+    /// receipt, reproducing a store executed before receipts existed. Never
+    /// point it at a running node or a production database.
+    #[test]
+    #[ignore = "drill over a stopped localnet store"]
+    fn drill_remove_global_execution_receipt() {
+        let Ok(path) = std::env::var("QUIL_DRILL_STORE") else { return };
+        let db = crate::RocksDb::open(std::path::Path::new(&path)).unwrap();
+        let inner = db.inner();
+        let key = crate::encoding::global_execution_checkpoint_key();
+        let pending = crate::encoding::global_execution_pending_key();
+        let receipt = inner.get(&key).unwrap();
+        assert!(inner.get(&pending).unwrap().is_none(), "unfinished execution; not a receipt-only drill");
+        inner.delete(&key).unwrap();
+        inner.flush_wal(true).unwrap();
+        eprintln!("removed receipt: {}", receipt.map_or("none".into(), |r| hex::encode(&r[..9.min(r.len())])));
+    }
+
+    /// Read-only listing of GLOBAL candidates above the canonical head, and
+    /// whether each carries a finalization certificate (non-empty signature).
+    /// Safe beside a running node: the store is opened read-only.
+    #[test]
+    #[ignore = "inspection of a localnet store"]
+    fn inspect_global_candidates() {
+        use quil_types::store::ClockStore as _;
+        let Ok(path) = std::env::var("QUIL_INSPECT_STORE") else { return };
+        let db = crate::RocksDb::open_for_read_only(std::path::Path::new(&path)).unwrap();
+        let store = super::RocksClockStore::new(db.inner());
+        let head = store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        eprintln!("canonical head {head}");
+        for frame in store.range_global_clock_frame_candidates(head + 1, head + 64, 512).unwrap() {
+            let header = frame.header.unwrap_or_default();
+            let certified = header.public_key_signature_bls48581.as_ref().is_some_and(|s| !s.signature.is_empty());
+            eprintln!("candidate {} rank {} certified {certified}", header.frame_number, header.rank);
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement over a copied node store"]
+    fn measure_app_frame_serving_cost() {
+        use quil_types::store::ClockStore as _;
+        let Ok(path) = std::env::var("QUIL_SERVE_STORE") else { return };
+        let db = crate::RocksDb::open(std::path::Path::new(&path)).unwrap();
+        let store = super::RocksClockStore::new(db.inner());
+        let mut keys = Vec::new();
+        let inner = db.inner();
+        let mut it = inner.raw_iterator();
+        it.seek([crate::encoding::CLOCK_FRAME, crate::encoding::CLOCK_SHARD_FRAME]);
+        while let Some(key) = it.key() {
+            if !key.starts_with(&[crate::encoding::CLOCK_FRAME, crate::encoding::CLOCK_SHARD_FRAME]) || key.len() < 10 {
+                break;
+            }
+            let (filter, number) = key[2..].split_at(key.len() - 10);
+            keys.push((filter.to_vec(), u64::from_be_bytes(number.try_into().unwrap())));
+            it.next();
+        }
+        // Forest serving: the full diff a new member's sync asks for, the QUIL
+        // application's vertex tree against an empty one.
+        let forest = quil_forest::Forest::with_namespace(db.inner(), crate::FOREST_NAMESPACE);
+        let app: [u8; 32] = hex::decode("11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9").unwrap().try_into().unwrap();
+        if let Some(version) = forest.read_head_version(&app, quil_forest::Phase::VertexAdds).unwrap() {
+            let reader = forest.shard_phase_reader(&app, quil_forest::Phase::VertexAdds);
+            for pass in ["cold", "warm"] {
+                let started = std::time::Instant::now();
+                let leaves = quil_forest::diff_leaves(&reader, version, &quil_forest::MemTreeStore::default(), 0).unwrap();
+                let elapsed = started.elapsed();
+                eprintln!("forest {pass}: {} leaves at version {version}, {:?}", leaves.len(), elapsed);
+            }
+        }
+        for pass in ["cold", "warm"] {
+            let started = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for (filter, number) in &keys {
+                let frame = store.get_shard_clock_frame(filter, *number, false).unwrap();
+                bytes += prost::Message::encoded_len(&frame);
+            }
+            let elapsed = started.elapsed();
+            eprintln!("{pass}: {} frames, {} bytes, {:?} total, {:.1} us/frame",
+                keys.len(), bytes, elapsed, elapsed.as_secs_f64() * 1e6 / keys.len().max(1) as f64);
+        }
+    }
+
     use super::*;
 
     fn test_db() -> RocksClockStore {
@@ -346,7 +674,214 @@ mod tests {
         let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
         // Leak to keep temp dir alive
         std::mem::forget(tmp);
-        RocksClockStore::new(Arc::new(db))
+        RocksClockStore::new(quil_forest::CoordinatedDb::new(db))
+    }
+
+    fn cached_frame(n: u64) -> global::GlobalFrame {
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader { frame_number: n, ..Default::default() }),
+            requests: vec![global::MessageBundle::default()],
+        }
+    }
+
+    #[test]
+    fn archive_cache_publishes_only_committed_frames() {
+        use store::ClockStore;
+        let s = test_db();
+        s.warm_global_frame_cache().unwrap();
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame(&cached_frame(1), txn.as_ref()).unwrap();
+        assert!(s.get_global_frame(1).is_err());
+        assert!(s.global_memory.cache.read().unwrap().frames.is_empty());
+        txn.abort().unwrap();
+        assert!(s.get_global_frame(1).is_err());
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_frame(&cached_frame(2), Some(txn.as_ref())).unwrap();
+        txn.commit().unwrap();
+        assert!(s.global_memory.cache.read().unwrap().frames.contains_key(&2));
+        assert_eq!(s.get_global_frame(2).unwrap(), cached_frame(2));
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame(&cached_frame(4), txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert!(s.global_memory.cache.read().unwrap().frames.contains_key(&4));
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame_candidate(&cached_frame(3), txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert!(!s.global_memory.cache.read().unwrap().frames.contains_key(&3));
+        let txn = s.new_transaction(false).unwrap();
+        txn.delete(&encoding::clock_global_frame_key(2)).unwrap();
+        txn.commit().unwrap();
+        assert!(s.get_global_frame(2).is_err(), "raw transaction must invalidate cached frames");
+    }
+
+    /// The committee-handoff flag day discards every application frame chain
+    /// and keeps GLOBAL frames, GLOBAL cursors and application state.
+    #[test]
+    fn discarding_app_frame_history_keeps_global_frames_and_state() {
+        use store::ClockStore;
+        let s = test_db();
+        let app = vec![0x55u8; 32];
+        let child = [app.clone(), vec![0x01]].concat();
+        for filter in [&app, &child] {
+            for n in [1u64, 2, 300_000] {
+                let frame = global::AppShardFrame {
+                    header: Some(global::FrameHeader {
+                        address: filter.to_vec(), frame_number: n, output: vec![n as u8; 516], ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let selector = vec![n as u8; 32];
+                let txn = s.new_transaction(false).unwrap();
+                s.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+                txn.commit().unwrap();
+                let txn = s.new_transaction(false).unwrap();
+                s.commit_shard_clock_frame(filter, n, &selector, txn.as_ref(), true).unwrap();
+                txn.commit().unwrap();
+                s.put_shard_frame_fee_total(filter, n, 7).unwrap();
+                s.put_shard_frame_settlements(filter, n, &[1, 2]).unwrap();
+            }
+            s.db.put(encoding::consensus_materialized_cursor_key(filter), 300_000u64.to_be_bytes()).unwrap();
+            s.db.put(encoding::consensus_liveness_key(filter), [1]).unwrap();
+        }
+        s.put_global_frame(&cached_frame(9), None).unwrap();
+        s.db.put(encoding::global_materialized_cursor_key(), 9u64.to_be_bytes()).unwrap();
+        s.db.put(encoding::consensus_liveness_key(&[]), [1]).unwrap();
+        let state_key = [encoding::HYPERGRAPH_SHARD, 0x30, 0x01].to_vec();
+        s.db.put(&state_key, [1]).unwrap();
+        assert_eq!(s.app_frame_history_discarded().unwrap(), None);
+
+        s.discard_app_frame_history(861_840).unwrap();
+        for filter in [&app, &child] {
+            assert!(s.get_latest_shard_clock_frame(filter).is_err());
+            for n in [1u64, 2, 300_000] {
+                assert!(s.get_shard_clock_frame(filter, n, false).is_err());
+                assert_eq!(s.get_shard_frame_fee_total(filter, n).unwrap(), None);
+                assert_eq!(s.get_shard_frame_settlements(filter, n).unwrap(), None);
+            }
+            assert!(s.db.get(encoding::consensus_materialized_cursor_key(filter)).unwrap().is_none());
+            assert!(s.db.get(encoding::consensus_liveness_key(filter)).unwrap().is_none());
+        }
+        let mut staged = s.db.raw_iterator();
+        staged.seek([encoding::CLOCK_FRAME, encoding::CLOCK_SHARD_STAGED]);
+        assert!(staged.key().is_none_or(|key| !key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_SHARD_STAGED])));
+        assert_eq!(s.get_global_frame(9).unwrap(), cached_frame(9));
+        assert!(s.db.get(encoding::global_materialized_cursor_key()).unwrap().is_some());
+        assert!(s.db.get(encoding::consensus_liveness_key(&[])).unwrap().is_some(), "a GLOBAL row has no filter");
+        assert!(s.db.get(&state_key).unwrap().is_some());
+        assert_eq!(s.app_frame_history_discarded().unwrap(), Some(861_840));
+        s.discard_app_frame_history(861_848).unwrap();
+        assert_eq!(s.app_frame_history_discarded().unwrap(), Some(861_848));
+    }
+
+    /// Holes between stored GLOBAL frame records, over the whole range or from
+    /// a height, which a regular's periodic scan uses.
+    #[test]
+    fn frame_record_gaps_are_found_from_any_height() {
+        let s = test_db();
+        for n in [1u64, 2, 3, 5, 6, 9, 10] {
+            s.put_global_frame(&cached_frame(n), None).unwrap();
+        }
+        assert_eq!(s.find_global_frame_record_gaps(), vec![(4, 4), (7, 8)]);
+        assert_eq!(s.find_global_frame_record_gaps_from(5), vec![(7, 8)]);
+        assert_eq!(s.find_global_frame_record_gaps_from(4), vec![(7, 8)], "a hole below the first record is not reported");
+        assert!(s.find_global_frame_record_gaps_from(9).is_empty());
+        assert!(s.find_global_frame_record_gaps_from(11).is_empty());
+    }
+
+    #[test]
+    fn archive_cache_byte_budget_evicts_oldest_and_tracks_every_removal() {
+        use store::ClockStore;
+        let s = test_db();
+        s.warm_global_frame_cache().unwrap();
+        let size = cached_frame(1).encoded_len();
+        // Room for three frames and part of a fourth.
+        s.global_memory.cache.write().unwrap().max_bytes = Some(size * 3 + size / 2);
+        for n in 1..=6 { s.put_global_frame(&cached_frame(n), None).unwrap(); }
+        let resident = |s: &RocksClockStore| {
+            let cache = s.global_memory.cache.read().unwrap();
+            assert_eq!(cache.bytes, cache.frames.values().map(|(_, size)| *size).sum::<usize>());
+            (cache.frames.keys().copied().collect::<Vec<_>>(), cache.bytes)
+        };
+        let (frames, bytes) = resident(&s);
+        assert_eq!(frames, vec![4, 5, 6], "the oldest frames leave first");
+        assert!(bytes <= size * 3 + size / 2);
+        // Evicted frames are still served, from disk, without re-entering ahead
+        // of the tip (an older frame is the first to be evicted again).
+        assert_eq!(s.get_global_frame(1).unwrap(), cached_frame(1));
+        assert_eq!(resident(&s).0, vec![4, 5, 6]);
+        // Re-publishing a height replaces its accounting instead of adding to it.
+        s.put_global_frame(&cached_frame(6), None).unwrap();
+        assert_eq!(resident(&s).0, vec![4, 5, 6]);
+        // Range pruning and invalidation keep the byte count exact.
+        s.delete_global_frame_range(4, 4).unwrap();
+        assert_eq!(resident(&s).0, vec![5, 6]);
+        s.global_memory.cache.write().unwrap().invalidate();
+        assert_eq!(resident(&s), (vec![], 0));
+        // A single frame larger than the whole budget still stays resident.
+        s.global_memory.cache.write().unwrap().max_bytes = Some(1);
+        s.put_global_frame(&cached_frame(7), None).unwrap();
+        assert_eq!(resident(&s).0, vec![7]);
+    }
+
+    #[test]
+    fn archive_cache_retains_720_and_restores_after_restart() {
+        use store::ClockStore;
+        let s = test_db();
+        s.warm_global_frame_cache().unwrap();
+        for n in 0..725 { s.put_global_frame(&cached_frame(n), None).unwrap(); }
+        {
+            let cache = s.global_memory.cache.read().unwrap();
+            assert_eq!(cache.frames.len(), 720);
+            assert_eq!(cache.frames.first_key_value().unwrap().0, &5);
+        }
+        // An old catchup read succeeds from disk without displacing the tip.
+        assert_eq!(s.get_global_frame(0).unwrap(), cached_frame(0));
+        assert!(!s.global_memory.cache.read().unwrap().frames.contains_key(&0));
+        s.delete_global_frame_range(0, 4).unwrap();
+        assert_eq!(s.global_memory.cache.read().unwrap().frames.len(), 720,
+            "pruning old history must preserve the hot window");
+        let reopened = RocksClockStore::new(s.db.clone());
+        assert_eq!(reopened.warm_global_frame_cache().unwrap(), 720);
+        assert_eq!(reopened.get_global_frame(724).unwrap(), cached_frame(724));
+        // Remove backing bytes directly to demonstrate that a hot read needs no
+        // DB access. Production mutations use store APIs, which invalidate.
+        reopened.db.delete(encoding::clock_global_frame_key(724)).unwrap();
+        assert_eq!(reopened.get_global_frame(724).unwrap(), cached_frame(724));
+        reopened.delete_global_frame_range(723, 724).unwrap();
+        assert!(reopened.get_global_frame(723).is_err());
+        assert!(reopened.get_global_frame(724).is_err());
+        reopened.get_global_frame(722).unwrap();
+        reopened.reset_global_clock_frames().unwrap();
+        assert!(reopened.get_global_frame(722).is_err());
+        assert!(reopened.global_memory.cache.read().unwrap().frames.is_empty());
+    }
+
+    #[test]
+    fn test_global_materialized_cursor_getter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, tmp.path()).unwrap());
+        let store = RocksClockStore::new(db.clone());
+
+        // Absent → None (fresh store; materializer treats as 0).
+        assert_eq!(store.get_global_materialized_cursor(), None);
+
+        // A raw 8-byte BE value at the single global key round-trips. In
+        // production this value is staged into the hypergraph CRDT commit's
+        // own batch (same shared DB); here we write it directly to isolate
+        // the getter.
+        let key = encoding::global_materialized_cursor_key();
+        db.put(&key, 1234u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(1234));
+
+        // Overwrite reflects the latest value (single global key).
+        db.put(&key, 5678u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(5678));
+
+        // A malformed (wrong-length) value is ignored (treated as absent).
+        db.put(&key, [0u8; 3]).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), None);
     }
 
     #[test]
@@ -363,6 +898,8 @@ mod tests {
                 parent_selector: vec![0u8; 32],
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
+                prover_tree_aux_roots: Vec::new(),
+                world_state_size: 0,
                 requests_root: Vec::new(),
                 prover: vec![0u8; 32],
                 public_key_signature_bls48581: None,
@@ -381,6 +918,226 @@ mod tests {
             loaded.header.as_ref().unwrap().difficulty,
             200000
         );
+    }
+
+    /// The committed head must SURVIVE a restart. Mimics the CW `on_finalized`
+    /// durable write (`put_global_clock_frame(&frame, &NoopTxn)` → falls to
+    /// `put_global_frame(frame, None)` → `self.db.write` + `latest_index`),
+    /// then closes and reopens the DB at the SAME path (a node restart). If the
+    /// head reverts to the migration frame, the write path is not durable; if
+    /// it survives here, the field revert-to-669975 is a STARTUP reset, not the
+    /// write.
+    #[test]
+    fn committed_head_survives_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let make_frame = |n: u64| global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                output: vec![0u8; 516],
+                parent_selector: vec![0u8; 32],
+                prover: vec![0u8; 32],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+
+        // Session 1: migration head 669975, then finalize 669976 + 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db.clone());
+            store.put_global_frame(&make_frame(669975), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669975));
+            store.put_global_frame(&make_frame(669976), None).unwrap();
+            store.put_global_frame(&make_frame(669977), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669977));
+            drop(store);
+            drop(db); // close (shutdown)
+        }
+
+        // Session 2: reopen SAME path (restart). Head must still be 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db);
+            assert_eq!(
+                store.get_latest_frame_number(),
+                Some(669977),
+                "committed head must survive restart (not revert to migration head)"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_outcomes_round_trip() {
+        use store::{ClockStore, RequestOutcome, RequestStatus};
+        let s = test_db();
+        // Absent → empty.
+        assert!(s.get_global_clock_frame_outcomes(7).unwrap().is_empty());
+        let outcomes = vec![
+            RequestOutcome { status: RequestStatus::Succeeded, error: String::new() },
+            RequestOutcome { status: RequestStatus::Rejected, error: "bad signature".into() },
+            RequestOutcome { status: RequestStatus::Failed, error: "insufficient balance".into() },
+            RequestOutcome { status: RequestStatus::Skipped, error: "encoded payload < 4 bytes (no type prefix)".into() },
+        ];
+        s.put_global_clock_frame_outcomes(7, &outcomes).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), outcomes);
+        // Distinct frames are independent.
+        assert!(s.get_global_clock_frame_outcomes(8).unwrap().is_empty());
+        // Overwrite replaces.
+        let one = vec![RequestOutcome { status: RequestStatus::Succeeded, error: String::new() }];
+        s.put_global_clock_frame_outcomes(7, &one).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), one);
+    }
+
+    /// Production stages an application frame and commits it in the next
+    /// transaction. The commit keeps only the canonical copy, and committing
+    /// the same frame again (after a restart) still finds it.
+    #[test]
+    fn a_committed_shard_frame_keeps_only_its_canonical_copy() {
+        use store::ClockStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let s = RocksClockStore::new(quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir.path()).unwrap()));
+        let filter = vec![3u8; 35];
+        let selector = vec![6u8; 32];
+        let frame = global::AppShardFrame {
+            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 6, ..Default::default() }),
+            ..Default::default()
+        };
+        let staged = encoding::clock_shard_staged_key(&selector, 6);
+        let txn = s.new_transaction(false).unwrap();
+        s.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert!(s.db.get(&staged).unwrap().is_some());
+
+        let txn = s.new_transaction(false).unwrap();
+        s.commit_shard_clock_frame(&filter, 6, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_shard_clock_frame(&filter, 6, false).unwrap(), frame);
+        assert_eq!(s.get_latest_shard_clock_frame(&filter).unwrap(), frame);
+        assert!(s.db.get(&staged).unwrap().is_none(), "the staged copy outlived its commit");
+
+        let txn = s.new_transaction(false).unwrap();
+        s.commit_shard_clock_frame(&filter, 6, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_latest_shard_clock_frame(&filter).unwrap(), frame);
+    }
+
+    /// A staged frame is keyed by its selector only; the durable commit, like
+    /// the overlay's, installs it only at the shard and height its header names.
+    #[test]
+    fn a_staged_shard_frame_is_committed_only_at_its_own_destination() {
+        use store::ClockStore;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let s = RocksClockStore::new(quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir.path()).unwrap()));
+        let filter = vec![3u8; 35];
+        let other = vec![4u8; 35];
+        let selector = vec![6u8; 32];
+        let frame = global::AppShardFrame {
+            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 6, ..Default::default() }),
+            ..Default::default()
+        };
+        let staged = encoding::clock_shard_staged_key(&selector, 6);
+        let txn = s.new_transaction(false).unwrap();
+        s.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+
+        let txn = s.new_transaction(false).unwrap();
+        assert!(s.commit_shard_clock_frame(&other, 6, &selector, txn.as_ref(), false).is_err(), "another shard");
+        txn.commit().unwrap();
+        assert!(s.get_shard_clock_frame(&other, 6, false).is_err());
+        assert!(s.get_latest_shard_clock_frame(&other).is_err());
+        assert!(s.db.get(&staged).unwrap().is_some(), "a refused commit keeps the staged copy");
+
+        let txn = s.new_transaction(false).unwrap();
+        s.commit_shard_clock_frame(&filter, 6, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_shard_clock_frame(&filter, 6, false).unwrap(), frame);
+    }
+
+    #[test]
+    fn global_candidates_are_atomic_resumable_and_range_bounded() {
+        use store::ClockStore;
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            RocksClockStore::new(quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir.path()).unwrap()))
+        };
+        let s = open();
+        let mut frame = cached_frame(12);
+        frame.header.as_mut().unwrap().output = vec![12; 516];
+        frame.requests = vec![global::MessageBundle::default(); 3];
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap();
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame_candidate(&frame, txn.as_ref()).unwrap();
+        assert!(s.get_global_clock_frame_candidate(12, &digest).is_err());
+        txn.abort().unwrap();
+        assert!(s.range_global_clock_frame_candidates(0, u64::MAX, 1).unwrap().is_empty());
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame_candidate(&frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_global_clock_frame_candidate(12, &digest).unwrap(), frame);
+        drop(s);
+        let s = open();
+        assert_eq!(s.range_global_clock_frame_candidates(12, 12, 1).unwrap(), vec![frame.clone()]);
+        assert!(s.range_global_clock_frame_candidates(13, u64::MAX, 1).unwrap().is_empty());
+        assert!(s.range_global_clock_frame_candidates(0, 11, 1).unwrap().is_empty());
+        assert!(s.range_global_clock_frame_candidates(0, u64::MAX, 0).unwrap().is_empty());
+        // A replacement cannot retain trailing requests from its previous body.
+        frame.requests.truncate(1);
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame_candidate(&frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_global_clock_frame_candidate(12, &digest).unwrap(), frame);
+        assert!(s.get_latest_global_clock_frame().is_err(), "candidates cannot advance the canonical head");
+    }
+
+    #[test]
+    fn a_certificate_less_rewrite_keeps_the_stored_finalization_certificate() {
+        use store::ClockStore;
+        let s = test_db();
+        let mut plain = cached_frame(7);
+        plain.header.as_mut().unwrap().output = vec![7; 516];
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&plain.header.as_ref().unwrap().output).unwrap();
+        let mut certified = plain.clone();
+        certified.header.as_mut().unwrap().public_key_signature_bls48581 =
+            Some(proto::keys::Bls48581AggregateSignature {
+                signature: b"CWCT-finalization".to_vec(),
+                ..Default::default()
+            });
+        struct Direct;
+        impl store::Transaction for Direct {
+            fn get(&self, _: &[u8]) -> Result<Option<Vec<u8>>> { Ok(None) }
+            fn set(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
+            fn commit(self: Box<Self>) -> Result<()> { Ok(()) }
+            fn delete(&self, _: &[u8]) -> Result<()> { Ok(()) }
+            fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
+            fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn store::Iterator>> {
+                Err(QuilError::Store("unused".into()))
+            }
+            fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> { Ok(()) }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+        }
+        // A notarized, certificate-less candidate is upgraded by finalization.
+        s.put_global_clock_frame_candidate(&plain, &Direct).unwrap();
+        assert_eq!(s.get_global_clock_frame_candidate(7, &digest).unwrap(), plain);
+        s.put_global_clock_frame_candidate(&certified, &Direct).unwrap();
+        assert_eq!(s.get_global_clock_frame_candidate(7, &digest).unwrap(), certified);
+        // Later ancestor persistence, direct or transactional, keeps it.
+        s.put_global_clock_frame_candidate(&plain, &Direct).unwrap();
+        let txn = s.new_transaction(false).unwrap();
+        s.put_global_clock_frame_candidate(&plain, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(s.get_global_clock_frame_candidate(7, &digest).unwrap(), certified);
+        assert_eq!(s.range_global_clock_frame_candidates(7, 7, 4).unwrap(), vec![certified]);
     }
 
     #[test]
@@ -422,7 +1179,20 @@ use quil_types::proto;
 /// latest/earliest indices, or frame + QC) commit atomically.
 pub(crate) struct RocksClockTxn {
     pub(crate) batch: std::sync::Mutex<rocksdb::WriteBatch>,
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
+    global_memory: Arc<GlobalFrameMemory>,
+    global_frames: Mutex<Vec<(Arc<GlobalFrameMemory>, Arc<global::GlobalFrame>)>>,
+    invalidate_global_cache: std::sync::atomic::AtomicBool,
+}
+
+impl RocksClockTxn {
+    fn note_raw_global_key(&self, key: &[u8]) {
+        if key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME])
+            || key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME_REQUEST])
+        {
+            self.invalidate_global_cache.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl store::Transaction for RocksClockTxn {
@@ -431,14 +1201,27 @@ impl store::Transaction for RocksClockTxn {
     }
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().put(key, value);
+        self.note_raw_global_key(key);
         Ok(())
     }
     fn commit(self: Box<Self>) -> Result<()> {
+        let _writes = self.global_memory.writes.lock().unwrap();
         let batch = self.batch.into_inner().unwrap();
-        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+        let invalidate = self.invalidate_global_cache.into_inner();
+        if invalidate { self.global_memory.cache.write().unwrap().invalidate(); }
+        for (memory, frame) in self.global_frames.into_inner().unwrap() {
+            if invalidate {
+                memory.cache.write().unwrap().invalidate();
+            } else {
+                memory.cache.write().unwrap().publish(frame);
+            }
+        }
+        Ok(())
     }
     fn delete(&self, key: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().delete(key);
+        self.note_raw_global_key(key);
         Ok(())
     }
     fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
@@ -447,6 +1230,9 @@ impl store::Transaction for RocksClockTxn {
     }
     fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().delete_range(lower, upper);
+        // Raw range operations are uncommon maintenance operations; invalidate
+        // conservatively because a range can span both frame key namespaces.
+        self.invalidate_global_cache.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     fn as_any(&self) -> &dyn std::any::Any { self }
@@ -470,22 +1256,43 @@ where
 }
 
 impl store::ClockStore for RocksClockStore {
+    fn backing_store_identity(&self) -> Option<store::BackingStoreIdentity> {
+        Some(self.db.backing_store_identity())
+    }
+    fn prepare_execution_publication(&self) -> Result<Box<dyn store::ExecutionPublicationObserver + '_>> {
+        // Clock writers and readers hold these briefly; a conflict here
+        // discards an executed frame, so wait them out within a deadline.
+        let patience = quil_types::lock_patience::Patience::new();
+        let writes = patience.lock(&self.global_memory.writes).ok_or_else(|| {
+            QuilError::ExecutionUnavailable("clock publication writer is busy or poisoned".into())
+        })?;
+        let cache = patience.write(&self.global_memory.cache).ok_or_else(|| {
+            QuilError::ExecutionUnavailable("clock publication cache is busy or poisoned".into())
+        })?;
+        Ok(Box::new(ClockPublication { _writes: writes, cache }))
+    }
     fn new_transaction(&self, _: bool) -> Result<Box<dyn store::Transaction>> {
         Ok(Box::new(RocksClockTxn {
             batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
             db: self.db.clone(),
+            global_memory: self.global_memory.clone(),
+            global_frames: Mutex::new(Vec::new()),
+            invalidate_global_cache: std::sync::atomic::AtomicBool::new(false),
         }))
     }
     fn get_latest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> { self.get_latest_global_frame() }
     fn get_earliest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> { self.get_earliest_global_frame() }
     fn get_global_clock_frame(&self, n: u64) -> Result<proto::global::GlobalFrame> { self.get_global_frame(n) }
+    fn get_global_clock_frame_header(&self, n: u64) -> Result<proto::global::GlobalFrameHeader> {
+        self.get_global_frame_header(n)
+    }
     fn put_global_clock_frame(&self, f: &proto::global::GlobalFrame, t: &dyn store::Transaction) -> Result<()> {
         self.put_global_frame_via_txn(f, t)
     }
     fn put_global_clock_frame_candidate(
         &self,
         frame: &proto::global::GlobalFrame,
-        _t: &dyn store::Transaction,
+        t: &dyn store::Transaction,
     ) -> Result<()> {
         // Store the candidate keyed by (frame_number, identity).
         // Identity = Poseidon(output) — same derivation as
@@ -511,23 +1318,68 @@ impl store::ClockStore for RocksClockStore {
             .unwrap_or_default();
         let frame_number = header.frame_number;
 
+        if frame.requests.len() > usize::from(u16::MAX) + 1 {
+            return Err(QuilError::InvalidArgument("too many candidate requests".into()));
+        }
         let header_bytes = header.encode_to_vec();
         let key = encoding::clock_global_frame_candidate_key(frame_number, &identity);
-        self.db
-            .put(&key, &header_bytes)
-            .map_err(|e| QuilError::Store(e.to_string()))?;
-
-        for (i, request) in frame.requests.iter().enumerate() {
-            let idx = i as u16;
-            let req_key = encoding::clock_global_frame_request_candidate_key(
-                &identity,
-                frame_number,
-                idx,
-            );
-            let req_bytes = request.encode_to_vec();
-            self.db
-                .put(&req_key, &req_bytes)
-                .map_err(|e| QuilError::Store(e.to_string()))?;
+        // A finalization certificate rides in the header's signature field,
+        // and restart recovery needs it. A later certificate-less write of the
+        // same frame (a proposal or vote persisting it as an ancestor) keeps
+        // the stored header: the key binds the VDF output, which binds the
+        // header fields and body commitment.
+        let certified = |h: &proto::global::GlobalFrameHeader| {
+            h.public_key_signature_bls48581
+                .as_ref()
+                .is_some_and(|s| !s.signature.is_empty())
+        };
+        let keep_header = !certified(header)
+            && self
+                .db
+                .get(&key)
+                .map_err(|e| QuilError::Store(e.to_string()))?
+                .and_then(|stored| proto::global::GlobalFrameHeader::decode(stored.as_slice()).ok())
+                .is_some_and(|stored| stored.frame_number == frame_number && certified(&stored));
+        let start = encoding::clock_global_frame_request_candidate_key(&identity, frame_number, 0);
+        let mut end = start[..start.len() - 2].to_vec();
+        end.extend_from_slice(&[0xff; 3]);
+        let requests: Vec<(Vec<u8>, Vec<u8>)> = frame
+            .requests
+            .iter()
+            .enumerate()
+            .map(|(i, request)| {
+                (
+                    encoding::clock_global_frame_request_candidate_key(&identity, frame_number, i as u16),
+                    request.encode_to_vec(),
+                )
+            })
+            .collect();
+        let write = |batch: &mut rocksdb::WriteBatch| {
+            if !keep_header {
+                batch.put(&key, &header_bytes);
+            }
+            batch.delete_range(&start, &end);
+            for (key, request) in &requests {
+                batch.put(key, request);
+            }
+        };
+        if !with_clock_batch(t, write) {
+            // Candidates are outside every execution footprint. Declaring them
+            // lets a concurrent finalization publish unless it read them.
+            let store = |e: quil_forest::DatabaseCommitError| QuilError::Store(e.to_string());
+            let mut batch = quil_forest::DisjointBatch::new(encoding::GLOBAL_CANDIDATE_PREFIXES);
+            if !keep_header {
+                batch.put(&key, &header_bytes).map_err(store)?;
+            }
+            batch.delete_range(&start, &end).map_err(store)?;
+            for (key, request) in &requests {
+                batch.put(key, request).map_err(store)?;
+            }
+            // Consensus must not emit a vote before the complete body survives
+            // a crash. Header and requests share one synced WAL batch.
+            let mut options = rocksdb::WriteOptions::default();
+            options.set_sync(true);
+            self.db.write_disjoint(batch, &options).map_err(store)?;
         }
         Ok(())
     }
@@ -546,14 +1398,18 @@ impl store::ClockStore for RocksClockStore {
         // non-matching fields and the caller proceeded with an empty
         // frame, which the forks tree quietly rejected.
         let key = encoding::clock_global_frame_candidate_key(frame_number, selector);
-        let header_bytes = match self
-            .db
+        let snapshot = self.db.snapshot();
+        let header_bytes = match snapshot
             .get(&key)
             .map_err(|e| QuilError::Store(e.to_string()))?
         {
             Some(b) => b,
             None => return self.get_global_frame(frame_number),
         };
+        let mut recovered_bytes = header_bytes.len();
+        if recovered_bytes > 64 * 1024 * 1024 {
+            return Err(QuilError::Store("global candidate header exceeds 64 MiB".into()));
+        }
         // Read as GlobalFrameHeader (Go's format). If that fails, an
         // older Rust build wrote the whole GlobalFrame at this key —
         // try that fallback and extract the header. Recovers stores
@@ -582,18 +1438,21 @@ impl store::ClockStore for RocksClockStore {
         // key; iterate by index until the first miss.
         let mut requests: Vec<proto::global::MessageBundle> = embedded_requests;
         if requests.is_empty() {
-            for i in 0u16.. {
+            for i in 0u16..=u16::MAX {
                 let req_key = encoding::clock_global_frame_request_candidate_key(
                     selector, frame_number, i,
                 );
-                let req_bytes = match self
-                    .db
+                let req_bytes = match snapshot
                     .get(&req_key)
                     .map_err(|e| QuilError::Store(e.to_string()))?
                 {
                     Some(b) => b,
                     None => break,
                 };
+                recovered_bytes = recovered_bytes.saturating_add(req_bytes.len());
+                if recovered_bytes > 64 * 1024 * 1024 {
+                    return Err(QuilError::Store("global candidate body exceeds 64 MiB".into()));
+                }
                 let bundle = proto::global::MessageBundle::decode(req_bytes.as_slice())
                     .map_err(|e| QuilError::Serialization(format!(
                         "candidate request {} decode at frame {}: {}",
@@ -608,23 +1467,130 @@ impl store::ClockStore for RocksClockStore {
             requests,
         })
     }
+    fn range_global_clock_frame_candidates(
+        &self,
+        min: u64,
+        max: u64,
+        limit: usize,
+    ) -> Result<Vec<proto::global::GlobalFrame>> {
+        let mut frames = Vec::new();
+        if min > max || limit == 0 { return Ok(frames); }
+        let mut it = self.db.raw_iterator();
+        it.seek(encoding::clock_global_frame_candidate_key(min, &[]));
+        let mut bytes = 0usize;
+        while it.valid() && frames.len() < limit {
+            let key = it.key().ok_or_else(|| QuilError::Store("candidate iterator missing key".into()))?;
+            if !key.starts_with(&[encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME_CANDIDATE]) { break; }
+            if key.len() != 42 { return Err(QuilError::Store("malformed global candidate key".into())); }
+            let number = u64::from_be_bytes(key[2..10].try_into().unwrap());
+            if number > max { break; }
+            let frame = self.get_global_clock_frame_candidate(number, &key[10..])?;
+            bytes = bytes.saturating_add(frame.encoded_len());
+            if bytes > 64 * 1024 * 1024 {
+                return Err(QuilError::Store("global candidate recovery exceeds 64 MiB".into()));
+            }
+            frames.push(frame);
+            it.next();
+        }
+        it.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(frames)
+    }
+    fn put_shard_frame_fee_total(&self, filter: &[u8], frame_number: u64, fee_total: u128) -> Result<()> {
+        let key = encoding::clock_shard_frame_fee_total_key(filter, frame_number);
+        self.db
+            .put(&key, &fee_total.to_be_bytes())
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn put_shard_frame_settlements(&self, filter: &[u8], frame_number: u64, entries: &[u8]) -> Result<()> {
+        let key = encoding::clock_shard_frame_settlements_key(filter, frame_number);
+        self.db.put(&key, entries).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_shard_frame_settlements(&self, filter: &[u8], frame_number: u64) -> Result<Option<Vec<u8>>> {
+        let key = encoding::clock_shard_frame_settlements_key(filter, frame_number);
+        self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn put_shard_frame_accumulator(&self, filter: &[u8], frame_number: u64, digest: &[u8], report: &[u8]) -> Result<()> {
+        // The report is stored once per distinct digest, so a shard whose part
+        // of the accumulator did not change costs one small record per frame.
+        if !digest.is_empty() {
+            let report_key = encoding::clock_shard_accumulator_report_key(filter, digest);
+            if self.db.get(&report_key).map_err(|e| QuilError::Store(e.to_string()))?.is_none() {
+                self.db.put(&report_key, report).map_err(|e| QuilError::Store(e.to_string()))?;
+            }
+        }
+        let key = encoding::clock_shard_frame_accumulator_key(filter, frame_number);
+        self.db.put(&key, digest).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_shard_frame_accumulator(&self, filter: &[u8], frame_number: u64) -> Result<Option<Vec<u8>>> {
+        let key = encoding::clock_shard_frame_accumulator_key(filter, frame_number);
+        self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn put_shard_frame_spends(&self, filter: &[u8], frame_number: u64, entries: &[u8]) -> Result<()> {
+        let key = encoding::clock_shard_frame_spends_key(filter, frame_number);
+        self.db.put(&key, entries).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_shard_frame_spends(&self, filter: &[u8], frame_number: u64) -> Result<Option<Vec<u8>>> {
+        let key = encoding::clock_shard_frame_spends_key(filter, frame_number);
+        self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_shard_accumulator_report(&self, filter: &[u8], digest: &[u8]) -> Result<Option<Vec<u8>>> {
+        let key = encoding::clock_shard_accumulator_report_key(filter, digest);
+        self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_shard_frame_fee_total(&self, filter: &[u8], frame_number: u64) -> Result<Option<u128>> {
+        let key = encoding::clock_shard_frame_fee_total_key(filter, frame_number);
+        Ok(self
+            .db
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+            .map(u128::from_be_bytes))
+    }
+    fn put_global_clock_frame_outcomes(
+        &self,
+        frame_number: u64,
+        outcomes: &[store::RequestOutcome],
+    ) -> Result<()> {
+        let bytes = crate::clock_codec::encode_outcomes(outcomes, usize::MAX)?;
+        self.db.put(encoding::clock_global_frame_outcomes_key(frame_number), bytes)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_global_clock_frame_outcomes(&self, frame_number: u64) -> Result<Vec<store::RequestOutcome>> {
+        let snapshot = self.db.snapshot();
+        match snapshot.get(encoding::clock_global_frame_outcomes_key(frame_number))
+            .map_err(|e| QuilError::Store(e.to_string()))? {
+            Some(bytes) => crate::clock_codec::decode_outcomes(&bytes),
+            None => crate::clock_codec::decode_legacy_outcomes(
+                snapshot.get(encoding::clock_global_certified_state_key(frame_number))
+                    .map_err(|e| QuilError::Store(e.to_string()))?),
+        }
+    }
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         let lower = encoding::clock_global_frame_key(min_frame);
         let upper = encoding::clock_global_frame_key(max_frame);
+        let _writes = self.global_memory.writes.lock().unwrap();
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
-        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+        let mut cache = self.global_memory.cache.write().unwrap();
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.frames.retain(|n, _| *n < min_frame || *n >= max_frame);
+        cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
+        Ok(())
     }
     fn reset_global_clock_frames(&self) -> Result<()> {
         let lo = encoding::clock_global_frame_key(0);
         let hi = encoding::clock_global_frame_key(20_000_000);
         let earliest = encoding::clock_global_earliest_index();
         let latest = encoding::clock_global_latest_index();
+        let _writes = self.global_memory.writes.lock().unwrap();
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lo, &hi);
         batch.delete(&earliest);
         batch.delete(&latest);
-        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+        self.global_memory.cache.write().unwrap().invalidate();
+        Ok(())
     }
     fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
         let key = encoding::clock_global_certified_state_latest_index();
@@ -845,6 +1811,12 @@ impl store::ClockStore for RocksClockStore {
         }
         Ok(())
     }
+    fn get_latest_shard_clock_frame_number(&self, filter: &[u8]) -> Result<Option<u64>> {
+        // The index only advances to a frame whose body is stored (see
+        // `commit_shard_clock_frame`), and retention never deletes canonical
+        // bodies, so it names the frame `get_latest_shard_clock_frame` reads.
+        self.read_u64_index_checked(&encoding::clock_shard_latest_index(filter))
+    }
     fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame> {
         let idx_key = encoding::clock_shard_latest_index(filter);
         let fn_ = self.read_u64_index(&idx_key).ok_or_else(|| QuilError::NotFound("no shard frame".into()))?;
@@ -872,22 +1844,60 @@ impl store::ClockStore for RocksClockStore {
         // Go's GetShardClockFrame already accepts a non-pointer value
         // at the canonical key (the `else` branch at clock.go:1290).
         let staged_key = encoding::clock_shard_staged_key(selector, frame_number);
+        let mut have_frame = false;
         if let Some(staged_bytes) = self
             .db
             .get(&staged_key)
             .map_err(|e| QuilError::Store(e.to_string()))?
         {
-            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
-            if !with_clock_batch(t, |b| b.put(&canonical_key, &staged_bytes)) {
-                self.db
-                    .put(&canonical_key, &staged_bytes)
-                    .map_err(|e| QuilError::Store(e.to_string()))?;
+            // A staged frame is keyed by its selector alone; only its header
+            // names the shard and height it belongs to. Mirrors the overlay
+            // store: never install one at another destination.
+            let staged = proto::global::AppShardFrame::decode(staged_bytes.as_slice())
+                .map_err(|e| QuilError::Serialization(e.to_string()))?;
+            if !staged
+                .header
+                .as_ref()
+                .is_some_and(|h| h.frame_number == frame_number && h.address == filter)
+            {
+                return Err(QuilError::Serialization(
+                    "staged shard frame does not match its destination".into(),
+                ));
             }
+            // The staged copy is read only by this commit. Keeping it stored
+            // every application frame twice, about half an archive's store.
+            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
+            if !with_clock_batch(t, |b| {
+                b.put(&canonical_key, &staged_bytes);
+                b.delete(&staged_key);
+            }) {
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.put(&canonical_key, &staged_bytes);
+                batch.delete(&staged_key);
+                self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+            }
+            have_frame = true;
+        } else {
+            // Staged frame absent (e.g. a re-commit after restart where the
+            // frame is already canonical). Only treat this frame_number as
+            // real if the canonical frame actually exists on disk.
+            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
+            have_frame = self
+                .db
+                .get(&canonical_key)
+                .map_err(|e| QuilError::Store(e.to_string()))?
+                .is_some();
         }
 
         // Update the latest-index pointer (skipped during backfill,
-        // matching Go).
-        if !backfill {
+        // matching Go). SECURITY: `frame_number` comes from the QC's wire
+        // field, which is NOT covered by the aggregate signature (the vote
+        // binds filter‖state_id‖rank only). A malicious peer can take a valid
+        // QC and set frame_number = u64::MAX; without the `have_frame` guard
+        // that would bump the index past every real frame and permanently
+        // wedge the shard (no future commit can exceed MAX). Only advance the
+        // index to a frame_number for which a frame actually exists.
+        if !backfill && have_frame {
             let idx_key = encoding::clock_shard_latest_index(filter);
             let current = self.read_u64_index(&idx_key);
             if current.is_none() || frame_number > current.unwrap() {
@@ -961,6 +1971,17 @@ impl store::ClockStore for RocksClockStore {
             batch.delete_range(&td_lo, &td_hi);
         }
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn discard_app_frame_history(&self, global_frame: u64) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        for (start, end) in encoding::app_frame_history_ranges() {
+            batch.delete_range(&start, &end);
+        }
+        batch.put(encoding::app_history_discarded_key(), global_frame.to_be_bytes());
+        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn app_frame_history_discarded(&self) -> Result<Option<u64>> {
+        self.read_u64_index_checked(&encoding::app_history_discarded_key())
     }
     fn reset_shard_clock_frames(&self, filter: &[u8]) -> Result<()> {
         let lo = encoding::clock_shard_frame_key(filter, 0);

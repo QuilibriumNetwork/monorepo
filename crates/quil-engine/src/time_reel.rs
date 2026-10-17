@@ -872,11 +872,10 @@ mod tests {
         let g = genesis_frame();
         let f1 = child_of(&g, 1);
 
-        // Insert child before parent — goes to pending
+        // Insert child before parent. Into an empty tree the first frame
+        // becomes the pseudo-root, so head = f1.
         reel.insert(f1.clone()).unwrap();
-        // Head should be the orphan (accepted as pseudo-root since tree was empty)
-        // Actually the first frame becomes pseudo-root, so head = f1
-        // Let's test with genesis first
+        // The out-of-order case proper, starting from genesis.
         let reel2 = GlobalTimeReel::new(1);
         let g2 = genesis_frame();
         reel2.insert(g2.clone()).unwrap();

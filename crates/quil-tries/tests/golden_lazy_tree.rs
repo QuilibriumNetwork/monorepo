@@ -1027,8 +1027,8 @@ fn golden_medium_scatter() {
 // Retry-safety: `commit` must NOT consume its dirty bookkeeping before the
 // surrounding transaction is durably committed. The tree stays dirty (and a
 // retry re-stages every node write) until the caller confirms durability via
-// `mark_persisted`. See the "consumes dirty state before the outer
-// transaction commits" follow-up in the refactored-galaxy plan.
+// `mark_persisted`, so `commit` never consumes dirty state before the outer
+// transaction commits.
 // ---------------------------------------------------------------------------
 
 #[test]

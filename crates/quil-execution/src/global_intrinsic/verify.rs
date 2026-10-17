@@ -101,7 +101,7 @@ pub fn verify_prover_pause(
 
     // 5. Verify BLS48-581 G1 signature
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -148,7 +148,7 @@ pub fn verify_prover_resume(
     let domain = prover_verify::prover_resume_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -212,11 +212,11 @@ pub fn verify_prover_leave(
         QuilError::InvalidArgument("verify prover leave: missing signature".into())
     })?;
 
-    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let message = prover_verify::prover_leave_signing_message(&op.filters, op.frame_number);
     let domain = prover_verify::prover_leave_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -240,11 +240,15 @@ pub const JOIN_FRESHNESS_WINDOW: u64 = 10;
 ///
 /// Checks:
 /// 1. All filters are >= 32 bytes
-/// 2. Proof size == 516 * len(filters)
-/// 3. frame_number + 10 >= current_frame (not too stale)
-/// 4. Signature-with-PoP is present
-/// 5. Public key in signature is non-empty
-/// 6. Prover address derivation succeeds
+/// 2. frame_number + 10 >= current_frame (not too stale)
+/// 3. Signature-with-PoP is present
+/// 4. Public key in signature is non-empty
+/// 5. Prover address derivation succeeds
+///
+/// The proof-of-sequential-work VDF gate was removed from joins: the
+/// `proof` field is no longer validated (it is retained in the wire
+/// format only so historical joins still decode, and is ignored — new
+/// joins carry an empty proof).
 pub fn validate_prover_join_structural(
     op: &ProverJoin,
     current_frame_number: u64,
@@ -261,18 +265,7 @@ pub fn validate_prover_join_structural(
         }
     }
 
-    // 2. Proof size
-    let expected_proof_size = PROOF_CHUNK_SIZE * op.filters.len();
-    if op.proof.len() != expected_proof_size {
-        return Err(QuilError::InvalidArgument(format!(
-            "prover join: proof size {} != expected {} (516 * {} filters)",
-            op.proof.len(),
-            expected_proof_size,
-            op.filters.len()
-        )));
-    }
-
-    // 3. Freshness
+    // 2. Freshness
     if op.frame_number + JOIN_FRESHNESS_WINDOW < current_frame_number {
         return Err(QuilError::InvalidArgument(format!(
             "prover join: request frame {} is too old (current {})",
@@ -280,12 +273,12 @@ pub fn validate_prover_join_structural(
         )));
     }
 
-    // 4. Signature present
+    // 3. Signature present
     let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join: missing signature with PoP".into())
     })?;
 
-    // 5. Public key non-empty
+    // 4. Public key non-empty
     let public_key = sig.public_key.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join: signature has no public key".into())
     })?;
@@ -295,7 +288,7 @@ pub fn validate_prover_join_structural(
         ));
     }
 
-    // 6. Derive prover address
+    // 5. Derive prover address
     let prover_address = prover_address_from_pubkey(public_key)?;
 
     Ok(ProverJoinValidation {
@@ -303,56 +296,6 @@ pub fn validate_prover_join_structural(
         prover_address,
         filter_count: op.filters.len(),
     })
-}
-
-/// Full ProverJoin verification including VDF multi-proof.
-///
-/// Requires:
-/// - `frame_output`: the VDF output of the frame referenced by `op.frame_number`
-/// - `frame_difficulty`: the difficulty of that frame
-/// - `frame_prover`: the VDF prover for multi-proof verification
-///
-/// This is the complete verify path that Go's `ProverJoin.Verify` runs.
-pub fn verify_prover_join_vdf(
-    op: &ProverJoin,
-    current_frame_number: u64,
-    frame_output: &[u8],
-    frame_difficulty: u32,
-    frame_prover: &dyn quil_types::crypto::FrameProver,
-) -> Result<bool> {
-    // 1. Structural validation
-    let validation = validate_prover_join_structural(op, current_frame_number)?;
-
-    // 2. Compute challenge from frame output (Go: sha3.Sum256)
-    use sha3::Digest;
-    let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
-
-    // 3. Build ID list: for each filter, id = prover_address || filter || index_be
-    let mut ids: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
-    for (idx, filter) in op.filters.iter().enumerate() {
-        let mut id = Vec::with_capacity(32 + filter.len() + 4);
-        id.extend_from_slice(&validation.prover_address);
-        id.extend_from_slice(filter);
-        id.extend_from_slice(&(idx as u32).to_be_bytes());
-        ids.push(id);
-    }
-
-    // 4. Split proof into 516-byte chunks
-    let mut solutions: Vec<Vec<u8>> = Vec::with_capacity(op.filters.len());
-    for i in 0..op.filters.len() {
-        solutions.push(op.proof[i * PROOF_CHUNK_SIZE..(i + 1) * PROOF_CHUNK_SIZE].to_vec());
-    }
-
-    // 5. Verify VDF multi-proof
-    let id_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_slice()).collect();
-    let sol_refs: Vec<&[u8]> = solutions.iter().map(|s| s.as_slice()).collect();
-
-    frame_prover.verify_multi_proof(
-        &challenge,
-        frame_difficulty,
-        &id_refs,
-        &sol_refs,
-    )
 }
 
 /// Output of structural validation — carries the derived values
@@ -373,12 +316,12 @@ pub struct ProverJoinValidation {
 ///
 /// Checks:
 /// 1. BLS sig over `concat(filters) || frame_number_be_u64` with domain
-///    `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_JOIN")`.
 /// 2. Proof-of-possession: BLS sig over pubkey with ASCII domain
-///    `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
-///    poseidon hash — matches `global_prover_join.go:1093`).
+/// `"BLS48_POP_SK"` (Go uses the domain bytes literally, not a
+/// poseidon hash — matches `global_prover_join.go:1093`).
 /// 3. Each merge target's signature over pubkey with Ed448 context
-///    `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
+/// `"PROVER_JOIN_MERGE"` (skipped for already-consumed targets).
 ///
 /// Go skips merge-sig verification when the merge's spent-vertex
 /// already exists in the hypergraph (replay guard). This port takes
@@ -389,6 +332,17 @@ pub fn verify_prover_join_signatures(
     validation: &ProverJoinValidation,
     key_manager: &dyn KeyManager,
     consumed_merge_check: Option<&dyn Fn(&[u8]) -> bool>,
+) -> Result<bool> {
+    Ok(verify_prover_join_key_signatures(op, validation, key_manager)?
+        && verify_prover_join_merge_signatures(op, validation, key_manager, consumed_merge_check)?)
+}
+
+/// Checks 1 and 2 of [`verify_prover_join_signatures`]: the joining key's
+/// signature over the join and its proof of possession.
+pub fn verify_prover_join_key_signatures(
+    op: &ProverJoin,
+    validation: &ProverJoinValidation,
+    key_manager: &dyn KeyManager,
 ) -> Result<bool> {
     let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
         QuilError::InvalidArgument("prover join verify: missing signature".into())
@@ -414,7 +368,7 @@ pub fn verify_prover_join_signatures(
     clone.public_key_signature_bls48581 = None;
     let join_message = clone.to_canonical_bytes()?;
     let ok = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &validation.public_key,
         &join_message,
         &sig.signature,
@@ -428,16 +382,23 @@ pub fn verify_prover_join_signatures(
     //    domain bytes "BLS48_POP_SK" (no poseidon wrapping in Go).
     const POP_DOMAIN: &[u8] = b"BLS48_POP_SK";
     let ok = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &validation.public_key,
         &validation.public_key,
         &sig.pop_signature,
         POP_DOMAIN,
     )?;
-    if !ok {
-        return Ok(false);
-    }
+    Ok(ok)
+}
 
+/// Check 3 of [`verify_prover_join_signatures`]: one Ed448 signature per merge
+/// target, and the decoder does not cap how many targets a join carries.
+pub fn verify_prover_join_merge_signatures(
+    op: &ProverJoin,
+    validation: &ProverJoinValidation,
+    key_manager: &dyn KeyManager,
+    consumed_merge_check: Option<&dyn Fn(&[u8]) -> bool>,
+) -> Result<bool> {
     // 3. Merge target signatures — each signs the local BLS pubkey
     //    with an Ed448 (or other) key under the "PROVER_JOIN_MERGE"
     //    domain. Skip targets whose spent-vertex already exists.
@@ -448,16 +409,14 @@ pub fn verify_prover_join_signatures(
                 continue;
             }
         }
+        // Merge targets are Ed448-only: seniority is Ed448-peer-key-bound, so the
+        // key that carries it forward (signing the new Falcon consensus pubkey) is
+        // always Ed448. No BLS/X448/Decaf/Falcon merge targets exist.
         let key_type = match mt.key_type {
             0 => KeyType::Ed448,
-            1 => KeyType::X448,
-            2 => KeyType::Bls48581G1,
-            3 => KeyType::Bls48581G2,
-            4 => KeyType::Decaf448,
             other => {
                 return Err(QuilError::InvalidArgument(format!(
-                    "prover join verify: merge target has unknown key_type {}",
-                    other
+                    "prover join verify: merge target key_type {other} unsupported (Ed448-only)"
                 )));
             }
         };
@@ -525,11 +484,11 @@ where
 /// `global_prover_seniority_merge.go:476-540`. For each merge target,
 /// look up two tombstone vertices in the global domain:
 ///
-///   - `spent_seniority_merge_address(target_pubkey)` —
-///     PROVER_SENIORITY_MERGE was already consumed.
-///   - `spent_join_merge_address(target_pubkey)` —
-///     PROVER_JOIN_MERGE consumed the same target during a
-///     ProverJoin's merge_targets list.
+/// - `spent_seniority_merge_address(target_pubkey)` —
+/// PROVER_SENIORITY_MERGE was already consumed.
+/// - `spent_join_merge_address(target_pubkey)` —
+/// PROVER_JOIN_MERGE consumed the same target during a
+/// ProverJoin's merge_targets list.
 ///
 /// Finding EITHER marker means the merge target has already been
 /// claimed by some prover; allowing the current op would split the
@@ -548,20 +507,30 @@ pub fn verify_prover_seniority_merge_spent_markers<F>(
 where
     F: FnMut(&[u8; 32]) -> Result<Option<Vec<u8>>>,
 {
+    // A merge target, once consumed, is spent FOREVER — by ANYONE, including the
+    // same prover. `merge_seniority` is ADDED to the prover's score
+    // (`materialize_seniority_merge`), and the aggregated targets add up (with
+    // overlapping-period scores collapsed to their max inside
+    // `GetAggregatedSeniority`), so allowing a prover to RE-SUBMIT its own merge
+    // would let it add the same seniority every frame without bound — a
+    // consensus-weight inflation. So reject on the mere EXISTENCE of either
+    // tombstone (a prior ProverJoin's `PROVER_JOIN_MERGE` or a prior
+    // ProverSeniorityMerge's `PROVER_SENIORITY_MERGE`), regardless of who stamped
+    // it. (A previous "allow same-prover re-use" relaxation here was the bug.)
     for mt in &op.merge_targets {
         let join_marker = super::materialize::spent_join_merge_address(&mt.prover_public_key)?;
         if lookup_tombstone(&join_marker)?.is_some() {
             return Err(QuilError::InvalidArgument(
-                "ProverSeniorityMerge verify: merge target already consumed by \
-                 a prior ProverJoin (PROVER_JOIN_MERGE tombstone)".into(),
+                "ProverSeniorityMerge verify: merge target already consumed \
+                 (PROVER_JOIN_MERGE tombstone)".into(),
             ));
         }
         let seniority_marker =
             super::materialize::spent_seniority_merge_address(&mt.prover_public_key)?;
         if lookup_tombstone(&seniority_marker)?.is_some() {
             return Err(QuilError::InvalidArgument(
-                "ProverSeniorityMerge verify: merge target already consumed by \
-                 a prior ProverSeniorityMerge (PROVER_SENIORITY_MERGE tombstone)".into(),
+                "ProverSeniorityMerge verify: merge target already consumed \
+                 (PROVER_SENIORITY_MERGE tombstone)".into(),
             ));
         }
     }
@@ -580,6 +549,7 @@ where
 /// validators that did and did not run materialize.
 pub fn verify_prover_join_not_kicked(
     prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame: u64,
 ) -> Result<()> {
     let kf_bytes =
         read_field(prover_tree, "allocation:ProverAllocation", "KickFrameNumber")
@@ -591,7 +561,9 @@ pub fn verify_prover_join_not_kicked(
         return Ok(());
     }
     let kf = u64::from_be_bytes(kf_bytes.try_into().unwrap());
-    if kf != 0 {
+    // Spurious-kick amnesty: a kick recorded before the flag-day frame no longer
+    // bars re-join once the chain reaches it (see `materialize::KICK_AMNESTY_FRAME`).
+    if super::materialize::kick_bars_rejoin(kf, current_frame) {
         return Err(QuilError::InvalidArgument(format!(
             "ProverJoin verify: prover has been previously kicked \
              (KickFrameNumber={})",
@@ -611,6 +583,17 @@ pub fn verify_prover_join_not_kicked(
 /// `lookup_alloc` is the per-allocation tree loader the caller
 /// supplies — it lets this helper stay free of state-store coupling.
 /// Pass `Ok(None)` for filters with no existing allocation vertex.
+/// How long the network keeps refusing a re-join of a filter whose allocation
+/// is still recorded as Joining or Leaving.
+///
+/// Expiry is computed from elapsed frames and NEVER written back, so the raw
+/// `Status` byte this verifier reads stays Joining/Leaving long after a node's
+/// own lifecycle calls the allocation expired. Both sides must use THIS
+/// constant: a node that considers such a filter re-joinable sooner just
+/// re-proposes joins the network drops as "existing allocation still active",
+/// spending its free workers on a shard it cannot take.
+pub const REJOIN_WINDOW_FRAMES: u64 = 720;
+
 pub fn verify_prover_join_allocations_expired<F>(
     op: &ProverJoin,
     pubkey: &[u8],
@@ -628,7 +611,13 @@ where
         let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
             .and_then(|b| b.first().copied())
             .unwrap_or(4);
-        if status == 4 {
+        // Byte 4 (Rejected) and byte 6 (Historic) are re-joinable: Historic is a
+        // slot vacated by a reassignment and RETAINED so it can be reactivated, so
+        // a fresh Join must be allowed to reclaim it rather than being blocked by
+        // the 720-frame still-active window. MUST stay in lockstep with the
+        // materialize-side gate in `invoke_step` (a validate/materialize mismatch
+        // would let a Join pass one and fail the other).
+        if status == 4 || status == super::materialize::STATUS_HISTORIC {
             continue;
         }
         let jf_bytes = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
@@ -645,8 +634,7 @@ where
             )));
         }
         let jf = u64::from_be_bytes(jf_bytes.try_into().unwrap());
-        const REJOIN_WINDOW: u64 = 720;
-        if frame_number < jf.saturating_add(REJOIN_WINDOW) {
+        if frame_number < jf.saturating_add(REJOIN_WINDOW_FRAMES) {
             return Err(QuilError::InvalidArgument(format!(
                 "ProverJoin verify: existing allocation still active \
                  (status={}, frames_since_join={})",
@@ -707,7 +695,7 @@ pub fn verify_prover_update(
     let domain = super::prover_update_materialize::prover_update_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         message,
         &sig.signature,
@@ -738,11 +726,12 @@ pub fn verify_prover_confirm(
         QuilError::InvalidArgument("verify prover confirm: missing signature".into())
     })?;
 
-    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let message =
+        prover_verify::confirm_signing_message(&op.filters, op.frame_number, &op.leaf_roots);
     let domain = prover_verify::prover_confirm_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -750,24 +739,46 @@ pub fn verify_prover_confirm(
     )
 }
 
-/// Validate ProverConfirm timing constraints. Called during invoke_step
-/// with the allocation tree loaded. Mirrors Go's frame window checks in
-/// `global_prover_confirm.go:492-574`.
+/// The signed frame also commits to the storage target epoch (signed epoch + 1).
+/// A delayed message must never relabel roots for a different inclusion epoch.
+pub fn validate_confirm_epoch(signed_frame: u64, inclusion_frame: u64) -> Result<()> {
+    if signed_frame > inclusion_frame
+        || quil_types::consensus::epoch_for_frame(signed_frame)
+            != quil_types::consensus::epoch_for_frame(inclusion_frame)
+    {
+        return Err(QuilError::InvalidArgument(
+            "confirm: signed frame must be in the inclusion epoch and not in the future".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate ProverConfirm timing constraints (epoch-aligned lifecycle). Called
+/// during invoke_step with the allocation tree loaded. A proposal made in epoch
+/// E must be confirmed in EXACTLY epoch E+1 — this is what keeps committee
+/// membership frozen within an epoch (a confirm can only ever take effect at the
+/// next boundary E+2).
 ///
-/// - Join confirm (status=0): must wait 360-720 frames after JoinFrameNumber
-/// - Leave confirm (status=3): must wait 360-720 frames after LeaveFrameNumber
+/// - Join confirm (status=0): `epoch_for_frame(frame) == epoch_for_frame(JoinFrameNumber)+1`.
+/// - Leave confirm (status=3): `epoch_for_frame(frame) == epoch_for_frame(LeaveFrameNumber)+1`.
+/// - Re-confirm (status=1): a data shard registering its NEXT epoch — allowed
+/// iff `!filter.is_empty() && Epoch <= epoch_for_frame(frame)` (renews for
+/// frame_epoch+1; rejects the empty/global filter and a double re-confirm that
+/// already registered ahead).
 pub fn validate_confirm_timing(
     frame_number: u64,
     allocation_tree: &quil_tries::VectorCommitmentTree,
 ) -> Result<()> {
+    use quil_types::consensus::epoch_for_frame;
     let cls = "allocation:ProverAllocation";
     let status = crate::global_schema::read_field(allocation_tree, cls, "Status")
         .and_then(|b| b.first().copied())
         .unwrap_or(255);
+    let confirm_epoch = epoch_for_frame(frame_number);
 
     match status {
         0 => {
-            // Joining — check JoinFrameNumber timing
+            // Joining — must confirm in exactly the epoch after the join.
             let join_frame_bytes = crate::global_schema::read_field(
                 allocation_tree, cls, "JoinFrameNumber",
             ).unwrap_or_default();
@@ -776,58 +787,27 @@ pub fn validate_confirm_timing(
                     "confirm: missing JoinFrameNumber".into(),
                 ));
             }
-            let mut join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
-
-            // Tier-5 #11: 2.1 transition window. Joins between
-            // 244100..255840 must wait until frame 255840 to confirm.
-            // Once frame 255840 hits, those joins immediately become
-            // eligible (they all "catch up" at once). Joins ≥ 255840
-            // fall through to the normal 360..720 window. Mirrors Go's
-            // `global_prover_confirm.go:507-546`.
-            const TRANSITION_END: u64 =
-                crate::token_intrinsic::constants::FRAME_2_1_EXTENDED_ENROLL_END;
-            const TRANSITION_BEGIN: u64 = 244_100;
-            if join_frame >= TRANSITION_BEGIN && join_frame < TRANSITION_END {
-                if frame_number < TRANSITION_END {
-                    return Err(QuilError::InvalidArgument(
-                        "confirm: cannot confirm before frame 255840 (2.1 enrollment window)"
-                            .into(),
-                    ));
-                }
-                // Clamp join_frame so the resulting window starts at
-                // (TRANSITION_END - 360). For joins newer than the
-                // floor, leave them alone so they get the full 360.
-                if join_frame < TRANSITION_END - 360 {
-                    join_frame = TRANSITION_END - 360;
-                }
-            }
-
-            // Joins ≥ (TRANSITION_END - 360) OR ≤ 244100 follow the
-            // normal MIN..MAX window (360..720 on mainnet; configurable
-            // for testnet via `set_confirm_window_frames`). Joins inside
-            // the transition band were either rejected above or
-            // clamped.
-            if join_frame >= TRANSITION_END - 360 || join_frame <= TRANSITION_BEGIN {
-                let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
-                let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
-                let frames_since = frame_number.saturating_sub(join_frame);
-                if frames_since < min {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "confirm: must wait {} frames after join (only {} elapsed)",
-                        min, frames_since
-                    )));
-                }
-                if frames_since > max {
-                    return Err(QuilError::InvalidArgument(format!(
-                        "confirm: join confirmation window expired ({} frames, {} elapsed)",
-                        max, frames_since
-                    )));
-                }
+            let join_frame = u64::from_be_bytes(join_frame_bytes.try_into().unwrap());
+            let expect = epoch_for_frame(join_frame) + 1;
+            if confirm_epoch != expect {
+                return Err(QuilError::InvalidArgument(format!(
+                    "confirm: join must be confirmed in epoch {} (join epoch {}), \
+                     not epoch {}",
+                    expect, epoch_for_frame(join_frame), confirm_epoch,
+                )));
             }
             Ok(())
         }
         3 => {
-            // Leaving — check LeaveFrameNumber timing
+            // Leaving — must confirm in exactly the epoch after the leave.
+            let confirmed = crate::global_schema::read_field(
+                allocation_tree, cls, "LeaveConfirmFrameNumber",
+            ).unwrap_or_default();
+            if !confirmed.is_empty() && confirmed != [0u8; 8] {
+                return Err(QuilError::InvalidArgument(
+                    "confirm: leave already confirmed".into(),
+                ));
+            }
             let leave_frame_bytes = crate::global_schema::read_field(
                 allocation_tree, cls, "LeaveFrameNumber",
             ).unwrap_or_default();
@@ -837,25 +817,43 @@ pub fn validate_confirm_timing(
                 ));
             }
             let leave_frame = u64::from_be_bytes(leave_frame_bytes.try_into().unwrap());
-            let frames_since = frame_number.saturating_sub(leave_frame);
-            let min = MIN_CONFIRM_FRAMES.load(Ordering::Relaxed);
-            let max = MAX_CONFIRM_FRAMES.load(Ordering::Relaxed);
-            if frames_since < min {
+            let expect = epoch_for_frame(leave_frame) + 1;
+            if confirm_epoch != expect {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: must wait {} frames after leave (only {} elapsed)",
-                    min, frames_since
+                    "confirm: leave must be confirmed in epoch {} (leave epoch {}), \
+                     not epoch {}",
+                    expect, epoch_for_frame(leave_frame), confirm_epoch,
                 )));
             }
-            if frames_since > max {
+            Ok(())
+        }
+        1 => {
+            // Active — epoch re-confirm (registers the NEXT epoch). A data-shard
+            // allocation renews by registering one epoch ahead; allowed only
+            // when it hasn't already (`Epoch <= confirm_epoch`). The empty/global
+            // filter never epoch-expires and is rejected.
+            let filter = crate::global_schema::read_field(
+                allocation_tree, cls, "ConfirmationFilter",
+            ).unwrap_or_default();
+            let epoch_bytes = crate::global_schema::read_field(
+                allocation_tree, cls, "Epoch",
+            ).unwrap_or_default();
+            let epoch = if epoch_bytes.len() == 8 {
+                u64::from_be_bytes(epoch_bytes.try_into().unwrap())
+            } else {
+                0
+            };
+            if filter.is_empty() || epoch > confirm_epoch {
                 return Err(QuilError::InvalidArgument(format!(
-                    "confirm: leave confirmation window expired ({} frames, {} elapsed)",
-                    max, frames_since
+                    "confirm: active re-confirm only for a data shard not already \
+                     registered ahead (epoch {} > confirm epoch {}, empty_filter={})",
+                    epoch, confirm_epoch, filter.is_empty(),
                 )));
             }
             Ok(())
         }
         _ => Err(QuilError::InvalidArgument(format!(
-            "confirm: invalid allocation status {} (expected 0=joining or 3=leaving)",
+            "confirm: invalid allocation status {} (expected 0=joining, 1=active re-confirm, or 3=leaving)",
             status
         ))),
     }
@@ -886,7 +884,7 @@ pub fn verify_prover_reject(
     let domain = prover_verify::prover_reject_domain()?;
 
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -953,7 +951,7 @@ fn verify_addressed_bls(
         return Ok(false);
     }
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         message,
         signature,
@@ -963,11 +961,11 @@ fn verify_addressed_bls(
 
 /// Verify a `ShardSplit` op. Mirrors Go's `ShardSplitOp.Verify` at
 /// `global_shard_split.go:53-133`:
-///   - shard_address 32–63 bytes
-///   - proposed_shards has 2–8 entries, each of parent_len+1 or
-///     parent_len+2 and prefixed by shard_address
-///   - BLS sig over `frame_be_u64 || shard_address` with domain
-///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
+/// - shard_address 32–63 bytes
+/// - proposed_shards has 2–8 entries, each of parent_len+1 or
+/// parent_len+2 and prefixed by shard_address
+/// - BLS sig over `frame_be_u64 || shard_address` with domain
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_SPLIT")`
 pub fn verify_shard_split(
     op: &super::prover_ops::ShardSplit,
     prover_tree: &quil_tries::VectorCommitmentTree,
@@ -985,19 +983,38 @@ pub fn verify_shard_split(
             op.proposed_shards.len()
         )));
     }
+    // Deep-bifurcation: post-cutover proposals encode children as bit-path
+    // FILTERS (`app ‖ bit_len ‖ packed`, variable length), validated as
+    // bit-prefix extensions of the parent — NOT the legacy byte-suffix children
+    // (exactly parent_len+1/+2, a byte prefix). The proposal frame decides the
+    // format, matching `materialize_shard_split`'s gate at the same frame.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.shard_address.len();
     for shard in &op.proposed_shards {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard split: proposed shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.shard_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard split: proposed shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.shard_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard split: proposed shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.shard_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: proposed shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -1024,11 +1041,11 @@ pub fn verify_shard_split(
 
 /// Verify a `ShardMerge` op. Mirrors Go's `ShardMergeOp.Verify` at
 /// `global_shard_merge.go:51-125`:
-///   - parent_address 32 bytes
-///   - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
-///     and each prefixed by parent_address
-///   - BLS sig over `frame_be_u64 || parent_address` with domain
-///     `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
+/// - parent_address 32 bytes
+/// - shard_addresses has 2–8 entries, each parent_len+1 or parent_len+2
+/// and each prefixed by parent_address
+/// - BLS sig over `frame_be_u64 || parent_address` with domain
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "SHARD_MERGE")`
 pub fn verify_shard_merge(
     op: &super::prover_ops::ShardMerge,
     prover_tree: &quil_tries::VectorCommitmentTree,
@@ -1046,19 +1063,38 @@ pub fn verify_shard_merge(
             op.shard_addresses.len()
         )));
     }
+    // Deep-bifurcation (parity with `verify_shard_split`): post-cutover the
+    // merged children are variable-length bit-path FILTERS validated as bit-prefix
+    // extensions of the parent — NOT the legacy parent_len+1/+2 byte suffixes. The
+    // proposal frame decides the format. The parent may be the bare app root or a
+    // bit-path filter; `shard_filter_extends` handles both.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.parent_address.len();
     for shard in &op.shard_addresses {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard merge: child shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.parent_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard merge: child shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.parent_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard merge: child shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.parent_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: child shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -1088,13 +1124,13 @@ pub fn verify_shard_merge(
 /// `global_prover_seniority_merge.go:391-618`.
 ///
 /// Checks:
-///   - addressed signature present, address 32 bytes
-///   - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
-///   - each merge-target signs `pubKeyBytes` with its own `key_type` under
-///     the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
-///   - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
-///     domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
-///   - address-binding: `poseidon(pubKeyBytes) == sig.address`
+/// - addressed signature present, address 32 bytes
+/// - 10-frame freshness: `op.frame_number + 10 >= current_frame_number`
+/// - each merge-target signs `pubKeyBytes` with its own `key_type` under
+/// the literal ASCII domain `"PROVER_SENIORITY_MERGE"`
+/// - main BLS sig over `frame_be_u64 || concat(helper_pubkeys)` under
+/// domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
+/// - address-binding: `poseidon(pubKeyBytes) == sig.address`
 ///
 /// NOT checked here (requires hypergraph state the dispatcher doesn't
 /// have): spent-merge tombstones, `mergeSeniority > existingSeniority`
@@ -1147,15 +1183,12 @@ pub fn verify_prover_seniority_merge(
     // literal ASCII domain — mirrors Go's :462-468.
     const MERGE_TARGET_DOMAIN: &[u8] = b"PROVER_SENIORITY_MERGE";
     for mt in &op.merge_targets {
+        // Ed448-only: seniority is Ed448-peer-key-bound (see the join-verify note).
         let key_type = match mt.key_type {
             0 => KeyType::Ed448,
-            1 => KeyType::X448,
-            2 => KeyType::Bls48581G1,
-            3 => KeyType::Bls48581G2,
-            4 => KeyType::Decaf448,
             other => {
                 return Err(QuilError::InvalidArgument(format!(
-                    "prover seniority merge: merge target has unknown key_type {other}"
+                    "prover seniority merge: merge target key_type {other} unsupported (Ed448-only)"
                 )));
             }
         };
@@ -1171,7 +1204,7 @@ pub fn verify_prover_seniority_merge(
         }
     }
 
-    // Main BLS sig over `frame_be || concat(helper_pubkeys)` under
+    // Main Falcon sig over `frame_be || concat(helper_pubkeys)` under
     // the poseidon-wrapped domain.
     let mut message = Vec::with_capacity(8);
     message.extend_from_slice(&op.frame_number.to_be_bytes());
@@ -1180,7 +1213,7 @@ pub fn verify_prover_seniority_merge(
     }
     let domain = intrinsic_domain(b"PROVER_SENIORITY_MERGE")?;
     key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &pubkey,
         &message,
         &sig.signature,
@@ -1194,6 +1227,57 @@ mod tests {
     use num_bigint::BigInt;
     use crate::global_schema::{TYPE_HASH_PROVER, TYPE_HASH_ALLOCATION};
     use super::super::addressed_signature::AddressedSignature;
+
+    /// A consumed merge target is spent FOREVER: the ONE-SHOT invariant. Since
+    /// `materialize_seniority_merge` ADDS the aggregated target seniority to the
+    /// prover's score, allowing a prover to re-submit its OWN merge would inflate
+    /// its consensus weight without bound. So the presence of EITHER tombstone
+    /// (same-prover, different-prover, or legacy/empty) blocks re-use.
+    #[test]
+    fn seniority_merge_spent_markers_reject_any_consumed_target() {
+        use crate::global_intrinsic::prover_ops::ProverSeniorityMerge;
+        use crate::global_intrinsic::seniority_merge::SeniorityMerge;
+
+        let self_addr = vec![0xAAu8; 32];
+        let other_addr = vec![0xBBu8; 32];
+        let make_op = || ProverSeniorityMerge {
+            frame_number: 5,
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0u8; 666],
+                address: self_addr.clone(),
+            }),
+            merge_targets: vec![SeniorityMerge {
+                signature: vec![0u8; 666],
+                key_type: 0,
+                prover_public_key: vec![0x11u8; 32],
+            }],
+        };
+        let tombstone_of = |addr: &[u8]| -> Vec<u8> {
+            let t = crate::global_intrinsic::materialize::create_spent_merge_tree(addr).unwrap();
+            crate::prover_registry::vertex_tree_to_blob(&t)
+        };
+
+        // No tombstone → allowed.
+        assert!(verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(None)).is_ok());
+        // Own (same-prover) tombstone → REJECTED. No re-submitting your own merge.
+        let self_blob = tombstone_of(&self_addr);
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(self_blob.clone())))
+                .is_err(),
+            "a consumed target must block re-use even by the SAME prover (no inflation)"
+        );
+        // Different-prover tombstone → rejected.
+        let other_blob = tombstone_of(&other_addr);
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(other_blob.clone())))
+                .is_err(),
+            "a DIFFERENT prover's tombstone must block the merge"
+        );
+        // Any present marker (even legacy/empty) means the target is consumed → rejected.
+        assert!(
+            verify_prover_seniority_merge_spent_markers(&make_op(), |_| Ok(Some(vec![]))).is_err()
+        );
+    }
 
     // Stub key manager that always accepts/rejects
     struct AcceptKeyManager;
@@ -1389,6 +1473,7 @@ mod tests {
                 address: vec![0xCCu8; 32],
             }),
             filters: vec![vec![0xDDu8; 32]],
+            leaf_roots: Vec::new(),
         }
     }
 
@@ -1480,10 +1565,15 @@ mod tests {
     }
 
     #[test]
-    fn join_structural_rejects_wrong_proof_size() {
+    fn join_structural_ignores_proof_field() {
+        // VDF was removed from joins: proof size is no longer validated.
+        // An empty proof (new joins) and a populated proof (historical
+        // joins, on replay) must both pass structural validation.
         let mut op = sample_join(vec![vec![0x01u8; 32]]);
-        op.proof = vec![0u8; 100]; // should be 516
-        assert!(validate_prover_join_structural(&op, 105).is_err());
+        op.proof = vec![]; // new joins carry no proof
+        assert!(validate_prover_join_structural(&op, 105).is_ok());
+        op.proof = vec![0u8; 100]; // arbitrary legacy blob
+        assert!(validate_prover_join_structural(&op, 105).is_ok());
     }
 
     #[test]
@@ -1541,70 +1631,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // verify_prover_join_vdf — regression for test #548
-    //
-    // Builds a real VDF multi-proof with the signer-side algorithm
-    // (SHA3-256 challenge over frame_output, matching Go's
-    // `sha3.Sum256` and Rust's prover_pipeline) and feeds it through
-    // the actual verifier. Pins the cross-implementation hash
-    // agreement; would have caught the original sha2/sha3 mismatch.
+    // Epoch-aligned confirm timing: a proposal in epoch E confirms in
+    // EXACTLY epoch E+1. EPOCH_LENGTH_FRAMES = 720.
     // -----------------------------------------------------------------
-
-    #[test]
-    fn verify_prover_join_vdf_accepts_real_proof() {
-        use quil_types::crypto::FrameProver;
-
-        let frame_prover = quil_crypto::WesolowskiFrameProver::new(2048);
-        let difficulty: u32 = 200;
-        let frame_output: &[u8] = b"deadbeef-test-frame-output";
-        let filters: Vec<Vec<u8>> = vec![vec![0x01u8; 32], vec![0x02u8; 48]];
-
-        let stub = sample_join(filters.clone());
-        let prover_address = validate_prover_join_structural(&stub, 105)
-            .unwrap()
-            .prover_address;
-
-        use sha3::Digest as _;
-        let challenge: [u8; 32] = sha3::Sha3_256::digest(frame_output).into();
-
-        let ids: Vec<Vec<u8>> = filters
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let mut id = Vec::with_capacity(32 + f.len() + 4);
-                id.extend_from_slice(&prover_address);
-                id.extend_from_slice(f);
-                id.extend_from_slice(&(i as u32).to_be_bytes());
-                id
-            })
-            .collect();
-        let id_refs: Vec<&[u8]> = ids.iter().map(|v| v.as_slice()).collect();
-
-        let mut proof = Vec::with_capacity(filters.len() * PROOF_CHUNK_SIZE);
-        for i in 0..filters.len() {
-            let chunk = frame_prover
-                .calculate_multi_proof(&challenge, difficulty, &id_refs, i as u32)
-                .unwrap();
-            assert_eq!(chunk.len(), PROOF_CHUNK_SIZE);
-            proof.extend_from_slice(&chunk);
-        }
-
-        let op = ProverJoin { proof, ..stub };
-
-        let ok = verify_prover_join_vdf(&op, 105, frame_output, difficulty, &frame_prover)
-            .expect("verify_prover_join_vdf returned an error");
-        assert!(ok, "real ProverJoin proof must verify (regression testfor #548)");
-    }
-
-    // -----------------------------------------------------------------
-    // Tier-5 #11: 2.1 transition window in validate_confirm_timing
-    // -----------------------------------------------------------------
+    const E: u64 = quil_types::consensus::EPOCH_LENGTH_FRAMES;
 
     fn make_alloc_tree_with_join_frame(status: u8, join_frame: u64)
         -> quil_tries::VectorCommitmentTree
     {
-        // ConfirmationFilter at order 2 → key 0x08; JoinFrameNumber at order 4 → key 0x10.
-        // Use schema-driven keys to be safe.
         let mut tree = make_allocation_tree(status);
         let cls = "allocation:ProverAllocation";
         let join_key = crate::global_schema::field_key(cls, "JoinFrameNumber").unwrap();
@@ -1612,53 +1646,124 @@ mod tests {
         tree
     }
 
-    /// Joins inside the 2.1 transition window (244100..255840) cannot
-    /// confirm before frame 255840.
-    #[test]
-    fn confirm_timing_blocks_transition_window_before_255840() {
-        let alloc = make_alloc_tree_with_join_frame(0, 244_500);
-        // frame_number < 255840 → must error.
-        let res = validate_confirm_timing(255_000, &alloc);
-        assert!(res.is_err(), "must reject confirm before 255840");
+    fn make_alloc_tree_with_leave_frame(leave_frame: u64)
+        -> quil_tries::VectorCommitmentTree
+    {
+        let mut tree = make_allocation_tree(3); // Leaving
+        let cls = "allocation:ProverAllocation";
+        let leave_key = crate::global_schema::field_key(cls, "LeaveFrameNumber").unwrap();
+        tree.insert(&leave_key, &leave_frame.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
+        tree
     }
 
-    /// Joins inside the transition window get clamped at frame 255840
-    /// so they all confirm immediately once the cutover frame hits.
+    /// A join proposed in epoch E must be confirmed in exactly epoch E+1.
     #[test]
-    fn confirm_timing_admits_transition_window_at_255840() {
-        // Join in the middle of the band; once frame_number hits
-        // 255840, the clamped join_frame becomes 255840-360, so
-        // frames_since == 360 → allowed.
-        let alloc = make_alloc_tree_with_join_frame(0, 244_200);
-        let res = validate_confirm_timing(255_840, &alloc);
-        assert!(res.is_ok(), "must admit transition-window join at 255840: {res:?}");
+    fn confirm_timing_join_requires_next_epoch() {
+        // Join in epoch 2.
+        let alloc = make_alloc_tree_with_join_frame(0, 2 * E + 100);
+        // Same epoch (2) → too early.
+        assert!(validate_confirm_timing(2 * E + 500, &alloc).is_err());
+        // Epoch 3 (= E+1) → ok, anywhere in the epoch.
+        assert!(validate_confirm_timing(3 * E, &alloc).is_ok());
+        assert!(validate_confirm_timing(3 * E + 719, &alloc).is_ok());
+        // Epoch 4 → too late (missed the slot).
+        assert!(validate_confirm_timing(4 * E, &alloc).is_err());
     }
 
-    /// Pre-transition joins (< 244100) follow the normal 360..720 window.
+    /// A leave proposed in epoch E must be confirmed in exactly epoch E+1.
     #[test]
-    fn confirm_timing_normal_window_pre_transition() {
-        let alloc = make_alloc_tree_with_join_frame(0, 200_000);
-
-        // Too early.
-        assert!(validate_confirm_timing(200_300, &alloc).is_err());
-        // In the window.
-        assert!(validate_confirm_timing(200_400, &alloc).is_ok());
-        // Past the window.
-        assert!(validate_confirm_timing(200_800, &alloc).is_err());
+    fn confirm_timing_leave_requires_next_epoch() {
+        let alloc = make_alloc_tree_with_leave_frame(5 * E + 10); // epoch 5
+        assert!(validate_confirm_timing(5 * E + 700, &alloc).is_err()); // same epoch
+        assert!(validate_confirm_timing(6 * E + 1, &alloc).is_ok());    // E+1
+        assert!(validate_confirm_timing(7 * E, &alloc).is_err());       // too late
     }
 
-    /// Joins after the cutover (≥ 255840) follow the normal 360..720
-    /// window — the transition logic does not affect them.
     #[test]
-    fn confirm_timing_normal_window_post_transition() {
-        let alloc = make_alloc_tree_with_join_frame(0, 256_000);
+    fn confirm_epoch_rejects_delayed_and_future_signed_frames() {
+        assert!(validate_confirm_epoch(E + 1, 2 * E - 1).is_ok());
+        assert!(validate_confirm_epoch(2 * E - 1, 2 * E).is_err());
+        assert!(validate_confirm_epoch(2 * E + 1, 2 * E).is_err());
+    }
 
-        // Too early.
-        assert!(validate_confirm_timing(256_200, &alloc).is_err());
-        // In the window (frames_since = 360).
-        assert!(validate_confirm_timing(256_360, &alloc).is_ok());
-        // Past 720 frames.
-        assert!(validate_confirm_timing(256_721, &alloc).is_err());
+    #[test]
+    fn confirm_timing_rejects_already_confirmed_leave() {
+        let mut alloc = make_alloc_tree_with_leave_frame(5 * E + 10);
+        super::super::materialize::materialize_prover_confirm(&mut alloc, 6 * E + 1).unwrap();
+        assert!(validate_confirm_timing(6 * E + 2, &alloc).is_err());
+    }
+
+    /// Active re-confirm registers the NEXT epoch: allowed iff the recorded
+    /// Epoch is not already ahead of the confirm epoch, and the filter is a
+    /// non-empty data shard.
+    #[test]
+    fn confirm_timing_active_reconfirm_not_already_ahead() {
+        let cls = "allocation:ProverAllocation";
+        let mk = |epoch: u64, filter: &[u8]| {
+            let mut tree = make_allocation_tree(1); // Active
+            tree.insert(
+                &crate::global_schema::field_key(cls, "Epoch").unwrap(),
+                &epoch.to_be_bytes(), &[], &BigInt::from(8),
+            ).unwrap();
+            tree.insert(
+                &crate::global_schema::field_key(cls, "ConfirmationFilter").unwrap(),
+                filter, &[], &BigInt::from(filter.len() as i64),
+            ).unwrap();
+            tree
+        };
+        // Registered for epoch 3, re-confirming in epoch 3 (to register 4) → ok.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(3, &[0xAB; 32])).is_ok());
+        // Already registered ahead (epoch 4) but confirming in epoch 3 → reject.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(4, &[0xAB; 32])).is_err());
+        // Empty/global filter never epoch-expires → reject.
+        assert!(validate_confirm_timing(3 * E + 5, &mk(3, &[])).is_err());
+    }
+
+    // ---- Defensive arms + stale recovery ------------------------------------
+
+    /// Missing JoinFrameNumber / LeaveFrameNumber (field length != 8) is rejected
+    /// rather than silently defaulting.
+    #[test]
+    fn confirm_timing_missing_frame_fields_error() {
+        // Status 0 (Joining) with no JoinFrameNumber field at all.
+        let joining = make_allocation_tree(0);
+        assert!(validate_confirm_timing(3 * E, &joining).is_err());
+        // Status 3 (Leaving) with no LeaveFrameNumber field.
+        let leaving = make_allocation_tree(3);
+        assert!(validate_confirm_timing(3 * E, &leaving).is_err());
+    }
+
+    /// Confirm on a non-confirmable status byte (paused / terminal / garbage)
+    /// hits the `_ =>` arm → Err.
+    #[test]
+    fn confirm_timing_invalid_status_byte_error() {
+        for byte in [2u8, 4u8, 5u8, 255u8] {
+            let t = make_allocation_tree(byte);
+            assert!(
+                validate_confirm_timing(3 * E, &t).is_err(),
+                "status byte {byte} must not be confirmable"
+            );
+        }
+    }
+
+    /// Active re-confirm RECOVERS from a stale (ExpiredEpoch) registration: an
+    /// allocation registered for epoch 2, confirming in epoch 5, is allowed
+    /// (`epoch <= confirm_epoch`) — it re-registers for epoch 6. Previously only
+    /// the `epoch == confirm_epoch` case was tested.
+    #[test]
+    fn confirm_timing_active_reconfirm_recovers_from_stale_epoch() {
+        let cls = "allocation:ProverAllocation";
+        let mut t = make_allocation_tree(1); // Active
+        t.insert(
+            &crate::global_schema::field_key(cls, "Epoch").unwrap(),
+            &2u64.to_be_bytes(), &[], &BigInt::from(8),
+        ).unwrap();
+        t.insert(
+            &crate::global_schema::field_key(cls, "ConfirmationFilter").unwrap(),
+            &[0xCD; 32], &[], &BigInt::from(32),
+        ).unwrap();
+        // Confirming in epoch 5 with a stale epoch-2 registration → recovery ok.
+        assert!(validate_confirm_timing(5 * E + 10, &t).is_ok());
     }
 
     // -----------------------------------------------------------------
@@ -1818,6 +1923,38 @@ mod tests {
         assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager).unwrap());
     }
 
+    /// Deep-bifurcation: post-cutover (`frame_number >= cutover`) the children are
+    /// variable-length bit-path FILTERS (`app ‖ bit_len ‖ packed`), NOT the legacy
+    /// parent_len+1/+2 byte suffixes — validated as bit-prefix extensions. The
+    /// parent here is the BARE 32-byte app address (the root shard). Both the
+    /// byte-length wall and the bare-app-root parent were bugs that silently
+    /// rejected real deep splits at this validation wall.
+    #[test]
+    fn shard_split_bit_path_mode_accepts_deep_children_under_bare_app_root() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32]; // == sample_split shard_address (the signer/app)
+        // A 4-bit descent past the immediate bit: children branch at bit 3.
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+        let mut op = sample_split();
+        op.frame_number = 700_000; // >= UNIFIED_TREE_CUTOVER_FRAME (698_000)
+        op.shard_address = app.to_vec(); // bare app root (empty bit-path parent)
+        op.proposed_shards = vec![c0, c1];
+        assert!(
+            verify_shard_split(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children under the bare-app root must pass validation"
+        );
+
+        // A child under a DIFFERENT app does not extend the parent → rejected.
+        let mut bad = op.clone();
+        bad.proposed_shards = vec![
+            encode_shard_bit_path(&app, &[true]),
+            encode_shard_bit_path(&[0x09u8; 32], &[false]),
+        ];
+        assert!(verify_shard_split(&bad, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
     fn sample_merge() -> ShardMerge {
         ShardMerge {
             shard_addresses: vec![vec![0x01u8; 33], vec![0x01u8; 33]],
@@ -1851,6 +1988,36 @@ mod tests {
         op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x77u8; 32];
         // poseidon(pubkey) != sig.address → Ok(false).
         assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    /// Deep-bifurcation (parity with the split): post-cutover the merged children
+    /// are bit-path FILTERS validated as bit-prefix extensions of the parent —
+    /// NOT the legacy parent_len+1/+2 byte suffixes. The parent here is a deep
+    /// bit-path filter (merging [0,0,0,0]/[0,0,0,1] back into [0,0,0]).
+    #[test]
+    fn shard_merge_bit_path_mode_accepts_deep_children() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32];
+        let mut op = sample_merge();
+        op.frame_number = 700_000; // >= cutover
+        op.parent_address = encode_shard_bit_path(&app, &[false, false, false]);
+        op.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[false, false, false, true]),
+        ];
+        assert!(
+            verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children merging into their parent branch must validate"
+        );
+
+        // A child that does NOT extend the parent branch is rejected.
+        let mut bad = op.clone();
+        bad.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[true, false, false, false]), // wrong branch
+        ];
+        assert!(verify_shard_merge(&bad, &prover_tree, &AcceptKeyManager).is_err());
     }
 
     fn sample_seniority_merge() -> ProverSeniorityMerge {
@@ -1942,7 +2109,7 @@ mod tests {
     #[test]
     fn join_not_kicked_passes_when_no_kick_field() {
         let prover_tree = make_prover_tree();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
     }
 
     #[test]
@@ -1951,7 +2118,8 @@ mod tests {
         // KickFrameNumber on prover:Prover at its schema key.
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &500u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_err());
+        // Before the amnesty frame, a kick still bars re-join.
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_err());
     }
 
     #[test]
@@ -1959,7 +2127,28 @@ mod tests {
         let mut prover_tree = make_prover_tree();
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &0u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
+    }
+
+    #[test]
+    fn join_not_kicked_amnesty_forgives_pre_flag_day_kick() {
+        use crate::global_intrinsic::materialize::KICK_AMNESTY_FRAME;
+        let mut prover_tree = make_prover_tree();
+        let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
+        // A kick BEFORE the amnesty frame.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME - 100).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        // Still barred while the chain is before the amnesty frame …
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME - 1).is_err());
+        // … forgiven once the chain reaches it.
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME).is_ok());
+
+        // A kick AT/AFTER the amnesty frame is never forgiven.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME + 50).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME + 1000).is_err());
     }
 
     // -----------------------------------------------------------------
@@ -2058,8 +2247,13 @@ mod tests {
     #[test]
     fn seniority_merge_spent_markers_rejects_consumed_target() {
         let op = sample_seniority_merge();
-        // Any tombstone present → reject.
-        let r = verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(vec![0x01])));
+        // A consumed target → reject. One-shot: the mere existence of a tombstone
+        // blocks re-use (see `seniority_merge_spent_markers_reject_any_consumed_target`).
+        let other = crate::global_intrinsic::materialize::create_spent_merge_tree(&vec![0x77u8; 32])
+            .unwrap();
+        let other_blob = crate::prover_registry::vertex_tree_to_blob(&other);
+        let r =
+            verify_prover_seniority_merge_spent_markers(&op, |_| Ok(Some(other_blob.clone())));
         assert!(r.is_err());
     }
 }

@@ -531,6 +531,12 @@ pub struct NoopHypergraphConfigResolver;
 impl crate::hypergraph_intrinsic::HypergraphConfigResolver
     for NoopHypergraphConfigResolver
 {
+    fn for_execution_context(
+        &self, _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> Result<Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>> {
+        Ok(Arc::new(Self))
+    }
+
     fn write_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
         None
     }

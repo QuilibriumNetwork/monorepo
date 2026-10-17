@@ -66,16 +66,37 @@ pub fn build_join_bundle(
     wrap_in_bundle(signed.to_canonical_bytes()?)
 }
 
-/// Build a signed ProverConfirm wrapped in a MessageBundle.
+/// Build a signed ProverConfirm wrapped in a MessageBundle (no storage
+/// leaf roots — the legacy / pre-storage-attestation path).
 pub fn build_confirm_bundle(
     filters: &[Vec<u8>],
     frame_number: u64,
     bls_signer: &dyn Signer,
     prover_address: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
-    msg.extend_from_slice(&frame_number.to_be_bytes());
+    build_confirm_bundle_with_leaf_roots(filters, frame_number, bls_signer, prover_address, &[])
+}
+
+/// Build a signed ProverConfirm carrying the prover's per-epoch storage
+/// `leaf_roots`. The signature covers `confirm_signing_message` (the
+/// multi-filter message with the leaf-root set appended), so the
+/// registered roots are authenticated. An empty `leaf_roots` slice signs
+/// + serializes byte-identically to the pre-storage-attestation confirm,
+/// so [`build_confirm_bundle`] delegates here with `&[]`. The roots are
+/// produced by `app_shard_metadata::compute_storage_confirm` (which also
+/// persists the SDR replicas). PoRep wiring E.
+pub fn build_confirm_bundle_with_leaf_roots(
+    filters: &[Vec<u8>],
+    frame_number: u64,
+    bls_signer: &dyn Signer,
+    prover_address: &[u8],
+    leaf_roots: &[quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots],
+) -> Result<Vec<u8>> {
+    let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+        filters,
+        frame_number,
+        leaf_roots,
+    );
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
     dp.extend_from_slice(b"PROVER_CONFIRM");
@@ -91,6 +112,7 @@ pub fn build_confirm_bundle(
             address: prover_address.to_vec(),
         }),
         filters: filters.to_vec(),
+        leaf_roots: leaf_roots.to_vec(),
     };
 
     wrap_in_bundle(confirm.to_canonical_bytes()?)
@@ -182,7 +204,9 @@ pub fn build_merge_helpers(
 
     Ok(vec![SeniorityMerge {
         signature: signature.to_vec(),
-        key_type: 4, // KeyTypeEd448
+        // Ed448 seniority key. FIX: was `4` (Decaf448's value, mislabeled
+        // "KeyTypeEd448") — the verify map is Ed448-only now and Ed448 = 0.
+        key_type: quil_types::crypto::KeyType::Ed448 as u32,
         prover_public_key: ed448_pubkey_bytes,
     }])
 }
@@ -256,7 +280,7 @@ pub fn build_shard_merge_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_crypto::Bls48581KeyConstructor;
+    use quil_crypto::FalconKeyConstructor;
     use quil_types::crypto::BlsConstructor;
 
     /// Decode a bundle's single inner request bytes (after stripping the
@@ -272,7 +296,10 @@ mod tests {
 
     /// Generate a real BLS keypair (signer + public key bytes).
     fn bls_keypair() -> (Box<dyn Signer>, Vec<u8>) {
-        Bls48581KeyConstructor.new_key().expect("bls keypair")
+        // Consensus is now Falcon-512 (FN-DSA); the prover bundle
+        // helpers embed `SignatureWithPop`, whose decode gate requires
+        // 666-byte Falcon signatures / 897-byte keys.
+        FalconKeyConstructor.new_key().expect("falcon keypair")
     }
 
     #[test]
@@ -339,7 +366,7 @@ mod tests {
         dp.extend_from_slice(b"PROVER_JOIN");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &join_message, &domain));
         // POP signature verifies over the pubkey under the POP domain.
         assert!(bls.verify_signature_raw(&pk, &sig.pop_signature, &pk, b"BLS48_POP_SK"));
@@ -350,7 +377,7 @@ mod tests {
         let (signer, pk) = bls_keypair();
         let merge = SeniorityMerge {
             signature: vec![0xAAu8; 114],
-            key_type: 4,
+            key_type: quil_types::crypto::KeyType::Ed448 as u32,
             prover_public_key: vec![0xBBu8; 57],
         };
         let bytes = build_join_bundle(
@@ -366,7 +393,7 @@ mod tests {
         let inner = decode_single_inner(&bytes);
         let join = ProverJoin::from_canonical_bytes(&inner).unwrap();
         assert_eq!(join.merge_targets.len(), 1);
-        assert_eq!(join.merge_targets[0].key_type, 4);
+        assert_eq!(join.merge_targets[0].key_type, quil_types::crypto::KeyType::Ed448 as u32);
         assert_eq!(join.merge_targets[0].prover_public_key, vec![0xBBu8; 57]);
     }
 
@@ -387,6 +414,61 @@ mod tests {
         assert_eq!(confirm.filter.len(), 32);
         let sig = confirm.public_key_signature_bls48581.expect("sig present");
         assert_eq!(sig.address, address);
+        assert!(!sig.signature.is_empty());
+    }
+
+    #[test]
+    fn confirm_bundle_with_leaf_roots_round_trips() {
+        use quil_execution::global_intrinsic::leaf_root_registration::{
+            ConfirmLeafRoots, LeafRootEntry,
+        };
+        let (signer, _pk) = bls_keypair();
+        let filters = vec![vec![0x05u8; 32]];
+        let frame_number = 778u64;
+        let address = vec![0x42u8; 32];
+        let roots = vec![ConfirmLeafRoots {
+            filter: filters[0].clone(),
+            entries: vec![LeafRootEntry {
+                prefix: vec![0u32, 1u32],
+                leaf_root: vec![0xABu8; 64],
+                num_blocks: 3,
+            }],
+        }];
+
+        let bytes = build_confirm_bundle_with_leaf_roots(
+            &filters,
+            frame_number,
+            signer.as_ref(),
+            &address,
+            &roots,
+        )
+        .unwrap();
+        let inner = decode_single_inner(&bytes);
+        let confirm = ProverConfirm::from_canonical_bytes(&inner).expect("confirm decodes");
+        assert_eq!(confirm.filters, filters);
+        assert_eq!(confirm.leaf_roots.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].filter, filters[0]);
+        assert_eq!(confirm.leaf_roots[0].entries.len(), 1);
+        assert_eq!(confirm.leaf_roots[0].entries[0].prefix, vec![0u32, 1u32]);
+        assert_eq!(confirm.leaf_roots[0].entries[0].num_blocks, 3);
+
+        // The signature must cover the leaf-root-bearing signing message, so a
+        // confirm whose declared roots were tampered no longer matches.
+        let sig = confirm.public_key_signature_bls48581.clone().expect("sig");
+        let signed_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &confirm.leaf_roots,
+        );
+        let tampered_msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
+            &confirm.filters,
+            confirm.frame_number,
+            &[],
+        );
+        assert_ne!(
+            signed_msg, tampered_msg,
+            "non-empty leaf roots must change the signed message vs the legacy form"
+        );
         assert!(!sig.signature.is_empty());
     }
 
@@ -447,8 +529,54 @@ mod tests {
         dp.extend_from_slice(b"PROVER_CONFIRM");
         let domain = quil_crypto::poseidon::hash_bytes_to_32(&dp).unwrap();
 
-        let bls = Bls48581KeyConstructor;
+        let bls = FalconKeyConstructor;
         assert!(bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain));
+    }
+
+    #[test]
+    fn leave_signature_verifies_under_domain() {
+        // Regression: the leave signer (`build_leave_bundle`) uses a
+        // LENGTH-DELIMITED message, but `verify_prover_leave` had reused the
+        // raw-concat `multi_filter_signing_message`, so EVERY leave failed
+        // signature verification (mass `op=ProverLeave` mempool drops; leaves
+        // never accepted; coverage stuck). This asserts the signed bytes match
+        // the verifier's `prover_leave_signing_message`. Use >1 filter of
+        // differing lengths so a raw-concat reconstruction cannot coincide.
+        let (signer, pk) = bls_keypair();
+        let filters = vec![vec![0x08u8; 32], vec![0x09u8; 40], vec![0x0au8; 8]];
+        let frame_number = 777u64;
+        let address = vec![0x42u8; 32];
+
+        let bytes =
+            build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let inner = decode_single_inner(&bytes);
+        let leave = ProverLeave::from_canonical_bytes(&inner).unwrap();
+        let sig = leave.public_key_signature_bls48581.unwrap();
+
+        // The verifier's message builder must reproduce the signed bytes.
+        let msg = quil_execution::global_intrinsic::prover_verify::prover_leave_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        let domain =
+            quil_execution::global_intrinsic::prover_verify::prover_leave_domain().unwrap();
+
+        let bls = FalconKeyConstructor;
+        assert!(
+            bls.verify_signature_raw(&pk, &sig.signature, &msg, &domain),
+            "leave signature must verify against prover_leave_signing_message"
+        );
+
+        // And it must NOT verify against the old raw-concat form (guards
+        // against silently reverting the verifier to multi_filter).
+        let wrong = quil_execution::global_intrinsic::prover_verify::multi_filter_signing_message(
+            &leave.filters,
+            leave.frame_number,
+        );
+        assert!(
+            !bls.verify_signature_raw(&pk, &sig.signature, &wrong, &domain),
+            "raw-concat form must not verify a length-delimited leave signature"
+        );
     }
 
     #[test]
@@ -458,7 +586,7 @@ mod tests {
         let merges = build_merge_helpers(&seed, &bls_pubkey).expect("merge helpers");
         assert_eq!(merges.len(), 1);
         let m = &merges[0];
-        assert_eq!(m.key_type, 4);
+        assert_eq!(m.key_type, quil_types::crypto::KeyType::Ed448 as u32);
         assert!(!m.signature.is_empty());
 
         // The prover_public_key must be the Ed448 public key derived

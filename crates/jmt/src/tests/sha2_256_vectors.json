@@ -1,0 +1,32 @@
+{
+	"description": "Test vectors for a JMT instantiated with the sha2-256 hash function. Keys and values are hex-encoded byte strings. Neither keys nor values have been pre-hashed.",
+	"hash_function": "sha2",
+	"vectors": [
+		{
+			"expected_root": "5350415253455f4d45524b4c455f504c414345484f4c4445525f484153485f5f",
+			"data": []
+		},
+		{
+			"expected_root": "6b97115f56e533f2fd443f7e76e4d1ff94d34e6b2e233f2dbdf5cfd1ec39a30c",
+			"data": [
+				{
+					"key": "68656c6c6f",
+					"value": "776f726c64"
+				}
+			]
+		},
+		{
+			"expected_root": "e1e1e220d4b4a9611a9a09dbcee964b4a6c3a40f6f4dee265ad45cf64568790b",
+			"data": [
+				{
+					"key": "68656c6c6f",
+					"value": "776f726c64"
+				},
+				{
+					"key": "676f6f64627965",
+					"value": "776f726c64"
+				}
+			]
+		}
+	]
+}

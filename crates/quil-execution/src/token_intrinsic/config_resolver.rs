@@ -19,8 +19,8 @@
 
 use super::constants::{
     MINT_WITH_AUTHORITY, MINT_WITH_PAYMENT, MINT_WITH_PROOF,
-    MINT_WITH_SIGNATURE, NO_MINT_BEHAVIOR, PROOF_OF_MEANINGFUL_WORK,
-    VERKLE_MULTIPROOF_WITH_SIGNATURE,
+    MERKLE_ENTITLEMENT_WITH_SIGNATURE, MINT_WITH_SIGNATURE, NO_MINT_BEHAVIOR,
+    PROOF_OF_MEANINGFUL_WORK, VERKLE_MULTIPROOF_WITH_SIGNATURE,
 };
 
 /// Routing decision for a MintTransaction's `MintBehavior`+`ProofBasis`
@@ -34,8 +34,11 @@ pub enum MintVariant {
     Signature,
     /// `MintWithProof + ProofOfMeaningfulWork`.
     ProofOfMeaningfulWork,
-    /// `MintWithProof + VerkleMultiproofWithSignature`.
+    /// `MintWithProof + VerkleMultiproofWithSignature` — retired with KZG.
     VerkleMultiproofWithSignature,
+    /// `MintWithProof + MerkleEntitlementWithSignature`: the configuration's
+    /// entitlement root, one signed leaf per mint.
+    MerkleEntitlementWithSignature,
     /// `MintWithPayment`.
     Payment,
     /// `NoMintBehavior` — non-mintable token; minting should reject.
@@ -59,6 +62,7 @@ impl MintVariant {
                 VERKLE_MULTIPROOF_WITH_SIGNATURE => {
                     MintVariant::VerkleMultiproofWithSignature
                 }
+                MERKLE_ENTITLEMENT_WITH_SIGNATURE => MintVariant::MerkleEntitlementWithSignature,
                 _ => MintVariant::Unknown,
             },
             _ => MintVariant::Unknown,
@@ -74,6 +78,16 @@ impl MintVariant {
 /// can dispatch correctly; the built-in [`QuilOnlyConfigResolver`]
 /// handles the QUIL case inline.
 pub trait TokenConfigResolver: Send + Sync {
+    /// Create independent state lookups/cache for the supplied execution view.
+    /// Unknown implementations must opt in rather than sharing mutable state.
+    fn for_execution_context(
+        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
+        Err(quil_types::error::QuilError::ExecutionUnavailable(
+            "token resolver cannot rebind execution state".into(),
+        ))
+    }
+
     fn mint_variant_for_domain(&self, domain: &[u8]) -> Option<MintVariant>;
 
     /// For Authority/Signature variants: the key type of the
@@ -84,7 +98,7 @@ pub trait TokenConfigResolver: Send + Sync {
     /// For Authority/Signature variants: the authority's public key.
     fn authority_public_key(&self, domain: &[u8]) -> Option<Vec<u8>>;
 
-    /// For VerkleMultiproofWithSignature: the configured verkle root.
+    /// For the Merkle entitlement basis: the configured entitlement root.
     fn verkle_root(&self, domain: &[u8]) -> Option<Vec<u8>>;
 
     /// For MintWithPayment: the fee baseline (None = free mint).
@@ -105,6 +119,12 @@ pub trait TokenConfigResolver: Send + Sync {
 pub struct QuilOnlyConfigResolver;
 
 impl TokenConfigResolver for QuilOnlyConfigResolver {
+    fn for_execution_context(
+        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
+        Ok(std::sync::Arc::new(Self))
+    }
+
     fn mint_variant_for_domain(&self, domain: &[u8]) -> Option<MintVariant> {
         if domain == &crate::domains::QUIL_TOKEN[..] {
             Some(MintVariant::ProofOfMeaningfulWork)
@@ -126,7 +146,8 @@ pub struct StaticTokenEntry {
     pub variant: MintVariant,
     pub authority_key_type: Option<u32>,
     pub authority_public_key: Option<Vec<u8>>,
-    pub verkle_root: Option<Vec<u8>>,
+    /// The configured proof root: a Merkle root of mint entitlements.
+    pub entitlement_root: Option<Vec<u8>>,
     pub payment_fee_baseline: Option<num_bigint::BigInt>,
     pub payment_address: Option<Vec<u8>>,
 }
@@ -169,6 +190,25 @@ impl StaticTokenConfigResolver {
     /// (the packed-binary form produced by Go deploys and decoded via
     /// `decode_mint_strategy_packed`). Surfaces the fields the engine
     /// needs for dispatch.
+    /// Reject a mint strategy naming a classical authority key. Application
+    /// authority is post-quantum only, so a token
+    /// deployed with an Ed448, Ed25519, secp256k1 or BLS48-581 authority could
+    /// never mint; refusing the configuration says so at deploy time instead.
+    pub fn check_post_quantum_authority(
+        strategy: &super::config::TokenMintStrategy,
+    ) -> Result<(), quil_types::error::QuilError> {
+        if strategy.authority.is_empty() {
+            return Ok(());
+        }
+        let authority = super::config::Authority::from_canonical_bytes(&strategy.authority)?;
+        if !super::signature::is_post_quantum_authority(authority.key_type) {
+            return Err(quil_types::error::QuilError::InvalidArgument(
+                "token configuration: mint authority keys must be post-quantum (Falcon-512)".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn entry_from_mint_strategy(
         strategy: &super::config::TokenMintStrategy,
     ) -> Result<StaticTokenEntry, quil_types::error::QuilError> {
@@ -187,7 +227,9 @@ impl StaticTokenConfigResolver {
             authority_public_key = Some(a.public_key);
         }
 
-        let verkle_root = if strategy.verkle_root.is_empty() {
+        // The configured proof root (`verkle_root` in the wire configuration)
+        // is the Merkle root of the token's mint entitlements.
+        let entitlement_root = if strategy.verkle_root.is_empty() {
             None
         } else {
             Some(strategy.verkle_root.clone())
@@ -224,7 +266,7 @@ impl StaticTokenConfigResolver {
             variant,
             authority_key_type,
             authority_public_key,
-            verkle_root,
+            entitlement_root,
             payment_fee_baseline,
             payment_address,
         })
@@ -238,6 +280,12 @@ impl Default for StaticTokenConfigResolver {
 }
 
 impl TokenConfigResolver for StaticTokenConfigResolver {
+    fn for_execution_context(
+        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
+        Ok(std::sync::Arc::new(Self { entries: self.entries.clone() }))
+    }
+
     fn mint_variant_for_domain(&self, domain: &[u8]) -> Option<MintVariant> {
         self.entries.get(domain).map(|e| e.variant.clone())
     }
@@ -248,7 +296,7 @@ impl TokenConfigResolver for StaticTokenConfigResolver {
         self.entries.get(domain).and_then(|e| e.authority_public_key.clone())
     }
     fn verkle_root(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.entries.get(domain).and_then(|e| e.verkle_root.clone())
+        self.entries.get(domain).and_then(|e| e.entitlement_root.clone())
     }
     fn payment_fee_baseline(&self, domain: &[u8]) -> Option<num_bigint::BigInt> {
         self.entries.get(domain).and_then(|e| e.payment_fee_baseline.clone())
@@ -334,6 +382,13 @@ impl HypergraphTokenConfigResolver {
 }
 
 impl TokenConfigResolver for HypergraphTokenConfigResolver {
+    fn for_execution_context(
+        &self, crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
+        // A cached deployment may belong to a different fork or a newer head.
+        Ok(std::sync::Arc::new(Self::new(crdt)))
+    }
+
     fn mint_variant_for_domain(&self, domain: &[u8]) -> Option<MintVariant> {
         self.load_entry(domain).map(|e| e.variant)
     }
@@ -344,7 +399,7 @@ impl TokenConfigResolver for HypergraphTokenConfigResolver {
         self.load_entry(domain).and_then(|e| e.authority_public_key)
     }
     fn verkle_root(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.load_entry(domain).and_then(|e| e.verkle_root)
+        self.load_entry(domain).and_then(|e| e.entitlement_root)
     }
     fn payment_fee_baseline(&self, domain: &[u8]) -> Option<num_bigint::BigInt> {
         self.load_entry(domain).and_then(|e| e.payment_fee_baseline)
@@ -411,6 +466,22 @@ mod tests {
             Some(MintVariant::ProofOfMeaningfulWork),
         );
         assert_eq!(r.mint_variant_for_domain(&[0xAAu8; 32]), None);
+    }
+
+    #[test]
+    fn fork_static_resolver_owns_its_configuration_entries() {
+        let mut source = StaticTokenConfigResolver::with_quil_default();
+        let app = vec![11; 32];
+        source.insert(app.clone(), StaticTokenEntry { variant: MintVariant::Payment, ..Default::default() });
+        let crdt = std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
+            std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+        ));
+        let branch = source.for_execution_context(crdt).unwrap();
+        source.insert(app.clone(), StaticTokenEntry { variant: MintVariant::NoMint, ..Default::default() });
+        assert_eq!(branch.mint_variant_for_domain(&app), Some(MintVariant::Payment));
+        assert_eq!(source.mint_variant_for_domain(&app), Some(MintVariant::NoMint));
+        assert_eq!(branch.mint_variant_for_domain(&crate::domains::QUIL_TOKEN), Some(MintVariant::ProofOfMeaningfulWork));
     }
 
     #[test]
@@ -513,7 +584,7 @@ mod tests {
         assert_eq!(entry.variant, MintVariant::Authority);
         assert_eq!(entry.authority_key_type, Some(5));
         assert_eq!(entry.authority_public_key, Some(vec![0xBBu8; 97]));
-        assert!(entry.verkle_root.is_none());
+        assert!(entry.entitlement_root.is_none());
         assert!(entry.payment_fee_baseline.is_none());
     }
 }

@@ -7,20 +7,20 @@
 //! scoring is:
 //!
 //! ```text
-//!     score(branch) = blend_bonus × Σ_i α^{n-i} · frame_score(i)
-//!     frame_score(i) = (w_r · ρ(dist_i) + w_p · π(seniority_i)) / w_denom
-//!     blend_bonus = 1 + (β · unique_provers_in_last_m / m)
+//! score(branch) = blend_bonus × Σ_i α^{n-i} · frame_score(i)
+//! frame_score(i) = (w_r · ρ(dist_i) + w_p · π(seniority_i)) / w_denom
+//! blend_bonus = 1 + (β · unique_provers_in_last_m / m)
 //! ```
 //!
 //! - `ρ` (rho) maps distance `r ∈ [0, R_max]` to `[0, SCALE]`, with
-//!   smaller distance → higher ρ. Closer frames to the target score
-//!   better.
+//! smaller distance → higher ρ. Closer frames to the target score
+//! better.
 //! - `π` (pi) maps seniority to `[0, SCALE]`, clamped.
 //! - `α` is the exponential-decay factor applied frame-by-frame —
-//!   older frames matter less.
+//! older frames matter less.
 //! - The blend bonus rewards branches that are extended by diverse
-//!   sets of provers within a sliding window of the last `m` frames,
-//!   penalizing single-prover forks.
+//! sets of provers within a sliding window of the last `m` frames,
+//! penalizing single-prover forks.
 //!
 //! The result is compared across branches with a tie-break
 //! tolerance ε: a new candidate must beat the incumbent by strictly

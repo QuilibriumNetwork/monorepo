@@ -140,7 +140,7 @@ pub fn validate_alt_shard_update(
     let message = alt_shard_update_signed_message(op);
 
     let valid = key_manager.validate_signature(
-        KeyType::Bls48581G1,
+        KeyType::Falcon512,
         &op.public_key,
         &message,
         &op.signature,

@@ -69,6 +69,7 @@ fn build_confirm() -> pb::MessageBundle {
         frame_number: FRAME_NUMBER,
         public_key_signature_bls48581: Some(addr_sig()),
         filters: vec![fixture_filter_a()],
+        leaf_roots: vec![],
     };
     bundle_with(pb::message_request::Request::Confirm(confirm))
 }

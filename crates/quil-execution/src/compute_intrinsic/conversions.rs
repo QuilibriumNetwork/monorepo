@@ -3,6 +3,7 @@
 
 use quil_types::error::Result;
 use quil_types::proto::compute as pb;
+use quil_types::proto::keys as keys_pb;
 
 use super::config::{ComputeConfiguration, ComputeDeploy, ComputeUpdate};
 use super::ops::{
@@ -58,14 +59,37 @@ pub fn compute_update_from_proto(p: &pb::ComputeUpdate) -> Result<ComputeUpdate>
         Some(c) => compute_config_from_proto(c).to_canonical_bytes()?,
         None => Vec::new(),
     };
+    // Raw Falcon signature bytes (verify uses the field directly — no 0x011C
+    // aggregate envelope). Matches the token-update fix.
     let sig = match &p.public_key_signature_bls48581 {
-        Some(s) => {
-            use crate::hypergraph_intrinsic::conversions::aggregate_sig_from_proto;
-            aggregate_sig_from_proto(s)?.to_canonical_bytes()?
-        }
+        Some(s) => s.signature.clone(),
         None => Vec::new(),
     };
     Ok(ComputeUpdate { config, rdf_schema: p.rdf_schema.clone(), public_key_signature_bls48581: sig })
+}
+
+pub fn compute_update_to_proto(u: &ComputeUpdate) -> Result<pb::ComputeUpdate> {
+    let config = if !u.config.is_empty() {
+        Some(compute_config_to_proto(
+            &ComputeConfiguration::from_canonical_bytes(&u.config)?,
+        ))
+    } else {
+        None
+    };
+    let public_key_signature_bls48581 = if u.public_key_signature_bls48581.is_empty() {
+        None
+    } else {
+        Some(keys_pb::Bls48581AggregateSignature {
+            signature: u.public_key_signature_bls48581.clone(),
+            public_key: None,
+            bitmask: Vec::new(),
+        })
+    };
+    Ok(pb::ComputeUpdate {
+        config,
+        rdf_schema: u.rdf_schema.clone(),
+        public_key_signature_bls48581,
+    })
 }
 
 // =====================================================================
@@ -117,6 +141,26 @@ pub fn execute_operation_from_proto(p: &pb::ExecuteOperation) -> Result<ExecuteO
     })
 }
 
+pub fn application_to_proto(a: &Application) -> pb::Application {
+    pb::Application {
+        address: a.address.clone(),
+        execution_context: a.execution_context as i32,
+    }
+}
+
+pub fn execute_operation_to_proto(o: &ExecuteOperation) -> Result<pb::ExecuteOperation> {
+    let application = if o.application.is_empty() {
+        None
+    } else {
+        Some(application_to_proto(&Application::from_canonical_bytes(&o.application)?))
+    };
+    Ok(pb::ExecuteOperation {
+        application,
+        identifier: o.identifier.clone(),
+        dependencies: o.dependencies.clone(),
+    })
+}
+
 // =====================================================================
 // CodeExecute
 // =====================================================================
@@ -135,6 +179,20 @@ pub fn code_execute_from_proto(p: &pb::CodeExecute) -> Result<CodeExecute> {
     Ok(CodeExecute {
         proof_of_payment: p.proof_of_payment.clone(),
         domain, rendezvous, execute_operations: ops,
+    })
+}
+
+pub fn code_execute_to_proto(e: &CodeExecute) -> Result<pb::CodeExecute> {
+    let execute_operations: Vec<pb::ExecuteOperation> = e
+        .execute_operations
+        .iter()
+        .map(|b| execute_operation_to_proto(&ExecuteOperation::from_canonical_bytes(b)?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pb::CodeExecute {
+        proof_of_payment: e.proof_of_payment.clone(),
+        domain: e.domain.to_vec(),
+        rendezvous: e.rendezvous.to_vec(),
+        execute_operations,
     })
 }
 
@@ -177,6 +235,45 @@ pub fn code_finalize_from_proto(p: &pb::CodeFinalize) -> Result<CodeFinalize> {
     })
 }
 
+pub fn execution_result_to_proto(r: &ExecutionResult) -> pb::ExecutionResult {
+    pb::ExecutionResult {
+        operation_id: r.operation_id.clone(),
+        success: r.success,
+        output: r.output.clone(),
+        error: r.error.clone(),
+    }
+}
+
+pub fn state_transition_to_proto(s: &StateTransition) -> pb::StateTransition {
+    pb::StateTransition {
+        domain: s.domain.to_vec(),
+        address: s.address.clone(),
+        old_value: s.old_value.clone(),
+        new_value: s.new_value.clone(),
+        proof: s.proof.clone(),
+    }
+}
+
+pub fn code_finalize_to_proto(f: &CodeFinalize) -> Result<pb::CodeFinalize> {
+    let results: Vec<pb::ExecutionResult> = f
+        .results
+        .iter()
+        .map(|b| Ok(execution_result_to_proto(&ExecutionResult::from_canonical_bytes(b)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let state_changes: Vec<pb::StateTransition> = f
+        .state_changes
+        .iter()
+        .map(|b| Ok(state_transition_to_proto(&StateTransition::from_canonical_bytes(b)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(pb::CodeFinalize {
+        rendezvous: f.rendezvous.to_vec(),
+        results,
+        state_changes,
+        proof_of_execution: f.proof_of_execution.clone(),
+        message_output: f.message_output.clone(),
+    })
+}
+
 // =====================================================================
 // Tests
 // =====================================================================
@@ -188,7 +285,7 @@ mod tests {
     #[test]
     fn compute_config_round_trip() {
         let pb = pb::ComputeConfiguration {
-            read_public_key: vec![1u8; 57],
+            read_public_key: vec![1u8; 1158],
             write_public_key: vec![2u8; 57],
             owner_public_key: vec![3u8; 585],
         };
@@ -201,7 +298,7 @@ mod tests {
     fn compute_deploy_round_trip() {
         let pb = pb::ComputeDeploy {
             config: Some(pb::ComputeConfiguration {
-                read_public_key: vec![1u8; 57],
+                read_public_key: vec![1u8; 1158],
                 write_public_key: vec![2u8; 57],
                 owner_public_key: vec![],
             }),
@@ -228,7 +325,7 @@ mod tests {
     #[test]
     fn compute_config_full_pipeline() {
         let pb = pb::ComputeConfiguration {
-            read_public_key: vec![0xAAu8; 57],
+            read_public_key: vec![0xAAu8; 1158],
             write_public_key: vec![0xBBu8; 57],
             owner_public_key: vec![0xCCu8; 585],
         };

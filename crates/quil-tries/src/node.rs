@@ -30,8 +30,8 @@ pub struct BranchNode {
     /// 64 children. Semantics depend on [`Self::fully_loaded`]:
     /// - `fully_loaded = true`: `None` means the slot is genuinely empty.
     /// - `fully_loaded = false`: `None` means "not yet loaded from store"
-    ///   — the lazy walker calls `get_node_by_path(full_prefix + [i])`
-    ///   to fetch on demand. `Some(...)` always means resident.
+    /// — the lazy walker calls `get_node_by_path(full_prefix + [i])`
+    /// to fetch on demand. `Some(...)` always means resident.
     pub children: [Option<Box<VectorCommitmentNode>>; BRANCH_NODES],
     /// KZG or SHA-512 commitment.
     pub commitment: Vec<u8>,

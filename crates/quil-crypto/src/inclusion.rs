@@ -26,6 +26,9 @@ impl Multiproof for KzgMultiproof {
 pub struct KzgInclusionProver;
 
 impl InclusionProver for KzgInclusionProver {
+    fn commit_parallel_threshold(&self) -> usize { 32 }
+    fn commit_parallel_budget(&self) -> usize { 64 }
+
     fn commit_raw(&self, data: &[u8], poly_size: u64) -> Result<Vec<u8>> {
         Ok(bls48581::commit_raw(data, poly_size))
     }

@@ -13,8 +13,8 @@
 //! Validation rules (enforced on decode):
 //!
 //! - `sig_len` is either 74 (single signer) or 590 (74 + 516 for
-//!   aggregation with one prover on an upgrade path). Go:
-//!   `sigLen != 74 && sigLen != (74+516)`.
+//! aggregation with one prover on an upgrade path). Go:
+//! `sigLen != 74 && sigLen != (74+516)`.
 //! - `addr_len` must be exactly 32. Go: `addrLen != 32`.
 
 use quil_types::error::{QuilError, Result};
@@ -25,13 +25,13 @@ pub const TYPE_BLS48581_ADDRESSED_SIGNATURE: u32 = 0x011B;
 
 /// Maximum canonical-bytes length (sanity bound used by callers that
 /// allocate `ProverLeave` / `ProverPause` / `ProverResume` signatures).
-/// Go uses `sigLen > 118` as a cutoff on the outer wrapper around
-/// `BLS48581AddressedSignature` canonical bytes — that 118 is not the
-/// length of the signature itself but of the whole wrapped envelope:
-/// 4 type + 4 sig_len + 74 sig + 4 addr_len + 32 addr = 118. We
-/// surface it as a constant so the filter-op decoders can enforce
-/// the same cap.
-pub const MAX_ADDRESSED_SIG_LEN: usize = 4 + 4 + (74 + 516) + 4 + 32; // 634
+/// This is the length of the whole wrapped envelope at its largest
+/// (one-extra-signer aggregate) variant:
+/// 4 type + 4 sig_len + (666 + 516) sig + 4 addr_len + 32 addr = 1226.
+/// The filter-op decoders (`prover_ops::read_opt_addr_sig`) enforce
+/// this as their cap. Falcon-512 single-sig is 666, aggregate-1 is
+/// 666+516 = 1182 (see `SIG_LEN_*`).
+pub const MAX_ADDRESSED_SIG_LEN: usize = 4 + 4 + (666 + 516) + 4 + 32; // 1226
 
 // Re-export from the crate-wide canonical cursor module.
 pub(crate) use crate::canonical_cursor::{put_u32, read_u32, read_bytes};
@@ -53,10 +53,10 @@ pub struct AddressedSignature {
 }
 
 impl AddressedSignature {
-    /// Canonical signature length: single-signer BLS48-581 is 74 bytes.
-    pub const SIG_LEN_SINGLE: usize = 74;
-    /// One-extra-signer aggregate: 74 base + 516 per extra signer.
-    pub const SIG_LEN_AGGREGATE_1: usize = 74 + 516;
+    /// Canonical signature length: single-signer Falcon-512 is 666 bytes.
+    pub const SIG_LEN_SINGLE: usize = 666;
+    /// One-extra-signer aggregate: 666 base + 516 per extra signer.
+    pub const SIG_LEN_AGGREGATE_1: usize = 666 + 516;
     /// Required address length.
     pub const ADDRESS_LEN: usize = 32;
 
@@ -129,8 +129,8 @@ mod tests {
     fn addressed_signature_round_trip_single() {
         let sig = sample_single_sig();
         let bytes = sig.to_canonical_bytes().unwrap();
-        // 4 type + 4 sig_len + 74 sig + 4 addr_len + 32 addr = 118
-        assert_eq!(bytes.len(), 118);
+        // 4 type + 4 sig_len + 666 sig + 4 addr_len + 32 addr = 710
+        assert_eq!(bytes.len(), 4 + 4 + AddressedSignature::SIG_LEN_SINGLE + 4 + 32);
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x01, 0x1B]);
         let restored = AddressedSignature::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(restored, sig);

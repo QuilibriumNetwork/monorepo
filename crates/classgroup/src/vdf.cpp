@@ -46,6 +46,20 @@
     const int64_t THRESH = 1UL<<31;
     const int64_t EXP_THRESH = 31;
 
+    // Each reducer invocation overwrites these values before reading them.
+    // Retain their limb allocations per thread rather than reallocating nine
+    // large integers for every square and proof multiplication.
+    struct reduction_scratch {
+        mpz_t faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc;
+        reduction_scratch() {
+            mpz_inits(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, NULL);
+        }
+        ~reduction_scratch() {
+            mpz_clears(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, NULL);
+        }
+        reduction_scratch(const reduction_scratch&) = delete;
+        reduction_scratch& operator=(const reduction_scratch&) = delete;
+    };
 
 extern "C" {
     //this normalization is based on Akashnil's entry to the previous round
@@ -129,10 +143,16 @@ extern "C" {
 		int64_t a, b, c, a_, b_, c_;
 		int64_t aa, ab, ac, ba, bb, bc, ca, cb, cc;
 		long int a_exp, b_exp, c_exp, max_exp, min_exp;
-		mpz_t faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu;
-
-		// Initialize all temporary variables
-		mpz_inits(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu, NULL);
+        thread_local reduction_scratch scratch;
+        auto& faa = scratch.faa;
+        auto& fab = scratch.fab;
+        auto& fac = scratch.fac;
+        auto& fba = scratch.fba;
+        auto& fbb = scratch.fbb;
+        auto& fbc = scratch.fbc;
+        auto& fca = scratch.fca;
+        auto& fcb = scratch.fcb;
+        auto& fcc = scratch.fcc;
 
 		while (!test_reduction(f)) {
 			a = mpz_get_si_2exp(&a_exp, f.a);
@@ -177,7 +197,7 @@ extern "C" {
 
 				a_ = c;
 				c_ = c * delta;
-				b_ = -b + (c_ << 1);
+				b_ = -b + c_ * 2;
 				gamma = b - c_;
 				c_ = a - delta * gamma;
 
@@ -201,9 +221,11 @@ extern "C" {
 			aa = u * u;
 			ab = u * w;
 			ac = w * w;
-			ba = u * v << 1;
+			// These bounded signed products may be negative; shifting a
+			// negative integer left is undefined in C++.
+			ba = u * v * 2;
 			bb = u * x + v * w;
-			bc = w * x << 1;
+			bc = w * x * 2;
 			ca = v * v;
 			cb = v * x;
 			cc = x * x;
@@ -231,27 +253,41 @@ extern "C" {
 			mpz_add(f.c, f.c, fcc);
 		}
 
-		// Clear all initialized GMP variables to avoid memory leaks
-		mpz_clears(faa, fab, fac, fba, fbb, fbc, fca, fcb, fcc, a2, mu, NULL);
 	}
 
     // https://www.researchgate.net/publication/221451638_Computational_aspects_of_NUCOMP
     //based on the implementation from Bulaiden
-    inline void gmp_nudupl(form& f, ulong times) {
+    //
+    // `cutoff` may be nonzero only for a positive-definite form whose
+    // b^2 - 4ac is the intended discriminant; the caller checks this. It stops
+    // the partial Euclidean algorithm at floor(|D|^(1/4)), where its remainders
+    // and cofactors already describe a nearly reduced square. With L = 0 (the
+    // original behaviour, kept for malformed forms) Euclid runs to the gcd and
+    // fast_reduce must walk the oversized result back down.
+    inline void gmp_nudupl(form& f, ulong times, int cutoff) {
+        if (times == 0) return;
     mpz_t D, L;
-    mpz_t G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom;
-    form F, f_;
+    mpz_t G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1;
     fmpz_t fy, fx, fby, fbx, fL;
-    	mpz_init(denom);
     	mpz_inits(D, L, NULL);
-    	mpz_inits(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom, NULL);
-    	mpz_inits(F.a, F.b, F.c, NULL);
+        mpz_inits(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1, NULL);
 
     	fmpz_init(fy);
     	fmpz_init(fx);
     	fmpz_init(fby);
     	fmpz_init(fbx);
     	fmpz_init(fL);
+        if (cutoff) {
+            // Squaring preserves D = b^2 - 4ac, so one cutoff serves every
+            // iteration. floor(sqrt(floor(sqrt(x)))) == floor(x^(1/4)).
+            mpz_mul(D, f.b, f.b);
+            mpz_mul(t, f.a, f.c);
+            mpz_mul_ui(t, t, 4);
+            mpz_sub(D, D, t);
+            mpz_abs(D, D);
+            mpz_sqrt(L, D);
+            mpz_sqrt(L, L);
+        }
         while(times > 0){
     	    mpz_gcdext(G, y, NULL, f.b, f.a);
 
@@ -277,6 +313,10 @@ extern "C" {
     	    	mpz_mul(t, G, dx);
     	    	mpz_sub(f.c, f.c, t);
                 times--;
+                // For a well-formed form (a > 0, so by >= 1) this is only
+                // reachable with a cutoff. The textbook square is not
+                // necessarily reduced; reduce it like the partial-GCD path.
+                fast_reduce(f);
     	    	continue;
     	    }
 
@@ -324,10 +364,8 @@ extern "C" {
             fast_reduce(f);
         }
 
-    	mpz_clear(denom);
     	mpz_clears(D, L, NULL);
-    	mpz_clears(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, q, t, Q1, denom, NULL);
-    	mpz_clears(F.a, F.b, F.c, NULL);
+        mpz_clears(G, dx, dy, By, Dy, x, y, bx, by, ax, ay, t, Q1, NULL);
 
     	fmpz_clear(fy);
     	fmpz_clear(fx);
@@ -336,18 +374,49 @@ extern "C" {
     	fmpz_clear(fL);
     }
 
-    void adapted_nudupl(mpz_t& a, mpz_t& b, mpz_t& c, ulong times) {
+    void adapted_nudupl(mpz_t& a, mpz_t& b, mpz_t& c, ulong times, int cutoff) {
         //initialise variables
         form newform;
         mpz_inits(newform.a, newform.b, newform.c, NULL);
         mpz_set(newform.a, a);
         mpz_set(newform.b, b);
         mpz_set(newform.c, c);
-        gmp_nudupl(newform, times);
+        gmp_nudupl(newform, times, cutoff);
+        // At |b| == a the reducer accepts both signs. For composite
+        // discriminants, partial and full Euclid can choose different signs,
+        // which changes serialized bytes despite representing the same form.
+        // Checking only the final form suffices: a reduced form is unique
+        // except at |b| == a (test_reduction already fixes the sign at
+        // a == c), so an intermediate sign difference cannot alter a later
+        // off-boundary square. For a prime discriminant the only reduced
+        // form on this boundary is the identity.
+        // The caller's coefficients still hold the input, so recover the exact
+        // original representative without retaining another copy on the fast path.
+        if (cutoff && mpz_cmpabs(newform.a, newform.b) == 0) {
+            mpz_set(newform.a, a);
+            mpz_set(newform.b, b);
+            mpz_set(newform.c, c);
+            gmp_nudupl(newform, times, 0);
+        }
         mpz_set(a, newform.a);
         mpz_set(b, newform.b);
         mpz_set(c, newform.c);
         mpz_clears(newform.a, newform.b, newform.c, NULL);
+    }
+
+    // Requires a positive-definite form: on other forms fast_reduce can loop
+    // forever or divide by zero. The Rust caller checks this.
+    void adapted_reduce(mpz_t& a, mpz_t& b, mpz_t& c) {
+        form f;
+        mpz_inits(f.a, f.b, f.c, NULL);
+        mpz_set(f.a, a);
+        mpz_set(f.b, b);
+        mpz_set(f.c, c);
+        fast_reduce(f);
+        mpz_set(a, f.a);
+        mpz_set(b, f.b);
+        mpz_set(c, f.c);
+        mpz_clears(f.a, f.b, f.c, NULL);
     }
 
 

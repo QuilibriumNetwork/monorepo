@@ -16,6 +16,15 @@ pub(crate) async fn start(
 ) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
     info!(core_id, parent_process, "worker node starting");
 
+    // Separate processes must apply the same network settings and localnet
+    // epoch override as their master before opening or evaluating state.
+    crate::consensus_settings::initialize(config.p2p.network);
+
+    // Fail before creating/opening any store when the verifier installation
+    // is unusable. Separate processes own separate admission slots.
+    #[cfg(feature = "native-proof")]
+    let proof_worker = crate::proof_worker::build_node_worker(config)?;
+
     // Resolve the per-worker store path. Worker processes can NOT
     // share the master's RocksDB directory: RocksDB takes an exclusive
     // file lock per `LOCK` file, so a second `open` against the same
@@ -54,42 +63,70 @@ pub(crate) async fn start(
     // process owns its own RocksDB store (per `worker_path_prefix`)
     // and therefore its own crdt + execution manager.
     let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-        Arc::new(quil_crypto::KzgInclusionProver);
-    let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-        Arc::new(quil_crypto::Bls48581KeyConstructor);
+        Arc::new(quil_tries::ShaInclusionProver);
     let key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-        Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
         hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
         inclusion_prover.clone(),
     ));
+    // Commit state into the JMT forest. Install the persistent forest on
+    // a migrated OR brand-new/fresh worker store (a fresh worker builds on the
+    // persistent forest from the start rather than the ephemeral in-memory
+    // default). A store with un-migrated legacy state is skipped (must
+    // `--migrate-db`).
+    let store_is_fresh = clock_store
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header.map(|h| h.frame_number))
+        .map(|n| n == 0)
+        .unwrap_or(true);
+    if quil_forest_migrate::install_forest_boot(
+        crdt.as_ref(),
+        hg_store.as_ref(),
+        store_is_fresh,
+        config.p2p.network == 0,
+    ) {
+        tracing::info!("Phase-3 JMT forest installed — committing state to the forest");
+    }
+    crate::master_node::worker_manager::initialize_worker_size_accounting(&crdt, "worker");
+    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env()) {
+        tracing::info!(?policy, "retained-version pruning enabled on the worker CRDT");
+        quil_hypergraph::spawn_retention_pruner(&crdt, policy, "worker".into());
+    }
+    crate::clock_retention::apply_snapshot_pin_limit(&crdt, "worker");
+    crate::clock_retention::spawn_staged_cleanup(
+        Arc::new(quil_store::RocksClockStore::new(db_arc.inner())), "worker".into());
     // Same crypto setup as the master node — bulletproof is real;
     // Decaf / circuit compiler are still noop stubs pending production
     // impls. See the master block earlier in this file for rationale.
-    let bulletproof_prover_worker: Arc<dyn quil_types::crypto::BulletproofProver> =
-        Arc::new(quil_crypto::Decaf448BulletproofProver);
-    let decaf_constructor_worker: Arc<dyn quil_types::crypto::DecafConstructor> =
-        Arc::new(quil_execution::testing::NoopDecafConstructor);
     let circuit_compiler_worker: Arc<dyn quil_types::execution::CircuitCompiler> =
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
     let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> =
         clock_store.clone();
     let hypergraph_resolver_worker: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
-    let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+        Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()));
+    let exec_manager = quil_execution::ExecutionEngineManager::new(
         inclusion_prover.clone(),
         key_manager.clone(),
         crdt.clone(),
-        bulletproof_prover_worker,
-        decaf_constructor_worker,
         circuit_compiler_worker,
         clock_store_for_exec_worker,
         hypergraph_resolver_worker,
         true,
-    ));
+    )
+    .with_pricing_network(config.p2p.network)
+    .with_application_venue()?;
+    // A separate OS process cannot share the master's admission slot, so the
+    // remote worker builds its own verifier client from the same configuration.
+    #[cfg(feature = "native-proof")]
+    let exec_manager = {
+        crate::proof_worker::install_token_worker(exec_manager, config.p2p.network, proof_worker.as_ref())?
+    };
+    let exec_manager = Arc::new(exec_manager);
 
     // Key management — same keys as master
-    let bls_ctor = quil_crypto::Bls48581KeyConstructor;
+    let bls_ctor = quil_crypto::FalconKeyConstructor;
     let keys_path = config.key.key_store_file.path.clone();
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "q-prover-key".to_string()
@@ -103,7 +140,7 @@ pub(crate) async fn start(
         Box::new(bls_ctor),
     )?);
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Bls48581G1)?;
+    let bls_pubkey = file_key_manager.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
     let prover_address = quil_crypto::poseidon::hash_bytes_to_32(&bls_pubkey)?;
 
     // Shared prover registry (syncs from store)
@@ -120,7 +157,7 @@ pub(crate) async fn start(
     let fkm = file_key_manager.clone();
     let signer_factory: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
         Arc::new(move || {
-            fkm.get_signer(quil_types::crypto::KeyType::Bls48581G1)
+            fkm.get_signer(quil_types::crypto::KeyType::Falcon512)
                 .expect("BLS signer should be available")
         });
 
@@ -163,9 +200,14 @@ pub(crate) async fn start(
         );
     }
     let factory_endpoint = master_endpoint.clone();
+    // Worker dials the master's :8340 with the node's FALCON identity, so the
+    // handshake peer-id == the node's peer-id (the master's self-identity gate).
+    let worker_dialer_falcon_sk: Option<Vec<u8>> = file_key_manager
+        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+        .ok();
     let channel_factory: quil_engine::worker_node::MasterChannelFactory = Arc::new(move || {
         let endpoint_str = factory_endpoint.clone();
-        let seed = worker_mtls_seed;
+        let seed = worker_dialer_falcon_sk.clone();
         Box::pin(async move {
             use tonic::transport::Endpoint;
             let endpoint = Endpoint::from_shared(endpoint_str)
@@ -175,10 +217,14 @@ pub(crate) async fn start(
                 .keep_alive_while_idle(true);
             match seed {
                 Some(seed) => {
-                    let client_config = quil_rpc::build_quil_client_config(&seed)
-                        .map_err(|e| Box::new(std::io::Error::other(format!("tls cfg: {}", e)))
-                            as Box<dyn std::error::Error + Send + Sync>)?;
-                    let connector = quil_rpc::QuilTlsConnector::new(client_config);
+                    // sntrup761 PQNoise (post-quantum), matching the master's
+                    // pqnoise-only :8340 acceptor. The worker dials with the
+                    // node's OWN Ed448 seed, so the handshake authenticates its
+                    // peer_id == the node's peer_id — which the master's
+                    // self-identity gate on worker-privileged RPCs enforces.
+                    // (Was Ed448/X.509 mTLS via QuilTlsConnector — a transport
+                    // mismatch against the pqnoise server + not post-quantum.)
+                    let connector = quil_rpc::QuilPqNoiseConnector::new(seed);
                     let channel = endpoint.connect_with_connector(connector).await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     Ok(channel)
@@ -192,12 +238,36 @@ pub(crate) async fn start(
         })
     });
 
+    // Worker-channel mTLS materials: derived deterministically from the node's
+    // Falcon key (the master derives the identical cert), so the DataIpc server
+    // requires a client cert from a master holding the node's key — closing the
+    // previously plaintext/unauthenticated control channel.
+    let (channel_tls_ca_pem, channel_tls_leaf_pem, channel_tls_key_pem) = match file_key_manager
+        .get_private_key(quil_types::crypto::KeyType::Falcon512)
+        .ok()
+        .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
+    {
+        Some(t) => (Some(t.ca_cert_pem), Some(t.leaf_cert_pem), Some(t.leaf_key_pem)),
+        None => {
+            warn!("could not build worker-channel mTLS cert — DataIpc server will be UNAUTHENTICATED plaintext");
+            (None, None, None)
+        }
+    };
+
     let worker_config = quil_engine::worker_node::WorkerNodeConfig {
         core_id,
         master_endpoint,
         listen_addr,
+        channel_tls_ca_pem,
+        channel_tls_leaf_pem,
+        channel_tls_key_pem,
         parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
         channel_factory: Some(channel_factory),
+        app_consensus_cw: config.engine.app_consensus_cw,
+        // Persist the app-shard CW journal under the worker's resolved data dir
+        // (else the ephemeral temp journal panics on prune once a real committee
+        // starts producing views).
+        data_dir: Some(db_path.clone()),
     };
 
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
@@ -207,6 +277,15 @@ pub(crate) async fn start(
     let min_active_provers_for_propose: u64 =
         if config.p2p.network == 0 { 3 } else { 1 };
 
+    // Concrete registry + store for the post-sync refresh hook (the trait
+    // `refresh()` is a no-op; a cluster worker must `refresh_from_store` to
+    // repopulate its registry after syncing the prover tree, else its committee
+    // build fails and the shard engine stays passive).
+    let registry_refresh: Arc<dyn Fn() -> quil_types::error::Result<()> + Send + Sync> = {
+        let r = prover_registry.clone();
+        let s = hg_store.clone();
+        Arc::new(move || r.refresh_from_store(s.as_ref()))
+    };
     let mut worker_node = quil_engine::worker_node::WorkerOnlyNode::new(
         worker_config,
         clock_store,
@@ -220,7 +299,12 @@ pub(crate) async fn start(
         reward_greedy,
         min_active_provers_for_propose,
     )
-    .with_state_engines(crdt, exec_manager, inclusion_prover);
+    .with_state_engines(crdt.clone(), exec_manager, inclusion_prover)
+    // Back the storage-attestation replica store with the worker's own RocksDB
+    // (disjoint keyspace from the hypergraph store). Without this the cluster
+    // worker never emits a storage attestation and its shard reward is withheld.
+    .with_kv_db(db_arc.clone() as Arc<dyn quil_types::store::KvDb>)
+    .with_registry_refresh(registry_refresh);
 
     // Wire the prover-tree syncer so the worker can sync the global
     // prover tree from the master at startup and before materializing
@@ -228,26 +312,54 @@ pub(crate) async fn start(
     // `HyperSyncSelf` which dials the master's
     // HypergraphComparisonService. We reuse the master_endpoint (the
     // same one the gRPC message stream connects to — port 8340).
-    if let Some(seed) = worker_mtls_seed {
+    if worker_mtls_seed.is_some() {
         // Extract `host:port` from the master endpoint URL
-        // (`http://host:port`) for the syncer.
+        // (`http://host:port`) for the syncer. Dials with the Falcon network
+        // identity (the same one the master's :8340 acceptor expects).
         let stream_addr = master_endpoint_for_syncer
             .strip_prefix("http://")
             .unwrap_or(&master_endpoint_for_syncer)
             .to_string();
-        let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> =
-            Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                master_stream_addr: stream_addr,
-                hg_store: hg_store.clone(),
-                ed448_seed: seed,
-            });
-        worker_node = worker_node.with_prover_tree_syncer(syncer);
+        if let Ok(falcon_sk) =
+            file_key_manager.get_private_key(quil_types::crypto::KeyType::Falcon512)
+        {
+            worker_node = worker_node.with_storage_history_source(
+                crate::storage_history::from_master(stream_addr.clone(), falcon_sk.clone()),
+            ).with_global_anchor_source(
+                crate::storage_history::global_frames_from_master(stream_addr.clone(), falcon_sk.clone()),
+            );
+            let prod_syncer =
+                Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                    master_stream_addr: stream_addr,
+                    hg_store: hg_store.clone(),
+                    falcon_signing_key: falcon_sk,
+                    crdt: crdt.clone(),
+                    // Discover through the authenticated master, then fetch
+                    // app trees directly: a regular master has no app forest.
+                    archive_pool: Some(Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                        std::time::Duration::from_secs(30),
+                    ))),
+                    discover_archives_from_master: true,
+                });
+            worker_node = worker_node.with_outgoing_history_source(prod_syncer.outgoing_history_source());
+            let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> = prod_syncer;
+            let delivery_syncer = syncer.clone();
+            worker_node = worker_node
+                .with_delivery_frame_source(Arc::new(move |filter, number| {
+                    let syncer = delivery_syncer.clone();
+                    Box::pin(async move {
+                        tokio::time::timeout(std::time::Duration::from_secs(10),
+                            syncer.get_app_shard_frame(&filter, number)).await.ok()?.ok().flatten()
+                    })
+                }))
+                .with_prover_tree_syncer(syncer);
+        }
     } else {
         warn!("worker has no mTLS seed — prover-tree sync will be unavailable");
     }
 
     // Outbound pubsub. Two mutually exclusive modes:
-    //   * `engine.enable_master_proxy = true`  → dial the master's
+    //   * `engine.enable_master_proxy = true` → dial the master's
     //     PubSubProxy on the peer mTLS listener and route all pubsub
     //     through it. Used when one machine should be the only mesh
     //     participant (homogenous LAN layouts, gateway-style setups).
@@ -291,8 +403,15 @@ pub(crate) async fn start(
         Arc<quil_p2p::P2PHandle>,
         tokio::sync::mpsc::Receiver<quil_p2p::ReceivedMessage>,
     )> = if !config.engine.enable_master_proxy {
-        let p2p_node = quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id)
-            .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
+        // Falcon q-prover-key = the node's real network identity; the worker
+        // signs pubsub as it (msg.from = real Falcon peer-id) while keeping a
+        // synthetic Ed448 host identity.
+        let worker_falcon_sk = file_key_manager
+            .get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .map_err(|e| anyhow::anyhow!("worker load Falcon identity key: {}", e))?;
+        let p2p_node =
+            quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id, Some(&worker_falcon_sk))
+                .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
         let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(
             &config.engine,
             core_id,
@@ -348,7 +467,9 @@ pub(crate) async fn start(
             move |_token| async move {
                 loop {
                     match rx.recv().await {
-                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask),
+                        // `msg.from` is the gossip sender's PeerId — needed to
+                        // resolve the committee key for inbound app-shard CW.
+                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask, &msg.from),
                         None => break,
                     }
                 }
@@ -359,6 +480,56 @@ pub(crate) async fn start(
     }
 
     info!(core_id, "worker node initialized, starting event loop");
+
+    // Memory telemetry for THIS worker process. In cluster mode each worker
+    // is a SEPARATE OS process with its own jemalloc heap + RocksDB, invisible
+    // to the master's status tick — so without this a cluster worker's memory
+    // (the most likely OOM contributor on a node running many workers) is
+    // completely unmonitored. Mirrors the master's `"jemalloc stats"` and the
+    // thread-worker's `"worker rocksdb memory"` lines. Every 60s.
+    {
+        let db_for_mem = db_arc.clone();
+        sup.run_until_cancelled("worker-mem-telemetry", move |token| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tick.tick() => {
+                        let rss = crate::mem_stats::process_memory()
+                            .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
+                            .unwrap_or_else(|| "?".to_string());
+                        let dbm = db_for_mem.memory_usage();
+                        if let Some(j) = crate::mem_stats::jemalloc_stats() {
+                            info!(
+                                core_id,
+                                rss_mb = %rss,
+                                allocated_mb = %crate::mem_stats::fmt_mb(j.allocated),
+                                resident_mb = %crate::mem_stats::fmt_mb(j.resident),
+                                retained_mb = %crate::mem_stats::fmt_mb(j.retained),
+                                rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                "worker process memory",
+                            );
+                            let br = crate::mem_stats::jemalloc_size_classes();
+                            info!(
+                                core_id,
+                                breakdown = %crate::mem_stats::fmt_breakdown(&br),
+                                "worker jemalloc size classes",
+                            );
+                        } else {
+                            info!(
+                                core_id,
+                                rss_mb = %rss,
+                                rocksdb_mb = %crate::mem_stats::fmt_mb(dbm.total()),
+                                "worker process memory",
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
 
     // Run the worker — uses plain `sup.spawn` (not `run_until_cancelled`)
     // because the cancel branch must call `worker.stop()`; drop-on-cancel

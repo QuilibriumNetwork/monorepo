@@ -22,7 +22,7 @@
 //! `app_address || data_address` (64 bytes), which occupies bytes 1..65
 //! of the serialized atom. The extrinsic tree (`bytes[65..]`) is
 //! opaque here — actually computing its commitment requires the
-//! lazy-tree integration (task #64).
+//! lazy-tree integration.
 //!
 //! Services NOT ported (same reason as `vertex_ops.rs`):
 //! - `prove` — needs signer, inclusion prover for commitment
@@ -33,6 +33,10 @@ use num_bigint::BigInt;
 use quil_types::error::{QuilError, Result};
 
 use super::types::{HyperedgeAdd, HyperedgeRemove};
+
+use quil_tries::{
+    deserialize_go_tree, serialize_go_tree, ShaInclusionProver, VectorCommitmentTree,
+};
 
 // =====================================================================
 // Constants
@@ -158,6 +162,88 @@ pub fn hyperedge_add_signing_message(
     msg.extend_from_slice(hyperedge_id);
     msg.extend_from_slice(commit);
     Ok(msg)
+}
+
+// =====================================================================
+// Extrinsic-tree construction + commitment (shared by node verify + client)
+// =====================================================================
+
+/// Commit the extrinsic tree carried in a serialized hyperedge-atom `value`
+/// (the tree bytes are `value[HYPEREDGE_MIN_VALUE_LEN..]`) with the SHA-256
+/// hash-Merkle prover ([`ShaInclusionProver`]).
+///
+/// This is the single source of truth for the hyperedge-add signing
+/// commitment. The engine's verify path and the client's build path both call
+/// it, so the signed `id ‖ commit` message is byte-identical on both sides.
+/// Post-quantum state model: NO KZG — the commitment is a hash-Merkle root,
+/// matching how every other vertex/shard commitment is formed now
+/// (`quil_tries::vertex_commitment`). The client has no ceremony SRS, so a KZG
+/// commitment here could never be reproduced client-side.
+pub fn hyperedge_extrinsic_commit(value: &[u8]) -> Result<Vec<u8>> {
+    if value.len() < HYPEREDGE_MIN_VALUE_LEN {
+        return Err(QuilError::InvalidArgument(
+            "hyperedge commit: value too short".into(),
+        ));
+    }
+    let tree_bytes = &value[HYPEREDGE_MIN_VALUE_LEN..];
+    if tree_bytes.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "hyperedge commit: extrinsic tree bytes empty".into(),
+        ));
+    }
+    let mut tree = VectorCommitmentTree::new();
+    tree.root = deserialize_go_tree(tree_bytes).map_err(|e| {
+        QuilError::InvalidArgument(format!(
+            "hyperedge commit: extrinsic tree failed structural deserialize: {e}"
+        ))
+    })?;
+    let commit = tree.commit(&ShaInclusionProver);
+    if commit.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "hyperedge commit: extrinsic tree commitment is empty — invalid tree".into(),
+        ));
+    }
+    Ok(commit)
+}
+
+/// Build a serialized hyperedge-atom `value` and its extrinsic-tree commitment
+/// from a hyperedge id (`app_address ‖ data_address`) and its member atom ids.
+///
+/// Mirror of Go `hypergraph.NewHyperedge` + `AddExtrinsic`(×N) + `ToBytes` /
+/// `Commit` (`hypergraph/hyperedge.go`). Each atom is inserted into the
+/// extrinsic tree as `(key = id, value = id, size = 64)` (Go's
+/// `Insert(id, atom.ToBytes(), nil, 64)` for a vertex atom-ref). The value is
+/// `[0x01] ‖ app ‖ data ‖ serialize_go_tree(tree)`.
+///
+/// The commitment is recomputed via [`hyperedge_extrinsic_commit`] over the
+/// serialized value (not the in-memory tree) so it is byte-identical to what
+/// the node recomputes on verify — no serialize/deserialize round-trip skew.
+pub fn build_hyperedge_add_value(
+    app_address: &[u8; 32],
+    data_address: &[u8; 32],
+    atom_ids: &[[u8; HYPEREDGE_ID_LEN]],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if atom_ids.is_empty() {
+        return Err(QuilError::InvalidArgument(
+            "hyperedge add: at least one atom address is required".into(),
+        ));
+    }
+    let mut tree = VectorCommitmentTree::new();
+    let size = BigInt::from(HYPEREDGE_ID_LEN as u64);
+    for id in atom_ids {
+        tree.insert(&id[..], &id[..], &[], &size)?;
+    }
+    let tree_bytes = serialize_go_tree(tree.root.as_ref())
+        .map_err(|e| QuilError::Internal(format!("serialize hyperedge extrinsic tree: {e}")))?;
+
+    let mut value = Vec::with_capacity(HYPEREDGE_MIN_VALUE_LEN + tree_bytes.len());
+    value.push(HYPEREDGE_ATOM_TYPE_BYTE);
+    value.extend_from_slice(app_address);
+    value.extend_from_slice(data_address);
+    value.extend_from_slice(&tree_bytes);
+
+    let commit = hyperedge_extrinsic_commit(&value)?;
+    Ok((value, commit))
 }
 
 /// Build the hyperedge-remove signing message. Go layout:
@@ -379,6 +465,41 @@ mod tests {
         let id = extract_hyperedge_id(&v).unwrap();
         assert_eq!(hyperedge_id_app_address(&id), &[0xA0u8; 32][..]);
         assert_eq!(hyperedge_id_data_address(&id), &[0xB0u8; 32][..]);
+    }
+
+    // -----------------------------------------------------------------
+    // Extrinsic-tree build + commit (client build == node verify)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_hyperedge_add_value_layout_and_commit_match_verify() {
+        let app = [0xABu8; 32];
+        let data = [0xCDu8; 32];
+        let atoms = [[0x11u8; 64], [0x22u8; 64], [0x33u8; 64]];
+
+        let (value, commit) = build_hyperedge_add_value(&app, &data, &atoms).unwrap();
+
+        // Value layout: 0x01 ‖ app ‖ data ‖ tree.
+        assert_eq!(value[0], HYPEREDGE_ATOM_TYPE_BYTE);
+        assert_eq!(&value[1..33], &app[..]);
+        assert_eq!(&value[33..65], &data[..]);
+        assert!(value.len() > HYPEREDGE_MIN_VALUE_LEN);
+
+        // The id embedded in the value round-trips.
+        let id = extract_hyperedge_id(&value).unwrap();
+        assert_eq!(&id[..32], &app[..]);
+        assert_eq!(&id[32..], &data[..]);
+
+        // The commit returned by the builder is exactly what the node
+        // recomputes from the serialized value on verify — no round-trip skew.
+        let verify_commit = hyperedge_extrinsic_commit(&value).unwrap();
+        assert_eq!(commit, verify_commit);
+        assert!(!commit.is_empty());
+    }
+
+    #[test]
+    fn build_hyperedge_add_value_rejects_empty_atoms() {
+        assert!(build_hyperedge_add_value(&[0u8; 32], &[0u8; 32], &[]).is_err());
     }
 
     // -----------------------------------------------------------------

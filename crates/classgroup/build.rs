@@ -78,6 +78,7 @@ fn main() {
         let inc_mpfr = format!("-I{}/include", mpfr);
         cc::Build::new()
             .cpp(true)
+            .std("c++11")
             .file("src/vdf.cpp")
             .flag(&inc_gmp)
             .flag(&inc_flint)
@@ -97,6 +98,7 @@ fn main() {
         println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu/");
         cc::Build::new()
             .cpp(true)
+            .std("c++11")
             .file("src/vdf.cpp")
             .static_flag(true)
             .flag("-lflint")
@@ -115,6 +117,7 @@ fn main() {
         println!("cargo:rustc-link-search=native=/usr/lib/");
         cc::Build::new()
             .cpp(true)
+            .std("c++11")
             .file("src/vdf.cpp")
             .static_flag(true)
             .flag("-lflint")

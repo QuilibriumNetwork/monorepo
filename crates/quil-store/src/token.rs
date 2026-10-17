@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use prost::Message;
 
@@ -10,11 +9,11 @@ use crate::encoding;
 
 /// RocksDB-backed token/balance store.
 pub struct RocksTokenStore {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
 }
 
 impl RocksTokenStore {
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
+    pub fn new(db: quil_forest::CoordinatedDb) -> Self {
         Self { db }
     }
 
@@ -394,7 +393,7 @@ mod tests {
         let db = rocksdb::DB::open(&opts, tmp.path()).unwrap();
         // Leak the TempDir so it lives as long as the DB handle.
         std::mem::forget(tmp);
-        RocksTokenStore::new(Arc::new(db))
+        RocksTokenStore::new(quil_forest::CoordinatedDb::new(db))
     }
 
     fn make_coin(amount: &[u8], owner_addr: &[u8]) -> Coin {

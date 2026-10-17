@@ -20,8 +20,8 @@
 //! - `ProverLeave::filterLen[i] <= 64`
 //! - `ProverPause/Resume::filterLen <= 64`
 //! - `sigLen <= 118` for all three — i.e. the signature payload
-//!   must fit in a single-signer envelope; no aggregation on
-//!   filter ops.
+//! must fit in a single-signer envelope; no aggregation on
+//! filter ops.
 
 use quil_types::error::{QuilError, Result};
 
@@ -43,15 +43,16 @@ pub const MAX_PROVER_FILTERS_COUNT: u32 = 100;
 /// is rejected for all three filter ops.
 pub const MAX_PROVER_FILTER_LEN: u32 = 64;
 /// Upper bound on the inner canonical-bytes payload for the
-/// `BLS48581AddressedSignature` — the single-signer envelope is
-/// exactly 118 bytes, which Go uses as the decoder cap via
-/// `sigLen > 118`.
-pub const MAX_FILTER_OP_SIG_LEN: u32 = 118;
+/// `BLS48581AddressedSignature` — with Falcon-512 the single-signer
+/// envelope is 710 bytes and the one-extra-signer aggregate is 1226.
+/// We reuse the shared [`MAX_ADDRESSED_SIG_LEN`] so the cap tracks the
+/// signature scheme.
+pub const MAX_FILTER_OP_SIG_LEN: u32 =
+    super::addressed_signature::MAX_ADDRESSED_SIG_LEN as u32;
 
 /// Read an optional `AddressedSignature` — a length prefix followed
 /// by that many bytes of nested canonical-bytes. Length 0 → `None`.
-/// Lengths above [`MAX_FILTER_OP_SIG_LEN`] are rejected (matches Go's
-/// `sigLen > 118` guard in each filter-op decoder).
+/// Lengths above [`MAX_FILTER_OP_SIG_LEN`] are rejected.
 fn read_optional_addressed_sig(
     buf: &[u8],
     cursor: &mut usize,

@@ -4,6 +4,40 @@
 
 use quil_crypto::poseidon::hash_bytes_to_32;
 
+/// Confidential token operation codes. Shared by current QCT3 routing and
+/// historical codecs; the payload's version tag selects its encoding.
+/// App-shard frames anchor to the global frame this many frames behind the
+/// latest one the proposer holds (`app_engine::resolve_global_anchor`).
+pub const GLOBAL_ANCHOR_SAFETY_MARGIN: u64 = 4;
+
+/// A mint claim executes in an app-shard frame whose anchor is at least
+/// `GLOBAL_ANCHOR_SAFETY_MARGIN` behind the latest global frame, and admits
+/// only citations at or before that anchor. Claim witnesses cite a frame this
+/// far behind the latest global frame, leaving slack for proposer lag.
+pub const MINT_CLAIM_CITATION_LAG: u64 = 2 * GLOBAL_ANCHOR_SAFETY_MARGIN;
+
+pub const TYPE_LATTICE_TRANSACTION: u32 = 0x0512;
+pub const TYPE_LATTICE_MINT: u32 = 0x0513;
+pub const TYPE_LATTICE_PENDING: u32 = 0x0514;
+pub const TYPE_LATTICE_PENDING_CLAIM: u32 = 0x0515;
+pub const TYPE_LATTICE_SHIELD: u32 = 0x0516;
+/// Global-authorization consumption; unsupported by the old suite.
+pub const TYPE_LATTICE_MINT_CLAIM: u32 = 0x0517;
+/// Cross-domain QUIL settlement.
+pub const TYPE_LATTICE_SETTLEMENT: u32 = 0x0518;
+/// Delivery of a globally committed output into its owning shard's block.
+/// Injected by the owning shard's proposer.
+pub const TYPE_COIN_DELIVERY: u32 = 0x051A;
+
+/// Historical accumulator root vertex, retained as a reserved address by
+/// migration and current scans. Its value must survive removal of the old
+/// accumulator implementation. It is distinct from `[0xff; 32]` metadata.
+pub const LEGACY_ACCUMULATOR_ROOT_ADDRESS: [u8; 32] = {
+    let mut address = [0xff; 32];
+    address[31] = 0xfe;
+    address
+};
+
 // =====================================================================
 // Token behavior flags (bit field)
 // =====================================================================
@@ -43,6 +77,12 @@ pub type ProofBasisType = u16;
 pub const NO_PROOF_BASIS: ProofBasisType = 0;
 pub const PROOF_OF_MEANINGFUL_WORK: ProofBasisType = 1;
 pub const VERKLE_MULTIPROOF_WITH_SIGNATURE: ProofBasisType = 2;
+/// A proof-basis custom token commits to a Merkle root of mint entitlements
+/// in its configuration (`TokenMintStrategy.verkle_root`), and each mint
+/// proves its leaf. Replaces the verkle basis, whose KZG
+/// commitments the post-quantum node no longer carries. Custom tokens never
+/// mint by proof of meaningful work.
+pub const MERKLE_ENTITLEMENT_WITH_SIGNATURE: ProofBasisType = 3;
 
 // =====================================================================
 // Fee basis
@@ -72,7 +112,62 @@ pub const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END: u64 = FRAME_2_1_EXTENDED_ENROLL
 /// shard isn't a dead zone where only prover-lifecycle ops can be
 /// processed. NEW protocol rule (no Go equivalent) — gated so all nodes
 /// switch behavior at the same height. See the global frame materializer.
-pub const FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX: u64 = 670000;
+///
+/// Set to the first CW-driven frame (the mainnet BLS/KZG→commonware flag day,
+/// where 669975 is the last legacy frame), so uncovered-shard global routing is
+/// live from the very first frame the new consensus produces.
+pub const FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX: u64 = 669976;
+
+/// The same rule on every network other than mainnet: test networks never
+/// reach the mainnet flag-day height, so they route uncovered-shard
+/// transactions and deploys through the global venue from their first frame.
+pub const NON_MAINNET_GLOBAL_UNCOVERED_SHARD_TX: u64 = 1;
+
+/// Fewest active provers with which an application shard produces its own
+/// frames: 3 on mainnet (the halt-risk floor), 1 elsewhere.
+pub fn min_active_provers_for_shard_frames(network: u8) -> u64 {
+    if network == crate::pricing::MAINNET_NETWORK { 3 } else { 1 }
+}
+
+/// Whether the global venue executes an application's bundles: exactly when
+/// its shard cannot produce frames. The two rules must be complements, or a
+/// bundle delivered to both venues (anyone can republish it to the global
+/// topic) executes twice against separate state.
+pub fn shard_is_globally_executed(network: u8, active_provers: u64) -> bool {
+    active_provers < min_active_provers_for_shard_frames(network)
+}
+
+/// First global frame of uncovered-shard global execution for `network` (the
+/// pricing network selector; mainnet is `pricing::MAINNET_NETWORK`).
+pub fn global_uncovered_shard_tx_frame(network: u8) -> u64 {
+    if network == crate::pricing::MAINNET_NETWORK {
+        FRAME_2_1_GLOBAL_UNCOVERED_SHARD_TX
+    } else {
+        NON_MAINNET_GLOBAL_UNCOVERED_SHARD_TX
+    }
+}
+
+#[cfg(test)]
+mod uncovered_shard_tx_tests {
+    #[test]
+    fn mainnet_keeps_the_flag_day_and_other_networks_activate_immediately() {
+        assert_eq!(super::global_uncovered_shard_tx_frame(0), 669_976);
+        assert_eq!(super::global_uncovered_shard_tx_frame(1), 1);
+        assert_eq!(super::global_uncovered_shard_tx_frame(5), 1);
+    }
+
+    #[test]
+    fn global_execution_is_the_complement_of_shard_frame_production() {
+        for network in [0u8, 1, 7] {
+            for active in 0..8u64 {
+                let produces = active >= super::min_active_provers_for_shard_frames(network);
+                assert_ne!(produces, super::shard_is_globally_executed(network, active));
+            }
+        }
+        assert!(super::shard_is_globally_executed(0, 2) && !super::shard_is_globally_executed(0, 3));
+        assert!(super::shard_is_globally_executed(1, 0) && !super::shard_is_globally_executed(1, 1));
+    }
+}
 
 // =====================================================================
 // Domain addresses (Poseidon-derived)
@@ -173,3 +268,8 @@ mod tests {
         assert_eq!(FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END, 255840 + 6500);
     }
 }
+
+/// Retired Decaf operation codes; these identify rejections, not supported codecs.
+pub const TYPE_TRANSACTION: u32 = 0x0509;
+pub const TYPE_PENDING_TRANSACTION: u32 = 0x050c;
+pub const TYPE_MINT_TRANSACTION: u32 = 0x050f;

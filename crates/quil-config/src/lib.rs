@@ -1,17 +1,23 @@
 mod config;
 mod db;
 mod engine;
+mod explorer;
 mod keys;
 mod logger;
 mod p2p;
+mod proof_worker;
+mod signatories;
 mod version;
 
 pub use config::*;
 pub use db::*;
 pub use engine::*;
+pub use explorer::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
+pub use proof_worker::*;
+pub use signatories::*;
 pub use version::*;
 
 use serde::{Deserialize, Deserializer};
@@ -301,6 +307,35 @@ rewardStrategy: ""
         assert_eq!(e.reward_strategy, "reward-greedy");
     }
 
+    /// `archiveBlacklistTtl` is special: `-1` means "disabled" and must
+    /// survive `apply_defaults`, while `0`/absent fall back to the 60s
+    /// default like every other engine field.
+    #[test]
+    fn apply_defaults_handles_archive_blacklist_ttl() {
+        // Absent → default.
+        let mut absent: EngineConfig = serde_yaml::from_str("{}").unwrap();
+        absent.apply_defaults();
+        assert_eq!(absent.archive_blacklist_ttl_secs, 60);
+
+        // Explicit 0 → default.
+        let mut zero: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: 0").unwrap();
+        zero.apply_defaults();
+        assert_eq!(zero.archive_blacklist_ttl_secs, 60);
+
+        // -1 (disabled) → preserved.
+        let mut disabled: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: -1").unwrap();
+        disabled.apply_defaults();
+        assert_eq!(disabled.archive_blacklist_ttl_secs, -1);
+
+        // Positive value → preserved.
+        let mut custom: EngineConfig =
+            serde_yaml::from_str("archiveBlacklistTtl: 30").unwrap();
+        custom.apply_defaults();
+        assert_eq!(custom.archive_blacklist_ttl_secs, 30);
+    }
+
     #[test]
     fn apply_defaults_preserves_non_zero_fields() {
         let yaml = r#"
@@ -401,6 +436,42 @@ rewardStrategy: "custom-strategy"
         assert_eq!(c2.engine.data_worker_filters[0], "shard-a");
         assert_eq!(c2.p2p.bootstrap_peers.len(), 2);
         assert_eq!(c2.p2p.bootstrap_peers[0], "/ip4/1.2.3.4/tcp/100");
+    }
+
+    /// On mainnet (network 0) the hardcoded archive bootstrap list
+    /// UNCONDITIONALLY supersedes the config (even a non-empty, non-old-domain
+    /// list) — the archives are the DHT bootstraps and their Falcon peer IDs
+    /// must be dialed, not stale `Qm…` ones. Non-mainnet keeps its own list.
+    #[test]
+    fn mainnet_forces_archive_bootstrap_peers() {
+        let mut c = Config::default();
+        c.p2p.network = 0;
+        // A stale config list that the OLD heuristic would have KEPT.
+        c.p2p.bootstrap_peers = vec![
+            "/dns4/quinoa.quilibrium.com/udp/8336/quic-v1/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH".into(),
+        ];
+        c.apply_defaults();
+        let expected: Vec<String> =
+            crate::MAINNET_BOOTSTRAP_PEERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(c.p2p.bootstrap_peers, expected, "mainnet must force the archive list");
+        assert!(
+            c.p2p
+                .bootstrap_peers
+                .iter()
+                .any(|p| p.contains("QmRECrGL6yDoMgSydFDN5bhnnpJLAByKVuieAbwmmAiodC")),
+            "must contain the Falcon archive peer IDs"
+        );
+        assert!(
+            !c.p2p.bootstrap_peers.iter().any(|p| p.contains("quinoa.quilibrium.com")),
+            "the stale quinoa/qualia hosts must be gone"
+        );
+
+        // Non-mainnet keeps its configured list (never inject mainnet archives).
+        let mut t = Config::default();
+        t.p2p.network = 7;
+        t.p2p.bootstrap_peers = vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".into()];
+        t.apply_defaults();
+        assert_eq!(t.p2p.bootstrap_peers, vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".to_string()]);
     }
 
     #[test]

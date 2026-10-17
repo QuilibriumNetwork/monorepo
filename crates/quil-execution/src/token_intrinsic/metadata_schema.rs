@@ -4,19 +4,27 @@
 //!
 //! Fields on `config:TokenConfiguration`:
 //!
-//! | Order | Field                | Size (bytes) | RDF type   |
+//! | Order | Field | Size (bytes) | RDF type   |
 //! |-------|----------------------|--------------|------------|
-//! | 0     | Behavior             | 2            | Uint       |
-//! | 1     | MintStrategy         | 701          | ByteArray  |
-//! | 2     | Units                | 32           | ByteArray  |
-//! | 3     | Supply               | 32           | ByteArray  |
-//! | 4     | Name                 | 64           | String     |
-//! | 5     | Symbol               | 8            | String     |
-//! | 6     | AdditionalReference  | 64           | ByteArray  |
-//! | 7     | OwnerPublicKey       | 585          | ByteArray  |
+//! | 0 | Behavior             | 2            | Uint       |
+//! | 1 | MintStrategy         | 1152         | ByteArray  |
+//! | 2 | Units                | 32           | ByteArray  |
+//! | 3 | Supply               | 32           | ByteArray  |
+//! | 4 | Name                 | 64           | String     |
+//! | 5 | Symbol               | 8            | String     |
+//! | 6 | AdditionalReference  | 64           | ByteArray  |
+//! | 7 | OwnerPublicKey       | 897          | ByteArray  |
 //!
 //! This module exposes a helper `field_key(name) -> Vec<u8>` built on
 //! top of the shared `order_to_key` encoder from `global_schema`.
+//!
+//! The two key-bearing sizes are post-quantum sizes, not Go's: an authority or
+//! owner key is Falcon-512 (897 bytes), so Go's 585-byte owner field (a
+//! BLS48-581 G2 key) and 701-byte mint strategy (sized for a classical
+//! authority) could not hold one — a token could not name a post-quantum mint
+//! authority at all. Both are raised here. This changes the committed
+//! token-configuration tree, so it is a format change; no QCT3 token is
+//! deployed yet.
 
 use crate::global_schema::order_to_key;
 
@@ -53,7 +61,7 @@ pub const OUTER_CONFIG_KEY: [u8; 1] = [16u8 << 2]; // 0x40
 /// `unpackAndVerifyTokenConfigurationMetadata`:
 ///
 /// 1. Load `[domain || HYPERGRAPH_METADATA_ADDRESS]` vertex data (outer
-///    tree serialized blob).
+/// tree serialized blob).
 /// 2. Deserialize as a `VectorCommitmentTree`.
 /// 3. Read key `[0x40]` → serialized inner tree bytes.
 /// 4. Deserialize the inner tree.
@@ -164,6 +172,14 @@ pub fn decode_token_config_from_tree(
 /// `MintStrategy` into the metadata tree. Inverse of
 /// `decode_mint_strategy_packed`. Mirrors Go
 /// `token_configuration.go:632-810`.
+/// Declared size of the packed `MintStrategy` field, and the cap its encoding
+/// enforces. Holds the worst case: both behaviors (4), a 32-byte proof root
+/// (35), a Falcon-512 authority (903), a payment address (34) and a fee basis
+/// (35), with headroom.
+pub const MAX_MINT_STRATEGY_BYTES: usize = 1152;
+/// Declared size of the `OwnerPublicKey` field: a Falcon-512 public key.
+pub const OWNER_PUBLIC_KEY_BYTES: usize = quil_crypto::FALCON_PUBLIC_KEY_LEN;
+
 pub fn encode_mint_strategy_packed(
     strategy: &super::config::TokenMintStrategy,
 ) -> quil_types::error::Result<Vec<u8>> {
@@ -211,7 +227,7 @@ pub fn encode_mint_strategy_packed(
         out.push(0);
     }
 
-    if out.len() > 701 {
+    if out.len() > MAX_MINT_STRATEGY_BYTES {
         return Err(quil_types::error::QuilError::InvalidArgument(
             "mint strategy data exceeds maximum size".into(),
         ));
@@ -253,7 +269,7 @@ pub fn build_token_configuration_metadata_tree(
             &field_key(field::MINT_STRATEGY),
             &packed,
             &[],
-            &BigInt::from(701),
+            &BigInt::from(MAX_MINT_STRATEGY_BYTES),
         )
         .map_err(|e| QuilError::Internal(format!("token config tree: {}", e)))?;
     }
@@ -314,7 +330,7 @@ pub fn build_token_configuration_metadata_tree(
             &field_key(field::OWNER_PUBLIC_KEY),
             &config.owner_public_key,
             &[],
-            &BigInt::from(585),
+            &BigInt::from(OWNER_PUBLIC_KEY_BYTES),
         )
         .map_err(|e| QuilError::Internal(format!("token config tree: {}", e)))?;
     }
@@ -471,12 +487,27 @@ mod tests {
         let m = TokenMintStrategy {
             mint_behavior: 0,
             proof_basis: 0,
-            verkle_root: vec![0xAAu8; 800], // pushes packed > 701 bytes
+            verkle_root: vec![0xAAu8; MAX_MINT_STRATEGY_BYTES], // over the field size
             authority: vec![],
             payment_address: vec![],
             fee_basis: vec![],
         };
         assert!(encode_mint_strategy_packed(&m).is_err());
+        // A Falcon-512 authority fits, which is what the field must hold:
+        // application authority keys are post-quantum only.
+        let falcon = TokenMintStrategy {
+            mint_behavior: 0, proof_basis: 0, verkle_root: vec![0xAAu8; 32],
+            authority: super::super::config::Authority {
+                key_type: quil_types::crypto::KeyType::Falcon512 as u32,
+                public_key: vec![0xBBu8; quil_crypto::FALCON_PUBLIC_KEY_LEN],
+                can_burn: false,
+            }.to_canonical_bytes().unwrap(),
+            payment_address: vec![0xCCu8; 32],
+            fee_basis: super::super::config::FeeBasisStruct {
+                fee_type: 1, baseline: vec![0xDDu8; 32],
+            }.to_canonical_bytes().unwrap(),
+        };
+        assert!(encode_mint_strategy_packed(&falcon).unwrap().len() <= MAX_MINT_STRATEGY_BYTES);
     }
 
     #[test]

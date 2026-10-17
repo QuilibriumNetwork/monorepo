@@ -10,7 +10,7 @@ env:
 
 vars:
   VERSION:
-    sh: cat config/version.go | grep -A 1 "func GetVersion() \[\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
+    sh: grep -m1 'VERSION_STRING' crates/quil-config/src/version.rs | cut -d'"' -f2
   GIT_REPO:
     sh: git config --get remote.origin.url | sed 's/\.git$//'
   GIT_BRANCH:
@@ -34,26 +34,12 @@ tasks:
   build_node_arm64_macos:
     desc: Build the Quilibrium node binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
     cmds:
-      - vdf/generate.sh
-      - bls48581/generate.sh
-      - verenc/generate.sh
-      - bulletproofs/generate.sh
-      - ferret/generate.sh
-      - channel/generate.sh
-      - rpm/generate.sh
-      - node/build.sh -o build/arm64_macos/node
+      - node/build.sh
 
   build_qclient_arm64_macos:
-    desc: Build the QClient node binary for MacOS ARM. Outputs to client/build
+    desc: Build the qclient binary (Rust crates/quil-client) for MacOS ARM. Outputs to crates/quil-client/build.
     cmds:
-      - vdf/generate.sh
-      - bls48581/generate.sh
-      - verenc/generate.sh
-      - bulletproofs/generate.sh
-      - ferret/generate.sh
-      - channel/generate.sh
-      - rpm/generate.sh
-      - client/build.sh -o build/arm64_macos/qclient
+      - CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient OUT_BASE_DIR=crates/quil-client/build node/build.sh
 
   backup:
     desc: Create a backup file with the critical configuration files.
@@ -125,19 +111,45 @@ tasks:
       - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_qclient_arm64_linux:
-    desc: Build the QClient node binary for ARM64 Linux. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for ARM64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
 
   build_node_amd64_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux. Outputs to node/build.
     cmds:
       - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output node/build/amd64_linux --target=node .
 
-  build_conntest_amd64_linux:
-    desc: Build the Quilibrium node connection test binary for AMD64 Linux. Outputs to conntest/build.
+  test_rust_amd64_linux:
+    desc: >-
+      Run the Rust workspace tests inside the AMD64 Linux build image — the
+      same environment that builds the node, carrying the GMP/FLINT/EMP native
+      deps that classgroup, bls48581, and vdf need to compile (which a bare
+      `cargo test` on a host lacking them cannot). Mirrors CI's `cargo nextest
+      run`, including the .nextest.toml skip-filter. Narrow scope by appending
+      args after `--`, e.g. `task test_rust_amd64_linux -- -p quil-engine` or
+      `task test_rust_amd64_linux -- -E 'test(materialize)'`; with no args it
+      runs the whole workspace. The cargo registry/git caches persist in named
+      volumes, but the compile target dir does not, so expect a cold compile
+      on the first run after a source change.
+    vars:
+      NEXTEST_ARGS: '{{.CLI_ARGS | default "--workspace --exclude channelwasm"}}'
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.conntest.source --output conntest/build/amd64_linux --target=conntest .
+      # test-context = build-context (full source + native deps) plus the node/
+      # tree that several crates embed fixtures from. Layers below build-context
+      # are already cached if the node image was built, so this is cheap.
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --target test-context -t quilibrium-rust-test:latest .
+      # The target volume persists compiled artifacts across runs so a long
+      # cold compile resumes instead of restarting; it starts empty and is
+      # populated from source exactly as CI does (CI has no prebuilt artifacts).
+      - >-
+        docker run --rm --ulimit stack=-1:-1 --platform linux/amd64
+        -v quilibrium-cargo-registry:/root/.cargo/registry
+        -v quilibrium-cargo-git:/root/.cargo/git
+        -v quilibrium-cargo-target:/opt/ceremonyclient/target
+        -w /opt/ceremonyclient quilibrium-rust-test:latest
+        bash -c 'curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin &&
+        cargo nextest run --locked --no-fail-fast --config-file .nextest.toml {{.NEXTEST_ARGS}}'
 
   build_node_amd64_avx512_linux:
     desc: Build the Quilibrium node binary for AMD64 Linux with AVX-512 extensions. Outputs to node/build.
@@ -145,14 +157,14 @@ tasks:
       - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output node/build/amd64_avx512_linux --target=node .
 
   build_qclient_amd64_linux:
-    desc: Build the QClient node binary for AMD64 Linux. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
 
   build_qclient_amd64_avx512_linux:
-    desc: Build the QClient node binary for AMD64 Linux with AVX-512 extensions. Outputs to client/build.
+    desc: Build the qclient binary (Rust crates/quil-client) for AMD64 Linux with AVX-512 extensions. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output client/build/amd64_avx512_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.sourceavx512 --output crates/quil-client/build/amd64_avx512_linux --target=qclient .
 
   build:source:
     desc: Build the Quilibrium docker image from source.
@@ -209,14 +221,20 @@ tasks:
       - docker push ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:latest
 
   test:qclient:
-    desc: Test the Quilibrium docker image.
+    desc: Test the Rust qclient (crates/quil-client).
     cmds:
-      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'
+      - cargo test -p quil-client
 
   config:gen:
-    desc: Generate configuration and keys using Go.
+    desc: >-
+      Generate configuration and keys (config.yml, keys.yml) with the
+      node-only image. Build it first with `task build:node:source`.
     cmds:
-      - go run utils/config-gen --config {{.CONFIG_DIR | default ".config"}}
+      - |
+        docker run --rm \
+           -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
+           ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
+           --config /root/.config --generate-keys
 
   build:node:source:
     desc: Build the optimized Quilibrium node-only docker image.
@@ -242,4 +260,4 @@ tasks:
            --restart unless-stopped \
            -v {{.CONFIG_DIR | default "$(pwd)/.config"}}:/root/.config \
            ${QUILIBRIUM_IMAGE_NAME:-quilibrium}:node-only \
-           -signature-check=false
+           --signature-check=false

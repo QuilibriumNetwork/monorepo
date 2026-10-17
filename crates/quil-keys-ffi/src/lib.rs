@@ -1,7 +1,7 @@
 // Handle-based FFI wrapper for quil-keys::FileKeyManager.
 //
 // UniFFI cannot pass trait objects across FFI, so we use u64 handles
-// into a global HashMap<u64, FileKeyManager>.  The Go side calls
+// into a global HashMap<u64, FileKeyManager>. The Go side calls
 // create_key_manager() to obtain a handle and destroy_key_manager()
 // to release it.
 
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use quil_crypto::Bls48581KeyConstructor;
+use quil_crypto::FalconKeyConstructor;
 use quil_keys::{FileKeyManager, KeyManager};
 use quil_types::crypto::KeyType;
 
@@ -47,6 +47,8 @@ fn key_type_from_u8(v: u8) -> KeyType {
         5 => KeyType::Secp256k1Sha256,
         6 => KeyType::Secp256k1Sha3,
         7 => KeyType::Ed25519,
+        8 => KeyType::Falcon512,
+        9 => KeyType::Sntrup761,
         _ => panic!("unknown key type: {}", v),
     }
 }
@@ -57,11 +59,11 @@ fn key_type_from_u8(v: u8) -> KeyType {
 
 /// Create a FileKeyManager and return its handle.
 ///
-/// * `path`           - filesystem path to the YAML keystore file
+/// * `path` - filesystem path to the YAML keystore file
 /// * `encryption_key` - hex-encoded 32-byte AES-256-GCM key (empty = insecure default)
 /// * `proving_key_id` - opaque proving key identifier
 pub fn create_key_manager(path: String, encryption_key: String, proving_key_id: String) -> u64 {
-    let bls = Box::new(Bls48581KeyConstructor);
+    let bls = Box::new(FalconKeyConstructor);
     let mgr = FileKeyManager::new(PathBuf::from(&path), &encryption_key, proving_key_id, bls)
         .unwrap_or_else(|e| panic!("create_key_manager failed: {}", e));
 
@@ -92,12 +94,21 @@ pub fn ensure_standard_keys(handle: u64) {
 /// Get the raw public key bytes for the given key type.
 ///
 /// `key_type` uses the same encoding as `quil_types::crypto::KeyType`:
-///   0=Ed448, 1=X448, 2=BLS48581G1, 3=BLS48581G2, 4=Decaf448, ...
+/// 0=Ed448, 1=X448, 2=BLS48581G1, 3=BLS48581G2, 4=Decaf448, ...,
+/// 8=Falcon512, 9=Sntrup761
 pub fn get_public_key(handle: u64, key_type: u8) -> Vec<u8> {
     with_managers(|m| {
         let mgr = m
             .get(&handle)
             .unwrap_or_else(|| panic!("invalid handle: {}", handle));
+        // Sntrup761 is the `q-onion-key` agreement/KEM key: it has no `Signer`,
+        // so it never appears in the signer map `get_public_key` searches.
+        // Read it from the stored-key table by its standard id instead.
+        if matches!(key_type_from_u8(key_type), KeyType::Sntrup761) {
+            return mgr
+                .get_public_key_bytes_by_id("q-onion-key")
+                .unwrap_or_else(|e| panic!("get_public_key failed: {}", e));
+        }
         mgr.get_public_key(key_type_from_u8(key_type))
             .unwrap_or_else(|e| panic!("get_public_key failed: {}", e))
     })
@@ -134,19 +145,19 @@ pub fn sign_with_domain(handle: u64, key_type: u8, message: Vec<u8>, domain: Vec
 }
 
 /// Convenience: create a temporary FileKeyManager, generate standard keys,
-/// and return the BLS48581G2 public key.  The keystore is discarded afterward.
+/// and return the Falcon-512 public key. The keystore is discarded afterward.
 pub fn create_temp_key_manager_and_get_pubkey(encryption_key: String) -> Vec<u8> {
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let keys_path = tmp_dir.path().join("keys.yml");
 
-    let bls = Box::new(Bls48581KeyConstructor);
+    let bls = Box::new(FalconKeyConstructor);
     let mgr = FileKeyManager::new(keys_path, &encryption_key, "temp".into(), bls)
         .expect("create temp key manager failed");
 
     mgr.ensure_standard_keys()
         .expect("ensure_standard_keys failed");
 
-    mgr.get_public_key(KeyType::Bls48581G2)
+    mgr.get_public_key(KeyType::Falcon512)
         .expect("get_public_key failed")
 }
 
@@ -176,7 +187,7 @@ mod tests {
         let path = tmp.path().join("keys.yml").to_string_lossy().to_string();
         let h = create_key_manager(path, TEST_KEY_HEX.into(), "test-id".into());
         ensure_standard_keys(h);
-        let pk = get_public_key(h, 3); // BLS48581G2
+        let pk = get_public_key(h, 8); // Falcon512
         assert!(!pk.is_empty());
         destroy_key_manager(h);
     }
@@ -188,12 +199,23 @@ mod tests {
         let h = create_key_manager(path, TEST_KEY_HEX.into(), "test-id".into());
         ensure_standard_keys(h);
 
-        let sig = sign(h, 3, b"hello".to_vec());
+        let sig = sign(h, 8, b"hello".to_vec());
         assert!(!sig.is_empty());
 
-        let sig2 = sign_with_domain(h, 3, b"hello".to_vec(), b"domain".to_vec());
+        let sig2 = sign_with_domain(h, 8, b"hello".to_vec(), b"domain".to_vec());
         assert!(!sig2.is_empty());
 
+        destroy_key_manager(h);
+    }
+
+    #[test]
+    fn onion_pubkey_via_sntrup_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.yml").to_string_lossy().to_string();
+        let h = create_key_manager(path, TEST_KEY_HEX.into(), "test-id".into());
+        ensure_standard_keys(h);
+        let pk = get_public_key(h, 9); // Sntrup761 (q-onion-key, agreement-only)
+        assert!(!pk.is_empty());
         destroy_key_manager(h);
     }
 

@@ -32,6 +32,15 @@ pub struct DecodingError {
 }
 
 impl DecodingError {
+    /// A key blob was structurally invalid (wrong length / bad encoding) — NOT a
+    /// missing cargo feature. Use this when a `*::decode` returns `None`, so the
+    /// error names the real cause (e.g. a 57-byte Ed448 key fed to the Falcon
+    /// decoder) instead of the misleading "feature not enabled".
+    #[cfg(feature = "falcon")]
+    pub(crate) fn invalid_key(msg: String) -> Self {
+        Self { msg, source: None }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn missing_feature(feature_name: &'static str) -> Self {
         Self {
@@ -45,6 +54,7 @@ impl DecodingError {
         feature = "secp256k1",
         feature = "ed25519",
         feature = "ed448",
+        feature = "falcon",
         feature = "rsa"
     ))]
     pub(crate) fn failed_to_parse<E, S>(what: &'static str, source: S) -> Self
@@ -66,6 +76,7 @@ impl DecodingError {
         feature = "secp256k1",
         feature = "ed25519",
         feature = "ed448",
+        feature = "falcon",
         feature = "rsa"
     ))]
     pub(crate) fn bad_protobuf(
@@ -108,7 +119,11 @@ pub struct SigningError {
 
 /// An error during encoding of key material.
 impl SigningError {
-    #[cfg(any(all(feature = "rsa", not(target_arch = "wasm32")), feature = "ed448"))]
+    #[cfg(any(
+        all(feature = "rsa", not(target_arch = "wasm32")),
+        feature = "ed448",
+        feature = "falcon"
+    ))]
     pub(crate) fn new<S: ToString>(msg: S) -> Self {
         Self {
             msg: msg.to_string(),

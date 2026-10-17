@@ -76,7 +76,11 @@ impl PublicKey {
         }
         let mut arr = [0u8; 57];
         arr.copy_from_slice(bytes);
-        let inner = ed448_rust::PublicKey::from(arr);
+        // `PublicKey::from([u8;57])` PANICS on any 57 bytes that aren't a valid
+        // curve point — and this decodes an attacker-supplied protobuf wire key,
+        // so a panic here is a remote DoS. Use the fallible `TryFrom` instead.
+        let inner = ed448_rust::PublicKey::try_from(&arr[..])
+            .map_err(|_| DecodingError::missing_feature("ed448"))?;
         Ok(Self { inner, bytes: arr })
     }
 

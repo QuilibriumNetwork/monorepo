@@ -28,6 +28,21 @@ pub struct GlobalState {
     pub parent_selector: Vec<u8>,
     pub prover: Vec<u8>,
     pub prover_tree_commitment: Vec<u8>,
+    /// The 256 Level-1 global bucket commitments (per first address byte). Set
+    /// by the leader from the CRDT (`global_commitments()`), bound into the
+    /// VDF challenge, and carried onto the rebuilt header
+    /// (`cw_global_seams::global_frame_from_state`) so a follower's
+    /// `verify_global_frame_header` recomputes the same challenge. Empty on
+    /// nodes without a CRDT wired (tolerated).
+    pub global_commitments: Vec<Vec<u8>>,
+    /// Prover shard phase 1/2/3 roots, bound into the VDF challenge
+    /// alongside `prover_tree_commitment` (phase 0) and carried onto the rebuilt
+    /// header so a follower recomputes the identical challenge. Mirrors
+    /// `global_commitments`.
+    pub prover_tree_aux_roots: Vec<Vec<u8>>,
+    /// Certified network world-state size as of the end of the parent frame
+    /// (bound into the VDF challenge when non-zero; the pricing input).
+    pub world_state_size: u64,
     pub requests_root: Vec<u8>,
     pub signature: Vec<u8>,
     /// Inbound message bundles attached to this proposal, decoded
@@ -36,7 +51,7 @@ pub struct GlobalState {
     /// `MessageCollector` → `decode_message_bundle`), carried through
     /// the consensus state, embedded into the wire `GlobalFrame.requests`
     /// field by `on_own_proposal`, and reconstituted on the receiver
-    /// via `wire_proposal_to_signed`. The `on_finalized_state` hook
+    /// on the receiver. The `on_finalized_state` hook
     /// re-attaches them to the persisted frame so the materializer
     /// iterates them on finalization to apply transactions
     /// (ProverJoin/Confirm/Leave, token, compute, hypergraph).
@@ -77,12 +92,36 @@ impl GlobalState {
             parent_selector,
             prover,
             prover_tree_commitment,
+            global_commitments: Vec::new(),
+            prover_tree_aux_roots: Vec::new(),
+            world_state_size: 0,
             requests_root,
             signature,
             messages: Vec::new(),
             identity_cache,
             source_cache,
         }
+    }
+
+    /// Attach the leader's 256 Level-1 global bucket commitments. Called in
+    /// `prove_next_state` with the value bound into the VDF challenge, so the
+    /// rebuilt header carries the identical bytes the challenge was hashed over.
+    pub fn with_global_commitments(mut self, commitments: Vec<Vec<u8>>) -> Self {
+        self.global_commitments = commitments;
+        self
+    }
+
+    /// Attach the prover shard's phase 1/2/3 roots, bound into the
+    /// VDF challenge, so the rebuilt header carries the identical bytes.
+    pub fn with_prover_aux_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.prover_tree_aux_roots = roots;
+        self
+    }
+
+    /// Carry the certified world-state size bound into the VDF challenge.
+    pub fn with_world_state_size(mut self, size: u64) -> Self {
+        self.world_state_size = size;
+        self
     }
 
     /// Attach the leader's collected message bundles to this state.
@@ -110,6 +149,9 @@ impl GlobalState {
             parent_selector: h.parent_selector.clone(),
             prover: h.prover.clone(),
             prover_tree_commitment: h.prover_tree_commitment.clone(),
+            global_commitments: h.global_commitments.clone(),
+            prover_tree_aux_roots: h.prover_tree_aux_roots.clone(),
+            world_state_size: h.world_state_size,
             requests_root: h.requests_root.clone(),
             signature: h
                 .public_key_signature_bls48581
@@ -238,159 +280,6 @@ impl Unique for GlobalVote {
 
     fn signature(&self) -> &[u8] {
         &self.signature_bytes
-    }
-}
-
-/// Type alias for the global consensus event loop handle.
-pub type GlobalEventLoopHandle =
-    quil_consensus::event_loop::EventLoopHandle<GlobalState, GlobalVote>;
-
-/// Bridge an inbound wire `GlobalProposal` into the typed `SignedProposal`
-/// the consensus event loop accepts.
-///
-/// Port of the decode half of `global_consensus_engine.go:handleGlobalProposal`.
-/// Splits the wire record's embedded QC/TC out (they should be submitted
-/// separately via `handle.submit_quorum_certificate` /
-/// `handle.submit_timeout_certificate`).
-pub fn wire_proposal_to_signed(
-    wire: crate::consensus_wire::GlobalProposal,
-) -> quil_types::error::Result<(
-    quil_consensus::models::SignedProposal<GlobalState, GlobalVote>,
-    std::sync::Arc<dyn quil_consensus::models::QuorumCertificate>,
-    Option<std::sync::Arc<dyn quil_consensus::models::TimeoutCertificate>>,
-)> {
-    // 1. Decode the embedded frame bytes → GlobalFrameHeader proto
-    let frame = crate::consensus_wire::decode_global_frame(&wire.state)?;
-    let header = frame.header.ok_or_else(|| {
-        quil_types::error::QuilError::InvalidArgument(
-            "GlobalProposal: embedded frame missing header".into(),
-        )
-    })?;
-    let frame_requests = frame.requests;
-
-    // 2. Build GlobalState (identity = SHA-256(output), source = hex(prover))
-    //    plus the inbound message bundles so the materializer sees
-    //    them when this state is finalized.
-    let state = GlobalState::from_header(&header).with_messages(frame_requests);
-    let identifier = state.compute_identity();
-
-    // 3. Convert the wire QC to a trait object — the event loop accepts it
-    //    both as the proposal's parent QC and (separately) via submit_qc().
-    let parent_qc: std::sync::Arc<dyn quil_consensus::models::QuorumCertificate> =
-        wire.parent_quorum_certificate.clone().into_trait_object();
-    let parent_qc_identity = parent_qc.identity().clone();
-    let parent_qc_rank = parent_qc.rank();
-
-    // 4. Optional prior-rank TC
-    let prior_tc: Option<std::sync::Arc<dyn quil_consensus::models::TimeoutCertificate>> =
-        wire.prior_rank_timeout_certificate.clone().map(|tc| tc.into_trait_object());
-
-    // 5. Build the State<GlobalState>
-    //
-    // `parent_quorum_certificate` is the QC the wire proposal carried
-    // in `wire.latest_quorum_certificate`; the same Arc is cloned into
-    // both the State and the wrapping Proposal so consumers reading
-    // the QC off the state see the same aggregated signature the
-    // proposer signed against. Mirrors Go's
-    // `models.State.ParentQuorumCertificate`.
-    let consensus_state = quil_consensus::models::State {
-        rank: wire.vote.rank,
-        identifier: identifier.clone(),
-        proposer_id: wire.vote.address.clone(),
-        parent_qc_identity,
-        parent_qc_rank,
-        parent_quorum_certificate: Some(std::sync::Arc::clone(&parent_qc)),
-        timestamp: wire.vote.timestamp,
-        state,
-    };
-
-    // 6. Build the proposer's self-vote — signature bytes from ProposalVote
-    let vote = GlobalVote::new(
-        identifier,
-        wire.vote.rank,
-        wire.vote.address.clone(),
-        wire.vote.timestamp,
-        wire.vote.signature,
-        Vec::new(),
-    );
-
-    let proposal = quil_consensus::models::Proposal {
-        state: consensus_state,
-        parent_quorum_certificate: std::sync::Arc::clone(&parent_qc),
-        previous_rank_timeout_certificate: prior_tc.clone(),
-    };
-    let signed = quil_consensus::models::SignedProposal { proposal, vote };
-
-    Ok((signed, parent_qc, prior_tc))
-}
-
-/// Convert a proto `GlobalProposal` (as returned by
-/// `GlobalService.GetGlobalProposal`) into a `SignedProposal` + QC (+ optional
-/// TC), reusing [`wire_proposal_to_signed`]. Used by the catch-up sync client to
-/// submit synced proposals to the consensus loop. Errors if the proposal is
-/// missing its state, parent QC, or vote (all required to reconstruct it).
-pub fn proto_proposal_to_signed(
-    proposal: &quil_types::proto::global::GlobalProposal,
-) -> quil_types::error::Result<(
-    quil_consensus::models::SignedProposal<GlobalState, GlobalVote>,
-    std::sync::Arc<dyn quil_consensus::models::QuorumCertificate>,
-    Option<std::sync::Arc<dyn quil_consensus::models::TimeoutCertificate>>,
-)> {
-    use quil_types::error::QuilError;
-    let state = proposal
-        .state
-        .as_ref()
-        .ok_or_else(|| QuilError::InvalidArgument("synced proposal missing state".into()))?;
-    let parent_qc = proposal.parent_quorum_certificate.as_ref().ok_or_else(|| {
-        QuilError::InvalidArgument("synced proposal missing parent QC".into())
-    })?;
-    let vote = proposal
-        .vote
-        .as_ref()
-        .ok_or_else(|| QuilError::InvalidArgument("synced proposal missing vote".into()))?;
-    let wire = crate::consensus_wire::GlobalProposal {
-        state: crate::consensus_wire::encode_global_frame(state)?,
-        parent_quorum_certificate: crate::consensus_wire::QuorumCertificate::from_proto(parent_qc),
-        prior_rank_timeout_certificate: proposal
-            .prior_rank_timeout_certificate
-            .as_ref()
-            .map(crate::consensus_wire::TimeoutCertificate::from_proto),
-        vote: crate::consensus_wire::ProposalVote::from_proto(vote),
-    };
-    wire_proposal_to_signed(wire)
-}
-
-/// Build a genesis `CertifiedState` for bootstrapping the consensus event loop.
-/// Takes the latest stored frame and produces the trusted root state.
-pub fn build_genesis_certified_state(
-    frame: &quil_types::proto::global::GlobalFrame,
-) -> quil_consensus::models::CertifiedState<GlobalState> {
-    let header = frame.header.as_ref().expect("frame must have header");
-    let state = GlobalState::from_header(header);
-    let identity = state.compute_identity();
-
-    // Genesis QC identity = Poseidon(output)
-    let qc_identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-        .map(|h| h.to_vec())
-        .unwrap_or_default();
-
-    quil_consensus::models::CertifiedState {
-        state: quil_consensus::models::State {
-            rank: header.rank,
-            identifier: identity,
-            proposer_id: header.prover.clone(),
-            parent_qc_identity: qc_identity.clone(),
-            parent_qc_rank: header.rank.saturating_sub(1),
-            // Genesis trusted-root: no parent QC trait object
-            // available (the seeded genesis QC is constructed separately
-            // and threaded through `genesis_qc_override`).
-            parent_quorum_certificate: None,
-            timestamp: header.timestamp as u64,
-            state,
-        },
-        certifying_qc_identity: qc_identity,
-        certifying_qc_rank: header.rank,
-        certifying_quorum_certificate: None,
     }
 }
 

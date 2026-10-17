@@ -50,15 +50,15 @@ pub struct ImportResult {
 /// [version: u32 BE]
 /// [entry_count: u64 BE]
 /// repeated {
-///   [key_len: u32 BE][key bytes]
-///   [value_len: u32 BE][value bytes]
+/// [key_len: u32 BE][key bytes]
+/// [value_len: u32 BE][value bytes]
 /// }
 /// [sha256: 32 bytes checksum]
 /// ```
 /// Import from a file path. For large databases, prefer
 /// `import_from_reader` with stdin piping to avoid extra disk usage.
 pub fn import_database(
-    db: &rocksdb::DB,
+    db: &quil_forest::CoordinatedDb,
     export_path: &Path,
 ) -> Result<ImportResult> {
     let file = std::fs::File::open(export_path)
@@ -210,7 +210,7 @@ pub fn import_database(
 /// ./node --export-db - | ./quil-node --import-db -
 /// ```
 pub fn import_from_reader<R: Read>(
-    db: &rocksdb::DB,
+    db: &quil_forest::CoordinatedDb,
     reader: R,
 ) -> Result<ImportResult> {
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, reader);
@@ -462,7 +462,7 @@ mod tests {
         let db_path = tmp.path().join("testdb");
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let db = rocksdb::DB::open(&opts, &db_path).unwrap();
+        let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, &db_path).unwrap());
 
         let result = import_database(&db, &export_path).unwrap();
         assert_eq!(result.entries, 3);
@@ -483,7 +483,7 @@ mod tests {
         let db_path = tmp.path().join("testdb");
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let db = rocksdb::DB::open(&opts, &db_path).unwrap();
+        let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, &db_path).unwrap());
 
         let result = import_database(&db, &export_path).unwrap();
         assert_eq!(result.entries, 0);
@@ -504,7 +504,7 @@ mod tests {
         let db_path = tmp.path().join("testdb");
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let db = rocksdb::DB::open(&opts, &db_path).unwrap();
+        let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, &db_path).unwrap());
 
         let result = import_database(&db, &export_path).unwrap();
         assert_eq!(result.entries, 1);

@@ -265,3 +265,960 @@ proptest! {
         prop_assert_eq!(snapshot(&crdt, &locs), expected);
     }
 }
+
+// ---------------------------------------------------------------------
+// Forest membership proof: producer (CRDT) → verifier round-trip
+// ---------------------------------------------------------------------
+
+/// The producer side (`build_membership_proof`, used by the node's
+/// CreateTraversalProof RPC) must yield a proof that the verifier side
+/// (`quil_forest::verify_vertex_membership`, used by the token/kick/PoMW
+/// engines) accepts against the shard's committed vertex-adds root. This
+/// closes the whole forest spend loop that replaced the KZG traversal proof.
+#[test]
+fn forest_membership_producer_verifier_round_trip() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let loc = Location { app_address: [0x2a; 32], data_address: [0x07; 32] };
+
+    // A coin-shaped vertex: commitment @ [0x04], type @ [0xFF; 32].
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    let roots = commits.get(&shard_key).expect("shard committed");
+    let root32: [u8; 32] = roots[0].as_slice().try_into().expect("32-byte vertex-adds root");
+
+    // Producer: build a membership proof for the vertex's two fields.
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id.clone(), field_keys)])
+        .expect("build membership proof");
+    assert_eq!(mp.inputs.len(), 1);
+    assert_eq!(mp.inputs[0].vertex_address, vertex_id);
+
+    // Wire round-trip, then verify against the committed root.
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![
+        (vec![0x04u8], commitment.clone()),
+        (vec![0xFFu8; 32], type_hash.clone()),
+    ];
+    quil_forest::verify_vertex_membership(&root32, &decoded.inputs[0], &expected)
+        .expect("produced proof verifies against the committed vertex-adds root");
+
+    // A tampered expected value is rejected.
+    let bad = vec![
+        (vec![0x04u8], vec![0xCCu8; 56]),
+        (vec![0xFFu8; 32], type_hash),
+    ];
+    assert!(quil_forest::verify_vertex_membership(&root32, &decoded.inputs[0], &bad).is_err());
+}
+
+/// The QUIL-split path in `commit_inner`: an app declared with a 64-way
+/// partition routes its vertices into sub-shards (by data-address top-6-bits)
+/// and aggregates the sub-shard roots into the app root. The result must be
+/// deterministic and MUST differ from committing the same vertices as one tree
+/// — proving the split actually happened.
+#[test]
+fn quil_split_commit_is_deterministic_and_differs_from_single_shard() {
+    let quil = [0xABu8; 32];
+    // data[0]=0x00 → shard 0; 0xFF → shard 63 (top-6-bits differ).
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: quil, data_address: a }
+    };
+    let (v0, v63) = (mk(0x00), mk(0xFF));
+
+    let build_split = || {
+        let c = fresh_crdt();
+        c.set_shard_partition(quil, 1);
+        c.add_vertex(&v0, b"a").unwrap();
+        c.add_vertex(&v63, b"b").unwrap();
+        c.commit(1).unwrap()
+    };
+    let r1 = build_split();
+    let r2 = build_split();
+
+    // Both vertices share the app → one ShardKey entry with the four phase roots.
+    let split_root = &r1.values().next().unwrap()[0];
+    assert_eq!(split_root.len(), 32, "aggregated app root is a 32-byte JMT/Merkle root");
+    assert_eq!(split_root, &r2.values().next().unwrap()[0], "split commit is deterministic");
+
+    // Same vertices, no partition → one tree. The root must differ.
+    let single = fresh_crdt();
+    single.add_vertex(&v0, b"a").unwrap();
+    single.add_vertex(&v63, b"b").unwrap();
+    let rs = single.commit(1).unwrap();
+    assert_ne!(
+        split_root,
+        &rs.values().next().unwrap()[0],
+        "splitting into sub-shards changes the app root vs a single tree"
+    );
+}
+
+/// The full model-B membership chain for a SPLIT app (QUIL): a vertex lives in
+/// a sub-shard, so its field proof is against the sub-shard root and the proof
+/// carries a co-path binding that sub-shard root up to the AGGREGATED app phase
+/// root the header advertises. The verifier accepts it against the app root and
+/// rejects it against any other root (the co-path is load-bearing).
+#[test]
+fn quil_split_membership_round_trip_binds_subshard_to_app_root() {
+    use num_bigint::BigInt;
+
+    let quil = [0xABu8; 32];
+    let crdt = fresh_crdt();
+    crdt.set_shard_partition(quil, 1);
+
+    // data[0]=0x07 → sub-shard 0x07>>2 = 1.
+    let loc = Location { app_address: quil, data_address: [0x07; 32] };
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    // The AGGREGATED app vertex-adds root (over all 64 sub-shards).
+    let app_root: [u8; 32] = commits.get(&shard_key).unwrap()[0]
+        .as_slice()
+        .try_into()
+        .expect("32-byte aggregated app root");
+
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id, field_keys)])
+        .expect("build membership proof");
+    assert!(
+        mp.inputs[0].shard_aggregation.is_some(),
+        "a split-app proof must carry the sub-shard aggregation co-path"
+    );
+
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![
+        (vec![0x04u8], commitment.clone()),
+        (vec![0xFFu8; 32], type_hash.clone()),
+    ];
+    quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &expected)
+        .expect("split-app proof verifies against the aggregated app root");
+
+    // The co-path binding is load-bearing: a different app root is rejected.
+    let mut wrong = app_root;
+    wrong[0] ^= 0xFF;
+    assert!(
+        quil_forest::verify_vertex_membership(&wrong, &decoded.inputs[0], &expected).is_err(),
+        "proof must not verify against a different app root"
+    );
+    // A tampered field value is still rejected (the JMT field proof).
+    let bad = vec![(vec![0x04u8], vec![0xCCu8; 56]), (vec![0xFFu8; 32], type_hash)];
+    assert!(quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &bad).is_err());
+}
+
+/// A NON-QUIL binary split (the case the encoding reconciliation fixes): the
+/// shard set is the rebalancer's marker-byte prefixes `[0]`/`[128]` (filter
+/// suffix `0x00`/`0x80`), NOT QUIL 6-bit indices. Routing sends a leaf by its
+/// data-address TOP BIT, canonical bit-paths give "0"/"1", and the commit is
+/// deterministic + differs from a single unsplit tree.
+#[test]
+fn binary_split_marker_prefixes_commit_deterministically() {
+    let app = [0xCDu8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+    // data[0] top bit 0 → sub-shard [0]; top bit 1 → sub-shard [128].
+    let (v_lo, v_hi) = (mk(0x00), mk(0x80));
+
+    let build_split = || {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, vec![vec![0], vec![128]]);
+        c.add_vertex(&v_lo, b"a").unwrap();
+        c.add_vertex(&v_hi, b"b").unwrap();
+        c.commit(1).unwrap()
+    };
+    let r1 = build_split();
+    let r2 = build_split();
+    let split_root = &r1.values().next().unwrap()[0];
+    assert_eq!(split_root.len(), 32, "aggregated binary-split app root is 32 bytes");
+    assert_eq!(split_root, &r2.values().next().unwrap()[0], "binary split is deterministic");
+
+    let single = fresh_crdt();
+    single.add_vertex(&v_lo, b"a").unwrap();
+    single.add_vertex(&v_hi, b"b").unwrap();
+    let rs = single.commit(1).unwrap();
+    assert_ne!(
+        split_root,
+        &rs.values().next().unwrap()[0],
+        "binary split changes the app root vs a single tree"
+    );
+}
+
+/// EVALUATION (mainnet KZG-era cascade repair): reproduce the non-prefix-free
+/// legacy grid observed on mainnet — a depth-1 DATA shard `[0]` coexisting with a
+/// deep EMPTY descendant `[0,0,0,0,0,0]` on its all-zeros sub-branch, plus a data
+/// sibling `[1]`. Establishes how the unified sharded model behaves on this state
+/// the unification must tolerate:
+///  (1) LEGACY whole-app aggregate (`compute_shard_root` → `app_root_from_shard_paths`,
+///      documented "MUST be prefix-free") — does it survive or panic?
+///  (2) UNIFIED per-shard subtree commitments (`sub_shard_commitment_for_filter`) —
+///      the data shard carries its data, the deep empty descendant commits the
+///      ZERO root, and the overlap is a view/sub-view, not a conflict.
+///  (3) ROUTING (`address_shard_index`, first-match) puts an under-`[0]`-not-deep
+///      address on the DATA shard, so the deep descendant genuinely stays empty.
+#[test]
+fn nonprefixfree_cascade_grid_evaluation() {
+    use quil_types::store::ShardKey;
+    let app = [0xCDu8; 32];
+    let sk = ShardKey { l1: [0u8; 3], l2: app };
+    // Several leaves under `[0]` (top-6-bits 000000) but NONE under the deep
+    // 36-zero path (byte 1 non-zero breaks the zero run at bit 8) — realistic: a
+    // mainnet data shard has millions of leaves, so its deep all-zeros descendant
+    // is genuinely empty (avoids JMT single-leaf compression, where one leaf would
+    // make the descendant inherit the parent's root).
+    let under0 = |b1: u8, b2: u8| Location {
+        app_address: app,
+        data_address: { let mut a = [0u8; 32]; a[1] = b1; a[2] = b2; a },
+    };
+    // Under `[1]` (top-6-bits 000001): byte0 0x04 = 0b0000_0100.
+    let d1 = Location { app_address: app, data_address: { let mut a=[0u8;32]; a[0]=0x04; a[1]=0xAB; a } };
+    // NON-prefix-free set: [0] ⊂ [0,0,0,0,0,0].
+    let nonpf = vec![vec![0u32], vec![1u32], vec![0u32, 0, 0, 0, 0, 0]];
+
+    // (1) LEGACY aggregate on the non-prefix-free grid — panic or survive?
+    let legacy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, nonpf.clone());
+        c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+        c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+        c.add_vertex(&d1, b"data1").unwrap();
+        c.commit(1).unwrap();
+        c.compute_shard_root("vertex", "adds", &sk)
+    }));
+    eprintln!(
+        "[eval] LEGACY whole-app aggregate on non-prefix-free grid: {}",
+        if legacy.is_ok() { "SURVIVED (no panic)" } else { "PANICKED (app_root_from_shard_paths requires prefix-free)" }
+    );
+    // KEY FINDING: the legacy whole-app aggregate cannot run on this grid.
+    assert!(legacy.is_err(),
+        "legacy app_root_from_shard_paths must PANIC on a non-prefix-free set (documents the flip requirement)");
+
+    // (2) UNIFIED per-subtree commitments on the SAME non-prefix-free grid.
+    let c = fresh_crdt();
+    c.set_app_shard_prefixes(app, nonpf.clone());
+    c.set_unified_tree(true);
+    c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+    c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+    c.add_vertex(&under0(0xF0, 0x33), b"c").unwrap();
+    c.add_vertex(&d1, b"data1").unwrap();
+    c.commit(1).unwrap();
+
+    let filt = |suffix: &[u8]| { let mut f = app.to_vec(); f.extend_from_slice(suffix); f };
+    let root0 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x00]));
+    let root1 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x01]));
+    let root_deep = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0, 0, 0, 0, 0, 0]));
+    let zero = vec![0u8; 32];
+    eprintln!(
+        "[eval] UNIFIED non-pf: [0] nonzero={}, [1] nonzero={}, deep==[0]? {}",
+        root0 != zero, root1 != zero, root_deep == root0
+    );
+
+    // KEY FINDING (2): `canonical_shard_bit_paths` collapses the non-prefix-free
+    // continuation. Tracing [[0],[1],[0,0,0,0,0,0]]: at depth 0 both `[0]` and
+    // `[0,0,0,0,0,0]` take bit `false`; at depth 1 `[0]` TERMINATES, leaving
+    // `[0,0,0,0,0,0]` alone in the branch → width-0 levels push no further bits.
+    // So the deep descendant resolves to the SAME bit-path `[false]` as `[0]`:
+    // it is an ALIAS of the data shard, NOT a distinct empty subtree.
+    assert_ne!(root0, zero, "data shard [0] carries its data under unified");
+    assert_ne!(root1, zero, "data shard [1] carries its data under unified");
+    assert_eq!(root_deep, root0,
+        "deep descendant ALIASES [0]'s subtree root (bit-path collapse) — a prover on the \
+         empty deep shard would be asked to commit [0]'s data root it does not hold");
+    assert_ne!(root0, root1, "distinct data shards still commit distinct roots");
+
+    // (3) ROUTING consequence: `address_shard_index` is FIRST-MATCH over the
+    // canonical bit-paths. `[0]` and the deep alias share bit-path `[false]`, and
+    // `[0]` appears first, so EVERY address that would fall under the alias is
+    // shadowed onto `[0]`. No new data ever routes to the deep shard — good, it
+    // stays empty — but its commitment still aliases `[0]` (finding 2).
+    let bit_paths = quil_forest::canonical_shard_bit_paths(&nonpf);
+    eprintln!("[eval] canonical bit-paths of non-pf grid: {:?}", bit_paths);
+    assert_eq!(bit_paths[0], bit_paths[2], "[0] and its deep descendant collapse to one bit-path");
+    let addr_under0 = { let mut a = [0u8; 32]; a[1] = 0xFF; a };
+    assert_eq!(quil_forest::address_shard_index(&addr_under0, &bit_paths), 0,
+        "first-match routes the address to [0], never to the aliased deep shard (index 2)");
+
+    // (4) THE RESET TARGET: rebuilding the QUIL grid to the 64-way genesis set
+    // (`[0]..[63]`, what `maybe_apply_split_reset` writes) is prefix-free by
+    // construction — the aliasing AND the legacy-aggregate panic are both gone,
+    // and the pre-existing data is preserved (routes to, and commits under, its
+    // genesis shard). This is the offline analogue of the flag-day reset.
+    let genesis64: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+    let legacy_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let c = fresh_crdt();
+        c.set_app_shard_prefixes(app, genesis64.clone());
+        // Data that lived under the cascade `[0]` (top byte 0x00 ⇒ genesis index 0).
+        c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+        c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+        c.add_vertex(&d1, b"data1").unwrap(); // top byte 0x04 ⇒ genesis index 1
+        c.commit(1).unwrap();
+        c.compute_shard_root("vertex", "adds", &sk)
+    }));
+    eprintln!(
+        "[eval] RESET-to-genesis-64 legacy aggregate: {}",
+        if legacy_ok.is_ok() { "SURVIVED" } else { "still PANICS" }
+    );
+    assert!(legacy_ok.is_ok(),
+        "the 64-way genesis grid is prefix-free — the legacy aggregate accepts it, no panic");
+
+    // Prefix-free: 64 distinct 6-bit paths, all depth 6, no shard a prefix of
+    // another (so nothing aliases and address routing is unambiguous).
+    let gbits = quil_forest::canonical_shard_bit_paths(&genesis64);
+    assert_eq!(gbits.len(), 64);
+    let mut seen = std::collections::HashSet::new();
+    for b in &gbits {
+        assert_eq!(b.len(), 6, "every genesis shard sits at depth 6");
+        assert!(seen.insert(b.clone()), "genesis bit-paths are all distinct");
+    }
+    // Data preserved: under the reset grid the data that was in cascade `[0]`
+    // routes to genesis index 0 and commits a non-zero subtree root there.
+    let c = fresh_crdt();
+    c.set_app_shard_prefixes(app, genesis64.clone());
+    c.set_unified_tree(true);
+    c.add_vertex(&under0(0xFF, 0x11), b"a").unwrap();
+    c.add_vertex(&under0(0xFE, 0x22), b"b").unwrap();
+    c.add_vertex(&d1, b"data1").unwrap();
+    c.commit(1).unwrap();
+    assert_eq!(quil_forest::address_shard_index(&under0(0xFF, 0x11).data_address, &gbits), 0,
+        "cascade-[0] data routes to genesis shard 0 after reset");
+    let g0 = c.sub_shard_commitment_for_filter("vertex", "adds", &filt(&[0x00]));
+    assert_ne!(g0, zero, "genesis shard 0 carries the preserved data under unified");
+}
+
+/// `rebucket_app` re-partitions the per-sub-shard size buckets after a shard-set
+/// change so a newly-created child reflects the PRE-EXISTING data that routes to
+/// it — instead of reading 0. This is the deep-split convergence fix: the
+/// incremental `bump_meta` only routes NEW writes, so without a re-bucket the
+/// pre-split data stays stranded in the removed parent bucket and the child leaf
+/// looks empty (provers churn, proposing to "leave" the data-bearing shard).
+/// Conservation: the app TOTAL is unchanged; only per-sub-shard attribution moves.
+#[test]
+fn rebucket_app_repartitions_size_after_split() {
+    use num_bigint::BigInt;
+    let app = [0xCDu8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+    // data[0] top bit 0 → child [0]; top bit 1 → child [128].
+    let (v_lo, v_hi) = (mk(0x00), mk(0x80));
+
+    let crdt = fresh_crdt();
+    // Register the app as a single shard first (mirrors genesis), so the later
+    // split is a genuine Some(old)→Some(new) TRANSITION, not first-sight.
+    assert!(
+        !crdt.set_app_shard_prefixes(app, vec![Vec::new()]),
+        "first-sight registration is not a transition"
+    );
+    // Single-shard app (empty prefix): both vertices land in the ONE
+    // whole-app bucket — mirroring data written before a shard ever split.
+    crdt.add_vertex(&v_lo, b"aaaa").unwrap(); // 4 bytes
+    crdt.add_vertex(&v_hi, b"bbbbbb").unwrap(); // 6 bytes
+    crdt.commit(1).unwrap();
+
+    let total_before = crdt.total_size();
+    assert_eq!(total_before, BigInt::from(10), "app total = 4 + 6");
+
+    let lo_filter = {
+        let mut f = app.to_vec();
+        f.push(0x00);
+        f
+    };
+    let hi_filter = {
+        let mut f = app.to_vec();
+        f.push(0x80);
+        f
+    };
+    // Pre-split the child buckets don't exist (single-shard app).
+    assert!(
+        crdt.sub_shard_metadata_for_filter(&lo_filter).is_none(),
+        "pre-split: child [0] bucket empty"
+    );
+
+    // Split into [0]/[128]; the setter reports the transition, then re-partition.
+    assert!(
+        crdt.set_app_shard_prefixes(app, vec![vec![0], vec![128]]),
+        "prefix-set transition detected"
+    );
+    crdt.rebucket_app(&app).unwrap();
+
+    // Conservation: total unchanged, but each child now reflects its own data.
+    assert_eq!(
+        crdt.total_size(),
+        total_before,
+        "rebucket preserves the app total"
+    );
+    let lo = crdt
+        .sub_shard_metadata_for_filter(&lo_filter)
+        .expect("child [0] now sized");
+    let hi = crdt
+        .sub_shard_metadata_for_filter(&hi_filter)
+        .expect("child [128] now sized");
+    assert_eq!(lo.size, BigInt::from(4), "child [0] holds v_lo's 4 bytes");
+    assert_eq!(hi.size, BigInt::from(6), "child [128] holds v_hi's 6 bytes");
+}
+
+/// Full membership chain for a binary-split app: a vertex in the `0x80` sub-shard
+/// proves against that sub-shard root, and the co-path binds it to the aggregated
+/// app root — verifying the marker-byte prefix path end to end.
+#[test]
+fn binary_split_membership_binds_subshard_to_app_root() {
+    use num_bigint::BigInt;
+
+    let app = [0xCDu8; 32];
+    let crdt = fresh_crdt();
+    crdt.set_app_shard_prefixes(app, vec![vec![0], vec![128]]);
+
+    // data[0]=0x80 → top bit 1 → sub-shard [128].
+    let loc = Location { app_address: app, data_address: [0x80; 32] };
+    let commitment = vec![0xAAu8; 56];
+    let type_hash = vec![0xBBu8; 32];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    tree.insert(&[0xFFu8; 32], &type_hash, &[], &BigInt::from(32u64)).unwrap();
+    let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&loc, &blob).unwrap();
+    let commits = crdt.commit(10).unwrap();
+    let shard_key = quil_hypergraph::shard_key_for_location(&loc);
+    let app_root: [u8; 32] =
+        commits.get(&shard_key).unwrap()[0].as_slice().try_into().unwrap();
+
+    let vertex_id = loc.to_id().to_vec();
+    let field_keys = vec![vec![0x04u8], vec![0xFFu8; 32]];
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &shard_key, &[(vertex_id, field_keys)])
+        .expect("build membership proof");
+    assert!(
+        mp.inputs[0].shard_aggregation.is_some(),
+        "binary-split proof carries the sub-shard co-path"
+    );
+    let decoded = quil_forest::MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
+    let expected = vec![(vec![0x04u8], commitment), (vec![0xFFu8; 32], type_hash)];
+    quil_forest::verify_vertex_membership(&app_root, &decoded.inputs[0], &expected)
+        .expect("binary-split proof verifies against the aggregated app root");
+    let mut wrong = app_root;
+    wrong[0] ^= 0xFF;
+    assert!(
+        quil_forest::verify_vertex_membership(&wrong, &decoded.inputs[0], &expected).is_err(),
+        "co-path binding is load-bearing"
+    );
+}
+
+/// Interleaved commits of different apps must NOT corrupt each other's trees.
+/// JMT needs contiguous per-tree versions; commit_inner uses a global version
+/// counter, so app A committed at frames 1 and 3 (with app B at frame 2 bumping
+/// the counter) gets non-contiguous versions. This asserts A keeps BOTH its
+/// vertices — i.e. the incremental commit built on A's real prior root, not an
+/// empty one.
+#[test]
+fn interleaved_app_commits_preserve_each_others_state() {
+    let crdt = fresh_crdt();
+    let a1 = Location { app_address: [0xA1; 32], data_address: [0x01; 32] };
+    let a2 = Location { app_address: [0xA1; 32], data_address: [0x02; 32] };
+    let b1 = Location { app_address: [0xB2; 32], data_address: [0x01; 32] };
+
+    // Frame 1: app A vertex 1.
+    crdt.add_vertex(&a1, b"a1").unwrap();
+    crdt.commit(1).unwrap();
+    // Frame 2: app B (bumps the global forest version).
+    crdt.add_vertex(&b1, b"b1").unwrap();
+    crdt.commit(2).unwrap();
+    // Frame 3: app A vertex 2 (incremental commit of A's tree, non-contiguous).
+    crdt.add_vertex(&a2, b"a2").unwrap();
+    crdt.commit(3).unwrap();
+
+    // Both of A's vertices must still be present.
+    assert_eq!(crdt.get_vertex_data(&a1).as_deref(), Some(&b"a1"[..]), "A vertex 1 survived");
+    assert_eq!(crdt.get_vertex_data(&a2).as_deref(), Some(&b"a2"[..]), "A vertex 2 present");
+}
+
+/// The FOREST tree (not just blobs) must survive interleaved commits: app A's
+/// frame-1 vertex must still prove against A's committed root after app B's
+/// frame-2 commit bumped the global version and A was re-committed at frame 3.
+/// This directly exercises whether commit_inner's global version counter builds
+/// each incremental commit on the tree's real prior root.
+#[test]
+fn interleaved_commits_keep_forest_tree_intact() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let app_a = [0xA1u8; 32];
+    let a1 = Location { app_address: app_a, data_address: [0x01; 32] };
+    let a2 = Location { app_address: app_a, data_address: [0x02; 32] };
+    let b1 = Location { app_address: [0xB2; 32], data_address: [0x01; 32] };
+
+    // A coin-shaped vertex for a1 so we can prove it.
+    let commitment = vec![0xAAu8; 56];
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x04u8], &commitment, &[], &BigInt::from(56u64)).unwrap();
+    let a1_blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+
+    crdt.add_vertex(&a1, &a1_blob).unwrap();
+    crdt.commit(1).unwrap(); // frame 1: A
+    crdt.add_vertex(&b1, b"b1").unwrap();
+    crdt.commit(2).unwrap(); // frame 2: B (bumps global version)
+    crdt.add_vertex(&a2, b"a2").unwrap();
+    let commits = crdt.commit(3).unwrap(); // frame 3: A incremental
+
+    let sk = quil_hypergraph::shard_key_for_location(&a1);
+    let root: [u8; 32] = commits.get(&sk).unwrap()[0].as_slice().try_into().unwrap();
+
+    // Prove a1's commitment field against A's frame-3 root.
+    let mp = crdt
+        .build_membership_proof("vertex", "adds", &sk, &[(a1.to_id().to_vec(), vec![vec![0x04u8]])])
+        .expect("build proof");
+    quil_forest::verify_vertex_membership(&root, &mp.inputs[0], &[(vec![0x04u8], commitment)])
+        .expect("a1 still proves against the forest root after interleaved commits");
+}
+
+/// The O(1) metadata memo (`metadata_cache`) MUST be transparent: repeated
+/// reads return the same value, and every mutation (stage) or `commit` is
+/// reflected on the very next read — never a stale cached `size`/`leaf_count`.
+/// This is consensus-critical: the reward path derives `state_size` /
+/// `shard_count` from `sub_shard_metadata_for_filter` (→ this memo), so a stale
+/// value would mis-mint and fork. Prior to the memo this path did a full
+/// RocksDB-iterator KV scan per call (the archive-OOM leak); the memoized value
+/// must equal what that scan produced.
+#[test]
+fn phase_metadata_memo_is_transparent_and_invalidates() {
+    use num_bigint::BigInt;
+
+    let crdt = fresh_crdt();
+    let app = [0x11u8; 32];
+    let mk = |d0: u8| {
+        let mut a = [0u8; 32];
+        a[0] = d0;
+        Location { app_address: app, data_address: a }
+    };
+
+    // Empty shard → no vertex-adds metadata (and a repeat read agrees).
+    assert!(crdt.sub_shard_metadata_for_filter(&app).is_none());
+    assert!(crdt.sub_shard_metadata_for_filter(&app).is_none());
+
+    // First add → next read reflects it (memo was invalidated by `stage`).
+    crdt.add_vertex(&mk(0x01), b"hello").unwrap(); // 5 bytes
+    let m1 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after add");
+    assert_eq!(m1.leaf_count, 1);
+    assert_eq!(m1.size, BigInt::from(5u64));
+    // Repeat read is a memo HIT → identical.
+    let m1b = crdt.sub_shard_metadata_for_filter(&app).expect("memo hit");
+    assert_eq!((m1b.leaf_count, m1b.size.clone()), (m1.leaf_count, m1.size.clone()));
+
+    // Second add → must UPDATE, not serve the stale memo.
+    crdt.add_vertex(&mk(0x02), b"worldwide").unwrap(); // 9 bytes
+    let m2 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after 2nd add");
+    assert_eq!(m2.leaf_count, 2);
+    assert_eq!(m2.size, BigInt::from(14u64));
+
+    // Commit also invalidates; the committed read matches the pre-commit live value.
+    crdt.commit(1).unwrap();
+    let m3 = crdt.sub_shard_metadata_for_filter(&app).expect("metadata after commit");
+    assert_eq!(m3.leaf_count, 2);
+    assert_eq!(m3.size, BigInt::from(14u64));
+}
+
+/// The maintained live-size accounting: `state_size` = Σ present vertices'
+/// blob size (adds − removes) + Σ present hyperedges' blob size (adds − removes),
+/// bucketed by the forest partition; `leaf_count` = RAW vertex-adds count;
+/// `total_size()` = Σ per-sub-shard sizes (prover shard 0xff excluded); and the
+/// `remove_hyperedge` bug (size never freed) is fixed. All maintained live in
+/// the mutation path — no scan — and `warm_sizes` recomputes the same value.
+#[test]
+fn live_size_all_phases_tombstones_and_world_sum() {
+    use num_bigint::BigInt;
+    let c = fresh_crdt();
+    let app = [0x11u8; 32];
+    c.set_shard_partition(app, 1); // 64-way split
+    let v = |d0: u8, tag: u8| {
+        let mut d = [0u8; 32];
+        d[0] = d0; // top 6 bits pick the sub-shard: 0x00 & 0x01 → 0; 0xFF → 63
+        d[31] = tag;
+        Location { app_address: app, data_address: d }
+    };
+    // Shard 0 lookup: BOTH the legacy byte-suffix `app ‖ 0x00` AND the sentinel
+    // `app ‖ 0x0006 ‖ 0x00` must resolve to the same (sentinel-keyed) bucket now
+    // that `sub_meta_for` matches by canonical bit-path.
+    let s0 = |c: &HypergraphCrdt| {
+        c.sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
+            .map(|m| (m.leaf_count, m.size))
+    };
+
+    c.add_vertex(&v(0x00, 1), b"aaaa").unwrap(); // 4  → shard 0
+    c.add_vertex(&v(0x00, 2), b"bbbbb").unwrap(); // 5 → shard 0
+    c.add_vertex(&v(0xFF, 3), b"cccccc").unwrap(); // 6 → shard 63
+    assert_eq!(c.total_size(), BigInt::from(15));
+    assert_eq!(s0(&c), Some((2, BigInt::from(9))));
+
+    // Remove a present vertex: LIVE size drops, RAW count is unchanged.
+    c.remove_vertex(&v(0x00, 1)).unwrap(); // -4
+    assert_eq!(c.total_size(), BigInt::from(11));
+    assert_eq!(s0(&c), Some((2, BigInt::from(5))));
+
+    // Hyperedge add contributes to size but NOT the vertex count.
+    c.add_hyperedge(&v(0x00, 4), b"eeeeeee").unwrap(); // +7
+    assert_eq!(s0(&c), Some((2, BigInt::from(12))));
+    assert_eq!(c.total_size(), BigInt::from(18));
+
+    // Hyperedge remove frees size — the bug fix (was never subtracted before).
+    c.remove_hyperedge(&v(0x00, 4)).unwrap(); // -7
+    assert_eq!(s0(&c), Some((2, BigInt::from(5))));
+    assert_eq!(c.total_size(), BigInt::from(11));
+
+    // Correct top-6-bit sharding: data 0x01 → shard 0 (the scan's bug misrouted it).
+    c.add_vertex(&v(0x01, 5), b"ff").unwrap(); // +2 → shard 0
+    assert_eq!(s0(&c), Some((3, BigInt::from(7))));
+
+    // The prover shard (app 0xff) is EXCLUDED from world size.
+    let before = c.total_size();
+    let pv = {
+        let mut d = [0u8; 32];
+        d[31] = 9;
+        Location { app_address: [0xFFu8; 32], data_address: d }
+    };
+    c.add_vertex(&pv, b"zzzzzzzz").unwrap();
+    assert_eq!(c.total_size(), before, "prover shard excluded from world size");
+    assert_eq!(c.total_size(), BigInt::from(13)); // Σ: shard0=7 + shard63=6
+
+    // Warm recomputes the SAME value from committed state (idempotent vs live).
+    c.commit(1).unwrap();
+    c.warm_sizes(&[app]).unwrap();
+    assert_eq!(c.total_size(), BigInt::from(13));
+    assert_eq!(s0(&c), Some((3, BigInt::from(7))));
+}
+
+/// REGRESSION (post-reset "GetAppShards size 0 → no join candidates / no rewards"):
+/// a persisted size-bucket cache keyed under the OLD encoding (byte-suffix `[i]`)
+/// must NOT be restored over the CURRENT sentinel prefixes. On a restart after a
+/// byte-suffix→sentinel grid reset, `warm_sizes`' fast path used to blindly
+/// overwrite `sub_meta` with the stale byte-suffix cache, so every `sub_meta_for`
+/// fold (which keys by the current sentinel prefixes) missed → size 0. The fix
+/// rejects the mismatched cache and rebuilds sentinel-keyed.
+#[test]
+fn warm_sizes_rejects_stale_encoded_bucket_cache() {
+    use num_bigint::BigInt;
+    // Sentinel `ShardInfo.prefix` for QUIL 64-way shard `i`: `[SENTINEL, b5..b0]`
+    // (the 6-bit binary of `i`, MSB-first) — matches `bit_path_to_prefix`.
+    let sentinel_prefix = |i: u32| -> Vec<u32> {
+        let mut p = vec![0xFFFF_FFFFu32];
+        for b in (0..6).rev() {
+            p.push((i >> b) & 1);
+        }
+        p
+    };
+
+    // Shared store so instance 2 is a genuine RESTART on instance 1's persisted state.
+    let store = Arc::new(MemStore::new());
+    let app = [0x11u8; 32];
+
+    // Instance 1: byte-suffix 64-way grid; add data to shard 0; commit persists a
+    // BYTE-SUFFIX bucket cache (key = `app ‖ 0x00000000`, len 36).
+    let c1 = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+    c1.set_shard_partition(app, 1);
+    let mut d = [0u8; 32];
+    d[31] = 1; // top 6 bits 0 ⇒ shard 0
+    c1.add_vertex(&Location { app_address: app, data_address: d }, b"aaaa").unwrap();
+    c1.commit(1).unwrap();
+    assert!(
+        !c1.dump_persisted_size_buckets(&app).is_empty()
+            && c1.dump_persisted_size_buckets(&app).iter().all(|(kl, _, _)| *kl == 36),
+        "instance 1 persisted a byte-suffix cache"
+    );
+
+    // Instance 2 (restart) on the SAME store, now with the SENTINEL grid (a reset
+    // flipped the encoding). sub_meta starts empty.
+    let c2 = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+    c2.set_app_shard_prefixes(app, (0..64u32).map(sentinel_prefix).collect());
+    c2.warm_sizes(&[app]).unwrap();
+
+    // The stale byte-suffix cache was NOT restored; the rebuild re-keyed to the
+    // current sentinel prefixes, so shard 0's size resolves non-zero (was 0).
+    let m = c2
+        .sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
+        .expect("shard 0 metadata after warm");
+    assert_eq!(m.leaf_count, 1, "shard-0 leaf count resolves post-reset");
+    assert_eq!(m.size, BigInt::from(4u64), "shard-0 live size resolves post-reset");
+    // Self-healed: the persisted cache is now sentinel-keyed (len 60).
+    assert!(
+        c2.dump_persisted_size_buckets(&app).iter().all(|(kl, _, _)| *kl == 60),
+        "cache re-persisted under sentinel keys"
+    );
+}
+
+/// Level-1 global commitments: each of the 256 buckets is the root of a tree
+/// of `AppEntry` leaves for the apps whose FIRST address byte equals the bucket
+/// index. `commit_inner` maintains them live; `global_commitments()` retrieves
+/// all 256 and touching a bucket updates only that bucket's root.
+#[test]
+fn global_commitments_maintained_per_bucket() {
+    let c = fresh_crdt();
+    // Two apps in bucket 0x2a, one in bucket 0x50, none elsewhere.
+    let app_a = { let mut a = [0u8; 32]; a[0] = 0x2a; a[31] = 0x01; a };
+    let app_b = { let mut a = [0u8; 32]; a[0] = 0x2a; a[31] = 0x02; a };
+    let app_c = { let mut a = [0u8; 32]; a[0] = 0x50; a };
+    c.add_vertex(&Location { app_address: app_a, data_address: [0x11; 32] }, b"a").unwrap();
+    c.add_vertex(&Location { app_address: app_b, data_address: [0x22; 32] }, b"b").unwrap();
+    c.add_vertex(&Location { app_address: app_c, data_address: [0x33; 32] }, b"c").unwrap();
+    c.commit(1).unwrap();
+
+    let gc = c.global_commitments();
+    assert_eq!(gc.len(), 256, "always 256 buckets");
+    assert!(!gc[0x2a].is_empty(), "bucket 0x2a has apps → non-empty root");
+    assert!(!gc[0x50].is_empty(), "bucket 0x50 has an app → non-empty root");
+    assert!(gc[0x00].is_empty(), "bucket 0x00 has no apps → empty");
+    assert_eq!(gc[0x2a].len(), 32, "a bucket root is a 32-byte JMT root");
+    assert_ne!(gc[0x2a], gc[0x50], "distinct buckets commit distinct app sets");
+
+    // Touching an app in bucket 0x2a changes THAT bucket's root only.
+    let before_2a = gc[0x2a].clone();
+    let before_50 = gc[0x50].clone();
+    c.add_vertex(&Location { app_address: app_a, data_address: [0x44; 32] }, b"more").unwrap();
+    c.commit(2).unwrap();
+    let gc2 = c.global_commitments();
+    assert_ne!(gc2[0x2a], before_2a, "touching bucket 0x2a updates its root");
+    assert_eq!(gc2[0x50], before_50, "untouched bucket 0x50 root is unchanged");
+}
+
+/// The global prover shard (`0xff..ff`) is excluded from L1 global commitments
+/// — its root is carried separately as `prover_tree_commitment`.
+#[test]
+fn global_prover_shard_excluded_from_l1() {
+    let c = fresh_crdt();
+    let global = [0xffu8; 32];
+    c.add_vertex(&Location { app_address: global, data_address: [0x01; 32] }, b"prover").unwrap();
+    c.commit(1).unwrap();
+    let gc = c.global_commitments();
+    assert!(gc[0xff].is_empty(), "global prover shard must NOT create an L1 bucket leaf");
+}
+
+// ---------------------------------------------------------------------
+// Prover-root determinism (the archive prover-root-mismatch class)
+// ---------------------------------------------------------------------
+
+/// The global intrinsic (prover) shard: `l1=[0;3], l2=[0xff;32]`. Matches
+/// `GlobalLeaderProvider::compute_prover_root` and the materializer's
+/// prover-root read — `compute_shard_root` uses only `l2`, so `l1` is nominal.
+fn global_prover_shard() -> quil_types::store::ShardKey {
+    quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] }
+}
+
+/// The PROVER ROOT (= `compute_shard_root("vertex","adds", global-shard)`) must
+/// be a pure function of the vertex SET, independent of insertion order. Two
+/// archives that applied the same prover/allocation vertices in different orders
+/// (different frame arrival, sync vs live, HashMap iteration) MUST commit to the
+/// same root — the invariant whose violation is the "prover root MISMATCH"
+/// field report. This is the core determinism guarantee that had no coverage.
+#[test]
+fn prover_root_is_insertion_order_independent() {
+    let global = [0xffu8; 32];
+    // A set of distinct prover-like vertices under the global intrinsic address.
+    let vertices: Vec<(Location, Vec<u8>)> = (0u8..12)
+        .map(|i| {
+            let mut data = [0u8; 32];
+            data[0] = i;
+            data[31] = i.wrapping_mul(7);
+            (
+                Location { app_address: global, data_address: data },
+                vec![i; 40 + i as usize],
+            )
+        })
+        .collect();
+
+    let commit_in_order = |order: &[usize]| -> Vec<u8> {
+        let c = fresh_crdt();
+        for &idx in order {
+            let (loc, blob) = &vertices[idx];
+            c.add_vertex(loc, blob).unwrap();
+        }
+        c.commit(1).unwrap();
+        // Read via the SAME entry point the leader/materializer use.
+        c.compute_shard_root("vertex", "adds", &global_prover_shard())
+    };
+
+    let forward: Vec<usize> = (0..vertices.len()).collect();
+    let reversed: Vec<usize> = (0..vertices.len()).rev().collect();
+    // A non-trivial shuffle (deterministic, no rng): odd indices then even.
+    let mut interleaved: Vec<usize> = (0..vertices.len()).filter(|i| i % 2 == 1).collect();
+    interleaved.extend((0..vertices.len()).filter(|i| i % 2 == 0));
+
+    let r_fwd = commit_in_order(&forward);
+    let r_rev = commit_in_order(&reversed);
+    let r_int = commit_in_order(&interleaved);
+
+    assert_eq!(r_fwd.len(), 32, "prover root is a 32-byte forest root");
+    assert!(r_fwd.iter().any(|&b| b != 0), "prover root must be non-empty");
+    assert_eq!(r_fwd, r_rev, "prover root must not depend on insertion order (fwd vs rev)");
+    assert_eq!(r_fwd, r_int, "prover root must not depend on insertion order (fwd vs interleaved)");
+}
+
+/// `compute_shard_root` (the verify/leader read path) must equal the root
+/// `commit` returns for the same shard/phase — the two are used
+/// interchangeably (leader binds `compute_shard_root`; the materializer's
+/// post-apply path publishes `commit`'s root), so if they ever diverged, a
+/// producer and a verifier on the SAME state would disagree → self-inflicted
+/// "mismatch". No prior test tied the compare path to a real committed tree.
+#[test]
+fn compute_shard_root_matches_commit_root_for_prover_shard() {
+    let global = [0xffu8; 32];
+    let c = fresh_crdt();
+    for i in 0u8..6 {
+        let mut data = [0u8; 32];
+        data[0] = i;
+        c.add_vertex(&Location { app_address: global, data_address: data }, &vec![i; 33])
+            .unwrap();
+    }
+    let commits = c.commit(9).unwrap();
+
+    let shard = global_prover_shard();
+    // commit() keys by the location-derived shard key (real l1); compute_shard_root
+    // ignores l1. Find the committed entry for l2 == global address.
+    let commit_root = commits
+        .iter()
+        .find(|(k, _)| k.l2 == global)
+        .map(|(_, roots)| roots[0].clone())
+        .expect("global shard committed");
+    let read_root = c.compute_shard_root("vertex", "adds", &shard);
+
+    assert_eq!(read_root.len(), 32);
+    assert_eq!(
+        read_root, commit_root,
+        "compute_shard_root (verify/leader read) must equal commit()'s vertex-adds root"
+    );
+}
+
+
+#[test]
+fn commit_setup_failure_preserves_staged_writes_for_retry() {
+    for failure in [(true, false), (false, true)] {
+        let store = Arc::new(MemStore::new());
+        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        let location = Location { app_address: [7; 32], data_address: [8; 32] };
+        crdt.add_vertex(&location, b"staged-value").unwrap();
+        store.fail_commit_setup(failure.0, failure.1);
+        assert!(crdt.commit(1).unwrap_err().is_execution_unavailable());
+        assert_eq!(store.per_vertex_count(), 0);
+        assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(), Some(b"staged-value".to_vec()));
+        store.fail_commit_setup(false, false);
+        crdt.commit(1).unwrap();
+        assert_eq!(store.per_vertex_count(), 1);
+        // A new CRDT has no pending writes; this read must come from the store.
+        let reopened = HypergraphCrdt::new(store, Arc::new(StubProver));
+        assert_eq!(reopened.get_vertex_data_checked(&location).unwrap(), Some(b"staged-value".to_vec()));
+    }
+}
+
+
+#[test]
+fn mutation_read_errors_preserve_committed_state_and_roots() {
+    // Both absent and existing entries: an I/O error is neither absence nor
+    // permission to overwrite a blob or stamp a zero-sized tombstone.
+    for existing in [false, true] {
+        for (operation, phase) in [(0, "adds"), (1, "adds"), (1, "removes"),
+                                   (2, "removes"), (3, "adds"), (3, "removes")] {
+            let store = Arc::new(MemStore::new());
+            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+            let location = Location { app_address: [7; 32], data_address: [8; 32] };
+            if existing {
+                crdt.add_vertex(&location, b"vertex-before").unwrap();
+                crdt.add_hyperedge(&location, b"edge-before").unwrap();
+            }
+            crdt.commit(1).unwrap();
+            let shard = quil_hypergraph::shard_key_for_location(&location);
+            let roots = || [("vertex", "adds"), ("vertex", "removes"),
+                ("hyperedge", "adds"), ("hyperedge", "removes")].map(|(set, phase)|
+                    crdt.compute_shard_root(set, phase, &shard));
+            let roots_before = roots();
+            store.fail_vertex_reads(Some(phase));
+            let result = match operation {
+                0 => crdt.add_vertex(&location, b"vertex-after"),
+                1 => crdt.remove_vertex(&location),
+                2 => crdt.add_hyperedge(&location, b"edge-after"),
+                3 => crdt.remove_hyperedge(&location),
+                _ => unreachable!(),
+            };
+            assert!(result.unwrap_err().is_execution_unavailable(), "operation={operation} phase={phase} existing={existing}");
+            store.fail_vertex_reads(None);
+            assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(),
+                existing.then(|| b"vertex-before".to_vec()));
+            assert_eq!(crdt.get_hyperedge_data_checked(&location).unwrap(),
+                existing.then(|| b"edge-before".to_vec()));
+            assert!(crdt.commit(2).unwrap().is_empty());
+            assert_eq!(roots(), roots_before);
+        }
+    }
+}
+
+#[test]
+fn ordered_batch_matches_sequential_mutations() {
+    use quil_hypergraph::Mutation;
+    use quil_types::store::RecordMutation;
+    let first = Location { app_address: [7; 32], data_address: [8; 32] };
+    let second = Location { app_address: [7; 32], data_address: [9; 32] };
+    let record_put = RecordMutation { key: b"test/frame-record".to_vec(), value: Some(vec![1]) };
+    let record_delete = RecordMutation { key: record_put.key.clone(), value: None };
+    let record_replacement = RecordMutation { key: record_put.key.clone(), value: Some(vec![2]) };
+    let operations = [
+        Mutation::Record(&record_put),
+        Mutation::AddVertex(first.clone(), b"original"),
+        Mutation::AddVertex(first.clone(), b"updated"),
+        Mutation::RemoveVertex(first.clone()),
+        Mutation::Record(&record_delete),
+        Mutation::RemoveVertex(first.clone()),
+        Mutation::RemoveVertex(second.clone()),
+        Mutation::AddVertex(second.clone(), b"removed-first"),
+        Mutation::AddHyperedge(first.clone(), b"edge"),
+        Mutation::RemoveHyperedge(first.clone()),
+        Mutation::AddHyperedge(first.clone(), b"must-stay-removed"),
+        Mutation::AddHyperedge(second.clone(), b"live-edge"),
+        Mutation::Record(&record_replacement),
+    ];
+    let sequential = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+    let batch = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+    for operation in &operations {
+        match operation {
+            Mutation::AddVertex(loc, data) => sequential.add_vertex(loc, data),
+            Mutation::RemoveVertex(loc) => sequential.remove_vertex(loc),
+            Mutation::AddHyperedge(loc, data) => sequential.add_hyperedge(loc, data),
+            Mutation::RemoveHyperedge(loc) => sequential.remove_hyperedge(loc),
+            Mutation::Record(_) => sequential.apply_mutations(std::slice::from_ref(operation)),
+        }.unwrap();
+    }
+    batch.apply_mutations(&operations).unwrap();
+    assert_eq!(batch.commit(1).unwrap(), sequential.commit(1).unwrap());
+    assert_eq!(batch.read_execution_record(&record_put.key).unwrap(), Some(vec![2]));
+    assert_eq!(batch.read_execution_record(&record_put.key).unwrap(),
+        sequential.read_execution_record(&record_put.key).unwrap());
+    for location in [&first, &second] {
+        assert_eq!(batch.get_vertex_data_checked(location).unwrap(), sequential.get_vertex_data_checked(location).unwrap());
+        assert_eq!(batch.get_hyperedge_data_checked(location).unwrap(), sequential.get_hyperedge_data_checked(location).unwrap());
+    }
+    assert_eq!(batch.get_vertex_data_checked(&first).unwrap(), None);
+    assert_eq!(batch.get_vertex_data_checked(&second).unwrap(), None);
+    assert_eq!(batch.get_hyperedge_data_checked(&first).unwrap(), None);
+    assert_eq!(batch.get_hyperedge_data_checked(&second).unwrap(), Some(b"live-edge".to_vec()));
+}

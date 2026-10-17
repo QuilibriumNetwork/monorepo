@@ -1,20 +1,8 @@
 //! Ed448 peer identity derivation compatible with Quilibrium's go-libp2p fork.
 //!
 //! The Go node uses Ed448 (KeyType=4) for peer identity. Peer IDs are derived
-//! as: `PeerId = multihash(SHA2-256, protobuf(PublicKey{Type:4, Data:pubkey}))`
-//!
-//! ## Compatibility Status
-//!
-//! **Peer ID derivation**: Implemented here — produces byte-identical peer IDs
-//! to Go nodes.
-//!
-//! **Transport (noise handshake)**: NOT YET COMPATIBLE. Stock rust-libp2p uses
-//! Ed25519 for noise. To connect to Go nodes, we need to fork rust-libp2p's
-//! noise implementation to support Ed448. Until then, the Rust node can only
-//! connect to other Rust nodes using Ed25519 transport.
-//!
-//! **Message signing (BlossomSub)**: NOT YET COMPATIBLE. BlossomSub messages
-//! are signed with Ed448. Need custom signing in the BlossomSub port.
+//! as: `PeerId = multihash(SHA2-256, protobuf(PublicKey{Type:4, Data:pubkey}))`,
+//! and the derivation here produces byte-identical peer IDs.
 
 use sha2::{Digest, Sha256};
 
@@ -109,9 +97,13 @@ impl Ed448Identity {
         if public_key.len() != 57 {
             return Ok(false);
         }
-        let mut pk_bytes = [0u8; 57];
-        pk_bytes.copy_from_slice(public_key);
-        let pk = ed448_rust::PublicKey::from(pk_bytes);
+        // Fallible decode: `PublicKey::from([u8;57])` panics on a non-point key,
+        // and this is a signature-verify entry reachable from untrusted bytes —
+        // a bad key must return `false`, not crash.
+        let pk = match ed448_rust::PublicKey::try_from(public_key) {
+            Ok(pk) => pk,
+            Err(_) => return Ok(false),
+        };
         Ok(pk.verify(message, signature, None).is_ok())
     }
 }
@@ -131,7 +123,7 @@ pub fn derive_public_key(seed: &[u8; 57]) -> Vec<u8> {
 ///
 /// ```text
 /// seed = SHAKE256(real_priv || "/worker/<core_id>")[:64]
-/// key  = Ed448(seed)
+/// key = Ed448(seed)
 /// ```
 ///
 /// The synthetic key is used as the worker's libp2p host identity

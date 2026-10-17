@@ -25,6 +25,29 @@ pub trait LeaderProvider<S: Unique>: Send + Sync {
         &self,
         rank: u64,
         filter: &[u8],
+        prior_frame_number: u64,
         prior_state: &Identity,
     ) -> Result<State<S>>;
+
+    /// Non-blocking read of the local prover root this node would commit for
+    /// `frame_number` — the deterministic post-materialize-(N-1) value every node
+    /// reproduces identically. Returns `None` when this node has not yet
+    /// materialized frame N-1 (so it cannot reproduce the root) or when the
+    /// provider tracks no prover tree. The vote seam uses this to verify a
+    /// proposal's declared prover-tree commitment against local state BEFORE
+    /// signing: nullifying on mismatch (or on an unreproducible root) turns a
+    /// silent prover-tree fork into a halt (no quorum) instead of letting divergent
+    /// roots finalize and reconcile-storm. Default `None` = no such verification
+    /// (app-shard / test providers, which have no global prover tree).
+    fn local_prover_root(&self, _frame_number: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Non-blocking read of the network world-state size this node recorded
+    /// at the end of frame N-1 — the value a valid frame N must declare. `None`
+    /// when N-1 is not materialized here, or the provider tracks no global
+    /// state (app-shard / test providers: no such verification).
+    fn local_world_state_size(&self, _frame_number: u64) -> Option<u64> {
+        None
+    }
 }

@@ -7,8 +7,7 @@
 //!     /path/to/store
 //!
 //! Specifically targets the global prover tree's shard
-//! (l1=[0;3], l2=[0xff;32]) since that's the one the user is
-//! debugging.
+//! (l1=[0;3], l2=[0xff;32]).
 
 use std::path::Path;
 
