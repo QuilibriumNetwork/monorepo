@@ -213,7 +213,7 @@ pub fn sum_check(
 pub fn keygen() -> Vec<u8> {
   let scalar = Scalar::random(&mut thread_rng());
   let point = scalar * Point(DecafPoint::GENERATOR);
-  [scalar.as_bytes().to_vec(), point.compress().as_bytes().to_vec()].concat()
+  [scalar.to_bytes().to_vec(), point.compress().as_bytes().to_vec()].concat()
 }
 
 pub fn scalar_mult(
@@ -225,7 +225,7 @@ pub fn scalar_mult(
   }
 
   let mult = Scalar::from_bits(lhs.as_slice().try_into().unwrap()) * Scalar::from_bits(rhs.as_slice().try_into().unwrap());
-  [mult.as_bytes().to_vec(), (mult * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
+  [mult.to_bytes().to_vec(), (mult * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
 }
 
 pub fn scalar_mult_point(
@@ -252,7 +252,7 @@ pub fn scalar_inverse(input_scalar: Vec<u8>) -> Vec<u8> {
 
   let inv = Scalar::from_bits(input_scalar.as_slice().try_into().unwrap()).invert();
 
-  [inv.as_bytes().to_vec(), (inv * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
+  [inv.to_bytes().to_vec(), (inv * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
 }
 
 pub fn scalar_mult_hash_to_scalar(
@@ -270,14 +270,14 @@ pub fn scalar_mult_hash_to_scalar(
 
   let mult = Scalar::from_bits(input_scalar.as_slice().try_into().unwrap()) * point.unwrap();
   let d = Scalar::hash_from_bytes::<sha3::Shake256>(mult.compress().as_bytes());
-  [d.as_bytes().to_vec(), (d * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
+  [d.to_bytes().to_vec(), (d * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
 }
 
 pub fn hash_to_scalar(
   input: Vec<u8>,
 ) -> Vec<u8> {
   let d = Scalar::hash_from_bytes::<sha3::Shake256>(&input);
-  [d.as_bytes().to_vec(), (d * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
+  [d.to_bytes().to_vec(), (d * Point(DecafPoint::GENERATOR)).compress().as_bytes().to_vec()].concat()
 }
 
 pub fn scalar_addition(lhs: Vec<u8>, rhs: Vec<u8>) -> Vec<u8> {
@@ -285,7 +285,7 @@ pub fn scalar_addition(lhs: Vec<u8>, rhs: Vec<u8>) -> Vec<u8> {
     return Vec::new();
   }
 
-  (Scalar::from_bits(lhs.as_slice().try_into().unwrap()) + Scalar::from_bits(rhs.as_slice().try_into().unwrap())).as_bytes().to_vec()
+  (Scalar::from_bits(lhs.as_slice().try_into().unwrap()) + Scalar::from_bits(rhs.as_slice().try_into().unwrap())).to_bytes().to_vec()
 }
 
 pub fn scalar_subtraction(lhs: Vec<u8>, rhs: Vec<u8>) -> Vec<u8> {
@@ -293,7 +293,7 @@ pub fn scalar_subtraction(lhs: Vec<u8>, rhs: Vec<u8>) -> Vec<u8> {
     return Vec::new();
   }
 
-  (Scalar::from_bits(lhs.as_slice().try_into().unwrap()) - Scalar::from_bits(rhs.as_slice().try_into().unwrap())).as_bytes().to_vec()
+  (Scalar::from_bits(lhs.as_slice().try_into().unwrap()) - Scalar::from_bits(rhs.as_slice().try_into().unwrap())).to_bytes().to_vec()
 }
 
 pub fn scalar_to_point(scalar: Vec<u8>) -> Vec<u8> {
@@ -365,7 +365,7 @@ fn internal_sign_hidden(
   // Fiat–Shamir challenge
   let data = [
     p.compress().as_bytes(),
-    t.as_bytes(),
+    &t.to_bytes()[..],
     c_point.compress().as_bytes(),
     r1.compress().as_bytes(),
     r2.compress().as_bytes(),
@@ -400,7 +400,7 @@ fn internal_verify_hidden(
 
   let data = [
     p_point.as_bytes(),
-    t.as_bytes(),
+    &t.to_bytes()[..],
     c_point.as_bytes(),
     r1.compress().as_bytes(),
     r2.compress().as_bytes(),
@@ -436,7 +436,7 @@ pub fn sign_simple(
   let c = Scalar::hash_from_bytes::<sha3::Shake256>(&data);
   let s = k - c * secret_scalar;
   
-  [r.compress().as_bytes().to_vec(), s.as_bytes().to_vec()].concat()
+  [r.compress().as_bytes().to_vec(), s.to_bytes().to_vec()].concat()
 }
 
 pub fn verify_simple(
@@ -490,10 +490,10 @@ pub fn sign_hidden(
   );
 
   [
-    c.as_bytes().to_vec(),
-    s1.as_bytes().to_vec(),
-    s2.as_bytes().to_vec(),
-    s3.as_bytes().to_vec(),
+    c.to_bytes().to_vec(),
+    s1.to_bytes().to_vec(),
+    s2.to_bytes().to_vec(),
+    s3.to_bytes().to_vec(),
     p.compress().as_bytes().to_vec(),
     c_point.compress().as_bytes().to_vec(),
   ].concat()

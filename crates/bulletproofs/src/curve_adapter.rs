@@ -496,14 +496,6 @@ impl Scalar {
         self.0.to_bytes()
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        static mut CACHED_BYTES: [u8; 56] = [0u8; 56];
-        unsafe {
-            CACHED_BYTES.copy_from_slice(&self.0.to_bytes());
-            &CACHED_BYTES
-        }
-    }
-
     pub fn zero() -> Self {
         // Create a zero scalar using u64 conversion
         Scalar(DecafScalar::from(0u64))
