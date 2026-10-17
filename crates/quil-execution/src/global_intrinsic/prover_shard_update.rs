@@ -563,6 +563,9 @@ fn build_shard_update_context_with_rings(
 /// 3. Address bytes ascending.
 ///
 /// Rank → ring via `floor(rank / ringGroupSize)`.
+// Ported ahead of the ring-assignment rollout; the shard-update path still
+// takes ring numbers off the wire.
+#[allow(dead_code)]
 fn compute_ring_assignments(
     active_provers: &[ProverInfo],
     filter: &[u8],

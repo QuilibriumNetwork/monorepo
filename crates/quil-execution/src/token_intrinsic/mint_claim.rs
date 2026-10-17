@@ -23,6 +23,8 @@ fn invalid(message: &str) -> QuilError {
 }
 
 pub struct VerifiedMintClaim {
+    // Retain the verified payload until consumption is integrated.
+    #[allow(dead_code)]
     claim: MintClaim,
 }
 

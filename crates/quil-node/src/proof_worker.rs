@@ -10,6 +10,8 @@ use quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerif
 
 static NEXT_LANE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+// Fixture filename; production launches the node in worker mode.
+#[allow(dead_code)]
 pub(crate) const WORKER_FILE_NAME: &str = "quil-amount-proof-worker";
 /// First argument that runs the node executable as the worker (see `main`).
 pub(crate) const WORKER_MODE_ARG: &str = "--amount-proof-worker";

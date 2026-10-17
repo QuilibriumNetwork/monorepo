@@ -205,6 +205,8 @@ fn check_state(state: &HypergraphState, s: &CustomMintStatement) -> Result<([u8;
 }
 
 /// Only successful policy authorization and native verification construct it.
+// Retained verified payload and payment authorization for consumption.
+#[allow(dead_code)]
 pub struct VerifiedCustomMint {
     mint: CustomMint,
     paid: Option<PaidMintAllowance>,

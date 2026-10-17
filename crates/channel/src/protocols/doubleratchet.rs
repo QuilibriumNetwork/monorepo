@@ -551,11 +551,15 @@ impl DoubleRatchetParticipant {
         }).map_err(|e| format!("Decryption failed: {}", e).into())
     }
 
+    // Ratchet control surface used by embedders of this crate rather than
+    // by the node itself.
+    #[allow(dead_code)]
     pub fn rotate_sending_key(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.sending_ephemeral_private_key = Scalar::random(&mut OsRng);
         self.ratchet_ephemeral_keys(&self.receiving_ephemeral_key.clone())
     }
 
+    #[allow(dead_code)] // see `rotate_sending_key`
     pub fn get_public_key(&self) -> EdwardsPoint {
         EdwardsPoint::mul_by_generator(&self.sending_ephemeral_private_key)
     }
@@ -618,6 +622,9 @@ impl Default for MessageCiphertext {
 
 // Implementation for P2PChannelEnvelope
 impl P2PChannelEnvelope {
+  // Envelopes are built field-wise by the ratchets; this constructor is part
+  // of the crate's public surface.
+  #[allow(dead_code)]
   pub fn new(protocol_identifier: u16) -> Self {
       P2PChannelEnvelope {
           protocol_identifier,

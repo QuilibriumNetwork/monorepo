@@ -89,6 +89,9 @@ mod execution_fork;
 /// Global execution engine — handles prover joins/leaves, shard management,
 /// and global state transitions.
 pub struct GlobalExecutionEngine {
+    /// Held so the engine can commit request trees once global inclusion
+    /// proving is wired in; the intrinsic does its own committing today.
+    #[allow(dead_code)]
     inclusion_prover: Arc<dyn InclusionProver>,
     intrinsic: Option<crate::global_intrinsic::intrinsic::GlobalIntrinsic>,
     crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
@@ -485,6 +488,9 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
 /// Confidential operations require the configured QCT3 policy, state and
 /// isolated amount-proof worker. Retired confidential formats are rejected.
 pub struct TokenExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     #[cfg(feature = "native-proof")]
     token_policy: Option<crate::token_intrinsic::dispatch::TokenPolicy>,
@@ -1464,6 +1470,9 @@ fn run_token_bundle(
 /// Crypto + compiler dependencies are mandatory. There is no longer a
 /// "structural peek only" fallback at dispatch time.
 pub struct ComputeExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
@@ -1858,6 +1867,9 @@ impl ComputeExecutionEngine {
 
 /// Hypergraph execution engine — handles vertex/hyperedge add/remove.
 pub struct HypergraphExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     inclusion_prover: Arc<dyn InclusionProver>,
@@ -1932,6 +1944,9 @@ impl HypergraphExecutionEngine {
         self
     }
 
+    // Accessor for the mandatory dependency above; the op paths hold their
+    // own reference.
+    #[allow(dead_code)]
     fn inclusion_prover(&self) -> &Arc<dyn InclusionProver> {
         &self.inclusion_prover
     }

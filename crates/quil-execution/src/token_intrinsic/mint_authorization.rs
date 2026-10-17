@@ -76,6 +76,9 @@ pub(crate) fn fields(
     ])
 }
 
+// Production mint admission needs this only with native proofs; tests also
+// construct authorization records to exercise membership verification.
+#[cfg(any(feature = "native-proof", test))]
 pub(crate) fn create_record(
     network: &[u8; 32],
     application: &[u8; 32],

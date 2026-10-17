@@ -188,6 +188,9 @@ fn append_suffix(p: &Path, suffix: &str) -> PathBuf {
 /// Default value for the signature-check flag, matching Go's
 /// `signatureCheckDefault()` at `node/main.go:195`. Honors
 /// `QUILIBRIUM_SIGNATURE_CHECK=true|false`; otherwise true.
+// Ported for parity with the Go node; the Rust CLI resolves the flag through
+// its own clap default today.
+#[allow(dead_code)]
 pub fn signature_check_default() -> bool {
     match std::env::var("QUILIBRIUM_SIGNATURE_CHECK") {
         Ok(v) => match v.parse::<bool>() {
