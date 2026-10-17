@@ -12,10 +12,11 @@ Ensure you have all required dependencies.
 
 ### Ubuntu Linux
 
-For Ubuntu Linux, you can install these by running the following from
-the project root:
-
-    ./scripts/install-deps-ubuntu.sh
+`docker/Dockerfile.source` is the reference for these dependencies: its
+`base` stage lists the Ubuntu packages, and its `gmp-builder`,
+`flint-builder`, `emp-builder` and `rust-base` stages build the native
+libraries and install the Rust toolchain. Run the same steps on the host,
+or build inside that image.
 
 ### macOS
 

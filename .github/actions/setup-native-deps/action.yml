@@ -208,8 +208,8 @@ runs:
       shell: bash
       run: |
         # Patch emp-tool's CMakeLists to build a STATIC library — matches
-        # scripts/install-deps-ubuntu.sh:60–79 and ensures the ferret
-        # crate links statically.
+        # docker/build-emp.sh and ensures the ferret crate links
+        # statically.
         sed -i.bak 's|add_library(${NAME} SHARED ${sources})|add_library(${NAME} STATIC ${sources})|g' emp-tool/CMakeLists.txt
         rm -f emp-tool/CMakeLists.txt.bak
 
