@@ -1359,7 +1359,7 @@ impl ECP {
 
         let num_buckets = 1usize << (w - 1);         // |digit| ranges 1..2^(w-1)
         let half = 1usize << (w - 1);              // 2^(w-1)
-        let mask = (1isize << w) - 1;              // 2^w - 1
+        let _mask = (1isize << w) - 1;              // 2^w - 1
         let nb = (max_bits + w - 1) / w + 1;       // +1 for potential carry overflow
 
         // 3. Signed-digit decomposition for each scalar

@@ -1,7 +1,6 @@
 // build.rs
 use cc;
 use std::env;
-use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -113,7 +112,7 @@ fn main() {
     println!("cargo:rerun-if-changed=emp_bridge.cpp");
     println!("cargo:rerun-if-changed=emp_bridge.h");
   } else {
-    panic!("unsupported target {target}");
+    panic!("unsupported target {}", target);
   }
   uniffi::generate_scaffolding("src/lib.udl").expect("uniffi generation failed");
 }
@@ -136,12 +135,13 @@ fn resolve_lib_root(pkg: &str, env_var: &str) -> String {
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8(o.stdout)
-                .unwrap_or_else(|e| panic!("brew --prefix {pkg}: utf8 decode failed: {e}"));
+                .unwrap_or_else(|e| panic!("brew --prefix {pkg}: utf8 decode failed: {}", e));
             let trimmed = s.trim();
             if trimmed.is_empty() {
                 panic!(
-                    "brew --prefix {pkg} returned empty; install with `brew install {pkg}` \
-                     or set {env_var} to the install root"
+                    "brew --prefix {} returned empty; install with `brew install {pkg}` \
+                     or set {env_var} to the install root",
+                    pkg
                 );
             }
             trimmed.to_string()
@@ -153,8 +153,9 @@ fn resolve_lib_root(pkg: &str, env_var: &str) -> String {
             String::from_utf8_lossy(&o.stderr).trim()
         ),
         Err(e) => panic!(
-            "could not invoke `brew --prefix {pkg}`: {e}; install Homebrew and run \
-             `brew install {pkg}`, or set {env_var} to the install root"
+            "could not invoke `brew --prefix {pkg}`: {}; install Homebrew and run \
+             `brew install {pkg}`, or set {env_var} to the install root",
+            e
         ),
     }
 }

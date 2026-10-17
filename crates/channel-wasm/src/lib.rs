@@ -636,10 +636,7 @@ pub fn js_verify_point(params: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use ed448_goldilocks_plus::{Scalar, elliptic_curve::Group, EdwardsPoint};
 
     #[test]
     fn test_verify() {    

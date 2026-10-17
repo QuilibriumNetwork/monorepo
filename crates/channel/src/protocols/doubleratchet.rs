@@ -9,7 +9,6 @@ use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
 use std::collections::HashMap;
-use std::error;
 use subtle::ConstantTimeEq;
 use serde::{Serialize, Deserialize};
 

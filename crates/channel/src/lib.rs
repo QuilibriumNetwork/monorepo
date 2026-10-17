@@ -684,7 +684,7 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     };
 }
 
-fn metadata_to_json(ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
+fn metadata_to_json(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
     let mut metadata_json = HashMap::<String, String>::new();
     for (k,v) in metadata {
         let env = v.to_json();
