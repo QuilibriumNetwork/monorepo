@@ -31,3 +31,8 @@ insecure-rng = []
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
 version = "0.2"
 features = ["js"]
+
+# Maintained fork of https://github.com/0xCarbon/DKLs23.
+# Scope cosmetic warnings here; retain soundness diagnostics.
+[lints.rust]
+unused_imports = "allow"

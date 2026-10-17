@@ -130,3 +130,11 @@ default = [
 migration = []
 mocks = ["dep:parking_lot"]
 std = ["dep:thiserror"]
+
+# Maintained fork of https://github.com/penumbra-zone/jmt.
+# Scope cosmetic warnings here; retain soundness diagnostics.
+[lints.rust]
+dead_code = "allow"
+mismatched_lifetime_syntaxes = "allow"
+non_local_definitions = "allow"
+unexpected_cfgs = "allow"
