@@ -546,7 +546,7 @@ pub fn code_finalize_cost(
 
 /// Create a state transition vertex for a finalized execution result.
 pub fn create_state_transition_vertex(
-    domain: &[u8; 32],
+    _domain: &[u8; 32],
     address: &[u8],
     old_value: &[u8],
     new_value: &[u8],

@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store;
@@ -57,7 +56,7 @@ pub fn detect_store_format(path: &Path) -> StoreFormat {
         had_options = true;
         // Only need the first few KB — version section is at the top.
         let mut buf = Vec::with_capacity(8 * 1024);
-        if let Ok(mut f) = std::fs::File::open(entry.path()) {
+        if let Ok(f) = std::fs::File::open(entry.path()) {
             use std::io::Read;
             let _ = f.take(8 * 1024).read_to_end(&mut buf);
         }

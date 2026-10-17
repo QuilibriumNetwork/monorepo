@@ -169,7 +169,7 @@ fn handoff_request_and_submission_codecs_survive_arbitrary_bytes_and_round_trip(
         let root = app.to_vec();
         let leaf0 = quil_forest::encode_shard_bit_path(&app, &[false]);
         let leaf1 = quil_forest::encode_shard_bit_path(&app, &[true]);
-        let mut member_session = |filter: &Vec<u8>, rng: &mut Rng| {
+        let member_session = |filter: &Vec<u8>, rng: &mut Rng| {
             let m = 1 + rng.below(4);
             let mut s = session(rng, m);
             s.chain_id = chain;

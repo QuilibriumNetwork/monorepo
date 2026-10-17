@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use commonware_actor::Feedback;
 use commonware_cryptography::sha256::Digest as Sha256Digest;
-use commonware_runtime::{Clock, Spawner, Supervisor as _};
+use commonware_runtime::{Clock, Spawner};
 use commonware_utils::channel::oneshot;
 use commonware_utils::sync::Mutex;
 

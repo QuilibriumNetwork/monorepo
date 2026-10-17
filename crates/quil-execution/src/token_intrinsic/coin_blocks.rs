@@ -33,10 +33,9 @@
 //! and no committed allocation map is needed. A shard that splits hands each
 //! child the blocks whose paths extend that child's prefix, which is again
 //! derivation rather than bookkeeping.
-use quil_lattice_ct::confidential::{
-    relation::membership::MAX_DEPTH,
-    sharded_tree::{position_of, split_position, Shape},
-};
+#[cfg(test)]
+use quil_lattice_ct::confidential::relation::membership::MAX_DEPTH;
+use quil_lattice_ct::confidential::sharded_tree::{position_of, split_position, Shape};
 use quil_types::error::{QuilError, Result};
 
 /// Widest the block field may grow: ids carry a sentinel bit, so a width-15

@@ -4,7 +4,7 @@
 
 pub use quil_lattice_ct::confidential::transfer::network_identifier;
 use quil_lattice_ct::confidential::{
-    coin_tree::{CoinRecord, CoinTree},
+    coin_tree::CoinRecord,
     transfer::{parameter_context, Output, MEMO_BYTES},
     AmountCommitment,
 };
@@ -14,7 +14,7 @@ use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_types::error::{QuilError, Result};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 
-use super::materialize::{coin_content_address, create_lattice_coin_vertex_tree};
+use super::materialize::create_lattice_coin_vertex_tree;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct StoredCoin {

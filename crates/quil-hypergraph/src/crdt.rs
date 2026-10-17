@@ -29,7 +29,7 @@ use num_bigint::BigInt;
 use num_traits::Zero;
 
 use quil_forest::{
-    app_membership_path_dynamic, app_root_from_shard_paths, canonical_shard_bit_paths, l3_leaf_key,
+    app_membership_path_dynamic, app_root_from_shard_paths, canonical_shard_bit_paths,
     rollup_phase_roots, Forest, PHASES,
 };
 use quil_types::crypto::InclusionProver;

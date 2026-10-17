@@ -4,7 +4,6 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
 
 use quil_types::crypto::NoopInclusionProver;
 

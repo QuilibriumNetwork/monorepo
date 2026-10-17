@@ -1,7 +1,6 @@
 //! KeyManager implementation that dispatches signature verification
 //! to the appropriate algorithm based on KeyType.
 
-use std::sync::Arc;
 
 use quil_types::crypto::{KeyManager, KeyType};
 use quil_types::error::{QuilError, Result};

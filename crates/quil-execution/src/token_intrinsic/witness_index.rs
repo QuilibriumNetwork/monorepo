@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn bounded_bootstrap_publishes_only_complete_roots_and_serves_point_witnesses() {
         use crate::{hypergraph_state::{HypergraphState, vertex_adds_discriminator}, token_intrinsic::{roots,
-            state::{create_coin, SnapshotLimits}, witnesses::indexed_witnesses}};
+            state::SnapshotLimits, witnesses::indexed_witnesses}};
         use quil_lattice_ct::confidential::transfer::{parameter_context, Output};
         use quil_types::crypto::NoopInclusionProver;
         let dir = tempfile::tempdir().unwrap();

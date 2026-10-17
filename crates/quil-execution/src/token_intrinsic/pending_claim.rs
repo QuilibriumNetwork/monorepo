@@ -1,19 +1,20 @@
 //! Escrow claim/refund admission and atomic state staging.
 //! Both authorities consume the same escrow marker. The caller supplies the
 //! consensus global anchor, serializes mutation and applies enclosing fee policy.
-use super::{escrow, roots,
-    state::{self, SnapshotLimits}, materialize};
+#[cfg(test)]
+use super::{escrow, roots, state::{self, SnapshotLimits}};
+#[cfg(test)]
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
-use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+#[cfg(test)]
+use quil_lattice_ct::confidential::{relation::{membership::IDENTITY_BYTES, backend::{native::{self, NativeBudget}, worker_client::WorkerVerifier}}, transfer::CompileLimits};
+#[cfg(test)]
+use quil_types::execution::FrameExecutionContext;
 use quil_lattice_ct::confidential::{
     pending_claim::{ClaimBranch, EscrowPolicy, PendingClaim},
-    relation::backend::{native::{self, NativeBudget}, worker_client::WorkerVerifier},
-    transfer::{parameter_context, CompileLimits},
+    transfer::parameter_context,
     AmountCommitment,
 };
 use quil_types::error::{QuilError, Result};
-use quil_types::execution::FrameExecutionContext;
-use std::collections::BTreeSet;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("pending claim: {message}"))

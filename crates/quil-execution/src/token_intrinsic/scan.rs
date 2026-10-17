@@ -282,7 +282,7 @@ mod tests {
     use super::*;
     use crate::{
         hypergraph_state::{vertex_adds_discriminator, HypergraphState},
-        token_intrinsic::state::{create_coin, SnapshotLimits},
+        token_intrinsic::state::SnapshotLimits,
     };
     use quil_lattice_ct::confidential::{transfer::Output, AmountOpening, CommitmentKey};
     use quil_types::crypto::NoopInclusionProver;

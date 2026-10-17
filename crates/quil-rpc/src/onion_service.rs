@@ -379,7 +379,6 @@ impl OnionService for OnionTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_p2p::onion::Transport as _;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn routing_lookup_allowing(addrs: Vec<String>) -> PeerRoutingLookup {

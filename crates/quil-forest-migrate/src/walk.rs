@@ -731,7 +731,7 @@ mod tests {
     use num_bigint::BigInt;
     use quil_forest::rollup_phase_roots;
     use quil_tries::{serialize_go_tree, VectorCommitmentTree};
-    use std::sync::Arc;
+
 
     fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
         let mut opts = rocksdb::Options::default();

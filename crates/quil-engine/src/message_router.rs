@@ -21,7 +21,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use tracing::debug;
 
 use quil_types::error::{QuilError, Result};
 
