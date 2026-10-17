@@ -930,7 +930,9 @@ impl WorkerAllocator {
                 let pending_in_flight = worker.pending_filter_frame > 0
                     && frame_number
                         <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
-                if !f_resolvable && !pending_in_flight {
+                // A retained worker is not stranded: its closing session still
+                // counts its vote, and the pass below restarts its engine.
+                if !f_resolvable && !pending_in_flight && !retained {
                     warn!(
                         core_id = worker.core_id,
                         stale_filter = hex::encode(&worker.filter),
@@ -952,6 +954,7 @@ impl WorkerAllocator {
                     if alloc.effective_status(frame_number)
                         == quil_types::consensus::EffectiveStatus::ExpiredEpoch
                         && !epoch_renewal_recovery_pending(alloc, frame_number)
+                        && !retained
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1054,6 +1057,7 @@ impl WorkerAllocator {
                             // explicitly asked to leave, forever.
                             if alloc.effective_status(frame_number)
                                 == quil_types::consensus::EffectiveStatus::ExpiredLeaving
+                                && !retained
                             {
                                 desired_allocated = false;
                                 info!(
@@ -1714,6 +1718,17 @@ mod tests {
         let _ = wm.set_allocated(1, false);
         active.on_new_frame(102).unwrap();
         assert!(wm.range_workers().unwrap()[0].allocated, "retention must not skip the Active transition");
+        // …nor the engine restart of a member whose allocation already ended,
+        // while another allocation waits for a worker.
+        let restarted = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+            allocations: vec![kicked.clone(), make_alloc(vec![0x02; 32])], ..prover(kicked.clone())
+        }])), vec![0xAA; 32]);
+        restarted.set_session_authority(global.clone());
+        wm.set_worker_filter(1, &filter, false).unwrap();
+        restarted.on_new_frame(102).unwrap();
+        let worker = wm.range_workers().unwrap()[0].clone();
+        assert_eq!(worker.filter, filter);
+        assert!(worker.allocated, "a closing member must restart its engine while another allocation waits");
 
         // Once GLOBAL state records the seal, the worker is released.
         let seal = Seal {
