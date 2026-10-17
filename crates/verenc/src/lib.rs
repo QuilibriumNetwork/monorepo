@@ -73,6 +73,9 @@ pub struct CompressedCiphertext {
     pub aux: Vec<Vec<u8>>,
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
         return VerencProofAndBlindingKey{
@@ -120,6 +123,9 @@ pub fn new_verenc_proof(data: Vec<u8>) -> VerencProofAndBlindingKey {
     };
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn new_verenc_proof_encrypt_only(data: Vec<u8>, encryption_key_bytes: Vec<u8>) -> VerencProofAndBlindingKey {
     if data.len() != 56 {
         return VerencProofAndBlindingKey{
@@ -207,6 +213,9 @@ fn point_from_bytes(bytes: Vec<u8>) -> Option<EdwardsPoint> {
     return Some(key.unwrap());
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_verify(proof: VerencProof) -> bool {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
@@ -281,6 +290,9 @@ pub fn verenc_verify(proof: VerencProof) -> bool {
 }
 
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     let blinding_key = point_from_bytes(proof.blinding_pubkey);
     if blinding_key.is_none() {
@@ -385,6 +397,9 @@ pub fn verenc_compress(proof: VerencProof) -> CompressedCiphertext {
     };
 }
 
+// `N` shadows the `RDkgithParams::N` field it is assigned to; keeping the
+// casing lets the struct literal below stay field-shorthand.
+#[allow(non_snake_case)]
 pub fn verenc_recover(recovery: VerencDecrypt) -> Vec<u8> {
     let blinding_key = point_from_bytes(recovery.blinding_pubkey);
     if blinding_key.is_none() {

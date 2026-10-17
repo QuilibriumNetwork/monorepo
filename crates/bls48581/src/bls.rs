@@ -8,6 +8,10 @@ use crate::bls48581::ecp;
 use crate::bls48581::ecp8;
 use crate::bls48581::bls256;
 
+// Field names mirror the Go ceremonyclient's KZG setup (`RootOfUnityBLS48581`,
+// `CeremonyBLS48581G1`, ...) and are read by name across the workspace, so they
+// keep the original casing rather than being renamed to snake case.
+#[allow(non_snake_case)]
 pub struct SingletonKZGSetup {
   pub RootOfUnityBLS48581: HashMap<u64, big::BIG>,
   pub RootsOfUnityBLS48581: HashMap<u64, Vec<big::BIG>>,
@@ -17,6 +21,10 @@ pub struct SingletonKZGSetup {
   pub FFTBLS48581: HashMap<u64, Vec<ecp::ECP>>,
 }
 
+// Locals mirror the `optimized_ceremony.json` keys they are loaded from
+// (`rootsOfUnity32`, `reverseRootsOfUnity`, ...), so the parsing code reads
+// the same as the file it parses.
+#[allow(non_snake_case)]
 pub fn singleton() -> &'static SingletonKZGSetup {
   static mut SINGLETON: MaybeUninit<SingletonKZGSetup> = MaybeUninit::uninit();
   static ONCE: Once = Once::new();
