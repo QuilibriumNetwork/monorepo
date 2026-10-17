@@ -1,5 +1,4 @@
-use std::sync::{Once};
-use std::{mem::MaybeUninit};
+use std::sync::OnceLock;
 use std::collections::HashMap;
 use serde_json;
 use hex;
@@ -18,11 +17,9 @@ pub struct SingletonKZGSetup {
 }
 
 pub fn singleton() -> &'static SingletonKZGSetup {
-  static mut SINGLETON: MaybeUninit<SingletonKZGSetup> = MaybeUninit::uninit();
-  static ONCE: Once = Once::new();
+  static SINGLETON: OnceLock<SingletonKZGSetup> = OnceLock::new();
 
-  unsafe {
-    ONCE.call_once(|| {
+  SINGLETON.get_or_init(|| {
       bls256::init();
       let bytes = include_bytes!("optimized_ceremony.json");
       let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
@@ -232,18 +229,13 @@ pub fn singleton() -> &'static SingletonKZGSetup {
       // }
       // ffts.insert(65536, f65536);
 
-      let singleton = SingletonKZGSetup {
+      SingletonKZGSetup {
         RootOfUnityBLS48581: rootOfUnity,
         RootsOfUnityBLS48581: rootsOfUnity,
         ReverseRootsOfUnityBLS48581: reverseRootsOfUnity,
         CeremonyBLS48581G1: blsg1,
         CeremonyBLS48581G2: blsg2,
         FFTBLS48581: ffts,
-      };
-
-      SINGLETON.write(singleton);
-    });
-
-    SINGLETON.assume_init_ref()
-  }
+      }
+  })
 }
