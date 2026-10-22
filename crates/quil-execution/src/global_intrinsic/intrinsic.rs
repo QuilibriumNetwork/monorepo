@@ -403,12 +403,12 @@ impl GlobalIntrinsic {
                 Ok(true)
             }
             super::handoff::TYPE_PRESENCE_REPORT => {
-                super::handoff::presence::require_active(frame_number)?;
+                let op = super::handoff::presence::PresenceOp::from_canonical_bytes(input)?;
+                op.require_active(frame_number)?;
                 let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
                     "presence report validation requires authenticated global state".into()))?;
                 let state = HypergraphState::new(crdt.clone());
-                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
-                self.verify_presence_report(frame_number, &report, &state)?;
+                self.verify_presence_op(frame_number, &op, &state)?;
                 Ok(true)
             }
             super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
@@ -1309,10 +1309,19 @@ impl GlobalIntrinsic {
                 Ok(())
             }
             super::handoff::TYPE_PRESENCE_REPORT => {
-                // Recorded from the presence credit frame; before it an
-                // accepted report writes nothing.
-                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
-                self.apply_presence_report(frame_number, &report, state)
+                // A report is recorded from the presence credit frame; before
+                // it an accepted report writes nothing. A claim is accepted
+                // from the presence exclusion frame.
+                match super::handoff::presence::PresenceOp::from_canonical_bytes(input)? {
+                    super::handoff::presence::PresenceOp::Report(report) => {
+                        self.apply_presence_report(frame_number, &report, state)
+                    }
+                    super::handoff::presence::PresenceOp::Claim(claim) => {
+                        super::handoff::exclusion::apply_claim(state, frame_number, &claim, |anchor| {
+                            self.presence_anchor_output(anchor)
+                        })
+                    }
+                }
             }
             super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
                 let proof = super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
@@ -2621,6 +2630,27 @@ impl GlobalIntrinsic {
             |frame| header(frame).map(|header| header.timestamp),
             &context,
         )
+    }
+
+    /// Check a presence report or claim against `state`, with each anchor
+    /// output from this node's clock store, without writing anything.
+    pub fn verify_presence_op(
+        &self,
+        frame_number: u64,
+        op: &super::handoff::presence::PresenceOp,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        match op {
+            super::handoff::presence::PresenceOp::Report(report) => {
+                self.verify_presence_report(frame_number, report, state)
+            }
+            super::handoff::presence::PresenceOp::Claim(claim) => {
+                super::handoff::exclusion::verify_claim(state, frame_number, claim, |anchor| {
+                    self.presence_anchor_output(anchor)
+                })
+                .map(|_| ())
+            }
+        }
     }
 
     /// Check a presence report against `state`, with each proposal's anchor
@@ -3998,18 +4028,47 @@ impl GlobalIntrinsic {
         filters.dedup();
         timing.filters = filters.len();
         timing.lap("grid filters");
+        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
+        // From the presence exclusion frame, the epoch's first pass first
+        // excludes the absent members of sessions that stalled through the
+        // previous epoch, where that unlocks quorum (`handoff::exclusion`),
+        // and fences those sessions early.
+        let mut absent: Vec<super::handoff::exclusion::Decision> = Vec::new();
+        if super::handoff::exclusion::evaluates(frame_number) {
+            let scan: &crate::prover_registry::CommittedProverScan =
+                scanned.insert(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+            let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+                Ok(super::handoff::schedule::desired_members(scan, filter, frame_number))
+            };
+            let checkpoint = state.changeset_len();
+            match super::handoff::exclusion::evaluate(state, frame_number, &filters, &mut desired) {
+                Ok(decisions) => absent = decisions,
+                Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                    state.rollback_to(checkpoint);
+                    tracing::error!(frame = frame_number, %error, "committee presence: exclusion pass failed; nothing excluded");
+                }
+                Err(error) => return Err(error),
+            }
+            timing.lap("presence exclusions");
+            // Fenced before the due fences and the membership pass, which
+            // then seat eligibility less the exclusions written here.
+            if !absent.is_empty() {
+                super::handoff::schedule::fence_absent(state, frame_number, &absent)?;
+                timing.lap("early fences");
+            }
+        }
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
         // compares against: the same scan, read only once a fence needs it.
-        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
         let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
             if scanned.is_none() {
                 scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
             }
-            Ok(scanned.as_ref().map_or_else(Vec::new, |scan| {
+            let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
                 super::handoff::schedule::desired_members(scan, filter, frame_number)
-            }))
+            });
+            super::handoff::exclusion::seated(state, frame_number, filter, desired)
         };
         let checkpoint = state.changeset_len();
         if let Err(error) = super::handoff::schedule::fence_stalled_sources(

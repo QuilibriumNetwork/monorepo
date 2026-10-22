@@ -693,6 +693,62 @@ pub fn set_presence_credit_frame_for_thread(frame: Option<u64>) {
     PRESENCE_CREDIT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
+/// From this GLOBAL frame the first maintenance pass of each epoch
+/// excludes, from the successor of a session that stalled through the
+/// previous epoch below its quorum, the members GLOBAL recorded no vote of
+/// ([`presence::present`]), when its present members then reach quorum, and
+/// fences that session early ([`exclusion`]); GLOBAL accepts presence
+/// reports carrying nullify votes ([`presence::VERSION_NULLIFY`]), which
+/// mark their signers protected from exclusion and earn no credit; and it
+/// accepts presence claims, an excluded member's way back
+/// ([`exclusion::PresenceClaim`]). It reads the records kept from the
+/// [`presence_credit_frame`], so it should not precede that frame. Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame,
+/// and app provers date an early fence by the frame GLOBAL records for it
+/// (`schedule::fence_frame`). The wire codec accepts a claim and a nullify
+/// report at any frame, so a build without it rejects a GLOBAL frame that
+/// carries one. Not
+/// scheduled on mainnet; `QUIL_PRESENCE_EXCLUSION_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_PRESENCE_EXCLUSION_FRAME: Option<u64> = None;
+
+static PRESENCE_EXCLUSION_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PRESENCE_EXCLUSION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn presence_exclusion_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_PRESENCE_EXCLUSION_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's presence exclusion frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_presence_exclusion_frame(network: u8) -> u64 {
+    *PRESENCE_EXCLUSION_FRAME.get_or_init(|| {
+        presence_exclusion_frame_for(network, std::env::var("QUIL_PRESENCE_EXCLUSION_FRAME").ok().as_deref())
+    })
+}
+
+/// The presence exclusion frame: the mainnet value until
+/// [`init_presence_exclusion_frame`] fixes the network, as
+/// [`presence_credit_frame`].
+pub fn presence_exclusion_frame() -> u64 {
+    if let Some(frame) = PRESENCE_EXCLUSION_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    PRESENCE_EXCLUSION_FRAME.get().copied().unwrap_or_else(|| presence_exclusion_frame_for(0, None))
+}
+
+/// Set the presence exclusion frame for the calling thread only (tests).
+pub fn set_presence_exclusion_frame_for_thread(frame: Option<u64>) {
+    PRESENCE_EXCLUSION_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 /// From this GLOBAL frame GLOBAL fences a closing session that has not
 /// sealed one epoch after its closing request, instead of
 /// [`schedule::FENCE_AFTER_EPOCHS`] epochs ([`schedule::fence_due_frame`]).
@@ -1682,6 +1738,9 @@ pub mod legacy;
 
 #[path = "handoff_presence.rs"]
 pub mod presence;
+
+#[path = "handoff_exclusion.rs"]
+pub mod exclusion;
 
 #[cfg(test)]
 #[path = "handoff_tests.rs"]

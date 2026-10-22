@@ -301,13 +301,13 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         let validate_inner = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
             if inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
                 use crate::global_intrinsic::handoff::presence;
-                presence::require_active(frame_number)?;
+                let op = presence::PresenceOp::from_canonical_bytes(inner_bytes)?;
+                op.require_active(frame_number)?;
                 let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) else {
                     return Err(QuilError::ExecutionUnavailable(
                         "presence report validation requires authenticated global state".into()));
                 };
-                let report = presence::PresenceReport::from_canonical_bytes(inner_bytes)?;
-                return intrinsic.verify_presence_report(frame_number, &report, state.as_ref());
+                return intrinsic.verify_presence_op(frame_number, &op, state.as_ref());
             }
             if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                 let state = self.state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(

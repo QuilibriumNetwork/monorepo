@@ -127,9 +127,11 @@ pub fn global_frame_body_matches_requests_root(
     header: &GlobalFrameHeader,
     requests: &[quil_types::proto::global::MessageBundle],
 ) -> bool {
+    // Presence encodings are judged at the header's frame, as every build
+    // judges the same body.
     let canonical: Vec<Vec<u8>> = requests
         .iter()
-        .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+        .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(b, Some(header.frame_number)).ok())
         .collect();
     if canonical.len() != requests.len() {
         return false;

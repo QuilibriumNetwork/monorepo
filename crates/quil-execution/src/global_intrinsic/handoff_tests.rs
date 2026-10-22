@@ -2059,6 +2059,9 @@ mod legacy_tests;
 #[path = "handoff_presence_tests.rs"]
 mod presence_tests;
 
+#[path = "handoff_exclusion_tests.rs"]
+mod exclusion_tests;
+
 /// The pending-change repair rebuilds a split whose parent's committee
 /// SEALED (not fenced) from its request, both while the parent seals and once
 /// it closed; it leaves the request alone once a shard the split registers,

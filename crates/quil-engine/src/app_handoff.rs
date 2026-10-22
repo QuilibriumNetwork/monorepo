@@ -1705,8 +1705,9 @@ pub fn fence_rewind_held(
             error,
         };
         // The fenced session's frames anchor before GLOBAL fenced it, at
-        // `schedule::fence_due_frame` of its closing request's frame, as
-        // GLOBAL dates the fence; this session's at or after that.
+        // `schedule::fence_frame`: the frame recorded for an early fence,
+        // else `schedule::fence_due_frame` of its closing request's frame,
+        // as GLOBAL dates the fence; this session's at or after that.
         let requested_at = || -> Result<Option<u64>> {
             let request = match handoff::status(&view, &source.id()?)? {
                 Status::Sealing(request) | Status::Closed(request) => handoff::request(&view, &request)?,
@@ -1727,7 +1728,8 @@ pub fn fence_rewind_held(
                 // anchored before GLOBAL fenced it, or a frame at the
                 // session's executed tip that differs from GLOBAL's, says
                 // which. Unknown counts as a joiner.
-                let discarded = at_tip == Some(false) || requested_at().ok().flatten().map(schedule::fence_due_frame).is_some_and(|due| {
+                let fenced_at = source.id().ok().and_then(|id| schedule::fence_frame(&view, &id).ok().flatten());
+                let discarded = at_tip == Some(false) || fenced_at.is_some_and(|due| {
                     let before = |frame: Result<quil_types::proto::global::AppShardFrame>| {
                         frame.ok().and_then(|frame| frame.header).is_some_and(|header| {
                             header.frame_number > checkpoint.frame && header.global_frame_number < due

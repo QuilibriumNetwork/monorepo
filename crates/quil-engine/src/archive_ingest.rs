@@ -1541,7 +1541,9 @@ impl ArchiveFrameVerifier {
         let canonical: Vec<Vec<u8>> = frame
             .requests
             .iter()
-            .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+            // As the application committee judges it: an application frame
+            // never carries a claim or a nullify report.
+            .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
             .collect();
         if canonical.len() != frame.requests.len() {
             warn!(

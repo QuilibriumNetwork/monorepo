@@ -340,6 +340,24 @@ impl SessionVotes {
         };
         self.scheme.verify_notarize(&proposal, &attestation)
     }
+
+    /// Whether `signature` is member `signer`'s NULLIFY of round (`epoch`,
+    /// `view`). The round is all a nullify signs, so it can be signed for
+    /// any view once the session exists; the namespace binds the session.
+    pub fn verify_nullify(&self, epoch: u64, view: u64, signer: u32, signature: &[u8]) -> bool {
+        let mut bytes = signature;
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &()) else {
+            return false;
+        };
+        if !bytes.is_empty() {
+            return false;
+        }
+        let vote = commonware_consensus::simplex::types::Nullify::<SimplexFalconScheme> {
+            round: Round::new(Epoch::new(epoch), View::new(view)),
+            attestation: Attestation { signer: Participant::new(signer), signature: signature.into() },
+        };
+        self.scheme.verify_nullify(&vote)
+    }
 }
 
 /// Small bounded codec shared with the global authorization record. Counts are
