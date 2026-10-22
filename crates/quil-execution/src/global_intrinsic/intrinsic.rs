@@ -1309,9 +1309,10 @@ impl GlobalIntrinsic {
                 Ok(())
             }
             super::handoff::TYPE_PRESENCE_REPORT => {
-                // Validation only: an accepted report writes nothing yet.
+                // Recorded from the presence credit frame; before it an
+                // accepted report writes nothing.
                 let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
-                self.verify_presence_report(frame_number, &report, state)
+                self.apply_presence_report(frame_number, &report, state)
             }
             super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
                 let proof = super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
@@ -2630,18 +2631,35 @@ impl GlobalIntrinsic {
         report: &super::handoff::presence::PresenceReport,
         state: &HypergraphState,
     ) -> Result<()> {
-        super::handoff::presence::verify(state, frame_number, report, |anchor| {
-            let clock_store = self.clock_store.as_ref().ok_or_else(|| {
-                QuilError::Internal("presence report: clock_store not installed — cannot recompute output".into())
-            })?;
-            clock_store
-                .get_global_clock_frame_header(anchor)
-                .ok()
-                .map(|header| header.output)
-                .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
-                    "presence report: anchored global frame {anchor} unavailable — cannot recompute output"
-                )))
-        })
+        super::handoff::presence::verify(state, frame_number, report, |anchor| self.presence_anchor_output(anchor))
+    }
+
+    /// Check a presence report as [`Self::verify_presence_report`] does and,
+    /// from the presence credit frame, record it
+    /// ([`super::handoff::presence::apply`]).
+    pub fn apply_presence_report(
+        &self,
+        frame_number: u64,
+        report: &super::handoff::presence::PresenceReport,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        super::handoff::presence::apply(state, frame_number, report, |anchor| self.presence_anchor_output(anchor))
+            .map(|_| ())
+    }
+
+    /// The output of GLOBAL frame `anchor` from this node's clock store, which
+    /// a presence report's header output is recomputed from.
+    fn presence_anchor_output(&self, anchor: u64) -> Result<Vec<u8>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal("presence report: clock_store not installed — cannot recompute output".into())
+        })?;
+        clock_store
+            .get_global_clock_frame_header(anchor)
+            .ok()
+            .map(|header| header.output)
+            .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
+                "presence report: anchored global frame {anchor} unavailable — cannot recompute output"
+            )))
     }
 
     fn invoke_frame_header(

@@ -594,14 +594,15 @@ pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
 
 /// From this GLOBAL frame GLOBAL validates presence reports
 /// ([`presence::PresenceReport`]); before it every report is refused, as an
-/// older build refuses it. An accepted report changes no state yet, but the
-/// operation is consensus-affecting all the same: an older build decodes it
-/// as an empty request, so it computes another requests root for any GLOBAL
-/// frame that carries one, and every archive and GLOBAL prover must run a
-/// build with it before the frame. From the same frame GLOBAL records the
-/// frame of each session's tip advance ([`session_tip_frame`]), which an
-/// older build does not write either. Not scheduled on mainnet;
-/// `QUIL_PRESENCE_REPORT_FRAME` elsewhere, never by default.
+/// older build refuses it. An accepted report changes no state before the
+/// [`presence_credit_frame`], but the operation is consensus-affecting all
+/// the same: an older build decodes it as an empty request, so it computes
+/// another requests root for any GLOBAL frame that carries one, and every
+/// archive and GLOBAL prover must run a build with it before the frame.
+/// From the same frame GLOBAL records the frame of each session's tip
+/// advance ([`session_tip_frame`]), which an older build does not write
+/// either. Not scheduled on mainnet; `QUIL_PRESENCE_REPORT_FRAME`
+/// elsewhere, never by default.
 pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = None;
 
 static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -638,6 +639,58 @@ pub fn presence_report_frame() -> u64 {
 /// Set the presence report frame for the calling thread only (tests).
 pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
     PRESENCE_REPORT_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame an accepted presence report is recorded
+/// ([`presence::apply`]): the members whose notarize votes it carries are
+/// marked present for its session and the inclusion frame's epoch, in a
+/// record that reports only add to ([`presence::present`]), and each such
+/// member's allocation on the session's filter is credited activity at the
+/// vote's anchor frame. From it a report that marks no member not already
+/// marked is refused. Reports themselves are accepted only from the
+/// [`presence_report_frame`], which an older build may already have set:
+/// it accepts a report and writes nothing, so this frame is a flag day of
+/// its own. Consensus-affecting for GLOBAL: every archive and GLOBAL prover
+/// must run a build with it before the frame. Not scheduled on mainnet;
+/// `QUIL_PRESENCE_CREDIT_FRAME` elsewhere, never by default.
+pub const MAINNET_PRESENCE_CREDIT_FRAME: Option<u64> = None;
+
+static PRESENCE_CREDIT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PRESENCE_CREDIT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn presence_credit_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_PRESENCE_CREDIT_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's presence credit frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_presence_credit_frame(network: u8) -> u64 {
+    *PRESENCE_CREDIT_FRAME.get_or_init(|| {
+        presence_credit_frame_for(network, std::env::var("QUIL_PRESENCE_CREDIT_FRAME").ok().as_deref())
+    })
+}
+
+/// The presence credit frame. A process that has not called
+/// [`init_presence_credit_frame`] gets the mainnet value: unlike the older
+/// getters above, this one never reads `QUIL_PRESENCE_CREDIT_FRAME` without
+/// knowing the network, so the setting cannot take effect on mainnet.
+pub fn presence_credit_frame() -> u64 {
+    if let Some(frame) = PRESENCE_CREDIT_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    PRESENCE_CREDIT_FRAME.get().copied().unwrap_or_else(|| presence_credit_frame_for(0, None))
+}
+
+/// Set the presence credit frame for the calling thread only (tests).
+pub fn set_presence_credit_frame_for_thread(frame: Option<u64>) {
+    PRESENCE_CREDIT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 /// From this GLOBAL frame GLOBAL fences a closing session that has not
