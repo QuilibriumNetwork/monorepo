@@ -31,12 +31,12 @@ use std::{
 use as_client::AsClient;
 pub use as_client::{OutboundProbeError, OutboundProbeEvent};
 use as_server::AsServer;
-pub use as_server::{InboundProbeError, InboundProbeEvent};
+pub use as_server::{InboundProbeError, InboundProbeEvent, ServerStats};
 use futures_timer::Delay;
 use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_request_response::{
-    self as request_response, InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel,
+    self as request_response, OutboundRequestId, ProtocolSupport,
 };
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm},
@@ -185,15 +185,11 @@ pub struct Behaviour {
     schedule_probe: Delay,
 
     // Ongoing inbound requests, where no response has been sent back to the remote yet.
-    ongoing_inbound: HashMap<
-        PeerId,
-        (
-            ProbeId,
-            InboundRequestId,
-            Vec<Multiaddr>,
-            ResponseChannel<DialResponse>,
-        ),
-    >,
+    // QUILIBRIUM: with the connection id of the dial-back.
+    ongoing_inbound: as_server::OngoingInbounds,
+
+    // QUILIBRIUM: what the server did since the last `take_server_stats`.
+    server_stats: ServerStats,
 
     // Ongoing outbound probes and mapped to the inner request id.
     ongoing_outbound: HashMap<OutboundRequestId, ProbeId>,
@@ -257,6 +253,7 @@ impl Behaviour {
             listen_addresses: Default::default(),
             other_candidates: Default::default(),
             last_probe_addresses: Vec::new(),
+            server_stats: ServerStats::default(),
         }
     }
 
@@ -304,6 +301,12 @@ impl Behaviour {
         self.other_candidates.push_front(candidate);
         self.other_candidates.truncate(MAX_CANDIDATES);
         self.as_client().on_new_address();
+    }
+
+    /// QUILIBRIUM: what this node did as a server with other nodes'
+    /// dial-back requests since the last call, for an operator summary.
+    pub fn take_server_stats(&mut self) -> ServerStats {
+        std::mem::take(&mut self.server_stats)
     }
 
     /// QUILIBRIUM: the dial-back addresses of the latest probe request
@@ -366,6 +369,7 @@ impl Behaviour {
             probe_id: &mut self.probe_id,
             throttled_clients: &mut self.throttled_clients,
             ongoing_inbound: &mut self.ongoing_inbound,
+            stats: &mut self.server_stats,
         }
     }
 
@@ -432,8 +436,19 @@ impl Behaviour {
         }
     }
 
-    fn on_dial_failure(&mut self, DialFailure { peer_id, error, .. }: DialFailure) {
-        if let Some(event) = self.as_server().on_outbound_dial_error(peer_id, error) {
+    fn on_dial_failure(
+        &mut self,
+        DialFailure {
+            peer_id,
+            error,
+            connection_id,
+        }: DialFailure,
+    ) {
+        // QUILIBRIUM: the connection id tells the dial-back from other dials.
+        if let Some(event) = self
+            .as_server()
+            .on_outbound_dial_error(peer_id, connection_id, error)
+        {
             self.pending_actions
                 .push_back(ToSwarm::GenerateEvent(Event::InboundProbe(event)));
         }

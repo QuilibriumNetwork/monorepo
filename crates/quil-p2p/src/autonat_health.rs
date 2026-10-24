@@ -255,8 +255,8 @@ impl Run {
                 "a server could not dial this node back; waiting for servers on other IPs"
             }
             ProbeFailure::DialRefused => {
-                "servers refused to dial back (their rate limits, or they see this node at a \
-                 non-public address); report this line if it persists"
+                "servers declined to dial back, usually at their own connection or rate limits; \
+                 expected now and then, no action needed"
             }
             ProbeFailure::DialFailure => {
                 "the chosen servers could not be dialed; check this node's outbound connectivity \
@@ -482,6 +482,13 @@ pub(crate) struct ProbeContext {
     pub(crate) confidence: usize,
 }
 
+/// Whether a failing-probes line is a warning: a repeat, unless servers
+/// mostly declined to dial back, which they do at their own connection
+/// limits and which tells nothing about this node.
+fn failing_is_warning(repeat: bool, dominant: ProbeFailure) -> bool {
+    repeat && dominant != ProbeFailure::DialRefused
+}
+
 /// Log `notice`. These lines concern this node's own reachability.
 pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
     match notice {
@@ -517,8 +524,10 @@ pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
                     )
                 };
             }
-            if *repeat {
+            if failing_is_warning(*repeat, *dominant) {
                 failing!(warn, "AutoNAT probes of this node are still failing")
+            } else if *repeat {
+                failing!(info, "AutoNAT probes of this node are still failing")
             } else {
                 failing!(info, "AutoNAT probes of this node are failing")
             }
@@ -704,6 +713,24 @@ mod tests {
                 }
                 other => panic!("{class:?}: {other:?}"),
             }
+        }
+    }
+
+    /// Declined dial-backs are routine: never a warning, and no request to
+    /// report them.
+    #[test]
+    fn declined_dial_backs_are_not_a_warning() {
+        assert!(!failing_is_warning(false, DialRefused));
+        assert!(!failing_is_warning(true, DialRefused));
+        assert!(failing_is_warning(true, Timeout));
+        assert!(!failing_is_warning(false, Timeout));
+        let mut health = AutonatHealth::new(Instant::now());
+        let notice = (0..3).find_map(|_| health.on_failure(DialRefused, ip("192.0.2.1"), Instant::now()));
+        match notice {
+            Some(AutonatNotice::Failing { hint, .. }) => {
+                assert!(hint.contains("no action needed") && !hint.contains("report"), "{hint}")
+            }
+            other => panic!("{other:?}"),
         }
     }
 

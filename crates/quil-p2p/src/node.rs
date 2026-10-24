@@ -18,6 +18,10 @@ use quil_types::error::QuilError;
 
 use crate::blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent};
 
+/// How often the swarm logs what it did with other nodes' AutoNAT dial-back
+/// requests, when it did anything.
+const AUTONAT_SERVER_SUMMARY_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// A received message from the network.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
@@ -609,6 +613,7 @@ impl P2PNode {
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
+            let mut autonat_server_summary_at = std::time::Instant::now();
             // Throttle NeedPeers-driven Kademlia discovery. BlossomSub
             // can fire `NeedPeers` repeatedly when the mesh is short
             // of peers (bootstrap, partition, sustained churn); each
@@ -631,6 +636,28 @@ impl P2PNode {
                         break;
                     }
                     _ = discovery_timer.tick() => {
+                        // Other nodes' AutoNAT dial-back requests: one line
+                        // per hour, only when there were any.
+                        let summary_secs = autonat_server_summary_at.elapsed();
+                        if summary_secs >= AUTONAT_SERVER_SUMMARY_EVERY {
+                            autonat_server_summary_at = std::time::Instant::now();
+                            let stats = swarm.behaviour_mut().autonat.take_server_stats();
+                            if !stats.is_empty() {
+                                tracing::info!(
+                                    interval_secs = summary_secs.as_secs(),
+                                    served = stats.served,
+                                    failed = stats.failed,
+                                    refused = stats.refused.values().sum::<u32>(),
+                                    refused_by_reason = %stats.refused_by_reason(),
+                                    request_failures = stats.request_failures,
+                                    "AutoNAT dial-back requests of other nodes this node handled: served \
+                                     reached the requester, failed reached none of its addresses, refused \
+                                     were declined by this node (denied: this node's connection limits, \
+                                     usually two connections already held to the requester; throttled: \
+                                     rate limits); background work for the network, no action needed"
+                                );
+                            }
+                        }
                         // Keep operator-configured direct peers (e.g. the
                         // genesis global archives) connected at all times.
                         // Unlike bootstrap re-dial, this is gated only on
