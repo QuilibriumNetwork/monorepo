@@ -22,6 +22,8 @@ path = "src/bin/blossom_chat.rs"
 # feature builds a node that rejects every confidential token operation.
 default = ["native-proof"]
 confidential-tokens = ["quil-execution/confidential-tokens", "quil-lattice-ct/confidential-tokens"]
+# Fault-injection hooks for scripts/devnet-smoke.sh; never part of a release.
+test-hooks = ["quil-execution/test-hooks"]
 native-proof = ["confidential-tokens", "quil-execution/native-proof", "quil-lattice-ct/native-proof"]
 
 [dependencies]
