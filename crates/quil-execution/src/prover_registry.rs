@@ -1382,6 +1382,16 @@ fn left_current(alloc: &ProverAllocationInfo) -> bool {
         || alloc.epoch >= quil_types::consensus::epoch_for_frame(alloc.leave_frame_number)
 }
 
+/// Does the leaving `alloc` still sit in its committee at `frame_number`,
+/// serving its notice? Before [`leaver_currency_frame`] every unexpired
+/// leaver does; from it, only one that was current when it left
+/// ([`left_current`]). The committee rule for leavers
+/// ([`committee_eligible`]), for callers that decide whether a leaver's
+/// worker still serves.
+pub fn leaver_seated(alloc: &ProverAllocationInfo, frame_number: u64) -> bool {
+    frame_number < leaver_currency_frame() || left_current(alloc)
+}
+
 /// Is `alloc` a member of the epoch-aligned consensus committee at
 /// `frame_number`? SHARED predicate behind both `get_active_provers`
 /// (quorum membership) and `get_ordered_provers` (leader rotation) — they
@@ -1418,7 +1428,7 @@ fn left_current(alloc: &ProverAllocationInfo) -> bool {
 fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: bool) -> bool {
     match alloc.effective_status(frame_number) {
         EffectiveStatus::Active => true,
-        EffectiveStatus::Leaving => frame_number < leaver_currency_frame() || left_current(alloc),
+        EffectiveStatus::Leaving => leaver_seated(alloc, frame_number),
         // Demoted-but-raw-Active: re-admitted only by the empty-committee floor.
         EffectiveStatus::Joining | EffectiveStatus::ExpiredEpoch => {
             lenient && alloc.status == ProverStatus::Active

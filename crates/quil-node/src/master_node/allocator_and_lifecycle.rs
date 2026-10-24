@@ -72,6 +72,11 @@ pub(crate) fn init(
         let shards = shards_store.clone();
         worker_allocator.set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
     }
+    // Workers recover no shard state of a seat this node gives up, judged at
+    // the frame the allocator last reconciled at.
+    if !archive_mode {
+        worker_allocator.install_recovery_gate();
+    }
 
     // Compute the config-derived seniority estimate from the mainnet
     // compat table. Uses our local libp2p peer ID plus any peer IDs
@@ -134,6 +139,7 @@ pub(crate) fn init(
         let wa_for_init = worker_allocator.clone();
         let pr_for_init = prover_registry.clone();
         let lhf_for_init = last_global_head_frame.clone();
+        let clock_for_init = clock_store.clone();
         sup.spawn_startup_task("early-worker-reconcile", move |token_for_init| async move {
             // The registry loads in the background at startup (18-29 s
             // on a regular node's store, 2026-10-24); reconciling before
@@ -144,14 +150,25 @@ pub(crate) fn init(
             }
             let frame = lhf_for_init.load(std::sync::atomic::Ordering::Relaxed);
             if frame > 0 {
-                if let Err(e) = wa_for_init.on_new_frame(frame) {
-                    warn!(
+                // Only a current stored head: a node back from downtime
+                // judges its seats at its first current frame instead.
+                let stamped = clock_for_init.get_latest_global_frame().ok()
+                    .and_then(|stored| stored.header.map(|header| u64::try_from(header.timestamp).unwrap_or(0)))
+                    .unwrap_or(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64);
+                match wa_for_init.startup_reconcile(frame, stamped, now) {
+                    Err(e) => warn!(
                         error = %e,
                         frame,
                         "early worker reconcile failed"
-                    );
-                } else {
-                    info!(frame, "early worker reconcile complete (off local registry)");
+                    ),
+                    Ok(true) => info!(frame, "early worker reconcile complete (off local registry)"),
+                    Ok(false) => info!(frame, stored_head_age_secs = now.saturating_sub(stamped) / 1000,
+                        scope = "this node",
+                        "early worker reconcile skipped: the stored GLOBAL head is over an epoch old, so this \
+                         node's seats are judged at its first current frame, after the startup state jump or \
+                         registry sync; its workers start then"),
                 }
             }
             Ok(())

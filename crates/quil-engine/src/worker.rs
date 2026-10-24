@@ -19,6 +19,11 @@ pub trait WorkerManager: Send + Sync {
         Ok(())
     }
 
+    /// Install what its workers ask before they recover a shard from an
+    /// archive (`WorkerAllocator::install_recovery_gate`); managers whose
+    /// workers recover elsewhere ignore it.
+    fn set_recovery_gate(&self, _gate: crate::worker_allocator::RecoveryGate) {}
+
     /// Bind `core_id` to `filter` and (re)start the consensus engine.
     /// Equivalent to `set_worker_filter(core_id, filter, true)`.
     /// Kept as the default for callers that always want full

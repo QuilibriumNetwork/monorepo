@@ -257,6 +257,30 @@ pub struct WorkerOwnedDeps {
 /// is cancelled ([`ThreadWorkerManager::stop_worker`]).
 const ENGINE_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Whether worker `core_id` recovers nothing of `filter` from an archive:
+/// the seat on it is one this node gives up (`WorkerAllocator::gives_up`).
+/// `withheld` keeps this engine's last answer, so each change is logged
+/// once: withholding starts, or ends because the seat is served again.
+fn recovery_withheld(
+    gate: &std::sync::RwLock<Option<crate::worker_allocator::RecoveryGate>>,
+    withheld: &std::sync::atomic::AtomicBool,
+    core_id: u32,
+    filter: &[u8],
+) -> bool {
+    let gate = gate.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let (frame, seat) = gate.map_or((0, None), |gate| gate(filter));
+    match (&seat, withheld.swap(seat.is_some(), std::sync::atomic::Ordering::Relaxed)) {
+        (Some(seat), false) => info!(core_id, filter = %hex::encode(filter), frame = seat.frame,
+            allocation_epoch = seat.allocation_epoch, current_epoch = seat.current_epoch,
+            reason = seat.cause.reason(), scope = "this node's worker", action = seat.cause.action(),
+            "archive recovery withheld for a seat this node gives up"),
+        (None, true) => info!(core_id, filter = %hex::encode(filter), frame, scope = "this node's worker",
+            "archive recovery resumes: this node no longer gives up the seat"),
+        _ => {}
+    }
+    seat.is_some()
+}
+
 /// Thread-based worker manager. Core 0 is reserved for the master;
 /// workers use cores 1..N.
 pub struct ThreadWorkerManager {
@@ -268,6 +292,9 @@ pub struct ThreadWorkerManager {
     num_cores: u32,
     /// Shared consensus dependencies — set after construction.
     consensus_deps: Mutex<Option<Arc<WorkerConsensusDeps>>>,
+    /// What workers ask before they recover a shard from an archive; set
+    /// once the allocator exists, after the workers may have started.
+    recovery_gate: Arc<std::sync::RwLock<Option<crate::worker_allocator::RecoveryGate>>>,
     /// Optional persistent registry — when wired, every state
     /// change (filter assigned, manually_managed flipped) is
     /// flushed so it survives restarts. Mirrors Go's
@@ -321,6 +348,7 @@ impl ThreadWorkerManager {
             master_tx,
             num_cores,
             consensus_deps: Mutex::new(None),
+            recovery_gate: Arc::default(),
             worker_store: Mutex::new(None),
         }
     }
@@ -487,6 +515,7 @@ impl ThreadWorkerManager {
         let master_tx = self.master_tx.clone();
         let cancel_clone = cancel.clone();
         let consensus_deps = self.consensus_deps.lock().unwrap().clone();
+        let recovery_gate = self.recovery_gate.clone();
         let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
         let execution_slot = execution_handle.clone();
 
@@ -662,6 +691,7 @@ impl ThreadWorkerManager {
                                             let master_tx_clone = master_tx.clone();
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
+                                            let recovery_gate = recovery_gate.clone();
                                             let execution_slot = execution_slot.clone();
                                             let owned = worker_owned.clone();
                                             let application = filter[..filter.len().min(32)].to_vec();
@@ -807,6 +837,10 @@ impl ThreadWorkerManager {
                                                     let sync_in_progress = std::sync::Arc::new(
                                                         std::sync::atomic::AtomicBool::new(false),
                                                     );
+                                                    // Whether this engine's archive recovery is
+                                                    // withheld for a seat this node gives up.
+                                                    let withheld = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                                    let withheld_filter = filter_clone.clone();
                                                     tokio::spawn(probed(ProbeSection::EngineEvents, async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -918,6 +952,10 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     }
                                                                     let release_sync = ReleaseSyncFlag(flag);
+                                                                    // Nothing renews a seat this node gives up, so
+                                                                    // the recovery asks before it reads an archive.
+                                                                    let gate = recovery_gate.clone();
+                                                                    let withheld = withheld.clone();
                                                                     tokio::spawn(probed(ProbeSection::ArchiveRecovery, async move {
                                                                         let _release_sync = release_sync;
                                                                         // A node's workers share its archive identity and
@@ -933,9 +971,10 @@ impl ThreadWorkerManager {
                                                                             Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
                                                                             Err(error) => Err(error),
                                                                         };
+                                                                        let given_up = || recovery_withheld(&gate, &withheld, core_id, &filter);
                                                                         let _ = crate::prover_tree_syncer::recover_in_turns(
                                                                             &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,
-                                                                            core_id, &lb, lb.execution_record(), lineage,
+                                                                            core_id, &lb, lb.execution_record(), lineage, given_up,
                                                                         ).await;
                                                                     }));
                                                                 }
@@ -946,6 +985,12 @@ impl ThreadWorkerManager {
                                                                     debug!(core_id, "engine event: {:?}", event);
                                                                 }
                                                             }
+                                                        }
+                                                        if withheld.load(std::sync::atomic::Ordering::Relaxed) {
+                                                            info!(core_id, filter = %hex::encode(&withheld_filter),
+                                                                scope = "this node's worker",
+                                                                "archive recovery no longer withheld: the worker's engine on the seat \
+                                                                 this node gives up stopped");
                                                         }
                                                     }));
 
@@ -1103,6 +1148,10 @@ impl ThreadWorkerManager {
 impl WorkerManager for ThreadWorkerManager {
     fn allocation_capacity(&self) -> Result<usize> {
         Ok(self.num_cores as usize)
+    }
+
+    fn set_recovery_gate(&self, gate: crate::worker_allocator::RecoveryGate) {
+        *self.recovery_gate.write().unwrap_or_else(|e| e.into_inner()) = Some(gate);
     }
 
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
@@ -1328,6 +1377,48 @@ fn run_falcon_self_test(core_id: u32, cpu: Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The allocator's recovery gate reaches this manager's recovery path,
+    /// at the frame the allocator last reconciled at: nothing is withheld
+    /// before it is installed or before the first reconcile; then a seat this
+    /// node gives up is, until the seat is served again.
+    #[test]
+    fn the_allocators_recovery_gate_reaches_thread_workers() {
+        use quil_types::consensus::{epoch_length_frames, ProverAllocationInfo, ProverInfo, ProverStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = epoch_length_frames();
+        let filter = vec![3u8; 32];
+        let manager = Arc::new(ThreadWorkerManager::new_with_count(1));
+        let withheld = AtomicBool::new(false);
+        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "no gate installed");
+        let lapsed = ProverAllocationInfo {
+            status: ProverStatus::Active, confirmation_filter: filter.clone(), rejection_filter: vec![],
+            join_frame_number: 1, leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
+            kick_frame_number: 0, join_confirm_frame_number: 2, join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0, leave_reject_frame_number: 0, last_active_frame_number: 100,
+            last_signed_frame_number: 0, epoch: 2, ring: 0, vertex_address: vec![],
+        };
+        let prover = ProverInfo {
+            public_key: vec![0xBB; 585], address: vec![0xAA; 32], status: ProverStatus::Active,
+            kick_frame_number: 0, allocations: vec![lapsed], available_storage: 0, seniority: 100,
+            delegate_address: vec![],
+        };
+        let allocator = Arc::new(crate::worker_allocator::WorkerAllocator::new(
+            manager.clone(), Arc::new(crate::test_support::TestProverRegistry::with_prover(prover)), vec![0xAA; 32]));
+        allocator.install_recovery_gate();
+        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "before the first reconcile");
+        allocator.on_new_frame(3 * e + 5).unwrap();
+        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "in its recovery epoch");
+        allocator.on_new_frame(20 * e + 5).unwrap();
+        assert!(recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "lapsed 18 epochs");
+        assert!(withheld.load(Ordering::Relaxed));
+        // A renewal of the seat starts: it is served again.
+        let renewal = allocator.submission_attempts
+            .begin(std::slice::from_ref(&filter), 20 * e + 5, crate::submission_attempts::OpKind::Confirm).unwrap();
+        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "its renewal runs");
+        assert!(!withheld.load(Ordering::Relaxed), "withholding ended");
+        drop(renewal);
+    }
 
     #[test]
     fn join_within_waits_for_finishing_threads_and_reports_the_rest() {
