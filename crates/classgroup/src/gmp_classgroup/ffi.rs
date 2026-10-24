@@ -31,7 +31,6 @@ use super::super::gmp::mpz::{
 use libc::{c_int, c_long, c_ulong, c_void, size_t};
 // pub use c_ulong;
 use std::cmp::Ordering;
-use std::usize;
 // We use the unsafe versions to avoid unnecessary allocations.
 extern "C" {
     fn adapted_nudupl(a: *mut Mpz, b: *mut Mpz, c: *mut Mpz, times: c_ulong, cutoff: c_int);
@@ -93,7 +92,6 @@ struct MpzStruct {
 macro_rules! impl_div_ui {
     ($t:ident, $i:ident, $f:expr) => {
         pub fn $i(n: &Mpz, d: $t) -> $t {
-            use std::$t;
             let res = unsafe { $f(n, c_ulong::from(d)) };
             assert!(res <= $t::MAX.into());
             res as $t

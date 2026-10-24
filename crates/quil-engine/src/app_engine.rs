@@ -8631,7 +8631,7 @@ pub(crate) fn prewarm_proof_verdicts(
     }
     let threads = &PROOF_PREWARM_THREADS;
     if threads
-        .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
+        .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |n| {
             (n < MAX_PROOF_PREWARMS).then_some(n + 1)
         })
         .is_err()
