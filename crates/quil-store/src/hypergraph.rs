@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::overlay::{OverlayDb, OverlayDbSnapshot, OverlayTxn, PageCursor, PageSnapshot};
+use crate::overlay::{
+    newest_version_within, BoundedCursorSource, OverlayDb, OverlayDbSnapshot, OverlayTxn,
+    PageCursor, PageSnapshot,
+};
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ShardKey;
@@ -1013,27 +1016,14 @@ impl SnapshotReadable for $snapshot {
         shard_key: &quil_types::store::ShardKey,
         vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
-        // MVCC "latest at capture" within the pinned snapshot: seek_for_prev to
-        // `vk_prefix ‖ u64::MAX`; the largest key still sharing `vk_prefix` (which
-        // is exactly `vk_prefix.len() + 8` bytes) is this vertex's latest version
-        // as-of the captured sequence. Mirrors the live `load_vertex_underlying_at`.
-        let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
-            set_type, phase_type, shard_key, vertex_key,
-        );
-        let seek = crate::encoding::hypergraph_vertex_data_v2_key(
-            set_type, phase_type, shard_key, vertex_key, u64::MAX,
-        );
-        let mut iter = self.snapshot.raw_iterator();
-        iter.seek_for_prev(&seek);
-        // An iterator read failure must not become authenticated absence via
-        // the legacy fallback, particularly during history reconstruction.
-        iter.status().map_err(|error| QuilError::Store(error.to_string()))?;
-        if iter.valid() {
-            if let Some(k) = iter.key() {
-                if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
-                    return Ok(iter.value().map(|v| v.to_vec()));
-                }
-            }
+        // MVCC "latest at capture" within the pinned snapshot, as the live
+        // `load_vertex_underlying_at` reads it. An iterator read failure must
+        // not become authenticated absence via the legacy fallback,
+        // particularly during history reconstruction.
+        if let Some(blob) = vertex_version_at(
+            &self.snapshot, set_type, phase_type, shard_key, vertex_key, u64::MAX,
+        )? {
+            return Ok(Some(blob));
         }
         // Legacy fallback: an un-migrated (unversioned) blob captured before the
         // version dimension existed.
@@ -1247,6 +1237,33 @@ impl RocksHypergraphStore {
 
 }
 
+/// MVCC read of one vertex blob: its newest version ≤ `version`, or `None`
+/// for the caller's legacy fallback. Versions are a fixed 8-byte
+/// non-inverted suffix of `vk_prefix`, so a match is exactly
+/// `vk_prefix.len() + 8` bytes long. The read is bounded to the vertex's own
+/// keys: an unbounded reverse seek for a vertex with no version ≤ `version`,
+/// such as an absent one, stepped over every record below it that a payload
+/// eviction had range-deleted while older snapshots still pinned them,
+/// blocking a mainnet worker's sweeps for 35-52 s each.
+fn vertex_version_at(
+    source: &impl BoundedCursorSource,
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &ShardKey,
+    vertex_key: &[u8],
+    version: u64,
+) -> Result<Option<Vec<u8>>> {
+    let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+        set_type, phase_type, shard_key, vertex_key,
+    );
+    let last = crate::encoding::hypergraph_vertex_data_v2_key(
+        set_type, phase_type, shard_key, vertex_key, version,
+    );
+    Ok(newest_version_within(source, &vk_prefix, &last)?
+        .filter(|(k, _)| k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix))
+        .map(|(_, blob)| blob))
+}
+
 include!("hypergraph_core.rs");
 
 #[cfg(test)]
@@ -1268,6 +1285,10 @@ mod orphaned_head_tests;
 #[cfg(test)]
 #[path = "hypergraph_selective_tests.rs"]
 mod selective_tests;
+
+#[cfg(test)]
+#[path = "hypergraph_mvcc_seek_tests.rs"]
+mod mvcc_seek_tests;
 
 #[cfg(test)]
 mod tests {

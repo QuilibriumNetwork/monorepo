@@ -685,25 +685,10 @@ macro_rules! impl_hypergraph_storage {
                 vertex_key: &[u8],
                 version: u64,
             ) -> Result<Option<Vec<u8>>> {
-                // MVCC: reverse-seek to `vk_prefix ‖ V`; the first (largest ≤ V) key that
-                // still shares `vk_prefix` is the latest write with version ≤ V. Version
-                // is a fixed 8-byte non-inverted suffix, so a matching key has length
-                // exactly `vk_prefix.len() + 8`.
-                let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
-                    set_type, phase_type, shard_key, vertex_key,
-                );
-                let seek = crate::encoding::hypergraph_vertex_data_v2_key(
-                    set_type, phase_type, shard_key, vertex_key, version,
-                );
-                let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
-                    &seek,
-                    rocksdb::Direction::Reverse,
-                ));
-                if let Some(entry) = iter.next() {
-                    let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-                    if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
-                        return Ok(Some(v.into_vec()));
-                    }
+                if let Some(blob) = vertex_version_at(
+                    &self.db, set_type, phase_type, shard_key, vertex_key, version,
+                )? {
+                    return Ok(Some(blob));
                 }
                 // Legacy fallback: an un-migrated (unversioned) blob written before the
                 // version dimension existed. The next commit re-writes it versioned.
