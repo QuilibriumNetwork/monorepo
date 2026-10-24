@@ -41,6 +41,33 @@ fn key_type_name(t: u8) -> &'static str {
     }
 }
 
+/// Parse keystore YAML. An empty file and an entry without a body, such as
+/// the `null:` placeholder written before a node's first start, hold no key;
+/// they are skipped, so saving the keystore drops them.
+fn parse_keystore(
+    contents: &str,
+) -> std::result::Result<HashMap<String, StoredKey>, serde_yaml::Error> {
+    use serde::de::Error as _;
+
+    let mut keys = HashMap::new();
+    if contents.trim().is_empty() {
+        return Ok(keys);
+    }
+    let entries = match serde_yaml::from_str::<serde_yaml::Value>(contents)? {
+        serde_yaml::Value::Mapping(entries) => entries,
+        serde_yaml::Value::Null => return Ok(keys),
+        _ => return Err(serde_yaml::Error::custom("the keystore is not a mapping of keys")),
+    };
+    for (id, entry) in entries {
+        if entry.is_null() {
+            continue;
+        }
+        let id: String = serde_yaml::from_value(id)?;
+        keys.insert(id, serde_yaml::from_value(entry)?);
+    }
+    Ok(keys)
+}
+
 /// A keystore entry summary returned by [`FileKeyManager::list_keys`].
 #[derive(Debug, Clone)]
 pub struct KeyEntry {
@@ -132,8 +159,13 @@ impl FileKeyManager {
         let contents = std::fs::read_to_string(&self.keys_path)
             .map_err(|e| QuilError::Crypto(format!("failed to read keystore: {}", e)))?;
 
-        let keys: HashMap<String, StoredKey> = serde_yaml::from_str(&contents)
-            .map_err(|e| QuilError::Crypto(format!("failed to parse keystore: {}", e)))?;
+        let keys = parse_keystore(&contents).map_err(|e| {
+            QuilError::Crypto(format!(
+                "failed to parse keystore {}: {}",
+                self.keys_path.display(),
+                e
+            ))
+        })?;
 
         tracing::info!(
             count = keys.len(),
@@ -495,7 +527,9 @@ impl FileKeyManager {
         // distinct `q-consensus-key`; it is left untouched (never deleted) but
         // is no longer consulted.
         self.ensure_key_type("q-prover-key", 8, &|s| {
-            s.create_falcon_key("q-prover-key").map(|_| ())
+            let public_key = s.create_falcon_key("q-prover-key")?;
+            s.warn_new_prover_identity(&public_key);
+            Ok(())
         })?;
         // sntrup761 (post-quantum KEM) onion-routing key.
         self.ensure_key_type("q-onion-key", 9, &|s| s.create_agreement_key("q-onion-key", 9))?;
@@ -507,6 +541,22 @@ impl FileKeyManager {
             s.create_agreement_key("q-device-pre-key", 4)
         })?;
         Ok(())
+    }
+
+    /// Warn once per created `q-prover-key`: the node now signs as a new
+    /// prover, so an operator whose keystore lives elsewhere must notice
+    /// before the old identity's seniority is left behind.
+    fn warn_new_prover_identity(&self, public_key: &[u8]) {
+        let prover_address = quil_crypto::poseidon::hash_bytes_to_32(public_key)
+            .map(hex::encode)
+            .unwrap_or_else(|e| format!("unavailable ({e})"));
+        tracing::warn!(
+            path = %self.keys_path.display(),
+            prover_address,
+            "created a new prover key: this node now has a new prover identity (prover_address); \
+             seniority earned by a previous prover key stays on that key's address. If this \
+             node already had a keystore, stop it and set key.keyManagerFile.path to that keys.yml"
+        );
     }
 
     /// Whether the loaded key for a type-keyed slot is actually USABLE (decodes).
@@ -998,7 +1048,7 @@ fn peer_id_from_ed448(public_key: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::Path;
     use quil_crypto::FalconKeyConstructor;
@@ -1091,6 +1141,71 @@ mod tests {
     fn constructor_stores_proving_key_id() {
         let (m, dir) = make_manager("stores_id");
         assert_eq!(m.get_proving_key_id(), "test-key-id");
+        cleanup(&dir);
+    }
+
+    /// Records the fields (message included) of every warn event.
+    struct WarnRecorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for WarnRecorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={:?} ", field.name(), value));
+                }
+            }
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    pub(crate) fn warns_of(run: impl FnOnce()) -> Vec<String> {
+        let warns = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(WarnRecorder(warns.clone()), run);
+        let recorded = warns.lock().unwrap().clone();
+        recorded
+    }
+
+    #[test]
+    fn creating_the_prover_key_warns_of_a_new_prover_identity() {
+        let (m, dir) = make_manager("new_prover_identity_warn");
+        let keys_path = dir.join("keys.yml");
+
+        let warns = warns_of(|| m.ensure_standard_keys().unwrap());
+        let new_identity: Vec<_> =
+            warns.iter().filter(|w| w.contains("new prover identity")).collect();
+        assert_eq!(new_identity.len(), 1, "one warn per created prover key: {warns:?}");
+        assert!(new_identity[0].contains(&keys_path.display().to_string()), "{warns:?}");
+        assert!(new_identity[0].contains("seniority"), "{warns:?}");
+
+        // Reloading the keystore keeps the identity and stays silent.
+        let reloaded =
+            FileKeyManager::new(keys_path, TEST_KEY_HEX, "test-key-id".into(), bls_constructor())
+                .unwrap();
+        let warns = warns_of(|| reloaded.ensure_standard_keys().unwrap());
+        assert!(
+            !warns.iter().any(|w| w.contains("new prover identity")),
+            "a loaded prover key is no new identity: {warns:?}"
+        );
         cleanup(&dir);
     }
 

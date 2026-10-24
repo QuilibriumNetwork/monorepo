@@ -489,11 +489,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         let ed_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
         let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed_pub);
         // Ensure the BLS prover key (auto-created if missing), read full pubkey.
-        let keys_path = if cfg.key.key_store_file.path.is_empty() {
-            args.config.join("keys.yml")
-        } else {
-            PathBuf::from(&cfg.key.key_store_file.path)
-        };
+        let keys_path = quil_keys::resolve_keystore_path(&cfg.key.key_store_file, &args.config)?;
         let proving_key_id = if cfg.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {
@@ -537,11 +533,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // or starting the node. Used to bootstrap a node's consensus identity for a
     // committee list.
     if args.generate_keys {
-        let keys_path = if config.key.key_store_file.path.is_empty() {
-            args.config.join("keys.yml")
-        } else {
-            PathBuf::from(&config.key.key_store_file.path)
-        };
+        let keys_path =
+            quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)?;
         let proving_key_id = if config.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {

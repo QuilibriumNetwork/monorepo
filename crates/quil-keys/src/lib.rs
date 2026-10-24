@@ -1,6 +1,8 @@
 mod file_key_manager;
+mod keystore_path;
 
 pub use file_key_manager::{FileKeyManager, KeyEntry};
+pub use keystore_path::{resolve_existing_keystore_path, resolve_keystore_path};
 
 use quil_types::crypto::{KeyType, Signer};
 use quil_types::error::Result;

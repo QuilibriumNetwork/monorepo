@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::info;
@@ -19,11 +18,9 @@ pub(crate) fn init(
     // ---------------------------------------------------------------
     // 2b. Key management — load or create BLS prover key from keys.yml
     // ---------------------------------------------------------------
-    let keys_path = if config.key.key_store_file.path.is_empty() {
-        config_dir.join("keys.yml")
-    } else {
-        PathBuf::from(&config.key.key_store_file.path)
-    };
+    // Refuses a missing keystore that must not be recreated, so a wrong
+    // path cannot silently give the node a new prover identity.
+    let keys_path = quil_keys::resolve_keystore_path(&config.key.key_store_file, config_dir)?;
 
     let bls_ctor = quil_crypto::FalconKeyConstructor;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {

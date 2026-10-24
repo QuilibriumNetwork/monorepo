@@ -4,7 +4,7 @@
 //! `ProposeJoin` / the reward basis), `data_shards`, and the `materialized_frame`
 //! / `latest_frame` the archive reports. Read-only; then exit.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use quil_keys::KeyManager as _;
 
@@ -54,30 +54,37 @@ pub async fn run_query_prover_root(
     Ok(())
 }
 
+/// The error of a tool whose keystore holds a prover key it cannot use as
+/// the Falcon network identity.
+pub(crate) fn falcon_key_unavailable(keys_path: &Path, e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "load Falcon network identity key from the keystore {}: {e}. A q-prover-key from \
+         before the Falcon migration is migrated when the node starts once; otherwise check \
+         key.keyManagerFile.encryptionKey",
+        keys_path.display()
+    )
+}
+
 /// The node's Falcon network identity (the :8340 mTLS key), self-contained
 /// like `keys::init`.
 pub(crate) fn falcon_identity(config: &quil_config::Config, config_dir: &Path) -> anyhow::Result<Vec<u8>> {
-    let keys_path = if config.key.key_store_file.path.is_empty() {
-        config_dir.join("keys.yml")
-    } else {
-        PathBuf::from(&config.key.key_store_file.path)
-    };
+    let keys_path =
+        quil_keys::resolve_existing_keystore_path(&config.key.key_store_file, config_dir)?;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "default-proving-key".to_string()
     } else {
         config.engine.proving_key_id.clone()
     };
     let file_key_manager = quil_keys::FileKeyManager::new(
-        keys_path,
+        keys_path.clone(),
         &config.key.key_store_file.encryption_key,
         proving_key_id,
         Box::new(quil_crypto::FalconKeyConstructor),
     )?;
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    file_key_manager.ensure_standard_keys()?;
     file_key_manager
         .get_private_key(quil_types::crypto::KeyType::Falcon512)
-        .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))
+        .map_err(|e| crate::query_shards::falcon_key_unavailable(&keys_path, e))
 }
 
 pub async fn run_query_shards(
@@ -90,27 +97,23 @@ pub async fn run_query_shards(
     println!("network: {network}");
 
     // Falcon signing key (the :8340 mTLS identity), self-contained like keys::init.
-    let keys_path = if config.key.key_store_file.path.is_empty() {
-        config_dir.join("keys.yml")
-    } else {
-        PathBuf::from(&config.key.key_store_file.path)
-    };
+    let keys_path =
+        quil_keys::resolve_existing_keystore_path(&config.key.key_store_file, config_dir)?;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "default-proving-key".to_string()
     } else {
         config.engine.proving_key_id.clone()
     };
     let file_key_manager = quil_keys::FileKeyManager::new(
-        keys_path,
+        keys_path.clone(),
         &config.key.key_store_file.encryption_key,
         proving_key_id,
         Box::new(quil_crypto::FalconKeyConstructor),
     )?;
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    file_key_manager.ensure_standard_keys()?;
     let falcon_key = file_key_manager
         .get_private_key(quil_types::crypto::KeyType::Falcon512)
-        .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?;
+        .map_err(|e| crate::query_shards::falcon_key_unavailable(&keys_path, e))?;
 
     let endpoints: Vec<String> = if !archive_arg.is_empty() {
         vec![archive_arg.to_string()]
