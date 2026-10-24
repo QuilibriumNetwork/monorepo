@@ -494,6 +494,12 @@ impl RecoveryTurns {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Workers waiting for a turn.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.lock().queue.waiters.len()
+    }
+
     /// Wait for a turn. Replays go before checkpoint installs, and a worker
     /// whose successor-blocked, re-anchor or lagging-voter flag is set when
     /// a turn frees up before others of its kind ([`Waiter::rank`]).

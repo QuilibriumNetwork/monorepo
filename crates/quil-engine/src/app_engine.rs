@@ -327,6 +327,14 @@ impl AppEngineHandle {
     pub(crate) fn execution_record(&self) -> &crate::worker_execution::SharedWorkerExecution { &self.execution }
     /// Whether the engine still accepts messages and has not been cancelled.
     pub(crate) fn is_running(&self) -> bool { !self.msg_tx.is_closed() && !self.cancel.is_cancelled() }
+    /// Resolves once the engine stops ([`Self::is_running`] false): it is
+    /// cancelled, or its message receiver went with it.
+    pub(crate) async fn stopped(&self) {
+        tokio::select! {
+            () = self.cancel.cancelled() => {}
+            () = self.msg_tx.closed() => {}
+        }
+    }
     /// A handle for `filter` whose messages arrive on the returned receiver.
     #[cfg(test)]
     pub(crate) fn for_test(filter: Vec<u8>) -> (Self, mpsc::Receiver<AppEngineMessage>) {

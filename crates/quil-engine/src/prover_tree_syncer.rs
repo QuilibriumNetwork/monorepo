@@ -78,6 +78,15 @@ pub(crate) enum ShardSyncResult {
     NotReady(&'static str),
 }
 
+/// How often [`ShardRecoveryTarget::stopped`] looks whether a target that
+/// cannot signal its stop still runs.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a recovery attempted nothing: its worker's engine stopped while it
+/// waited for a turn ([`recover_in_turns`]).
+pub(crate) const ENGINE_STOPPED_WHILE_QUEUED: &str =
+    "the worker's shard engine stopped while its recovery waited for a turn";
+
 /// The owning actor authenticates and installs a checkpoint. A recovery task
 /// keeps this exact target through completion, even if a worker is reassigned.
 #[async_trait]
@@ -119,6 +128,14 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     /// Whether the worker's engine still runs, so its recovery goes on.
     fn running(&self) -> bool {
         true
+    }
+    /// Resolves once the worker's engine has stopped ([`Self::running`]
+    /// false), looked at every [`STOP_POLL`]: a recovery still waiting for
+    /// its turn then withdraws ([`recover_in_turns`]).
+    async fn stopped(&self) {
+        while self.running() {
+            tokio::time::sleep(STOP_POLL).await;
+        }
     }
     /// The worker's committed cursor is at its same-filter predecessor's
     /// sealed checkpoint with other state there
@@ -165,6 +182,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
         self.execution_record().reanchor_yielded();
     }
     fn running(&self) -> bool { self.is_running() }
+    async fn stopped(&self) {
+        crate::app_engine::AppEngineHandle::stopped(self).await
+    }
     async fn sealed_state_mismatch(&self) -> Option<crate::app_handoff::SealedStateMismatch> {
         crate::app_engine::AppEngineHandle::sealed_state_mismatch(self).await
     }
@@ -211,7 +231,8 @@ pub(crate) enum ShardRecoveryProgress {
     SealedStateInstalled { frame: u64 },
     NotReady(&'static str),
     /// Nothing was attempted, for a reason that is no failure of the
-    /// recovery (a re-anchor at the fence has its own attempt): no counter,
+    /// recovery (a re-anchor at the fence has its own attempt, or the
+    /// worker's engine stopped while it waited for a turn): no counter,
     /// streak or archive state changes.
     Deferred(&'static str),
     /// The tree install handed its turn back at the hold limit
@@ -396,6 +417,12 @@ fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgres
 /// member 40 to 90 frames behind on an operator's node waited up to 5 hours
 /// for each 32-frame batch. `lineage` reads the worker's latest frame of the
 /// shard before each attempt. Returns the last attempt's outcome.
+///
+/// A claim still queued when the worker's engine stops is withdrawn
+/// ([`ENGINE_STOPPED_WHILE_QUEUED`]): it leaves the queue and keeps no
+/// place. Left queued, a worker whose allocation had moved to other cores
+/// waited about 20,000 s on an operator's node, then failed within seconds
+/// of its turn ("shard engine stopped before sync validation").
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_in_turns(
     turns: &crate::recovery_turns::RecoveryTurns,
@@ -415,7 +442,20 @@ pub(crate) async fn recover_in_turns(
             crate::worker_execution::recovery_phase("waiting_for_permit");
             let kind = if local.is_some() { RecoveryKind::Replay } else { RecoveryKind::Install };
             let claim = Claim { core, filter: filter.to_vec(), kind, execution: execution.clone(), ticket };
-            let turn = turns.acquire(claim).await;
+            let queued = tokio::time::Instant::now();
+            // Dropped unanswered, the claim leaves the queue; granted in the
+            // meantime, its turn passes on (`recovery_turns::Queued`).
+            let turn = tokio::select! {
+                biased;
+                () = target.stopped() => {
+                    tracing::info!(core, filter = %hex::encode(filter), kind = kind.as_str(),
+                        waited_secs = queued.elapsed().as_secs(), scope = "this worker",
+                        "archive recovery turn request withdrawn: the shard engine stopped while it waited; the \
+                        shard runs elsewhere or is no longer allocated here, and the waiters behind it move up");
+                    return Ok(ShardRecoveryProgress::Deferred(ENGINE_STOPPED_WHILE_QUEUED));
+                }
+                turn = turns.acquire(claim) => turn,
+            };
             ticket.get_or_insert(turn.ticket());
             let (blocked, lagging) = (execution.successor_blocked_flag(), execution.lagging_voter_flag());
             recover_shard_from_latest(syncer, filter, local, target, &[&*blocked, &*lagging], Some(turn)).await
@@ -1073,6 +1113,83 @@ mod tests {
             .await.unwrap();
         assert!(matches!(done, ShardRecoveryProgress::Replayed { materialized: 200, .. }), "{done:?}");
         assert_eq!(execution.take_replay_ticket(&[5; 32]), None);
+    }
+
+    /// A recovery waiting for its turn withdraws once its worker's engine
+    /// stops, rather than taking the turn to fail: an operator's node had
+    /// two workers wait about 20,000 s for shards whose engines had stopped,
+    /// then fail within seconds of their turns. It leaves the queue, reads
+    /// no archive, takes no turn and keeps no place.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_recovery_withdraws_when_its_engine_stops() {
+        use crate::recovery_turns::{Claim, RecoveryKind, RecoveryTurns};
+        use std::time::Duration;
+        struct Stopping { inner: Target, running: AtomicBool }
+        #[async_trait]
+        impl ShardRecoveryTarget for Stopping {
+            fn materialized(&self) -> u64 { self.inner.materialized() }
+            async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
+                self.inner.replay(frame, descendants).await
+            }
+            async fn validate(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<bool> {
+                self.inner.validate(anchor, predecessor).await
+            }
+            async fn install(&self, anchor: AppShardFrame, predecessor: Option<AppShardFrame>) -> Result<()> {
+                self.inner.install(anchor, predecessor).await
+            }
+            fn inherited(&self) { self.inner.inherited() }
+            fn running(&self) -> bool { self.running.load(Ordering::SeqCst) }
+        }
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
+        let target = Stopping {
+            inner: Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
+                blocked: false.into(), unblock_at: 0 },
+            running: true.into(),
+        };
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        execution.keep_replay_ticket(&[5; 32], 0);
+        let claim = |core: u32| Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Install,
+            execution: Default::default(), ticket: None };
+        let held = turns.acquire(claim(9)).await;
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(3600),
+                recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(130))))),
+            async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                assert_eq!(turns.waiting(), 1, "queued behind the held turn");
+                target.running.store(false, Ordering::SeqCst);
+            },
+        );
+        let result = result.expect("withdrawn, not left waiting for the turn").unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Deferred(ENGINE_STOPPED_WHILE_QUEUED));
+        assert_eq!(turns.waiting(), 0, "its claim left the queue");
+        assert!(calls.lock().unwrap().is_empty(), "no archive read");
+        assert!(execution.turn().since.is_none(), "no turn taken");
+        assert_eq!(execution.take_replay_ticket(&[5; 32]), None, "no place kept");
+        // The next waiter takes the released turn.
+        let next = tokio::spawn(async move { drop(turns.acquire(claim(2)).await) });
+        tokio::task::yield_now().await;
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), next).await.expect("the turn passed on").unwrap();
+    }
+
+    /// An engine handle's stop resolves once its engine is cancelled or
+    /// its message receiver is gone, and not while it runs.
+    #[tokio::test]
+    async fn an_engine_handle_resolves_its_stop() {
+        use std::time::Duration;
+        let (handle, receiver) = crate::app_engine::AppEngineHandle::for_test(vec![5; 32]);
+        assert!(tokio::time::timeout(Duration::from_millis(50), ShardRecoveryTarget::stopped(&handle)).await.is_err(),
+            "a running engine has not stopped");
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(5), ShardRecoveryTarget::stopped(&handle)).await
+            .expect("its receiver went with the engine");
+        let (handle, _receiver) = crate::app_engine::AppEngineHandle::for_test(vec![5; 32]);
+        handle.stop();
+        tokio::time::timeout(Duration::from_secs(5), ShardRecoveryTarget::stopped(&handle)).await
+            .expect("cancelled");
     }
 
     struct Archive {
