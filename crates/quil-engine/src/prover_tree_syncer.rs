@@ -49,6 +49,385 @@ pub trait ProverTreeSyncer: Send + Sync {
     async fn get_app_shard_frame(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<AppShardFrame>> {
         Ok(None)
     }
+
+    /// The headers of `filter`'s frame `frame_number` that the GLOBAL frames
+    /// `globals` carry, read in the order given, each with the number of the
+    /// GLOBAL frame carrying it: the certified headers members submitted for
+    /// the frame's work, a bounded set of distinct plausible copies
+    /// ([`plausible_carried_copy`]), one per copy apart from its attestation
+    /// field ([`carried_copy_digest`]), best first ([`rank_carried_copy`]).
+    /// `named`: the parent the frame after it names. `verify`, when given,
+    /// checks each copy's certificate before it is kept
+    /// ([`verify_carried_copy`]); a copy it refuses is dropped. With the
+    /// copies certified and those a frame rebuilt from failed to replay
+    /// ([`Self::reject_carried_copy`]), which the caller passes over.
+    /// Default empty for syncers that read no GLOBAL frames.
+    async fn carried_shard_headers(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _globals: &[u64],
+        _named: Option<[u8; 32]>,
+        _verify: Option<&CarriedVerifier>,
+    ) -> Result<CarriedHeaders> {
+        Ok(CarriedHeaders::default())
+    }
+
+    /// The answer [`Self::carried_shard_headers`] gives from what it
+    /// remembers of an earlier search, without reading GLOBAL frames;
+    /// `None` when it would read them. Asked first, so a rebuild answered
+    /// from memory never waits on the engine for its check.
+    fn cached_carried_shard_headers(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _named: Option<[u8; 32]>,
+    ) -> Option<Result<CarriedHeaders>> {
+        None
+    }
+
+    /// The frame rebuilt from the copy of `filter`'s frame `frame_number`
+    /// header with digest `copy` failed to replay: the next copy is tried.
+    fn reject_carried_copy(&self, _filter: &[u8], _frame_number: u64, _copy: CopyId) {}
+
+    /// Every copy [`Self::carried_shard_headers`] found for `filter`'s frame
+    /// `frame_number` failed to replay: drop them, so a later search reads
+    /// the GLOBAL frames again.
+    fn reject_carried_shard_headers(&self, _filter: &[u8], _frame_number: u64) {}
+}
+
+/// The copies of a shard frame's header GLOBAL frames carry
+/// ([`ProverTreeSyncer::carried_shard_headers`]): the digests
+/// ([`carried_copy_digest`]) of those whose check passed
+/// ([`verify_carried_copy`]), and of those a frame rebuilt from failed to
+/// replay.
+/// `refused`: copies the search refused when it checked them;
+/// `passed_over`: copies it passed over as refused or rejected before. A
+/// search that found nothing while frames of its range went unread or
+/// copies unchecked answers with an error instead, a wait.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CarriedHeaders {
+    pub copies: Vec<(u64, quil_types::proto::global::FrameHeader)>,
+    pub certified: Vec<CopyId>,
+    pub rejected: Vec<CopyId>,
+    pub refused: usize,
+    pub passed_over: usize,
+}
+
+/// What checking a carried copy found ([`verify_carried_copy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyVerdict {
+    /// Its certificate and deterministic output verify, and its storage
+    /// attestation, when it holds one, in full: possession included.
+    Certified,
+    /// Its certificate and output verify, its attestation does not: the copy
+    /// with that field cleared is the frame's.
+    AttestationRefused,
+    /// Its certificate and output verify, its attestation cannot be checked
+    /// now (registrations unavailable): only the cleared copy is kept.
+    AttestationUnavailable,
+    /// Its output or structure does not verify: the copy is no frame's.
+    Refused,
+    /// Its output and structure verify, its certificate does not, here and
+    /// now: the committee or session records it needs may be missing from
+    /// this node's view, so the copy is passed over only for a while.
+    CertificateRefused,
+    /// They cannot be checked now (a GLOBAL frame or committee unavailable).
+    Unavailable,
+}
+
+/// Checks a carried copy as replay would ([`verify_carried_copy`]).
+pub type CarriedVerifier = std::sync::Arc<
+    dyn Fn(quil_types::proto::global::FrameHeader) -> std::pin::Pin<Box<dyn std::future::Future<Output = CopyVerdict> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The frame `header` rebuilds, checked as archive replay checks a
+/// certified frame. Its structure and deterministic output first, without
+/// its certificate, so a copy whose output does not follow from its header
+/// is refused before any historical committee is prepared for it. The
+/// output is computed from public inputs, the anchor among them: it pins a
+/// named copy (whose output the frame after it names) to the genuine
+/// anchor, while an unnamed copy can carry a matching output for any
+/// anchor, which the search's per-anchor limit bounds.
+/// Then, after the same preparation as replay (the historical committee of
+/// a legacy certificate and, for a copy holding an attestation, the
+/// storage registrations it names), its certificate
+/// ([`crate::frame_validator::BlsAppFrameValidator::validate_certified_without_storage`]),
+/// which binds the output, and the attestation, in full. A certificate
+/// this node does not reproduce is a wait while a committee that could
+/// decide it could not be had (the preparation, not the copy, may be at
+/// fault), and else refused only for a while
+/// ([`CopyVerdict::CertificateRefused`]).
+pub async fn verify_carried_copy(
+    validator: std::sync::Arc<crate::frame_validator::BlsAppFrameValidator>,
+    header: quil_types::proto::global::FrameHeader,
+) -> CopyVerdict {
+    let attested = !header.storage_attestation.is_empty();
+    let cleared_header = quil_types::proto::global::FrameHeader { storage_attestation: Vec::new(), ..header.clone() };
+    let (cleared, _) = crate::app_handoff::frame_from_carried_header(&cleared_header);
+    let (full, missing) = crate::app_handoff::frame_from_carried_header(&header);
+    let decoded = attested && missing.is_none();
+    // Without the GLOBAL anchor the output check below is itself a wait.
+    let _ = validator.prepare_global_anchor(&cleared).await;
+    let structure = {
+        let (validator, mut bare) = (validator.clone(), cleared.clone());
+        if let Some(header) = bare.header.as_mut() {
+            header.public_key_signature_bls48581 = None;
+        }
+        tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_linked_without_storage(&bare)))
+        })
+        .await
+    };
+    if let Some(verdict) = structure_verdict(structure.unwrap_or_else(|_| Ok(Err(
+        quil_types::error::QuilError::Internal("carried copy check ended early".into())))))
+    {
+        return verdict;
+    }
+    // In its own task: a search that runs out of time leaves it to finish,
+    // and the committee it rebuilds serves the next search.
+    let committee = {
+        let (validator, cleared) = (validator.clone(), cleared.clone());
+        tokio::spawn(async move { validator.prepare_historical_committee(&cleared).await }).await
+            .unwrap_or_else(|error| Err(quil_types::error::QuilError::Internal(format!("committee preparation: {error}"))))
+    };
+    let history = match decoded {
+        true => Some(validator.prepare_storage_history(&full).await),
+        false => None,
+    };
+    let could_cure = cleared.header.as_ref().is_some_and(|header| validator.legacy_committee_applies(header));
+    let checked = tokio::task::spawn_blocking(move || {
+        let check = |run: &dyn Fn() -> Result<bool>| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+                Err(quil_types::error::QuilError::Internal("carried copy check panicked".into()))
+            })
+        };
+        let certified = check(&|| validator.validate_certified_without_storage(&cleared));
+        let possession = match (&certified, decoded) {
+            (Ok(true), true) => Some(check(&|| quil_types::consensus::AppFrameValidator::validate(&*validator, &full))),
+            _ => None,
+        };
+        (certified, possession)
+    })
+    .await;
+    let Ok((certified, possession)) = checked else { return CopyVerdict::Unavailable };
+    match certified {
+        Ok(true) => {}
+        Err(error) if !refuses_frame(&error) => return CopyVerdict::Unavailable,
+        // Refused for its certificate alone, its structure and output sound.
+        // A committee that could not be had is a wait only when one could
+        // decide this certificate; else this node's view (a session or
+        // committee it lacks) may be at fault, not the copy.
+        _ if committee.is_err() && could_cure => return CopyVerdict::Unavailable,
+        _ => return CopyVerdict::CertificateRefused,
+    }
+    if !attested {
+        return CopyVerdict::Certified;
+    }
+    match possession {
+        Some(Ok(true)) => CopyVerdict::Certified,
+        _ if history.as_ref().is_some_and(|prepared| prepared.is_err()) => CopyVerdict::AttestationUnavailable,
+        Some(Err(error)) if !refuses_frame(&error) => CopyVerdict::AttestationUnavailable,
+        _ => CopyVerdict::AttestationRefused,
+    }
+}
+
+/// What the check of a copy's structure and output (`result`, a panic
+/// caught) says of it: `None` when it passes. Only a refusal of the copy
+/// refuses it; a panic, the check ending early, or an error of this node's
+/// (a GLOBAL frame it lacks, its own clock) is a wait.
+fn structure_verdict(result: std::thread::Result<Result<bool>>) -> Option<CopyVerdict> {
+    match result {
+        Ok(Ok(true)) => None,
+        Ok(Ok(false)) => Some(CopyVerdict::Refused),
+        Ok(Err(error)) if refuses_frame(&error) => Some(CopyVerdict::Refused),
+        _ => Some(CopyVerdict::Unavailable),
+    }
+}
+
+/// Where archive replay gets its [`CarriedVerifier`]: asked of the
+/// recovery target by the first rebuild that needs it, and again by later
+/// ones while it gives none, so a replay with every frame served never waits
+/// on the engine for it.
+#[derive(Default)]
+pub(crate) struct CarriedVerifierSource<'a> {
+    target: Option<&'a dyn ShardRecoveryTarget>,
+    verifier: tokio::sync::OnceCell<CarriedVerifier>,
+}
+
+impl<'a> CarriedVerifierSource<'a> {
+    pub(crate) fn of(target: &'a dyn ShardRecoveryTarget) -> Self {
+        Self { target: Some(target), verifier: Default::default() }
+    }
+
+    /// The verifier, asked for again by a later rebuild while the target
+    /// has not answered one.
+    async fn get(&self) -> Option<&CarriedVerifier> {
+        self.verifier.get_or_try_init(|| async {
+            match self.target {
+                Some(target) => target.carried_copy_verifier().await.ok_or(()),
+                None => Err(()),
+            }
+        }).await.ok()
+    }
+}
+
+/// Whether `header` can be `filter`'s frame `frame_number`, rebuilt from it:
+/// that frame's, with a certificate, committing to no requests. A cheap
+/// check before any copy is kept.
+pub fn plausible_carried_copy(header: &quil_types::proto::global::FrameHeader, filter: &[u8], frame_number: u64) -> bool {
+    header.address == filter
+        && header.frame_number == frame_number
+        && header.public_key_signature_bls48581.as_ref().is_some_and(|signature| !signature.signature.is_empty())
+        && crate::frame_validator::commits_no_requests(&header.requests_root)
+}
+
+/// Whether a copy anchored to GLOBAL frame `anchor` can be carried by GLOBAL
+/// frame `carried_by`: GLOBAL takes a shard header only while its anchor
+/// lies within [`STORAGE_ANCHOR_LOCKSTEP_WINDOW`](quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW)
+/// below the carrying frame. A copy anchored elsewhere is no copy GLOBAL
+/// executed. Nothing GLOBAL checks keeps a frame's anchor from lying below
+/// its predecessor's; that anchor only places the search.
+pub fn plausibly_anchored(anchor: u64, carried_by: u64) -> bool {
+    let lockstep = quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+    anchor < carried_by && carried_by - anchor <= 1 + lockstep
+}
+
+/// `header` with the fields of a commonware certificate's signature that
+/// neither the certificate nor the output binds cleared: its bitmask and
+/// public key. A planted copy with other bytes there is the same copy, and
+/// those bytes are not stored (`app_handoff::frame_from_carried_header`
+/// gives the key back the empty value members store). Its fee total in the
+/// canonical form members store (empty for zero, 16 bytes otherwise): the
+/// output binds its value, which any other length reads as zero, so a copy
+/// with other bytes there is the same copy too.
+pub fn normalize_carried_header(header: &mut quil_types::proto::global::FrameHeader) {
+    use quil_execution::global_intrinsic::frame_header::{fee_total_field, fee_total_from_bytes};
+    header.fee_total = fee_total_field(fee_total_from_bytes(&header.fee_total));
+    if let Some(signature) = header.public_key_signature_bls48581.as_mut()
+        .filter(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).is_some())
+    {
+        signature.bitmask.clear();
+        signature.public_key = None;
+    }
+}
+
+/// Whether `header`'s certificate is a legacy one (generation zero), whose
+/// check may rebuild a historical committee from GLOBAL history.
+pub fn carried_copy_is_legacy(header: &quil_types::proto::global::FrameHeader) -> bool {
+    header.public_key_signature_bls48581.as_ref()
+        .and_then(|signature| quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature))
+        .and_then(quil_cw_consensus::app_cert::unverified_finalization_epoch)
+        == Some(0)
+}
+
+/// The order carried copies are tried in, lowest first: a copy whose
+/// certificate verified, then one whose output `named` (the parent the frame
+/// after it names) is the digest of, then one with the committee's storage
+/// attestation. GLOBAL keeps a header whose execution failed, so anyone who
+/// gets a bundle into GLOBAL can plant a copy, and no certificate binds the
+/// attestation field.
+pub fn rank_carried_copy(
+    header: &quil_types::proto::global::FrameHeader,
+    named: Option<&[u8; 32]>,
+    certified: bool,
+) -> (bool, bool, bool) {
+    let is_named = named.is_some_and(|named| {
+        quil_crypto::poseidon::hash_bytes_to_32(&header.output).is_ok_and(|digest| digest == *named)
+    });
+    (!certified, !is_named, header.storage_attestation.is_empty())
+}
+
+/// The identity of a copy of a carried header ([`carried_copy_digest`]).
+pub type CopyId = [u8; 32];
+
+/// A digest of one copy of a carried header, apart from its storage
+/// attestation bytes and the unbound signature fields
+/// ([`normalize_carried_header`]): whether it holds an attestation counts,
+/// its bytes do not, so copies that vary only there are one copy, and the
+/// same copy with that field cleared another. SHA-256, so no copy can be
+/// ground to share another's identity and have the refusal of one pass
+/// over the other.
+pub fn carried_copy_digest(header: &quil_types::proto::global::FrameHeader) -> CopyId {
+    use sha2::Digest;
+    let mut cleared = quil_types::proto::global::FrameHeader { storage_attestation: Vec::new(), ..header.clone() };
+    normalize_carried_header(&mut cleared);
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"quil/app/carried-copy/v1");
+    hasher.update([u8::from(!header.storage_attestation.is_empty())]);
+    hasher.update(prost::Message::encode_to_vec(&cleared));
+    hasher.finalize().into()
+}
+
+/// The digest of `header` with its attestation field cleared: the copy
+/// apart from its attestation ([`carried_copy_digest`]).
+pub fn carried_copy_key(header: &quil_types::proto::global::FrameHeader) -> CopyId {
+    carried_copy_digest(&quil_types::proto::global::FrameHeader { storage_attestation: Vec::new(), ..header.clone() })
+}
+
+/// Why no carried copy is left to rebuild a frame from ([`next_carried_copy`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoCarriedCopy {
+    /// None carried; the reason a copy carried was refused, if one was.
+    NoneCarried(Option<String>),
+    /// Every copy carried failed to replay, its attestation cleared too.
+    Exhausted,
+}
+
+/// The copy of `filter`'s frame `number` header to rebuild it from next, with
+/// the GLOBAL frame carrying it and its digest: the best ranked
+/// ([`rank_carried_copy`]) not rejected, then each attested copy with that
+/// field cleared, validated on its certificate and output alone. A rejected
+/// copy stays in `carried` so its cleared form is still reached.
+pub fn next_carried_copy(
+    carried: &CarriedHeaders,
+    filter: &[u8],
+    number: u64,
+    named: Option<&[u8; 32]>,
+) -> std::result::Result<(u64, quil_types::proto::global::FrameHeader, CopyId), NoCarriedCopy> {
+    use quil_types::proto::global::FrameHeader;
+    let mut refused = None;
+    let mut usable: Vec<(u64, FrameHeader)> = Vec::new();
+    for (global, header) in &carried.copies {
+        let why = if header.address != filter || header.frame_number != number {
+            "carries another frame's header in its place"
+        } else if header.public_key_signature_bls48581.as_ref().is_none_or(|signature| signature.signature.is_empty()) {
+            "carries its header without a certificate"
+        } else if !crate::frame_validator::commits_no_requests(&header.requests_root) {
+            "carries its header, which commits requests only its body holds"
+        } else if !plausibly_anchored(header.global_frame_number, *global) {
+            "carries its header anchored where GLOBAL could not have taken it"
+        } else {
+            let mut header = header.clone();
+            normalize_carried_header(&mut header);
+            usable.push((*global, header));
+            continue;
+        };
+        refused.get_or_insert(format!("GLOBAL frame {global} {why}"));
+    }
+    if usable.is_empty() {
+        return Err(match carried.rejected.is_empty() {
+            true => NoCarriedCopy::NoneCarried(refused),
+            false => NoCarriedCopy::Exhausted,
+        });
+    }
+    usable.sort_by_key(|(_, header)| {
+        rank_carried_copy(header, named, carried.certified.contains(&carried_copy_digest(header)))
+    });
+    let cleared: Vec<(u64, FrameHeader)> = usable.iter()
+        .filter(|(_, header)| !header.storage_attestation.is_empty())
+        .map(|(global, header)| (*global, FrameHeader { storage_attestation: Vec::new(), ..header.clone() }))
+        .collect();
+    let mut tried = std::collections::HashSet::new();
+    usable.into_iter().chain(cleared)
+        .map(|(global, header)| {
+            let copy = carried_copy_digest(&header);
+            (global, header, copy)
+        })
+        .find(|(_, _, copy)| tried.insert(*copy) && !carried.rejected.contains(copy))
+        .ok_or(NoCarriedCopy::Exhausted)
 }
 
 /// A random delay of at most `max`. Every node receives a GLOBAL frame, and
@@ -114,6 +493,18 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     async fn committed_tip(&self) -> Option<u64> {
         None
     }
+    /// The GLOBAL frame the worker's materialized frame `frame` is anchored
+    /// to, read from its own store; `None` when unknown.
+    async fn materialized_anchor(&self, _frame: u64) -> Option<u64> {
+        None
+    }
+    /// Checks each copy of a frame's header GLOBAL carried, as replay would
+    /// ([`verify_carried_copy`]), before a search keeps it. `None` (no
+    /// engine, or it did not answer): a search keeps copies unchecked, named
+    /// ones first, and replay checks them; the next rebuild asks again.
+    async fn carried_copy_verifier(&self) -> Option<CarriedVerifier> {
+        None
+    }
     /// Whether this shard owes a re-anchor (`app_handoff::ReanchorMarker`),
     /// its head past its session's fence on frames the fence discarded, and
     /// whether this sync makes the attempt.
@@ -171,6 +562,12 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     }
     async fn committed_tip(&self) -> Option<u64> {
         crate::app_engine::AppEngineHandle::committed_tip(self).await
+    }
+    async fn materialized_anchor(&self, frame: u64) -> Option<u64> {
+        crate::app_engine::AppEngineHandle::materialized_anchor(self, frame).await
+    }
+    async fn carried_copy_verifier(&self) -> Option<CarriedVerifier> {
+        crate::app_engine::AppEngineHandle::carried_copy_verifier(self).await
     }
     async fn reanchor_fence(&self) -> ReanchorAttempt {
         crate::app_engine::AppEngineHandle::reanchor_fence(self).await
@@ -308,15 +705,25 @@ pub(crate) async fn recover_shard_from_latest(
         let (mut materialized, mut batches) = (from, 0);
         // A batch short of its target replayed all its frames: each frame
         // advances the replay or fails it.
+        let verify = CarriedVerifierSource::of(target);
+        // The anchor of the frame the last batch ended on, which `local`
+        // no longer is: at first, that of the frame materialized, from the
+        // worker's own store, as an earlier recovery may have rebuilt it from
+        // its carried header, which no archive serves.
+        let mut known = match local.header.as_ref().map(|header| header.frame_number) == Some(from) {
+            true => None,
+            false => target.materialized_anchor(from).await.map(|anchor| (from, anchor)),
+        };
         let replay = loop {
-            let replay = replay_shard_from_latest(
-                syncer, filter, local.clone(), materialized, committed_tip, |frame, child| async move {
+            let (replay, last) = replay_shard_from(
+                syncer, filter, local.clone(), materialized, known, committed_tip, &verify, |frame, child| async move {
                     let at = Instant::now();
                     let advanced = target.replay(frame, child).await;
                     replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
                     advanced
                 },
             ).await?;
+            known = last;
             batches += 1;
             if replay.materialized >= replay.target || !crate::recovery_turns::holds_turn(keep_turn, started.elapsed()) {
                 break replay;
@@ -533,6 +940,52 @@ async fn reanchor_shard_at_fence(
 const TIP_PROBES: usize = 3;
 const FRAME_ATTEMPTS: usize = 3;
 
+/// The largest frame archive replay takes.
+const MAX_REPLAY_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long a replay batch goes on rebuilding frames from their carried
+/// headers (each a search of GLOBAL frames, up to a minute and a half with
+/// the engine's answer) before it ends with what it materialized: well
+/// within a recovery turn's hold limit
+/// ([`crate::recovery_turns::MAX_TURN_HOLD`]).
+const REBUILT_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// GLOBAL frames read at most per search for the header of a shard frame no
+/// archive serves. Members submit a finalized frame's header within a few
+/// GLOBAL frames (seven to nine for the frames no archive served on
+/// 2026-10-23).
+pub const CARRIED_HEADER_WINDOW: u64 = 64;
+/// GLOBAL frames searched at most for one frame's header, over successive
+/// searches, each reading frames the ones before it read without a copy.
+pub const CARRIED_HEADER_SPAN: u64 = 4096;
+
+/// The GLOBAL frames that can carry the header of a shard frame, in the
+/// order to read them, from the GLOBAL frames its predecessor and its
+/// successor (when known) are anchored to. GLOBAL frame `g` takes a shard
+/// header only while that header's anchor is within
+/// [`STORAGE_ANCHOR_LOCKSTEP_WINDOW`](quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW)
+/// below `g` ([`plausibly_anchored`]); members anchor a frame no earlier
+/// than its predecessor and no later than its successor, which no GLOBAL
+/// check enforces, so these anchors only place the search. A range longer
+/// than [`CARRIED_HEADER_WINDOW`] is read in this order over successive
+/// searches: its top half-window from the top down, for a shard that paused
+/// before the frame, its bottom half-window, for one that paused after it,
+/// then the rest from the bottom up, at most [`CARRIED_HEADER_SPAN`] in all.
+pub fn carried_header_globals(predecessor: u64, successor: Option<u64>) -> Vec<u64> {
+    let lockstep = quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+    let from = predecessor.saturating_add(1);
+    let through = match successor {
+        Some(successor) => successor.max(predecessor).saturating_add(1 + lockstep),
+        None => from.saturating_add(CARRIED_HEADER_WINDOW - 1),
+    };
+    if through - from < CARRIED_HEADER_WINDOW {
+        return (from..=through).collect();
+    }
+    let half = CARRIED_HEADER_WINDOW / 2;
+    let middle = (from + half..=through - half).take((CARRIED_HEADER_SPAN - CARRIED_HEADER_WINDOW) as usize);
+    (through - half + 1..=through).rev().chain(from..from + half).chain(middle).collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ShardReplay {
     pub materialized: u64,
@@ -564,6 +1017,162 @@ async fn fetch_shard_frame(
     }
 }
 
+/// Frame `number` of `filter`, which no archive serves, rebuilt from the
+/// certified header a GLOBAL frame carries, when that header commits to no
+/// requests ([`crate::app_handoff::frame_from_carried_header`]), with the
+/// digest of the copy used. The frame's certificate binds its output and the
+/// output binds its requests root and storage attestation root, so the
+/// header and the committee's storage attestation it carries are the body;
+/// the engine validates the frame as any certified one, possession included.
+/// A header carried without the attestation still rebuilds the frame, which
+/// is then validated on its certificate and output alone
+/// ([`crate::frame_validator::empty_without_attestation`]). Archives that
+/// executed such a frame from that header never stored a body to serve, and
+/// replay stopped there for good (shard …0c1db0 frame 14372, carried by
+/// GLOBAL 924341, 2026-10-23).
+///
+/// `anchor`: the GLOBAL frame the frame before it is anchored to; `None`
+/// reads that frame from an archive. The frame after it, read too, bounds
+/// the search ([`carried_header_globals`]). Of the copies carried, one whose
+/// output that frame names comes first, then one with the attestation, then
+/// the attested copies with their attestation field cleared: no certificate
+/// binds that field, and GLOBAL's audit of a wrong one does not refuse the
+/// frame, so a copy whose attestation fails is followed by one without it.
+/// A copy whose frame failed to replay is passed over; once every copy has,
+/// the GLOBAL frames are searched again later. `Err` says why nothing was
+/// rebuilt.
+async fn rebuild_from_carried_header(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    number: u64,
+    anchor: Option<u64>,
+    ceiling: Option<u64>,
+    verify: &CarriedVerifierSource<'_>,
+) -> std::result::Result<(AppShardFrame, CopyId), String> {
+    let neighbour = |offset: i64| async move {
+        let neighbour = number.checked_add_signed(offset)?;
+        fetch_shard_frame(syncer, filter, neighbour, FRAME_ATTEMPTS).await.ok().flatten()
+            .and_then(|frame| frame.header)
+            .filter(|header| header.address == filter && header.frame_number == neighbour)
+    };
+    let anchor = match anchor {
+        Some(anchor) => Some(anchor),
+        None => neighbour(-1).await.map(|header| header.global_frame_number),
+    };
+    let Some(from) = anchor.filter(|&anchor| anchor > 0) else {
+        return Err("the GLOBAL frame its predecessor is anchored to is unknown".into());
+    };
+    let successor = neighbour(1).await;
+    // Without the frame after it, the tip the archive serves bounds the search.
+    let bound = successor.as_ref().map(|header| header.global_frame_number).or(ceiling);
+    let globals = carried_header_globals(from, bound);
+    let (low, high) = (globals.iter().min().copied().unwrap_or(from), globals.iter().max().copied().unwrap_or(from));
+    // A range cut at CARRIED_HEADER_SPAN says how much of it is searched.
+    let span = match (high - low + 1) as usize > globals.len() {
+        true => format!("{low}..={high} ({} of them searched)", globals.len()),
+        false => format!("{low}..={high}"),
+    };
+    let named = successor.and_then(|header| <[u8; 32]>::try_from(header.parent_selector.as_slice()).ok());
+    let carried = match syncer.cached_carried_shard_headers(filter, number, named) {
+        Some(answer) => answer,
+        None => syncer.carried_shard_headers(filter, number, &globals, named, verify.get().await).await,
+    }
+    .map_err(|error| format!("the GLOBAL frames {span} that may carry its header are unavailable: {error}"))?;
+    let (global, header, copy) = match next_carried_copy(&carried, filter, number, named.as_ref()) {
+        Ok(next) => next,
+        Err(NoCarriedCopy::NoneCarried(refused)) => {
+            return Err(refused.unwrap_or_else(|| match carried.refused + carried.passed_over {
+                0 => format!("no GLOBAL frame {span} carries its header"),
+                _ => format!("GLOBAL frames {span} carry only copies of its header refused ({} when checked, {} \
+                     passed over as refused before)", carried.refused, carried.passed_over),
+            }));
+        }
+        Err(NoCarriedCopy::Exhausted) => {
+            syncer.reject_carried_shard_headers(filter, number);
+            return Err(format!(
+                "every header GLOBAL frames {span} carry for it failed to replay; they are read again after the \
+                 retry interval"
+            ));
+        }
+    };
+    let certified = carried.certified.contains(&carried_copy_digest(&header));
+    let (frame, missing) = crate::app_handoff::frame_from_carried_header(&header);
+    if first_rebuild(filter, number, copy) {
+        match &missing {
+            None => tracing::info!(filter = %hex::encode(filter), frame = number, global_frame = global,
+                attested = frame.storage_attestation.is_some(), certified, passed_over = carried.rejected.len(),
+                "archive replay rebuilt an empty shard frame from the certified header GLOBAL carried, \
+                 with its committee's storage attestation: no archive serves its body"),
+            Some(reason) => tracing::warn!(filter = %hex::encode(filter), frame = number, global_frame = global,
+                %reason, certified, passed_over = carried.rejected.len(),
+                "archive replay rebuilt an empty shard frame from the certified header GLOBAL carried, \
+                 without its storage attestation: no archive serves its body, and this worker validates \
+                 it on its certificate and output alone"),
+        }
+    }
+    Ok((frame, copy))
+}
+
+/// Whether `error` refuses a replayed frame (its certificate, output,
+/// possession proof or link), rather than a wait on something unavailable.
+/// The validator reports a GLOBAL frame this node lacks (the anchor its
+/// output or attestation is checked against) as a `Crypto` error, and a
+/// frame timestamp ahead of this node's clock as an `InvalidArgument` one,
+/// which its other callers treat as refusals; for archive replay and the
+/// copies it rebuilds from, they are waits.
+pub(crate) fn refuses_frame(error: &quil_types::error::QuilError) -> bool {
+    use quil_types::error::QuilError;
+    match error {
+        QuilError::Crypto(reason) => !(reason.contains("unavailable")
+            && (reason.contains("anchored global frame") || reason.contains("storage attestation: global frame"))),
+        // Measured against this node's clock, not the frame's history.
+        QuilError::InvalidArgument(reason) => !reason.contains("too far in the future"),
+        QuilError::InvalidSignature(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether `error` names frame `number` as replay does
+/// ("archive replay frame 5577: …", `app_engine::refusal_of`): a refusal of
+/// one frame in a replay batch says nothing of the others.
+fn names_frame(error: &quil_types::error::QuilError, number: u64) -> bool {
+    error.to_string().contains(&format!("archive replay frame {number}:"))
+}
+
+/// Whether the rebuild of `filter`'s frame `number` from copy `copy` is new
+/// to this process, which logs it once: the last 64 rebuilds are remembered.
+fn first_rebuild(filter: &[u8], number: u64, copy: CopyId) -> bool {
+    static REBUILT: std::sync::Mutex<std::collections::VecDeque<(Vec<u8>, u64, CopyId)>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut rebuilt = REBUILT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if rebuilt.iter().any(|(shard, frame, used)| shard == filter && *frame == number && *used == copy) {
+        return false;
+    }
+    if rebuilt.len() >= 64 {
+        rebuilt.pop_front();
+    }
+    rebuilt.push_back((filter.to_vec(), number, copy));
+    true
+}
+
+/// [`replay_shard_from`] knowing no anchor but `local`'s.
+#[cfg(test)]
+pub(crate) async fn replay_shard_from_latest<F, Fut>(
+    syncer: &dyn ProverTreeSyncer,
+    filter: &[u8],
+    local: AppShardFrame,
+    materialized: u64,
+    committed: Option<u64>,
+    verify: &CarriedVerifierSource<'_>,
+    replay: F,
+) -> Result<ShardReplay>
+where
+    F: FnMut(AppShardFrame, Vec<AppShardFrame>) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    replay_shard_from(syncer, filter, local, materialized, None, committed, verify, replay).await.map(|(replay, _)| replay)
+}
+
 /// Repair a materialized worker by replaying a bounded number of certified
 /// frames through its owning engine. Tree-only fast-forward loses fee, spend,
 /// settlement and accumulator history and can race normal materialization.
@@ -573,20 +1182,29 @@ async fn fetch_shard_frame(
 /// none, while it or another holds the frames, so one archive's answer alone
 /// never ends recovery below what GLOBAL has executed. Every frame is still
 /// authenticated by `replay`.
-pub(crate) async fn replay_shard_from_latest<F, Fut>(
+///
+/// `known`: the GLOBAL frame a frame replayed earlier is anchored to (frame,
+/// anchor); the answer carries that of the frame it materialized last, when
+/// known. A batch after one that ended on a frame rebuilt from its carried
+/// header, which no archive serves, still finds the GLOBAL frames after
+/// that frame's anchor.
+pub(crate) async fn replay_shard_from<F, Fut>(
     syncer: &dyn ProverTreeSyncer,
     filter: &[u8],
     local: AppShardFrame,
     mut materialized: u64,
+    known: Option<(u64, u64)>,
     committed: Option<u64>,
+    verify: &CarriedVerifierSource<'_>,
     mut replay: F,
-) -> Result<ShardReplay>
+) -> Result<(ShardReplay, Option<(u64, u64)>)>
 where
     F: FnMut(AppShardFrame, Vec<AppShardFrame>) -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
     use prost::Message;
     use quil_types::error::QuilError;
+    let batch_started = tokio::time::Instant::now();
     let height = |frame: &AppShardFrame| frame.header.as_ref().map_or(0, |h| h.frame_number);
     let committed = committed.unwrap_or(0);
     let mut remote: Option<AppShardFrame> = None;
@@ -616,6 +1234,13 @@ where
             return Err(error);
         }
     }
+    // The GLOBAL frame the frame at `materialized` is anchored to, when known
+    // here: a frame no archive serves is sought among the GLOBAL frames after it.
+    let anchor_of = |frame: &AppShardFrame| frame.header.as_ref().map(|header| header.global_frame_number);
+    let mut anchor = match height(&local) == materialized {
+        true => anchor_of(&local),
+        false => known.filter(|&(frame, _)| frame == materialized).map(|(_, anchor)| anchor),
+    };
     let archive_tip = remote.as_ref().map(height);
     let tip = match remote {
         Some(remote) if height(&remote) >= height(&local) => remote,
@@ -625,6 +1250,10 @@ where
         return Err(QuilError::InvalidArgument("wrong-shard archive replay tip".into()));
     }
     let tip_height = height(&tip);
+    // The GLOBAL frame the archive's tip is anchored to, which bounds the
+    // search for a frame below the tip: a frame above it (GLOBAL committed
+    // beyond the archive) has no such bound.
+    let ceiling = anchor_of(&tip).filter(|&anchor| anchor > 0);
     let target = tip_height.max(committed);
     if archive_tip.unwrap_or(0) < committed && materialized < committed {
         tracing::info!(filter = %hex::encode(filter), materialized, ?archive_tip, committed_tip = committed,
@@ -633,17 +1262,37 @@ where
     for _ in 0..32 {
         if materialized >= target { break; }
         let next = materialized + 1;
+        // Frames of this batch rebuilt from carried headers, and the copies used.
+        let mut rebuilt = Vec::new();
         let frame = if next == tip_height {
             tip.clone()
         } else {
-            fetch_shard_frame(syncer, filter, next, FRAME_ATTEMPTS).await?.ok_or_else(|| {
-                QuilError::ExecutionUnavailable(format!(
-                    "archive replay is missing shard frame {next} (archive tip {archive_tip:?}, committed {committed})"
-                ))
-            })?
+            match fetch_shard_frame(syncer, filter, next, FRAME_ATTEMPTS).await? {
+                Some(frame) => frame,
+                None => {
+                    let ceiling = ceiling.filter(|_| next < tip_height);
+                    let (frame, copy) = rebuild_from_carried_header(syncer, filter, next, anchor, ceiling, verify).await.map_err(|why| {
+                        QuilError::ExecutionUnavailable(format!(
+                            "archive replay is missing shard frame {next} (archive tip {archive_tip:?}, committed {committed}): {why}"
+                        ))
+                    })?;
+                    rebuilt.push((next, copy));
+                    frame
+                }
+            }
+        };
+        // A frame rebuilt from a carried copy that is itself invalid or
+        // oversized never reaches replay: its copy is passed over here.
+        let reject_rebuilt = |rebuilt: &[(u64, CopyId)], number: u64| {
+            for &(rebuilt_number, copy) in rebuilt {
+                if rebuilt_number == number {
+                    syncer.reject_carried_copy(filter, number, copy);
+                }
+            }
         };
         if frame.header.as_ref().is_none_or(|h| h.address != filter || h.frame_number != next)
-            || frame.encoded_len() > 16 * 1024 * 1024 {
+            || frame.encoded_len() > MAX_REPLAY_FRAME_BYTES {
+            reject_rebuilt(&rebuilt, next);
             return Err(QuilError::InvalidArgument("invalid or oversized archive replay frame".into()));
         }
         let certified = |frame: &AppShardFrame| frame.header.as_ref()
@@ -662,13 +1311,27 @@ where
                     .ok_or_else(|| QuilError::ExecutionUnavailable(
                         "archive replay has no certified descendant within its target".into()))?;
                 let child = if number == tip_height { tip.clone() } else {
-                    fetch_shard_frame(syncer, filter, number, FRAME_ATTEMPTS).await?
-                        .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
-                            "archive replay is missing descendant frame {number}")))?
+                    match fetch_shard_frame(syncer, filter, number, FRAME_ATTEMPTS).await? {
+                        Some(child) => child,
+                        None => {
+                            let below = anchor_of(descendants.last().unwrap_or(&frame));
+                            let ceiling = ceiling.filter(|_| number < tip_height);
+                            let (child, copy) = rebuild_from_carried_header(syncer, filter, number, below, ceiling, verify).await.map_err(|why| {
+                                QuilError::ExecutionUnavailable(format!(
+                                    "archive replay is missing descendant frame {number}: {why}"))
+                            })?;
+                            rebuilt.push((number, copy));
+                            child
+                        }
+                    }
                 };
                 bytes = bytes.saturating_add(child.encoded_len());
-                if child.header.as_ref().is_none_or(|h| h.address != filter || h.frame_number != number)
-                    || bytes > crate::frame_validator::MAX_REPLAY_CHAIN_BYTES {
+                let invalid = child.header.as_ref().is_none_or(|h| h.address != filter || h.frame_number != number)
+                    || child.encoded_len() > MAX_REPLAY_FRAME_BYTES;
+                if invalid || bytes > crate::frame_validator::MAX_REPLAY_CHAIN_BYTES {
+                    if invalid {
+                        reject_rebuilt(&rebuilt, number);
+                    }
                     return Err(QuilError::InvalidArgument("invalid or oversized archive replay chain".into()));
                 }
                 let terminal = certified(&child);
@@ -679,13 +1342,44 @@ where
                 return Err(QuilError::ExecutionUnavailable("archive replay certified descendant limit reached".into()));
             }
         }
-        let advanced = replay(frame, descendants).await?;
-        if advanced < next {
-            return Err(QuilError::ExecutionUnavailable("archive replay did not materialize its frame".into()));
-        }
+        let last = descendants.last().unwrap_or(&frame);
+        let (last_number, last_anchor) = (height(last), anchor_of(last));
+        let alone = descendants.is_empty();
+        let replayed = replay(frame, descendants).await.and_then(|advanced| match advanced < next {
+            true => Err(QuilError::ExecutionUnavailable("archive replay did not materialize its frame".into())),
+            false => Ok(advanced),
+        });
+        let advanced = match replayed {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                // Only a refusal rejects a copy: GLOBAL or registrations
+                // unavailable, or an archive read failing, says nothing of it.
+                // A batch of several frames rejects the copy of the frame the
+                // refusal names; a refusal naming none rejects only a frame
+                // replayed alone.
+                if refuses_frame(&error) {
+                    for &(number, copy) in &rebuilt {
+                        if (alone && number == next) || names_frame(&error, number) {
+                            syncer.reject_carried_copy(filter, number, copy);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+        anchor = if advanced == last_number { last_anchor } else { None };
         materialized = advanced;
+        // Each frame rebuilt from a carried header costs a search of GLOBAL
+        // frames: past the budget the batch ends with what it materialized,
+        // so a run of such frames hands the recovery turn back in time; the
+        // next batch goes on from this frame's anchor.
+        if !rebuilt.is_empty() && batch_started.elapsed() >= REBUILT_BATCH_BUDGET {
+            tracing::info!(filter = %hex::encode(filter), materialized, target, elapsed_secs = batch_started.elapsed().as_secs(),
+                "archive replay batch ends early after rebuilding frames from their carried headers; the next recovery turn goes on");
+            break;
+        }
     }
-    Ok(ShardReplay { materialized, archive_tip, target })
+    Ok((ShardReplay { materialized, archive_tip, target }, anchor.map(|anchor| (materialized, anchor))))
 }
 
 /// The base state of a session based at frame 0 of which GLOBAL executed no
@@ -1247,7 +1941,7 @@ mod tests {
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
         let replayed = Arc::new(Mutex::new(Vec::new()));
         let seen = replayed.clone();
-        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None,
+        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None, &CarriedVerifierSource::default(),
             move |frame, _child| {
                 let height = frame.header.unwrap().frame_number;
                 seen.lock().unwrap().push(height);
@@ -1282,7 +1976,7 @@ mod tests {
     async fn archive_replay_hands_an_uncertified_frame_its_certified_child() {
         let replayed = Arc::new(Mutex::new(Vec::new()));
         let seen = replayed.clone();
-        let result = replay_shard_from_latest(&BareArchive, &[5; 32], frame(130), 130, None,
+        let result = replay_shard_from_latest(&BareArchive, &[5; 32], frame(130), 130, None, &CarriedVerifierSource::default(),
             move |frame, child| {
                 let height = frame.header.unwrap().frame_number;
                 seen.lock().unwrap().push((height, child.into_iter().map(|child| child.header.unwrap().frame_number).collect::<Vec<_>>()));
@@ -1314,7 +2008,7 @@ mod tests {
         let archive = ChainArchive { missing: None, wrong_shard: false, unsigned_end: 132 };
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
-        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None,
+        let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None, &CarriedVerifierSource::default(),
             move |frame, descendants| {
                 let height = frame.header.unwrap().frame_number;
                 seen.lock().unwrap().push((height, descendants.iter()
@@ -1335,7 +2029,7 @@ mod tests {
             ChainArchive { missing: Some(132), wrong_shard: false, unsigned_end: 132 },
             ChainArchive { missing: None, wrong_shard: true, unsigned_end: 132 },
         ] {
-            assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None,
+            assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, None, &CarriedVerifierSource::default(),
                 |_, _| async { panic!("incomplete chain must not reach replay") }).await.is_err());
         }
     }
@@ -1344,10 +2038,597 @@ mod tests {
     async fn archive_replay_stops_on_engine_rejection_and_never_skips_the_gap() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
-        assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None,
+        assert!(replay_shard_from_latest(&archive, &[5; 32], frame(130), 129, None, &CarriedVerifierSource::default(),
             |_, _| async { Err(quil_types::error::QuilError::InvalidSignature("rejected certificate".into())) }
         ).await.is_err());
         assert_eq!(*calls.lock().unwrap(), ["fetch 0", "fetch 130"]);
+    }
+
+    /// [`ChainArchive`] missing frame `missing`, whose frames are anchored to
+    /// GLOBAL frame 9000 plus their number, and `pause` more from `missing`
+    /// on; GLOBAL frames carry `carried` as the missing frame's headers, and
+    /// the frame after it names `names` as its parent when set. `searches`:
+    /// each GLOBAL search, as the frame sought and the GLOBAL frames read;
+    /// `rejected_copies`: the copies rejected; `rejected`: the frames all of
+    /// whose copies were. `tip`: the frame it reports as its tip (200 unset);
+    /// `refused`, `passed_over`: the copies each search says it refused, and
+    /// passed over as refused before.
+    struct CarryingArchive {
+        chain: ChainArchive,
+        missing: u64,
+        pause: u64,
+        names: Option<Vec<u8>>,
+        carried: Vec<(u64, quil_types::proto::global::FrameHeader)>,
+        searches: Mutex<Vec<(u64, Vec<u64>)>>,
+        rejected_copies: Mutex<Vec<CopyId>>,
+        rejected: Mutex<Vec<u64>>,
+        asked_named: Mutex<Vec<Option<[u8; 32]>>>,
+        also_missing: Option<u64>,
+        tip: Option<u64>,
+        refused: usize,
+        passed_over: usize,
+        /// Whether searches are answered from memory.
+        cached: bool,
+        /// How long each search takes.
+        delay: Option<std::time::Duration>,
+    }
+
+    impl CarryingArchive {
+        fn new(missing: u64, carried: Vec<(u64, quil_types::proto::global::FrameHeader)>) -> Self {
+            Self { chain: ChainArchive { missing: Some(missing), wrong_shard: false, unsigned_end: 0 }, missing,
+                pause: 0, names: None, carried, searches: Mutex::new(Vec::new()),
+                rejected_copies: Mutex::new(Vec::new()), rejected: Mutex::new(Vec::new()),
+                asked_named: Mutex::new(Vec::new()), also_missing: None, tip: None, refused: 0, passed_over: 0,
+                cached: false, delay: None }
+        }
+    }
+
+    /// [`frame`] anchored to GLOBAL frame 9000 plus its number.
+    fn anchored(mut frame: AppShardFrame) -> AppShardFrame {
+        let header = frame.header.as_mut().unwrap();
+        header.global_frame_number = 9000 + header.frame_number;
+        frame
+    }
+
+    /// Frame `number`'s header as members submit it to GLOBAL: certified,
+    /// committing to no requests.
+    fn carried_header(number: u64) -> quil_types::proto::global::FrameHeader {
+        let mut header = anchored(frame(number)).header.unwrap();
+        header.requests_root = vec![0; 32];
+        header
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for CarryingArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn get_app_shard_frame(&self, filter: &[u8], number: u64) -> Result<Option<AppShardFrame>> {
+            let number = match (number, self.tip) {
+                (0, Some(tip)) => tip,
+                _ => number,
+            };
+            if self.also_missing == Some(number) {
+                return Ok(None);
+            }
+            Ok(self.chain.get_app_shard_frame(filter, number).await?.map(anchored).map(|mut frame| {
+                let header = frame.header.as_mut().unwrap();
+                if number >= self.missing {
+                    header.global_frame_number += self.pause;
+                }
+                if number == self.missing + 1 {
+                    header.parent_selector = self.names.clone().unwrap_or_default();
+                }
+                frame
+            }))
+        }
+        async fn sync_shard_tree(&self, _: &[u8], _: &[Vec<u8>]) -> Result<bool> { unreachable!() }
+        async fn carried_shard_headers(&self, _: &[u8], number: u64, globals: &[u64], named: Option<[u8; 32]>,
+            _: Option<&CarriedVerifier>) -> Result<CarriedHeaders> {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.searches.lock().unwrap().push((number, globals.to_vec()));
+            self.asked_named.lock().unwrap().push(named);
+            Ok(CarriedHeaders {
+                copies: self.carried.clone(), certified: Vec::new(), rejected: self.rejected_copies.lock().unwrap().clone(),
+                refused: self.refused, passed_over: self.passed_over,
+            })
+        }
+        fn cached_carried_shard_headers(&self, _: &[u8], _: u64, _: Option<[u8; 32]>) -> Option<Result<CarriedHeaders>> {
+            self.cached.then(|| Ok(CarriedHeaders { copies: self.carried.clone(), ..Default::default() }))
+        }
+        fn reject_carried_copy(&self, _: &[u8], _: u64, copy: CopyId) {
+            self.rejected_copies.lock().unwrap().push(copy);
+        }
+        fn reject_carried_shard_headers(&self, _: &[u8], number: u64) {
+            self.rejected.lock().unwrap().push(number);
+        }
+    }
+
+    /// Replay from `local` at `materialized` to the 32-frame batch's end,
+    /// with the frames replayed; the replay of a frame `refuse` names fails.
+    async fn replay_carrying(archive: &CarryingArchive, local: u64, materialized: u64, refuse: fn(&AppShardFrame) -> bool)
+        -> (Result<ShardReplay>, Vec<AppShardFrame>) {
+        let replayed = Arc::new(Mutex::new(Vec::new()));
+        let seen = replayed.clone();
+        let result = replay_shard_from_latest(archive, &[5; 32], anchored(frame(local)), materialized, None, &CarriedVerifierSource::default(),
+            move |frame, descendants| {
+                assert!(descendants.is_empty());
+                let height = frame.header.as_ref().unwrap().frame_number;
+                let refused = refuse(&frame);
+                seen.lock().unwrap().push(frame);
+                async move {
+                    match refused {
+                        true => Err(quil_types::error::QuilError::InvalidArgument("refused".into())),
+                        false => Ok(height),
+                    }
+                }
+            }).await;
+        let replayed = replayed.lock().unwrap().clone();
+        (result, replayed)
+    }
+
+    /// The number of `frame`.
+    fn number_of(frame: &AppShardFrame) -> u64 {
+        frame.header.as_ref().unwrap().frame_number
+    }
+
+    /// No archive serves an empty frame its archives executed from the
+    /// certified header GLOBAL carried (…0c1db0 frame 14372, carried by
+    /// GLOBAL 924341, 2026-10-23): replay rebuilds it from that header,
+    /// sought in the GLOBAL frames that can carry it, from the one after its
+    /// predecessor's anchor through GLOBAL's lockstep window above its
+    /// successor's, and goes on past it.
+    #[tokio::test]
+    async fn archive_replay_rebuilds_an_empty_frame_no_archive_serves_from_its_carried_header() {
+        // The predecessor's anchor is the local head's, or read from an archive.
+        for (local, missing) in [(130, 140), (130, 131), (135, 131)] {
+            let archive = CarryingArchive::new(missing, vec![(9000 + missing + 6, carried_header(missing))]);
+            let (result, replayed) = replay_carrying(&archive, local, 130, |_| false).await;
+            assert_eq!(result.unwrap().materialized, 162);
+            let from = 9000 + missing;
+            assert_eq!(*archive.searches.lock().unwrap(), [(missing, (from..=from + 14).collect::<Vec<_>>())]);
+            assert_eq!(replayed.iter().map(|frame| frame.header.as_ref().unwrap().frame_number).collect::<Vec<_>>(),
+                (131..=162).collect::<Vec<_>>());
+            let rebuilt = AppShardFrame { header: Some(carried_header(missing)), requests: vec![], storage_attestation: None };
+            assert_eq!(replayed[(missing - 131) as usize], rebuilt);
+            assert!(archive.rejected.lock().unwrap().is_empty());
+        }
+    }
+
+    /// GLOBAL takes a frame's header only within its lockstep window above
+    /// the frame's own anchor, which lies between its neighbours' anchors.
+    /// When a shard paused longer than the search window around the frame,
+    /// the top of that range is read first, from the top down, then its
+    /// bottom: a search from the predecessor's anchor up never reached the
+    /// header of a frame proposed after the pause. Then its middle, over
+    /// later searches, so a header carried there is reached too, within
+    /// [`CARRIED_HEADER_SPAN`] frames in all.
+    #[tokio::test]
+    async fn archive_replay_reads_the_global_frames_that_can_carry_a_header_after_a_pause() {
+        assert_eq!(carried_header_globals(9139, Some(9141)), (9140..=9154).collect::<Vec<_>>());
+        assert_eq!(carried_header_globals(9139, None), (9140..=9203).collect::<Vec<_>>());
+        let paused = carried_header_globals(9139, Some(9241));
+        assert_eq!(paused, (9223..=9254).rev().chain(9140..=9171).chain(9172..=9222).collect::<Vec<_>>());
+        let long = carried_header_globals(9139, Some(9139 + 100_000));
+        assert_eq!(long.len() as u64, CARRIED_HEADER_SPAN);
+        assert_eq!(long[CARRIED_HEADER_WINDOW as usize], 9140 + CARRIED_HEADER_WINDOW / 2, "the middle from the bottom up");
+
+        let mut header = carried_header(140);
+        header.global_frame_number += 100;
+        let mut archive = CarryingArchive::new(140, vec![(9247, header.clone())]);
+        archive.pause = 100;
+        let (result, replayed) = replay_carrying(&archive, 130, 130, |_| false).await;
+        assert_eq!(result.unwrap().materialized, 162);
+        assert_eq!(*archive.searches.lock().unwrap(), [(140, paused)]);
+        assert_eq!(replayed[9].header, Some(header));
+    }
+
+    /// Several members submit a frame's header. Replay takes the copy whose
+    /// output the frame after it names, then one holding the committee's
+    /// storage attestation, which the rebuilt frame then carries as its body
+    /// does; the header's own attestation field is left empty, as stored.
+    #[tokio::test]
+    async fn archive_replay_prefers_the_carried_header_its_successor_names_then_one_with_the_attestation() {
+        use prost::Message;
+        let attestation = quil_types::proto::global::StorageAttestation { openings: vec![Default::default()] };
+        let copy = |output: u8, attested: bool| {
+            let mut header = carried_header(140);
+            header.output = vec![output; 32];
+            if attested {
+                header.storage_attestation = attestation.encode_to_vec();
+            }
+            header
+        };
+        let carried = vec![(9141, copy(1, false)), (9142, copy(2, true)), (9143, copy(3, false))];
+        for (names, chosen) in [(None, 2), (Some(3), 3), (Some(2), 2)] {
+            let mut archive = CarryingArchive::new(140, carried.clone());
+            archive.names = names.map(|output| quil_crypto::poseidon::hash_bytes_to_32(&[output; 32]).unwrap().to_vec());
+            let (result, replayed) = replay_carrying(&archive, 130, 130, |_| false).await;
+            assert_eq!(result.unwrap().materialized, 162);
+            assert_eq!(replayed[9].header, Some(copy(chosen, false)));
+            assert_eq!(replayed[9].storage_attestation.is_some(), chosen == 2, "chose {chosen}");
+        }
+    }
+
+    /// No certificate binds a carried header's storage attestation field,
+    /// and GLOBAL's audit of a wrong one does not refuse the frame. A frame
+    /// rebuilt from a copy that fails to replay has that copy rejected, and
+    /// the next attempt takes another member's copy, else the attested copy
+    /// with its attestation cleared, which replays on its certificate and
+    /// output. Once every copy has failed, the GLOBAL frames are searched
+    /// again later. A failure of a frame served whole rejects nothing.
+    #[tokio::test]
+    async fn a_carried_copy_whose_frame_fails_to_replay_is_passed_over_for_the_next() {
+        use prost::Message;
+        let junk = quil_types::proto::global::StorageAttestation { openings: vec![Default::default()] }.encode_to_vec();
+        let attested = quil_types::proto::global::FrameHeader { storage_attestation: junk, ..carried_header(140) };
+        let attested_fails: fn(&AppShardFrame) -> bool = |frame| frame.storage_attestation.is_some();
+        let bare = AppShardFrame { header: Some(carried_header(140)), requests: vec![], storage_attestation: None };
+        for carried in [vec![(9146, attested.clone()), (9147, carried_header(140))], vec![(9146, attested.clone())]] {
+            let archive = CarryingArchive::new(140, carried);
+            let (result, replayed) = replay_carrying(&archive, 130, 130, attested_fails).await;
+            assert!(result.is_err());
+            assert!(replayed[9].storage_attestation.is_some(), "the attested copy first");
+            assert_eq!(*archive.rejected_copies.lock().unwrap(), [carried_copy_digest(&attested)]);
+            let (result, replayed) = replay_carrying(&archive, 139, 139, attested_fails).await;
+            assert_eq!(result.unwrap().materialized, 171);
+            assert_eq!(replayed[0], bare);
+            assert!(archive.rejected.lock().unwrap().is_empty());
+        }
+
+        let archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+        let (result, replayed) = replay_carrying(&archive, 130, 130, |frame| number_of(frame) == 140).await;
+        assert!(result.is_err());
+        assert_eq!(replayed.len(), 10);
+        assert_eq!(*archive.rejected_copies.lock().unwrap(), [carried_copy_digest(&carried_header(140))]);
+        let (result, _) = replay_carrying(&archive, 139, 139, |_| false).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.ends_with("every header GLOBAL frames 9140..=9154 carry for it failed to replay; \
+            they are read again after the retry interval"), "{error}");
+        assert_eq!(*archive.rejected.lock().unwrap(), [140]);
+
+        let archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+        let (result, _) = replay_carrying(&archive, 130, 130, |frame| number_of(frame) == 139).await;
+        assert!(result.is_err());
+        assert!(archive.rejected_copies.lock().unwrap().is_empty());
+    }
+
+    /// GLOBAL keeps a header whose execution failed, so anyone who gets a
+    /// bundle into GLOBAL can plant a copy of a frame's header, with any
+    /// output and attestation. A forged copy carried before the genuine one
+    /// is not taken: the copy whose output the frame after it names comes
+    /// first, and the search is told that name.
+    #[tokio::test]
+    async fn a_forged_copy_carried_before_the_genuine_one_is_not_taken() {
+        use prost::Message;
+        let junk = quil_types::proto::global::StorageAttestation { openings: vec![Default::default()] }.encode_to_vec();
+        let forged = quil_types::proto::global::FrameHeader {
+            output: vec![0x46; 32], storage_attestation: junk, ..carried_header(140)
+        };
+        let genuine = quil_types::proto::global::FrameHeader { output: vec![0x47; 32], ..carried_header(140) };
+        let named = quil_crypto::poseidon::hash_bytes_to_32(&genuine.output).unwrap();
+        let mut archive = CarryingArchive::new(140, vec![(9141, forged), (9146, genuine.clone())]);
+        archive.names = Some(named.to_vec());
+        let forged_fails: fn(&AppShardFrame) -> bool = |frame| frame.header.as_ref().unwrap().output == vec![0x46; 32];
+        let (result, replayed) = replay_carrying(&archive, 130, 130, forged_fails).await;
+        assert_eq!(result.unwrap().materialized, 162);
+        assert_eq!(replayed[9].header, Some(genuine));
+        assert!(archive.rejected_copies.lock().unwrap().is_empty());
+        assert_eq!(*archive.asked_named.lock().unwrap(), [Some(named)]);
+    }
+
+    /// A rebuilt frame whose replay waits on something unavailable (GLOBAL
+    /// frames, registrations, an archive read) has its copy kept: only a
+    /// refusal of the frame passes it over.
+    #[tokio::test]
+    async fn a_rebuilt_frame_whose_replay_waits_keeps_its_copy() {
+        let archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+        let result = replay_shard_from_latest(&archive, &[5; 32], anchored(frame(130)), 130, None, &CarriedVerifierSource::default(),
+            |frame, _| {
+                let height = number_of(&frame);
+                async move {
+                    match height {
+                        140 => Err(quil_types::error::QuilError::ExecutionUnavailable("anchor unavailable".into())),
+                        _ => Ok(height),
+                    }
+                }
+            }).await;
+        assert!(result.is_err());
+        assert!(archive.rejected_copies.lock().unwrap().is_empty());
+    }
+
+    /// A refusal in a replay batch rejects the copy of the frame it names:
+    /// "frame 140" names 140, not 14 or 1400.
+    #[test]
+    fn a_refusal_names_the_frame_it_refuses() {
+        use quil_types::error::QuilError;
+        let refusal = QuilError::InvalidArgument("archive replay frame 140: anchor does not link to predecessor".into());
+        assert!(names_frame(&refusal, 140));
+        assert!(!names_frame(&refusal, 14));
+        assert!(!names_frame(&refusal, 1400));
+        assert!(!names_frame(&QuilError::InvalidSignature("app shard frame BLS signature rejected".into()), 140));
+        let another = QuilError::InvalidArgument("archive replay frame 139: does not link to frame 140: parent".into());
+        assert!(!names_frame(&another, 140), "only the frame replay names first");
+        assert!(names_frame(&another, 139));
+    }
+
+    /// A frame rebuilt from a carried copy as the certified frame ending a
+    /// run of frames without certificates of their own is not replayed
+    /// alone: its copy is passed over when the refusal names it, as the
+    /// engine now names the frame it refuses (`app_engine::refusal_of`),
+    /// and kept when the refusal names another frame of the batch.
+    #[tokio::test]
+    async fn a_refusal_of_a_rebuilt_terminal_frame_rejects_its_copy() {
+        use quil_types::error::QuilError;
+        let named = crate::app_engine::refusal_of(140, QuilError::Crypto("app shard frame storage attestation rejected".into()));
+        assert_eq!(named.to_string(), QuilError::Crypto(
+            "archive replay frame 140: app shard frame storage attestation rejected".into()).to_string());
+        let wait = crate::app_engine::refusal_of(140, QuilError::ExecutionUnavailable("anchor unavailable".into()));
+        assert!(matches!(wait, QuilError::ExecutionUnavailable(reason) if reason == "anchor unavailable"));
+        for (refused, rejected) in [(140, true), (135, false)] {
+            let mut archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+            archive.chain.unsigned_end = 139;
+            let batches = Arc::new(Mutex::new(Vec::new()));
+            let seen = batches.clone();
+            let result = replay_shard_from_latest(&archive, &[5; 32], anchored(frame(130)), 130, None,
+                &CarriedVerifierSource::default(), move |frame, descendants| {
+                    seen.lock().unwrap().push((number_of(&frame), descendants.iter().map(number_of).collect::<Vec<_>>()));
+                    async move {
+                        Err::<u64, _>(crate::app_engine::refusal_of(refused, QuilError::Crypto("storage attestation rejected".into())))
+                    }
+                }).await;
+            assert!(result.is_err());
+            assert_eq!(*batches.lock().unwrap(), [(131, (132..=140).collect::<Vec<_>>())], "one batch, the rebuilt frame last");
+            let expected: Vec<CopyId> = if rejected { vec![carried_copy_digest(&carried_header(140))] } else { Vec::new() };
+            assert_eq!(*archive.rejected_copies.lock().unwrap(), expected, "refusal of frame {refused}");
+        }
+    }
+
+    /// A recovery target answering how carried copies are checked, or not.
+    struct AskedTarget(std::sync::atomic::AtomicUsize, bool);
+
+    #[async_trait]
+    impl ShardRecoveryTarget for AskedTarget {
+        fn materialized(&self) -> u64 { unreachable!() }
+        async fn replay(&self, _: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> { unreachable!() }
+        async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> { unreachable!() }
+        async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> { unreachable!() }
+        fn inherited(&self) { unreachable!() }
+        async fn carried_copy_verifier(&self) -> Option<CarriedVerifier> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let unchecked: CarriedVerifier = Arc::new(|_: quil_types::proto::global::FrameHeader| Box::pin(async { CopyVerdict::Unavailable }));
+            self.1.then_some(unchecked)
+        }
+    }
+
+    /// The engine is asked how to check carried copies only by the first
+    /// frame rebuilt from one, once per recovery: a replay with every frame
+    /// served never waits on it. An engine that gives no answer is asked
+    /// again by the next rebuild.
+    #[tokio::test]
+    async fn the_copy_check_is_asked_for_only_by_a_rebuild() {
+        let replay = |frame: AppShardFrame, _: Vec<AppShardFrame>| async move { Ok::<u64, quil_types::error::QuilError>(number_of(&frame)) };
+        for (answers, asks) in [(true, 1), (false, 2)] {
+            let asked = AskedTarget(std::sync::atomic::AtomicUsize::new(0), answers);
+            let source = CarriedVerifierSource::of(&asked);
+            let served = ChainArchive { missing: None, wrong_shard: false, unsigned_end: 0 };
+            assert_eq!(replay_shard_from_latest(&served, &[5; 32], frame(130), 130, None, &source, replay).await.unwrap().materialized, 162);
+            assert_eq!(asked.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+            for _ in 0..2 {
+                replay_shard_from_latest(&archive, &[5; 32], anchored(frame(130)), 130, None, &source, replay).await.unwrap();
+            }
+            assert_eq!(asked.0.load(std::sync::atomic::Ordering::SeqCst), asks, "answers: {answers}");
+        }
+    }
+
+    /// A batch that rebuilds frames from their carried headers, each a
+    /// search of GLOBAL frames, ends with what it materialized once its
+    /// budget has passed, rather than holding the recovery turn through a
+    /// long run of such frames; the next batch goes on from there.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_of_rebuilt_frames_ends_within_its_budget() {
+        let mut archive = CarryingArchive::new(140, vec![(9146, carried_header(140)), (9147, carried_header(141))]);
+        archive.also_missing = Some(141);
+        archive.delay = Some(REBUILT_BATCH_BUDGET / 2 + std::time::Duration::from_secs(10));
+        let (result, _) = replay_carrying(&archive, 130, 130, |_| false).await;
+        assert_eq!(result.unwrap().materialized, 141, "the batch ends after the frame that passed its budget");
+    }
+
+    /// A recovery whose worker's head is not its materialized frame (the
+    /// head a worker's lineage reports may lag) still knows that frame's
+    /// anchor, from the worker's own store: a frame rebuilt from its carried
+    /// header by an earlier recovery, which no archive serves, does not
+    /// leave the next one asking archives for it.
+    #[tokio::test]
+    async fn a_recovery_knows_the_anchor_of_the_frame_materialized_before() {
+        struct Anchored {
+            cursor: std::sync::atomic::AtomicU64,
+            anchors: Mutex<std::collections::HashMap<u64, u64>>,
+        }
+        #[async_trait]
+        impl ShardRecoveryTarget for Anchored {
+            fn materialized(&self) -> u64 { self.cursor.load(std::sync::atomic::Ordering::SeqCst) }
+            async fn replay(&self, frame: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+                let header = frame.header.unwrap();
+                self.anchors.lock().unwrap().insert(header.frame_number, header.global_frame_number);
+                self.cursor.store(header.frame_number, std::sync::atomic::Ordering::SeqCst);
+                Ok(header.frame_number)
+            }
+            async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> { unreachable!() }
+            async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> { unreachable!() }
+            fn inherited(&self) { unreachable!() }
+            async fn materialized_anchor(&self, frame: u64) -> Option<u64> {
+                self.anchors.lock().unwrap().get(&frame).copied()
+            }
+        }
+        let mut archive = CarryingArchive::new(162, vec![(9170, carried_header(162)), (9171, carried_header(163))]);
+        archive.also_missing = Some(163);
+        let target = Anchored { cursor: std::sync::atomic::AtomicU64::new(130), anchors: Mutex::new(Default::default()) };
+        for expected in [162, 194] {
+            let progress = recover_shard_from_latest(&archive, &[5; 32], Some(anchored(frame(130))), &target, Default::default(), None)
+                .await.unwrap();
+            assert!(matches!(progress, ShardRecoveryProgress::Replayed { materialized, .. } if materialized == expected),
+                "{progress:?}");
+        }
+    }
+
+    /// The check of a copy's structure and output refuses it only on a
+    /// refusal: a panic, the check ending early, or this node's clock behind
+    /// the frame's timestamp is a wait, not a refusal kept for the process's
+    /// life.
+    #[test]
+    fn only_a_refusal_of_its_structure_refuses_a_copy() {
+        use quil_types::error::QuilError;
+        assert_eq!(structure_verdict(Ok(Ok(true))), None);
+        assert_eq!(structure_verdict(Ok(Ok(false))), Some(CopyVerdict::Refused));
+        assert_eq!(structure_verdict(Ok(Err(QuilError::InvalidArgument("output mismatch".into())))), Some(CopyVerdict::Refused));
+        assert_eq!(structure_verdict(Err(Box::new("validation panicked"))), Some(CopyVerdict::Unavailable));
+        assert_eq!(structure_verdict(Ok(Err(QuilError::Internal("carried copy check ended early".into())))),
+            Some(CopyVerdict::Unavailable));
+        let ahead = QuilError::InvalidArgument("storage frame: timestamp 9 too far in the future (now 1, >7200000ms)".into());
+        assert!(!refuses_frame(&ahead));
+        assert_eq!(structure_verdict(Ok(Err(ahead))), Some(CopyVerdict::Unavailable));
+    }
+
+    /// A search answered from memory never waits on the engine for its
+    /// check: only one that reads GLOBAL frames asks for it.
+    #[tokio::test]
+    async fn a_search_answered_from_memory_asks_the_engine_nothing() {
+        let replay = |frame: AppShardFrame, _: Vec<AppShardFrame>| async move { Ok::<u64, quil_types::error::QuilError>(number_of(&frame)) };
+        let asked = AskedTarget(std::sync::atomic::AtomicUsize::new(0), false);
+        let source = CarriedVerifierSource::of(&asked);
+        let mut archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+        archive.cached = true;
+        replay_shard_from_latest(&archive, &[5; 32], anchored(frame(130)), 130, None, &source, replay).await.unwrap();
+        assert_eq!(asked.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(archive.searches.lock().unwrap().is_empty());
+    }
+
+    /// A frame rebuilt from a carried copy too large to replay never reaches
+    /// replay, and its copy is passed over, not tried again for ever.
+    #[tokio::test]
+    async fn a_copy_rebuilding_an_oversized_frame_is_passed_over() {
+        let mut huge = carried_header(140);
+        huge.settlements = vec![0; MAX_REPLAY_FRAME_BYTES + 1];
+        let archive = CarryingArchive::new(140, vec![(9146, huge.clone())]);
+        let (result, _) = replay_carrying(&archive, 130, 130, |_| false).await;
+        assert!(result.unwrap_err().to_string().contains("oversized"));
+        assert_eq!(*archive.rejected_copies.lock().unwrap(), [carried_copy_digest(&huge)]);
+    }
+
+    /// Copies whose fee total differs only in how its value is written are
+    /// one copy: the output binds the value alone, which any length but 16
+    /// bytes reads as zero, and the copy kept holds the form members store.
+    #[test]
+    fn copies_differing_only_in_how_their_fee_total_is_written_are_one() {
+        let forms = [Vec::new(), vec![0; 3], vec![0; 16], vec![7; 15]];
+        let digests: std::collections::HashSet<CopyId> = forms.iter()
+            .map(|fee_total| carried_copy_digest(&quil_types::proto::global::FrameHeader {
+                fee_total: fee_total.clone(), ..carried_header(140)
+            }))
+            .collect();
+        assert_eq!(digests.len(), 1);
+        let mut header = quil_types::proto::global::FrameHeader { fee_total: vec![0; 3], ..carried_header(140) };
+        normalize_carried_header(&mut header);
+        assert!(header.fee_total.is_empty());
+        let mut paid = quil_types::proto::global::FrameHeader { fee_total: 5u128.to_be_bytes().to_vec(), ..carried_header(140) };
+        normalize_carried_header(&mut paid);
+        assert_eq!(paid.fee_total, 5u128.to_be_bytes().to_vec());
+    }
+
+    /// GLOBAL checks a header's anchor only against the frame carrying it,
+    /// so a genuine frame may be anchored below its predecessor: its copy is
+    /// taken. With the frame after it missing too, the search is bounded by
+    /// the GLOBAL frame the archive's tip is anchored to. Copies of it all
+    /// refused before are said to be.
+    #[tokio::test]
+    async fn the_search_takes_a_frame_anchored_below_its_predecessor_and_is_bounded_by_the_tip() {
+        let low = quil_types::proto::global::FrameHeader { global_frame_number: 9135, ..carried_header(140) };
+        let archive = CarryingArchive::new(140, vec![(9140, low.clone())]);
+        let (result, replayed) = replay_carrying(&archive, 130, 130, |_| false).await;
+        assert_eq!(result.unwrap().materialized, 162);
+        assert_eq!(replayed[9].header, Some(low));
+
+        let mut archive = CarryingArchive::new(140, vec![(9146, carried_header(140))]);
+        archive.also_missing = Some(141);
+        let _ = replay_carrying(&archive, 130, 130, |_| false).await;
+        let tip = 9200 + 1 + quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+        assert_eq!(archive.searches.lock().unwrap()[0],
+            (140, (tip - 31..=tip).rev().chain(9140..9172).chain(9172..=tip - 32).collect::<Vec<_>>()));
+
+        for (refused, passed_over) in [(0, 3), (2, 0)] {
+            let mut archive = CarryingArchive::new(140, Vec::new());
+            (archive.refused, archive.passed_over) = (refused, passed_over);
+            let error = replay_carrying(&archive, 130, 130, |_| false).await.0.unwrap_err().to_string();
+            assert!(error.ends_with(&format!("GLOBAL frames 9140..=9154 carry only copies of its header refused \
+                ({refused} when checked, {passed_over} passed over as refused before)")), "{error}");
+        }
+    }
+
+    /// Two frames no archive serves, the first ending a 32-frame batch:
+    /// the next batch, from a head it no longer knows the anchor of, is told
+    /// that of the frame the last batch rebuilt, so its search for the second
+    /// starts after it rather than failing once.
+    #[tokio::test]
+    async fn a_batch_after_a_rebuilt_frame_knows_its_anchor() {
+        let mut archive = CarryingArchive::new(162, vec![(9170, carried_header(162)), (9171, carried_header(163))]);
+        archive.also_missing = Some(163);
+        let replay = |frame: AppShardFrame, _| async move { Ok(frame.header.as_ref().unwrap().frame_number) };
+        let verify = CarriedVerifierSource::default();
+        let (first, known) = replay_shard_from(&archive, &[5; 32], anchored(frame(130)), 130, None, None, &verify, replay)
+            .await.unwrap();
+        assert_eq!((first.materialized, known), (162, Some((162, 9162))));
+        let (second, _) = replay_shard_from(&archive, &[5; 32], anchored(frame(130)), 162, known, None, &verify, replay)
+            .await.unwrap();
+        assert_eq!(second.materialized, 194);
+    }
+
+    /// GLOBAL's committed tip can lie beyond every archive's tip: a frame
+    /// above the archive's tip is sought without the bound of the GLOBAL
+    /// frame that tip is anchored to, which lies below the frame's own
+    /// anchor, so its carried header is reached even when the frame after
+    /// it is missing too.
+    #[tokio::test]
+    async fn a_frame_above_the_archive_tip_is_sought_unbounded_by_that_tip() {
+        let mut archive = CarryingArchive::new(140, vec![(9146, carried_header(140)), (9147, carried_header(141))]);
+        (archive.also_missing, archive.tip) = (Some(141), Some(135));
+        let result = replay_shard_from_latest(&archive, &[5; 32], anchored(frame(130)), 130, Some(150),
+            &CarriedVerifierSource::default(), |frame, _| {
+                let height = frame.header.as_ref().unwrap().frame_number;
+                async move { Ok(height) }
+            }).await;
+        assert_eq!(result.unwrap().materialized, 150);
+        assert_eq!(archive.searches.lock().unwrap()[0], (140, (9140..=9203).collect::<Vec<_>>()));
+    }
+
+    /// Only a certified header of the missing frame that commits to no
+    /// requests replaces its body: otherwise replay stops below it and says
+    /// why.
+    #[tokio::test]
+    async fn archive_replay_keeps_waiting_for_a_body_no_carried_header_replaces() {
+        let mut with_requests = carried_header(140);
+        with_requests.requests_root = vec![7; 32];
+        let mut uncertified = carried_header(140);
+        uncertified.public_key_signature_bls48581 = None;
+        let mut other_shard = carried_header(140);
+        other_shard.address = vec![9; 32];
+        for (carried, why) in [
+            (Some(with_requests), "GLOBAL frame 9146 carries its header, which commits requests only its body holds"),
+            (Some(uncertified), "GLOBAL frame 9146 carries its header without a certificate"),
+            (Some(other_shard), "GLOBAL frame 9146 carries another frame's header in its place"),
+            (Some(carried_header(141)), "GLOBAL frame 9146 carries another frame's header in its place"),
+            (Some(quil_types::proto::global::FrameHeader { global_frame_number: 9100, ..carried_header(140) }),
+                "GLOBAL frame 9146 carries its header anchored where GLOBAL could not have taken it"),
+            (None, "no GLOBAL frame 9140..=9154 carries its header"),
+        ] {
+            let archive = CarryingArchive::new(140, carried.map(|header| (9146, header)).into_iter().collect());
+            let (result, replayed) = replay_carrying(&archive, 130, 130, |_| false).await;
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("archive replay is missing shard frame 140 (archive tip Some(200), committed 0): "), "{error}");
+            assert!(error.ends_with(why), "{error}");
+            assert_eq!(replayed.len(), 9, "replayed up to the frame below it");
+        }
     }
 
     #[tokio::test]
@@ -1565,13 +2846,13 @@ mod tests {
         for tip in [Some(130), None] {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let archive = BehindArchive { tip, calls: calls.clone() };
-            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(137),
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(137), &CarriedVerifierSource::default(),
                 |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap();
             assert_eq!(result, ShardReplay { materialized: 137, archive_tip: tip, target: 137 });
             assert_eq!(calls.lock().unwrap()[..TIP_PROBES], [0; TIP_PROBES], "the tip is asked of more archives");
         }
         let archive = BehindArchive { tip: Some(130), calls: Arc::new(Mutex::new(Vec::new())) };
-        let missing = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(150),
+        let missing = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(150), &CarriedVerifierSource::default(),
             |frame, _| async move { Ok(frame.header.unwrap().frame_number) }).await.unwrap_err();
         assert!(missing.to_string().contains("missing shard frame 141"), "{missing}");
     }
@@ -1605,7 +2886,7 @@ mod tests {
         for tip in [130, 131] {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let seen = calls.clone();
-            let result = replay_shard_from_latest(&SealedTipArchive { tip }, &[5; 32], frame(130), 130, Some(131),
+            let result = replay_shard_from_latest(&SealedTipArchive { tip }, &[5; 32], frame(130), 130, Some(131), &CarriedVerifierSource::default(),
                 move |frame, descendants| {
                     let height = frame.header.unwrap().frame_number;
                     seen.lock().unwrap().push((height, descendants.len()));
@@ -1615,7 +2896,7 @@ mod tests {
             assert_eq!(*calls.lock().unwrap(), vec![(131, 0)]);
         }
         for committed in [Some(130), None, Some(132)] {
-            let error = replay_shard_from_latest(&SealedTipArchive { tip: 131 }, &[5; 32], frame(130), 130, committed,
+            let error = replay_shard_from_latest(&SealedTipArchive { tip: 131 }, &[5; 32], frame(130), 130, committed, &CarriedVerifierSource::default(),
                 |_, _| async { panic!("an unauthenticated frame must not reach replay") }).await.unwrap_err();
             assert!(error.to_string().contains("descendant"), "{error}");
         }
@@ -1646,7 +2927,7 @@ mod tests {
             let archive = RotatingArchive { tips: Mutex::new([first, Some(134)].into()), calls: calls.clone() };
             let replayed = Arc::new(Mutex::new(Vec::new()));
             let installed = replayed.clone();
-            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127),
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127), &CarriedVerifierSource::default(),
                 move |frame, _| {
                     let height = frame.header.unwrap().frame_number;
                     installed.lock().unwrap().push(height);
@@ -1666,7 +2947,7 @@ mod tests {
         ] {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let archive = RotatingArchive { tips: Mutex::new(tips.into()), calls: calls.clone() };
-            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127),
+            let result = replay_shard_from_latest(&archive, &[5; 32], frame(130), 130, Some(127), &CarriedVerifierSource::default(),
                 |_, _| async { panic!("already materialized through the known target") }).await.unwrap();
             assert_eq!(result, ShardReplay { materialized: 130, archive_tip: Some(expected_tip), target: 130 });
             assert_eq!(*calls.lock().unwrap(), vec![0; expected_calls]);

@@ -654,3 +654,564 @@ async fn a_legacy_certificate_verifies_under_its_rebuilt_historical_committee() 
     assert!(rebuilt.validate(&frame).unwrap());
     assert_eq!(calls.load(Ordering::SeqCst), 2, "once per validator and anchor");
 }
+
+/// An empty frame rebuilt from the certified header GLOBAL carried, which
+/// is all archives hold of some frames, has no storage attestation: archive
+/// replay validates it on its certificate and output. Its body's possession
+/// proof is still verified when present, and a frame with requests, without
+/// a certificate or altered gets no exception.
+#[test]
+fn archive_replay_validates_a_certified_empty_frame_without_its_attestation() {
+    let validator = |fixture: &AgedOutRegistration| {
+        BlsAppFrameValidator::new(
+            fixture.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(fixture.clock.clone())
+    };
+    let validate = crate::app_engine::validate_certified_frame;
+    let empty = aged_out_registration(vec![0; 32]);
+    let rebuilt = AppShardFrame { storage_attestation: None, ..empty.frame.clone() };
+    assert!(validate(&validator(&empty), &rebuilt, true).unwrap());
+    assert!(validate(&validator(&empty), &empty.frame, true).is_err(),
+        "the body's proof is verified: this registration aged out of the live registry");
+    let mut unsigned = rebuilt.clone();
+    unsigned.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    assert!(!validate(&validator(&empty), &unsigned, true).unwrap_or(false));
+    let mut altered = rebuilt.clone();
+    altered.header.as_mut().unwrap().state_roots[0][0] ^= 1;
+    assert!(!validate(&validator(&empty), &altered, true).unwrap_or(false), "the certificate binds the header");
+    let mut bundled = rebuilt.clone();
+    bundled.requests.push(Default::default());
+    assert!(validate(&validator(&empty), &bundled, true).is_err());
+    let with_requests = aged_out_registration(vec![7; 32]);
+    let stripped = AppShardFrame { storage_attestation: None, ..with_requests.frame.clone() };
+    assert!(validate(&validator(&with_requests), &stripped, true).is_err());
+}
+
+/// The header a GLOBAL frame carries for an app frame holds its committee's
+/// storage attestation (`app_handoff::canonical_header`). An empty frame
+/// rebuilt from it is the body its members stored, and passes full
+/// validation, possession included; a corrupt attestation fails it. Without
+/// the attestation (a member that held none submitted the header) the
+/// possession proof cannot be verified, and archive replay validates the
+/// frame on its certificate and output alone.
+#[test]
+fn an_empty_frame_rebuilt_from_its_carried_header_is_its_stored_body() {
+    use crate::app_handoff::{canonical_header, frame_from_carried_header};
+    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    let fixture = aged_out_registration_attested(vec![0; 32], &[]);
+    // As a member stores a commonware-finalized frame.
+    let mut body = fixture.frame.clone();
+    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    signature.bitmask = Vec::new();
+    let validator = || {
+        BlsAppFrameValidator::new(
+            fixture.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(fixture.clock.clone())
+        .with_handoff_authority(fixture.archive.crdt.clone())
+    };
+    let replayed = |frame: &AppShardFrame| crate::app_engine::validate_certified_frame(&validator(), frame, true);
+    let carried = |body: &AppShardFrame| {
+        frame_header_to_proto(&CarriedHeader::from_canonical_bytes(&canonical_header(body).unwrap()).unwrap())
+    };
+    assert!(validator().validate(&body).unwrap(), "the stored body validates");
+    let header = carried(&body);
+    assert!(!header.storage_attestation.is_empty(), "GLOBAL carries the attestation");
+    let (rebuilt, missing) = frame_from_carried_header(&header);
+    assert_eq!(missing, None);
+    assert_eq!(rebuilt, body);
+    assert!(validator().validate(&rebuilt).unwrap(), "possession is verified");
+    assert!(replayed(&rebuilt).unwrap());
+
+    let mut corrupt = body.clone();
+    corrupt.storage_attestation.as_mut().unwrap().openings[0].proof[0] ^= 1;
+    let (tampered, missing) = frame_from_carried_header(&carried(&corrupt));
+    assert_eq!(missing, None);
+    assert!(validator().validate(&tampered).is_err());
+    assert!(replayed(&tampered).is_err(), "a carried attestation is verified");
+
+    let mut bare = header.clone();
+    bare.storage_attestation.clear();
+    let (stripped, missing) = frame_from_carried_header(&bare);
+    assert!(missing.unwrap().contains("holds no storage attestation"));
+    assert_eq!(stripped.storage_attestation, None);
+    assert!(validator().validate(&stripped).is_err(), "no possession proof");
+    assert!(replayed(&stripped).unwrap(), "its certificate and output");
+
+    let mut junk = header;
+    junk.storage_attestation = vec![0xff; 3];
+    let (undecoded, missing) = frame_from_carried_header(&junk);
+    assert!(missing.unwrap().contains("does not decode"));
+    assert_eq!(undecoded.storage_attestation, None);
+}
+
+/// Before a search keeps a copy of the header GLOBAL carried, it is
+/// checked as archive replay checks a certified frame: certificate and
+/// deterministic output, then an attestation it holds, in full. A copy with
+/// another output is refused; one whose attestation does not decode or
+/// fails possession keeps only its cleared form, as does one whose
+/// registrations cannot be fetched; one whose anchored GLOBAL frame this
+/// node lacks waits. The validator reports the missing frame as
+/// unavailable, not as a refusal, so replay keeps the copy too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carried_copy_is_checked_as_replay_checks_it_and_a_missing_anchor_is_a_wait() {
+    use crate::prover_tree_syncer::{refuses_frame, verify_carried_copy, CopyVerdict};
+    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    let fixture = aged_out_registration_attested(vec![0; 32], &[]);
+    let mut body = fixture.frame.clone();
+    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    signature.bitmask = Vec::new();
+    let carried = |body: &AppShardFrame| frame_header_to_proto(
+        &CarriedHeader::from_canonical_bytes(&crate::app_handoff::canonical_header(body).unwrap()).unwrap(),
+    );
+    let header = carried(&body);
+    let validator = |clock: Arc<quil_store::testing::InMemoryClockStore>| {
+        Arc::new(
+            BlsAppFrameValidator::new(
+                fixture.registry.clone(),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock)
+            .with_handoff_authority(fixture.archive.crdt.clone()),
+        )
+    };
+    let verify = |header: &quil_types::proto::global::FrameHeader| verify_carried_copy(validator(fixture.clock.clone()), header.clone());
+    assert_eq!(verify(&header).await, CopyVerdict::Certified, "possession included");
+    let cleared = quil_types::proto::global::FrameHeader { storage_attestation: Vec::new(), ..header.clone() };
+    assert_eq!(verify(&cleared).await, CopyVerdict::Certified);
+    let mut forged = header.clone();
+    forged.output[0] ^= 1;
+    assert_eq!(verify(&forged).await, CopyVerdict::Refused);
+    let mut junk = header.clone();
+    junk.storage_attestation = vec![0xff; 3];
+    assert_eq!(verify(&junk).await, CopyVerdict::AttestationRefused, "does not decode");
+    let mut corrupt = body.clone();
+    corrupt.storage_attestation.as_mut().unwrap().openings[0].proof[0] ^= 1;
+    assert_eq!(verify(&carried(&corrupt)).await, CopyVerdict::AttestationRefused, "fails possession");
+    let unavailable = Arc::new(
+        BlsAppFrameValidator::new(
+            fixture.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(fixture.clock.clone())
+        .with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(None) }))),
+    );
+    assert_eq!(verify_carried_copy(unavailable, header.clone()).await, CopyVerdict::AttestationUnavailable,
+        "registrations unavailable");
+
+    let lacking = Arc::new(quil_store::testing::InMemoryClockStore::new());
+    let (frame, _) = crate::app_handoff::frame_from_carried_header(&cleared);
+    // The validator's other callers keep refusing a frame whose anchor this
+    // node lacks; archive replay and its copies wait for it.
+    let error = validator(lacking.clone()).validate_certified_without_storage(&frame).unwrap_err();
+    assert!(matches!(error, QuilError::Crypto(_)), "{error}");
+    assert!(!refuses_frame(&error));
+    let full = validator(lacking.clone()).validate(&body).unwrap_err();
+    assert!(!refuses_frame(&full), "{full}");
+    assert!(matches!(crate::app_engine::refusal_of(40, full), QuilError::ExecutionUnavailable(_)));
+    assert_eq!(verify_carried_copy(validator(lacking), header).await, CopyVerdict::Unavailable);
+}
+
+/// A certified frame refused while the committee that may have signed it
+/// cannot be had waits only when it passes without its certificate as it
+/// would be checked with it: with its storage history, possession
+/// included, whether that history was had with the certificate or without
+/// it. A frame whose possession proof fails is refused all the same; one
+/// whose storage history cannot be had at all is checked without
+/// possession, and waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_certificate_waits_only_when_possession_holds() {
+    use crate::app_engine::Prepared;
+    let fixture = aged_out_registration_attested(vec![0; 32], &[]);
+    let body = fixture.frame.clone();
+    let mut corrupt = body.clone();
+    corrupt.storage_attestation.as_mut().unwrap().openings[0].proof[0] ^= 1;
+    let validator = |handoff: bool, source: bool| {
+        let validator = BlsAppFrameValidator::new(
+            fixture.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(fixture.clock.clone());
+        let validator = match handoff {
+            true => validator.with_handoff_authority(fixture.archive.crdt.clone()),
+            false => validator,
+        };
+        match source {
+            true => validator.with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(None) }))),
+            false => validator,
+        }
+    };
+    let unavailable = || QuilError::ExecutionUnavailable("no archive answered".into());
+    let refused = || Err(QuilError::InvalidSignature("app shard frame certificate rejected".into()));
+    let judged = |validator: &BlsAppFrameValidator, prepared: &Prepared, frame: &AppShardFrame| {
+        match prepared.judge(validator, frame, refused()) {
+            Err(QuilError::ExecutionUnavailable(_)) => "waits",
+            Err(error) if crate::prover_tree_syncer::refuses_frame(&error) => "refused",
+            other => panic!("{other:?}"),
+        }
+    };
+    let with_history = Prepared { committee: Some(unavailable()), ..Default::default() };
+    let full = validator(true, false);
+    assert_eq!(judged(&full, &with_history, &body), "waits");
+    assert_eq!(judged(&full, &with_history, &corrupt), "refused", "possession is checked with its own history");
+    for (frame, expected) in [(&body, "waits"), (&corrupt, "refused")] {
+        let mut prepared = Prepared { committee: Some(unavailable()), history: Some(unavailable()), ..Default::default() };
+        prepared.prepare_without_certificate(&full, frame).await;
+        assert!(prepared.possession);
+        assert_eq!(judged(&full, &prepared, frame), expected, "and with the history had without its certificate");
+    }
+    let lacking = validator(false, true);
+    let mut prepared = Prepared { committee: Some(unavailable()), history: Some(unavailable()), ..Default::default() };
+    prepared.prepare_without_certificate(&lacking, &body).await;
+    assert!(!prepared.possession);
+    assert_eq!(judged(&lacking, &prepared, &body), "waits", "no history at all: checked without possession");
+}
+
+/// A shard GLOBAL manages through a session of generation 1, as GLOBAL's
+/// committed view gives it.
+fn managed_shard(filter: &[u8]) -> Arc<quil_hypergraph::HypergraphCrdt> {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+        Arc::new(quil_hypergraph::testing::StubProver),
+    ));
+    global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+    let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+    let commit = |frame: u64| {
+        state.commit().unwrap();
+        state.abort();
+        global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+    };
+    let signer = quil_crypto::FalconSigner::generate();
+    let session = quil_cw_consensus::handoff::Session {
+        chain_id: [7; 32], filter: filter.to_vec(), generation: 1,
+        genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+        base_frame: 0, authorization: [0; 32], members: vec![signer.public_key().to_vec()],
+    };
+    commit(1);
+    quil_execution::global_intrinsic::handoff::initialize(&state, 2, &session).unwrap();
+    commit(2);
+    global
+}
+
+/// A copy wrapping a legacy (generation-0) certificate around the frame of
+/// a shard GLOBAL manages is refused (for now: this node's view may lack a
+/// session), never a wait on a historical committee, which could not decide
+/// it: neither its check nor its replay asks for one, so a source that never
+/// answers holds neither, and replay refuses the frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_wrapper_on_a_managed_shard_is_refused_not_a_wait() {
+    use crate::app_engine::{prepare_replayed_frame, validate_certified_frame};
+    use crate::prover_tree_syncer::{refuses_frame, verify_carried_copy, CopyVerdict};
+    let fixture = aged_out_registration_attested(vec![0; 32], &[]);
+    let filter = fixture.frame.header.as_ref().unwrap().address.clone();
+    let never: crate::historical_committee::HistoricalCommitteeSource =
+        Arc::new(|_, _| Box::pin(std::future::pending()));
+    let validator = Arc::new(
+        BlsAppFrameValidator::new(
+            fixture.registry.clone(),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+            Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+        )
+        .with_clock_store(fixture.clock.clone())
+        .with_handoff_authority(managed_shard(&filter))
+        .with_historical_committee_source(never),
+    );
+    // A generation-0 certificate today's committee does not verify (another
+    // frame's), wrapped around the genuine header.
+    let mut header = fixture.frame.header.clone().unwrap();
+    header.public_key_signature_bls48581 = legacy_committee_frame().frame.header.unwrap().public_key_signature_bls48581;
+    assert!(!validator.legacy_committee_applies(&header));
+    let within = std::time::Duration::from_secs(30);
+    let verdict = tokio::time::timeout(within, verify_carried_copy(validator.clone(), header.clone()))
+        .await
+        .expect("no historical committee is waited on");
+    assert_eq!(verdict, CopyVerdict::CertificateRefused);
+    let frame = AppShardFrame { header: Some(header), ..fixture.frame.clone() };
+    let prepared = tokio::time::timeout(within, prepare_replayed_frame(&validator, &frame)).await.unwrap();
+    assert!(prepared.committee.is_none(), "{:?}", prepared.committee);
+    let judged = prepared.judge(&validator, &frame, validate_certified_frame(&validator, &frame, prepared.retained()));
+    assert!(match &judged { Ok(valid) => !valid, Err(error) => refuses_frame(error) }, "{judged:?}");
+}
+
+/// Archive replay, in the engine, waits on a legacy certificate's
+/// historical committee at most `REPLAY_COMMITTEE_WAIT`: the reconstruction
+/// goes on in its own task, and a frame needing the same committee
+/// meanwhile starts no other.
+#[tokio::test(start_paused = true)]
+async fn replay_waits_briefly_on_a_committee_being_rebuilt() {
+    use crate::app_engine::prepare_replayed_frame;
+    let legacy = legacy_committee_frame();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let never: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    });
+    let validator = (legacy.validator)(never);
+    let first = prepare_replayed_frame(&validator, &legacy.frame).await;
+    assert!(first.committee.as_ref().is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
+        "{:?}", first.committee);
+    let second = prepare_replayed_frame(&validator, &legacy.frame).await;
+    assert!(second.committee.as_ref().is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
+        "it waits on the reconstruction under way: {:?}", second.committee);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one reconstruction");
+}
+
+/// A frame needing a committee another frame is rebuilding waits on that
+/// reconstruction and takes its result, as it would its own: sync anchors
+/// and engine starts are not refused because a carried copy or another
+/// frame started it first.
+#[tokio::test(start_paused = true)]
+async fn frames_needing_one_committee_share_its_reconstruction() {
+    use crate::app_engine::prepare_certified_frame;
+    let legacy = legacy_committee_frame();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (counted, members) = (calls.clone(), legacy.members.clone());
+    let slow: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let members = members.clone();
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(vec![members])
+        })
+    });
+    let validator = (legacy.validator)(slow);
+    let (first, second) = tokio::join!(
+        prepare_certified_frame(&validator, &legacy.frame),
+        prepare_certified_frame(&validator, &legacy.frame),
+    );
+    assert!(first.committee.is_none() && second.committee.is_none(), "{:?} {:?}", first.committee, second.committee);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A copy with the genuine output under a junk legacy certificate and
+/// another anchor (the output binds the anchor) is refused by its output,
+/// before any historical committee is prepared for that anchor, in the
+/// copy check and in replay alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_anchored_elsewhere_is_refused_before_any_committee_is_rebuilt() {
+    use crate::app_engine::prepare_replayed_frame;
+    use crate::prover_tree_syncer::{verify_carried_copy, CopyVerdict};
+    let legacy = legacy_committee_frame();
+    legacy.clock.seed_frame(GlobalFrame {
+        header: Some(GlobalFrameHeader { frame_number: 4_001, output: vec![3; 516], ..Default::default() }),
+        requests: vec![],
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (counted, members) = (calls.clone(), legacy.members.clone());
+    let source: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        let members = members.clone();
+        Box::pin(async move { Ok(vec![members]) })
+    });
+    let validator = (legacy.validator)(source);
+    let mut header = legacy.frame.header.clone().unwrap();
+    header.global_frame_number = 4_001;
+    assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Refused);
+    let frame = AppShardFrame { header: Some(header), ..legacy.frame.clone() };
+    let prepared = prepare_replayed_frame(&validator, &frame).await;
+    assert!(prepared.committee.is_none(), "{:?}", prepared.committee);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no committee rebuilt");
+}
+
+/// A legacy-certified empty frame whose committee today's registry no
+/// longer reproduces, with validators over that registry and a historical
+/// committee source.
+struct LegacyCommitteeFrame {
+    frame: AppShardFrame,
+    members: Vec<Vec<u8>>,
+    clock: Arc<quil_store::testing::InMemoryClockStore>,
+    validator: Box<dyn Fn(crate::historical_committee::HistoricalCommitteeSource) -> Arc<BlsAppFrameValidator>>,
+}
+
+fn legacy_committee_frame() -> LegacyCommitteeFrame {
+    quil_crypto::init();
+    let filter = [8; 32];
+    let global_frame = 4_000;
+    let output = vec![9; 516];
+    let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+    clock.seed_frame(GlobalFrame {
+        header: Some(GlobalFrameHeader { frame_number: global_frame, output: output.clone(), ..Default::default() }),
+        requests: vec![],
+    });
+    let prover = |signer: &quil_crypto::FalconSigner, address: u8| ProverInfo {
+        public_key: signer.public_key().to_vec(),
+        address: vec![address; 32],
+        status: ProverStatus::Active,
+        kick_frame_number: 0,
+        allocations: vec![],
+        available_storage: 0,
+        seniority: 0,
+        delegate_address: vec![],
+    };
+    let then = quil_crypto::FalconSigner::generate();
+    let now = quil_crypto::FalconSigner::generate();
+    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(prover(&now, 2)));
+    let mut frame = AppShardFrame {
+        header: Some(FrameHeader {
+            address: filter.to_vec(),
+            frame_number: 40,
+            rank: 40,
+            global_frame_number: global_frame,
+            timestamp: 1,
+            state_roots: vec![vec![0; 32]; 4],
+            prover: vec![1; 32],
+            requests_root: vec![0; 32],
+            ..Default::default()
+        }),
+        requests: vec![],
+        storage_attestation: None,
+    };
+    certify(&mut frame, &then, &output);
+    LegacyCommitteeFrame {
+        frame,
+        members: vec![then.public_key().to_vec()],
+        clock: clock.clone(),
+        validator: Box::new(move |source| {
+            Arc::new(
+                BlsAppFrameValidator::new(
+                    registry.clone(),
+                    Arc::new(quil_crypto::FalconKeyConstructor),
+                    Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+                )
+                .with_clock_store(clock.clone())
+                .with_historical_committee_source(source),
+            )
+        }),
+    }
+}
+
+/// Historical committee sources answering `members`, and failing.
+fn committee_sources(members: Vec<Vec<u8>>) -> [crate::historical_committee::HistoricalCommitteeSource; 2] {
+    let rebuilt: crate::historical_committee::HistoricalCommitteeSource =
+        Arc::new(move |_, _| { let members = members.clone(); Box::pin(async move { Ok(vec![members]) }) });
+    let failing: crate::historical_committee::HistoricalCommitteeSource =
+        Arc::new(|_, _| Box::pin(async { Err(QuilError::ExecutionUnavailable("no archive answered".into())) }));
+    [rebuilt, failing]
+}
+
+/// A copy with a legacy certificate whose committee today's registry no
+/// longer reproduces is checked after that committee is rebuilt from GLOBAL
+/// history, as replay prepares it: it is certified, not refused for good.
+/// When the committee cannot be had, the copy waits; one whose output is
+/// forged is refused all the same. A certificate refused over a sound
+/// output (here, no committee reconstructed) is refused only for a while:
+/// this node's view, not the copy, may be at fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_carried_copy_whose_committee_needs_history_is_certified() {
+    use crate::prover_tree_syncer::{verify_carried_copy, CopyVerdict};
+    let legacy = legacy_committee_frame();
+    let header = legacy.frame.header.clone().unwrap();
+    let [rebuilt, failing] = committee_sources(legacy.members.clone());
+    assert_eq!(verify_carried_copy((legacy.validator)(rebuilt), header.clone()).await, CopyVerdict::Certified);
+    assert_eq!(verify_carried_copy((legacy.validator)(failing), header.clone()).await, CopyVerdict::Unavailable,
+        "a committee that cannot be had says nothing of the copy");
+    let [_, failing] = committee_sources(legacy.members.clone());
+    let mut forged = header.clone();
+    forged.output[0] ^= 1;
+    assert_eq!(verify_carried_copy((legacy.validator)(failing), forged).await, CopyVerdict::Refused,
+        "a forged output is refused whatever the committee");
+    // A committee rebuilt that does not verify it: refused for now.
+    let other = vec![quil_crypto::FalconSigner::generate().public_key().to_vec()];
+    let wrong: crate::historical_committee::HistoricalCommitteeSource =
+        Arc::new(move |_, _| { let other = other.clone(); Box::pin(async move { Ok(vec![other]) }) });
+    assert_eq!(verify_carried_copy((legacy.validator)(wrong), header.clone()).await, CopyVerdict::CertificateRefused);
+    // None rebuilt is no answer: no committee kept, a wait, answered as a
+    // failure for a while (in-actor callers do not repeat it at once), then
+    // asked again.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let none: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(Vec::new()) })
+    });
+    let validator = (legacy.validator)(none);
+    for _ in 0..2 {
+        assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Unavailable);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the failure answers for a while");
+    assert!(validator.historical_committees.get(&header.address, legacy_committee_frame_of(&header)).is_none());
+    validator.historical_committees.expire();
+    assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Unavailable);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "asked again after it");
+}
+
+/// At most two historical reconstructions run at a time, node-wide: forced
+/// rebuilds at chosen anchors queue rather than pile up.
+#[tokio::test(start_paused = true)]
+async fn historical_reconstructions_run_two_at_a_time() {
+    let legacy = legacy_committee_frame();
+    let (running, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (counted, peak, members) = (running.clone(), most.clone(), legacy.members.clone());
+    let source: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        let (counted, peak, members) = (counted.clone(), peak.clone(), members.clone());
+        Box::pin(async move {
+            peak.fetch_max(counted.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            counted.fetch_sub(1, Ordering::SeqCst);
+            Ok(vec![members])
+        })
+    });
+    let validator = (legacy.validator)(source);
+    let at = |anchor: u64| {
+        let mut frame = legacy.frame.clone();
+        frame.header.as_mut().unwrap().global_frame_number = anchor;
+        frame
+    };
+    let (a, b, c) = (at(4_000), at(4_001), at(4_002));
+    let (ra, rb, rc) = tokio::join!(
+        validator.prepare_historical_committee(&a),
+        validator.prepare_historical_committee(&b),
+        validator.prepare_historical_committee(&c),
+    );
+    assert!(ra.is_ok() && rb.is_ok() && rc.is_ok(), "{ra:?} {rb:?} {rc:?}");
+    assert_eq!(most.load(Ordering::SeqCst), 2);
+}
+
+/// The anchor a legacy certificate's committee is rebuilt for.
+fn legacy_committee_frame_of(header: &FrameHeader) -> u64 {
+    super::legacy_committee_frame(header)
+}
+
+/// Archive replay applies the same rule: a legacy-certified frame whose
+/// committee cannot be had waits rather than being refused, so the copy it
+/// was rebuilt from is not passed over (`refuses_frame`); with the committee
+/// rebuilt it validates.
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_waits_on_a_frame_whose_committee_cannot_be_had() {
+    use crate::app_engine::{prepare_certified_frame, validate_certified_frame};
+    use crate::prover_tree_syncer::refuses_frame;
+    let legacy = legacy_committee_frame();
+    let [rebuilt, failing] = committee_sources(legacy.members.clone());
+    let replayed = |validator: Arc<BlsAppFrameValidator>| {
+        let frame = legacy.frame.clone();
+        async move {
+            let prepared = prepare_certified_frame(&validator, &frame).await;
+            prepared.judge(&validator, &frame, validate_certified_frame(&validator, &frame, prepared.retained()))
+        }
+    };
+    assert!(replayed((legacy.validator)(rebuilt)).await.unwrap());
+    let waits = replayed((legacy.validator)(failing)).await.unwrap_err();
+    assert!(matches!(waits, QuilError::ExecutionUnavailable(_)) && !refuses_frame(&waits), "{waits}");
+
+    // Only a refused certificate waits on the committee: a frame whose
+    // output is forged is refused while it cannot be had too.
+    let [_, failing] = committee_sources(legacy.members.clone());
+    let validator = (legacy.validator)(failing);
+    let mut forged = legacy.frame.clone();
+    forged.header.as_mut().unwrap().output[0] ^= 1;
+    let prepared = prepare_certified_frame(&validator, &forged).await;
+    let refused = prepared.judge(&validator, &forged, validate_certified_frame(&validator, &forged, prepared.retained()));
+    assert!(match &refused { Ok(valid) => !valid, Err(error) => refuses_frame(error) }, "{refused:?}");
+}

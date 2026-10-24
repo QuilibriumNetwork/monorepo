@@ -47,6 +47,16 @@ const MAX_MATERIALIZE_RETRIES: u32 = 3;
 // Inbound messages to the app engine
 // =====================================================================
 
+/// Where the engine sends its frame validator
+/// ([`AppEngineMessage::CarriedCopyValidator`]).
+pub struct ValidatorReply(pub tokio::sync::oneshot::Sender<Arc<BlsAppFrameValidator>>);
+
+impl std::fmt::Debug for ValidatorReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ValidatorReply")
+    }
+}
+
 /// Inbound messages from the master/network to the app engine.
 #[derive(Debug)]
 pub enum AppEngineMessage {
@@ -79,6 +89,18 @@ pub enum AppEngineMessage {
     /// so the gap would re-fire forever and later-arriving full frames
     /// could be re-applied on top of the already-synced tree.
     ShardSyncCompleted { synced_to_frame: u64 },
+    /// The engine's frame validator, for checking the certificates of the
+    /// header copies GLOBAL carried off the actor
+    /// ([`crate::prover_tree_syncer::verify_carried_copy`]).
+    CarriedCopyValidator {
+        reply: ValidatorReply,
+    },
+    /// The GLOBAL frame this worker's materialized frame `frame` is anchored
+    /// to, from its clock store.
+    MaterializedAnchor {
+        frame: u64,
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
     /// Authenticate an archive anchor before a background sync mutates the
     /// worker's trees. An accepted request gates propose/vote until completion.
     ValidateShardSyncAnchor {
@@ -359,6 +381,33 @@ impl AppEngineHandle {
     /// Send a message to the app engine (non-blocking, drops on full).
     pub fn send(&self, msg: AppEngineMessage) {
         let _ = self.msg_tx.try_send(msg);
+    }
+
+    /// The GLOBAL frame this worker's materialized frame `frame` is anchored
+    /// to, read from its clock store; `None` when it holds no such frame or
+    /// the engine does not answer within 30 s.
+    pub(crate) async fn materialized_anchor(&self, frame: u64) -> Option<u64> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::MaterializedAnchor { frame, reply }).await.ok()?;
+            receive.await.ok().flatten()
+        }).await.ok().flatten()
+    }
+
+    /// A check of carried header copies' certificates with this engine's
+    /// frame validator ([`crate::prover_tree_syncer::verify_carried_copy`]);
+    /// `None` when the engine does not answer.
+    pub(crate) async fn carried_copy_verifier(&self) -> Option<crate::prover_tree_syncer::CarriedVerifier> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let validator = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.msg_tx.send(AppEngineMessage::CarriedCopyValidator { reply: ValidatorReply(reply) }).await.ok()?;
+            receive.await.ok()
+        }).await.ok()??;
+        let verifier: crate::prover_tree_syncer::CarriedVerifier =
+            Arc::new(move |header: quil_types::proto::global::FrameHeader| {
+                Box::pin(crate::prover_tree_syncer::verify_carried_copy(validator.clone(), header))
+            });
+        Some(verifier)
     }
 
     pub(crate) async fn validate_sync_anchor(
@@ -3370,9 +3419,9 @@ impl AppConsensusEngine {
             .and_then(|header| header.public_key_signature_bls48581.as_ref())
             .is_none_or(|signature| signature.signature.is_empty());
         if !uncertified {
-            let retained = storage_history_retained(&validator, &frame).await;
+            let prepared = prepare_replayed_frame(&validator, &frame).await;
             return self.replay_archive_frame_with(frame, None, |frame| {
-                validate_certified_frame(&validator, frame, retained)
+                prepared.judge(&validator, frame, validate_certified_frame(&validator, frame, prepared.retained()))
             }).await;
         }
         if descendants.is_empty() {
@@ -3383,15 +3432,21 @@ impl AppConsensusEngine {
         // which may span several headers without certificates of their own.
         let terminal = descendants.last().ok_or_else(|| QuilError::InvalidSignature(
             "archive replay frame has no certified descendant".into()))?;
-        let terminal_retained = storage_history_retained(&validator, terminal).await;
-        let terminal_valid = validate_certified_frame(&validator, terminal, terminal_retained)?
+        let terminal_prepared = prepare_replayed_frame(&validator, terminal).await;
+        let terminal_number = terminal.header.as_ref().map_or(0, |header| header.frame_number);
+        let terminal_valid = terminal_prepared
+            .judge(&validator, terminal, validate_certified_frame(&validator, terminal, terminal_prepared.retained()))
+            .map_err(|error| refusal_of(terminal_number, error))?
             && self.body_matches_requests_root(terminal);
+        // A refusal names the frame it refuses (`refusal_of`).
+        if !terminal_valid {
+            return Err(QuilError::InvalidSignature(format!(
+                "archive replay frame {terminal_number}: descendant certificate rejected")));
+        }
         // The linked frames' outputs are checked against GLOBAL anchors from
         // this node's clock: fetch the missing ones first, once the
         // certificate checks out, as their storage history is fetched below.
-        if terminal_valid {
-            crate::frame_validator::prepare_archive_replay_anchors(&validator, &frame, &descendants).await?;
-        }
+        crate::frame_validator::prepare_archive_replay_anchors(&validator, &frame, &descendants).await?;
         crate::frame_validator::validate_archive_replay_chain(
             &frame, &descendants,
             |_| Ok(terminal_valid),
@@ -3547,8 +3602,8 @@ impl AppConsensusEngine {
         if number != self.last_materialized_frame + 1 {
             return Err(QuilError::ExecutionUnavailable("archive replay would skip a materialization gap".into()));
         }
-        if !validate(&frame)? {
-            return Err(QuilError::InvalidSignature("archive replay certificate rejected".into()));
+        if !validate(&frame).map_err(|error| refusal_of(number, error))? {
+            return Err(QuilError::InvalidSignature(format!("archive replay frame {number}: certificate rejected")));
         }
         let previous = if number > 1 {
             Some(self.clock_store.get_shard_clock_frame(&self.filter, number - 1, false)?)
@@ -4637,6 +4692,16 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::ReanchorFailed { reason }) => {
                             self.fence_reanchor.outcome();
                             self.note_reanchor_wait(&reason, std::time::Instant::now());
+                        }
+                        Some(AppEngineMessage::CarriedCopyValidator { reply }) => {
+                            let _ = reply.0.send(self.frame_validator());
+                        }
+                        Some(AppEngineMessage::MaterializedAnchor { frame, reply }) => {
+                            let anchor = self.clock_store.get_shard_clock_frame(&self.filter, frame, false).ok()
+                                .and_then(|frame| frame.header)
+                                .map(|header| header.global_frame_number)
+                                .filter(|&anchor| anchor > 0);
+                            let _ = reply.send(anchor);
                         }
                         Some(AppEngineMessage::ValidateShardSyncAnchor { anchor, predecessor, reply }) => {
                             let reanchor = self.owed_reanchor_now();
@@ -9592,6 +9657,28 @@ pub(crate) fn shard_path_of_filter(filter: &[u8]) -> quil_types::execution::Shar
     }
 }
 
+/// `error`, a refusal of archive replay frame `number`, naming that frame,
+/// as the link refusals do: a replay batch can hold several frames, and a
+/// frame rebuilt from a copy of its header GLOBAL carried has that copy
+/// passed over only when the refusal names it
+/// (`prover_tree_syncer::replay_shard_from`). A wait is unchanged.
+pub(crate) fn refusal_of(number: u64, error: QuilError) -> QuilError {
+    let named = |reason: String| format!("archive replay frame {number}: {reason}");
+    if !crate::prover_tree_syncer::refuses_frame(&error) {
+        // A GLOBAL frame this node lacks: a wait for replay.
+        return match error {
+            QuilError::Crypto(reason) => QuilError::ExecutionUnavailable(reason),
+            other => other,
+        };
+    }
+    match error {
+        QuilError::InvalidSignature(reason) => QuilError::InvalidSignature(named(reason)),
+        QuilError::InvalidArgument(reason) => QuilError::InvalidArgument(named(reason)),
+        QuilError::Crypto(reason) => QuilError::Crypto(named(reason)),
+        other => other,
+    }
+}
+
 /// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
 /// validating untrusted frame or storage-proof bytes is a validation failure
 /// rather than unwinding the receive task. Mirrors the global frame
@@ -9611,28 +9698,141 @@ async fn storage_history_unavailable(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> Option<QuilError> {
-    // Every certified frame taken from an archive or the local store passes
-    // here before it is validated: a legacy certificate today's registry no
-    // longer reproduces gets its historical committees first.
+    prepare_certified_frame(validator, frame).await.history
+}
+
+/// What preparing a certified frame for validation found
+/// ([`prepare_certified_frame`]): why its storage history, and why the
+/// historical committee of its legacy certificate, could not be had.
+#[derive(Debug, Default)]
+pub(crate) struct Prepared {
+    pub(crate) history: Option<QuilError>,
+    pub(crate) committee: Option<QuilError>,
+    /// Whether the storage history of the frame without its certificate was
+    /// had, when neither its committee nor its own could be
+    /// ([`Self::prepare_without_certificate`]).
+    pub(crate) possession: bool,
+}
+
+impl Prepared {
+    /// Whether its storage history is retained; without it the frame is
+    /// validated on its certificate alone ([`validate_certified_frame`]).
+    pub(crate) fn retained(&self) -> bool {
+        self.history.is_none()
+    }
+
+    /// The storage history of `frame` without its certificate, when neither
+    /// the committee that may have signed it nor, therefore, its own storage
+    /// history could be had: fetching that history authenticates the
+    /// certificate first, and without the committee it cannot. The frame's
+    /// structure and output are checked before any read, and only the
+    /// registrations GLOBAL's root authenticates are kept, so
+    /// [`Self::judge`] can still check possession.
+    pub(crate) async fn prepare_without_certificate(
+        &mut self,
+        validator: &BlsAppFrameValidator,
+        frame: &quil_types::proto::global::AppShardFrame,
+    ) {
+        if self.committee.is_none() || self.retained() || frame.storage_attestation.is_none() {
+            return;
+        }
+        self.possession = validator.prepare_storage_history_of_linked(&without_certificate(frame)).await.is_ok();
+    }
+
+    /// `result`, the validation of `frame`, as a wait when it is refused
+    /// for its certificate while the committee that may have signed it could
+    /// not be had: the preparation, not the frame, may be at fault, and a
+    /// refusal would pass over a genuine copy the frame was rebuilt from
+    /// (`prover_tree_syncer::replay_shard_from`). It is the
+    /// certificate when the frame passes without it: structure, output and,
+    /// with its storage history (its own, or that had without its
+    /// certificate), possession, as [`validate_certified_frame`] checks it.
+    /// Any other refusal stands. Without either storage history the frame is
+    /// checked without possession, and without its GLOBAL anchor its output
+    /// check is itself a wait.
+    pub(crate) fn judge(
+        &self,
+        validator: &BlsAppFrameValidator,
+        frame: &quil_types::proto::global::AppShardFrame,
+        result: Result<bool>,
+    ) -> Result<bool> {
+        let Some(committee) = self.committee.as_ref() else { return result };
+        // Only a certificate a historical committee could decide waits on it.
+        if !frame.header.as_ref().is_some_and(|header| validator.legacy_committee_applies(header)) {
+            return result;
+        }
+        let refused = match &result {
+            Ok(valid) => !valid,
+            Err(error) => crate::prover_tree_syncer::refuses_frame(error),
+        };
+        if !refused {
+            return result;
+        }
+        let bare = without_certificate(frame);
+        let possession = (self.retained() || self.possession) && !crate::frame_validator::empty_without_attestation(frame);
+        let sound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match possession {
+            true => validator.validate_proposal(&bare),
+            false => validator.validate_linked_without_storage(&bare),
+        }));
+        match (sound, result) {
+            (Ok(Ok(true)), Ok(_)) => Err(QuilError::ExecutionUnavailable(format!(
+                "its certificate is not checked while its historical committee is unavailable: {committee}"))),
+            (Ok(Ok(true)), Err(error)) => Err(QuilError::ExecutionUnavailable(format!(
+                "{error}, while its historical committee is unavailable: {committee}"))),
+            (_, result) => result,
+        }
+    }
+}
+
+/// `frame` without its certificate: its structure, output and attestation.
+fn without_certificate(frame: &quil_types::proto::global::AppShardFrame) -> quil_types::proto::global::AppShardFrame {
+    let mut bare = frame.clone();
+    if let Some(header) = bare.header.as_mut() {
+        header.public_key_signature_bls48581 = None;
+    }
+    bare
+}
+
+/// Prepare a certified frame taken from an archive or the local store for
+/// validation: the historical committees a legacy certificate today's
+/// registry no longer reproduces needs, then the storage history its
+/// attestation names, with why either could not be had.
+pub(crate) async fn prepare_certified_frame(
+    validator: &BlsAppFrameValidator,
+    frame: &quil_types::proto::global::AppShardFrame,
+) -> Prepared {
+    let committee = validator.prepare_historical_committee(frame).await;
+    prepare_with_committee(validator, frame, committee).await
+}
+
+/// [`prepare_certified_frame`] once the historical committee's preparation
+/// has ended with `committee`.
+async fn prepare_with_committee(
+    validator: &BlsAppFrameValidator,
+    frame: &quil_types::proto::global::AppShardFrame,
+    committee: Result<()>,
+) -> Prepared {
     // One condition per shard, whichever of its frames is being checked.
     let (filter, number) = frame.header.as_ref().map_or((Vec::new(), 0), |h| (h.address.clone(), h.frame_number));
     let committee_key = ("history-committee", filter.clone(), 0, 0);
-    match validator.prepare_historical_committee(frame).await {
+    let committee = match committee {
         Ok(()) => {
             if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&committee_key, number) {
                 info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
                     "historical committee of a certified legacy frame available after earlier failures");
             }
+            None
         }
         Err(error) => {
             if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&committee_key, number) {
                 warn!(filter = hex::encode(&filter), frame = number, attempts, ongoing_secs = duration.as_secs(), %error,
                     "historical committee of a certified legacy frame unavailable");
             }
+            Some(error)
         }
-    }
+    };
     let history_key = ("history-storage", filter.clone(), 0, 0);
-    match validator.prepare_storage_history(frame).await {
+    let history = match validator.prepare_storage_history(frame).await {
         Ok(()) => {
             if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&history_key, number) {
                 info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
@@ -9647,7 +9847,52 @@ async fn storage_history_unavailable(
             }
             Some(error)
         }
-    }
+    };
+    Prepared { history, committee, possession: false }
+}
+
+/// How long archive replay, in the engine, waits on the historical
+/// committee a legacy certificate needs; its reconstruction goes on in its
+/// own task, for the next attempt, up to
+/// [`crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT`].
+const REPLAY_COMMITTEE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// [`prepare_certified_frame`] for archive replay: once the frame's
+/// structure and output pass without its certificate, the historical
+/// committee is rebuilt in its own task, waited on at most [`REPLAY_COMMITTEE_WAIT`],
+/// so a copy whose certificate sends the node to GLOBAL history cannot hold
+/// the engine for the reconstruction's ten minutes; then, when neither the
+/// committee nor its storage history could be had, the storage history of
+/// the frame without its certificate ([`Prepared::prepare_without_certificate`]).
+pub(crate) async fn prepare_replayed_frame(
+    validator: &Arc<BlsAppFrameValidator>,
+    frame: &quil_types::proto::global::AppShardFrame,
+) -> Prepared {
+    // Structure and output first, without the certificate: a frame whose
+    // output does not follow from its header (or that waits on its GLOBAL
+    // anchor) gets no committee rebuilt for it, and its validation refuses
+    // it, or waits, as it is.
+    let _ = validator.prepare_global_anchor(frame).await;
+    let bare = without_certificate(frame);
+    let sound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_linked_without_storage(&bare)));
+    let committee = match sound {
+        Ok(Ok(true)) => {
+            let rebuild = {
+                let (validator, frame) = (validator.clone(), frame.clone());
+                tokio::spawn(async move { validator.prepare_historical_committee(&frame).await })
+            };
+            match tokio::time::timeout(REPLAY_COMMITTEE_WAIT, rebuild).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(QuilError::Internal(format!("historical committee preparation: {error}"))),
+                Err(_) => Err(QuilError::ExecutionUnavailable(format!(
+                    "historical committee not rebuilt within {}s; rebuilding on", REPLAY_COMMITTEE_WAIT.as_secs()))),
+            }
+        }
+        _ => Ok(()),
+    };
+    let mut prepared = prepare_with_committee(validator, frame, committee).await;
+    prepared.prepare_without_certificate(validator, frame).await;
+    prepared
 }
 
 /// Whether a start failed only because this successor has not yet recovered
@@ -10435,13 +10680,16 @@ mod start_block_tests {
     }
 }
 
-/// A certified frame, with its possession proof when `retained`.
-fn validate_certified_frame(
+/// A certified frame, with its possession proof when `retained`. A frame
+/// that carried no requests and comes without its storage attestation
+/// ([`crate::frame_validator::empty_without_attestation`]) has no proof to
+/// verify: its certificate and output authenticate it.
+pub(crate) fn validate_certified_frame(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
     retained: bool,
 ) -> Result<bool> {
-    if retained {
+    if retained && !crate::frame_validator::empty_without_attestation(frame) {
         return validate_app_frame_panic_safe(validator, frame, false);
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| validator.validate_certified_without_storage(frame))) {
