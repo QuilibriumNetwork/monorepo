@@ -1,3 +1,4 @@
+mod clean;
 mod config;
 mod db;
 mod diagnostics;
@@ -8,8 +9,10 @@ mod logger;
 mod p2p;
 mod proof_worker;
 mod signatories;
+mod unused_keys;
 mod version;
 
+pub use clean::*;
 pub use config::*;
 pub use db::*;
 pub use diagnostics::*;
@@ -20,6 +23,7 @@ pub use logger::*;
 pub use p2p::*;
 pub use proof_worker::*;
 pub use signatories::*;
+pub use unused_keys::*;
 pub use version::*;
 
 use serde::{Deserialize, Deserializer};
@@ -133,8 +137,47 @@ pub enum ConfigError {
     Other(String),
 }
 
+/// What the operator should know about how the node read its config.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigNotices {
+    /// Keys of the config that the node does not use.
+    pub unused_keys: Vec<UnusedKey>,
+    /// Configured `p2p.bootstrapPeers` entries that the built-in mainnet
+    /// list replaced ([`replaced_mainnet_bootstrap_peers`]).
+    pub replaced_bootstrap_peers: Option<usize>,
+}
+
+impl ConfigNotices {
+    /// The warning naming the keys the node does not know, if any.
+    pub fn unknown_keys_line(&self) -> Option<String> {
+        unknown_keys_warning(&self.unused_keys)
+    }
+
+    /// The notice naming the settings of earlier releases, if any.
+    pub fn retired_keys_line(&self) -> Option<String> {
+        retired_keys_notice(&self.unused_keys)
+    }
+
+    /// The notice that mainnet replaced the configured bootstrap peers.
+    pub fn bootstrap_peers_line(&self) -> Option<String> {
+        self.replaced_bootstrap_peers.map(|configured| {
+            format!(
+                "mainnet uses its {} built-in bootstrap peers instead of the {configured} configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this",
+                MAINNET_BOOTSTRAP_PEERS.len()
+            )
+        })
+    }
+}
+
 /// Load a config from the given directory, applying defaults.
 pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
+    load_config_with_notices(config_dir).map(|(config, _)| config)
+}
+
+/// [`load_config`], also returning what the operator should know about
+/// the config file: keys the node does not use and replaced settings.
+/// A config generated on first run has nothing to report.
+pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNotices), ConfigError> {
     let config_path = config_dir.join("config.yml");
 
     if !config_path.exists() {
@@ -171,12 +214,17 @@ pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
         // Save config.yml
         save_config(config_dir, &config)?;
 
-        return Ok(config);
+        return Ok((config, ConfigNotices::default()));
     }
 
     let contents = std::fs::read_to_string(&config_path)?;
     let mut config: Config = serde_yaml::from_str(&contents)?;
+    let configured_bootstrap_peers = config.p2p.bootstrap_peers.clone();
     config.apply_defaults();
+    let notices = ConfigNotices {
+        unused_keys: unused_keys(&contents),
+        replaced_bootstrap_peers: replaced_mainnet_bootstrap_peers(config.p2p.network, &configured_bootstrap_peers),
+    };
 
     // Fill in defaults for keys path if empty (matching Go)
     if config.key.key_store_file.path.is_empty() {
@@ -201,7 +249,7 @@ pub fn load_config(config_dir: &Path) -> Result<Config, ConfigError> {
             .to_string();
     }
 
-    Ok(config)
+    Ok((config, notices))
 }
 
 /// Save a config to the given directory.
@@ -253,7 +301,6 @@ mod tests {
     fn default_config_listens_for_grpc_locally_only() {
         let c = Config::default();
         assert_eq!(c.listen_grpc_multiaddr, DEFAULT_LISTEN_GRPC_MULTIADDR);
-        assert!(c.listen_rest_multiaddr.is_empty());
     }
 
     #[test]
@@ -270,23 +317,16 @@ mod tests {
         let e = EngineConfig::default();
         assert_eq!(e.data_worker_base_p2p_port, 25000);
         assert_eq!(e.data_worker_base_stream_port, 32500);
-        assert_eq!(e.data_worker_memory_limit, 1792 * 1024 * 1024);
-        assert_eq!(e.sync_timeout_ms, 4000);
-        assert_eq!(e.sync_candidates, 8);
+        assert_eq!(e.archive_blacklist_ttl_secs, 60);
         assert_eq!(e.reward_strategy, "reward-greedy");
     }
 
     #[test]
     fn p2p_config_defaults_populated_via_yaml_empty_object() {
         let p = P2PConfig::default();
-        assert_eq!(p.low_watermark_connections, 160);
-        assert_eq!(p.high_watermark_connections, 192);
-        assert_eq!(p.min_bootstrap_peers, 3);
-        assert_eq!(p.grpc_server_rate_limit, 10);
         assert_eq!(p.stream_listen_multiaddr, "/ip4/0.0.0.0/tcp/8340");
-        assert_eq!(p.ping_timeout_ms, 5000);
-        assert_eq!(p.ping_period_ms, 30000);
-        assert_eq!(p.ping_attempts, 3);
+        assert_eq!(p.d_lo, 0);
+        assert_eq!(p.heartbeat_interval_ms, 0);
     }
 
     #[test]
@@ -305,16 +345,12 @@ mod tests {
     #[test]
     fn apply_defaults_populates_zero_engine_fields() {
         let yaml = r#"
-minimumPeersRequired: 0
-syncTimeoutMs: 0
-syncCandidates: 0
+archiveBlacklistTtl: 0
 rewardStrategy: ""
 "#;
         let mut e: EngineConfig = serde_yaml::from_str(yaml).unwrap();
         e.apply_defaults();
-        assert_eq!(e.minimum_peers_required, 3);
-        assert_eq!(e.sync_timeout_ms, 4000);
-        assert_eq!(e.sync_candidates, 8);
+        assert_eq!(e.archive_blacklist_ttl_secs, 60);
         assert_eq!(e.reward_strategy, "reward-greedy");
     }
 
@@ -350,14 +386,12 @@ rewardStrategy: ""
     #[test]
     fn apply_defaults_preserves_non_zero_fields() {
         let yaml = r#"
-minimumPeersRequired: 42
-syncTimeoutMs: 1000
+archiveBlacklistTtl: 42
 rewardStrategy: "custom-strategy"
 "#;
         let mut e: EngineConfig = serde_yaml::from_str(yaml).unwrap();
         e.apply_defaults();
-        assert_eq!(e.minimum_peers_required, 42);
-        assert_eq!(e.sync_timeout_ms, 1000);
+        assert_eq!(e.archive_blacklist_ttl_secs, 42);
         assert_eq!(e.reward_strategy, "custom-strategy");
     }
 
@@ -379,28 +413,24 @@ rewardStrategy: "custom-strategy"
     fn apply_defaults_populates_p2p_stream_addr_when_empty() {
         let mut p = P2PConfig::default();
         p.stream_listen_multiaddr = String::new();
-        p.low_watermark_connections = 0;
-        p.high_watermark_connections = 0;
         p.apply_defaults();
         assert_eq!(p.stream_listen_multiaddr, "/ip4/0.0.0.0/tcp/8340");
-        assert_eq!(p.low_watermark_connections, 160);
-        assert_eq!(p.high_watermark_connections, 192);
+        assert_eq!(p.d_lo, 6);
+        assert_eq!(p.heartbeat_interval_ms, 700);
     }
 
     #[test]
     fn top_level_apply_defaults_cascades_to_subconfigs() {
         let mut c = Config::default();
-        c.engine.minimum_peers_required = 0;
-        c.engine.sync_timeout_ms = 0;
+        c.engine.archive_blacklist_ttl_secs = 0;
         c.db.notice_percentage = 0;
-        c.p2p.low_watermark_connections = 0;
+        c.p2p.d_lo = 0;
 
         c.apply_defaults();
 
-        assert_eq!(c.engine.minimum_peers_required, 3);
-        assert_eq!(c.engine.sync_timeout_ms, 4000);
+        assert_eq!(c.engine.archive_blacklist_ttl_secs, 60);
         assert_eq!(c.db.notice_percentage, 70);
-        assert_eq!(c.p2p.low_watermark_connections, 160);
+        assert_eq!(c.p2p.d_lo, 6);
     }
 
     // =================================================================
@@ -410,8 +440,8 @@ rewardStrategy: "custom-strategy"
     #[test]
     fn yaml_round_trip_preserves_scalar_fields() {
         let mut c = Config::default();
-        c.engine.minimum_peers_required = 17;
-        c.engine.sync_timeout_ms = 5555;
+        c.engine.data_worker_count = 17;
+        c.p2p.heartbeat_interval_ms = 5555;
         c.engine.archive_mode = true;
         c.engine.delegate_address = "delegate-xyz".into();
         c.db.path = "/data/store".into();
@@ -421,8 +451,8 @@ rewardStrategy: "custom-strategy"
         let yaml = serde_yaml::to_string(&c).unwrap();
         let c2: Config = serde_yaml::from_str(&yaml).unwrap();
 
-        assert_eq!(c2.engine.minimum_peers_required, 17);
-        assert_eq!(c2.engine.sync_timeout_ms, 5555);
+        assert_eq!(c2.engine.data_worker_count, 17);
+        assert_eq!(c2.p2p.heartbeat_interval_ms, 5555);
         assert!(c2.engine.archive_mode);
         assert_eq!(c2.engine.delegate_address, "delegate-xyz");
         assert_eq!(c2.db.path, "/data/store");
@@ -488,28 +518,16 @@ rewardStrategy: "custom-strategy"
     #[test]
     fn yaml_field_names_use_camel_case() {
         let mut c = Config::default();
-        c.engine.minimum_peers_required = 5;
+        c.engine.data_worker_count = 5;
         let yaml = serde_yaml::to_string(&c).unwrap();
         assert!(
-            yaml.contains("minimumPeersRequired"),
+            yaml.contains("dataWorkerCount"),
             "yaml missing camelCase field: {}",
             yaml
         );
         assert!(
-            !yaml.contains("minimum_peers_required"),
+            !yaml.contains("data_worker_count"),
             "yaml has snake_case field: {}",
-            yaml
-        );
-    }
-
-    #[test]
-    fn yaml_special_rest_multiaddr_rename() {
-        let mut c = Config::default();
-        c.listen_rest_multiaddr = "/ip4/0.0.0.0/tcp/9000".into();
-        let yaml = serde_yaml::to_string(&c).unwrap();
-        assert!(
-            yaml.contains("listenRESTMultiaddr"),
-            "yaml missing listenRESTMultiaddr: {}",
             yaml
         );
     }
@@ -518,7 +536,7 @@ rewardStrategy: "custom-strategy"
     fn parse_yaml_with_unknown_fields_ignores_them() {
         let yaml = r#"
 engine:
-  minimumPeersRequired: 5
+  dataWorkerCount: 5
   unknownFutureField: "ignored"
 "#;
         let result: std::result::Result<Config, _> = serde_yaml::from_str(yaml);
@@ -528,7 +546,7 @@ engine:
             result.err()
         );
         let c = result.unwrap();
-        assert_eq!(c.engine.minimum_peers_required, 5);
+        assert_eq!(c.engine.data_worker_count, 5);
     }
 
     // =================================================================
@@ -558,7 +576,7 @@ engine:
         let dir = tempdir("parse_real_yaml");
         let yaml = r#"
 engine:
-  minimumPeersRequired: 5
+  dataWorkerCount: 5
   rewardStrategy: "custom"
   archiveMode: true
 db:
@@ -574,7 +592,7 @@ p2p:
         drop(f);
 
         let c = load_config(&dir).unwrap();
-        assert_eq!(c.engine.minimum_peers_required, 5);
+        assert_eq!(c.engine.data_worker_count, 5);
         assert_eq!(c.engine.reward_strategy, "custom");
         assert!(c.engine.archive_mode);
         assert_eq!(c.db.path, "/var/quil-db");
@@ -598,8 +616,8 @@ engine:
         std::fs::write(dir.join("config.yml"), yaml).unwrap();
         let c = load_config(&dir).unwrap();
         assert!(c.engine.archive_mode);
-        assert_eq!(c.engine.minimum_peers_required, 3);
-        assert_eq!(c.engine.sync_timeout_ms, 4000);
+        assert_eq!(c.engine.archive_blacklist_ttl_secs, 60);
+        assert_eq!(c.p2p.heartbeat_interval_ms, 700);
 
         cleanup(&dir);
     }
@@ -611,14 +629,14 @@ engine:
         assert!(!nested.exists());
 
         let mut c = Config::default();
-        c.engine.minimum_peers_required = 99;
+        c.engine.data_worker_count = 99;
 
         save_config(&nested, &c).unwrap();
         assert!(nested.exists());
         assert!(nested.join("config.yml").exists());
 
         let loaded = load_config(&nested).unwrap();
-        assert_eq!(loaded.engine.minimum_peers_required, 99);
+        assert_eq!(loaded.engine.data_worker_count, 99);
 
         cleanup(&dir);
     }
@@ -627,18 +645,18 @@ engine:
     fn save_then_load_round_trip_preserves_config() {
         let dir = tempdir("save_load_round_trip");
         let mut c = Config::default();
-        c.engine.minimum_peers_required = 25;
+        c.engine.data_worker_count = 25;
         c.engine.archive_mode = true;
-        c.engine.rewards_address = "rewards-abc".into();
+        c.engine.delegate_address = "delegate-abc".into();
         c.db.path = "/nested/path".into();
         c.listen_grpc_multiaddr = "/ip4/0.0.0.0/tcp/8337".into();
 
         save_config(&dir, &c).unwrap();
         let loaded = load_config(&dir).unwrap();
 
-        assert_eq!(loaded.engine.minimum_peers_required, 25);
+        assert_eq!(loaded.engine.data_worker_count, 25);
         assert!(loaded.engine.archive_mode);
-        assert_eq!(loaded.engine.rewards_address, "rewards-abc");
+        assert_eq!(loaded.engine.delegate_address, "delegate-abc");
         assert_eq!(loaded.db.path, "/nested/path");
         assert_eq!(loaded.listen_grpc_multiaddr, "/ip4/0.0.0.0/tcp/8337");
 
@@ -652,48 +670,6 @@ engine:
         let err = load_config(&dir).unwrap_err();
         assert!(matches!(err, ConfigError::Yaml(_)));
         cleanup(&dir);
-    }
-
-    // =================================================================
-    // Frame publish / Reed-Solomon sub-config
-    // =================================================================
-
-    #[test]
-    fn reed_solomon_defaults() {
-        let rs = ReedSolomonConfig::default();
-        assert_eq!(rs.data_shards, 224);
-        assert_eq!(rs.parity_shards, 32);
-    }
-
-    #[test]
-    fn frame_publish_defaults() {
-        let fp = FramePublishConfig::default();
-        assert_eq!(fp.mode, "full");
-        assert_eq!(fp.threshold, 1024 * 1024);
-        assert_eq!(fp.fragmentation.algorithm, "reed-solomon");
-        assert_eq!(fp.fragmentation.reed_solomon.data_shards, 224);
-        assert_eq!(fp.fragmentation.reed_solomon.parity_shards, 32);
-    }
-
-    #[test]
-    fn grpc_message_limits_defaults_scale_with_sync_limit() {
-        let g = GrpcMessageLimitsConfig::default();
-        let expected = 64 * 1024 * 1024;
-        assert_eq!(g.max_recv_msg_size, expected);
-        assert_eq!(g.max_send_msg_size, expected);
-    }
-
-    #[test]
-    fn apply_defaults_sets_frame_publish_mode_when_empty() {
-        let yaml = r#"
-framePublish:
-  mode: ""
-  threshold: 2048
-"#;
-        let mut e: EngineConfig = serde_yaml::from_str(yaml).unwrap();
-        e.apply_defaults();
-        assert_eq!(e.frame_publish.mode, "full");
-        assert_eq!(e.frame_publish.threshold, 2048);
     }
 
     #[test]
@@ -720,15 +696,7 @@ p2p:
   fanoutTTL: 60s
   pruneBackoff: 60s
   unsubscribeBackoff: 10s
-  connectionTimeout: 30s
-  directConnectInitialDelay: 1s
-  graftFloodThreshold: 10s
   iWantFollowupTime: 3s
-  pingTimeout: 5s
-  pingPeriod: 30s
-  peerReconnectCheckInterval: 60s
-engine:
-  syncTimeout: 4s
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.p2p.heartbeat_initial_delay_ms, 100);
@@ -736,14 +704,7 @@ engine:
         assert_eq!(config.p2p.fanout_ttl_ms, 60_000);
         assert_eq!(config.p2p.prune_backoff_ms, 60_000);
         assert_eq!(config.p2p.unsubscribe_backoff_ms, 10_000);
-        assert_eq!(config.p2p.connection_timeout_ms, 30_000);
-        assert_eq!(config.p2p.direct_connect_initial_delay_ms, 1_000);
-        assert_eq!(config.p2p.graft_flood_threshold_ms, 10_000);
         assert_eq!(config.p2p.iwant_followup_time_ms, 3_000);
-        assert_eq!(config.p2p.ping_timeout_ms, 5_000);
-        assert_eq!(config.p2p.ping_period_ms, 30_000);
-        assert_eq!(config.p2p.peer_reconnect_check_interval_ms, 60_000);
-        assert_eq!(config.engine.sync_timeout_ms, 4_000);
     }
 
     #[test]
@@ -753,15 +714,12 @@ engine:
 p2p:
   heartbeatInitialDelay: 0s
   heartbeatInterval: 0s
-  pingTimeout: 0s
-engine:
-  syncTimeout: 0s
+  fanoutTTL: 0s
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.p2p.heartbeat_initial_delay_ms, 0);
         assert_eq!(config.p2p.heartbeat_interval_ms, 0);
-        assert_eq!(config.p2p.ping_timeout_ms, 0);
-        assert_eq!(config.engine.sync_timeout_ms, 0);
+        assert_eq!(config.p2p.fanout_ttl_ms, 0);
     }
 
     #[test]
@@ -779,5 +737,84 @@ engine:
             assert!(!config.p2p.peer_priv_key.is_empty(), "peer key should be set");
             assert!(!config.p2p.bootstrap_peers.is_empty(), "bootstrap peers should be set");
         }
+    }
+
+    // =================================================================
+    // Notices
+    // =================================================================
+
+    /// Mainnet's replacement of the configured bootstrap peers is reported
+    /// only when a non-empty configured list differs from the built-in one.
+    #[test]
+    fn a_replaced_mainnet_bootstrap_list_is_reported_when_it_differs() {
+        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS.iter().map(|peer| peer.to_string()).collect();
+        let stale = vec!["/ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale".to_string(), built_in[0].clone()];
+        assert_eq!(replaced_mainnet_bootstrap_peers(0, &stale), Some(2));
+        assert_eq!(replaced_mainnet_bootstrap_peers(0, &built_in[1..]), Some(built_in.len() - 1));
+        assert_eq!(replaced_mainnet_bootstrap_peers(0, &[]), None);
+        assert_eq!(replaced_mainnet_bootstrap_peers(0, &built_in), None);
+        let mut reordered = built_in.clone();
+        reordered.reverse();
+        assert_eq!(replaced_mainnet_bootstrap_peers(0, &reordered), None);
+        assert_eq!(replaced_mainnet_bootstrap_peers(1, &stale), None);
+
+        let dir = tempdir("bootstrap_notice");
+        std::fs::write(dir.join("config.yml"), "p2p:\n  network: 0\n  bootstrapPeers:\n    - /ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale\n").unwrap();
+        let (config, notices) = load_config_with_notices(&dir).unwrap();
+        assert_eq!(config.p2p.bootstrap_peers, built_in);
+        assert_eq!(notices.replaced_bootstrap_peers, Some(1));
+        assert_eq!(
+            notices.bootstrap_peers_line().unwrap(),
+            format!(
+                "mainnet uses its {} built-in bootstrap peers instead of the 1 configured in p2p.bootstrapPeers, which differ; the setting has no effect on mainnet: no action needed, remove p2p.bootstrapPeers to silence this",
+                built_in.len()
+            )
+        );
+        assert_eq!((notices.unknown_keys_line(), notices.retired_keys_line()), (None, None));
+        std::fs::write(dir.join("config.yml"), "p2p:\n  network: 2\n  bootstrapPeers:\n    - /ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale\n").unwrap();
+        let (_, notices) = load_config_with_notices(&dir).unwrap();
+        assert_eq!(notices, ConfigNotices::default());
+        cleanup(&dir);
+    }
+
+    /// The loader reports the unused keys of the file it read; a config it
+    /// generates has none.
+    #[test]
+    fn load_config_reports_unused_keys() {
+        let dir = tempdir("unused_keys_notice");
+        std::fs::write(dir.join("config.yml"), "p2p:\n  network: 1\n  d: 8\n  dLo: 6\nengine:\n  archiveMod: true\n").unwrap();
+        let (_, notices) = load_config_with_notices(&dir).unwrap();
+        assert_eq!(
+            notices.unused_keys,
+            vec![UnusedKey::Retired("p2p.d".into()), UnusedKey::Unknown("engine.archiveMod".into())]
+        );
+        assert_eq!(
+            notices.unknown_keys_line().unwrap(),
+            "1 config key is not a known setting (typo?): engine.archiveMod"
+        );
+        assert_eq!(
+            notices.retired_keys_line().unwrap(),
+            "1 setting of an earlier release has no effect in this node; remove it from config.yml when convenient: p2p.d; run `qclient node config clean` to comment it out"
+        );
+        let generated = tempdir("unused_keys_generated");
+        let _ = std::fs::remove_dir_all(&generated);
+        assert_eq!(load_config_with_notices(&generated).unwrap().1, ConfigNotices::default());
+        assert_eq!(load_config_with_notices(&generated).unwrap().1, ConfigNotices::default());
+        cleanup(&dir);
+        cleanup(&generated);
+    }
+
+    /// The devnet configs load and use every key they set.
+    #[test]
+    fn devnet_configs_use_every_key() {
+        let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../devnet/config");
+        let mut loaded = 0;
+        for node in ["archive-1", "archive-2", "archive-3", "archive-4", "client-1", "proxy"] {
+            let contents = std::fs::read_to_string(configs.join(format!("{node}-config/config.yml"))).unwrap();
+            serde_yaml::from_str::<Config>(&contents).unwrap_or_else(|e| panic!("{node}: {e}"));
+            assert_eq!(unused_keys(&contents), Vec::new(), "{node}");
+            loaded += 1;
+        }
+        assert_eq!(loaded, 6);
     }
 }

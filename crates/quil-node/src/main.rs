@@ -397,7 +397,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
     // Load configuration first so logger paths / filters come from it.
-    let config = quil_config::load_config(&args.config)?;
+    let (config, config_notices) = quil_config::load_config_with_notices(&args.config)?;
     // Token proof worker settings fail fast, before any store opens.
     config
         .proof_worker
@@ -731,6 +731,22 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     );
 
     info!(config_dir = %args.config.display(), "loaded configuration");
+    // The master reports, once, config keys the node does not know, the
+    // settings of earlier releases and, on mainnet, a configured bootstrap
+    // list that the built-in one replaced.
+    if args.core == 0 {
+        if let Some(line) = config_notices.unknown_keys_line() {
+            warn!("{line}");
+        }
+        if let Some(line) = config_notices.retired_keys_line() {
+            info!("{line}");
+        }
+        if args.network == 0 {
+            if let Some(line) = config_notices.bootstrap_peers_line() {
+                info!("{line}");
+            }
+        }
+    }
 
     // Before any shard engine runs: shard frames anchored below this frame
     // relay nothing, as the mainnet build that made them did.

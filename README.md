@@ -55,12 +55,11 @@ with:
 
     task build_node_arm64_macos
 
-## gRPC/REST Support
+## gRPC Support
 
-If you want to enable gRPC/REST, add the following entries to your config.yml:
+If you want to enable gRPC, add the following entry to your config.yml:
 
     listenGrpcMultiaddr: <multiaddr> 
-    listenRESTMultiaddr: <multiaddr>
 
 Please note: this interface, while read-only, is unauthenticated and not rate-
 limited. It is recommended that you only enable if you are properly controlling
