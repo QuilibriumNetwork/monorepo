@@ -261,13 +261,13 @@ impl InMemoryProverRegistry {
         // every leaf there on every commit, and the RPC sync path
         // populates it too. One row per `(set, phase, shard, vk)` so
         // no dedup is required.
-        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut rows = RegistryRows::default();
         visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
             row(vk.len(), data.len());
             rows.add(vk[32..].try_into().expect("64-byte registry key"), &data);
-            leaves.push((vk, data));
+            // Rows retain the decoded data. Release serialized blobs with each
+            // page instead of holding another whole registry until publication.
             Ok(())
         })?;
         let from_rows = rows.has_adds();
@@ -278,7 +278,8 @@ impl InMemoryProverRegistry {
         // running before the first post-upgrade commit doesn't see an
         // empty cache. The next commit re-populates the per-vertex
         // range, after which this branch is a no-op.
-        if leaves.is_empty() {
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if !from_rows {
             if let Some(blob) = snapshot.load_tree_blob("vertex", "adds", &shard)? {
                 budget.input(0, blob.len(), false)?;
                 if let Some(root) = quil_tries::deserialize_tree(&blob)

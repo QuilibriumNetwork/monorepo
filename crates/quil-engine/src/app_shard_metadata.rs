@@ -235,6 +235,8 @@ pub fn leaf_data_for(
 /// Seed a worker's own committed data for its full coverage filter. Unified
 /// workers reject unrelated addresses before retaining blobs and do not write
 /// unchanged vertices again. Legacy trees retain whole-app seed semantics.
+/// A process worker already uses its own CRDT as the source; skip that copy
+/// before enumerating blobs, including before unified mode is enabled.
 pub fn sync_app_shard_to_own_crdt(
     source: &HypergraphCrdt,
     own: &HypergraphCrdt,
@@ -250,6 +252,9 @@ pub fn sync_app_shard_to_own_crdt(
             .ok_or_else(|| QuilError::InvalidArgument("invalid unified seed filter".into()))?;
         Some(bits)
     } else { None };
+    if std::ptr::eq(source, own) {
+        return Ok(0);
+    }
     let matches = |key: &[u8]| key.len() == 64 && bits.as_ref().is_none_or(|bits| {
         key[..32] == app && bits.iter().enumerate().all(|(i, bit)| {
             (key[32 + i / 8] >> (7 - i % 8) & 1 != 0) == *bit
@@ -703,6 +708,18 @@ mod tests {
             assert!(sync_app_shard_to_own_crdt(&source, &invalid, &filter, 2).is_err());
         }
         assert_eq!(db.inner().latest_sequence_number(), before);
+    }
+
+    #[test]
+    fn worker_seed_from_its_own_crdt_copies_nothing() {
+        // A cluster worker wires its own CRDT as the storage source.
+        let (db, own) = seed_test_crdt(false);
+        let app = [0x71; 32];
+        own.add_vertex(&Location { app_address: app, data_address: [0; 32] }, b"a").unwrap();
+        own.commit(1).unwrap();
+        let before = db.inner().latest_sequence_number();
+        assert_eq!(sync_app_shard_to_own_crdt(&own, &own, &app, 2).unwrap(), 0);
+        assert_eq!(db.inner().latest_sequence_number(), before, "no re-add or commit of its own data");
     }
 
     /// A bit-path filter names its subtree in sentinel prefix form; a legacy
