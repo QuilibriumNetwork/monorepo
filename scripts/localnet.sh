@@ -283,6 +283,7 @@ write_archive_config() {
 key:
   keyManagerFile:
     path: "$dir/keys.yml"
+    createIfMissing: true
 p2p:
   network: $NETWORK
   peerPrivKey: "$peerkey"
@@ -352,11 +353,11 @@ write_regular_config() {
   # rejects every gossiped frame as "BLS signature INVALID". COMMITTEE_HEX /
   # COMMITTEE_PID are set in the archive pass (identical on every node).
   local committee_yaml=" []" committee_pid_yaml=" []" _c
-  if (( ${#COMMITTEE_HEX[@]:-0} > 0 )); then
+  if (( ${#COMMITTEE_HEX[@]} > 0 )); then
     committee_yaml=""
     for _c in "${COMMITTEE_HEX[@]}"; do committee_yaml+=$'\n    - "'"$_c"'"'; done
   fi
-  if (( ${#COMMITTEE_PID[@]:-0} > 0 )); then
+  if (( ${#COMMITTEE_PID[@]} > 0 )); then
     committee_pid_yaml=""
     for _c in "${COMMITTEE_PID[@]}"; do committee_pid_yaml+=$'\n    - "'"$_c"'"'; done
   fi
@@ -364,6 +365,7 @@ write_regular_config() {
 key:
   keyManagerFile:
     path: "$dir/keys.yml"
+    createIfMissing: true
 p2p:
   network: $NETWORK
   peerPrivKey: "$peerkey"
