@@ -21,7 +21,8 @@
 #                     floor(2N/3)+1 (N=1→1, N=2→2, N=3→3, N=4→3).
 #   REGULARS=3        number of regular (non-archive) nodes
 #   CORES=3           dataWorkerCount per regular node (worker threads)
-#   PROFILE=release   cargo build profile (release|debug)
+#   PROFILE=release   cargo build profile: release, debug, or the name of a
+#                     custom profile from Cargo.toml (e.g. devnet)
 #   NET_DIR=path      isolated directory for this test network
 #   SKIP_BUILD=1      use binaries already built from the intended source tree
 #   NETWORK=1         network id (1 = primary testnet; non-0, non-99)
@@ -216,9 +217,12 @@ TARGET_DIR="${TARGET_DIR:-$ROOT/target}"
 if [[ "$PROFILE" == "release" ]]; then
   BIN="$TARGET_DIR/release/quil-node"
   CARGO_FLAGS="--release"
-else
+elif [[ "$PROFILE" == "debug" ]]; then
   BIN="$TARGET_DIR/debug/quil-node"
   CARGO_FLAGS=""
+else
+  BIN="$TARGET_DIR/$PROFILE/quil-node"
+  CARGO_FLAGS="--profile $PROFILE"
 fi
 
 # Common flags. Source builds aren't signed, so signature check is off.
