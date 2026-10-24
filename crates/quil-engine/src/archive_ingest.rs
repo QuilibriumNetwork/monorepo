@@ -2193,6 +2193,42 @@ mod tests {
         assert!(ingest.wants_owed_body(&filter, &certified));
     }
 
+    /// While GLOBAL's records cannot be read (a committee-handoff policy is
+    /// installed and this archive holds no GLOBAL cursor yet), whether the
+    /// frame after a reported hole opens a session cannot be told: the hole
+    /// is not owed, nor remembered as not owed, so the next report looks
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_report_whose_session_cannot_be_told_is_looked_into_again() {
+        use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
+        struct RestorePolicy(Option<CommitteeHandoffPolicy>);
+        impl Drop for RestorePolicy {
+            fn drop(&mut self) { quil_types::consensus::set_committee_handoff_policy(self.0); }
+        }
+        let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
+        quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 0, chain_id: [1; 32], legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX,
+        }));
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (gap, _gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        for index in [0, 2, 3] {
+            ingest.admit(&filter, frames[index].clone(), true);
+        }
+        ingest.last_materialized.insert(filter.clone(), 4);
+        assert!(ingest.opens_session_after(&filter, 2).is_err(), "GLOBAL's records cannot be read");
+        report.try_send((filter.clone(), 2)).unwrap();
+        ingest.retry_pending();
+        assert!(!ingest.owes_body(&filter, 2) && rx.try_recv().is_err(), "not owed");
+        assert!(!ingest.not_owed(&filter, 2), "nor remembered as not owed");
+    }
+
     /// A session's first frame names the session's genesis as its parent,
     /// not the frame before it: a hole at a sealed session's last frame is
     /// owed under the digest GLOBAL committed for it, so its genuine body,
