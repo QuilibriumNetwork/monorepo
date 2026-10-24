@@ -253,6 +253,10 @@ pub struct WorkerOwnedDeps {
     pub global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
 }
 
+/// How long a stopping worker's engine gets to tear down before its thread
+/// is cancelled ([`ThreadWorkerManager::stop_worker`]).
+const ENGINE_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Thread-based worker manager. Core 0 is reserved for the master;
 /// workers use cores 1..N.
 pub struct ThreadWorkerManager {
@@ -355,6 +359,69 @@ impl ThreadWorkerManager {
         join_within(handles, deadline)
     }
 
+    /// Stop worker `core_id` so its own stores close, keeping its allocation
+    /// (filter, allocated, manual mode): its engine is torn down first, as
+    /// for an idle worker, so the master drops its routing, then its thread
+    /// is cancelled and joined within `deadline`. Commands sent while it is
+    /// stopped change only the allocation, which [`Self::restart_worker`]
+    /// applies. Returns whether the thread ended.
+    pub fn stop_worker(&self, core_id: u32, deadline: std::time::Duration) -> bool {
+        let Some(tx) = self.workers.lock().unwrap().get(&core_id).map(|w| w.tx.clone()) else {
+            return true;
+        };
+        if tx.try_send(MasterToWorker::Respawn { filter: Vec::new(), start_consensus: true }).is_ok() {
+            std::thread::sleep(ENGINE_TEARDOWN);
+        }
+        let handle = {
+            let mut workers = self.workers.lock().unwrap();
+            let Some(w) = workers.get_mut(&core_id) else { return true };
+            w.cancel.cancel();
+            *w.execution_handle.lock().unwrap() = None;
+            w.handle.take()
+        };
+        handle.is_none_or(|handle| join_within(vec![(core_id, handle)], deadline).is_empty())
+    }
+
+    /// Start a worker stopped by [`Self::stop_worker`] on a new thread, which
+    /// reopens its own stores, and bind it to the allocation it has now. If
+    /// the worker builder cannot reopen them, the thread ends at once rather
+    /// than run the worker on the master's stores. A worker whose thread
+    /// still runs is never replaced.
+    pub fn restart_worker(&self, core_id: u32) -> Result<()> {
+        match self.workers.lock().unwrap().get(&core_id) {
+            None => return Err(QuilError::InvalidArgument(format!("worker {core_id} has no state to restart"))),
+            Some(w) if w.handle.as_ref().is_some_and(|handle| !handle.is_finished()) => {
+                return Err(QuilError::ExecutionUnavailable(format!("worker {core_id}'s thread still runs")));
+            }
+            Some(_) => {}
+        }
+        let fresh = self.spawn_worker(core_id, true)?;
+        self.mutate(core_id, move |w| {
+            w.cancel = fresh.cancel;
+            w.tx = fresh.tx;
+            w.handle = fresh.handle;
+            w.execution_handle = fresh.execution_handle;
+            if !w.filter.is_empty() {
+                let _ = w.tx.try_send(MasterToWorker::Respawn {
+                    filter: w.filter.clone(),
+                    start_consensus: w.allocated,
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// Whether worker `core_id`'s thread still runs (opening its stores, or
+    /// serving).
+    pub fn worker_running(&self, core_id: u32) -> bool {
+        self.workers
+            .lock()
+            .unwrap()
+            .get(&core_id)
+            .and_then(|w| w.handle.as_ref())
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
     /// Returns persisted worker state for the given core, when a
     /// store is wired and an entry exists.
     pub fn load_persisted(
@@ -412,7 +479,9 @@ impl ThreadWorkerManager {
     /// Spawn a worker thread pinned to the given core. The thread runs
     /// its own single-threaded tokio runtime and listens for commands
     /// on the `MasterToWorker` channel.
-    fn spawn_worker(&self, core_id: u32) -> Result<WorkerState> {
+    /// `own_stores`: the worker restarts after a stop to reopen its stores,
+    /// so it must not fall back to the master's when they do not open.
+    fn spawn_worker(&self, core_id: u32, own_stores: bool) -> Result<WorkerState> {
         let cancel = CancellationToken::new();
         let (tx, mut rx) = mpsc::channel::<MasterToWorker>(32);
         let master_tx = self.master_tx.clone();
@@ -457,6 +526,12 @@ impl ThreadWorkerManager {
                         .and_then(|d| d.worker_state_builder.as_ref())
                         .and_then(|b| match b(core_id) {
                             Ok(o) => Some(o),
+                            Err(e) if own_stores => {
+                                tracing::error!(core_id,
+                                    error = %quil_forest::storage_health::redact_paths(&e),
+                                    "worker_state_builder failed");
+                                None
+                            }
                             Err(e) => {
                                 tracing::error!(
                                     core_id,
@@ -466,6 +541,17 @@ impl ThreadWorkerManager {
                                 None
                             }
                         });
+                if own_stores && worker_owned.is_none()
+                    && consensus_deps.as_ref().is_some_and(|d| d.worker_state_builder.is_some())
+                {
+                    tracing::error!(
+                        core_id,
+                        scope = "this node",
+                        "worker could not reopen its own store after it was stopped; it stays stopped rather than \
+                         run on the master's stores: restart the node"
+                    );
+                    return;
+                }
 
                 // Create per-thread tokio runtime
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1044,7 +1130,7 @@ impl WorkerManager for ThreadWorkerManager {
         {
             let mut workers = self.workers.lock().unwrap();
             if !workers.contains_key(&core_id) {
-                let state = self.spawn_worker(core_id)?;
+                let state = self.spawn_worker(core_id, false)?;
                 workers.insert(core_id, state);
             }
         }
@@ -1290,6 +1376,206 @@ mod tests {
             assert!(!names.iter().any(|name| name == "worker-1" || name == "worker-2"),
                 "a joined worker thread is gone: {names:?}");
         }
+    }
+
+    /// A stopped worker's thread ends and its allocation stays; restarted, it
+    /// runs on a new thread with the allocation it has then.
+    #[tokio::test]
+    async fn a_stopped_worker_restarts_with_its_allocation() {
+        let mgr = Arc::new(ThreadWorkerManager::new());
+        let mut rx = mgr.take_master_rx().unwrap();
+        async fn ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
+            let wait = std::time::Duration::from_secs(5);
+            loop {
+                match tokio::time::timeout(wait, rx.recv()).await {
+                    Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
+                    Ok(Some(_)) => continue,
+                    _ => return false,
+                }
+            }
+        }
+        mgr.set_worker_filter(1, b"active-filter", true).unwrap();
+        assert!(ready(&mut rx).await);
+        let stopping = mgr.clone();
+        let stopped = tokio::task::spawn_blocking(move || stopping.stop_worker(1, std::time::Duration::from_secs(5)));
+        assert!(stopped.await.unwrap(), "the worker thread ends");
+        #[cfg(target_os = "linux")]
+        {
+            let running = std::fs::read_dir("/proc/self/task").unwrap().filter_map(|task| {
+                let path = task.ok()?.path();
+                let name = std::fs::read_to_string(path.join("comm")).ok()?;
+                let stat = std::fs::read_to_string(path.join("stat")).ok()?;
+                let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
+                (name.trim() == "worker-1" && flags & 0x4 == 0).then_some(())
+            }).count();
+            assert_eq!(running, 0, "no worker-1 thread runs while stopped");
+        }
+        assert!(mgr.worker_execution().is_empty(), "a stopped worker reports nothing of its own");
+        while let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {}
+        mgr.set_worker_filter(1, b"moved-filter", true).unwrap();
+        let workers = mgr.range_workers().unwrap();
+        assert_eq!((workers[0].filter.as_slice(), workers[0].allocated), (&b"moved-filter"[..], true));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await.is_err(),
+            "a stopped worker runs nothing");
+        mgr.restart_worker(1).unwrap();
+        assert!(ready(&mut rx).await, "the new thread starts");
+        assert!(ready(&mut rx).await, "and applies the allocation it has now");
+        assert!(mgr.restart_worker(2).is_err(), "only a known worker restarts");
+        let mgr_done = mgr.clone();
+        let running = tokio::task::spawn_blocking(move || mgr_done.shutdown_workers(std::time::Duration::from_secs(5)));
+        assert!(running.await.unwrap().is_empty());
+    }
+
+    /// The next `Ready` from worker 1 within five seconds, if any.
+    async fn worker_ready(rx: &mut mpsc::Receiver<WorkerToMaster>) -> bool {
+        let wait = std::time::Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(wait, rx.recv()).await {
+                Ok(Some(WorkerToMaster::Ready { core_id: 1 })) => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    /// A builder of worker stores over `dir`, as the node's opens its own
+    /// RocksDB per worker; it fails while `fail` is set.
+    fn store_builder(
+        dir: std::path::PathBuf,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Arc<dyn Fn(u32) -> std::result::Result<WorkerOwnedDeps, String> + Send + Sync> {
+        Arc::new(move |core_id: u32| {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("the store cannot be opened".into());
+            }
+            let db = Arc::new(quil_store::RocksDb::open(&dir).map_err(|e| e.to_string())?);
+            db.inner().register_store(quil_forest::StoreRole::Worker(core_id));
+            let clock_store: Arc<dyn quil_types::store::ClockStore> =
+                Arc::new(quil_store::RocksClockStore::new(db.inner()));
+            let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> = Arc::new(quil_tries::ShaInclusionProver);
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+                inclusion_prover.clone(),
+            ));
+            let execution_engine = Arc::new(quil_execution::ExecutionEngineManager::new(
+                inclusion_prover.clone(),
+                Arc::new(quil_crypto::DefaultKeyManager::new()),
+                crdt.clone(),
+                Arc::new(quil_execution::testing::NoopCircuitCompiler),
+                clock_store.clone(),
+                Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone())),
+                true,
+            ));
+            Ok(WorkerOwnedDeps {
+                clock_store,
+                hypergraph: crdt,
+                execution_engine,
+                inclusion_prover,
+                kv_db: Some(db as Arc<dyn quil_types::store::KvDb>),
+                shard_syncer: None,
+                unified_cutover_hook: None,
+                delivery_frame_source: None,
+                storage_history_source: None,
+                outgoing_history_source: None,
+                historical_committee_source: None,
+                global_anchor_source: None,
+            })
+        })
+    }
+
+    fn consensus_deps(
+        builder: Arc<dyn Fn(u32) -> std::result::Result<WorkerOwnedDeps, String> + Send + Sync>,
+    ) -> WorkerConsensusDeps {
+        let master = quil_store::RocksDb::open_in_memory().unwrap();
+        WorkerConsensusDeps {
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(crate::message_collector::MessageCollector::new()),
+            clock_store: Arc::new(quil_store::RocksClockStore::new(master.inner())),
+            fee_manager: Arc::new(crate::InMemoryDynamicFeeManager::new(32)),
+            local_prover_address: vec![1; 32],
+            local_bls_pubkey: Vec::new(),
+            bls_signer_factory: Arc::new(|| -> Box<dyn quil_types::crypto::Signer> {
+                unreachable!("no engine starts in this test")
+            }),
+            reward_greedy: false,
+            min_active_provers_for_propose: 1,
+            app_consensus_cw: false,
+            db_config: quil_config::DbConfig::default(),
+            coverage_publish: None,
+            hypergraph: None,
+            topology: None,
+            execution_engine: None,
+            inclusion_prover: None,
+            worker_init: None,
+            worker_state_builder: Some(builder),
+            kv_db: None,
+        }
+    }
+
+    async fn store_open_becomes(open: bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(1)) != open {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// A worker stopped to reopen its store closes it and, restarted,
+    /// reopens it through the worker builder; when the store cannot be
+    /// opened, the restarted worker stays stopped: no thread runs, it
+    /// reports nothing and it never falls back to the master's stores.
+    #[tokio::test]
+    async fn a_restarted_worker_reopens_its_own_store_or_stays_stopped() {
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp = TempDir(std::env::temp_dir()
+            .join(format!("quil-worker-reopen-{}-{}", std::process::id(), rand::random::<u64>())));
+        let dir = temp.0.clone();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mgr = Arc::new(ThreadWorkerManager::new());
+        mgr.set_consensus_deps(consensus_deps(store_builder(dir.clone(), fail.clone())));
+        let mut rx = mgr.take_master_rx().unwrap();
+        let drain = |rx: &mut mpsc::Receiver<WorkerToMaster>| while rx.try_recv().is_ok() {};
+        let stop = |mgr: &Arc<ThreadWorkerManager>| {
+            let mgr = mgr.clone();
+            tokio::task::spawn_blocking(move || mgr.stop_worker(1, std::time::Duration::from_secs(10)))
+        };
+
+        mgr.set_worker_filter(1, b"pinned-filter", false).unwrap();
+        assert!(worker_ready(&mut rx).await, "the worker starts on its own store");
+        assert!(store_open_becomes(true).await);
+        assert!(stop(&mgr).await.unwrap());
+        assert!(store_open_becomes(false).await, "its store closes with the worker");
+        drain(&mut rx);
+
+        mgr.restart_worker(1).unwrap();
+        assert!(worker_ready(&mut rx).await && worker_ready(&mut rx).await, "restarted on its allocation");
+        assert!(store_open_becomes(true).await, "the store is reopened");
+        assert!(mgr.worker_running(1));
+        assert!(mgr.restart_worker(1).is_err(), "a running worker is never replaced");
+        assert!(stop(&mgr).await.unwrap());
+        assert!(!mgr.worker_running(1));
+        assert!(store_open_becomes(false).await);
+        drain(&mut rx);
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        mgr.restart_worker(1).unwrap();
+        assert!(!worker_ready(&mut rx).await, "no worker runs without its own store");
+        assert!(!mgr.worker_running(1), "its thread ended");
+        assert!(!quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(1)));
+        assert!(mgr.worker_execution().is_empty(), "it reports nothing");
+        let mgr_done = mgr.clone();
+        let running = tokio::task::spawn_blocking(move || mgr_done.shutdown_workers(std::time::Duration::from_secs(5)));
+        assert!(running.await.unwrap().is_empty());
+        drop(temp);
     }
 
     #[test]

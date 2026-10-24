@@ -52,12 +52,15 @@ impl NodeWitnessIndex {
         let service = Arc::new(Self::new(db, crdt.clone(), network, spawner.clone()));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         crdt.set_local_vertex_observer(Arc::new(UpdateSender(tx)));
-        let worker = service.clone(); let token = spawner.token();
+        // The task holds the index weakly: its owners decide when it and its
+        // store go, and then the observer's channel closes and the task ends.
+        let index = Arc::downgrade(&service); let token = spawner.token();
         spawner.detach("token-witness-index-updates", async move {
             loop {
                 let event = tokio::select! { _ = token.cancelled() => return Ok(()), event = rx.recv() => match event {
                     Some(event) => event, None => return Ok(()),
                 }};
+                let Some(worker) = index.upgrade() else { return Ok(()) };
                 // Bootstrap and updates share one writer slot. Queue memory is
                 // bounded even while a long bootstrap is holding the slot.
                 loop {

@@ -1948,7 +1948,9 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         };
         Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
             filter,
-            execution,
+            // A store that refuses writes reads as blocked by it, to the
+            // master's lifecycle and health report alike.
+            execution: crate::worker_execution::with_store_state(self.worker.config.core_id, execution),
             now_unix_ms: crate::worker_execution::now_ms(),
         }))
     }

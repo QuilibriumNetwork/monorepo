@@ -229,8 +229,6 @@ struct CrdtCoinWitness {
     /// witnesses for such an application read the worker's CRDT and index.
     worker_app_states: super::worker_manager::WorkerAppStates,
     #[cfg(feature = "confidential-tokens")]
-    worker_witness_indexes: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, Arc<crate::witness_index::NodeWitnessIndex>>>,
-    #[cfg(feature = "confidential-tokens")]
     spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// Scans in progress over an application held in SEVERAL local worker
     /// stores: the identity handed to the wallet → each store's own retained
@@ -545,7 +543,7 @@ impl CrdtCoinWitness {
             if owned.is_empty() {
                 continue;
             }
-            let index = self.worker_witness_indexes.lock().entry(filter).or_insert_with(|| {
+            let index = state.witness_index.get_or_init(|| {
                 crate::witness_index::NodeWitnessIndex::start(
                     state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone())
             }).clone();
@@ -578,9 +576,8 @@ impl CrdtCoinWitness {
     fn witness_index_for(&self, domain: &[u8; 32]) -> Arc<crate::witness_index::NodeWitnessIndex> {
         match self.worker_state(domain) {
             None => self.witness_index.clone(),
-            Some((filter, state)) => self.worker_witness_indexes.lock()
-                .entry(filter)
-                .or_insert_with(|| crate::witness_index::NodeWitnessIndex::start(
+            Some((_filter, state)) => state.witness_index
+                .get_or_init(|| crate::witness_index::NodeWitnessIndex::start(
                     state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone(),
                 ))
                 .clone(),
@@ -1545,8 +1542,6 @@ pub(crate) fn spawn_all(
                 }) as Arc<dyn Fn() -> Option<u64> + Send + Sync>
             },
             worker_app_states: worker_app_states.clone(),
-            #[cfg(feature = "confidential-tokens")]
-            worker_witness_indexes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             composite_scans: parking_lot::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "confidential-tokens")]
             spawner: spawner.clone(),

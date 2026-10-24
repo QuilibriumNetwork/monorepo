@@ -1660,7 +1660,8 @@ impl ProverLifecycle {
             let lapsed: std::collections::HashSet<&[u8]> = prover.allocations.iter()
                 .filter(|a| a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch)
                 .map(|a| a.confirmation_filter.as_slice()).collect();
-            let executions = worker_manager.worker_execution();
+            // A worker stopped to reopen its store cannot host its seat.
+            let executions = crate::worker_execution::with_held_stores(worker_manager.worker_execution(), &bound);
             let unanswered = worker_manager.unanswered_workers();
             let now = crate::worker_execution::now_ms();
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
@@ -1723,7 +1724,11 @@ impl ProverLifecycle {
             hosting.held_back()
         };
         self.allocator.set_held_back(held_back.clone());
-        free_worker_ids.retain(|core_id| !held_back.contains(core_id));
+        // A worker whose store stopped writing cannot host a new seat either:
+        // a join for it would only expire, its confirm left out, and repeat.
+        free_worker_ids.retain(|core_id| {
+            !held_back.contains(core_id) && !crate::worker_execution::store_stopped(*core_id)
+        });
         let mut held_back_cores: Vec<u32> = held_back.iter().copied().collect();
         held_back_cores.sort_unstable();
         let unbound_held_count = all_our_filters
@@ -4702,6 +4707,30 @@ mod proposal_loop_tests {
         lc.session_hosting.lock().unwrap()
             .observe_votes(epoch + 1, epoch, &[0xEF; 32], 1, Seat::Member, &Hosting::Voting, instance);
         assert!(joins(&lc) > 0, "it votes");
+    }
+
+    /// A free worker whose store stopped writing, held for its reopening,
+    /// takes no new seat: a join would expire with its confirm left out and
+    /// repeat for as long as the disk stays full. Once released, it joins.
+    #[test]
+    fn a_worker_whose_store_stopped_does_not_join() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_summaries((1..=4).map(|byte| shard_summary(filter_bytes(byte), 1)).collect());
+        reg.set_prover(prover(address.clone(), vec![]));
+        let joins = || {
+            let lc = make_lifecycle(address.clone(), wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>);
+            lc.set_prover_root_verified_frame(100);
+            count_proposed_joins(&lc.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(1));
+        let while_held = joins();
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(1));
+        assert_eq!(while_held, 0, "a worker held for its store takes no seat");
+        assert!(joins() > 0, "it joins once its store is back");
     }
 
     /// Authenticated GLOBAL state in which each filter's committee session

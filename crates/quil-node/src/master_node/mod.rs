@@ -65,6 +65,11 @@ pub(crate) async fn start(
     let storage = storage::init(config, archive_mode)?;
     // Thread workers register their stores with this process's watch too.
     crate::storage_watch::start(&config.db);
+    // A master store that stopped writing is reopened by a restart of the
+    // process once its disk has room again.
+    sup.run_until_cancelled("store-reopen", |_token| {
+        crate::storage_watch::exit_when_store_reopenable(quil_forest::StoreRole::Master)
+    });
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
     let key_store = storage.key_store.clone();
