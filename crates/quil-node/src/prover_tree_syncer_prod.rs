@@ -783,7 +783,7 @@ impl CarriedCopies {
     async fn check_where(
         &mut self,
         verify: Option<&CarriedVerifier>,
-        deadline: std::time::Instant,
+        deadline: tokio::time::Instant,
         chosen: impl Fn(&Self, &OfferedCopy) -> bool,
     ) {
         let (mut take, keep): (Vec<OfferedCopy>, Vec<OfferedCopy>) =
@@ -840,7 +840,7 @@ impl CarriedCopies {
             }
             // Each check within its slice of the search's time: one copy
             // whose check waits on GLOBAL history cannot use it all.
-            let slice = deadline.min(std::time::Instant::now() + self.slice);
+            let slice = deadline.min(tokio::time::Instant::now() + self.slice);
             let Some(verdict) = check_within(verify, &copy.2, slice).await else {
                 self.unverified += 1 + take.len();
                 break;
@@ -852,13 +852,13 @@ impl CarriedCopies {
     }
 
     /// [`Self::check_where`] of every copy gathered.
-    async fn check(&mut self, verify: Option<&CarriedVerifier>, deadline: std::time::Instant) {
+    async fn check(&mut self, verify: Option<&CarriedVerifier>, deadline: tokio::time::Instant) {
         self.check_where(verify, deadline, |_, _| true).await
     }
 
     /// [`Self::check_where`] of the named copies with an attestation: once
     /// one passes, reading on finds nothing better.
-    async fn check_named_attested(&mut self, verify: Option<&CarriedVerifier>, deadline: std::time::Instant) {
+    async fn check_named_attested(&mut self, verify: Option<&CarriedVerifier>, deadline: tokio::time::Instant) {
         if verify.is_none() {
             return;
         }
@@ -933,7 +933,7 @@ impl CarriedCopies {
     /// [`Self::check`] within a minute; whether the search is [`Self::done`].
     #[cfg(test)]
     async fn take(&mut self, global: u64, carried: Vec<quil_types::proto::global::FrameHeader>, verify: Option<&CarriedVerifier>) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         self.offer(global, carried);
         self.check_named_attested(verify, deadline).await;
         self.check(verify, deadline).await;
@@ -955,9 +955,9 @@ impl CarriedCopies {
 async fn check_within(
     verify: &CarriedVerifier,
     copy: &quil_types::proto::global::FrameHeader,
-    deadline: std::time::Instant,
+    deadline: tokio::time::Instant,
 ) -> Option<CopyVerdict> {
-    let left = deadline.checked_duration_since(std::time::Instant::now()).filter(|left| !left.is_zero())?;
+    let left = deadline.checked_duration_since(tokio::time::Instant::now()).filter(|left| !left.is_zero())?;
     Some(tokio::time::timeout(left, verify(copy.clone())).await.unwrap_or(CopyVerdict::Unavailable))
 }
 
@@ -1427,7 +1427,7 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
         let addr = self.resolve_addr().await?;
         let read_before = carried_searched().get(&key).map(|search| search.read_by(&addr)).unwrap_or_default();
         let started = std::time::Instant::now();
-        let (read_until, check_until) = (started + CARRIED_READ_BUDGET, started + CARRIED_CHECK_BUDGET);
+        let (read_until, check_until) = (started + CARRIED_READ_BUDGET, tokio::time::Instant::now() + CARRIED_CHECK_BUDGET);
         let (mut bytes, mut unanswered, mut head, mut unread) = (0usize, 0u64, None, 0usize);
         let mut read_globals = Vec::new();
         let mut copies = CarriedCopies::new(filter, frame_number, named, skip).with_for_now(for_now).with_rechecked(rechecked);
@@ -2184,7 +2184,7 @@ mod archive_routing_tests {
         copies.offer(13, vec![copy(0x4a)]);
         copies.offer(14, Vec::new());
         copies.offer(15, vec![copy(0x47)]);
-        copies.check(Some(&verify), std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+        copies.check(Some(&verify), tokio::time::Instant::now() + std::time::Duration::from_secs(60)).await;
         let read: Vec<_> = (10..=15).map(|global| copies.frame_read(global)).collect();
         assert_eq!(read, [Some(true), Some(false), Some(false), Some(true), Some(true), None]);
 
@@ -2269,8 +2269,11 @@ mod archive_routing_tests {
     /// kept only such copies, others unchecked, hands them to replay but is
     /// not taken for a find: the next search reads on after the short
     /// back-off of a search cut short, not after a found search's interval.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_check_cannot_keep_the_genuine_copy_unchecked() {
+        // Virtual time: a search's budget and each check's slice are tokio
+        // instants, so exactly six forged checks (6 x 50 ms) fit in one search
+        // whatever the machine load, and the genuine copy is reached in the second.
         let filter = [0x49; 33];
         let signed = |signature: Vec<u8>| quil_types::proto::global::FrameHeader {
             public_key_signature_bls48581: Some(quil_types::proto::keys::Bls48581AggregateSignature {
@@ -2306,7 +2309,7 @@ mod archive_routing_tests {
             copies.slice = std::time::Duration::from_millis(50);
             copies.offer(10, forged.clone());
             copies.offer(11, vec![genuine.clone()]);
-            copies.check(Some(&verify), std::time::Instant::now() + std::time::Duration::from_millis(300)).await;
+            copies.check(Some(&verify), tokio::time::Instant::now() + std::time::Duration::from_millis(300)).await;
             let (best, certified) = copies.best();
             let state = search_state(&best, &certified, search_incomplete(false, 0, 0, copies.unverified), 0);
             if search == 1 {
@@ -2354,7 +2357,7 @@ mod archive_routing_tests {
             let mut copies = CarriedCopies::new(&filter, 7, Some(named), skip);
             copies.offer(10, forged.clone());
             copies.offer(11, vec![genuine.clone()]);
-            copies.check(None, std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+            copies.check(None, tokio::time::Instant::now() + std::time::Duration::from_secs(60)).await;
             let (best, certified) = copies.best();
             keep_carried_search(key.clone(), SearchOutcome {
                 state: Some(search_state(&best, &certified, false, 0)), named: Some(named), ..Default::default()
@@ -2471,7 +2474,7 @@ mod archive_routing_tests {
             let mut copies = CarriedCopies::new(&filter, 7, Some(named), skip).with_rechecked(rechecked);
             copies.offer(10, forgeries.clone());
             copies.offer(11, vec![genuine.clone()]);
-            copies.check(Some(&verify), std::time::Instant::now() + std::time::Duration::from_secs(60)).await;
+            copies.check(Some(&verify), tokio::time::Instant::now() + std::time::Duration::from_secs(60)).await;
             let (best, certified) = copies.best();
             keep_carried_search(key.clone(), SearchOutcome {
                 state: Some(search_state(&best, &certified, search_incomplete(false, 0, 0, copies.unverified), 0)),
@@ -2543,7 +2546,7 @@ mod archive_routing_tests {
                 }
             })
         });
-        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(60);
 
         let mut copies = CarriedCopies::new(&filter, 7, Some(named), Default::default());
         for global in 10..15u8 {
@@ -2626,11 +2629,11 @@ mod archive_routing_tests {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             CopyVerdict::Certified
         }));
-        let soon = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let soon = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
         assert_eq!(check_within(&verify, &copy, soon).await, Some(CopyVerdict::Certified));
-        assert_eq!(check_within(&slow, &copy, std::time::Instant::now() + std::time::Duration::from_millis(50)).await,
+        assert_eq!(check_within(&slow, &copy, tokio::time::Instant::now() + std::time::Duration::from_millis(50)).await,
             Some(CopyVerdict::Unavailable));
-        assert_eq!(check_within(&verify, &copy, std::time::Instant::now()).await, None, "out of time");
+        assert_eq!(check_within(&verify, &copy, tokio::time::Instant::now()).await, None, "out of time");
     }
 
     /// A search that fails with nothing found keeps the copies refused
@@ -2781,7 +2784,7 @@ mod archive_routing_tests {
         // Gathered, a named copy with an attestation is checked at once: a
         // search stops reading only once one passes in full.
         let mut copies = CarriedCopies::new(&filter, 7, Some(named), Default::default());
-        let soon = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let soon = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
         copies.offer(10, vec![copy(&[9])]);
         copies.check_named_attested(Some(&verify), soon).await;
         assert!(!copies.done(), "a forged attestation: reading goes on");
