@@ -566,6 +566,41 @@ pub fn canonical_header(frame: &quil_types::proto::global::AppShardFrame) -> Res
     .to_canonical_bytes()
 }
 
+/// A finalized app frame that carried no requests, rebuilt from the header
+/// a GLOBAL frame carries for it ([`canonical_header`], back as a proto
+/// `FrameHeader`): the frame its members stored. That header carries the
+/// committee's storage attestation, which the body holds beside its header
+/// and whose header field stays empty, and a commonware certificate there
+/// lacks the empty public key members store with it. The second value says
+/// why the frame comes without the attestation its header commits to (a
+/// member that held none submitted the header, or the bytes do not decode),
+/// so its possession proof cannot be verified; `None` when it carries the
+/// attestation or commits to none.
+pub fn frame_from_carried_header(
+    carried: &quil_types::proto::global::FrameHeader,
+) -> (quil_types::proto::global::AppShardFrame, Option<String>) {
+    use prost::Message;
+    let mut header = carried.clone();
+    let encoded = std::mem::take(&mut header.storage_attestation);
+    if let Some(signature) = header.public_key_signature_bls48581.as_mut().filter(|signature| {
+        signature.public_key.is_none()
+            && quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).is_some()
+    }) {
+        signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    }
+    let (storage_attestation, missing) = if encoded.is_empty() {
+        let missing = (!header.storage_attestation_root.is_empty())
+            .then(|| "the carried header holds no storage attestation".to_string());
+        (None, missing)
+    } else {
+        match quil_types::proto::global::StorageAttestation::decode(encoded.as_slice()) {
+            Ok(attestation) => (Some(attestation), None),
+            Err(error) => (None, Some(format!("the carried storage attestation does not decode: {error}"))),
+        }
+    };
+    (quil_types::proto::global::AppShardFrame { header: Some(header), requests: Vec::new(), storage_attestation }, missing)
+}
+
 /// A finalized seal as submitted: the encoded submission, with the drain
 /// headers GLOBAL needs to accept it (#699).
 pub struct DrainedSeal {
