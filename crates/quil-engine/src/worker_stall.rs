@@ -336,7 +336,14 @@ mod tests {
         let StallReport::Ended { core_id, blocked, seen, exited, .. } = ended else { unreachable!() };
         assert_eq!((core_id, exited), (7, false));
         assert!(blocked > Duration::from_millis(1000));
-        assert_eq!(seen, vec!["app engine / consensus retry timer / CRDT commit lock wait within successor state check"]);
+        // The first sighting is the blocked place. The closure then drops its
+        // sections before the next heartbeat, so a poll under load may also see
+        // the unwound place: the same task and step, shorter.
+        let blocked_place = "app engine / consensus retry timer / CRDT commit lock wait within successor state check";
+        let unwound_prefix = "app engine / consensus retry timer";
+        assert_eq!(seen.first().map(String::as_str), Some(blocked_place), "{seen:?}");
+        assert!(seen[1..].iter().all(|later| later.starts_with(unwound_prefix) && later.len() < blocked_place.len()),
+            "{seen:?}");
         worker.join().unwrap();
         // The thread's probe is gone; the watchdog drops it without a report.
         assert!(watch.poll(now_ms()).is_empty());
