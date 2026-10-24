@@ -1084,6 +1084,17 @@ impl WorkerAllocator {
             info!(frame = frame_number, cleared, "prover-reset v3: cleared auto-managed worker filters (re-join lands on genesis grid)");
         }
 
+        // A node loads its prover registry in the background at startup.
+        // Read before that load ends, it shows none of our allocations, and
+        // every bound worker below would be released as orphaned.
+        if !self.prover_registry.initial_load_complete() {
+            info!(
+                frame = frame_number,
+                "worker reconcile deferred: the prover registry has not finished its first load from the store",
+            );
+            return Ok(());
+        }
+
         // Get our prover info from the registry
         let prover_info = self
             .prover_registry
@@ -2156,6 +2167,34 @@ mod tests {
         };
         assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES), 100, "no sync has refreshed the registry since");
         assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
+    }
+
+    /// A node loads its prover registry in the background at startup. A
+    /// reconcile before that load ends must not release the workers the
+    /// still-empty registry shows no allocation for.
+    #[test]
+    fn reconcile_waits_for_the_registry_first_load() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: filter.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: true,
+        });
+        let registry = Arc::new(quil_execution::SharedProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), registry.clone(), vec![0xAAu8; 32]);
+        let frame = PENDING_FILTER_GRACE_FRAMES + 100;
+        alloc.on_new_frame(frame).unwrap();
+        assert_eq!(wm.range_workers().unwrap()[0].filter, filter, "nothing is released before the load");
+        // Loaded and still without the allocation, the worker is orphaned.
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        registry.refresh_from_store(&quil_store::RocksHypergraphStore::new(db.inner())).unwrap();
+        alloc.on_new_frame(frame + 1).unwrap();
+        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "the loaded registry decides");
     }
 
     #[test]
