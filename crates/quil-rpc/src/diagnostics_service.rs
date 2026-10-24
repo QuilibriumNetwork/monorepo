@@ -78,7 +78,7 @@ const BLOCKERS: [(&str, Blocker); 14] = [
     ("consensus startup unavailable", Blocker::ConsensusStartupUnavailable),
     ("session identity unavailable", Blocker::SessionIdentityUnavailable),
     ("session state unavailable", Blocker::SessionStateUnavailable),
-    ("storage write failed", Blocker::StorageWriteFailed),
+    ("storage writes stopped", Blocker::StorageWriteFailed),
 ];
 
 const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [

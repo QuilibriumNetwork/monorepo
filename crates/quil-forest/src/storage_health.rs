@@ -8,7 +8,7 @@
 //! Reports name the role and the filesystem's free space and inodes, never
 //! the store's path; stores on one filesystem share one headroom report.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -144,6 +144,7 @@ pub fn fs_usage(_path: &Path) -> Option<FsUsage> {
 pub fn error_class(cause: &str) -> &'static str {
     let lowered = cause.to_ascii_lowercase();
     [
+        ("free space fell below the floor", "FLOOR"),
         ("no space left", "ENOSPC"),
         ("storage full", "ENOSPC"),
         ("quota exceeded", "EDQUOT"),
@@ -158,9 +159,33 @@ pub fn error_class(cause: &str) -> &'static str {
 }
 
 /// Whether more free space or inodes on the store's filesystem resolves
-/// a failure of `class`.
+/// a failure of `class` (FLOOR: the storage watch stopped the store's
+/// writes when free space fell below [`FLOOR_FREE_BYTES`]).
 pub fn space_class(class: &str) -> bool {
-    matches!(class, "ENOSPC" | "EDQUOT")
+    matches!(class, "ENOSPC" | "EDQUOT" | "FLOOR")
+}
+
+/// Below this much free space, or [`FLOOR_FREE_INODES`] free inodes, a
+/// write is about to fail: the storage watch stops the stores on that
+/// filesystem first, so they are reopened like a store whose write failed.
+/// Percentages only report (see [`DiskThresholds`]): a high percentage of
+/// a large disk leaves ample room.
+pub const FLOOR_FREE_BYTES: u64 = 2 << 30;
+pub const FLOOR_FREE_INODES: u64 = 10_000;
+
+/// Whether `usage` is below the floor where the stores stop writing.
+pub fn below_floor(usage: &FsUsage) -> bool {
+    usage.free_bytes < FLOOR_FREE_BYTES || (usage.total_inodes > 0 && usage.free_inodes < FLOOR_FREE_INODES)
+}
+
+/// Whether `usage` leaves room to reopen a stopped store: twice the floor.
+pub fn has_headroom(usage: &FsUsage) -> bool {
+    usage.free_bytes >= 2 * FLOOR_FREE_BYTES && (usage.total_inodes == 0 || usage.free_inodes >= 2 * FLOOR_FREE_INODES)
+}
+
+/// The headroom [`has_headroom`] requires, for log lines.
+pub fn headroom_text() -> String {
+    format!("{} MiB and {} inodes free", 2 * FLOOR_FREE_BYTES >> 20, 2 * FLOOR_FREE_INODES)
 }
 
 /// `cause` without file paths: RocksDB names the file it was writing.
@@ -189,6 +214,11 @@ pub const FAILED_WRITE_REPEAT: Duration = Duration::from_secs(600);
 /// bounded interval, one line per filesystem ([`check_stores`]).
 struct WriteFailure {
     cause: String,
+    /// Whether the store's filesystem showed less than the reopening
+    /// headroom when its writes stopped ([`has_headroom`]). A space error on
+    /// a filesystem that shows room (a disk quota, filesystem metadata) is
+    /// not resolved by the free space the node can see.
+    no_room: bool,
     since: Instant,
     refused: u64,
     last_logged: Instant,
@@ -234,10 +264,6 @@ impl StoreState {
         self.role.get().copied()
     }
 
-    fn name(&self) -> String {
-        self.role().map_or_else(|| "unregistered".to_string(), |role| role.to_string())
-    }
-
     pub(crate) fn is_latched(&self) -> bool {
         self.failed.load(Ordering::Acquire)
     }
@@ -250,8 +276,24 @@ impl StoreState {
         if failure.is_some() {
             return;
         }
-        report_failed_write(&self.name(), &cause, fs_usage(&self.path));
-        *failure = Some(WriteFailure { cause, since: now, refused: 0, last_logged: now });
+        let usage = fs_usage(&self.path);
+        let no_room = usage.is_some_and(|usage| !has_headroom(&usage));
+        report_failed_write(self.role(), &cause, no_room, usage);
+        *failure = Some(WriteFailure { cause, no_room, since: now, refused: 0, last_logged: now });
+    }
+
+    /// [`Self::latch`] without its line, for a caller that reports a group
+    /// of stores at once, when free space fell below the floor; whether the
+    /// store was not latched before.
+    pub(crate) fn latch_quietly(&self, cause: String) -> bool {
+        let now = Instant::now();
+        let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        self.failed.store(true, Ordering::Release);
+        if failure.is_some() {
+            return false;
+        }
+        *failure = Some(WriteFailure { cause, no_room: true, since: now, refused: 0, last_logged: now });
+        true
     }
 
     /// Count one refused write.
@@ -261,13 +303,15 @@ impl StoreState {
         }
     }
 
-    /// The error class, seconds since the failure and refused writes of a
-    /// latched store whose reminder is due at `now`.
-    fn reminder(&self, now: Instant) -> Option<(&'static str, u64, u64)> {
+    /// The error class, whether the filesystem showed no room, seconds since
+    /// the failure and refused writes of a latched store whose reminder is
+    /// due at `now`.
+    fn reminder(&self, now: Instant) -> Option<(&'static str, bool, u64, u64)> {
         let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
         let failure = failure.as_mut().filter(|_| self.is_latched())?;
         failure.due(now).then(|| {
-            (error_class(&failure.cause), now.saturating_duration_since(failure.since).as_secs(), failure.refused)
+            let failed_secs = now.saturating_duration_since(failure.since).as_secs();
+            (error_class(&failure.cause), failure.no_room, failed_secs, failure.refused)
         })
     }
 
@@ -288,15 +332,62 @@ impl StoreState {
     }
 }
 
-fn action(class: &str) -> &'static str {
-    if space_class(class) {
-        "its disk is full: free space and inodes there, then restart the node"
-    } else {
-        "check the disk and the store files, then restart the node"
+fn store_name(role: Option<StoreRole>) -> String {
+    role.map_or_else(|| "unregistered".to_string(), |role| role.to_string())
+}
+
+/// What the operator does about stores whose writes stopped for `class`,
+/// and what the node does next: it restarts a thread worker to reopen the
+/// worker's store, and a process whose own store it is (the master, or a
+/// separate worker process) exits to be restarted. `no_room`: the store's
+/// filesystem showed no room when its writes stopped.
+fn action(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
+    let operator = match class {
+        "FLOOR" => "free space or inodes on its disk fell below the floor: free space there",
+        class if space_class(class) && no_room => "its disk is full: free space and inodes there",
+        class if space_class(class) => {
+            "it ran out of space although its filesystem shows room: check the disk quota and the filesystem's \
+             metadata space"
+        }
+        _ => "check the disk and the store files",
+    };
+    format!("{operator}; {}", next_step(class, no_room, role))
+}
+
+/// Whether more free space the node can see resolves a store's failure:
+/// a space class on a filesystem that showed no room when writes stopped.
+pub fn recovers_with_space(class: &str, no_room: bool) -> bool {
+    space_class(class) && no_room
+}
+
+/// What the node does next about a store of `role` stopped for `class`. A
+/// thread worker is restarted, at most a few times in a row. A process
+/// whose own store it is exits only when the space it can see resolves the
+/// failure ([`recovers_with_space`]), once that space returns: otherwise a
+/// restart would fail again at once, so the operator acts and restarts the
+/// node.
+fn next_step(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
+    let headroom = headroom_text();
+    match role {
+        Some(StoreRole::Worker(_)) if master_in_process() => format!(
+            "the node stops the worker, keeping its allocation, and restarts it to reopen the store once the disk \
+             has {headroom}, at most three times in a row"
+        ),
+        Some(_) if !recovers_with_space(class, no_room) => "then restart the node".to_string(),
+        Some(_) => format!(
+            "this process exits once the disk has {headroom}, for its service manager to restart it and reopen \
+             the store (the service needs a restart policy: systemd Restart=on-failure, launchd KeepAlive)"
+        ),
+        None => "then restart the node".to_string(),
     }
 }
 
-fn report_failed_write(store: &str, cause: &str, usage: Option<FsUsage>) {
+fn master_in_process() -> bool {
+    open_stores().iter().any(|store| store.role() == Some(StoreRole::Master))
+}
+
+fn report_failed_write(role: Option<StoreRole>, cause: &str, no_room: bool, usage: Option<FsUsage>) {
+    let store = store_name(role);
     let class = error_class(cause);
     tracing::error!(
         scope = "this node",
@@ -307,13 +398,20 @@ fn report_failed_write(store: &str, cause: &str, usage: Option<FsUsage>) {
         used_pct = usage.map(|usage| usage.used_percent()),
         first_error = %redact_paths(cause),
         "store write failed: this node's {store} store refuses further writes until it is reopened; {}",
-        action(class),
+        action(class, no_room, role),
     );
 }
 
 /// The reminder of the latched stores on one filesystem: the longest time
 /// since a store's write failed and the writes refused since, in all.
-fn report_still_refused(roles: &[StoreRole], class: &str, failed_secs: u64, refused: u64, usage: Option<FsUsage>) {
+fn report_still_refused(
+    roles: &[StoreRole],
+    class: &str,
+    no_room: bool,
+    failed_secs: u64,
+    refused: u64,
+    usage: Option<FsUsage>,
+) {
     let stores = describe_stores(roles);
     tracing::error!(
         scope = "this node",
@@ -324,9 +422,9 @@ fn report_still_refused(roles: &[StoreRole], class: &str, failed_secs: u64, refu
         free_mb = usage.map(|usage| usage.free_mb()),
         free_inodes = usage.map(|usage| usage.free_inodes),
         used_pct = usage.map(|usage| usage.used_percent()),
-        "stores still refuse writes: this node's {stores} store(s) have refused {refused} writes since a write \
-         failed {failed_secs}s ago; {}",
-        action(class),
+        "stores still refuse writes: this node's {stores} store(s) have refused {refused} writes since their \
+         writes stopped {failed_secs}s ago; {}",
+        action(class, no_room, roles.first().copied()),
     );
 }
 
@@ -351,9 +449,50 @@ pub(crate) fn register(state: &Arc<StoreState>, database: Weak<DatabaseInner>, r
 
 /// This process's registered stores that are still open.
 fn open_stores() -> Vec<Arc<StoreState>> {
+    open_databases().into_iter().map(|(state, _)| state).collect()
+}
+
+fn open_databases() -> Vec<(Arc<StoreState>, Weak<DatabaseInner>)> {
     let mut stores = STORES.lock().unwrap_or_else(PoisonError::into_inner);
     stores.retain(|store| store.database.strong_count() > 0);
-    stores.iter().map(|store| store.state.clone()).collect()
+    stores.iter().map(|store| (store.state.clone(), store.database.clone())).collect()
+}
+
+/// The error class of the open store of `role` that stopped writing, and
+/// whether its filesystem showed no room then; `None` until both are known.
+pub fn store_failure(role: StoreRole) -> Option<(&'static str, bool)> {
+    open_stores().into_iter().find(|store| store.role() == Some(role) && store.is_latched()).and_then(|store| {
+        let failure = store.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        failure.as_ref().map(|failure| (error_class(&failure.cause), failure.no_room))
+    })
+}
+
+/// Whether this process has an open store of `role`.
+pub fn store_open(role: StoreRole) -> bool {
+    open_stores().iter().any(|store| store.role() == Some(role))
+}
+
+/// The directory of this process's open store of `role`, to watch its
+/// filesystem once the store has closed; never logged.
+pub fn store_path(role: StoreRole) -> Option<PathBuf> {
+    open_stores().iter().find(|store| store.role() == Some(role)).map(|store| store.path.clone())
+}
+
+static HELD: Mutex<BTreeSet<StoreRole>> = Mutex::new(BTreeSet::new());
+
+/// Mark the store of `role` as stopped for its recovery, until
+/// [`release_store`]: its worker reads as stopped by it.
+pub fn hold_store(role: StoreRole) {
+    HELD.lock().unwrap_or_else(PoisonError::into_inner).insert(role);
+}
+
+pub fn release_store(role: StoreRole) {
+    HELD.lock().unwrap_or_else(PoisonError::into_inner).remove(&role);
+}
+
+/// Whether the store of `role` is held stopped for its recovery.
+pub fn store_held(role: StoreRole) -> bool {
+    HELD.lock().unwrap_or_else(PoisonError::into_inner).contains(&role)
 }
 
 /// Whether this process's open store of `role` refuses writes after a
@@ -369,6 +508,7 @@ pub fn latched_stores() -> Vec<StoreRole> {
 
 /// How full a store's filesystem may get before the operator hears of it
 /// (`db.noticePercentage`, `db.warnPercentage`, `db.terminatePercentage`).
+/// They only report: writes stop at an absolute floor ([`below_floor`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiskThresholds {
     pub notice: u8,
@@ -535,6 +675,7 @@ pub fn log_disk_report(report: &DiskReport, thresholds: &DiskThresholds) {
     let stores = describe_stores(&report.stores);
     let used = report.usage.used_percent();
     let threshold = thresholds.threshold(if report.change == DiskChange::Lowered { report.from } else { report.level });
+    let (floor_mb, floor_inodes) = (FLOOR_FREE_BYTES >> 20, FLOOR_FREE_INODES);
     macro_rules! disk_line {
         ($level:ident, $($message:tt)+) => {
             tracing::$level!(
@@ -561,44 +702,88 @@ pub fn log_disk_report(report: &DiskReport, thresholds: &DiskThresholds) {
              store(s) is used (notice at {threshold}%); plan more space before it fills"),
         (_, DiskLevel::Warn) => disk_line!(warn,
             "store disk nearly full: {used}% of the filesystem holding this node's {stores} store(s) is used \
-             (warn at {threshold}%); free space there before writes fail and stop the stores until the node \
-             restarts; repeats every 10 minutes while it holds"),
+             (warn at {threshold}%); free space there: below {floor_mb} MiB or {floor_inodes} inodes free the \
+             stores stop writing until the disk has room again; repeats every 10 minutes while it holds"),
         (_, DiskLevel::Terminate) => disk_line!(error,
-            "store disk critically full: {used}% of the filesystem holding this node's {stores} store(s) is \
-             used (terminate at {threshold}%); writes will soon fail for lack of space and stop the stores until \
-             the node restarts: free space there now; repeats every 10 minutes while it holds"),
+            "store disk usage at the terminate level: {used}% of the filesystem holding this node's {stores} \
+             store(s) is used (terminate at {threshold}%); free space there: the stores stop writing only below \
+             {floor_mb} MiB or {floor_inodes} inodes free, until the disk has room again; repeats every 10 minutes \
+             while it holds"),
         (_, DiskLevel::Normal) => {}
     }
 }
 
 /// One pass over this process's registered stores: the headroom reports of
 /// their filesystems, and the reminders of latched stores, one line per
-/// filesystem. `probe` reads a store's filesystem ([`fs_usage`] outside
-/// tests).
+/// filesystem. Stores on a filesystem below the floor ([`below_floor`])
+/// stop writing, as after a failed write, so they are recovered like one
+/// instead of running into ENOSPC. `probe` reads a store's filesystem
+/// ([`fs_usage`] outside tests).
 pub fn check_stores(watch: &mut StorageWatch, now: Instant, probe: &dyn Fn(&Path) -> Option<FsUsage>) -> Vec<DiskReport> {
     let mut usages = Vec::new();
-    // Due reminders by filesystem (None: unreadable): roles, class, longest
-    // failure, refused writes and the filesystem's usage.
-    let mut due: BTreeMap<Option<u64>, (Vec<StoreRole>, &'static str, u64, u64, Option<FsUsage>)> = BTreeMap::new();
-    for store in open_stores() {
+    // Due reminders by filesystem (None: unreadable), class and whether the
+    // store is the master's (its next step differs): roles, longest failure,
+    // refused writes and the filesystem's usage.
+    let mut due: BTreeMap<(Option<u64>, &'static str, bool, bool), (Vec<StoreRole>, u64, u64, Option<FsUsage>)> =
+        BTreeMap::new();
+    // Stores to stop at the floor, by filesystem.
+    let mut floor: BTreeMap<u64, (Vec<(StoreRole, Weak<DatabaseInner>)>, FsUsage)> = BTreeMap::new();
+    for (store, database) in open_databases() {
         let Some(role) = store.role() else { continue };
         let usage = probe(&store.path);
-        if let Some((class, failed_secs, refused)) = store.reminder(now) {
-            let entry = due.entry(usage.map(|usage| usage.device)).or_insert((Vec::new(), class, 0, 0, usage));
+        if let Some(usage) = usage.filter(|usage| below_floor(usage) && !store.is_latched()) {
+            floor.entry(usage.device).or_insert_with(|| (Vec::new(), usage)).0.push((role, database));
+        }
+        if let Some((class, no_room, failed_secs, refused)) = store.reminder(now) {
+            let key = (usage.map(|usage| usage.device), class, no_room, role == StoreRole::Master);
+            let entry = due.entry(key).or_insert((Vec::new(), 0, 0, usage));
             entry.0.push(role);
-            entry.2 = entry.2.max(failed_secs);
-            entry.3 += refused;
+            entry.1 = entry.1.max(failed_secs);
+            entry.2 += refused;
         }
         if let Some(usage) = usage {
             usages.push((role, usage));
         }
     }
-    for (roles, class, failed_secs, refused, usage) in due.into_values() {
-        report_still_refused(&roles, class, failed_secs, refused, usage);
+    for ((_, class, no_room, _), (roles, failed_secs, refused, usage)) in due {
+        report_still_refused(&roles, class, no_room, failed_secs, refused, usage);
     }
     let reports = watch.observe(&usages, now);
     for report in &reports {
         log_disk_report(report, &watch.thresholds());
+    }
+    for (stopping, usage) in floor.into_values() {
+        let cause = format!(
+            "free space fell below the floor: {} MiB and {} inodes free (floor {} MiB or {} inodes)",
+            usage.free_mb(),
+            usage.free_inodes,
+            FLOOR_FREE_BYTES >> 20,
+            FLOOR_FREE_INODES
+        );
+        let roles: Vec<StoreRole> = stopping
+            .iter()
+            .filter(|(_, database)| crate::database::stop_writes(database, cause.clone()))
+            .map(|(role, _)| *role)
+            .collect();
+        if roles.is_empty() {
+            continue;
+        }
+        let stores = describe_stores(&roles);
+        let next =
+            next_step("FLOOR", true, roles.iter().find(|role| **role == StoreRole::Master).or(roles.first()).copied());
+        tracing::error!(
+            scope = "this node",
+            stores = %stores,
+            error_class = "FLOOR",
+            free_mb = usage.free_mb(),
+            free_inodes = usage.free_inodes,
+            used_pct = usage.used_percent(),
+            "store writes stopped: free space on the filesystem holding this node's {stores} store(s) fell below \
+             the floor ({} MiB or {} inodes free), so they stop writing before a write fails; free space there; \
+             {next}",
+            FLOOR_FREE_BYTES >> 20,
+            FLOOR_FREE_INODES,
+        );
     }
     reports
 }
@@ -681,7 +866,9 @@ mod tests {
         assert_eq!(lines.matches("store write failed").count(), 1, "{lines}");
         assert!(!lines.contains("still refuses"), "{lines}");
         assert!(lines.contains("worker 7001 store refuses further writes"), "{lines}");
-        assert!(lines.contains("ENOSPC") && lines.contains("its disk is full"), "{lines}");
+        // The action depends on whether the test's filesystem shows room.
+        assert!(lines.contains("ENOSPC") && (lines.contains("its disk is full") || lines.contains("shows room")),
+            "{lines}");
         for field in ["free_mb=", "free_inodes=", "used_pct=", "first_error=IO error: "] {
             assert!(lines.contains(field), "{field}: {lines}");
         }
@@ -785,6 +972,74 @@ mod tests {
         let lines = logged(|| log_disk_report(&reports[0], &watch.thresholds()));
         assert!(lines.contains("WARN") && lines.contains("store disk nearly full: 92%"), "{lines}");
         assert!(lines.contains("worker 9 store(s)") && lines.contains("inodes_used_pct=92"), "{lines}");
+    }
+
+    fn free(device: u64, free_gib: u64) -> FsUsage {
+        FsUsage {
+            device,
+            total_bytes: 1_000 << 30,
+            used_bytes: (1_000 - free_gib) << 30,
+            free_bytes: free_gib << 30,
+            total_inodes: 1_000_000,
+            used_inodes: 1_000,
+            free_inodes: 999_000,
+        }
+    }
+
+    /// Stores on a filesystem below the free-space floor stop writing as
+    /// after a failed write, reported in one line; a filesystem at 99% with
+    /// ample space left keeps writing however full it is in percent.
+    #[test]
+    fn stores_stop_writing_below_the_floor_and_not_at_a_percentage() {
+        let (roomy, full) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let roomy_db = open(roomy.path());
+        let (full_a, full_b) = (open(&full.path().join("a")), open(&full.path().join("b")));
+        roomy_db.register_store(StoreRole::Worker(7_021));
+        full_a.register_store(StoreRole::Worker(7_022));
+        full_b.register_store(StoreRole::Worker(7_023));
+        let (roomy_path, full_path) = (roomy.path().to_path_buf(), full.path().to_path_buf());
+        let probe = move |path: &Path| -> Option<FsUsage> {
+            (path == roomy_path.as_path()).then(|| free(70_021, 10))
+                .or_else(|| path.starts_with(&full_path).then(|| free(70_022, 1)))
+        };
+        let mut watch = StorageWatch::new(DiskThresholds::default());
+        let lines = logged(|| {
+            check_stores(&mut watch, Instant::now(), &probe);
+            check_stores(&mut watch, Instant::now(), &probe);
+        });
+        assert!(!roomy_db.write_failed() && roomy_db.put([1], b"v").is_ok(), "99% used, 10 GiB free: {lines}");
+        assert!(full_a.write_failed() && full_b.write_failed(), "{lines}");
+        assert!(matches!(full_a.put([1], b"v"), Err(DatabaseCommitError::PriorWriteFailed)));
+        assert_eq!(lines.matches("store writes stopped").count(), 1, "one line per filesystem: {lines}");
+        assert!(lines.contains("workers 7022-7023 store(s) fell below the floor (2048 MiB or 10000 inodes free)"),
+            "{lines}");
+        assert!(lines.contains("this process exits once the disk has 4096 MiB and 20000 inodes free"), "{lines}");
+        assert!(!lines.contains("store write failed"), "no write failed: {lines}");
+        assert!(lines.contains("store disk usage at the terminate level: 99%"), "the percentage only reports: {lines}");
+        assert!(store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_some());
+        drop(full_a);
+        assert!(!store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_none());
+    }
+
+    #[test]
+    fn the_floor_and_the_headroom_are_absolute() {
+        assert!(below_floor(&free(1, 1)) && !below_floor(&free(1, 2)));
+        assert!(below_floor(&FsUsage { free_inodes: 9_999, ..free(1, 500) }), "inodes count too");
+        assert!(!has_headroom(&free(1, 3)) && has_headroom(&free(1, 4)));
+        assert!(!has_headroom(&FsUsage { free_inodes: 19_999, ..free(1, 500) }));
+        assert!(has_headroom(&FsUsage { total_inodes: 0, free_inodes: 0, ..free(1, 5) }), "no inode count");
+        assert_eq!(error_class("free space fell below the floor: 1 MiB"), "FLOOR");
+        assert!(space_class("FLOOR"));
+    }
+
+    #[test]
+    fn a_held_store_is_reported_until_released() {
+        let role = StoreRole::Worker(7_031);
+        assert!(!store_held(role));
+        hold_store(role);
+        assert!(store_held(role) && !store_held(StoreRole::Worker(7_032)));
+        release_store(role);
+        assert!(!store_held(role));
     }
 
     #[test]

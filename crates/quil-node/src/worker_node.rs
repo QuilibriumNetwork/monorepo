@@ -56,6 +56,11 @@ pub(crate) async fn start(
     let db = quil_store::RocksDb::open(&db_path)?;
     db.inner().register_store(quil_forest::StoreRole::Worker(core_id));
     crate::storage_watch::start(&config.db);
+    // This process's store, once it stops writing, is reopened by a restart
+    // of the process once its disk has room again.
+    sup.run_until_cancelled("store-reopen", move |_token| {
+        crate::storage_watch::exit_when_store_reopenable(quil_forest::StoreRole::Worker(core_id))
+    });
     let db_arc = Arc::new(db);
     let clock_store: Arc<dyn quil_types::store::ClockStore> =
         Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));

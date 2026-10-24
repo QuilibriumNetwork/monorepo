@@ -1459,7 +1459,11 @@ impl WorkerAllocator {
         // last, so a healthy idle worker takes an unbound seat first
         // (`provers::session_hosting`).
         let held_back = self.held_back.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        idle_workers.sort_by_key(|core_id| !held_back.contains(core_id));
+        // So is a worker whose store stopped writing: it cannot serve a seat
+        // until its store is reopened (`worker_execution::store_stopped`).
+        idle_workers.sort_by_key(|core_id| {
+            !held_back.contains(core_id) && !crate::worker_execution::store_stopped(*core_id)
+        });
 
         // Manually-managed-but-unbound workers — the operator picked
         // these via the TUI's worker-selector at join time. We
@@ -2326,6 +2330,22 @@ mod tests {
         alloc.set_held_back(std::collections::HashSet::from([1]));
         alloc.on_new_frame(101).unwrap();
         assert_eq!(bound_cores(&wm), vec![1], "with no other idle worker it is bound");
+    }
+
+    /// A worker whose store stopped writing is bound to an unbound seat only
+    /// after every other idle worker.
+    #[test]
+    fn workers_whose_store_stopped_are_bound_last() {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        wm.allocate_worker(2, &[]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(1));
+        let result = alloc.on_new_frame(101);
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(1));
+        result.unwrap();
+        assert_eq!(bound_cores(&wm), vec![2], "the worker with a working store takes the seat");
     }
 
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {

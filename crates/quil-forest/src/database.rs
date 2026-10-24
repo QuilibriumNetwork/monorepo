@@ -523,6 +523,15 @@ impl DatabaseWriteGuard<'_> {
     }
 }
 
+/// Stop the database's writes, under its write barrier, as after a failed
+/// write with `cause`, without its own log line (the caller reports a group
+/// of stores at once). Whether it was open and not stopped before.
+pub(crate) fn stop_writes(database: &Weak<DatabaseInner>, cause: String) -> bool {
+    let Some(inner) = database.upgrade() else { return false };
+    let _barrier = inner.writes.lock();
+    inner.state.latch_quietly(cause)
+}
+
 pub(crate) fn key_under(prefixes: &[Vec<u8>], key: &[u8]) -> bool {
     prefixes.iter().any(|p| key.starts_with(p))
 }

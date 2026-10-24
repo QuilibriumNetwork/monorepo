@@ -532,8 +532,8 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
 }
 
 /// The report's line for a master store that refuses writes.
-const MASTER_STORE_WRITE_FAILED: &str = "Master store refuses writes after a failed write (a full disk or an I/O \
-    error): this node cannot follow GLOBAL until the store is reopened.";
+const MASTER_STORE_WRITE_FAILED: &str = "Master store stopped writing (a failed write, or free space below the \
+    floor): this node cannot follow GLOBAL until the store is reopened.";
 
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
@@ -745,7 +745,7 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         latched.master_store_write_failed = true;
         let text = render_report("this node", &latched);
         assert_eq!(text.lines().nth(1), Some(MASTER_STORE_WRITE_FAILED), "{text}");
-        assert!(MASTER_STORE_WRITE_FAILED.contains("a full disk or an I/O error"), "{MASTER_STORE_WRITE_FAILED}");
+        assert!(MASTER_STORE_WRITE_FAILED.contains("free space below the floor"), "{MASTER_STORE_WRITE_FAILED}");
         assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Master store"));
     }
 

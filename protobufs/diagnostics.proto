@@ -54,8 +54,9 @@ enum Blocker {
   BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE = 12;
   BLOCKER_SESSION_IDENTITY_UNAVAILABLE = 13;
   BLOCKER_SESSION_STATE_UNAVAILABLE = 14;
-  // The worker's own store refuses writes after a failed write (a full
-  // disk, an I/O error) until it is reopened.
+  // The worker's own store stopped writing until it is reopened: after a
+  // failed write (a full disk, an I/O error), or below the node's
+  // free-space floor.
   BLOCKER_STORAGE_WRITE_FAILED = 15;
 }
 
