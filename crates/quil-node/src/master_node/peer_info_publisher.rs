@@ -142,14 +142,30 @@ enum AnnounceSource {
     Override,
     /// The current AutoNAT-confirmed external address.
     Confirmed,
-    /// The configured `p2p.listenMultiaddr`, verbatim.
+    /// The configured `p2p.listenMultiaddr` when it names a specific IP, else
+    /// none (empty).
     Fallback,
+}
+
+/// Whether `addr` may go into PeerInfo: not empty, and no unspecified IP
+/// (`0.0.0.0`, `::`), which names no host a peer can dial and only makes
+/// peers and explorers take a reachable node for an unreachable one.
+fn announceable(addr: &str) -> bool {
+    let mut parts = addr.trim_start_matches('/').split('/');
+    match (parts.next(), parts.next()) {
+        (Some(""), _) | (None, _) => false,
+        (Some("ip4"), Some(ip)) => ip.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| !ip.is_unspecified()),
+        (Some("ip6"), Some(ip)) => ip.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| !ip.is_unspecified()),
+        (Some("ip4" | "ip6"), None) => false,
+        _ => true,
+    }
 }
 
 /// The pubsub address PeerInfo announces: the `announceListenMultiaddr`
 /// override when set; else the confirmed address on the transport of the
 /// configured listen address; else any confirmed address; else the configured
-/// listen address verbatim (often `0.0.0.0`, which no peer can dial).
+/// listen address when it names a specific IP; else none (empty), rather than
+/// a `0.0.0.0` no peer can dial.
 fn select_pubsub_addr(
     announce: &str,
     confirmed: &[String],
@@ -164,8 +180,64 @@ fn select_pubsub_addr(
     });
     match on_listen_transport.or(confirmed.first()) {
         Some(addr) => (addr.clone(), AnnounceSource::Confirmed),
-        None => (listen.to_string(), AnnounceSource::Fallback),
+        None if announceable(listen) => (listen.to_string(), AnnounceSource::Fallback),
+        None => (String::new(), AnnounceSource::Fallback),
     }
+}
+
+/// The stream addresses PeerInfo announces: the
+/// `announceStreamListenMultiaddr` override when set; else the stream listen
+/// port on the IP of `pubsub_addr`, or on the stream listen IP when it names
+/// one.
+fn select_stream_addrs(announce_stream: &str, stream_listen: &str, pubsub_addr: &str) -> Vec<String> {
+    if !announce_stream.is_empty() {
+        vec![announce_stream.to_string()]
+    } else if !stream_listen.is_empty() {
+        crate::util::multiaddr::extract_stream_addr(pubsub_addr, stream_listen).into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// The worker configuration of `quil_p2p::build_worker_reachability`.
+struct WorkerAddrs<'a> {
+    p2p: &'a [String],
+    stream: &'a [String],
+    announce_p2p: &'a [String],
+    announce_stream: &'a [String],
+}
+
+/// The reachability records of a PeerInfo: the master's under the global
+/// filter `[0xFF; 32]`, then one per running worker with a filter
+/// (`workers`). Addresses PeerInfo must not carry (see [`announceable`]) are
+/// left out, so a record without a usable address has an empty list.
+fn build_reachability(
+    pubsub_addr: &str,
+    stream_addrs: &[String],
+    workers: &[(u32, Vec<u8>)],
+    worker_addrs: &WorkerAddrs<'_>,
+) -> Vec<quil_p2p::CanonicalReachability> {
+    let mut reachability = vec![quil_p2p::CanonicalReachability {
+        filter: vec![0xFF; 32],
+        pubsub_multiaddrs: vec![pubsub_addr.to_string()],
+        stream_multiaddrs: stream_addrs.to_vec(),
+    }];
+    if !workers.is_empty() {
+        reachability.extend(quil_p2p::build_worker_reachability(
+            workers,
+            pubsub_addr,
+            stream_addrs,
+            worker_addrs.p2p,
+            worker_addrs.stream,
+            worker_addrs.announce_p2p,
+            worker_addrs.announce_stream,
+        ));
+    }
+    for record in &mut reachability {
+        record.pubsub_multiaddrs.retain(|addr| announceable(addr));
+        record.stream_multiaddrs.retain(|addr| announceable(addr));
+    }
+    reachability
 }
 
 /// The `reason` of an announce change: the override, or the confirmed-set
@@ -437,7 +509,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
     // while nothing is confirmed, since peers then get the listen fallback.
     if pi_announce.is_empty() {
         let rx = p2p_handle.watch_external_addresses();
-        let fallback = pi_listen_fallback.clone();
+        let fallback = match select_pubsub_addr("", &[], &pi_listen_fallback).0 {
+            addr if addr.is_empty() => "none".to_string(),
+            addr => addr,
+        };
         let port = |addr: &str| port_of(addr).map_or_else(|| "unknown".to_string(), |p| p.to_string());
         let p2p_port = port(&pi_listen_fallback);
         let p2p_protocol = p2p_protocol(&pi_listen_fallback);
@@ -469,16 +544,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                         match unconfirmed_cause(&autonat) {
                             UnconfirmedCause::Unreachable => unconfirmed!(
                                 "AutoNAT servers on distinct IPs could not dial this node back, \
-                                 or not within 30 s, so PeerInfo announces the configured listen \
-                                 address and peers may be unable \
+                                 or not within 30 s, so PeerInfo announces only the 'announced' \
+                                 address (none for a wildcard listen address) and peers may be unable \
                                  to dial this node's p2p or stream port; forward p2p_port over \
                                  p2p_protocol and stream_port over TCP to this node, or set \
                                  p2p.announceListenMultiaddr and p2p.announceStreamListenMultiaddr"
                             ),
                             UnconfirmedCause::ProbesFailing => unconfirmed!(
                                 "AutoNAT has confirmed no usable external address because its \
-                                 requests fail (probe_failure), so PeerInfo \
-                                 announces the configured listen address; a port forward does \
+                                 requests fail (probe_failure), so PeerInfo announces only the \
+                                 'announced' address (none for a wildcard listen address); a port forward does \
                                  not help. Report this line with the 'AutoNAT probes of this \
                                  node are failing' line; p2p.announceListenMultiaddr bypasses \
                                  AutoNAT for a static public address"
@@ -486,8 +561,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                             UnconfirmedCause::Unsettled => unconfirmed!(
                                 "AutoNAT has confirmed no usable external address yet \
                                  (nat_status; see the 'AutoNAT status of this node changed' \
-                                 lines), so PeerInfo announces the configured listen address and \
-                                 peers may be unable to dial this node; \
+                                 lines), so PeerInfo announces only the 'announced' address (none \
+                                 for a wildcard listen address) and peers may be unable to dial this node; \
                                  p2p.announceListenMultiaddr bypasses AutoNAT for a static public \
                                  address"
                             ),
@@ -516,6 +591,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         // The pubsub address of the last publish, and when the last
         // change-triggered publish ran.
         let mut published_addr: Option<String> = None;
+        // What that publish carried, for the change line.
+        let mut published_carried: Option<String> = None;
         let mut last_change_publish: Option<tokio::time::Instant> = None;
         loop {
             // Tick FIRST. `interval`'s opening tick completes immediately, so
@@ -544,56 +621,45 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             wait_for_topic_peer(&pi_handle, &bitmask).await;
 
             // Resolve multiaddrs: the announce override, else the current
-            // confirmed address, else the configured listen address.
+            // confirmed address, else the configured listen address when it
+            // names a specific IP, else none.
             let ext = addr_rx.borrow().clone();
             let (pubsub_addr, source) =
                 select_pubsub_addr(&pi_announce, &ext.addrs, &pi_listen_fallback);
-            let stream_addrs = if !pi_announce_stream.is_empty() {
-                vec![pi_announce_stream.clone()]
-            } else if !pi_stream_listen.is_empty() {
-                // Derive from pubsub addr IP + stream port
-                crate::util::multiaddr::extract_stream_addr(&pubsub_addr, &pi_stream_listen)
-                    .into_iter().collect()
-            } else {
-                vec![]
-            };
-            // Master reachability with the global-filter `[0xFF;32]`
-            // convention. Then per-worker reachabilities (one per
-            // running worker with a non-empty filter), populated
-            // from the worker manager once it's available.
-            let mut reachability = vec![quil_p2p::CanonicalReachability {
-                filter: vec![0xFF; 32], // global filter
-                pubsub_multiaddrs: vec![pubsub_addr.clone()],
-                stream_multiaddrs: stream_addrs.clone(),
-            }];
-            if let Some(wm) = pi_worker_manager_slot.get() {
-                let view = quil_engine::worker::WorkerView::snapshot(wm.as_ref());
-                let pairs: Vec<(u32, Vec<u8>)> = view
+            let stream_addrs = select_stream_addrs(&pi_announce_stream, &pi_stream_listen, &pubsub_addr);
+            // Per-worker reachabilities (one per running worker with a
+            // non-empty filter) once the worker manager is available.
+            let pairs: Vec<(u32, Vec<u8>)> = match pi_worker_manager_slot.get() {
+                Some(wm) => quil_engine::worker::WorkerView::snapshot(wm.as_ref())
                     .filter_set()
                     .map(|w| (w.core_id, w.filter.clone()))
-                    .collect();
-                if !pairs.is_empty() {
-                    reachability.extend(quil_p2p::build_worker_reachability(
-                        &pairs,
-                        &pubsub_addr,
-                        &stream_addrs,
-                        &pi_worker_p2p_multiaddrs,
-                        &pi_worker_stream_multiaddrs,
-                        &pi_worker_announce_p2p,
-                        &pi_worker_announce_stream,
-                    ));
-                }
-            }
+                    .collect(),
+                None => Vec::new(),
+            };
+            let reachability = build_reachability(
+                &pubsub_addr,
+                &stream_addrs,
+                &pairs,
+                &WorkerAddrs {
+                    p2p: &pi_worker_p2p_multiaddrs,
+                    stream: &pi_worker_stream_multiaddrs,
+                    announce_p2p: &pi_worker_announce_p2p,
+                    announce_stream: &pi_worker_announce_stream,
+                },
+            );
             let worker_reachability_count = reachability.len().saturating_sub(1);
 
+            // What PeerInfo carries: an unannounceable selection (a
+            // `0.0.0.0` override) is left out of the record.
+            let carried = reachability[0].pubsub_multiaddrs.first().cloned().unwrap_or_default();
             if published_addr.as_deref() != Some(pubsub_addr.as_str()) {
                 info!(
-                    old = published_addr.as_deref().unwrap_or("none"),
-                    new = %pubsub_addr,
-                    transport = quil_p2p::external_addr::transport_of(&pubsub_addr)
+                    old = %published_carried.as_deref().map_or("unpublished", |a| if a.is_empty() { "none" } else { a }),
+                    new = if carried.is_empty() { "none" } else { carried.as_str() },
+                    transport = quil_p2p::external_addr::transport_of(&carried)
                         .map_or("unknown", |t| t.as_str()),
                     reason = announce_reason(source, &ext),
-                    stream = ?stream_addrs,
+                    stream = ?reachability[0].stream_multiaddrs,
                     "PeerInfo announce address changed"
                 );
             }
@@ -601,6 +667,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                 last_change_publish = Some(tokio::time::Instant::now());
             }
             published_addr = Some(pubsub_addr.clone());
+            published_carried = Some(carried);
 
             let info = quil_p2p::CanonicalPeerInfo {
                 peer_id: pi_peer_id_bytes.clone(),
@@ -767,10 +834,89 @@ mod tests {
                 select_pubsub_addr("", &strings(&[QUIC_A]), LISTEN),
                 (QUIC_A.to_string(), AnnounceSource::Confirmed)
             );
+            // A wildcard listen address is no address; a specific one is.
+            assert_eq!(select_pubsub_addr("", &[], LISTEN), (String::new(), AnnounceSource::Fallback));
             assert_eq!(
-                select_pubsub_addr("", &[], LISTEN),
-                (LISTEN.to_string(), AnnounceSource::Fallback)
+                select_pubsub_addr("", &[], "/ip4/192.0.2.10/tcp/8336"),
+                ("/ip4/192.0.2.10/tcp/8336".to_string(), AnnounceSource::Fallback)
             );
+        }
+
+        #[test]
+        fn unspecified_and_empty_addresses_are_not_announceable() {
+            for addr in [
+                "",
+                "/ip4/0.0.0.0/tcp/8336",
+                "/ip4/0.0.0.0/udp/8336/quic-v1",
+                "/ip6/::/tcp/8336",
+                "/ip6/0:0:0:0:0:0:0:0/tcp/8336",
+                "/ip4/not-an-ip/tcp/8336",
+                "/ip4",
+            ] {
+                assert!(!announceable(addr), "{addr}");
+            }
+            for addr in [TCP_A, QUIC_A, "/ip6/2001:db8::7/tcp/8336", "/dns4/node.example.com/tcp/8336"] {
+                assert!(announceable(addr), "{addr}");
+            }
+        }
+
+        fn every_address(reachability: &[quil_p2p::CanonicalReachability]) -> Vec<String> {
+            reachability
+                .iter()
+                .flat_map(|r| r.pubsub_multiaddrs.iter().chain(&r.stream_multiaddrs))
+                .cloned()
+                .collect()
+        }
+
+        /// Whatever the configuration, PeerInfo never carries an unspecified
+        /// IP: without a confirmed or specific address, the records are empty.
+        #[test]
+        fn peer_info_never_announces_an_unspecified_ip() {
+            let workers = vec![(1, vec![0x11; 32]), (2, vec![0x22; 32]), (3, Vec::new())];
+            let none: Vec<String> = Vec::new();
+            let wildcard_workers = strings(&["/ip4/0.0.0.0/tcp/40001", "/ip6/::/tcp/40002"]);
+            let thread_mode = WorkerAddrs { p2p: &none, stream: &none, announce_p2p: &none, announce_stream: &none };
+            let process_mode = WorkerAddrs {
+                p2p: &wildcard_workers,
+                stream: &wildcard_workers,
+                announce_p2p: &none,
+                announce_stream: &none,
+            };
+            for listen in [LISTEN, "/ip4/0.0.0.0/udp/8336/quic-v1", "/ip6/::/tcp/8336"] {
+                for announce in ["", "/ip4/0.0.0.0/tcp/8336"] {
+                    for stream_listen in ["", "/ip4/0.0.0.0/tcp/8340", "/ip4/127.0.0.1/tcp/8340"] {
+                        for worker_addrs in [&thread_mode, &process_mode] {
+                            let (pubsub, _) = select_pubsub_addr(announce, &[], listen);
+                            let stream = select_stream_addrs("", stream_listen, &pubsub);
+                            let reachability = build_reachability(&pubsub, &stream, &workers, worker_addrs);
+                            assert_eq!(reachability.len(), 3, "{listen} {announce} {stream_listen}");
+                            assert_eq!(
+                                every_address(&reachability),
+                                Vec::<String>::new(),
+                                "{listen} {announce} {stream_listen}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A confirmed address and its stream port go into every record.
+        #[test]
+        fn peer_info_announces_the_confirmed_address_with_its_stream_port() {
+            let workers = vec![(1, vec![0x11; 32])];
+            let none: Vec<String> = Vec::new();
+            let thread_mode = WorkerAddrs { p2p: &none, stream: &none, announce_p2p: &none, announce_stream: &none };
+            let (pubsub, source) = select_pubsub_addr("", &strings(&[TCP_A]), LISTEN);
+            assert_eq!(source, AnnounceSource::Confirmed);
+            let stream = select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub);
+            let reachability = build_reachability(&pubsub, &stream, &workers, &thread_mode);
+            assert_eq!(reachability.len(), 2);
+            for record in &reachability {
+                assert_eq!(record.pubsub_multiaddrs, strings(&[TCP_A]));
+                assert_eq!(record.stream_multiaddrs, strings(&["/ip4/203.0.113.7/tcp/8340"]));
+            }
+            assert_eq!(reachability[0].filter, vec![0xFF; 32]);
         }
 
         #[test]
@@ -817,7 +963,7 @@ mod tests {
             let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
             let _driver = drive(tx, vec![(10, confirmed(&[TCP_A]))]);
             let started = tokio::time::Instant::now();
-            announce_change_due(&mut rx, selected, LISTEN, None, SETTLE, GAP).await;
+            announce_change_due(&mut rx, selected, "", None, SETTLE, GAP).await;
             assert_eq!(started.elapsed(), Duration::from_secs(10) + SETTLE);
         }
 
@@ -826,7 +972,7 @@ mod tests {
             let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
             let _driver = drive(tx, vec![(0, confirmed(&[TCP_A])), (30, confirmed(&[TCP_B]))]);
             let started = tokio::time::Instant::now();
-            announce_change_due(&mut rx, selected, LISTEN, None, SETTLE, GAP).await;
+            announce_change_due(&mut rx, selected, "", None, SETTLE, GAP).await;
             assert_eq!(started.elapsed(), Duration::from_secs(30) + SETTLE);
         }
 
@@ -877,7 +1023,7 @@ mod tests {
             ];
             let _driver = drive(tx, steps);
             let started = tokio::time::Instant::now();
-            announce_change_due(&mut rx, selected, LISTEN, None, SETTLE, GAP).await;
+            announce_change_due(&mut rx, selected, "", None, SETTLE, GAP).await;
             assert_eq!(started.elapsed(), Duration::from_secs(10) + SETTLE);
         }
 
@@ -891,21 +1037,22 @@ mod tests {
             assert_eq!(started.elapsed(), GAP);
         }
 
-        /// An address lost when AutoNAT finds the node private reverts to
-        /// the fallback, and that is published too.
+        /// An address dropped after going unconfirmed reverts to the
+        /// fallback, none for a wildcard listen address, and that is
+        /// published too.
         #[tokio::test(start_paused = true)]
         async fn losing_the_address_publishes_the_fallback() {
             let (tx, mut rx) = watch::channel(confirmed(&[TCP_A]));
-            let private = ConfirmedExternalAddrs {
+            let stale = ConfirmedExternalAddrs {
                 addrs: Vec::new(),
-                last_change: Some(ExternalAddrChange::Private),
+                last_change: Some(ExternalAddrChange::Stale),
                 ..Default::default()
             };
-            let _driver = drive(tx, vec![(20, private)]);
+            let _driver = drive(tx, vec![(20, stale)]);
             let started = tokio::time::Instant::now();
             announce_change_due(&mut rx, selected, TCP_A, None, SETTLE, GAP).await;
             assert_eq!(started.elapsed(), Duration::from_secs(20) + SETTLE);
-            assert_eq!(selected(&rx.borrow()), LISTEN);
+            assert_eq!(selected(&rx.borrow()), "");
         }
 
         type Notices = Arc<Mutex<Vec<(u64, ReachabilityNotice)>>>;
@@ -1004,7 +1151,7 @@ mod tests {
             assert!(notices.lock().unwrap().is_empty());
             tx.send_replace(ConfirmedExternalAddrs {
                 addrs: Vec::new(),
-                last_change: Some(ExternalAddrChange::Private),
+                last_change: Some(ExternalAddrChange::Stale),
                 ..Default::default()
             });
             tokio::time::sleep(Duration::from_secs(700)).await;

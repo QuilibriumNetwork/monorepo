@@ -5,14 +5,25 @@
 //! the current one: after a dynamic-IP change the old address is useless to
 //! the peers that dial it. [`ExternalAddrTracker`] keeps, per transport, the
 //! latest confirmed address that is globally routable and on one of our listen
-//! ports, but only while AutoNAT holds the node public. It drops every address
-//! when AutoNAT finds the node private, and moves an established address to a
-//! different IP only once two servers on distinct IPs confirm the new one, so
-//! a single dishonest operator, however many nodes it runs behind one IP,
-//! cannot redirect the peers that dial us.
+//! ports. It moves an established address to a different IP only once two
+//! servers on distinct IPs confirm the new one, so a single dishonest
+//! operator, however many nodes it runs behind one IP, cannot redirect the
+//! peers that dial us.
 //!
-//! Addresses do not age out. The swarm's expiry signal is handled, but nothing
-//! emits it today: AutoNAT v1 only confirms, and the node never calls
+//! AutoNAT's status alone neither adds nor drops an address. A server that
+//! does not run this repository's AutoNAT patch answers a dial-back it
+//! refused itself (it already holds two connections to us, or another dial
+//! to us failed meanwhile) as a failed dial, so a reachable node sees most
+//! probes fail and AutoNAT holds it private while servers still reach it now
+//! and then; and a node whose port forward broke while AutoNAT held it public
+//! sees its probes time out, which leaves the status public. So every
+//! dial-back confirms its address whatever the status, and an address goes
+//! once [`KEEP_UNCONFIRMED`] has passed without a confirmation and
+//! [`DROP_AFTER_UNREACHABLE`] probes since the last one found the node
+//! unreachable.
+//!
+//! The swarm's expiry signal is handled too, but nothing emits it today:
+//! AutoNAT v1 only confirms, and the node never calls
 //! `remove_external_address`.
 
 use std::net::IpAddr;
@@ -46,8 +57,9 @@ pub enum ExternalAddrChange {
     Confirmed,
     /// The swarm expired a confirmed address (nothing emits this today).
     Expired,
-    /// AutoNAT found the node unreachable and dropped every address.
-    Private,
+    /// No server confirmed the address for [`KEEP_UNCONFIRMED`] while
+    /// AutoNAT did not hold the node public.
+    Stale,
 }
 
 impl ExternalAddrChange {
@@ -55,7 +67,7 @@ impl ExternalAddrChange {
         match self {
             ExternalAddrChange::Confirmed => "confirmed",
             ExternalAddrChange::Expired => "expired",
-            ExternalAddrChange::Private => "autonat_private",
+            ExternalAddrChange::Stale => "not_reconfirmed",
         }
     }
 }
@@ -171,6 +183,39 @@ impl ProbeServer {
 /// warning.
 pub(crate) const PENDING_WARN_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// How long an address stays without a confirming dial-back: counted from
+/// its latest confirmation, or from when AutoNAT stopped holding the node
+/// public if that came later, so a public node that probes rarely does not
+/// lose its address at the first private verdict. It goes only once
+/// [`DROP_AFTER_UNREACHABLE`] probes have also found the node unreachable.
+pub(crate) const KEEP_UNCONFIRMED: Duration = Duration::from_secs(60 * 60);
+
+/// How many probes since an address's latest confirmation must have found
+/// the node unreachable before it goes: a `dial_error` or `timeout`, or a
+/// dial-back that reached another port of the address's transport after
+/// the listen port, which servers dial first. Probes that tell nothing
+/// (refused, no server, a failed request) do not count, and at most one
+/// miss counts per [`MISS_SPACING`].
+///
+/// AutoNAT probes a node it holds private every 3 min while peers connect to
+/// it and every 15 min otherwise. Servers without this repository's AutoNAT
+/// patch report the dial-backs they refuse themselves as `dial_error`, and
+/// on reachable nodes about one probe in seven came back confirmed. Twelve
+/// such probes in a row then happen with about a 16% chance, and with the
+/// hour on top a reachable node loses its address about every 7 to 9 hours
+/// until its next confirmation, minutes later. As servers upgrade, that
+/// falls to the rate of real failures. A node that became unreachable loses
+/// its address within one to three hours, depending on its probe rate.
+pub(crate) const DROP_AFTER_UNREACHABLE: u32 = 12;
+
+/// The least time between two misses that count against an address.
+/// AutoNAT retries a timed-out probe at once, so a short outage of this
+/// node's uplink brings a burst of timeouts about 30 s apart; a failed
+/// dial-back is retried after AutoNAT's 90 s retry interval. Counting one
+/// miss per 90 s makes the twelve misses span at least 16.5 min of failing
+/// probes, so a few minutes of lost connectivity cannot drop an address.
+pub(crate) const MISS_SPACING: Duration = Duration::from_secs(90);
+
 /// A move of a transport's address to a new IP, waiting for a second server.
 struct PendingMove {
     transport: ExternalTransport,
@@ -189,7 +234,8 @@ pub(crate) enum PendingNotice {
     /// Still waiting after [`PENDING_WARN_AFTER`].
     Stale { transport: ExternalTransport, secs: u64 },
     /// The move ended: `moved`, `current_reconfirmed`, `replaced`,
-    /// `expired` or `autonat_private`.
+    /// `expired`, or `current_dropped`/`current_expired` with its transport's
+    /// address.
     Resolved { transport: ExternalTransport, secs: u64, outcome: &'static str },
 }
 
@@ -217,12 +263,73 @@ pub(crate) fn log_pending(notice: &PendingNotice) {
     }
 }
 
+/// An operator line about keeping or dropping an address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HoldNotice {
+    /// AutoNAT holds the node private while `addr` is held; a server
+    /// confirmed it `confirmed_secs` ago.
+    Kept { transport: ExternalTransport, addr: String, confirmed_secs: u64 },
+    /// No server confirmed `addr` for `unconfirmed_secs`, and
+    /// `unreachable_probes` probes since found the node unreachable, so it
+    /// was dropped.
+    Dropped { transport: ExternalTransport, addr: String, unconfirmed_secs: u64, unreachable_probes: u32 },
+}
+
+/// Log a hold notice; `failures` counts the failing probes since the last
+/// dial-back (`dial_error=6`). These lines concern this node's own address.
+pub(crate) fn log_hold(notice: &HoldNotice, nat_status: &'static str, failures: &str) {
+    match notice {
+        HoldNotice::Kept { transport, addr, confirmed_secs } => info!(
+            transport = transport.as_str(),
+            address = %addr,
+            confirmed_secs,
+            nat_status,
+            failures,
+            keep_secs = KEEP_UNCONFIRMED.as_secs(),
+            drop_after_unreachable = DROP_AFTER_UNREACHABLE,
+            "this node's AutoNAT probes hold it private, but a server reached it at its address \
+             confirmed_secs ago, so PeerInfo keeps announcing the address until keep_secs pass \
+             without a confirmation and drop_after_unreachable probes find the node unreachable; \
+             a server that already holds two connections to this node refuses its dial-back, and \
+             one without the AutoNAT fix reports that as a failed dial, so this is expected on a \
+             reachable node. A static public address can be set with p2p.announceListenMultiaddr \
+             and p2p.announceStreamListenMultiaddr"
+        ),
+        HoldNotice::Dropped { transport, addr, unconfirmed_secs, unreachable_probes } => warn!(
+            transport = transport.as_str(),
+            address = %addr,
+            unconfirmed_secs,
+            unreachable_probes,
+            nat_status,
+            failures,
+            "no AutoNAT server has reached this node at its address for unconfirmed_secs, and \
+             unreachable_probes probes since found it unreachable, so PeerInfo stops announcing \
+             it and peers may be unable to dial the node until a server confirms it again; check \
+             that the p2p and stream ports are forwarded to this node, or set \
+             p2p.announceListenMultiaddr and p2p.announceStreamListenMultiaddr for a static \
+             public address"
+        ),
+    }
+}
+
+/// What a probe without a dial-back tells about this node's reachability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeMiss {
+    /// A server could not dial this node back (`dial_error`), or not in time
+    /// (`timeout`).
+    Unreachable,
+    /// Nothing: the server refused, the request failed, or no server or
+    /// address was available.
+    Inconclusive,
+}
+
 /// A signal from the swarm event loop to [`ExternalAddrTracker::apply`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ExternalAddrEvent<'a> {
-    /// An AutoNAT probe finished; `Some` when its server dialed us back on
-    /// that address.
-    Probe(Option<(&'a Multiaddr, ProbeServer)>),
+    /// A probe's server dialed us back on that address.
+    Confirmed(&'a Multiaddr, ProbeServer),
+    /// A probe brought no dial-back.
+    Failed(ProbeMiss),
     /// AutoNAT's status flipped.
     StatusChanged,
     /// The swarm expired one of its confirmed addresses.
@@ -232,16 +339,12 @@ pub(crate) enum ExternalAddrEvent<'a> {
 /// What [`ExternalAddrTracker::apply`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Applied {
-    /// A dial-back from a server while AutoNAT holds the node public.
+    /// A dial-back from a server, whatever AutoNAT's status.
     Confirm(ConfirmOutcome),
-    /// A dial-back while AutoNAT's status is still unknown.
-    NotPublic,
-    /// AutoNAT holds the node private: every address dropped (`true` when
-    /// one was held).
-    Private(bool),
     /// The swarm expired an address (`true` when it was ours).
     Expired(bool),
-    /// Nothing to do.
+    /// Nothing changed: a failed probe or a status change keeps every
+    /// address (see [`ExternalAddrTracker::expire_unconfirmed`]).
     Nothing,
 }
 
@@ -250,10 +353,31 @@ impl Applied {
     /// published value instead, which also carries AutoNAT's view.
     #[cfg(test)]
     pub(crate) fn changed(self) -> bool {
-        matches!(
-            self,
-            Applied::Confirm(ConfirmOutcome::Accepted) | Applied::Private(true) | Applied::Expired(true)
-        )
+        matches!(self, Applied::Confirm(ConfirmOutcome::Accepted) | Applied::Expired(true))
+    }
+}
+
+/// A transport's current address.
+struct Held {
+    transport: ExternalTransport,
+    addr: Multiaddr,
+    /// The latest dial-back that confirmed it.
+    confirmed_at: Instant,
+    /// Probes since then that found the node unreachable, at most one per
+    /// [`MISS_SPACING`].
+    unreachable_probes: u32,
+    /// When the latest of them counted.
+    last_miss_at: Option<Instant>,
+}
+
+impl Held {
+    /// A probe at `now` found the node unreachable at this address.
+    fn miss(&mut self, now: Instant) {
+        if self.last_miss_at.is_some_and(|last| now.saturating_duration_since(last) < MISS_SPACING) {
+            return;
+        }
+        self.last_miss_at = Some(now);
+        self.unreachable_probes = self.unreachable_probes.saturating_add(1);
     }
 }
 
@@ -263,13 +387,24 @@ pub(crate) struct ExternalAddrTracker {
     quic_port: Option<u16>,
     routable: fn(&Multiaddr) -> bool,
     /// Most recently accepted first; at most one per transport.
-    current: Vec<(ExternalTransport, Multiaddr)>,
+    current: Vec<Held>,
     /// A different address for a transport that has one, with the server
-    /// that confirmed it; at most one per transport.
+    /// that confirmed it; at most one per transport, and none for a
+    /// transport without a current address.
     pending: Vec<PendingMove>,
     /// Moves that ended since the last `pending_notices`, with their start.
     ended: Vec<(ExternalTransport, Option<Instant>, &'static str)>,
     last_change: Option<ExternalAddrChange>,
+    /// Whether AutoNAT held the node public at the last event.
+    public: bool,
+    /// When AutoNAT stopped holding the node public; `None` while it does,
+    /// and before it ever did.
+    left_public_at: Option<Instant>,
+    /// Whether the addresses held since AutoNAT last turned private were
+    /// reported kept; cleared when it turns public or nothing is held.
+    kept_reported: bool,
+    /// Hold lines not yet taken by `hold_notices`.
+    holds: Vec<HoldNotice>,
 }
 
 impl ExternalAddrTracker {
@@ -288,38 +423,125 @@ impl ExternalAddrTracker {
             pending: Vec::new(),
             ended: Vec::new(),
             last_change: None,
+            public: false,
+            left_public_at: None,
+            kept_reported: false,
+            holds: Vec::new(),
         }
     }
 
-    /// Apply `event`, given AutoNAT's status after it.
+    /// Apply `event` at `now`, given AutoNAT's status after it.
     ///
-    /// A dial-back counts only while the status is public. AutoNAT keeps a
-    /// private status through a public reply while it still has confidence
-    /// in it (it only lowers that confidence) yet reports the reply anyway;
-    /// accepting it would announce an address AutoNAT holds unreachable, and
-    /// later private replies, which only raise the confidence again, would
-    /// never clear it. So every probe outcome that leaves the status private
-    /// drops all addresses. The status already reflects the probe when its
-    /// event reaches the swarm: the behaviour updates it while handling the
-    /// response and drains its queued events before handling the next one.
-    pub(crate) fn apply(&mut self, event: ExternalAddrEvent<'_>, nat: &NatStatus) -> Applied {
-        match event {
+    /// A dial-back confirms its address whatever the status: a server
+    /// reached us there. A probe that found the node unreachable counts
+    /// against every held address, for [`Self::expire_unconfirmed`]. The
+    /// status already reflects the probe when its event reaches the swarm:
+    /// the behaviour updates it while handling the response and drains its
+    /// queued events before handling the next one.
+    pub(crate) fn apply(&mut self, event: ExternalAddrEvent<'_>, nat: &NatStatus, now: Instant) -> Applied {
+        let applied = match event {
             ExternalAddrEvent::Expired(addr) => Applied::Expired(self.on_expired(addr)),
-            ExternalAddrEvent::Probe(_) | ExternalAddrEvent::StatusChanged
-                if *nat == NatStatus::Private =>
-            {
-                Applied::Private(self.on_private())
+            ExternalAddrEvent::Confirmed(addr, server) => Applied::Confirm(self.confirm_at(addr, server, now)),
+            ExternalAddrEvent::Failed(ProbeMiss::Unreachable) => {
+                for held in &mut self.current {
+                    held.miss(now);
+                }
+                Applied::Nothing
             }
-            ExternalAddrEvent::Probe(Some((addr, server))) if nat.is_public() => {
-                Applied::Confirm(self.on_confirmed(addr, server))
+            ExternalAddrEvent::Failed(ProbeMiss::Inconclusive) | ExternalAddrEvent::StatusChanged => {
+                Applied::Nothing
             }
-            ExternalAddrEvent::Probe(Some(_)) => Applied::NotPublic,
-            ExternalAddrEvent::Probe(None) | ExternalAddrEvent::StatusChanged => Applied::Nothing,
-        }
+        };
+        self.note_status(nat, now);
+        applied
     }
 
-    /// `server` dialed us back on `address`.
+    /// Follow AutoNAT's status: when it left public, and one report of the
+    /// held addresses when it turns private.
+    fn note_status(&mut self, nat: &NatStatus, now: Instant) {
+        if nat.is_public() {
+            self.public = true;
+            self.left_public_at = None;
+            self.kept_reported = false;
+            return;
+        }
+        if self.public {
+            self.public = false;
+            self.left_public_at = Some(now);
+        }
+        if *nat != NatStatus::Private || self.kept_reported || self.current.is_empty() {
+            return;
+        }
+        self.kept_reported = true;
+        // An address past its window goes at the next expiry instead.
+        let kept: Vec<HoldNotice> = self
+            .current
+            .iter()
+            .filter(|held| !self.is_stale(held, now))
+            .map(|held| HoldNotice::Kept {
+                transport: held.transport,
+                addr: held.addr.to_string(),
+                confirmed_secs: now.saturating_duration_since(held.confirmed_at).as_secs(),
+            })
+            .collect();
+        self.holds.extend(kept);
+    }
+
+    /// Whether `held` is due to go at `now`: [`KEEP_UNCONFIRMED`] without a
+    /// confirmation, counted from when AutoNAT left public if that came
+    /// later, and [`DROP_AFTER_UNREACHABLE`] probes that found the node
+    /// unreachable since the confirmation.
+    fn is_stale(&self, held: &Held, now: Instant) -> bool {
+        let since = self.left_public_at.map_or(held.confirmed_at, |left| left.max(held.confirmed_at));
+        now.saturating_duration_since(since) >= KEEP_UNCONFIRMED
+            && held.unreachable_probes >= DROP_AFTER_UNREACHABLE
+    }
+
+    /// Drop every address due to go at `now` (see [`Self::is_stale`]),
+    /// whatever AutoNAT's status, with the pending move of its transport.
+    /// Returns whether the confirmed set changed.
+    pub(crate) fn expire_unconfirmed(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.current.len() {
+            if !self.is_stale(&self.current[i], now) {
+                i += 1;
+                continue;
+            }
+            let held = self.current.remove(i);
+            if let Some(j) = self.pending.iter().position(|p| p.transport == held.transport) {
+                self.end_pending(j, "current_dropped");
+            }
+            self.holds.push(HoldNotice::Dropped {
+                transport: held.transport,
+                addr: held.addr.to_string(),
+                unconfirmed_secs: now.saturating_duration_since(held.confirmed_at).as_secs(),
+                unreachable_probes: held.unreachable_probes,
+            });
+            changed = true;
+        }
+        if !changed {
+            return false;
+        }
+        if self.current.is_empty() {
+            self.kept_reported = false;
+        }
+        self.last_change = Some(ExternalAddrChange::Stale);
+        true
+    }
+
+    /// Hold lines since the last call.
+    pub(crate) fn hold_notices(&mut self) -> Vec<HoldNotice> {
+        std::mem::take(&mut self.holds)
+    }
+    /// `server` dialed us back on `address` just now.
+    #[cfg(test)]
     fn on_confirmed(&mut self, address: &Multiaddr, server: ProbeServer) -> ConfirmOutcome {
+        self.confirm_at(address, server, Instant::now())
+    }
+
+    /// `server` dialed us back on `address` at `now`.
+    fn confirm_at(&mut self, address: &Multiaddr, server: ProbeServer, now: Instant) -> ConfirmOutcome {
         let addr = without_peer_id(address);
         let Some((transport, port)) = transport_and_port(&addr) else {
             return ConfirmOutcome::Rejected("transport");
@@ -329,6 +551,12 @@ impl ExternalAddrTracker {
             ExternalTransport::Quic => self.quic_port,
         };
         if listen_port != Some(port) {
+            // Servers dial the listen port first: a dial-back that reached
+            // another port means the held address on the listen port did
+            // not answer.
+            for held in self.current.iter_mut().filter(|h| h.transport == transport) {
+                held.miss(now);
+            }
             return ConfirmOutcome::Rejected("port");
         }
         if !(self.routable)(&addr) {
@@ -336,20 +564,24 @@ impl ExternalAddrTracker {
         }
         let pending = self.pending.iter().position(|p| p.transport == transport);
         let new_move = |addr| PendingMove { transport, addr, server, since: None, warned: false };
-        match self.current.iter().position(|(t, _)| *t == transport) {
-            Some(i) if self.current[i].1 == addr => {
+        let held = |addr| Held { transport, addr, confirmed_at: now, unreachable_probes: 0, last_miss_at: None };
+        match self.current.iter().position(|h| h.transport == transport) {
+            Some(i) if self.current[i].addr == addr => {
                 // A server still sees us here, so a different pending IP
                 // was not where peers reach us.
                 if let Some(j) = pending {
                     self.end_pending(j, "current_reconfirmed");
                 }
+                self.current[i].confirmed_at = now;
+                self.current[i].unreachable_probes = 0;
+                self.current[i].last_miss_at = None;
                 ConfirmOutcome::Unchanged
             }
             Some(i) => match pending {
                 Some(j) if self.pending[j].addr == addr && self.pending[j].server.independent_of(&server) => {
                     self.end_pending(j, "moved");
                     self.current.remove(i);
-                    self.current.insert(0, (transport, addr));
+                    self.current.insert(0, held(addr));
                     self.last_change = Some(ExternalAddrChange::Confirmed);
                     ConfirmOutcome::Accepted
                 }
@@ -372,10 +604,14 @@ impl ExternalAddrTracker {
                 }
             },
             None => {
+                // Nothing to protect: the first confirmation is taken, as
+                // at startup. A pending move ends with its transport's
+                // address, so none can be left here.
+                debug_assert!(pending.is_none(), "a pending move without a current address");
                 if let Some(j) = pending {
                     self.end_pending(j, "moved");
                 }
-                self.current.insert(0, (transport, addr));
+                self.current.insert(0, held(addr));
                 self.last_change = Some(ExternalAddrChange::Confirmed);
                 ConfirmOutcome::Accepted
             }
@@ -388,25 +624,17 @@ impl ExternalAddrTracker {
         while let Some(j) = self.pending.iter().position(|p| p.addr == addr) {
             self.end_pending(j, "expired");
         }
-        let Some(i) = self.current.iter().position(|(_, a)| *a == addr) else {
+        let Some(i) = self.current.iter().position(|h| h.addr == addr) else {
             return false;
         };
-        self.current.remove(i);
-        self.last_change = Some(ExternalAddrChange::Expired);
-        true
-    }
-
-    /// AutoNAT found the node private. Returns whether the confirmed set
-    /// changed.
-    fn on_private(&mut self) -> bool {
-        while !self.pending.is_empty() {
-            self.end_pending(0, "autonat_private");
+        let held = self.current.remove(i);
+        if let Some(j) = self.pending.iter().position(|p| p.transport == held.transport) {
+            self.end_pending(j, "current_expired");
         }
         if self.current.is_empty() {
-            return false;
+            self.kept_reported = false;
         }
-        self.current.clear();
-        self.last_change = Some(ExternalAddrChange::Private);
+        self.last_change = Some(ExternalAddrChange::Expired);
         true
     }
 
@@ -445,7 +673,7 @@ impl ExternalAddrTracker {
 
     pub(crate) fn snapshot(&self) -> ConfirmedExternalAddrs {
         ConfirmedExternalAddrs {
-            addrs: self.current.iter().map(|(_, a)| a.to_string()).collect(),
+            addrs: self.current.iter().map(|h| h.addr.to_string()).collect(),
             last_change: self.last_change,
             autonat: AutonatSummary::default(),
         }
@@ -657,17 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn private_status_clears_every_address() {
-        let mut t = tracker();
-        assert!(!t.on_private());
-        t.on_confirmed(&ma("/ip4/203.0.113.7/tcp/8336"), any_server());
-        t.on_confirmed(&ma("/ip4/203.0.113.7/udp/8336/quic-v1"), any_server());
-        assert!(t.on_private());
-        assert!(addrs(&t).is_empty());
-        assert_eq!(t.snapshot().last_change, Some(ExternalAddrChange::Private));
-    }
-
-    #[test]
     fn rejects_other_ports_and_transports() {
         let mut t = ExternalAddrTracker::new(Some(8336), None, routable);
         let server = any_server();
@@ -709,79 +926,325 @@ mod tests {
         NatStatus::Public(ma("/ip4/203.0.113.7/tcp/8336"))
     }
 
-    /// AutoNAT reports a public reply while it still holds the node private:
-    /// the address must not be announced, and a private outcome drops what
-    /// was held.
-    #[test]
-    fn a_dial_back_while_autonat_holds_the_node_private_is_not_announced() {
-        let mut t = tracker();
-        let a = ma("/ip4/203.0.113.7/tcp/8336");
-        assert_eq!(
-            t.apply(ExternalAddrEvent::Probe(Some((&a, any_server()))), &public()),
-            Applied::Confirm(ConfirmOutcome::Accepted)
-        );
-        // A failed dial-back that leaves the status private clears it.
-        let cleared = t.apply(ExternalAddrEvent::Probe(None), &NatStatus::Private);
-        assert_eq!(cleared, Applied::Private(true));
-        assert!(cleared.changed());
-        assert!(addrs(&t).is_empty());
-        // A public reply that only lowers AutoNAT's confidence in private.
-        let reply = t.apply(ExternalAddrEvent::Probe(Some((&a, any_server()))), &NatStatus::Private);
-        assert_eq!(reply, Applied::Private(false));
-        assert!(!reply.changed());
-        assert!(addrs(&t).is_empty());
+    fn minutes(t0: Instant, m: u64) -> Instant {
+        t0 + Duration::from_secs(60 * m)
     }
 
-    #[test]
-    fn a_dial_back_before_autonat_has_a_status_is_ignored() {
-        let mut t = tracker();
-        let a = ma("/ip4/203.0.113.7/tcp/8336");
-        assert_eq!(
-            t.apply(ExternalAddrEvent::Probe(Some((&a, any_server()))), &NatStatus::Unknown),
-            Applied::NotPublic
-        );
-        assert!(addrs(&t).is_empty());
+    fn confirm(t: &mut ExternalAddrTracker, addr: &Multiaddr, nat: &NatStatus, at: Instant) -> Applied {
+        t.apply(ExternalAddrEvent::Confirmed(addr, any_server()), nat, at)
     }
 
-    #[test]
-    fn a_flip_to_private_clears_every_address() {
-        let mut t = tracker();
-        let a = ma("/ip4/203.0.113.7/tcp/8336");
-        t.apply(ExternalAddrEvent::Probe(Some((&a, any_server()))), &public());
-        assert_eq!(t.apply(ExternalAddrEvent::StatusChanged, &public()), Applied::Nothing);
-        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
-        assert_eq!(
-            t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private),
-            Applied::Private(true)
-        );
-        assert!(addrs(&t).is_empty());
+    /// `n` probes that found the node unreachable, from `at` on, spaced so
+    /// that each counts.
+    fn unreachable(t: &mut ExternalAddrTracker, n: u32, nat: &NatStatus, at: Instant) {
+        for k in 0..n {
+            let when = at + MISS_SPACING * k;
+            assert_eq!(t.apply(ExternalAddrEvent::Failed(ProbeMiss::Unreachable), nat, when), Applied::Nothing);
+        }
     }
 
+    const WINDOW: u64 = KEEP_UNCONFIRMED.as_secs() / 60;
+
+    /// Servers report dial-backs they refused themselves as failed dials, so
+    /// AutoNAT holds a reachable node private: that keeps every address,
+    /// pending moves included, and reports each address once.
     #[test]
-    fn private_and_expiry_clear_pending_entries() {
+    fn a_private_status_keeps_every_address_and_reports_it_once() {
+        let t0 = Instant::now();
         let mut t = tracker();
         let a = ma("/ip4/203.0.113.7/tcp/8336");
         let b = ma("/ip4/198.51.100.9/tcp/8336");
-        t.apply(ExternalAddrEvent::Probe(Some((&a, any_server()))), &public());
-        let first = t.apply(ExternalAddrEvent::Probe(Some((&b, any_server()))), &public());
+        let q = ma("/ip4/203.0.113.7/udp/8336/quic-v1");
+        confirm(&mut t, &a, &public(), t0);
+        confirm(&mut t, &q, &public(), minutes(t0, 1));
+        confirm(&mut t, &b, &public(), minutes(t0, 2));
+        assert_eq!(t.pending.len(), 1);
+        assert!(t.hold_notices().is_empty());
+        unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, 5));
+        assert!(!t.expire_unconfirmed(minutes(t0, 5)));
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/udp/8336/quic-v1", "/ip4/203.0.113.7/tcp/8336"]);
+        assert_eq!(t.pending.len(), 1);
+        assert_eq!(t.snapshot().last_change, Some(ExternalAddrChange::Confirmed));
+        assert_eq!(
+            t.hold_notices(),
+            vec![
+                HoldNotice::Kept { transport: ExternalTransport::Quic, addr: q.to_string(), confirmed_secs: 4 * 60 },
+                HoldNotice::Kept { transport: ExternalTransport::Tcp, addr: a.to_string(), confirmed_secs: 5 * 60 },
+            ]
+        );
+        // Further private outcomes and flips do not repeat the line.
+        t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private, minutes(t0, 6));
+        confirm(&mut t, &a, &NatStatus::Private, minutes(t0, 7));
+        unreachable(&mut t, 3, &NatStatus::Private, minutes(t0, 8));
+        assert!(t.hold_notices().is_empty());
+        // After a public spell, the next private run reports again.
+        t.apply(ExternalAddrEvent::StatusChanged, &public(), minutes(t0, 9));
+        t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private, minutes(t0, 10));
+        assert_eq!(t.hold_notices().len(), 2);
+    }
+
+    /// A dial-back is a confirmation whatever AutoNAT's status.
+    #[test]
+    fn a_dial_back_counts_whatever_autonats_status() {
+        let t0 = Instant::now();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        for nat in [NatStatus::Private, NatStatus::Unknown, public()] {
+            let mut t = tracker();
+            assert_eq!(confirm(&mut t, &a, &nat, t0), Applied::Confirm(ConfirmOutcome::Accepted), "{nat:?}");
+            assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
+        }
+    }
+
+    /// An address goes, with one line, only once the window has passed and
+    /// enough probes found the node unreachable; inconclusive probes do not
+    /// count.
+    #[test]
+    fn an_address_goes_after_the_window_and_enough_unreachable_probes() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        confirm(&mut t, &a, &NatStatus::Unknown, t0);
+        for _ in 0..50 {
+            t.apply(ExternalAddrEvent::Failed(ProbeMiss::Inconclusive), &NatStatus::Private, minutes(t0, 1));
+        }
+        unreachable(&mut t, DROP_AFTER_UNREACHABLE - 1, &NatStatus::Private, minutes(t0, 1));
+        t.hold_notices();
+        assert!(!t.expire_unconfirmed(minutes(t0, 10 * WINDOW)));
+        unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, 10 * WINDOW));
+        assert!(!t.expire_unconfirmed(minutes(t0, WINDOW - 1)));
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
+        assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
+        assert!(addrs(&t).is_empty());
+        assert_eq!(t.snapshot().last_change, Some(ExternalAddrChange::Stale));
+        assert_eq!(
+            t.hold_notices(),
+            vec![HoldNotice::Dropped {
+                transport: ExternalTransport::Tcp,
+                addr: a.to_string(),
+                unconfirmed_secs: WINDOW * 60,
+                unreachable_probes: DROP_AFTER_UNREACHABLE,
+            }]
+        );
+        assert!(!t.expire_unconfirmed(minutes(t0, WINDOW + 5)));
+        assert!(t.hold_notices().is_empty());
+        // The next dial-back brings it back, needing one server again.
+        let at = minutes(t0, WINDOW + 10);
+        assert_eq!(confirm(&mut t, &a, &NatStatus::Private, at), Applied::Confirm(ConfirmOutcome::Accepted));
+        assert_eq!(t.hold_notices().len(), 1);
+    }
+
+    /// A port forward that breaks while AutoNAT holds the node public: the
+    /// dial-backs time out, which leaves the status public, and the address
+    /// still goes. Without such probes a public node keeps it.
+    #[test]
+    fn a_public_node_loses_an_address_its_probes_cannot_reach() {
+        let t0 = Instant::now();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let mut kept = tracker();
+        confirm(&mut kept, &a, &public(), t0);
+        for _ in 0..50 {
+            kept.apply(ExternalAddrEvent::Failed(ProbeMiss::Inconclusive), &public(), minutes(t0, 1));
+        }
+        assert!(!kept.expire_unconfirmed(minutes(t0, 10 * WINDOW)));
+        assert_eq!(addrs(&kept), vec!["/ip4/203.0.113.7/tcp/8336"]);
+
+        let mut lost = tracker();
+        confirm(&mut lost, &a, &public(), t0);
+        unreachable(&mut lost, DROP_AFTER_UNREACHABLE, &public(), minutes(t0, 20));
+        assert!(!lost.expire_unconfirmed(minutes(t0, WINDOW - 1)));
+        assert!(lost.expire_unconfirmed(minutes(t0, WINDOW)));
+        assert!(addrs(&lost).is_empty());
+        assert!(matches!(lost.hold_notices()[..], [HoldNotice::Dropped { .. }]));
+    }
+
+    /// A few minutes of lost uplink bring a burst of timeouts, retried at
+    /// once: they count as one miss per spacing and cannot drop a reachable
+    /// node's address.
+    #[test]
+    fn a_burst_of_timeouts_does_not_drop_an_address() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        confirm(&mut t, &a, &public(), t0);
+        // Six minutes of timeouts, one every 30 s, 50 minutes after the
+        // confirmation.
+        let burst = minutes(t0, 50);
+        for k in 0..12u32 {
+            t.apply(ExternalAddrEvent::Failed(ProbeMiss::Unreachable), &public(), burst + Duration::from_secs(30) * k);
+        }
+        assert!(t.current[0].unreachable_probes <= 4);
+        for at in [minutes(t0, WINDOW), minutes(t0, 2 * WINDOW)] {
+            assert!(!t.expire_unconfirmed(at));
+        }
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
+    }
+
+    /// Behind a NAT whose forward of the listen port broke, servers still
+    /// reach the node on a port the NAT maps: each such dial-back means the
+    /// listen port failed, so the address on it goes in time.
+    #[test]
+    fn dial_backs_on_another_port_count_against_the_listen_port_address() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let mapped = ma("/ip4/203.0.113.7/tcp/40123");
+        let quic = ma("/ip4/203.0.113.7/udp/8336/quic-v1");
+        confirm(&mut t, &a, &public(), t0);
+        confirm(&mut t, &quic, &public(), t0);
+        for k in 0..DROP_AFTER_UNREACHABLE {
+            let at = minutes(t0, 5) + MISS_SPACING * k;
+            assert_eq!(
+                t.apply(ExternalAddrEvent::Confirmed(&mapped, any_server()), &public(), at),
+                Applied::Confirm(ConfirmOutcome::Rejected("port"))
+            );
+        }
+        assert!(!t.expire_unconfirmed(minutes(t0, WINDOW - 1)));
+        assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
+        // Only the TCP address: the QUIC one was not dialed first.
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/udp/8336/quic-v1"]);
+    }
+
+    /// An address that aged while AutoNAT held the node public gets its
+    /// hour from the flip to private, and is reported kept, not dropped.
+    #[test]
+    fn the_window_starts_when_the_node_leaves_public() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        confirm(&mut t, &a, &public(), t0);
+        let flip = minutes(t0, 2 * WINDOW);
+        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Private, flip);
+        assert!(!t.expire_unconfirmed(flip));
+        assert_eq!(
+            t.hold_notices(),
+            vec![HoldNotice::Kept {
+                transport: ExternalTransport::Tcp,
+                addr: a.to_string(),
+                confirmed_secs: 2 * WINDOW * 60,
+            }]
+        );
+        assert!(!t.expire_unconfirmed(minutes(t0, 3 * WINDOW - 1)));
+        assert!(t.expire_unconfirmed(minutes(t0, 3 * WINDOW)));
+        assert!(matches!(t.hold_notices()[..], [HoldNotice::Dropped { unconfirmed_secs, .. }] if unconfirmed_secs == 3 * WINDOW * 60));
+    }
+
+    /// An entry already past its window when AutoNAT turns private is
+    /// dropped, never reported kept.
+    #[test]
+    fn an_address_past_its_window_is_not_reported_kept() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        confirm(&mut t, &a, &NatStatus::Unknown, t0);
+        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, WINDOW));
+        assert!(t.hold_notices().is_empty());
+        assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
+        assert!(matches!(t.hold_notices()[..], [HoldNotice::Dropped { .. }]));
+    }
+
+    /// The sparse dial-backs a reachable node gets while held private keep
+    /// its address: each restarts the window and the count.
+    #[test]
+    fn a_dial_back_restarts_the_window_and_the_count() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        confirm(&mut t, &a, &public(), t0);
+        for k in 1..=5 {
+            let at = minutes(t0, k * WINDOW);
+            unreachable(&mut t, DROP_AFTER_UNREACHABLE - 1, &NatStatus::Private, at);
+            assert!(!t.expire_unconfirmed(at));
+            assert_eq!(confirm(&mut t, &a, &NatStatus::Private, at), Applied::Confirm(ConfirmOutcome::Unchanged));
+        }
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
+    }
+
+    /// Only the stale transport goes; one confirmed since stays.
+    #[test]
+    fn the_window_is_kept_per_transport() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let q = ma("/ip4/203.0.113.7/udp/8336/quic-v1");
+        confirm(&mut t, &a, &NatStatus::Unknown, t0);
+        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        confirm(&mut t, &q, &NatStatus::Unknown, minutes(t0, 30));
+        assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/udp/8336/quic-v1"]);
+    }
+
+    /// A dropped address takes its transport's pending move with it, so the
+    /// move's single server never stands in for a second one later.
+    #[test]
+    fn dropping_an_address_ends_its_pending_move() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let b = ma("/ip4/198.51.100.9/tcp/8336");
+        confirm(&mut t, &a, &NatStatus::Unknown, t0);
+        assert_eq!(
+            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")), &NatStatus::Unknown, t0),
+            Applied::Confirm(ConfirmOutcome::Pending)
+        );
+        assert_eq!(t.pending_notices(t0), vec![PendingNotice::Started { transport: ExternalTransport::Tcp }]);
+        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
+        assert!(t.pending.is_empty());
+        assert_eq!(
+            t.pending_notices(minutes(t0, WINDOW)),
+            vec![PendingNotice::Resolved {
+                transport: ExternalTransport::Tcp,
+                secs: WINDOW * 60,
+                outcome: "current_dropped",
+            }]
+        );
+    }
+
+    /// A new IP still needs two independent servers while held private, and
+    /// then replaces the old address at once.
+    #[test]
+    fn a_new_ip_moves_while_private_after_two_distinct_servers() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let b = ma("/ip4/198.51.100.9/tcp/8336");
+        confirm(&mut t, &a, &public(), t0);
+        let private = NatStatus::Private;
+        assert_eq!(
+            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")), &private, t0),
+            Applied::Confirm(ConfirmOutcome::Pending)
+        );
+        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
+        assert_eq!(
+            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.45")), &private, t0),
+            Applied::Confirm(ConfirmOutcome::Accepted)
+        );
+        assert_eq!(addrs(&t), vec!["/ip4/198.51.100.9/tcp/8336"]);
+    }
+
+    #[test]
+    fn expiry_clears_pending_entries() {
+        let t0 = Instant::now();
+        let mut t = tracker();
+        let a = ma("/ip4/203.0.113.7/tcp/8336");
+        let b = ma("/ip4/198.51.100.9/tcp/8336");
+        confirm(&mut t, &a, &public(), t0);
+        let first = confirm(&mut t, &b, &public(), t0);
         assert_eq!(first, Applied::Confirm(ConfirmOutcome::Pending));
         assert!(!first.changed());
         assert_eq!(t.pending.len(), 1);
         // Expiry of the pending address drops it; A stays.
-        assert_eq!(t.apply(ExternalAddrEvent::Expired(&b), &public()), Applied::Expired(false));
+        assert_eq!(t.apply(ExternalAddrEvent::Expired(&b), &public(), t0), Applied::Expired(false));
         assert!(t.pending.is_empty());
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
-        // So B needs two fresh servers again.
-        assert_eq!(
-            t.apply(ExternalAddrEvent::Probe(Some((&b, any_server()))), &public()),
-            Applied::Confirm(ConfirmOutcome::Pending)
-        );
-        assert_eq!(
-            t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private),
-            Applied::Private(true)
-        );
-        assert!(t.pending.is_empty());
+        // So B needs two fresh servers again; expiry of A ends that move.
+        assert_eq!(confirm(&mut t, &b, &public(), t0), Applied::Confirm(ConfirmOutcome::Pending));
+        let expired = t.apply(ExternalAddrEvent::Expired(&a), &public(), t0);
+        assert_eq!(expired, Applied::Expired(true));
+        assert!(expired.changed());
         assert!(addrs(&t).is_empty());
+        assert!(t.pending.is_empty());
     }
 
     #[test]

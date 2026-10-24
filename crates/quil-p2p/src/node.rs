@@ -818,6 +818,7 @@ impl P2PNode {
                                 let applied = external_tracker.apply(
                                     crate::external_addr::ExternalAddrEvent::Expired(&address),
                                     &swarm.behaviour().autonat.nat_status(),
+                                    std::time::Instant::now(),
                                 );
                                 debug!(%address, ?applied, "external address expired");
                                 publish_external(
@@ -985,22 +986,23 @@ impl P2PNode {
                                                 ip: probe_servers.ip_of_server(peer),
                                             };
                                             (
-                                                Some(ExternalAddrEvent::Probe(Some((address, server)))),
+                                                Some(ExternalAddrEvent::Confirmed(address, server)),
                                                 autonat_health.on_success(now),
                                             )
                                         }
                                         OutboundProbeEvent::Error { peer, error, .. } => {
                                             let server_ip = peer.as_ref().and_then(|p| probe_servers.ip_of_server(p));
+                                            let failure = ProbeFailure::of(error);
                                             (
-                                                Some(ExternalAddrEvent::Probe(None)),
-                                                autonat_health.on_failure(ProbeFailure::of(error), server_ip, now),
+                                                Some(ExternalAddrEvent::Failed(failure.miss())),
+                                                autonat_health.on_failure(failure, server_ip, now),
                                             )
                                         }
                                     };
                                     if let Some(event) = event {
                                         // The status already reflects this probe.
                                         let nat = swarm.behaviour().autonat.nat_status();
-                                        let applied = external_tracker.apply(event, &nat);
+                                        let applied = external_tracker.apply(event, &nat, now);
                                         debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
                                         publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
                                         let owed = autonat_health.flush_status(&nat, now);
@@ -1015,8 +1017,11 @@ impl P2PNode {
                                 NodeBehaviourEvent::Autonat(
                                     libp2p::autonat::Event::StatusChanged { old, new }
                                 ) => {
-                                    let applied = external_tracker
-                                        .apply(crate::external_addr::ExternalAddrEvent::StatusChanged, &new);
+                                    let applied = external_tracker.apply(
+                                        crate::external_addr::ExternalAddrEvent::StatusChanged,
+                                        &new,
+                                        std::time::Instant::now(),
+                                    );
                                     debug!(?old, ?new, ?applied, "AutoNAT status changed");
                                     if let Some(notice) =
                                         autonat_health.on_status_changed(&new, std::time::Instant::now())
@@ -1781,16 +1786,27 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
-/// Publish the confirmed addresses with AutoNAT's current view, when either
-/// changed, and log the tracker's pending-move lines.
+/// Drop the addresses no dial-back confirmed for too long, publish the
+/// confirmed addresses with AutoNAT's current view when either changed, and
+/// log the tracker's pending-move and hold lines. Runs after every AutoNAT
+/// event, so an address goes at the first probe past its window.
 fn publish_external(
     tx: &tokio::sync::watch::Sender<ConfirmedExternalAddrs>,
     tracker: &mut ExternalAddrTracker,
     health: &AutonatHealth,
     nat: &libp2p::autonat::NatStatus,
 ) {
-    for notice in tracker.pending_notices(std::time::Instant::now()) {
+    let now = std::time::Instant::now();
+    tracker.expire_unconfirmed(now);
+    for notice in tracker.pending_notices(now) {
         crate::external_addr::log_pending(&notice);
+    }
+    for notice in tracker.hold_notices() {
+        crate::external_addr::log_hold(
+            &notice,
+            crate::autonat_health::status_str(nat),
+            &health.run_failures(),
+        );
     }
     let next = ConfirmedExternalAddrs { autonat: health.summary(nat), ..tracker.snapshot() };
     tx.send_if_modified(|current| {

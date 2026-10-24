@@ -116,6 +116,15 @@ impl ProbeFailure {
         matches!(self, ProbeFailure::DialError | ProbeFailure::Timeout)
     }
 
+    /// What the failure tells the address tracker.
+    pub(crate) fn miss(self) -> crate::external_addr::ProbeMiss {
+        if self.unreachable_class() {
+            crate::external_addr::ProbeMiss::Unreachable
+        } else {
+            crate::external_addr::ProbeMiss::Inconclusive
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ProbeFailure::NoServer => "no_server",
@@ -439,6 +448,12 @@ impl AutonatHealth {
         self.status_logged = true;
         self.logged_status = new;
         notice
+    }
+
+    /// The failure counts of the probes since the last dial-back
+    /// (`dial_error=6`), `none` when the latest probe brought one.
+    pub(crate) fn run_failures(&self) -> String {
+        self.run.as_ref().map_or_else(|| "none".to_string(), |run| run.failures.to_string())
     }
 
     /// AutoNAT's view for the PeerInfo publisher.
@@ -794,5 +809,33 @@ mod tests {
             health.on_status_changed(&NatStatus::Private, at(2_100)),
             Some(AutonatNotice::StatusChanged { old: "public", new: "private", suppressed_flips: 0, .. })
         ));
+    }
+
+    /// The hold lines carry the failures since the last dial-back.
+    #[test]
+    fn run_failures_count_the_probes_since_the_last_dial_back() {
+        let t0 = Instant::now();
+        let mut health = AutonatHealth::new(t0);
+        assert_eq!(health.run_failures(), "none");
+        health.on_failure(DialError, ip("192.0.2.1"), t0);
+        health.on_failure(DialError, ip("192.0.2.2"), t0);
+        health.on_failure(Timeout, ip("192.0.2.3"), t0);
+        assert_eq!(health.run_failures(), "dial_error=2 timeout=1");
+        health.on_success(t0);
+        assert_eq!(health.run_failures(), "none");
+    }
+
+    /// Only a server's failed or timed-out dial-back counts against an
+    /// address.
+    #[test]
+    fn only_failed_dial_backs_count_against_an_address() {
+        use crate::external_addr::ProbeMiss;
+        for class in CLASSES {
+            let expected = match class {
+                DialError | Timeout => ProbeMiss::Unreachable,
+                _ => ProbeMiss::Inconclusive,
+            };
+            assert_eq!(class.miss(), expected, "{class:?}");
+        }
     }
 }
