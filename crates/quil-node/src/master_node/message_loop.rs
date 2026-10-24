@@ -293,6 +293,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut peer_policy_unavailable = super::committee_peer_policy::Unavailability::default();
         let mut committee_builds = super::committee_builds::CommitteeBuilds::default();
         let mut committee_builds_checked = std::time::Instant::now();
+        let mut host_memory_watch = crate::mem_stats::HostMemoryWatch::default();
         let mut last_committee_peers = std::collections::HashSet::new();
         let mut pending_committee_policy: Option<(std::collections::HashSet<quil_p2p::PeerId>, Arc<std::sync::atomic::AtomicBool>)> = None;
         let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -616,6 +617,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         peer_info_digest_cache.len(),
                     );
                     let proc_mem = crate::mem_stats::process_memory();
+                    let host_mem = crate::mem_stats::host_memory();
                     info!(
                         rss_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
@@ -623,6 +625,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         vsize_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.vsize_bytes))
                             .unwrap_or_else(|| "?".to_string()),
+                        // Whole host (all processes), from /proc/meminfo;
+                        // omitted when unavailable.
+                        host_mem_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.total_bytes)),
+                        host_mem_available_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.available_bytes)),
+                        host_swap_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_total_bytes)),
+                        host_swap_used_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_used_bytes)),
                         peer_info_cache = sizes.peer_info_cache,
                         shard_engines = sizes.shard_engines,
                         signer_registry = sizes.signer_registry,
@@ -642,6 +650,31 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         execution_views_held = quil_forest::ExecutionViewAdmission::process().active(),
                         "memory snapshot"
                     );
+                    if let Some(h) = host_mem {
+                        match host_memory_watch.observe(&h, std::time::Instant::now()) {
+                            crate::mem_stats::HostMemoryAction::Warn { low_secs } => warn!(
+                                scope = "this host",
+                                low_secs,
+                                host_mem_available_mb = %crate::mem_stats::fmt_mb(h.available_bytes),
+                                host_mem_total_mb = %crate::mem_stats::fmt_mb(h.total_bytes),
+                                host_swap_used_mb = %crate::mem_stats::fmt_mb(h.swap_used_bytes),
+                                host_swap_total_mb = %crate::mem_stats::fmt_mb(h.swap_total_bytes),
+                                "host memory low: available memory is below 10% of total \
+                                 (all processes on this host, not only this node); the \
+                                 host may swap or kill processes. Reduce dataWorkerCount \
+                                 or check other processes on the host. Repeats every 10 \
+                                 minutes while it holds"
+                            ),
+                            crate::mem_stats::HostMemoryAction::Cleared { low_secs } => info!(
+                                scope = "this host",
+                                low_secs,
+                                host_mem_available_mb = %crate::mem_stats::fmt_mb(h.available_bytes),
+                                host_mem_total_mb = %crate::mem_stats::fmt_mb(h.total_bytes),
+                                "host memory recovered: available memory is back above 10% of total"
+                            ),
+                            crate::mem_stats::HostMemoryAction::None => {}
+                        }
+                    }
                     // jemalloc allocator stats — PROCESS-GLOBAL, so this single
                     // line captures the master, every worker thread, AND the
                     // C++ RocksDB allocations. The decisive OOM signal:

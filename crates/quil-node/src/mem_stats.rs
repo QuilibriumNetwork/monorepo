@@ -151,6 +151,109 @@ fn mach_rss_bytes() -> Option<u64> {
     }
 }
 
+/// Host-wide memory from `/proc/meminfo`, in bytes. Covers every process
+/// on the machine, unlike [`ProcessMemory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
+/// Parse the text of `/proc/meminfo`. Returns `None` unless `MemTotal`
+/// and `MemAvailable` are both present. Absent swap lines count as no
+/// swap; malformed lines are skipped. Never panics.
+pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
+    let (mut total, mut avail, mut swap_total, mut swap_free) = (None, None, 0u64, 0u64);
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(Ok(value)) = parts.next().map(str::parse::<u64>) else {
+            continue;
+        };
+        let bytes = match parts.next() {
+            Some("kB") => value.saturating_mul(1024),
+            None => value,
+            Some(_) => continue,
+        };
+        match key {
+            "MemTotal" => total = Some(bytes),
+            "MemAvailable" => avail = Some(bytes),
+            "SwapTotal" => swap_total = bytes,
+            "SwapFree" => swap_free = bytes,
+            _ => {}
+        }
+    }
+    Some(HostMemory {
+        total_bytes: total?,
+        available_bytes: avail?,
+        swap_total_bytes: swap_total,
+        swap_used_bytes: swap_total.saturating_sub(swap_free),
+    })
+}
+
+/// Host memory now, or `None` when `/proc/meminfo` is unreadable
+/// (non-Linux) or lacks the required fields.
+pub fn host_memory() -> Option<HostMemory> {
+    parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Minimum interval between repeated low-memory warnings.
+pub const HOST_LOW_MEMORY_WARN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// Available host memory below 10% of the total.
+pub fn host_memory_is_low(mem: &HostMemory) -> bool {
+    mem.total_bytes > 0 && mem.available_bytes.saturating_mul(10) < mem.total_bytes
+}
+
+/// What the caller should log after a host memory sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMemoryAction {
+    None,
+    /// Low and no warning in the last interval: warn; `low_secs` is how
+    /// long it has been low (0 on the first warning).
+    Warn { low_secs: u64 },
+    /// Was low, no longer is: log one recovery line; `low_secs` is the
+    /// episode's total length.
+    Cleared { low_secs: u64 },
+}
+
+/// Rate-limit state for the host low-memory warning.
+#[derive(Debug, Default)]
+pub struct HostMemoryWatch {
+    low_since: Option<std::time::Instant>,
+    last_warn: Option<std::time::Instant>,
+}
+
+impl HostMemoryWatch {
+    pub fn observe(&mut self, mem: &HostMemory, now: std::time::Instant) -> HostMemoryAction {
+        if host_memory_is_low(mem) {
+            let since = *self.low_since.get_or_insert(now);
+            let due = self
+                .last_warn
+                .map_or(true, |t| now.duration_since(t) >= HOST_LOW_MEMORY_WARN_INTERVAL);
+            if due {
+                self.last_warn = Some(now);
+                return HostMemoryAction::Warn {
+                    low_secs: now.duration_since(since).as_secs(),
+                };
+            }
+            HostMemoryAction::None
+        } else if let Some(since) = self.low_since.take() {
+            self.last_warn = None;
+            HostMemoryAction::Cleared {
+                low_secs: now.duration_since(since).as_secs(),
+            }
+        } else {
+            HostMemoryAction::None
+        }
+    }
+}
+
 /// Pretty-print bytes as MB (rounded to 0.1).
 pub fn fmt_mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
@@ -431,5 +534,91 @@ impl StructuralSources {
             app_engine_proposal_cache: pc,
             app_engine_pending_certified_parents: pcp,
         }
+    }
+}
+
+#[cfg(test)]
+mod host_memory_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn mem(total_gib: u64, avail_gib: u64) -> HostMemory {
+        HostMemory {
+            total_bytes: total_gib * GIB,
+            available_bytes: avail_gib * GIB,
+            swap_total_bytes: 0,
+            swap_used_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn parses_a_normal_meminfo() {
+        let text = "MemTotal:       16384000 kB\nMemFree:          100000 kB\n\
+                    MemAvailable:    8192000 kB\nSwapCached: 0 kB\n\
+                    SwapTotal:       4194304 kB\nSwapFree:        3145728 kB\n";
+        let m = parse_meminfo(text).unwrap();
+        assert_eq!(m.total_bytes, 16384000 * 1024);
+        assert_eq!(m.available_bytes, 8192000 * 1024);
+        assert_eq!(m.swap_total_bytes, 4194304 * 1024);
+        assert_eq!(m.swap_used_bytes, (4194304 - 3145728) * 1024);
+    }
+
+    #[test]
+    fn missing_swap_means_no_swap_and_missing_required_is_none() {
+        let m = parse_meminfo("MemTotal: 100 kB\nMemAvailable: 50 kB\n").unwrap();
+        assert_eq!((m.swap_total_bytes, m.swap_used_bytes), (0, 0));
+        assert_eq!(parse_meminfo("MemTotal: 100 kB\n"), None);
+        assert_eq!(parse_meminfo("MemAvailable: 50 kB\n"), None);
+    }
+
+    #[test]
+    fn garbage_is_skipped_without_panicking() {
+        assert_eq!(parse_meminfo(""), None);
+        assert_eq!(parse_meminfo("\u{0}\u{1}not meminfo\n:::\n"), None);
+        let m = parse_meminfo("MemTotal: abc kB\nMemTotal: 10 kB\nMemAvailable: 5 kB\nSwapFree: 99999999999999999999 kB\nSwapTotal: 1 kB\n").unwrap();
+        assert_eq!((m.total_bytes, m.available_bytes), (10 * 1024, 5 * 1024));
+        // An unparsable SwapFree counts as 0 free; no underflow either way.
+        assert_eq!(m.swap_used_bytes, 1024);
+    }
+
+    #[test]
+    fn threshold_is_ten_percent_of_total() {
+        assert!(host_memory_is_low(&mem(100, 9)));
+        assert!(!host_memory_is_low(&mem(100, 10)));
+        assert!(!host_memory_is_low(&mem(100, 50)));
+        assert!(host_memory_is_low(&mem(100, 0)));
+        assert!(!host_memory_is_low(&mem(0, 0)));
+    }
+
+    #[test]
+    fn warning_is_rate_limited_and_clear_is_reported_once() {
+        let t0 = Instant::now();
+        let mut w = HostMemoryWatch::default();
+        assert_eq!(w.observe(&mem(100, 50), t0), HostMemoryAction::None);
+        assert_eq!(
+            w.observe(&mem(100, 5), t0),
+            HostMemoryAction::Warn { low_secs: 0 }
+        );
+        let t1 = t0 + Duration::from_secs(599);
+        assert_eq!(w.observe(&mem(100, 5), t1), HostMemoryAction::None);
+        let t2 = t0 + Duration::from_secs(600);
+        assert_eq!(
+            w.observe(&mem(100, 4), t2),
+            HostMemoryAction::Warn { low_secs: 600 }
+        );
+        let t3 = t0 + Duration::from_secs(700);
+        assert_eq!(
+            w.observe(&mem(100, 40), t3),
+            HostMemoryAction::Cleared { low_secs: 700 }
+        );
+        assert_eq!(w.observe(&mem(100, 40), t3), HostMemoryAction::None);
+        // A new episode warns at once, with its own start.
+        let t4 = t3 + Duration::from_secs(1);
+        assert_eq!(
+            w.observe(&mem(100, 3), t4),
+            HostMemoryAction::Warn { low_secs: 0 }
+        );
     }
 }
