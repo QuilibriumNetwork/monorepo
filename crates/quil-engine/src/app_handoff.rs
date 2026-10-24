@@ -801,6 +801,11 @@ const MAX_OWN_CHAIN_FRAMES: u64 = 4096;
 /// The prefix of [`fence_rewind`]'s refusal of the frames at a fence.
 const FENCE_FRAMES_DIFFER: &str = "local frames at the fence differ from the fenced frame";
 
+/// Why [`fence_rewind`] re-anchors a member whose frames past the fence
+/// name its session's genesis but contradict its chain
+/// ([`OwnChain::Broken`]).
+pub(crate) const OWN_CHAIN_BROKEN: &str = "local frames past the fence do not form this session's chain";
+
 /// What a member's frames past its session's fenced same-filter
 /// predecessor checkpoint are ([`own_session_chain`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -1594,7 +1599,8 @@ pub fn rewind_past_fence(
 /// frame the fence names. State, cursor and clock head move back to the
 /// fence; the discarded frames are deleted. A member without those frames or
 /// the fenced state is named as such ([`UnrewindableFence`]) and left as it
-/// is.
+/// is, as is one whose own frames past the fence contradict its session's
+/// chain ([`OWN_CHAIN_BROKEN`]): both owe a re-anchor.
 pub fn fence_rewind(
     global: &Arc<HypergraphCrdt>,
     shard: &Arc<HypergraphCrdt>,
@@ -1743,6 +1749,17 @@ pub fn fence_rewind_held(
         // executed tip differing from GLOBAL's is refused. Too few of its
         // frames to verify, behind the executed tip, are left for the
         // successor check, which asks the shard sync for them.
+        //
+        // Own frames that contradict the session's chain (a frame that does
+        // not extend the one before it) cannot all be the session's, and
+        // this node cannot tell which are: refused, the member stayed
+        // blocked for good (an operator's node: "local frame 5779 does not
+        // extend frame 5778" for 6.5 hours), as no start, sync or replay
+        // mends a stored frame below the head. The shard is re-anchored at
+        // the frame GLOBAL committed instead: its state is synced pinned to
+        // that frame's roots, and the session's later frames are replayed
+        // from archives, each linked to its parent. A head GLOBAL's
+        // executed tip vouches for returned untouched above.
         let behind = tip.is_some_and(|tip| tip > cursor);
         match own_session_chain_held(clock, session, &checkpoint, cursor, held)? {
             OwnChain::Held if at_tip != Some(false) => return Ok(FenceRewind::Untouched),
@@ -1750,7 +1767,10 @@ pub fn fence_rewind_held(
                 return Err(differ("this session's local frame at its executed tip is not the one GLOBAL executed".into()));
             }
             OwnChain::Unverified(_) if behind => return Ok(FenceRewind::Untouched),
-            OwnChain::Broken(reason) | OwnChain::Unverified(reason) => return Err(differ(reason)),
+            OwnChain::Broken(reason) => {
+                return Ok(unrewindable(OWN_CHAIN_BROKEN, Some(fence_refusal(OWN_CHAIN_BROKEN, &reason, session, cursor, tip))));
+            }
+            OwnChain::Unverified(reason) => return Err(differ(reason)),
             OwnChain::NotOwn => {}
         }
         if !crate::frame_validator::app_frame_links_to_child(&fenced, &header) {
@@ -3210,9 +3230,10 @@ mod successor_tests {
     // Frames past the fence that are not the session's own chain stay
     // refused: a frame after the fence naming neither the fenced frame nor
     // the session's genesis, own frames over a frame at the fence that is not
-    // the fenced one, own frames broken by a frame that does not extend the
-    // one before it, and own frames whose frame at GLOBAL's executed tip is
-    // not the one GLOBAL executed.
+    // the fenced one, and own frames whose frame at GLOBAL's executed tip is
+    // not the one GLOBAL executed. Own frames broken by a frame that does
+    // not extend the one before it are re-anchored instead
+    // (`own_frames_broken_past_the_fence_are_reanchored`).
     #[test]
     fn frames_past_a_fence_that_are_not_the_sessions_own_chain_stay_refused() {
         let refused = |past: &PastFence, case: &str| {
@@ -3237,17 +3258,80 @@ mod successor_tests {
         refused(&past, "another frame at the fence");
 
         let past = past_fence();
-        own_frames(&past, 6);
-        store_header(&past.clock, quil_types::proto::global::FrameHeader {
-            address: past.filter.clone(), frame_number: 5, rank: 5, output: vec![0x55; 32],
-            parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
-        });
-        refused(&past, "a frame that does not extend its parent");
-
-        let past = past_fence();
         own_frames(&past, 5);
         execute_successor_through(&past, 5, 0x66);
         refused(&past, "another frame at the executed tip");
+    }
+
+    // A member's own frames past the fence broken by a frame that does not
+    // extend the one before it owe a re-anchor at the frame GLOBAL
+    // committed, rather than a refusal for good (an operator's node: "local
+    // frame 5779 does not extend frame 5778" for 6.5 hours, nothing owed).
+    // Nothing is rewound locally; the rebase drops the frames past the
+    // fence, and the anchor's replay leaves a member the successor accepts.
+    // Behind GLOBAL's executed tip it is re-anchored at that tip; a head
+    // GLOBAL's executed tip vouches for stays untouched whatever lies below.
+    #[test]
+    fn own_frames_broken_past_the_fence_are_reanchored() {
+        use quil_types::store::ClockStore as _;
+        let broken = |through: u64| {
+            let past = past_fence();
+            own_frames(&past, through);
+            store_header(&past.clock, quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(), frame_number: 5, rank: 5, output: vec![0x55; 32],
+                parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
+            });
+            past
+        };
+        let past = broken(6);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        let FenceRewind::Unrewindable { fence, error } = &outcome else { panic!("{outcome:?}") };
+        assert_eq!((fence.fence, fence.local_head, fence.session_tip, fence.reason), (3, 6, None, OWN_CHAIN_BROKEN));
+        let error = error.as_ref().expect("the broken link is named").to_string();
+        assert!(error.contains(&format!("{OWN_CHAIN_BROKEN}: local frame 5 does not extend frame 4")) && error.contains("local_head 6"), "{error}");
+        assert!(!error.contains(FENCE_FRAMES_DIFFER), "the fenced frame matched: {error}");
+        assert_eq!(past.cursor(), 6, "nothing is rewound locally");
+        let marker = outcome.reanchor().expect("a broken own chain owes a re-anchor");
+        assert_eq!(marker, ReanchorMarker { generation: past.successor.generation, fence: 3, from_cursor: 6, head: None });
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(3), "the anchor is the fence");
+        let marker = marker.with_head(&past.clock, &past.filter);
+        write_reanchor_marker(&past.clock, &past.filter, &marker).unwrap();
+        assert_eq!(gate_of(&past), ReanchorGate::Owed(marker));
+
+        // The shard sync installed frame 3's pre-state; the actor rebases.
+        let rebased = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 3,
+            Some(&header_frame(&past.filter, 2, 0x22)), |kept| { assert_eq!(kept, 2); Ok(()) }).unwrap();
+        assert_eq!(rebased, Rebased { from: 3, to: 6 });
+        assert_eq!(past.cursor(), 2);
+        for number in 4..=6 {
+            assert!(past.clock.get_shard_clock_frame(&past.filter, number, false).is_err(), "frame {number} is dropped");
+        }
+        assert_eq!(gate_of(&past), ReanchorGate::Absent);
+        // The anchor's replay: the fenced frame and the state after it.
+        past.shard.rewind_app_shard(&past.filter, &past.fenced_roots).unwrap();
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 3, rank: 5, output: vec![0x33; 32], ..Default::default()
+        });
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        past.shard.checkpoint_frame_cursor(3, &cursor_key).unwrap();
+        assert!(matches!(fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+
+        // Behind GLOBAL's executed tip: re-anchored at that tip.
+        let past = broken(6);
+        execute_successor_through(&past, 9, 0x59);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(&outcome, FenceRewind::Unrewindable { fence, error: Some(_) }
+            if fence.reason == OWN_CHAIN_BROKEN && fence.session_tip == Some(9)), "{outcome:?}");
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(9));
+
+        // A head at GLOBAL's executed tip, its frame the one GLOBAL executed.
+        let past = broken(7);
+        execute_successor_through(&past, 7, 0x57);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(past.cursor(), 7);
     }
 
     // The own-chain check names why frames past a fence are not the

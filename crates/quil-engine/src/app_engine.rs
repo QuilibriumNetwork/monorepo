@@ -2816,10 +2816,7 @@ impl AppConsensusEngine {
             }
             crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
                 let now = std::time::Instant::now();
-                self.note_unrewindable_fence(&fence, now);
-                if let Some(error) = error {
-                    debug!(core_id = self.core_id, %error, "local fence rewind refused; the shard is re-anchored instead");
-                }
+                self.note_unrewindable_fence(&fence, error.as_ref(), now);
                 if let Some(marker) = reanchor {
                     // Durable before the shard sync may write the trees.
                     crate::app_handoff::write_reanchor_marker(self.clock_store.as_ref(), &self.filter, &marker)?;
@@ -3157,12 +3154,19 @@ impl AppConsensusEngine {
     /// ([`crate::app_handoff::UnrewindableFence`]) when first found or its
     /// reason changes, then every [`UNREWINDABLE_FENCE_REPEAT`] with how long
     /// it has lasted.
-    fn note_unrewindable_fence(&mut self, fence: &crate::app_handoff::UnrewindableFence, now: std::time::Instant) {
+    /// `detail`: the local check's own refusal, when it names more than
+    /// the reason (the broken link of an own chain, a rewind's refusal).
+    fn note_unrewindable_fence(
+        &mut self, fence: &crate::app_handoff::UnrewindableFence, detail: Option<&QuilError>, now: std::time::Instant,
+    ) {
         let Some(elapsed) = self.unrewindable_fence.observe(now, &self.filter, fence.reason) else { return };
         let session_tip = fence.session_tip.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let detail = detail.map_or_else(|| "none".to_string(), ToString::to_string);
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = fence.generation,
             local_head = fence.local_head, fence = fence.fence, session_tip = %session_tip, reason = fence.reason,
-            action = "this node re-anchors the shard at the fence from an archive; a warning follows \
+            detail = %detail,
+            action = "this node re-anchors the shard at the frame GLOBAL committed (the fence, or GLOBAL's executed tip \
+                past it) from an archive; a warning follows \
                 if no archive can serve it",
             elapsed_secs = elapsed.as_secs(),
             "local shard head lies past the session fence and cannot be rewound locally");
