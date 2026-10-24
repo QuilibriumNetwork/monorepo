@@ -678,6 +678,7 @@ pub(crate) fn init(
                     format!("worker {} open db {}: {e}", core_id, path.display())
                 })?;
                 let db_arc = Arc::new(db);
+                db_arc.inner().register_store(quil_forest::StoreRole::Worker(core_id));
                 let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
                     quil_store::RocksClockStore::new(db_arc.inner()),
                 );

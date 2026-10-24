@@ -77,6 +77,7 @@ pub(crate) fn init(
         quil_store::RocksDb::open(&db_path)?
     };
     let db_arc = Arc::new(db);
+    db_arc.inner().register_store(quil_forest::StoreRole::Master);
     info!(
         path = %db_path.display(),
         block_cache_mb = db_arc.health().block_cache_capacity / (1024 * 1024),

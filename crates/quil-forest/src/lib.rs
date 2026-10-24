@@ -37,6 +37,7 @@ mod forest;
 mod membership_proof;
 mod overlay;
 mod scope;
+pub mod storage_health;
 mod store;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
@@ -47,6 +48,7 @@ pub use forest::{
     ShardRoots, PHASES,
 };
 pub use scope::ScopeDeletion;
+pub use storage_health::{DiskThresholds, StoreRole};
 pub use sync::{diff_leaves, diff_leaves_under_prefix, key_range_under, BatchTreeReader, SubtreeSyncAnchor};
 pub use forest::tree_generation;
 // Re-export so sync callers can name the diff's key type + the reader bound

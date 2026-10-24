@@ -63,6 +63,8 @@ pub(crate) async fn start(
     #[cfg(feature = "native-proof")]
     let proof_worker = crate::proof_worker::build_node_worker(config)?;
     let storage = storage::init(config, archive_mode)?;
+    // Thread workers register their stores with this process's watch too.
+    crate::storage_watch::start(&config.db);
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
     let key_store = storage.key_store.clone();

@@ -2936,14 +2936,19 @@ pub(crate) const ONION_EXIT_METHODS: [&str; 4] = [
     "/quilibrium.node.global.pb.GlobalService/GetAppShards",
 ];
 
-/// The worker view: each worker with its engine's execution report.
+/// The worker view: each worker with its engine's execution report, and a
+/// worker whose own store refuses writes as blocked by it. Only this view
+/// shows the store: the lifecycle's renewal reads the engine's own report.
 fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::WorkerEntry> {
     let execution = wm.worker_execution();
     quil_engine::worker::WorkerView::snapshot(wm)
         .all
         .into_iter()
         .map(|w| quil_rpc::WorkerEntry {
-            execution: execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
+            execution: quil_engine::worker_execution::with_store_state(
+                w.core_id,
+                execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
+            ),
             core_id: w.core_id,
             filter: w.filter.clone(),
             available_storage: w.available_storage,
@@ -2985,7 +2990,14 @@ fn health_inputs(
             Default::default()
         }
     };
-    quil_rpc::diagnostics_service::HealthInputs { workers, committee_heads, global_head_frame, join_waits }
+    let master_store_write_failed = quil_forest::storage_health::store_latched(quil_forest::StoreRole::Master);
+    quil_rpc::diagnostics_service::HealthInputs {
+        workers,
+        committee_heads,
+        global_head_frame,
+        join_waits,
+        master_store_write_failed,
+    }
 }
 
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the

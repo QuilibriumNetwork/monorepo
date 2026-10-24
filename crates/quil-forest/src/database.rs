@@ -7,11 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
 
 use quil_types::store::{BackingStoreIdentity, ScanPoint};
+use crate::storage_health::{StoreRole, StoreState};
 use rocksdb::{
     DBIterator, DBRawIterator, IteratorMode, ReadOptions, Snapshot, WriteBatch, WriteOptions, DB,
 };
@@ -34,75 +34,15 @@ pub enum DatabaseCommitError {
     Storage(#[from] rocksdb::Error),
 }
 
-struct DatabaseInner {
+pub(crate) struct DatabaseInner {
     db: DB,
     writes: Mutex<WriteLedger>,
-    failed_write: AtomicBool,
-    /// The first write error and the refusals since, for the operator log.
-    failure: Mutex<Option<WriteFailure>>,
+    /// The failed-write latch and the store's role in the operator log.
+    state: Arc<StoreState>,
     /// Process-unique, never reused: a scan of one instance never matches a
     /// later database, even one reopened at the same path.
     instance: u64,
     watched: Option<Vec<Vec<u8>>>,
-}
-
-/// How often the operator is reminded while writes keep being refused.
-const FAILED_WRITE_REPEAT: Duration = Duration::from_secs(600);
-
-/// What the first failed write was, and how many writes it has stopped since.
-/// RocksDB keeps refusing writes after an I/O error until the database is
-/// reopened, and callers only see one per-call error, so this names the cause
-/// and the operator action once, then repeats at a bounded interval.
-struct WriteFailure {
-    cause: String,
-    since: Instant,
-    refused: u64,
-    last_logged: Instant,
-}
-
-impl WriteFailure {
-    fn new(cause: String, now: Instant) -> Self {
-        Self {
-            cause,
-            since: now,
-            refused: 0,
-            last_logged: now,
-        }
-    }
-
-    /// Count one refused write; the repeat line when one is due.
-    fn refuse(&mut self, now: Instant) -> Option<String> {
-        self.refused += 1;
-        if now.duration_since(self.last_logged) < FAILED_WRITE_REPEAT {
-            return None;
-        }
-        self.last_logged = now;
-        Some(failed_write_message(
-            &self.cause,
-            self.refused,
-            now.duration_since(self.since),
-        ))
-    }
-}
-
-/// The operator-facing line: this node's store, what failed first, how long
-/// and how many writes ago, and what to do. A full disk is named as such.
-fn failed_write_message(cause: &str, refused: u64, elapsed: Duration) -> String {
-    let lowered = cause.to_ascii_lowercase();
-    let action = if lowered.contains("no space left") || lowered.contains("storage full") {
-        "the disk is full: free space, then restart the node"
-    } else {
-        "check the disk and the store files, then restart the node"
-    };
-    let since = if refused == 0 {
-        String::new()
-    } else {
-        format!(" (first failure {}s ago, {refused} writes refused since)", elapsed.as_secs())
-    };
-    format!(
-        "store write failed and the database refuses further writes until the node restarts: \
-         {cause}; {action}{since}"
-    )
 }
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -275,6 +215,7 @@ impl CoordinatedDb {
 
     fn open(db: DB, watched: Option<Vec<Vec<u8>>>) -> Self {
         let general = db.latest_sequence_number();
+        let state = Arc::new(StoreState::new(db.path().to_path_buf()));
         Self(Arc::new(DatabaseInner {
             db,
             writes: Mutex::new(WriteLedger {
@@ -283,8 +224,7 @@ impl CoordinatedDb {
                 // Nothing written before the watch is known to be unwatched.
                 watched: general,
             }),
-            failed_write: AtomicBool::new(false),
-            failure: Mutex::new(None),
+            state,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             watched,
         }))
@@ -320,7 +260,7 @@ impl CoordinatedDb {
             .writes
             .lock()
             .map_err(|_| DatabaseCommitError::Poisoned)?;
-        if self.0.failed_write.load(Ordering::Acquire) {
+        if self.0.state.is_latched() {
             return Err(self.refuse_write());
         }
         Ok(DatabaseWriteGuard {
@@ -329,29 +269,40 @@ impl CoordinatedDb {
         })
     }
 
-    /// Count a write refused after an earlier failure and log the repeat line
-    /// when one is due. The failure state is leaf-locked: callers hold only
-    /// the write barrier.
+    /// Count a write refused after an earlier failure; the store repeats
+    /// its report at a bounded interval. Callers hold only the write barrier.
     fn refuse_write(&self) -> DatabaseCommitError {
-        let line = self
-            .0
-            .failure
-            .lock()
-            .ok()
-            .and_then(|mut failure| failure.as_mut()?.refuse(Instant::now()));
-        if let Some(line) = line {
-            tracing::error!(store = %self.0.db.path().display(), "{line}");
-        }
+        self.0.state.refuse();
         DatabaseCommitError::PriorWriteFailed
     }
 
-    /// Remember the first write error and log it once, with the action.
-    fn record_failed_write(&self, cause: String) {
-        let line = failed_write_message(&cause, 0, Duration::ZERO);
-        if let Ok(mut failure) = self.0.failure.lock() {
-            failure.get_or_insert_with(|| WriteFailure::new(cause.clone(), Instant::now()));
-        }
-        tracing::error!(store = %self.0.db.path().display(), first_error = %cause, "{line}");
+    /// Name this database as one of the node's stores, for the reports of a
+    /// failed write and of its disk headroom ([`crate::storage_health`]).
+    /// Returns false when it already has a role, which it keeps.
+    pub fn register_store(&self, role: StoreRole) -> bool {
+        crate::storage_health::register(&self.0.state, Arc::downgrade(&self.0), role)
+    }
+
+    /// Whether a write failed, so the database refuses every later write
+    /// until it is reopened.
+    pub fn write_failed(&self) -> bool {
+        self.0.state.is_latched()
+    }
+
+    /// Latch the database as if a write had failed with `cause`: report it
+    /// once and refuse every later write until it is reopened. For fault
+    /// injection in tests of what owns the store. Takes the write barrier,
+    /// so never call it while holding a [`DatabaseWriteGuard`].
+    #[doc(hidden)]
+    pub fn refuse_writes(&self, cause: impl Into<String>) {
+        let _barrier = self.0.writes.lock();
+        self.0.state.latch(cause.into());
+    }
+
+    /// Fail the next write with `error`, as if RocksDB had returned it.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&self, error: rocksdb::Error) {
+        self.0.state.arm_fault(error);
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<(), DatabaseCommitError> {
@@ -501,7 +452,7 @@ impl DatabaseWriteGuard<'_> {
         batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<(), DatabaseCommitError> {
-        if self.database.0.failed_write.load(Ordering::Acquire) {
+        if self.database.0.state.is_latched() {
             return Err(self.database.refuse_write());
         }
         let watched = self
@@ -510,7 +461,10 @@ impl DatabaseWriteGuard<'_> {
             .watched
             .as_ref()
             .is_some_and(|prefixes| batch_may_write_under(batch.data(), prefixes));
-        let written = self.database.0.db.write_opt(batch, options);
+        let written = match self.database.0.state.take_fault() {
+            Some(fault) => Err(fault),
+            None => self.database.0.db.write_opt(batch, options),
+        };
         if watched {
             // Recorded even for a failed write, whose durable effect is unknown.
             self.ledger.watched = self.database.0.db.latest_sequence_number();
@@ -518,8 +472,7 @@ impl DatabaseWriteGuard<'_> {
         if let Err(error) = written {
             // An I/O/WAL-sync error is not proof that no durable bytes exist.
             // Never reuse execution metadata against an ambiguous write result.
-            self.database.0.failed_write.store(true, Ordering::Release);
-            self.database.record_failed_write(error.to_string());
+            self.database.0.state.latch(error.to_string());
             return Err(DatabaseCommitError::Storage(error));
         }
         Ok(())
@@ -795,57 +748,5 @@ mod prefix_set_tests {
         let mut key = KeyPrefixSet::default();
         key.mark_key(&[0x12]);
         assert!(key.contains([0x12, 0x00]) && !key.contains([0x12, 0x01]));
-    }
-}
-
-#[cfg(test)]
-mod failed_write_report_tests {
-    use super::*;
-
-    #[test]
-    fn a_full_disk_is_named_with_its_cause_and_the_action() {
-        let line = failed_write_message(
-            "IO error: No space left on device: While appending to file: .config/store/1.log",
-            0,
-            Duration::ZERO,
-        );
-        assert!(line.contains("the disk is full: free space, then restart the node"));
-        assert!(line.contains("No space left on device"));
-        assert!(!line.contains("refused since"), "{line}");
-        let other = failed_write_message("Corruption: bad block", 3, Duration::from_secs(70));
-        assert!(!other.contains("disk is full"));
-        assert!(other.contains("Corruption: bad block"));
-        assert!(other.contains("70s ago, 3 writes refused"));
-    }
-
-    #[test]
-    fn refusals_repeat_the_report_at_most_once_per_interval() {
-        let t0 = Instant::now();
-        let mut failure = WriteFailure::new("IO error: No space left on device".into(), t0);
-        let step = FAILED_WRITE_REPEAT / 4;
-        for i in 1..4 {
-            assert!(failure.refuse(t0 + step * i).is_none());
-        }
-        let line = failure.refuse(t0 + FAILED_WRITE_REPEAT).expect("repeat due");
-        assert!(line.contains("4 writes refused"), "{line}");
-        assert!(failure.refuse(t0 + FAILED_WRITE_REPEAT + step).is_none());
-        assert!(failure.refuse(t0 + FAILED_WRITE_REPEAT * 2).is_some());
-    }
-
-    #[test]
-    fn the_first_error_is_kept_and_later_writes_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = CoordinatedDb::new(DB::open_default(dir.path()).unwrap());
-        db.0.failed_write.store(true, Ordering::Release);
-        db.record_failed_write("IO error: No space left on device".into());
-        db.record_failed_write("IO error: later".into());
-        assert!(matches!(
-            db.lock_writes(),
-            Err(DatabaseCommitError::PriorWriteFailed)
-        ));
-        let failure = db.0.failure.lock().unwrap();
-        let failure = failure.as_ref().unwrap();
-        assert!(failure.cause.contains("No space left"));
-        assert_eq!(failure.refused, 1);
     }
 }

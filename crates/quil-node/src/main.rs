@@ -64,6 +64,7 @@ mod master_node;
 mod clock_retention;
 
 mod mem_stats;
+mod storage_watch;
 
 mod metrics_tui;
 mod rpc_metrics;

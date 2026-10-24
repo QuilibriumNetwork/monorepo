@@ -54,6 +54,9 @@ enum Blocker {
   BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE = 12;
   BLOCKER_SESSION_IDENTITY_UNAVAILABLE = 13;
   BLOCKER_SESSION_STATE_UNAVAILABLE = 14;
+  // The worker's own store refuses writes after a failed write (a full
+  // disk, an I/O error) until it is reopened.
+  BLOCKER_STORAGE_WRITE_FAILED = 15;
 }
 
 // The phase of a worker's archive recovery (`ShardRecovery.phase`).
@@ -155,6 +158,9 @@ message HealthReport {
   repeated WorkerHealth workers = 8;
   // Workers left out by those bounds.
   uint32 omitted_workers = 9;
+  // The master's store refuses writes after a failed write (a full disk,
+  // an I/O error) until it is reopened.
+  bool master_store_write_failed = 10;
 }
 
 message GetHealthReportRequest {}
