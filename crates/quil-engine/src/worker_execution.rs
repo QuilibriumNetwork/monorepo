@@ -20,7 +20,7 @@ pub const STATES: [&str; 9] =
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
-pub const BLOCKERS: [&str; 13] = [
+pub const BLOCKERS: [&str; 14] = [
     "waiting for transport",
     "restarting consensus host",
     "engine exited",
@@ -34,7 +34,12 @@ pub const BLOCKERS: [&str; 13] = [
     "consensus startup unavailable",
     "session identity unavailable",
     "session state unavailable",
+    STORAGE_WRITE_FAILED,
 ];
+
+/// The blocker of a worker whose own store refuses writes after a failed
+/// write ([`with_store_state`]).
+pub const STORAGE_WRITE_FAILED: &str = "storage write failed";
 
 /// Every archive recovery phase (`ShardRecovery.phase`).
 pub const RECOVERY_PHASES: [&str; 6] = [
@@ -49,6 +54,21 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 /// Every class [`failure_class`] gives a failed recovery attempt.
 pub const FAILURE_CLASSES: [&str; 6] =
     [NO_ARCHIVE, "connect", "archive_request", "archive_state", "replay_mismatch", "other"];
+
+/// A worker's execution report with its store's state: a worker whose own
+/// store refuses writes after a failed write reads as blocked by it, also
+/// while it runs no engine, since it cannot progress until the store is
+/// reopened. `execution` is what its engine reports, if it runs one.
+pub fn with_store_state(core_id: u32, execution: Option<WorkerExecution>) -> Option<WorkerExecution> {
+    if !quil_forest::storage_health::store_latched(quil_forest::StoreRole::Worker(core_id)) {
+        return execution;
+    }
+    let mut execution = execution.unwrap_or_default();
+    execution.state = "blocked".into();
+    execution.blocker = STORAGE_WRITE_FAILED.into();
+    execution.observed_unix_ms = now_ms();
+    Some(execution)
+}
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -679,6 +699,26 @@ pub fn recovery_leaves(tree_phase: u32, installed: u64, planned: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker whose store latched reads as blocked by it, with or without
+    /// an engine; others keep their engine's report.
+    #[test]
+    fn a_worker_whose_store_refuses_writes_reads_as_blocked_by_it() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let core = 9_401;
+        assert!(db.inner().register_store(quil_forest::StoreRole::Worker(core)));
+        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 1, ..Default::default() };
+        assert_eq!(with_store_state(core, Some(serving.clone())), Some(serving.clone()));
+        assert_eq!(with_store_state(core, None), None);
+        db.inner().refuse_writes("IO error: No space left on device");
+        for execution in [Some(serving.clone()), None] {
+            let reported = with_store_state(core, execution).expect("a latched store is reported");
+            assert_eq!((reported.state.as_str(), reported.blocker.as_str()), ("blocked", STORAGE_WRITE_FAILED));
+            assert!(reported.observed_unix_ms > 1);
+        }
+        assert_eq!(with_store_state(core + 1, Some(serving.clone())), Some(serving));
+    }
+
     #[test]
     fn restoration_rewind_and_state_are_independent() {
         let s = SharedWorkerExecution::default();
@@ -1002,6 +1042,8 @@ mod tests").unwrap()];
         let chained = literals(chain, "{ ", '}');
         assert_eq!(chained.len(), 4, "{chain}");
         written.extend(chained.into_iter().map(|blocker| vec!["blocked", blocker[0]]));
+        // A store's state, which no engine writes (`with_store_state`).
+        written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
         let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();
         let blockers: BTreeSet<&str> = written.iter().filter_map(|args| args.get(1).copied()).filter(|b| !b.is_empty()).collect();
         assert_eq!(states, STATES.into_iter().collect::<BTreeSet<_>>());
