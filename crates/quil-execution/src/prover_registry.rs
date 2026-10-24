@@ -1432,28 +1432,6 @@ fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: 
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
     execution_binding: Option<(quil_types::store::BackingStoreIdentity, RegistryLimits)>,
-    refresh: Arc<RefreshGate>,
-}
-
-/// Lets a full refresh read the store without holding the cache's lock.
-/// Refreshes of one cache run one at a time, so a slower read cannot
-/// replace a newer one; `edits` counts the other writes to the cache, so a
-/// refresh that one overlapped reads the store again under the lock.
-#[derive(Default)]
-struct RefreshGate {
-    serial: std::sync::Mutex<()>,
-    edits: std::sync::atomic::AtomicU64,
-}
-
-impl RefreshGate {
-    /// Call while holding the cache's write lock, before changing it.
-    fn note_edit(&self) {
-        self.edits.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    fn edits(&self) -> u64 {
-        self.edits.load(std::sync::atomic::Ordering::Acquire)
-    }
 }
 
 pub(crate) struct PreparedRegistryAdoption<'a> {
@@ -1495,7 +1473,6 @@ impl SharedProverRegistry {
         let patience = quil_types::lock_patience::Patience::new();
         let source = patience.write(&self.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "canonical registry is busy or poisoned".into()))?;
-        self.refresh.note_edit();
         let incoming = patience.write(&incoming.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "private registry is busy or poisoned".into()))?;
         Ok(PreparedRegistryAdoption { source, incoming, adopted: false })
@@ -1509,7 +1486,6 @@ impl SharedProverRegistry {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
             execution_binding: None,
-            refresh: Arc::default(),
         }
     }
 
@@ -1547,7 +1523,6 @@ impl SharedProverRegistry {
         let mut registry = Self {
             inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
             execution_binding: Some((identity.clone(), read_limits)),
-            refresh: Arc::default(),
         };
         if read {
             registry.refresh_from_store(store)?;
@@ -1606,7 +1581,6 @@ impl SharedProverRegistry {
         let registry = Self {
             inner: Arc::new(RwLock::new(seeded)),
             execution_binding: Some((identity, bound)),
-            refresh: Arc::default(),
         };
         registry.update_written_rows(store, overlay)?;
         Ok(registry)
@@ -1619,10 +1593,8 @@ impl SharedProverRegistry {
         Ok(())
     }
 
-    /// Rebuild the cache from the given hypergraph store. The canonical
-    /// registry reads the store without its lock and takes the write lock
-    /// only to install the result; readers (worker threads among them)
-    /// keep reading the previous cache meanwhile.
+    /// Rebuild the cache from the given hypergraph store. Takes a
+    /// write lock for the duration of the refresh.
     ///
     /// Logs an `info!` whenever any field of the LOCAL prover (the one whose
     /// address matches `LOCAL_PROVER_ADDRESS`) or any of its allocations changes
@@ -1637,31 +1609,16 @@ impl SharedProverRegistry {
                 .refresh_with_limits(hg_store, *limits)
                 .map_err(|error| QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}")));
         }
-        // Snapshot the local prover BEFORE the refresh; it is snapshotted
-        // again after and diffed.
+        // Snapshot the local prover BEFORE taking the write lock for
+        // the refresh; it is snapshotted again after and diffed.
         let before = self.snapshot_local_prover();
-        self.refresh_canonical(|| {
-            let mut fresh = InMemoryProverRegistry::new();
-            fresh.refresh(hg_store)?;
-            Ok(fresh)
-        })?;
+        {
+            let mut guard = self.inner.write()
+                .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+            guard.refresh(hg_store)?;
+        }
         let after = self.snapshot_local_prover();
         log_local_prover_diff(before.as_ref(), after.as_ref());
-        Ok(())
-    }
-
-    /// Install the registry `read` builds from the store. Reading every
-    /// prover vertex takes 18-29 s on a regular node's store (2026-10-24);
-    /// under the write lock, every worker thread reading the registry
-    /// stopped for that long. When another write reached the cache during
-    /// the read, `read` runs again under the lock, as before.
-    fn refresh_canonical(&self, read: impl Fn() -> QuilResult<InMemoryProverRegistry>) -> QuilResult<()> {
-        let _serial = self.refresh.serial.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let edits = self.refresh.edits();
-        let fresh = read()?;
-        let mut guard = self.inner.write()
-            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        *guard = if self.refresh.edits() == edits { fresh } else { read()? };
         Ok(())
     }
 
@@ -1921,7 +1878,6 @@ impl SharedProverRegistry {
                 .inner
                 .write()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-            self.refresh.note_edit();
             for candidate in &evicted {
                 if let Some(info) = guard.prover_cache.get_mut(&candidate.prover_address) {
                     for alloc in info.allocations.iter_mut() {
@@ -2288,7 +2244,6 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .inner
             .write()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        self.refresh.note_edit();
         guard.update_prover_activity(address, filter, frame_number);
         Ok(())
     }
@@ -3219,47 +3174,6 @@ mod tests {
         // An epoch it never registered stays absent.
         assert!(reg.get_leaf_root(&member, &leaf_id, 39).is_none());
         assert!(reg.get_leaf_root(&member, &leaf_id, 43).is_none());
-    }
-
-    #[test]
-    fn refresh_reads_the_store_without_blocking_readers() {
-        let shared = SharedProverRegistry::new();
-        shared.refresh_canonical(|| {
-            // A worker thread reads the registry while the store is read.
-            let reader = shared.clone();
-            let free = std::thread::spawn(move || reader.inner.try_read().is_ok()).join().unwrap();
-            assert!(free, "a refresh's store read must not hold the registry lock");
-            let mut fresh = InMemoryProverRegistry::new();
-            fresh.largest_row = 7;
-            Ok(fresh)
-        }).unwrap();
-        assert_eq!(shared.read(|r| r.largest_row), 7, "the read registry is installed");
-    }
-
-    #[test]
-    fn refresh_overlapped_by_an_edit_reads_again_under_the_lock() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let shared = SharedProverRegistry::new();
-        let reads = AtomicUsize::new(0);
-        shared.refresh_canonical(|| {
-            let read = reads.fetch_add(1, Ordering::SeqCst) + 1;
-            if read == 1 {
-                // An edit lands while the store is read: its read may lack
-                // the edit's rows, so it must not be installed.
-                let editor = shared.clone();
-                let (done, edited) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    editor.update_prover_activity(&[1; 32], &[2; 32], 5).unwrap();
-                    let _ = done.send(());
-                });
-                let _ = edited.recv_timeout(std::time::Duration::from_secs(5));
-            }
-            let mut fresh = InMemoryProverRegistry::new();
-            fresh.largest_row = read;
-            Ok(fresh)
-        }).unwrap();
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "the overlapped read is repeated");
-        assert_eq!(shared.read(|r| r.largest_row), 2, "the repeated read is installed");
     }
 
     #[test]
