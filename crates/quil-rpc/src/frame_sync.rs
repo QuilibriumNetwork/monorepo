@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use quil_store::RocksClockStore;
 use quil_types::proto::global::GlobalFrame;
+use quil_types::thread_probe::{self as probe, Section as ProbeSection};
 
 use crate::archive_client::{error_chain, ArchiveClient, ArchiveClientError};
 
@@ -326,12 +327,18 @@ fn store_chain(
         return Ok(timing);
     }
     let started = Instant::now();
-    let taken = config.store_hook.as_ref().is_some_and(|store| store(chain));
+    let taken = {
+        let _store = probe::section(ProbeSection::GlobalFrameStore);
+        config.store_hook.as_ref().is_some_and(|store| store(chain))
+    };
     timing.store += started.elapsed();
     for frame in chain {
         let started = Instant::now();
-        if !taken && !already_canonical(clock_store, frame) {
-            clock_store.put_global_frame(frame, None)?;
+        if !taken {
+            let _store = probe::section(ProbeSection::GlobalFrameStore);
+            if !already_canonical(clock_store, frame) {
+                clock_store.put_global_frame(frame, None)?;
+            }
         }
         timing.store += started.elapsed();
         if let Some(ref cb) = config.on_frame {
@@ -416,11 +423,13 @@ where
                 fetched_on_connection = connection.frames,
                 "archive connection gone under the poller; reconnecting"
             );
+            probe::step(ProbeSection::PollerReconnect);
             let Ok(fresh) = connect(addr.to_owned()).await else {
                 return result;
             };
             *client = fresh;
             *connection = ConnectionTraffic::new();
+            probe::step(ProbeSection::PollerRefetch);
             let started = Instant::now();
             result = tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
             if let Ok(Ok(frame)) = &result {
@@ -746,6 +755,8 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
     F: std::future::Future<Output = Result<S, ArchiveClientError>>,
 {
     info!("archive frame poller started");
+    // No deadline on an endpoint or the state-jump barrier.
+    probe::idle();
     pool.wait_nonempty(&cancel).await;
     if cancel.is_cancelled() {
         return;
@@ -862,6 +873,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         .unwrap_or_else(tokio::time::Instant::now);
 
     loop {
+        // Each pass, and each catch-up frame, beats: the stall watchdog
+        // reports a pass that does not return.
+        probe::beat();
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {}
@@ -889,6 +903,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             let hard_due = last_actual_rpc.elapsed() >= HARD_RECONCILE_INTERVAL;
             let reconcile_needs_rpc = (reconcile_due && !current_per_peerinfo) || hard_due;
             if gf.fresh_within(GOSSIP_FRESH_WINDOW) && !reconcile_needs_rpc {
+                probe::step(ProbeSection::PollerGossipFollow);
                 // If we hit the reconcile point but PeerInfo already confirms
                 // we're current, treat it as reconciled: reset the timer so we
                 // don't re-check every tick, and stay paused with no RPC.
@@ -901,6 +916,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 // network round-trip.
                 let mut hole = false;
                 while last_frame < target {
+                    // Each executed frame is progress.
+                    probe::beat();
+                    probe::step(ProbeSection::PollerGossipFollow);
                     let next = last_frame + 1;
                     match clock_store.get_global_frame(next) {
                         Ok(frame) => {
@@ -942,6 +960,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
 
         // Acquire a working client.
         if current_client.is_none() {
+            probe::step(ProbeSection::PollerConnect);
             if let Some(addr) = pool.next().await {
                 match connect(addr.clone()).await {
                     Ok(c) => {
@@ -961,6 +980,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 }
             } else {
                 // Pool empty — wait for PeerInfo discovery to feed us.
+                probe::idle();
                 pool.wait_nonempty(&cancel).await;
                 continue;
             }
@@ -974,6 +994,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         // 1. Fetch the latest frame, whole only if it is newer than ours: an
         // archive that is not ahead sends its header, and the no-progress
         // path below reads nothing else.
+        probe::step(ProbeSection::PollerHeadFetch);
         let fetch_started = Instant::now();
         let head = match fetch_frame(
             client,
@@ -1086,7 +1107,11 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     head = new_number,
                     "archive poller: far behind at runtime — attempting state-jump",
                 );
-                if let Some(n) = jump(new_number, cancel.clone()).await {
+                // A state jump takes as long as the snapshot does.
+                probe::idle();
+                let jumped = jump(new_number, cancel.clone()).await;
+                probe::beat();
+                if let Some(n) = jumped {
                     if n > last_frame {
                         last_frame = n;
                     }
@@ -1128,6 +1153,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             // its own distinct-endpoint tally.
             let mut failed_validation = false;
             for fn_ in (last_frame + 1)..fill_end {
+                probe::beat();
                 if cancel.is_cancelled() {
                     return;
                 }
@@ -1144,6 +1170,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         continue;
                     }
                 }
+                probe::step(ProbeSection::PollerFillFetch);
                 let fetch_started = Instant::now();
                 let fetched = tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -1159,6 +1186,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 };
                 match fetched {
                     Ok(Ok(frame)) => {
+                        probe::step(ProbeSection::PollerFillFrame);
                         let processing = Instant::now();
                         // Gate BEFORE persist — genesis-prover allowlist +
                         // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
@@ -1168,7 +1196,11 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         // honest archive may serve the real record at this
                         // height) rather than persisting forged data.
                         if let Some(ref validate) = config.frame_validator {
-                            if !validate(&frame) {
+                            let valid = {
+                                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                                validate(&frame)
+                            };
+                            if !valid {
                                 debug!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
                                 failed_frame = Some(fn_);
                                 failed_validation = true;
@@ -1309,9 +1341,14 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         // gossip GLOBAL_FRAME handler. A head frame failing validation is
         // dropped: don't store, don't fire on_frame, and don't advance
         // last_frame (the next tick re-polls the head).
+        probe::step(ProbeSection::PollerHeadFrame);
         let processing = Instant::now();
         if let Some(ref validate) = config.frame_validator {
-            if !validate(&head) {
+            let valid = {
+                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                validate(&head)
+            };
+            if !valid {
                 debug!(%addr, frame = new_number, "head frame failed validation — dropping");
                 continue;
             }

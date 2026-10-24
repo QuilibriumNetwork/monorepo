@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use quil_types::thread_probe::{self as probe, Section as ProbeSection};
 use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
@@ -241,7 +242,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         time_reel: time_reel_for_recv.clone(),
     };
 
-    sup.spawn("message-loop", move |recv_token| async move {
+    // A blocked loop holds every inbound message; the watchdog names where.
+    let loop_probe = super::stall_watch::watch(
+        ProbeSection::MessageLoop,
+        super::stall_watch::MESSAGE_LOOP_IMPACT,
+        super::stall_watch::MESSAGE_LOOP_STALL_AFTER,
+    );
+    sup.spawn("message-loop", move |recv_token| probe::task_probed(loop_probe, async move {
         let mut time_reel_rx = time_reel_for_recv
             .as_ref()
             .and_then(|tr| tr.take_event_rx());
@@ -325,8 +332,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut last_committee_epoch: u64 =
             quil_types::consensus::epoch_for_frame(last_executed_frame);
         loop {
+            // Its timers bring the loop round at least every five seconds.
+            probe::beat();
             tokio::select! {
                 _ = remote_direct_timer.tick() => {
+                    probe::step(ProbeSection::LoopRemoteDirect);
                     if let Some(remote) = remote_workers_for_recv.get() {
                         let served: std::collections::HashSet<Vec<u8>> = remote
                             .served_filters()
@@ -358,6 +368,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                 }
                 _ = committee_peer_timer.tick() => {
+                    probe::step(ProbeSection::LoopCommitteePeers);
                     if !committee_peer_busy.load(std::sync::atomic::Ordering::Acquire) {
                         if let Some((peers, applied)) = pending_committee_policy.take() {
                             if applied.load(std::sync::atomic::Ordering::Acquire) { last_committee_peers = peers; }
@@ -482,6 +493,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                 }
                 _ = status_timer.tick() => {
+                    probe::step(ProbeSection::LoopStatus);
                     if let Some(ingest) = archive_ingest_for_recv.as_ref() {
                         ingest.lock().unwrap_or_else(|p| p.into_inner()).retry_pending();
                     }
@@ -494,14 +506,21 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     // Resolver messages delivered point-to-point instead of to
                     // the shard topic, cumulative since start.
                     let direct = p2p_for_recv.direct_stats();
-                    let latest_frame = clock_store_recv.get_latest_global_frame()
+                    let latest_frame = {
+                        let _read = probe::section(ProbeSection::LatestGlobalFrameRead);
+                        clock_store_recv.get_latest_global_frame()
+                    }
                         .ok()
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
                         .unwrap_or(0);
                     global_execution.observe(std::time::Instant::now(), cf_for_recv.materialized(), cf_for_recv.effective());
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::{EffectiveStatus, ProverRegistry};
-                        match pr_for_recv.get_prover_info(&pa_for_recv) {
+                        let info = {
+                            let _read = probe::section(ProbeSection::ProverInfoRead);
+                            pr_for_recv.get_prover_info(&pa_for_recv)
+                        };
+                        match info {
                             Ok(Some(info)) => {
                                 let mut a = 0usize;
                                 let mut p = 0usize;
@@ -718,6 +737,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                 } => {
                     match msg {
                         Some(mut received) => {
+                            probe::step(ProbeSection::LoopMessage);
                             // Explorer tap: record every inbound gossip
                             // message for the `GET /messages` endpoint.
                             // Only present when the explorer is enabled,
@@ -844,6 +864,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
 
                             match received.bitmask.as_slice() {
                             GLOBAL_PEER_INFO => {
+                                probe::step(ProbeSection::LoopPeerInfo);
                                 match quil_p2p::classify_peer_info_message(&received.data) {
                                     Ok(quil_p2p::PeerInfoMessage::PeerInfo(info)) => {
                                         peer_infos_received += 1;
@@ -1145,6 +1166,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 }
                             }
                             GLOBAL_FRAME => {
+                                probe::step(ProbeSection::LoopGlobalFrame);
                                 // Try canonical bytes first (the wire format),
                                 // fall back to proto decode (archive poller uses proto).
                                 let frame_result: std::result::Result<quil_types::proto::global::GlobalFrame, _> =
@@ -1225,7 +1247,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // Wrap in catch_unwind — the classgroup can panic
                                         // on malformed VDF output from canonical decode bugs.
                                         let validate_result = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| frame_validator_for_recv.validate(&frame))
+                                            std::panic::AssertUnwindSafe(|| {
+                                                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                                                frame_validator_for_recv.validate(&frame)
+                                            })
                                         );
                                         match validate_result {
                                             Ok(Ok(true)) => {}
@@ -1297,10 +1322,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // above — a panic ⇒ treat as invalid ⇒ drop, never crash the
                                         // recv loop.
                                         let requests_root_ok = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| match frame.header.as_ref() {
-                                                Some(h) => frame_validator_for_recv
-                                                    .verify_global_requests_root(h, &frame.requests),
-                                                None => false,
+                                            std::panic::AssertUnwindSafe(|| {
+                                                let _check = probe::section(ProbeSection::GlobalFrameRequestsRoot);
+                                                match frame.header.as_ref() {
+                                                    Some(h) => frame_validator_for_recv
+                                                        .verify_global_requests_root(h, &frame.requests),
+                                                    None => false,
+                                                }
                                             }),
                                         )
                                         .unwrap_or(false);
@@ -1318,13 +1346,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // authenticated frame as a durable certified
                                         // candidate; its worker publishes it together
                                         // with the execution state.
-                                        let stored = if global_finalization_for_recv
-                                            .get()
-                                            .is_some_and(|pipeline| pipeline.offer_synced(&frame))
-                                        {
-                                            Ok(())
-                                        } else {
-                                            clock_store_recv.put_global_frame(&frame, None)
+                                        let stored = {
+                                            let _store = probe::section(ProbeSection::GlobalFrameStore);
+                                            if global_finalization_for_recv
+                                                .get()
+                                                .is_some_and(|pipeline| pipeline.offer_synced(&frame))
+                                            {
+                                                Ok(())
+                                            } else {
+                                                clock_store_recv.put_global_frame(&frame, None)
+                                            }
                                         };
                                         match stored {
                                             Ok(()) => {
@@ -1472,13 +1503,17 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             Err(e) => warn!(error = %e, frame = exec_num, "regular at-reset prover-tree reset FAILED"),
                                                         }
                                                     }
-                                                    match quil_engine::frame_processor::process_global_frame_with_rewards(
-                                                        &exec_mgr_for_recv,
-                                                        &exec_frame,
-                                                        &num_bigint::BigInt::from(1),
-                                                        Some(reward_issuer.as_ref() as &dyn quil_types::consensus::RewardIssuance),
-                                                        Some(pr_for_recv.as_ref() as &dyn quil_types::consensus::ProverRegistry),
-                                                    ) {
+                                                    let executed = {
+                                                        let _execute = probe::section(ProbeSection::GlobalFrameExecution);
+                                                        quil_engine::frame_processor::process_global_frame_with_rewards(
+                                                            &exec_mgr_for_recv,
+                                                            &exec_frame,
+                                                            &num_bigint::BigInt::from(1),
+                                                            Some(reward_issuer.as_ref() as &dyn quil_types::consensus::RewardIssuance),
+                                                            Some(pr_for_recv.as_ref() as &dyn quil_types::consensus::ProverRegistry),
+                                                        )
+                                                    };
+                                                    match executed {
                                                         Ok((applied, skipped)) => {
                                                             info!(
                                                                 frame = exec_num,
@@ -1499,7 +1534,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                             let exec_epoch =
                                                                 quil_types::consensus::epoch_for_frame(exec_num);
                                                             if exec_epoch != last_committee_epoch {
-                                                                match pr_for_recv.refresh_from_store(hg_store_for_recv.as_ref()) {
+                                                                let refreshed = {
+                                                                    let _refresh = probe::section(ProbeSection::ProverRegistryRefresh);
+                                                                    pr_for_recv.refresh_from_store(hg_store_for_recv.as_ref())
+                                                                };
+                                                                match refreshed {
                                                                     Ok(()) => {
                                                                         last_committee_epoch = exec_epoch;
                                                                         debug!(frame = exec_num, epoch = exec_epoch,
@@ -1510,7 +1549,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 }
                                                             }
                                                             if !archive_mode_recv {
-                                                                if let Err(e) = wa_for_recv.on_new_frame(exec_num) {
+                                                                let reconciled = {
+                                                                    let _reconcile = probe::section(ProbeSection::AllocationReconcile);
+                                                                    wa_for_recv.on_new_frame(exec_num)
+                                                                };
+                                                                if let Err(e) = reconciled {
                                                                     warn!(error = %e, "worker allocation failed");
                                                                 }
                                                             }
@@ -1519,12 +1562,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                                 .unwrap_or(0);
                                                             pl_for_recv.set_prover_root_verified_frame(exec_num);
                                                             if !archive_mode_recv {
-                                                                match pl_for_recv.evaluate(
-                                                                    exec_num,
-                                                                    frame_difficulty as u64,
-                                                                    pr_for_recv.as_ref(),
-                                                                    wm_for_recv.as_ref(),
-                                                                ) {
+                                                                let evaluated = {
+                                                                    let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
+                                                                    pl_for_recv.evaluate(
+                                                                        exec_num,
+                                                                        frame_difficulty as u64,
+                                                                        pr_for_recv.as_ref(),
+                                                                        wm_for_recv.as_ref(),
+                                                                    )
+                                                                };
+                                                                match evaluated {
                                                                     Ok(actions) => {
                                                                         for action in actions {
                                                                             info!(frame = exec_num, ?action, "prover lifecycle action");
@@ -1788,7 +1835,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
             "message receiver stopped"
         );
         Ok(())
-    });
+    }));
 }
 
 #[cfg(test)]
