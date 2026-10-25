@@ -298,6 +298,8 @@ pub struct Model {
     pub seniority: String,
     pub running_workers: u32,
     pub allocated_workers: u32,
+    /// The node's configured worker count; 0 from a node that predates it.
+    pub worker_capacity: u32,
     pub last_global_head: u64,
     pub reachable: bool,
     pub frame_number: u64,
@@ -701,6 +703,7 @@ impl Model {
         }
         self.running_workers = node_info.running_workers;
         self.allocated_workers = node_info.allocated_workers;
+        self.worker_capacity = node_info.worker_capacity;
         self.last_global_head = node_info.last_global_head_frame;
         self.reachable = node_info.reachable;
         self.epoch_length = node_info.epoch_length_frames;

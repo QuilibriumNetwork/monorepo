@@ -91,6 +91,9 @@ message NodeInfoResponse {
   // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
   // this rather than hardcoding a value.
   uint64 epoch_length_frames = 13;
+  // The configured worker count: how many allocations this node may hold.
+  // Workers above it drain (`WorkerInfo.draining`). 0 on older nodes.
+  uint32 worker_capacity = 16;
   FrameCadence frame_cadence = 14;
 }
 
@@ -102,6 +105,10 @@ message WorkerInfo {
   bool manually_managed = 5;
   // Absent on older nodes and worker implementations without local telemetry.
   WorkerExecution execution = 6;
+  // Above the configured worker count: the worker takes no new seat or
+  // join, its seat leaves through the surplus leave, and it stops once it
+  // holds none. False on older nodes.
+  bool draining = 7;
 }
 
 // Local engine observations; independent of allocation and remote shard data.

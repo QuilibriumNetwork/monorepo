@@ -256,6 +256,9 @@ pub struct WorkerOwnedDeps {
 /// How long a stopping worker's engine gets to tear down before its thread
 /// is cancelled ([`ThreadWorkerManager::stop_worker`]).
 const ENGINE_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a retired worker's thread may take to end (closing its own
+/// stores) before the node says it has not.
+const RETIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether worker `core_id` recovers nothing of `filter` from an archive:
 /// the seat on it is one this node gives up (`WorkerAllocator::gives_up`).
@@ -1291,6 +1294,67 @@ impl WorkerManager for ThreadWorkerManager {
         Ok(())
     }
 
+    /// Cores above the configured count drain: the count is the capacity,
+    /// and a record left from a larger configuration keeps serving only
+    /// until its seat departs.
+    fn is_draining(&self, core_id: u32) -> bool {
+        core_id > self.num_cores
+    }
+
+    /// Remove an idle draining worker from the pool and its persisted record,
+    /// cancel its thread and join it off the caller's thread, so a lifecycle
+    /// tick does not wait for the worker's stores to close. Logs once, when
+    /// the thread has ended (or has not within [`RETIRE_DEADLINE`]).
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(QuilError::InvalidArgument(format!(
+                "worker {core_id} is within the configured count of {}", self.num_cores)));
+        }
+        let (state, running) = {
+            let mut workers = self.workers.lock().unwrap();
+            match workers.get(&core_id) {
+                None => return Ok(()),
+                Some(w) if !w.filter.is_empty() || w.pending_filter_frame != 0 => {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "worker {core_id} still holds a seat or a pending join")));
+                }
+                Some(_) => {}
+            }
+            let state = workers.remove(&core_id).expect("checked above");
+            (state, workers.len())
+        };
+        state.cancel.cancel();
+        self.shard_data.forget(core_id);
+        let deleted = match self.worker_store.lock().unwrap().as_ref() {
+            Some(store) => store.delete_worker(core_id).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        if let Err(error) = &deleted {
+            warn!(core_id, %error, scope = "this node",
+                action = "none needed: an idle record above the configured count is not restored at startup",
+                "retired draining worker's persisted record could not be deleted");
+        }
+        let configured = self.num_cores;
+        let join = move || {
+            let started = std::time::Instant::now();
+            let ended = state.handle.is_none_or(|handle| join_within(vec![(core_id, handle)], RETIRE_DEADLINE).is_empty());
+            if ended {
+                info!(core_id, configured, running, waited_ms = started.elapsed().as_millis() as u64,
+                    scope = "this node",
+                    "draining worker retired: it was above the configured worker count and held no seat or \
+                     join, so its thread stopped and its record was removed; its store stays on disk");
+            } else {
+                warn!(core_id, configured, running, waited_secs = RETIRE_DEADLINE.as_secs(), scope = "this node",
+                    action = "it ends when its stores close; report it if the worker still runs after a restart",
+                    "draining worker removed from the pool, but its thread has not ended");
+            }
+        };
+        if let Err(error) = std::thread::Builder::new().name(format!("retire-worker-{core_id}")).spawn(join) {
+            warn!(core_id, %error, scope = "this node", "could not start the thread that waits for a retired worker");
+        }
+        Ok(())
+    }
+
     fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
         self.shard_data.snapshot()
     }
@@ -1855,6 +1919,37 @@ mod tests {
         // load_persisted reads through the same store.
         let lp = mgr.load_persisted(1).expect("load_persisted hit");
         assert_eq!(lp.filter, b"shard-filter");
+    }
+
+    /// A worker above the configured count drains; once it holds no seat and
+    /// no join it is retired: dropped from the pool with its persisted
+    /// record. Workers within the count, or holding a seat or join, are not.
+    #[tokio::test]
+    async fn an_idle_draining_worker_is_retired_with_its_record() {
+        let mgr = ThreadWorkerManager::new_with_count(1);
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+        mgr.set_worker_filter(1, &[], false).unwrap();
+        mgr.set_worker_filter(2, &[], false).unwrap();
+        mgr.set_worker_filter(3, b"seat", false).unwrap();
+        mgr.set_worker_filter(4, &[], false).unwrap();
+        mgr.set_pending_filter_frame(4, 90).unwrap();
+        assert_eq!(mgr.draining_workers(), std::collections::HashSet::from([2, 3, 4]));
+        assert!(!mgr.is_draining(1) && mgr.is_draining(5));
+
+        assert!(mgr.retire_worker(1).is_err(), "within the configured count");
+        assert!(mgr.retire_worker(3).is_err(), "still holds a seat");
+        assert!(mgr.retire_worker(4).is_err(), "still holds a join");
+        mgr.retire_worker(2).unwrap();
+        let cores: Vec<u32> = { let mut c: Vec<u32> = mgr.range_workers().unwrap().iter().map(|w| w.core_id).collect(); c.sort(); c };
+        assert_eq!(cores, vec![1, 3, 4]);
+        assert!(store.get_worker(2).unwrap().is_none(), "its record is deleted");
+        assert!(store.get_worker(3).unwrap().is_some());
+        mgr.retire_worker(2).unwrap();
+        let mgr = Arc::new(mgr);
+        let done = mgr.clone();
+        tokio::task::spawn_blocking(move || done.shutdown_workers(std::time::Duration::from_secs(5))).await.unwrap();
     }
 
     /// Toggling manual-management mode flushes through to the store while

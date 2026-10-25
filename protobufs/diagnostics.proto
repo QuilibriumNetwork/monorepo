@@ -141,6 +141,9 @@ message WorkerHealth {
   // While it waits on committed GLOBAL state (`PHASE_WAITING`): the GLOBAL
   // frame by which the awaited event happens.
   optional uint64 awaited_frame = 24;
+  // Above the node's configured worker count: the worker takes no new seat
+  // or join and stops once it holds none. Readers that predate it ignore it.
+  bool draining = 25;
 }
 
 message HealthReport {
@@ -162,6 +165,8 @@ message HealthReport {
   // The master's store refuses writes after a failed write (a full disk,
   // an I/O error) until it is reopened.
   bool master_store_write_failed = 10;
+  // The configured worker count; 0 from nodes that predate it.
+  uint32 worker_capacity = 11;
 }
 
 message GetHealthReportRequest {}

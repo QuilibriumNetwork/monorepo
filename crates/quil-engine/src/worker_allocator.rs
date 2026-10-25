@@ -289,6 +289,15 @@ pub fn apply_config_worker_filters(
         };
 
         let core_id = (i as u32) + 1;
+        if worker_manager.is_draining(core_id) {
+            stats.skipped_missing_core += 1;
+            warn!(
+                index = i,
+                core_id,
+                "data_worker_filters: the worker is above the configured worker count and drains; skipping"
+            );
+            continue;
+        }
         let Some(existing) = current.get(&core_id) else {
             stats.skipped_missing_core += 1;
             warn!(
@@ -378,6 +387,22 @@ pub const MAX_DEFERRED_REPLACEMENTS_PER_REVIEW: usize = 4;
 /// Roughly ten minutes of frames — often enough that a fresh log window
 /// always shows the current state, rare enough not to bury the log.
 pub const REBIND_TELEMETRY_REPEAT_FRAMES: u64 = 75;
+
+/// How often the orphan warning repeats while the same allocations stay
+/// without a worker, about ten minutes of frames. A change of the orphan
+/// set is logged at once.
+pub const ORPHAN_WARNING_REPEAT_FRAMES: u64 = 75;
+
+/// The allocations without a worker as of the last reconcile that found
+/// some, for the bounded orphan warning ([`WorkerAllocator::watch_orphans`]).
+struct OrphanWatch {
+    /// Frame at which the current episode began.
+    since_frame: u64,
+    /// Frame of the last line logged for it.
+    logged_frame: u64,
+    /// The orphans as sorted `filter:Status` strings.
+    set: Vec<String>,
+}
 
 /// Hysteresis for a priority rebind within the same tier: the unbound
 /// allocation must score at least this percent of the bound one before
@@ -669,6 +694,8 @@ pub struct WorkerAllocator {
     /// means unknown: no eviction is requested.
     pending_shard_changes: RwLock<Option<PendingShardChanges>>,
     payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
+    /// The running orphan episode, `None` while every seat has a worker.
+    orphan_watch: std::sync::Mutex<Option<OrphanWatch>>,
 }
 
 impl WorkerAllocator {
@@ -934,7 +961,83 @@ impl WorkerAllocator {
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
+            orphan_watch: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Log the allocations left without a worker, once per episode and
+    /// change of its set, then every `ORPHAN_WARNING_REPEAT_FRAMES` while it
+    /// lasts, and its end when the set empties. A node under a lowered worker
+    /// count reconciles every frame with the same orphans, so a line per
+    /// pass would repeat one fact about a hundred times an hour. Returns the
+    /// event logged, if any.
+    fn watch_orphans(
+        &self,
+        frame_number: u64,
+        orphans: &[(Vec<u8>, ProverStatus)],
+        draining: usize,
+    ) -> Option<&'static str> {
+        let mut watch = self.orphan_watch.lock().unwrap_or_else(|e| e.into_inner());
+        let capacity = self.worker_manager.allocation_capacity().unwrap_or_default();
+        let bound = self
+            .worker_manager
+            .range_workers()
+            .map(|ws| ws.iter().filter(|w| !w.filter.is_empty()).count())
+            .unwrap_or_default();
+        if orphans.is_empty() {
+            if let Some(ended) = watch.take() {
+                info!(
+                    frame_number,
+                    since_frame = ended.since_frame,
+                    orphaned_frames = frame_number.saturating_sub(ended.since_frame),
+                    bound_workers = bound,
+                    configured_workers = capacity,
+                    "every allocation has a worker again; the allocations without one have left or been bound"
+                );
+                return Some("ended");
+            }
+            return None;
+        }
+        let mut set: Vec<String> = orphans
+            .iter()
+            .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+            .collect();
+        set.sort();
+        let (event, since_frame) = match watch.as_ref() {
+            None => ("started", frame_number),
+            Some(w) if w.set != set => ("changed", w.since_frame),
+            Some(w) if frame_number.abs_diff(w.logged_frame) >= ORPHAN_WARNING_REPEAT_FRAMES => {
+                ("continues", w.since_frame)
+            }
+            Some(_) => return None,
+        };
+        *watch = Some(OrphanWatch { since_frame, logged_frame: frame_number, set });
+        let count_of = |status: ProverStatus| orphans.iter().filter(|(_, s)| *s == status).count();
+        let sample: Vec<String> = orphans
+            .iter()
+            .take(8)
+            .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+            .collect();
+        warn!(
+            event,
+            orphan_count = orphans.len(),
+            joining = count_of(ProverStatus::Joining),
+            active = count_of(ProverStatus::Active),
+            leaving = count_of(ProverStatus::Leaving),
+            bound_workers = bound,
+            configured_workers = capacity,
+            draining_workers = draining,
+            frame_number,
+            since_frame,
+            orphaned_frames = frame_number.saturating_sub(since_frame),
+            ?sample,
+            "allocations without a worker: this node holds more seats than it has workers \
+             (a lowered dataWorkerCount, lost workers or overlapping joins). An expected wait: \
+             an unconfirmed Joining seat expires after its confirm epoch, a Leaving seat departs \
+             at its confirmed boundary or expiry, an Active seat leaves through the surplus \
+             leave or lapses when its reconfirm is missed. Report it only if it outlasts these"
+        );
+        Some(event)
     }
 
     /// The workers held back from new seats for sending no vote in their
@@ -1729,11 +1832,14 @@ impl WorkerAllocator {
             .map(|w| w.filter.clone())
             .collect();
 
+        // A worker above the configured count drains: it takes no new seat,
+        // so neither idle list offers it (`WorkerManager::is_draining`).
+        let draining = self.worker_manager.draining_workers();
         let mut idle_workers: Vec<u32> = self
             .worker_manager
             .range_workers()?
             .iter()
-            .filter(|w| w.filter.is_empty() && !w.manually_managed)
+            .filter(|w| w.filter.is_empty() && !w.manually_managed && !draining.contains(&w.core_id))
             .map(|w| w.core_id)
             .collect();
         // Sorted DESCENDING so `pop()` yields the LOWEST core id first.
@@ -1769,7 +1875,7 @@ impl WorkerAllocator {
             .worker_manager
             .range_workers()?
             .iter()
-            .filter(|w| w.filter.is_empty() && w.manually_managed)
+            .filter(|w| w.filter.is_empty() && w.manually_managed && !draining.contains(&w.core_id))
             .map(|w| w.core_id)
             .collect();
         manual_pending.sort();
@@ -1844,10 +1950,16 @@ impl WorkerAllocator {
         // join merely because the latter scores higher; nor may a confirmed
         // join, a committee member from the next boundary whatever this node
         // does, lose the worker to a join that may never be confirmed.
+        // A leave not yet confirmed comes after the seats the node keeps:
+        // when workers are short (a lowered count, or a restart that binds
+        // anew), it stays unbound, and its confirm then goes through as an
+        // orphan's instead of being rejected for its score. A confirmed
+        // leave serves its notice and keeps its place.
         bind_candidates.sort_by(|a, b| {
             use quil_types::consensus::AllocationPhase;
             let pending = |a: &quil_types::consensus::ProverAllocationInfo| match a.phase(frame_number) {
-                Some(AllocationPhase::Joining) => 2u8,
+                Some(AllocationPhase::Joining) => 3u8,
+                Some(AllocationPhase::Leaving) => 2,
                 Some(AllocationPhase::Activating) => 1,
                 _ => 0,
             };
@@ -1946,14 +2058,14 @@ impl WorkerAllocator {
             } else {
                 // No idle worker available — the alloc is on-chain
                 // but has no local worker bound. This is a
-                // worker-budget overflow, almost always caused by
-                // overlapping ProposeJoin cycles materializing more
-                // distinct filters than we have worker slots for.
-                // The lifecycle's per-filter Join cooldown prevents
-                // the upstream cause; this branch logs the symptom
-                // so the operator (or a future regression) can spot
-                // it. Collected and logged in aggregate below so a
-                // batch of 9 orphans produces one log line, not 9.
+                // worker-budget overflow: a lowered worker count, lost
+                // workers, or overlapping ProposeJoin cycles
+                // materializing more distinct filters than we have
+                // worker slots for (the lifecycle's per-filter Join
+                // cooldown prevents the last). Collected and logged in
+                // aggregate by `watch_orphans` below, so a batch of 9
+                // orphans produces one line, not 9, and a steady state
+                // one line per `ORPHAN_WARNING_REPEAT_FRAMES`.
                 orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
         }
@@ -1971,26 +2083,9 @@ impl WorkerAllocator {
             prover_info.as_ref().map(|p| p.allocations.as_slice()).unwrap_or(&[]),
         )?;
 
-        if !orphan_filters.is_empty() {
-            let count = orphan_filters.len();
-            let sample: Vec<String> = orphan_filters
-                .iter()
-                .take(8)
-                .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
-                .collect();
-            warn!(
-                orphan_count = count,
-                frame_number,
-                ?sample,
-                "allocations with no worker bound — idle pool exhausted; \
-                 likely overlapping ProposeJoin cycles produced more \
-                 distinct Joining filters than worker slots. The orphan \
-                 alloc stays in the registry until its 720-frame grace \
-                 expires (Joining) or until the network confirms/rejects \
-                 it. Lifecycle's `JOIN_FILTER_COOLDOWN_FRAMES` is the \
-                 upstream guard against this."
-            );
+        let _ = self.watch_orphans(frame_number, &orphan_filters, draining.len());
 
+        if !orphan_filters.is_empty() {
             // Orphans are not necessarily the least valuable
             // allocations: workers lost to an incident (crashed data
             // worker, reduced core count, an operator shrinking the
@@ -2801,6 +2896,115 @@ mod tests {
         alloc.set_held_back(std::collections::HashSet::from([1]));
         alloc.on_new_frame(101).unwrap();
         assert_eq!(bound_to(&wm), vec![(2, f(1)), (3, f(2)), (4, f(3))]);
+    }
+
+    /// A worker above the configured count drains: an unbound allocation is
+    /// bound to an idle worker within the count, or to none, but never to a
+    /// draining one, manual or not.
+    #[test]
+    fn a_draining_worker_is_never_bound_to_a_seat() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=4u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        wm.set_manually_managed(4, true).unwrap();
+        wm.set_configured_count(2);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_cores(&wm), vec![1, 2], "cores 3 and 4 drain; the third seat stays unbound");
+    }
+
+    /// With fewer idle workers than seats, a leave not yet confirmed waits
+    /// behind the seats the node keeps, so it stays unbound; a confirmed
+    /// leave serving its notice keeps its precedence.
+    #[test]
+    fn an_unconfirmed_leave_is_bound_after_the_seats_the_node_keeps() {
+        let f = |byte: u8| vec![byte; 32];
+        let e = epoch_length_frames();
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=3u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let mut leaving = current(f(1));
+        leaving.status = ProverStatus::Leaving;
+        leaving.leave_frame_number = e + 10;
+        let mut departing = current(f(2));
+        departing.status = ProverStatus::Leaving;
+        departing.leave_frame_number = 10;
+        departing.leave_confirm_frame_number = e + 5;
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            leaving, departing, current(f(3)), current(f(4)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(e + 101).unwrap();
+        let mut bound: Vec<Vec<u8>> = bound_to(&wm).into_iter().map(|(_, filter)| filter).collect();
+        bound.sort();
+        assert_eq!(bound, vec![f(2), f(3), f(4)], "the unconfirmed leave waits for a spare worker");
+    }
+
+    /// Allocations without a worker are logged once per episode and change
+    /// of their set, repeated once per interval while they last, and their
+    /// end is logged: not a line per pass.
+    #[test]
+    fn orphan_warning_is_bounded_by_the_interval_and_the_set() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            current(f(1)), current(f(2)), current(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        let two = vec![(f(2), ProverStatus::Active), (f(3), ProverStatus::Active)];
+        let swapped = vec![(f(2), ProverStatus::Active), (f(3), ProverStatus::Leaving)];
+        let base = 1_000u64;
+        assert_eq!(alloc.watch_orphans(base, &two, 0), Some("started"));
+        for pass in 1..ORPHAN_WARNING_REPEAT_FRAMES {
+            assert_eq!(alloc.watch_orphans(base + pass, &two, 0), None, "frame +{pass} is inside the interval");
+        }
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES, &two, 0),
+            Some("continues"),
+            "the interval has elapsed"
+        );
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 1, &two, 0), None);
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 2, &swapped, 0),
+            Some("changed"),
+            "a changed status is logged at once"
+        );
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 3, &swapped[..1], 0), Some("changed"));
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 4, &swapped[..1], 0), None);
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 5, &[], 0), Some("ended"));
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 6, &[], 0), None, "the end is logged once");
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 7, &two, 0), Some("started"));
+    }
+
+    /// The reconcile feeds the episode: two seats beyond the one worker are
+    /// an episode that ends when a seat is gone.
+    #[test]
+    fn orphan_episode_follows_the_reconcile() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            current(f(1)), current(f(2)), current(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+        let since = alloc.orphan_watch.lock().unwrap().as_ref().map(|w| (w.since_frame, w.set.len()));
+        assert_eq!(since, Some((101, 2)));
+        alloc.on_new_frame(102).unwrap();
+        assert_eq!(alloc.orphan_watch.lock().unwrap().as_ref().map(|w| w.logged_frame), Some(101));
+        reg.set_prover(prover_with(vec![current(f(1))]));
+        alloc.on_new_frame(103).unwrap();
+        assert!(alloc.orphan_watch.lock().unwrap().is_none(), "the episode ended with its orphans");
     }
 
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {

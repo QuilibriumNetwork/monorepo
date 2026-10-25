@@ -475,6 +475,17 @@ impl LifecycleReadiness {
     }
 }
 
+/// The surplus leave's choice: how many Active seats exceed the configured
+/// count, how many seats it may leave, the bound seats the halt-risk shield
+/// holds, and the seats it leaves, lowest reward first.
+#[derive(Debug, Default)]
+struct SurplusSelection {
+    surplus: usize,
+    eligible: usize,
+    shielded: std::collections::HashSet<Vec<u8>>,
+    picks: Vec<Vec<u8>>,
+}
+
 /// Tracks the lifecycle state for this node's prover.
 pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
@@ -630,6 +641,11 @@ pub struct ProverLifecycle {
     /// Held gone shards, each with the syncs begun when first seen gone.
     /// Its leave waits for a sync begun after that.
     gone_shards_seen: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Seats of draining workers whose leave this node proposed, with the
+    /// frame it first did, until the registry shows them leaving.
+    drain_leaves_proposed: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// The epoch the draining summary was last logged in.
+    drain_summary_epoch: std::sync::Mutex<Option<u64>>,
 }
 
 impl ProverLifecycle {
@@ -681,6 +697,8 @@ impl ProverLifecycle {
             registry_syncs_begun: AtomicU64::new(0),
             registry_synced_through: AtomicU64::new(0),
             gone_shards_seen: std::sync::Mutex::new(HashMap::new()),
+            drain_leaves_proposed: std::sync::Mutex::new(HashMap::new()),
+            drain_summary_epoch: std::sync::Mutex::new(None),
         }
     }
 
@@ -1110,7 +1128,7 @@ impl ProverLifecycle {
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
-    /// Returns lowest-scoring active filters when total active allocs
+    /// more than it may. Picks (`SurplusSelection::picks`) the lowest-scoring active filters when total active allocs
     /// exceed `total_capacity` (the configured worker count). Manually-managed pins are
     /// protected — they're never picked as leave candidates — but
     /// they DO count toward capacity (an idle manual worker is still
@@ -1124,7 +1142,8 @@ impl ProverLifecycle {
         allocated_descriptors: &[ShardDescriptor],
         difficulty: u64,
         world_bytes: &BigInt,
-    ) -> Vec<Vec<u8>> {
+        draining_filters: &std::collections::HashSet<Vec<u8>>,
+    ) -> SurplusSelection {
         let mm_filters = manually_managed_filters(workers);
         let bound_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
@@ -1141,11 +1160,7 @@ impl ProverLifecycle {
         // capacity while still counting all actives, falsely
         // concluding "too many allocs, propose leave."
         let total_active_count = active_filters.len();
-
-        if total_active_count <= total_capacity {
-            return Vec::new();
-        }
-        let surplus = total_active_count - total_capacity;
+        let surplus = total_active_count.saturating_sub(total_capacity);
 
         // Shed the worst-scoring allocations, bound or not.
         //
@@ -1181,15 +1196,20 @@ impl ProverLifecycle {
         // orphan likely to be shed: few provers means a low ring, which
         // scores high, so the ranking keeps it anyway — and
         // `priority_key` gives it the top rebind tier.
-        let mut excluded = mm_filters.clone();
-        for d in allocated_descriptors {
-            if d.size > 0
+        //
+        // Eligibility comes first: the shield's predicate is applied to the
+        // shard's count after our departure (`active_count` includes us), and
+        // shielded seats are dropped before ranking, so a shielded low scorer
+        // never takes a pick an eligible seat could have.
+        let shielded: std::collections::HashSet<Vec<u8>> = allocated_descriptors.iter()
+            .filter(|d| d.size > 0
                 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1
                 && bound_filters.contains(&d.filter)
-            {
-                excluded.insert(d.filter.clone());
-            }
-        }
+                && !mm_filters.contains(&d.filter))
+            .map(|d| d.filter.clone())
+            .collect();
+        let mut excluded = mm_filters.clone();
+        excluded.extend(shielded.iter().cloned());
         let mut ranked = proposer::rank_allocated_by_score_ascending(
             allocated_descriptors,
             difficulty,
@@ -1198,10 +1218,15 @@ impl ProverLifecycle {
             self.strategy,
             &excluded,
         );
+        // Among equal scores, a seat bound to a draining worker (one above
+        // the configured count) goes before one of a worker the node keeps,
+        // so the draining worker can stop; the score still decides first.
         ranked.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| bound_filters.contains(&a.0).cmp(&bound_filters.contains(&b.0)))
+                .then_with(|| draining_filters.contains(&b.0).cmp(&draining_filters.contains(&a.0)))
         });
+        let eligible = ranked.len();
         // A filter that's `Active` but absent from `allocated_descriptors`
         // is, in practice, a size-0 shard (build_decide_descriptors
         // skipped it). Mirroring Go's `worker_allocator.go:821-824` —
@@ -1212,7 +1237,73 @@ impl ProverLifecycle {
         let mut picks: Vec<Vec<u8>> =
             ranked.into_iter().take(surplus).map(|(f, _)| f).collect();
         picks.truncate(MAX_PROPOSALS_PER_CYCLE);
-        picks
+        SurplusSelection { surplus, eligible, shielded, picks }
+    }
+
+    /// Record the first frame this node proposed leaving each draining
+    /// worker's seat, and forget seats no longer Active on a draining worker
+    /// (the leave landed, or the seat went otherwise).
+    fn note_drain_leaves(
+        &self,
+        actions: &[LifecycleAction],
+        draining_filters: &std::collections::HashSet<Vec<u8>>,
+        active_filters: &[Vec<u8>],
+        frame_number: u64,
+    ) {
+        let mut proposed = self.drain_leaves_proposed.lock().unwrap_or_else(|e| e.into_inner());
+        proposed.retain(|filter, _| draining_filters.contains(filter) && active_filters.contains(filter));
+        for action in actions {
+            if let LifecycleAction::ProposeLeave { filters, .. } = action {
+                for filter in filters.iter().filter(|f| draining_filters.contains(*f)) {
+                    proposed.entry(filter.clone()).or_insert(frame_number);
+                }
+            }
+        }
+    }
+
+    /// Log where each draining worker stands, once per epoch while any
+    /// drains (`super::draining`).
+    fn log_drain_summary(
+        &self,
+        frame_number: u64,
+        worker_capacity: usize,
+        workers: &[crate::worker::WorkerInfo],
+        draining_cores: &std::collections::HashSet<u32>,
+        prover: Option<&quil_types::consensus::ProverInfo>,
+        selection: &SurplusSelection,
+        descriptors: &[ShardDescriptor],
+    ) {
+        use super::draining::{DrainSeat, DrainSummary};
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        {
+            let mut logged = self.drain_summary_epoch.lock().unwrap_or_else(|e| e.into_inner());
+            if logged.is_some_and(|last| last >= epoch) {
+                return;
+            }
+            *logged = Some(epoch);
+        }
+        let proposed = self.drain_leaves_proposed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut seats: Vec<(u32, Vec<u8>, DrainSeat)> = workers.iter()
+            .filter(|w| draining_cores.contains(&w.core_id))
+            .map(|w| {
+                let allocation = prover.and_then(|p| p.allocations.iter()
+                    .find(|a| !w.filter.is_empty() && a.confirmation_filter == w.filter));
+                let shield_active = (selection.surplus > 0 && selection.shielded.contains(&w.filter))
+                    .then(|| descriptors.iter().find(|d| d.filter == w.filter).map_or(0, |d| d.active_count));
+                let seat = DrainSeat::of(&w.filter, w.pending_filter_frame > 0, allocation, frame_number,
+                    proposed.get(&w.filter).copied(), shield_active, selection.picks.contains(&w.filter));
+                (w.core_id, w.filter.clone(), seat)
+            })
+            .collect();
+        seats.sort_by_key(|(core_id, ..)| *core_id);
+        DrainSummary {
+            configured: worker_capacity,
+            running: workers.len(),
+            surplus: selection.surplus,
+            eligible: selection.eligible,
+            shielded: selection.shielded.len(),
+            seats,
+        }.log(frame_number);
     }
 
     /// Snapshot every lifecycle gate at once, returning a single
@@ -1306,6 +1397,10 @@ impl ProverLifecycle {
         let _evaluation = self.evaluation_lock.lock().map_err(|_|
             quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into()))?;
 
+        // Between frames, before any gate: a draining worker that holds no
+        // seat and no join stops.
+        retire_drained_workers(worker_manager);
+
         // `CurrentFrame` is advanced upstream by the BlossomSub
         // recv path / archive poller / materializer — every
         // reachable production caller of `evaluate` has already
@@ -1338,6 +1433,12 @@ impl ProverLifecycle {
         // from a larger configuration still finish their obligations but add
         // no capacity.
         let worker_capacity = worker_manager.allocation_capacity()?;
+        // Workers above the configured count, and the seats they hold.
+        let draining_cores = worker_manager.draining_workers();
+        let draining_filters: std::collections::HashSet<Vec<u8>> = workers.iter()
+            .filter(|w| draining_cores.contains(&w.core_id) && !w.filter.is_empty())
+            .map(|w| w.filter.clone())
+            .collect();
 
         // Discover shard filters from the local `ShardsStore`.
         // Mainnet seeds many shards at genesis (per
@@ -1725,8 +1826,10 @@ impl ProverLifecycle {
         self.allocator.set_held_back(held_back.clone());
         // A worker whose store stopped writing cannot host a new seat either:
         // a join for it would only expire, its confirm left out, and repeat.
+        // Nor does a draining worker: it is above the configured count.
         free_worker_ids.retain(|core_id| {
             !held_back.contains(core_id) && !crate::worker_execution::store_stopped(*core_id)
+                && !draining_cores.contains(core_id)
         });
         let mut held_back_cores: Vec<u32> = held_back.iter().copied().collect();
         held_back_cores.sort_unstable();
@@ -2020,15 +2123,17 @@ impl ProverLifecycle {
         // Surplus-active leave: proactively shed the worst-scoring
         // active filters when count exceeds auto-managed worker
         // capacity. Shares the join cooldown.
+        let surplus_selection = self.select_excess_active_filters(
+            &active_filters,
+            &workers,
+            worker_capacity,
+            &allocated_descriptors,
+            difficulty,
+            &world_bytes,
+            &draining_filters,
+        );
         if shard_info_ready && !active_filters.is_empty() && !join_proposed_this_cycle {
-            let surplus = self.select_excess_active_filters(
-                &active_filters,
-                &workers,
-                worker_capacity,
-                &allocated_descriptors,
-                difficulty,
-                &world_bytes,
-            );
+            let surplus = surplus_selection.picks.clone();
             if !surplus.is_empty() {
                 let last_join = self.allocator.last_join_attempt();
                 let cooldown_ok = last_join == 0
@@ -2044,12 +2149,16 @@ impl ProverLifecycle {
                         .iter()
                         .map(hex::encode)
                         .collect();
+                    let draining_leaves = surplus.iter().filter(|f| draining_filters.contains(*f)).count();
                     info!(
                         frame = frame_number,
                         active_count = active_filters.len(),
                         worker_capacity,
                         manually_managed_pinned = mm_count,
                         surplus = surplus.len(),
+                        eligible = surplus_selection.eligible,
+                        shielded = surplus_selection.shielded.len(),
+                        draining_leaves,
                         ?leave_summary,
                         reason = "capacity reduction (active count exceeds worker count)",
                         "proposing leaves for surplus actives"
@@ -2923,23 +3032,29 @@ impl ProverLifecycle {
             // holdings down to the count. Departures in notice no longer
             // count, nor do bound leaves confirmed above; the score rule's
             // halt-risk shield still applies.
+            //
+            // Every held seat counts, bound or not: after a restart the
+            // allocator may bind leaving seats while Active ones wait for a
+            // worker, and counting only bound seats then hid the surplus, so
+            // the score rule rejected the leaves of a lowered count. Each
+            // orphan, lapsed or manual leave confirmed above is one of them.
             let serving = prover_info.iter().flat_map(|p| &p.allocations)
-                .filter(|a| bound_filters.contains(&a.confirmation_filter))
-                .filter(|a| match a.phase(frame_number) {
-                    Some(quil_types::consensus::AllocationPhase::Joining
-                        | quil_types::consensus::AllocationPhase::Departing) => false,
-                    Some(_) => true,
-                    None => self.allocator.renewal_recovering(a, frame_number),
-                })
+                .filter(|a| super::draining::holds_seat(a, frame_number, false)
+                    || (a.phase(frame_number).is_none() && bound_filters.contains(&a.confirmation_filter)
+                        && self.allocator.renewal_recovering(a, frame_number)))
                 .count()
-                .saturating_sub(orphan_ready.iter().chain(&lapsed_ready).chain(&manual_ready)
-                    .filter(|f| bound_filters.contains(*f)).count());
+                .saturating_sub(orphan_ready.len() + lapsed_ready.len() + manual_ready.len());
             let shielded: std::collections::HashSet<Vec<u8>> = held_descriptors.iter()
                 .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT + 1)
                 .map(|d| d.filter.clone())
                 .collect();
-            let capacity_ready: Vec<Vec<u8>> = proposer::rank_allocated_by_score_ascending(
-                &held_descriptors, difficulty, &world_bytes, self.units, self.strategy, &shielded)
+            // As the surplus leave picks: lowest score first, and among equal
+            // scores a draining worker's seat first.
+            let mut capacity_ranked = proposer::rank_allocated_by_score_ascending(
+                &held_descriptors, difficulty, &world_bytes, self.units, self.strategy, &shielded);
+            capacity_ranked.sort_by(|a, b| a.1.cmp(&b.1)
+                .then_with(|| draining_filters.contains(&b.0).cmp(&draining_filters.contains(&a.0))));
+            let capacity_ready: Vec<Vec<u8>> = capacity_ranked
                 .into_iter()
                 .map(|(f, _)| f)
                 .filter(|f| auto_ready.contains(f))
@@ -3071,6 +3186,11 @@ impl ProverLifecycle {
                     if accepted { self.allocation_reasons.record(&[filter], joining, frame_number, reason)?; }
                 }
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
+                if !draining_cores.is_empty() {
+                    self.note_drain_leaves(&actions, &draining_filters, &active_filters, frame_number);
+                    self.log_drain_summary(frame_number, worker_capacity, &workers, &draining_cores,
+                        prover_info.as_ref(), &surplus_selection, &held_descriptors);
+                }
                 if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
                     let inputs: Vec<_> = held_descriptors.iter().map(|d| {
                         let summary = summaries.iter().find(|s| s.filter == d.filter);
@@ -3098,6 +3218,26 @@ impl ProverLifecycle {
                     "lifecycle plan rejected before dispatch");
                 Err(error)
             }
+        }
+    }
+}
+
+/// Retire each draining worker that holds no seat and no pending join
+/// (`WorkerManager::retire_worker`); its store stays on disk.
+fn retire_drained_workers(worker_manager: &dyn WorkerManager) {
+    let draining = worker_manager.draining_workers();
+    if draining.is_empty() {
+        return;
+    }
+    let Ok(workers) = worker_manager.range_workers() else { return };
+    for worker in workers.iter().filter(|w| draining.contains(&w.core_id)) {
+        if !worker.filter.is_empty() || worker.pending_filter_frame != 0 {
+            continue;
+        }
+        if let Err(error) = worker_manager.retire_worker(worker.core_id) {
+            tracing::warn!(core_id = worker.core_id, %error, scope = "this node",
+                action = "the next lifecycle tick retries; report it if this repeats",
+                "draining worker could not be retired");
         }
     }
 }
@@ -7387,6 +7527,239 @@ mod proposal_loop_tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// After a store reset and a lowered count, the allocator may bind leaving
+    /// seats while Active ones wait for a worker. Every held seat counts
+    /// towards the configured count, bound or not, so the bound leaves of the
+    /// surplus confirm for capacity instead of being rejected for their
+    /// score, and the unbound one as an orphan.
+    #[test]
+    fn surplus_leaves_confirm_though_active_seats_are_unbound_after_a_restart() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let active: Vec<Vec<u8>> = (1..=6u8).map(|i| filter_bytes(0xA0 + i)).collect();
+        let leaving: Vec<Vec<u8>> = (1..=3u8).map(|i| filter_bytes(0xB0 + i)).collect();
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, leaving[0].clone()));
+        wm.add(allocated_worker(2, leaving[1].clone()));
+        for (core, filter) in (3..=6u32).zip(&active) {
+            wm.add(allocated_worker(core, filter.clone()));
+        }
+        wm.set_configured_count(6);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut allocations: Vec<_> = active.iter().map(|f| alloc(f.clone(), ProverStatus::Active, 5)).collect();
+        allocations.extend(leaving.iter().map(|f| ProverAllocationInfo { leave_frame_number: 10,
+            ..alloc(f.clone(), ProverStatus::Leaving, 5) }));
+        reg.set_prover(prover(address.clone(), allocations));
+        reg.set_summaries(active.iter().chain(&leaving).map(|f| shard_summary(f.clone(), 10)).collect());
+        let lc = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lc.set_prover_root_verified_frame(720);
+        let actions = lc.evaluate(720, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        let decided = |reject: bool| -> Vec<Vec<u8>> {
+            let mut filters: Vec<Vec<u8>> = actions.iter().flat_map(|a| match a {
+                LifecycleAction::ConfirmLeaves { filters, .. } if !reject => filters.clone(),
+                LifecycleAction::RejectLeaves { filters, .. } if reject => filters.clone(),
+                _ => Vec::new(),
+            }).collect();
+            filters.sort();
+            filters
+        };
+        assert_eq!(decided(false), leaving, "{actions:?}");
+        assert!(decided(true).is_empty(), "{actions:?}");
+    }
+
+    /// One evaluation and what it logged.
+    fn evaluate_logged(
+        lc: &ProverLifecycle,
+        frame: u64,
+        reg: &dyn ProverRegistry,
+        wm: &dyn WorkerManager,
+    ) -> (Vec<LifecycleAction>, String) {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let actions = tracing::subscriber::with_default(subscriber, || lc.evaluate(frame, 1, reg, wm).unwrap());
+        let bytes = lines.0.lock().unwrap().clone();
+        (actions, String::from_utf8(bytes).unwrap())
+    }
+
+    /// One seated core, an idle manual core and an idle auto core, with one
+    /// allocation slot free and joinable shards; `configured` sets the count.
+    fn one_free_slot(configured: u32) -> (Arc<ConfigurableWorkerManager>, Arc<ConfigurableRegistry>, Arc<ProverLifecycle>) {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(manual_worker(2, Vec::new()));
+        wm.add(idle_worker(3));
+        wm.set_configured_count(configured);
+        reg.set_prover(prover(address.clone(), vec![alloc(filter_bytes(0xA1), ProverStatus::Active, 10)]));
+        let mut summaries = vec![shard_summary(filter_bytes(0xA1), 1)];
+        summaries.extend((0..4u8).map(|i| shard_summary(filter_bytes(0x10 + i), 1)));
+        reg.set_summaries(summaries);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(100);
+        (wm, reg, lifecycle)
+    }
+
+    /// A worker above the configured count takes no new seat: with the only
+    /// idle auto worker draining (and, here, not retired: its retirement
+    /// fails), no join is proposed although a slot is free.
+    #[test]
+    fn a_draining_worker_takes_no_new_seat() {
+        let (wm, reg, lifecycle) = one_free_slot(2);
+        wm.refuse_retirement();
+        assert_eq!(wm.draining_workers(), std::collections::HashSet::from([3]));
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_joins(&actions), 0, "{actions:?}");
+    }
+
+    /// After the count is raised, the same core is within it: it is offered
+    /// and joins.
+    #[test]
+    fn an_upscaled_core_is_offered_and_joins() {
+        let (wm, reg, lifecycle) = one_free_slot(3);
+        assert!(wm.draining_workers().is_empty());
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_joins(&actions), 1, "{actions:?}");
+    }
+
+    /// A draining worker with no seat and no join is retired at the next
+    /// tick, its record gone; one still serving or joining is kept.
+    #[test]
+    fn a_drained_worker_is_retired_and_one_with_a_seat_or_join_is_kept() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(idle_worker(2));
+        wm.add(idle_worker(3));
+        wm.add(allocated_worker(4, filter_bytes(0xA4)));
+        wm.add(WorkerInfo { pending_filter_frame: 95, ..idle_worker(5) });
+        wm.set_configured_count(2);
+        reg.set_prover(prover(address.clone(), vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA4), ProverStatus::Active, 10),
+        ]));
+        reg.set_summaries(vec![shard_summary(filter_bytes(0xA1), 3), shard_summary(filter_bytes(0xA4), 3)]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(wm.retired(), vec![3]);
+        let cores: Vec<u32> = wm.range_workers().unwrap().iter().map(|w| w.core_id).collect();
+        assert_eq!(cores, vec![1, 2, 4, 5]);
+        // Once its seat goes, the draining worker stops too.
+        wm.deallocate_worker(4).unwrap();
+        lifecycle.evaluate(101, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(wm.retired(), vec![3, 4]);
+    }
+
+    /// The surplus leave takes eligible seats first, then the lowest reward:
+    /// with 3 surplus seats and the lowest scorer held by the halt-risk
+    /// shield, the next three eligible seats go, and the per-epoch draining
+    /// summary says so.
+    #[test]
+    fn surplus_leaves_skip_a_shielded_low_scorer_and_the_summary_reports_it() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // A1 (core 4, draining) scores lowest but its shard has 3 active
+        // provers; A2..A6 score from A2 (most crowded) up.
+        let cores = [(4u32, 0xA1u8), (5, 0xA2), (6, 0xA3), (1, 0xA4), (2, 0xA5), (3, 0xA6)];
+        for (core, byte) in cores {
+            wm.add(allocated_worker(core, filter_bytes(byte)));
+        }
+        wm.set_configured_count(3);
+        reg.set_prover(prover(address.clone(),
+            cores.iter().map(|(_, byte)| alloc(filter_bytes(*byte), ProverStatus::Active, 10)).collect()));
+        let sized = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            sized(filter_bytes(0xA1), 3, 1_000),
+            sized(filter_bytes(0xA2), 20, 1_000_000),
+            sized(filter_bytes(0xA3), 18, 1_000_000),
+            sized(filter_bytes(0xA4), 16, 1_000_000),
+            sized(filter_bytes(0xA5), 14, 1_000_000),
+            sized(filter_bytes(0xA6), 12, 1_000_000),
+        ]);
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(100);
+        let (actions, logged) = evaluate_logged(&lifecycle, 100, reg.as_ref(), wm.as_ref());
+        let mut left = proposed_leave_filters(&actions);
+        left.sort();
+        assert_eq!(left, vec![filter_bytes(0xA2), filter_bytes(0xA3), filter_bytes(0xA4)], "{actions:?}");
+        assert!(logged.contains("surplus_leave=eligible 3 of 3 surplus; 1 held by the shield"), "{logged}");
+        assert!(logged.contains(&format!("core 4 {}: shielded (3 active provers)", hex::encode(filter_bytes(0xA1)))),
+            "{logged}");
+        assert!(logged.contains("a shielded seat is held until its shard has more than 4 active provers"), "{logged}");
+        assert!(logged.contains(&format!("core 5 {}: leave proposed at frame 100", hex::encode(filter_bytes(0xA2)))),
+            "{logged}");
+        // Once per epoch: the next frame of the same epoch logs no summary.
+        let (_, again) = evaluate_logged(&lifecycle, 101, reg.as_ref(), wm.as_ref());
+        assert!(!again.contains("workers above the configured count are draining"), "{again}");
+    }
+
+    /// Among seats of equal reward, a draining worker's seat goes first, so
+    /// that worker can stop; the score still decides first.
+    #[test]
+    fn equal_reward_surplus_seats_of_draining_workers_go_first() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        for core in 1..=4u32 {
+            wm.add(allocated_worker(core, filter_bytes(0xB0 + core as u8)));
+        }
+        wm.set_configured_count(2);
+        reg.set_prover(prover(address.clone(),
+            (1..=4u8).map(|core| alloc(filter_bytes(0xB0 + core), ProverStatus::Active, 10)).collect()));
+        reg.set_summaries((1..=4u8).map(|core| shard_summary(filter_bytes(0xB0 + core), 10)).collect());
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let mut left = proposed_leave_filters(&actions);
+        left.sort();
+        assert_eq!(left, vec![filter_bytes(0xB3), filter_bytes(0xB4)], "{actions:?}");
+    }
+
+    /// An operator's case at scale: 48 configured, 103 seated workers, the
+    /// seats of 30 draining workers on shards the shield holds. 55 seats are
+    /// surplus and 73 eligible: the 25 draining seats the shield does not
+    /// hold go first among equal rewards, then 30 of the workers within the
+    /// count; every shielded seat stays, and the summary counts them.
+    #[test]
+    fn a_103_worker_node_configured_for_48_sheds_55_eligible_seats() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let shielded = |core: u32| (49..=78).contains(&core);
+        for core in 1..=103u32 {
+            wm.add(allocated_worker(core, filter_bytes(core as u8)));
+        }
+        wm.set_configured_count(48);
+        reg.set_prover(prover(address.clone(),
+            (1..=103u32).map(|core| alloc(filter_bytes(core as u8), ProverStatus::Active, 10)).collect()));
+        reg.set_summaries((1..=103u32)
+            .map(|core| shard_summary(filter_bytes(core as u8), if shielded(core) { 4 } else { 10 })).collect());
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.set_prover_root_verified_frame(100);
+        let (actions, logged) = evaluate_logged(&lifecycle, 100, reg.as_ref(), wm.as_ref());
+        let left: std::collections::HashSet<Vec<u8>> = proposed_leave_filters(&actions).into_iter().collect();
+        assert_eq!(left.len(), 55, "{actions:?}");
+        assert!((79..=103u32).all(|core| left.contains(&filter_bytes(core as u8))), "unshielded draining seats first");
+        assert!(!(49..=78u32).any(|core| left.contains(&filter_bytes(core as u8))), "no shielded seat");
+        assert!(logged.contains("surplus_leave=eligible 55 of 55 surplus; 30 held by the shield"), "{logged}");
+        assert!(logged.contains("draining=55") && logged.contains("draining_shielded=30")
+            && logged.contains("draining_proposed=25"), "{logged}");
     }
 
     fn manual_worker(core_id: u32, filter: Vec<u8>) -> WorkerInfo {
