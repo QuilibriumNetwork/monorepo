@@ -369,14 +369,24 @@ pub struct ForestWriteGuard<'a> {
 }
 
 /// What [`HypergraphCrdt::confine_forest`] did: confinement commits, deleted
-/// node and stale records, and leaf-key ranges deleted.
+/// node and stale records, and leaf-key ranges deleted, and the lineages
+/// whose subtree a commit dropped ([`HypergraphCrdt::confine_forest_recording`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ForestConfinement {
     pub commits: usize,
     pub nodes: usize,
     pub stale_records: usize,
     pub key_ranges: usize,
+    pub dropped_lineages: Vec<Vec<u8>>,
+    /// The caller's condition to go on failed before the confinement
+    /// finished; the rest waits for a later pass.
+    pub stopped: bool,
 }
+
+/// A shard filter whose frame history a store keeps, and the writes that
+/// record that a confinement dropped its subtree
+/// ([`HypergraphCrdt::confine_forest_recording`]).
+pub type LineageRecord = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
 
 /// The forest-native hypergraph CRDT.
 pub struct HypergraphCrdt {
@@ -3095,6 +3105,28 @@ impl HypergraphCrdt {
     /// Applications without a kept shard are untouched. A later assignment
     /// syncs a dropped shard as it would on a fresh store.
     pub fn confine_forest(&self, keep: &[Vec<u8>], scan_budget: usize) -> Result<ForestConfinement> {
+        self.confine_forest_recording(keep, scan_budget, &[], &|| true)
+    }
+
+    /// [`Self::confine_forest`], recording which of `lineages` each
+    /// confinement commit drops: a lineage of the confined application that
+    /// no kept scope covers loses its subtree, wholly or in part, so that
+    /// commit also stages the lineage's writes and names it in
+    /// [`ForestConfinement::dropped_lineages`]. The frames and cursor a store
+    /// keeps for a shard claim a state its trees no longer hold; the record
+    /// tells a later binding to that shard so, in the same write as the drop.
+    /// A filter that does not decode is taken as covered. `proceed` is asked
+    /// under the forest locks before each confinement commit and sweep
+    /// batch; once it says no, the confinement stops
+    /// ([`ForestConfinement::stopped`]), as when the store's binding changed
+    /// to a shard `keep` does not protect.
+    pub fn confine_forest_recording(
+        &self,
+        keep: &[Vec<u8>],
+        scan_budget: usize,
+        lineages: &[LineageRecord],
+        proceed: &dyn Fn() -> bool,
+    ) -> Result<ForestConfinement> {
         let mut outcome = ForestConfinement::default();
         if !self.unified_tree() || !self.forest_is_persistent() {
             return Ok(outcome);
@@ -3117,9 +3149,18 @@ impl HypergraphCrdt {
             if paths.iter().any(|bits| bits.is_empty()) {
                 continue;
             }
+            // The lineages a confinement commit of this application drops.
+            let uncovered: Vec<(&[u8], &[(Vec<u8>, Vec<u8>)])> = lineages.iter()
+                .filter(|(filter, _)| filter.get(..32) == Some(&app[..]) && !self.lineage_covered(filter, &paths))
+                .map(|(filter, writes)| (filter.as_slice(), writes.as_slice()))
+                .collect();
             {
                 let _forest_guard = self.forest_write_lock.lock().unwrap();
                 let _guard = self.commit_lock.lock().unwrap();
+                if !proceed() {
+                    outcome.stopped = true;
+                    return Ok(outcome);
+                }
                 if self.pending.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
                     || self.pending_blobs.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
                 {
@@ -3140,10 +3181,20 @@ impl HypergraphCrdt {
                     txn.set(&confinement_sweep_key(&app, phase_idx), &[1])?;
                     staged.push((phase_idx, version));
                 }
+                let mut dropped = Vec::new();
+                if !staged.is_empty() {
+                    for (filter, writes) in &uncovered {
+                        for (key, value) in *writes {
+                            txn.set(key, value)?;
+                        }
+                        dropped.push(filter.to_vec());
+                    }
+                }
                 if staged.is_empty() {
                     txn.abort()?;
                 } else {
                     txn.commit()?;
+                    outcome.dropped_lineages.extend(dropped);
                     for (phase_idx, version) in &staged {
                         self.phase_versions.write().unwrap().insert((app.to_vec(), *phase_idx), *version);
                     }
@@ -3166,6 +3217,10 @@ impl HypergraphCrdt {
                 loop {
                     let _forest_guard = self.forest_write_lock.lock().unwrap();
                     let _guard = self.commit_lock.lock().unwrap();
+                    if !proceed() {
+                        outcome.stopped = true;
+                        return Ok(outcome);
+                    }
                     let forest = self.forest.read().unwrap();
                     let Some(head) = self.resolve_phase_version_checked(&forest, &app, phase_idx)? else { break };
                     let deletion = forest.delete_outside_scope(&app, PHASES[phase_idx], head, &paths, cursor, scan_budget)
@@ -3185,6 +3240,24 @@ impl HypergraphCrdt {
             }
         }
         Ok(outcome)
+    }
+
+    /// Whether a kept scope (canonical bit paths in `paths`) covers the whole
+    /// subtree of shard `filter`: in either of its decodings, as kept filters
+    /// are protected. One that does not decode counts as covered.
+    fn lineage_covered(&self, filter: &[u8], paths: &[Vec<bool>]) -> bool {
+        let inside = |bits: &[bool]| paths.iter().any(|kept| bits.len() >= kept.len() && bits[..kept.len()] == kept[..]);
+        match (quil_forest::decode_shard_filter_or_root(filter, 32), self.canonical_bits_for_filter(filter)) {
+            (Some((_, decoded)), canonical) => inside(&decoded) || canonical.is_some_and(|bits| inside(&bits)),
+            (None, _) => true,
+        }
+    }
+
+    /// The persistent store under the forest, for reads of keyspaces this
+    /// CRDT does not own (the frame cursors and records of the stores sharing
+    /// it); `None` for an in-memory forest.
+    pub fn forest_store(&self) -> Option<quil_forest::CoordinatedDb> {
+        self.forest.read().unwrap().db().cloned()
     }
 
     /// Forest-sync CLIENT: pull one shard/phase tree from a remote `source` (at
@@ -3415,6 +3488,35 @@ impl HypergraphCrdt {
         forest
             .app_subtree_leaf_count(app, PHASES[phase_idx], ver, bit_path)
             .unwrap_or(0)
+    }
+
+    /// [`Self::unified_subtree_leaf_count`], where a legacy tree, an unknown
+    /// phase or a failed read (of the head version or of a node) is `None`
+    /// (unknown) rather than zero. An absent tree or subtree is zero.
+    pub fn unified_subtree_leaf_count_checked(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        app: &[u8],
+        bit_path: &[bool],
+    ) -> Option<u64> {
+        if !self.unified_tree() {
+            return None;
+        }
+        let phase_idx = match (set_type, phase_type) {
+            ("vertex", "adds") => 0,
+            ("vertex", "removes") => 1,
+            ("hyperedge", "adds") => 2,
+            ("hyperedge", "removes") => 3,
+            _ => return None,
+        };
+        let forest = self.forest.read().unwrap();
+        let ver = match self.resolve_phase_version_checked(&forest, app, phase_idx) {
+            Ok(Some(ver)) => ver,
+            Ok(None) => return Some(0),
+            Err(_) => return None,
+        };
+        forest.app_subtree_leaf_count(app, PHASES[phase_idx], ver, bit_path).ok()
     }
 
     /// DEEP-BIFURCATION split PROPOSAL: compute a shard's MEANINGFUL

@@ -1020,8 +1020,13 @@ impl ThreadWorkerManager {
                                             crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base,
                                                 move |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
                                                     crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey)))));
+                                        // Still serving the binding the passes start for: a
+                                        // rebind retires the engine first.
+                                        let (slot, binding) = (execution_slot.clone(), current_filter.clone());
+                                        let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move ||
+                                            slot.lock().unwrap().as_ref().is_some_and(|h| h.filter == binding && h.is_running()));
                                         tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
-                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage).await;
+                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage, bound).await;
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                         }));
                                     }
