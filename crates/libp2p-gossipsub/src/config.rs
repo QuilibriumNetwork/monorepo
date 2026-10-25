@@ -138,6 +138,7 @@ pub struct Config {
     idontwant_message_size_threshold: usize,
     idontwant_on_publish: bool,
     topic_configuration: TopicConfigs,
+    mcache_max_bytes: usize,
 }
 
 impl Config {
@@ -149,6 +150,12 @@ impl Config {
     /// Number of heartbeats to keep in the `memcache` (default is 5).
     pub fn history_length(&self) -> usize {
         self.history_length
+    }
+
+    /// QUILIBRIUM: byte budget of the `memcache`. When a new message would take it over the
+    /// budget, the oldest messages are evicted, validated ones first (default is unbounded).
+    pub fn mcache_max_bytes(&self) -> usize {
+        self.mcache_max_bytes
     }
 
     /// Number of past heartbeats to gossip about (default is 3).
@@ -557,6 +564,7 @@ impl Default for ConfigBuilder {
                 idontwant_message_size_threshold: 1000,
                 idontwant_on_publish: false,
                 topic_configuration: TopicConfigs::default(),
+                mcache_max_bytes: usize::MAX,
             },
             invalid_protocol: false,
         }
@@ -641,6 +649,13 @@ impl ConfigBuilder {
     /// Number of past heartbeats to gossip about (default is 3).
     pub fn history_gossip(&mut self, history_gossip: usize) -> &mut Self {
         self.config.history_gossip = history_gossip;
+        self
+    }
+
+    /// QUILIBRIUM: byte budget of the `memcache`. When a new message would take it over the
+    /// budget, the oldest messages are evicted, validated ones first (default is unbounded).
+    pub fn mcache_max_bytes(&mut self, mcache_max_bytes: usize) -> &mut Self {
+        self.config.mcache_max_bytes = mcache_max_bytes;
         self
     }
 
@@ -1142,6 +1157,7 @@ impl std::fmt::Debug for Config {
         let _ = builder.field("protocol", &self.protocol);
         let _ = builder.field("history_length", &self.history_length);
         let _ = builder.field("history_gossip", &self.history_gossip);
+        let _ = builder.field("mcache_max_bytes", &self.mcache_max_bytes);
         let _ = builder.field(
             "mesh_n",
             &self.topic_configuration.default_mesh_params.mesh_n,

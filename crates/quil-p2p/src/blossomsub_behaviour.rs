@@ -132,6 +132,8 @@ pub struct BlossomSubBehaviour {
     pending_events: VecDeque<BlossomSubEvent>,
     /// Last time the NeedPeers cadence check ran.
     last_need_peers_check: std::time::Instant,
+    /// Operator log state for the message cache's byte budget.
+    cache_pressure: CachePressure,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -179,6 +181,7 @@ impl BlossomSubBehaviour {
             application_scores: HashMap::new(),
             pending_events: VecDeque::new(),
             last_need_peers_check: std::time::Instant::now(),
+            cache_pressure: CachePressure::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
@@ -226,6 +229,8 @@ impl BlossomSubBehaviour {
             .with_traffic_observer(self.traffic.clone())
         };
         self.inner = inner;
+        // The new inner behaviour's cache counters start from zero.
+        self.cache_pressure = CachePressure::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -438,6 +443,8 @@ impl BlossomSubBehaviour {
             return;
         }
         self.last_need_peers_check = now;
+        // The message cache's byte-budget signal shares this cadence.
+        self.cache_pressure.observe(self.inner.message_cache_stats(), now);
         if self.subscriptions.is_empty() {
             return;
         }
@@ -468,6 +475,113 @@ impl BlossomSubBehaviour {
 impl Default for BlossomSubBehaviour {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+/// While the message cache evicts to stay within its byte budget, the warning repeats at this
+/// interval; this long without an eviction ends the episode.
+const CACHE_PRESSURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator log of the message cache's byte budget: a warning when evictions start, one per
+/// [`CACHE_PRESSURE_LOG_INTERVAL`] while they continue, and an info line when they stop.
+#[derive(Debug, Default)]
+struct CachePressure {
+    /// Counters at the previous check.
+    seen: gossipsub::MessageCacheStats,
+    episode: Option<CachePressureEpisode>,
+}
+
+#[derive(Debug)]
+struct CachePressureEpisode {
+    /// Counters before the episode's first eviction.
+    base: gossipsub::MessageCacheStats,
+    started: std::time::Instant,
+    last_eviction: std::time::Instant,
+    last_log: std::time::Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CachePressureLog {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl CachePressure {
+    fn observe(
+        &mut self,
+        stats: gossipsub::MessageCacheStats,
+        now: std::time::Instant,
+    ) -> Option<CachePressureLog> {
+        let evicting = stats.evicted_messages > self.seen.evicted_messages;
+        let before = std::mem::replace(&mut self.seen, stats);
+        let log = match self.episode.as_mut() {
+            None if evicting => CachePressureLog::Started,
+            None => return None,
+            Some(episode) if evicting => {
+                episode.last_eviction = now;
+                if now.duration_since(episode.last_log) < CACHE_PRESSURE_LOG_INTERVAL {
+                    return None;
+                }
+                episode.last_log = now;
+                CachePressureLog::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_eviction) < CACHE_PRESSURE_LOG_INTERVAL {
+                    return None;
+                }
+                CachePressureLog::Ended
+            }
+        };
+        if log == CachePressureLog::Started {
+            self.episode = Some(CachePressureEpisode {
+                base: before,
+                started: now,
+                last_eviction: now,
+                last_log: now,
+            });
+        }
+        let episode = self.episode.as_ref()?;
+        let evicted_messages = stats.evicted_messages.saturating_sub(episode.base.evicted_messages);
+        let evicted_bytes = stats.evicted_bytes.saturating_sub(episode.base.evicted_bytes);
+        let evicted_unvalidated =
+            stats.evicted_unvalidated.saturating_sub(episode.base.evicted_unvalidated);
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        match log {
+            CachePressureLog::Started => tracing::warn!(
+                budget_bytes = stats.max_bytes,
+                cached_bytes = stats.bytes,
+                cached_messages = stats.messages,
+                evicted_messages,
+                evicted_bytes,
+                "gossip message cache reached its byte budget; evicting the oldest messages, \
+                 which peers can then no longer request from this node. Expected during a burst \
+                 of large messages; report it with these counts if it persists"
+            ),
+            CachePressureLog::Continuing => tracing::warn!(
+                budget_bytes = stats.max_bytes,
+                cached_bytes = stats.bytes,
+                cached_messages = stats.messages,
+                evicted_messages,
+                evicted_bytes,
+                evicted_unvalidated,
+                duration_secs,
+                "gossip message cache still evicting to stay within its byte budget"
+            ),
+            CachePressureLog::Ended => {
+                tracing::info!(
+                    budget_bytes = stats.max_bytes,
+                    cached_bytes = stats.bytes,
+                    evicted_messages,
+                    evicted_bytes,
+                    evicted_unvalidated,
+                    duration_secs,
+                    "gossip message cache back within its byte budget"
+                );
+                self.episode = None;
+            }
+        }
+        Some(log)
     }
 }
 
@@ -652,7 +766,8 @@ impl NetworkBehaviour for BlossomSubBehaviour {
 /// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
 /// per-network protocol id and setting the BlossomSub message id
 /// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
-/// (`mesh_peers_per_subnet`, `mcache_max_bytes`) are dropped.
+/// (`mesh_peers_per_subnet`) are dropped; `mcache_max_bytes` maps onto the
+/// vendored crate's message-cache byte budget.
 /// Peer-score config. Two channels are active: (1) the application score
 /// (`set_application_score`, driven by the node — peer_authenticator + per-source
 /// drop-rate penalties); (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO, so
@@ -710,6 +825,9 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         )
         .history_length(params.history_length)
         .history_gossip(params.history_gossip)
+        // The history windows bound the message cache by heartbeats only; this
+        // bounds its bytes (oldest, validated messages evicted first).
+        .mcache_max_bytes(params.mcache_max_bytes)
         // Mesh-degree (D) family is DELIBERATELY left at gossipsub's own
         // defaults (mesh_n=6, mesh_n_low=5, mesh_n_high=12, gossip_lazy=6,
         // mesh_outbound_min=2): higher fan-out multiplies traffic on
@@ -723,9 +841,8 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
-        // Per-message size cap (fork used `mcache_max_bytes` for the mcache; the
-        // stock knob is the per-message transmit cap). 16 MiB matches the RPC
-        // frame cap in `protocol.rs`.
+        // Per-message size cap. 16 MiB matches the RPC frame cap in
+        // `protocol.rs`.
         .max_transmit_size(crate::protocol::MAX_MESSAGE_SIZE)
         // Keep de-duplicated message IDs at least as long as the peer-score
         // delivery-record window (WAN margin); cost is holding 33-byte ids a bit
@@ -757,6 +874,35 @@ mod propagation_tests {
     use libp2p::swarm::SwarmEvent;
     use libp2p::{Multiaddr, Swarm, SwarmBuilder};
     use std::time::Duration;
+
+    #[test]
+    fn build_config_applies_the_message_cache_byte_budget() {
+        let params = crate::BlossomsubParams::default();
+        assert_eq!(
+            build_config(0, &params).mcache_max_bytes(),
+            crate::params::MCACHE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_pressure_logs_start_bounded_repeats_and_end() {
+        let stats = |evicted_messages| gossipsub::MessageCacheStats {
+            evicted_messages,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut pressure = CachePressure::default();
+        assert_eq!(pressure.observe(stats(0), at(0)), None);
+        assert_eq!(pressure.observe(stats(5), at(1)), Some(CachePressureLog::Started));
+        assert_eq!(pressure.observe(stats(9), at(2)), None);
+        assert_eq!(pressure.observe(stats(9), at(30)), None);
+        assert_eq!(pressure.observe(stats(12), at(61)), Some(CachePressureLog::Continuing));
+        assert_eq!(pressure.observe(stats(12), at(100)), None);
+        assert_eq!(pressure.observe(stats(12), at(121)), Some(CachePressureLog::Ended));
+        assert_eq!(pressure.observe(stats(12), at(200)), None);
+        assert_eq!(pressure.observe(stats(13), at(201)), Some(CachePressureLog::Started));
+    }
 
     // The peer-score config must pass gossipsub's own validation, or
     // `with_peer_score` errors and scoring silently stays OFF (warn path).
