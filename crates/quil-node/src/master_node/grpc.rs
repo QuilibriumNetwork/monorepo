@@ -1014,8 +1014,17 @@ pub(crate) fn spawn_all(
             // Shard frames are verified before they are held; that runs on
             // the blocking pool, not the runtime that delivers consensus.
             let outcome = if submit_mc.requires_verification(&data) {
+                // Held back for a slot rather than refused: the submitter
+                // retries only when every archive refuses.
+                let wait = std::time::Duration::from_secs(5);
+                let Some(permit) = super::message_loop::SHARD_FRAME_VERIFY_TASKS.enter_within(wait).await else {
+                    return Err(SubmitRefusal::retry_later("shard-frame verification is saturated"));
+                };
                 let collector = submit_mc.clone();
-                tokio::task::spawn_blocking(move || collector.add_message_outcome(rank, data))
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    collector.add_message_outcome(rank, data)
+                })
                     .await
                     .map_err(|error| SubmitRefusal::retry_later(format!("verification task failed: {error}")))?
             } else {

@@ -5,6 +5,12 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
+/// Gossiped or submitted prover messages being verified on the blocking pool.
+/// The collector runs 4 verifications at once; the rest only queue. The cap
+/// leaves 32 queued per running verification, so it binds only on a flood.
+pub(crate) static SHARD_FRAME_VERIFY_TASKS: quil_engine::spawn_gate::SpawnGate =
+    quil_engine::spawn_gate::SpawnGate::new("shard-frame-verify", 128);
+
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
@@ -1629,8 +1635,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 // Shard frames are verified before they are
                                 // held: off this loop.
                                 if mc_for_recv.requires_verification(&received.data) {
-                                    let (collector, data) = (mc_for_recv.clone(), received.data.clone());
-                                    tokio::task::spawn_blocking(move || collector.add_message(current_rank, data));
+                                    // At most SHARD_FRAME_VERIFY_TASKS wait on the
+                                    // blocking pool; the sender's relays cover a drop.
+                                    if let Some(permit) = SHARD_FRAME_VERIFY_TASKS.try_enter() {
+                                        let (collector, data) = (mc_for_recv.clone(), received.data.clone());
+                                        tokio::task::spawn_blocking(move || {
+                                            let _permit = permit;
+                                            collector.add_message(current_rank, data)
+                                        });
+                                    }
                                 } else {
                                     mc_for_recv.add_message(current_rank, received.data.clone());
                                 }
