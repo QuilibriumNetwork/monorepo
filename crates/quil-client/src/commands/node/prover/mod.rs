@@ -26,6 +26,7 @@ mod ops;
 mod shardinfo;
 mod shards;
 pub(crate) mod sign;
+mod gossip_traffic;
 mod status;
 pub(crate) mod local_execution;
 

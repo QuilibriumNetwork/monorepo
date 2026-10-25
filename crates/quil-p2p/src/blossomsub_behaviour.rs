@@ -140,6 +140,8 @@ pub struct BlossomSubBehaviour {
     /// Prometheus registry carrying gossipsub's metric families plus the
     /// swarm-level `libp2p_*` families that `node.rs` registers afterward.
     metrics_registry: crate::metrics::SharedRegistry,
+    /// Every message copy by class, kept across `set_signing_identity`.
+    traffic: Arc<crate::gossip_traffic::GossipTraffic>,
 }
 
 impl BlossomSubBehaviour {
@@ -157,11 +159,13 @@ impl BlossomSubBehaviour {
         // after construction, before the swarm polls or we subscribe) rebuilds
         // `inner` with the real key.
         let placeholder = Keypair::generate_ed25519();
+        let traffic: Arc<crate::gossip_traffic::GossipTraffic> = Default::default();
         let inner = Inner::new(
             gossipsub::MessageAuthenticity::Signed(placeholder),
             config.clone(),
         )
-        .expect("valid gossipsub config");
+        .expect("valid gossipsub config")
+        .with_traffic_observer(traffic.clone());
         Self {
             inner,
             config,
@@ -180,7 +184,13 @@ impl BlossomSubBehaviour {
             metrics_registry: Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
             )),
+            traffic,
         }
+    }
+
+    /// This behaviour's gossip traffic counters (see [`crate::gossip_traffic`]).
+    pub fn traffic(&self) -> Arc<crate::gossip_traffic::GossipTraffic> {
+        self.traffic.clone()
     }
 
     /// Shared handle to this behaviour's prometheus registry.
@@ -202,7 +212,8 @@ impl BlossomSubBehaviour {
                 self.config.clone(),
             )
             .expect("valid gossipsub config")
-            .with_metrics(sub, gossipsub::MetricsConfig::default());
+            .with_metrics(sub, gossipsub::MetricsConfig::default())
+            .with_traffic_observer(self.traffic.clone());
             drop(guard);
             self.metrics_registered = true;
             inner
@@ -212,6 +223,7 @@ impl BlossomSubBehaviour {
                 self.config.clone(),
             )
             .expect("valid gossipsub config")
+            .with_traffic_observer(self.traffic.clone())
         };
         self.inner = inner;
         // Enable peer scoring. Two channels are active:

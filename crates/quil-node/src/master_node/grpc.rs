@@ -1662,6 +1662,7 @@ pub(crate) fn spawn_all(
             Box::pin(async move { h.get_peer_score(pid).await })
         }));
     }
+    node_rpc_builder = node_rpc_builder.with_gossip_traffic(p2p_handle.gossip_traffic_counters());
 
     {
         let store = hg_store.clone();

@@ -426,6 +426,30 @@ pub mod bitmasks {
             assert_eq!(shard_cw_addressee(&[0x82, 0xAD, 1, 2]), None, "truncated");
         }
 
+        /// The node's gossip traffic classes follow this module's layouts.
+        #[test]
+        fn gossip_traffic_classes_match_the_bitmask_layouts() {
+            use quil_p2p::GossipClass;
+            let address = [0x5au8; 32];
+            let cw = shard_cw_bitmask(&address);
+            let class = GossipClass::of_bitmask;
+            assert_eq!(class(&cw, &shard_cw_frame_payload(0, b"vote")), GossipClass::Votes);
+            assert_eq!(class(&cw, &shard_cw_frame_for(0, b"vote", &[vec![1u8; 8]])), GossipClass::Votes);
+            for channel in 1..=3 {
+                assert_eq!(class(&cw, &shard_cw_frame_payload(channel, b"cw")), GossipClass::ShardConsensus);
+                assert_eq!(class(&cw, &shard_cw_frame_for(channel, b"cw", &[vec![1u8; 8]])), GossipClass::ShardConsensus);
+            }
+            assert_eq!(class(&shard_frame_bitmask(&address), b"frame"), GossipClass::ShardFrames);
+            assert_eq!(class(&shard_consensus_bitmask(&address), b"vote"), GossipClass::Votes);
+            assert_eq!(class(&shard_prover_bitmask(&address), b"op"), GossipClass::Other);
+            assert_eq!(class(&shard_dispatch_bitmask(&address), b"op"), GossipClass::Other);
+            for global in [GLOBAL_CONSENSUS, GLOBAL_FRAME, GLOBAL_PROVER, GLOBAL_ALERT,
+                GLOBAL_CW_VOTE, GLOBAL_CW_CERT, GLOBAL_CW_RESOLVER, GLOBAL_CW_BLOCK] {
+                assert_eq!(class(global, b"x"), GossipClass::Global, "{}", hex::encode(global));
+            }
+            assert_eq!(class(GLOBAL_PEER_INFO, b"x"), GossipClass::PeerInfo);
+        }
+
         /// A wallet addresses an application, not a shard. Every sub-shard of a
         /// split application must therefore subscribe to the SAME submission
         /// topic the wallet publishes on — the one keyed by the 32-byte app

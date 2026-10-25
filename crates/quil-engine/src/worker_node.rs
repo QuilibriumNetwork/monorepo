@@ -1949,6 +1949,12 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             (None, Some(handle)) => (handle.filter.clone(), Some(handle.execution())),
             (None, None) => (Vec::new(), None),
         };
+        // A standalone worker runs its own swarm: its gossip traffic is not
+        // in the master's.
+        let execution = execution.map(|mut execution| {
+            execution.gossip_traffic = self.worker.worker_p2p.as_ref().map(|p2p| p2p.gossip_traffic().to_proto());
+            execution
+        });
         Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
             filter,
             // A store that refuses writes reads as blocked by it, to the
