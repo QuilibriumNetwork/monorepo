@@ -500,7 +500,7 @@ fn join_reason(worker: &WorkerHealth) -> Option<String> {
 fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
     let blocker = Blocker::try_from(worker.blocker).map_or("unrecognized", diag::blocker_text);
     let waiting = worker.phase == Phase::Waiting as i32;
-    let reason = match (join_reason(worker), worker.awaited_frame) {
+    let mut reason = match (join_reason(worker), worker.awaited_frame) {
         (Some(join), _) if worker.phase == Phase::Joining as i32 => join,
         _ if blocker.is_empty() => "-".into(),
         // Refused only its committee seat, which committed GLOBAL state grants.
@@ -509,6 +509,10 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
         (_, Some(frame)) if waiting => format!("{blocker} (by frame {frame})"),
         _ => blocker.into(),
     };
+    // Above the configured count: the phase stays the engine's.
+    if worker.draining {
+        reason = if reason == "-" { "draining".into() } else { format!("draining; {reason}") };
+    }
     let seal = worker.seal_generation.map_or_else(
         || "-".into(),
         |generation| {
@@ -547,9 +551,15 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         0 => String::new(),
         n => format!(", {n} more not sent (report size bound)"),
     };
+    // Against the configured count, from nodes that report it.
+    let configured = match (report.worker_capacity, report.workers.iter().filter(|w| w.draining).count()) {
+        (0, _) => String::new(),
+        (count, 0) => format!(" of {count} configured"),
+        (count, draining) => format!(" of {count} configured, {draining} draining"),
+    };
     let _ = writeln!(
         out,
-        "Health report of {target}: release {}, build {build}, GLOBAL head frame {}; {} workers{omitted}.",
+        "Health report of {target}: release {}, build {build}, GLOBAL head frame {}; {} workers{configured}{omitted}.",
         release(report),
         report.global_head_frame,
         report.workers.len()
@@ -636,6 +646,7 @@ mod tests {
             workers,
             omitted_workers,
             master_store_write_failed: false,
+            worker_capacity: 0,
         }
     }
 
@@ -740,6 +751,22 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let text = render_report("this node", &report(vec![seat], 0));
         assert!(text.lines().nth(2).unwrap().starts_with("  12  yes    wait   awaiting a committee seat (by frame 919440)  "),
             "{text}");
+    }
+
+    /// A node running more workers than configured names the count and its
+    /// draining workers; their phase stays the engine's.
+    #[test]
+    fn draining_workers_are_counted_against_the_configured_count() {
+        let mut workers = two_workers();
+        workers[1].draining = true;
+        let mut with_count = report(workers, 0);
+        with_count.worker_capacity = 1;
+        let text = render_report("…Ab12cd", &with_count);
+        assert!(text.starts_with("Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame \
+            90001; 2 workers of 1 configured, 1 draining.\n"), "{text}");
+        assert!(text.contains("  blocked  draining; state unavailable"), "{text}");
+        let older = render_report("…Ab12cd", &report(two_workers(), 0));
+        assert!(older.contains("; 2 workers.\n") && !older.contains("draining"), "{older}");
     }
 
     #[test]

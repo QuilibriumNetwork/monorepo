@@ -1917,6 +1917,10 @@ pub(crate) fn spawn_all(
                 if let Some(filter) = filters.iter().find(|filter| filter.len() > MAX_FILTER_LEN) {
                     return Err(format!("filters: a filter of {} bytes; no node decodes one over {MAX_FILTER_LEN}", filter.len()));
                 }
+                if let Some(core_id) = worker_ids.iter().find(|core_id| wm.is_draining(**core_id)) {
+                    return Err(format!("worker {core_id} is above the configured worker count and drains; \
+                        it takes no new seat"));
+                }
                 if !worker_ids.is_empty() {
                     if worker_ids.len() != filters.len() {
                         return Err(format!("worker_ids length ({}) must match filters length ({})", worker_ids.len(), filters.len()));
@@ -1955,19 +1959,25 @@ pub(crate) fn spawn_all(
 
     let workers_view: Arc<std::sync::RwLock<Vec<quil_rpc::WorkerEntry>>> =
         Arc::new(std::sync::RwLock::new(Vec::new()));
+    let worker_capacity: Arc<std::sync::atomic::AtomicU32> = Arc::default();
     {
         let wm = worker_manager.clone();
         let view = workers_view.clone();
+        let capacity = worker_capacity.clone();
         sup.run_until_cancelled("workers-view-refresh", move |_token| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
                 let entries = worker_entries(wm.as_ref());
                 { *view.write().unwrap() = entries; }
+                if let Ok(count) = wm.allocation_capacity() {
+                    capacity.store(u32::try_from(count).unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
+                }
             }
         });
     }
-    node_rpc_builder = node_rpc_builder.with_workers_view(workers_view.clone());
+    node_rpc_builder = node_rpc_builder.with_workers_view(workers_view.clone())
+        .with_worker_capacity(worker_capacity.clone());
 
     struct LocalShardInfoProvider {
         lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
@@ -1989,6 +1999,8 @@ pub(crate) fn spawn_all(
         archive_mode: bool,
         archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
         sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
+        /// The configured worker count, for a leave's inferred reason.
+        worker_capacity: Arc<std::sync::atomic::AtomicU32>,
     }
     impl quil_types::consensus::ShardInfoProvider for LocalShardInfoProvider {
         fn allocation_scoring_strategy(&self) -> &'static str { self.allocation_scoring_strategy }
@@ -2003,12 +2015,12 @@ pub(crate) fn spawn_all(
         {
             let mut result = self.get_shard_info_inner(include_all)?;
             let own = self.registry.get_prover_info(&self.self_address)?;
+            let capacity = self.worker_capacity.load(std::sync::atomic::Ordering::Relaxed) as usize;
             for detail in &mut result.0 {
-                if let Some(a) = own.as_ref().and_then(|p| p.allocations.iter().find(|a| a.confirmation_filter == detail.filter)) {
-                    let joining = a.effective_status(result.3) == quil_types::consensus::EffectiveStatus::Joining;
-                    if joining || a.effective_status(result.3) == quil_types::consensus::EffectiveStatus::Leaving {
-                        detail.allocation_reason = self.lifecycle.allocation_reasons.reason(&detail.filter, joining,
-                            if joining { a.join_frame_number } else { a.leave_frame_number });
+                if let Some(own) = own.as_ref() {
+                    if let Some(a) = own.allocations.iter().find(|a| a.confirmation_filter == detail.filter) {
+                        detail.allocation_reason = self.lifecycle.allocation_reasons
+                            .reason_or_inferred(a, &own.allocations, result.3, capacity);
                     }
                 }
             }
@@ -2265,6 +2277,7 @@ pub(crate) fn spawn_all(
             "reward-greedy"
         } else { "data-greedy" },
         sizes: committed_shard_sizes.clone(),
+        worker_capacity: worker_capacity.clone(),
         registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
         clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         crdt: crdt.clone(),
@@ -2710,8 +2723,12 @@ pub(crate) fn spawn_all(
             ));
             let (view, head, crdt) = (workers_view.clone(), last_global_head_frame.clone(), crdt.clone());
             let registry = prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
-            let source: quil_rpc::diagnostics_service::HealthSource =
-                Arc::new(move || health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address));
+            let capacity = worker_capacity.clone();
+            let source: quil_rpc::diagnostics_service::HealthSource = Arc::new(move || {
+                let mut inputs = health_inputs(&view, &head, &crdt, registry.as_ref(), &prover_address);
+                inputs.worker_capacity = capacity.load(std::sync::atomic::Ordering::Relaxed);
+                inputs
+            });
             let fingerprint = hex::decode(env!("QUIL_BUILD_FINGERPRINT"))
                 .expect("build script emits a SHA-256 fingerprint");
             tonic::service::interceptor::InterceptedService::new(
@@ -2969,6 +2986,7 @@ pub(crate) const ONION_EXIT_METHODS: [&str; 4] = [
 /// shows the store: the lifecycle's renewal reads the engine's own report.
 fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::WorkerEntry> {
     let execution = wm.worker_execution();
+    let draining = wm.draining_workers();
     quil_engine::worker::WorkerView::snapshot(wm)
         .all
         .into_iter()
@@ -2983,6 +3001,7 @@ fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::
             total_storage: w.total_storage,
             manually_managed: w.manually_managed,
             allocated: !w.filter.is_empty(),
+            draining: draining.contains(&w.core_id),
         })
         .collect()
 }
@@ -3025,6 +3044,8 @@ fn health_inputs(
         global_head_frame,
         join_waits,
         master_store_write_failed,
+        // The configured count is the worker manager's; the source sets it.
+        worker_capacity: 0,
     }
 }
 

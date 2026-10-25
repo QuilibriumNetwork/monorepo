@@ -22,7 +22,7 @@ struct State {
 pub struct AllocationReasons(Mutex<State>);
 
 fn valid_reason(reason: &str) -> bool {
-    matches!(reason, "$" | "H" | "S" | "G" | "T" | "E" | "C" | "O" | "M" | "D")
+    matches!(reason, "$" | "H" | "S" | "G" | "T" | "E" | "C" | "O" | "M" | "D" | "W")
 }
 
 impl AllocationReasons {
@@ -74,6 +74,31 @@ impl AllocationReasons {
         Ok(())
     }
 
+    /// The reason of `allocation`'s pending join or leave at `frame`: the
+    /// recorded intent, else, for a leave of a node holding more seats than
+    /// `worker_capacity` (its configured worker count), `W`, worker shortage.
+    /// `W` is inferred from the current counts when no record exists (after
+    /// a store reset, say); it is never recorded.
+    pub fn reason_or_inferred(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame: u64,
+        worker_capacity: usize,
+    ) -> Option<String> {
+        use quil_types::consensus::EffectiveStatus;
+        let joining = match allocation.effective_status(frame) {
+            EffectiveStatus::Joining => true,
+            EffectiveStatus::Leaving => false,
+            _ => return None,
+        };
+        let request = if joining { allocation.join_frame_number } else { allocation.leave_frame_number };
+        self.reason(&allocation.confirmation_filter, joining, request).or_else(|| {
+            let held = allocations.iter().filter(|a| super::draining::holds_seat(a, frame, true)).count();
+            (!joining && worker_capacity > 0 && held > worker_capacity).then(|| "W".to_string())
+        })
+    }
+
     /// A local intent cannot establish a reason for an older request or for a
     /// future epoch's unrelated request. Exact matches take precedence.
     pub fn reason(&self, filter: &[u8], joining: bool, request_frame: u64) -> Option<String> {
@@ -104,5 +129,34 @@ mod tests {
         assert!(reopened.reason(&[9], true, 99).is_none());
         assert!(reopened.reason(&[9], true, 800).is_none());
         assert!(reopened.reason(&[8], true, 101).is_none());
+    }
+
+    /// A leave with no local record reads `W` while the node holds more seats
+    /// than its configured worker count, and unknown otherwise; a record
+    /// wins, a join is never inferred, and `W` is not recorded.
+    #[test]
+    fn a_leave_without_a_record_is_a_worker_shortage_while_seats_exceed_workers() {
+        use quil_types::consensus::{ProverAllocationInfo, ProverStatus};
+        let seat = |filter: u8, status: ProverStatus, frame: u64| ProverAllocationInfo {
+            status, confirmation_filter: vec![filter], join_frame_number: if status == ProverStatus::Joining { frame } else { 1 },
+            leave_frame_number: if status == ProverStatus::Leaving { frame } else { 0 }, epoch: u64::MAX,
+            rejection_filter: vec![], pause_frame_number: 0, resume_frame_number: 0, kick_frame_number: 0,
+            join_confirm_frame_number: 0, join_reject_frame_number: 0, leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0, last_active_frame_number: 0, last_signed_frame_number: 0, ring: 0,
+            vertex_address: vec![],
+        };
+        // After a store reset: 6 Active seats and 3 leaves of a 9 -> 6 downscale.
+        let mut held: Vec<ProverAllocationInfo> = (1..=6).map(|f| seat(f, ProverStatus::Active, 0)).collect();
+        held.extend((7..=9).map(|f| seat(f, ProverStatus::Leaving, 100)));
+        held.push(seat(10, ProverStatus::Joining, 100));
+        let reasons = AllocationReasons::default();
+        assert_eq!(reasons.reason_or_inferred(&held[6], &held, 200, 6).as_deref(), Some("W"));
+        assert_eq!(reasons.reason_or_inferred(&held[6], &held, 200, 9), None, "seats within the count");
+        assert_eq!(reasons.reason_or_inferred(&held[6], &held, 200, 0), None, "count unknown");
+        assert_eq!(reasons.reason_or_inferred(&held[9], &held, 200, 6), None, "a join is not inferred");
+        assert_eq!(reasons.reason_or_inferred(&held[0], &held, 200, 6), None, "an Active seat has no reason");
+        reasons.record(&[vec![7]], false, 100, "C").unwrap();
+        assert_eq!(reasons.reason_or_inferred(&held[6], &held, 200, 6).as_deref(), Some("C"), "the record wins");
+        assert_eq!(reasons.reason(&[8], false, 100), None, "W is never recorded");
     }
 }

@@ -144,6 +144,8 @@ pub struct WorkerEntry {
     pub manually_managed: bool,
     pub allocated: bool,
     pub execution: Option<node::WorkerExecution>,
+    /// Above the configured worker count (`WorkerManager::is_draining`).
+    pub draining: bool,
 }
 
 /// gRPC NodeService implementation with live node state.
@@ -253,6 +255,8 @@ pub struct NodeRpcServer {
     pub send_handler_fn: Option<SendHandler>,
     /// When unset, `peer_score` in `GetNodeInfo` returns 0.
     pub peer_score_provider: Option<PeerScoreProvider>,
+    /// The configured worker count, refreshed with `workers`; 0 unknown.
+    pub worker_capacity: Arc<std::sync::atomic::AtomicU32>,
     pub workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
     /// This process's gossip traffic counters, reported by `GetNodeInfo`.
     pub gossip_traffic: Option<Arc<quil_p2p::GossipTraffic>>,
@@ -351,6 +355,7 @@ impl NodeRpcServer {
             traversal_proof_generator: None,
             send_handler_fn: None,
             peer_score_provider: None,
+            worker_capacity: Arc::default(),
             workers: Arc::new(std::sync::RwLock::new(Vec::new())),
             gossip_traffic: None,
         }
@@ -563,6 +568,11 @@ impl NodeRpcServer {
         self.workers = workers;
         self
     }
+    /// The configured worker count `GetNodeInfo` reports.
+    pub fn with_worker_capacity(mut self, capacity: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        self.worker_capacity = capacity;
+        self
+    }
 }
 
 impl Default for NodeRpcServer {
@@ -699,6 +709,7 @@ impl NodeService for NodeRpcServer {
             // checks above used (`current_frame.effective()`), so the client's
             // epoch matches the one the allocations were evaluated against.
             current_epoch: epoch_for_frame(self.current_frame.effective()),
+            worker_capacity: self.worker_capacity.load(Ordering::Relaxed),
             epoch_length_frames: epoch_length_frames(),
             gossip_traffic: self.gossip_traffic.as_ref().map(|traffic| traffic.snapshot().to_proto()),
         }))
@@ -718,6 +729,7 @@ impl NodeService for NodeRpcServer {
                 total_storage: w.total_storage,
                 manually_managed: w.manually_managed,
                 execution: w.execution.clone(),
+                draining: w.draining,
             })
             .collect();
 
@@ -1972,13 +1984,14 @@ mod worker_execution_tests {
         };
         let server = NodeRpcServer::new().with_workers_view(Arc::new(std::sync::RwLock::new(vec![
             WorkerEntry { core_id: 1, filter: vec![1], available_storage: 0, total_storage: 0,
-                manually_managed: false, allocated: true, execution: Some(observed.clone()) },
+                manually_managed: false, allocated: true, execution: Some(observed.clone()), draining: false },
             WorkerEntry { core_id: 2, filter: vec![2], available_storage: 0, total_storage: 0,
-                manually_managed: false, allocated: true, execution: None },
+                manually_managed: false, allocated: true, execution: None, draining: true },
         ])));
         let response = server.get_worker_info(Request::new(node::GetWorkerInfoRequest {})).await.unwrap().into_inner();
         assert_eq!(response.worker_info[0].execution, Some(observed));
         assert!(response.worker_info[1].execution.is_none());
+        assert_eq!(response.worker_info.iter().map(|w| w.draining).collect::<Vec<_>>(), vec![false, true]);
     }
 }
 

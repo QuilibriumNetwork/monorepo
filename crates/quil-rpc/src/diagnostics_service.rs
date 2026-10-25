@@ -196,6 +196,7 @@ pub fn worker_health(
         core_id: entry.core_id,
         filter: entry.filter.clone(),
         allocated: entry.allocated,
+        draining: entry.draining,
         committee_head_frame: head.map(|head| head.frame),
         committed_generation: head.map(|head| head.generation),
         ..Default::default()
@@ -262,6 +263,8 @@ pub struct HealthInputs {
     pub join_waits: HashMap<Vec<u8>, JoinWait>,
     /// This node's master store refuses writes after a failed write.
     pub master_store_write_failed: bool,
+    /// The configured worker count; 0 unknown.
+    pub worker_capacity: u32,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -276,6 +279,7 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         global_head_frame: inputs.global_head_frame,
         generated_unix_ms: now_ms,
         master_store_write_failed: inputs.master_store_write_failed,
+        worker_capacity: inputs.worker_capacity,
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -620,6 +624,7 @@ mod tests {
             manually_managed: false,
             allocated: !filter.is_empty(),
             execution,
+            draining: false,
         }
     }
 
@@ -810,6 +815,21 @@ mod tests {
         assert!(!report.master_store_write_failed);
         let inputs = HealthInputs { master_store_write_failed: true, ..inputs };
         assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
+    }
+
+    /// The configured count and each worker above it, which drains, are
+    /// reported; the worker's phase stays the engine's.
+    #[test]
+    fn the_configured_count_and_draining_workers_are_reported() {
+        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 2_000, ..Default::default() };
+        let mut above = entry(7, &[7; 32], Some(serving));
+        above.draining = true;
+        let inputs = HealthInputs { workers: vec![entry(1, &[1; 32], None), above], worker_capacity: 6,
+            ..Default::default() };
+        let report = build_report(&inputs, &[], 3_000);
+        assert_eq!(report.worker_capacity, 6);
+        let draining: Vec<(u32, bool, Phase)> = report.workers.iter().map(|w| (w.core_id, w.draining, w.phase())).collect();
+        assert_eq!(draining, vec![(1, false, Phase::Unspecified), (7, true, Phase::Serving)]);
     }
 
     fn noisy_execution() -> WorkerExecution {

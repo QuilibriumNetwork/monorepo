@@ -591,20 +591,33 @@ fn global_alarm_active(m: &Model) -> bool {
 }
 
 fn worker_counts_line(m: &Model) -> Line<'static> {
-    let (automatic, manual) = match m.cached_worker_info.as_ref() {
+    let (automatic, manual, draining) = match m.cached_worker_info.as_ref() {
         Some(info) => {
             let workers: std::collections::HashMap<_, _> = info.worker_info.iter()
-                .map(|w| (w.core_id, w.manually_managed)).collect();
-            let manual = workers.values().filter(|&&manual| manual).count();
-            ((workers.len() - manual).to_string(), manual.to_string())
+                .map(|w| (w.core_id, (w.manually_managed, w.draining))).collect();
+            let manual = workers.values().filter(|(manual, _)| *manual).count();
+            let draining = workers.values().filter(|(_, draining)| *draining).count();
+            ((workers.len() - manual).to_string(), manual.to_string(), draining)
         }
-        None => ("?".into(), "?".into()),
+        None => ("?".into(), "?".into(), 0),
+    };
+    // Against the configured count, which a node that predates it reports as 0.
+    let configured = match (m.worker_capacity, m.compact_actions) {
+        (0, _) => String::new(),
+        (count, true) => format!(" of {count}"),
+        (count, false) => format!(" of {count} configured"),
+    };
+    let draining = match (draining, m.compact_actions) {
+        (0, _) => String::new(),
+        (count, true) => format!(" | drain {count}"),
+        (count, false) => format!(" | draining {count}"),
     };
     if m.compact_actions {
-        Line::from(format!("Workers: run {} | assigned {}{}", m.running_workers, m.allocated_workers,
+        Line::from(format!("Workers: run {}{configured}{draining} | assigned {}{}", m.running_workers, m.allocated_workers,
             if manual == "0" { String::new() } else { format!(" | manual {manual}") }))
     } else {
-        Line::from(format!("Workers: running {} | assigned {} | auto {} | manual {}", m.running_workers, m.allocated_workers, automatic, manual))
+        Line::from(format!("Workers: running {}{configured}{draining} | assigned {} | auto {} | manual {}",
+            m.running_workers, m.allocated_workers, automatic, manual))
     }
 }
 
@@ -846,7 +859,7 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
         Some("S") => ("S", "split"), Some("G") => ("G", "merge"), Some("T") => ("T", "retired"),
         Some("E") => ("E", "empty"), Some("C") => ("C", "capacity"),
         Some("O") => ("O", "orphan"), Some("M") => ("M", "manual"),
-        Some("D") => ("D", "data"), _ => ("?", "unknown"),
+        Some("D") => ("D", "data"), Some("W") => ("W", "worker shortage"), _ => ("?", "unknown"),
     };
     format!("{}({})", a.status_name, if m.compact_actions { symbol } else { name })
 }
@@ -2307,7 +2320,8 @@ fn help_items() -> Vec<HelpItem> {
         sec("Panel header KPIs"),
         kv("KPI separators", "Middle dot `·` separates KPIs; pipe `|` separates the lowercase fields within a KPI"),
         kv("Workers", "This node's workers:"),
-        item("`run` (expanded: `running`): reported workers"),
+        item("`run` (expanded: `running`): reported workers; `of N` (expanded: `of N configured`): the configured worker count, which caps the allocations the node holds"),
+        item("`drain` (expanded: `draining`): workers above the configured count, shown when any. They take no new seat; their seats leave through the surplus leave, lowest reward first, and each stops once it holds none. A seat on a shard at the halt-risk count stays until the shard gains provers (expected wait)"),
         item("`assigned`: workers marked allocated; a binding may outlive its live allocation"),
         item("`auto` / `manual`: workers in each management mode, idle ones included; compact shows only a nonzero `manual`"),
         kv("Status", "Allocations rows by effective protocol status, including unassigned, bound and idle rows; ignores filters. Compact shows nonzero counts only. Compact / expanded labels:"),
@@ -2383,7 +2397,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`bound`: a worker bound to a filter with no live allocation row, usually because a closing session it still belongs to keeps it until that session seals or GLOBAL fences it; it is then released for a waiting allocation. Shown with its local execution, excluded from rewards"),
         item("`idle`: a worker with no filter; every reported worker remains visible alongside unassigned allocations"),
         item("`unknown`: a raw allocation status this client cannot classify"),
-        item("`joining(…)` / `activating(…)` / `leaving(…)` / `departing(…)`: the recorded local reason, a symbol in compact mode and a name in expanded: `$` reward, `H` halt risk, `S` split, `G` merge, `T` retired, `E` empty, `C` capacity, `O` orphan, `M` manual, `D` data, `?` unavailable history; current counts never establish history"),
+        item("`joining(…)` / `activating(…)` / `leaving(…)` / `departing(…)`: the recorded local reason, a symbol in compact mode and a name in expanded: `$` reward, `H` halt risk, `S` split, `G` merge, `T` retired, `E` empty, `C` capacity, `O` orphan, `M` manual, `D` data, `?` unavailable history. `W` worker shortage is not history: the node infers it from its current seat and worker counts (more seats than configured workers) for a leave it holds no local record of, e.g. after a store reset; other current counts never establish history"),
         kv("Mode", "Worker management; ‹Ctrl+O› toggles:"),
         item("`a`: automatic"),
         item("`m`: manual"),
@@ -3868,6 +3882,56 @@ mod tests {
         assert!(help.contains("excluded from rewards"));
     }
 
+    /// A leave the node holds no record of (after a store reset) reads as a
+    /// worker shortage while it holds more seats than configured workers.
+    #[test]
+    fn a_leave_inferred_from_a_worker_shortage_renders_as_w() {
+        let mut m = Model::new(); m.data_loaded = true;
+        m.running_workers = 6; m.allocated_workers = 6; m.worker_capacity = 6;
+        m.allocations = (1..=9u8).map(|i| {
+            let mut a = row(&format!("{:064x}", 0x9000800 + u32::from(i)), 10, 1_000_000, if i <= 6 { i64::from(i) } else { -1 }, "", "");
+            if i <= 6 { a.status = 2; a.status_name = "active".into(); }
+            else { a.status = 4; a.status_name = "leaving".into(); a.allocation_reason = Some("W".into()); }
+            a
+        }).collect();
+        let compact = render_text(&mut m, 160, 24);
+        assert_eq!(compact.matches("leaving(W)").count(), 3, "{compact}");
+        m.compact_actions = false;
+        let leaving = m.allocations[8].clone();
+        assert_eq!(allocation_status_text(&m, &leaving), "leaving(worker shortage)");
+        let expanded = render_text(&mut m, 200, 24);
+        assert!(expanded.contains("leaving(worker shortage)"), "{expanded}");
+    }
+
+    /// A node running more workers than configured shows the configured
+    /// count and, while any drain, the draining workers; a node that predates
+    /// the configured count keeps the old line.
+    #[test]
+    fn worker_header_names_the_configured_count_and_draining_workers() {
+        use quil_types::proto::node::{WorkerInfo, WorkerInfoResponse};
+        let mut m = Model::new(); m.compact_actions = false; m.compact_units = false; m.data_loaded = true;
+        m.running_workers = 9; m.allocated_workers = 9; m.worker_capacity = 6;
+        let workers = |running: u32, configured: u32| WorkerInfoResponse { worker_info: (1..=running).map(|core_id|
+            WorkerInfo { core_id, filter: vec![core_id as u8; 32], draining: core_id > configured, ..Default::default() })
+            .collect() };
+        m.cached_worker_info = Some(workers(9, 6));
+        assert_eq!(worker_counts_line(&m).to_string(),
+            "Workers: running 9 of 6 configured | draining 3 | assigned 9 | auto 9 | manual 0");
+        let expanded = render_text(&mut m, 160, 12);
+        assert!(expanded.contains("Workers: running 9 of 6 configured | draining 3 | assigned 9"), "{expanded}");
+        m.compact_actions = true;
+        assert_eq!(worker_counts_line(&m).to_string(), "Workers: run 9 of 6 | drain 3 | assigned 9");
+        let compact = render_text(&mut m, 100, 12);
+        assert!(compact.contains("Workers: run 9 of 6 | drain 3 | assigned 9"), "{compact}");
+        m.running_workers = 6; m.allocated_workers = 6; m.cached_worker_info = Some(workers(6, 6));
+        assert_eq!(worker_counts_line(&m).to_string(), "Workers: run 6 of 6 | assigned 6");
+        m.worker_capacity = 0;
+        assert_eq!(worker_counts_line(&m).to_string(), "Workers: run 6 | assigned 6");
+        let help = help_body().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        assert!(help.contains("drain (expanded: draining): workers above the configured count"), "{help}");
+        assert!(help.contains("stays until the shard gains provers (expected wait)"));
+    }
+
     #[test]
     fn worker_header_separates_assignment_activity_and_individual_modes() {
         use quil_types::proto::node::{WorkerInfo, WorkerInfoResponse};
@@ -4716,7 +4780,7 @@ mod compact_action_tests {
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         for status in ["joining", "leaving"] {
             a.status_name = status.into();
-            for (symbol, name) in [("$", "reward"), ("H", "halt risk"), ("S", "split"), ("G", "merge"), ("T", "retired"), ("E", "empty"), ("C", "capacity"), ("O", "orphan"), ("M", "manual"), ("D", "data")] {
+            for (symbol, name) in [("$", "reward"), ("H", "halt risk"), ("S", "split"), ("G", "merge"), ("T", "retired"), ("E", "empty"), ("C", "capacity"), ("O", "orphan"), ("M", "manual"), ("D", "data"), ("W", "worker shortage")] {
                 a.allocation_reason = Some(symbol.into());
                 assert_eq!(allocation_status_text(&m, &a), format!("{status}({symbol})"));
                 super::super::update::handle_key(&mut m, key('n'));
