@@ -27,7 +27,22 @@ pub struct VerifiedFrame {
 }
 
 fn invalid(message: &str) -> QuilError {
-    QuilError::InvalidSignature(format!("app session certificate: {message}"))
+    QuilError::InvalidSignature(format!("{CERTIFICATE_REFUSED}{message}"))
+}
+
+const CERTIFICATE_REFUSED: &str = "app session certificate: ";
+
+/// Why a frame whose generation the state read holds no session for is
+/// refused.
+const UNAUTHORIZED_GENERATION: &str = "generation has no authorization";
+
+/// Whether `error` refused a frame because the state it was verified against
+/// holds no session for its generation ([`verify`], [`verify_history`],
+/// [`verify_discarded_base_frame`]). Unlike the other refusals, which the
+/// session decides, a later GLOBAL frame can still authorize that generation.
+pub fn unauthorized_generation(error: &QuilError) -> bool {
+    matches!(error, QuilError::InvalidSignature(message)
+        if message.strip_prefix(CERTIFICATE_REFUSED) == Some(UNAUTHORIZED_GENERATION))
 }
 
 /// `None` permits the explicitly legacy, generation-zero verifier only when
@@ -76,7 +91,7 @@ pub fn verify_discarded_base_frame(
         return Err(invalid("a legacy frame attests no session base"));
     }
     let session = session_at_generation(state, claim.filter, generation)?
-        .ok_or_else(|| invalid("generation has no authorization"))?;
+        .ok_or_else(|| invalid(UNAUTHORIZED_GENERATION))?;
     let certificate = quil_cw_consensus::app_cert::check_finalization(
         bytes, &session.members, &session.namespace()?, claim.digest,
     )
@@ -116,7 +131,7 @@ fn verify_with(
             || manages_application(state, claim.filter)?
             || head(state, claim.filter)?.is_some()
         {
-            return Err(invalid("generation has no authorization"));
+            return Err(invalid(UNAUTHORIZED_GENERATION));
         }
         return Ok(None);
     };

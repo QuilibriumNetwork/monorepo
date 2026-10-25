@@ -278,6 +278,9 @@ pub enum Refusal {
     RankFull,
     /// A shard frame failed verification against committed state.
     InvalidShardFrame,
+    /// A shard frame waits for GLOBAL execution to reach its anchor, and the
+    /// frames this node holds for its shard while they wait are at their cap.
+    AwaitingExecution,
 }
 
 impl Refusal {
@@ -287,12 +290,13 @@ impl Refusal {
             Self::UnknownShard => "shard frame address not in this node's committed shard set",
             Self::RankFull => "rank buffer full",
             Self::InvalidShardFrame => "shard frame failed verification",
+            Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, and its shard's waiting frames are at their cap",
         }
     }
 
     /// The same message may be accepted later: the submitter should retry.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::RankFull)
+        matches!(self, Self::RankFull | Self::AwaitingExecution)
     }
 }
 
@@ -305,6 +309,9 @@ pub enum ShardFrameVerdict {
     Invalid(String),
     /// Committed state cannot judge it now; it may be valid later.
     Unavailable(String),
+    /// As [`Self::Unavailable`], but not held: the frames held for its shard
+    /// are at their cap. The submitter may retry.
+    Full(String),
 }
 
 /// Verifies the shard frames of a bundle ([`MessageCollector::set_shard_frame_verifier`]).
@@ -755,6 +762,10 @@ impl MessageCollector {
                         }
                         ShardFrameVerdict::Unavailable(reason) => {
                             tracing::debug!(%reason, "message collector: shard frame not verifiable now; held unverified");
+                        }
+                        ShardFrameVerdict::Full(reason) => {
+                            tracing::debug!(%reason, "message collector: shard frame not verifiable now and its shard's held frames are at their cap");
+                            return SubmitOutcome::Filtered(Refusal::AwaitingExecution);
                         }
                     }
                 }

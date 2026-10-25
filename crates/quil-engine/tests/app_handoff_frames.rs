@@ -472,6 +472,215 @@ async fn historical_certificate_reaches_archive_and_global_admission_after_commi
     );
 }
 
+/// Frame `number` of `session` at `view`, extending `parent` (certified at
+/// `parent_view`), anchored to GLOBAL frame `anchor` whose output is
+/// `anchor_output`, certified by `keys` under the session's generation.
+#[allow(clippy::too_many_arguments)]
+fn anchored_frame(
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    number: u64,
+    view: u64,
+    parent_view: u64,
+    parent: Vec<u8>,
+    anchor: u64,
+    anchor_output: &[u8],
+) -> AppShardFrame {
+    let mut header = FrameHeader {
+        address: session.filter.clone(),
+        frame_number: number,
+        rank: view,
+        difficulty: 1,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        global_frame_number: anchor,
+        parent_selector: parent,
+        requests_root: vec![0; 32],
+        state_roots: vec![vec![0; 32]; 4],
+        ..Default::default()
+    };
+    header.output = quil_crypto::porep::deterministic_app_frame_output(
+        &header.parent_selector,
+        &header.requests_root,
+        &header.state_roots,
+        &quil_crypto::porep::derive_storage_beacon(anchor, anchor_output),
+        header.frame_number,
+        header.rank,
+        &header.prover,
+        header.difficulty,
+        header.fee_multiplier_vote,
+        header.timestamp,
+        &header.storage_attestation_root,
+        0,
+        &header.settlements,
+        &header.accumulator,
+        &header.spends,
+    );
+    let certificate = sign(
+        session,
+        keys,
+        header.rank,
+        parent_view,
+        quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
+    );
+    header.public_key_signature_bls48581 = Some(Bls48581AggregateSignature {
+        signature: wrap_cert_for_header(&certificate),
+        ..Default::default()
+    });
+    AppShardFrame {
+        header: Some(header),
+        ..Default::default()
+    }
+}
+
+/// The first frame of `session`, anchored as [`anchored_frame`].
+fn anchored_first_frame(
+    session: &Session,
+    keys: &[FalconPrivateKey],
+    anchor: u64,
+    anchor_output: &[u8],
+) -> AppShardFrame {
+    let number = session.base_frame + 1;
+    anchored_frame(session, keys, number, 5, 0, session.genesis.to_vec(), anchor, anchor_output)
+}
+
+/// Store GLOBAL frame `number` with `output`, without executing it.
+fn store_global_frame(fixture: &Fixture, number: u64, output: &[u8]) {
+    use quil_types::store::ClockStore as _;
+    let txn = fixture.clock.new_transaction(false).unwrap();
+    fixture
+        .clock
+        .put_global_clock_frame(
+            &quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: output.to_vec(),
+                    ..Default::default()
+                }),
+                requests: Vec::new(),
+            },
+            txn.as_ref(),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+/// An archive whose GLOBAL execution trails its stored head verifies a frame
+/// against executed state, which does not hold the session a later GLOBAL
+/// frame authorized. A frame anchored past executed state that names its
+/// shard's next generation waits for execution to reach its anchor instead
+/// of being refused, and is admitted once it does; a frame naming any other
+/// generation, or that no session authorizes by then, is refused.
+#[test]
+fn a_frame_anchored_past_executed_global_state_waits_for_execution() {
+    use quil_engine::archive_ingest::FrameCheck;
+    let keys = keys();
+    let authorized = session(&keys, vec![0x63; 32]);
+    let unauthorized = session(&keys, vec![0x64; 32]);
+    let fixture = Fixture::new(&authorized);
+    // GLOBAL frame 2 is stored; execution is at frame 1.
+    let anchor_output = vec![0x42; 32];
+    store_global_frame(&fixture, 2, &anchor_output);
+    let frame = anchored_first_frame(&authorized, &keys, 2, &anchor_output);
+    let stranger = anchored_first_frame(&unauthorized, &keys, 2, &anchor_output);
+    let far = anchored_first_frame(&Session { generation: 9, ..authorized.clone() }, &keys, 2, &anchor_output);
+    let archive = fixture.archive();
+    let verifier = archive.verifier();
+    assert_eq!(
+        verifier.check(&frame),
+        FrameCheck::AwaitExecution { anchor: 2, executed: 1 }
+    );
+    assert_eq!(
+        verifier.check(&stranger),
+        FrameCheck::AwaitExecution { anchor: 2, executed: 1 },
+        "unknown until GLOBAL frame 2 executes"
+    );
+    assert_eq!(
+        verifier.check(&far),
+        FrameCheck::Refused,
+        "not the shard's next generation, which GLOBAL frames not yet executed could authorize"
+    );
+
+    // GLOBAL frame 2 executes and authorizes the session.
+    handoff::initialize(&fixture.state, 2, &authorized).unwrap();
+    commit(&fixture.state, 2);
+    assert_eq!(verifier.check(&frame), FrameCheck::Admit { certified: true });
+    assert_eq!(
+        verifier.check(&stranger),
+        FrameCheck::Refused,
+        "still unauthorized once execution reached its anchor"
+    );
+}
+
+/// A forged header naming a shard's next generation and anchored past
+/// executed GLOBAL state waits for execution, through ingest as through the
+/// gap fetch, but cannot hold back the GLOBAL frame that needs the shard's
+/// real frame at its height: that frame is asked for at once. A forged header
+/// naming any other generation is refused, so it does not wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_frame_waiting_for_execution_does_not_hold_back_global_execution() {
+    let keys = keys();
+    let authorized = session(&keys, vec![0x65; 32]);
+    let fixture = Fixture::new(&authorized);
+    handoff::initialize(&fixture.state, 2, &authorized).unwrap();
+    commit(&fixture.state, 2);
+    // GLOBAL frame 3 is stored; execution is at frame 2.
+    let anchor_output = vec![0x43; 32];
+    store_global_frame(&fixture, 3, &anchor_output);
+    let (gap_tx, mut gap_rx) = tokio::sync::mpsc::channel(64);
+    let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(64);
+    let mut archive = fixture
+        .archive()
+        .with_gap_fetch(gap_tx)
+        .with_prefetch(prefetch_tx)
+        .sequenced();
+    let drain = |rx: &mut tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>| {
+        let mut frames = Vec::new();
+        while let Ok((_, number)) = rx.try_recv() {
+            frames.push(number);
+        }
+        frames
+    };
+    // The archive holds the shard's first frame.
+    let first = first_frame(&authorized, &keys);
+    archive.ingest(&prost::Message::encode_to_vec(&first));
+    assert!(archive.materialize_through(&authorized.filter, 1).unwrap());
+    assert_eq!(fixture.cursor(&authorized.filter), 1);
+    drain(&mut gap_rx);
+    drain(&mut prefetch_rx);
+    let parent = quil_crypto::poseidon::hash_bytes_to_32(&first.header.as_ref().unwrap().output)
+        .unwrap()
+        .to_vec();
+
+    // A forged frame 2 names generation 2, which no GLOBAL frame executed so
+    // far authorized; it is anchored to GLOBAL frame 3.
+    let successor = Session { generation: 2, ..authorized.clone() };
+    let forged = anchored_frame(&successor, &keys, 2, 7, 5, parent.clone(), 3, &anchor_output);
+    archive.ingest(&prost::Message::encode_to_vec(&forged));
+    assert_eq!(archive.prefetch_through(&authorized.filter, 2).unwrap(), 0, "the forged frame waits");
+    assert!(drain(&mut prefetch_rx).is_empty());
+    assert!(!archive.materialize_through(&authorized.filter, 2).unwrap());
+    assert_eq!(drain(&mut gap_rx), vec![2], "the GLOBAL frame waiting for frame 2 asks for it at once");
+
+    // The gap fetch does not count a frame that waits as recovered.
+    let ingest = std::sync::Mutex::new(archive);
+    let verifier = ingest.lock().unwrap().verifier();
+    assert_eq!(
+        quil_engine::archive_ingest::admit_fetched(&ingest, &verifier, &authorized.filter, vec![forged]),
+        quil_engine::archive_ingest::FetchedFrames::AwaitsExecution { anchor: 3, executed: 2 }
+    );
+    let mut archive = ingest.into_inner().unwrap();
+
+    // A forged frame 3 naming generation 9 is refused, not parked.
+    let far = Session { generation: 9, ..authorized.clone() };
+    let refused = anchored_frame(&far, &keys, 3, 9, 7, vec![0x77; 32], 3, &anchor_output);
+    archive.ingest(&prost::Message::encode_to_vec(&refused));
+    archive.prefetch_through(&authorized.filter, 3).unwrap();
+    assert_eq!(drain(&mut prefetch_rx), vec![3], "asked for as any missing frame");
+}
+
 /// A sealed session's last headers can miss their lockstep window for good,
 /// and GLOBAL accepts a seal only at its executed tip (#699). The seal brings
 /// them: GLOBAL checks each against the session and executes it, from the
