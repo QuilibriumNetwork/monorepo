@@ -21,7 +21,8 @@
 #                     floor(2N/3)+1 (N=1→1, N=2→2, N=3→3, N=4→3).
 #   REGULARS=3        number of regular (non-archive) nodes
 #   CORES=3           dataWorkerCount per regular node (worker threads)
-#   PROFILE=release   cargo build profile (release|debug)
+#   PROFILE=release   cargo build profile: release, debug, or the name of a
+#                     custom profile from Cargo.toml (e.g. devnet)
 #   NET_DIR=path      isolated directory for this test network
 #   SKIP_BUILD=1      use binaries already built from the intended source tree
 #   NETWORK=1         network id (1 = primary testnet; non-0, non-99)
@@ -216,9 +217,12 @@ TARGET_DIR="${TARGET_DIR:-$ROOT/target}"
 if [[ "$PROFILE" == "release" ]]; then
   BIN="$TARGET_DIR/release/quil-node"
   CARGO_FLAGS="--release"
-else
+elif [[ "$PROFILE" == "debug" ]]; then
   BIN="$TARGET_DIR/debug/quil-node"
   CARGO_FLAGS=""
+else
+  BIN="$TARGET_DIR/$PROFILE/quil-node"
+  CARGO_FLAGS="--profile $PROFILE"
 fi
 
 # Common flags. Source builds aren't signed, so signature check is off.
@@ -283,6 +287,7 @@ write_archive_config() {
 key:
   keyManagerFile:
     path: "$dir/keys.yml"
+    createIfMissing: true
 p2p:
   network: $NETWORK
   peerPrivKey: "$peerkey"
@@ -352,11 +357,11 @@ write_regular_config() {
   # rejects every gossiped frame as "BLS signature INVALID". COMMITTEE_HEX /
   # COMMITTEE_PID are set in the archive pass (identical on every node).
   local committee_yaml=" []" committee_pid_yaml=" []" _c
-  if (( ${#COMMITTEE_HEX[@]:-0} > 0 )); then
+  if (( ${#COMMITTEE_HEX[@]} > 0 )); then
     committee_yaml=""
     for _c in "${COMMITTEE_HEX[@]}"; do committee_yaml+=$'\n    - "'"$_c"'"'; done
   fi
-  if (( ${#COMMITTEE_PID[@]:-0} > 0 )); then
+  if (( ${#COMMITTEE_PID[@]} > 0 )); then
     committee_pid_yaml=""
     for _c in "${COMMITTEE_PID[@]}"; do committee_pid_yaml+=$'\n    - "'"$_c"'"'; done
   fi
@@ -364,6 +369,7 @@ write_regular_config() {
 key:
   keyManagerFile:
     path: "$dir/keys.yml"
+    createIfMissing: true
 p2p:
   network: $NETWORK
   peerPrivKey: "$peerkey"

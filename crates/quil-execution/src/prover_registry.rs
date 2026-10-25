@@ -228,6 +228,7 @@ impl InMemoryProverRegistry {
     /// blob`. The commitment tree blob holds only topology + per-node
     /// commitments and is not consulted here.
     pub fn refresh(&mut self, hg_store: &dyn HypergraphStore) -> QuilResult<()> {
+        crate::test_hooks::registry_load_delay();
         self.refresh_with_limits(hg_store, RegistryLimits::UNBOUNDED)
     }
 
