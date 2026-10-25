@@ -46,6 +46,7 @@ pub mod prover_update_materialize;
 pub mod prover_verify;
 pub mod reassignment;
 pub mod seniority_merge;
+pub mod seniority_succession;
 pub mod sig_with_pop;
 pub mod verify;
 

@@ -2546,6 +2546,20 @@ fn decode_prover(vertex_key: &[u8], root: &VectorCommitmentNode) -> Option<Prove
     })
 }
 
+/// Decode the allocation vertex tree stored at `address` in the GLOBAL
+/// domain as the registry does: `(parent_prover_address, allocation_info)`,
+/// `None` when it is not a well-formed allocation.
+pub fn decode_allocation_tree(
+    address: &[u8; 32],
+    tree: &quil_tries::VectorCommitmentTree,
+) -> Option<(Vec<u8>, ProverAllocationInfo)> {
+    let root = tree.root.as_ref()?;
+    let mut vertex_key = Vec::with_capacity(64);
+    vertex_key.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+    vertex_key.extend_from_slice(address);
+    decode_allocation(&vertex_key, root)
+}
+
 /// Decode an `allocation:ProverAllocation` vertex. Returns
 /// `(parent_prover_address, allocation_info)`.
 fn decode_allocation(

@@ -193,7 +193,10 @@ pub fn peek_global_message_kind(input: &[u8]) -> Result<MessageKindGlobal> {
         TYPE_PROVER_KICK => Ok(MessageKindGlobal::ProverKick),
         TYPE_PROVER_UPDATE => Ok(MessageKindGlobal::ProverUpdate),
         TYPE_FRAME_HEADER => Ok(MessageKindGlobal::Shard),
-        TYPE_SENIORITY_MERGE => Ok(MessageKindGlobal::SeniorityMerge),
+        // The outer op's own prefix (see `is_global_type_prefix_at`).
+        TYPE_SENIORITY_MERGE | crate::global_intrinsic::TYPE_PROVER_SENIORITY_MERGE => {
+            Ok(MessageKindGlobal::SeniorityMerge)
+        }
         TYPE_SHARD_SPLIT => Ok(MessageKindGlobal::ShardSplit),
         TYPE_SHARD_MERGE => Ok(MessageKindGlobal::ShardMerge),
         TYPE_COMMITTEE_HANDOFF => Ok(MessageKindGlobal::CommitteeHandoff),
@@ -274,6 +277,19 @@ pub fn is_global_type_prefix(tp: u32) -> bool {
             | TYPE_COMMITTEE_HANDOFF
             | TYPE_PRESENCE_REPORT
     )
+}
+
+/// [`is_global_type_prefix`] at GLOBAL frame `frame`. A
+/// `ProverSeniorityMerge` carries `TYPE_PROVER_SENIORITY_MERGE` (0x031A),
+/// not `TYPE_SENIORITY_MERGE` (0x0310, the prefix of its inner target
+/// records), so GLOBAL validation and execution skipped every seniority
+/// merge as a non-global request. From the seniority succession epoch they
+/// reach the global intrinsic; before it they stay skipped, as every node
+/// running an earlier build skips them.
+pub fn is_global_type_prefix_at(tp: u32, frame: u64) -> bool {
+    is_global_type_prefix(tp)
+        || (tp == crate::global_intrinsic::TYPE_PROVER_SENIORITY_MERGE
+            && quil_types::consensus::seniority_succession_active(frame))
 }
 
 // =====================================================================

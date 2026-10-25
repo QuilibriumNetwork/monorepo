@@ -384,6 +384,78 @@ pub fn epoch_for_frame(frame_number: u64) -> u64 {
     frame_number / epoch_length_frames()
 }
 
+/// The epoch from which a `ProverSeniorityMerge` follows the seniority
+/// succession rules: an Ed448 node key whose spent markers name another,
+/// idle prover can move that prover's seniority to the prover submitting
+/// the merge, a merge must raise the submitter's seniority, a merge may
+/// name targets the submitter itself consumed, and a rejoin keeps the
+/// prover's `LastSeniorityFrameNumber`. Consensus-affecting: every archive
+/// and prover must run a build with it before then. A proposal: `None`
+/// keeps mainnet on the earlier rules until the maintainer sets the epoch.
+/// `QUIL_SENIORITY_SUCCESSION_EPOCH` elsewhere, never by default.
+pub const MAINNET_SENIORITY_SUCCESSION_EPOCH: Option<u64> = None;
+
+/// Frames a predecessor must stay without any recorded activity before a
+/// succession can move its seniority, on mainnet: two epochs. After one
+/// epoch every allocation missed a re-confirm and reads as `ExpiredEpoch`;
+/// the second lets `ALLOCATION_GRACE_FRAMES` lapse for a joining or leaving
+/// allocation, and gives whoever holds the predecessor's prover key a full
+/// epoch to contest the move by participating, which moves its last
+/// activity. A proposal, like the activation epoch.
+pub const SENIORITY_SUCCESSION_QUIET_FRAMES: u64 = 2 * EPOCH_LENGTH_FRAMES;
+
+/// The quiet period in frames on this network: two epochs of its length
+/// ([`SENIORITY_SUCCESSION_QUIET_FRAMES`] on mainnet).
+pub fn seniority_succession_quiet_frames() -> u64 {
+    2 * epoch_length_frames()
+}
+
+static SENIORITY_SUCCESSION_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SENIORITY_SUCCESSION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seniority_succession_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seniority succession epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_seniority_succession_epoch(network: u8) -> u64 {
+    *SENIORITY_SUCCESSION_EPOCH.get_or_init(|| {
+        seniority_succession_epoch_for(
+            network,
+            std::env::var("QUIL_SENIORITY_SUCCESSION_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_seniority_succession_epoch`]; the mainnet epoch
+/// in a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn seniority_succession_epoch() -> u64 {
+    if let Some(epoch) = SENIORITY_SUCCESSION_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SENIORITY_SUCCESSION_EPOCH.get_or_init(|| seniority_succession_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` applies the seniority succession rules.
+pub fn seniority_succession_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= seniority_succession_epoch()
+}
+
+/// Set the seniority succession epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_seniority_succession_epoch_for_thread(epoch: Option<u64>) {
+    SENIORITY_SUCCESSION_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -1614,5 +1686,40 @@ mod committee_handoff_policy_tests {
         .unwrap();
         assert_eq!((drill.activation_frame, drill.legacy_history), (9, LegacyHistory::Discard));
         assert_ne!(drill.chain_id, mainnet.chain_id);
+    }
+}
+
+#[cfg(test)]
+mod seniority_succession_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_seniority_succession_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::seniority_succession_epoch_for(0, setting),
+                super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX));
+        }
+        assert_eq!(super::seniority_succession_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::seniority_succession_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::seniority_succession_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mode selection hangs on this: inert while unset, from the first frame
+    /// of the activation epoch once set.
+    #[test]
+    fn succession_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_seniority_succession_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::seniority_succession_active(u64::MAX - 1), "inert while unset");
+        super::set_seniority_succession_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::seniority_succession_active(first - 1));
+        assert!(super::seniority_succession_active(first));
+        super::set_seniority_succession_epoch_for_thread(None);
+        assert_eq!(super::seniority_succession_epoch(),
+            super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX));
+    }
+
+    #[test]
+    fn the_quiet_period_is_two_epochs() {
+        assert_eq!(super::SENIORITY_SUCCESSION_QUIET_FRAMES, 1_440);
+        assert_eq!(super::seniority_succession_quiet_frames(), 2 * super::epoch_length_frames());
     }
 }
