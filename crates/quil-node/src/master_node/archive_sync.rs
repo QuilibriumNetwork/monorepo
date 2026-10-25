@@ -2496,6 +2496,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     "startup: re-materializing CRDT gap [cursor+1..=head] \
                                      (crash between clock-head and CRDT commit)"
                                 );
+                                let mut catch_up = quil_engine::global_catch_up::CatchUp::default();
                                 for n in (durable_cursor + 1)..=canonical_head {
                                     let frame = match cs.get_global_frame(n) {
                                         Ok(f) => f,
@@ -2536,6 +2537,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             break;
                                         }
                                     }
+                                    catch_up.observe_and_log(
+                                        std::time::Instant::now(),
+                                        n - 1,
+                                        canonical_head,
+                                        m.execution_counts(),
+                                    );
                                     // Mirror the live worker: refresh halt
                                     // durations before each materialize so the
                                     // eviction step is gated identically.
@@ -2545,13 +2552,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         use quil_engine::frame_materializer::{
                                             CanonicalAttempt,
                                         };
-                                        match canonical_atomic_attempts(&m, &frame) {
-                                            CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed => continue,
-                                            CanonicalAttempt::Unavailable(error) => info!(
+                                        match canonical_atomic_attempts(&m, &frame, catch_up.atomic_attempts()) {
+                                            Some(CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed) => continue,
+                                            Some(CanonicalAttempt::Unavailable(error)) => info!(
                                                 frame = n,
                                                 %error,
                                                 "startup: canonical GLOBAL frame not executable atomically; executing in place"
                                             ),
+                                            None => {}
                                         }
                                     }
                                     if let Err(e) = m.materialize(&frame) {
@@ -2564,6 +2572,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         );
                                         break;
                                     }
+                                    catch_up.record_in_place();
                                 }
                                 info!(
                                     cursor = m.last_materialized_frame(),
@@ -2986,6 +2995,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // also retries on a timer without a new signal.
                             let mut target = 0u64;
                             let mut retry: Option<std::time::Duration> = None;
+                            let catch_up = std::sync::Arc::new(std::sync::Mutex::new(
+                                quil_engine::global_catch_up::CatchUp::default(),
+                            ));
                             loop {
                                 let signal = match retry.take() {
                                     Some(delay) => match tokio::time::timeout(delay, rx.recv()).await {
@@ -3016,7 +3028,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 let sizes_for_merge = sizes_for_merge.clone();
                                 let shards_store_for_merge = shards_store_for_merge.clone();
                                 let registry_for_merge = registry_for_merge.clone();
+                                let catch_up = catch_up.clone();
                                 let outcome = tokio::task::spawn_blocking(move || {
+                                    let mut catch_up = catch_up.lock().unwrap_or_else(|p| p.into_inner());
+                                    // The freshest GLOBAL frame this node has evidence of.
+                                    // An inflated head only starts a catch-up early:
+                                    // frames then execute in place, as every frame
+                                    // did before atomic execution; none is skipped.
+                                    let head = || cf.effective().max(target);
+                                    // A consensus finalization the pipeline handed to
+                                    // the legacy path after its own attempts (or with
+                                    // none allowed): its canonical record executes in
+                                    // place directly, not after three more attempts.
+                                    let mut handed_over: Option<u64> = None;
                                     // Leader-gated shard-split rebalance trigger:
                                     // only the producer of THIS frame proposes,
                                     // matching Go's `frameProver` gate (exactly one
@@ -3075,6 +3099,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // height and `target` does not bound the pass.
                                     loop {
                                         let next = m.last_materialized_frame() + 1;
+                                        catch_up.observe_and_log(
+                                            std::time::Instant::now(),
+                                            next - 1,
+                                            head(),
+                                            m.execution_counts(),
+                                        );
                                         if pipeline.is_none() && next > target {
                                             break Ok(None);
                                         }
@@ -3109,7 +3139,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 // supplies; the branch captures it.
                                                 m.set_coverage_halt_durations(cov.check(next));
                                                 use quil_engine::global_finalization::FinalizationStep;
-                                                match pipeline.step(next) {
+                                                let attempts = catch_up.atomic_attempts();
+                                                match pipeline.step_within(next, attempts) {
                                                     FinalizationStep::Published { frame, result } => {
                                                         // Consumed bundles leave the mempool
                                                         // only after publication.
@@ -3125,7 +3156,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     }
                                                     // Now canonical; the legacy branch below
                                                     // materializes it on the next iteration.
-                                                    FinalizationStep::Legacy => continue,
+                                                    FinalizationStep::Legacy => {
+                                                        if attempts == 0 || pipeline.attempted(next) {
+                                                            handed_over = Some(next);
+                                                        }
+                                                        continue;
+                                                    }
                                                     FinalizationStep::Retry(delay) => break Ok(Some(delay)),
                                                     FinalizationStep::Idle => break Ok(None),
                                                 }
@@ -3135,7 +3171,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // The application frames this frame rewards
                                         // must be ingested first, on every path.
                                         if let Some(ingest) = ingest.as_ref() {
-                                            match ingest(&frame) {
+                                            let ready = ingest(&frame);
+                                            catch_up.note_ingest(std::time::Instant::now(), matches!(ready, Ok(true)));
+                                            match ready {
                                                 Ok(true) => {}
                                                 Ok(false) => break Ok(Some(std::time::Duration::from_secs(1))),
                                                 Err(error) => {
@@ -3157,8 +3195,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             use quil_engine::frame_materializer::{
                                                 CanonicalAttempt,
                                             };
-                                            match canonical_atomic_attempts(&m, &frame) {
-                                                CanonicalAttempt::Published(result) => {
+                                            let attempts = if handed_over == Some(frame_number) {
+                                                0
+                                            } else {
+                                                catch_up.atomic_attempts()
+                                            };
+                                            match canonical_atomic_attempts(&m, &frame, attempts) {
+                                                Some(CanonicalAttempt::Published(result)) => {
                                                     if !result.consumed_bundles.is_empty() {
                                                         mc.mark_finalized(&result.consumed_bundles);
                                                     }
@@ -3178,14 +3221,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     rebalance(&frame, frame_number);
                                                     continue;
                                                 }
-                                                CanonicalAttempt::Replayed => continue,
-                                                CanonicalAttempt::Unavailable(error) => {
+                                                Some(CanonicalAttempt::Replayed) => continue,
+                                                Some(CanonicalAttempt::Unavailable(error)) => {
                                                     tracing::info!(
                                                         frame = frame_number,
                                                         %error,
                                                         "canonical GLOBAL frame not executable atomically; executing in place"
                                                     );
                                                 }
+                                                // Trailing the head: counted by the
+                                                // catch-up progress line.
+                                                None => {}
                                             }
                                         }
                                         match m.materialize(&frame) {
@@ -3197,6 +3243,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     mc.mark_finalized(&result.finalized_bundles);
                                                 }
                                                 if m.last_materialized_frame() >= frame_number {
+                                                    catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
@@ -4897,29 +4944,27 @@ mod validation_tests {
     }
 }
 
-/// Atomic GLOBAL finalization is on unless `QUIL_GLOBAL_ATOMIC_FINALIZATION`
-/// is `0`, `false` or `off`.
-/// Execute a canonical GLOBAL record atomically, retrying a failed attempt:
-/// most failures are commit conflicts with concurrent writers (application
-/// ingest, the poller), which were heavy during a live catch-up and sent every
-/// early frame to the in-place path. Matches the finalization pipeline's
-/// three attempts before its legacy fallback.
+/// Execute a canonical GLOBAL record atomically, retrying a failed attempt up
+/// to `attempts` times: most failures are commit conflicts with concurrent
+/// writers (application ingest, the poller). `attempts` comes from
+/// [`quil_engine::global_catch_up::CatchUp::atomic_attempts`]: three near
+/// the head, none during a catch-up, where those writers made nearly every
+/// attempt fail. `None`: none was made.
 fn canonical_atomic_attempts(
     m: &quil_engine::frame_materializer::FrameMaterializer,
     frame: &quil_types::proto::global::GlobalFrame,
-) -> quil_engine::frame_materializer::CanonicalAttempt {
-    use quil_engine::frame_materializer::{CanonicalAttempt, GlobalParentLimits};
-    let limits = GlobalParentLimits::default().branch.for_finalized_frame();
-    let mut attempt = m.materialize_canonical_atomically(frame, limits);
-    for _ in 1..3 {
-        if !matches!(attempt, CanonicalAttempt::Unavailable(_)) {
-            break;
-        }
-        attempt = m.materialize_canonical_atomically(frame, limits);
-    }
-    attempt
+    attempts: u32,
+) -> Option<quil_engine::frame_materializer::CanonicalAttempt> {
+    let limits = quil_engine::frame_materializer::GlobalParentLimits::default()
+        .branch
+        .for_finalized_frame();
+    quil_engine::global_catch_up::attempt_atomically(attempts, || {
+        m.materialize_canonical_atomically(frame, limits)
+    })
 }
 
+/// Atomic GLOBAL finalization is on unless `QUIL_GLOBAL_ATOMIC_FINALIZATION`
+/// is `0`, `false` or `off`.
 fn atomic_global_finalization_enabled() -> bool {
     !matches!(
         std::env::var("QUIL_GLOBAL_ATOMIC_FINALIZATION")

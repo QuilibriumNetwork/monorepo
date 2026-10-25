@@ -1438,6 +1438,19 @@ fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: 
     }
 }
 
+/// How [`SharedProverRegistry::catch_up`] left the registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryCatchUp {
+    /// No registry row was written since its scan.
+    Current,
+    /// Re-read the rows of this many addresses.
+    Updated { rows: usize },
+    /// Read every row again.
+    Refreshed,
+    /// Not a canonical registry built from rows; left as it was.
+    Skipped,
+}
+
 /// no-op because the trait doesn't know which store to read from.
 #[derive(Clone)]
 pub struct SharedProverRegistry {
@@ -1600,6 +1613,15 @@ impl SharedProverRegistry {
         Ok(registry)
     }
 
+    /// Whether [`Self::for_execution_capture`] of a view at `capture` would
+    /// copy this registry instead of reading every prover row again. A busy
+    /// registry is skipped there, so it does not seed here either.
+    pub fn seeds(&self, capture: &CapturePoint) -> bool {
+        self.inner
+            .try_read()
+            .is_ok_and(|source| source.reproduces(capture, RegistryLimits::UNBOUNDED))
+    }
+
     /// `limits` as headroom above the committed registry this one comes
     /// from: a branch registry's own bound, or this canonical registry's
     /// usage. A busy canonical registry leaves `limits` as they are.
@@ -1751,6 +1773,66 @@ impl SharedProverRegistry {
             }
         }
         self.refresh_from_store(store)
+    }
+
+    /// Bring this canonical registry up to the prover rows `store` holds now
+    /// by re-reading only the rows written since its last scan, as
+    /// `written_since(database, sequence)` lists them (see
+    /// [`quil_forest::CoordinatedDb::watched_writes_since`]); read every row
+    /// again when they cannot be listed or an update cannot reproduce a
+    /// refresh. The result is what [`Self::refresh_from_store`] would leave,
+    /// and its scan is current, so a capture now copies it.
+    ///
+    /// A cache edited directly (eviction) is read again in full. A registry
+    /// without a row scan (built from the legacy tree) or bound to an
+    /// execution branch is left as it is.
+    pub fn catch_up(
+        &self,
+        store: &dyn HypergraphStore,
+        written_since: impl FnOnce(u64, u64) -> Option<Vec<Vec<u8>>>,
+    ) -> QuilResult<RegistryCatchUp> {
+        if self.execution_binding.is_some() {
+            return Ok(RegistryCatchUp::Skipped);
+        }
+        let before = self.snapshot_local_prover();
+        let outcome = {
+            let mut guard = self.inner.write()
+                .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+            let Some(scan) = guard.scanned else {
+                return Ok(RegistryCatchUp::Skipped);
+            };
+            // Taken before listing: a write between the two is listed and
+            // re-read at this snapshot, and leaves the new scan stale.
+            let snapshot = store.capture_tree_snapshot()?.ok_or_else(|| {
+                QuilError::Store("prover registry requires a consistent store snapshot".into())
+            })?;
+            let point = snapshot.scan_point().filter(|point| point.database == scan.database);
+            let written = point
+                .and_then(|_| written_since(scan.database, scan.from))
+                .map(registry_rows::rows_of_keys);
+            // An edited cache may differ from its rows even where none changed.
+            let updated = match (point, &written) {
+                _ if guard.diverged || guard.rows.is_none() => None,
+                (Some(point), Some(written)) if written.is_empty() => Some((point, RegistryCatchUp::Current)),
+                (Some(point), Some(written)) => guard
+                    .update_rows(snapshot.as_ref(), written, RegistryLimits::UNBOUNDED)?
+                    .then_some((point, RegistryCatchUp::Updated { rows: written.len() })),
+                _ => None,
+            };
+            match updated {
+                Some((point, outcome)) => {
+                    guard.scanned = Some(point);
+                    outcome
+                }
+                None => {
+                    guard.refresh_from_snapshot(snapshot.as_ref())?;
+                    RegistryCatchUp::Refreshed
+                }
+            }
+        };
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(outcome)
     }
 
     /// Read the LOCAL prover's `ProverInfo` (if any), keyed by the

@@ -283,10 +283,15 @@ pub(super) struct Written {
 /// The registry rows `overlay` wrote, by address; `None` when a range
 /// deletion reaches them, so they cannot be listed.
 pub(super) fn written_rows(overlay: &quil_forest::ExecutionOverlay) -> Option<BTreeMap<[u8; 32], Written>> {
+    let all = quil_store::encoding::prover_registry_key_prefixes();
+    Some(rows_of_keys(overlay.written_keys_under(&all)?))
+}
+
+/// The registry rows, by address and phase, that writes of `keys` changed.
+pub(super) fn rows_of_keys(keys: impl IntoIterator<Item = Vec<u8>>) -> BTreeMap<[u8; 32], Written> {
     let prefixes = quil_store::encoding::prover_registry_row_prefixes();
-    let all: Vec<Vec<u8>> = prefixes.iter().map(|(_, prefix)| prefix.clone()).collect();
     let mut written: BTreeMap<[u8; 32], Written> = BTreeMap::new();
-    for key in overlay.written_keys_under(&all)? {
+    for key in keys {
         for (phase, prefix) in &prefixes {
             let Some(address) = key.get(prefix.len()..prefix.len() + 32).filter(|_| key.starts_with(prefix)) else {
                 continue;
@@ -299,7 +304,7 @@ pub(super) fn written_rows(overlay: &quil_forest::ExecutionOverlay) -> Option<BT
             }
         }
     }
-    Some(written)
+    written
 }
 
 /// One address's rows after the update: `Some` for a phase it re-read.

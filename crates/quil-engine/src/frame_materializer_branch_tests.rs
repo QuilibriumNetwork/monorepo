@@ -1215,3 +1215,99 @@ fn startup_recovers_an_unfinished_execution_by_its_cursor() {
         Err(QuilError::ExecutionUnavailable(message)) if message.contains("restart to recover")));
     assert!(pending(&fixture).is_some());
 }
+
+/// In-place execution reads the prover rows written since the canonical
+/// registry's last scan, as an atomic capture would, without reading every
+/// row again. Until then a capture would read them all, which an archive
+/// catching up skips.
+#[test]
+fn in_place_execution_catches_the_registry_up_with_rows_written_since_its_scan() {
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let fixture = Fixture::new(Some(&key));
+    let source = &fixture.source;
+    let registry = source
+        .prover_registry
+        .as_any()
+        .and_then(|r| r.downcast_ref::<ConcreteProverRegistry>())
+        .unwrap()
+        .clone();
+    // Past this epoch's refresh, which would read every row anyway.
+    source
+        .last_eviction_pass_epoch
+        .store(quil_types::consensus::epoch_for_frame(1), Ordering::SeqCst);
+    assert!(source.capture_would_seed(), "the registry was read at startup");
+    // A prover row written beside the registry, as an in-place frame writes.
+    let tree = quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(&[0xcd; 57], 0).unwrap();
+    let mut vertex = vec![0xff; 32];
+    vertex.extend_from_slice(&[7; 32]);
+    fixture
+        .store
+        .save_vertex_underlying(
+            "vertex",
+            "adds",
+            &quil_store::encoding::prover_registry_shard(),
+            &vertex,
+            &quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+        )
+        .unwrap();
+    assert!(!source.capture_would_seed());
+    assert!(registry.read(|r| r.get_prover_info(&[7; 32]).is_none()));
+
+    let root = source.hypergraph.current_forest_phase_root(&[0xff; 32], 0).unwrap();
+    source.materialize(&frame(1, root)).unwrap();
+    assert_eq!(source.last_materialized_frame(), 1);
+    assert!(
+        registry.read(|r| r.get_prover_info(&[7; 32]).is_some()),
+        "the row was read before the frame executed"
+    );
+    assert_eq!(source.execution_counts().registry_reads, 0, "without reading every row");
+    assert!(source.capture_would_seed(), "the rows the frame wrote were taken in after it");
+}
+
+/// A shard's GLOBAL venue route depends on its active committee count, which
+/// a confirm written earlier in the epoch changes. In-place execution counts
+/// what an atomic capture counts, not the registry as the epoch began.
+#[test]
+fn in_place_execution_routes_by_the_committee_an_atomic_capture_sees() {
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let fixture = Fixture::new(Some(&key));
+    let source = &fixture.source;
+    let registry = source
+        .prover_registry
+        .as_any()
+        .and_then(|r| r.downcast_ref::<ConcreteProverRegistry>())
+        .unwrap()
+        .clone();
+    let shard = [9u8; 32];
+    let floor = quil_execution::token_intrinsic::constants::min_active_provers_for_shard_frames(
+        source.execution_manager.pricing_network(),
+    );
+    let seed = || {
+        let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+        crate::genesis::seed_active_prover_on_filter(&source.hypergraph, &key, 1000, 0, &shard).unwrap();
+    };
+    for _ in 1..floor {
+        seed();
+    }
+    registry.refresh_from_store(fixture.store.as_ref()).unwrap();
+    source
+        .last_eviction_pass_epoch
+        .store(quil_types::consensus::epoch_for_frame(1), Ordering::SeqCst);
+    assert!(source.shard_is_uncovered(&shard, 1), "one prover short of producing its own frames");
+
+    // Confirmed earlier in the epoch, by a frame executed in place.
+    seed();
+    let root = source.hypergraph.current_forest_phase_root(&[0xff; 32], 0).unwrap();
+    source.hypergraph.record_prover_root(0, root.to_vec());
+    let branch = source.capture_execution_branch(limits()).unwrap();
+    assert!(!branch.materializer.shard_is_uncovered(&shard, 1), "a capture counts the new member");
+    assert!(source.shard_is_uncovered(&shard, 1), "the registry as the epoch began does not");
+
+    // What an in-place frame does before executing.
+    source.catch_up_registry(1);
+    assert_eq!(
+        source.shard_is_uncovered(&shard, 1),
+        branch.materializer.shard_is_uncovered(&shard, 1)
+    );
+    assert_eq!(source.execution_counts().registry_reads, 0, "without reading every row");
+}

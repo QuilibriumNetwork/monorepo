@@ -218,6 +218,11 @@ pub struct FrameMaterializer {
     /// falls back to the legacy size-blind behavior.
     shard_size_source:
         Option<Arc<dyn Fn() -> std::collections::HashMap<Vec<u8>, u64> + Send + Sync>>,
+    /// Atomic publications, failed attempts, slow captures and full registry
+    /// reads since start, for the catch-up progress line.
+    execution_counters: crate::global_catch_up::ExecutionCounters,
+    /// Registry catch-ups failed in a row, to bound their warnings.
+    registry_catch_up_failures: AtomicU64,
 }
 
 /// Frame at and after which inactive-prover eviction actually mutates
@@ -279,6 +284,11 @@ impl FrameMaterializer {
         prover_address: Vec<u8>,
         archive_mode: bool,
     ) -> Self {
+        // The registry catch-up around in-place frames lists the prover rows
+        // written since its last scan from this journal; started here, writes
+        // between startup and the first frame need no full read. A branch's
+        // forest has no database of its own, so this is a no-op there.
+        hypergraph.enable_watched_journal();
         Self {
             frame_execution: std::sync::Mutex::new(()),
             tentative_execution: false,
@@ -314,6 +324,8 @@ impl FrameMaterializer {
             frame_prover: None,
             bls: None,
             shard_size_source: None,
+            execution_counters: Default::default(),
+            registry_catch_up_failures: AtomicU64::new(0),
         }
     }
 
@@ -503,6 +515,11 @@ impl FrameMaterializer {
             }
         }
         self.apply_bound_maintenance(&forest_guard, frame_number)?;
+        // Execute with the prover rows written since the registry's last scan,
+        // as a capture would (forest, then registry, as the eviction refresh).
+        if !self.tentative_execution {
+            self.catch_up_registry(frame_number);
+        }
         // Signature cache entries are pure byte-input results, but every exit
         // (including an unavailable branch) must release this frame's cache.
         struct ClearPreverified<'a>(Option<&'a Arc<dyn quil_types::crypto::FrameProver>>);
@@ -1508,6 +1525,12 @@ impl FrameMaterializer {
             // the racy live forest. Single source of truth, network-identical.
             self.hypergraph.record_prover_root(frame_number, mroot);
         }
+        // Take in the rows this frame wrote, so the next capture (a proposal,
+        // a vote or an atomic attempt) copies the registry instead of reading
+        // every prover row again (~10 s on a mainnet archive).
+        if !self.tentative_execution {
+            self.catch_up_registry(frame_number);
+        }
 
         info!(
             frame = frame_number,
@@ -2025,6 +2048,78 @@ impl FrameMaterializer {
     /// The last materialized frame number.
     pub fn last_materialized_frame(&self) -> u64 {
         self.last_materialized_frame.load(Ordering::SeqCst)
+    }
+
+    /// Whether an atomic capture now would copy the canonical prover registry
+    /// rather than read every prover row through the branch again (~10 s on
+    /// a mainnet archive): no prover row was written since the registry's
+    /// last scan, catch-up or publication.
+    pub fn capture_would_seed(&self) -> bool {
+        let Some(registry) = self
+            .prover_registry
+            .as_any()
+            .and_then(|r| r.downcast_ref::<ConcreteProverRegistry>())
+        else {
+            return false;
+        };
+        self.hypergraph
+            .current_capture_point()
+            .is_some_and(|point| registry.seeds(&point))
+    }
+
+    /// Canonical atomic execution work since start.
+    pub fn execution_counts(&self) -> crate::global_catch_up::ExecutionCounts {
+        self.execution_counters.counts()
+    }
+
+    /// Bring the canonical registry up to the prover rows in the store, before
+    /// an in-place frame executes and after it commits. It was otherwise
+    /// refreshed only at epoch boundaries and by atomic publications, while
+    /// the committee counts execution reads (the GLOBAL venue route below
+    /// three active provers, the leave-confirm halt check) change within an
+    /// epoch with confirms, leaves, pauses and kicks; and a capture after an
+    /// in-place frame read every prover row again. Only the rows written
+    /// since the registry's last scan are read. A failure leaves the registry
+    /// as it was, as before this step existed.
+    fn catch_up_registry(&self, frame_number: u64) {
+        let Some(registry) = self
+            .prover_registry
+            .as_any()
+            .and_then(|r| r.downcast_ref::<ConcreteProverRegistry>())
+        else {
+            return;
+        };
+        // Rows of another store cannot be listed; reading them all for every
+        // frame would cost more than the staleness this removes.
+        if self.hypergraph_store.backing_store_identity() != self.hypergraph.backing_store_identity() {
+            return;
+        }
+        let caught_up = registry.catch_up(self.hypergraph_store.as_ref(), |database, sequence| {
+            self.hypergraph.watched_writes_since(database, sequence)
+        });
+        match caught_up {
+            Ok(outcome) => {
+                if outcome == quil_execution::prover_registry::RegistryCatchUp::Refreshed {
+                    self.execution_counters.registry_read();
+                }
+                let failures = self.registry_catch_up_failures.swap(0, Ordering::Relaxed);
+                if failures > 0 {
+                    info!(frame = frame_number, failures, "prover registry catch-up recovered");
+                }
+            }
+            // The first failure, then one line per 100 in a row.
+            Err(error) => {
+                let failures = self.registry_catch_up_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if failures % 100 == 1 {
+                    warn!(
+                        frame = frame_number,
+                        failures,
+                        %error,
+                        "prover registry catch-up around in-place GLOBAL execution failed; executing with the registry as last read"
+                    );
+                }
+            }
+        }
     }
 
     /// Re-seed `prover_root_by_frame[last_materialized]` from the LIVE forest root.
