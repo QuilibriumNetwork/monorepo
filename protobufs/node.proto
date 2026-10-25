@@ -739,6 +739,9 @@ message ConfidentialCoin {
   // committed content address.
   uint64 position = 6;
 }
+// An empty root_record answers a fresh scan of an application that has no
+// coin root: no confidential coin exists in it yet. Such a page has no
+// coins, no cursor and has_more false; every other page carries the root.
 message ListCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;

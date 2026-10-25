@@ -645,7 +645,7 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
 
     #[cfg(feature = "confidential-tokens")]
     fn coin_page(&self, domain: &[u8; 32], snapshot_id: Option<&[u8; 32]>, after: Option<&[u8; 32]>) -> quil_types::error::Result<Option<quil_types::store::CoinPageData>> {
-        use quil_execution::token_intrinsic::{state::network_identifier, scan::scan_page};
+        use quil_execution::token_intrinsic::{state::network_identifier, scan::{scan_wallet_page, unrooted_coins_error, WalletPage}};
         use quil_types::{error::QuilError, store::{CoinPageData, CoinData, VertexPageLimits}};
         if after.is_some() && snapshot_id.is_none() {
             return Err(QuilError::InvalidArgument("coin scan continuation requires snapshot identity".into()));
@@ -655,13 +655,20 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
         let local = self.worker_states(domain);
         if local.len() > 1 {
             let network = network_identifier(self.network);
+            // Whether a store without a root held a coin: the scan then cannot
+            // answer that the application has none.
+            let unrooted_coins = std::cell::Cell::new(false);
             let (id, root, coins, cursor, has_more) = composite_page(&self.composite_scans, Self::local_crdts(local), snapshot_id, after, |_, snapshot, after| {
-                let page = match scan_page(snapshot, &network, domain, after,
+                let page = match scan_wallet_page(snapshot, &network, domain, after,
                     VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 }) {
-                    Ok(page) => page,
+                    Ok(WalletPage::Page(page)) => page,
                     // A store that has received no root (a sub-shard this node
                     // only just joined) holds no coin the network recognizes:
                     // it adds nothing to the scan rather than failing all of it.
+                    Ok(rootless) => {
+                        unrooted_coins.set(unrooted_coins.get() || matches!(rootless, WalletPage::UnrootedCoins));
+                        return Ok(StorePage { entries: Vec::new(), cursor: None, has_more: false, root_record: None });
+                    }
                     Err(QuilError::NotFound(_)) => return Ok(StorePage {
                         entries: Vec::new(), cursor: None, has_more: false, root_record: None,
                     }),
@@ -671,10 +678,17 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
                     .map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?.to_vec();
                 Ok(StorePage { entries: page.coins, cursor: page.cursor, has_more: page.has_more, root_record: Some(root_record) })
             })?;
+            let root_record = match root {
+                Some(root) => root,
+                None if unrooted_coins.get() => return Err(unrooted_coins_error()),
+                // No store has a root or a coin: the answer a single store
+                // gives for an application without confidential coins.
+                None if after.is_none() && coins.is_empty() && !has_more => Vec::new(),
+                None => return Err(QuilError::NotFound("coin scan: no root in snapshot".into())),
+            };
             return Ok(Some(CoinPageData {
                 network, snapshot_id: id,
-                // No store has a root: the same answer a single rootless store gives.
-                root_record: root.ok_or_else(|| QuilError::NotFound("coin scan: no root in snapshot".into()))?,
+                root_record,
                 coins: coins.into_iter().map(|(address, coin)| CoinData {
                     address, frame_number: coin.frame_number, position: coin.position, owner: coin.output.owner.to_vec(),
                     commitment: coin.output.commitment.to_bytes().to_vec(), memo: coin.output.memo.to_vec(),
@@ -685,8 +699,17 @@ impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
         let generation = self.crdt_for(domain).acquire_or_capture_scan_snapshot(snapshot_id)?
             .ok_or_else(|| QuilError::NotFound("coin scan snapshot unavailable or expired; restart scan".into()))?;
         let network = network_identifier(self.network);
-        let result = scan_page(generation.db_snapshot.as_ref().unwrap().as_ref(), &network, domain, after,
-            VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 })?;
+        let result = match scan_wallet_page(generation.db_snapshot.as_ref().unwrap().as_ref(), &network, domain, after,
+            VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 })? {
+            WalletPage::Page(page) => page,
+            // No confidential coin exists in the application yet: one empty,
+            // final page without a root answers the scan.
+            WalletPage::NoRoot => return Ok(Some(CoinPageData {
+                network, snapshot_id: generation.scan_id.unwrap(), root_record: Vec::new(),
+                coins: Vec::new(), cursor: None, has_more: false,
+            })),
+            WalletPage::UnrootedCoins => return Err(unrooted_coins_error()),
+        };
         Ok(Some(CoinPageData {
             network, snapshot_id: generation.scan_id.unwrap(),
             root_record: result.root.encode().map_err(|e| QuilError::Internal(format!("coin scan root: {e:?}")))?.to_vec(),

@@ -6,7 +6,8 @@ use quil_types::proto::node::{
 };
 use tonic::transport::Channel;
 
-pub(super) async fn claimable_rewards(tc: &TokenCtx) -> String {
+/// The claimable rewards line, and whether the reward read succeeded.
+pub(super) async fn claimable_rewards(tc: &TokenCtx) -> (String, bool) {
     // Rewards are GLOBAL state held by the configured node. --read-rpc may
     // name a worker holding application coins, so it is not used for this read.
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -16,7 +17,8 @@ pub(super) async fn claimable_rewards(tc: &TokenCtx) -> String {
     })
     .await
     .unwrap_or_else(|_| Err(anyhow::anyhow!("reward query timed out")));
-    format_claimable_rewards(result)
+    let read = result.is_ok();
+    (format_claimable_rewards(result), read)
 }
 
 pub(crate) async fn read_claimable_rewards(
@@ -52,6 +54,39 @@ fn format_claimable_rewards(result: anyhow::Result<Option<(u128, u64)>>) -> Stri
         ),
         Ok(None) => "Claimable prover rewards: unavailable (no claimable reward witness returned)".into(),
         Err(error) => format!("Claimable prover rewards: unavailable ({error})"),
+    }
+}
+
+/// The `token balance` line for this identity's unshielded legacy coins:
+/// `(total, unshielded, shielded)`, or `None` without an Ed448 identity.
+pub(super) fn format_legacy_coins(result: anyhow::Result<Option<(u128, usize, usize)>>) -> String {
+    match result {
+        Ok(Some((total, unshielded, shielded))) => format!(
+            "Unshielded legacy coins: {total} base units across {unshielded} coins ({shielded} already shielded)"
+        ),
+        Ok(None) => "Unshielded legacy coins: none (this node has no Ed448 identity)".into(),
+        Err(error) => format!("Unshielded legacy coins: unavailable ({})", reason(&error)),
+    }
+}
+
+/// The `token balance` line for confidential coins: `(total, coins)`, or
+/// `None` when the node answers that the application has no coin root yet.
+pub(super) fn format_confidential_coins(result: anyhow::Result<Option<(u128, usize)>>, quil: bool) -> String {
+    match result {
+        Ok(Some((total, coins))) => format!(
+            "Confidential coins: {total} base units across {coins} coins reported unspent by the configured node (not a finalized balance)"
+        ),
+        Ok(None) if quil => "Confidential QUIL coins: none exist on the network yet (no QUIL root published)".into(),
+        Ok(None) => "Confidential coins: none exist in this application yet (no root published)".into(),
+        Err(error) => format!("Confidential coins: unavailable ({})", reason(&error)),
+    }
+}
+
+/// A refusal's own message rather than tonic's whole status dump.
+fn reason(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<tonic::Status>() {
+        Some(status) => status.message().to_string(),
+        None => format!("{error:#}"),
     }
 }
 

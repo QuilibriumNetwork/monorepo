@@ -164,10 +164,11 @@ pub type RemoteVertex = Arc<
         + Sync,
 >;
 
-/// Forwards one coin-scan page to a node holding the application.
+/// Forwards one coin-scan page to a node holding the application. `Err`
+/// carries the asked peers' reasons for declining, for the wallet's status.
 pub type RemoteCoinPage = Arc<
     dyn Fn([u8; 32], Option<[u8; 32]>, Option<[u8; 32]>)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<quil_types::store::CoinPageData>> + Send>>
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<quil_types::store::CoinPageData, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -905,14 +906,24 @@ impl NodeService for NodeRpcServer {
                 .ok_or_else(|| Status::unimplemented("coin scan is not enabled"))?
         } else {
             let remote = self.remote_coin_page.as_ref().ok_or_else(|| self.coverage_error(&domain))?;
-            remote(domain, snapshot_id, after).await.ok_or_else(|| Status::unavailable(format!(
-                "no node serving application {} answered this node", hex::encode(domain)
+            // The peers' own reasons travel with the refusal, so the wallet
+            // learns why its node could not read the application.
+            remote(domain, snapshot_id, after).await.map_err(|reasons| Status::unavailable(format!(
+                "no node serving application {} answered this node: {reasons}", hex::encode(domain)
             )))?
         };
+        // An empty root record answers a scan of an application without any
+        // coin root: no confidential coin exists in it yet. It is valid only
+        // as a fresh scan's single page, empty and final.
+        let root_valid = if page.root_record.is_empty() {
+            snapshot_id.is_none() && page.coins.is_empty() && !page.has_more && page.cursor.is_none()
+        } else {
+            page.root_record.len() == ROOT_RECORD_BYTES
+                && page.root_record.get(..8) == Some(b"QCT3RT\0\x02".as_slice())
+                && page.root_record.get(40).is_some_and(|depth| (1..=32).contains(depth))
+        };
         if snapshot_id.is_some_and(|id| id != page.snapshot_id)
-            || page.root_record.len() != ROOT_RECORD_BYTES
-            || page.root_record.get(..8) != Some(b"QCT3RT\0\x02".as_slice())
-            || !page.root_record.get(40).is_some_and(|depth| (1..=32).contains(depth))
+            || !root_valid
             || page.coins.len() > 8
             || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
             || page.cursor < after {
@@ -1707,6 +1718,59 @@ mod witness_tests {
         }
         let disabled = NodeRpcServer::new().with_coin_witness_provider(Arc::new(Provider { enabled: false, bad_path: false, bad_root: false }));
         assert_eq!(disabled.list_coins(request(vec![], vec![])).await.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    /// QUIL before its first confidential coin has no root anywhere (#698):
+    /// the scan's one page is empty, final and rootless, and that is an
+    /// answer rather than a malformed page. Only there is a page rootless.
+    #[tokio::test]
+    async fn a_rootless_page_ends_a_fresh_scan_empty() {
+        struct Rootless {
+            coins: u8,
+            has_more: bool,
+        }
+        impl CoinWitnessProvider for Rootless {
+            fn coin_page(&self, _: &[u8; 32], _: Option<&[u8; 32]>, _: Option<&[u8; 32]>) -> quil_types::error::Result<Option<CoinPageData>> {
+                Ok(Some(CoinPageData {
+                    network: [0; 32], snapshot_id: [7; 32], root_record: Vec::new(),
+                    coins: (1..=self.coins).map(|i| CoinData {
+                        address: [i; 32], frame_number: 1, position: 0, owner: vec![0; IDENTITY_BYTES],
+                        commitment: vec![0; 10368], memo: vec![0; 1115],
+                    }).collect(),
+                    cursor: (self.coins > 0 || self.has_more).then_some([8; 32]),
+                    has_more: self.has_more,
+                }))
+            }
+        }
+        let request = |snapshot_id: Vec<u8>, after: Vec<u8>| Request::new(node::ListCoinsRequest {
+            domain: vec![1; 32], snapshot_id, after,
+        });
+        let server = |coins, has_more| NodeRpcServer::new().with_coin_witness_provider(Arc::new(Rootless { coins, has_more }));
+        let page = server(0, false).list_coins(request(vec![], vec![])).await.unwrap().into_inner();
+        assert!(page.root_record.is_empty() && page.coins.is_empty() && page.cursor.is_empty() && !page.has_more);
+        assert_eq!(page.snapshot_id, vec![7; 32]);
+        for (coins, has_more) in [(1, false), (0, true)] {
+            assert_eq!(server(coins, has_more).list_coins(request(vec![], vec![])).await.unwrap_err().code(),
+                tonic::Code::Internal, "coins={coins} has_more={has_more}");
+        }
+        assert_eq!(server(0, false).list_coins(request(vec![7; 32], vec![9; 32])).await.unwrap_err().code(),
+            tonic::Code::Internal, "a continuation cannot lose its root");
+    }
+
+    /// A node that does not hold the application forwards the scan; when
+    /// every asked peer declines, their reasons reach the wallet (#698).
+    #[tokio::test]
+    async fn a_forwarded_scan_refusal_names_the_peers_reasons() {
+        let reasons = "4 peers declined: 4x Unavailable: coin scan: no root in snapshot";
+        let remote: RemoteCoinPage = Arc::new(move |_, _, _| Box::pin(async move { Err(reasons.to_string()) }));
+        let server = NodeRpcServer::new()
+            .with_application_coverage(Arc::new(|_: &[u8]| false))
+            .with_remote_coin_page(remote);
+        let status = server.list_coins(Request::new(node::ListCoinsRequest {
+            domain: vec![1; 32], snapshot_id: Vec::new(), after: Vec::new(),
+        })).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().ends_with(reasons), "{}", status.message());
     }
 
     fn request(addresses: Vec<Vec<u8>>) -> Request<node::GetCoinWitnessesRequest> {
