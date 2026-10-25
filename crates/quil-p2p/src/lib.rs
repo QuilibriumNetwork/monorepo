@@ -8,6 +8,7 @@ pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod external_addr;
+pub mod gossip_traffic;
 pub mod handler;
 pub mod metrics;
 pub mod node;
@@ -32,6 +33,7 @@ pub use falcon_identity::{
 };
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
 pub use direct::{DirectOutcome, DirectStatsSnapshot};
+pub use gossip_traffic::{ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind};
 pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{

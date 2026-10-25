@@ -68,6 +68,13 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     );
     println!("Reachable:          {}", info.reachable);
 
+    let worker_info = client
+        .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
+        .await
+        .map(|response| response.into_inner().worker_info);
+    let workers_listed = worker_info.as_deref().unwrap_or_default();
+    println!("\n{}", super::gossip_traffic::render(info.gossip_traffic.as_ref(), workers_listed));
+
     if info.shard_allocations.is_empty() {
         println!("\nNo shard allocations");
         return Ok(());
@@ -131,14 +138,10 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     // Also display worker info.
-    if let Ok(worker_info) = client
-        .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
-        .await
-    {
-        let worker_info = worker_info.into_inner();
-        if !worker_info.worker_info.is_empty() {
-            println!("\nWorkers ({}):", worker_info.worker_info.len());
-            for w in &worker_info.worker_info {
+    if let Ok(worker_info) = worker_info {
+        if !worker_info.is_empty() {
+            println!("\nWorkers ({}):", worker_info.len());
+            for w in &worker_info {
                 println!(
                     "  Core {}: Filter: {}  Storage: {} / {}",
                     w.core_id,

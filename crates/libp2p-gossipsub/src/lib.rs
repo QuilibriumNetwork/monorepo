@@ -110,6 +110,7 @@ mod rpc_proto;
 mod subscription_filter;
 mod time_cache;
 mod topic;
+mod traffic;
 mod transform;
 mod types;
 
@@ -130,6 +131,7 @@ pub use self::{
         WhitelistSubscriptionFilter,
     },
     topic::{Hasher, Topic, TopicHash},
+    traffic::{TrafficKind, TrafficObserver},
     transform::{DataTransform, IdentityTransform},
     types::{FailedMessages, Message, MessageAcceptance, MessageId, RawMessage},
 };

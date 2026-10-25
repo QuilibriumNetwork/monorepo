@@ -254,6 +254,8 @@ pub struct NodeRpcServer {
     /// When unset, `peer_score` in `GetNodeInfo` returns 0.
     pub peer_score_provider: Option<PeerScoreProvider>,
     pub workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
+    /// This process's gossip traffic counters, reported by `GetNodeInfo`.
+    pub gossip_traffic: Option<Arc<quil_p2p::GossipTraffic>>,
 }
 
 /// Async closure returning the local node's peer-score as `f64`. The
@@ -350,6 +352,7 @@ impl NodeRpcServer {
             send_handler_fn: None,
             peer_score_provider: None,
             workers: Arc::new(std::sync::RwLock::new(Vec::new())),
+            gossip_traffic: None,
         }
     }
 
@@ -527,6 +530,10 @@ impl NodeRpcServer {
         self.metrics_renderer = Some(renderer);
         self
     }
+    pub fn with_gossip_traffic(mut self, traffic: Arc<quil_p2p::GossipTraffic>) -> Self {
+        self.gossip_traffic = Some(traffic);
+        self
+    }
     pub fn with_worker_control(mut self, ctl: Arc<dyn WorkerControl>) -> Self {
         self.worker_control = Some(ctl);
         self
@@ -693,6 +700,7 @@ impl NodeService for NodeRpcServer {
             // epoch matches the one the allocations were evaluated against.
             current_epoch: epoch_for_frame(self.current_frame.effective()),
             epoch_length_frames: epoch_length_frames(),
+            gossip_traffic: self.gossip_traffic.as_ref().map(|traffic| traffic.snapshot().to_proto()),
         }))
     }
 
