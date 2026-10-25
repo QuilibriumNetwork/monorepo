@@ -384,6 +384,7 @@ message GetVertexDataResponse {
 
 message GetHyperedgeDataRequest {
   bytes address = 1;  // 64-byte hyperedge ID (32-byte app address + 32-byte data address)
+  bool full_data = 2; // When true, return the serialized tree in raw_data
 }
 
 message GetHyperedgeDataResponse {
@@ -392,6 +393,7 @@ message GetHyperedgeDataResponse {
   string phase_type = 3;  // "adds"
   bytes shard_l1 = 4;     // ShardKey.L1 (3 bytes)
   bytes shard_l2 = 5;     // ShardKey.L2 (32 bytes)
+  bytes raw_data = 6;     // Serialized tree when full_data requested
 }
 
 message CreateTraversalProofRequest {

@@ -1942,10 +1942,18 @@ impl ProverLifecycle {
         // action. The pipeline owns the multisig Ed448 signer set and
         // produces the signed `ProverSeniorityMerge` message from this
         // trigger.
+        //
+        // From the seniority succession epoch a merge proposal also covers
+        // successions, which can raise a prover whose accrual already passes
+        // the estimate; the pipeline holds proposals for the rest of the
+        // epoch when its keys can make nothing GLOBAL would apply.
         let config_estimate = self.allocator.config_seniority_estimate();
         let current_seniority = prover_info.as_ref().map(|p| p.seniority).unwrap_or(0);
-        if config_estimate > current_seniority
-            && prover_info.is_some()
+        // A prover the registry hides (all its allocations left) can still
+        // succeed another under the succession rules.
+        let succession_rules = quil_types::consensus::seniority_succession_active(frame_number);
+        if (config_estimate > current_seniority || succession_rules)
+            && (prover_info.is_some() || succession_rules)
             && !self.allocator.seniority_merge_held(frame_number)
         {
             let last_merge = self.allocator.last_seniority_merge_attempt();
@@ -1956,13 +1964,19 @@ impl ProverLifecycle {
             let join_cd_ok =
                 last_join == 0 || frame_number.saturating_sub(last_join) >= MERGE_COOLDOWN;
             if merge_cd_ok && join_cd_ok {
-                info!(
-                    frame = frame_number,
-                    current_seniority,
-                    config_estimate,
-                    delta = config_estimate - current_seniority,
-                    "emitting ProverSeniorityMerge to raise on-chain seniority"
-                );
+                if config_estimate > current_seniority {
+                    info!(
+                        frame = frame_number,
+                        current_seniority,
+                        config_estimate,
+                        delta = config_estimate - current_seniority,
+                        "emitting ProverSeniorityMerge to raise on-chain seniority"
+                    );
+                } else {
+                    // Only a succession could raise it; the pipeline submits
+                    // one (and says so) when GLOBAL would apply it.
+                    tracing::debug!(frame = frame_number, current_seniority, "checking for seniority successions");
+                }
                 // Record attempt eagerly so duplicate evaluates within
                 // the cooldown don't re-emit; the pipeline will log if
                 // the actual submission fails.
@@ -5322,6 +5336,30 @@ mod proposal_loop_tests {
         assert_eq!(merges(first + 20), 0, "held after a merge with no creditable target");
         assert_eq!(merges(next_epoch - 1), 0, "held for the rest of the epoch");
         assert_eq!(merges(next_epoch), 1, "checked again in the next epoch");
+    }
+
+    /// From the seniority succession epoch the lifecycle proposes merges
+    /// without a retro estimate above the prover's seniority: a succession
+    /// can raise a prover whose accrual passed it.
+    #[test]
+    fn seniority_merges_are_proposed_for_successions_from_activation() {
+        let address = vec![0xCFu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        let merges = |frame: u64| {
+            lifecycle.set_prover_root_verified_frame(frame);
+            count_seniority_merges(&lifecycle.evaluate(frame, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        quil_types::consensus::set_seniority_succession_epoch_for_thread(Some(u64::MAX));
+        assert_eq!(merges(100), 0, "no estimate above the seniority, no succession rules");
+        quil_types::consensus::set_seniority_succession_epoch_for_thread(Some(0));
+        assert_eq!(merges(110), 1, "a succession may raise it");
     }
 
     #[test]

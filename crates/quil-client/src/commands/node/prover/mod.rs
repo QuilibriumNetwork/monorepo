@@ -107,7 +107,9 @@ pub enum ProverCommand {
     Merge {
         /// Primary config dir followed by additional config dirs.
         configs: Vec<String>,
-        /// Evaluate the seniority score without merging configs.
+        /// Evaluate the seniority score without merging configs, and
+        /// simulate on the local node a seniority succession to this
+        /// node's prover from the prover the configs' peer keys name.
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
     },
@@ -181,9 +183,13 @@ impl ProverCtx {
 }
 
 pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> {
-    // `merge` operates directly on config files — no node connection.
+    // `merge` operates directly on config files; its dry run also reads
+    // GLOBAL state from the local node.
     if let ProverCommand::Merge { configs, dry_run } = cmd {
-        return merge::run(configs, *dry_run);
+        if *dry_run {
+            return merge::dry_run(global, configs).await;
+        }
+        return merge::run(configs);
     }
 
     if let ProverCommand::Manage { help_text: true, width, .. } = cmd {

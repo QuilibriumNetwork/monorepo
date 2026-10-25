@@ -1165,6 +1165,19 @@ impl NodeService for NodeRpcServer {
         let raw = store
             .load_vertex_underlying_raw("hyperedge", "adds", &shard, &req.address)
             .map_err(|e| Status::internal(format!("load hyperedge underlying: {e}")))?;
+        // The serialized tree itself: a prover's hyperedge keys its
+        // allocations by 64-byte atom IDs, which the canonical entries below
+        // do not list.
+        if req.full_data {
+            return Ok(Response::new(node::GetHyperedgeDataResponse {
+                entries: Vec::new(),
+                set_type: "hyperedge".into(),
+                phase_type: "adds".into(),
+                shard_l1: shard.l1.to_vec(),
+                shard_l2: shard.l2.to_vec(),
+                raw_data: raw.unwrap_or_default(),
+            }));
+        }
         let entries = match raw {
             None => Vec::new(),
             Some(bytes) => {
@@ -1200,6 +1213,7 @@ impl NodeService for NodeRpcServer {
             phase_type: "adds".into(),
             shard_l1: shard.l1.to_vec(),
             shard_l2: shard.l2.to_vec(),
+            raw_data: Vec::new(),
         }))
     }
 
