@@ -57,7 +57,7 @@ use crate::{
     config::{Config, ValidationMode},
     gossip_promises::GossipPromises,
     handler::{Handler, HandlerEvent, HandlerIn},
-    mcache::MessageCache,
+    mcache::{MessageCache, MessageCacheStats},
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
     rpc::Sender,
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
@@ -443,7 +443,11 @@ where
                 config.heartbeat_interval(),
                 config.backoff_slack(),
             ),
-            mcache: MessageCache::new(config.history_gossip(), config.history_length()),
+            mcache: MessageCache::new(
+                config.history_gossip(),
+                config.history_length(),
+                config.mcache_max_bytes(),
+            ),
             heartbeat: Delay::new(config.heartbeat_interval() + config.heartbeat_initial_delay()),
             heartbeat_ticks: 0,
             px_peers: HashSet::new(),
@@ -481,6 +485,11 @@ where
     /// Lists the hashes of the topics we are currently subscribed to.
     pub fn topics(&self) -> impl Iterator<Item = &TopicHash> {
         self.mesh.keys()
+    }
+
+    /// QUILIBRIUM: occupancy of the message cache and its byte-budget evictions.
+    pub fn message_cache_stats(&self) -> MessageCacheStats {
+        self.mcache.stats()
     }
 
     /// Lists all mesh peers for a certain topic hash.
