@@ -463,6 +463,22 @@ impl GlobalParentExecutor {
         }
     }
 
+    /// Authenticate a finalization handed to the legacy materializer without
+    /// an atomic attempt, as [`Self::attempt_finalization`] (or, with its
+    /// chain and certified descendant, [`Self::attempt_implied_finalization`])
+    /// does before capturing. An error is a rejection.
+    pub fn authenticate_for_legacy(
+        &self,
+        frame: &GlobalFrame,
+        implied: Option<(&[GlobalFrame], &GlobalFrame)>,
+        verifier: &GlobalFrameVerifier,
+    ) -> Result<()> {
+        match implied {
+            None => self.authenticate_finalization(frame, verifier).map(|_| ()),
+            Some((chain, descendant)) => self.authenticate_implied(frame, chain, descendant, verifier),
+        }
+    }
+
     /// Publish a notarized ancestor that a certified descendant finalized.
     /// Simplex finalizes every ancestor of a finalized block, but only that
     /// block carries a certificate. After a restart, views can be notarized

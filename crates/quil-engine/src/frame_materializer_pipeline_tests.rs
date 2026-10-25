@@ -533,3 +533,92 @@ fn a_synced_chain_that_does_not_link_or_certify_is_refused() {
     assert!(rig.clock.get_global_clock_frame_candidate(1, &selector).is_err(),
         "a refused chain leaves no ancestor candidate");
 }
+
+/// While execution trails the head beyond the voting window, an authentic
+/// finalization goes to the legacy materializer without an atomic attempt
+/// when none is allowed, and after one failed attempt when one is. An
+/// unauthentic one is still refused.
+#[test]
+fn a_catching_up_worker_hands_finalizations_to_the_legacy_path_without_retrying() {
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let (pipeline, seen) = pipeline(&rig, prover(&input), 8);
+    let mut substituted = input.clone();
+    substituted
+        .requests
+        .push(quil_types::proto::global::MessageBundle::default());
+    pipeline.offer(substituted);
+    assert!(matches!(pipeline.step_within(1, 0), FinalizationStep::Idle));
+    assert!(rig.clock.get_global_clock_frame(1).is_err());
+
+    pipeline.offer(input.clone());
+    let before = rig.source.execution_counts();
+    assert!(matches!(pipeline.step_within(1, 0), FinalizationStep::Legacy));
+    assert_eq!(rig.source.execution_counts(), before, "no atomic attempt");
+    assert_eq!(rig.source.last_materialized_frame(), 0, "nothing executed yet");
+    assert_eq!(rig.clock.get_global_clock_frame(1).unwrap(), input);
+    assert_eq!(seen.heads.load(Ordering::SeqCst), 0);
+    rig.source.materialize(&input).unwrap();
+    assert!(pipeline.finish_legacy(&input));
+
+    // One attempt allowed: its failure hands the frame over at once.
+    let mut stored = input.clone();
+    stored.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    save(rig.clock.as_ref(), &stored);
+    let mut next = state_frame(&rig.source, 2, 73, id(&input));
+    certify_parent(&mut next, &rig.signer, 0, input.header.as_ref().unwrap().rank);
+    pipeline.offer(next.clone());
+    assert!(matches!(pipeline.step_within(2, 1), FinalizationStep::Legacy));
+    let counts = rig.source.execution_counts();
+    assert_eq!((counts.atomic_published, counts.atomic_failed), (0, 1));
+    assert_eq!(rig.clock.get_global_clock_frame(2).unwrap(), next);
+}
+
+/// Near the head, a finalization whose atomic attempts fail goes to the
+/// legacy path after three, and its canonical record then executes in place
+/// at once: no frame executes more than three times plus once in place.
+/// The canonical clock written ahead by sync is not an attempt.
+#[test]
+fn a_finalization_handed_over_after_failed_attempts_is_not_attempted_again() {
+    let rig = Rig::new();
+    let old = certified_deploy(&rig);
+    rig.source.materialize(&old).unwrap();
+    let mut stored = old.clone();
+    stored.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    save(rig.clock.as_ref(), &stored);
+    let mut next = state_frame(&rig.source, 2, 73, id(&old));
+    certify_parent(&mut next, &rig.signer, 0, old.header.as_ref().unwrap().rank);
+    let (worker, _) = pipeline(&rig, prover(&next), 8);
+    worker.offer(next.clone());
+    for _ in 0..2 {
+        assert!(matches!(worker.step(2), FinalizationStep::Retry(_)));
+    }
+    assert!(matches!(worker.step(2), FinalizationStep::Legacy));
+    assert!(worker.attempted(2));
+    let failed = rig.source.execution_counts();
+    assert_eq!((failed.atomic_published, failed.atomic_failed), (0, 3));
+
+    // The worker's canonical path.
+    let attempts = if worker.attempted(2) { 0 } else { crate::global_catch_up::AT_HEAD_ATOMIC_ATTEMPTS };
+    let outcome = crate::global_catch_up::attempt_atomically(attempts, || {
+        rig.source.materialize_canonical_atomically(&next, limits())
+    });
+    assert!(outcome.is_none());
+    rig.source.materialize(&next).unwrap();
+    assert_eq!(rig.source.last_materialized_frame(), 2);
+    let counts = rig.source.execution_counts();
+    assert_eq!((counts.atomic_published, counts.atomic_failed), (0, 3), "three attempts, then in place");
+    assert!(worker.finish_legacy(&next));
+    assert!(!worker.attempted(2));
+
+    // Written ahead by sync: handed over without an attempt.
+    let rig = Rig::new();
+    let input = certified_deploy(&rig);
+    let mut ahead = input.clone();
+    ahead.header.as_mut().unwrap().frame_number = 2;
+    save(rig.clock.as_ref(), &ahead);
+    let (synced, _) = pipeline(&rig, vec![], 8);
+    synced.offer(input);
+    assert!(matches!(synced.step(1), FinalizationStep::Legacy));
+    assert!(!synced.attempted(1));
+}
