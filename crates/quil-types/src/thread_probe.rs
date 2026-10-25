@@ -1,13 +1,16 @@
-//! Marks what a worker thread is running, so that a watchdog on another
-//! thread can name what blocks it.
+//! Marks what a worker thread or a master task is running, so that a
+//! watchdog on another thread can name what blocks it.
 //!
 //! Each worker thread runs a current-thread runtime: one synchronous call
 //! that does not return stalls every task on it, among them consensus
 //! messages and votes. A worker thread installs a [`ThreadProbe`]; its
 //! heartbeat task [`ThreadProbe::beat`]s it, [`probed`] marks the task
 //! being polled, [`step`] the step a task is in, and [`section`] guards
-//! mark synchronous sections. Every mark is a few atomic stores, and on
-//! threads without a probe (the master, tests) a no-op.
+//! mark synchronous sections. A master task, which moves between the
+//! threads of a multi-thread runtime, carries its own probe instead
+//! ([`task_probed`]) and [`beat`]s it each time its loop comes round.
+//! Every mark is a few atomic stores, and on threads without a probe
+//! (tests, untracked tasks) a no-op.
 use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -82,6 +85,41 @@ sections! {
     FrameStoreCleanup => "frame store cleanup",
     PreStateHeal => "pre-state heal check",
     GenesisSupersededCheck => "adopted genesis check",
+    // Master tasks.
+    MessageLoop => "message loop",
+    ArchivePoller => "archive frame poller",
+    // Steps of the master's message loop.
+    LoopRemoteDirect => "remote worker topic tick",
+    LoopCommitteePeers => "committee peer tick",
+    LoopStatus => "status tick",
+    LoopMessage => "inbound message",
+    LoopPeerInfo => "inbound peer info",
+    LoopGlobalFrame => "inbound GLOBAL frame",
+    // Steps of the archive frame poller.
+    PollerGossipFollow => "gossip-carried frame follow",
+    PollerConnect => "archive connect",
+    PollerHeadFetch => "archive head fetch",
+    PollerHeadFrame => "archive head frame processing",
+    PollerFillFetch => "archive catch-up fetch",
+    PollerFillFrame => "archive catch-up frame processing",
+    PollerReconnect => "archive reconnect",
+    PollerRefetch => "archive fetch on a fresh connection",
+    // Synchronous sections of master tasks.
+    LatestGlobalFrameRead => "latest GLOBAL frame read",
+    ProverInfoRead => "own prover info read",
+    GlobalFrameValidation => "GLOBAL frame validation",
+    GlobalFrameRequestsRoot => "GLOBAL frame requests root check",
+    GlobalFrameStore => "GLOBAL frame store",
+    GlobalFrameExecution => "GLOBAL frame execution",
+    PollerFrameCallback => "poller frame callback",
+    ProverRegistryRefresh => "prover registry refresh",
+    AllocationReconcile => "worker allocation reconcile",
+    ShardSizeRead => "local shard size read",
+    LifecycleEvaluate => "prover lifecycle evaluation",
+    // Clock store lock waits, marked only when the lock is contended.
+    ClockCacheWait => "GLOBAL frame cache lock wait",
+    ClockWriterWait => "GLOBAL frame writer lock wait",
+    ClockLoadWait => "GLOBAL frame load lock wait",
 }
 
 impl Section {
@@ -92,6 +130,8 @@ impl Section {
 
 const MS_BITS: u32 = 56;
 const MS_MASK: u64 = (1 << MS_BITS) - 1;
+/// The beat of a task waiting with no deadline ([`ThreadProbe::idle`]).
+const IDLE: u64 = u64::MAX;
 
 fn pack(section: Section, at_ms: u64) -> u64 {
     if section == Section::None {
@@ -118,9 +158,10 @@ pub struct Mark {
     pub since_ms: u64,
 }
 
-/// What one worker thread was last seen doing.
+/// What one worker thread or master task was last seen doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    /// When it last beat ([`now_ms`]); see [`Snapshot::idle`].
     pub last_beat_ms: u64,
     /// The task being polled.
     pub task: Option<Mark>,
@@ -132,7 +173,16 @@ pub struct Snapshot {
     pub outer: Option<Mark>,
 }
 
-/// One worker thread's marks, written by that thread and read by a watchdog.
+impl Snapshot {
+    /// It waits with no deadline (an empty endpoint pool, a state jump)
+    /// since it last beat: not blocked until it beats again.
+    pub fn idle(&self) -> bool {
+        self.last_beat_ms == IDLE
+    }
+}
+
+/// One worker thread's or master task's marks, written by that thread or
+/// task and read by a watchdog.
 pub struct ThreadProbe {
     beat: AtomicU64,
     task: AtomicU64,
@@ -156,7 +206,17 @@ impl ThreadProbe {
 
     /// The thread ran its heartbeat task: it is not blocked.
     pub fn beat(&self) {
-        self.beat.store(now_ms(), Ordering::Relaxed);
+        self.beat_at(now_ms());
+    }
+
+    /// A beat at `at_ms` on the probe's clock ([`now_ms`]).
+    pub fn beat_at(&self, at_ms: u64) {
+        self.beat.store(at_ms, Ordering::Relaxed);
+    }
+
+    /// The task now waits with no deadline; its next beat ends the wait.
+    pub fn idle(&self) {
+        self.beat.store(IDLE, Ordering::Relaxed);
     }
 
     /// The shard this thread's worker is bound to (empty: none).
@@ -187,6 +247,14 @@ std::thread_local! {
 
 fn current() -> Option<Arc<ThreadProbe>> {
     CURRENT.try_with(|current| current.borrow().clone()).ok().flatten()
+}
+
+fn with_current(mark: impl FnOnce(&ThreadProbe)) {
+    let _ = CURRENT.try_with(|current| {
+        if let Some(probe) = current.borrow().as_deref() {
+            mark(probe);
+        }
+    });
 }
 
 /// The probe installed on this thread until [`Installed`] drops.
@@ -243,6 +311,46 @@ impl Drop for SectionGuard {
 pub fn step(step: Section) {
     if let Some(probe) = current() {
         probe.step.store(pack(step, now_ms()), Ordering::Relaxed);
+    }
+}
+
+/// A master task's loop came round: beat the probe of the task being polled
+/// ([`task_probed`]) and clear its step.
+pub fn beat() {
+    with_current(|probe| {
+        probe.beat();
+        probe.step.store(0, Ordering::Relaxed);
+    });
+}
+
+/// The master task being polled now waits with no deadline, as for an
+/// archive endpoint or a state jump: not blocked until its next [`beat`].
+pub fn idle() {
+    with_current(|probe| {
+        probe.idle();
+        probe.step.store(0, Ordering::Relaxed);
+    });
+}
+
+/// Install `probe` on the thread that polls `future`, during each poll: a
+/// master task moves between the threads of a multi-thread runtime, so its
+/// marks follow the task rather than a thread.
+pub fn task_probed<F: Future>(probe: Arc<ThreadProbe>, future: F) -> TaskProbed<F> {
+    TaskProbed { probe, future: Box::pin(future) }
+}
+
+pub struct TaskProbed<F> {
+    probe: Arc<ThreadProbe>,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for TaskProbed<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        // Uninstalled when the poll returns or panics.
+        let _installed = install(self.probe.clone());
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -331,6 +439,30 @@ mod tests {
         let seen = probe.snapshot();
         assert_eq!(seen.task.map(|m| m.section), Some(Section::WorkerLoop));
         assert_eq!((seen.section, seen.outer), (None, None));
+    }
+
+    #[test]
+    fn a_task_probe_marks_only_while_its_task_is_polled() {
+        let probe = ThreadProbe::new();
+        probe.idle();
+        let mut task = task_probed(probe.clone(), async {
+            beat();
+            step(Section::PollerHeadFetch);
+            std::future::pending::<()>().await
+        });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut task).poll(&mut cx).is_pending());
+        let seen = probe.snapshot();
+        assert!(!seen.idle());
+        assert_eq!(seen.step.map(|m| m.section), Some(Section::PollerHeadFetch));
+        // Between polls the thread carries no probe: other tasks mark nothing.
+        let _other = section(Section::CommitLockWait);
+        step(Section::LoopStatus);
+        idle();
+        let seen = probe.snapshot();
+        assert_eq!(seen.section, None);
+        assert_eq!(seen.step.map(|m| m.section), Some(Section::PollerHeadFetch));
+        assert!(!seen.idle());
     }
 
     #[test]

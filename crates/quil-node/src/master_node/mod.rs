@@ -18,6 +18,7 @@ mod committee_peer_policy;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;
+pub(crate) mod stall_watch;
 pub(crate) mod storage;
 pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;

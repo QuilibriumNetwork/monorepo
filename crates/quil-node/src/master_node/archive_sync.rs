@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use quil_types::thread_probe::{self as probe, Section as ProbeSection};
 use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
@@ -1790,6 +1791,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }) as quil_rpc::frame_sync::FrameCertified
             }),
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
+                let _callback = probe::section(ProbeSection::PollerFrameCallback);
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
                 // Skip bogus frames (no header or frame_number=0):
@@ -1849,6 +1851,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // turn an archive's rejected join into local-only prover records.
                 if !signaled && !archive_mode_poller && (network == 99
                     || !quil_types::consensus::committee_handoff_active(frame_num)) {
+                let _execute = probe::section(ProbeSection::GlobalFrameExecution);
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
                     &exec_mgr_for_poller,
@@ -1907,7 +1910,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
                                 warn!(error = %e, frame = frame_num, "hypergraph commit failed");
                             }
-                            if let Err(error) = pr_for_poller.refresh_from_store(hg_for_poller.as_ref()) {
+                            let refreshed = {
+                                let _refresh = probe::section(ProbeSection::ProverRegistryRefresh);
+                                pr_for_poller.refresh_from_store(hg_for_poller.as_ref())
+                            };
+                            if let Err(error) = refreshed {
                                 warn!(frame = frame_num, %error, "inline prover registry refresh failed");
                             }
                             // Keep the CRDT's per-app shard sets in sync with the
@@ -1935,7 +1942,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // versions.
                 cov_for_poller.check(frame_num);
                 if !archive_mode_poller {
-                    if let Err(e) = wa_for_poller.on_new_frame(frame_num) {
+                    let reconciled = {
+                        let _reconcile = probe::section(ProbeSection::AllocationReconcile);
+                        wa_for_poller.on_new_frame(frame_num)
+                    };
+                    if let Err(e) = reconciled {
                         tracing::warn!(error = %e, "worker allocation failed");
                     }
                 }
@@ -1972,6 +1983,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // on this task, between fetches (2026-10-04).
                 if !archive_mode_poller {
                     use std::collections::HashMap;
+                    let _sizes = probe::section(ProbeSection::ShardSizeRead);
                     let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
                         crdt_for_poller.clone(),
                         shards_store_for_poller.clone(),
@@ -2028,12 +2040,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // be ignored anyway since there are no workers to
                 // bind allocations to.
                 if !archive_mode_poller {
-                    match pl_for_poller.evaluate(
-                        frame_num,
-                        frame_difficulty as u64,
-                        pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
-                        wm_for_poller.as_ref(),
-                    ) {
+                    let evaluated = {
+                        let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
+                        pl_for_poller.evaluate(
+                            frame_num,
+                            frame_difficulty as u64,
+                            pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
+                            wm_for_poller.as_ref(),
+                        )
+                    };
+                    match evaluated {
                         Ok(actions) => {
                             for action in actions {
                                 tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
@@ -2063,12 +2079,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         {
             let pool = archive_pool.clone();
             let cs = clock_store.clone();
+            // A blocked poller fetches and executes no GLOBAL frame; the
+            // watchdog names where it is blocked.
+            let poller_probe = super::stall_watch::watch(
+                ProbeSection::ArchivePoller,
+                super::stall_watch::POLLER_IMPACT,
+                super::stall_watch::POLLER_STALL_AFTER,
+            );
             sup.run_until_cancelled("archive-poller", {
                 let seed = seed.clone();
-                move |cancel| async move {
+                move |cancel| probe::task_probed(poller_probe, async move {
                     quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
                     Ok(())
-                }
+                })
             });
         }
         info!("archive frame poller spawned (with execution pipeline)");

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::BTreeMap;
 
 use prost::Message;
@@ -6,6 +6,7 @@ use prost::Message;
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global;
 use quil_types::store;
+use quil_types::thread_probe::{self, Section};
 
 use crate::encoding;
 
@@ -71,6 +72,43 @@ struct GlobalFrameMemory {
     writes: Mutex<()>,
 }
 
+// Each lock is tried first: only a contended wait is marked, so that a
+// blocked master task or worker thread names the lock it waits for.
+impl GlobalFrameMemory {
+    fn read_cache(&self) -> RwLockReadGuard<'_, GlobalFrameCache> {
+        if let Ok(cache) = self.cache.try_read() {
+            return cache;
+        }
+        let _wait = thread_probe::section(Section::ClockCacheWait);
+        self.cache.read().unwrap()
+    }
+
+    fn write_cache(&self) -> RwLockWriteGuard<'_, GlobalFrameCache> {
+        if let Ok(cache) = self.cache.try_write() {
+            return cache;
+        }
+        let _wait = thread_probe::section(Section::ClockCacheWait);
+        self.cache.write().unwrap()
+    }
+
+    fn lock_writes(&self) -> MutexGuard<'_, ()> {
+        if let Ok(writes) = self.writes.try_lock() {
+            return writes;
+        }
+        let _wait = thread_probe::section(Section::ClockWriterWait);
+        self.writes.lock().unwrap()
+    }
+
+    fn lock_load(&self, frame_number: u64) -> MutexGuard<'_, ()> {
+        let load = &self.loads[(frame_number % 32) as usize];
+        if let Ok(held) = load.try_lock() {
+            return held;
+        }
+        let _wait = thread_probe::section(Section::ClockLoadWait);
+        load.lock().unwrap()
+    }
+}
+
 /// RocksDB-backed clock/frame store.
 pub struct RocksClockStore {
     db: quil_forest::CoordinatedDb,
@@ -95,7 +133,7 @@ impl RocksClockStore {
     /// Run on a blocking worker at startup. Live commits populate the same
     /// cache; candidates and aborted transactions never enter it.
     pub fn warm_global_frame_cache(&self) -> Result<usize> {
-        self.global_memory.cache.write().unwrap().enabled = true;
+        self.global_memory.write_cache().enabled = true;
         let Some(head) = self.get_latest_frame_number() else { return Ok(0) };
         // Walk stored headers rather than assuming contiguous heights: a node
         // recovering a gap should still restore 720 frames when available.
@@ -119,7 +157,7 @@ impl RocksClockStore {
                 Err(e) => return Err(e),
             }
         }
-        Ok(self.global_memory.cache.read().unwrap().frames.len())
+        Ok(self.global_memory.read_cache().frames.len())
     }
 
     // ---------------------------------------------------------------
@@ -129,20 +167,20 @@ impl RocksClockStore {
     /// Get a global frame by frame number.
     pub fn get_global_frame(&self, frame_number: u64) -> Result<global::GlobalFrame> {
         let (enabled, cached) = {
-            let cache = self.global_memory.cache.read().unwrap();
+            let cache = self.global_memory.read_cache();
             (cache.enabled, cache.get(frame_number))
         };
         if !enabled { return self.read_global_frame(frame_number); }
         if let Some(frame) = cached { return Ok((*frame).clone()); }
-        let _load = self.global_memory.loads[(frame_number % 32) as usize].lock().unwrap();
+        let _load = self.global_memory.lock_load(frame_number);
         let (generation, cached) = {
-            let cache = self.global_memory.cache.read().unwrap();
+            let cache = self.global_memory.read_cache();
             (cache.generation, cache.get(frame_number))
         };
         if let Some(frame) = cached { return Ok((*frame).clone()); }
         let frame = self.read_global_frame(frame_number)?;
         let cached = Arc::new(frame.clone());
-        let mut cache = self.global_memory.cache.write().unwrap();
+        let mut cache = self.global_memory.write_cache();
         if cache.generation == generation { cache.insert(cached); }
         Ok(frame)
     }
@@ -151,7 +189,7 @@ impl RocksClockStore {
     /// it holds the frame, else the header key, never its request bundles.
     pub fn get_global_frame_header(&self, frame_number: u64) -> Result<global::GlobalFrameHeader> {
         let cached = {
-            let cache = self.global_memory.cache.read().unwrap();
+            let cache = self.global_memory.read_cache();
             cache.enabled.then(|| cache.get(frame_number)).flatten()
         };
         if let Some(header) = cached.and_then(|frame| frame.header.clone()) {
@@ -308,7 +346,7 @@ impl RocksClockStore {
             return Ok(());
         }
 
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let _writes = self.global_memory.lock_writes();
         // No caller txn: use a local batch so 2+N+2 writes are atomic.
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(&header_key, &header_bytes);
@@ -326,7 +364,7 @@ impl RocksClockStore {
             .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))?;
         let cached = Arc::new(frame.clone());
-        self.global_memory.cache.write().unwrap().publish(cached);
+        self.global_memory.write_cache().publish(cached);
         Ok(())
     }
 
@@ -352,7 +390,7 @@ impl RocksClockStore {
         min_frame: u64,
         max_frame: u64,
     ) -> Result<()> {
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let _writes = self.global_memory.lock_writes();
         let mut batch = rocksdb::WriteBatch::default();
 
         let start = encoding::clock_global_frame_key(min_frame);
@@ -367,7 +405,7 @@ impl RocksClockStore {
         self.db
             .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))?;
-        let mut cache = self.global_memory.cache.write().unwrap();
+        let mut cache = self.global_memory.write_cache();
         cache.generation = cache.generation.wrapping_add(1);
         cache.frames.retain(|n, _| *n < min_frame || *n > max_frame);
         cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
@@ -1272,16 +1310,16 @@ impl store::Transaction for RocksClockTxn {
         Ok(())
     }
     fn commit(self: Box<Self>) -> Result<()> {
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let _writes = self.global_memory.lock_writes();
         let batch = self.batch.into_inner().unwrap();
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
         let invalidate = self.invalidate_global_cache.into_inner();
-        if invalidate { self.global_memory.cache.write().unwrap().invalidate(); }
+        if invalidate { self.global_memory.write_cache().invalidate(); }
         for (memory, frame) in self.global_frames.into_inner().unwrap() {
             if invalidate {
-                memory.cache.write().unwrap().invalidate();
+                memory.write_cache().invalidate();
             } else {
-                memory.cache.write().unwrap().publish(frame);
+                memory.write_cache().publish(frame);
             }
         }
         Ok(())
@@ -1635,11 +1673,11 @@ impl store::ClockStore for RocksClockStore {
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         let lower = encoding::clock_global_frame_key(min_frame);
         let upper = encoding::clock_global_frame_key(max_frame);
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let _writes = self.global_memory.lock_writes();
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
-        let mut cache = self.global_memory.cache.write().unwrap();
+        let mut cache = self.global_memory.write_cache();
         cache.generation = cache.generation.wrapping_add(1);
         cache.frames.retain(|n, _| *n < min_frame || *n >= max_frame);
         cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
@@ -1650,13 +1688,13 @@ impl store::ClockStore for RocksClockStore {
         let hi = encoding::clock_global_frame_key(20_000_000);
         let earliest = encoding::clock_global_earliest_index();
         let latest = encoding::clock_global_latest_index();
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let _writes = self.global_memory.lock_writes();
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lo, &hi);
         batch.delete(&earliest);
         batch.delete(&latest);
         self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
-        self.global_memory.cache.write().unwrap().invalidate();
+        self.global_memory.write_cache().invalidate();
         Ok(())
     }
     fn get_latest_certified_global_state(&self) -> Result<proto::global::GlobalProposal> {
