@@ -240,6 +240,39 @@ fn captured_materializer_matches_durable_execution_without_publication() {
     assert_eq!(primary.db.inner().latest_sequence_number(), sequence);
 }
 
+/// A GLOBAL frame executed atomically touches no key an archive stores its
+/// served application frames under: storing one between capture and commit
+/// leaves the execution publishable.
+#[test]
+fn a_global_execution_publishes_across_storing_a_served_shard_frame() {
+    use quil_types::store::ClockStore as _;
+    let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
+    let fixture = Fixture::new(Some(&key));
+    let mut branch = fixture.source.capture_execution_branch(limits()).unwrap();
+    let input = frame(1, branch.prover_root().unwrap());
+    // As a selected-parent execution does, the branch's clock records the frame.
+    let clock = branch.execution.clock_store().clone();
+    let txn = clock.new_transaction(false).unwrap();
+    clock.put_global_clock_frame(&input, txn.as_ref()).unwrap();
+    txn.commit().unwrap();
+    branch.materialize(&input).unwrap();
+    let address = vec![0x31; 32];
+    let served = quil_types::proto::global::AppShardFrame {
+        header: Some(quil_types::proto::global::FrameHeader {
+            address: address.clone(),
+            frame_number: 7,
+            output: vec![7; 32],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    fixture.clock.store_shard_clock_frame_for_serving(&[0xaa; 32], &served).unwrap();
+    let plan = branch.execution.overlay().prepare_commit().unwrap();
+    plan.commit(&fixture.db.inner()).unwrap();
+    assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
+    assert_eq!(fixture.clock.get_latest_shard_clock_frame_number(&address).unwrap(), Some(7));
+}
+
 #[test]
 fn tentative_deployment_matches_durable_application_state_and_continues_in_child() {
     let fixture = Fixture::new(None);

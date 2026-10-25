@@ -2024,6 +2024,26 @@ impl store::ClockStore for RocksClockStore {
         }
         self.db.put(&key, &data).map_err(|e| QuilError::Store(e.to_string()))
     }
+    fn store_shard_clock_frame_for_serving(&self, _selector: &[u8], frame: &proto::global::AppShardFrame) -> Result<()> {
+        let header = frame.header.as_ref()
+            .ok_or_else(|| QuilError::InvalidArgument("shard frame has no header".into()))?;
+        let canonical_key = encoding::clock_shard_frame_key(&header.address, header.frame_number);
+        let index_key = encoding::clock_shard_latest_index(&header.address);
+        let advance = self.read_u64_index_checked(&index_key)?
+            .is_none_or(|current| header.frame_number > current);
+        // The state `commit_shard_clock_frame` leaves after staging, in one
+        // batch confined to the frames and their index: a concurrent atomic
+        // GLOBAL execution conflicts at commit only if it touched them. Stored
+        // as ordinary writes, an archive's frames for about a hundred shards
+        // made its atomic attempts stale ("execution base changed").
+        let store = |e: quil_forest::DatabaseCommitError| QuilError::Store(e.to_string());
+        let mut batch = quil_forest::DisjointBatch::new(encoding::CLOCK_SHARD_SERVING_PREFIXES);
+        batch.put(&canonical_key, frame.encode_to_vec()).map_err(store)?;
+        if advance {
+            batch.put(&index_key, header.frame_number.to_be_bytes()).map_err(store)?;
+        }
+        self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)
+    }
     fn get_staged_shard_clock_frame(&self, _filter: &[u8], frame_number: u64, parent_selector: &[u8], _truncate: bool) -> Result<proto::global::AppShardFrame> {
         let key = encoding::clock_shard_staged_key(parent_selector, frame_number);
         let data = self.db.get(&key).map_err(|e| QuilError::Store(e.to_string()))?
@@ -2222,5 +2242,71 @@ impl store::ClockStore for RocksClockStore {
     fn compact_data(&self, _filter: &[u8]) -> Result<()> {
         // RocksDB handles compaction automatically; manual trigger not needed
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod serving_tests {
+    use quil_types::proto::global::{AppShardFrame, FrameHeader};
+    use quil_types::store::ClockStore as _;
+
+    fn limits() -> quil_forest::OverlayLimits {
+        quil_forest::OverlayLimits {
+            max_delta_bytes: 1 << 20,
+            max_delta_entries: 10_000,
+            max_record_bytes: 1 << 16,
+            max_read_bytes: 1 << 20,
+            max_read_operations: 100_000,
+            max_cursors: 8,
+        }
+    }
+
+    fn frame(address: &[u8], number: u64) -> AppShardFrame {
+        AppShardFrame {
+            header: Some(FrameHeader {
+                address: address.to_vec(),
+                frame_number: number,
+                output: vec![number as u8; 32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// An archive stores each application frame it admits for serving while
+    /// GLOBAL executes atomically. That write leaves an execution that never
+    /// read stored shard frames publishable; one that read them conflicts.
+    #[test]
+    fn serving_a_shard_frame_leaves_a_concurrent_global_execution_publishable() {
+        let db = crate::RocksDb::open_in_memory().unwrap();
+        let inner = db.inner();
+        let clock = super::RocksClockStore::new(inner.clone());
+        let address = vec![0x31; 32];
+        let latest = |clock: &super::RocksClockStore| clock.get_latest_shard_clock_frame_number(&address).unwrap();
+        let execute = |key: &[u8]| {
+            let overlay = quil_forest::ExecutionOverlay::capture(inner.clone(), limits()).unwrap();
+            overlay.apply(&[quil_forest::OverlayMutation::Put(key.to_vec(), b"executed".to_vec())]).unwrap();
+            overlay
+        };
+
+        let overlay = execute(b"\x09\x00state");
+        clock.store_shard_clock_frame_for_serving(&[0xaa; 32], &frame(&address, 1)).unwrap();
+        overlay.prepare_commit().unwrap().commit(&inner).unwrap();
+        assert_eq!(latest(&clock), Some(1));
+        assert_eq!(clock.get_shard_clock_frame(&address, 1, false).unwrap(), frame(&address, 1));
+
+        // An execution that read the shard's frames conflicts.
+        let overlay = execute(b"\x09\x00state");
+        assert!(overlay.get(&crate::encoding::clock_shard_frame_key(&address, 1)).unwrap().is_some());
+        clock.store_shard_clock_frame_for_serving(&[0xab; 32], &frame(&address, 2)).unwrap();
+        assert!(matches!(
+            overlay.prepare_commit().unwrap().commit(&inner),
+            Err(quil_forest::DatabaseCommitError::Stale { .. })
+        ));
+        assert_eq!(latest(&clock), Some(2));
+
+        // A lower frame is stored without moving the latest index back.
+        clock.store_shard_clock_frame_for_serving(&[0xaa; 32], &frame(&address, 1)).unwrap();
+        assert_eq!(latest(&clock), Some(2));
     }
 }
