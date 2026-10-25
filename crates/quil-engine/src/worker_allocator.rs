@@ -885,18 +885,25 @@ impl WorkerAllocator {
     }
 
     /// Of `filters`, those whose current committee session counts `member`
-    /// ([`crate::app_handoff::member_sessions`]). None without authenticated
+    /// ([`crate::app_handoff::member_sessions`]). Empty without authenticated
     /// GLOBAL state or when it is unreadable: no seat is then held to
-    /// hosting a session.
-    pub(crate) fn session_member_filters(&self, filters: &[Vec<u8>], member: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    /// hosting a session. `None` while a GLOBAL state sync withholds the
+    /// committed view: membership is then unknown, not empty.
+    pub(crate) fn session_member_filters(
+        &self, filters: &[Vec<u8>], member: &[u8],
+    ) -> Option<std::collections::HashSet<Vec<u8>>> {
         let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
-            return Default::default();
+            return Some(Default::default());
         };
         match crate::app_handoff::member_sessions(&global, filters, member) {
-            Ok(members) => members,
+            Ok(members) => Some(members),
+            Err(error) if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) => {
+                debug!(%error, "committee sessions withheld by a GLOBAL state sync; seat hosting is not observed");
+                None
+            }
             Err(error) => {
                 debug!(%error, "committee sessions unreadable; no seat is held to hosting");
-                Default::default()
+                Some(Default::default())
             }
         }
     }

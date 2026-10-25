@@ -169,6 +169,9 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
     };
     match check() {
         Ok(retain) => retain,
+        // A GLOBAL state sync between chunks withholds the view for a while;
+        // it says nothing about the session, so keep a possibly hosting member.
+        Err(error) if handoff::global_sync_in_progress(&error) => true,
         // No authenticated GLOBAL state yet: this node cannot be running a
         // session host (startup needs the same snapshot), so nothing is closing.
         Err(QuilError::ExecutionUnavailable(_)) => false,
@@ -2361,6 +2364,51 @@ mod successor_tests {
             let page: Vec<_> = frames.iter().filter(|f| f.frame >= from && f.frame <= through).take(2).cloned().collect();
             Box::pin(async move { Ok(page) })
         })
+    }
+
+    /// While an archive state sync of GLOBAL installs its chunks, the
+    /// committed view is withheld, and a member of the head session keeps
+    /// its worker: the wait says nothing about the session, unlike a node
+    /// with no GLOBAL state yet. Once the sync is in, the view shows the
+    /// archive's state (here without the session).
+    #[test]
+    fn a_global_sync_between_chunks_withholds_the_view_but_keeps_the_worker() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let (global, state) = global_state();
+        let filter = vec![0x0c; 32];
+        let (source, _, _) = closing_session(&global, &state, &filter);
+        let member = source.members[0].clone();
+        assert!(retains_worker(&global, &filter, &member));
+
+        let address = [0xff; 32];
+        let archive = Arc::new(HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location { app_address: address, data_address: [byte; 32] };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader { source: archive, shard_id: address.to_vec(), phase: 0 };
+        let mut plan = global.prepare_phase_sync(&reader, version, &address, 0, &[],
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        // The archive's records replace the local ones, which it lacks.
+        let blob = |(key, leaf): &([u8; 32], Option<Vec<u8>>)| if leaf.is_some() { vec![key[0]; 48] } else { Vec::new() };
+        let first = vec![blob(&plan.remaining()[0])];
+        global.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = CommittedView::capture(&global).err().expect("no committed view between a sync's chunks");
+        assert!(global_sync_in_progress(&error), "{error}");
+        assert!(retains_worker(&global, &filter, &member), "the member keeps its worker while the sync installs");
+
+        let rest: Vec<_> = plan.remaining().iter().map(blob).collect();
+        global.apply_sync_chunk(&mut plan, &rest).unwrap();
+        assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
+        let view = CommittedView::capture(&global).unwrap();
+        assert!(handoff::head(&view, &filter).unwrap().is_none());
+        assert!(!retains_worker(&global, &filter, &member));
     }
 
     /// A member whose cursor is at its predecessor's sealed checkpoint, with
