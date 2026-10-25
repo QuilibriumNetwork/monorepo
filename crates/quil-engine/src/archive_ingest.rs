@@ -70,6 +70,13 @@ pub struct ArchiveAppShardIngest {
     awaiting_anchor: HashMap<Vec<u8>, BTreeMap<u64, u64>>,
     /// The GLOBAL frames [`Self::awaiting_anchor`] has logged waiting on.
     anchors_noted: std::collections::BTreeSet<u64>,
+    /// Frames received whose session generation executed GLOBAL state has not
+    /// authorized, anchored past it, per address: frame → (that anchor, since
+    /// when). Not asked for again until execution reaches the anchor
+    /// ([`Self::await_execution`]).
+    awaiting_execution: HashMap<Vec<u8>, BTreeMap<u64, (u64, Instant)>>,
+    /// The operator lines on [`Self::awaiting_execution`].
+    execution_deferrals: crate::execution_deferral::DeferralLog,
     /// Frames are materialized only through [`Self::materialize_through`], at
     /// the points the GLOBAL chain sequences, never on arrival.
     sequenced: bool,
@@ -127,6 +134,17 @@ const _: () = assert!(PREFETCH_DEPTH < MAX_BUFFERED_FRAMES_PER_SHARD as u64);
 /// links to them. Keyed by output identity, so a well-formed impostor cannot
 /// displace the real frame at the same height.
 const MAX_HELD_FRAMES_PER_SHARD: usize = 32;
+/// Frames of one shard that wait for GLOBAL execution to reach their anchor
+/// ([`ArchiveAppShardIngest::await_execution`]). Past it the farthest frame is
+/// forgotten: it is asked for again like any missing frame once a GLOBAL frame
+/// needs it, and verified then.
+const MAX_AWAITING_EXECUTION_PER_SHARD: usize = MAX_BUFFERED_FRAMES_PER_SHARD;
+/// Frames of all shards that wait for GLOBAL execution to reach their anchor.
+/// Past it a frame is not parked: it is asked for like any missing frame.
+const MAX_AWAITING_EXECUTION: usize = 4096;
+/// The longest a frame waits for GLOBAL execution to reach its anchor before
+/// it may be asked for, and verified, again.
+const AWAIT_EXECUTION_TTL: Duration = Duration::from_secs(30 * 60);
 /// How often an archive compares each shard's committed GLOBAL tip with the
 /// frame it serves ([`ArchiveAppShardIngest::request_committed_tips`]).
 const COMMITTED_TIP_SCAN: Duration = Duration::from_secs(60);
@@ -245,6 +263,8 @@ impl ArchiveAppShardIngest {
             requested: HashMap::new(),
             awaiting_anchor: HashMap::new(),
             anchors_noted: std::collections::BTreeSet::new(),
+            awaiting_execution: HashMap::new(),
+            execution_deferrals: crate::execution_deferral::DeferralLog::new("archive ingest"),
             sequenced: false,
             missing_since: HashMap::new(),
             empty_body_grace: EMPTY_FRAME_BODY_GRACE,
@@ -340,6 +360,7 @@ impl ArchiveAppShardIngest {
             inclusion_prover: self.inclusion_prover.clone(),
             has_forest: self.hypergraph.has_forest(),
             clock_store: self.clock_store.clone(),
+            hypergraph: self.hypergraph.clone(),
         }
     }
 
@@ -359,6 +380,66 @@ impl ArchiveAppShardIngest {
             info!(anchor, frame = number, address = %hex::encode(address),
                 "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
                  they are asked for again once it is");
+        }
+    }
+
+    /// Park frame `number` of `address` until GLOBAL execution, at `executed`,
+    /// reaches `anchor`, the GLOBAL frame it is anchored to: executed state
+    /// holds no session for the generation its certificate names, which is the
+    /// shard's next ([`FrameCheck::AwaitExecution`]). It is asked for again
+    /// then, at once when a GLOBAL frame waits for it, or after
+    /// [`AWAIT_EXECUTION_TTL`], and verified again; one still unauthorized is
+    /// refused then. Only shards this archive holds frames of are parked, at
+    /// most [`MAX_AWAITING_EXECUTION_PER_SHARD`] frames each and
+    /// [`MAX_AWAITING_EXECUTION`] in all; the first anchor and time stand, so
+    /// a copy received again does not extend the wait. Returns whether the
+    /// frame waits; one that does not is dropped and asked for as any missing
+    /// frame.
+    ///
+    /// Refused instead, such frames were fetched again and again: an archive
+    /// 510 frames behind refused 9870 of them on 83 shards in 24 minutes, and
+    /// its gap fetch recovered 3677 (2026-10-25).
+    pub fn await_execution(&mut self, address: &[u8], number: u64, anchor: u64, executed: u64) -> bool {
+        match self.materialized_height(address) {
+            Ok(height) if height > 0 && number > height => {}
+            _ => return false,
+        }
+        let parked: usize = self.awaiting_execution.values().map(BTreeMap::len).sum();
+        let waiting = self.awaiting_execution.entry(address.to_vec()).or_default();
+        if waiting.contains_key(&number) {
+            return true;
+        }
+        if parked >= MAX_AWAITING_EXECUTION {
+            if waiting.is_empty() {
+                self.awaiting_execution.remove(address);
+            }
+            return false;
+        }
+        waiting.insert(number, (anchor, Instant::now()));
+        while waiting.len() > MAX_AWAITING_EXECUTION_PER_SHARD {
+            waiting.pop_last();
+        }
+        if !waiting.contains_key(&number) {
+            return false;
+        }
+        let shards = self.awaiting_execution.len();
+        self.execution_deferrals.deferred(address, number, anchor, executed, Some(shards));
+        true
+    }
+
+    /// The GLOBAL frame executed state is at; `None` when unreadable.
+    fn executed_global_frame(&self) -> Option<u64> {
+        self.hypergraph
+            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+            .ok()
+    }
+
+    /// Log the end of a wait for execution once it reached every anchor.
+    fn note_execution(&self) {
+        if self.execution_deferrals.waiting() {
+            if let Some(executed) = self.executed_global_frame() {
+                self.execution_deferrals.executed(executed);
+            }
         }
     }
 
@@ -391,6 +472,12 @@ impl ArchiveAppShardIngest {
             }
             let awaiting = &self.awaiting_anchor;
             self.anchors_noted.retain(|anchor| awaiting.values().any(|waiting| waiting.values().any(|a| a == anchor)));
+        }
+        if let Some(waiting) = self.awaiting_execution.get_mut(address) {
+            *waiting = waiting.split_off(&(frame + 1));
+            if waiting.is_empty() {
+                self.awaiting_execution.remove(address);
+            }
         }
         self.missing_since.remove(address);
     }
@@ -430,6 +517,7 @@ impl ArchiveAppShardIngest {
         self.request_committed_tips();
         self.take_missing_frame_reports();
         self.request_owed_bodies();
+        self.note_execution();
         if self.sequenced {
             return;
         }
@@ -490,7 +578,14 @@ impl ArchiveAppShardIngest {
             self.await_anchor(&address, frame_number, anchor);
             return;
         }
-        let Some(certified) = verifier.verify(&frame) else { return };
+        let certified = match verifier.check(&frame) {
+            FrameCheck::Admit { certified } => certified,
+            FrameCheck::AwaitExecution { anchor, executed } => {
+                self.await_execution(&address, frame_number, anchor, executed);
+                return;
+            }
+            FrameCheck::Refused => return,
+        };
         self.admit(&address, frame, certified);
         if !self.sequenced {
             self.try_materialize(&address);
@@ -1108,7 +1203,7 @@ impl ArchiveAppShardIngest {
             } else {
                 (wanted, GAP_RETRY_INTERVAL)
             };
-            let requested = self.request_frames(address, wanted..=upto, true, interval);
+            let requested = self.request_frames(address, wanted..=upto, true, waiting, interval);
             if requested > 0 {
                 warn!(
                     address = %hex::encode(address),
@@ -1151,18 +1246,28 @@ impl ArchiveAppShardIngest {
         if last == 0 || upto <= last {
             return Ok(0);
         }
-        Ok(self.request_frames(address, last + 1..=upto, false, GAP_RETRY_INTERVAL))
+        Ok(self.request_frames(address, last + 1..=upto, false, false, GAP_RETRY_INTERVAL))
     }
 
     /// Ask for each frame of `frames` neither buffered nor held, unless it was
     /// asked for within `interval` (at this priority or above). `urgent` asks
     /// on `gap_requests`, otherwise on `prefetch_requests`. A full queue
     /// leaves the rest for the next pass.
-    fn request_frames(&mut self, address: &[u8], frames: RangeInclusive<u64>, urgent: bool, interval: Duration) -> usize {
+    /// `global_waits`: a GLOBAL frame waits for these frames, so one parked
+    /// until execution reaches its anchor is asked for at once.
+    fn request_frames(
+        &mut self,
+        address: &[u8],
+        frames: RangeInclusive<u64>,
+        urgent: bool,
+        global_waits: bool,
+        interval: Duration,
+    ) -> usize {
         let sender = if urgent { self.gap_requests.clone() } else { self.prefetch_requests.clone() };
         let Some(sender) = sender else { return 0 };
         let mut sent = 0;
         let mut stored: HashMap<u64, bool> = HashMap::new();
+        let mut executed: Option<Option<u64>> = None;
         for number in frames {
             if self.buffered.get(address).is_some_and(|buffered| buffered.contains_key(&number))
                 || self.is_held(address, number)
@@ -1186,6 +1291,30 @@ impl ArchiveAppShardIngest {
                     requested.remove(&number);
                 }
             }
+            if let Some((anchor, since)) = self.awaiting_execution.get(address).and_then(|waiting| waiting.get(&number)).copied() {
+                // A GLOBAL frame waiting for this one sequences only a frame
+                // anchored at or below the executed frame, so the parked copy
+                // is not it: ask at once. A gap alone does not (unsequenced
+                // ingest asks for the first missing frame urgently too).
+                // Unreadable, the cursor holds nothing back: verification then
+                // refuses as before.
+                let reached = global_waits || executed
+                    .get_or_insert_with(|| self.executed_global_frame())
+                    .is_none_or(|executed| executed >= anchor);
+                if !reached && since.elapsed() < AWAIT_EXECUTION_TTL {
+                    continue;
+                }
+                // Execution reached the anchor: verify the frame again, so ask at once.
+                if let Some(waiting) = self.awaiting_execution.get_mut(address) {
+                    waiting.remove(&number);
+                    if waiting.is_empty() {
+                        self.awaiting_execution.remove(address);
+                    }
+                }
+                if let Some(requested) = self.requested.get_mut(address) {
+                    requested.remove(&number);
+                }
+            }
             let due = self.requested.get(address).and_then(|requested| requested.get(&number))
                 .is_none_or(|&(at, was_urgent)| (urgent && !was_urgent) || at.elapsed() >= interval);
             if !due {
@@ -1196,6 +1325,9 @@ impl ArchiveAppShardIngest {
             }
             self.requested.entry(address.to_vec()).or_default().insert(number, (Instant::now(), urgent));
             sent += 1;
+        }
+        if let Some(Some(executed)) = executed {
+            self.execution_deferrals.executed(executed);
         }
         sent
     }
@@ -1316,6 +1448,24 @@ pub struct ArchiveFrameVerifier {
     inclusion_prover: Arc<dyn InclusionProver>,
     has_forest: bool,
     clock_store: Arc<dyn quil_types::store::ClockStore>,
+    /// GLOBAL state frames verify against, whose executed frame tells a frame
+    /// that waits for execution from one that is refused.
+    hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+}
+
+/// What [`ArchiveFrameVerifier::check`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameCheck {
+    /// It may be admitted; `certified` says whether it carries its own
+    /// certificate.
+    Admit { certified: bool },
+    /// GLOBAL state executed through `executed` holds no session for its
+    /// generation, and it is anchored past it, at `anchor`: it waits for
+    /// execution to reach the anchor
+    /// ([`ArchiveAppShardIngest::await_execution`]).
+    AwaitExecution { anchor: u64, executed: u64 },
+    /// Refused (logged).
+    Refused,
 }
 
 impl ArchiveFrameVerifier {
@@ -1328,9 +1478,21 @@ impl ArchiveFrameVerifier {
     }
 
     /// `Some(certified)` when `frame` may be admitted, `certified` saying
-    /// whether it carries its own certificate; `None` (logged) when refused.
+    /// whether it carries its own certificate; `None` when refused or when it
+    /// waits for execution ([`Self::check`]).
     pub fn verify(&self, frame: &AppShardFrame) -> Option<bool> {
-        let header = frame.header.as_ref().filter(|header| !header.address.is_empty())?;
+        match self.check(frame) {
+            FrameCheck::Admit { certified } => Some(certified),
+            FrameCheck::AwaitExecution { .. } | FrameCheck::Refused => None,
+        }
+    }
+
+    /// Whether `frame` may be admitted, waits for GLOBAL execution to reach
+    /// its anchor, or is refused (logged).
+    pub fn check(&self, frame: &AppShardFrame) -> FrameCheck {
+        let Some(header) = frame.header.as_ref().filter(|header| !header.address.is_empty()) else {
+            return FrameCheck::Refused;
+        };
         let (address, frame_number, requests_root) = (&header.address, header.frame_number, &header.requests_root);
         // 1. Quorum BLS cert + VDF against the shard committee. A frame with
         // no certificate of its own is one a certified descendant finalized
@@ -1346,9 +1508,28 @@ impl ArchiveFrameVerifier {
                     address = %hex::encode(address),
                     "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
             Err(e) => {
+                let anchor = header.global_frame_number;
+                let executed = self
+                    .hypergraph
+                    .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    .ok()
+                    .filter(|&executed| crate::execution_deferral::awaits_execution(&e, anchor, executed))
+                    // Only the shard's next generation can be authorized by
+                    // GLOBAL frames not yet executed; any other is refused, so a
+                    // header naming an arbitrary generation is not parked.
+                    .filter(|_| {
+                        let claimed = header.public_key_signature_bls48581.as_ref()
+                            .and_then(|s| crate::execution_deferral::claimed_generation(&s.signature));
+                        claimed.is_some() && claimed == crate::execution_deferral::next_generation(&self.hypergraph, address)
+                    });
+                if let Some(executed) = executed {
+                    debug!(frame = frame_number, address = %hex::encode(address), anchor, executed, error = %e,
+                        "archive ingest: shard frame waits for GLOBAL execution to reach its anchor");
+                    return FrameCheck::AwaitExecution { anchor, executed };
+                }
                 // Elevated from debug: this is the primary "why wasn't my shard
                 // frame accepted" signal. A common cause is the anchored GLOBAL
                 // frame being absent from the local clock store (ρ_N unavailable,
@@ -1361,7 +1542,7 @@ impl ArchiveFrameVerifier {
                     error = %e,
                     "archive ingest: shard frame validation FAILED — rejecting"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
         }
 
@@ -1381,7 +1562,7 @@ impl ArchiveFrameVerifier {
                 frame.requests.len().saturating_sub(canonical.len()),
                 frame.requests.len(),
             );
-            return None;
+            return FrameCheck::Refused;
         }
         let recomputed = match compute_requests_root(
             &canonical,
@@ -1399,16 +1580,62 @@ impl ArchiveFrameVerifier {
                     error = %e,
                     "archive ingest: requests_root recompute errored — rejecting frame"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
         };
         if recomputed != *requests_root {
             warn!(frame = frame_number, address = %hex::encode(address), "archive ingest: requests_root mismatch — rejecting");
-            return None;
+            return FrameCheck::Refused;
         }
 
-        Some(certified)
+        FrameCheck::Admit { certified }
     }
+}
+
+/// What [`admit_fetched`] made of the frames one endpoint served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchedFrames {
+    /// The frame asked for was admitted, or waits for its GLOBAL anchor to
+    /// be stored.
+    Admitted,
+    /// The frame asked for failed verification.
+    Refused,
+    /// The frame asked for waits for GLOBAL execution to reach `anchor`
+    /// ([`FrameCheck::AwaitExecution`]). Not recovered from this endpoint:
+    /// another may serve a copy that verifies now.
+    AwaitsExecution { anchor: u64, executed: u64 },
+}
+
+/// Check the frames a gap fetch recovered from one endpoint (the frame asked
+/// for first, then the run up to its certified descendant) and admit them to
+/// `ingest`, which is held only to admit.
+pub fn admit_fetched(
+    ingest: &std::sync::Mutex<ArchiveAppShardIngest>,
+    verifier: &ArchiveFrameVerifier,
+    address: &[u8],
+    frames: Vec<AppShardFrame>,
+) -> FetchedFrames {
+    let lock = || ingest.lock().unwrap_or_else(|p| p.into_inner());
+    let mut outcome = FetchedFrames::Admitted;
+    for (index, frame) in frames.into_iter().enumerate() {
+        let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        if let Some(anchor) = verifier.missing_anchor(&frame) {
+            lock().await_anchor(address, number, anchor);
+            continue;
+        }
+        match verifier.check(&frame) {
+            FrameCheck::Admit { certified } => lock().admit_verified(frame, certified),
+            FrameCheck::AwaitExecution { anchor, executed } => {
+                lock().await_execution(address, number, anchor, executed);
+                if index == 0 {
+                    outcome = FetchedFrames::AwaitsExecution { anchor, executed };
+                }
+            }
+            FrameCheck::Refused if index == 0 => return FetchedFrames::Refused,
+            FrameCheck::Refused => {}
+        }
+    }
+    outcome
 }
 
 /// The `requests_root` of a frame with no requests: zero bytes, 32 on the
@@ -1982,6 +2209,90 @@ mod tests {
         assert!(ingest.materialize_through(&filter, 3).unwrap());
         assert!(ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty(),
             "frames at or below the cursor no longer wait");
+    }
+
+    /// A frame that waits for GLOBAL execution to reach its anchor is not asked
+    /// for again until execution does, or at once when a GLOBAL frame waits
+    /// for it: that frame sequences only one anchored at or below the
+    /// executed frame, so the parked copy is not it. A copy received again
+    /// keeps the first wait. Only shards this archive holds frames of are
+    /// parked, within the per-shard and overall caps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_awaiting_execution_is_asked_for_once_execution_reaches_its_anchor() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let execute = |number: u64| {
+            global.commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        execute(907_000);
+        let filter = vec![0x5c; 32];
+        let (urgent_tx, mut urgent_rx) = tokio::sync::mpsc::channel(256);
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = fixture_over(global.clone(), None)
+            .with_gap_fetch(urgent_tx)
+            .with_prefetch(prefetch_tx)
+            .sequenced();
+        ingest.last_materialized.insert(filter.clone(), 1);
+        // `urgent` asks on the gap fetch, `waits` for a waiting GLOBAL frame.
+        let mut ask_for = |ingest: &mut ArchiveAppShardIngest, urgent: bool, waits: bool| {
+            for request in ingest.requested.values_mut().flat_map(|requested| requested.values_mut()) {
+                request.0 = Instant::now() - GAP_RETRY_INTERVAL;
+            }
+            ingest.request_frames(&filter, 2..=4, urgent, waits, GLOBAL_WAIT_RETRY_INTERVAL);
+            let rx = if urgent { &mut urgent_rx } else { &mut prefetch_rx };
+            let mut frames = Vec::new();
+            while let Ok((_, number)) = rx.try_recv() {
+                frames.push(number);
+            }
+            frames
+        };
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4]);
+        assert!(ingest.await_execution(&filter, 3, 907_473, 907_000));
+        assert!(!ingest.await_execution(&filter, 1, 907_473, 907_000), "at or below the cursor");
+        assert!(!ingest.await_execution(&[0x5d; 32], 3, 907_473, 907_000), "a shard this archive holds no frames of");
+        assert!(ingest.execution_deferrals.waiting());
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4], "frame 3 waits for execution");
+        let first = ingest.awaiting_execution[&filter][&3];
+        assert!(ingest.await_execution(&filter, 3, 907_480, 907_000));
+        assert_eq!(ingest.awaiting_execution[&filter][&3], first, "a copy received again keeps the first wait");
+        execute(907_472);
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
+        execute(907_473);
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4], "asked for again once execution reached its anchor");
+        assert!(ingest.awaiting_execution.is_empty());
+        assert!(!ingest.execution_deferrals.waiting(), "the wait's end is logged");
+
+        // A forged copy anchored far ahead cannot hold back a GLOBAL frame
+        // that waits for the real one.
+        assert!(ingest.await_execution(&filter, 3, 908_000, 907_473));
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
+        assert_eq!(ask_for(&mut ingest, true, false), vec![2, 4], "a gap alone does not release it");
+        assert_eq!(ask_for(&mut ingest, true, true), vec![2, 3, 4], "asked for at once for a waiting GLOBAL frame");
+        assert!(ingest.awaiting_execution.is_empty());
+
+        let cap = MAX_AWAITING_EXECUTION_PER_SHARD as u64;
+        for number in 2..=cap + 6 {
+            ingest.await_execution(&filter, number, 908_000, 907_473);
+        }
+        let waiting = &ingest.awaiting_execution[&filter];
+        assert_eq!(waiting.len(), MAX_AWAITING_EXECUTION_PER_SHARD);
+        assert_eq!(waiting.keys().next_back().copied(), Some(cap + 1), "the farthest frames are forgotten");
+        let shards = MAX_AWAITING_EXECUTION / MAX_AWAITING_EXECUTION_PER_SHARD;
+        for shard in 1..shards {
+            let address = vec![shard as u8; 32];
+            ingest.last_materialized.insert(address.clone(), 1);
+            for number in 2..=cap + 1 {
+                assert!(ingest.await_execution(&address, number, 908_000, 907_473));
+            }
+        }
+        let address = vec![0xfe; 32];
+        ingest.last_materialized.insert(address.clone(), 1);
+        assert!(!ingest.await_execution(&address, 2, 908_000, 907_473), "the overall cap");
+        assert!(!ingest.awaiting_execution.contains_key(&address));
     }
 
     /// A frame no endpoint serves is materialized from the certified header the

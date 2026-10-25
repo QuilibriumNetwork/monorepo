@@ -1404,6 +1404,7 @@ pub(crate) async fn start(
                     // next endpoint is asked, as when one lacks the frame,
                     // unless the frame's registrations were unavailable.
                     let mut failures = Vec::new();
+                    let mut awaiting_execution = 0usize;
                     let mut recovered = None;
                     let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
                         let attempt = fetch_from(addr.clone(), frame_number);
@@ -1466,28 +1467,25 @@ pub(crate) async fn start(
                             Some((ingest, verifier)) => {
                                 let address = filter.clone();
                                 let admitted = tokio::task::spawn_blocking(move || {
-                                    for (index, frame) in frames.into_iter().enumerate() {
-                                        if let Some(anchor) = verifier.missing_anchor(&frame) {
-                                            let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
-                                            ingest.lock().unwrap_or_else(|p| p.into_inner())
-                                                .await_anchor(&address, number, anchor);
-                                        } else if let Some(certified) = verifier.verify(&frame) {
-                                            ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
-                                        } else if index == 0 {
-                                            // The frame asked for failed verification.
-                                            return false;
-                                        }
-                                    }
-                                    true
+                                    quil_engine::archive_ingest::admit_fetched(&ingest, &verifier, &address, frames)
                                 }).await;
+                                use quil_engine::archive_ingest::FetchedFrames;
                                 match admitted {
-                                    Ok(true) => {}
-                                    Ok(false) => {
+                                    Ok(FetchedFrames::Admitted) => {}
+                                    Ok(FetchedFrames::Refused) => {
                                         failures.push(format!("{source}: served a frame that failed verification"));
                                         if prepared_ok {
                                             continue;
                                         }
                                         break;
+                                    }
+                                    // Not recovered from this endpoint: a forged copy
+                                    // must not keep the others from being asked.
+                                    Ok(FetchedFrames::AwaitsExecution { anchor, executed }) => {
+                                        failures.push(format!("{source}: served a frame whose generation GLOBAL \
+                                            execution at {executed} has not authorized (anchor {anchor})"));
+                                        awaiting_execution += 1;
+                                        continue;
                                     }
                                     Err(error) => tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
                                         "app-shard gap fetch: admitting the recovered frames failed"),
@@ -1506,6 +1504,10 @@ pub(crate) async fn start(
                         Some((source, through)) => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             through, %source, endpoints_failed = failures.len(),
                             "app-shard gap fetch recovered a missing frame"),
+                        None if awaiting_execution > 0 => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            tried = endpoints.len(), awaiting_execution, ?failures,
+                            "app-shard gap fetch: endpoints served the frame, but its session generation is not authorized \
+                             in executed GLOBAL state yet; it is asked for again once execution reaches its anchor"),
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             tried = endpoints.len(), ?failures,
                             "app-shard gap fetch found no endpoint with the frame; ingest will retry"),
