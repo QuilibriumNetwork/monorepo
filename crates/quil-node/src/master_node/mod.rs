@@ -1,3 +1,4 @@
+mod activation_wait;
 mod frame_observations;
 mod peer_info_file;
 use std::sync::Arc;
@@ -1170,6 +1171,13 @@ pub(crate) async fn start(
             )
         };
 
+    // `cw_router` and `global_finalization` stay unset until activation; report
+    // when readers start and stop falling back. Only an archive with a committee
+    // ever sets them.
+    let activation_waits = Arc::new(activation_wait::ActivationWaits::new(
+        archive_mode && !consensus_committee.is_empty(),
+    ));
+
     // Bind the fixed global committee (genesis archives' Falcon pubkeys) into the
     // receive-path frame validator so CW-finalized global frames arriving over
     // GLOBAL_FRAME gossip are verified via their carried finalization cert (CWCT).
@@ -1262,6 +1270,7 @@ pub(crate) async fn start(
         consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
         cw_router: cw_router.clone(),
         global_finalization: global_finalization.clone(),
+        activation_waits: activation_waits.clone(),
         app_ingest: app_ingest.clone(),
         // A STABLE subdir of the node's data dir for the simplex journal, so
         // consensus resumes across restarts instead of replaying from the
@@ -1604,6 +1613,7 @@ pub(crate) async fn start(
         current_frame: current_frame.clone(),
         cw_router: cw_router.clone(),
         global_finalization: global_finalization.clone(),
+        activation_waits: activation_waits.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
         gossip_freshness: gossip_freshness.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),

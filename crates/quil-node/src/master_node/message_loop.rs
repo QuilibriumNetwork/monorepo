@@ -45,6 +45,8 @@ pub(crate) struct MessageLoopArgs {
         Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
     /// Atomic GLOBAL finalization pipeline (archives with CW GLOBAL consensus).
     pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
+    /// Reports when readers of the two cells above start and stop falling back.
+    pub activation_waits: Arc<super::activation_wait::ActivationWaits>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -202,6 +204,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         recent_messages: recent_messages_for_recv,
         cw_router: cw_router_for_recv,
         global_finalization: global_finalization_for_recv,
+        activation_waits: activation_waits_for_recv,
     } = args;
     let archive_ingest_for_recv = archive_app_shard_ingest;
 
@@ -864,7 +867,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             // one of its channel bitmasks is fed to the engine and
                             // the legacy dispatch below is skipped. Off by default
                             // (router unset) → zero overhead.
-                            if let Some(router) = cw_router_for_recv.get() {
+                            let router = cw_router_for_recv.get();
+                            activation_waits_for_recv.cw_router.observe(router.is_some(), None);
+                            if let Some(router) = router {
                                 if router.route(
                                     &received.bitmask,
                                     &received.from,
@@ -1347,9 +1352,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // with the execution state.
                                         let stored = {
                                             let _store = probe::section(ProbeSection::GlobalFrameStore);
-                                            if global_finalization_for_recv
-                                                .get()
-                                                .is_some_and(|pipeline| pipeline.offer_synced(&frame))
+                                            let pipeline = global_finalization_for_recv.get();
+                                            activation_waits_for_recv.global_finalization.observe(pipeline.is_some(), Some(frame_num));
+                                            if pipeline.is_some_and(|pipeline| pipeline.offer_synced(&frame))
                                             {
                                                 Ok(())
                                             } else {

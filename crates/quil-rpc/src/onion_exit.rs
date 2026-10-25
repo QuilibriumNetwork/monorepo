@@ -25,6 +25,7 @@
 //! 1 = error (payload = UTF-8 message).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -94,6 +95,13 @@ fn err_reply(msg: &str) -> Vec<u8> {
 /// queued), which for an anonymous proxy is the right back-pressure.
 const MAX_CONCURRENT_EXIT_RPCS: usize = 64;
 
+/// Seconds between warnings that replies are dropped for want of a handle.
+const UNBOUND_WARN_INTERVAL_SECS: u64 = 60;
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// The onion exit RPC proxy. Wire [`into_on_data`](Self::into_on_data) as the
 /// `OnionNode` exit handler, and set the reply handle once the node exists.
 pub struct OnionExitProxy {
@@ -101,6 +109,10 @@ pub struct OnionExitProxy {
     peer_lookup: PeerRoutingLookup,
     allowed_methods: HashSet<String>,
     reply: OnceLock<OnionReplyHandle>,
+    /// Replies dropped for want of a handle since the last warning.
+    unbound_dropped: AtomicU64,
+    /// Unix seconds of the last such warning (0: none yet).
+    unbound_warned: AtomicU64,
     inflight: Arc<tokio::sync::Semaphore>,
 }
 
@@ -115,6 +127,8 @@ impl OnionExitProxy {
             peer_lookup,
             allowed_methods,
             reply: OnceLock::new(),
+            unbound_dropped: AtomicU64::new(0),
+            unbound_warned: AtomicU64::new(0),
             inflight: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXIT_RPCS)),
         })
     }
@@ -157,7 +171,28 @@ impl OnionExitProxy {
             if let Err(e) = handle.send_reply(up_peer, circ_id, &reply).await {
                 tracing::debug!(error = %e, "onion exit reply send failed");
             }
+        } else if let Some(dropped) = self.note_unbound(unix_secs()) {
+            tracing::warn!(
+                circ_id, dropped, interval_secs = UNBOUND_WARN_INTERVAL_SECS,
+                "onion exit has no reply handle; proxied replies are dropped and callers time out \
+                 (defect on this node: node startup did not bind the onion node to its exit proxy)",
+            );
         }
+    }
+
+    /// Counts a reply dropped for want of a handle. Returns the number dropped
+    /// since the last warning when one is due at `now` (the first drop, then at
+    /// most once per [`UNBOUND_WARN_INTERVAL_SECS`]).
+    fn note_unbound(&self, now: u64) -> Option<u64> {
+        self.unbound_dropped.fetch_add(1, Ordering::Relaxed);
+        let last = self.unbound_warned.load(Ordering::Relaxed);
+        if last != 0 && now < last + UNBOUND_WARN_INTERVAL_SECS {
+            return None;
+        }
+        self.unbound_warned
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        Some(self.unbound_dropped.swap(0, Ordering::Relaxed))
     }
 
     async fn process(&self, payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -304,6 +339,16 @@ mod tests {
             OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), Arc::new(|_| None), HashSet::new());
         let err = proxy.process(vec![0x00]).await.unwrap_err();
         assert!(err.contains("malformed"), "got: {err}");
+    }
+
+    #[test]
+    fn unbound_reply_warns_first_then_once_a_minute_with_a_count() {
+        let proxy = OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), Arc::new(|_| None), HashSet::new());
+        assert_eq!(proxy.note_unbound(1_000), Some(1), "the first drop warns");
+        assert_eq!(proxy.note_unbound(1_001), None);
+        assert_eq!(proxy.note_unbound(1_059), None);
+        assert_eq!(proxy.note_unbound(1_060), Some(3), "a minute on, with the drops since");
+        assert_eq!(proxy.note_unbound(1_061), None);
     }
 
     #[test]
