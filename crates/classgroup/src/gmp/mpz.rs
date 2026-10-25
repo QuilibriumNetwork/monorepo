@@ -13,7 +13,6 @@ use std::ops::{
 };
 use std::str::FromStr;
 use std::{fmt, hash};
-use std::{i32, u32, usize};
 
 use super::ffi::*;
 

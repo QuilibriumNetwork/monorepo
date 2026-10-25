@@ -155,7 +155,7 @@ impl ExecutionViewAdmission {
     fn acquire(&self) -> Result<()> {
         let limit = self.max_views.load(Ordering::Acquire);
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|next| *next <= limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|next| *next <= limit))
             .map(|_| ())
             .map_err(|_| anyhow::anyhow!("execution view admission limit ({limit} held views)"))
     }
@@ -480,7 +480,7 @@ struct ForkPermit(Arc<ForkAdmission>);
 impl ForkAdmission {
     fn acquire(self: &Arc<Self>, limit: usize) -> Result<ForkPermit> {
         let limit = limit.min(self.limit);
-        self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        self.active.try_update(Ordering::AcqRel, Ordering::Acquire,
             |n| n.checked_add(1).filter(|next| *next <= limit))
             .map_err(|_| anyhow::anyhow!("overlay descendant branch limit"))?;
         Ok(ForkPermit(self.clone()))

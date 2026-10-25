@@ -56,7 +56,7 @@ struct FailingClockTxn {
 }
 
 fn clock_fault_due(counter: &std::sync::atomic::AtomicUsize) -> bool {
-    counter.fetch_update(std::sync::atomic::Ordering::SeqCst,
+    counter.try_update(std::sync::atomic::Ordering::SeqCst,
         std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)) == Ok(1)
 }
 
