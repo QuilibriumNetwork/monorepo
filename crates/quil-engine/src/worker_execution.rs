@@ -1071,10 +1071,11 @@ mod tests {
     }
 
     /// The string literals of each `open` … `close` in `source` that starts
-    /// with a literal, e.g. each `state("…", "…")` call.
+    /// with a literal, e.g. each `state("…", "…")` call. Whitespace after
+    /// `open` is skipped, so a line break inserted by rustfmt hides nothing.
     fn literals<'a>(source: &'a str, open: &str, close: char) -> Vec<Vec<&'a str>> {
         source.match_indices(open).filter_map(|(at, _)| {
-            let rest = &source[at + open.len()..];
+            let rest = source[at + open.len()..].trim_start();
             rest.starts_with('"').then(|| rest[..rest.find(close).unwrap()].split('"').skip(1).step_by(2).collect())
         }).collect()
     }
@@ -1095,7 +1096,7 @@ mod tests").unwrap()];
         let mut written: Vec<Vec<&str>> = [engine, thread].iter().flat_map(|s| literals(s, "state(", ')')).collect();
         assert!(written.len() >= 10, "{written:?}");
         written.extend(literals(phase, "(", ')'));
-        let chained = literals(chain, "{ ", '}');
+        let chained = literals(chain, "{", '}');
         assert_eq!(chained.len(), 4, "{chain}");
         written.extend(chained.into_iter().map(|blocker| vec!["blocked", blocker[0]]));
         // A store's state, which no engine writes (`with_store_state`).
