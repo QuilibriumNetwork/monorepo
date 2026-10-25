@@ -38,6 +38,10 @@ const DST_AUDIT: &[u8] = b"quil/porep/audit/v1";
 
 const DST_FRAME_OUTPUT: &[u8] = b"quil/porep/frame-output/v1";
 
+/// Domain-separation tag of the key a possession verdict is remembered under
+/// (never on the wire).
+const DST_POSSESSION_CHECK: &[u8] = b"quil/porep/possession-check/v1";
+
 /// Derive the per-frame storage beacon `ρ_N = SHA3(DST ‖ global_frame_number ‖
 /// global_output)`. The shard frame commits `global_frame_number` in its VDF
 /// challenge and the verifier loads `global_frame[global_frame_number].output`
@@ -215,6 +219,9 @@ fn opening_audit_id(o: &StorageOpening) -> Vec<u8> {
 /// Possession is checked per opening (so culprits are identifiable); each is
 /// γ-independent at k=1, so frame/bitmask are don't-cares and a single `rho_n`
 /// (the global frame's beacon) drives every challenge.
+///
+/// The two halves are [`audit_storage_registry`] and
+/// [`audit_storage_possession`], for a caller that times them apart.
 pub fn audit_frame_storage_attestations<F>(
     openings: &[StorageOpening],
     rho_n: &[u8],
@@ -226,36 +233,66 @@ pub fn audit_frame_storage_attestations<F>(
 where
     F: Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
 {
-    use rayon::prelude::*;
-    use std::collections::HashSet;
+    let audited = audit_storage_registry(openings, rho_n, active_epoch, sample_size, lookup);
+    audit_storage_possession(&audited, rho_n, poly_size)
+}
+
+/// Step (a) of [`audit_frame_storage_attestations`]: the openings sampled this
+/// frame, in order, each with its registry cross-check (cheap, no pairing).
+/// `lookup` reads committed state, which this audit does not change, so each
+/// `(member, leaf)` registration is read once, however many of the member's
+/// queries open that leaf (`STORAGE_QUERIES_PER_LEAF` of them).
+pub fn audit_storage_registry<'a, F>(
+    openings: &'a [StorageOpening],
+    rho_n: &[u8],
+    active_epoch: u64,
+    sample_size: u64,
+    lookup: F,
+) -> Vec<(&'a StorageOpening, bool)>
+where
+    F: Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
+{
+    use std::collections::HashMap;
     let total = openings.len() as u64;
-    // (a) registry cross-check (cheap, no pairing). `lookup` reads committed
-    // state, so it runs here, in order.
-    let audited: Vec<(&StorageOpening, bool)> = openings
+    let mut registered: HashMap<(&[u8], &[u8]), Option<(Vec<u8>, u64, u64)>> = HashMap::new();
+    openings
         .iter()
         .filter(|o| is_audited(rho_n, &opening_audit_id(o), sample_size, total))
         .map(|o| {
-            let registry_ok = match lookup(&o.member_id, &o.shard_id) {
+            let registration = registered
+                .entry((o.member_id.as_slice(), o.shard_id.as_slice()))
+                .or_insert_with(|| lookup(&o.member_id, &o.shard_id));
+            let registry_ok = match registration {
                 Some((leaf_root, num_blocks, epoch)) => {
-                    epoch == active_epoch
+                    *epoch == active_epoch
                         && o.epoch == active_epoch
-                        && leaf_root == o.leaf_root
-                        && num_blocks == o.num_blocks
+                        && *leaf_root == o.leaf_root
+                        && *num_blocks == o.num_blocks
                 }
                 None => false,
             };
             (o, registry_ok)
         })
-        .collect();
-    // (b) possession + path (skipped if the registry already failed). Each
-    // opening is its own pairing check, independent of the others, so they run
-    // in parallel: one after another they were most of a shard header's GLOBAL
-    // execution time. The result is the same as checking them in turn.
+        .collect()
+}
+
+/// Step (b) of [`audit_frame_storage_attestations`]: possession + path of each
+/// sampled opening whose registry check passed. Returns the distinct members
+/// with a failing opening, first failure first.
+pub fn audit_storage_possession(
+    audited: &[(&StorageOpening, bool)],
+    rho_n: &[u8],
+    poly_size: u64,
+) -> Vec<Vec<u8>> {
+    use rayon::prelude::*;
+    use std::collections::HashSet;
+    // Each opening is its own pairing check, independent of the others, so
+    // they run in parallel: one after another they were most of a shard
+    // header's GLOBAL execution time. The result is the same as checking them
+    // in turn.
     let verified: Vec<bool> = audited
         .par_iter()
-        .map(|(o, registry_ok)| {
-            *registry_ok && verify_storage_attestation(std::slice::from_ref(*o), 0, rho_n, &[], poly_size)
-        })
+        .map(|(o, registry_ok)| *registry_ok && opening_possession_verifies(o, rho_n, poly_size))
         .collect();
     // Failed members in opening order, as before: every node kicks the same
     // members in the same order.
@@ -267,6 +304,64 @@ where
         }
     }
     failed
+}
+
+/// `verify_storage_attestation` of one opening, remembered. GLOBAL executes a
+/// frame's shard headers two or three times (proposal check, vote,
+/// publication), and each time the audit re-checked the same openings against
+/// the same beacon. The check is a pure function of the opening, `rho_n` and
+/// `poly_size`, and the key hashes all of them, so a remembered verdict is the
+/// verdict the check would return.
+fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    /// A frame carries a few thousand openings: a few frames' worth, about
+    /// 2 MB at most, cleared when full.
+    const MAX_ENTRIES: usize = 1 << 14;
+    static REMEMBERED: LazyLock<Mutex<HashMap<[u8; 32], bool>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let key = possession_check_key(o, rho_n, poly_size);
+    if let Some(ok) = REMEMBERED.lock().ok().and_then(|seen| seen.get(&key).copied()) {
+        return ok;
+    }
+    let ok = verify_storage_attestation(std::slice::from_ref(o), 0, rho_n, &[], poly_size);
+    if let Ok(mut seen) = REMEMBERED.lock() {
+        if seen.len() >= MAX_ENTRIES {
+            seen.clear();
+        }
+        seen.insert(key, ok);
+    }
+    ok
+}
+
+/// Every input of one opening's possession check, length-prefixed.
+fn possession_check_key(o: &StorageOpening, rho_n: &[u8], poly_size: u64) -> [u8; 32] {
+    fn field(h: &mut Sha3_256, bytes: &[u8]) {
+        h.update((bytes.len() as u64).to_be_bytes());
+        h.update(bytes);
+    }
+    let mut h = Sha3_256::new();
+    field(&mut h, DST_POSSESSION_CHECK);
+    field(&mut h, rho_n);
+    h.update(poly_size.to_be_bytes());
+    field(&mut h, &o.shard_id);
+    h.update(o.epoch.to_be_bytes());
+    field(&mut h, &o.member_id);
+    h.update(o.query.to_be_bytes());
+    field(&mut h, &o.leaf_root);
+    h.update(o.num_blocks.to_be_bytes());
+    for list in [&o.path_commits, &o.path_proofs] {
+        h.update((list.len() as u64).to_be_bytes());
+        for item in list {
+            field(&mut h, item);
+        }
+    }
+    field(&mut h, &o.commitment);
+    field(&mut h, &o.value);
+    field(&mut h, &o.proof);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&h.finalize());
+    key
 }
 
 /// Filter `ids` to the subset audited this frame (see [`is_audited`]).
@@ -1560,5 +1655,204 @@ mod tests {
             overlap < sel_b.len(),
             "different beacons must not select an identical audited set"
         );
+    }
+
+    /// The audit as it ran before it read each `(member, leaf)` registration
+    /// once and remembered possession verdicts: a registry read and a check
+    /// per opening, in turn.
+    fn audit_reading_per_opening(
+        openings: &[StorageOpening],
+        rho_n: &[u8],
+        poly_size: u64,
+        epoch: u64,
+        lookup: &dyn Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
+    ) -> Vec<Vec<u8>> {
+        let mut failed: Vec<Vec<u8>> = Vec::new();
+        for o in openings {
+            let registry_ok = lookup(&o.member_id, &o.shard_id).is_some_and(|(root, blocks, e)| {
+                e == epoch && o.epoch == epoch && root == o.leaf_root && blocks == o.num_blocks
+            });
+            let ok = registry_ok
+                && verify_storage_attestation(std::slice::from_ref(o), 0, rho_n, &[], poly_size);
+            if !ok && !failed.contains(&o.member_id) {
+                failed.push(o.member_id.clone());
+            }
+        }
+        failed
+    }
+
+    type Registry = std::collections::HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)>;
+
+    /// [`build_attestation`] plus m0's two openings of a second leaf of its
+    /// own, and the registry the honest openings imply.
+    fn two_leaf_attestation(rho_n: &[u8], poly_size: u64) -> (Vec<StorageOpening>, Registry) {
+        let mut openings = build_attestation(rho_n, poly_size);
+        for q in 0..2u32 {
+            openings.push(make_opening(0x40, b"shardB", EPOCH, b"m0", q, rho_n, NUM_BLOCKS, poly_size));
+        }
+        let mut registry = Registry::new();
+        for o in &openings {
+            registry.insert(
+                (o.member_id.clone(), o.shard_id.clone()),
+                (o.leaf_root.clone(), o.num_blocks, EPOCH),
+            );
+        }
+        (openings, registry)
+    }
+
+    #[test]
+    fn audit_reads_each_member_leaf_registration_once() {
+        use std::cell::Cell;
+        bls48581::init();
+        let poly_size = 16u64;
+        let rho_n = [0xB2u8; 32];
+        let (openings, registry) = two_leaf_attestation(&rho_n, poly_size);
+        let reads = Cell::new(0usize);
+        let lookup = |m: &[u8], l: &[u8]| {
+            reads.set(reads.get() + 1);
+            registry.get(&(m.to_vec(), l.to_vec())).cloned()
+        };
+        let failed =
+            audit_frame_storage_attestations(&openings, &rho_n, poly_size, EPOCH, u64::MAX, &lookup);
+        assert!(failed.is_empty(), "honest registered openings must pass: {failed:?}");
+        assert_eq!(openings.len(), 8);
+        assert_eq!(reads.get(), 4, "one registry read per (member, leaf), not per query");
+    }
+
+    fn registry_key(member: &[u8], leaf: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        (member.to_vec(), leaf.to_vec())
+    }
+
+    /// `openings` with `edit` applied to `member`'s opening of `leaf` for `query`.
+    fn edited(
+        openings: &[StorageOpening],
+        member: &[u8],
+        leaf: &[u8],
+        query: u32,
+        edit: &dyn Fn(&mut StorageOpening),
+    ) -> Vec<StorageOpening> {
+        let mut openings = openings.to_vec();
+        for o in openings.iter_mut() {
+            if o.member_id == member && o.shard_id == leaf && o.query == query {
+                edit(o);
+            }
+        }
+        openings
+    }
+
+    fn edited_registry(registry: &Registry, edit: &dyn Fn(&mut Registry)) -> Registry {
+        let mut registry = registry.clone();
+        edit(&mut registry);
+        registry
+    }
+
+    #[test]
+    fn audit_reading_each_registration_once_flags_what_a_read_per_opening_flags() {
+        bls48581::init();
+        let poly_size = 16u64;
+        let rho_n = [0xB3u8; 32];
+        let (honest, registry) = two_leaf_attestation(&rho_n, poly_size);
+        let other_root = honest[0].leaf_root.clone();
+        let other_proof = honest[0].proof.clone();
+        let mut reversed = edited(&honest, b"m2", SHARD, 0, &|o: &mut StorageOpening| {
+            o.value = vec![0xFFu8; o.value.len()]
+        });
+        reversed.reverse();
+        let cases: Vec<(&str, Vec<StorageOpening>, Registry, Vec<Vec<u8>>)> = vec![
+            ("honest, m0 on two leaves", honest.clone(), registry.clone(), vec![]),
+            (
+                "m1 registered another leaf root",
+                honest.clone(),
+                edited_registry(&registry, &|r: &mut Registry| {
+                    r.get_mut(&registry_key(b"m1", SHARD)).unwrap().0 = other_root.clone()
+                }),
+                vec![b"m1".to_vec()],
+            ),
+            (
+                "m2 registered for another epoch",
+                honest.clone(),
+                edited_registry(&registry, &|r: &mut Registry| {
+                    r.get_mut(&registry_key(b"m2", SHARD)).unwrap().2 = EPOCH + 1
+                }),
+                vec![b"m2".to_vec()],
+            ),
+            (
+                "an opening of m0's second leaf claims another epoch",
+                edited(&honest, b"m0", b"shardB", 1, &|o: &mut StorageOpening| o.epoch = EPOCH + 1),
+                registry.clone(),
+                vec![b"m0".to_vec()],
+            ),
+            (
+                "m0's second leaf unregistered",
+                honest.clone(),
+                edited_registry(&registry, &|r: &mut Registry| {
+                    r.remove(&registry_key(b"m0", b"shardB"));
+                }),
+                vec![b"m0".to_vec()],
+            ),
+            (
+                "m2 opens with another opening's proof",
+                edited(&honest, b"m2", SHARD, 1, &|o: &mut StorageOpening| o.proof = other_proof.clone()),
+                registry.clone(),
+                vec![b"m2".to_vec()],
+            ),
+            (
+                "m1 unregistered and m2 tampered, last first",
+                reversed,
+                edited_registry(&registry, &|r: &mut Registry| {
+                    r.remove(&registry_key(b"m1", SHARD));
+                }),
+                vec![b"m2".to_vec(), b"m1".to_vec()],
+            ),
+        ];
+        for (name, openings, registry, expected) in cases {
+            let lookup = |m: &[u8], l: &[u8]| registry.get(&registry_key(m, l)).cloned();
+            let failed =
+                audit_frame_storage_attestations(&openings, &rho_n, poly_size, EPOCH, u64::MAX, &lookup);
+            assert_eq!(
+                failed,
+                audit_reading_per_opening(&openings, &rho_n, poly_size, EPOCH, &lookup),
+                "{name}"
+            );
+            assert_eq!(failed, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn remembered_possession_verdicts_are_the_checks_verdicts() {
+        bls48581::init();
+        let poly_size = 16u64;
+        let rho_n = [0xB4u8; 32];
+        let other_rho = [0xB5u8; 32];
+        let openings = build_attestation(&rho_n, poly_size);
+        let mut verdicts = [0usize; 2];
+        for (i, o) in openings.iter().enumerate() {
+            // Another member's opening: every part of it differs from `o`'s.
+            let other = &openings[(i + 2) % openings.len()];
+            // `o`, then variants that differ from it in one input of the
+            // check each, checked after `o`'s verdict is remembered.
+            let mut variants: Vec<(StorageOpening, &[u8])> = vec![(o.clone(), &rho_n[..])];
+            let edits: [&dyn Fn(&mut StorageOpening); 5] = [
+                &|v: &mut StorageOpening| v.value = other.value.clone(),
+                &|v: &mut StorageOpening| v.proof = other.proof.clone(),
+                &|v: &mut StorageOpening| v.commitment = other.commitment.clone(),
+                &|v: &mut StorageOpening| v.path_proofs = other.path_proofs.clone(),
+                &|v: &mut StorageOpening| v.path_commits = other.path_commits.clone(),
+            ];
+            for edit in edits {
+                let mut v = o.clone();
+                edit(&mut v);
+                variants.push((v, &rho_n[..]));
+            }
+            variants.push((o.clone(), &other_rho[..]));
+            for (v, rho) in &variants {
+                let expected = verify_storage_attestation(std::slice::from_ref(v), 0, rho, &[], poly_size);
+                verdicts[usize::from(expected)] += 1;
+                for _ in 0..2 {
+                    assert_eq!(opening_possession_verifies(v, rho, poly_size), expected, "opening {i}");
+                }
+            }
+        }
+        assert!(verdicts[0] > 0 && verdicts[1] >= openings.len(), "{verdicts:?}");
     }
 }

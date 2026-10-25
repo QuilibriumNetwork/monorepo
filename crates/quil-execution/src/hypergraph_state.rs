@@ -211,6 +211,12 @@ impl HypergraphState {
     }
 
     /// Set (create or update) a state entry. Appends to the changeset.
+    ///
+    /// The change is labelled `Update` whether or not the entry exists: every
+    /// reader of the changeset (`commit`, `pending_vertex_adds`) treats
+    /// `Create` and `Update` alike, so telling them apart cost a store read
+    /// (two, with the tombstone) per write and decided nothing. GLOBAL
+    /// execution writes three vertices per participant of every shard header.
     pub fn set(
         &self,
         domain: &[u8],
@@ -219,33 +225,20 @@ impl HypergraphState {
         _frame_number: u64,
         value: Vec<u8>,
     ) -> Result<()> {
-        let loc = location_from_domain_address(domain, address)?;
+        location_from_domain_address(domain, address)?;
         let va_disc = vertex_adds_discriminator()?;
         let ha_disc = hyperedge_adds_discriminator()?;
-
-        let event = if discriminator == va_disc.as_slice() {
-            if self.crdt.get_vertex_data_checked(&loc)?.is_some() {
-                StateChangeEvent::Update
-            } else {
-                StateChangeEvent::Create
-            }
-        } else if discriminator == ha_disc.as_slice() {
-            if self.crdt.get_hyperedge_data_checked(&loc)?.is_some() {
-                StateChangeEvent::Update
-            } else {
-                StateChangeEvent::Create
-            }
-        } else {
+        if discriminator != va_disc.as_slice() && discriminator != ha_disc.as_slice() {
             return Err(QuilError::InvalidArgument(
                 "HypergraphState::set: invalid discriminator".into(),
             ));
-        };
+        }
 
         self.changeset.lock().unwrap().push(ExecutionChange::State(StateChange {
             domain: domain.to_vec(),
             address: address.to_vec(),
             discriminator: discriminator.to_vec(),
-            state_change: event,
+            state_change: StateChangeEvent::Update,
             value,
         }));
 
@@ -672,17 +665,30 @@ mod tests {
     }
 
     #[test]
-    fn database_read_errors_stop_reads_and_staging() {
+    fn database_read_errors_stop_reads_but_writes_stage_without_reading() {
         let store = Arc::new(MemStore::new());
         let state = HypergraphState::new(Arc::new(HypergraphCrdt::new(
             store.clone(), Arc::new(NoopInclusionProver),
         )));
-        for disc in [vertex_adds_discriminator().unwrap(), hyperedge_adds_discriminator().unwrap()] {
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        for disc in [va, ha] {
             for phase in ["adds", "removes"] {
                 store.fail_vertex_reads(Some(phase));
                 assert!(state.get(&domain(), &addr(), &disc).is_err());
-                assert!(state.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).is_err());
-                assert_eq!(state.changeset_len(), 0);
+                // A write reads nothing, so it stages the same change whether
+                // or not the store can be read.
+                state.set(&domain(), &addr(), &disc, 1, b"data".to_vec()).unwrap();
+                assert_eq!(state.changeset_len(), 1);
+                assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), Some(b"data".to_vec()));
+                // Staging reads the entry's adds (a vertex) or tombstone (a
+                // hyperedge): a store that cannot serve it stops the commit,
+                // and the changeset stays for a retry.
+                if (disc == va && phase == "adds") || (disc == ha && phase == "removes") {
+                    assert!(state.commit().unwrap_err().is_execution_unavailable());
+                    assert_eq!(state.changeset_len(), 1);
+                }
+                state.abort();
             }
             store.fail_vertex_reads(None);
             assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), None);
@@ -691,6 +697,66 @@ mod tests {
             assert_eq!(state.get(&domain(), &addr(), &disc).unwrap(), Some(b"pending".to_vec()));
             state.abort();
             assert!(state.get(&domain(), &addr(), &disc).is_err());
+            store.fail_vertex_reads(None);
+        }
+    }
+
+    /// Stage `value` as `set` did while it read the store to label the change:
+    /// `Create` for an absent entry, `Update` for a present one.
+    fn stage_labelled(state: &HypergraphState, address: &[u8], disc: &[u8], value: &[u8]) -> StateChangeEvent {
+        let loc = location_from_domain_address(&domain(), address).unwrap();
+        let present = if disc == vertex_adds_discriminator().unwrap().as_slice() {
+            state.crdt.get_vertex_data_checked(&loc).unwrap().is_some()
+        } else {
+            state.crdt.get_hyperedge_data_checked(&loc).unwrap().is_some()
+        };
+        let event = if present { StateChangeEvent::Update } else { StateChangeEvent::Create };
+        state.changeset.lock().unwrap().push(ExecutionChange::State(StateChange {
+            domain: domain(),
+            address: address.to_vec(),
+            discriminator: disc.to_vec(),
+            state_change: event,
+            value: value.to_vec(),
+        }));
+        event
+    }
+
+    #[test]
+    fn set_commits_what_the_create_and_update_labels_committed() {
+        // The same writes go to two stores: through `set`, and labelled as
+        // `set` labelled them when it read the store. The first frame creates
+        // every entry, the second updates them.
+        let va = vertex_adds_discriminator().unwrap();
+        let ha = hyperedge_adds_discriminator().unwrap();
+        let (unread, labelled) = (stub_state(), stub_state());
+        let addresses = [addr(), vec![0xBCu8; 32]];
+        for (frame, value, label) in [
+            (1u64, b"created".as_slice(), StateChangeEvent::Create),
+            (2, b"updated".as_slice(), StateChangeEvent::Update),
+        ] {
+            for disc in [va, ha] {
+                for address in &addresses {
+                    unread.set(&domain(), address, &disc, frame, value.to_vec()).unwrap();
+                    assert_eq!(stage_labelled(&labelled, address, &disc, value), label);
+                }
+            }
+            assert_eq!(
+                unread.pending_vertex_adds(&domain()).unwrap(),
+                labelled.pending_vertex_adds(&domain()).unwrap(),
+            );
+            assert_eq!(unread.pending_vertex_adds(&domain()).unwrap().len(), addresses.len());
+            let mut roots = Vec::new();
+            for state in [&unread, &labelled] {
+                state.commit().unwrap();
+                state.abort();
+                roots.push(state.crdt.commit(frame).unwrap());
+                for address in &addresses {
+                    let loc = location_from_domain_address(&domain(), address).unwrap();
+                    assert_eq!(state.crdt.get_vertex_data_checked(&loc).unwrap().as_deref(), Some(value));
+                    assert_eq!(state.crdt.get_hyperedge_data_checked(&loc).unwrap().as_deref(), Some(value));
+                }
+            }
+            assert_eq!(roots[0], roots[1], "frame {frame}");
         }
     }
 
