@@ -280,6 +280,8 @@ impl WorkerVerifier {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         command.args(self.worker_mode_arg);
+        // The worker otherwise reads a node running as PID 1 as init.
+        command.env(super::worker_limits::PARENT_PID_ENV, std::process::id().to_string());
         command.arg("--cpu-seconds").arg(self.cpu_seconds.to_string());
         if let Some(bytes) = self.address_space_bytes {
             command.arg("--address-space-bytes").arg(bytes.to_string());
@@ -359,6 +361,16 @@ fn test_limit_secs(value: Option<&str>, default: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::confidential::transfer::CompileLimits;
+
+    #[test]
+    fn the_worker_command_names_this_process_as_its_parent() {
+        use super::super::worker_limits::PARENT_PID_ENV;
+        use std::ffi::OsStr;
+        let verifier = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap();
+        let pid = std::process::id().to_string();
+        assert!(verifier.command().get_envs()
+            .any(|(key, value)| key == OsStr::new(PARENT_PID_ENV) && value == Some(OsStr::new(&pid))));
+    }
 
     #[cfg(unix)]
     #[test]

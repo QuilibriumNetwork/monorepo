@@ -61,6 +61,25 @@ pub fn apply_to_current_worker(cpu_seconds: u64) -> io::Result<()> {
 /// the verdict codes, so it can never read as a proof verdict.
 pub const ORPHANED_EXIT: i32 = 83;
 
+/// Environment variable through which a launcher names itself to its worker:
+/// the decimal PID of the process that spawns it. A worker cannot otherwise
+/// tell a launcher running as PID 1 (a container entrypoint without an init)
+/// from init adopting an orphan.
+pub const PARENT_PID_ENV: &str = "QUIL_PROOF_WORKER_PARENT_PID";
+
+/// The parent this worker must keep, or `None` when it is already orphaned.
+/// `named` is the launcher's [`PARENT_PID_ENV`] value and `startup` the parent
+/// the worker saw at startup. A named PID is trusted, including 1. Without
+/// one, a startup parent of 1 or less is init that adopted the worker.
+#[cfg(unix)]
+fn watched_parent(named: Option<&str>, startup: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+    let Some(named) = named else { return Ok((startup > 1).then_some(startup)) };
+    match named.parse::<libc::pid_t>() {
+        Ok(pid) if pid >= 1 => Ok((startup == pid).then_some(pid)),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid proof worker parent PID")),
+    }
+}
+
 /// Stop this worker when the node that launched it dies. The parent kills and
 /// reaps its worker on every path it still controls; an abrupt parent death
 /// (SIGKILL, OOM kill, crash) reaches neither, and would leave a verifier
@@ -69,18 +88,22 @@ pub const ORPHANED_EXIT: i32 = 83;
 /// Linux delivers SIGKILL on parent death. Every Unix also gets a watchdog
 /// that notices reparenting, which covers macOS and the window before the
 /// Linux request was installed. Call once, before reading the request.
+/// The launcher names itself through [`PARENT_PID_ENV`]; only a worker started
+/// without it takes a parent of PID 1 for init.
 pub fn exit_when_orphaned() -> io::Result<()> {
     #[cfg(unix)]
     {
-        let parent = unsafe { libc::getppid() };
+        let startup = unsafe { libc::getppid() };
         #[cfg(target_os = "linux")]
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let named = std::env::var_os(PARENT_PID_ENV).map(|value| value.into_string().unwrap_or_default());
         // The parent may have died between our exec and the calls above.
-        if parent <= 1 || unsafe { libc::getppid() } != parent {
-            unsafe { libc::_exit(ORPHANED_EXIT) };
-        }
+        let parent = match watched_parent(named.as_deref(), startup)? {
+            Some(parent) if unsafe { libc::getppid() } == parent => parent,
+            _ => unsafe { libc::_exit(ORPHANED_EXIT) },
+        };
         std::thread::Builder::new().name("proof-worker-parent-watch".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if unsafe { libc::getppid() } != parent {
@@ -93,4 +116,30 @@ pub fn exit_when_orphaned() -> io::Result<()> {
     }
     #[cfg(not(unix))]
     Err(io::Error::new(io::ErrorKind::Unsupported, "worker orphan handling unsupported on this OS"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_named_parent_is_kept_even_as_pid_1() {
+        // A node running as PID 1: a container entrypoint without an init.
+        assert_eq!(watched_parent(Some("1"), 1).unwrap(), Some(1));
+        assert_eq!(watched_parent(Some("4242"), 4242).unwrap(), Some(4242));
+        // The worker was already adopted by init or a subreaper.
+        assert_eq!(watched_parent(Some("4242"), 1).unwrap(), None);
+        assert_eq!(watched_parent(Some("4242"), 77).unwrap(), None);
+        assert_eq!(watched_parent(Some("1"), 77).unwrap(), None);
+        for bad in ["", "0", "-1", "x", "99999999999"] {
+            assert!(watched_parent(Some(bad), 4242).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_parent_of_pid_1_reads_as_init() {
+        assert_eq!(watched_parent(None, 4242).unwrap(), Some(4242));
+        assert_eq!(watched_parent(None, 1).unwrap(), None);
+        assert_eq!(watched_parent(None, 0).unwrap(), None);
+    }
 }
