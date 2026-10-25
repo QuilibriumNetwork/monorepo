@@ -25,6 +25,9 @@ use quil_types::store::ClockStore;
 use crate::app_engine::{AppConsensusEngine, AppEngineDeps, AppEngineHandle, AppEngineMessage};
 use crate::message_collector::MessageCollector;
 
+/// Resolver replies being relayed to a shard's members at once.
+static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate = crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -836,7 +839,11 @@ impl WorkerOnlyNode {
                                         // members drop it unread.
                                         let worker = worker_for_pump.clone();
                                         let publish = publish.clone();
+                                        // A peer's resolver requests drive these; each can wait
+                                        // out the master's timeout. A dropped reply is re-asked.
+                                        let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
                                         tokio::spawn(async move {
+                                            let _permit = permit;
                                             let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
                                             if !worker.relay_direct(filter.clone(), channel, bytes, recipients).await {
                                                 publish(crate::bitmasks::shard_cw_bitmask(&filter), payload).await;

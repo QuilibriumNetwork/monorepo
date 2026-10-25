@@ -42,6 +42,7 @@ pub mod frame_replay;
 pub mod frame_validator;
 pub mod halt_state;
 pub mod message_collector;
+pub mod spawn_gate;
 pub mod execution_deferral;
 pub mod message_router;
 pub mod leader_provider;
