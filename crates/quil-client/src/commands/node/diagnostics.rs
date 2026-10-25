@@ -93,7 +93,10 @@ pub enum DiagnosticsCommand {
     /// exceeds its maxBundleBytes. A target that writes no log files, or
     /// runs an older release, leaves it to its operator, who reviews a
     /// redacted preview first. With --filter only lines mentioning those
-    /// shard filters are exported, plus every warn and error line.
+    /// shard filters are exported, plus every warn and error line. The
+    /// answer states how many of the target's requestsPerDay are left to
+    /// this requester in the last 24 h and, once none are, when the next
+    /// request is possible; a target of an earlier release states neither.
     ///
     /// The target sees the IP address you connect from; use a network you
     /// are willing to reveal. With --identity <file> (from `qclient
