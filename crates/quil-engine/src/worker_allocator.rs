@@ -437,6 +437,44 @@ impl RebindOutcome {
     }
 }
 
+/// How far a worker's held shard may trail the frame GLOBAL committed for
+/// it and still be bound to that worker: an epoch's worth of frames. A
+/// lineage further behind replays that many frames from archives, a cost
+/// that outgrows the install a worker without it makes.
+fn shard_data_trail() -> u64 {
+    quil_types::consensus::epoch_length_frames()
+}
+
+/// For each of `filters` in turn, the worker among `eligible` whose store
+/// holds that shard's data (`holders`, [`WorkerManager::shard_data`]): the
+/// one with the highest materialized cursor, then the lowest core, among
+/// those within [`shard_data_trail`] of the shard's committed tip (`tip`;
+/// any holder when it is unknown). Each worker is chosen once; a filter no
+/// eligible worker holds is absent.
+fn data_holders<'a>(
+    filters: impl Iterator<Item = &'a [u8]>,
+    eligible: &[u32],
+    holders: &HashMap<u32, Vec<(Vec<u8>, u64)>>,
+    tip: impl Fn(&[u8]) -> Option<u64>,
+) -> HashMap<Vec<u8>, u32> {
+    let mut chosen: HashMap<Vec<u8>, u32> = HashMap::new();
+    for filter in filters {
+        let tip = tip(filter);
+        let best = eligible.iter()
+            .filter(|core| !chosen.values().any(|taken| taken == *core))
+            .filter_map(|core| {
+                let (_, cursor) = holders.get(core)?.iter().find(|(held, _)| held.as_slice() == filter)?;
+                Some((*cursor, *core))
+            })
+            .filter(|(cursor, _)| tip.is_none_or(|tip| cursor.saturating_add(shard_data_trail()) >= tip))
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((_, core)) = best {
+            chosen.entry(filter.to_vec()).or_insert(core);
+        }
+    }
+    chosen
+}
+
 /// Snapshot of the current allocation state across the network.
 #[derive(Debug, Clone)]
 pub struct AllocationSnapshot {
@@ -632,6 +670,22 @@ impl WorkerAllocator {
             return Ok(());
         }
         self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    /// The frame GLOBAL committed for each of `filters` that has one
+    /// ([`crate::app_handoff::committed_tips`]); none without authenticated
+    /// GLOBAL state or when it is unreadable.
+    fn committed_tips(&self, filters: &[Vec<u8>]) -> HashMap<Vec<u8>, u64> {
+        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return HashMap::new();
+        };
+        match crate::app_handoff::committed_tips(&global, filters) {
+            Ok(tips) => tips.into_iter().collect(),
+            Err(error) => {
+                debug!(%error, "committed shard tips unreadable; binding prefers any holder of a shard's data");
+                HashMap::new()
+            }
+        }
     }
 
     pub fn set_session_authority(&self, global: Arc<quil_hypergraph::HypergraphCrdt>) {
@@ -1570,14 +1624,51 @@ impl WorkerAllocator {
             })
         });
 
+        // The candidates the idle pool serves go first to the idle worker
+        // whose own store holds their shard's data. A restart or release
+        // that frees several workers at once rebinds them here, and a shard
+        // given to a worker without its data installs all of it from an
+        // archive (minutes and about a gigabyte for a large shard, through
+        // the node's two archive recovery turns) while the worker holding it
+        // installs another. Which candidates get a worker, and the manual
+        // pool's precedence, stay as they were; a worker held back or whose
+        // store stopped keeps its place at the end.
+        let served = bind_candidates.len().min(manual_pending.len() + idle_workers.len());
+        let eligible: Vec<u32> = idle_workers.iter().copied()
+            .filter(|core| !held_back.contains(core) && !crate::worker_execution::store_stopped(*core))
+            .collect();
+        let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served].iter()
+            .map(|a| a.confirmation_filter.clone())
+            .collect();
+        let holders = self.worker_manager.shard_data();
+        let tips = if holders.values().any(|held| !held.is_empty()) {
+            self.committed_tips(&from_idle)
+        } else {
+            HashMap::new()
+        };
+        let mut on_data = data_holders(
+            from_idle.iter().map(Vec::as_slice),
+            &eligible,
+            &holders,
+            |filter| tips.get(filter).copied(),
+        );
+        idle_workers.retain(|core| !on_data.values().any(|held| held == core));
+        let mut bound_on_data: Vec<String> = Vec::new();
+
         // Unconfirmed joins bound in this pass, by the epoch their confirm is
         // due in: (count, first join frame, last join frame).
         let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> = Default::default();
         for alloc in bind_candidates {
             // Prefer a manually-pending (user-picked) worker before
             // falling back to the auto-managed idle pool.
-            let pick = manual_pending.pop().or_else(|| idle_workers.pop());
+            let holds_data = manual_pending.is_empty() && on_data.contains_key(&alloc.confirmation_filter);
+            let pick = manual_pending.pop()
+                .or_else(|| on_data.remove(&alloc.confirmation_filter))
+                .or_else(|| idle_workers.pop());
             if let Some(core_id) = pick {
+                if holds_data {
+                    bound_on_data.push(format!("{core_id}:{}", hex::encode(&alloc.confirmation_filter)));
+                }
                 if let Some(quil_types::consensus::JoinWait::Confirmation { epoch }) = alloc.join_wait(frame_number) {
                     let join = alloc.join_frame_number;
                     let entry = landed_joins.entry(epoch).or_insert((0, join, join));
@@ -1604,6 +1695,7 @@ impl WorkerAllocator {
                     status = ?alloc.status,
                     start_consensus,
                     manual,
+                    holds_data,
                     "assigning shard to worker"
                 );
                 self.worker_manager.set_worker_filter(
@@ -1624,6 +1716,12 @@ impl WorkerAllocator {
                 // batch of 9 orphans produces one log line, not 9.
                 orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
+        }
+
+        if !bound_on_data.is_empty() {
+            info!(frame = frame_number, bound = bound_on_data.len(),
+                workers = ?bound_on_data.iter().take(8).collect::<Vec<_>>(),
+                "bound shards to the idle workers whose stores hold their data");
         }
 
         self.log_idled_manual_workers(frame_number, &manual_seats, &alloc_by_filter)?;
@@ -2346,6 +2444,82 @@ mod tests {
         quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(1));
         result.unwrap();
         assert_eq!(bound_cores(&wm), vec![2], "the worker with a working store takes the seat");
+    }
+
+    fn bound_to(wm: &MockWorkerManager) -> Vec<(u32, Vec<u8>)> {
+        wm.range_workers().unwrap().into_iter()
+            .filter(|w| !w.filter.is_empty())
+            .map(|w| (w.core_id, w.filter))
+            .collect()
+    }
+
+    /// Workers a restart released together (an early reconcile against an
+    /// unloaded registry clears every binding) are bound back to the shards
+    /// their own stores hold, whatever order the shards are bound in: the
+    /// worker with the highest cursor of a shard wins, and no worker is
+    /// given to two shards.
+    #[test]
+    fn a_restart_rebinds_each_shard_to_the_worker_holding_its_data() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for (core, filter) in [(1, f(2)), (2, f(3)), (3, f(1)), (4, Vec::new())] {
+            wm.add_with_filter(core, filter);
+            wm.deallocate_worker(core).unwrap();
+        }
+        wm.set_shard_data(1, vec![(f(2), 70)]);
+        wm.set_shard_data(2, vec![(f(3), 80), (f(1), 12)]);
+        wm.set_shard_data(3, vec![(f(1), 90)]);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        let logged = reconcile_logged(&alloc, 101);
+        assert_eq!(bound_to(&wm), vec![(1, f(2)), (2, f(3)), (3, f(1))], "each shard back on its data");
+        assert!(logged.contains("bound shards to the idle workers whose stores hold their data")
+            && logged.contains("bound=3"), "{logged}");
+    }
+
+    /// A holder trailing the shard's committed tip by more than an epoch's
+    /// worth of frames is not preferred; one within it, or any holder of a
+    /// shard whose tip is unknown, is, the highest cursor first.
+    #[test]
+    fn a_holder_far_behind_the_committed_tip_is_not_preferred() {
+        let f = |byte: u8| vec![byte; 32];
+        let trail = shard_data_trail();
+        let holders = HashMap::from([
+            (1, vec![(f(1), 10), (f(2), 10)]),
+            (2, vec![(f(1), 5000 - trail)]),
+        ]);
+        let tips = HashMap::from([(f(1), 5000u64), (f(2), 5000)]);
+        let pick = |filters: &[Vec<u8>], tips: &HashMap<Vec<u8>, u64>| {
+            let mut chosen: Vec<_> = data_holders(filters.iter().map(Vec::as_slice), &[1, 2], &holders,
+                |filter| tips.get(filter).copied()).into_iter().collect();
+            chosen.sort();
+            chosen
+        };
+        assert_eq!(pick(&[f(1), f(2)], &tips), vec![(f(1), 2)], "core 1's lineages trail too far");
+        assert_eq!(pick(&[f(2)], &HashMap::new()), vec![(f(2), 1)], "an unknown tip bounds nothing");
+    }
+
+    /// A shard no idle worker's store holds takes the lowest free core as
+    /// before, and a worker held back from new seats is not preferred for
+    /// the shard its store holds: it is still bound last.
+    #[test]
+    fn binding_by_shard_data_keeps_the_free_order_otherwise() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=4u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        wm.set_shard_data(1, vec![(f(1), 50)]);
+        wm.set_shard_data(4, vec![(f(3), 40)]);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.set_held_back(std::collections::HashSet::from([1]));
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_to(&wm), vec![(2, f(1)), (3, f(2)), (4, f(3))]);
     }
 
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {

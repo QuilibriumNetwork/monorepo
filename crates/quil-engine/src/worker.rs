@@ -44,6 +44,14 @@ pub trait WorkerManager: Send + Sync {
     ) -> Result<()>;
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
+    /// The shards whose data each worker's own store holds, by core, with
+    /// their materialized cursors, as each worker last read its store
+    /// ([`crate::worker_payload_eviction::held_shards`]). Managers that
+    /// cannot tell (workers in separate processes) report none, and binding
+    /// keeps its order.
+    fn shard_data(&self) -> std::collections::HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        Default::default()
+    }
     fn check_workers_connected(&self) -> Result<Vec<u32>>;
     fn range_workers(&self) -> Result<Vec<WorkerInfo>>;
     /// Filter-bound local execution observations; unsupported managers return none.

@@ -327,6 +327,25 @@ pub(crate) fn lineage_drop_records(crdt: &HypergraphCrdt) -> Result<Vec<quil_hyp
         .collect())
 }
 
+/// The shards whose data this store holds, with their materialized cursors:
+/// a lineage ([`lineages`]) that no current dropped-lineage record names
+/// and, while the store commits unified trees, whose subtree holds committed
+/// leaves ([`crate::app_shard_metadata::has_committed_shard_data`]). Binding
+/// a shard to the worker that holds it saves an archive install of it.
+pub(crate) fn held_shards(crdt: &HypergraphCrdt) -> Result<Vec<(Vec<u8>, u64)>> {
+    let Some(db) = crdt.forest_store() else { return Ok(Vec::new()) };
+    let mut held = Vec::new();
+    for (filter, cursor) in lineages(&db)? {
+        let dropped = db.get(quil_store::encoding::app_lineage_dropped_key(&filter)).map_err(store_error)?
+            .is_some_and(|bytes| bytes == cursor.to_be_bytes());
+        if dropped || (crdt.unified_tree() && !crate::app_shard_metadata::has_committed_shard_data(crdt, &filter)) {
+            continue;
+        }
+        held.push((filter, cursor));
+    }
+    Ok(held)
+}
+
 /// Forest node records a confinement sweep examines per hold of the worker's
 /// forest and commit locks, keeping each pause of its frame commits short.
 const FOREST_SCAN_BUDGET: usize = 250_000;
@@ -652,7 +671,8 @@ mod tests {
     /// kept shard, another application's and a lineage whose subtree holds
     /// nothing are not recorded, and a confinement whose worker was rebound
     /// before it commits stops untouched. A replay then
-    /// reads the dropped shard as the empty subtree.
+    /// reads the dropped shard as the empty subtree, and only the kept shard
+    /// is held.
     #[test]
     fn confinement_records_each_lineage_whose_subtree_it_drops() {
         use quil_forest::{SubtreeSyncAnchor, PHASES};
@@ -678,6 +698,9 @@ mod tests {
         for (filter, cursor) in [(&served[0], 40u64), (&left, 31), (&other, 12), (&quiet, 7)] {
             db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(filter), cursor.to_be_bytes()).unwrap();
         }
+        let sorted = |mut held: Vec<(Vec<u8>, u64)>| { held.sort(); held };
+        assert_eq!(sorted(held_shards(&target).unwrap()), sorted(vec![(served[0].clone(), 40), (left.clone(), 31)]),
+            "another application's lineage holds no data here");
         let left_root = target.sub_shard_commitment_for_filter("vertex", "adds", &left);
         assert!(!left_root.is_empty() && left_root != vec![0; 32]);
 
@@ -703,6 +726,7 @@ mod tests {
         let gone = quil_forest::encode_shard_bit_path(&APP, &[true, false, false, false]);
         assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &gone), vec![0; 32]);
         assert_eq!(target.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]), 0);
+        assert_eq!(held_shards(&target).unwrap(), vec![(served[0].clone(), 40)]);
         assert!(target.confine_forest_recording(&served, 1, &lineage_drop_records(&target).unwrap(), &|| true).unwrap()
             .dropped_lineages.is_empty(), "a repeat drops nothing");
     }
