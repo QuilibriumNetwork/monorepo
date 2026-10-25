@@ -247,6 +247,18 @@ fn mark_sync_incomplete(
     Ok(true)
 }
 
+/// Whether committed snapshot `records` lists any scope of `shard_id` as
+/// partly installed by a sync: its records then mix the state before the
+/// sync with part of the source's, in any phase.
+pub fn snapshot_sync_incomplete(
+    records: &dyn quil_types::store::SnapshotReadable,
+    shard_id: &[u8],
+) -> Result<bool> {
+    Ok(records
+        .read_record(&sync_incomplete_key(shard_id))?
+        .is_some_and(|bytes| !decode_sync_scopes(&bytes).is_empty()))
+}
+
 /// Expand a UNIFORM 64-way split `depth` into its complete prefix set: depth 0 ⇒
 /// `[[]]` (single shard); depth 1 ⇒ `{[0]..[63]}` (QUIL); etc. Used by the
 /// convenience [`HypergraphCrdt::set_shard_partition`].

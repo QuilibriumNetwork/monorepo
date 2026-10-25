@@ -1655,7 +1655,14 @@ impl ProverLifecycle {
             let bound: Vec<(u32, Vec<u8>)> = worker_view.filter_set()
                 .map(|w| (w.core_id, w.filter.clone())).collect();
             let filters: Vec<Vec<u8>> = bound.iter().map(|(_, filter)| filter.clone()).collect();
-            let members = self.allocator.session_member_filters(&filters, &prover.public_key);
+            let read = self.allocator.session_member_filters(&filters, &prover.public_key);
+            // While a GLOBAL state sync withholds the committed view, which
+            // sessions count this prover is unknown, not "none": the seats
+            // are still classified as outside them for the leave decision,
+            // as for unreadable state, but their hosting is not observed, so
+            // no run is ended, started over or lifted on that reading.
+            let membership_known = read.is_some();
+            let members = read.unwrap_or_default();
             let lapsed: std::collections::HashSet<&[u8]> = prover.allocations.iter()
                 .filter(|a| a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch)
                 .map(|a| a.confirmation_filter.as_slice()).collect();
@@ -1681,6 +1688,9 @@ impl ProverLifecycle {
                 };
                 if observed.seen_unable(seat) {
                     unable_seats.insert(filter.clone());
+                }
+                if !membership_known {
+                    continue;
                 }
                 let hosts = matches!(observed, Hosting::Hosting | Hosting::Voting | Hosting::Silent { .. });
                 let instance = super::session_hosting::Instance::of(report);
@@ -4641,6 +4651,102 @@ mod proposal_loop_tests {
                 let late = lc.evaluate(730, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
                 assert!(renews(&late, &held), "{late:?}");
             }
+        }
+    }
+
+    /// While a GLOBAL state sync withholds the committed view, a seat's
+    /// membership is unknown, not "outside its session": a renewal withheld
+    /// for a worker that cannot host stays withheld, even when the worker
+    /// now reports a refusal that only a seat outside its session would
+    /// count as able to host.
+    #[test]
+    fn a_withheld_renewal_is_not_lifted_while_a_global_sync_withholds_membership() {
+        use quil_cw_consensus::handoff::Session;
+        use quil_execution::global_intrinsic::handoff;
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let local_key = signers[0].public_key().to_vec();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let address = vec![0xCD; 32];
+        let held = vec![0xA1; 32];
+        commit(1);
+        handoff::initialize(&state, 2, &Session {
+            chain_id: [7; 32], filter: held.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members,
+        }).unwrap();
+        commit(2);
+
+        let report = |blocker: &str| WorkerExecution {
+            state: "blocked".into(), blocker: blocker.into(),
+            observed_unix_ms: crate::worker_execution::now_ms(), ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction]| actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held)));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        wm.set_execution(1, &held, report("predecessor state has not been recovered through its seal"));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut due = alloc(held.clone(), ProverStatus::Active, 10);
+        due.epoch = 1;
+        reg.set_prover(ProverInfo { public_key: local_key, ..prover(address.clone(), vec![due]) });
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.allocator.set_session_authority(global.clone());
+        for frame in std::iter::once(5).chain((65..=725).step_by(60)) {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            if frame == 725 {
+                assert!(!renews(&actions), "a worker unable to host withholds its renewal: {actions:?}");
+            }
+        }
+
+        // An archive state sync of GLOBAL has installed its first chunk only.
+        let archive_address = [0xff; 32];
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location { app_address: archive_address, data_address: [byte; 32] };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&archive_address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: archive, shard_id: archive_address.to_vec(), phase: 0,
+        };
+        let mut plan = global.prepare_phase_sync(&reader, version, &archive_address, 0, &[],
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        let (key, leaf) = plan.remaining()[0].clone();
+        global.apply_sync_chunk(&mut plan, &[if leaf.is_some() { vec![key[0]; 48] } else { Vec::new() }]).unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = handoff::CommittedView::capture(&global).err().expect("the view is withheld");
+        assert!(handoff::global_sync_in_progress(&error), "{error}");
+
+        // Outside its session this refusal would count as able to host.
+        wm.set_execution(1, &held, report("committee admission unavailable"));
+        for frame in [730, 790] {
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(!renews(&actions), "frame {frame}: membership unknown lifts nothing: {actions:?}");
         }
     }
 

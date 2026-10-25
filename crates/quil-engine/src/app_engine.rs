@@ -5665,7 +5665,11 @@ impl AppConsensusEngine {
         let now = std::time::Instant::now();
         let filter = hex::encode(&self.filter);
         let error = status.as_ref().err().map(ToString::to_string).unwrap_or_default();
-        match self.session_status_outage.observe(now, status.is_ok()) {
+        // A GLOBAL state sync between chunks withholds the view: an expected
+        // wait the master logs, during which the session keeps running.
+        let syncing = status.as_ref()
+            .is_err_and(|error| quil_execution::global_intrinsic::handoff::global_sync_in_progress(error));
+        match (!syncing).then(|| self.session_status_outage.observe(now, status.is_ok())).flatten() {
             Some(OutageEvent::Began) => warn!(core_id = self.core_id, filter = %filter,
                 generation = session.generation, error = %error, scope = "local", action = "report",
                 "committee session status unavailable; the session keeps running until it can be read"),
@@ -6193,7 +6197,11 @@ impl AppConsensusEngine {
                 // the missing frames from an archive when it has a lineage, the
                 // archive's certified tip otherwise. Nothing else requests it,
                 // and the retry loop would otherwise ask this question forever.
-                if matches!(error, QuilError::ExecutionUnavailable(_)) {
+                // A GLOBAL view withheld while its sync installs is no missing
+                // shard state: the retry finds it once the sync is in.
+                if matches!(error, QuilError::ExecutionUnavailable(_))
+                    && !quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error)
+                {
                     let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested {
                         filter: self.filter.clone(),
                     });
@@ -10446,6 +10454,10 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             its head lay past its session fence or its archive replays kept failing; attempted every 5 minutes, \
             backing off to hourly after a replay mismatch; it starts once the re-anchor installs; the re-anchor \
             warnings name an attempt that fails or has no outcome", true)
+    } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
+        (ExpectedWait, "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
+            withheld until its last chunk is in (the 'sync phase: installing' lines show its progress); it retries \
+            every 10 s", true)
     } else if text.contains("authenticated GLOBAL state") {
         (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
             check the master if it persists", true)
