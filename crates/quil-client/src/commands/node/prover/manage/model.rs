@@ -1401,7 +1401,7 @@ pub fn alloc_row_numeric_val(m: &Model, row: &AllocationRow, col: usize) -> f64 
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else {
-                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / 1e8)
+                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64)
             }
         }
         11 => row.worker_id as f64,
@@ -1433,7 +1433,7 @@ pub fn avail_row_numeric_val(m: &Model, row: &ShardRow, col: usize) -> f64 {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else {
-                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / 1e8)
+                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64)
             }
         }
         11 => m.app_interval(&row.filter).unwrap_or(f64::NAN),
