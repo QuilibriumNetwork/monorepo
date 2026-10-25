@@ -300,6 +300,57 @@ pub struct ThreadWorkerManager {
     /// flushed so it survives restarts. Mirrors Go's
     /// `engine.workerStore` plumbing.
     worker_store: Mutex<Option<Arc<dyn quil_types::store::WorkerStore>>>,
+    /// The shards whose data each worker's own store holds
+    /// ([`WorkerManager::shard_data`]), read by the worker when its store
+    /// opens, at each change of its binding and after each eviction.
+    shard_data: Arc<ShardData>,
+}
+
+/// The shards whose data each worker's store holds, by core, and when a
+/// failed read of each was last warned about.
+#[derive(Default)]
+struct ShardData {
+    held: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    warned: Mutex<HashMap<u32, std::time::Instant>>,
+}
+
+/// How often a worker's failed shard-data read is warned about again.
+const SHARD_DATA_WARN_REPEAT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+impl ShardData {
+    /// Record the shards whose data worker `core_id`'s store holds
+    /// ([`crate::worker_payload_eviction::held_shards`]), for binding. A
+    /// failed read leaves none recorded for it, and is warned about at
+    /// once, then every [`SHARD_DATA_WARN_REPEAT`].
+    fn publish(&self, core_id: u32, crdt: &quil_hypergraph::HypergraphCrdt) {
+        match crate::worker_payload_eviction::held_shards(crdt) {
+            Ok(held) => {
+                self.held.lock().unwrap().insert(core_id, held);
+            }
+            Err(error) => {
+                self.forget(core_id);
+                let now = std::time::Instant::now();
+                let mut warned = self.warned.lock().unwrap();
+                if warned.get(&core_id).is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT) {
+                    warned.insert(core_id, now);
+                    warn!(core_id, error = %quil_forest::storage_health::redact_paths(&error.to_string()),
+                        scope = "this node",
+                        action = "binding gives this worker no preference for the shards its store holds; check the \
+                            worker's store if it persists",
+                        "this worker's shard data could not be read");
+                }
+            }
+        }
+    }
+
+    /// Record none for worker `core_id`, while its store may lose shards.
+    fn forget(&self, core_id: u32) {
+        self.held.lock().unwrap().remove(&core_id);
+    }
+
+    fn snapshot(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.held.lock().unwrap().clone()
+    }
 }
 
 impl ThreadWorkerManager {
@@ -350,6 +401,7 @@ impl ThreadWorkerManager {
             consensus_deps: Mutex::new(None),
             recovery_gate: Arc::default(),
             worker_store: Mutex::new(None),
+            shard_data: Default::default(),
         }
     }
 
@@ -518,6 +570,7 @@ impl ThreadWorkerManager {
         let recovery_gate = self.recovery_gate.clone();
         let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
         let execution_slot = execution_handle.clone();
+        let shard_data = self.shard_data.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", core_id))
@@ -580,6 +633,10 @@ impl ThreadWorkerManager {
                          run on the master's stores: restart the node"
                     );
                     return;
+                }
+
+                if let Some(owned) = worker_owned.as_ref() {
+                    shard_data.publish(core_id, &owned.hypergraph);
                 }
 
                 // Create per-thread tokio runtime
@@ -655,6 +712,10 @@ impl ThreadWorkerManager {
                                             cancel.cancel();
                                             // Give the engine a moment to clean up
                                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        // The shard it leaves holds data here.
+                                        if let Some(owned) = worker_owned.as_ref() {
+                                            shard_data.publish(core_id, &owned.hypergraph);
                                         }
 
                                         if filter.is_empty() {
@@ -1065,8 +1126,18 @@ impl ThreadWorkerManager {
                                             crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base,
                                                 move |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
                                                     crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey)))));
+                                        // Still serving the binding the passes start for: a
+                                        // rebind retires the engine first.
+                                        let (slot, binding) = (execution_slot.clone(), current_filter.clone());
+                                        let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move ||
+                                            slot.lock().unwrap().as_ref().is_some_and(|h| h.filter == binding && h.is_running()));
+                                        // The store is not read as holding the shards the
+                                        // passes may drop until they end.
+                                        let shard_data = shard_data.clone();
+                                        shard_data.forget(core_id);
                                         tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
-                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage).await;
+                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt.clone(), keep, storage, bound).await;
+                                            shard_data.publish(core_id, &crdt);
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                         }));
                                     }
@@ -1218,6 +1289,10 @@ impl WorkerManager for ThreadWorkerManager {
             });
         });
         Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.snapshot()
     }
 
     fn check_workers_connected(&self) -> Result<Vec<u32>> {
@@ -1841,6 +1916,25 @@ mod tests {
             },
             |m, sig| quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN),
         )
+    }
+
+    /// A worker's shard data is withdrawn while an eviction pass may drop
+    /// shards from its store, and read again after it.
+    #[test]
+    fn shard_data_is_withdrawn_during_an_eviction_and_read_again_after() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = quil_hypergraph::HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let filter = vec![0x21; 32];
+        db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(&filter), 9u64.to_be_bytes()).unwrap();
+        let table = ShardData::default();
+        table.publish(3, &crdt);
+        assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter.clone(), 9)])]));
+        table.forget(3);
+        assert!(table.snapshot().is_empty(), "withdrawn while the passes run");
+        table.publish(3, &crdt);
+        assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter, 9)])]));
     }
 
     #[test]

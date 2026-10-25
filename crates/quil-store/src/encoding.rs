@@ -65,6 +65,11 @@ pub const CONSENSUS_APP_HISTORY_DISCARDED: u8 = 0x07;
 /// the local frame at that cursor (zero for none): 56 bytes. A 24-byte
 /// value is the same without the digest.
 pub const CONSENSUS_APP_REANCHOR: u8 = 0x08;
+/// `[CONSENSUS, 0x09] ‖ filter` → 8-byte BE materialized cursor: a payload
+/// eviction dropped this shard's subtree from the store while its frames and
+/// cursor stayed, at that cursor. The state those frames claim is gone, so a
+/// later binding re-anchors the shard rather than replay onto nothing.
+pub const CONSENSUS_APP_LINEAGE_DROPPED: u8 = 0x09;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -986,6 +991,14 @@ pub fn app_reanchor_key(filter: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Key of `filter`'s dropped-lineage record. See
+/// [`CONSENSUS_APP_LINEAGE_DROPPED`].
+pub fn app_lineage_dropped_key(filter: &[u8]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED];
+    key.extend_from_slice(filter);
+    key
+}
+
 /// The key ranges that hold application-shard frame chains (as opposed to
 /// application state and GLOBAL frames), each `[start, end)`:
 /// - clock: shard frames, staged shard frames, prover-trie and total-distance
@@ -996,7 +1009,7 @@ pub fn app_reanchor_key(filter: &[u8]) -> Vec<u8> {
 ///   GLOBAL request candidates `0xF8`);
 /// - consensus: per-filter legacy state and liveness (a GLOBAL row has no
 ///   filter and is kept), application materialized cursors, history
-///   recovery progress and pending re-anchors.
+///   recovery progress, pending re-anchors and dropped-lineage records.
 pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
     let clock = |from: u8, to: u8| (vec![CLOCK_FRAME, from], vec![CLOCK_FRAME, to]);
     vec![
@@ -1016,6 +1029,7 @@ pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
         (vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1]),
         (vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY], vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1]),
         (vec![CONSENSUS, CONSENSUS_APP_REANCHOR], vec![CONSENSUS, CONSENSUS_APP_REANCHOR + 1]),
+        (vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED], vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED + 1]),
     ]
 }
 

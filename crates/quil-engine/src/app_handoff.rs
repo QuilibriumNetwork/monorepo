@@ -1850,6 +1850,20 @@ pub fn replay_mismatch_reanchor(generation: u64, cursor: u64, committed: Option<
         .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
 }
 
+/// The re-anchor a shard owes when a payload eviction dropped its subtree
+/// from this worker's store at materialized cursor `cursor`
+/// ([`dropped_lineage`]): as [`replay_mismatch_reanchor`], except that it
+/// anchors at the cursor itself when GLOBAL committed no frame above it, as
+/// on a shard whose committee stalled at this worker's head. The trees
+/// cannot match any frame there, so the shard would otherwise start on an
+/// empty subtree; the rebase replaces the local frame at an anchor that is
+/// the fence ([`rebase_for_reanchor`]). `None` without a committed frame at
+/// or above the cursor.
+pub fn evicted_lineage_reanchor(generation: u64, cursor: u64, committed: Option<u64>) -> Option<ReanchorMarker> {
+    committed.filter(|&tip| tip >= cursor)
+        .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
+}
+
 /// Why a shard owes a re-anchor, read from its marker: a head past its
 /// session fence records the fence below that head ([`fence_rewind`]), a
 /// persistent replay mismatch records the cursor itself
@@ -1997,6 +2011,36 @@ pub fn write_reanchor_marker(clock: &dyn ClockStore, filter: &[u8], marker: &Rea
 pub fn clear_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
     let txn = clock.new_transaction(false)?;
     if let Err(error) = txn.delete(&quil_store::encoding::app_reanchor_key(filter)) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+/// The materialized cursor at which a payload eviction dropped `filter`'s
+/// subtree from this worker's store while its frames and cursor stayed
+/// ([`quil_store::encoding::CONSENSUS_APP_LINEAGE_DROPPED`]), while that
+/// record still describes the shard: its cursor has not moved since. A
+/// record the cursor moved past (a sync or re-anchor installed the state
+/// again) is cleared, as is a malformed one.
+pub fn dropped_lineage(shard: &HypergraphCrdt, clock: &dyn ClockStore, filter: &[u8]) -> Result<Option<u64>> {
+    let txn = clock.new_transaction(false)?;
+    let value = txn.get(&quil_store::encoding::app_lineage_dropped_key(filter));
+    let _ = txn.abort();
+    let Some(bytes) = value? else { return Ok(None) };
+    let cursor = shard.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))?;
+    match <[u8; 8]>::try_from(bytes.as_slice()).map(u64::from_be_bytes) {
+        Ok(dropped) if dropped == cursor && cursor > 0 => Ok(Some(cursor)),
+        _ => {
+            clear_dropped_lineage(clock, filter)?;
+            Ok(None)
+        }
+    }
+}
+
+pub fn clear_dropped_lineage(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = txn.delete(&quil_store::encoding::app_lineage_dropped_key(filter)) {
         let _ = txn.abort();
         return Err(error);
     }
@@ -2233,6 +2277,7 @@ pub fn rebase_for_reanchor(
     }
     shard.checkpoint_frame_cursor(synced_to, &cursor_key)?;
     clear_reanchor_marker(clock, filter)?;
+    clear_dropped_lineage(clock, filter)?;
     Ok(Rebased { from, to: top })
 }
 
@@ -4174,6 +4219,21 @@ mod successor_tests {
         assert_eq!(reanchor_gate(Some(unheaded), 6, Some([0x66; 32])), ReanchorGate::Owed(unheaded));
     }
 
+    /// An evicted lineage anchors at the frame GLOBAL committed, or at its
+    /// own head when that is the committed tip, as on a shard whose
+    /// committee stalled there; a replay mismatch needs a committed frame
+    /// above the head.
+    #[test]
+    fn an_evicted_lineage_anchors_at_its_head_when_the_shard_stalled_there() {
+        let at = |fence| Some(ReanchorMarker { generation: 3, fence, from_cursor: fence, head: None });
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(5)), at(5), "the stalled shard");
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(9)), at(5));
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(4)), None, "GLOBAL behind the head");
+        assert_eq!(evicted_lineage_reanchor(3, 5, None), None);
+        assert_eq!(replay_mismatch_reanchor(3, 5, Some(5)), None);
+        assert_eq!(at(5).unwrap().cause(), ReanchorCause::ReplayMismatch);
+    }
+
     // An operator's joining worker held a lineage from an earlier tenure
     // whose trees no longer matched it (2026-10-20): every archive frame
     // past its head failed to replay with a pre-state mismatch, for hours,
@@ -4236,6 +4296,12 @@ mod successor_tests {
         write_reanchor_marker(&clock, &filter, &marker).unwrap();
         let gate = || reanchor_gate_at(&shard, &clock, &filter, read_reanchor_marker(&clock, &filter).unwrap()).unwrap();
         assert_eq!(gate(), ReanchorGate::Owed(marker));
+        // A payload eviction's record of the dropped subtree at the cursor.
+        let dropped_key = quil_store::encoding::app_lineage_dropped_key(&filter);
+        let txn = clock.new_transaction(false).unwrap();
+        txn.set(&dropped_key, &4u64.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(dropped_lineage(&shard, &clock, &filter).unwrap(), Some(4));
         assert!(reanchor_applies(&global, &filter).unwrap());
         assert!(anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x99)).unwrap());
         assert!(!anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x98)).unwrap());
@@ -4254,6 +4320,9 @@ mod successor_tests {
         }
         assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap().header.unwrap().output, vec![0x88; 32]);
         assert_eq!(gate(), ReanchorGate::Absent, "the rebase committed");
+        let txn = clock.new_transaction(false).unwrap();
+        assert_eq!(txn.get(&dropped_key).unwrap(), None, "and cleared the dropped-lineage record");
+        let _ = txn.abort();
 
         // The anchor replays: the head is the frame GLOBAL executed.
         store_header(&clock, FrameHeader {

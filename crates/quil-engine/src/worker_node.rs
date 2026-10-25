@@ -1899,8 +1899,11 @@ where
         return Some("an eviction is running");
     }
     let flag = evicting.clone();
+    // A rebind stops the engine the passes start for.
+    let engine = handle.cloned();
+    let serving: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || engine.as_ref().is_some_and(|h| h.is_running()));
     tokio::spawn(async move {
-        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage).await;
+        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage, serving).await;
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     None
