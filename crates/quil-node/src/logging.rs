@@ -388,8 +388,8 @@ pub fn log_filename_for_core(core_id: u32) -> String {
 /// or above `cfg.stderr_level` (default `warn`); `path: none` logs every
 /// level to stderr only.
 ///
-/// Rotation (`cfg.rotation()`; the default directory gets 50 MB, 10, 14 days,
-/// compressed):
+/// Rotation (`cfg.rotation()`; the default directory defaults to 50 MB, 10,
+/// 14 days, compressed):
 /// * `max_size` MB — rotation trigger (0 → daily).
 /// * `max_backups` — rotated files retained (0 → 1024 cap).
 /// * `max_age` days — reaper deletes older rotations.

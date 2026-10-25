@@ -700,10 +700,9 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .history_gossip(params.history_gossip)
         // Mesh-degree (D) family is DELIBERATELY left at gossipsub's own
         // defaults (mesh_n=6, mesh_n_low=5, mesh_n_high=12, gossip_lazy=6,
-        // mesh_outbound_min=2) rather than the blossomsub-tuned config values
-        // (D=8/D_lo=6). Higher fan-out multiplies traffic on high-rate topics
-        // (e.g. GLOBAL_PEER_INFO); `params.{d,d_lo,d_hi,d_lazy,d_out}` are
-        // intentionally NOT applied here.
+        // mesh_outbound_min=2): higher fan-out multiplies traffic on
+        // high-rate topics (e.g. GLOBAL_PEER_INFO). `params.d_lo` only
+        // gates the under-meshed check in `maybe_emit_need_peers`.
         .gossip_factor(params.gossip_factor)
         .heartbeat_interval(params.heartbeat_interval)
         .heartbeat_initial_delay(params.heartbeat_initial_delay)

@@ -59,11 +59,20 @@ impl LogConfig {
         }
     }
 
-    /// `(max_size MB, max_backups, max_age days, compress)`: as configured,
-    /// except that the default directory gets a bounded default rotation.
+    /// `(max_size MB, max_backups, max_age days, compress)` as configured.
+    /// The default directory stays bounded: a setting of 0 there takes the
+    /// default rotation's value, and its rotated files are always
+    /// compressed, since generated configs carry `compress: false`.
     pub fn rotation(&self) -> (i32, i32, i32, bool) {
         if self.path.trim().is_empty() {
-            DEFAULT_ROTATION
+            let (max_size, max_backups, max_age, compress) = DEFAULT_ROTATION;
+            let or_default = |configured: i32, default: i32| if configured > 0 { configured } else { default };
+            (
+                or_default(self.max_size, max_size),
+                or_default(self.max_backups, max_backups),
+                or_default(self.max_age, max_age),
+                compress,
+            )
         } else {
             (self.max_size, self.max_backups, self.max_age, self.compress)
         }
@@ -104,6 +113,18 @@ mod tests {
         assert_eq!(with_path(".logs").log_dir(config_dir), Some(PathBuf::from(".logs")));
         let custom = LogConfig { max_size: 5, max_backups: 2, ..with_path("logs") };
         assert_eq!(custom.rotation(), (5, 2, 0, false));
+    }
+
+    /// Rotation settings apply to the default directory too; unset ones
+    /// keep its bounded defaults.
+    #[test]
+    fn rotation_settings_apply_to_the_default_directory() {
+        let configured = LogConfig { max_size: 200, max_backups: 3, max_age: 30, ..with_path("") };
+        assert_eq!(configured.rotation(), (200, 3, 30, true));
+        let partly = LogConfig { max_backups: 40, ..with_path(" ") };
+        assert_eq!(partly.rotation(), (50, 40, 14, true));
+        let parsed: LogConfig = serde_yaml::from_str("maxSize: 10\nmaxAge: 2\ncompress: false\n").unwrap();
+        assert_eq!(parsed.rotation(), (10, 10, 2, true));
     }
 
     /// While log files are written, stderr (the journal) keeps warnings and

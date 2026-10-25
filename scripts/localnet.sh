@@ -211,7 +211,6 @@ fi
 P2P_BASE=$((8336 + PORT_OFFSET))    # /udp QUIC
 STREAM_BASE=$((8340 + PORT_OFFSET)) # /tcp :8340 (peer mTLS + worker cluster + direct consensus)
 GRPC_BASE=$((8337 + PORT_OFFSET))
-REST_BASE=$((8338 + PORT_OFFSET))
 
 TARGET_DIR="${TARGET_DIR:-$ROOT/target}"
 if [[ "$PROFILE" == "release" ]]; then
@@ -248,7 +247,6 @@ node_dir()  { echo "$NET_DIR/$1"; }
 node_p2p()  { echo $((P2P_BASE + $1 * 10)); }
 node_strm() { echo $((STREAM_BASE + $1 * 10)); }
 node_grpc() { echo $((GRPC_BASE + $1 * 10)); }
-node_rest() { echo $((REST_BASE + $1 * 10)); }
 
 # Extract the persisted Ed448 peer key hex from a node's config.yml.
 read_peerkey() {
@@ -276,14 +274,14 @@ yaml_list() {
 write_archive_config() {
   local dir="$1" idx="$2" seed="$3" peerkey="$4" bootstrap="$5"
   mkdir -p "$dir"
-  local p2p strm grpc rest boot_block=""
+  local p2p strm grpc boot_block=""
   p2p=$(node_p2p "$idx"); strm=$(node_strm "$idx")
-  grpc=$(node_grpc "$idx"); rest=$(node_rest "$idx")
+  grpc=$(node_grpc "$idx")
   if [[ -n "$bootstrap" ]]; then boot_block=$'\n    - "'"$bootstrap"'"'; fi
   {
     cat <<YAML
 key:
-  keyStoreFile:
+  keyManagerFile:
     path: "$dir/keys.yml"
 p2p:
   network: $NETWORK
@@ -292,7 +290,6 @@ p2p:
   announceListenMultiaddr: "/ip4/127.0.0.1/udp/$p2p/quic-v1"
   streamListenMultiaddr: "/ip4/0.0.0.0/tcp/$strm"
   announceStreamListenMultiaddr: "/ip4/127.0.0.1/tcp/$strm"
-  minBootstrapPeers: $([[ -z "$bootstrap" ]] && echo 0 || echo 1)
   bootstrapPeers:$( [[ -n "$bootstrap" ]] && echo "$boot_block" || echo " []" )
   directPeers: []
 engine:
@@ -311,7 +308,6 @@ proofWorker:
 db:
   path: "$dir/store"
 listenGrpcMultiaddr: "/ip4/127.0.0.1/tcp/$grpc"
-listenRESTMultiaddr: "/ip4/127.0.0.1/tcp/$rest"
 YAML
   } > "$dir/config.yml"
 }
@@ -321,12 +317,12 @@ YAML
 write_regular_config() {
   local dir="$1" idx="$2" seed="$3" bootstrap="$4" workers="$5" direct_block="${6:-}"
   mkdir -p "$dir"
-  local p2p strm grpc rest boot_block="" peerkey=""
+  local p2p strm grpc boot_block="" peerkey=""
   # --print-identity persists this seed during pass 1. Retain it when adding
   # direct peers in pass 2 so cluster workers can start before the master.
   [[ ! -f "$dir/config.yml" ]] || peerkey=$(read_peerkey "$dir")
   p2p=$(node_p2p "$idx"); strm=$(node_strm "$idx")
-  grpc=$(node_grpc "$idx"); rest=$(node_rest "$idx")
+  grpc=$(node_grpc "$idx")
   if [[ -n "$bootstrap" ]]; then boot_block=$'\n    - "'"$bootstrap"'"'; fi
   # The archive pool is seeded ONLY from engine.archiveEndpoints (or mainnet's
   # hardcoded genesis IPs) — nothing populates it from PeerInfo gossip, despite
@@ -366,7 +362,7 @@ write_regular_config() {
   fi
   cat > "$dir/config.yml" <<YAML
 key:
-  keyStoreFile:
+  keyManagerFile:
     path: "$dir/keys.yml"
 p2p:
   network: $NETWORK
@@ -375,7 +371,6 @@ p2p:
   announceListenMultiaddr: "/ip4/127.0.0.1/udp/$p2p/quic-v1"
   streamListenMultiaddr: "/ip4/0.0.0.0/tcp/$strm"
   announceStreamListenMultiaddr: "/ip4/127.0.0.1/tcp/$strm"
-  minBootstrapPeers: 1
   bootstrapPeers:$boot_block
   directPeers:$( [[ -n "$direct_block" ]] && echo "$direct_block" || echo " []" )
 engine:
@@ -394,7 +389,6 @@ proofWorker:
 db:
   path: "$dir/store"
 listenGrpcMultiaddr: "/ip4/127.0.0.1/tcp/$grpc"
-listenRESTMultiaddr: "/ip4/127.0.0.1/tcp/$rest"
 YAML
 }
 
