@@ -22,6 +22,10 @@
 //! Shard filters and other hex, frame numbers, versions, timestamps, levels
 //! and callsites are kept. Public endpoints (the mainnet bootstrap archive
 //! peers) keep their IPs and peer IDs, as do loopback/unspecified addresses.
+//! The policy is the same in every field and message: an archive endpoint
+//! stays wherever it occurs (`addr`, `peer`, free text), including a
+//! `peer` field naming a bootstrap archive; any other peer ID or address is
+//! tokenized.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -140,7 +144,9 @@ impl Patterns {
             ip6_bracket: re(r"\[([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)(%[0-9A-Za-z]+)?\]"),
             ip4: re(r"\b[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b"),
             ip6_bare: re(r"[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}"),
-            peer: re(r"\b(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3KooW[1-9A-HJ-NP-Za-km-z]{44}|16Uiu2HA[1-9A-HJ-NP-Za-km-z]{45})\b"),
+            // No `\b` anchors: `_` is a word byte, so `peer_<id>` and `<id>_x`
+            // (labels glued to an ID by a logging format) must still match.
+            peer: re(r"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3KooW[1-9A-HJ-NP-Za-km-z]{44}|16Uiu2HA[1-9A-HJ-NP-Za-km-z]{45})"),
             raw_balance: re(r#""(delta|new_balance|balance)"\s*:\s*(?:"(?:[^"\\]|\\.)*"|[-+0-9.eE]+)"#),
             raw_self: re(r#""(prover_address|peer_id|ed448_peer_id)"\s*:\s*"([^"\\]*)""#),
         }
@@ -1020,6 +1026,45 @@ mod tests {
             out,
             line(&format!("archive {ip}:8340 via {addr}, and ip4#6fe0c5ee:8340 peer {peer}"), r#"{"coreId":0}"#)
         );
+    }
+
+    /// A line shaped like the node's "inbound SubmitGlobalConsensus" record.
+    fn submit_line(peer: &str) -> String {
+        line(
+            "inbound SubmitGlobalConsensus",
+            &format!(r#"{{"bitmask":"0013","bytes":1892,"coreId":0,"kind":"other","peer":"{peer}"}}"#),
+        )
+    }
+
+    #[test]
+    fn peer_ids_are_tokenized_in_any_field_shape() {
+        let mut r = redactor();
+        let (qm, ed) = (token(&SALT, "peer", QM), token(&SALT, "peer", ED));
+        assert_eq!(r.redact_line(&submit_line(QM)), submit_line(&qm));
+        assert_eq!(r.redact_line(&submit_line(ED)), submit_line(&ed));
+        // IDs glued to a label or suffix by `_` are still IDs.
+        assert_eq!(r.redact_line(&submit_line(&format!("peer_{QM}"))), submit_line(&format!("peer_{qm}")));
+        assert_eq!(r.redact_line(&submit_line(&format!("{ED}_inbound"))), submit_line(&format!("{ed}_inbound")));
+        assert_eq!(
+            r.redact_line(&line(&format!("rejected submit_{QM}_x"), r#"{"coreId":0}"#)),
+            line(&format!("rejected submit_{qm}_x"), r#"{"coreId":0}"#)
+        );
+        assert!(!r.token_map().values().any(|v| v.contains("_")), "tokens map whole IDs only");
+    }
+
+    #[test]
+    fn bootstrap_archive_policy_is_the_same_in_every_field() {
+        let addr = quil_config::MAINNET_BOOTSTRAP_PEERS[0];
+        let parts: Vec<&str> = addr.split('/').collect();
+        let (ip, peer) = (parts[2], parts[parts.len() - 1]);
+        let mut r = Redactor::new(SALT, RedactOptions::with_bootstrap_endpoints(false));
+        // Public archive endpoints stay in `peer` and `addr` fields ...
+        let kept = line("archive poll", &format!(r#"{{"addr":"{ip}:8340","coreId":0,"peer":"{peer}"}}"#));
+        assert_eq!(r.redact_line(&kept), kept);
+        // ... while any other peer or address is tokenized in the same fields.
+        let other = line("archive poll", &format!(r#"{{"addr":"192.0.2.10:8340","coreId":0,"peer":"{QM}"}}"#));
+        let want = line("archive poll", &format!(r#"{{"addr":"ip4#6fe0c5ee:8340","coreId":0,"peer":"{}"}}"#, token(&SALT, "peer", QM)));
+        assert_eq!(r.redact_line(&other), want);
     }
 
     #[test]
