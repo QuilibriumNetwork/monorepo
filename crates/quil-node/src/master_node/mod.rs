@@ -1,4 +1,5 @@
 mod frame_observations;
+mod peer_info_file;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -321,7 +322,8 @@ pub(crate) async fn start(
             }
         }
     }
-    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path.
+    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path, and
+    // at startup from the verified records the last run saved.
     // Read by NodeService::get_peer_info so CLI tools can enumerate
     // the peers this node has observed on the network. Keyed by the
     // raw peer_id bytes; last-write-wins.
@@ -335,6 +337,19 @@ pub(crate) async fn start(
     let peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // Restored before any reader runs: regular nodes republish their
+    // PeerInfo every 30 minutes on mainnet, and until then a restarted
+    // node knew none of their endpoints. Saved every few minutes and at
+    // shutdown (peer_info_file.rs).
+    {
+        let path = config_dir.join(peer_info_file::FILE_NAME);
+        peer_info_file::restore_at_startup(&peer_info_cache, &path, network);
+        let cache = peer_info_cache.clone();
+        sup.spawn("peer-info-cache-saver", move |token| async move {
+            peer_info_file::save_until_cancelled(cache, path, network, token).await;
+            Ok(())
+        });
+    }
     // filter → AppEngineHandle registry. Populated by the worker→master
     // drain task on `WorkerToMaster::ShardActivated` and cleared on
     // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
@@ -1295,6 +1310,7 @@ pub(crate) async fn start(
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
         let gap_network = config.p2p.network;
+        let no_member_notice: Arc<peer_info_file::HourlyNotice> = Default::default();
         // One connection per endpoint, shared by every fetch: a frame each
         // second used to open a new connection to every endpoint it asked.
         let clients: Arc<parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>> =
@@ -1327,15 +1343,15 @@ pub(crate) async fn start(
                 // archives that restarted together (the usual way a gap opens)
                 // missed the same frame. A live run sat on such a gap for the
                 // whole session while every member of the shard had the frame.
-                let mut endpoints: Vec<String> = gap_peers.read().values()
-                    .flat_map(|info| info.reachability.iter()
-                        .filter(|reach| reach.filter == filter)
-                        .flat_map(|reach| reach.stream_multiaddrs.iter())
-                        .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, gap_network))
-                        .collect::<Vec<_>>())
-                    .collect();
-                endpoints.sort();
-                endpoints.dedup();
+                let (mut endpoints, peer_info_records) = {
+                    let peers = gap_peers.read();
+                    (peer_info_file::shard_member_endpoints(&peers, &filter, gap_network), peers.len())
+                };
+                if endpoints.is_empty() && no_member_notice.due(&filter) {
+                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, peer_info_records,
+                        "app-shard gap fetch knows no member endpoint for this shard, so it asks archives only; \
+                         it ends when a member's PeerInfo arrives (repeated hourly while it lasts)");
+                }
                 async move {
                     let Some(key) = key.as_ref() else { return };
                     // Every one of the shard's members, then every archive: an
