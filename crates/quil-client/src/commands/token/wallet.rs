@@ -131,6 +131,8 @@ pub(super) struct CoinScan {
     after: Option<[u8; 32]>,
     remaining_pages: usize,
     finished: bool,
+    /// The node answered that the application has no coin root yet.
+    rootless: bool,
 }
 impl CoinScan {
     pub(super) fn new(max_pages: usize) -> anyhow::Result<Self> {
@@ -141,6 +143,7 @@ impl CoinScan {
             after: None,
             remaining_pages: max_pages,
             finished: false,
+            rootless: false,
         })
     }
     pub(super) fn finished(&self) -> bool {
@@ -1404,11 +1407,22 @@ impl RecipientWallet {
 
     /// Complete bounded scan. Errors discard partial results. The RPC provider
     /// observes queried markers; these are node-local, current-state hints.
+    /// An application without a coin root holds no coin to list.
     pub(super) async fn scan_unspent(
         self: std::sync::Arc<Self>,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
         max_pages: usize, max_owned: usize,
     ) -> anyhow::Result<Vec<OwnedCoin>> {
+        Ok(self.scan_unspent_or_rootless(client, max_pages, max_owned).await?.unwrap_or_default())
+    }
+
+    /// [`Self::scan_unspent`], or `None` when the node answers that the
+    /// application has no coin root: no confidential coin exists in it yet.
+    pub(super) async fn scan_unspent_or_rootless(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+        max_pages: usize, max_owned: usize,
+    ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
         let mut unspent = Vec::new();
@@ -1423,7 +1437,7 @@ impl RecipientWallet {
                 }
             }
         }
-        Ok(unspent)
+        Ok((!scan.rootless).then_some(unspent))
     }
 
     fn decode_escrow_page(
@@ -1535,6 +1549,21 @@ impl RecipientWallet {
             scan.snapshot_id.is_none_or(|old| old == id),
             "scan snapshot changed"
         );
+        // No root anywhere: the application holds no confidential coin yet.
+        // Only a fresh scan's single page, empty and final, may say so; a
+        // node that drops the root mid-scan or beside a coin is refused.
+        if response.root_record.is_empty() {
+            anyhow::ensure!(
+                scan.snapshot_id.is_none() && response.coins.is_empty()
+                    && response.cursor.is_empty() && !response.has_more,
+                "scan page without a root must be the empty, final page of a fresh scan"
+            );
+            scan.snapshot_id = Some(id);
+            scan.remaining_pages -= 1;
+            scan.finished = true;
+            scan.rootless = true;
+            return Ok(Vec::new());
+        }
         let root = RootRecord::decode(&response.root_record, &self.context)
             .map_err(|e| anyhow::anyhow!("scan root: {e:?}"))?;
         anyhow::ensure!(
@@ -2028,18 +2057,42 @@ pub(super) fn run(tc: &TokenCtx, application: &str, escrow: bool) -> anyhow::Res
     Ok(())
 }
 
+/// `token balance`: claimable rewards and legacy coins (QUIL only), then
+/// confidential coins, each on its own line so that one failed read does not
+/// hide the others. The command still fails when any of them failed.
 pub(super) async fn run_balance(tc: &TokenCtx, application: &str, max_pages: usize, max_coins: usize) -> anyhow::Result<()> {
     let application_id = identifier(application)?;
-    if application_id == quil_execution::domains::QUIL_TOKEN {
-        println!("{}", super::balance::claimable_rewards(tc).await);
+    let quil = application_id == quil_execution::domains::QUIL_TOKEN;
+    let mut failed = Vec::new();
+    if quil {
+        let (line, read) = super::balance::claimable_rewards(tc).await;
+        println!("{line}");
+        if !read {
+            failed.push("claimable rewards");
+        }
     }
     let network = quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application_id)?);
     let client = tc.connect().await?;
-    let coins = wallet.scan_unspent(&client, max_pages, max_coins).await?;
-    let total = coins.iter().try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
-        .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
-    println!("{total} base units across {} coins reported unspent by the configured node (not a finalized balance)", coins.len());
+    if quil {
+        let legacy = super::legacy::unshielded(tc, &client, &application_id).await;
+        if legacy.is_err() {
+            failed.push("legacy coins");
+        }
+        println!("{}", super::balance::format_legacy_coins(legacy));
+    }
+    let confidential = match wallet.scan_unspent_or_rootless(&client, max_pages, max_coins).await {
+        Ok(Some(coins)) => coins.iter().try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+            .map(|total| Some((total, coins.len())))
+            .ok_or_else(|| anyhow::anyhow!("balance overflows u128")),
+        Ok(None) => Ok(None),
+        Err(error) => Err(error),
+    };
+    if confidential.is_err() {
+        failed.push("confidential coins");
+    }
+    println!("{}", super::balance::format_confidential_coins(confidential, quil));
+    anyhow::ensure!(failed.is_empty(), "balance incomplete: {} unavailable", failed.join(", "));
     Ok(())
 }
 
@@ -3767,13 +3820,15 @@ mod tests {
             cursor: vec![255; 32],
             ..first.clone()
         };
-        for case in 0..4 {
+        for case in 0..5 {
             let mut bad = next.clone();
             match case {
                 0 => bad.snapshot_id[0] ^= 1,
                 1 => bad.cursor = address.to_vec(),
                 2 => bad.network[0] ^= 1,
-                _ => bad.root_record[8] ^= 1,
+                3 => bad.root_record[8] ^= 1,
+                // A node cannot drop the root mid-scan.
+                _ => bad.root_record.clear(),
             }
             assert!(wallet.decode_scan_page(&mut scan, bad).is_err());
             assert_eq!(scan.after, Some(address));
@@ -3800,6 +3855,33 @@ mod tests {
             .decode_scan_page(&mut limited, first.clone())
             .unwrap();
         assert!(wallet.decode_scan_page(&mut limited, first).is_err());
+    }
+
+    /// #698: an application without a coin root (QUIL before its first
+    /// confidential coin) answers a fresh scan with one empty, final page
+    /// that has no root. The wallet takes it as a complete scan holding no
+    /// coin, and refuses a rootless page that claims more.
+    #[test]
+    fn a_rootless_first_page_completes_the_scan_without_coins() {
+        use quil_types::proto::node::ListCoinsResponse;
+        let keys = sntrup761::Sntrup761KeyPair::generate();
+        let wallet = RecipientWallet::from_keys(&[1; 32], &[2; 32], &keys.public, Zeroizing::new(keys.secret)).unwrap();
+        let rootless = ListCoinsResponse {
+            network: wallet.network.to_vec(), snapshot_id: vec![7; 32], root_record: Vec::new(),
+            coins: Vec::new(), cursor: Vec::new(), has_more: false,
+        };
+        for bad in [
+            ListCoinsResponse { has_more: true, cursor: vec![8; 32], ..rootless.clone() },
+            ListCoinsResponse { cursor: vec![8; 32], ..rootless.clone() },
+        ] {
+            let mut scan = CoinScan::new(2).unwrap();
+            assert!(wallet.decode_scan_page(&mut scan, bad).is_err());
+            assert!(!scan.finished() && scan.snapshot_id.is_none());
+        }
+        let mut scan = CoinScan::new(2).unwrap();
+        assert!(wallet.decode_scan_page(&mut scan, rootless.clone()).unwrap().is_empty());
+        assert!(scan.finished(), "nothing follows a rootless page");
+        assert!(wallet.decode_scan_page(&mut scan, rootless).is_err());
     }
 
     #[test]

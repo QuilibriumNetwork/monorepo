@@ -165,3 +165,24 @@ fn claimable_rewards_report_rpc_failure_as_unavailable() {
     assert!(display.contains("reward history unavailable"));
     assert!(!display.contains("0.000000000000 QUIL"));
 }
+
+/// #698: `token balance` shows every section. A network with no
+/// confidential coin yet has no QUIL root, which is one plain line, not an
+/// error; a failed read names its reason.
+#[test]
+fn balance_lines_show_a_missing_root_as_no_coins_and_failures_with_their_reason() {
+    assert_eq!(format_confidential_coins(Ok(None), true),
+        "Confidential QUIL coins: none exist on the network yet (no QUIL root published)");
+    assert_eq!(format_confidential_coins(Ok(None), false),
+        "Confidential coins: none exist in this application yet (no root published)");
+    assert_eq!(format_confidential_coins(Ok(Some((25, 2))), true),
+        "Confidential coins: 25 base units across 2 coins reported unspent by the configured node (not a finalized balance)");
+    let refusal = "no node serving application 01 answered this node: 1 peer declined: 1x dial failed";
+    assert_eq!(format_confidential_coins(Err(tonic::Status::unavailable(refusal).into()), true),
+        format!("Confidential coins: unavailable ({refusal})"));
+    assert_eq!(format_legacy_coins(Ok(Some((7, 2, 1)))),
+        "Unshielded legacy coins: 7 base units across 2 coins (1 already shielded)");
+    assert_eq!(format_legacy_coins(Ok(None)), "Unshielded legacy coins: none (this node has no Ed448 identity)");
+    assert_eq!(format_legacy_coins(Err(anyhow::anyhow!("legacy coins: no archive answered for legacy coins"))),
+        "Unshielded legacy coins: unavailable (legacy coins: no archive answered for legacy coins)");
+}
