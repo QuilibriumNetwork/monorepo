@@ -1432,6 +1432,15 @@ fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: 
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
     execution_binding: Option<(quil_types::store::BackingStoreIdentity, RegistryLimits)>,
+    /// Set once a full refresh of the canonical cache from the store has
+    /// succeeded. A node starts with an empty cache and loads it in the
+    /// background, so a reader that decides something once at startup waits
+    /// for this rather than for the cache's lock.
+    initial_load: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+fn initial_load_signal(loaded: bool) -> Arc<tokio::sync::watch::Sender<bool>> {
+    Arc::new(tokio::sync::watch::Sender::new(loaded))
 }
 
 pub(crate) struct PreparedRegistryAdoption<'a> {
@@ -1482,10 +1491,29 @@ impl SharedProverRegistry {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Whether a full refresh from the store has filled the canonical cache.
+    /// Until then it may be empty: a node loads it in the background at
+    /// startup. An execution branch registry is filled when it is built.
+    pub fn initial_load_complete(&self) -> bool {
+        *self.initial_load.borrow()
+    }
+
+    /// Completes once [`Self::initial_load_complete`] holds.
+    pub async fn initial_load(&self) {
+        let mut loaded = self.initial_load.subscribe();
+        // `self` holds the sender, so the channel cannot close here.
+        let _ = loaded.wait_for(|loaded| *loaded).await;
+    }
+
+    fn note_initial_load(&self) {
+        self.initial_load.send_if_modified(|loaded| !std::mem::replace(loaded, true));
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
             execution_binding: None,
+            initial_load: initial_load_signal(false),
         }
     }
 
@@ -1523,6 +1551,8 @@ impl SharedProverRegistry {
         let mut registry = Self {
             inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
             execution_binding: Some((identity.clone(), read_limits)),
+            // Read or copied whole before it is returned.
+            initial_load: initial_load_signal(true),
         };
         if read {
             registry.refresh_from_store(store)?;
@@ -1581,6 +1611,8 @@ impl SharedProverRegistry {
         let registry = Self {
             inner: Arc::new(RwLock::new(seeded)),
             execution_binding: Some((identity, bound)),
+            // Read or copied whole before it is returned.
+            initial_load: initial_load_signal(true),
         };
         registry.update_written_rows(store, overlay)?;
         Ok(registry)
@@ -1617,6 +1649,7 @@ impl SharedProverRegistry {
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
             guard.refresh(hg_store)?;
         }
+        self.note_initial_load();
         let after = self.snapshot_local_prover();
         log_local_prover_diff(before.as_ref(), after.as_ref());
         Ok(())
@@ -2097,6 +2130,10 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
 }
 
 impl ProverRegistryTrait for SharedProverRegistry {
+    fn initial_load_complete(&self) -> bool {
+        SharedProverRegistry::initial_load_complete(self)
+    }
+
     fn get_lifecycle_view(
         &self, address: &[u8], frame: u64,
     ) -> QuilResult<quil_types::consensus::ProverLifecycleView> {
@@ -3174,6 +3211,24 @@ mod tests {
         // An epoch it never registered stays absent.
         assert!(reg.get_leaf_root(&member, &leaf_id, 39).is_none());
         assert!(reg.get_leaf_root(&member, &leaf_id, 43).is_none());
+    }
+
+    #[test]
+    fn initial_load_is_reported_after_a_full_refresh() {
+        let shared = SharedProverRegistry::new();
+        let reader = shared.clone();
+        assert!(!reader.initial_load_complete(), "a new registry has not loaded");
+        shared.update_prover_activity(&[1; 32], &[2; 32], 5).unwrap();
+        assert!(!reader.initial_load_complete(), "an edit is not a load");
+        let (_tmp, store) = temp_store();
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert!(reader.initial_load_complete(), "clones share the signal");
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert!(reader.initial_load_complete(), "it stays set");
+        assert!(!SharedProverRegistry::new().initial_load_complete(),
+            "another registry has its own signal");
+        let branch = SharedProverRegistry::for_execution_store(store.as_ref(), RegistryLimits::UNBOUNDED).unwrap();
+        assert!(ProverRegistryTrait::initial_load_complete(&branch), "a branch registry is built loaded");
     }
 
     #[test]

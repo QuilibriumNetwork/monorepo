@@ -135,16 +135,12 @@ pub(crate) fn init(
         let pr_for_init = prover_registry.clone();
         let lhf_for_init = last_global_head_frame.clone();
         sup.spawn_startup_task("early-worker-reconcile", move |token_for_init| async move {
-            // The background refresh at startup is spawn_blocking and
-            // typically finishes in well under a second. Poll up to
-            // ~5s for `distinct_provers() > 0`; on a fresh node with
-            // an empty registry this just gives up silently and the
-            // archive-poller path picks it up later.
-            for _ in 0..50 {
-                if token_for_init.is_cancelled() { return Ok(()); }
-                let count = pr_for_init.read(|r| r.distinct_provers());
-                if count > 0 { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The registry loads in the background at startup (18-29 s
+            // on a regular node's store, 2026-10-24); reconciling before
+            // that load ends would find none of our allocations. A fresh
+            // node's empty store loads at once.
+            if !super::archive_sync::await_registry_load(&pr_for_init, &token_for_init, "early worker reconcile").await {
+                return Ok(());
             }
             let frame = lhf_for_init.load(std::sync::atomic::Ordering::Relaxed);
             if frame > 0 {

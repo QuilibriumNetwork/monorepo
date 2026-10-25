@@ -110,6 +110,100 @@ where
     }
 }
 
+/// Whether `registry` shows `prover` with an allocation on the GLOBAL (empty)
+/// confirmation filter, which makes it a GLOBAL prover.
+fn holds_global_allocation(registry: &dyn quil_types::consensus::ProverRegistry, prover: &[u8]) -> bool {
+    match registry.get_prover_info(prover) {
+        Ok(Some(info)) => info.allocations.iter().any(|a| a.confirmation_filter.is_empty()),
+        _ => false,
+    }
+}
+
+/// How long startup work waits for the prover registry's first load before
+/// warning, and how often it warns again while it waits.
+const REGISTRY_LOAD_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for the prover registry's first full load from the store; `false`
+/// when cancelled first. A node loads the registry in the background at
+/// startup and reads it empty until then, so startup work that acts once on
+/// what it reads waits here. `waiter` names that work in the log.
+pub(crate) async fn await_registry_load(
+    registry: &quil_execution::SharedProverRegistry,
+    cancel: &tokio_util::sync::CancellationToken,
+    waiter: &'static str,
+) -> bool {
+    if registry.initial_load_complete() {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    info!(waiter, "waiting for the prover registry's first load from the store");
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = registry.initial_load() => break,
+            _ = tokio::time::sleep(REGISTRY_LOAD_WARN_INTERVAL) => warn!(
+                waiter,
+                waited_secs = started.elapsed().as_secs(),
+                "prover registry is still loading from the store, and startup work that reads it \
+                 keeps waiting (the load normally takes under a minute: check this node's disk and \
+                 the \"prover registry loaded (background)\" line)",
+            ),
+        }
+    }
+    info!(
+        waiter,
+        waited_ms = started.elapsed().as_millis() as u64,
+        provers = registry.read(|r| r.distinct_provers()),
+        "prover registry loaded; startup work resumes",
+    );
+    true
+}
+
+/// Whether this node is a GLOBAL prover, read once the prover registry has
+/// finished its first load from the store; `None` when cancelled first.
+///
+/// An archive decides once, here, whether to run GLOBAL consensus. Reading
+/// the registry before its load ends finds it empty, and the archive never
+/// runs GLOBAL consensus (two mainnet archives on 2026-10-24, after which
+/// GLOBAL halted).
+async fn global_prover_once_loaded(
+    registry: &quil_execution::SharedProverRegistry,
+    prover: &[u8],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<bool> {
+    if !await_registry_load(registry, cancel, "GLOBAL consensus activation").await {
+        return None;
+    }
+    Some(holds_global_allocation(registry, prover))
+}
+
+/// How often an archive that did not activate GLOBAL consensus at startup
+/// checks whether the prover registry has since given it a GLOBAL allocation.
+const GLOBAL_ALLOCATION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often that archive repeats its warning once it holds one.
+const GLOBAL_ALLOCATION_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Completes with `true` once `registry` shows `prover` as a GLOBAL prover,
+/// checking every `recheck`; `false` when cancelled first.
+async fn await_global_allocation(
+    registry: &quil_execution::SharedProverRegistry,
+    prover: &[u8],
+    cancel: &tokio_util::sync::CancellationToken,
+    recheck: std::time::Duration,
+) -> bool {
+    loop {
+        if holds_global_allocation(registry, prover) {
+            return true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(recheck) => {}
+        }
+    }
+}
+
 /// Whether the archive shard-info refresh is due: first load, every
 /// `REFRESH_CADENCE_FRAMES` (60, ~10 min on mainnet), and a couple of frames
 /// after each epoch boundary. Splits and merges flip at epoch boundaries;
@@ -2312,6 +2406,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // forward by consensus). Distinct from the record-only
                 // backfill, which fills clock-record holes `[H+1,N-1]`
                 // WITHOUT re-materializing.
+                // GLOBAL frames executed in place route each bundle and check
+                // frame headers by the canonical prover registry, and the
+                // shard rebalance proposes merges from it: read before its
+                // first load ends, it shows no prover on any shard.
+                if sync_archive_mode
+                    && !await_registry_load(&sync_pr, &sync_token, "GLOBAL frame materialization").await
+                {
+                    return Ok(());
+                }
                 if sync_archive_mode {
                     if let Some(m) = frame_materializer.clone() {
                         let cs = sync_cs.clone();
@@ -3186,16 +3289,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     // do not until ConfirmJoins flips their allocation
                     // to Active (at which point a future activation
                     // path can spin up the loop).
-                    let is_global_prover: bool = {
-                        use quil_types::consensus::ProverRegistry;
-                        match sync_pr.get_prover_info(&sync_pa) {
-                            Ok(Some(info)) => info
-                                .allocations
-                                .iter()
-                                .any(|a| a.confirmation_filter.is_empty()),
-                            _ => false,
-                        }
-                    };
+                    //
+                    // The decision is taken once, so it waits for the
+                    // prover registry's first load (see
+                    // `global_prover_once_loaded`).
+                    //
                     // Global consensus (HotStuff over the global frame
                     // chain) is archive-only. In Go this is gated on
                     // `isConsensusParticipant() = ArchiveMode || Network == 99`.
@@ -3209,6 +3307,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     // verification failures with genesis-shaped all-zero
                     // signatures.
                     let is_consensus_participant = sync_archive_mode || network == 99;
+                    let is_global_prover = if is_consensus_participant {
+                        match global_prover_once_loaded(&sync_pr, &sync_pa, &sync_token).await {
+                            Some(global) => global,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        false
+                    };
                     if !is_consensus_participant {
                         info!(
                             "non-archive, non-devnet — skipping global consensus event loop activation \
@@ -3217,6 +3323,37 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     } else if !is_global_prover {
                         info!(
                             "archive/devnet but not a global prover — skipping global consensus activation",
+                        );
+                        // GLOBAL consensus starts only here, from the state
+                        // read at startup (anchor frame, journal marker,
+                        // committee epoch), so an allocation that appears
+                        // later takes a restart to act on.
+                        let recheck_pr = sync_pr.clone();
+                        let recheck_cancel = sync_token.clone();
+                        spawner.detach("global-allocation-recheck", async move {
+                            if !await_global_allocation(&recheck_pr, &sync_pa, &recheck_cancel, GLOBAL_ALLOCATION_RECHECK).await {
+                                return Ok(());
+                            }
+                            let since = std::time::Instant::now();
+                            loop {
+                                warn!(
+                                    prover = %hex::encode(sync_pa),
+                                    since_secs = since.elapsed().as_secs(),
+                                    "this node's prover now holds a GLOBAL allocation, but GLOBAL \
+                                     consensus was not activated at startup and does not start \
+                                     while the node runs: restart the node to activate it",
+                                );
+                                tokio::select! {
+                                    _ = recheck_cancel.cancelled() => return Ok(()),
+                                    _ = tokio::time::sleep(GLOBAL_ALLOCATION_WARN_INTERVAL) => {}
+                                }
+                            }
+                        });
+                    } else if let Err(error) = &genesis_frame_result {
+                        warn!(
+                            %error,
+                            "this node holds a GLOBAL allocation but has no GLOBAL frame to anchor \
+                             consensus on — GLOBAL consensus is not activated",
                         );
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
@@ -3699,6 +3836,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             );
                                         }
                                     }
+                            } else {
+                                warn!(
+                                    "this node holds a GLOBAL allocation but has no Falcon512 prover \
+                                     key — GLOBAL consensus is not activated",
+                                );
                             }
                         }
                     }
@@ -5188,4 +5330,117 @@ mod gap_backfill_tests {
         assert!(store.find_global_frame_record_gaps().is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod global_activation_tests {
+    use super::{await_global_allocation, global_prover_once_loaded};
+    use quil_execution::global_intrinsic::materialize::{
+        allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree,
+        prover_address_from_pubkey,
+    };
+    use quil_execution::prover_registry::vertex_tree_to_blob;
+    use quil_execution::SharedProverRegistry;
+    use quil_store::RocksHypergraphStore;
+    use quil_types::store::{HypergraphStore, ShardKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// A store holding one prover with one allocation on `filter`, and that
+    /// prover's address.
+    fn store_with_allocation(filter: &[u8]) -> (tempfile::TempDir, Arc<RocksHypergraphStore>, [u8; 32]) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
+        let public_key = vec![0xA5u8; 585];
+        let prover = prover_address_from_pubkey(&public_key).unwrap();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let txn = <RocksHypergraphStore as HypergraphStore>::new_transaction(&store, false).unwrap();
+        for (address, tree) in [
+            (prover, create_prover_vertex_tree(&public_key, 0).unwrap()),
+            (
+                allocation_address(&public_key, filter).unwrap(),
+                create_allocation_vertex_tree(&prover, filter, 1).unwrap(),
+            ),
+        ] {
+            let mut key = quil_execution::domains::GLOBAL.to_vec();
+            key.extend_from_slice(&address);
+            <RocksHypergraphStore as HypergraphStore>::save_vertex_underlying(
+                &store, txn.as_ref(), "vertex", "adds", &shard, &key, &vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        (tmp, store, prover)
+    }
+
+    /// Fill `registry` from `store` after `delay`, as the startup load does
+    /// in the background.
+    fn load_later(
+        registry: &Arc<SharedProverRegistry>,
+        store: &Arc<RocksHypergraphStore>,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<quil_types::error::Result<()>> {
+        let (registry, store) = (registry.clone(), store.clone());
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(delay);
+            registry.refresh_from_store(store.as_ref())
+        })
+    }
+
+    /// Two mainnet archives decided before their registry had loaded,
+    /// found it empty and never ran GLOBAL consensus (2026-10-24).
+    #[tokio::test]
+    async fn activation_waits_for_a_registry_load_that_ends_after_the_check() {
+        let (_tmp, store, prover) = store_with_allocation(&[]);
+        let registry = Arc::new(SharedProverRegistry::new());
+        let loader = load_later(&registry, &store, Duration::from_millis(300));
+        let decided = tokio::time::timeout(
+            Duration::from_secs(30),
+            global_prover_once_loaded(&registry, &prover, &CancellationToken::new()),
+        )
+        .await
+        .expect("decides once the registry has loaded");
+        loader.await.unwrap().unwrap();
+        assert_eq!(decided, Some(true), "a GLOBAL prover activates GLOBAL consensus");
+    }
+
+    #[tokio::test]
+    async fn an_app_shard_prover_is_not_a_global_prover() {
+        let (_tmp, store, prover) = store_with_allocation(&[0xAB; 32]);
+        let registry = SharedProverRegistry::new();
+        registry.refresh_from_store(store.as_ref()).unwrap();
+        assert_eq!(
+            global_prover_once_loaded(&registry, &prover, &CancellationToken::new()).await,
+            Some(false),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_the_wait_without_a_decision() {
+        let registry = SharedProverRegistry::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(global_prover_once_loaded(&registry, &[7; 32], &cancel).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_later_global_allocation_is_noticed() {
+        let (_tmp, store, prover) = store_with_allocation(&[]);
+        let registry = Arc::new(SharedProverRegistry::new());
+        let cancel = CancellationToken::new();
+        let loader = load_later(&registry, &store, Duration::from_millis(100));
+        let noticed = tokio::time::timeout(
+            Duration::from_secs(30),
+            await_global_allocation(&registry, &prover, &cancel, Duration::from_millis(20)),
+        )
+        .await
+        .expect("noticed within the timeout");
+        loader.await.unwrap().unwrap();
+        assert!(noticed);
+        cancel.cancel();
+        let other = SharedProverRegistry::new();
+        assert!(!await_global_allocation(&other, &prover, &cancel, Duration::from_millis(20)).await);
+    }
 }
