@@ -6611,8 +6611,8 @@ impl AppConsensusEngine {
                 };
                 let source = crate::app_handoff::ParentSource::new(
                     session.clone(), global, shard, self.clock_store.clone(), self.session_closing.clone(),
+                    self.data_ready.clone(),
                 )?;
-                source.require_staged_data(self.data_ready.clone());
                 let msg_tx = self.self_msg_tx.clone();
                 let read_private_parent = self.private_parents.clone().map(|parents| {
                     let source = source.clone();

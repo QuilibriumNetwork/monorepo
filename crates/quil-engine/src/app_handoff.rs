@@ -225,8 +225,15 @@ pub struct ParentSource {
     history: Mutex<Option<HistoryTip>>,
     /// Unix seconds of the last operator-visible "parent unavailable" line.
     last_reported: std::sync::atomic::AtomicU64,
-    /// The engine's staged-data flag ([`Self::require_staged_data`]).
-    data_ready: std::sync::OnceLock<Arc<AtomicBool>>,
+    /// The engine's staged-data flag: no parent, and so no seal, while false.
+    /// At its base a session's checkpoint is this member's committed shard
+    /// roots, and a seal checks only that members agree on them: members that
+    /// had not staged the shard's data agreed on their partial roots and
+    /// certified them, and every same-filter successor then required those
+    /// roots. Data frames are gated on the same flag
+    /// (`AppSeamProposer::data_ready`). Required at construction, so an
+    /// unbound flag cannot read as staged.
+    data_ready: Arc<AtomicBool>,
 }
 
 impl ParentSource {
@@ -236,6 +243,7 @@ impl ParentSource {
         shard: Arc<HypergraphCrdt>,
         clock: Arc<dyn ClockStore>,
         closing: Arc<AtomicBool>,
+        staged: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
         let session_id = session.id()?;
         Ok(Arc::new(Self {
@@ -247,24 +255,15 @@ impl ParentSource {
             closing,
             history: Mutex::new(None),
             last_reported: std::sync::atomic::AtomicU64::new(0),
-            data_ready: std::sync::OnceLock::new(),
+            data_ready: staged,
         }))
     }
 
-    /// No parent, and so no seal, while `staged` is false. At its base a
-    /// session's checkpoint is this member's committed shard roots, and a seal
-    /// checks only that members agree on them: members that had not staged the
-    /// shard's data agreed on their partial roots and certified them, and
-    /// every same-filter successor then required those roots. Data frames are
-    /// gated on the same flag (`AppSeamProposer::data_ready`).
-    pub fn require_staged_data(&self, staged: Arc<AtomicBool>) {
-        let _ = self.data_ready.set(staged);
-    }
-
     fn check_staged(&self) -> Result<()> {
-        match self.data_ready.get() {
-            Some(staged) if !staged.load(Ordering::Acquire) => Err(unavailable("covered shard data is not staged")),
-            _ => Ok(()),
+        if self.data_ready.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(unavailable("covered shard data is not staged"))
         }
     }
 
@@ -4549,7 +4548,7 @@ mod successor_tests {
         });
         let source = ParentSource::new(
             session.clone(), global.clone(), crdt(), anchors.clone() as Arc<dyn ClockStore>,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)),
         ).unwrap();
         use crate::global_view_refresh::{Reason, ViewRefresh};
         let refresh = Arc::new(ViewRefresh::default());
@@ -4664,16 +4663,16 @@ mod successor_tests {
         let request = schedule::closing_request(&CommittedView::capture(&global).unwrap(), &zero).unwrap().unwrap();
 
         let closing = Arc::new(AtomicBool::new(false));
+        // A member that has not staged the shard's data reads no parent, so it
+        // can neither propose nor verify a seal of its partial roots.
+        let staged = Arc::new(AtomicBool::new(false));
         let source = ParentSource::new(
             zero.clone(), global.clone(), shard.clone(), clock.clone() as Arc<dyn ClockStore>, closing.clone(),
+            staged.clone(),
         ).unwrap();
         let context = |view: u64, parent_view: u64, parent: [u8; 32]| ProposalContext {
             epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent),
         };
-        // A member that has not staged the shard's data reads no parent, so it
-        // can neither propose nor verify a seal of its partial roots.
-        let staged = Arc::new(AtomicBool::new(false));
-        source.require_staged_data(staged.clone());
         let unstaged = source.read(context(18, 17, tip_digest)).unwrap_err();
         assert!(unstaged.to_string().contains("not staged"), "{unstaged}");
         staged.store(true, Ordering::Release);
@@ -4705,7 +4704,7 @@ mod successor_tests {
         }
         let drained_source = ParentSource::new(
             zero.clone(), global.clone(), drained_shard, drained_clock as Arc<dyn ClockStore>,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)),
         ).unwrap();
         assert_eq!(drained_source.read(context(18, 17, tip_digest)).unwrap().closing_request, None);
 
