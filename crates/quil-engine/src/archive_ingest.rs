@@ -689,18 +689,9 @@ impl ArchiveAppShardIngest {
         }
         let Some(header) = frame.header.as_ref() else { return false };
         let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
-        // Two transactions: the commit reads the staged copy from the store.
-        let stored = self.clock_store.new_transaction(false)
-            .and_then(|txn| {
-                self.clock_store.stage_shard_clock_frame(&selector, frame, txn.as_ref())?;
-                txn.commit()
-            })
-            .and_then(|()| {
-                let txn = self.clock_store.new_transaction(false)?;
-                self.clock_store.commit_shard_clock_frame(&header.address, header.frame_number, &selector, txn.as_ref(), false)?;
-                txn.commit()
-            });
-        if let Err(error) = stored {
+        // Outside every GLOBAL execution footprint, so it does not make a
+        // concurrent atomic execution stale.
+        if let Err(error) = self.clock_store.store_shard_clock_frame_for_serving(&selector, frame) {
             warn!(frame = header.frame_number, %error,
                 address = %hex::encode(&header.address),
                 "archive ingest: storing a verified shard frame for serving failed");

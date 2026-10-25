@@ -338,6 +338,18 @@ pub fn clock_global_frame_candidate_latest_index() -> Vec<u8> {
 /// them; no execution plan does, so their cleanup is declared disjoint.
 pub const CLOCK_SHARD_STAGED_PREFIXES: &[[u8; 2]] = &[[CLOCK_FRAME, CLOCK_SHARD_STAGED]];
 
+/// Committed application-shard frames and their latest index. An archive
+/// stores each frame it admits for serving as a write confined to these
+/// prefixes, which makes stale only an execution plan that touched them
+/// (`CoordinatedDb::commit_execution`); an ordinary write made every
+/// concurrent atomic GLOBAL execution stale. Safety rests on that check, not
+/// on what execution reads: GLOBAL execution is not expected to touch them,
+/// and one that does still conflicts.
+pub const CLOCK_SHARD_SERVING_PREFIXES: &[[u8; 2]] = &[
+    [CLOCK_FRAME, CLOCK_SHARD_FRAME],
+    [CLOCK_FRAME, INDEX_LATEST | CLOCK_SHARD_FRAME],
+];
+
 /// Committed GLOBAL request bodies and their retention index. Only frame
 /// reads touch them; a regular node does not execute GLOBAL requests.
 pub const GLOBAL_REQUEST_PREFIXES: &[[u8; 2]] = &[

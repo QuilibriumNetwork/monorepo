@@ -414,6 +414,28 @@ pub trait ClockStore: Send + Sync {
         parent_selector: &[u8],
         truncate: bool,
     ) -> Result<proto::global::AppShardFrame>;
+    /// Store an authenticated application frame, whose output hashes to
+    /// `selector`, where shard frames are served from: as
+    /// [`Self::stage_shard_clock_frame`] then [`Self::commit_shard_clock_frame`]
+    /// leave it. A store may write it as a batch confined to the shard-frame
+    /// keys, so that a concurrent execution plan conflicts at commit only if
+    /// it touched them.
+    fn store_shard_clock_frame_for_serving(
+        &self,
+        selector: &[u8],
+        frame: &proto::global::AppShardFrame,
+    ) -> Result<()> {
+        let header = frame.header.as_ref().ok_or_else(|| {
+            crate::error::QuilError::InvalidArgument("shard frame has no header".into())
+        })?;
+        // Two transactions: the commit reads the staged copy from the store.
+        let txn = self.new_transaction(false)?;
+        self.stage_shard_clock_frame(selector, frame, txn.as_ref())?;
+        txn.commit()?;
+        let txn = self.new_transaction(false)?;
+        self.commit_shard_clock_frame(&header.address, header.frame_number, selector, txn.as_ref(), false)?;
+        txn.commit()
+    }
     fn set_latest_shard_clock_frame_number(
         &self,
         filter: &[u8],
