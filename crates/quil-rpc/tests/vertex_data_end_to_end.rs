@@ -171,6 +171,7 @@ async fn get_hyperedge_data_returns_known_indices() {
     let resp = svc
         .get_hyperedge_data(Request::new(GetHyperedgeDataRequest {
             address: address.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -178,6 +179,7 @@ async fn get_hyperedge_data_returns_known_indices() {
     assert_eq!(resp.set_type, "hyperedge");
     assert_eq!(resp.phase_type, "adds");
     assert_eq!(resp.entries.len(), leaves.len());
+    assert!(resp.raw_data.is_empty());
     for (k, v) in &leaves {
         let found = resp
             .entries
@@ -186,6 +188,19 @@ async fn get_hyperedge_data_returns_known_indices() {
             .unwrap_or_else(|| panic!("missing entry for key {:?}", k));
         assert_eq!(&found.value, v);
     }
+
+    // `full_data` returns the stored tree itself, keys of any length
+    // included (a prover hyperedge keys allocations by 64-byte atom IDs).
+    let full = svc
+        .get_hyperedge_data(Request::new(GetHyperedgeDataRequest {
+            address: address.clone(),
+            full_data: true,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(full.raw_data, serialized_tree);
+    assert!(full.entries.is_empty());
 }
 
 #[tokio::test]
