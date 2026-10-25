@@ -2,7 +2,6 @@
 name = "ed448-bulletproofs"
 # Before doing a release:
 # - update version field 
-# - ensure yoloproofs was disabled in an atomic (revertable) commit
 # - update CHANGELOG
 version = "1.0.0"
 authors = ["Cassandra Heart <cassandra@quilibrium.com>"]
@@ -39,7 +38,6 @@ uniffi = { version = "0.28.3", features = ["build"], optional = true }
 
 [features]
 default = ["uniffi-bindings", "clear_on_drop"]
-yoloproofs = []
 uniffi-bindings = ["uniffi", "uniffi/build"]
 
 [dev-dependencies]
@@ -51,10 +49,6 @@ rand_chacha = "0.3"
 [[test]]
 name = "range_proof"
 
-[[test]]
-name = "r1cs"
-required-features = ["yoloproofs"]
-
 [[bench]]
 name = "range_proof"
 harness = false
@@ -62,11 +56,6 @@ harness = false
 [[bench]]
 name = "generators"
 harness = false
-
-[[bench]]
-name = "r1cs"
-harness = false
-required-features = ["yoloproofs"]
 
 [[bench]]
 name = "linear_proof"
