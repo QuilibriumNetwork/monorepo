@@ -399,46 +399,77 @@ pub(crate) fn spawn_worker_recovery(control: Arc<dyn WorkerControl>, shutdown: t
     }
 }
 
+/// What a process whose own store stopped writing waits for before it
+/// exits for its service manager to restart it and reopen the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reopen {
+    /// An error more space does not resolve: the operator acts.
+    Never,
+    /// A space error on a filesystem that showed no room: its headroom.
+    Headroom,
+    /// A space error on a filesystem that showed room (a disk quota,
+    /// filesystem metadata, or space released after the failed write):
+    /// its headroom and a test reservation next to the store
+    /// ([`storage_health::can_reserve`]), so a limit the free counts do
+    /// not show is not met again at once by the restarted process.
+    Reservation,
+}
+
+/// How often a test reservation next to a stopped store is tried.
+const RESERVE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// When a process whose own store stopped writing exits: once the store's
 /// disk has room again, so that its service manager restarts it and the
 /// store is reopened.
 pub(crate) struct ProcessExit {
     role: StoreRole,
-    /// The store's directory, when it stopped and whether space resolves
-    /// its error class.
-    latched: Option<(PathBuf, Instant, bool)>,
+    /// The store's directory, when it stopped and what its reopening
+    /// waits for.
+    latched: Option<(PathBuf, Instant, Reopen)>,
     reminded: Instant,
+    /// When the last test reservation was tried.
+    reserved_at: Option<Instant>,
+    reserve: fn(&Path, u64) -> Option<bool>,
 }
 
 impl ProcessExit {
     pub(crate) fn new(role: StoreRole, now: Instant) -> Self {
-        Self { role, latched: None, reminded: now }
+        Self { role, latched: None, reminded: now, reserved_at: None, reserve: storage_health::can_reserve }
+    }
+
+    /// Whether a test reservation next to the store succeeds at `now`, at
+    /// most once per [`RESERVE_INTERVAL`]. Where the filesystem cannot
+    /// reserve space without writing it, its headroom is all there is.
+    fn reserved(&mut self, now: Instant, path: &Path) -> bool {
+        if self.reserved_at.is_some_and(|at| now.saturating_duration_since(at) < RESERVE_INTERVAL) {
+            return false;
+        }
+        self.reserved_at = Some(now);
+        (self.reserve)(path, storage_health::REOPEN_RESERVE_BYTES).unwrap_or(true)
     }
 
     /// One look at the store at `now`; the reason to exit, once due.
     pub(crate) fn tick(&mut self, now: Instant, probe: &dyn Fn(&Path) -> Option<FsUsage>) -> Option<String> {
         let (store, headroom) = (self.role.to_string(), storage_health::headroom_text());
+        let reserve_mb = storage_health::REOPEN_RESERVE_BYTES >> 20;
         if self.latched.is_none() {
             if !storage_health::store_latched(self.role) {
                 return None;
             }
             // Read once the failure is recorded: the latch sets its flag first.
             let (class, no_room) = storage_health::store_failure(self.role)?;
-            let space = storage_health::recovers_with_space(class, no_room);
-            self.latched = Some((storage_health::store_path(self.role)?, now, space));
+            let reopen = if !storage_health::space_class(class) {
+                Reopen::Never
+            } else if storage_health::recovers_with_space(class, no_room) {
+                Reopen::Headroom
+            } else {
+                Reopen::Reservation
+            };
+            self.latched = Some((storage_health::store_path(self.role)?, now, reopen));
             self.reminded = now;
-            if !space {
-                // A restart would fail again at once: the operator acts.
-                if storage_health::space_class(class) {
-                    error!(
-                        store = %store,
-                        error_class = class,
-                        scope = "this node",
-                        "store ran out of space although its filesystem shows room (a disk quota, or filesystem \
-                         metadata): this process does not exit for it, as a restart would fail again; check them, \
-                         then restart the node"
-                    );
-                } else {
+            match reopen {
+                Reopen::Never => {
+                    // A restart would fail again at once: the operator acts.
                     error!(
                         store = %store,
                         error_class = class,
@@ -446,24 +477,36 @@ impl ProcessExit {
                         "store stopped writing after an error more space does not resolve: this process does not \
                          exit for it; check the disk and the store files, then restart the node"
                     );
+                    return None;
                 }
-                return None;
+                Reopen::Reservation => info!(
+                    store = %store,
+                    error_class = class,
+                    reserve_mb,
+                    scope = "this node",
+                    "store ran out of space although its filesystem shows room (a disk quota, filesystem metadata, \
+                     or space released after the failed write): this process exits once its disk has {headroom} \
+                     and {reserve_mb} MiB can be reserved next to the store, for its service manager to restart it \
+                     and reopen the store; the service needs a restart policy (systemd Restart=on-failure, launchd \
+                     KeepAlive)"
+                ),
+                Reopen::Headroom => info!(
+                    store = %store,
+                    scope = "this node",
+                    "store stopped writing (a failed write, or free space below the floor): this process exits once \
+                     its disk has {headroom}, for its service manager to restart it and reopen the store; the \
+                     service needs a restart policy (systemd Restart=on-failure, launchd KeepAlive)"
+                ),
             }
-            info!(
-                store = %store,
-                scope = "this node",
-                "store stopped writing (a failed write, or free space below the floor): this process exits once its \
-                 disk has {headroom}, for its service manager to restart it and reopen the store; the service needs \
-                 a restart policy (systemd Restart=on-failure, launchd KeepAlive)"
-            );
         }
-        let (path, since, space) = self.latched.as_ref()?;
-        if !space {
+        let (path, since, reopen) = self.latched.clone()?;
+        if reopen == Reopen::Never {
             return None;
         }
-        let usage = probe(path);
-        let waited_secs = now.saturating_duration_since(*since).as_secs();
-        if has_space(usage) {
+        let usage = probe(&path);
+        let waited_secs = now.saturating_duration_since(since).as_secs();
+        let room = has_space(usage);
+        if room && (reopen == Reopen::Headroom || self.reserved(now, &path)) {
             error!(
                 store = %store,
                 free_mb = usage.map(|usage| usage.free_mb()),
@@ -476,15 +519,28 @@ impl ProcessExit {
         }
         if now.saturating_duration_since(self.reminded) >= REMIND {
             self.reminded = now;
-            warn!(
-                store = %store,
-                free_mb = usage.map(|usage| usage.free_mb()),
-                free_inodes = usage.map(|usage| usage.free_inodes),
-                waited_secs,
-                scope = "this node",
-                "store still stopped and waits for disk space: free space on its disk; this process exits for a \
-                 restart once it has {headroom}"
-            );
+            if room {
+                warn!(
+                    store = %store,
+                    free_mb = usage.map(|usage| usage.free_mb()),
+                    reserve_mb,
+                    waited_secs,
+                    scope = "this node",
+                    "store still stopped: its disk shows room but {reserve_mb} MiB cannot be reserved next to the \
+                     store; check the disk quota and the filesystem's metadata space; this process exits for a \
+                     restart once the reservation succeeds"
+                );
+            } else {
+                warn!(
+                    store = %store,
+                    free_mb = usage.map(|usage| usage.free_mb()),
+                    free_inodes = usage.map(|usage| usage.free_inodes),
+                    waited_secs,
+                    scope = "this node",
+                    "store still stopped and waits for disk space: free space on its disk; this process exits for \
+                     a restart once it has {headroom}"
+                );
+            }
         }
         None
     }
@@ -870,32 +926,83 @@ mod tests {
     #[test]
     fn a_process_whose_store_failed_for_another_error_does_not_exit() {
         let probe = |_: &Path| Some(usage(500));
-        // An I/O error, and space errors on a filesystem that showed room when
-        // the store failed (a disk quota, filesystem metadata): a restart
-        // would fail again at once.
-        for (core, cause) in [
-            (8_311, "IO error: Input/output error"),
-            (8_312, "IO error: Disk quota exceeded"),
-            (8_313, "IO error: No space left on device"),
-        ] {
+        for (core, cause) in [(8_311, "IO error: Input/output error"), (8_314, "IO error: Read-only file system")] {
             let dir = tempfile::tempdir().unwrap();
             let store = quil_store::RocksDb::open(dir.path()).unwrap();
             let role = StoreRole::Worker(core);
             assert!(store.inner().register_store(role));
             store.inner().refuse_writes(cause);
-            let (class, no_room) = storage_health::store_failure(role).expect("latched");
-            if no_room && storage_health::space_class(class) {
-                // The test's own filesystem is short of the headroom: a space
-                // error then counts as seen, which other tests cover. An I/O
-                // error never exits, whatever the filesystem shows.
-                continue;
-            }
             let t0 = Instant::now();
             let mut exit = ProcessExit::new(role, t0);
             for secs in [10, 20, 700, 3_600] {
                 assert_eq!(exit.tick(t0 + Duration::from_secs(secs), &probe), None, "{cause} at {secs}s");
             }
         }
+    }
+
+    /// A store whose filesystem showed room when it ran out of space (a
+    /// failed compaction released its output, a disk quota) is reopened
+    /// by an exit too, once space can be reserved next to it: it does not
+    /// wait for an operator's restart (#665).
+    #[test]
+    fn a_process_whose_store_ran_out_of_space_with_room_showing_exits() {
+        let probe = |_: &Path| Some(usage(500));
+        for (core, cause) in [(8_321, "IO error: No space left on device"), (8_322, "IO error: Disk quota exceeded")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = quil_store::RocksDb::open(dir.path()).unwrap();
+            let role = StoreRole::Worker(core);
+            assert!(store.inner().register_store(role));
+            store.inner().refuse_writes(cause);
+            let (_, no_room) = storage_health::store_failure(role).expect("latched");
+            if no_room {
+                // The test's own filesystem is short of the headroom: the
+                // store then waits for it, which other tests cover.
+                continue;
+            }
+            let t0 = Instant::now();
+            let mut exit = ProcessExit::new(role, t0);
+            let reason = exit.tick(t0 + Duration::from_secs(10), &probe).expect("exits once space can be reserved");
+            assert!(reason.contains(&format!("worker {core} store")), "{reason}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().filter(|entry| {
+                entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(".reserve-")
+            }).count(), 0, "the reservation is removed");
+        }
+    }
+
+    /// While space cannot be reserved next to such a store (a quota that
+    /// still holds), the process keeps waiting, trying once a minute.
+    #[test]
+    fn a_process_waits_while_space_cannot_be_reserved_next_to_its_store() {
+        static RESERVABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static TRIED: AtomicU64 = AtomicU64::new(0);
+        fn reserve(_: &Path, bytes: u64) -> Option<bool> {
+            assert_eq!(bytes, storage_health::REOPEN_RESERVE_BYTES);
+            TRIED.fetch_add(1, Ordering::SeqCst);
+            Some(RESERVABLE.load(Ordering::SeqCst))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = quil_store::RocksDb::open(dir.path()).unwrap();
+        let role = StoreRole::Worker(8_331);
+        assert!(store.inner().register_store(role));
+        store.inner().refuse_writes("IO error: Disk quota exceeded");
+        if storage_health::store_failure(role).expect("latched").1 {
+            return; // No room showing on the test's filesystem: covered elsewhere.
+        }
+        let full = |_: &Path| Some(usage(1));
+        let room = |_: &Path| Some(usage(500));
+        let t0 = Instant::now();
+        let mut exit = ProcessExit::new(role, t0);
+        exit.reserve = reserve;
+        assert_eq!(exit.tick(t0 + Duration::from_secs(10), &full), None, "no room showing now");
+        assert_eq!(TRIED.load(Ordering::SeqCst), 0, "nothing reserved without room");
+        assert_eq!(exit.tick(t0 + Duration::from_secs(20), &room), None, "the quota still holds");
+        assert_eq!(exit.tick(t0 + Duration::from_secs(30), &room), None);
+        assert_eq!(TRIED.load(Ordering::SeqCst), 1, "tried once a minute");
+        RESERVABLE.store(true, Ordering::SeqCst);
+        assert_eq!(exit.tick(t0 + Duration::from_secs(40), &room), None, "not before the minute is up");
+        let reason = exit.tick(t0 + Duration::from_secs(80), &room).expect("exits once space can be reserved");
+        assert!(reason.contains("worker 8331 store"), "{reason}");
+        assert_eq!(TRIED.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -188,6 +188,39 @@ pub fn headroom_text() -> String {
     format!("{} MiB and {} inodes free", 2 * FLOOR_FREE_BYTES >> 20, 2 * FLOOR_FREE_INODES)
 }
 
+/// What a process reserves next to its stopped store before it exits to
+/// reopen it, after a space error on a filesystem that showed room: about
+/// what reopening writes (a recovery flush, a new log and manifest).
+pub const REOPEN_RESERVE_BYTES: u64 = 256 << 20;
+
+/// Whether `bytes` can be reserved in `dir` now: a new file there is
+/// given that much space and removed at once, so a disk quota or a
+/// filesystem's metadata limit that its free counts do not show counts.
+/// `None` where the filesystem cannot reserve space without writing it.
+#[cfg(target_os = "linux")]
+pub fn can_reserve(dir: &Path, bytes: u64) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+    // Removed when dropped, also when the reservation fails.
+    let Ok(file) = tempfile::Builder::new().prefix(".reserve-").tempfile_in(dir) else {
+        return Some(false);
+    };
+    let length = libc::off_t::try_from(bytes).ok()?;
+    // SAFETY: fallocate reads only its integer arguments, and the file's
+    // descriptor stays open for the call.
+    if unsafe { libc::fallocate(file.as_file().as_raw_fd(), 0, 0, length) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => None,
+        _ => Some(false),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn can_reserve(_dir: &Path, _bytes: u64) -> Option<bool> {
+    None
+}
+
 /// `cause` without file paths: RocksDB names the file it was writing.
 pub fn redact_paths(cause: &str) -> String {
     let word = |word: &str| -> String {
@@ -217,7 +250,7 @@ struct WriteFailure {
     /// Whether the store's filesystem showed less than the reopening
     /// headroom when its writes stopped ([`has_headroom`]). A space error on
     /// a filesystem that shows room (a disk quota, filesystem metadata) is
-    /// not resolved by the free space the node can see.
+    /// not resolved by the free space the node can see alone.
     no_room: bool,
     since: Instant,
     refused: u64,
@@ -362,10 +395,11 @@ pub fn recovers_with_space(class: &str, no_room: bool) -> bool {
 
 /// What the node does next about a store of `role` stopped for `class`. A
 /// thread worker is restarted, at most a few times in a row. A process
-/// whose own store it is exits only when the space it can see resolves the
-/// failure ([`recovers_with_space`]), once that space returns: otherwise a
-/// restart would fail again at once, so the operator acts and restarts the
-/// node.
+/// whose own store it is exits only for a space error, once that space
+/// returns: when its filesystem showed room, only once space can also be
+/// reserved next to the store ([`can_reserve`]), since a disk quota or a
+/// metadata limit would fail the restarted process again at once. Other
+/// errors leave it to the operator, who restarts the node.
 fn next_step(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
     let headroom = headroom_text();
     match role {
@@ -373,7 +407,13 @@ fn next_step(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
             "the node stops the worker, keeping its allocation, and restarts it to reopen the store once the disk \
              has {headroom}, at most three times in a row"
         ),
-        Some(_) if !recovers_with_space(class, no_room) => "then restart the node".to_string(),
+        Some(_) if !space_class(class) => "then restart the node".to_string(),
+        Some(_) if !recovers_with_space(class, no_room) => format!(
+            "this process exits once the disk has {headroom} and {} MiB can be reserved next to the store, for its \
+             service manager to restart it and reopen the store (the service needs a restart policy: systemd \
+             Restart=on-failure, launchd KeepAlive)",
+            REOPEN_RESERVE_BYTES >> 20
+        ),
         Some(_) => format!(
             "this process exits once the disk has {headroom}, for its service manager to restart it and reopen \
              the store (the service needs a restart policy: systemd Restart=on-failure, launchd KeepAlive)"
@@ -1074,5 +1114,27 @@ mod tests {
         assert!(usage.total_bytes > 0 && usage.used_bytes <= usage.total_bytes, "{usage:?}");
         assert!(usage.used_percent() <= 100);
         assert!(fs_usage(&dir.path().join("missing")).is_none());
+    }
+
+    /// A reservation next to a store leaves nothing behind; one where no
+    /// file can be made fails.
+    #[test]
+    fn a_reservation_next_to_a_store_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_ne!(can_reserve(dir.path(), 1 << 20), Some(false));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the reservation is removed");
+        assert_eq!(can_reserve(&dir.path().join("missing"), 1 << 20), Some(false));
+    }
+
+    /// A space error on a filesystem that showed room is reopened by an
+    /// exit once space can be reserved; other errors are left to the
+    /// operator.
+    #[test]
+    fn a_process_store_names_what_its_exit_waits_for() {
+        let master = Some(StoreRole::Master);
+        assert!(next_step("ENOSPC", true, master).starts_with("this process exits once the disk has 4096 MiB"));
+        let reserve = next_step("EDQUOT", false, master);
+        assert!(reserve.contains("and 256 MiB can be reserved next to the store"), "{reserve}");
+        assert_eq!(next_step("EIO", true, master), "then restart the node");
     }
 }
