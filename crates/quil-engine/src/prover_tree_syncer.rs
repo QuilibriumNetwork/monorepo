@@ -466,6 +466,10 @@ const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(10);
 pub(crate) const ENGINE_STOPPED_WHILE_QUEUED: &str =
     "the worker's shard engine stopped while its recovery waited for a turn";
 
+/// Why a recovery attempted nothing: this node gives up the worker's seat
+/// (`WorkerAllocator::gives_up`), so nothing needs its shard state.
+pub(crate) const SEAT_GIVEN_UP: &str = "this node gives up the worker's seat";
+
 /// The owning actor authenticates and installs a checkpoint. A recovery task
 /// keeps this exact target through completion, even if a worker is reassigned.
 #[async_trait]
@@ -830,6 +834,10 @@ fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgres
 /// place. Left queued, a worker whose allocation had moved to other cores
 /// waited about 20,000 s on an operator's node, then failed within seconds
 /// of its turn ("shard engine stopped before sync validation").
+///
+/// A recovery for a seat this node gives up reads no archive
+/// ([`SEAT_GIVEN_UP`]): it asks `given_up` before each attempt and again
+/// once its turn is granted, which it then hands on unused.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_in_turns(
     turns: &crate::recovery_turns::RecoveryTurns,
@@ -839,10 +847,18 @@ pub(crate) async fn recover_in_turns(
     target: &dyn ShardRecoveryTarget,
     execution: &crate::worker_execution::SharedWorkerExecution,
     mut lineage: impl FnMut() -> Result<Option<AppShardFrame>>,
+    given_up: impl Fn() -> bool,
 ) -> Result<ShardRecoveryProgress> {
     use crate::recovery_turns::{Claim, RecoveryKind};
     let mut ticket = execution.take_replay_ticket(filter);
     loop {
+        if given_up() {
+            // Withholding may end (the seat renews): the place stays.
+            if let Some(ticket) = ticket {
+                execution.keep_replay_ticket(filter, ticket);
+            }
+            return Ok(ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
+        }
         let local = lineage().inspect_err(|error| tracing::warn!(core, filter = %hex::encode(filter), %error,
             "cannot determine local shard lineage for sync"))?;
         let attempt = async {
@@ -863,7 +879,11 @@ pub(crate) async fn recover_in_turns(
                 }
                 turn = turns.acquire(claim) => turn,
             };
-            ticket.get_or_insert(turn.ticket());
+            let place = *ticket.get_or_insert(turn.ticket());
+            if given_up() {
+                execution.keep_replay_ticket(filter, place);
+                return Ok(ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
+            }
             let (blocked, lagging) = (execution.successor_blocked_flag(), execution.lagging_voter_flag());
             recover_shard_from_latest(syncer, filter, local, target, &[&*blocked, &*lagging], Some(turn)).await
         };
@@ -1752,7 +1772,7 @@ mod tests {
                 inner: Target { calls, cursor: 129.into(), valid: false, install_ok: false, blocked: false.into(), unblock_at: 0 },
                 lagging: execution.lagging_voter_flag(), caught_up_at: 170,
             };
-            let result = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(130))))
+            let result = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(130))), || false)
                 .await.unwrap();
             let ShardRecoveryProgress::Replayed { materialized, turn, .. } = result else { panic!("expected a replay") };
             assert_eq!((materialized, turn.frames, turn.batches, turn.behind), (expected, expected - 129, batches, true),
@@ -1773,7 +1793,7 @@ mod tests {
             blocked: false.into(), unblock_at: 0 };
         let execution = crate::worker_execution::SharedWorkerExecution::default();
         let lineage = || Ok(Some(frame(130)));
-        let first = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage).await.unwrap();
+        let first = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage, || false).await.unwrap();
         assert!(matches!(first, ShardRecoveryProgress::Replayed { materialized: 161, .. }), "{first:?}");
         // Another worker holds the turn, a replay queues behind it, and then
         // the first worker's next recovery.
@@ -1789,7 +1809,7 @@ mod tests {
         tokio::task::yield_now().await;
         calls.lock().unwrap().clear();
         let (again, ()) = tokio::join!(
-            recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage),
+            recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage, || false),
             async {
                 for _ in 0..3 { tokio::task::yield_now().await; }
                 drop(held);
@@ -1803,7 +1823,7 @@ mod tests {
         assert!(execution.take_replay_ticket(&[5; 32]).is_some(), "still behind, it keeps its place");
         // A replay that reaches its target keeps none.
         let archive = Archive { latest: Some(frame(200)), calls: Arc::default() };
-        let done = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(193))))
+        let done = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(193))), || false)
             .await.unwrap();
         assert!(matches!(done, ShardRecoveryProgress::Replayed { materialized: 200, .. }), "{done:?}");
         assert_eq!(execution.take_replay_ticket(&[5; 32]), None);
@@ -1849,7 +1869,7 @@ mod tests {
         let held = turns.acquire(claim(9)).await;
         let (result, ()) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(3600),
-                recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(130))))),
+                recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, || Ok(Some(frame(130))), || false)),
             async {
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 assert_eq!(turns.waiting(), 1, "queued behind the held turn");
@@ -1867,6 +1887,48 @@ mod tests {
         tokio::task::yield_now().await;
         drop(held);
         tokio::time::timeout(Duration::from_secs(5), next).await.expect("the turn passed on").unwrap();
+    }
+
+    /// A recovery for a seat this node gives up reads no archive: it asks
+    /// before it queues, and again once its turn is granted, which it then
+    /// hands on unused (an operator's node installed 1.26M leaves per shard
+    /// of seats its planner left).
+    #[tokio::test]
+    async fn a_recovery_for_a_given_up_seat_reads_no_archive() {
+        use crate::recovery_turns::{Claim, RecoveryKind, RecoveryTurns};
+        use std::time::Duration;
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive { latest: Some(frame(600)), calls: calls.clone() };
+        let target = Target { calls: calls.clone(), cursor: 129.into(), valid: false, install_ok: false,
+            blocked: false.into(), unblock_at: 0 };
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        let lineage = || Ok(Some(frame(130)));
+        execution.keep_replay_ticket(&[5; 32], 7);
+        let result = recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage, || true)
+            .await.unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
+        assert_eq!(turns.waiting(), 0, "it never queued");
+        assert_eq!(execution.take_replay_ticket(&[5; 32]), Some(7), "its place is kept for when it resumes");
+        // Given up while it waited for its turn.
+        let claim = |core: u32| Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Install,
+            execution: Default::default(), ticket: None };
+        let held = turns.acquire(claim(9)).await;
+        let given_up = AtomicBool::new(false);
+        let (result, ()) = tokio::join!(
+            recover_in_turns(turns, &archive, &[5; 32], 1, &target, &execution, lineage,
+                || given_up.load(Ordering::SeqCst)),
+            async {
+                for _ in 0..3 { tokio::task::yield_now().await; }
+                assert_eq!(turns.waiting(), 1, "queued behind the held turn");
+                given_up.store(true, Ordering::SeqCst);
+                drop(held);
+            },
+        );
+        assert_eq!(result.unwrap(), ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
+        assert!(calls.lock().unwrap().is_empty(), "no archive read");
+        assert!(execution.take_replay_ticket(&[5; 32]).is_some(), "the granted place is kept");
+        drop(tokio::time::timeout(Duration::from_secs(5), turns.acquire(claim(2))).await.expect("the turn passed on"));
     }
 
     /// An engine handle's stop resolves once its engine is cancelled or
@@ -3210,7 +3272,7 @@ mod tests {
                 let target = Target { calls: calls.clone(), cursor: 0.into(), valid: true, install_ok: true,
                     blocked: false.into(), unblock_at: 0 };
                 let execution = crate::worker_execution::SharedWorkerExecution::default();
-                let result = recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None)).await;
+                let result = recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None), || false).await;
                 let installed = archive.installed.load(Ordering::SeqCst);
                 let calls = calls.lock().unwrap().clone();
                 (result, calls, installed, execution.snapshot().recovery.unwrap())
@@ -3254,7 +3316,7 @@ mod tests {
                 let target = Target { calls: Arc::default(), cursor: 0.into(), valid: true, install_ok: true,
                     blocked: false.into(), unblock_at: 0 };
                 let execution = crate::worker_execution::SharedWorkerExecution::default();
-                recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None)).await
+                recover_in_turns(turns, &archive, &[5; 32], core, &target, &execution, || Ok(None), || false).await
             });
             tokio::task::yield_now().await;
             workers.push((chunks, task, syncs));

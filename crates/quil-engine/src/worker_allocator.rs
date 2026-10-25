@@ -73,6 +73,15 @@ fn manual_release_reason(
     }
 }
 
+/// Whether a GLOBAL head stamped `head_unix_ms` is current at `now_unix_ms`:
+/// at most an epoch of ideal frame time old. An older stored head belongs to
+/// a node returning from downtime, whose seats may have lapsed since.
+pub fn stored_head_current(head_unix_ms: u64, now_unix_ms: u64) -> bool {
+    let epoch_ms = quil_types::consensus::epoch_length_frames()
+        .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs());
+    now_unix_ms.saturating_sub(head_unix_ms) <= epoch_ms
+}
+
 /// A recently expired storage registration gets one epoch to recover its
 /// worker and publish renewal. This reserves local capacity only; it never
 /// changes protocol membership, proof eligibility or the stored epoch.
@@ -85,6 +94,84 @@ pub(crate) fn epoch_renewal_recovery_pending(
     allocation.effective_status(frame) == EffectiveStatus::ExpiredEpoch
         && (allocation.epoch.checked_add(1) == Some(epoch_for_frame(frame))
             || rejected_leave_recovery_pending(allocation, frame))
+}
+
+/// Why this node gives up a data-shard seat it still holds
+/// (`WorkerAllocator::gives_up`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GivenUp {
+    /// Its storage registration lapsed past the recovery epoch, and no
+    /// renewal of it runs or awaits the first renewal decision after this
+    /// start: the allocator releases its worker and the lifecycle's orphan
+    /// sweep leaves it.
+    Lapsed,
+    /// It is being left after its storage registration so lapsed, and the
+    /// registry no longer seats it in its committee for its notice
+    /// (`quil_execution::prover_registry::leaver_seated`, from the leaver
+    /// currency frame on); a renewal naming a leaving seat is refused.
+    LeftLapsed,
+}
+
+impl GivenUp {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Lapsed => "its storage registration lapsed past its recovery epoch and no renewal of it runs",
+            Self::LeftLapsed => "it is being left after its storage registration lapsed past its recovery epoch, \
+                and its committee no longer seats it",
+        }
+    }
+
+    /// What the operator can do about it, and what ends it.
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Lapsed => "none: unless a renewal of the seat starts, the allocator releases this worker and the \
+                lifecycle leaves the seat",
+            Self::LeftLapsed => "none: the allocator releases this worker and the seat departs at its leave boundary",
+        }
+    }
+}
+
+/// A seat this node gives up at GLOBAL `frame`, as the archive-recovery gate
+/// reports it ([`WorkerAllocator::given_up_seat`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenUpSeat {
+    pub cause: GivenUp,
+    pub frame: u64,
+    /// The epoch its storage was last registered for.
+    pub allocation_epoch: u64,
+    /// The epoch of `frame`.
+    pub current_epoch: u64,
+}
+
+/// What a worker manager's workers ask before they recover a shard from an
+/// archive: the GLOBAL frame it judges at, and the seat on that filter this
+/// node gives up there, if it does ([`WorkerAllocator::install_recovery_gate`]).
+pub type RecoveryGate = Arc<dyn Fn(&[u8]) -> (u64, Option<GivenUpSeat>) + Send + Sync>;
+
+/// The registry's part of [`WorkerAllocator::gives_up`]: a seat lapsed past
+/// its recovery epoch, or one left after it so lapsed that its committee no
+/// longer seats. The planner leaves only seats lapsed past recovery as
+/// unrecoverable orphans. A leaver the registry seats serves its notice,
+/// whatever its epoch: until the leaver currency frame is set (it is not on
+/// mainnet) that is every unexpired leaver; and a seat left while current,
+/// or within its recovery epoch, is not given up either way.
+fn lapsed_seat(
+    allocation: &quil_types::consensus::ProverAllocationInfo,
+    frame: u64,
+) -> Option<GivenUp> {
+    use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
+    match allocation.effective_status(frame) {
+        EffectiveStatus::ExpiredEpoch if !epoch_renewal_recovery_pending(allocation, frame) => Some(GivenUp::Lapsed),
+        EffectiveStatus::Leaving
+            if !allocation.confirmation_filter.is_empty()
+                && allocation.leave_frame_number > 0
+                && allocation.epoch.saturating_add(1) < epoch_for_frame(allocation.leave_frame_number)
+                && !quil_execution::prover_registry::leaver_seated(allocation, frame) =>
+        {
+            Some(GivenUp::LeftLapsed)
+        }
+        _ => None,
+    }
 }
 
 // =====================================================================
@@ -482,6 +569,9 @@ pub struct WorkerAllocator {
     /// was running when the node stopped, or the node was down for an epoch.
     /// `None` until the first reconcile that finds this prover registered.
     interrupted_seats: std::sync::Mutex<Option<std::collections::HashSet<Vec<u8>>>>,
+    /// The latest GLOBAL frame a reconcile ran at: the frame the registry it
+    /// reads reflects, at which the recovery gate judges seats.
+    reconciled_frame: std::sync::atomic::AtomicU64,
     /// The lifecycle has decided renewals since this process started.
     renewals_offered: std::sync::atomic::AtomicBool,
     /// Workers the lifecycle holds back from new seats for sending no vote
@@ -587,6 +677,108 @@ impl WorkerAllocator {
         self.renewals_offered.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Whether this node gives up `allocation` at GLOBAL `frame`, and why: a
+    /// data-shard seat lapsed past its recovery epoch that no renewal of this
+    /// node is running for or waits on ([`Self::renewal_recovering`],
+    /// [`Self::awaits_renewal_offer`]), or one being left after it so lapsed
+    /// that its committee no longer seats. Nothing renews such a seat. The
+    /// reconcile releases its worker (unless its committee session retains
+    /// it) and binds none to it, the lifecycle's orphan sweep leaves it, and
+    /// workers recover none of its shard from archives
+    /// ([`Self::install_recovery_gate`]): one rule, so they cannot disagree
+    /// (an operator's node recovered 1.26M leaves per shard of nine seats
+    /// lapsed 18 epochs, which its planner then left).
+    pub(crate) fn gives_up(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> Option<GivenUp> {
+        match lapsed_seat(allocation, frame)? {
+            GivenUp::Lapsed
+                if self.renewal_recovering(allocation, frame) || self.awaits_renewal_offer(allocation, frame) =>
+            {
+                None
+            }
+            given_up => Some(given_up),
+        }
+    }
+
+    /// The seat on `filter` this node gives up at GLOBAL `frame`
+    /// ([`Self::gives_up`]), from the registry, for the recovery gate: `None`
+    /// while the registry lists no such seat or one on `filter` it still
+    /// serves, and fail-open in two cases where the reconcile keeps the
+    /// worker too. Before the first reconcile finds this prover registered,
+    /// the seats a worker served at this start, which keep it until renewals
+    /// are decided ([`Self::awaits_renewal_offer`]), are not known yet: no
+    /// lapsed seat is given up then, so a bootstrap a starting engine asks
+    /// for once is not lost. And a worker its committee session retains
+    /// still serves that session.
+    pub fn given_up_seat(&self, filter: &[u8], frame: u64) -> Option<GivenUpSeat> {
+        let prover = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()?;
+        let seat = self.given_up_among(&prover.allocations, filter, frame)?;
+        let reconciled = self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if seat.cause == GivenUp::Lapsed && !reconciled {
+            return None;
+        }
+        if self.session_retains(filter, &prover.public_key) {
+            return None;
+        }
+        Some(seat)
+    }
+
+    /// Whether the committee session on `filter` retains this node's worker
+    /// there, `member` being this prover's key: the reconcile's retention
+    /// (`app_handoff::retains_worker`).
+    fn session_retains(&self, filter: &[u8], member: &[u8]) -> bool {
+        !filter.is_empty()
+            && self.session_authority.read().unwrap_or_else(|e| e.into_inner()).as_ref()
+                .is_some_and(|global| crate::app_handoff::retains_worker(global, filter, member))
+    }
+
+    /// The seat on `filter` among this prover's `allocations` that this node
+    /// gives up at GLOBAL `frame` ([`Self::gives_up`]): `None` when none is,
+    /// or another, non-terminal allocation on `filter` is not given up (one
+    /// still served, or Paused, Historic or Unknown).
+    pub(crate) fn given_up_among(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        filter: &[u8],
+        frame: u64,
+    ) -> Option<GivenUpSeat> {
+        let mut given_up = None;
+        for allocation in allocations.iter().filter(|a| a.confirmation_filter == filter) {
+            match self.gives_up(allocation, frame) {
+                Some(cause) => {
+                    given_up.get_or_insert(GivenUpSeat {
+                        cause,
+                        frame,
+                        allocation_epoch: allocation.epoch,
+                        current_epoch: quil_types::consensus::epoch_for_frame(frame),
+                    });
+                }
+                None if !allocation.effective_status(frame).is_terminal() => return None,
+                None => {}
+            }
+        }
+        given_up
+    }
+
+    /// Have the workers ask [`Self::given_up_seat`] before they recover a
+    /// shard from an archive, at the frame the latest reconcile ran at: the
+    /// registry follows executed GLOBAL state, so judged at a gossip head
+    /// beyond it, every seat of a node whose execution lags would read lapsed
+    /// and lose its catch-up recovery while the reconcile keeps its worker.
+    /// Until the registry has loaded, or a reconcile has run, it gives
+    /// nothing up.
+    pub fn install_recovery_gate(self: &Arc<Self>) {
+        let allocator = Arc::downgrade(self);
+        self.worker_manager.set_recovery_gate(Arc::new(move |filter: &[u8]| {
+            let Some(allocator) = allocator.upgrade() else { return (0, None) };
+            let frame = allocator.reconciled_frame.load(std::sync::atomic::Ordering::Relaxed);
+            (frame, allocator.given_up_seat(filter, frame))
+        }));
+    }
+
     /// Tell the operator about each manual worker this pass released and
     /// left idle. Releases are mode-agnostic: a seat that expired, was
     /// rejected or evicted, or was vacated for a split child frees a manual
@@ -664,6 +856,7 @@ impl WorkerAllocator {
             reconcile_lock: std::sync::Mutex::new(()),
             submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             interrupted_seats: std::sync::Mutex::new(None),
+            reconciled_frame: std::sync::atomic::AtomicU64::new(0),
             renewals_offered: std::sync::atomic::AtomicBool::new(false),
             held_back: Default::default(),
             worker_manager,
@@ -1042,6 +1235,27 @@ impl WorkerAllocator {
     /// Key timing constants:
     /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
     /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
+    /// The startup reconcile, at the stored GLOBAL head `head` (stamped
+    /// `head_unix_ms`) before any frame arrives from the network; run only
+    /// when that head is current ([`stored_head_current`]). Judged at an
+    /// older head, the seats of a node returning from downtime look as they
+    /// were before it: workers were bound to, and recovered the shards of,
+    /// seats lapsed since, which nothing renews (an operator's node back
+    /// after 18 epochs installed 1.26M leaves per shard of nine), and the
+    /// seats a worker served at this start were latched there
+    /// ([`Self::awaits_renewal_offer`]). The node waits instead for its
+    /// first reconcile at a current frame: the archive poller's after the
+    /// startup state jump, the registry sync's at its authenticated cursor,
+    /// or an executed frame's. Workers restored from the store start no
+    /// engine before a reconcile. Returns whether it reconciled.
+    pub fn startup_reconcile(&self, head: u64, head_unix_ms: u64, now_unix_ms: u64) -> Result<bool> {
+        if !stored_head_current(head_unix_ms, now_unix_ms) {
+            return Ok(false);
+        }
+        self.on_new_frame(head)?;
+        Ok(true)
+    }
+
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
         let result = self.reconcile(frame_number);
         if let Err(error) = self.schedule_payload_eviction(std::time::Instant::now()) {
@@ -1052,6 +1266,7 @@ impl WorkerAllocator {
 
     fn reconcile(&self, frame_number: u64) -> Result<()> {
         let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.reconciled_frame.fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
         // the deep filter that survived the v2 tree wipe in the local worker store
@@ -1244,21 +1459,33 @@ impl WorkerAllocator {
                     // epoch is stale is effectively inactive until its
                     // re-confirmation lands, so it must not pin a scarce
                     // worker while a live allocation is unbound.
-                    if alloc.effective_status(frame_number)
-                        == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                        && !self.renewal_recovering(alloc, frame_number)
-                        && !self.awaits_renewal_offer(alloc, frame_number)
-                        && !retained
-                    {
-                        info!(
-                            core_id = worker.core_id,
-                            filter = hex::encode(&worker.filter),
-                            allocation_epoch = alloc.epoch,
-                            current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
-                            "epoch-expired allocation released so a live shard can use the worker"
-                        );
-                        self.release_worker(worker, retained)?;
-                        continue;
+                    match self.gives_up(alloc, frame_number).filter(|_| !retained) {
+                        Some(GivenUp::Lapsed) => {
+                            info!(
+                                core_id = worker.core_id,
+                                filter = hex::encode(&worker.filter),
+                                allocation_epoch = alloc.epoch,
+                                current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
+                                "epoch-expired allocation released so a live shard can use the worker"
+                            );
+                            self.release_worker(worker, retained)?;
+                            continue;
+                        }
+                        Some(GivenUp::LeftLapsed) => {
+                            info!(
+                                core_id = worker.core_id,
+                                filter = hex::encode(&worker.filter),
+                                frame = frame_number,
+                                allocation_epoch = alloc.epoch,
+                                leave_frame = alloc.leave_frame_number,
+                                scope = "this node's worker",
+                                "worker released from a seat left after its storage registration lapsed, which its \
+                                 committee no longer seats: it owes no notice; the seat departs at its leave boundary"
+                            );
+                            self.release_worker(worker, retained)?;
+                            continue;
+                        }
+                        None => {}
                     }
 
                     // Compute desired_allocated AFTER the
@@ -1545,8 +1772,10 @@ impl WorkerAllocator {
                     if self.renewal_recovering(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
-                // the worker or change the frozen committee mid-epoch.
-                EffectiveStatus::Leaving => {}
+                // the worker or change the frozen committee mid-epoch. A seat
+                // left after it lapsed that its committee no longer seats owes
+                // no notice.
+                EffectiveStatus::Leaving if self.gives_up(alloc, frame_number).is_none() => {}
                 _ => continue,
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
@@ -2087,6 +2316,18 @@ mod tests {
         let worker = wm.range_workers().unwrap()[0].clone();
         assert_eq!(worker.filter, filter);
         assert!(worker.allocated, "a closing member must restart its engine while another allocation waits");
+        // Nor does the recovery gate give up a lapsed seat the session
+        // retains, whose worker the reconcile keeps.
+        let e = epoch_length_frames();
+        let lapsed_gate = || {
+            let gate = WorkerAllocator::new(Arc::new(MockWorkerManager::new()),
+                Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(filter.clone()))])), vec![0xAA; 32]);
+            gate.set_session_authority(global.clone());
+            gate.on_new_frame(3 * e).unwrap();
+            gate.note_renewals_offered();
+            gate.given_up_seat(&filter, 3 * e).map(|seat| seat.cause)
+        };
+        assert_eq!(lapsed_gate(), None, "retained by its closing session");
 
         // Once GLOBAL state records the seal, the worker is released.
         let seal = Seal {
@@ -2099,6 +2340,7 @@ mod tests {
         commit(4);
         alloc.on_new_frame(103).unwrap();
         assert!(bound(&wm).is_empty());
+        assert_eq!(lapsed_gate(), Some(GivenUp::Lapsed), "the seal recorded, nothing retains it");
     }
 
     #[test]
@@ -2783,6 +3025,174 @@ mod tests {
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
         allocator.on_new_frame(3 * e).unwrap();
         assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "an unbound lapsed seat is not bound");
+    }
+
+    /// Sets this thread's leaver currency frame, and unsets it when dropped.
+    struct LeaverCurrency;
+    impl LeaverCurrency {
+        fn at(frame: Option<u64>) -> Self {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(frame);
+            Self
+        }
+    }
+    impl Drop for LeaverCurrency {
+        fn drop(&mut self) {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(None);
+        }
+    }
+
+    /// A seat registered for `epoch` on filter `[byte; 32]`, and one left
+    /// at `leave_frame`.
+    fn lapsed(byte: u8, epoch: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo { epoch, ..make_alloc(vec![byte; 32]) }
+    }
+    fn left(byte: u8, epoch: u64, leave_frame: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo { status: ProverStatus::Leaving, leave_frame_number: leave_frame, ..lapsed(byte, epoch) }
+    }
+
+    /// The recovery gate withholds archive recovery from exactly the seats
+    /// nothing renews, read from the registry before any lifecycle
+    /// evaluation: one lapsed past its recovery epoch, and one being left
+    /// after it so lapsed that its committee no longer seats (from the
+    /// leaver currency frame). A current seat, one in its recovery epoch, one
+    /// whose renewal runs, one a worker served at this start (until renewals
+    /// are decided) and one left while current all keep recovering. An
+    /// operator's node recovered 1.26M leaves per shard of nine seats lapsed
+    /// 18 epochs, before and after its planner left them.
+    #[test]
+    fn the_recovery_gate_withholds_only_seats_nothing_renews() {
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = epoch_length_frames();
+        let frame = 20 * e + 5;
+        let allocations = vec![
+            lapsed(1, 20), lapsed(2, 19), lapsed(3, 2), lapsed(4, 2), lapsed(5, 2),
+            left(6, 2, 20 * e + 1), left(7, 20, 20 * e + 1),
+        ];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[5; 32]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(allocations)));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let renewal = allocator.submission_attempts
+            .begin(&[vec![4; 32]], frame, crate::submission_attempts::OpKind::Confirm).unwrap();
+        allocator.on_new_frame(frame).unwrap();
+        assert_eq!(wm.range_workers().unwrap()[0].filter, vec![5; 32], "kept until renewals are decided");
+        let gate = |byte: u8| allocator.given_up_seat(&[byte; 32], frame).map(|seat| seat.cause);
+        let expected = [
+            (1, None), (2, None), (3, Some(GivenUp::Lapsed)), (4, None), (5, None),
+            (6, Some(GivenUp::LeftLapsed)), (7, None), (8, None),
+        ];
+        for (byte, cause) in expected {
+            assert_eq!(gate(byte), cause, "seat {byte}");
+        }
+        assert_eq!(allocator.given_up_seat(&[3; 32], frame),
+            Some(GivenUpSeat { cause: GivenUp::Lapsed, frame, allocation_epoch: 2, current_epoch: 20 }));
+        allocator.note_renewals_offered();
+        assert_eq!(gate(5), Some(GivenUp::Lapsed), "renewals decided without it");
+        drop(renewal);
+    }
+
+    /// A node back after 18 epochs judges no seat at its stored GLOBAL head:
+    /// the startup reconcile waits, so no lapsed seat is bound, and no shard
+    /// recovered, before a reconcile at a current frame, which binds none of
+    /// them and gives them up. A head stored a minute ago is reconciled at once.
+    #[test]
+    fn a_node_back_after_18_epochs_binds_no_seat_before_its_global_view_is_current() {
+        let e = epoch_length_frames();
+        let (stored, current) = (1274 * e + 100, 1292 * e + 50);
+        let now = 1_800_000_000_000;
+        let epoch_ms = e * crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs();
+        let idle = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.is_empty();
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(3, 1274)])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        assert!(!allocator.startup_reconcile(stored, now - 18 * epoch_ms, now).unwrap(), "the stored head is stale");
+        assert!(idle(&wm), "nothing is bound off the stored head");
+        allocator.on_new_frame(current).unwrap();
+        assert!(idle(&wm), "at a current frame the lapsed seat is not bound");
+        assert_eq!(allocator.given_up_seat(&[3; 32], current).map(|seat| seat.cause), Some(GivenUp::Lapsed));
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(4, 1292)])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        assert!(allocator.startup_reconcile(current, now - 60_000, now).unwrap(), "a current head is used at once");
+        assert_eq!(wm.range_workers().unwrap()[0].filter, vec![4; 32]);
+        assert!(stored_head_current(now - epoch_ms, now) && !stored_head_current(now - epoch_ms - 1, now));
+    }
+
+    /// The gate judges at the frame the latest reconcile ran at, which the
+    /// registry reflects: a seat current there is not withheld however far
+    /// a lagging node's gossip head runs past an epoch boundary, and is once
+    /// a reconcile reaches the frame it lapsed at.
+    #[test]
+    fn the_recovery_gate_judges_at_the_reconciled_frame_not_the_head() {
+        let e = epoch_length_frames();
+        let wm = Arc::new(MockWorkerManager::new());
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(3, 20)])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let frame = |allocator: &WorkerAllocator| allocator.reconciled_frame.load(std::sync::atomic::Ordering::Relaxed);
+        allocator.on_new_frame(20 * e + 5).unwrap();
+        // Execution, and so the reconcile, stays in epoch 20 while the head
+        // passes the boundaries of epochs 21 and 22.
+        let head = 22 * e + 5;
+        assert_eq!(allocator.given_up_seat(&[3; 32], head).map(|seat| seat.cause), Some(GivenUp::Lapsed),
+            "judged at the head, the seat would read lapsed");
+        assert_eq!(allocator.given_up_seat(&[3; 32], frame(&allocator)), None, "current at the reconciled frame");
+        allocator.on_new_frame(head).unwrap();
+        assert_eq!(frame(&allocator), head);
+        allocator.on_new_frame(21 * e).unwrap();
+        assert_eq!(frame(&allocator), head, "an older reconcile frame does not move it back");
+        assert_eq!(allocator.given_up_seat(&[3; 32], frame(&allocator)).map(|seat| seat.cause), Some(GivenUp::Lapsed));
+    }
+
+    /// Before the first reconcile finds this prover registered, the gate
+    /// gives up no lapsed seat: which seats a worker served at this start,
+    /// and keeps until renewals are decided, is not known yet, and an engine
+    /// starting on one asks for some bootstraps only once. A leaver its
+    /// committee no longer seats needs no such wait.
+    #[test]
+    fn the_recovery_gate_gives_up_no_lapsed_seat_before_the_first_reconcile() {
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = epoch_length_frames();
+        let frame = 20 * e + 5;
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[3; 32]).unwrap();
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            lapsed(3, 2), lapsed(4, 2), left(6, 2, 20 * e + 1),
+        ])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let gate = |byte: u8| allocator.given_up_seat(&[byte; 32], frame).map(|seat| seat.cause);
+        assert_eq!((gate(3), gate(4), gate(6)), (None, None, Some(GivenUp::LeftLapsed)));
+        allocator.on_new_frame(frame).unwrap();
+        assert_eq!((gate(3), gate(4)), (None, Some(GivenUp::Lapsed)),
+            "the seat served at this start waits for the renewal decision; the other is given up");
+    }
+
+    /// A seat left after its registration lapsed keeps its worker while its
+    /// committee seats it for its notice: under an unset leaver currency
+    /// frame (mainnet) every unexpired leaver is seated. From that frame, a
+    /// seat left in its recovery epoch keeps it too, and one left an epoch
+    /// later gets none, a bound one being released.
+    #[test]
+    fn a_seat_left_after_it_lapsed_keeps_its_worker_while_its_committee_seats_it() {
+        let e = epoch_length_frames();
+        let frame = 20 * e + 5;
+        for (currency, epoch, keeps) in [(None, 18, true), (Some(0), 19, true), (Some(0), 18, false)] {
+            let _currency = LeaverCurrency::at(currency);
+            for initially_bound in [false, true] {
+                let wm = Arc::new(MockWorkerManager::new());
+                wm.allocate_worker(1, if initially_bound { &[6; 32] } else { &[] }).unwrap();
+                let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![left(6, epoch, 20 * e + 1)])));
+                let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+                allocator.on_new_frame(frame).unwrap();
+                let worker = wm.range_workers().unwrap().remove(0);
+                let case = format!("currency={currency:?}, epoch={epoch}, initially_bound={initially_bound}");
+                assert_eq!(worker.filter == [6; 32], keeps, "{case}");
+                assert_eq!(worker.allocated, keeps, "{case}");
+                assert_eq!(allocator.given_up_seat(&[6; 32], frame).is_none(), keeps, "{case}");
+            }
+        }
     }
 
     #[test]

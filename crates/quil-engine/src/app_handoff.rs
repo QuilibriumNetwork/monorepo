@@ -174,9 +174,19 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
         Err(QuilError::ExecutionUnavailable(_)) => false,
         // A store or decoding failure says nothing about the session: do not
         // release a possibly closing member on it.
+        // Once a minute at most: the reconcile asks every frame, and the
+        // recovery gate on each recovery request.
         Err(error) => {
-            tracing::warn!(filter = hex::encode(filter), %error,
-                "committee authorization unreadable; retaining the worker");
+            static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60
+                && LAST_WARN_SECS.compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed).is_ok()
+            {
+                tracing::warn!(filter = hex::encode(filter), %error,
+                    "committee authorization unreadable; retaining the worker (repeats at most once a minute)");
+            }
             true
         }
     }

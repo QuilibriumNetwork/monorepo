@@ -1432,16 +1432,15 @@ impl ProverLifecycle {
         }
         // A missed renewal or rejected leave needs bounded recovery before
         // cleanup, even if reconciliation has not restored the worker yet.
-        // Use the same grace as the allocator so releasing a worker cannot
-        // turn a recoverable registration into an orphan in the same cycle.
-        let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
-            .as_ref()
-            .map(|p| p.allocations.iter()
-                .filter(|a| self.allocator.renewal_recovering(a, frame_number))
-                .map(|a| a.confirmation_filter.clone()).collect())
-            .unwrap_or_default();
+        // Sweep only the seats the allocator gives up, by the rule it
+        // releases workers and withholds archive recovery by, so releasing a
+        // worker cannot turn a recoverable registration into an orphan in
+        // the same cycle, and no worker recovers a seat this sweep leaves.
         let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
-            .filter(|f| !recovery_filters.contains(*f)).cloned().collect();
+            .filter(|f| prover_info.as_ref()
+                .and_then(|p| self.allocator.given_up_among(&p.allocations, f, frame_number))
+                .is_some_and(|seat| seat.cause == crate::worker_allocator::GivenUp::Lapsed))
+            .cloned().collect();
 
         // Build separate descriptor views.
         //
@@ -5005,6 +5004,64 @@ mod proposal_loop_tests {
         assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
         assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
             "cleanup must not race an opposite confirmation: {actions:?}");
+    }
+
+    /// An unbound seat still Active, registered only for the current epoch,
+    /// is not an unrecoverable orphan: the allocator can bind a worker to
+    /// it, so only the score and capacity ranking may shed it. The sweep
+    /// took it with the lapsed seats, which share its renewal bucket.
+    #[test]
+    fn an_unbound_current_seat_is_not_swept_as_an_unrecoverable_orphan() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![ProverAllocationInfo { epoch: 2, ..alloc(held.clone(), ProverStatus::Active, 10) }]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "{actions:?}");
+        assert_eq!(lc.allocator.given_up_seat(&held, 1440), None);
+    }
+
+    /// The planner leaves as unrecoverable orphans exactly the seats the
+    /// recovery gate withholds archive recovery from, by one rule
+    /// (`WorkerAllocator::gives_up`): no worker recovers a seat the planner
+    /// leaves, and every seat it keeps, in its recovery epoch or with its
+    /// renewal running, may still recover.
+    #[test]
+    fn the_planner_leaves_exactly_the_seats_the_recovery_gate_withholds() {
+        use crate::submission_attempts::OpKind;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let lapsed = filter_bytes(0xA1);
+        let recovering = filter_bytes(0xA2);
+        let renewing = filter_bytes(0xA3);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let seat = |filter: &Vec<u8>, epoch: u64| ProverAllocationInfo { epoch, ..alloc(filter.clone(), ProverStatus::Active, 10) };
+        reg.set_prover(prover(address.clone(), vec![seat(&lapsed, 0), seat(&recovering, 1), seat(&renewing, 0)]));
+        reg.set_summaries(vec![
+            shard_summary(lapsed.clone(), 50), shard_summary(recovering.clone(), 50), shard_summary(renewing.clone(), 50),
+        ]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewal = lc.submission_attempts.begin(std::slice::from_ref(&renewing), 1440, OpKind::Confirm).unwrap();
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        let left = proposed_leave_filters(&actions);
+        assert_eq!(left, vec![lapsed.clone()], "{actions:?}");
+        // The gate gives up lapsed seats once a reconcile has found which ones
+        // a worker served at this start.
+        lc.allocator.on_new_frame(1440).unwrap();
+        for filter in [&lapsed, &recovering, &renewing] {
+            assert_eq!(lc.allocator.given_up_seat(filter, 1440).is_some(), left.contains(filter),
+                "{}", hex::encode(filter));
+        }
+        drop(renewal);
     }
 
     #[test]
