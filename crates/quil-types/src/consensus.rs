@@ -468,12 +468,8 @@ pub const STORAGE_SEAL_BYTES_PER_FRAME: usize = 4 << 20;
 /// proofs) instead of KZG over BLS48-581, which is not post-quantum. Members
 /// register for an epoch during the one before it, so the first hash
 /// registrations land in the epoch before this one. Consensus-affecting:
-/// every archive and prover must run a build with it before then. Mainnet:
-/// epoch 1290, from GLOBAL frame 928,800 (decided 2026-10-23); its snapshot
-/// is taken at 928,096 and its registrations and seals land during epoch
-/// 1289, from 928,080. `QUIL_HASH_STORAGE_PROOF_EPOCH` elsewhere, never by
-/// default.
-pub const MAINNET_HASH_STORAGE_PROOF_EPOCH: Option<u64> = Some(1290);
+/// every archive and prover must run a build with it before then.
+pub const MAINNET_HASH_STORAGE_PROOF_EPOCH: Option<u64> = Some(1311);
 
 static HASH_STORAGE_PROOF_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
