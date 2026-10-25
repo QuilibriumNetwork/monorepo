@@ -9804,10 +9804,6 @@ pub(crate) fn refusal_of(number: u64, error: QuilError) -> QuilError {
     }
 }
 
-/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
-/// validating untrusted frame or storage-proof bytes is a validation failure
-/// rather than unwinding the receive task. Mirrors the global frame
-/// path's `catch_unwind` (`message_loop.rs`).
 /// Fetch the historical storage registrations a certified frame's attestation
 /// names. False when they cannot be had: the frame is then validated on its
 /// certificate alone ([`validate_certified_frame`]).
@@ -9818,11 +9814,24 @@ async fn storage_history_retained(
     storage_history_unavailable(validator, frame).await.is_none()
 }
 
-/// [`storage_history_retained`], with why the history is not.
-async fn storage_history_unavailable(
+/// [`storage_history_retained`], with why the history is not. A frame
+/// without a certificate of its own (final through its certified child, or
+/// the frame GLOBAL committed) is validated without possession, so only its
+/// GLOBAL anchor is prepared: asked for as a certified frame's, its history
+/// was refused for the certificate it never had ("missing BLS signature"),
+/// warned as a certified frame's, and named as the anchor's history error
+/// of a sync whose predecessor its child authenticated (…091200 at frame
+/// 28439, 2026-10-24).
+pub(crate) async fn storage_history_unavailable(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> Option<QuilError> {
+    let certified = frame.header.as_ref()
+        .and_then(|header| header.public_key_signature_bls48581.as_ref())
+        .is_some_and(|signature| !signature.signature.is_empty());
+    if !certified {
+        return validator.prepare_global_anchor(frame).await.err();
+    }
     prepare_certified_frame(validator, frame).await.history
 }
 
@@ -10823,6 +10832,10 @@ pub(crate) fn validate_certified_frame(
     }
 }
 
+/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
+/// validating untrusted frame or storage-proof bytes is a validation failure
+/// rather than unwinding the receive task. Mirrors the global frame
+/// path's `catch_unwind` (`message_loop.rs`).
 pub(crate) fn validate_app_frame_panic_safe(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
