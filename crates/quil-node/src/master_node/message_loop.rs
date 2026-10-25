@@ -255,6 +255,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut frames_received: u64 = 0;
         let mut peer_infos_received: u64 = 0;
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        // Peers whose build identity this run has logged.
+        let mut peer_builds_logged: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         // When the loop started: archives announce themselves about every
         // thirty minutes, so the first one is verified up to that long after it.
@@ -437,6 +439,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             // this node and members without PeerInfo report no head.
                             let (mut builds, mut releases, mut heads) = (Vec::new(), Vec::new(), Vec::new());
                             {
+                                // A head reported over an hour ago is not current:
+                                // a live member republishes every 30 minutes.
+                                let now_ms = super::peer_info_file::unix_millis();
                                 let infos = pic_for_recv.read();
                                 for key in &session.members {
                                     if quil_engine::bitmasks::shard_cw_addressee_tag(key) == local_cw_tag {
@@ -447,7 +452,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         let info = infos.get(&quil_p2p::peer_id_from_falcon_pubkey(key));
                                         builds.push(super::committee_builds::Build::of(info.map(|info| info.build_fingerprint())));
                                         releases.push(super::committee_builds::Release::of(info.map(|info| info.release())));
-                                        heads.push(info.map(|info| info.last_global_head_frame));
+                                        heads.push(info.filter(|info| super::peer_info_file::head_is_current(info, now_ms))
+                                            .map(|info| info.last_global_head_frame));
                                     }
                                 }
                             }
@@ -885,28 +891,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         //      the admission gate.
                                         //   3. Falcon verify (empty domain, matching
                                         //      `Signer::sign` = sign_with_domain(m,&[])).
-                                        if info.peer_id.is_empty()
-                                            || info.public_key.len() != 897
-                                            || info.signature.len() != 666
-                                        {
-                                            continue;
-                                        }
-                                        if info.peer_id
-                                            != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key)
-                                        {
-                                            continue;
-                                        }
-                                        let signing_payload = quil_p2p::encode_canonical_peer_info(
-                                            &info,
-                                            &info.public_key,
-                                            &[],
-                                        );
-                                        if !quil_crypto::falcon_verify(
-                                            &info.public_key,
-                                            &info.signature,
-                                            &signing_payload,
-                                            &[],
-                                        ) {
+                                        // Records restored at startup pass the same checks.
+                                        if !super::peer_info_file::verified(&info) {
                                             continue;
                                         }
                                         // Dedup: hash PeerInfo with timestamp zeroed
@@ -929,7 +915,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         if !info.peer_id.is_empty() {
                                             let mut cache = pic_for_recv.write();
                                             let fingerprint = info.build_fingerprint();
-                                            let build_changed = cache.get(&info.peer_id).map(|old| {
+                                            // Logged at each peer's first PeerInfo of
+                                            // this run too, also when a record restored
+                                            // from the last run already names its build.
+                                            let first_this_run = peer_builds_logged.insert(info.peer_id.clone());
+                                            if peer_builds_logged.len() > 10_000 {
+                                                peer_builds_logged.clear();
+                                            }
+                                            let build_changed = first_this_run || cache.get(&info.peer_id).map(|old| {
                                                 old.build_fingerprint() != fingerprint
                                                     || old.version != info.version
                                                     || old.patch_number != info.patch_number
