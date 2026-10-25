@@ -480,6 +480,21 @@ fn refusal_text(refusal: LogRequestRefusal) -> &'static str {
     }
 }
 
+/// The target's report of this requester's budget of requests in the last
+/// 24 h and, once none are left, when the next is possible. Nothing from a
+/// node of an earlier release, which reports no budget.
+fn budget_lines(response: &SubmitLogRequestResponse) -> String {
+    let (Some(remaining), Some(per_day)) = (response.requests_remaining, response.requests_per_day) else {
+        return String::new();
+    };
+    let mut out = format!("Requests left: {remaining} of {per_day} per 24 h.\n");
+    if let Some(next_ms) = response.next_request_unix_ms.filter(|_| remaining == 0) {
+        let secs = i64::try_from(next_ms.saturating_add(999) / 1000).unwrap_or(i64::MAX);
+        let _ = writeln!(out, "Next request possible at {} (UTC).", format_rfc3339_utc(secs));
+    }
+    out
+}
+
 /// The answer to a submitted request.
 pub(crate) fn render_submitted(
     target: &str,
@@ -501,6 +516,7 @@ pub(crate) fn render_submitted(
     match response.status() {
         LogRequestStatus::Refused => {
             let _ = writeln!(out, "{target} refused log request {short}: {}.", refusal_text(response.refusal()));
+            out.push_str(&budget_lines(response));
         }
         status => {
             let _ = writeln!(out, "Asked {target} for {filters} of {}: request {id}.", window_text(since, until));
@@ -515,6 +531,7 @@ pub(crate) fn render_submitted(
                      it expires in {expires} unless approved."),
                 status => writeln!(out, "It was submitted before and is {}.", logs::status_name(status)),
             };
+            out.push_str(&budget_lines(response));
             let _ = writeln!(out, "Check it with: qclient node diagnostics status {peer} {short}");
             let _ = writeln!(out, "Once approved, fetch it with: qclient node diagnostics fetch {peer} {short}");
         }
@@ -1036,6 +1053,47 @@ Once approved, fetch it with: qclient node diagnostics fetch QmTarget 3f3f3f3f
         response.set_refusal(LogRequestRefusal::OverBudget);
         assert_eq!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW),
             "…Ab12cd refused log request 3f3f3f3f: this node used its requests for the last 24 h (diagnostics.logRequests.requestsPerDay).\n");
+    }
+
+    /// The target's budget follows the answer; a node of an earlier
+    /// release reports none, and the answer reads as before.
+    #[test]
+    fn a_submitted_request_reports_the_targets_budget() {
+        let mut response = SubmitLogRequestResponse { request_id: vec![0x3f; 16], expires_unix_ms: NOW + 86_400_000, ..Default::default() };
+        response.set_status(LogRequestStatus::Pending);
+        let older = render_submitted("…Ab12cd", "QmTarget", 1_791_978_400, 1_792_000_000, 0, &response, NOW);
+        assert!(!older.contains("Requests left") && !older.contains("Next request"), "{older}");
+        (response.requests_remaining, response.requests_per_day, response.next_request_unix_ms) = (Some(1), Some(2), Some(NOW + 86_400_000));
+        let text = render_submitted("…Ab12cd", "QmTarget", 1_791_978_400, 1_792_000_000, 0, &response, NOW);
+        assert_eq!(text.lines().nth(2), Some("Requests left: 1 of 2 per 24 h."), "{text}");
+        assert!(text.lines().nth(3).unwrap().starts_with("Check it with:"), "no time while requests are left: {text}");
+        assert_eq!(text.replace("Requests left: 1 of 2 per 24 h.\n", ""), older, "the rest reads as before");
+        (response.requests_remaining, response.next_request_unix_ms) = (Some(0), Some(NOW + 86_400_000 - 1));
+        let text = render_submitted("…Ab12cd", "QmTarget", 1_791_978_400, 1_792_000_000, 0, &response, NOW);
+        assert!(text.contains("\
+Requests left: 0 of 2 per 24 h.
+Next request possible at 2026-10-15T17:46:40Z (UTC).
+Check it with:"), "{text}");
+        response.set_status(LogRequestStatus::Refused);
+        response.set_refusal(LogRequestRefusal::OverBudget);
+        assert_eq!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW), "\
+…Ab12cd refused log request 3f3f3f3f: this node used its requests for the last 24 h (diagnostics.logRequests.requestsPerDay).
+Requests left: 0 of 2 per 24 h.
+Next request possible at 2026-10-15T17:46:40Z (UTC).
+");
+        response.set_refusal(LogRequestRefusal::QueueFull);
+        (response.requests_remaining, response.requests_per_day, response.next_request_unix_ms) = (Some(4), Some(4), None);
+        assert_eq!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW), "\
+…Ab12cd refused log request 3f3f3f3f: its queue is full (diagnostics.logRequests.maxPending); ask again later.
+Requests left: 4 of 4 per 24 h.
+");
+        (response.requests_remaining, response.requests_per_day, response.next_request_unix_ms) = (None, None, None);
+        response.set_refusal(LogRequestRefusal::OverBudget);
+        assert_eq!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW),
+            "…Ab12cd refused log request 3f3f3f3f: this node used its requests for the last 24 h (diagnostics.logRequests.requestsPerDay).\n",
+            "a node of an earlier release reports no budget");
+        (response.requests_remaining, response.requests_per_day, response.next_request_unix_ms) = (Some(0), Some(2), Some(u64::MAX));
+        assert!(render_submitted("…Ab12cd", "QmTarget", 0, 1, 0, &response, NOW).contains("Next request possible at "), "no overflow");
     }
 
     #[test]

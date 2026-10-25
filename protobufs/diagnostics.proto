@@ -253,6 +253,14 @@ message SubmitLogRequestResponse {
   // The target's node approves the request itself rather than waiting for
   // its operator.
   bool automatic = 5;
+  // The requester's budget of `requestsPerDay` in the last 24 h, after
+  // this submission: the requests it may still make, and the budget. A
+  // node of an earlier release sets neither.
+  optional uint32 requests_remaining = 6;
+  optional uint32 requests_per_day = 7;
+  // When the oldest request counted in the last 24 h ages out, freeing one
+  // request; unset while none is counted.
+  optional uint64 next_request_unix_ms = 8;
 }
 
 message GetLogRequestStatusRequest {

@@ -202,6 +202,9 @@ struct RefusalSummary {
     since_ms: Option<u64>,
     counts: BTreeMap<Refused, u64>,
     requesters: HashSet<PeerId>,
+    /// The budget of the latest allowlisted requester whose request was
+    /// refused, as [`Budget::summary`] states it.
+    latest_budget: Option<String>,
 }
 
 impl RefusalSummary {
@@ -222,8 +225,10 @@ impl RefusalSummary {
         let refused: u64 = counts.values().sum();
         let reasons = counts.iter().map(|(r, n)| format!("{}:{n}", r.label())).collect::<Vec<_>>().join(",");
         let window_secs = now_ms.saturating_sub(since) / 1000;
+        let latest_budget = self.latest_budget.take();
         if counts.keys().any(|r| r.of_allowlisted()) {
-            warn!(refused, requesters, %reasons, window_secs, scope = "allowlisted peers",
+            warn!(refused, requesters, %reasons, window_secs,
+                latest_budget = latest_budget.as_ref().map(tracing::field::display), scope = "allowlisted peers",
                 action = "over_budget and queue_full count requests beyond diagnostics.logRequests.requestsPerDay \
                     and maxPending (review the queue with 'qclient node diagnostics pending'); stale means a \
                     clock is off; key_mismatch, bad_signature and malformed mean a broken or incompatible requester",
@@ -324,6 +329,36 @@ pub struct Tick {
     pub expired: usize,
     pub reminded: usize,
     pub abandoned: usize,
+}
+
+/// A requester's budget of `requestsPerDay` in the last 24 h, as its
+/// next submission is checked against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    /// Requests it may still make: none means its next is over budget.
+    remaining: u32,
+    per_day: u32,
+    /// When its oldest counted request ages out, freeing one request.
+    next_ms: Option<u64>,
+}
+
+impl Budget {
+    /// Report the budget in a submit answer.
+    fn fill(self, response: &mut SubmitLogRequestResponse) {
+        response.requests_remaining = Some(self.remaining);
+        response.requests_per_day = Some(self.per_day);
+        response.next_request_unix_ms = self.next_ms;
+    }
+
+    /// The budget of `requester`, as the refusal summary logs it.
+    fn summary(self, requester: &str) -> String {
+        let mut text = format!("{requester}: {} of {} requests left in 24 h", self.remaining, self.per_day);
+        if let Some(next_ms) = self.next_ms.filter(|_| self.remaining == 0) {
+            let secs = i64::try_from(next_ms.saturating_add(999) / 1000).unwrap_or(i64::MAX);
+            text.push_str(&format!(", next at {}", format_rfc3339_utc(secs)));
+        }
+        text
+    }
 }
 
 /// The queue of log requests: admission, approval (this node's own or its
@@ -469,6 +504,18 @@ impl LogRequests {
     /// `maxPending`, at least one, so no peer fills the queue.
     fn per_requester(&self) -> usize {
         (self.limits.max_pending as usize / 2).max(1)
+    }
+
+    /// `caller`'s budget of requests in the last 24 h. Read it after
+    /// [`Self::sweep`], which drops the requests older than that.
+    fn budget(&self, state: &State, caller: &PeerId) -> Budget {
+        let times = state.queued.get(caller);
+        let used = u32::try_from(times.map_or(0, VecDeque::len)).unwrap_or(u32::MAX);
+        Budget {
+            remaining: self.limits.requests_per_day.saturating_sub(used),
+            per_day: self.limits.requests_per_day,
+            next_ms: times.and_then(VecDeque::front).map(|at| at.saturating_add(DAY_MS)),
+        }
     }
 
     /// Whether `entry` holds a place in the queue: it waits for a decision
@@ -618,10 +665,13 @@ impl LogRequests {
         self.sweep(&mut state, now_ms);
         let id = request_id(&signed.request);
         let refuse = |state: &mut State, refusal: LogRequestRefusal| -> Result<SubmitLogRequestResponse, Status> {
+            let budget = self.budget(state, &caller);
+            state.refusals.latest_budget = Some(budget.summary(&peer_tail(&caller)));
             state.refusals.note(Refused::Request(refusal), Some(&caller), now_ms);
             let mut response = SubmitLogRequestResponse { request_id: id.to_vec(), ..Default::default() };
             response.set_status(LogRequestStatus::Refused);
             response.set_refusal(refusal);
+            budget.fill(&mut response);
             Ok(response)
         };
         let Ok(request) = LogRequest::decode(signed.request.as_slice()) else {
@@ -645,6 +695,7 @@ impl LogRequests {
                 ..Default::default()
             };
             response.set_status(seen.status);
+            self.budget(&state, &caller).fill(&mut response);
             return Ok(response);
         }
         let malformed = request.schema != REQUEST_SCHEMA
@@ -671,7 +722,7 @@ impl LogRequests {
             LogRequestRefusal::TooManyFilters
         } else if state.nonces.contains_key(&(caller, request.nonce.clone())) {
             LogRequestRefusal::Replayed
-        } else if state.queued.get(&caller).map_or(0, VecDeque::len) >= self.limits.requests_per_day as usize {
+        } else if self.budget(&state, &caller).remaining == 0 {
             LogRequestRefusal::OverBudget
         } else if pending_here >= self.per_requester() {
             LogRequestRefusal::TooManyPending
@@ -708,6 +759,7 @@ impl LogRequests {
         let mut response =
             SubmitLogRequestResponse { request_id: id.to_vec(), expires_unix_ms, automatic: self.automatic(), ..Default::default() };
         response.set_status(LogRequestStatus::Pending);
+        self.budget(&state, &caller).fill(&mut response);
         Ok(response)
     }
 
@@ -1558,6 +1610,61 @@ mod tests {
         let next_day = NOW + DAY_MS;
         queue.tick(next_day);
         assert_eq!(submit(&a, 4, next_day).unwrap().status(), LogRequestStatus::Pending, "the budget renews after 24 h");
+    }
+
+    /// Every answer to a submission, queued or refused, reports the
+    /// requester's budget as the next submission is checked against it:
+    /// none left means over budget until the oldest counted request ages
+    /// out, at exactly the time reported.
+    #[test]
+    fn every_answer_reports_the_requesters_budget() {
+        let (own, a, b, c) = (key(), key(), key(), key());
+        let mut limits = config(true, &[&a, &b, &c]);
+        (limits.requests_per_day, limits.max_pending) = (2, 8);
+        let (queue, _dir) = queue(&limits, &own);
+        let submit = |from: &Key, nonce: u8, at: u64| {
+            let request = LogRequest { issued_unix_ms: at, ..request(from, &own.peer, nonce) };
+            queue.submit(Some(&from.peer), &signed(from, &request), at).unwrap()
+        };
+        let budget = |response: &SubmitLogRequestResponse| {
+            (response.status(), response.refusal(), response.requests_remaining, response.requests_per_day, response.next_request_unix_ms)
+        };
+        let (pending, refused) = (LogRequestStatus::Pending, LogRequestStatus::Refused);
+        let (none, over) = (LogRequestRefusal::None, LogRequestRefusal::OverBudget);
+        let first_frees = NOW + DAY_MS;
+        assert_eq!(budget(&submit(&a, 1, NOW)), (pending, none, Some(1), Some(2), Some(first_frees)));
+        assert_eq!(budget(&submit(&a, 2, NOW + 1_000)), (pending, none, Some(0), Some(2), Some(first_frees)));
+        assert_eq!(budget(&submit(&a, 3, NOW + 2_000)), (refused, over, Some(0), Some(2), Some(first_frees)));
+        let resubmitted = queue.submit(Some(&a.peer), &signed(&a, &request(&a, &own.peer, 1)), NOW + 3_000).unwrap();
+        assert_eq!(budget(&resubmitted), (pending, none, Some(0), Some(2), Some(first_frees)),
+            "a resubmission reports the budget too");
+        assert_eq!(budget(&submit(&a, 4, first_frees - 1)), (refused, over, Some(0), Some(2), Some(first_frees)),
+            "still over budget a millisecond before");
+        assert_eq!(budget(&submit(&a, 4, first_frees)), (pending, none, Some(0), Some(2), Some(NOW + 1_000 + DAY_MS)),
+            "the reported time frees one request");
+        let later = NOW + 3 * DAY_MS;
+        let wrong_target = LogRequest { issued_unix_ms: later, ..request(&a, &a.peer, 5) };
+        let answer = queue.submit(Some(&a.peer), &signed(&a, &wrong_target), later).unwrap();
+        assert_eq!(budget(&answer), (refused, LogRequestRefusal::WrongTarget, Some(2), Some(2), None),
+            "the whole budget renews once every counted request is older than 24 h");
+
+        (limits.requests_per_day, limits.max_pending) = (8, 2);
+        let (small, _dir) = self::queue(&limits, &own);
+        let submit = |from: &Key, nonce: u8| small.submit(Some(&from.peer), &signed(from, &request(from, &own.peer, nonce)), NOW).unwrap();
+        assert_eq!(budget(&submit(&a, 1)), (pending, none, Some(7), Some(8), Some(NOW + DAY_MS)));
+        assert_eq!(budget(&submit(&a, 2)), (refused, LogRequestRefusal::TooManyPending, Some(7), Some(8), Some(NOW + DAY_MS)),
+            "a refusal is not charged");
+        assert_eq!(budget(&submit(&b, 1)), (pending, none, Some(7), Some(8), Some(NOW + DAY_MS)));
+        assert_eq!(budget(&submit(&c, 1)), (refused, LogRequestRefusal::QueueFull, Some(8), Some(8), None),
+            "no time while no request is counted");
+    }
+
+    #[test]
+    fn the_refusal_summary_states_the_latest_budget() {
+        let full = Budget { remaining: 0, per_day: 2, next_ms: Some(NOW + DAY_MS - 1) };
+        assert_eq!(full.summary("…Ab12cd"), "…Ab12cd: 0 of 2 requests left in 24 h, next at 2027-01-16T08:00:00Z");
+        assert_eq!(Budget { remaining: 1, ..full }.summary("…Ab12cd"), "…Ab12cd: 1 of 2 requests left in 24 h");
+        assert!(Budget { next_ms: Some(u64::MAX), ..full }.summary("…Ab12cd").ends_with('Z'), "no overflow");
     }
 
     /// A peer holds at most half of maxPending (at least one), so no peer
