@@ -1039,6 +1039,270 @@ pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
 /// is deterministic across the fleet.
 pub const MIN_SHARD_CONSENSUS_PROVERS: u64 = 4;
 
+/// The first epoch in which seniority penalties apply (issue #976). Rule 2:
+/// a leave that departs, confirmed or expired unconfirmed, with its shard at
+/// or below [`SENIORITY_PENALTY_HALT_RISK_PROVERS`] effectively-active
+/// provers costs [`HALT_RISK_LEAVE_PENALTY`] seniority. Rule 3: a committee
+/// member that neither signs nor produces more than
+/// [`ABSENCE_PENALTY_GRACE_FRAMES`] consecutive frames its committee produced
+/// loses [`ABSENCE_PENALTY_PER_FRAME`] for every further absent frame and is
+/// evicted after [`ABSENCE_EVICTION_FRAMES`]. A committee that produces no
+/// frame (no quorum, GLOBAL or archives down) accrues no absence for anyone.
+/// Rule 1 (missed turn) is not implemented. Consensus-affecting: every node
+/// that executes GLOBAL frames applies both from committed GLOBAL state, so
+/// archives and provers must run a build carrying the epoch before it.
+/// Penalties never apply before [`MAINNET_SENIORITY_SUCCESSION_EPOCH`]: the
+/// rules before it let a rejoin restore a prover's seniority to what its
+/// keys' retro is worth, which would undo a penalty
+/// ([`seniority_penalties_at`]). `None` on mainnet until it is decided;
+/// `QUIL_SENIORITY_PENALTY_EPOCH` elsewhere, never by default.
+pub const MAINNET_SENIORITY_PENALTY_EPOCH: Option<u64> = None;
+
+/// Seniority a halt-risk departure costs: one epoch of accrual
+/// (`SENIORITY_PER_ACTIVE_FRAME` × [`EPOCH_LENGTH_FRAMES`]).
+pub const HALT_RISK_LEAVE_PENALTY: u64 = 7_200;
+
+/// Effectively-active provers a shard may keep after a departure and still
+/// cost the departing prover [`HALT_RISK_LEAVE_PENALTY`]: the halt-risk
+/// threshold, one below [`MIN_SHARD_CONSENSUS_PROVERS`].
+pub const SENIORITY_PENALTY_HALT_RISK_PROVERS: u64 = 3;
+
+/// Consecutive frames of its committee, included in GLOBAL, a member may miss
+/// (neither sign nor produce) before each further missed frame costs
+/// [`ABSENCE_PENALTY_PER_FRAME`].
+pub const ABSENCE_PENALTY_GRACE_FRAMES: u64 = 720;
+
+/// Seniority an attributable absent frame costs: accrual reversed.
+pub const ABSENCE_PENALTY_PER_FRAME: u64 = 10;
+
+/// Consecutive missed committee frames after which the member's allocation is
+/// evicted at the next epoch boundary.
+pub const ABSENCE_EVICTION_FRAMES: u64 = 2_160;
+
+static SENIORITY_PENALTY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SENIORITY_PENALTY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seniority_penalty_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SENIORITY_PENALTY_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seniority penalty epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_seniority_penalty_epoch(network: u8) -> u64 {
+    *SENIORITY_PENALTY_EPOCH.get_or_init(|| {
+        seniority_penalty_epoch_for(
+            network,
+            std::env::var("QUIL_SENIORITY_PENALTY_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_seniority_penalty_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX`: never.
+pub fn seniority_penalty_epoch() -> u64 {
+    if let Some(epoch) = SENIORITY_PENALTY_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SENIORITY_PENALTY_EPOCH.get_or_init(|| seniority_penalty_epoch_for(0, None))
+}
+
+/// Whether seniority penalties apply in `epoch`: from the penalty epoch, and
+/// never before the seniority succession epoch. Before it a rejoin sets an
+/// existing prover's seniority to at least what its merge targets' retro is
+/// worth, which would refund a penalty, so a penalty epoch set earlier
+/// takes effect at the succession epoch.
+pub fn seniority_penalties_at(epoch: u64) -> bool {
+    epoch >= seniority_penalty_epoch().max(seniority_succession_epoch())
+}
+
+/// Set the seniority penalty epoch for the calling thread only (tests).
+pub fn set_seniority_penalty_epoch_for_thread(epoch: Option<u64>) {
+    SENIORITY_PENALTY_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// Set both the seniority penalty and the seniority succession epoch to
+/// `epoch` for the calling thread only (tests): penalties apply only from the
+/// succession epoch too ([`seniority_penalties_at`]). `None` restores both
+/// process settings.
+pub fn set_seniority_penalty_and_succession_epoch_for_thread(epoch: Option<u64>) {
+    set_seniority_penalty_epoch_for_thread(epoch);
+    set_seniority_succession_epoch_for_thread(epoch);
+}
+
+impl ProverAllocationInfo {
+    /// The epoch a leave departs at: the boundary after its confirm, or,
+    /// never confirmed, the boundary that expires it, two after its proposal
+    /// (`EffectiveStatus::ExpiredLeaving`). `None` unless the allocation is
+    /// Leaving with a leave frame.
+    pub fn departure_epoch(&self) -> Option<u64> {
+        if self.status != ProverStatus::Leaving {
+            return None;
+        }
+        if self.leave_confirm_frame_number > 0 {
+            return Some(epoch_for_frame(self.leave_confirm_frame_number) + 1);
+        }
+        (self.leave_frame_number > 0).then(|| epoch_for_frame(self.leave_frame_number) + 2)
+    }
+
+    /// Whether this allocation counted toward its shard when its leave was
+    /// proposed: it would have read effectively Active at its leave frame.
+    /// A lapsed seat (missed its epoch renewal), a paused one or one still
+    /// activating did not, so its departure takes no prover from the shard.
+    pub fn counted_when_leaving(&self) -> bool {
+        if self.leave_frame_number == 0 || self.pause_frame_number > self.resume_frame_number {
+            return false;
+        }
+        let mut before = self.clone();
+        before.status = ProverStatus::Active;
+        before.effective_status(self.leave_frame_number) == EffectiveStatus::Active
+    }
+}
+
+/// Whether a departure that leaves its shard with `remaining_active`
+/// effectively-active provers is a halt-risk departure, which costs
+/// [`HALT_RISK_LEAVE_PENALTY`] once penalties apply. A shard already halted
+/// (none left) counts too.
+pub fn halt_risk_departure(remaining_active: u64) -> bool {
+    remaining_active <= SENIORITY_PENALTY_HALT_RISK_PROVERS
+}
+
+#[cfg(test)]
+mod seniority_penalty_tests {
+    use super::*;
+
+    fn leaving(leave_frame: u64, confirm_frame: u64, epoch: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            confirmation_filter: vec![7; 32],
+            rejection_filter: Vec::new(),
+            join_frame_number: 10,
+            leave_frame_number: leave_frame,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: confirm_frame,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 0,
+            last_signed_frame_number: 0,
+            epoch,
+            ring: 0,
+            vertex_address: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_test_network_reads_the_seniority_penalty_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::seniority_penalty_epoch_for(0, setting),
+                super::MAINNET_SENIORITY_PENALTY_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::seniority_penalty_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::seniority_penalty_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::seniority_penalty_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Unset on mainnet: no epoch applies penalties, and a thread override
+    /// is the only way a test turns them on.
+    #[test]
+    fn penalties_are_off_until_the_epoch_is_set() {
+        assert_eq!(MAINNET_SENIORITY_PENALTY_EPOCH, None);
+        set_seniority_succession_epoch_for_thread(Some(0));
+        set_seniority_penalty_epoch_for_thread(None);
+        assert!(!seniority_penalties_at(u64::MAX - 1));
+        set_seniority_penalty_epoch_for_thread(Some(5));
+        assert!(!seniority_penalties_at(4));
+        assert!(seniority_penalties_at(5));
+        set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
+    /// Before the succession epoch a rejoin restores seniority a penalty
+    /// took, so penalties wait for it however early their own epoch is set.
+    #[test]
+    fn penalties_never_apply_before_the_succession_epoch() {
+        set_seniority_penalty_epoch_for_thread(Some(0));
+        set_seniority_succession_epoch_for_thread(Some(u64::MAX));
+        assert!(!seniority_penalties_at(0));
+        assert!(!seniority_penalties_at(u64::MAX - 1));
+        set_seniority_penalty_and_succession_epoch_for_thread(Some(5));
+        assert!(!seniority_penalties_at(4));
+        assert!(seniority_penalties_at(5));
+        // A succession epoch after the penalty epoch delays penalties to it.
+        set_seniority_succession_epoch_for_thread(Some(7));
+        assert!(!seniority_penalties_at(6));
+        assert!(seniority_penalties_at(7));
+        set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
+    #[test]
+    fn halt_risk_leave_penalty_is_one_epoch_of_accrual() {
+        assert_eq!(HALT_RISK_LEAVE_PENALTY, 10 * EPOCH_LENGTH_FRAMES);
+        assert_eq!(
+            SENIORITY_PENALTY_HALT_RISK_PROVERS + 1,
+            MIN_SHARD_CONSENSUS_PROVERS
+        );
+        assert!(halt_risk_departure(0));
+        assert!(halt_risk_departure(3));
+        assert!(!halt_risk_departure(4));
+    }
+
+    #[test]
+    fn a_leave_departs_after_its_confirm_or_at_its_expiry() {
+        let len = epoch_length_frames();
+        let confirmed = leaving(5 * len + 3, 6 * len + 1, 6);
+        assert_eq!(confirmed.departure_epoch(), Some(7));
+        // Never confirmed: expired, and so departed, from the same boundary.
+        let unconfirmed = leaving(5 * len + 3, 0, 6);
+        assert_eq!(unconfirmed.departure_epoch(), Some(7));
+        assert_eq!(
+            unconfirmed.effective_status(7 * len - 1),
+            EffectiveStatus::Leaving
+        );
+        assert_eq!(
+            unconfirmed.effective_status(7 * len),
+            EffectiveStatus::ExpiredLeaving
+        );
+        let mut active = confirmed.clone();
+        active.status = ProverStatus::Active;
+        assert_eq!(active.departure_epoch(), None);
+    }
+
+    #[test]
+    fn only_a_seat_that_counted_when_leaving_takes_a_prover_from_its_shard() {
+        let len = epoch_length_frames();
+        let leave = 5 * len + 3;
+        // Renewed for the leave's epoch: counted.
+        assert!(leaving(leave, 6 * len, 5).counted_when_leaving());
+        // Missed its renewal before leaving: lapsed, not counted.
+        assert!(!leaving(leave, 6 * len, 4).counted_when_leaving());
+        // Paused when leaving: not counted.
+        let mut paused = leaving(leave, 6 * len, 5);
+        paused.pause_frame_number = leave - 1;
+        assert!(!paused.counted_when_leaving());
+        paused.resume_frame_number = leave - 1;
+        assert!(paused.counted_when_leaving());
+        // Confirmed join still activating when it left: not counted.
+        let mut activating = leaving(leave, 6 * len, 6);
+        activating.join_confirm_frame_number = leave - 1;
+        assert!(!activating.counted_when_leaving());
+    }
+}
+
 /// Registry inputs for one lifecycle evaluation. Membership lists use the
 /// same raw allocation statuses as `get_provers_by_status`; this is planning
 /// information, not committee authorization or storage-proof eligibility.

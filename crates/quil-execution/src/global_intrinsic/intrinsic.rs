@@ -2094,8 +2094,10 @@ impl GlobalIntrinsic {
                 .unwrap_or_default();
             let existing_tree =
                 crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_blob);
-            // So does its retro moved out by successions.
-            for field in ["LastSeniorityFrameNumber", "RetroMoved"] {
+            // So does its retro moved out by successions, and the seniority
+            // penalties took from it (#976), which a later succession counts
+            // in its accrual.
+            for field in ["LastSeniorityFrameNumber", "RetroMoved", "SeniorityPenalty"] {
                 if let Some(value) = read_field(&existing_tree, "prover:Prover", field) {
                     write_field(&mut output.prover_tree, "prover:Prover", field, &value)?;
                 }

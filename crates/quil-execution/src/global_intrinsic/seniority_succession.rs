@@ -45,8 +45,9 @@ use std::collections::HashMap;
 
 use quil_tries::VectorCommitmentTree;
 use quil_types::consensus::{
-    seniority_succession_active, seniority_succession_epoch, seniority_succession_quiet_frames,
-    EffectiveStatus, ProverAllocationInfo,
+    epoch_for_frame, seniority_penalties_at, seniority_succession_active,
+    seniority_succession_epoch, seniority_succession_quiet_frames, EffectiveStatus,
+    ProverAllocationInfo,
 };
 use quil_types::crypto::KeyManager;
 use quil_types::error::{QuilError, Result};
@@ -331,6 +332,10 @@ pub struct PredecessorState {
     pub retro: ProverRetro,
     /// Every allocation its hyperedge links, and its global allocation.
     pub allocations: Vec<ProverAllocationInfo>,
+    /// For each of `allocations`, its `LeavePenaltyFrameNumber`: the leave
+    /// frame of the last departure the seniority penalty pass decided (#976),
+    /// 0 when none.
+    pub leave_penalty_frames: Vec<u64>,
 }
 
 /// Every frame field of an allocation.
@@ -369,6 +374,7 @@ impl PredecessorState {
             linked.push(global);
         }
         let mut allocations = Vec::with_capacity(linked.len());
+        let mut leave_penalty_frames = Vec::with_capacity(linked.len());
         for allocation in &linked {
             let Some(blob) = reader.vertex(allocation)? else {
                 continue;
@@ -377,6 +383,16 @@ impl PredecessorState {
             if let Some((owner, info)) = decode_allocation_tree(allocation, &tree) {
                 if owner.as_slice() == address.as_slice() {
                     allocations.push(info);
+                    leave_penalty_frames.push(
+                        read_field(
+                            &tree,
+                            "allocation:ProverAllocation",
+                            "LeavePenaltyFrameNumber",
+                        )
+                        .filter(|bytes| bytes.len() == 8)
+                        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap_or_default()))
+                        .unwrap_or(0),
+                    );
                 }
             }
         }
@@ -388,6 +404,7 @@ impl PredecessorState {
             retro: ProverRetro::of(&tree),
             public_key,
             allocations,
+            leave_penalty_frames,
         }))
     }
 
@@ -427,6 +444,35 @@ impl PredecessorState {
         (status.is_live() && (recent || global)).then_some(status)
     }
 
+    /// Its shard allocations that counted toward their shard and whose leave
+    /// departs in `frame`'s epoch, while seniority penalties apply and the
+    /// epoch's penalty pass (#976) has not decided the departure (its
+    /// `LeavePenaltyFrameNumber` is not the leave's frame). The pass runs
+    /// after the operations of the epoch's first GLOBAL frame, and a leave
+    /// proposed at an epoch's first frame and never confirmed departs exactly
+    /// when the quiet period lapses: a succession in that frame would move
+    /// the seniority its halt-risk charge is due from. Only the departure
+    /// epoch is checked, so a departure the pass skips blocks a succession
+    /// for that epoch at most.
+    pub fn undecided_departures(
+        &self,
+        frame: u64,
+    ) -> impl Iterator<Item = &ProverAllocationInfo> + '_ {
+        let epoch = epoch_for_frame(frame);
+        let penalties = seniority_penalties_at(epoch);
+        self.allocations
+            .iter()
+            .zip(&self.leave_penalty_frames)
+            .filter(move |&(allocation, &decided)| {
+                penalties
+                    && !allocation.confirmation_filter.is_empty()
+                    && allocation.departure_epoch() == Some(epoch)
+                    && allocation.counted_when_leaving()
+                    && decided != allocation.leave_frame_number
+            })
+            .map(|(allocation, _)| allocation)
+    }
+
     /// The frame its first recorded allocation joined, if any.
     pub fn start_frame(&self) -> Option<u64> {
         self.allocations
@@ -461,6 +507,10 @@ pub enum SuccessionBlocker {
     },
     /// The predecessor's last activity is within the quiet period.
     Quiet { remaining: u64, until: u64 },
+    /// A leave of the predecessor departs in this epoch and the epoch's
+    /// seniority penalty pass has not decided it yet
+    /// ([`PredecessorState::undecided_departures`]).
+    PenaltyUndecided { filter: Vec<u8>, epoch: u64 },
     /// The keys would not raise the submitting prover's seniority: they are
     /// worth nothing, or their retro already counts for it.
     NoGain,
@@ -487,6 +537,11 @@ impl std::fmt::Display for SuccessionBlocker {
             Self::Quiet { remaining, until } => write!(
                 f,
                 "the predecessor was active too recently: {remaining} more frames without activity (until frame {until})"
+            ),
+            Self::PenaltyUndecided { filter, epoch } => write!(
+                f,
+                "the predecessor's leave of shard {} departs at epoch {epoch} and its seniority penalty is not decided yet (the epoch's penalty pass runs after this frame's operations)",
+                hex::encode(filter)
             ),
             Self::NoGain => write!(f, "the keys would not raise this prover's seniority"),
         }
@@ -537,12 +592,14 @@ fn write_parts(tree: &mut VectorCommitmentTree, field: &str, parts: &RetroParts)
 /// A prover's seniority and retro ledger: the retro it holds
 /// (`RetroCredited`) and the retro successions moved out of it
 /// (`RetroMoved`), per part. Neither is recorded before its first op under
-/// the succession rules.
+/// the succession rules. `penalty` is the seniority penalties took from it
+/// (`SeniorityPenalty`, #976), which a succession never changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProverRetro {
     pub seniority: u64,
     pub held: Option<RetroParts>,
     pub moved: Option<RetroParts>,
+    pub penalty: u64,
 }
 
 impl ProverRetro {
@@ -551,6 +608,7 @@ impl ProverRetro {
             seniority: prover_u64(tree, "Seniority"),
             held: credited_retro(tree),
             moved: read_parts(tree, "RetroMoved"),
+            penalty: prover_u64(tree, "SeniorityPenalty"),
         }
     }
 
@@ -559,7 +617,8 @@ impl ProverRetro {
         self.held.is_some() || self.moved.is_some()
     }
 
-    /// Write `held`, `moved` and `seniority` on the prover vertex `tree`.
+    /// Write `held`, `moved` and `seniority` on the prover vertex `tree`
+    /// (`penalty` stays as recorded).
     pub fn write(&self, tree: &mut VectorCommitmentTree) -> Result<()> {
         write_field(tree, PROVER, "Seniority", &self.seniority.to_be_bytes())?;
         if let Some(held) = &self.held {
@@ -570,6 +629,18 @@ impl ProverRetro {
         }
         Ok(())
     }
+}
+
+/// Add `charged`, the seniority a penalty (#976) just took from the prover
+/// vertex `tree`, to its `SeniorityPenalty`, so a later succession counts the
+/// prover's accrual before it ([`succession_amounts`]). Writes nothing when
+/// the penalty took nothing.
+pub fn record_seniority_penalty(tree: &mut VectorCommitmentTree, charged: u64) -> Result<()> {
+    if charged == 0 {
+        return Ok(());
+    }
+    let total = prover_u64(tree, "SeniorityPenalty").saturating_add(charged);
+    write_field(tree, PROVER, "SeniorityPenalty", &total.to_be_bytes())
 }
 
 /// What crediting `added` keys gives a prover that records `credited` (and
@@ -654,7 +725,12 @@ pub struct SuccessionAmounts {
 /// The successor's accrual earned before the predecessor stopped (beyond
 /// `SENIORITY_PER_ACTIVE_FRAME` per frame since then) is taken off the
 /// moved accrual, so the same node's time counts once; none is when the
-/// successor started after the predecessor stopped.
+/// successor started after the predecessor stopped. Its accrual counts what
+/// seniority penalties took from it (`ProverRetro::penalty`): a penalty
+/// lowers its seniority, and would otherwise lower the overlap and come back
+/// as credit. The predecessor's penalty needs no such count: it already
+/// lowered the seniority every debit is capped by and every accrual share is
+/// computed from, so what moves is net of it.
 #[allow(clippy::too_many_arguments)]
 pub fn succession_amounts(
     predecessor: &ProverRetro,
@@ -694,7 +770,10 @@ pub fn succession_amounts(
     let base = held_base(successor.held, successor.moved, own, retro);
     let after = parts_max(&base, &taken);
     let retro_credit = retro_value(&after).saturating_sub(retro_value(&base));
-    let successor_accrual = successor.seniority.saturating_sub(retro_value(&base));
+    let successor_accrual = successor
+        .seniority
+        .saturating_add(successor.penalty)
+        .saturating_sub(retro_value(&base));
     let overlap = match successor_start {
         Some(start) if start >= end_frame => 0,
         _ => successor_accrual.saturating_sub(
@@ -726,11 +805,13 @@ pub fn succession_amounts(
             seniority: predecessor.seniority - debit,
             held: Some(left),
             moved: Some(std::array::from_fn(|p| out[p].saturating_add(taken[p]))),
+            penalty: predecessor.penalty,
         },
         successor: ProverRetro {
             seniority: successor.seniority.saturating_add(credit),
             held: Some(successor_held),
             moved: (successor.moved.is_some() || successor_out != [0; 5]).then_some(successor_out),
+            penalty: successor.penalty,
         },
     }
 }
@@ -832,6 +913,12 @@ pub fn succession_preview(
                 blockers.push(SuccessionBlocker::Quiet {
                     remaining: quiet_frames - elapsed,
                     until: end.saturating_add(quiet_frames),
+                });
+            }
+            for allocation in state.undecided_departures(frame) {
+                blockers.push(SuccessionBlocker::PenaltyUndecided {
+                    filter: allocation.confirmation_filter.clone(),
+                    epoch: epoch_for_frame(frame),
                 });
             }
             let successor_start =
@@ -947,8 +1034,8 @@ impl SeniorityMergePlan {
 /// its signature (checked before any marker is read) and the targets'
 /// consent for the mode. A merge must name an unconsumed target and raise
 /// the prover's seniority ([`credit_retro`]). A succession requires an
-/// idle, quiet, unkicked predecessor holding seniority, and a gain
-/// ([`succession_preview`]).
+/// idle, quiet, unkicked predecessor holding seniority, with no departure
+/// awaiting its penalty decision, and a gain ([`succession_preview`]).
 pub fn plan_seniority_merge(
     op: &ProverSeniorityMerge,
     frame: u64,
@@ -1223,7 +1310,8 @@ mod tests {
 
     use quil_hypergraph::HypergraphCrdt;
     use quil_types::consensus::{
-        epoch_for_frame, epoch_length_frames, set_seniority_succession_epoch_for_thread,
+        epoch_for_frame, epoch_length_frames, set_seniority_penalty_epoch_for_thread,
+        set_seniority_succession_epoch_for_thread,
     };
     use quil_types::crypto::KeyType;
     use quil_types::execution::ShardExecutionEngine;
@@ -1722,6 +1810,7 @@ mod tests {
             seniority,
             held: None,
             moved: None,
+            penalty: 0,
         }
     }
 
@@ -1753,7 +1842,8 @@ mod tests {
             ProverRetro {
                 seniority: 0,
                 held: Some([0; 5]),
-                moved: Some([5_000_000, 0, 0, 0, 0])
+                moved: Some([5_000_000, 0, 0, 0, 0]),
+                penalty: 0
             }
         );
         // A ledger of 6,000,000 and 300,000 accrual: key 1 holds 5/6.
@@ -1761,6 +1851,7 @@ mod tests {
             seniority: 6_300_000,
             held: Some([5_000_000, 1_000_000, 0, 0, 0]),
             moved: None,
+            penalty: 0,
         };
         let first = succession_amounts(&x, &bare(0), None, &moved, &[], F, end, &parts);
         assert_eq!(
@@ -1808,6 +1899,7 @@ mod tests {
             seniority: 5_000_000,
             held: Some([5_000_000, 0, 0, 0, 0]),
             moved: None,
+            penalty: 0,
         };
         let amounts =
             succession_amounts(&bare(5_000_000), &holder, None, &moved, &[], F, end, &parts);
@@ -1834,7 +1926,8 @@ mod tests {
             ProverRetro {
                 seniority: 3_000_000,
                 held: Some([3_000_000, 0, 0, 0, 0]),
-                moved: Some([2_000_000, 0, 0, 0, 0])
+                moved: Some([2_000_000, 0, 0, 0, 0]),
+                penalty: 0
             }
         );
         let onward = succession_amounts(
@@ -1850,6 +1943,53 @@ mod tests {
         assert_eq!(onward.debit, 3_000_000);
     }
 
+    /// A penalty (#976) lowers the successor's seniority but not the accrual
+    /// it earned: the overlap still takes all of that accrual off the moved
+    /// accrual, so a succession does not hand the penalty back as credit.
+    #[test]
+    fn a_succession_does_not_refund_the_successors_penalty() {
+        let moved = [target(1)];
+        let x = ProverRetro {
+            seniority: 6_300_000,
+            held: Some([5_000_000, 1_000_000, 0, 0, 0]),
+            moved: None,
+            penalty: 0,
+        };
+        let end = F - 1_000;
+        let unpenalised = succession_amounts(&x, &bare(100_000), None, &moved, &[], F, end, &parts);
+        assert_eq!(unpenalised.credit, 5_160_000);
+        // Two penalties took 7,200 of its 100,000; the vertex records them.
+        let mut tree = create_prover_vertex_tree(&key(Y), 92_800).unwrap();
+        record_seniority_penalty(&mut tree, 0).unwrap();
+        assert_eq!(
+            read_field(&tree, PROVER, "SeniorityPenalty"),
+            None,
+            "a penalty that took nothing writes nothing"
+        );
+        record_seniority_penalty(&mut tree, 7_000).unwrap();
+        record_seniority_penalty(&mut tree, 200).unwrap();
+        let penalised = ProverRetro::of(&tree);
+        assert_eq!(
+            penalised,
+            ProverRetro {
+                seniority: 92_800,
+                penalty: 7_200,
+                ..bare(0)
+            }
+        );
+        let amounts = succession_amounts(&x, &penalised, None, &moved, &[], F, end, &parts);
+        assert_eq!(amounts.debit, unpenalised.debit);
+        assert_eq!(
+            amounts.credit, unpenalised.credit,
+            "the penalty does not come back as credit"
+        );
+        assert_eq!(amounts.successor.seniority, 92_800 + 5_160_000);
+        assert_eq!(
+            amounts.successor.penalty, 7_200,
+            "a succession keeps the record"
+        );
+    }
+
     /// Two keys of one period are debited once; a part missing from a
     /// bootstrapped ledger is proven by the key's marker.
     #[test]
@@ -1859,6 +1999,7 @@ mod tests {
             seniority: 10_000,
             held: Some([500, 0, 0, 0, 0]),
             moved: None,
+            penalty: 0,
         };
         let first = succession_amounts(&x, &bare(0), None, &[target(5)], &[], F, end, &parts);
         assert_eq!(first.predecessor.held, Some([0; 5]));
@@ -1880,6 +2021,7 @@ mod tests {
             seniority: 6_000_000,
             held: Some([0, 1_000_000, 0, 0, 0]),
             moved: None,
+            penalty: 0,
         };
         let amounts = succession_amounts(
             &bootstrapped,
@@ -1928,7 +2070,8 @@ mod tests {
             ProverRetro {
                 seniority: 0,
                 held: Some([0; 5]),
-                moved: Some([5_000_000, 0, 0, 0, 0])
+                moved: Some([5_000_000, 0, 0, 0, 0]),
+                penalty: 0
             }
         );
         assert_eq!(
@@ -2331,7 +2474,8 @@ mod tests {
             ProverRetro {
                 seniority: 5_100_000,
                 held: Some([5_000_000, 0, 0, 0, 0]),
-                moved: Some([0; 5])
+                moved: Some([0; 5]),
+                penalty: 0
             }
         );
     }
@@ -2641,6 +2785,85 @@ mod tests {
             engine.validate_message(F + 1, &global, &bundle).is_err(),
             "a replay is refused"
         );
+    }
+
+    /// A leave proposed at an epoch's first frame and never confirmed departs
+    /// two epochs later, exactly when the predecessor's quiet period lapses,
+    /// in the frame whose operations run before that epoch's penalty pass
+    /// (#976). Once penalties apply, a succession waits for the pass to
+    /// decide the departure, within its epoch; before then it applies as it
+    /// did.
+    #[test]
+    fn a_succession_waits_for_the_penalty_pass_to_decide_a_departure() {
+        let leave = F - seniority_succession_quiet_frames();
+        let shard = vec![0x6B; 32];
+        let setup = |penalties: Option<u64>, decided: u64| {
+            let world = World::eligible();
+            set_seniority_penalty_epoch_for_thread(penalties);
+            world.allocation(
+                X,
+                &shard,
+                3,
+                &[
+                    ("JoinFrameNumber", F - 90_000),
+                    ("Epoch", epoch_for_frame(leave)),
+                    ("LeaveFrameNumber", leave),
+                    ("LeavePenaltyFrameNumber", decided),
+                ],
+            );
+            world
+        };
+        let claim_x = claim(Y, F, &[1], Consent::Succession(X));
+        // Penalties not yet applying: unchanged.
+        let world = setup(None, 0);
+        assert_eq!(world.preview(F).blockers, vec![]);
+        world.apply(&claim_x, F);
+        assert_eq!((world.seniority(X), world.seniority(Y)), (0, 5_100_000));
+        // Penalties apply and the pass has not run: refused.
+        let world = setup(Some(ACTIVATION), 0);
+        assert_eq!(
+            world.preview(F).blockers,
+            vec![SuccessionBlocker::PenaltyUndecided {
+                filter: shard.clone(),
+                epoch: epoch_for_frame(F)
+            }]
+        );
+        assert!(world.refusal(&claim_x, F).contains("not decided yet"));
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y)),
+            (5_000_000, 100_000)
+        );
+        // Only within the departure epoch: a departure the pass skips blocks
+        // no longer.
+        assert_eq!(world.preview(F + epoch_length_frames()).blockers, vec![]);
+        // Decided, charged or not: it applies.
+        let world = setup(Some(ACTIVATION), leave);
+        assert_eq!(world.preview(F).blockers, vec![]);
+        world.apply(&claim_x, F);
+        assert_eq!(world.seniority(Y), 5_100_000);
+        set_seniority_penalty_epoch_for_thread(None);
+    }
+
+    /// A rejoin rewrites the prover vertex; it keeps the record of what
+    /// penalties took, so the prover's accrual still counts it.
+    #[test]
+    fn a_rejoin_keeps_the_penalty_record() {
+        let world = World::new();
+        world.prover(Y, 1_000, Some(F - 1), 0);
+        let mut tree = world.tree(Y);
+        record_seniority_penalty(&mut tree, 7_200).unwrap();
+        world.put(&address(Y), &tree);
+        world.allocation(
+            Y,
+            &DATA_SHARD,
+            1,
+            &[
+                ("JoinConfirmFrameNumber", F - 99_000),
+                ("Epoch", epoch_for_frame(F)),
+            ],
+        );
+        world.rejoin(Y, F, &[]);
+        assert_eq!(ProverRetro::of(&world.tree(Y)).penalty, 7_200);
     }
 
     /// A rejoin rewrites the prover vertex; from activation it keeps the

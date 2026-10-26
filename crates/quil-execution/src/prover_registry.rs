@@ -50,6 +50,9 @@ pub use registry_budget::{RegistryLimits, RegistryUsage};
 #[path = "registry_rows.rs"]
 mod registry_rows;
 use registry_rows::RegistryRows;
+#[path = "prover_registry_penalties.rs"]
+mod penalties;
+pub use penalties::{LeaveDeparture, SeniorityPenalty, SeniorityPenaltyPass};
 
 /// BN254 scalar field modulus, same as `iden3-crypto/ff.Modulus()`.
 /// Used for the modular-distance sort that picks "next prover" order.
@@ -1147,6 +1150,23 @@ impl InMemoryProverRegistry {
         (active_by_filter, fresh_by_filter)
     }
 
+    /// The vertex address of `prover`'s allocation on `filter`: `recorded`
+    /// when it is a 32-byte address, else derived from the prover's public
+    /// key. `None` when neither is known.
+    fn allocation_vertex(&self, prover: &[u8], filter: &[u8], recorded: &[u8]) -> Option<Vec<u8>> {
+        if recorded.len() == 32 {
+            return Some(recorded.to_vec());
+        }
+        self.prover_cache
+            .get(prover)
+            .filter(|info| !info.public_key.is_empty())
+            .and_then(|info| {
+                crate::global_intrinsic::materialize::allocation_address(&info.public_key, filter)
+                    .ok()
+            })
+            .map(|a| a.to_vec())
+    }
+
     /// No-op. Pruning orphan joins is disabled because non-deterministic
     /// pruning was causing tree divergence between nodes.
     pub fn prune_orphan_joins(&mut self, _frame_number: u64) {}
@@ -1221,6 +1241,40 @@ impl EvictionCandidate {
         self.prover_address == other.prover_address
             && self.confirmation_filter == other.confirmation_filter
     }
+}
+
+/// Read a GLOBAL vertex's raw blob, preferring the CRDT (`state.get`) but
+/// falling back to the authoritative flat per-vertex keyspace. The CRDT's
+/// in-memory tree can be missing a vertex that hypergraph SYNC wrote straight
+/// into the flat keyspace (sync does not insert into the running CRDT tree),
+/// which is exactly why find_eviction_candidates — sourced from
+/// `refresh_from_store` over that same flat keyspace — selects an allocation
+/// the CRDT can't load. Writing back via `state.set` then inserts/updates the
+/// blob into the CRDT tree on commit.
+fn read_global_vertex_blob(
+    state: &crate::hypergraph_state::HypergraphState,
+    store: Option<&dyn HypergraphStore>,
+    addr: &[u8],
+) -> QuilResult<Option<Vec<u8>>> {
+    let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+    if let Some(b) = state.get(&crate::domains::GLOBAL[..], addr, &va_disc)? {
+        return Ok(Some(b));
+    }
+    if let (Some(s), 32) = (store, addr.len()) {
+        // Flat per-vertex keyspace shard for all global vertices — the same
+        // (l1=0, l2=0xFF*32) shard `refresh_from_store` reads candidates from.
+        let global_shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let mut vk = Vec::with_capacity(64);
+        vk.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+        vk.extend_from_slice(addr);
+        return s
+            .load_vertex_underlying_raw("vertex", "adds", &global_shard, &vk)
+            .map_err(|e| QuilError::Internal(format!("global vertex flat-store read: {e}")));
+    }
+    Ok(None)
 }
 
 /// Frames of inactivity counted against `alloc` at `frame_number`, after
@@ -2145,26 +2199,30 @@ impl SharedProverRegistry {
                 .into_iter()
                 .take(EVICTION_MAX_PER_PASS)
                 .map(|candidate| {
-                    let vertex = if candidate.vertex_address.len() == 32 {
-                        Some(candidate.vertex_address.clone())
-                    } else {
-                        guard
-                            .prover_cache
-                            .get(&candidate.prover_address)
-                            .filter(|info| !info.public_key.is_empty())
-                            .and_then(|info| {
-                                crate::global_intrinsic::materialize::allocation_address(
-                                    &info.public_key,
-                                    &candidate.confirmation_filter,
-                                )
-                                .ok()
-                            })
-                            .map(|a| a.to_vec())
-                    };
+                    let vertex = guard.allocation_vertex(
+                        &candidate.prover_address,
+                        &candidate.confirmation_filter,
+                        &candidate.vertex_address,
+                    );
                     (candidate, vertex)
                 })
                 .collect()
         };
+        self.kick_selected(candidates, frame_number, state, store)
+    }
+
+    /// Kick each selected allocation vertex (Status=4, KickFrameNumber=frame)
+    /// in `state`, and mark it no longer active in the cache. `vertex` is the
+    /// allocation's vertex address; a candidate without one, or whose vertex
+    /// is in neither the CRDT nor the flat store, is skipped. Returns the
+    /// allocations kicked.
+    fn kick_selected(
+        &self,
+        candidates: Vec<(EvictionCandidate, Option<Vec<u8>>)>,
+        frame_number: u64,
+        state: &crate::hypergraph_state::HypergraphState,
+        store: Option<&dyn HypergraphStore>,
+    ) -> QuilResult<Vec<EvictionCandidate>> {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -2175,38 +2233,7 @@ impl SharedProverRegistry {
         // allocation vertex is what removes the prover from that shard.
         let domain = &crate::domains::GLOBAL[..];
         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-        let global_app: [u8; 32] = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
-        // Flat per-vertex keyspace shard for all global vertices — the same
-        // (l1=0, l2=0xFF*32) shard `refresh_from_store` reads candidates from.
-        let global_shard = ShardKey {
-            l1: [0u8; 3],
-            l2: [0xffu8; 32],
-        };
-        // Read a vertex's raw blob, preferring the CRDT (`state.get`) but
-        // falling back to the authoritative flat per-vertex keyspace. The
-        // CRDT's in-memory tree can be missing a vertex that hypergraph SYNC
-        // wrote straight into the flat keyspace (sync does not insert into the
-        // running CRDT tree), which is exactly why find_eviction_candidates —
-        // sourced from `refresh_from_store` over that same flat keyspace —
-        // selects an allocation the CRDT can't load. Writing back via
-        // `state.set` then inserts/updates the kicked blob into the CRDT tree
-        // on commit.
-        let read_vertex = |addr: &[u8]| -> QuilResult<Option<Vec<u8>>> {
-            if let Some(b) = state.get(domain, addr, &va_disc)? {
-                return Ok(Some(b));
-            }
-            if let Some(s) = store {
-                if addr.len() == 32 {
-                    let mut vk = Vec::with_capacity(64);
-                    vk.extend_from_slice(&global_app);
-                    vk.extend_from_slice(addr);
-                    return s
-                        .load_vertex_underlying_raw("vertex", "adds", &global_shard, &vk)
-                        .map_err(|e| QuilError::Internal(format!("evict: flat-store read: {e}")));
-                }
-            }
-            Ok(None)
-        };
+        let read_vertex = |addr: &[u8]| read_global_vertex_blob(state, store, addr);
         let mut evicted: Vec<EvictionCandidate> = Vec::new();
 
         for (candidate, vertex) in candidates {
@@ -8214,5 +8241,6 @@ mod tests {
     }
 
     include!("prover_registry_storage_tests.rs");
+    include!("prover_registry_penalties_tests.rs");
     include!("registry_rows_tests.rs");
 }

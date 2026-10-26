@@ -29,6 +29,7 @@ use quil_types::error::Result;
 
 use crate::halt_state::HaltState;
 use crate::provers::proposer::{self, ShardDescriptor, Strategy};
+use crate::provers::seniority_guard::{penalised_departure, SeniorityGuard};
 use crate::worker::{manually_managed_filters, WorkerManager, WorkerView};
 use crate::worker_allocator::WorkerAllocator;
 
@@ -519,6 +520,8 @@ pub struct ProverLifecycle {
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
     /// The contents and time of the last `lifecycle allocation buckets` line.
     buckets_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Halt-risk leave penalty notices already logged (#976).
+    seniority_guard: std::sync::Mutex<SeniorityGuard>,
     /// How long each bound seat's worker has not hosted the committee
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
@@ -695,6 +698,7 @@ impl ProverLifecycle {
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
             buckets_logged: std::sync::Mutex::new(None),
+            seniority_guard: Default::default(),
             session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
@@ -1649,6 +1653,38 @@ impl ProverLifecycle {
                 "lifecycle allocation buckets"
             );
         }
+        // Seniority penalties (#976): warn about a fall of this prover's
+        // committed seniority no executed penalty explains (the aggregated
+        // per-epoch warning reports those), and tell the operator once when a
+        // pending manual leave will cost the halt-risk leave penalty. Inert
+        // until the penalty epoch.
+        if let (Some(prover), Ok(mut guard)) = (prover_info.as_ref(), self.seniority_guard.lock()) {
+            guard.observe_seniority(
+                frame_number,
+                prover.seniority,
+                quil_execution::seniority_penalty_log::own_charged_at(),
+            );
+            let manual = manually_managed_filters(&workers);
+            for a in prover.allocations.iter().filter(|a| {
+                a.status == ProverStatus::Leaving && manual.contains(&a.confirmation_filter)
+            }) {
+                if let Some(departure) = penalised_departure(
+                    a,
+                    frame_number,
+                    membership.get(&a.confirmation_filter),
+                    &self.prover_address,
+                ) {
+                    guard.manual_notice(
+                        frame_number,
+                        "pending",
+                        &a.confirmation_filter,
+                        a.leave_frame_number,
+                        departure,
+                    );
+                }
+            }
+        }
+
         // A missed renewal or rejected leave needs bounded recovery before
         // cleanup, even if reconciliation has not restored the worker yet.
         // Sweep only the seats the allocator gives up, by the rule it
@@ -3157,6 +3193,41 @@ impl ProverLifecycle {
             leave_candidates = self.filter_recent_leave_attempts(leave_candidates, frame_number);
             let cooldown_suppressed = pre_cooldown_count.saturating_sub(leave_candidates.len());
 
+            // Halt-risk leave penalty (#976): never propose an automatic
+            // leave whose departure would leave its shard at halt risk and
+            // cost this prover seniority. Operator pins go ahead.
+            let mut penalty_withheld = Vec::new();
+            leave_candidates.retain(|f| {
+                if manually_managed_filters.contains(f) {
+                    return true;
+                }
+                let departure = prover_info
+                    .as_ref()
+                    .and_then(|p| {
+                        p.allocations.iter().find(|a| {
+                            &a.confirmation_filter == f && a.status == ProverStatus::Active
+                        })
+                    })
+                    .and_then(|a| {
+                        penalised_departure(
+                            a,
+                            frame_number,
+                            membership.get(f),
+                            &self.prover_address,
+                        )
+                    });
+                match departure {
+                    Some(departure) => {
+                        penalty_withheld.push((f.clone(), departure));
+                        false
+                    }
+                    None => true,
+                }
+            });
+            if let Ok(mut guard) = self.seniority_guard.lock() {
+                guard.withheld(frame_number, "proposal", &penalty_withheld);
+            }
+
             if leave_candidates.len() > MAX_PROPOSALS_PER_CYCLE {
                 leave_candidates.truncate(MAX_PROPOSALS_PER_CYCLE);
             }
@@ -3493,6 +3564,80 @@ impl ProverLifecycle {
                 false
             });
 
+            // Halt-risk leave penalty (#976, rule 2): reject, rather than
+            // confirm, an automatic leave whose departure would leave its
+            // shard at halt risk and cost this prover seniority. Left
+            // undecided it would expire and depart at the same boundary,
+            // costing the same; rejected, the allocation stays and keeps the
+            // shard covered. An operator's manual leave is confirmed, with a
+            // notice.
+            let mut penalty_withheld = Vec::new();
+            let mut withhold = |bucket: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+                bucket
+                    .into_iter()
+                    .filter(|f| {
+                        let departure = prover_info
+                            .as_ref()
+                            .and_then(|p| {
+                                p.allocations.iter().find(|a| {
+                                    &a.confirmation_filter == f
+                                        && a.status == ProverStatus::Leaving
+                                        && a.leave_confirm_frame_number == 0
+                                })
+                            })
+                            .and_then(|a| {
+                                penalised_departure(
+                                    a,
+                                    frame_number,
+                                    membership.get(f),
+                                    &self.prover_address,
+                                )
+                            });
+                        match departure {
+                            Some(departure) => {
+                                penalty_withheld.push((f.clone(), departure));
+                                false
+                            }
+                            None => true,
+                        }
+                    })
+                    .collect()
+            };
+            let auto_confirm = withhold(auto_confirm);
+            let capacity_ready = withhold(capacity_ready);
+            let swap_confirm = withhold(swap_confirm);
+            let orphan_ready = withhold(orphan_ready);
+            let lapsed_ready = withhold(lapsed_ready);
+            if let Ok(mut guard) = self.seniority_guard.lock() {
+                guard.withheld(frame_number, "confirm", &penalty_withheld);
+                for f in &manual_ready {
+                    let Some(a) = prover_info.as_ref().and_then(|p| {
+                        p.allocations.iter().find(|a| {
+                            &a.confirmation_filter == f
+                                && a.status == ProverStatus::Leaving
+                                && a.leave_confirm_frame_number == 0
+                        })
+                    }) else {
+                        continue;
+                    };
+                    if let Some(departure) = penalised_departure(
+                        a,
+                        frame_number,
+                        membership.get(f),
+                        &self.prover_address,
+                    ) {
+                        guard.manual_notice(
+                            frame_number,
+                            "confirm",
+                            f,
+                            a.leave_frame_number,
+                            departure,
+                        );
+                    }
+                }
+            }
+            auto_reject.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
+
             auto_reject.extend(retained_rejections);
             info!(
                 frame = frame_number,
@@ -3503,6 +3648,7 @@ impl ProverLifecycle {
                 lapsed = lapsed_ready.len(),
                 manual = manual_ready.len(),
                 reject = auto_reject.len(),
+                penalty_withheld = penalty_withheld.len(),
                 confirmed_departure_workers = confirmed_departure_workers.len(),
                 "lifecycle leave decision causes"
             );
@@ -7623,6 +7769,96 @@ mod proposal_loop_tests {
             "no leave should fire when size is None (no data yet); got {:?}",
             actions
         );
+    }
+
+    /// Halt-risk leave penalty (#976): the existing halt-risk shield spares
+    /// only bound allocations on shards with data, so the empty-shard sweep
+    /// proposes leaving a shard this prover alone serves. Once penalties
+    /// apply at the departure's epoch, that automatic leave is withheld;
+    /// before then it is proposed as before.
+    #[test]
+    fn an_automatic_leave_that_would_cost_the_halt_risk_penalty_is_withheld() {
+        let address = vec![0xCDu8; 32];
+        let empty = filter_bytes(0xA1);
+        let proposes = |penalty_epoch: Option<u64>| {
+            quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(
+                penalty_epoch,
+            );
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            let reg = Arc::new(ConfigurableRegistry::new());
+            wm.add(allocated_worker(1, empty.clone()));
+            reg.set_prover(prover(
+                address.clone(),
+                vec![alloc(empty.clone(), ProverStatus::Active, 10)],
+            ));
+            reg.set_summaries(vec![shard_summary(empty.clone(), 1)]);
+            let lifecycle = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lifecycle.set_prover_root_verified_frame(100);
+            lifecycle.set_remote_shard_sizes(HashMap::from([(empty.clone(), 0u64)]));
+            let actions = lifecycle
+                .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+            actions.iter().any(|a| matches!(a, LifecycleAction::ProposeLeave { filters, .. } if filters.contains(&empty)))
+        };
+        assert!(
+            proposes(None),
+            "before the penalty epoch the empty-shard leave is proposed"
+        );
+        // Proposed in epoch 0, it would depart at epoch 2.
+        assert!(
+            proposes(Some(3)),
+            "a departure before the penalty epoch is not withheld"
+        );
+        assert!(
+            !proposes(Some(2)),
+            "a departure that costs the penalty is withheld"
+        );
+    }
+
+    /// Halt-risk leave penalty (#976): an orphan's pending leave (no worker
+    /// bound) confirms at its window regardless of the halt-risk shield. Once
+    /// penalties apply, the lifecycle rejects it instead when its shard would
+    /// keep at most three provers; an operator's manual leave still confirms.
+    #[test]
+    fn a_pending_leave_that_would_cost_the_halt_risk_penalty_is_rejected_unless_manual() {
+        let address = vec![0xCDu8; 32];
+        let held = filter_bytes(0xA1);
+        // (penalty epoch, manual, confirmed)
+        for (penalty_epoch, manual, confirmed) in [
+            (None, false, true),
+            (Some(3), false, true),
+            (Some(2), false, false),
+            (Some(2), true, true),
+        ] {
+            quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(
+                penalty_epoch,
+            );
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            if manual {
+                let mut worker = allocated_worker(1, held.clone());
+                worker.manually_managed = true;
+                wm.add(worker);
+            } else {
+                wm.add(idle_worker(1));
+            }
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.leave_frame_number = 100;
+            reg.set_prover(prover(address.clone(), vec![leaving]));
+            reg.set_summaries(vec![shard_summary(held.clone(), 1)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_prover_root_verified_frame(720);
+            let actions = lc.evaluate(720, 1, reg.as_ref(), wm.as_ref()).unwrap();
+            quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+            let rejects = actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held)));
+            let confirms = actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held)));
+            assert_eq!(
+                (confirms, rejects),
+                (confirmed, !confirmed),
+                "penalty epoch {penalty_epoch:?}, manual {manual}: actions={actions:?}"
+            );
+        }
     }
 
     /// The leave sweep must stay reachable when epoch expiry empties the

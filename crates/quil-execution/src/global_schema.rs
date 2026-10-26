@@ -115,6 +115,16 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
                 size: 40,
                 rdf_type: RdfType::ByteArray,
             },
+            // order 37 — not in the Go schema: the seniority penalties (#976)
+            // have taken from this prover in total, u64 BE, so a succession
+            // counts its accrual before them and does not refund them.
+            // Written only when a penalty takes seniority. Key 0x94, unique.
+            FieldTag {
+                name: "SeniorityPenalty",
+                order: 37,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
         ],
     },
     ClassDef {
@@ -273,6 +283,37 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
                 order: 19,
                 size: 6,
                 rdf_type: RdfType::ByteArray,
+            },
+            // order 34 — not in the Go schema: the `LeaveFrameNumber` of the
+            // last departed leave the seniority penalty pass decided (#976),
+            // whether or not it cost seniority, so each departure is decided
+            // once. Written only once penalties apply. Key 0x88. Orders 20–33
+            // are left to #899 (20–31) and #959, of the same flag-day set,
+            // so no two fields share a key across classes.
+            FieldTag {
+                name: "LeavePenaltyFrameNumber",
+                order: 34,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            // order 35 — not in the Go schema: how many consecutive app frames
+            // of its shard, included in GLOBAL, this committee member neither
+            // signed nor produced (#976); reset when it signs or produces one.
+            // Written only once penalties apply. Key 0x8C.
+            FieldTag {
+                name: "AbsentFrameCount",
+                order: 35,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            // order 36 — not in the Go schema: the app frame number last
+            // counted in `AbsentFrameCount`, so a re-materialized header is
+            // not counted twice. Key 0x90.
+            FieldTag {
+                name: "LastAbsentFrameNumber",
+                order: 36,
+                size: 8,
+                rdf_type: RdfType::Uint,
             },
         ],
     },
@@ -588,12 +629,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 33 (a prover's
-/// `RetroMoved`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 37 (a prover's
+/// `SeniorityPenalty`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 33;
+pub const GLOBAL_MAX_ORDER: u16 = 37;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -896,6 +937,58 @@ mod tests {
     }
 
     #[test]
+    fn penalty_keys_are_unique_across_classes_and_keep_every_key() {
+        // Orders 34–37 → 0x88, 0x8C, 0x90 and 0x94, still in the single-byte
+        // band: no existing key changes width, and no other field shares them.
+        let cls = "allocation:ProverAllocation";
+        assert_eq!(field_key(cls, "LeavePenaltyFrameNumber"), Some(vec![0x88]));
+        assert_eq!(field_key(cls, "AbsentFrameCount"), Some(vec![0x8C]));
+        assert_eq!(field_key(cls, "LastAbsentFrameNumber"), Some(vec![0x90]));
+        assert_eq!(
+            field_key("prover:Prover", "SeniorityPenalty"),
+            Some(vec![0x94])
+        );
+        assert_eq!(
+            GLOBAL_MAX_ORDER, 37,
+            "SeniorityPenalty (order 37) is the highest"
+        );
+        assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
+        assert_eq!(
+            GLOBAL_CLASSES
+                .iter()
+                .flat_map(|c| c.fields.iter())
+                .map(|f| f.order)
+                .max(),
+            Some(GLOBAL_MAX_ORDER)
+        );
+        for class in GLOBAL_CLASSES {
+            for field in class.fields {
+                assert_eq!(
+                    order_to_key(field.order, GLOBAL_MAX_ORDER),
+                    vec![(field.order as u8) << 2]
+                );
+                for (owner, name, key) in [
+                    (cls, "LeavePenaltyFrameNumber", 0x88u8),
+                    (cls, "AbsentFrameCount", 0x8C),
+                    (cls, "LastAbsentFrameNumber", 0x90),
+                    ("prover:Prover", "SeniorityPenalty", 0x94),
+                ] {
+                    if class.name == owner && field.name == name {
+                        continue;
+                    }
+                    assert_ne!(
+                        order_to_key(field.order, GLOBAL_MAX_ORDER),
+                        vec![key],
+                        "{}.{} shares the {name} key",
+                        class.name,
+                        field.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn last_signed_frame_number_key_is_unique_across_classes() {
         // Order 18 → 0x48 in the single-byte band. Readers probe one class's
         // key on another class's tree (the kicked-prover gate reads the
@@ -949,7 +1042,7 @@ mod tests {
         // changes width, and no other field of any class shares it.
         let cls = "allocation:ProverAllocation";
         assert_eq!(field_key(cls, "Release"), Some(vec![0x4C]));
-        assert_eq!(GLOBAL_MAX_ORDER, 33, "RetroMoved (order 33) is the highest");
+        assert!(GLOBAL_MAX_ORDER >= 19);
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(
             GLOBAL_CLASSES

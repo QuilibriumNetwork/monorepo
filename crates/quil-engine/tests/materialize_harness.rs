@@ -446,6 +446,106 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
 }
 
 // =====================================================================
+// Seniority penalties (#976): inert until their epoch
+// =====================================================================
+
+/// Nodes with byte-identical committed state, in which a confirmed leave
+/// departs at an epoch boundary and leaves its shard with three provers.
+/// Before the penalty epoch nothing is written: an archive (which also runs
+/// the inactivity eviction pass) and a regular node reach the same prover
+/// root with the epoch unset or not yet reached. Once it is reached, the same
+/// frame charges the penalty, the root moves, and both node kinds still
+/// agree.
+#[test]
+fn seniority_penalties_leave_the_prover_root_unchanged_before_their_epoch() {
+    let epoch = 940u64;
+    let departure = quil_types::consensus::epoch_start_frame(epoch);
+    assert!(departure > GLOBAL_EVICTION_ACTIVATION_FRAME);
+    let filter = vec![0x35u8; 64];
+    let seed = |node: &MaterializeHarness| {
+        let paddr = [0x57u8; 32];
+        let mut prover = create_prover_vertex_tree(&vec![0xCDu8; 57], 0).unwrap();
+        write_field(&mut prover, "prover:Prover", "Status", &[STATUS_ACTIVE]).unwrap();
+        write_field(
+            &mut prover,
+            "prover:Prover",
+            "Seniority",
+            &10_000u64.to_be_bytes(),
+        )
+        .unwrap();
+        let cls = "allocation:ProverAllocation";
+        let mut alloc = create_allocation_vertex_tree(&paddr, &filter, 0).unwrap();
+        write_field(&mut alloc, cls, "Status", &[3u8]).unwrap();
+        let leave = quil_types::consensus::epoch_start_frame(epoch - 2) + 10;
+        let confirm = quil_types::consensus::epoch_start_frame(epoch - 1) + 5;
+        write_field(&mut alloc, cls, "LeaveFrameNumber", &leave.to_be_bytes()).unwrap();
+        write_field(
+            &mut alloc,
+            cls,
+            "LeaveConfirmFrameNumber",
+            &confirm.to_be_bytes(),
+        )
+        .unwrap();
+        write_field(&mut alloc, cls, "Epoch", &(epoch - 2).to_be_bytes()).unwrap();
+        node.seed_flat_vertex(&paddr, &vertex_tree_to_blob(&prover));
+        node.seed_flat_vertex(&[0xA7u8; 32], &vertex_tree_to_blob(&alloc));
+        for i in 0..3u8 {
+            let faddr = [0xB0u8 + i; 32];
+            let (fp, fa) = active_recent_prover(&faddr, &filter, departure);
+            node.seed_flat_vertex(&faddr, &fp);
+            node.seed_flat_vertex(&[0xC0u8 + i; 32], &fa);
+        }
+        node.refresh_registry();
+    };
+    let root_after = |archive: bool, penalty_epoch: Option<u64>| -> (Vec<u8>, u64) {
+        let node = MaterializeHarness::new(archive, Arc::new(NoopInclusionProver));
+        seed(&node);
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(penalty_epoch);
+        let result = materialize_synced(&node.materializer, &frame_at(departure));
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+        result.expect("materialize");
+        let seniority = node
+            .registry
+            .get_prover_info(&[0x57u8; 32])
+            .unwrap()
+            .unwrap()
+            .seniority;
+        (prover_root(&node), seniority)
+    };
+    let (baseline, seniority) = root_after(false, None);
+    assert_eq!(seniority, 10_000);
+    assert_eq!(
+        root_after(true, None),
+        (baseline.clone(), 10_000),
+        "epoch unset"
+    );
+    assert_eq!(
+        root_after(true, Some(epoch + 1)),
+        (baseline.clone(), 10_000),
+        "epoch not reached"
+    );
+    assert_eq!(
+        root_after(false, Some(epoch + 1)),
+        (baseline.clone(), 10_000),
+        "epoch not reached, regular node"
+    );
+    let (charged_root, charged) = root_after(true, Some(epoch));
+    assert_eq!(
+        charged, 2_800,
+        "the penalty is persisted and read back by the refresh"
+    );
+    assert_ne!(
+        charged_root, baseline,
+        "the penalty changes the prover root once its epoch is reached"
+    );
+    assert_eq!(
+        root_after(false, Some(epoch)),
+        (charged_root, 2_800),
+        "a regular node reaches the archive's root"
+    );
+}
+
+// =====================================================================
 // Shard split: real materialize + authorization (real RocksShardsStore)
 // =====================================================================
 

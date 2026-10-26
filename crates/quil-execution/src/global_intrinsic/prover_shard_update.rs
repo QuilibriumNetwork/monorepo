@@ -1080,6 +1080,15 @@ pub fn materialize_prover_shard_update_with_fees(
             update_allocation_activity(state, current_frame_number, prover, &frame_header.address)?;
         }
     }
+    let present: std::collections::HashSet<usize> =
+        ctx.participant_indices.iter().copied().collect();
+    record_committee_absence(
+        state,
+        current_frame_number,
+        frame_header,
+        &ctx.active_provers,
+        &present,
+    )?;
 
     // Per-shard-frame reward-accrual signal. Unlike the worker-side "reward
     // balance updated by sync" (which only fires on an occasional prover-tree
@@ -1480,6 +1489,146 @@ fn update_allocation_activity_from(
     accrue_active_seniority(state, &prover.public_key, frame_number)?;
 
     Ok(())
+}
+
+/// Count which members of `committee` missed this included app frame, for
+/// the seniority absence penalty (#976, rule 3: disappearance). A member is present when its index
+/// is in `present`, the signers of the frame's certificate
+/// (`FrameHeader.public_key_signature_bls48581`: the authorized session's
+/// certificate signers, or the legacy aggregate's participant bitmask, whose
+/// members each also carry the frame's VDF multi-proof), or when it produced
+/// the frame (`FrameHeader.prover`). A present member's `AbsentFrameCount`
+/// returns to zero; an absent member's grows by one per app frame, keyed by
+/// `LastAbsentFrameNumber` so a re-materialized header counts once. Past
+/// `ABSENCE_PENALTY_GRACE_FRAMES` each further absent frame costs
+/// `ABSENCE_PENALTY_PER_FRAME` seniority; the epoch-boundary registry pass
+/// evicts at `ABSENCE_EVICTION_FRAMES`.
+///
+/// Only frames the committee produced count, so a committee that produces
+/// none (no quorum, GLOBAL or archives down) accrues no absence for anyone.
+/// Reads and writes nothing before the penalty epoch.
+fn record_committee_absence(
+    state: &HypergraphState,
+    current_frame_number: u64,
+    frame_header: &FrameHeader,
+    committee: &[ProverInfo],
+    present: &std::collections::HashSet<usize>,
+) -> Result<()> {
+    use quil_types::consensus::{
+        epoch_for_frame, seniority_penalties_at, ABSENCE_PENALTY_GRACE_FRAMES,
+        ABSENCE_PENALTY_PER_FRAME,
+    };
+    if !seniority_penalties_at(epoch_for_frame(current_frame_number)) {
+        return Ok(());
+    }
+    let cls = "allocation:ProverAllocation";
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+    let app_frame = frame_header.frame_number;
+    for (idx, member) in committee.iter().enumerate() {
+        let alloc_addr = allocation_address(&member.public_key, &frame_header.address)?;
+        let Some(blob) = state
+            .get(domain, &alloc_addr, &va_disc)?
+            .filter(|b| !b.is_empty())
+        else {
+            continue;
+        };
+        let mut tree = rebuild_vertex_tree_from_blob(&blob);
+        let count = read_prover_u64(&tree, cls, "AbsentFrameCount");
+        if present.contains(&idx) || member.address == frame_header.prover {
+            if count > 0 {
+                write_field(&mut tree, cls, "AbsentFrameCount", &0u64.to_be_bytes())?;
+                state.set(
+                    domain,
+                    &alloc_addr,
+                    &va_disc,
+                    current_frame_number,
+                    vertex_tree_to_blob(&tree),
+                )?;
+                if count > ABSENCE_PENALTY_GRACE_FRAMES {
+                    tracing::debug!(
+                        shard = %hex::encode(&frame_header.address),
+                        prover = %hex::encode(&member.address[..member.address.len().min(8)]),
+                        frame = current_frame_number, app_frame, missed = count,
+                        "seniority absence penalty ended: the member signed or produced a frame again",
+                    );
+                }
+            }
+            continue;
+        }
+        if app_frame <= read_prover_u64(&tree, cls, "LastAbsentFrameNumber") {
+            continue; // this app frame was already counted
+        }
+        let count = count + 1;
+        write_field(&mut tree, cls, "AbsentFrameCount", &count.to_be_bytes())?;
+        write_field(
+            &mut tree,
+            cls,
+            "LastAbsentFrameNumber",
+            &app_frame.to_be_bytes(),
+        )?;
+        state.set(
+            domain,
+            &alloc_addr,
+            &va_disc,
+            current_frame_number,
+            vertex_tree_to_blob(&tree),
+        )?;
+        if count <= ABSENCE_PENALTY_GRACE_FRAMES {
+            continue;
+        }
+        charge_absence(
+            state,
+            &member.public_key,
+            current_frame_number,
+            ABSENCE_PENALTY_PER_FRAME,
+        )?;
+        crate::seniority_penalty_log::record(
+            current_frame_number,
+            crate::seniority_penalty_log::PenaltyRule::Absence,
+            &member.address,
+            &frame_header.address,
+            ABSENCE_PENALTY_PER_FRAME,
+            app_frame,
+        );
+    }
+    Ok(())
+}
+
+/// Subtract `amount` from the prover's `Seniority`, saturating at zero, and
+/// add what it subtracted to the prover's `SeniorityPenalty`.
+fn charge_absence(
+    state: &HypergraphState,
+    public_key: &[u8],
+    frame_number: u64,
+    amount: u64,
+) -> Result<()> {
+    let prover_addr = prover_address_from_pubkey(public_key)?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+    let Some(blob) = state
+        .get(domain, &prover_addr, &va_disc)?
+        .filter(|b| !b.is_empty())
+    else {
+        return Ok(());
+    };
+    let mut tree = rebuild_vertex_tree_from_blob(&blob);
+    let seniority = read_prover_u64(&tree, "prover:Prover", "Seniority");
+    let charged = seniority.min(amount);
+    write_field(
+        &mut tree,
+        "prover:Prover",
+        "Seniority",
+        &(seniority - charged).to_be_bytes(),
+    )?;
+    super::seniority_succession::record_seniority_penalty(&mut tree, charged)?;
+    state.set(
+        domain,
+        &prover_addr,
+        &va_disc,
+        frame_number,
+        vertex_tree_to_blob(&tree),
+    )
 }
 
 /// Seniority a prover accrues for each frame it is active.
@@ -3647,5 +3796,217 @@ mod tests {
             super::super::handoff::record_session_rings(&state, 13, &id, &[0; 9]).is_err(),
             "a recorded snapshot is never replaced"
         );
+    }
+
+    // --- Seniority absence penalty (#976) ---------------------------------
+
+    /// Committee members with prover vertices (seniority `seniority`) and
+    /// allocations on `filter`.
+    fn absence_committee(
+        state: &HypergraphState,
+        seeds: &[u8],
+        filter: &[u8],
+        seniority: u64,
+    ) -> Vec<ProverInfo> {
+        use crate::global_intrinsic::materialize::materialize_prover_join;
+        let va_disc = vertex_adds_discriminator().unwrap();
+        seeds
+            .iter()
+            .map(|&seed| {
+                let mut prover = fake_prover(seed, 1, seniority, filter);
+                let output =
+                    materialize_prover_join(&prover.public_key, &[filter.to_vec()], 1, seniority)
+                        .unwrap();
+                prover.address = output.prover_address.to_vec();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS[..],
+                        &output.prover_address,
+                        &va_disc,
+                        1,
+                        vertex_tree_to_blob(&output.prover_tree),
+                    )
+                    .unwrap();
+                seed_alloc_blob(state, &prover, filter);
+                prover
+            })
+            .collect()
+    }
+
+    fn missed(state: &HypergraphState, prover: &ProverInfo, filter: &[u8]) -> u64 {
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let address = allocation_address(&prover.public_key, filter).unwrap();
+        let blob = state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)
+            .unwrap()
+            .unwrap();
+        read_prover_u64(
+            &rebuild_vertex_tree_from_blob(&blob),
+            "allocation:ProverAllocation",
+            "AbsentFrameCount",
+        )
+    }
+
+    fn seniority_of(state: &HypergraphState, prover: &ProverInfo) -> u64 {
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let blob = state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover.address, &va_disc)
+            .unwrap()
+            .unwrap();
+        read_prover_u64(
+            &rebuild_vertex_tree_from_blob(&blob),
+            "prover:Prover",
+            "Seniority",
+        )
+    }
+
+    fn penalty_of(state: &HypergraphState, prover: &ProverInfo) -> u64 {
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let blob = state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover.address, &va_disc)
+            .unwrap()
+            .unwrap();
+        read_prover_u64(
+            &rebuild_vertex_tree_from_blob(&blob),
+            "prover:Prover",
+            "SeniorityPenalty",
+        )
+    }
+
+    /// Include app frame `app_frame` of `filter`, produced by `committee[0]`
+    /// and signed by the members at `signers`, in GLOBAL frame `global`.
+    fn include_frame(
+        state: &HypergraphState,
+        committee: &[ProverInfo],
+        filter: &[u8],
+        app_frame: u64,
+        global: u64,
+        signers: &[usize],
+    ) {
+        let mut header = fake_header(filter.to_vec(), app_frame);
+        header.prover = committee[0].address.clone();
+        let present = signers.iter().copied().collect();
+        record_committee_absence(state, global, &header, committee, &present).unwrap();
+    }
+
+    /// A member that misses 721 consecutive frames its committee produced is
+    /// charged for the 721st and each one after, once per frame.
+    #[test]
+    fn a_member_missing_721_produced_frames_is_charged() {
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(0));
+        let state = make_state();
+        let filter = vec![0xB1u8; 32];
+        let committee = absence_committee(&state, &[1, 2], &filter, 1_000);
+        for n in 1..=720 {
+            include_frame(&state, &committee, &filter, n, 1_000 + n, &[0]);
+        }
+        assert_eq!(missed(&state, &committee[1], &filter), 720);
+        assert_eq!(
+            seniority_of(&state, &committee[1]),
+            1_000,
+            "the grace costs nothing"
+        );
+        include_frame(&state, &committee, &filter, 721, 1_721, &[0]);
+        assert_eq!(missed(&state, &committee[1], &filter), 721);
+        assert_eq!(seniority_of(&state, &committee[1]), 990);
+        // A re-materialized header counts once.
+        include_frame(&state, &committee, &filter, 721, 1_721, &[0]);
+        assert_eq!(seniority_of(&state, &committee[1]), 990);
+        include_frame(&state, &committee, &filter, 722, 1_722, &[0]);
+        assert_eq!(seniority_of(&state, &committee[1]), 980);
+        assert_eq!(
+            penalty_of(&state, &committee[1]),
+            20,
+            "the charges are recorded"
+        );
+        // The producer, present in every frame, accrued no absence.
+        assert_eq!(missed(&state, &committee[0], &filter), 0);
+        assert_eq!(seniority_of(&state, &committee[0]), 1_000);
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
+    /// Absence counts frames the committee produced, not GLOBAL time: a
+    /// committee that produces nothing (no quorum, GLOBAL or archives down)
+    /// accrues no absence for any member, however many GLOBAL frames pass,
+    /// while another shard's committee keeps producing.
+    #[test]
+    fn a_committee_that_produces_no_frame_accrues_no_absence() {
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(0));
+        let state = make_state();
+        let producing = vec![0xB2u8; 32];
+        let halted = vec![0xB3u8; 32];
+        let busy = absence_committee(&state, &[3, 4], &producing, 1_000);
+        let stalled = absence_committee(&state, &[5, 6, 7, 8], &halted, 1_000);
+        for n in 1..=800 {
+            include_frame(&state, &busy, &producing, n, 10 * n, &[0, 1]);
+        }
+        for member in &stalled {
+            assert_eq!(missed(&state, member, &halted), 0);
+            assert_eq!(seniority_of(&state, member), 1_000);
+        }
+        // One frame after 8,000 GLOBAL frames of silence counts as one.
+        include_frame(&state, &stalled, &halted, 1, 9_000, &[0, 1, 2]);
+        assert_eq!(missed(&state, &stalled[3], &halted), 1);
+        assert_eq!(seniority_of(&state, &stalled[3]), 1_000);
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
+    /// Signing one frame inside the window resets the count.
+    #[test]
+    fn signing_one_frame_resets_the_absence_count() {
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(0));
+        let state = make_state();
+        let filter = vec![0xB4u8; 32];
+        let committee = absence_committee(&state, &[9, 10], &filter, 1_000);
+        for n in 1..=700 {
+            include_frame(&state, &committee, &filter, n, 1_000 + n, &[0]);
+        }
+        include_frame(&state, &committee, &filter, 701, 1_701, &[0, 1]);
+        assert_eq!(missed(&state, &committee[1], &filter), 0);
+        for n in 702..=1_401 {
+            include_frame(&state, &committee, &filter, n, 1_000 + n, &[0]);
+        }
+        assert_eq!(missed(&state, &committee[1], &filter), 700);
+        assert_eq!(
+            seniority_of(&state, &committee[1]),
+            1_000,
+            "1,400 missed frames, but never 721 in a row"
+        );
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+
+    /// Before the penalty epoch nothing is read or written: the allocation
+    /// and prover vertices stay byte for byte as they were.
+    #[test]
+    fn absence_is_not_counted_before_the_penalty_epoch() {
+        for epoch in [None, Some(5)] {
+            quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(epoch);
+            let state = make_state();
+            let filter = vec![0xB5u8; 32];
+            let committee = absence_committee(&state, &[11, 12], &filter, 1_000);
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let alloc = allocation_address(&committee[1].public_key, &filter).unwrap();
+            let blobs = |state: &HypergraphState| {
+                (
+                    state
+                        .get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc, &va_disc)
+                        .unwrap(),
+                    state
+                        .get(
+                            &GLOBAL_INTRINSIC_ADDRESS[..],
+                            &committee[1].address,
+                            &va_disc,
+                        )
+                        .unwrap(),
+                )
+            };
+            let before = blobs(&state);
+            // Epoch 5 starts at GLOBAL frame 3,600: every frame here is earlier.
+            for n in 1..=800 {
+                include_frame(&state, &committee, &filter, n, 2_000 + n, &[0]);
+            }
+            assert_eq!(blobs(&state), before, "epoch {epoch:?}");
+        }
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
     }
 }
