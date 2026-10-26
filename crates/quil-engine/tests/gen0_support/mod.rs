@@ -220,9 +220,9 @@ pub enum Tip {
     /// generation 0 is registered, so generation 0's own hosts extend the
     /// tip, drain and seal.
     AtEveryHead,
-    /// Behind the heads, as headers lag frames in production: the legacy
-    /// instance keeps finalizing past the tip until each member switches, and
-    /// those frames become generation-0 frames.
+    /// Behind every member's head, as headers lag frames in production: the
+    /// legacy instance keeps finalizing past the tip until each member
+    /// switches, and those frames become generation-0 frames.
     Lagging,
 }
 
@@ -320,7 +320,24 @@ pub async fn migrate_in_place(tip_kind: Tip) {
     // 3. Registration: the tip has advanced; the maintenance pass registers
     // generation 0 at it and schedules generation 1 with the same members.
     let tip = match tip_kind {
-        Tip::Lagging => tip_of(after_activation.last().unwrap()),
+        Tip::Lagging => {
+            // A frame every member has materialized, not merely the newest
+            // one some member finalized: a member whose head still precedes
+            // the registered tip at its maintenance tick is refused the
+            // generation-0 restart and stays without a consensus host,
+            // dropping its peers' blocks, until a later tick. A slow runner
+            // leaves a member that far behind.
+            let frame = until(Duration::from_secs(90), || {
+                let floor = cursors(&harness).into_iter().min()?;
+                if floor <= first_tip.checkpoint.frame {
+                    return None;
+                }
+                finalized(&harness).into_iter().find(|f| number(f) == floor)
+            })
+            .await
+            .expect("every member materializes past the first recorded tip");
+            tip_of(&frame)
+        }
         Tip::AtEveryHead => {
             for worker in &harness.workers {
                 worker.handle.set_halted(true);
