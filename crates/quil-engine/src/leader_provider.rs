@@ -113,6 +113,71 @@ impl RejectedMessages {
 /// the frame cadence; the rest wait for a later frame.
 const MESSAGE_VALIDATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// A shard header a GLOBAL proposal would carry, as the application frame
+/// bodies executing it needs: archives materialize the shard through
+/// `frame_number` before they execute the GLOBAL frame. `empty`: the header
+/// proves that frame carried no requests, so it stands in for its own body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardBodyNeed {
+    pub address: Vec<u8>,
+    pub frame_number: u64,
+    pub empty: bool,
+}
+
+/// Whether this GLOBAL prover holds the application frame bodies each need
+/// requires, one answer per need
+/// ([`GlobalLeaderProvider::with_body_availability`]).
+pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<bool> + Send + Sync>;
+
+/// The bodies the shard headers a proof bundle carries need.
+pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    let Ok(bundle) = CanonicalMessageBundle::from_canonical_bytes(raw) else {
+        return Vec::new();
+    };
+    bundle
+        .requests
+        .into_iter()
+        .flatten()
+        .filter(|request| request.inner_type_prefix == TYPE_FRAME_HEADER)
+        .filter_map(|request| FrameHeader::from_canonical_bytes(&request.inner_bytes).ok())
+        .filter(|header| !header.address.is_empty())
+        .map(|header| ShardBodyNeed {
+            empty: crate::archive_ingest::requests_root_is_empty(&header.requests_root),
+            address: header.address,
+            frame_number: header.frame_number,
+        })
+        .collect()
+}
+
+/// Split shard proofs into those whose headers' bodies `available` reports
+/// held, which may ride this proposal, and the needs it does not report
+/// held. A proof with any such need stays in the mempool, for a later
+/// proposal within its anchor window once the bodies arrive.
+pub(crate) fn hold_back_unavailable_shard_proofs(
+    proofs: Vec<Vec<u8>>,
+    available: &dyn Fn(&[ShardBodyNeed]) -> Vec<bool>,
+) -> (Vec<Vec<u8>>, Vec<ShardBodyNeed>) {
+    let needs: Vec<Vec<ShardBodyNeed>> = proofs.iter().map(|raw| shard_body_needs(raw)).collect();
+    let all: Vec<ShardBodyNeed> = needs.iter().flatten().cloned().collect();
+    let mut answers = available(all.as_slice()).into_iter();
+    let mut ready = Vec::with_capacity(proofs.len());
+    let mut missing = Vec::new();
+    for (raw, needs) in proofs.into_iter().zip(needs) {
+        let before = missing.len();
+        for need in needs {
+            if !answers.next().unwrap_or(false) {
+                missing.push(need);
+            }
+        }
+        if missing.len() == before {
+            ready.push(raw);
+        }
+    }
+    (ready, missing)
+}
+
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
 /// `parent_selector`. Produces frames by collecting messages, computing
@@ -161,6 +226,10 @@ pub struct GlobalLeaderProvider {
     /// state-jump sync anchoring. `None` (unit tests without a store)
     /// leaves the commitment empty, which those consumers tolerate.
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Whether this node holds the application frame bodies a shard proof's
+    /// headers need ([`ShardBodyAvailability`]). `None` proposes every
+    /// verified proof, as a node without an archive ingest does.
+    body_availability: Option<ShardBodyAvailability>,
 }
 
 impl GlobalLeaderProvider {
@@ -239,6 +308,7 @@ impl GlobalLeaderProvider {
             Some(branch.manager().crdt()),
         );
         leader.rejected = self.rejected.clone();
+        leader.body_availability = self.body_availability.clone();
         Ok(leader)
     }
 
@@ -268,7 +338,18 @@ impl GlobalLeaderProvider {
             message_validator,
             rejected: Default::default(),
             hypergraph,
+            body_availability: None,
         }
+    }
+
+    /// Propose a shard's certified header only while `available` reports
+    /// every application frame body executing it needs held: an archive's
+    /// execution waits for those bodies, so a header whose body its
+    /// committee withholds would otherwise halt GLOBAL on every archive.
+    /// `None` proposes every verified proof.
+    pub fn with_body_availability(mut self, available: Option<ShardBodyAvailability>) -> Self {
+        self.body_availability = available;
+        self
     }
 
     /// Compute the `prover_tree_commitment` for the frame being proved:
@@ -1062,7 +1143,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // Each shard's tip must be verified: held verified by the
                 // collector (an archive verifies on admission) or checked here,
                 // with refusals remembered under this validation context.
-                let tips = {
+                let mut tips = {
                     let (collector, rejected) = (&self.message_collector, &self.rejected);
                     let (context, global_addr) = (&context, &global_addr);
                     select_shard_tips(
@@ -1094,6 +1175,26 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         },
                     )
                 };
+                // A verified tip rides only while this node holds every
+                // application frame body executing it needs. Archives wait
+                // for those bodies before they execute the GLOBAL frame, so
+                // one a committee certified but never released would halt
+                // GLOBAL on all of them. The rest stay in the mempool, for a
+                // later frame within their anchor window.
+                if let Some(available) = self.body_availability.as_ref() {
+                    let kept = std::mem::take(&mut tips.kept);
+                    let (ready, missing) = hold_back_unavailable_shard_proofs(kept, &**available);
+                    tips.kept = ready;
+                    if let Some(first) = missing.first() {
+                        tracing::info!(
+                            frame = frame_number,
+                            held_back = missing.len(),
+                            first_shard = %hex::encode(&first.address),
+                            first_frame = first.frame_number,
+                            "shard headers held back from this GLOBAL proposal: this archive lacks application frame bodies their execution needs; each rides a later frame once its bodies arrive"
+                        );
+                    }
+                }
                 let coalesced = tips.superseded.len();
                 valid.extend(tips.kept);
                 for s in &tips.superseded {
@@ -2114,6 +2215,89 @@ mod tests {
         assert_eq!(kept.len(), 64);
         assert!(kept.iter().all(|m| frame_of(m) == 3));
         assert_eq!(superseded.len(), 128);
+    }
+
+    /// A verified tip rides only while the bodies its headers need are held:
+    /// a tip whose body was withheld stays back, a bundle stays back whole
+    /// when any of its headers does, and a header with an empty requests
+    /// root says so.
+    #[test]
+    fn shard_tips_whose_bodies_are_not_held_stay_back() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let bundle = |headers: Vec<FrameHeader>| {
+            CanonicalMessageBundle {
+                requests: headers
+                    .into_iter()
+                    .map(|header| {
+                        Some(CanonicalMessageRequest {
+                            inner_type_prefix: TYPE_FRAME_HEADER,
+                            inner_bytes: header.to_canonical_bytes().unwrap(),
+                        })
+                    })
+                    .collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let header = |addr: u8, frame_number: u64| FrameHeader {
+            address: vec![addr; 32],
+            frame_number,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        let need = |addr: u8, frame_number: u64| ShardBodyNeed {
+            address: vec![addr; 32],
+            frame_number,
+            empty: false,
+        };
+        // Shard 0x22's frame 9 body was never released.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<bool> {
+            needs
+                .iter()
+                .map(|n| n.address != vec![0x22u8; 32] || n.frame_number < 9)
+                .collect()
+        };
+        let held = make_shard_frame(0x11, 7);
+        let withheld = make_shard_frame(0x22, 9);
+        let both = bundle(vec![header(0x33, 4), header(0x22, 9)]);
+        let junk = b"not a bundle".to_vec();
+        let (kept, superseded) = coalesce_verified(vec![
+            held.clone(),
+            make_shard_frame(0x22, 8),
+            withheld.clone(),
+            both,
+            junk.clone(),
+        ]);
+        assert_eq!(superseded.len(), 1);
+        let (mut ready, missing) = hold_back_unavailable_shard_proofs(kept, &available);
+        ready.sort();
+        let mut want = vec![held, junk];
+        want.sort();
+        assert_eq!(
+            ready, want,
+            "the withheld tip and the bundle carrying it stay back"
+        );
+        assert_eq!(missing, vec![need(0x22, 9), need(0x22, 9)]);
+
+        let mut empty = header(0x11, 3);
+        empty.requests_root = vec![0; 32];
+        assert_eq!(
+            shard_body_needs(&bundle(vec![empty, header(0x11, 4)])),
+            vec![
+                ShardBodyNeed {
+                    empty: true,
+                    ..need(0x11, 3)
+                },
+                need(0x11, 4)
+            ]
+        );
+        // Nothing held: every proof with a shard header stays back.
+        let none_held = |needs: &[ShardBodyNeed]| vec![false; needs.len()];
+        let (ready, missing) = hold_back_unavailable_shard_proofs(vec![withheld], &none_held);
+        assert!(ready.is_empty());
+        assert_eq!(missing, vec![need(0x22, 9)]);
     }
 
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {

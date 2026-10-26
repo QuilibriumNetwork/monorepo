@@ -1496,6 +1496,54 @@ impl ArchiveAppShardIngest {
         Ok(self.request_frames(address, last + 1..=upto, false, false, GAP_RETRY_INTERVAL))
     }
 
+    /// Whether this archive holds every frame of `address` that
+    /// materializing it through `through` needs: each frame above its cursor
+    /// buffered, or held as the frame GLOBAL committed at that height (a
+    /// sealed session's last frame); `through` itself may instead be provably
+    /// empty (`empty`: its certified header's `requests_root` is all zero),
+    /// which [`Self::empty_frame_from_header`] rebuilds from that header. The
+    /// first frame it lacks is asked for, with those above it to the
+    /// prefetch depth, for a shard it already holds frames of: a header
+    /// naming any other address may be forged (a bundle carrying several
+    /// shards' headers rides without verification).
+    ///
+    /// A GLOBAL prover proposes a shard's certified header only while this
+    /// holds. Execution on every archive waits for the body of each frame a
+    /// GLOBAL frame sequences, so a header whose body its committee never
+    /// released halted GLOBAL for everyone. Held back, it rides a later
+    /// GLOBAL frame within its anchor window once the body arrives.
+    pub fn holds_bodies_through(
+        &mut self,
+        address: &[u8],
+        through: u64,
+        empty: bool,
+    ) -> quil_types::error::Result<bool> {
+        let last = self.materialized_height(address)?;
+        if through <= last {
+            return Ok(true);
+        }
+        for number in last + 1..=through {
+            let buffered = self
+                .buffered
+                .get(address)
+                .is_some_and(|frames| frames.contains_key(&number));
+            if buffered
+                || (empty && number == through)
+                || self.committed_held(address, number).is_some()
+            {
+                continue;
+            }
+            let known = last > 0 || self.buffered.contains_key(address);
+            if known || self.held.contains_key(address) {
+                let reach = last.saturating_add(PREFETCH_DEPTH);
+                let upto = through.min(reach).max(number);
+                self.request_frames(address, number..=upto, false, false, GAP_RETRY_INTERVAL);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Ask for each frame of `frames` neither buffered nor held, unless it was
     /// asked for within `interval` (at this priority or above). `urgent` asks
     /// on `gap_requests`, otherwise on `prefetch_requests`. A full queue
@@ -1969,7 +2017,7 @@ pub fn admit_fetched(
 
 /// The `requests_root` of a frame with no requests: zero bytes, 32 on the
 /// forest path and 64 on the legacy one ([`compute_requests_root`]).
-fn requests_root_is_empty(root: &[u8]) -> bool {
+pub(crate) fn requests_root_is_empty(root: &[u8]) -> bool {
     matches!(root.len(), 32 | 64) && root.iter().all(|&byte| byte == 0)
 }
 
@@ -2677,6 +2725,87 @@ mod tests {
             "behind the cursor is already there"
         );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+    }
+
+    /// A GLOBAL prover proposes a shard's certified header only while it
+    /// holds every body executing it needs. A frame whose body never arrives,
+    /// at the header or below it, holds the header back and is asked for; a
+    /// provably empty header stands in for its own body only. Once the body
+    /// arrives the header rides and is sequenced as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_header_is_proposed_only_while_its_bodies_are_held() {
+        let (ingest, _) = fixture();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = ingest.with_prefetch(prefetch_tx).sequenced();
+        let buffer = |ingest: &mut ArchiveAppShardIngest, number: u64| {
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
+        };
+        assert!(!ingest.holds_bodies_through(&filter, 2, false).unwrap());
+        assert!(
+            prefetch_rx.try_recv().is_err(),
+            "a shard this archive holds nothing of is not asked for"
+        );
+        buffer(&mut ingest, 1);
+        buffer(&mut ingest, 3);
+        assert!(ingest.holds_bodies_through(&filter, 1, false).unwrap());
+        assert!(
+            !ingest.holds_bodies_through(&filter, 3, false).unwrap(),
+            "frame 2's body was never released"
+        );
+        assert_eq!(
+            prefetch_rx.try_recv().unwrap(),
+            (filter.clone(), 2),
+            "and is asked for"
+        );
+        assert!(
+            !ingest.holds_bodies_through(&filter, 3, true).unwrap(),
+            "an empty header stands in for its own body, not for one below it"
+        );
+        assert!(!ingest.holds_bodies_through(&filter, 4, false).unwrap());
+
+        buffer(&mut ingest, 2);
+        assert!(ingest.holds_bodies_through(&filter, 3, false).unwrap());
+        assert!(!ingest.holds_bodies_through(&filter, 4, false).unwrap());
+        assert!(
+            ingest.holds_bodies_through(&filter, 4, true).unwrap(),
+            "a provably empty frame is rebuilt from its header"
+        );
+        assert!(ingest.materialize_through(&filter, 3).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
+        assert!(
+            ingest.holds_bodies_through(&filter, 2, false).unwrap(),
+            "behind the cursor is already there"
+        );
+    }
+
+    /// Archives that hold different bodies execute the same GLOBAL frame
+    /// alike: what each materializes follows the headers the frame carries,
+    /// not what it happens to hold beyond them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn archives_holding_different_bodies_sequence_a_global_frame_alike() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let (one, _) = fixture();
+        let (two, _) = fixture();
+        let mut archives = [one.sequenced(), two.sequenced()];
+        for (held, archive) in [3, 2].into_iter().zip(archives.iter_mut()) {
+            for number in 1..=held {
+                archive
+                    .buffered
+                    .entry(filter.clone())
+                    .or_default()
+                    .insert(number, verified_frame(&filter, number));
+            }
+        }
+        // The leader held frame 3's header back: the GLOBAL frame carries 2.
+        for archive in archives.iter_mut() {
+            assert!(archive.materialize_through(&filter, 2).unwrap());
+            assert_eq!(archive.materialized_height(&filter).unwrap(), 2);
+        }
     }
 
     /// A GLOBAL frame waiting on a shard asks for every missing frame it needs

@@ -1735,6 +1735,62 @@ fn sequenced_ingest_hook(
     })
 }
 
+/// Which shard headers a GLOBAL proposal may carry: those whose application
+/// frame bodies this archive's ingest holds
+/// (`ArchiveAppShardIngest::holds_bodies_through`), the bodies sequenced
+/// ingest waits for before the GLOBAL frame executes. Sequenced execution
+/// holds the ingest while it materializes; a proposal waits for it at most
+/// `LOCK_WAIT` and otherwise carries no shard header this time.
+fn shard_body_availability(
+    cell: AppIngestCell,
+) -> quil_engine::leader_provider::ShardBodyAvailability {
+    use quil_engine::leader_provider::ShardBodyNeed;
+    use std::sync::TryLockError;
+    const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+    Arc::new(move |needs: &[ShardBodyNeed]| {
+        if needs.is_empty() {
+            return Vec::new();
+        }
+        let Some(ingest) = cell.get() else {
+            return vec![false; needs.len()]; // not built yet: nothing executes
+        };
+        let started = std::time::Instant::now();
+        let mut ingest = loop {
+            match ingest.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                    std::thread::sleep(LOCK_RETRY)
+                }
+                Err(TryLockError::WouldBlock) => {
+                    warn!(
+                        shard_headers = needs.len(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "GLOBAL proposal carries no shard headers: the application frame ingest stayed busy"
+                    );
+                    return vec![false; needs.len()];
+                }
+            }
+        };
+        needs
+            .iter()
+            .map(|need| {
+                ingest
+                    .holds_bodies_through(&need.address, need.frame_number, need.empty)
+                    .unwrap_or_else(|error| {
+                        debug!(
+                            %error,
+                            address = %hex::encode(&need.address),
+                            "shard body check unavailable; its header is held back"
+                        );
+                        false
+                    })
+            })
+            .collect()
+    })
+}
+
 /// Per shard, the highest frame the stored GLOBAL frames after `frame`, at most
 /// `count` of them, carry a header for: certified ones, or a candidate where
 /// none is. A hint for prefetching only, not verified: the state their
@@ -1821,13 +1877,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     // before executing it, on every execution path below.
     let sequenced_ingest = archive_mode.then(|| {
         sequenced_ingest_hook(
-            app_ingest,
+            app_ingest.clone(),
             crdt.clone(),
             frame_prover.clone(),
             prover_registry.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
         )
     });
+    // A GLOBAL prover proposes a shard's header only once it holds the bodies
+    // that sequenced ingest waits for.
+    let body_availability = archive_mode.then(|| shard_body_availability(app_ingest.clone()));
 
     // The archive-sync transport identity is the FALCON network key (all
     // outbound :8340 dials below use it). `mtls_seed` (Ed448) presence still
@@ -2478,6 +2537,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let sync_consensus_finalized = consensus_finalized.clone();
             let sync_finalization = global_finalization.clone();
             let sync_ingest = sequenced_ingest.clone();
+            let sync_bodies = body_availability.clone();
             let sync_archive_mode = archive_mode;
             // Committee endpoints for the direct global-consensus publisher.
             let sync_archive_pool = archive_pool.clone();
@@ -3882,7 +3942,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     // CRDT for the prover_tree_commitment the leader
                                                     // binds into each frame header + VDF challenge.
                                                     Some(sync_crdt.clone()),
-                                                );
+                                                )
+                                                .with_body_availability(sync_bodies.clone());
                                             let leader_provider = Arc::new(leader_provider);
 
                                             let selected_parent_execution = sync_mat.as_ref().map(|materializer| {
