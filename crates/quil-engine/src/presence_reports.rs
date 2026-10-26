@@ -484,6 +484,10 @@ pub enum Wait {
     /// This node lacks the output of GLOBAL frame `anchor`, a proposal's
     /// anchor.
     Anchor { anchor: u64 },
+    /// GLOBAL already recorded every member the report carries present for
+    /// this epoch, so it would refuse the report
+    /// ([`handoff::presence::marks_new_member`]).
+    Recorded,
 }
 
 impl Wait {
@@ -493,6 +497,7 @@ impl Wait {
             Self::Superseded => "session superseded by a successor",
             Self::Closed => "session closed",
             Self::Anchor { .. } => "anchor GLOBAL frame missing from this node's stores",
+            Self::Recorded => "every member carried is already recorded present this epoch",
         }
     }
 
@@ -502,6 +507,7 @@ impl Wait {
             Self::UnknownSession => "this node's GLOBAL view materializes the session",
             Self::Superseded | Self::Closed => "this node's host retires the session",
             Self::Anchor { .. } => "this worker syncs the anchor GLOBAL frame",
+            Self::Recorded => "a member GLOBAL has not recorded present this epoch votes, or the epoch ends",
         }
     }
 }
@@ -744,7 +750,7 @@ impl PresenceReporter {
             self.schedule.idle(inclusion);
             return None;
         }
-        let outputs = match waits(look.view, &id, session, &built.report, &anchor_output) {
+        let outputs = match waits(look.view, inclusion, &id, session, &built.report, &anchor_output) {
             Ok(outputs) => outputs,
             Err(wait) => {
                 return attempt(Outcome::Wait(wait), self.schedule.note(wait.cause()));
@@ -788,12 +794,14 @@ impl PresenceReporter {
     }
 }
 
-/// The expected waits of GLOBAL's check of `report` ([`handoff::presence::verify`]):
-/// the session as head of its filter and not closed in `view`, and every
-/// anchor's output at hand, which it returns. What remains for the check to
-/// refuse is a defect of the report.
+/// The expected waits of GLOBAL's check of `report` for inclusion in GLOBAL
+/// frame `inclusion` ([`handoff::presence::verify`]): the session as head of
+/// its filter and not closed in `view`, a member the epoch's presence record
+/// lacks, and every anchor's output at hand, which it returns. What remains
+/// for the check to refuse is a defect of the report.
 fn waits(
     view: &impl Records,
+    inclusion: u64,
     id: &[u8; 32],
     session: &Session,
     report: &PresenceReport,
@@ -805,6 +813,9 @@ fn waits(
     }
     if matches!(handoff::status(view, id), Ok(handoff::Status::Closed(_))) {
         return Err(Wait::Closed);
+    }
+    if !handoff::presence::marks_new_member(view, inclusion, &committed, report).unwrap_or(true) {
+        return Err(Wait::Recorded);
     }
     let mut outputs = BTreeMap::new();
     for proposal in &report.proposals {

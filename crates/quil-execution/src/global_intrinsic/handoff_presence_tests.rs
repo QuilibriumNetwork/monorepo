@@ -1,4 +1,5 @@
-//! Presence report validation ([`crate::global_intrinsic::handoff::presence`]).
+//! Presence report validation and recording
+//! ([`crate::global_intrinsic::handoff::presence`]).
 
 use super::*;
 use crate::global_intrinsic::frame_header::FrameHeader;
@@ -65,10 +66,15 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(keys())
+}
+
+/// [`fixture`] for the members `keys`: two fixtures of the same keys hold
+/// the same session.
+fn fixture_with(keys: Vec<FalconPrivateKey>) -> Fixture {
     set_presence_report_frame_for_thread(Some(0));
     let db = quil_store::RocksDb::open_in_memory().unwrap();
     let (_, state) = make_state(&db);
-    let keys = keys();
     let session = initial(vec![0x61; 32], &keys);
     initialize(&state, 1, &session).unwrap();
     commit(&state, 1);
@@ -215,6 +221,18 @@ fn presence_anchor_outside_the_inclusion_epoch_is_refused_before_lookup() {
     // An in-epoch anchor this node does not hold is unavailable, not refused.
     let missing = f.report(vec![f.proposal(5, f.anchor + 1, &[0, 1])]);
     assert!(matches!(f.verify(&missing), Err(QuilError::ExecutionUnavailable(_))));
+}
+
+/// Signatures are checked before proposal outputs: a forged vote is refused
+/// without the output check, and so without reading its anchor, which a
+/// node lacking that anchor could not complete.
+#[test]
+fn forged_presence_vote_is_refused_before_its_anchor_is_read() {
+    let f = fixture();
+    let mut missing = f.report(vec![f.proposal(5, f.anchor + 1, &[0, 1])]);
+    assert!(matches!(f.verify(&missing), Err(QuilError::ExecutionUnavailable(_))));
+    missing.proposals[0].votes[0].signature[20] ^= 1;
+    refused_for(f.verify(&missing), "notarize of the proposal");
 }
 
 #[test]
@@ -426,5 +444,361 @@ fn engine_validates_a_lone_presence_report_and_refuses_it_beside_other_requests(
             engine.validate_message(f.frame, &GLOBAL_INTRINSIC_ADDRESS, &lone),
             Err(QuilError::InvalidArgument(_))
         ));
+    }
+}
+
+/// The notarize of `signer` (an index into the fixture's keys) replaced by
+/// its nullify of the same round, which a member can sign ahead for every
+/// view.
+fn nullify_signature(f: &Fixture, proposal: &PresenceProposal, signer: usize) -> Vec<u8> {
+    let participants: Set<_> = f.keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+    let scheme: Generic<Namespace> =
+        Generic::signer(&f.session.namespace().unwrap(), participants, f.keys[signer].clone()).unwrap();
+    let round = Round::new(Epoch::new(proposal.epoch), View::new(proposal.view));
+    let vote = scheme.sign::<SimplexFalconScheme, Digest>(Subject::Nullify { round }).unwrap();
+    vote.signature.get().unwrap().to_vec()
+}
+
+/// An allocation of `member` on `filter` with `last_active` recorded.
+fn seed_allocation(state: &HypergraphState, member: &[u8], filter: &[u8], last_active: Option<u64>) {
+    use crate::global_schema::write_field;
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    write_field(&mut tree, "allocation:ProverAllocation", "Status", &[1]).unwrap();
+    if let Some(frame) = last_active {
+        write_field(&mut tree, "allocation:ProverAllocation", "LastActiveFrameNumber", &frame.to_be_bytes()).unwrap();
+    }
+    let address = crate::global_intrinsic::materialize::allocation_address(member, filter).unwrap();
+    state
+        .set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &vertex_adds_discriminator().unwrap(), 1,
+            crate::prover_registry::vertex_tree_to_blob(&tree))
+        .unwrap();
+}
+
+/// The allocation blob of `member` on `filter`, if any.
+fn allocation_blob(state: &HypergraphState, member: &[u8], filter: &[u8]) -> Option<Vec<u8>> {
+    let address = crate::global_intrinsic::materialize::allocation_address(member, filter).unwrap();
+    state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &vertex_adds_discriminator().unwrap()).unwrap()
+}
+
+/// `LastActiveFrameNumber` of `member`'s allocation on `filter`.
+fn last_active(state: &HypergraphState, member: &[u8], filter: &[u8]) -> Option<u64> {
+    let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&allocation_blob(state, member, filter)?);
+    crate::global_schema::read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber")
+        .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+}
+
+/// The member indexes a report carries votes of.
+fn voters(report: &PresenceReport) -> BTreeSet<usize> {
+    report.proposals.iter().flat_map(|proposal| &proposal.votes).map(|vote| vote.signer as usize).collect()
+}
+
+fn marked(present: &[bool]) -> BTreeSet<usize> {
+    present.iter().enumerate().filter(|(_, &member)| member).map(|(index, _)| index).collect()
+}
+
+impl Fixture {
+    fn apply(&self, report: &PresenceReport) -> Result<presence::Applied> {
+        presence::apply(&self.state, self.frame, report, |frame| self.intrinsic_anchor(frame))
+    }
+
+    fn intrinsic_anchor(&self, frame: u64) -> Result<Vec<u8>> {
+        self.clock
+            .get_global_clock_frame_header(frame)
+            .map(|header| header.output)
+            .map_err(|_| QuilError::ExecutionUnavailable(format!("anchor {frame} not held")))
+    }
+
+    fn epoch(&self) -> u64 {
+        quil_types::consensus::epoch_for_frame(self.frame)
+    }
+
+    fn present(&self) -> Option<Vec<bool>> {
+        presence::present(&self.state, &self.session, self.epoch()).unwrap()
+    }
+
+    /// An allocation for every member, last active at `last_active`, committed.
+    fn seed_members(&self, last_active: u64) {
+        for member in &self.session.members {
+            seed_allocation(&self.state, member, &self.session.filter, Some(last_active));
+        }
+        commit(&self.state, 2);
+    }
+}
+
+/// Credit for presence is GLOBAL consensus and not scheduled on mainnet; a
+/// process that never fixed its network reads no setting.
+#[test]
+fn presence_credit_is_not_scheduled_by_default() {
+    assert_eq!(MAINNET_PRESENCE_CREDIT_FRAME, None);
+    assert_eq!(presence_credit_frame_for(0, None), u64::MAX);
+    assert_eq!(presence_credit_frame_for(0, Some("7")), u64::MAX);
+    assert_eq!(presence_credit_frame_for(1, Some("7")), 7);
+    assert_eq!(presence_credit_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(presence_credit_frame_for(1, None), u64::MAX);
+    set_presence_credit_frame_for_thread(None);
+    assert_eq!(presence_credit_frame(), u64::MAX, "without init, the mainnet value");
+}
+
+/// Before the credit frame an accepted report writes nothing, as an older
+/// build that accepts it; from it the report's voters are recorded present
+/// for the inclusion epoch, and only for it.
+#[test]
+fn an_accepted_report_is_recorded_only_from_the_credit_frame() {
+    let f = fixture();
+    let report = f.report(vec![f.proposal(5, f.anchor, &[0, 1])]);
+    let bytes = report.to_canonical_bytes().unwrap();
+    set_presence_credit_frame_for_thread(Some(f.frame + 1));
+    f.intrinsic().invoke_step(f.frame, &bytes, &f.state).unwrap();
+    assert_eq!(f.state.changeset_len(), 0, "before the credit frame nothing is written");
+    assert_eq!(f.present(), None);
+    set_presence_credit_frame_for_thread(Some(f.frame));
+    f.intrinsic().invoke_step(f.frame, &bytes, &f.state).unwrap();
+    assert_eq!(marked(&f.present().unwrap()), voters(&report));
+    assert_eq!(presence::present(&f.state, &f.session, f.epoch() + 1).unwrap(), None, "kept per epoch");
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// The record is the union of the epoch's reports, and each voter's credit
+/// the latest anchor it voted at, whatever order the reports arrive in.
+#[test]
+fn the_presence_record_is_the_union_of_reports_in_any_order() {
+    set_presence_credit_frame_for_thread(Some(0));
+    let keys = keys();
+    let one = fixture_with(keys.clone());
+    let other = fixture_with(keys);
+    assert_eq!(one.session, other.session);
+    for f in [&one, &other] {
+        put_anchor(&f.clock, f.anchor + 1);
+        f.seed_members(1);
+    }
+    // Two votes each, enough for credit in a committee of four.
+    let first = one.report(vec![one.proposal(5, one.anchor, &[0, 1])]);
+    let second = one.report(vec![one.proposal(6, one.anchor + 1, &[2, 3])]);
+    one.apply(&first).unwrap();
+    let applied = one.apply(&second).unwrap();
+    assert_eq!(applied.marked, voters(&second).difference(&voters(&first)).count());
+    other.apply(&second).unwrap();
+    other.apply(&first).unwrap();
+    let union: BTreeSet<usize> = voters(&first).union(&voters(&second)).copied().collect();
+    assert_eq!(marked(&one.present().unwrap()), union);
+    assert_eq!(one.present(), other.present());
+    for (index, member) in one.session.members.iter().enumerate() {
+        let filter = &one.session.filter;
+        assert_eq!(allocation_blob(&one.state, member, filter), allocation_blob(&other.state, member, filter));
+        let expected = if voters(&second).contains(&index) {
+            one.anchor + 1
+        } else if voters(&first).contains(&index) {
+            one.anchor
+        } else {
+            1
+        };
+        assert_eq!(last_active(&one.state, member, filter), Some(expected), "member {index}");
+    }
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// A voter's activity is raised to its vote's anchor, not to the inclusion
+/// frame, and never lowered; a voter without an allocation on the filter is
+/// marked present but not credited.
+#[test]
+fn presence_credit_raises_activity_to_the_vote_anchor_and_never_lowers_it() {
+    set_presence_credit_frame_for_thread(Some(0));
+    let f = fixture();
+    let report = f.report(vec![f.proposal(5, f.anchor, &[0, 1, 2])]);
+    let votes: Vec<usize> = voters(&report).into_iter().collect();
+    let member = |index: usize| f.session.members[index].clone();
+    let filter = f.session.filter.clone();
+    seed_allocation(&f.state, &member(votes[0]), &filter, Some(3));
+    seed_allocation(&f.state, &member(votes[1]), &filter, Some(f.frame + 100));
+    commit(&f.state, 2);
+    let applied = f.apply(&report).unwrap();
+    assert_eq!(applied, presence::Applied { marked: 3, credited: 1, present: 3, members: f.session.members.len() });
+    assert_eq!(last_active(&f.state, &member(votes[0]), &filter), Some(f.anchor), "the anchor, not the inclusion frame");
+    assert_eq!(last_active(&f.state, &member(votes[1]), &filter), Some(f.frame + 100), "never lowered");
+    assert_eq!(allocation_blob(&f.state, &member(votes[2]), &filter), None, "no allocation is created");
+    assert_eq!(marked(&f.present().unwrap()), voters(&report));
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// Forged, stale, foreign-session and nullify evidence is refused and
+/// changes nothing; a report that marks no new member is refused, so the
+/// epoch's reports of a session are bounded by its members.
+#[test]
+fn presence_credit_refuses_forged_stale_foreign_duplicate_and_nullify_evidence() {
+    set_presence_credit_frame_for_thread(Some(0));
+    let f = fixture();
+    f.seed_members(1);
+    // Every state change so far is committed: a refused report stages none.
+    let unchanged = |result: Result<presence::Applied>, reason: &str| {
+        match result {
+            Err(QuilError::InvalidArgument(message)) => assert!(message.contains(reason), "{message}"),
+            other => panic!("expected refusal for {reason}, got {other:?}"),
+        }
+        assert_eq!(f.state.changeset_len(), 0, "{reason}: nothing staged");
+        assert_eq!(f.present(), None, "{reason}: nothing recorded");
+        for member in &f.session.members {
+            assert_eq!(last_active(&f.state, member, &f.session.filter), Some(1), "{reason}: nothing credited");
+        }
+    };
+    let valid = f.report(vec![f.proposal(5, f.anchor, &[0, 1])]);
+    // Forged: a flipped signature bit.
+    let mut forged = valid.clone();
+    forged.proposals[0].votes[0].signature[20] ^= 1;
+    unchanged(f.apply(&forged), "notarize");
+    // Stale: anchored in the previous epoch.
+    let stale = 3 * quil_types::consensus::epoch_length_frames() - 1;
+    put_anchor(&f.clock, stale);
+    unchanged(f.apply(&f.report(vec![f.proposal(5, stale, &[0, 1])])), "inclusion epoch");
+    // Foreign session: valid votes of this session named for another.
+    let other = initial(vec![0x62; 32], &keys());
+    initialize(&f.state, 3, &other).unwrap();
+    commit(&f.state, 3);
+    let mut foreign = valid.clone();
+    foreign.session = other.id().unwrap();
+    foreign.filter = other.filter.clone();
+    unchanged(f.apply(&foreign), "another filter");
+    assert_eq!(presence::present(&f.state, &other, f.epoch()).unwrap(), None);
+    // A pre-signed nullify presented as a notarize.
+    let mut nullified = f.report(vec![f.proposal(5, f.anchor, &[0])]);
+    nullified.proposals[0].votes[0].signature = nullify_signature(&f, &nullified.proposals[0], 0);
+    unchanged(f.apply(&nullified), "notarize");
+    // Duplicate: the same voters again mark nothing new.
+    let applied = f.apply(&valid).unwrap();
+    assert_eq!(applied.marked, 2);
+    let recorded = f.present();
+    let before = f.state.changeset_len();
+    match f.apply(&valid) {
+        Err(QuilError::InvalidArgument(message)) => assert!(message.contains("marks no member"), "{message}"),
+        other => panic!("a duplicate report was not refused: {other:?}"),
+    }
+    let mut again = f.report(vec![f.proposal(7, f.anchor, &[0, 1])]);
+    assert!(voters(&again) == voters(&valid));
+    assert!(f.apply(&again).is_err(), "other proposals of the same voters mark nothing new");
+    assert_eq!((f.state.changeset_len(), f.present()), (before, recorded));
+    // One new voter beside recorded ones is accepted, and marks only it.
+    again = f.report(vec![f.proposal(7, f.anchor, &[0, 1, 2])]);
+    assert_eq!(f.apply(&again).unwrap().marked, 1);
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// A filter's mark record holds its current and previous epoch in two
+/// slots: a slot holding another epoch reads as no record, a corrupt one is a
+/// store error, and a later epoch's write replaces the slot it reuses.
+#[test]
+fn presence_records_cycle_through_two_epoch_slots() {
+    set_presence_credit_frame_for_thread(Some(0));
+    let f = fixture();
+    let epoch = f.epoch();
+    let key = |epoch: u64| {
+        let mut key = (f.session.filter.len() as u32).to_be_bytes().to_vec();
+        key.extend_from_slice(&f.session.filter);
+        key.push((epoch % 2) as u8);
+        key
+    };
+    let record = |version: u8, epoch: u64, bitmap: &[u8]| {
+        let mut value = vec![version];
+        value.extend_from_slice(&epoch.to_be_bytes());
+        value.extend_from_slice(&1u32.to_be_bytes());
+        value.extend_from_slice(&f.session.id().unwrap());
+        value.extend_from_slice(&(bitmap.len() as u32).to_be_bytes());
+        value.extend_from_slice(bitmap);
+        value
+    };
+    // Four members fit one byte: a bit past the last member, a second byte,
+    // another version or a truncated record is not one this build writes.
+    for value in [record(1, epoch, &[0b0001_0011]), record(1, epoch, &[0, 0]), record(2, epoch, &[0]), vec![1]] {
+        write(&f.state, f.frame, b"presence", &key(epoch), &value).unwrap();
+        assert!(matches!(presence::present(&f.state, &f.session, epoch), Err(QuilError::Store(_))), "{value:?}");
+    }
+    write(&f.state, f.frame, b"presence", &key(epoch), &record(1, epoch, &[0b0000_1001])).unwrap();
+    assert_eq!(f.present(), Some(vec![true, false, false, true]));
+    assert_eq!(presence::present(&f.state, &f.session, epoch + 2).unwrap(), None, "the slot holds another epoch");
+    // A report two epochs on reuses the slot and replaces it.
+    let later = f.frame + 2 * quil_types::consensus::epoch_length_frames();
+    let anchor = later - 3;
+    put_anchor(&f.clock, anchor);
+    let report = f.report(vec![f.proposal(5, anchor, &[0])]);
+    presence::apply(&f.state, later, &report, |frame| f.intrinsic_anchor(frame)).unwrap();
+    assert_eq!(f.present(), None, "the older epoch is gone");
+    assert_eq!(marked(&presence::present(&f.state, &f.session, epoch + 2).unwrap().unwrap()), voters(&report));
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// Only a proposal that more members notarized than the committee's
+/// tolerated faults earns its voters credit: one of them is honest, and an
+/// honest member notarizes only its leader's real proposal. A member
+/// notarizing a header it made up, at a view it picked, proves its key
+/// alive and is marked present, but earns nothing.
+#[test]
+fn presence_credit_needs_more_notarizes_than_the_committee_tolerates_faults() {
+    assert_eq!([1, 4, 7, 23, 26].map(presence::credited_votes), [1, 2, 3, 8, 9]);
+    set_presence_credit_frame_for_thread(Some(0));
+    let f = fixture();
+    f.seed_members(1);
+    let alone = f.report(vec![f.proposal(5, f.anchor, &[0]), f.proposal(9, f.anchor, &[1])]);
+    let applied = f.apply(&alone).unwrap();
+    assert_eq!((applied.marked, applied.credited), (2, 0), "one vote each: marked, not credited");
+    for member in &f.session.members {
+        assert_eq!(last_active(&f.state, member, &f.session.filter), Some(1));
+    }
+    let pair = f.report(vec![f.proposal(6, f.anchor, &[0, 2])]);
+    let applied = f.apply(&pair).unwrap();
+    assert_eq!((applied.marked, applied.credited), (1, 2), "two of four: one is honest");
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// A report whose new marks are forged is refused after one signature
+/// check, whatever else it carries: new marks are verified first.
+#[test]
+fn a_report_with_forged_new_marks_is_refused_at_its_first_signature() {
+    set_presence_credit_frame_for_thread(Some(0));
+    let f = fixture();
+    f.apply(&f.report(vec![f.proposal(5, f.anchor, &[0, 1, 2])])).unwrap();
+    let recorded = marked(&f.present().unwrap());
+    // Recorded members' votes on an earlier view, the one new member's,
+    // forged, on a later one.
+    let mut report = f.report(vec![f.proposal(6, f.anchor, &[0, 1, 2]), f.proposal(7, f.anchor, &[3])]);
+    assert!(!recorded.contains(&(report.proposals[1].votes[0].signer as usize)));
+    report.proposals[1].votes[0].signature[20] ^= 1;
+    let checks = std::cell::Cell::new(0);
+    let result = presence::verify(&f.state, f.frame, &report, |frame| {
+        checks.set(checks.get() + 1);
+        f.intrinsic_anchor(frame)
+    });
+    assert!(matches!(result, Err(QuilError::InvalidArgument(_))), "{result:?}");
+    // The forged vote is the first checked, and its signature before
+    // any proposal's output lookup.
+    assert_eq!(checks.get(), 0);
+    set_presence_credit_frame_for_thread(None);
+}
+
+/// One slot holds at most sixteen sessions of a filter in an epoch; a
+/// seventeenth is refused, and a recorded session can still be updated.
+#[test]
+fn a_presence_slot_holds_at_most_sixteen_sessions() {
+    let f = fixture();
+    let epoch = f.epoch();
+    let session = |generation: u64| Session { generation, ..f.session.clone() };
+    for generation in 1..=16 {
+        presence::set_marks(&f.state, f.frame, b"presence", &session(generation), epoch, &[true, false, false, false])
+            .unwrap();
+    }
+    let overflow = presence::set_marks(&f.state, f.frame, b"presence", &session(17), epoch, &[true, false, false, false]);
+    assert!(matches!(overflow, Err(QuilError::InvalidArgument(_))), "{overflow:?}");
+    presence::set_marks(&f.state, f.frame, b"presence", &session(16), epoch, &[true, true, false, false]).unwrap();
+    assert_eq!(presence::present(&f.state, &session(16), epoch).unwrap(), Some(vec![true, true, false, false]));
+    assert_eq!(presence::present(&f.state, &session(1), epoch).unwrap(), Some(vec![true, false, false, false]));
+    assert_eq!(presence::present(&f.state, &session(17), epoch).unwrap(), None);
+}
+
+/// The credit threshold is one more than the faults commonware's own N3f1
+/// rule tolerates, the rule the session's Simplex quorum follows.
+#[test]
+fn credited_votes_is_one_more_than_the_tolerated_faults_of_n3f1() {
+    use quil_cw_consensus::_utils::Faults as _;
+    for members in 1..=64u32 {
+        let faults = N3f1::max_faults(members);
+        assert_eq!(members - N3f1::quorum(members), faults);
+        assert_eq!(presence::credited_votes(members as usize), faults as usize + 1, "{members} members");
     }
 }
