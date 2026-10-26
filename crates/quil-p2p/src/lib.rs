@@ -40,9 +40,11 @@ pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
     decode_canonical_peer_info, encode_canonical_peer_info, encode_key_registry,
-    peek_key_registry_timestamp, peek_peer_info_timestamp, CanonicalCapability,
-    CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability, InMemoryPeerInfoManager,
-    PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, BUILD_FINGERPRINT_CAPABILITY_ID,
+    encode_signed_key_registry, key_registry_timestamp_message, peek_key_registry_timestamp,
+    peek_peer_info_timestamp, set_strict_peer_info_validation, strict_peer_info_validation,
+    verify_key_registry_timestamp, verify_peer_info, CanonicalCapability, CanonicalKeyRegistry,
+    CanonicalPeerInfo, CanonicalReachability, InMemoryPeerInfoManager, PeerInfoMessage,
+    ARCHIVE_SERVICE_CAPABILITY_ID, BUILD_FINGERPRINT_CAPABILITY_ID, KEY_REGISTRY_TIMESTAMP_DOMAIN,
     KEY_REGISTRY_TYPE, PEER_INFO_TYPE, RELEASE_SUBPATCH_CAPABILITY_ID,
 };
 pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};

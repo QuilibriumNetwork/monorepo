@@ -37,6 +37,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_VERTEX_VALUE_BINDING_EPOCH override active (localnet only)"
         );
     }
+    let strict_peer_info_epoch = quil_types::consensus::init_strict_peer_info_epoch(network);
+    if network != 0 && strict_peer_info_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = strict_peer_info_epoch,
+            "QUIL_STRICT_PEER_INFO_EPOCH override active (localnet only)"
+        );
+    }
     let succession_epoch = quil_types::consensus::init_seniority_succession_epoch(network);
     if network != 0 && succession_epoch != u64::MAX {
         tracing::warn!(

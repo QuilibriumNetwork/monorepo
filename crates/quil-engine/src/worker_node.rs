@@ -183,8 +183,10 @@ pub struct WorkerOnlyNode {
     /// but the engine's `CwIn` handler needs the raw committee key
     /// (`FalconPublicKey::from_bytes`) and DROPS any message whose `from` doesn't
     /// resolve. Without this a cluster worker would receive CW votes and silently
-    /// drop every one → its simplex engine never reaches quorum.
-    peer_key_by_id: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    /// drop every one → its simplex engine never reaches quorum. Only a key the
+    /// peer ID is derived from is learned ([`learn_peer_key`]); the flag marks
+    /// keys a CW message used since the map was last pruned.
+    peer_key_by_id: std::sync::Mutex<std::collections::HashMap<Vec<u8>, (Vec<u8>, bool)>>,
     /// Worker-local mirror of the master's coverage-halt verdict
     /// (set via the `SetHalted` IPC RPC). The publish pump consults
     /// this to drop in-flight FrameProduced / VoteProduced /
@@ -1546,12 +1548,11 @@ impl WorkerOnlyNode {
         // p2p or the master stream.
         if bitmask == crate::bitmasks::GLOBAL_PEER_INFO {
             if let Ok(info) = quil_p2p::decode_canonical_peer_info(data) {
-                if !info.peer_id.is_empty() && !info.public_key.is_empty() {
-                    self.peer_key_by_id
-                        .lock()
-                        .unwrap()
-                        .insert(info.peer_id, info.public_key);
-                }
+                learn_peer_key(
+                    &mut self.peer_key_by_id.lock().unwrap(),
+                    info.peer_id,
+                    info.public_key,
+                );
             }
         }
         let handle = {
@@ -1607,8 +1608,11 @@ impl WorkerOnlyNode {
                     .peer_key_by_id
                     .lock()
                     .unwrap()
-                    .get(from)
-                    .cloned()
+                    .get_mut(from)
+                    .map(|(key, used)| {
+                        *used = true;
+                        key.clone()
+                    })
                     .unwrap_or_default();
                 h.send(AppEngineMessage::CwIn {
                     channel,
@@ -1627,6 +1631,41 @@ impl WorkerOnlyNode {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
+}
+
+/// Most peer keys a worker keeps. A mainnet node knew about 105 peers
+/// (2026-10-26).
+const MAX_PEER_KEYS: usize = 4096;
+
+/// Learn `peer_id`'s committee key from a PeerInfo when the ID is derived
+/// from the key: a PeerInfo is unauthenticated on the worker's own mesh,
+/// and an ID names one key only, so no record can attribute a peer's
+/// messages to another key. When full, the keys no CW message used since
+/// the last pruning are dropped (a committee member's are used), and the
+/// rest are marked unused; if every key was used, all are dropped. Returns
+/// whether the key is known now.
+fn learn_peer_key(
+    keys: &mut std::collections::HashMap<Vec<u8>, (Vec<u8>, bool)>,
+    peer_id: Vec<u8>,
+    public_key: Vec<u8>,
+) -> bool {
+    if peer_id.is_empty()
+        || public_key.len() != quil_crypto::FALCON_PUBLIC_KEY_LEN
+        || quil_p2p::peer_id_from_falcon_pubkey(&public_key) != peer_id
+    {
+        return false;
+    }
+    if keys.contains_key(&peer_id) {
+        return true;
+    }
+    if keys.len() >= MAX_PEER_KEYS {
+        keys.retain(|_, held| std::mem::take(&mut held.1));
+        if keys.len() >= MAX_PEER_KEYS {
+            keys.clear();
+        }
+    }
+    keys.insert(peer_id, (public_key, false));
+    true
 }
 
 /// Subscription installation must finish before a remote peer (or an
@@ -3487,6 +3526,33 @@ mod respawn_queue_tests {
         ))
     }
 
+    /// A/B reproducer (M3): a PeerInfo naming another peer's ID with the
+    /// sender's own key, unsigned, must not teach the worker that key for
+    /// the ID (cluster workers attribute CW votes by it).
+    #[tokio::test]
+    async fn reproduces_worker_learns_unbound_peer_key() {
+        use quil_types::crypto::Signer as _;
+        let worker = idle_worker();
+        let victim = quil_crypto::FalconSigner::generate();
+        let victim_peer = quil_p2p::peer_id_from_falcon_pubkey(victim.public_key());
+        let attacker = quil_crypto::FalconSigner::generate();
+        let forged = quil_p2p::CanonicalPeerInfo {
+            peer_id: victim_peer.clone(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let wire = quil_p2p::encode_canonical_peer_info(&forged, attacker.public_key(), &[]);
+        worker.route_message(&wire, crate::bitmasks::GLOBAL_PEER_INFO, &[]);
+        assert!(
+            !worker
+                .peer_key_by_id
+                .lock()
+                .unwrap()
+                .contains_key(&victim_peer),
+            "the worker attributes the victim's peer ID to the attacker's key from an unauthenticated PeerInfo"
+        );
+    }
+
     /// The filter `service`'s worker reports running.
     async fn reported_filter(service: &DataIpcServiceImpl) -> Vec<u8> {
         use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
@@ -3771,5 +3837,30 @@ mod prover_tree_sync_log_tests {
                 BLOCKING_PROVER_SYNC_RETRY * 2
             ) > 1
         );
+    }
+
+    /// A key whose hash is not the peer ID is never learned; a full map
+    /// keeps the keys CW messages used.
+    #[test]
+    fn learned_peer_keys_are_bound_to_their_ids_and_bounded() {
+        let key = |i: u32| {
+            let mut key = vec![0u8; quil_crypto::FALCON_PUBLIC_KEY_LEN];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            key
+        };
+        let id = |i: u32| quil_p2p::peer_id_from_falcon_pubkey(&key(i));
+        let mut keys = std::collections::HashMap::new();
+        assert!(!learn_peer_key(&mut keys, id(1), key(2)), "another key");
+        assert!(!learn_peer_key(&mut keys, id(1), vec![1; 32]), "not a key");
+        assert!(!learn_peer_key(&mut keys, Vec::new(), key(1)));
+        assert!(keys.is_empty());
+        assert!(learn_peer_key(&mut keys, id(0), key(0)));
+        keys.get_mut(&id(0)).unwrap().1 = true;
+        for i in 1..=MAX_PEER_KEYS as u32 {
+            assert!(learn_peer_key(&mut keys, id(i), key(i)));
+        }
+        assert!(keys.len() <= MAX_PEER_KEYS);
+        assert!(keys.contains_key(&id(0)), "a used key survives pruning");
+        assert!(keys.contains_key(&id(MAX_PEER_KEYS as u32)));
     }
 }

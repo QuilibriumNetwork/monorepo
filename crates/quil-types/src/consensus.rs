@@ -594,6 +594,66 @@ pub fn set_anchored_issuance_epoch_for_thread(epoch: Option<u64>) {
     ANCHORED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which nodes enforce strict GLOBAL_PEER_INFO validation:
+/// a KeyRegistry must sign its timestamp, and the mesh penalises a peer
+/// that forwards a PeerInfo, KeyRegistry or alert no release accepts.
+/// Before it, such messages are dropped without penalty and KeyRegistry
+/// records with an unsigned timestamp are accepted, because releases before
+/// this rule publish the former and forward the latter. Not
+/// consensus-affecting (frames and operations are unchanged), but it splits
+/// gossip from nodes on older releases: set it only once nearly every node
+/// runs a release that signs the KeyRegistry timestamp.
+/// `QUIL_STRICT_PEER_INFO_EPOCH` elsewhere, never by default.
+pub const MAINNET_STRICT_PEER_INFO_EPOCH: Option<u64> = None;
+
+static STRICT_PEER_INFO_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STRICT_PEER_INFO_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn strict_peer_info_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STRICT_PEER_INFO_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's strict GLOBAL_PEER_INFO epoch from its network, and
+/// return it. Called at startup; the first call decides.
+pub fn init_strict_peer_info_epoch(network: u8) -> u64 {
+    *STRICT_PEER_INFO_EPOCH.get_or_init(|| {
+        strict_peer_info_epoch_for(
+            network,
+            std::env::var("QUIL_STRICT_PEER_INFO_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_strict_peer_info_epoch`]; the mainnet epoch in
+/// a process that never called it. `u64::MAX` when the network has none.
+pub fn strict_peer_info_epoch() -> u64 {
+    if let Some(epoch) = STRICT_PEER_INFO_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STRICT_PEER_INFO_EPOCH.get_or_init(|| strict_peer_info_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` falls in or after the strict
+/// GLOBAL_PEER_INFO epoch.
+pub fn strict_peer_info_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= strict_peer_info_epoch()
+}
+
+/// Set the strict GLOBAL_PEER_INFO epoch for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_strict_peer_info_epoch_for_thread(epoch: Option<u64>) {
+    STRICT_PEER_INFO_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -2626,5 +2686,32 @@ mod vertex_value_binding_epoch_tests {
             super::vertex_value_binding_epoch(),
             super::MAINNET_VERTEX_VALUE_BINDING_EPOCH.unwrap_or(u64::MAX)
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_peer_info_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_strict_peer_info_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::strict_peer_info_epoch_for(0, setting),
+                super::MAINNET_STRICT_PEER_INFO_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::strict_peer_info_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::strict_peer_info_epoch_for(1, None), u64::MAX);
+        assert_eq!(super::MAINNET_STRICT_PEER_INFO_EPOCH, None);
+    }
+
+    #[test]
+    fn strict_peer_info_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_strict_peer_info_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::strict_peer_info_active(u64::MAX - 1));
+        super::set_strict_peer_info_epoch_for_thread(Some(3));
+        let first = 3 * super::epoch_length_frames();
+        assert!(!super::strict_peer_info_active(first - 1));
+        assert!(super::strict_peer_info_active(first));
+        super::set_strict_peer_info_epoch_for_thread(None);
     }
 }

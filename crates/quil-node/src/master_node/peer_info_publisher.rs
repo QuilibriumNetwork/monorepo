@@ -802,13 +802,36 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
                     match kr_key_manager.get_signer(quil_types::crypto::KeyType::Falcon512) {
                         Ok(bls_signer) => {
                             if let Ok(p2i_sig) = bls_signer.sign_with_domain(&pi_ed448_pubkey, b"KEY_REGISTRY") {
-                                let kr = quil_p2p::encode_key_registry(
+                                // The prover key also signs the binding's
+                                // timestamp, so nobody else can re-date it.
+                                let stamp = quil_p2p::key_registry_timestamp_message(
                                     &pi_ed448_pubkey,
                                     &kr_bls_pubkey,
-                                    &i2p_sig,
-                                    &p2i_sig,
                                     now_ms,
                                 );
+                                let kr = match bls_signer.sign_with_domain(
+                                    &stamp,
+                                    quil_p2p::KEY_REGISTRY_TIMESTAMP_DOMAIN,
+                                ) {
+                                    Ok(stamp_sig) => quil_p2p::encode_signed_key_registry(
+                                        &pi_ed448_pubkey,
+                                        &kr_bls_pubkey,
+                                        &i2p_sig,
+                                        &p2i_sig,
+                                        now_ms,
+                                        &stamp_sig,
+                                    ),
+                                    Err(e) => {
+                                        warn!(error = %e, "cannot sign the KeyRegistry timestamp; publishing it unsigned, which nodes refuse once strict PeerInfo validation is active");
+                                        quil_p2p::encode_key_registry(
+                                            &pi_ed448_pubkey,
+                                            &kr_bls_pubkey,
+                                            &i2p_sig,
+                                            &p2i_sig,
+                                            now_ms,
+                                        )
+                                    }
+                                };
                                 if let Err(e) = pi_handle.publish(bitmask.clone(), kr).await {
                                     warn!(error = %e, "failed to publish KeyRegistry");
                                 } else {

@@ -137,8 +137,8 @@ pub(crate) async fn init(
     p2p_handle
         .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
         .await;
-    // Drop stale PeerInfo/KeyRegistry at the MESH (before forward), not just at
-    // the app router. Both ride the GLOBAL_PEER_INFO bitmask; without this the
+    // Drop stale or invalid PeerInfo/KeyRegistry at the MESH (before forward),
+    // not just at the app router. Both ride the GLOBAL_PEER_INFO bitmask; without this the
     // composite broker re-gossips millions of already-stale PeerInfo/KeyRegistry
     // per hour (`*_ts_too_old`), self-amplifying the flood and bloating the
     // gossip dedup caches. The app router still fully validates the fresh ones.
@@ -147,6 +147,10 @@ pub(crate) async fn init(
         .await;
     p2p_handle
         .subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
+        .await;
+    // Forward only alerts the receive loop can verify.
+    p2p_handle
+        .register_global_alert_validator(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
         .await;
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
