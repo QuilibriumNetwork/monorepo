@@ -6,16 +6,16 @@
 //! a consume-once decision needs is derived from the operation and decided by
 //! the global commit.
 use super::{
-    escrow,
+    custom_mint, escrow,
     global_commit::{self, EscrowClaim, EscrowCreate, SpendEntry},
-    custom_mint, roots, settlement_record, spent, spent_check,
+    roots, settlement_record, spent, spent_check,
     state::coin_identity,
 };
 use crate::domains;
 use crate::hypergraph_state::HypergraphState;
 use crate::token_engine::{
-    TYPE_LATTICE_MINT, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SETTLEMENT,
-    TYPE_LATTICE_SHIELD, TYPE_LATTICE_TRANSACTION,
+    TYPE_LATTICE_MINT, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM,
+    TYPE_LATTICE_SETTLEMENT, TYPE_LATTICE_SHIELD, TYPE_LATTICE_TRANSACTION,
 };
 use quil_lattice_ct::confidential::{
     custom_mint::CustomMint,
@@ -56,7 +56,10 @@ pub fn is_relayed(tp: u32) -> bool {
 }
 
 fn output_addresses(context: &[u8; 32], frame: u64, outputs: &[Output]) -> Result<Vec<[u8; 32]>> {
-    outputs.iter().map(|output| coin_identity(context, frame, output).map(|(address, _)| address)).collect()
+    outputs
+        .iter()
+        .map(|output| coin_identity(context, frame, output).map(|(address, _)| address))
+        .collect()
 }
 
 fn base(tp: u32, bytes: &[u8], frame: u64, context: [u8; 32]) -> SpendEntry {
@@ -95,23 +98,61 @@ fn funding(entry: &mut SpendEntry, s: &TransferStatement, outputs: &[Output]) ->
 
 /// The outputs a relayed operation creates, in the order its spend entry lists
 /// their addresses — what an owning shard delivers once they commit.
-pub fn operation_outputs(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &[u8]) -> Result<Vec<Output>> {
+pub fn operation_outputs(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    tp: u32,
+    bytes: &[u8],
+) -> Result<Vec<Output>> {
     let decode = |_| invalid("invalid operation encoding or context");
     Ok(match tp {
-        TYPE_LATTICE_TRANSACTION => Transfer::decode(bytes, network, application).map_err(decode)?.statement.outputs,
+        TYPE_LATTICE_TRANSACTION => {
+            Transfer::decode(bytes, network, application)
+                .map_err(decode)?
+                .statement
+                .outputs
+        }
         TYPE_LATTICE_PENDING => {
             let tx = PendingCreate::decode(bytes, network, application).map_err(decode)?;
-            let (_, change) = tx.statement.split_outputs().map_err(|_| invalid("missing escrow output"))?;
+            let (_, change) = tx
+                .statement
+                .split_outputs()
+                .map_err(|_| invalid("missing escrow output"))?;
             change.to_vec()
         }
-        TYPE_LATTICE_PENDING_CLAIM => PendingClaim::decode(bytes, network, application).map_err(decode)?.statement.outputs,
-        TYPE_LATTICE_SHIELD => AnyShield::decode(bytes, network, application).map_err(decode)?.outputs().to_vec(),
-        TYPE_LATTICE_MINT_CLAIM => MintClaim::decode(bytes, network, application).map_err(decode)?.outputs,
-        TYPE_LATTICE_MINT if application != &domains::QUIL_TOKEN => {
-            CustomMint::decode(bytes, network, application).map_err(decode)?.statement.outputs
+        TYPE_LATTICE_PENDING_CLAIM => {
+            PendingClaim::decode(bytes, network, application)
+                .map_err(decode)?
+                .statement
+                .outputs
         }
-        TYPE_LATTICE_SETTLEMENT => Settlement::decode(bytes, network, application).map_err(decode)?.statement.funding.outputs,
-        _ => return Err(invalid("operation is not relayed through the global commit")),
+        TYPE_LATTICE_SHIELD => AnyShield::decode(bytes, network, application)
+            .map_err(decode)?
+            .outputs()
+            .to_vec(),
+        TYPE_LATTICE_MINT_CLAIM => {
+            MintClaim::decode(bytes, network, application)
+                .map_err(decode)?
+                .outputs
+        }
+        TYPE_LATTICE_MINT if application != &domains::QUIL_TOKEN => {
+            CustomMint::decode(bytes, network, application)
+                .map_err(decode)?
+                .statement
+                .outputs
+        }
+        TYPE_LATTICE_SETTLEMENT => {
+            Settlement::decode(bytes, network, application)
+                .map_err(decode)?
+                .statement
+                .funding
+                .outputs
+        }
+        _ => {
+            return Err(invalid(
+                "operation is not relayed through the global commit",
+            ))
+        }
     })
 }
 
@@ -128,7 +169,8 @@ pub fn commit_entry(
     if !(tp == TYPE_LATTICE_MINT && application != &domains::QUIL_TOKEN) {
         return spend_entry(network, application, tp, bytes, frame);
     }
-    let mint = CustomMint::decode(bytes, network, application).map_err(|_| invalid("invalid operation encoding or context"))?;
+    let mint = CustomMint::decode(bytes, network, application)
+        .map_err(|_| invalid("invalid operation encoding or context"))?;
     let context = parameter_context(network, application);
     let mut entry = base(tp, bytes, frame, context);
     entry.consumptions = custom_mint::commit_consumptions(state, bytes, network, application)?;
@@ -139,7 +181,13 @@ pub fn commit_entry(
 
 /// The spend entry of one verified confidential operation, executed at
 /// `frame` of a shard of `application`.
-pub fn spend_entry(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &[u8], frame: u64) -> Result<SpendEntry> {
+pub fn spend_entry(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    tp: u32,
+    bytes: &[u8],
+    frame: u64,
+) -> Result<SpendEntry> {
     let context = parameter_context(network, application);
     let mut entry = base(tp, bytes, frame, context);
     let decode = |_| invalid("invalid operation encoding or context");
@@ -152,9 +200,12 @@ pub fn spend_entry(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &
         TYPE_LATTICE_PENDING => {
             let tx = PendingCreate::decode(bytes, network, application).map_err(decode)?;
             let s = &tx.statement;
-            let (escrowed, change) = s.split_outputs().map_err(|_| invalid("missing escrow output"))?;
+            let (escrowed, change) = s
+                .split_outputs()
+                .map_err(|_| invalid("missing escrow output"))?;
             funding(&mut entry, &s.funding, change)?;
-            let (address, _) = escrow::create_escrow(&context, frame, escrowed, &s.policy, &s.refund_recovery)?;
+            let (address, _) =
+                escrow::create_escrow(&context, frame, escrowed, &s.policy, &s.refund_recovery)?;
             entry.escrow_create = Some(EscrowCreate {
                 address,
                 binding: global_commit::escrow_binding(
@@ -191,7 +242,9 @@ pub fn spend_entry(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &
             // One consumption marker per legacy source: a batch commits all of
             // them or none.
             let tx = AnyShield::decode(bytes, network, application).map_err(decode)?;
-            entry.consumptions = tx.sources().iter()
+            entry.consumptions = tx
+                .sources()
+                .iter()
                 .map(|source| spent_check::key_image_spent_address(&source.address))
                 .collect::<Result<Vec<_>>>()?;
             entry.outputs = output_addresses(&context, frame, tx.outputs())?;
@@ -205,12 +258,20 @@ pub fn spend_entry(network: &[u8; 32], application: &[u8; 32], tp: u32, bytes: &
         }
         TYPE_LATTICE_SETTLEMENT => {
             let tx = Settlement::decode(bytes, network, application).map_err(decode)?;
-            funding(&mut entry, &tx.statement.funding, &tx.statement.funding.outputs)?;
+            funding(
+                &mut entry,
+                &tx.statement.funding,
+                &tx.statement.funding.outputs,
+            )?;
             // The operation's own gas; the settlement amount is not a fee.
             entry.fee = tx.statement.fee;
             entry.settlement = Some(settlement_record::entry(&tx.statement)?);
         }
-        _ => return Err(invalid("operation is not relayed through the global commit")),
+        _ => {
+            return Err(invalid(
+                "operation is not relayed through the global commit",
+            ))
+        }
     }
     // Enforce the relay's own bounds here, where a malformed entry is the
     // executing shard's error, not the global frame's.
@@ -236,7 +297,10 @@ mod tests {
     fn output(context: &[u8; 32], seed: u8) -> Output {
         Output {
             owner: [seed; IDENTITY_BYTES],
-            commitment: CommitmentKey::derive(context).commit(u128::from(seed), &AmountOpening::from_seed(context, &[seed; 32])),
+            commitment: CommitmentKey::derive(context).commit(
+                u128::from(seed),
+                &AmountOpening::from_seed(context, &[seed; 32]),
+            ),
             memo: [seed; MEMO_BYTES],
         }
     }
@@ -249,29 +313,52 @@ mod tests {
         let context = parameter_context(&network, &application);
         let root = Node::from_bytes(&[3u8; NODE_BYTES]).unwrap();
         let statement = TransferStatement {
-            network, application, depth: 32, root: root.clone(),
+            network,
+            application,
+            depth: 32,
+            root: root.clone(),
             images: vec![[4; IDENTITY_BYTES], [5; IDENTITY_BYTES]],
             outputs: vec![output(&context, 6), output(&context, 7)],
             fee: 9,
         };
-        let bytes = Transfer { statement: statement.clone(), proof: proof() }.encode().unwrap();
-        let entry = spend_entry(&network, &application, TYPE_LATTICE_TRANSACTION, &bytes, 55).unwrap();
+        let bytes = Transfer {
+            statement: statement.clone(),
+            proof: proof(),
+        }
+        .encode()
+        .unwrap();
+        let entry =
+            spend_entry(&network, &application, TYPE_LATTICE_TRANSACTION, &bytes, 55).unwrap();
         assert_eq!(entry.kind, TYPE_LATTICE_TRANSACTION);
         assert_eq!(entry.tx_id, global_commit::tx_id(&bytes));
         assert_eq!(entry.source_frame, 55);
-        assert_eq!(entry.root_digest, Some(roots::root_digest(&context, 32, &root)));
-        assert_eq!(entry.consumptions, vec![
-            spent::marker_address(&network, &application, &[4; IDENTITY_BYTES]).unwrap(),
-            spent::marker_address(&network, &application, &[5; IDENTITY_BYTES]).unwrap(),
-        ]);
-        assert_eq!(entry.outputs, vec![
-            coin_identity(&context, 55, &statement.outputs[0]).unwrap().0,
-            coin_identity(&context, 55, &statement.outputs[1]).unwrap().0,
-        ]);
+        assert_eq!(
+            entry.root_digest,
+            Some(roots::root_digest(&context, 32, &root))
+        );
+        assert_eq!(
+            entry.consumptions,
+            vec![
+                spent::marker_address(&network, &application, &[4; IDENTITY_BYTES]).unwrap(),
+                spent::marker_address(&network, &application, &[5; IDENTITY_BYTES]).unwrap(),
+            ]
+        );
+        assert_eq!(
+            entry.outputs,
+            vec![
+                coin_identity(&context, 55, &statement.outputs[0])
+                    .unwrap()
+                    .0,
+                coin_identity(&context, 55, &statement.outputs[1])
+                    .unwrap()
+                    .0,
+            ]
+        );
         assert_eq!(entry.fee, 9);
         // The same operation executed at another frame creates other addresses
         // but consumes the same markers — so only one of the two can commit.
-        let later = spend_entry(&network, &application, TYPE_LATTICE_TRANSACTION, &bytes, 56).unwrap();
+        let later =
+            spend_entry(&network, &application, TYPE_LATTICE_TRANSACTION, &bytes, 56).unwrap();
         assert_ne!(later.outputs, entry.outputs);
         assert_eq!(later.consumptions, entry.consumptions);
         // A relayed entry is small, and round-trips.

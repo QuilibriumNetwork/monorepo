@@ -266,11 +266,20 @@ fn a_global_execution_publishes_across_storing_a_served_shard_frame() {
         }),
         ..Default::default()
     };
-    fixture.clock.store_shard_clock_frame_for_serving(&[0xaa; 32], &served).unwrap();
+    fixture
+        .clock
+        .store_shard_clock_frame_for_serving(&[0xaa; 32], &served)
+        .unwrap();
     let plan = branch.execution.overlay().prepare_commit().unwrap();
     plan.commit(&fixture.db.inner()).unwrap();
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
-    assert_eq!(fixture.clock.get_latest_shard_clock_frame_number(&address).unwrap(), Some(7));
+    assert_eq!(
+        fixture
+            .clock
+            .get_latest_shard_clock_frame_number(&address)
+            .unwrap(),
+        Some(7)
+    );
 }
 
 #[test]
@@ -1138,7 +1147,11 @@ fn unavailable_global_bucket_cannot_be_checkpointed_as_empty() {
 #[test]
 fn startup_recovers_an_unfinished_execution_by_its_cursor() {
     let root = |fixture: &Fixture| {
-        fixture.source.hypergraph.current_forest_phase_root(&[0xff; 32], 0).unwrap()
+        fixture
+            .source
+            .hypergraph
+            .current_forest_phase_root(&[0xff; 32], 0)
+            .unwrap()
     };
     let receipt = |fixture: &Fixture| {
         fixture
@@ -1157,16 +1170,25 @@ fn startup_recovers_an_unfinished_execution_by_its_cursor() {
 
     // Stopped before the state batch: the frame runs again on its receipted base.
     let fixture = Fixture::new(None);
-    fixture.source.materialize(&frame(1, root(&fixture))).unwrap();
+    fixture
+        .source
+        .materialize(&frame(1, root(&fixture)))
+        .unwrap();
     let base_receipt = receipt(&fixture);
     let second = frame(2, root(&fixture));
     fixture.source.begin_execution_checkpoint(&second).unwrap();
     assert!(matches!(fixture.source.materialize(&second),
         Err(QuilError::ExecutionUnavailable(message)) if message.contains("recovery before retry")));
-    assert_eq!(fixture.source.recover_unfinished_execution().unwrap(),
-        Some(UnfinishedExecution::NotApplied(2)));
+    assert_eq!(
+        fixture.source.recover_unfinished_execution().unwrap(),
+        Some(UnfinishedExecution::NotApplied(2))
+    );
     assert!(pending(&fixture).is_none());
-    assert_eq!(receipt(&fixture), base_receipt, "a receipt describing the state is kept");
+    assert_eq!(
+        receipt(&fixture),
+        base_receipt,
+        "a receipt describing the state is kept"
+    );
     fixture.source.materialize(&second).unwrap();
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 2);
     assert_eq!(fixture.source.recover_unfinished_execution().unwrap(), None);
@@ -1174,26 +1196,52 @@ fn startup_recovers_an_unfinished_execution_by_its_cursor() {
     // Stopped after the state batch: the frame is not applied again, and the
     // stale receipt is dropped so a certified child authenticates the state.
     let fixture = Fixture::new(None);
-    fixture.source.materialize(&frame(1, root(&fixture))).unwrap();
+    fixture
+        .source
+        .materialize(&frame(1, root(&fixture)))
+        .unwrap();
     let second = frame(2, root(&fixture));
     fixture.source.begin_execution_checkpoint(&second).unwrap();
-    fixture.source.execution_manager.commit_frame_with_global_cursor(2).unwrap();
-    assert_eq!(fixture.source.recover_unfinished_execution().unwrap(),
-        Some(UnfinishedExecution::Applied(2)));
+    fixture
+        .source
+        .execution_manager
+        .commit_frame_with_global_cursor(2)
+        .unwrap();
+    assert_eq!(
+        fixture.source.recover_unfinished_execution().unwrap(),
+        Some(UnfinishedExecution::Applied(2))
+    );
     assert!(pending(&fixture).is_none());
     assert!(receipt(&fixture).is_none());
     assert_eq!(fixture.source.last_materialized_frame(), 2);
     let sequence = fixture.db.inner().latest_sequence_number();
     fixture.source.materialize(&second).unwrap();
-    assert_eq!(fixture.db.inner().latest_sequence_number(), sequence, "not applied twice");
-    fixture.source.materialize(&frame(3, root(&fixture))).unwrap();
+    assert_eq!(
+        fixture.db.inner().latest_sequence_number(),
+        sequence,
+        "not applied twice"
+    );
+    fixture
+        .source
+        .materialize(&frame(3, root(&fixture)))
+        .unwrap();
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 3);
 
     // A cursor that is neither is refused, and the marker stays.
     let fixture = Fixture::new(None);
-    fixture.source.materialize(&frame(1, root(&fixture))).unwrap();
-    fixture.source.begin_execution_checkpoint(&frame(2, root(&fixture))).unwrap();
-    fixture.source.execution_manager.commit_frame_with_global_cursor(5).unwrap();
+    fixture
+        .source
+        .materialize(&frame(1, root(&fixture)))
+        .unwrap();
+    fixture
+        .source
+        .begin_execution_checkpoint(&frame(2, root(&fixture)))
+        .unwrap();
+    fixture
+        .source
+        .execution_manager
+        .commit_frame_with_global_cursor(5)
+        .unwrap();
     assert!(matches!(fixture.source.recover_unfinished_execution(),
         Err(QuilError::ExecutionUnavailable(message)) if message.contains("must be resynced")));
     assert!(pending(&fixture).is_some());
@@ -1201,13 +1249,22 @@ fn startup_recovers_an_unfinished_execution_by_its_cursor() {
     // Mutations a failed attempt left staged in this process would be
     // published by any later commit: only a restart recovers.
     let fixture = Fixture::new(None);
-    fixture.source.materialize(&frame(1, root(&fixture))).unwrap();
-    fixture.source.begin_execution_checkpoint(&frame(2, root(&fixture))).unwrap();
+    fixture
+        .source
+        .materialize(&frame(1, root(&fixture)))
+        .unwrap();
+    fixture
+        .source
+        .begin_execution_checkpoint(&frame(2, root(&fixture)))
+        .unwrap();
     fixture
         .source
         .hypergraph
         .add_vertex(
-            &quil_hypergraph::Location { app_address: [0xff; 32], data_address: [7; 32] },
+            &quil_hypergraph::Location {
+                app_address: [0xff; 32],
+                data_address: [7; 32],
+            },
             b"staged by a failed attempt",
         )
         .unwrap();
@@ -1235,9 +1292,14 @@ fn in_place_execution_catches_the_registry_up_with_rows_written_since_its_scan()
     source
         .last_eviction_pass_epoch
         .store(quil_types::consensus::epoch_for_frame(1), Ordering::SeqCst);
-    assert!(source.capture_would_seed(), "the registry was read at startup");
+    assert!(
+        source.capture_would_seed(),
+        "the registry was read at startup"
+    );
     // A prover row written beside the registry, as an in-place frame writes.
-    let tree = quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(&[0xcd; 57], 0).unwrap();
+    let tree =
+        quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(&[0xcd; 57], 0)
+            .unwrap();
     let mut vertex = vec![0xff; 32];
     vertex.extend_from_slice(&[7; 32]);
     fixture
@@ -1253,15 +1315,25 @@ fn in_place_execution_catches_the_registry_up_with_rows_written_since_its_scan()
     assert!(!source.capture_would_seed());
     assert!(registry.read(|r| r.get_prover_info(&[7; 32]).is_none()));
 
-    let root = source.hypergraph.current_forest_phase_root(&[0xff; 32], 0).unwrap();
+    let root = source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
     source.materialize(&frame(1, root)).unwrap();
     assert_eq!(source.last_materialized_frame(), 1);
     assert!(
         registry.read(|r| r.get_prover_info(&[7; 32]).is_some()),
         "the row was read before the frame executed"
     );
-    assert_eq!(source.execution_counts().registry_reads, 0, "without reading every row");
-    assert!(source.capture_would_seed(), "the rows the frame wrote were taken in after it");
+    assert_eq!(
+        source.execution_counts().registry_reads,
+        0,
+        "without reading every row"
+    );
+    assert!(
+        source.capture_would_seed(),
+        "the rows the frame wrote were taken in after it"
+    );
 }
 
 /// A shard's GLOBAL venue route depends on its active committee count, which
@@ -1284,7 +1356,8 @@ fn in_place_execution_routes_by_the_committee_an_atomic_capture_sees() {
     );
     let seed = || {
         let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
-        crate::genesis::seed_active_prover_on_filter(&source.hypergraph, &key, 1000, 0, &shard).unwrap();
+        crate::genesis::seed_active_prover_on_filter(&source.hypergraph, &key, 1000, 0, &shard)
+            .unwrap();
     };
     for _ in 1..floor {
         seed();
@@ -1293,15 +1366,27 @@ fn in_place_execution_routes_by_the_committee_an_atomic_capture_sees() {
     source
         .last_eviction_pass_epoch
         .store(quil_types::consensus::epoch_for_frame(1), Ordering::SeqCst);
-    assert!(source.shard_is_uncovered(&shard, 1), "one prover short of producing its own frames");
+    assert!(
+        source.shard_is_uncovered(&shard, 1),
+        "one prover short of producing its own frames"
+    );
 
     // Confirmed earlier in the epoch, by a frame executed in place.
     seed();
-    let root = source.hypergraph.current_forest_phase_root(&[0xff; 32], 0).unwrap();
+    let root = source
+        .hypergraph
+        .current_forest_phase_root(&[0xff; 32], 0)
+        .unwrap();
     source.hypergraph.record_prover_root(0, root.to_vec());
     let branch = source.capture_execution_branch(limits()).unwrap();
-    assert!(!branch.materializer.shard_is_uncovered(&shard, 1), "a capture counts the new member");
-    assert!(source.shard_is_uncovered(&shard, 1), "the registry as the epoch began does not");
+    assert!(
+        !branch.materializer.shard_is_uncovered(&shard, 1),
+        "a capture counts the new member"
+    );
+    assert!(
+        source.shard_is_uncovered(&shard, 1),
+        "the registry as the epoch began does not"
+    );
 
     // What an in-place frame does before executing.
     source.catch_up_registry(1);
@@ -1309,5 +1394,9 @@ fn in_place_execution_routes_by_the_committee_an_atomic_capture_sees() {
         source.shard_is_uncovered(&shard, 1),
         branch.materializer.shard_is_uncovered(&shard, 1)
     );
-    assert_eq!(source.execution_counts().registry_reads, 0, "without reading every row");
+    assert_eq!(
+        source.execution_counts().registry_reads,
+        0,
+        "without reading every row"
+    );
 }

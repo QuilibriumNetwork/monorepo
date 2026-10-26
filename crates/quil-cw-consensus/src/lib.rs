@@ -20,10 +20,10 @@
 
 // Reference the commonware crates so the dependency graph resolves and any
 // version conflict with the workspace surfaces at build time.
+pub use commonware_codec as _codec;
 pub use commonware_consensus as _consensus;
 pub use commonware_cryptography as _crypto;
 pub use commonware_runtime as _runtime;
-pub use commonware_codec as _codec;
 pub use commonware_utils as _utils;
 
 /// Falcon-512 base crypto types implementing commonware's `Signature` /
@@ -33,10 +33,10 @@ pub mod falcon_base;
 /// Falcon-512 `certificate::Scheme` — the multi-party quorum-certificate layer.
 pub mod falcon_scheme;
 
+pub mod app_cert;
 /// Binds the Falcon scheme to commonware simplex's vote subject; includes the
 /// compile-time proof that `simplex::Engine` accepts it.
 pub mod falcon_simplex;
-pub mod app_cert;
 pub mod handoff;
 
 /// Quilibrium adapters (Automaton / Relay / Reporter) over three narrow seam

@@ -59,7 +59,12 @@ pub fn assign_child_index(prover_address: &[u8], num_children: usize) -> usize {
 /// blob to be written at the child-filter allocation address.
 pub fn rewrite_allocation_filter(old_blob: &[u8], new_filter: &[u8]) -> Result<Vec<u8>> {
     let mut tree = rebuild_vertex_tree_from_blob(old_blob);
-    write_field(&mut tree, ALLOCATION_CLASS, "ConfirmationFilter", new_filter)?;
+    write_field(
+        &mut tree,
+        ALLOCATION_CLASS,
+        "ConfirmationFilter",
+        new_filter,
+    )?;
     Ok(vertex_tree_to_blob(&tree))
 }
 
@@ -244,7 +249,11 @@ mod tests {
         for a in &addrs {
             hashed[assign_child_index(a, k)] += 1;
         }
-        assert_eq!(hashed, vec![4, 0], "assign_child_index leaves child 1 EMPTY for clustered small-N");
+        assert_eq!(
+            hashed,
+            vec![4, 0],
+            "assign_child_index leaves child 1 EMPTY for clustered small-N"
+        );
 
         // Round-robin over the sorted provers (what reassign_shard_allocations
         // does at/after the cutover) covers both children.
@@ -297,14 +306,14 @@ mod tests {
     fn rebuild_hyperedge_from_empty_yields_single_atom() {
         let prover_addr = [0x22u8; 32];
         let new_filter = vec![0xBBu8; 33];
-        let new_addr = super::super::materialize::allocation_address(&prover_addr, &new_filter)
-            .unwrap();
+        let new_addr =
+            super::super::materialize::allocation_address(&prover_addr, &new_filter).unwrap();
         let new_tree =
             super::super::materialize::create_allocation_vertex_tree(&prover_addr, &new_filter, 7)
                 .unwrap();
 
-        let old_addr = super::super::materialize::allocation_address(&prover_addr, &[0xBBu8; 32])
-            .unwrap();
+        let old_addr =
+            super::super::materialize::allocation_address(&prover_addr, &[0xBBu8; 32]).unwrap();
         let blob =
             rebuild_hyperedge_with_reassigned_atom(&[], &old_addr, &new_addr, &new_tree).unwrap();
 
@@ -338,7 +347,10 @@ mod tests {
 
         let existing = build_prover_allocation_hyperedge_blob(
             &prover_addr,
-            &[(parent_addr, &parent_tree), (unrelated_addr, &unrelated_tree)],
+            &[
+                (parent_addr, &parent_tree),
+                (unrelated_addr, &unrelated_tree),
+            ],
         )
         .unwrap();
 
@@ -372,8 +384,14 @@ mod tests {
 
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&atom_key(&child_addr)), "child atom present");
-        assert!(keys.contains(&atom_key(&unrelated_addr)), "unrelated atom kept");
-        assert!(!keys.contains(&atom_key(&parent_addr)), "old parent atom removed");
+        assert!(
+            keys.contains(&atom_key(&unrelated_addr)),
+            "unrelated atom kept"
+        );
+        assert!(
+            !keys.contains(&atom_key(&parent_addr)),
+            "old parent atom removed"
+        );
     }
 
     #[test]
@@ -397,7 +415,10 @@ mod tests {
         let child_zero_a = allocation_address(&prover_addr, &child_zero).unwrap();
         let child_high_a = allocation_address(&prover_addr, &child_high).unwrap();
 
-        assert_eq!(parent_a, child_zero_a, "0x00-suffix child collides → in-place");
+        assert_eq!(
+            parent_a, child_zero_a,
+            "0x00-suffix child collides → in-place"
+        );
         assert_ne!(parent_a, child_high_a, "non-zero-suffix child re-keys");
     }
 }

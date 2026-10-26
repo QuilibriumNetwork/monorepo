@@ -157,10 +157,8 @@ impl P2PNode {
             // Generate Ed448 key
             let id = crate::ed448_identity::Ed448Identity::generate()?;
             let config_hex = id.to_config_hex();
-            let kp = Keypair::ed448_from_config_bytes(
-                &hex::decode(&config_hex).unwrap(),
-            )
-            .map_err(|e| QuilError::P2p(format!("ed448 key error: {}", e)))?;
+            let kp = Keypair::ed448_from_config_bytes(&hex::decode(&config_hex).unwrap())
+                .map_err(|e| QuilError::P2p(format!("ed448 key error: {}", e)))?;
             (kp, Some(config_hex))
         } else {
             let key_bytes = hex::decode(&config.peer_priv_key)
@@ -169,9 +167,12 @@ impl P2PNode {
                 114 => Keypair::ed448_from_config_bytes(&key_bytes),
                 57 => Keypair::ed448_from_bytes(&key_bytes),
                 32 => Keypair::ed25519_from_bytes(key_bytes),
-                n => return Err(QuilError::P2p(format!(
-                    "unexpected key length: {} (expected 114/57/32)", n
-                ))),
+                n => {
+                    return Err(QuilError::P2p(format!(
+                        "unexpected key length: {} (expected 114/57/32)",
+                        n
+                    )))
+                }
             }
             .map_err(|e| QuilError::P2p(format!("invalid key: {}", e)))?;
             (kp, None)
@@ -277,8 +278,7 @@ impl P2PNode {
         // Synthetic worker key for host identity (connection-level only, keeps
         // worker processes from colliding on the real node's peer-id). Remains
         // a deterministic Ed448 synthetic derived from the Ed448 seed + core_id.
-        let worker_identity =
-            crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
+        let worker_identity = crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
         let mut worker_seed = [0u8; 57];
         worker_seed.copy_from_slice(&worker_identity.private_key);
         let worker_keypair = Keypair::ed448_from_bytes(&worker_seed)
@@ -403,8 +403,7 @@ impl P2PNode {
                 } else {
                     let proto = format!("/testnet/kad/1.0.0");
                     libp2p::kad::Config::new(
-                        libp2p::StreamProtocol::try_from_owned(proto)
-                            .expect("valid protocol"),
+                        libp2p::StreamProtocol::try_from_owned(proto).expect("valid protocol"),
                     )
                 };
                 kad_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
@@ -412,11 +411,8 @@ impl P2PNode {
                 // Default libp2p-kad limit is 16KB — must increase to accept them.
                 kad_config.set_max_packet_size(1024 * 1024);
                 let kad_store = libp2p::kad::store::MemoryStore::new(local_peer_id);
-                let kademlia = libp2p::kad::Behaviour::with_config(
-                    local_peer_id,
-                    kad_store,
-                    kad_config,
-                );
+                let kademlia =
+                    libp2p::kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
 
                 let ping = libp2p::ping::Behaviour::default();
                 let identify = libp2p::identify::Behaviour::new(
@@ -434,13 +430,11 @@ impl P2PNode {
                 // prover key here so `msg.from` carries the prover's
                 // peer ID; the libp2p host (`key`) is the synthetic
                 // worker key for connection-level identity.
-                let (sign_peer_id, sign_key) = match (
-                    pubsub_from_peer_id,
-                    pubsub_signing_keypair.clone(),
-                ) {
-                    (Some(pid), Some(kp)) => (pid, kp),
-                    _ => (key.public().to_peer_id(), key.clone()),
-                };
+                let (sign_peer_id, sign_key) =
+                    match (pubsub_from_peer_id, pubsub_signing_keypair.clone()) {
+                        (Some(pid), Some(kp)) => (pid, kp),
+                        _ => (key.public().to_peer_id(), key.clone()),
+                    };
                 blossomsub.set_signing_identity(sign_peer_id, sign_key);
                 // Do NOT pre-subscribe to global bitmasks here. The
                 // caller (`main.rs` or `run_worker_node`) selects
@@ -477,8 +471,7 @@ impl P2PNode {
                     .with_max_established_per_peer(Some(2))
                     .with_max_pending_incoming(Some(64))
                     .with_max_pending_outgoing(Some(64));
-                let connection_limits =
-                    libp2p::connection_limits::Behaviour::new(conn_limits);
+                let connection_limits = libp2p::connection_limits::Behaviour::new(conn_limits);
 
                 let direct = libp2p::request_response::Behaviour::new(
                     [(
@@ -548,8 +541,9 @@ impl P2PNode {
         }
 
         if let Some(port) = want_quic {
-            let quic_addr: Multiaddr =
-                format!("/ip4/0.0.0.0/udp/{}/quic-v1", port).parse().unwrap();
+            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port)
+                .parse()
+                .unwrap();
             match swarm.listen_on(quic_addr.clone()) {
                 Ok(_) => debug!(%quic_addr, "QUIC listener starting"),
                 Err(e) => debug!(error = format!("{:?}", e), "failed to start QUIC listener"),
@@ -1316,7 +1310,15 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, external_addrs, peer_count, metrics_registry, direct_stats, gossip_traffic },
+            P2PHandle {
+                peer_id,
+                cmd_tx,
+                external_addrs,
+                peer_count,
+                metrics_registry,
+                direct_stats,
+                gossip_traffic,
+            },
             msg_rx,
         ))
     }
@@ -1347,29 +1349,59 @@ impl P2PHandle {
     /// Subscribe and wait until the swarm loop has actually applied it.
     pub async fn subscribe_confirmed(&self, bitmask: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SubscribeConfirmed { bitmask, ack: ack_tx }).await
-            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
-        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into()))
+        self.cmd_tx
+            .send(P2PCommand::SubscribeConfirmed {
+                bitmask,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into())
+        })
     }
 
     /// Count connected peers which advertised this exact topic subscription.
-    pub async fn subscribed_peer_count(&self, bitmask: Vec<u8>) -> quil_types::error::Result<usize> {
+    pub async fn subscribed_peer_count(
+        &self,
+        bitmask: Vec<u8>,
+    ) -> quil_types::error::Result<usize> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SubscribedPeerCount { bitmask, ack: ack_tx }).await
-            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
-        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into()))
+        self.cmd_tx
+            .send(P2PCommand::SubscribedPeerCount {
+                bitmask,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into())
+        })
     }
 
     /// Refresh peers derived from committed committees; never trust PeerInfo
     /// for this exemption. Only the IP-colocation penalty is exempted.
-    pub async fn set_committee_peers(&self, peers: std::collections::HashSet<PeerId>) -> quil_types::error::Result<usize> {
+    pub async fn set_committee_peers(
+        &self,
+        peers: std::collections::HashSet<PeerId>,
+    ) -> quil_types::error::Result<usize> {
         if peers.len() > 16_384 {
-            return Err(QuilError::P2p("committee peer policy exceeds its bounds".into()));
+            return Err(QuilError::P2p(
+                "committee peer policy exceeds its bounds".into(),
+            ));
         }
         let (ack, received) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SetCommitteePeers { peers, ack }).await
+        self.cmd_tx
+            .send(P2PCommand::SetCommitteePeers { peers, ack })
+            .await
             .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
-        received.await.map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
+        received
+            .await
+            .map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
     }
 
     /// Register a blossomsub-level validator on `bitmask` that filters stale
@@ -1400,40 +1432,39 @@ impl P2PHandle {
         // Beyond this age → Reject + penalize; no honest relayer forwards
         // something this old.
         const STALE_REJECT_PAST_MS: i64 = 300_000; // 5 min
-        let validator: Box<
-            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
-        > = Box::new(|_peer, data| {
-            use crate::ValidationResult;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            if data.len() >= 4 {
-                let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
-                if tp == crate::peer_info::PEER_INFO_TYPE {
-                    if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
-                        if ts < now_ms - STALE_REJECT_PAST_MS {
-                            return ValidationResult::Reject;
+        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
+            Box::new(|_peer, data| {
+                use crate::ValidationResult;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                if data.len() >= 4 {
+                    let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
+                    if tp == crate::peer_info::PEER_INFO_TYPE {
+                        if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
+                            if ts < now_ms - STALE_REJECT_PAST_MS {
+                                return ValidationResult::Reject;
+                            }
+                            if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
+                                return ValidationResult::Ignore;
+                            }
                         }
-                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
-                            return ValidationResult::Ignore;
-                        }
-                    }
-                } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
-                    if let Some(ts) =
-                        crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
-                    {
-                        if ts < now_ms - STALE_REJECT_PAST_MS {
-                            return ValidationResult::Reject;
-                        }
-                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
-                            return ValidationResult::Ignore;
+                    } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
+                        if let Some(ts) =
+                            crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
+                        {
+                            if ts < now_ms - STALE_REJECT_PAST_MS {
+                                return ValidationResult::Reject;
+                            }
+                            if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
+                                return ValidationResult::Ignore;
+                            }
                         }
                     }
                 }
-            }
-            ValidationResult::Accept
-        });
+                ValidationResult::Accept
+            });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
@@ -1467,38 +1498,37 @@ impl P2PHandle {
         const MAP_CAP: usize = 4096;
         let counters: std::sync::Arc<Mutex<HashMap<PeerId, (u64, u32)>>> =
             std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let validator: Box<
-            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
-        > = Box::new(move |peer, data| {
-            use crate::ValidationResult;
-            // (1) cheap shape/type check — legit frames are canonical-wire with
-            // the 4-byte type prefix; anything else on this topic is bogus.
-            if data.len() < 4
-                || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
-            {
-                return ValidationResult::Reject;
-            }
-            // (2) per-peer rate limit.
-            let now_s = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if let Ok(mut map) = counters.lock() {
-                if map.len() > MAP_CAP {
-                    map.clear();
-                }
-                let entry = map.entry(*peer).or_insert((now_s, 0));
-                if entry.0 == now_s {
-                    entry.1 = entry.1.saturating_add(1);
-                } else {
-                    *entry = (now_s, 1);
-                }
-                if entry.1 > MAX_FRAMES_PER_SEC {
+        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
+            Box::new(move |peer, data| {
+                use crate::ValidationResult;
+                // (1) cheap shape/type check — legit frames are canonical-wire with
+                // the 4-byte type prefix; anything else on this topic is bogus.
+                if data.len() < 4
+                    || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
+                {
                     return ValidationResult::Reject;
                 }
-            }
-            ValidationResult::Accept
-        });
+                // (2) per-peer rate limit.
+                let now_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Ok(mut map) = counters.lock() {
+                    if map.len() > MAP_CAP {
+                        map.clear();
+                    }
+                    let entry = map.entry(*peer).or_insert((now_s, 0));
+                    if entry.0 == now_s {
+                        entry.1 = entry.1.saturating_add(1);
+                    } else {
+                        *entry = (now_s, 1);
+                    }
+                    if entry.1 > MAX_FRAMES_PER_SEC {
+                        return ValidationResult::Reject;
+                    }
+                }
+                ValidationResult::Accept
+            });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
@@ -1533,11 +1563,7 @@ impl P2PHandle {
     /// exited without acknowledging the publish, or the underlying
     /// BlossomSub behaviour rejected the message (e.g. local node not
     /// subscribed to the bitmask).
-    pub async fn publish(
-        &self,
-        bitmask: Vec<u8>,
-        data: Vec<u8>,
-    ) -> quil_types::error::Result<()> {
+    pub async fn publish(&self, bitmask: Vec<u8>, data: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.cmd_tx
             .send(P2PCommand::Publish {
@@ -1546,9 +1572,9 @@ impl P2PHandle {
                 ack: Some(ack_tx),
             })
             .await
-            .map_err(|_| QuilError::P2p(
-                "p2p command channel closed (swarm shutting down?)".into(),
-            ))?;
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
         match ack_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => Err(QuilError::P2p(format!(
@@ -1667,10 +1693,22 @@ impl P2PHandle {
         data: Vec<u8>,
     ) -> crate::direct::DirectOutcome {
         let (ack, outcome) = oneshot::channel();
-        if self.cmd_tx.send(P2PCommand::SendDirect { peer, bitmask, data, ack }).await.is_err() {
+        if self
+            .cmd_tx
+            .send(P2PCommand::SendDirect {
+                peer,
+                bitmask,
+                data,
+                ack,
+            })
+            .await
+            .is_err()
+        {
             return crate::direct::DirectOutcome::Failed;
         }
-        outcome.await.unwrap_or(crate::direct::DirectOutcome::Failed)
+        outcome
+            .await
+            .unwrap_or(crate::direct::DirectOutcome::Failed)
     }
 
     /// Accept direct messages on `bitmask` (delivered like its gossip).
@@ -1685,7 +1723,9 @@ impl P2PHandle {
 
     /// Record that a send went over gossip after its direct attempt.
     pub fn note_direct_fallback(&self) {
-        self.direct_stats.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.direct_stats
+            .fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn direct_stats(&self) -> crate::direct::DirectStatsSnapshot {
@@ -1757,9 +1797,18 @@ impl P2PHandle {
 
 enum P2PCommand {
     Subscribe(Vec<u8>),
-    SubscribeConfirmed { bitmask: Vec<u8>, ack: oneshot::Sender<()> },
-    SubscribedPeerCount { bitmask: Vec<u8>, ack: oneshot::Sender<usize> },
-    SetCommitteePeers { peers: std::collections::HashSet<PeerId>, ack: oneshot::Sender<usize> },
+    SubscribeConfirmed {
+        bitmask: Vec<u8>,
+        ack: oneshot::Sender<()>,
+    },
+    SubscribedPeerCount {
+        bitmask: Vec<u8>,
+        ack: oneshot::Sender<usize>,
+    },
+    SetCommitteePeers {
+        peers: std::collections::HashSet<PeerId>,
+        ack: oneshot::Sender<usize>,
+    },
     Unsubscribe(Vec<u8>),
     /// Install a per-(source, target) gossip forward filter. Used by the
     /// devnet test proxy to impose bipartite network partitions.
@@ -1799,9 +1848,15 @@ enum P2PCommand {
         ack: oneshot::Sender<f64>,
     },
     /// Replace a peer's application score override.
-    SetPeerScore { peer: PeerId, score: f64 },
+    SetPeerScore {
+        peer: PeerId,
+        score: f64,
+    },
     /// Add `delta` to a peer's application score override.
-    AddPeerScore { peer: PeerId, delta: f64 },
+    AddPeerScore {
+        peer: PeerId,
+        delta: f64,
+    },
     /// Disconnect + redial a peer.
     Reconnect {
         peer: PeerId,
@@ -1871,7 +1926,10 @@ fn publish_external(
             &health.run_failures(),
         );
     }
-    let next = ConfirmedExternalAddrs { autonat: health.summary(nat), ..tracker.snapshot() };
+    let next = ConfirmedExternalAddrs {
+        autonat: health.summary(nat),
+        ..tracker.snapshot()
+    };
     tx.send_if_modified(|current| {
         if *current == next {
             return false;
@@ -1904,9 +1962,13 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
     for proto in addr.iter() {
         match proto {
             Protocol::Ip4(ip) => {
-                if ip.is_loopback() || ip.is_link_local() || ip.is_private()
-                    || ip == Ipv4Addr::UNSPECIFIED || ip.is_broadcast()
-                    || ip.is_documentation() || ip.is_multicast()
+                if ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_private()
+                    || ip == Ipv4Addr::UNSPECIFIED
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                    || ip.is_multicast()
                 {
                     return false;
                 }

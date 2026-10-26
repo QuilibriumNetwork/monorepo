@@ -12,9 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use commonware_consensus::simplex::{
-    elector::RoundRobin, Config, Engine, Floor, ForwardingPolicy,
-};
+use commonware_consensus::simplex::{elector::RoundRobin, Config, Engine, Floor, ForwardingPolicy};
 use commonware_consensus::types::{Epoch, View, ViewDelta};
 use commonware_cryptography::Sha256;
 use commonware_p2p::Blocker;
@@ -24,8 +22,8 @@ use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, Supervi
 use commonware_utils::{NZUsize, NZU16};
 
 use crate::adapters::{
-    BlockStore, CountingBlocker, Digest, FalconAutomaton, FalconRelay, FalconReporter, FrameFinalizer,
-    FrameSink, GlobalProposer,
+    BlockStore, CountingBlocker, Digest, FalconAutomaton, FalconRelay, FalconReporter,
+    FrameFinalizer, FrameSink, GlobalProposer,
 };
 use crate::falcon_base::FalconPublicKey;
 use crate::falcon_simplex::SimplexFalconScheme;
@@ -280,7 +278,9 @@ where
     let me = {
         use commonware_cryptography::certificate::Scheme as _;
         use commonware_utils::ordered::Quorum as _;
-        scheme.me().and_then(|index| scheme.participants().key(index).cloned())
+        scheme
+            .me()
+            .and_then(|index| scheme.participants().key(index).cloned())
     };
     let ch0 = build_vote_channel(0, peers.clone(), out_tx.clone(), me);
     let ch1 = build_channel(1, peers.clone(), out_tx.clone());
@@ -291,8 +291,10 @@ where
         ch1.inbound_tx.clone(),
         ch2.inbound_tx.clone(),
     ];
-    let (s0, r0) = (ch0.sender, crate::nullify_receiver::NullifyReceiver::new(
-        ch0.receiver, scheme.clone(), params.epoch));
+    let (s0, r0) = (
+        ch0.sender,
+        crate::nullify_receiver::NullifyReceiver::new(ch0.receiver, scheme.clone(), params.epoch),
+    );
     let (s1, r1) = (ch1.sender, ch1.receiver);
     let (s2, r2) = (ch2.sender, ch2.receiver);
 
@@ -335,7 +337,10 @@ where
                 // in this runtime); on set, fall through and drop the engine
                 // handle to stop this instance. Without a shutdown flag, run
                 // until the engine exits or the process stops.
-                if shutdown.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                if shutdown
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
                     break;
                 }
                 tokio::select! {
@@ -349,10 +354,19 @@ where
             if let Some(outcome) = stopped {
                 // The owner may ask for a stop while the engine is already
                 // returning: closing its inputs also ends the engine.
-                if shutdown.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
-                    tracing::info!(?outcome, "consensus engine stopped on request; host exiting");
+                if shutdown
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    tracing::info!(
+                        ?outcome,
+                        "consensus engine stopped on request; host exiting"
+                    );
                 } else {
-                    tracing::error!(?outcome, "consensus engine stopped on its own; host exiting");
+                    tracing::error!(
+                        ?outcome,
+                        "consensus engine stopped on its own; host exiting"
+                    );
                 }
             }
             // An actor may still be returning from a blocking proposer or
@@ -363,7 +377,11 @@ where
         });
     });
 
-    GlobalHostHandle { inbound, outbound: out_rx, thread }
+    GlobalHostHandle {
+        inbound,
+        outbound: out_rx,
+        thread,
+    }
 }
 
 /// Runtime blob header: magic, runtime version, blob version.
@@ -376,7 +394,9 @@ const BLOB_MAGIC: &[u8; 4] = b"CWIC";
 /// the member silently stops taking part. Nothing is lost: records follow the
 /// header. A larger blob with a bad header is real corruption and is left.
 fn remove_torn_blobs(dir: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();

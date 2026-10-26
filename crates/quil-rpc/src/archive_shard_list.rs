@@ -80,7 +80,12 @@ impl ShardList {
 
 /// Comma-separated full hex filters, at most [`MAX_LOGGED_FILTERS`] of them.
 pub fn hex_filters(filters: &[Vec<u8>]) -> String {
-    filters.iter().take(MAX_LOGGED_FILTERS).map(hex::encode).collect::<Vec<_>>().join(",")
+    filters
+        .iter()
+        .take(MAX_LOGGED_FILTERS)
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Two endpoints whose recent lists differ: the one just refreshed, and the
@@ -134,7 +139,10 @@ pub enum ShardListEvent {
     /// A new disagreement.
     Started(Disagreement),
     /// Still disagreeing, `duration` after it started.
-    Persisting { disagreement: Disagreement, duration: Duration },
+    Persisting {
+        disagreement: Disagreement,
+        duration: Duration,
+    },
     /// Every recent list agrees again, `duration` after the disagreement
     /// started.
     Ended {
@@ -152,8 +160,17 @@ impl ShardListEvent {
     pub fn log(&self, frame: u64) {
         let (d, duration) = match self {
             ShardListEvent::Started(d) => (d, Duration::ZERO),
-            ShardListEvent::Persisting { disagreement, duration } => (disagreement, *duration),
-            ShardListEvent::Ended { duration, cause, digest, recent_endpoints, shards } => {
+            ShardListEvent::Persisting {
+                disagreement,
+                duration,
+            } => (disagreement, *duration),
+            ShardListEvent::Ended {
+                duration,
+                cause,
+                digest,
+                recent_endpoints,
+                shards,
+            } => {
                 info!(
                     frame,
                     duration_secs = duration.as_secs(),
@@ -246,14 +263,18 @@ impl ArchiveShardListTracker {
                     other != endpoint && r.at > previous.at && r.list.filters != list.filters
                 })
         });
-        self.reports.insert(endpoint.to_string(), Report { list, at: now });
+        self.reports
+            .insert(endpoint.to_string(), Report { list, at: now });
         let current = &self.reports[endpoint].list;
 
         let mut recent: Vec<(&String, &Report)> = self.reports.iter().collect();
         // Report order; ties by endpoint, so the result is deterministic.
         recent.sort_by(|a, b| a.1.at.cmp(&b.1.at).then_with(|| a.0.cmp(b.0)));
 
-        if recent.iter().all(|(_, r)| r.list.filters == current.filters) {
+        if recent
+            .iter()
+            .all(|(_, r)| r.list.filters == current.filters)
+        {
             let since = self.disagreeing_since.take()?;
             let (warned, expired) = (self.warned, self.expired);
             self.warned = false;
@@ -262,7 +283,11 @@ impl ArchiveShardListTracker {
             // earlier warning was never logged: neither is its end.
             return warned.then(|| ShardListEvent::Ended {
                 duration: now.saturating_duration_since(since),
-                cause: if expired { EndCause::Expired } else { EndCause::Agreement },
+                cause: if expired {
+                    EndCause::Expired
+                } else {
+                    EndCause::Agreement
+                },
                 digest: current.digest(),
                 recent_endpoints: recent.len(),
                 shards: current.filters.len(),
@@ -276,7 +301,12 @@ impl ArchiveShardListTracker {
             .rev()
             .find(|(_, r)| r.list.filters != current.filters)
             .copied()?;
-        let agreeing = |filters: &BTreeSet<Vec<u8>>| recent.iter().filter(|(_, r)| &r.list.filters == filters).count();
+        let agreeing = |filters: &BTreeSet<Vec<u8>>| {
+            recent
+                .iter()
+                .filter(|(_, r)| &r.list.filters == filters)
+                .count()
+        };
         let mut distinct: Vec<&BTreeSet<Vec<u8>>> = Vec::new();
         for (_, r) in &recent {
             if !distinct.contains(&&r.list.filters) {
@@ -324,7 +354,10 @@ impl ArchiveShardListTracker {
         if !std::mem::replace(&mut self.warned, true) {
             return Some(ShardListEvent::Started(disagreement));
         }
-        Some(ShardListEvent::Persisting { disagreement, duration: now.saturating_duration_since(since) })
+        Some(ShardListEvent::Persisting {
+            disagreement,
+            duration: now.saturating_duration_since(since),
+        })
     }
 }
 
@@ -337,7 +370,9 @@ fn alternates(reports: &[(&String, &Report)]) -> bool {
             runs.push(&r.list.filters);
         }
     }
-    runs.iter().enumerate().any(|(i, list)| runs[..i].contains(list))
+    runs.iter()
+        .enumerate()
+        .any(|(i, list)| runs[..i].contains(list))
 }
 
 #[cfg(test)]
@@ -348,28 +383,49 @@ mod tests {
     const HOUR: Duration = Duration::from_secs(60 * 60);
 
     fn list(filters: &[u8]) -> ShardList {
-        ShardList { filters: filters.iter().map(|&f| vec![f; 3]).collect(), frozen: BTreeSet::new() }
+        ShardList {
+            filters: filters.iter().map(|&f| vec![f; 3]).collect(),
+            frozen: BTreeSet::new(),
+        }
     }
 
     fn pool() -> Vec<String> {
-        ["a:8340", "b:8340", "c:8340"].iter().map(|s| s.to_string()).collect()
+        ["a:8340", "b:8340", "c:8340"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// The parent `1` split into `2` and `3`; a stale archive still lists `1`.
-    fn split() -> ShardList { list(&[2, 3, 9]) }
-    fn stale() -> ShardList { list(&[1, 9]) }
+    fn split() -> ShardList {
+        list(&[2, 3, 9])
+    }
+    fn stale() -> ShardList {
+        list(&[1, 9])
+    }
 
     #[test]
     fn a_list_coming_back_starts_a_disagreement_naming_the_differing_filters() {
         let mut t = ArchiveShardListTracker::new();
         let t0 = Instant::now();
         assert_eq!(t.observe("a:8340", split(), t0, &pool()), None);
-        assert_eq!(t.observe("b:8340", stale(), t0 + 10 * MIN, &pool()), None, "a newer list alone is not a disagreement");
-        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 20 * MIN, &pool()) else {
+        assert_eq!(
+            t.observe("b:8340", stale(), t0 + 10 * MIN, &pool()),
+            None,
+            "a newer list alone is not a disagreement"
+        );
+        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 20 * MIN, &pool())
+        else {
             panic!("the split list came back after the stale one");
         };
-        assert_eq!((d.endpoint.as_str(), d.shards, d.endpoint_agreeing), ("c:8340", 3, 2));
-        assert_eq!((d.other_endpoint.as_str(), d.other_shards, d.other_agreeing), ("b:8340", 2, 1));
+        assert_eq!(
+            (d.endpoint.as_str(), d.shards, d.endpoint_agreeing),
+            ("c:8340", 3, 2)
+        );
+        assert_eq!(
+            (d.other_endpoint.as_str(), d.other_shards, d.other_agreeing),
+            ("b:8340", 2, 1)
+        );
         assert_eq!(d.endpoint_only, vec![vec![2; 3], vec![3; 3]]);
         assert_eq!(d.other_only, vec![vec![1; 3]]);
         assert_eq!(d.other_age, 10 * MIN);
@@ -385,10 +441,18 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(t.observe("a:8340", stale(), t0, &two), None);
         assert_eq!(t.observe("b:8340", split(), t0 + 10 * MIN, &two), None);
-        let Some(ShardListEvent::Started(d)) = t.observe("a:8340", stale(), t0 + 20 * MIN, &two) else {
+        let Some(ShardListEvent::Started(d)) = t.observe("a:8340", stale(), t0 + 20 * MIN, &two)
+        else {
             panic!("a repeated its list after b reported another");
         };
-        assert_eq!((d.other_endpoint.as_str(), d.endpoint_agreeing, d.other_agreeing), ("b:8340", 1, 1));
+        assert_eq!(
+            (
+                d.other_endpoint.as_str(),
+                d.endpoint_agreeing,
+                d.other_agreeing
+            ),
+            ("b:8340", 1, 1)
+        );
     }
 
     #[test]
@@ -398,12 +462,23 @@ mod tests {
         let third = list(&[4, 9]);
         t.observe("a:8340", split(), t0, &pool());
         t.observe("b:8340", stale(), t0 + 10 * MIN, &pool());
-        assert_eq!(t.observe("c:8340", third.clone(), t0 + 20 * MIN, &pool()), None, "each list once is no alternation");
-        let Some(ShardListEvent::Started(d)) = t.observe("a:8340", split(), t0 + 30 * MIN, &pool()) else {
+        assert_eq!(
+            t.observe("c:8340", third.clone(), t0 + 20 * MIN, &pool()),
+            None,
+            "each list once is no alternation"
+        );
+        let Some(ShardListEvent::Started(d)) = t.observe("a:8340", split(), t0 + 30 * MIN, &pool())
+        else {
             panic!("a repeated its list after two others");
         };
-        assert_eq!((d.other_endpoint.as_str(), d.other_digest.clone()), ("c:8340", third.digest()));
-        assert_eq!((d.distinct_lists, d.endpoint_agreeing, d.other_agreeing), (3, 1, 1));
+        assert_eq!(
+            (d.other_endpoint.as_str(), d.other_digest.clone()),
+            ("c:8340", third.digest())
+        );
+        assert_eq!(
+            (d.distinct_lists, d.endpoint_agreeing, d.other_agreeing),
+            (3, 1, 1)
+        );
         assert_eq!(d.other_only, vec![vec![4; 3]]);
     }
 
@@ -424,17 +499,34 @@ mod tests {
         let t0 = Instant::now();
         t.observe("a:8340", split(), t0, &pool());
         t.observe("b:8340", stale(), t0 + 10 * MIN, &pool());
-        assert!(matches!(t.observe("c:8340", split(), t0 + 20 * MIN, &pool()), Some(ShardListEvent::Started(_))));
-        assert_eq!(t.observe("a:8340", split(), t0 + 30 * MIN, &pool()), None, "repeat suppressed within the hour");
-        assert_eq!(t.observe("b:8340", stale(), t0 + 50 * MIN, &pool()), None, "repeat suppressed within the hour");
-        let Some(ShardListEvent::Persisting { disagreement, duration }) =
-            t.observe("c:8340", split(), t0 + 80 * MIN, &pool())
+        assert!(matches!(
+            t.observe("c:8340", split(), t0 + 20 * MIN, &pool()),
+            Some(ShardListEvent::Started(_))
+        ));
+        assert_eq!(
+            t.observe("a:8340", split(), t0 + 30 * MIN, &pool()),
+            None,
+            "repeat suppressed within the hour"
+        );
+        assert_eq!(
+            t.observe("b:8340", stale(), t0 + 50 * MIN, &pool()),
+            None,
+            "repeat suppressed within the hour"
+        );
+        let Some(ShardListEvent::Persisting {
+            disagreement,
+            duration,
+        }) = t.observe("c:8340", split(), t0 + 80 * MIN, &pool())
         else {
             panic!("an hour after the warning it repeats");
         };
         assert_eq!(duration, 60 * MIN);
         assert_eq!(disagreement.other_endpoint, "b:8340");
-        assert_eq!(t.observe("a:8340", split(), t0 + 90 * MIN, &pool()), None, "b's stale list is still recent");
+        assert_eq!(
+            t.observe("a:8340", split(), t0 + 90 * MIN, &pool()),
+            None,
+            "b's stale list is still recent"
+        );
         assert_eq!(
             t.observe("b:8340", split(), t0 + 100 * MIN, &pool()),
             Some(ShardListEvent::Ended {
@@ -445,7 +537,11 @@ mod tests {
                 shards: 3,
             })
         );
-        assert_eq!(t.observe("c:8340", split(), t0 + 110 * MIN, &pool()), None, "the end is logged once");
+        assert_eq!(
+            t.observe("c:8340", split(), t0 + 110 * MIN, &pool()),
+            None,
+            "the end is logged once"
+        );
     }
 
     #[test]
@@ -454,20 +550,38 @@ mod tests {
         let t0 = Instant::now();
         t.observe("a:8340", split(), t0, &pool());
         t.observe("b:8340", stale(), t0 + 10 * MIN, &pool());
-        assert!(matches!(t.observe("c:8340", split(), t0 + 20 * MIN, &pool()), Some(ShardListEvent::Started(_))));
-        assert!(matches!(t.observe("b:8340", split(), t0 + 30 * MIN, &pool()), Some(ShardListEvent::Ended { .. })));
+        assert!(matches!(
+            t.observe("c:8340", split(), t0 + 20 * MIN, &pool()),
+            Some(ShardListEvent::Started(_))
+        ));
+        assert!(matches!(
+            t.observe("b:8340", split(), t0 + 30 * MIN, &pool()),
+            Some(ShardListEvent::Ended { .. })
+        ));
         // b flips back: a new disagreement, 20 minutes after the warning.
         assert_eq!(t.observe("b:8340", stale(), t0 + 40 * MIN, &pool()), None);
-        assert_eq!(t.observe("a:8340", split(), t0 + 50 * MIN, &pool()), None, "started, not warned within the hour");
-        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 80 * MIN, &pool()) else {
+        assert_eq!(
+            t.observe("a:8340", split(), t0 + 50 * MIN, &pool()),
+            None,
+            "started, not warned within the hour"
+        );
+        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 80 * MIN, &pool())
+        else {
             panic!("an hour after the last warning the new disagreement is warned");
         };
         assert_eq!(d.other_endpoint, "b:8340");
         // Its end and a further silent start/end log nothing new.
-        assert!(matches!(t.observe("b:8340", split(), t0 + 90 * MIN, &pool()), Some(ShardListEvent::Ended { .. })));
+        assert!(matches!(
+            t.observe("b:8340", split(), t0 + 90 * MIN, &pool()),
+            Some(ShardListEvent::Ended { .. })
+        ));
         assert_eq!(t.observe("b:8340", stale(), t0 + 100 * MIN, &pool()), None);
         assert_eq!(t.observe("a:8340", split(), t0 + 110 * MIN, &pool()), None);
-        assert_eq!(t.observe("b:8340", split(), t0 + 120 * MIN, &pool()), None, "an unwarned disagreement ends silently");
+        assert_eq!(
+            t.observe("b:8340", split(), t0 + 120 * MIN, &pool()),
+            None,
+            "an unwarned disagreement ends silently"
+        );
     }
 
     #[test]
@@ -476,10 +590,14 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(t.observe("a:8340", split(), t0, &pool()), None);
         assert_eq!(t.observe("b:8340", stale(), t0 + HOUR, &pool()), None);
-        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 5 * HOUR, &pool()) else {
+        let Some(ShardListEvent::Started(d)) = t.observe("c:8340", split(), t0 + 5 * HOUR, &pool())
+        else {
             panic!("a's five-hour-old list came back after b's");
         };
-        assert_eq!((d.other_endpoint.as_str(), d.other_age), ("b:8340", 4 * HOUR));
+        assert_eq!(
+            (d.other_endpoint.as_str(), d.other_age),
+            ("b:8340", 4 * HOUR)
+        );
         assert_eq!(d.recent_endpoints, 3);
     }
 
@@ -501,10 +619,19 @@ mod tests {
         let t0 = Instant::now();
         t.observe("a:8340", split(), t0, &pool());
         t.observe("b:8340", stale(), t0 + 10 * MIN, &pool());
-        assert!(matches!(t.observe("c:8340", split(), t0 + 20 * MIN, &pool()), Some(ShardListEvent::Started(_))));
+        assert!(matches!(
+            t.observe("c:8340", split(), t0 + 20 * MIN, &pool()),
+            Some(ShardListEvent::Started(_))
+        ));
         // a and c take turns hourly while b's stale list stays recent: the
         // warning repeats hourly and no agreement is logged.
-        for (hours, endpoint) in [(1, "a:8340"), (2, "c:8340"), (3, "a:8340"), (4, "c:8340"), (5, "a:8340")] {
+        for (hours, endpoint) in [
+            (1, "a:8340"),
+            (2, "c:8340"),
+            (3, "a:8340"),
+            (4, "c:8340"),
+            (5, "a:8340"),
+        ] {
             let event = t.observe(endpoint, split(), t0 + 20 * MIN + hours * HOUR, &pool());
             assert!(
                 matches!(&event, Some(ShardListEvent::Persisting { disagreement, .. }) if disagreement.other_endpoint == "b:8340"),
@@ -543,7 +670,10 @@ mod tests {
         t.observe("a:8340", split(), t0, &a_b);
         t.observe("b:8340", stale(), t0 + MIN, &a_b);
         assert!(
-            matches!(t.observe("x:8340", split(), t0 + 2 * MIN, &a_b), Some(ShardListEvent::Started(_))),
+            matches!(
+                t.observe("x:8340", split(), t0 + 2 * MIN, &a_b),
+                Some(ShardListEvent::Started(_))
+            ),
             "the refreshed endpoint's own report is compared"
         );
         t.observe("a:8340", split(), t0 + 3 * MIN, &a_b);
@@ -555,7 +685,10 @@ mod tests {
     fn a_partial_refresh_is_not_compared() {
         let mut info = ArchiveShardInfo::default();
         info.sizes.insert(vec![2; 3], 1);
-        assert_eq!(ShardList::from_complete(&info).map(|l| l.filters.len()), Some(1));
+        assert_eq!(
+            ShardList::from_complete(&info).map(|l| l.filters.len()),
+            Some(1)
+        );
         info.failed_shard_keys = 1;
         assert_eq!(ShardList::from_complete(&info), None);
     }
@@ -565,7 +698,10 @@ mod tests {
         let filters: Vec<Vec<u8>> = (0..40u8).map(|f| vec![f]).collect();
         let logged = hex_filters(&filters);
         assert_eq!(logged.split(',').count(), MAX_LOGGED_FILTERS);
-        assert!(logged.starts_with("00,01,") && logged.ends_with(",0f"), "{logged}");
+        assert!(
+            logged.starts_with("00,01,") && logged.ends_with(",0f"),
+            "{logged}"
+        );
     }
 
     #[test]
@@ -576,8 +712,14 @@ mod tests {
         assert_ne!(stale().digest(), split().digest());
         assert_eq!(split().digest().len(), 8);
         // Without length prefixes both lists would hash the bytes 1, 1, 2.
-        let a = ShardList { filters: [vec![1u8, 1], vec![2u8]].into_iter().collect(), ..Default::default() };
-        let b = ShardList { filters: [vec![1u8], vec![1u8, 2]].into_iter().collect(), ..Default::default() };
+        let a = ShardList {
+            filters: [vec![1u8, 1], vec![2u8]].into_iter().collect(),
+            ..Default::default()
+        };
+        let b = ShardList {
+            filters: [vec![1u8], vec![1u8, 2]].into_iter().collect(),
+            ..Default::default()
+        };
         assert_ne!(a.digest(), b.digest());
     }
 }

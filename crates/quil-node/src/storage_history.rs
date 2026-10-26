@@ -1,5 +1,7 @@
 //! Small historical GLOBAL proofs over the existing authenticated peer link.
-use crate::prover_tree_syncer_prod::{read_breaks_connection, reap_frame_client, FrameClients, FRAME_CLIENTS};
+use crate::prover_tree_syncer_prod::{
+    read_breaks_connection, reap_frame_client, FrameClients, FRAME_CLIENTS,
+};
 use quil_engine::storage_history::GlobalVertexProofSource;
 use quil_rpc::{ArchiveClient, ArchiveClientError};
 use quil_types::error::{QuilError, Result};
@@ -19,7 +21,13 @@ impl Rotation {
             return Vec::new();
         }
         let start = self.0.fetch_add(1, Ordering::Relaxed) % endpoints.len();
-        endpoints.iter().cycle().skip(start).take(endpoints.len().min(3)).cloned().collect()
+        endpoints
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(endpoints.len().min(3))
+            .cloned()
+            .collect()
     }
 }
 
@@ -41,7 +49,11 @@ where
     Ask: Fn(C) -> Asked,
     Asked: std::future::Future<Output = std::result::Result<Option<Vec<u8>>, ArchiveClientError>>,
 {
-    let kept = || clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept = || {
+        clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     for endpoint in endpoints {
         let key = (std::thread::current().id(), endpoint);
         // The error says whether the connection broke.
@@ -51,7 +63,12 @@ where
                 Some(client) => client,
                 None => {
                     let client = dial(key.1.clone()).await.map_err(|_| false)?;
-                    let id = kept().insert(key.clone(), signing_key, client.clone(), std::time::Instant::now());
+                    let id = kept().insert(
+                        key.clone(),
+                        signing_key,
+                        client.clone(),
+                        std::time::Instant::now(),
+                    );
                     tokio::spawn(reap_frame_client(clients, key.clone(), id));
                     client
                 }
@@ -123,15 +140,22 @@ pub fn from_master(endpoint: String, key: Vec<u8>) -> GlobalVertexProofSource {
 
 /// The worker and master share a Falcon identity. Pin it before treating a
 /// historical GLOBAL frame as canonical, just as with the master's live feed.
-pub fn global_frames_from_master(endpoint: String, key: Vec<u8>) -> quil_engine::global_anchor::GlobalAnchorSource {
+pub fn global_frames_from_master(
+    endpoint: String,
+    key: Vec<u8>,
+) -> quil_engine::global_anchor::GlobalAnchorSource {
     Arc::new(move |number| {
         let endpoint = endpoint.clone();
         let key = key.clone();
         Box::pin(async move {
-            let mut client = quil_rpc::ArchiveClient::connect_own_master(&endpoint, &key).await
-                .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL anchor master connect: {e}")))?;
-            client.get_global_anchor(number).await
-                .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL anchor master read: {e}")))
+            let mut client = quil_rpc::ArchiveClient::connect_own_master(&endpoint, &key)
+                .await
+                .map_err(|e| {
+                    QuilError::ExecutionUnavailable(format!("GLOBAL anchor master connect: {e}"))
+                })?;
+            client.get_global_anchor(number).await.map_err(|e| {
+                QuilError::ExecutionUnavailable(format!("GLOBAL anchor master read: {e}"))
+            })
         })
     })
 }
@@ -147,7 +171,9 @@ async fn outgoing_page_from(
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut client = quil_rpc::ArchiveClient::connect_mtls(endpoint, key)
             .await
-            .map_err(|e| QuilError::ExecutionUnavailable(format!("outgoing history peer connect: {e}")))?;
+            .map_err(|e| {
+                QuilError::ExecutionUnavailable(format!("outgoing history peer connect: {e}"))
+            })?;
         let frames = client
             .get_shard_outgoing_history(filter, from, through)
             .await
@@ -199,7 +225,8 @@ pub(crate) async fn outgoing_history_from_endpoints(
     outgoing_history_with(endpoints, from, through, |endpoint| {
         let (key, filter) = (key.to_vec(), filter.clone());
         async move { outgoing_page_from(&endpoint, &key, filter, from, through).await }
-    }).await
+    })
+    .await
 }
 
 async fn outgoing_history_with<F, Fut>(
@@ -213,8 +240,13 @@ where
     Fut: std::future::Future<Output = Result<Vec<quil_engine::app_handoff::FrameOutgoing>>>,
 {
     use futures::stream::{FuturesUnordered, StreamExt};
-    let mut asked: FuturesUnordered<_> = endpoints.iter().cloned()
-        .map(|endpoint| { let answer = page(endpoint.clone()); async move { (endpoint, answer.await) } })
+    let mut asked: FuturesUnordered<_> = endpoints
+        .iter()
+        .cloned()
+        .map(|endpoint| {
+            let answer = page(endpoint.clone());
+            async move { (endpoint, answer.await) }
+        })
         .collect();
     let mut answers = Vec::new();
     while let Some((endpoint, answer)) = asked.next().await {
@@ -228,7 +260,10 @@ where
     Err(QuilError::ExecutionUnavailable(if answers.is_empty() {
         format!("no archive is known to ask for outgoing records of frames {from}-{through}")
     } else {
-        format!("no archive served outgoing records of frames {from}-{through} ({})", answers.join("; "))
+        format!(
+            "no archive served outgoing records of frames {from}-{through} ({})",
+            answers.join("; ")
+        )
     }))
 }
 
@@ -238,7 +273,12 @@ mod tests {
 
     fn outgoing(frame: u64) -> quil_engine::app_handoff::FrameOutgoing {
         quil_engine::app_handoff::FrameOutgoing {
-            frame, fees: Vec::new(), settlements: Vec::new(), spends: Vec::new(), digest: Vec::new(), report: Vec::new(),
+            frame,
+            fees: Vec::new(),
+            settlements: Vec::new(),
+            spends: Vec::new(),
+            digest: Vec::new(),
+            report: Vec::new(),
         }
     }
 
@@ -249,23 +289,45 @@ mod tests {
         let served = outgoing_history_with(&endpoints, 44, 597, |endpoint| async move {
             match endpoint.as_str() {
                 "192.0.2.5:8340" => Ok(vec![outgoing(44), outgoing(45)]),
-                "192.0.2.2:8340" => Err(QuilError::ExecutionUnavailable("outgoing history peer timed out".into())),
+                "192.0.2.2:8340" => Err(QuilError::ExecutionUnavailable(
+                    "outgoing history peer timed out".into(),
+                )),
                 _ => Ok(Vec::new()),
             }
-        }).await.unwrap();
-        assert_eq!(served.iter().map(|o| o.frame).collect::<Vec<_>>(), vec![44, 45]);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            served.iter().map(|o| o.frame).collect::<Vec<_>>(),
+            vec![44, 45]
+        );
 
         let error = outgoing_history_with(&endpoints[..2], 44, 597, |endpoint| async move {
             if endpoint.ends_with(".2:8340") {
-                Err(QuilError::ExecutionUnavailable("outgoing history peer timed out".into()))
+                Err(QuilError::ExecutionUnavailable(
+                    "outgoing history peer timed out".into(),
+                ))
             } else {
                 Ok(Vec::new())
             }
-        }).await.unwrap_err().to_string();
+        })
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("frames 44-597"), "{error}");
-        assert!(error.contains("192.0.2.1:8340: holds none from frame 44"), "{error}");
-        assert!(error.contains("192.0.2.2:8340: execution unavailable: outgoing history peer timed out"), "{error}");
-        let none = outgoing_history_with(&[], 44, 597, |_| async { Ok(Vec::new()) }).await.unwrap_err().to_string();
+        assert!(
+            error.contains("192.0.2.1:8340: holds none from frame 44"),
+            "{error}"
+        );
+        assert!(
+            error
+                .contains("192.0.2.2:8340: execution unavailable: outgoing history peer timed out"),
+            "{error}"
+        );
+        let none = outgoing_history_with(&[], 44, 597, |_| async { Ok(Vec::new()) })
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(none.contains("no archive is known"), "{none}");
     }
 
@@ -279,12 +341,20 @@ mod tests {
         assert_eq!(turns[3], [&endpoints[3..], &endpoints[..2]].concat());
         assert_eq!(turns[4], turns[0]);
         // Fewer than three known: each is asked once.
-        assert_eq!(rotation.next(&endpoints[..2]), [endpoints[1].clone(), endpoints[0].clone()]);
+        assert_eq!(
+            rotation.next(&endpoints[..2]),
+            [endpoints[1].clone(), endpoints[0].clone()]
+        );
         assert!(rotation.next(&[]).is_empty());
     }
 
     #[derive(Clone, Copy, PartialEq)]
-    enum Reply { Held, Busy, Broken, Silent }
+    enum Reply {
+        Held,
+        Busy,
+        Broken,
+        Silent,
+    }
 
     /// Proofs from one archive: a connection numbered by its dial serves
     /// every proof until a read breaks it or outlasts the attempt.
@@ -307,7 +377,9 @@ mod tests {
                 async move {
                     match reply {
                         Held => Ok(Some(vec![7])),
-                        Busy => Err(ArchiveClientError::Rpc(tonic::Status::resource_exhausted("busy"))),
+                        Busy => Err(ArchiveClientError::Rpc(tonic::Status::resource_exhausted(
+                            "busy",
+                        ))),
                         Broken => Err(ArchiveClientError::Rpc(tonic::Status::unavailable("reset"))),
                         Silent => std::future::pending().await,
                     }
@@ -340,7 +412,9 @@ mod tests {
         };
         let proof = proof_from(&KEPT, endpoints.clone(), b"k", dial, ask).await;
         assert_eq!(proof.unwrap(), Some(vec![7]));
-        let error = proof_from(&KEPT, endpoints[..2].to_vec(), b"k", dial, ask).await.unwrap_err();
+        let error = proof_from(&KEPT, endpoints[..2].to_vec(), b"k", dial, ask)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("no archive retained"), "{error}");
     }
 }

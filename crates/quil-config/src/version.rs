@@ -60,7 +60,10 @@ fn with_subpatch(version: &str, subpatch: &str) -> String {
 pub fn format_version(version: &[u8]) -> String {
     match version.len() {
         3 => format!("{}.{}.{}", version[0], version[1], version[2]),
-        4 => format!("{}.{}.{}-p{}", version[0], version[1], version[2], version[3]),
+        4 => format!(
+            "{}.{}.{}-p{}",
+            version[0], version[1], version[2], version[3]
+        ),
         _ => String::new(),
     }
 }

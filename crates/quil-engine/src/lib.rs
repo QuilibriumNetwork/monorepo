@@ -1,78 +1,78 @@
 pub mod app_engine;
-pub mod storage_history;
-pub mod global_anchor;
+pub mod app_glue;
 pub mod app_handoff;
 mod app_history_recovery;
-mod bounded_warn;
-pub mod app_glue;
-pub mod archive_ingest;
 pub mod app_shard_cache;
 pub mod app_shard_metadata;
 pub mod app_types;
-pub mod multi_proof_cache;
-pub mod outage;
-mod delivery_sources;
+pub mod archive_ingest;
+mod bounded_warn;
+mod closing_certificate;
 pub mod committee;
 pub mod consensus_metrics;
 pub mod consensus_types;
-/// Commonware-simplex consensus seams: real-state impls of the
-/// quil-cw-consensus GlobalProposer/FrameSink/FrameFinalizer traits.
-pub mod cw_app_seams;
-mod closing_certificate;
-pub mod cw_global_seams;
-mod cw_host_supervisor;
 pub mod consensus_wire;
 pub mod coverage;
 pub mod current_frame;
-pub mod shard_rebalancer;
+/// Commonware-simplex consensus seams: real-state impls of the
+/// quil-cw-consensus GlobalProposer/FrameSink/FrameFinalizer traits.
+pub mod cw_app_seams;
+pub mod cw_global_seams;
+mod cw_host_supervisor;
+mod delivery_sources;
 pub mod difficulty;
 pub mod engine_state;
 pub mod event_distributor;
+pub mod execution_deferral;
 pub mod fees;
 pub mod fork_choice;
 pub mod frame_chain_checker;
-pub mod frame_materializer;
 pub mod frame_maintenance;
+pub mod frame_materializer;
 pub mod frame_processor;
+pub mod frame_replay;
+pub mod frame_validator;
 pub mod genesis;
+pub mod global_anchor;
 pub mod global_catch_up;
 pub mod global_finalization;
 pub mod global_stall;
 pub mod global_view_refresh;
-pub mod frame_replay;
-pub mod frame_validator;
 pub mod halt_state;
-pub mod message_collector;
-pub mod spawn_gate;
-pub mod execution_deferral;
-pub mod message_router;
-pub mod leader_provider;
-pub mod prover_op_tally;
 pub mod historical_committee;
-pub mod resolver_traffic;
+pub mod leader_provider;
+pub mod message_collector;
+pub mod message_router;
 pub mod metrics;
+pub mod multi_proof_cache;
+pub mod outage;
+pub mod own_prover_ops;
+pub(crate) mod own_votes;
+pub mod presence_reports;
+pub mod prover_message_transport;
+pub mod prover_op_tally;
+pub mod prover_pipeline;
+pub mod prover_tree_syncer;
+pub mod provers;
+mod recovery_turns;
 pub mod remote_worker;
+pub mod resolver_traffic;
 pub mod rewards;
+pub mod shard_info;
+pub mod shard_rebalancer;
+pub mod spawn_gate;
+pub mod storage_epoch_batch;
+pub mod storage_history;
+pub mod storage_snapshot;
 pub mod thread_worker;
 pub mod time_reel;
-pub mod prover_message_transport;
-pub mod prover_pipeline;
-pub mod own_prover_ops;
-pub mod presence_reports;
-pub mod storage_epoch_batch;
-pub mod storage_snapshot;
-pub mod provers;
-pub mod shard_info;
-pub mod worker_allocator;
-pub mod worker_node;
 pub mod worker;
-pub mod worker_payload_eviction;
-pub mod worker_stall;
+pub mod worker_allocator;
 pub mod worker_consensus_storage;
 pub mod worker_execution;
-pub(crate) mod own_votes;
-pub mod prover_tree_syncer;
-mod recovery_turns;
+pub mod worker_node;
+pub mod worker_payload_eviction;
+pub mod worker_stall;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
 /// Exposed for integration tests in `tests/`; hidden from public
@@ -83,8 +83,8 @@ pub mod test_support;
 pub use app_engine::AppConsensusEngine;
 pub use app_shard_cache::AppShardCache;
 pub use difficulty::AsertDifficultyAdjuster;
-pub use rewards::OptRewardIssuance;
 pub use fees::InMemoryDynamicFeeManager;
+pub use rewards::OptRewardIssuance;
 pub use time_reel::GlobalTimeReel;
 
 /// Consensus bitmask constants matching the Go implementation.
@@ -171,7 +171,11 @@ pub mod bitmasks {
     /// whole-application shard's filter already IS that address, so this is
     /// the identity before any split.
     pub fn app_address_of(filter: &[u8]) -> &[u8] {
-        if filter.len() >= 32 { &filter[..32] } else { filter }
+        if filter.len() >= 32 {
+            &filter[..32]
+        } else {
+            filter
+        }
     }
 
     /// Per-APPLICATION submission topic, on which wallets publish operations.
@@ -243,7 +247,8 @@ pub mod bitmasks {
         // Distinct across restarts too: a replayed vote must not collide with
         // the copy its previous process published less than five minutes ago.
         let base = *BASE.get_or_init(|| {
-            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            let time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos() as u64);
             time ^ (u64::from(std::process::id()) << 32)
         });
@@ -338,13 +343,21 @@ pub mod bitmasks {
         match addressee {
             Some(tag) if &tag != local => {
                 if resolver {
-                    ResolverTraffic::process().note_received(filter, cw_bytes, Addressed::Elsewhere);
+                    ResolverTraffic::process().note_received(
+                        filter,
+                        cw_bytes,
+                        Addressed::Elsewhere,
+                    );
                 }
                 None
             }
             addressee => {
                 if resolver {
-                    let addressed = if addressee.is_some() { Addressed::Here } else { Addressed::Untagged };
+                    let addressed = if addressee.is_some() {
+                        Addressed::Here
+                    } else {
+                        Addressed::Untagged
+                    };
                     ResolverTraffic::process().note_received(filter, cw_bytes, addressed);
                 }
                 Some((channel, cw_bytes))
@@ -361,14 +374,22 @@ pub mod bitmasks {
         #[test]
         fn shard_cw_framing_survives_arbitrary_bytes() {
             let mut x = 0x9e37_79b9_7f4a_7c15u64;
-            let mut next = || { x ^= x >> 12; x ^= x << 25; x ^= x >> 27; x.wrapping_mul(0x2545_F491_4F6C_DD1D) };
+            let mut next = || {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            };
             for i in 0..20_000u64 {
                 let len = (next() % 64) as usize;
                 let mut bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
                 if i % 3 == 0 {
                     let channel = next() % 4;
                     let framed = shard_cw_frame_payload(channel, &bytes);
-                    assert_eq!(shard_cw_split_payload(&framed), Some((channel, bytes.as_slice())));
+                    assert_eq!(
+                        shard_cw_split_payload(&framed),
+                        Some((channel, bytes.as_slice()))
+                    );
                     bytes = framed;
                     if !bytes.is_empty() {
                         let at = (next() as usize) % bytes.len();
@@ -387,12 +408,18 @@ pub mod bitmasks {
             let vote = b"identical signed vote bytes";
             let first = shard_cw_frame_payload(1, vote);
             let second = shard_cw_frame_payload(1, vote);
-            assert_ne!(first, second, "a content-hashed message id would drop the retry");
+            assert_ne!(
+                first, second,
+                "a content-hashed message id would drop the retry"
+            );
             for payload in [&first, &second] {
                 assert_eq!(shard_cw_split_payload(payload), Some((1, vote.as_slice())));
             }
             // The earlier framing still decodes; truncated nonces do not.
-            assert_eq!(shard_cw_split_payload(&[3, 9, 9]), Some((3, [9u8, 9].as_slice())));
+            assert_eq!(
+                shard_cw_split_payload(&[3, 9, 9]),
+                Some((3, [9u8, 9].as_slice()))
+            );
             assert_eq!(shard_cw_split_payload(&first[..5]), None);
             assert_eq!(shard_cw_split_payload(&[]), None);
         }
@@ -403,16 +430,27 @@ pub mod bitmasks {
         #[test]
         fn an_addressed_transmission_reaches_only_its_member() {
             let (alice, bob) = (vec![1u8; 897], vec![2u8; 897]);
-            let (alice_tag, bob_tag) = (shard_cw_addressee_tag(&alice), shard_cw_addressee_tag(&bob));
+            let (alice_tag, bob_tag) =
+                (shard_cw_addressee_tag(&alice), shard_cw_addressee_tag(&bob));
             assert_ne!(alice_tag, bob_tag);
             let filter = [7u8; 32];
             let request = b"resolver request bytes";
             let framed = shard_cw_frame_for(2, request, std::slice::from_ref(&alice));
             assert_eq!(shard_cw_addressee(&framed), Some(alice_tag));
-            assert_eq!(shard_cw_split_payload(&framed), Some((2, request.as_slice())));
-            assert_eq!(shard_cw_admit(&filter, &framed, &alice_tag), Some((2, request.as_slice())));
+            assert_eq!(
+                shard_cw_split_payload(&framed),
+                Some((2, request.as_slice()))
+            );
+            assert_eq!(
+                shard_cw_admit(&filter, &framed, &alice_tag),
+                Some((2, request.as_slice()))
+            );
             assert_eq!(shard_cw_admit(&filter, &framed, &bob_tag), None);
-            assert_ne!(framed, shard_cw_frame_for(2, request, std::slice::from_ref(&alice)), "still distinct per transmission");
+            assert_ne!(
+                framed,
+                shard_cw_frame_for(2, request, std::slice::from_ref(&alice)),
+                "still distinct per transmission"
+            );
 
             // Broadcasts, several recipients and earlier framings name nobody.
             for framed in [
@@ -421,14 +459,26 @@ pub mod bitmasks {
                 shard_cw_frame_for(2, request, &[alice.clone(), bob.clone()]),
             ] {
                 assert_eq!(shard_cw_addressee(&framed), None);
-                assert_eq!(framed[1] & 0x80, 0, "a broadcast nonce never looks addressed");
-                assert_eq!(shard_cw_admit(&filter, &framed, &bob_tag), Some((2, request.as_slice())));
+                assert_eq!(
+                    framed[1] & 0x80,
+                    0,
+                    "a broadcast nonce never looks addressed"
+                );
+                assert_eq!(
+                    shard_cw_admit(&filter, &framed, &bob_tag),
+                    Some((2, request.as_slice()))
+                );
             }
             let mut legacy = vec![0x82u8];
-            legacy.extend_from_slice(&(1_780_000_000_000_000_000u64 ^ (4_194_303u64 << 32)).to_be_bytes());
+            legacy.extend_from_slice(
+                &(1_780_000_000_000_000_000u64 ^ (4_194_303u64 << 32)).to_be_bytes(),
+            );
             legacy.extend_from_slice(request);
             assert_eq!(shard_cw_addressee(&legacy), None);
-            assert_eq!(shard_cw_admit(&filter, &legacy, &bob_tag), Some((2, request.as_slice())));
+            assert_eq!(
+                shard_cw_admit(&filter, &legacy, &bob_tag),
+                Some((2, request.as_slice()))
+            );
             assert_eq!(shard_cw_addressee(&[0x82, 0xAD, 1, 2]), None, "truncated");
         }
 
@@ -439,19 +489,56 @@ pub mod bitmasks {
             let address = [0x5au8; 32];
             let cw = shard_cw_bitmask(&address);
             let class = GossipClass::of_bitmask;
-            assert_eq!(class(&cw, &shard_cw_frame_payload(0, b"vote")), GossipClass::Votes);
-            assert_eq!(class(&cw, &shard_cw_frame_for(0, b"vote", &[vec![1u8; 8]])), GossipClass::Votes);
+            assert_eq!(
+                class(&cw, &shard_cw_frame_payload(0, b"vote")),
+                GossipClass::Votes
+            );
+            assert_eq!(
+                class(&cw, &shard_cw_frame_for(0, b"vote", &[vec![1u8; 8]])),
+                GossipClass::Votes
+            );
             for channel in 1..=3 {
-                assert_eq!(class(&cw, &shard_cw_frame_payload(channel, b"cw")), GossipClass::ShardConsensus);
-                assert_eq!(class(&cw, &shard_cw_frame_for(channel, b"cw", &[vec![1u8; 8]])), GossipClass::ShardConsensus);
+                assert_eq!(
+                    class(&cw, &shard_cw_frame_payload(channel, b"cw")),
+                    GossipClass::ShardConsensus
+                );
+                assert_eq!(
+                    class(&cw, &shard_cw_frame_for(channel, b"cw", &[vec![1u8; 8]])),
+                    GossipClass::ShardConsensus
+                );
             }
-            assert_eq!(class(&shard_frame_bitmask(&address), b"frame"), GossipClass::ShardFrames);
-            assert_eq!(class(&shard_consensus_bitmask(&address), b"vote"), GossipClass::Votes);
-            assert_eq!(class(&shard_prover_bitmask(&address), b"op"), GossipClass::Other);
-            assert_eq!(class(&shard_dispatch_bitmask(&address), b"op"), GossipClass::Other);
-            for global in [GLOBAL_CONSENSUS, GLOBAL_FRAME, GLOBAL_PROVER, GLOBAL_ALERT,
-                GLOBAL_CW_VOTE, GLOBAL_CW_CERT, GLOBAL_CW_RESOLVER, GLOBAL_CW_BLOCK] {
-                assert_eq!(class(global, b"x"), GossipClass::Global, "{}", hex::encode(global));
+            assert_eq!(
+                class(&shard_frame_bitmask(&address), b"frame"),
+                GossipClass::ShardFrames
+            );
+            assert_eq!(
+                class(&shard_consensus_bitmask(&address), b"vote"),
+                GossipClass::Votes
+            );
+            assert_eq!(
+                class(&shard_prover_bitmask(&address), b"op"),
+                GossipClass::Other
+            );
+            assert_eq!(
+                class(&shard_dispatch_bitmask(&address), b"op"),
+                GossipClass::Other
+            );
+            for global in [
+                GLOBAL_CONSENSUS,
+                GLOBAL_FRAME,
+                GLOBAL_PROVER,
+                GLOBAL_ALERT,
+                GLOBAL_CW_VOTE,
+                GLOBAL_CW_CERT,
+                GLOBAL_CW_RESOLVER,
+                GLOBAL_CW_BLOCK,
+            ] {
+                assert_eq!(
+                    class(global, b"x"),
+                    GossipClass::Global,
+                    "{}",
+                    hex::encode(global)
+                );
             }
             assert_eq!(class(GLOBAL_PEER_INFO, b"x"), GossipClass::PeerInfo);
         }
@@ -474,18 +561,23 @@ pub mod bitmasks {
             let wallet_publishes_to = app_prover_bitmask(&app);
             for filter in [app.to_vec(), child(1, 0x00), child(1, 0x80), child(3, 0x20)] {
                 assert_eq!(
-                    app_prover_bitmask(&filter), wallet_publishes_to,
-                    "shard {} must share the application's submission topic", hex::encode(&filter),
+                    app_prover_bitmask(&filter),
+                    wallet_publishes_to,
+                    "shard {} must share the application's submission topic",
+                    hex::encode(&filter),
                 );
             }
             // Why the helper exists: the bloom hashes every byte it is given, so
             // keying on the longer child filter lands on a different topic.
             assert_ne!(shard_prover_bitmask(&child(1, 0x00)), wallet_publishes_to);
             // Per-shard traffic stays per-shard.
-            assert_ne!(shard_frame_bitmask(&child(1, 0x00)), shard_frame_bitmask(&app));
+            assert_ne!(
+                shard_frame_bitmask(&child(1, 0x00)),
+                shard_frame_bitmask(&app)
+            );
         }
     }
 }
-pub(crate) mod submission_attempts;
-pub(crate) mod stage_clock;
 pub mod shard_drain;
+pub(crate) mod stage_clock;
+pub(crate) mod submission_attempts;

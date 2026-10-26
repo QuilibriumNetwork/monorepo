@@ -52,8 +52,14 @@ impl ClockStore for GlobalAnchorView {
     }
     fn get_earliest_global_clock_frame(&self) -> Result<proto::global::GlobalFrame> {
         let frame = self.inner.get_earliest_global_clock_frame()?;
-        if frame.header.as_ref().is_some_and(|h| h.frame_number > self.max_frame) {
-            return Err(QuilError::NotFound("no GLOBAL frame at or below the anchor".into()));
+        if frame
+            .header
+            .as_ref()
+            .is_some_and(|h| h.frame_number > self.max_frame)
+        {
+            return Err(QuilError::NotFound(
+                "no GLOBAL frame at or below the anchor".into(),
+            ));
         }
         Ok(frame)
     }
@@ -66,7 +72,10 @@ impl ClockStore for GlobalAnchorView {
         }
         self.inner.get_global_clock_frame(frame_number)
     }
-    fn get_global_clock_frame_header(&self, frame_number: u64) -> Result<proto::global::GlobalFrameHeader> {
+    fn get_global_clock_frame_header(
+        &self,
+        frame_number: u64,
+    ) -> Result<proto::global::GlobalFrameHeader> {
         if frame_number > self.max_frame {
             return Err(QuilError::NotFound(format!(
                 "GLOBAL frame {frame_number} is above the anchor {}",
@@ -80,7 +89,9 @@ impl ClockStore for GlobalAnchorView {
         frame_number: u64,
     ) -> Result<Vec<quil_types::store::RequestOutcome>> {
         if frame_number > self.max_frame {
-            return Err(QuilError::NotFound("GLOBAL outcomes above the anchor".into()));
+            return Err(QuilError::NotFound(
+                "GLOBAL outcomes above the anchor".into(),
+            ));
         }
         self.inner.get_global_clock_frame_outcomes(frame_number)
     }
@@ -120,31 +131,72 @@ impl ClockStore for GlobalAnchorView {
     ) -> Result<()> {
         refused("outcome write")
     }
-    fn put_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64, _fee_total: u128) -> Result<()> {
+    fn put_shard_frame_fee_total(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _fee_total: u128,
+    ) -> Result<()> {
         refused("shard fee write")
     }
-    fn get_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<u128>> {
+    fn get_shard_frame_fee_total(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<u128>> {
         refused("shard fee read")
     }
-    fn put_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+    fn put_shard_frame_settlements(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _entries: &[u8],
+    ) -> Result<()> {
         refused("shard settlement write")
     }
-    fn get_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_settlements(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         refused("shard settlement read")
     }
-    fn put_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64, _digest: &[u8], _report: &[u8]) -> Result<()> {
+    fn put_shard_frame_accumulator(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _digest: &[u8],
+        _report: &[u8],
+    ) -> Result<()> {
         refused("shard accumulator write")
     }
-    fn get_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_accumulator(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         refused("shard accumulator read")
     }
-    fn put_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+    fn put_shard_frame_spends(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _entries: &[u8],
+    ) -> Result<()> {
         refused("shard spend write")
     }
-    fn get_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_spends(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         refused("shard spend read")
     }
-    fn get_shard_accumulator_report(&self, _filter: &[u8], _digest: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn get_shard_accumulator_report(
+        &self,
+        _filter: &[u8],
+        _digest: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         refused("shard accumulator report read")
     }
     fn delete_global_clock_frame_range(&self, _min_frame: u64, _max_frame: u64) -> Result<()> {
@@ -171,10 +223,17 @@ impl ClockStore for GlobalAnchorView {
         refused("certified state write")
     }
 
-    fn get_latest_quorum_certificate(&self, _filter: &[u8]) -> Result<proto::global::QuorumCertificate> {
+    fn get_latest_quorum_certificate(
+        &self,
+        _filter: &[u8],
+    ) -> Result<proto::global::QuorumCertificate> {
         refused("quorum certificate")
     }
-    fn get_quorum_certificate(&self, _filter: &[u8], _rank: u64) -> Result<proto::global::QuorumCertificate> {
+    fn get_quorum_certificate(
+        &self,
+        _filter: &[u8],
+        _rank: u64,
+    ) -> Result<proto::global::QuorumCertificate> {
         refused("quorum certificate")
     }
     fn put_quorum_certificate(
@@ -185,10 +244,17 @@ impl ClockStore for GlobalAnchorView {
         refused("quorum certificate write")
     }
 
-    fn get_latest_timeout_certificate(&self, _filter: &[u8]) -> Result<proto::global::TimeoutCertificate> {
+    fn get_latest_timeout_certificate(
+        &self,
+        _filter: &[u8],
+    ) -> Result<proto::global::TimeoutCertificate> {
         refused("timeout certificate")
     }
-    fn get_timeout_certificate(&self, _filter: &[u8], _rank: u64) -> Result<proto::global::TimeoutCertificate> {
+    fn get_timeout_certificate(
+        &self,
+        _filter: &[u8],
+        _rank: u64,
+    ) -> Result<proto::global::TimeoutCertificate> {
         refused("timeout certificate")
     }
     fn put_timeout_certificate(
@@ -237,17 +303,29 @@ impl ClockStore for GlobalAnchorView {
     ) -> Result<proto::global::AppShardFrame> {
         refused("staged shard frame")
     }
-    fn set_latest_shard_clock_frame_number(&self, _filter: &[u8], _frame_number: u64) -> Result<()> {
+    fn set_latest_shard_clock_frame_number(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<()> {
         refused("shard frame write")
     }
-    fn delete_shard_clock_frame_range(&self, _filter: &[u8], _min_frame: u64, _max_frame: u64) -> Result<()> {
+    fn delete_shard_clock_frame_range(
+        &self,
+        _filter: &[u8],
+        _min_frame: u64,
+        _max_frame: u64,
+    ) -> Result<()> {
         refused("shard frame delete")
     }
     fn reset_shard_clock_frames(&self, _filter: &[u8]) -> Result<()> {
         refused("shard frame reset")
     }
 
-    fn get_latest_certified_app_shard_state(&self, _filter: &[u8]) -> Result<proto::global::AppShardProposal> {
+    fn get_latest_certified_app_shard_state(
+        &self,
+        _filter: &[u8],
+    ) -> Result<proto::global::AppShardProposal> {
         refused("certified shard state")
     }
     fn put_certified_app_shard_state(
@@ -258,7 +336,11 @@ impl ClockStore for GlobalAnchorView {
         refused("certified shard state write")
     }
 
-    fn put_proposal_vote(&self, _txn: &dyn Transaction, _vote: &proto::global::ProposalVote) -> Result<()> {
+    fn put_proposal_vote(
+        &self,
+        _txn: &dyn Transaction,
+        _vote: &proto::global::ProposalVote,
+    ) -> Result<()> {
         refused("vote write")
     }
     fn get_proposal_vote(
@@ -269,10 +351,18 @@ impl ClockStore for GlobalAnchorView {
     ) -> Result<proto::global::ProposalVote> {
         refused("vote")
     }
-    fn get_proposal_votes(&self, _filter: &[u8], _rank: u64) -> Result<Vec<proto::global::ProposalVote>> {
+    fn get_proposal_votes(
+        &self,
+        _filter: &[u8],
+        _rank: u64,
+    ) -> Result<Vec<proto::global::ProposalVote>> {
         refused("votes")
     }
-    fn put_timeout_vote(&self, _txn: &dyn Transaction, _vote: &proto::global::TimeoutState) -> Result<()> {
+    fn put_timeout_vote(
+        &self,
+        _txn: &dyn Transaction,
+        _vote: &proto::global::TimeoutState,
+    ) -> Result<()> {
         refused("timeout vote write")
     }
     fn get_timeout_vote(
@@ -283,11 +373,20 @@ impl ClockStore for GlobalAnchorView {
     ) -> Result<proto::global::TimeoutState> {
         refused("timeout vote")
     }
-    fn get_timeout_votes(&self, _filter: &[u8], _rank: u64) -> Result<Vec<proto::global::TimeoutState>> {
+    fn get_timeout_votes(
+        &self,
+        _filter: &[u8],
+        _rank: u64,
+    ) -> Result<Vec<proto::global::TimeoutState>> {
         refused("timeout votes")
     }
 
-    fn get_total_distance(&self, _filter: &[u8], _frame_number: u64, _selector: &[u8]) -> Result<BigInt> {
+    fn get_total_distance(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _selector: &[u8],
+    ) -> Result<BigInt> {
         refused("total distance")
     }
     fn set_total_distance(

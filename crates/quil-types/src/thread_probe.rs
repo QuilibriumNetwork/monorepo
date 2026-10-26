@@ -124,7 +124,10 @@ sections! {
 
 impl Section {
     fn from_id(id: u8) -> Section {
-        Section::ALL.get(id as usize).copied().unwrap_or(Section::None)
+        Section::ALL
+            .get(id as usize)
+            .copied()
+            .unwrap_or(Section::None)
     }
 }
 
@@ -142,7 +145,10 @@ fn pack(section: Section, at_ms: u64) -> u64 {
 
 fn unpack(value: u64) -> Option<Mark> {
     let section = Section::from_id((value >> MS_BITS) as u8);
-    (section != Section::None).then_some(Mark { section, since_ms: value & MS_MASK })
+    (section != Section::None).then_some(Mark {
+        section,
+        since_ms: value & MS_MASK,
+    })
 }
 
 /// Milliseconds since this process first asked; the probe's clock.
@@ -227,7 +233,10 @@ impl ThreadProbe {
     }
 
     pub fn filter(&self) -> Vec<u8> {
-        self.filter.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.filter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -246,7 +255,10 @@ std::thread_local! {
 }
 
 fn current() -> Option<Arc<ThreadProbe>> {
-    CURRENT.try_with(|current| current.borrow().clone()).ok().flatten()
+    CURRENT
+        .try_with(|current| current.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 fn with_current(mark: impl FnOnce(&ThreadProbe)) {
@@ -260,7 +272,10 @@ fn with_current(mark: impl FnOnce(&ThreadProbe)) {
 /// The probe installed on this thread until [`Installed`] drops.
 pub fn install(probe: Arc<ThreadProbe>) -> Installed {
     let previous = CURRENT.with(|current| current.replace(Some(probe)));
-    Installed { previous, _thread: PhantomData }
+    Installed {
+        previous,
+        _thread: PhantomData,
+    }
 }
 
 /// Uninstalls its probe, restoring the one it replaced, when dropped.
@@ -280,7 +295,10 @@ impl Drop for Installed {
 /// held across an `.await` would mark the section while other tasks run.
 pub fn section(section: Section) -> SectionGuard {
     let Some(probe) = current() else {
-        return SectionGuard { entered: None, _thread: PhantomData };
+        return SectionGuard {
+            entered: None,
+            _thread: PhantomData,
+        };
     };
     let previous = probe.section.load(Ordering::Relaxed);
     let mark = pack(section, now_ms());
@@ -288,7 +306,10 @@ pub fn section(section: Section) -> SectionGuard {
         probe.outer.store(mark, Ordering::Relaxed);
     }
     probe.section.store(mark, Ordering::Relaxed);
-    SectionGuard { entered: Some((probe, previous)), _thread: PhantomData }
+    SectionGuard {
+        entered: Some((probe, previous)),
+        _thread: PhantomData,
+    }
 }
 
 pub struct SectionGuard {
@@ -336,7 +357,10 @@ pub fn idle() {
 /// master task moves between the threads of a multi-thread runtime, so its
 /// marks follow the task rather than a thread.
 pub fn task_probed<F: Future>(probe: Arc<ThreadProbe>, future: F) -> TaskProbed<F> {
-    TaskProbed { probe, future: Box::pin(future) }
+    TaskProbed {
+        probe,
+        future: Box::pin(future),
+    }
 }
 
 pub struct TaskProbed<F> {
@@ -356,7 +380,10 @@ impl<F: Future> Future for TaskProbed<F> {
 
 /// Mark `task` as the task being polled during each of its polls.
 pub fn probed<F: Future>(task: Section, future: F) -> Probed<F> {
-    Probed { task, future: Box::pin(future) }
+    Probed {
+        task,
+        future: Box::pin(future),
+    }
 }
 
 pub struct Probed<F> {
@@ -371,7 +398,9 @@ impl<F: Future> Future for Probed<F> {
         let Some(probe) = current() else {
             return self.future.as_mut().poll(cx);
         };
-        let previous = probe.task.swap(pack(self.task, now_ms()), Ordering::Relaxed);
+        let previous = probe
+            .task
+            .swap(pack(self.task, now_ms()), Ordering::Relaxed);
         // Restored even when the poll panics: the runtime catches a task's
         // panic and the thread lives on.
         let _restore = RestoreTask { probe, previous };
@@ -404,12 +433,24 @@ mod tests {
             {
                 let _inner = section(Section::CommitLockWait);
                 let seen = probe.snapshot();
-                assert_eq!(seen.section.map(|m| m.section), Some(Section::CommitLockWait));
-                assert_eq!(seen.outer.map(|m| m.section), Some(Section::SuccessorStateCheck));
+                assert_eq!(
+                    seen.section.map(|m| m.section),
+                    Some(Section::CommitLockWait)
+                );
+                assert_eq!(
+                    seen.outer.map(|m| m.section),
+                    Some(Section::SuccessorStateCheck)
+                );
             }
             let seen = probe.snapshot();
-            assert_eq!(seen.section.map(|m| m.section), Some(Section::SuccessorStateCheck));
-            assert_eq!(seen.outer.map(|m| m.section), Some(Section::SuccessorStateCheck));
+            assert_eq!(
+                seen.section.map(|m| m.section),
+                Some(Section::SuccessorStateCheck)
+            );
+            assert_eq!(
+                seen.outer.map(|m| m.section),
+                Some(Section::SuccessorStateCheck)
+            );
         }
         let seen = probe.snapshot();
         assert_eq!((seen.section, seen.outer), (None, None));
@@ -431,7 +472,9 @@ mod tests {
         });
         let mut cx = Context::from_waker(std::task::Waker::noop());
         // The mark the poll replaced, as when a task polls another.
-        probe.task.store(pack(Section::WorkerLoop, now_ms()), Ordering::Relaxed);
+        probe
+            .task
+            .store(pack(Section::WorkerLoop, now_ms()), Ordering::Relaxed);
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = Pin::new(&mut task).poll(&mut cx);
         }));
@@ -469,7 +512,10 @@ mod tests {
     fn every_section_id_round_trips() {
         for (id, section) in Section::ALL.iter().enumerate() {
             assert_eq!(Section::from_id(id as u8), *section);
-            assert_eq!(unpack(pack(*section, 1234)).map(|m| m.section), (*section != Section::None).then_some(*section));
+            assert_eq!(
+                unpack(pack(*section, 1234)).map(|m| m.section),
+                (*section != Section::None).then_some(*section)
+            );
         }
     }
 }

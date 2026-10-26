@@ -4,12 +4,12 @@
 //! enter sender APIs or memos. Complete erasure of underlying library
 //! temporaries is not guaranteed.
 
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::membership::{MembershipKey, NoteSecrets, RecipientSecret},
     transfer::{Output, MEMO_BYTES},
     *,
 };
-use super::relation::membership::IDENTITY_BYTES;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Nonce, Tag,
@@ -58,8 +58,12 @@ pub struct CreatedEscrowRecovery {
 /// Recovery confers no authority to consume an escrow.
 pub struct OpenedEscrow(OpenedOutput);
 impl OpenedEscrow {
-    pub fn amount(&self) -> u128 { self.0.amount }
-    pub fn opening(&self) -> &AmountOpening { &self.0.secrets.opening }
+    pub fn amount(&self) -> u128 {
+        self.0.amount
+    }
+    pub fn opening(&self) -> &AmountOpening {
+        &self.0.secrets.opening
+    }
 }
 
 /// Encrypt one fresh escrow opening independently to both recovery addresses.
@@ -72,18 +76,43 @@ pub fn create_escrow_recovery(
     refund: &super::address::RecipientAddress,
     amount: u128,
 ) -> Result<CreatedEscrowRecovery, MemoError> {
-    if recipient.context() != context || refund.context() != context { return Err(MemoError::Context); }
-    let recipient_key = sntrup761::PublicKey::from_bytes(recipient.kem_public_key()).map_err(|_| MemoError::Key)?;
-    let refund_key = sntrup761::PublicKey::from_bytes(refund.kem_public_key()).map_err(|_| MemoError::Key)?;
+    if recipient.context() != context || refund.context() != context {
+        return Err(MemoError::Context);
+    }
+    let recipient_key =
+        sntrup761::PublicKey::from_bytes(recipient.kem_public_key()).map_err(|_| MemoError::Key)?;
+    let refund_key =
+        sntrup761::PublicKey::from_bytes(refund.kem_public_key()).map_err(|_| MemoError::Key)?;
     let mut seed = Zeroizing::new([0; 32]);
-    OsRng.try_fill_bytes(&mut seed[..]).map_err(|_| MemoError::Random)?;
-    let CreatedOutput { output: to, opening } = create_output_with_seed(context, &recipient_key, recipient.recipient_key(), amount, &seed)?;
-    let back = create_output_with_seed(context, &refund_key, refund.recipient_key(), amount, &seed)?;
-    if to.commitment != back.output.commitment { return Err(MemoError::InconsistentOutput); }
+    OsRng
+        .try_fill_bytes(&mut seed[..])
+        .map_err(|_| MemoError::Random)?;
+    let CreatedOutput {
+        output: to,
+        opening,
+    } = create_output_with_seed(
+        context,
+        &recipient_key,
+        recipient.recipient_key(),
+        amount,
+        &seed,
+    )?;
+    let back =
+        create_output_with_seed(context, &refund_key, refund.recipient_key(), amount, &seed)?;
+    if to.commitment != back.output.commitment {
+        return Err(MemoError::InconsistentOutput);
+    }
     Ok(CreatedEscrowRecovery {
-        commitment: to.commitment, opening,
-        recipient: EscrowRecoveryMemo { owner: to.owner, ciphertext: to.memo },
-        refund: EscrowRecoveryMemo { owner: back.output.owner, ciphertext: back.output.memo },
+        commitment: to.commitment,
+        opening,
+        recipient: EscrowRecoveryMemo {
+            owner: to.owner,
+            ciphertext: to.memo,
+        },
+        refund: EscrowRecoveryMemo {
+            owner: back.output.owner,
+            ciphertext: back.output.memo,
+        },
     })
 }
 
@@ -94,9 +123,17 @@ pub fn open_escrow_recovery(
     commitment: &AmountCommitment,
     memo: &EscrowRecoveryMemo,
 ) -> Result<OpenedEscrow, MemoError> {
-    open_output(context, kem_secret_key, recipient, &Output {
-        commitment: commitment.clone(), owner: memo.owner, memo: memo.ciphertext,
-    }).map(OpenedEscrow)
+    open_output(
+        context,
+        kem_secret_key,
+        recipient,
+        &Output {
+            commitment: commitment.clone(),
+            owner: memo.owner,
+            memo: memo.ciphertext,
+        },
+    )
+    .map(OpenedEscrow)
 }
 
 pub struct OpenedOutput {
@@ -120,7 +157,11 @@ fn aead_key(context: &[u8; 32], kem: &[u8], shared_secret: &[u8]) -> Zeroizing<[
     result
 }
 
-fn associated_data(context: &[u8; 32], recipient: &[u8; IDENTITY_BYTES], output: &Output) -> Vec<u8> {
+fn associated_data(
+    context: &[u8; 32],
+    recipient: &[u8; IDENTITY_BYTES],
+    output: &Output,
+) -> Vec<u8> {
     let mut aad = b"quil/token/memo-aad/v2\0".to_vec();
     aad.extend_from_slice(context);
     aad.extend_from_slice(recipient);
@@ -161,7 +202,8 @@ pub fn create_output_with_nonce(
     if address.context() != context {
         return Err(MemoError::Context);
     }
-    let public = sntrup761::PublicKey::from_bytes(address.kem_public_key()).map_err(|_| MemoError::Key)?;
+    let public =
+        sntrup761::PublicKey::from_bytes(address.kem_public_key()).map_err(|_| MemoError::Key)?;
     create_output_with_seed(context, &public, address.recipient_key(), amount, nonce)
 }
 
@@ -278,45 +320,110 @@ mod tests {
         let (back_public, back_secret) = sntrup761::keypair();
         let to = RecipientSecret::from_seed(&context, &[92; 32]);
         let back = RecipientSecret::from_seed(&context, &[93; 32]);
-        let to_address = super::super::address::RecipientAddress::new(&context, &to, to_public.as_bytes()).unwrap();
-        let back_address = super::super::address::RecipientAddress::new(&context, &back, back_public.as_bytes()).unwrap();
+        let to_address =
+            super::super::address::RecipientAddress::new(&context, &to, to_public.as_bytes())
+                .unwrap();
+        let back_address =
+            super::super::address::RecipientAddress::new(&context, &back, back_public.as_bytes())
+                .unwrap();
         let key = CommitmentKey::derive(&context);
         for amount in [0, u128::MAX] {
-            let created = create_escrow_recovery(&context, &to_address, &back_address, amount).unwrap();
+            let created =
+                create_escrow_recovery(&context, &to_address, &back_address, amount).unwrap();
             assert_ne!(created.recipient.owner, created.refund.owner);
             assert_ne!(created.recipient.ciphertext, created.refund.ciphertext);
-            let recipient = open_escrow_recovery(&context, to_secret.as_bytes(), &to,
-                &created.commitment, &created.recipient).unwrap();
-            let refund = open_escrow_recovery(&context, back_secret.as_bytes(), &back,
-                &created.commitment, &created.refund).unwrap();
+            let recipient = open_escrow_recovery(
+                &context,
+                to_secret.as_bytes(),
+                &to,
+                &created.commitment,
+                &created.recipient,
+            )
+            .unwrap();
+            let refund = open_escrow_recovery(
+                &context,
+                back_secret.as_bytes(),
+                &back,
+                &created.commitment,
+                &created.refund,
+            )
+            .unwrap();
             for recovered in [&recipient, &refund] {
                 assert_eq!(recovered.amount(), amount);
-                assert_eq!(key.commit(recovered.amount(), recovered.opening()), created.commitment);
+                assert_eq!(
+                    key.commit(recovered.amount(), recovered.opening()),
+                    created.commitment
+                );
             }
             assert_eq!(key.commit(amount, &created.opening), created.commitment);
-            assert!(open_escrow_recovery(&context, to_secret.as_bytes(), &to,
-                &created.commitment, &created.refund).is_err());
-            assert!(open_escrow_recovery(&context, back_secret.as_bytes(), &back,
-                &created.commitment, &created.recipient).is_err());
-            assert!(open_escrow_recovery(&context, to_secret.as_bytes(), &back,
-                &created.commitment, &created.recipient).is_err());
+            assert!(open_escrow_recovery(
+                &context,
+                to_secret.as_bytes(),
+                &to,
+                &created.commitment,
+                &created.refund
+            )
+            .is_err());
+            assert!(open_escrow_recovery(
+                &context,
+                back_secret.as_bytes(),
+                &back,
+                &created.commitment,
+                &created.recipient
+            )
+            .is_err());
+            assert!(open_escrow_recovery(
+                &context,
+                to_secret.as_bytes(),
+                &back,
+                &created.commitment,
+                &created.recipient
+            )
+            .is_err());
             for index in [0, KEM_BYTES, NONCE_END, BODY_END] {
                 let mut changed = created.recipient.clone();
                 changed.ciphertext[index] ^= 1;
-                assert!(open_escrow_recovery(&context, to_secret.as_bytes(), &to,
-                    &created.commitment, &changed).is_err());
+                assert!(open_escrow_recovery(
+                    &context,
+                    to_secret.as_bytes(),
+                    &to,
+                    &created.commitment,
+                    &changed
+                )
+                .is_err());
             }
-            assert!(open_escrow_recovery(&[94; 32], to_secret.as_bytes(), &to,
-                &created.commitment, &created.recipient).is_err());
+            assert!(open_escrow_recovery(
+                &[94; 32],
+                to_secret.as_bytes(),
+                &to,
+                &created.commitment,
+                &created.recipient
+            )
+            .is_err());
             let changed_commitment = key.commit(amount ^ 1, &created.opening);
-            assert!(open_escrow_recovery(&context, to_secret.as_bytes(), &to,
-                &changed_commitment, &created.recipient).is_err());
-            let fresh = create_escrow_recovery(&context, &to_address, &back_address, amount).unwrap();
+            assert!(open_escrow_recovery(
+                &context,
+                to_secret.as_bytes(),
+                &to,
+                &changed_commitment,
+                &created.recipient
+            )
+            .is_err());
+            let fresh =
+                create_escrow_recovery(&context, &to_address, &back_address, amount).unwrap();
             assert_ne!(fresh.commitment, created.commitment);
         }
-        let other_address = super::super::address::RecipientAddress::new(&[94; 32], &back, back_public.as_bytes()).unwrap();
-        assert!(matches!(create_escrow_recovery(&context, &to_address, &other_address, 1), Err(MemoError::Context)));
-        assert!(matches!(create_escrow_recovery(&context, &other_address, &back_address, 1), Err(MemoError::Context)));
+        let other_address =
+            super::super::address::RecipientAddress::new(&[94; 32], &back, back_public.as_bytes())
+                .unwrap();
+        assert!(matches!(
+            create_escrow_recovery(&context, &to_address, &other_address, 1),
+            Err(MemoError::Context)
+        ));
+        assert!(matches!(
+            create_escrow_recovery(&context, &other_address, &back_address, 1),
+            Err(MemoError::Context)
+        ));
     }
 
     #[test]
@@ -422,8 +529,8 @@ mod tests {
         bad.owner[0] ^= 1;
         assert!(open_output(&context, secret.as_bytes(), &recipient, &bad).is_err());
         let mut bad = output.clone();
-        bad.commitment =
-            CommitmentKey::derive(&context).commit(8, &AmountOpening::from_seed(&context, &[0; 32]));
+        bad.commitment = CommitmentKey::derive(&context)
+            .commit(8, &AmountOpening::from_seed(&context, &[0; 32]));
         assert!(open_output(&context, secret.as_bytes(), &recipient, &bad).is_err());
         assert!(matches!(
             create_output_inner(&context, &[], &membership.recipient_key(&recipient), 0),

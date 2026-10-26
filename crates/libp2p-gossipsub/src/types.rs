@@ -183,7 +183,10 @@ impl RawMessage {
             + field(self.data.len())
             + self.sequence_number.map_or(0, |_| field(8))
             + field(self.topic.as_str().len())
-            + self.signature.as_ref().map_or(0, |signature| field(signature.len()))
+            + self
+                .signature
+                .as_ref()
+                .map_or(0, |signature| field(signature.len()))
             + self.key.as_ref().map_or(0, |key| field(key.len()))
     }
 }

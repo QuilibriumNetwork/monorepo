@@ -11,17 +11,41 @@ pub struct P2PConfig {
     pub history_gossip: i32,
     #[serde(default)]
     pub gossip_factor: f64,
-    #[serde(default, alias = "heartbeatInitialDelay", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "heartbeatInitialDelay",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub heartbeat_initial_delay_ms: u64,
-    #[serde(default, alias = "heartbeatInterval", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "heartbeatInterval",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub heartbeat_interval_ms: u64,
-    #[serde(default, alias = "fanoutTTL", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "fanoutTTL",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub fanout_ttl_ms: u64,
-    #[serde(default, alias = "pruneBackoff", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "pruneBackoff",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub prune_backoff_ms: u64,
-    #[serde(default, alias = "unsubscribeBackoff", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "unsubscribeBackoff",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub unsubscribe_backoff_ms: u64,
-    #[serde(default, alias = "iWantFollowupTime", deserialize_with = "crate::deserialize_go_duration_ms")]
+    #[serde(
+        default,
+        alias = "iWantFollowupTime",
+        deserialize_with = "crate::deserialize_go_duration_ms"
+    )]
     pub iwant_followup_time_ms: u64,
     #[serde(default, alias = "iDontWantMessageThreshold")]
     pub idont_want_message_threshold: i32,
@@ -49,7 +73,9 @@ pub struct P2PConfig {
     pub disable_onion_routing: bool,
 }
 
-fn default_stream_listen() -> String { "/ip4/0.0.0.0/tcp/8340".into() }
+fn default_stream_listen() -> String {
+    "/ip4/0.0.0.0/tcp/8340".into()
+}
 
 impl Default for P2PConfig {
     fn default() -> Self {
@@ -84,9 +110,8 @@ pub const MAINNET_BOOTSTRAP_PEERS: &[&str] = &[
 /// (`quil_types::consensus::MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`).
 ///
 /// QmQfp3 (109.94.96.183) was decommissioned 2026-10-20.
-pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] = &[
-    "QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr",
-];
+pub const DECOMMISSIONED_GENESIS_ARCHIVES: &[&str] =
+    &["QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr"];
 
 /// How many configured bootstrap peers [`P2PConfig::apply_defaults`]
 /// replaces with [`MAINNET_BOOTSTRAP_PEERS`]: the number of distinct
@@ -96,8 +121,10 @@ pub fn replaced_mainnet_bootstrap_peers(network: u8, configured: &[String]) -> O
     if network != 0 || configured.is_empty() {
         return None;
     }
-    let configured: std::collections::BTreeSet<&str> = configured.iter().map(|peer| peer.trim()).collect();
-    let built_in: std::collections::BTreeSet<&str> = MAINNET_BOOTSTRAP_PEERS.iter().copied().collect();
+    let configured: std::collections::BTreeSet<&str> =
+        configured.iter().map(|peer| peer.trim()).collect();
+    let built_in: std::collections::BTreeSet<&str> =
+        MAINNET_BOOTSTRAP_PEERS.iter().copied().collect();
     (configured != built_in).then_some(configured.len())
 }
 
@@ -105,29 +132,51 @@ impl P2PConfig {
     /// Apply defaults for all P2P and BlossomSub parameters.
     pub fn apply_defaults(&mut self) {
         // BlossomSub mesh parameters
-        if self.d_lo == 0 { self.d_lo = 6; }
+        if self.d_lo == 0 {
+            self.d_lo = 6;
+        }
 
         // Gossip/history
-        if self.history_length == 0 { self.history_length = 9; }
-        if self.history_gossip == 0 { self.history_gossip = 6; }
-        if self.gossip_factor == 0.0 { self.gossip_factor = 0.25; }
+        if self.history_length == 0 {
+            self.history_length = 9;
+        }
+        if self.history_gossip == 0 {
+            self.history_gossip = 6;
+        }
+        if self.gossip_factor == 0.0 {
+            self.gossip_factor = 0.25;
+        }
 
         // Heartbeat (Go: 100ms initial, 700ms interval)
-        if self.heartbeat_initial_delay_ms == 0 { self.heartbeat_initial_delay_ms = 100; }
-        if self.heartbeat_interval_ms == 0 { self.heartbeat_interval_ms = 700; }
+        if self.heartbeat_initial_delay_ms == 0 {
+            self.heartbeat_initial_delay_ms = 100;
+        }
+        if self.heartbeat_interval_ms == 0 {
+            self.heartbeat_interval_ms = 700;
+        }
 
         // Fanout TTL (Go: 60s)
-        if self.fanout_ttl_ms == 0 { self.fanout_ttl_ms = 60_000; }
+        if self.fanout_ttl_ms == 0 {
+            self.fanout_ttl_ms = 60_000;
+        }
 
         // Prune/unsubscribe backoff (Go: 60s, 10s)
-        if self.prune_backoff_ms == 0 { self.prune_backoff_ms = 60_000; }
-        if self.unsubscribe_backoff_ms == 0 { self.unsubscribe_backoff_ms = 10_000; }
+        if self.prune_backoff_ms == 0 {
+            self.prune_backoff_ms = 60_000;
+        }
+        if self.unsubscribe_backoff_ms == 0 {
+            self.unsubscribe_backoff_ms = 10_000;
+        }
 
         // IWANT followup (Go: 3s)
-        if self.iwant_followup_time_ms == 0 { self.iwant_followup_time_ms = 3_000; }
+        if self.iwant_followup_time_ms == 0 {
+            self.iwant_followup_time_ms = 3_000;
+        }
 
         // IDONTWANT (Go: 1024 byte threshold)
-        if self.idont_want_message_threshold == 0 { self.idont_want_message_threshold = 1024; }
+        if self.idont_want_message_threshold == 0 {
+            self.idont_want_message_threshold = 1024;
+        }
 
         // Stream listen (Go: /ip4/0.0.0.0/tcp/8340)
         if self.stream_listen_multiaddr.is_empty() {
@@ -143,7 +192,10 @@ impl P2PConfig {
         // joins the mesh. Non-mainnet networks keep their own configured
         // bootstrap list (never inject mainnet archives onto a testnet/devnet).
         if self.network == 0 {
-            self.bootstrap_peers = MAINNET_BOOTSTRAP_PEERS.iter().map(|s| s.to_string()).collect();
+            self.bootstrap_peers = MAINNET_BOOTSTRAP_PEERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         }
     }
 }

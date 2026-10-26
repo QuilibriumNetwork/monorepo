@@ -566,11 +566,8 @@ pub fn reward_address(prover_address: &[u8]) -> Result<[u8; 32]> {
 
 /// Read the current balance from a reward vertex tree.
 /// Returns zero-length vec if balance field is not set.
-pub fn read_reward_balance(
-    reward_tree: &quil_tries::VectorCommitmentTree,
-) -> Vec<u8> {
-    read_field(reward_tree, "reward:ProverReward", "Balance")
-        .unwrap_or_default()
+pub fn read_reward_balance(reward_tree: &quil_tries::VectorCommitmentTree) -> Vec<u8> {
+    read_field(reward_tree, "reward:ProverReward", "Balance").unwrap_or_default()
 }
 
 /// Update the balance on a reward vertex tree.
@@ -625,7 +622,12 @@ pub fn set_reward_delegate_address(
     delegate_address: &[u8],
 ) -> Result<()> {
     write_type(reward_tree, "reward:ProverReward")?;
-    write_field(reward_tree, "reward:ProverReward", "DelegateAddress", delegate_address)?;
+    write_field(
+        reward_tree,
+        "reward:ProverReward",
+        "DelegateAddress",
+        delegate_address,
+    )?;
     Ok(())
 }
 
@@ -657,7 +659,12 @@ pub fn materialize_prover_kick(
     )?;
     // Zero out seniority — kicked provers lose accumulated seniority.
     // Go misses this; Rust intentionally diverges to fix the bug.
-    write_field(prover_tree, "prover:Prover", "Seniority", &0u64.to_be_bytes())?;
+    write_field(
+        prover_tree,
+        "prover:Prover",
+        "Seniority",
+        &0u64.to_be_bytes(),
+    )?;
     Ok(())
 }
 
@@ -669,7 +676,12 @@ pub fn materialize_prover_kick_allocation(
 ) -> Result<()> {
     let cls = "allocation:ProverAllocation";
     write_field(allocation_tree, cls, "Status", &[STATUS_KICKED])?;
-    write_field(allocation_tree, cls, "KickFrameNumber", &frame_number.to_be_bytes())?;
+    write_field(
+        allocation_tree,
+        cls,
+        "KickFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
     Ok(())
 }
 
@@ -692,7 +704,11 @@ fn remembered_poseidon(preimage: Vec<u8>) -> Result<[u8; 32]> {
     const MAX_ENTRIES: usize = 1 << 15;
     static REMEMBERED: LazyLock<Mutex<HashMap<Vec<u8>, [u8; 32]>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    if let Some(address) = REMEMBERED.lock().ok().and_then(|cache| cache.get(&preimage).copied()) {
+    if let Some(address) = REMEMBERED
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&preimage).copied())
+    {
         return Ok(address);
     }
     let address = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
@@ -757,7 +773,12 @@ pub fn create_allocation_vertex_tree(
     write_field(&mut tree, cls, "Prover", prover_address)?;
     write_field(&mut tree, cls, "Status", &[STATUS_JOINING])?;
     write_field(&mut tree, cls, "ConfirmationFilter", filter)?;
-    write_field(&mut tree, cls, "JoinFrameNumber", &frame_number.to_be_bytes())?;
+    write_field(
+        &mut tree,
+        cls,
+        "JoinFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
 
     Ok(tree)
 }
@@ -856,18 +877,19 @@ pub fn create_leaf_root_vertex_tree(
     write_field(&mut tree, cls, "Epoch", &epoch.to_be_bytes())?;
     write_field(&mut tree, cls, "LeafRoot", leaf_root)?;
     write_field(&mut tree, cls, "NumBlocks", &num_blocks.to_be_bytes())?;
-    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+    write_field(
+        &mut tree,
+        cls,
+        "RegistrationFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
 
     Ok(tree)
 }
 
 /// Read a `u64` field from a vertex tree (big-endian, first 8 bytes), `None` if
 /// absent.
-fn read_u64_field(
-    tree: &quil_tries::VectorCommitmentTree,
-    cls: &str,
-    name: &str,
-) -> Option<u64> {
+fn read_u64_field(tree: &quil_tries::VectorCommitmentTree, cls: &str, name: &str) -> Option<u64> {
     let b = read_field(tree, cls, name)?;
     let arr: [u8; 8] = b.get(..8)?.try_into().ok()?;
     Some(u64::from_be_bytes(arr))
@@ -891,9 +913,21 @@ const REGISTRATION_CLASS: &str = "leafroot:LeafRootRegistration";
 /// Per slot (prev, current, next): epoch, leaf root, block count, registered
 /// at, sealed at.
 const SLOT_FIELDS: [[&str; 5]; 3] = [
-    ["PrevEpoch", "PrevLeafRoot", "PrevNumBlocks", "PrevRegisteredAt", "PrevSealedAt"],
+    [
+        "PrevEpoch",
+        "PrevLeafRoot",
+        "PrevNumBlocks",
+        "PrevRegisteredAt",
+        "PrevSealedAt",
+    ],
     ["Epoch", "LeafRoot", "NumBlocks", "RegisteredAt", "SealedAt"],
-    ["NextEpoch", "NextLeafRoot", "NextNumBlocks", "NextRegisteredAt", "NextSealedAt"],
+    [
+        "NextEpoch",
+        "NextLeafRoot",
+        "NextNumBlocks",
+        "NextRegisteredAt",
+        "NextSealedAt",
+    ],
 ];
 
 /// A registration vertex's slots, by ascending epoch.
@@ -932,10 +966,18 @@ fn write_registration(
     write_field(&mut tree, cls, "Member", member)?;
     write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
     write_field(&mut tree, cls, "Prefix", prefix_bytes)?;
-    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+    write_field(
+        &mut tree,
+        cls,
+        "RegistrationFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
     let cur_idx = slots.len().saturating_sub(2); // len1→0, len2→0, len3→1
     let placed = [
-        (cur_idx.checked_sub(1).and_then(|i| slots.get(i)), &SLOT_FIELDS[0]),
+        (
+            cur_idx.checked_sub(1).and_then(|i| slots.get(i)),
+            &SLOT_FIELDS[0],
+        ),
         (slots.get(cur_idx), &SLOT_FIELDS[1]),
         (slots.get(cur_idx + 1), &SLOT_FIELDS[2]),
     ];
@@ -944,7 +986,12 @@ fn write_registration(
         let Some(slot) = slot else { continue };
         let [epoch, root, blocks, registered, sealed] = names;
         write_field(&mut tree, cls, epoch, &slot.epoch.to_be_bytes())?;
-        write_field(&mut tree, cls, root, slot.leaf_root.as_deref().unwrap_or(&[]))?;
+        write_field(
+            &mut tree,
+            cls,
+            root,
+            slot.leaf_root.as_deref().unwrap_or(&[]),
+        )?;
         write_field(&mut tree, cls, blocks, &slot.num_blocks.to_be_bytes())?;
         if let Some(frame) = slot.registered_at {
             write_field(&mut tree, cls, registered, &frame.to_be_bytes())?;
@@ -986,7 +1033,8 @@ pub fn upsert_leaf_root_registration(
         epoch: new_epoch,
         leaf_root: Some(new_leaf_root.to_vec()),
         num_blocks: new_num_blocks,
-        registered_at: quil_types::consensus::hash_storage_proofs_at(new_epoch).then_some(frame_number),
+        registered_at: quil_types::consensus::hash_storage_proofs_at(new_epoch)
+            .then_some(frame_number),
         sealed_at: None,
     });
     // Keep the THREE highest epochs (drop the lowest if 4+), epoch-sorted
@@ -999,7 +1047,13 @@ pub fn upsert_leaf_root_registration(
     while slots.len() > 3 {
         slots.remove(0);
     }
-    write_registration(member, shard_filter, &pack_prefix(prefix), frame_number, &slots)
+    write_registration(
+        member,
+        shard_filter,
+        &pack_prefix(prefix),
+        frame_number,
+        &slots,
+    )
 }
 
 /// The registration vertex with `epoch`'s slot sealed at `frame_number`; every
@@ -1020,7 +1074,14 @@ pub fn mark_registration_sealed(
             .ok_or_else(|| QuilError::InvalidArgument(format!("leaf registration has no {name}")))
     };
     let registered = read_u64_field(tree, cls, "RegistrationFrameNumber").unwrap_or(0);
-    write_registration(&field("Member")?, &field("ShardFilter")?, &field("Prefix")?, registered, &slots).map(Some)
+    write_registration(
+        &field("Member")?,
+        &field("ShardFilter")?,
+        &field("Prefix")?,
+        registered,
+        &slots,
+    )
+    .map(Some)
 }
 
 /// Look up the registered `(leaf_root, num_blocks)` for `member`+`leaf_id` at the
@@ -1034,7 +1095,9 @@ pub fn leaf_root_registration_for_epoch(
     tree: &quil_tries::VectorCommitmentTree,
     active_epoch: u64,
 ) -> Option<(Vec<u8>, u64)> {
-    let slot = registration_slots(tree).into_iter().find(|slot| slot.epoch == active_epoch)?;
+    let slot = registration_slots(tree)
+        .into_iter()
+        .find(|slot| slot.epoch == active_epoch)?;
     if quil_types::consensus::hash_storage_proofs_at(active_epoch) && slot.sealed_at.is_none() {
         return None;
     }
@@ -1149,12 +1212,39 @@ pub fn allocation_hyperedge_atom(
             h.update(data);
             Ok(h.finalize().to_vec())
         }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> quil_types::error::Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64)
-            -> quil_types::error::Result<Box<dyn quil_types::crypto::Multiproof>>
-        { Err(quil_types::error::QuilError::Internal("not impl".into())) }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<Vec<u8>> {
+            Ok(vec![0u8; 64])
+        }
+        fn verify_raw(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Multiproof>> {
+            Err(quil_types::error::QuilError::Internal("not impl".into()))
+        }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     let mut atom_id = [0u8; 64];
@@ -1245,7 +1335,12 @@ pub fn extend_prover_allocation_hyperedge_blob(
         }
     }
     for (atom_id, atom_bytes) in &added {
-        tree.insert(atom_id, atom_bytes, &[], &BigInt::from(atom_bytes.len() as u64))?;
+        tree.insert(
+            atom_id,
+            atom_bytes,
+            &[],
+            &BigInt::from(atom_bytes.len() as u64),
+        )?;
     }
     Ok(crate::prover_registry::vertex_tree_to_blob(&tree))
 }
@@ -1266,12 +1361,15 @@ pub fn spent_seniority_merge_address(merge_target_pubkey: &[u8]) -> Result<[u8; 
 /// Create a spent-merge marker tree. Stores the prover address at the
 /// `merge:SpentMerge` / `ProverAddress` field so that the same merge
 /// target cannot be consumed by a different prover.
-pub fn create_spent_merge_tree(
-    prover_address: &[u8],
-) -> Result<quil_tries::VectorCommitmentTree> {
+pub fn create_spent_merge_tree(prover_address: &[u8]) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     write_type(&mut tree, "merge:SpentMerge")?;
-    write_field(&mut tree, "merge:SpentMerge", "ProverAddress", prover_address)?;
+    write_field(
+        &mut tree,
+        "merge:SpentMerge",
+        "ProverAddress",
+        prover_address,
+    )?;
     Ok(tree)
 }
 
@@ -1303,7 +1401,9 @@ pub fn materialize_seniority_merge(
     let existing_seniority = read_field(prover_tree, cls, "Seniority")
         .and_then(|b| {
             if b.len() == 8 {
-                Some(u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                Some(u64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]))
             } else {
                 None
             }
@@ -1431,8 +1531,8 @@ pub fn materialize_shard_split(
     // and REMOVE the parent (it is replaced by the partition). The spine shards
     // carry no data → excluded from halt-risk / proposal until data lands.
     let removed_parent = if bit_path_mode {
-        let (app, parent_bits) =
-            quil_forest::decode_shard_filter_or_root(shard_address, 32).ok_or_else(|| {
+        let (app, parent_bits) = quil_forest::decode_shard_filter_or_root(shard_address, 32)
+            .ok_or_else(|| {
                 QuilError::InvalidArgument("materialize shard split: bad parent filter".into())
             })?;
         let branch = longest_common_bit_prefix(&child_bits);
@@ -1444,7 +1544,10 @@ pub fn materialize_shard_split(
         None
     };
 
-    Ok(ShardSplitOutput { new_shards, removed_parent })
+    Ok(ShardSplitOutput {
+        new_shards,
+        removed_parent,
+    })
 }
 
 /// Deep-bifurcation migration (b): convert an app's stored shard rows from
@@ -1599,7 +1702,10 @@ pub fn materialize_shard_merge(
         None
     };
 
-    Ok(ShardMergeOutput { removed_shards, added_parent })
+    Ok(ShardMergeOutput {
+        removed_shards,
+        added_parent,
+    })
 }
 
 // =====================================================================
@@ -1658,7 +1764,7 @@ pub const REWARD_UNITS: u64 = 8_000_000_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global_schema::{write_type, read_type};
+    use crate::global_schema::{read_type, write_type};
 
     #[test]
     fn three_slot_registration_keeps_highest_three_and_lookup_matches_by_epoch() {
@@ -1667,15 +1773,28 @@ mod tests {
         let prefix: Vec<u32> = vec![3, 9];
         let mk = |existing: Option<&quil_tries::VectorCommitmentTree>, epoch: u64, lr: u8| {
             upsert_leaf_root_registration(
-                existing, &member, &filter, &prefix, epoch, &vec![lr; 74], (epoch * 10) + 1, 1000,
+                existing,
+                &member,
+                &filter,
+                &prefix,
+                epoch,
+                &vec![lr; 74],
+                (epoch * 10) + 1,
+                1000,
             )
             .unwrap()
         };
 
         // First confirm (epoch 5) → single slot.
         let t1 = mk(None, 5, 0x05);
-        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
-        assert_eq!(read_u64_field(&t1, "leafroot:LeafRootRegistration", "NextEpoch"), None);
+        assert_eq!(
+            read_u64_field(&t1, "leafroot:LeafRootRegistration", "Epoch"),
+            Some(5)
+        );
+        assert_eq!(
+            read_u64_field(&t1, "leafroot:LeafRootRegistration", "NextEpoch"),
+            None
+        );
         assert_eq!(
             leaf_root_registration_for_epoch(&t1, 5),
             Some((vec![0x05u8; 74], 51)),
@@ -1683,41 +1802,90 @@ mod tests {
 
         // Pre-register the next epoch (6) → {current=5, next=6}, epoch-sorted.
         let t2 = mk(Some(&t1), 6, 0x06);
-        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "Epoch"), Some(5));
-        assert_eq!(read_u64_field(&t2, "leafroot:LeafRootRegistration", "NextEpoch"), Some(6));
+        assert_eq!(
+            read_u64_field(&t2, "leafroot:LeafRootRegistration", "Epoch"),
+            Some(5)
+        );
+        assert_eq!(
+            read_u64_field(&t2, "leafroot:LeafRootRegistration", "NextEpoch"),
+            Some(6)
+        );
         // Audit can match EITHER slot by epoch.
-        assert_eq!(leaf_root_registration_for_epoch(&t2, 5), Some((vec![0x05u8; 74], 51)));
-        assert_eq!(leaf_root_registration_for_epoch(&t2, 6), Some((vec![0x06u8; 74], 61)));
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t2, 5),
+            Some((vec![0x05u8; 74], 51))
+        );
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t2, 6),
+            Some((vec![0x06u8; 74], 61))
+        );
         assert_eq!(leaf_root_registration_for_epoch(&t2, 4), None);
 
         // Roll forward to epoch 7 → keeps {5,6,7}: prev=5, current=6, next=7.
         // The previous epoch (5) is RETAINED (three-slot) so the anchor-lagged
         // audit can still find it just after the boundary.
         let t3 = mk(Some(&t2), 7, 0x07);
-        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(5));
-        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "Epoch"), Some(6));
-        assert_eq!(read_u64_field(&t3, "leafroot:LeafRootRegistration", "NextEpoch"), Some(7));
+        assert_eq!(
+            read_u64_field(&t3, "leafroot:LeafRootRegistration", "PrevEpoch"),
+            Some(5)
+        );
+        assert_eq!(
+            read_u64_field(&t3, "leafroot:LeafRootRegistration", "Epoch"),
+            Some(6)
+        );
+        assert_eq!(
+            read_u64_field(&t3, "leafroot:LeafRootRegistration", "NextEpoch"),
+            Some(7)
+        );
         assert_eq!(
             leaf_root_registration_for_epoch(&t3, 5),
             Some((vec![0x05u8; 74], 51)),
             "previous epoch retained for the anchor-lagged audit window",
         );
-        assert_eq!(leaf_root_registration_for_epoch(&t3, 6), Some((vec![0x06u8; 74], 61)));
-        assert_eq!(leaf_root_registration_for_epoch(&t3, 7), Some((vec![0x07u8; 74], 71)));
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t3, 6),
+            Some((vec![0x06u8; 74], 61))
+        );
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t3, 7),
+            Some((vec![0x07u8; 74], 71))
+        );
 
         // Roll forward to epoch 8 → NOW the oldest (5) drops, keeps {6,7,8}.
         // By this point (two epochs later) the audit anchor is well past epoch 5.
         let t4 = mk(Some(&t3), 8, 0x08);
-        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "PrevEpoch"), Some(6));
-        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
-        assert_eq!(read_u64_field(&t4, "leafroot:LeafRootRegistration", "NextEpoch"), Some(8));
-        assert_eq!(leaf_root_registration_for_epoch(&t4, 5), None, "two-epochs-old slot dropped");
-        assert_eq!(leaf_root_registration_for_epoch(&t4, 8), Some((vec![0x08u8; 74], 81)));
+        assert_eq!(
+            read_u64_field(&t4, "leafroot:LeafRootRegistration", "PrevEpoch"),
+            Some(6)
+        );
+        assert_eq!(
+            read_u64_field(&t4, "leafroot:LeafRootRegistration", "Epoch"),
+            Some(7)
+        );
+        assert_eq!(
+            read_u64_field(&t4, "leafroot:LeafRootRegistration", "NextEpoch"),
+            Some(8)
+        );
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t4, 5),
+            None,
+            "two-epochs-old slot dropped"
+        );
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t4, 8),
+            Some((vec![0x08u8; 74], 81))
+        );
 
         // Same-epoch re-register overwrites that slot's value (still three slots).
         let t5 = mk(Some(&t4), 8, 0xF8);
-        assert_eq!(leaf_root_registration_for_epoch(&t5, 8), Some((vec![0xF8u8; 74], 81)));
-        assert_eq!(read_u64_field(&t5, "leafroot:LeafRootRegistration", "Epoch"), Some(7));
+        assert_eq!(
+            leaf_root_registration_for_epoch(&t5, 8),
+            Some((vec![0xF8u8; 74], 81))
+        );
+        assert_eq!(
+            read_u64_field(&t5, "leafroot:LeafRootRegistration", "Epoch"),
+            Some(7)
+        );
     }
 
     #[test]
@@ -1744,11 +1912,17 @@ mod tests {
         let r_filter = read_field(&out.tree, cls, "ShardFilter").unwrap();
         let r_prefix = unpack_prefix(&read_field(&out.tree, cls, "Prefix").unwrap());
         let r_epoch = u64::from_be_bytes(
-            read_field(&out.tree, cls, "Epoch").unwrap().try_into().unwrap(),
+            read_field(&out.tree, cls, "Epoch")
+                .unwrap()
+                .try_into()
+                .unwrap(),
         );
         let r_leaf_root = read_field(&out.tree, cls, "LeafRoot").unwrap();
         let r_num_blocks = u64::from_be_bytes(
-            read_field(&out.tree, cls, "NumBlocks").unwrap().try_into().unwrap(),
+            read_field(&out.tree, cls, "NumBlocks")
+                .unwrap()
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(r_member, member.to_vec());
         assert_eq!(r_filter, reg.shard_filter);
@@ -1766,13 +1940,22 @@ mod tests {
         reg2.epoch = r_epoch + 1;
         reg2.leaf_root = vec![0x22; 74];
         let out2 = materialize_leaf_root_registration(&member, &reg2).unwrap();
-        assert_eq!(out2.address, out.address, "re-registration must overwrite in place");
+        assert_eq!(
+            out2.address, out.address,
+            "re-registration must overwrite in place"
+        );
     }
 
     fn make_allocation_tree(status: u8) -> quil_tries::VectorCommitmentTree {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         write_type(&mut tree, "allocation:ProverAllocation").unwrap();
-        write_field(&mut tree, "allocation:ProverAllocation", "Status", &[status]).unwrap();
+        write_field(
+            &mut tree,
+            "allocation:ProverAllocation",
+            "Status",
+            &[status],
+        )
+        .unwrap();
         tree
     }
 
@@ -1961,11 +2144,23 @@ mod tests {
         let pk = vec![0xAAu8; 585];
         let tree = create_prover_vertex_tree(&pk, 42).unwrap();
 
-        assert_eq!(crate::global_schema::read_type(&tree), Some("prover:Prover"));
+        assert_eq!(
+            crate::global_schema::read_type(&tree),
+            Some("prover:Prover")
+        );
         assert_eq!(read_field(&tree, "prover:Prover", "PublicKey").unwrap(), pk);
-        assert_eq!(read_field(&tree, "prover:Prover", "Status").unwrap(), vec![STATUS_JOINING]);
-        assert_eq!(read_field(&tree, "prover:Prover", "AvailableStorage").unwrap(), 0u64.to_be_bytes().to_vec());
-        assert_eq!(read_field(&tree, "prover:Prover", "Seniority").unwrap(), 42u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Status").unwrap(),
+            vec![STATUS_JOINING]
+        );
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "AvailableStorage").unwrap(),
+            0u64.to_be_bytes().to_vec()
+        );
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Seniority").unwrap(),
+            42u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -1974,11 +2169,26 @@ mod tests {
         let filter = vec![0xDDu8; 48];
         let tree = create_allocation_vertex_tree(&prover_addr, &filter, 100).unwrap();
 
-        assert_eq!(crate::global_schema::read_type(&tree), Some("allocation:ProverAllocation"));
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Prover").unwrap(), prover_addr.to_vec());
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_JOINING]);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap(), filter);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "JoinFrameNumber").unwrap(), 100u64.to_be_bytes().to_vec());
+        assert_eq!(
+            crate::global_schema::read_type(&tree),
+            Some("allocation:ProverAllocation")
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Prover").unwrap(),
+            prover_addr.to_vec()
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_JOINING]
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap(),
+            filter
+        );
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "JoinFrameNumber").unwrap(),
+            100u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -1988,17 +2198,29 @@ mod tests {
         let output = materialize_prover_join(&pk, &filters, 50, 0).unwrap();
 
         // Prover tree
-        assert_eq!(crate::global_schema::read_type(&output.prover_tree), Some("prover:Prover"));
-        assert_eq!(read_field(&output.prover_tree, "prover:Prover", "PublicKey").unwrap(), pk);
+        assert_eq!(
+            crate::global_schema::read_type(&output.prover_tree),
+            Some("prover:Prover")
+        );
+        assert_eq!(
+            read_field(&output.prover_tree, "prover:Prover", "PublicKey").unwrap(),
+            pk
+        );
 
         // Prover address
-        assert_eq!(output.prover_address, prover_address_from_pubkey(&pk).unwrap());
+        assert_eq!(
+            output.prover_address,
+            prover_address_from_pubkey(&pk).unwrap()
+        );
 
         // Two allocations
         assert_eq!(output.allocations.len(), 2);
         for (alloc_addr, alloc_tree) in &output.allocations {
             assert_eq!(alloc_addr.len(), 32);
-            assert_eq!(crate::global_schema::read_type(alloc_tree), Some("allocation:ProverAllocation"));
+            assert_eq!(
+                crate::global_schema::read_type(alloc_tree),
+                Some("allocation:ProverAllocation")
+            );
             assert_eq!(
                 read_field(alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber").unwrap(),
                 50u64.to_be_bytes().to_vec()
@@ -2014,10 +2236,8 @@ mod tests {
         // takes to refill the 64-way sentinel grid. If this rejects/mangles the
         // sentinel filter, no re-join can land.
         let quil = [0x11u8; 32];
-        let sentinel = quil_forest::shard_prefix_to_filter(
-            &quil,
-            &quil_forest::genesis_grid_prefixes(0)[5],
-        );
+        let sentinel =
+            quil_forest::shard_prefix_to_filter(&quil, &quil_forest::genesis_grid_prefixes(0)[5]);
         assert_eq!(sentinel.len(), 35, "genesis sentinel filter is 35B");
         let pk = vec![0xCDu8; 585];
         let output = materialize_prover_join(&pk, &[sentinel.clone()], 100, 0).unwrap();
@@ -2051,28 +2271,46 @@ mod tests {
 
     #[test]
     fn aggregate_active_wins_over_all() {
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_ACTIVE]), STATUS_ACTIVE);
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_JOINING, STATUS_ACTIVE, STATUS_PAUSED]), STATUS_ACTIVE);
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_ACTIVE]),
+            STATUS_ACTIVE
+        );
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_JOINING, STATUS_ACTIVE, STATUS_PAUSED]),
+            STATUS_ACTIVE
+        );
     }
 
     #[test]
     fn aggregate_joining_wins_over_leaving_paused_left() {
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_JOINING, STATUS_LEAVING, STATUS_PAUSED]), STATUS_JOINING);
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_JOINING, STATUS_LEAVING, STATUS_PAUSED]),
+            STATUS_JOINING
+        );
     }
 
     #[test]
     fn aggregate_leaving_wins_over_paused_left() {
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_LEAVING, STATUS_PAUSED, STATUS_KICKED]), STATUS_LEAVING);
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_LEAVING, STATUS_PAUSED, STATUS_KICKED]),
+            STATUS_LEAVING
+        );
     }
 
     #[test]
     fn aggregate_paused_wins_over_left() {
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_PAUSED, STATUS_KICKED]), STATUS_PAUSED);
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_PAUSED, STATUS_KICKED]),
+            STATUS_PAUSED
+        );
     }
 
     #[test]
     fn aggregate_all_left_is_left() {
-        assert_eq!(compute_aggregate_prover_status(&[STATUS_KICKED, STATUS_KICKED]), STATUS_KICKED);
+        assert_eq!(
+            compute_aggregate_prover_status(&[STATUS_KICKED, STATUS_KICKED]),
+            STATUS_KICKED
+        );
     }
 
     #[test]
@@ -2081,12 +2319,14 @@ mod tests {
         write_type(&mut tree, "prover:Prover").unwrap();
         write_field(&mut tree, "prover:Prover", "Status", &[STATUS_JOINING]).unwrap();
 
-        let new_status = update_prover_status_from_allocations(
-            &mut tree,
-            &[STATUS_ACTIVE, STATUS_PAUSED],
-        ).unwrap();
+        let new_status =
+            update_prover_status_from_allocations(&mut tree, &[STATUS_ACTIVE, STATUS_PAUSED])
+                .unwrap();
         assert_eq!(new_status, STATUS_ACTIVE);
-        assert_eq!(read_field(&tree, "prover:Prover", "Status").unwrap(), vec![STATUS_ACTIVE]);
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2097,29 +2337,66 @@ mod tests {
     fn confirm_join_sets_active_and_frame_numbers() {
         let mut tree = make_allocation_tree(STATUS_JOINING);
         materialize_prover_confirm(&mut tree, 400, None).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(), 400u64.to_be_bytes().to_vec());
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(), 400u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "JoinConfirmFrameNumber"
+            )
+            .unwrap(),
+            400u64.to_be_bytes().to_vec()
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber"
+            )
+            .unwrap(),
+            400u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
     fn confirm_records_its_release_on_join_and_reconfirm_only() {
         use super::super::prover_release::{read_release, Release};
-        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+        let release = Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch: 92,
+        };
         let frame = 5 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
         for status in [STATUS_JOINING, STATUS_ACTIVE] {
             let mut tree = make_allocation_tree(status);
             materialize_prover_confirm(&mut tree, frame, None).unwrap();
             assert_eq!(read_release(&tree), None, "no release, nothing recorded");
-            materialize_prover_confirm(&mut tree, frame + quil_types::consensus::EPOCH_LENGTH_FRAMES, Some(&release)).unwrap();
+            materialize_prover_confirm(
+                &mut tree,
+                frame + quil_types::consensus::EPOCH_LENGTH_FRAMES,
+                Some(&release),
+            )
+            .unwrap();
             assert_eq!(read_release(&tree), Some(release));
             // A later confirm without a release keeps the recorded one.
-            materialize_prover_confirm(&mut tree, frame + 2 * quil_types::consensus::EPOCH_LENGTH_FRAMES, None).unwrap();
+            materialize_prover_confirm(
+                &mut tree,
+                frame + 2 * quil_types::consensus::EPOCH_LENGTH_FRAMES,
+                None,
+            )
+            .unwrap();
             assert_eq!(read_release(&tree), Some(release));
         }
         let mut leaving = make_allocation_tree(STATUS_LEAVING);
         materialize_prover_confirm(&mut leaving, frame, Some(&release)).unwrap();
-        assert_eq!(read_release(&leaving), None, "a leave confirm records no release");
+        assert_eq!(
+            read_release(&leaving),
+            None,
+            "a leave confirm records no release"
+        );
     }
 
     #[test]
@@ -2128,8 +2405,19 @@ mod tests {
         // departure is derived at the E+2 boundary by `effective_status`.
         let mut tree = make_allocation_tree(STATUS_LEAVING);
         materialize_prover_confirm(&mut tree, 500, None).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 500u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_LEAVING]
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "LeaveConfirmFrameNumber"
+            )
+            .unwrap(),
+            500u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -2148,11 +2436,18 @@ mod tests {
         );
         assert_eq!(
             read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
-            (quil_types::consensus::epoch_for_frame(frame) + 1).to_be_bytes().to_vec(),
+            (quil_types::consensus::epoch_for_frame(frame) + 1)
+                .to_be_bytes()
+                .to_vec(),
             "re-confirm must register the next storage epoch (one ahead)",
         );
         assert_eq!(
-            read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber"
+            )
+            .unwrap(),
             frame.to_be_bytes().to_vec(),
         );
     }
@@ -2171,17 +2466,47 @@ mod tests {
     fn reject_join_sets_kicked() {
         let mut tree = make_allocation_tree(STATUS_JOINING);
         materialize_prover_reject(&mut tree, 450).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "JoinRejectFrameNumber").unwrap(), 450u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_KICKED]
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "JoinRejectFrameNumber"
+            )
+            .unwrap(),
+            450u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
     fn reject_leave_sets_active() {
         let mut tree = make_allocation_tree(STATUS_LEAVING);
         materialize_prover_reject(&mut tree, 550).unwrap();
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LeaveRejectFrameNumber").unwrap(), 550u64.to_be_bytes().to_vec());
-        assert_eq!(read_field(&tree, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(), 550u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "LeaveRejectFrameNumber"
+            )
+            .unwrap(),
+            550u64.to_be_bytes().to_vec()
+        );
+        assert_eq!(
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber"
+            )
+            .unwrap(),
+            550u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -2200,7 +2525,13 @@ mod tests {
     fn reject_leave_does_not_bump_epoch() {
         let mut tree = make_allocation_tree(STATUS_LEAVING);
         // Pre-existing epoch registration the prover already held.
-        write_field(&mut tree, "allocation:ProverAllocation", "Epoch", &7u64.to_be_bytes()).unwrap();
+        write_field(
+            &mut tree,
+            "allocation:ProverAllocation",
+            "Epoch",
+            &7u64.to_be_bytes(),
+        )
+        .unwrap();
         // Reject at a frame several epochs later.
         let frame = 9 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 3;
         materialize_prover_reject(&mut tree, frame).unwrap();
@@ -2242,13 +2573,20 @@ mod tests {
         materialize_prover_confirm(&mut tree, f1, None).unwrap();
         materialize_prover_confirm(&mut tree, f2, None).unwrap();
         assert_eq!(
-            read_field(&tree, "allocation:ProverAllocation", "JoinConfirmFrameNumber").unwrap(),
+            read_field(
+                &tree,
+                "allocation:ProverAllocation",
+                "JoinConfirmFrameNumber"
+            )
+            .unwrap(),
             f1.to_be_bytes().to_vec(),
             "second confirm must not move the activation anchor"
         );
         assert_eq!(
             read_field(&tree, "allocation:ProverAllocation", "Epoch").unwrap(),
-            (quil_types::consensus::epoch_for_frame(f2) + 1).to_be_bytes().to_vec(),
+            (quil_types::consensus::epoch_for_frame(f2) + 1)
+                .to_be_bytes()
+                .to_vec(),
             "second confirm renews the storage epoch"
         );
     }
@@ -2258,9 +2596,15 @@ mod tests {
     #[test]
     fn confirm_and_reject_reject_terminal_status() {
         let mut t1 = make_allocation_tree(STATUS_KICKED);
-        assert!(materialize_prover_confirm(&mut t1, 400, None).is_err(), "confirm on byte-4 rejected");
+        assert!(
+            materialize_prover_confirm(&mut t1, 400, None).is_err(),
+            "confirm on byte-4 rejected"
+        );
         let mut t2 = make_allocation_tree(STATUS_KICKED);
-        assert!(materialize_prover_reject(&mut t2, 400).is_err(), "reject on byte-4 rejected");
+        assert!(
+            materialize_prover_reject(&mut t2, 400).is_err(),
+            "reject on byte-4 rejected"
+        );
     }
 
     /// Kick and reject-join BOTH write status byte 4 (intended overload); they
@@ -2274,14 +2618,26 @@ mod tests {
         let mut k = make_allocation_tree(STATUS_ACTIVE);
         materialize_prover_kick_allocation(&mut k, 999).unwrap();
         assert_eq!(read_field(&k, cls, "Status").unwrap(), vec![STATUS_KICKED]);
-        assert_eq!(read_field(&k, cls, "KickFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
-        assert!(read_field(&k, cls, "JoinRejectFrameNumber").is_none(), "kick stamps no JoinRejectFrameNumber");
+        assert_eq!(
+            read_field(&k, cls, "KickFrameNumber").unwrap(),
+            999u64.to_be_bytes().to_vec()
+        );
+        assert!(
+            read_field(&k, cls, "JoinRejectFrameNumber").is_none(),
+            "kick stamps no JoinRejectFrameNumber"
+        );
         // Reject-join: byte 4 + JoinRejectFrameNumber, no KickFrameNumber.
         let mut r = make_allocation_tree(STATUS_JOINING);
         materialize_prover_reject(&mut r, 999).unwrap();
         assert_eq!(read_field(&r, cls, "Status").unwrap(), vec![STATUS_KICKED]);
-        assert_eq!(read_field(&r, cls, "JoinRejectFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
-        assert!(read_field(&r, cls, "KickFrameNumber").is_none(), "reject-join stamps no KickFrameNumber");
+        assert_eq!(
+            read_field(&r, cls, "JoinRejectFrameNumber").unwrap(),
+            999u64.to_be_bytes().to_vec()
+        );
+        assert!(
+            read_field(&r, cls, "KickFrameNumber").is_none(),
+            "reject-join stamps no KickFrameNumber"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2295,38 +2651,68 @@ mod tests {
 
         // Join creates the allocation with status=0
         let mut alloc = create_allocation_vertex_tree(&prover_addr, &filter, 100).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_JOINING]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_JOINING]
+        );
 
         // Confirm join → active
         materialize_prover_confirm(&mut alloc, 460, None).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
 
         // Pause
         materialize_prover_pause(&mut alloc, 500).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_PAUSED]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_PAUSED]
+        );
 
         // Resume
         materialize_prover_resume(&mut alloc, 600).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
 
         // Leave
         materialize_prover_leave(&mut alloc, 700).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_LEAVING]
+        );
 
         // Confirm leave → keeps Leaving byte (departs at E+2 via read-side)
         materialize_prover_confirm(&mut alloc, 1060, None).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_LEAVING]);
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "LeaveConfirmFrameNumber").unwrap(), 1060u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_LEAVING]
+        );
+        assert_eq!(
+            read_field(
+                &alloc,
+                "allocation:ProverAllocation",
+                "LeaveConfirmFrameNumber"
+            )
+            .unwrap(),
+            1060u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
     fn lifecycle_join_then_reject() {
         let prover_addr = [0xCCu8; 32];
-        let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
+        let mut alloc =
+            create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
 
         // Reject join → kicked
         materialize_prover_reject(&mut alloc, 460).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_KICKED]
+        );
 
         // Cannot do anything further with kicked allocation
         assert!(materialize_prover_pause(&mut alloc, 500).is_err());
@@ -2337,7 +2723,8 @@ mod tests {
     #[test]
     fn lifecycle_leave_then_reject_returns_to_active() {
         let prover_addr = [0xEEu8; 32];
-        let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xFFu8; 32], 100).unwrap();
+        let mut alloc =
+            create_allocation_vertex_tree(&prover_addr, &vec![0xFFu8; 32], 100).unwrap();
 
         // Confirm join
         materialize_prover_confirm(&mut alloc, 460, None).unwrap();
@@ -2345,11 +2732,17 @@ mod tests {
         materialize_prover_leave(&mut alloc, 500).unwrap();
         // Reject leave → back to active
         materialize_prover_reject(&mut alloc, 600).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_ACTIVE]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_ACTIVE]
+        );
 
         // Can pause again after reject-leave
         materialize_prover_pause(&mut alloc, 700).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_PAUSED]);
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_PAUSED]
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2375,7 +2768,10 @@ mod tests {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         let delegate = vec![0xDDu8; 32];
         set_reward_delegate_address(&mut tree, &delegate).unwrap();
-        assert_eq!(crate::global_schema::read_type(&tree), Some("reward:ProverReward"));
+        assert_eq!(
+            crate::global_schema::read_type(&tree),
+            Some("reward:ProverReward")
+        );
         assert_eq!(
             read_field(&tree, "reward:ProverReward", "DelegateAddress").unwrap(),
             delegate
@@ -2434,7 +2830,10 @@ mod tests {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         add_to_reward_balance(&mut tree, &BigInt::from(42)).unwrap();
         let b = read_reward_balance(&tree);
-        assert_eq!(BigInt::from_bytes_be(num_bigint::Sign::Plus, &b), BigInt::from(42));
+        assert_eq!(
+            BigInt::from_bytes_be(num_bigint::Sign::Plus, &b),
+            BigInt::from(42)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2449,8 +2848,14 @@ mod tests {
         write_field(&mut tree, "prover:Prover", "Status", &[STATUS_ACTIVE]).unwrap();
 
         materialize_prover_kick(&mut tree, 999).unwrap();
-        assert_eq!(read_field(&tree, "prover:Prover", "Status").unwrap(), vec![STATUS_KICKED]);
-        assert_eq!(read_field(&tree, "prover:Prover", "KickFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Status").unwrap(),
+            vec![STATUS_KICKED]
+        );
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "KickFrameNumber").unwrap(),
+            999u64.to_be_bytes().to_vec()
+        );
         // PublicKey and Seniority should be unchanged
         assert_eq!(read_field(&tree, "prover:Prover", "PublicKey").unwrap(), pk);
     }
@@ -2458,13 +2863,26 @@ mod tests {
     #[test]
     fn kick_allocation_sets_status_and_frame() {
         let prover_addr = [0xBBu8; 32];
-        let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xCCu8; 32], 100).unwrap();
+        let mut alloc =
+            create_allocation_vertex_tree(&prover_addr, &vec![0xCCu8; 32], 100).unwrap();
         // Simulate confirm
-        write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+        write_field(
+            &mut alloc,
+            "allocation:ProverAllocation",
+            "Status",
+            &[STATUS_ACTIVE],
+        )
+        .unwrap();
 
         materialize_prover_kick_allocation(&mut alloc, 999).unwrap();
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(), vec![STATUS_KICKED]);
-        assert_eq!(read_field(&alloc, "allocation:ProverAllocation", "KickFrameNumber").unwrap(), 999u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "Status").unwrap(),
+            vec![STATUS_KICKED]
+        );
+        assert_eq!(
+            read_field(&alloc, "allocation:ProverAllocation", "KickFrameNumber").unwrap(),
+            999u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -2473,7 +2891,10 @@ mod tests {
         let mut tree = create_prover_vertex_tree(&pk, 42).unwrap();
         materialize_prover_kick(&mut tree, 100).unwrap();
         // Kicked provers lose their seniority
-        assert_eq!(read_field(&tree, "prover:Prover", "Seniority").unwrap(), 0u64.to_be_bytes().to_vec());
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Seniority").unwrap(),
+            0u64.to_be_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -2509,7 +2930,13 @@ mod tests {
         );
 
         // Simulate confirm by manually setting status to active
-        write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+        write_field(
+            &mut alloc,
+            "allocation:ProverAllocation",
+            "Status",
+            &[STATUS_ACTIVE],
+        )
+        .unwrap();
 
         // Pause
         materialize_prover_pause(&mut alloc, 20).unwrap();
@@ -2544,9 +2971,8 @@ mod tests {
         let prover_addr = prover_address_from_pubkey(&pk).unwrap();
 
         let merge_pubkeys = vec![vec![0xBBu8; 57], vec![0xCCu8; 57]];
-        let spent = materialize_seniority_merge(
-            &mut tree, &prover_addr, 500, &merge_pubkeys,
-        ).unwrap();
+        let spent =
+            materialize_seniority_merge(&mut tree, &prover_addr, 500, &merge_pubkeys).unwrap();
 
         // Seniority should be 100 + 500 = 600
         let seniority = read_field(&tree, "prover:Prover", "Seniority").unwrap();
@@ -2573,9 +2999,8 @@ mod tests {
         let mut tree = create_prover_vertex_tree(&pk, 0).unwrap();
         let prover_addr = prover_address_from_pubkey(&pk).unwrap();
 
-        let _ = materialize_seniority_merge(
-            &mut tree, &prover_addr, 42, &[vec![0xEEu8; 57]],
-        ).unwrap();
+        let _ =
+            materialize_seniority_merge(&mut tree, &prover_addr, 42, &[vec![0xEEu8; 57]]).unwrap();
 
         let seniority = read_field(&tree, "prover:Prover", "Seniority").unwrap();
         assert_eq!(seniority, 42u64.to_be_bytes().to_vec());
@@ -2668,10 +3093,16 @@ mod tests {
             vec![false, true],                // spine [0,1]
             vec![false, false, true],         // spine [0,0,1]
         ] {
-            assert!(prefixes.contains(&bit_path_to_prefix(&bits)), "missing {bits:?}");
+            assert!(
+                prefixes.contains(&bit_path_to_prefix(&bits)),
+                "missing {bits:?}"
+            );
         }
         // The parent (root) is removed → replaced by the partition.
-        assert_eq!(output.removed_parent, Some((app.to_vec(), bit_path_to_prefix(&[]))));
+        assert_eq!(
+            output.removed_parent,
+            Some((app.to_vec(), bit_path_to_prefix(&[])))
+        );
 
         // A child under a DIFFERENT app (does not extend the parent) is rejected.
         let other = encode_shard_bit_path(&[0xBBu8; 32], &[false]);
@@ -2704,7 +3135,10 @@ mod tests {
                 Ok(())
             }
             fn delete_app_shard(&self, _t: &dyn Transaction, k: &[u8], p: &[u32]) -> Result<()> {
-                self.0.lock().unwrap().retain(|r| !(r.shard_key == k && r.prefix == p));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .retain(|r| !(r.shard_key == k && r.prefix == p));
                 Ok(())
             }
         }
@@ -2755,8 +3189,10 @@ mod tests {
         migrate_app_shards_to_sentinel(&store, &txn, &grid_a).unwrap();
         let after = store.range_app_shards().unwrap();
         let key = |v: &[ShardInfo]| {
-            let mut k: Vec<(Vec<u8>, Vec<u32>)> =
-                v.iter().map(|r| (r.shard_key.clone(), r.prefix.clone())).collect();
+            let mut k: Vec<(Vec<u8>, Vec<u32>)> = v
+                .iter()
+                .map(|r| (r.shard_key.clone(), r.prefix.clone()))
+                .collect();
             k.sort();
             k
         };
@@ -2850,8 +3286,14 @@ mod tests {
         let output = materialize_shard_merge(&[c0, c1], &parent, true).unwrap();
         assert_eq!(output.removed_shards.len(), 2);
         assert_eq!(output.removed_shards[0].0, app.to_vec());
-        assert_eq!(output.removed_shards[0].1, bit_path_to_prefix(&[false, false, false, false]));
-        assert_eq!(output.removed_shards[1].1, bit_path_to_prefix(&[false, false, false, true]));
+        assert_eq!(
+            output.removed_shards[0].1,
+            bit_path_to_prefix(&[false, false, false, false])
+        );
+        assert_eq!(
+            output.removed_shards[1].1,
+            bit_path_to_prefix(&[false, false, false, true])
+        );
         // The merged parent (branch [0,0,0]) is re-registered as a leaf.
         assert_eq!(
             output.added_parent,
@@ -2871,13 +3313,25 @@ mod tests {
     #[test]
     fn frame_header_activity_updates_last_active() {
         let prover_addr = [0xAAu8; 32];
-        let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xBBu8; 32], 100).unwrap();
+        let mut alloc =
+            create_allocation_vertex_tree(&prover_addr, &vec![0xBBu8; 32], 100).unwrap();
         // Simulate confirm
-        write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+        write_field(
+            &mut alloc,
+            "allocation:ProverAllocation",
+            "Status",
+            &[STATUS_ACTIVE],
+        )
+        .unwrap();
 
         materialize_frame_header_activity(&mut alloc, 500).unwrap();
         assert_eq!(
-            read_field(&alloc, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            read_field(
+                &alloc,
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber"
+            )
+            .unwrap(),
             500u64.to_be_bytes().to_vec(),
         );
     }
@@ -2885,12 +3339,18 @@ mod tests {
     #[test]
     fn frame_header_activity_overwrites_previous() {
         let prover_addr = [0xCCu8; 32];
-        let mut alloc = create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
+        let mut alloc =
+            create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
 
         materialize_frame_header_activity(&mut alloc, 500).unwrap();
         materialize_frame_header_activity(&mut alloc, 600).unwrap();
         assert_eq!(
-            read_field(&alloc, "allocation:ProverAllocation", "LastActiveFrameNumber").unwrap(),
+            read_field(
+                &alloc,
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber"
+            )
+            .unwrap(),
             600u64.to_be_bytes().to_vec(),
         );
     }

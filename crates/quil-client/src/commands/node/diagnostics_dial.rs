@@ -122,9 +122,18 @@ pub(crate) fn parse_target(multiaddr: &str, peer: Option<&str>) -> anyhow::Resul
     let host = match parts.next() {
         Some(Protocol::Ip4(ip)) => Host::Ip(ip.into()),
         Some(Protocol::Ip6(ip)) => Host::Ip(ip.into()),
-        Some(Protocol::Dns(name)) => Host::Dns { name: name.to_string(), family: Family::Any },
-        Some(Protocol::Dns4(name)) => Host::Dns { name: name.to_string(), family: Family::V4 },
-        Some(Protocol::Dns6(name)) => Host::Dns { name: name.to_string(), family: Family::V6 },
+        Some(Protocol::Dns(name)) => Host::Dns {
+            name: name.to_string(),
+            family: Family::Any,
+        },
+        Some(Protocol::Dns4(name)) => Host::Dns {
+            name: name.to_string(),
+            family: Family::V4,
+        },
+        Some(Protocol::Dns6(name)) => Host::Dns {
+            name: name.to_string(),
+            family: Family::V6,
+        },
         Some(Protocol::Dnsaddr(_)) => {
             bail!("{text}: /dnsaddr lists addresses in DNS TXT records; dial one of the addresses it lists")
         }
@@ -153,17 +162,31 @@ pub(crate) fn parse_target(multiaddr: &str, peer: Option<&str>) -> anyhow::Resul
         bail!("{text}: nothing may follow /p2p/<peer-id>, found {extra}");
     }
     let flag = peer
-        .map(|p| PeerId::from_str(p.trim()).map_err(|e| anyhow!("--peer {}: not a peer ID: {e}", printable(p))))
+        .map(|p| {
+            PeerId::from_str(p.trim())
+                .map_err(|e| anyhow!("--peer {}: not a peer ID: {e}", printable(p)))
+        })
         .transpose()?;
     let expected = match (flag, embedded) {
         (Some(flag), Some(embedded)) if flag != embedded => {
             bail!("--peer {flag} and the address's /p2p/{embedded} name different peers")
         }
-        (Some(peer), _) => Some(Expected { peer, source: "--peer" }),
-        (None, Some(peer)) => Some(Expected { peer, source: "/p2p" }),
+        (Some(peer), _) => Some(Expected {
+            peer,
+            source: "--peer",
+        }),
+        (None, Some(peer)) => Some(Expected {
+            peer,
+            source: "/p2p",
+        }),
         (None, None) => None,
     };
-    Ok(Target { host, port, carrier, expected })
+    Ok(Target {
+        host,
+        port,
+        carrier,
+        expected,
+    })
 }
 
 /// The socket address to dial. DNS names resolve through the system
@@ -220,11 +243,16 @@ pub(crate) enum Stage {
 }
 
 fn set_stage(stage: &Mutex<Stage>, value: Stage) {
-    *stage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    *stage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
 }
 
 fn stage_of(stage: &Mutex<Stage>) -> Stage {
-    stage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    stage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn quic_stage(error: &libp2p::quic::Error) -> Stage {
@@ -242,13 +270,37 @@ fn quic_stage(error: &libp2p::quic::Error) -> Stage {
 /// Why a dial failed, in terms an operator can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DialFailure {
-    Refused { carrier: Carrier, endpoint: String },
-    NoAnswer { carrier: Carrier, endpoint: String, secs: u64 },
-    HandshakeStalled { endpoint: String, secs: u64 },
-    Handshake { carrier: Carrier, endpoint: String, detail: String },
-    PeerMismatch { endpoint: String, expected: Expected, actual: PeerId },
-    Unreachable { endpoint: String, detail: String },
-    Other { endpoint: String, detail: String },
+    Refused {
+        carrier: Carrier,
+        endpoint: String,
+    },
+    NoAnswer {
+        carrier: Carrier,
+        endpoint: String,
+        secs: u64,
+    },
+    HandshakeStalled {
+        endpoint: String,
+        secs: u64,
+    },
+    Handshake {
+        carrier: Carrier,
+        endpoint: String,
+        detail: String,
+    },
+    PeerMismatch {
+        endpoint: String,
+        expected: Expected,
+        actual: PeerId,
+    },
+    Unreachable {
+        endpoint: String,
+        detail: String,
+    },
+    Other {
+        endpoint: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for DialFailure {
@@ -294,36 +346,77 @@ impl std::fmt::Display for DialFailure {
 
 /// The failure a transport error amounts to, given how far the transport
 /// got.
-pub(crate) fn classify(carrier: Carrier, stage: &Stage, addr: SocketAddr, secs: u64, detail: &str) -> DialFailure {
+pub(crate) fn classify(
+    carrier: Carrier,
+    stage: &Stage,
+    addr: SocketAddr,
+    secs: u64,
+    detail: &str,
+) -> DialFailure {
     let endpoint = carrier.endpoint(addr);
     let detail = printable(detail);
     match stage {
         Stage::Io(ErrorKind::ConnectionRefused, _) => DialFailure::Refused { carrier, endpoint },
-        Stage::Io(ErrorKind::TimedOut, _) | Stage::QuicTimedOut => DialFailure::NoAnswer { carrier, endpoint, secs },
+        Stage::Io(ErrorKind::TimedOut, _) | Stage::QuicTimedOut => DialFailure::NoAnswer {
+            carrier,
+            endpoint,
+            secs,
+        },
         Stage::Io(ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable, io) => {
-            DialFailure::Unreachable { endpoint, detail: printable(io) }
+            DialFailure::Unreachable {
+                endpoint,
+                detail: printable(io),
+            }
         }
-        Stage::Io(_, io) => DialFailure::Other { endpoint, detail: printable(io) },
-        Stage::TcpConnected(_) => DialFailure::Handshake { carrier, endpoint, detail },
-        Stage::QuicRejected(quic) => DialFailure::Handshake { carrier, endpoint, detail: printable(quic) },
+        Stage::Io(_, io) => DialFailure::Other {
+            endpoint,
+            detail: printable(io),
+        },
+        Stage::TcpConnected(_) => DialFailure::Handshake {
+            carrier,
+            endpoint,
+            detail,
+        },
+        Stage::QuicRejected(quic) => DialFailure::Handshake {
+            carrier,
+            endpoint,
+            detail: printable(quic),
+        },
         Stage::Dialing => DialFailure::Other { endpoint, detail },
     }
 }
 
 /// The failure of a dial that saw no connection within `secs`.
-pub(crate) fn on_timeout(carrier: Carrier, stage: &Stage, addr: SocketAddr, secs: u64) -> DialFailure {
+pub(crate) fn on_timeout(
+    carrier: Carrier,
+    stage: &Stage,
+    addr: SocketAddr,
+    secs: u64,
+) -> DialFailure {
     let endpoint = carrier.endpoint(addr);
     match stage {
         Stage::TcpConnected(_) => DialFailure::HandshakeStalled { endpoint, secs },
-        Stage::Dialing | Stage::QuicTimedOut => DialFailure::NoAnswer { carrier, endpoint, secs },
+        Stage::Dialing | Stage::QuicTimedOut => DialFailure::NoAnswer {
+            carrier,
+            endpoint,
+            secs,
+        },
         stage => classify(carrier, stage, addr, secs, "no connection"),
     }
 }
 
 /// Refuses a handshake that proved another peer ID than the one named.
-pub(crate) fn verify_peer(expected: Option<Expected>, actual: PeerId, endpoint: String) -> Result<(), DialFailure> {
+pub(crate) fn verify_peer(
+    expected: Option<Expected>,
+    actual: PeerId,
+    endpoint: String,
+) -> Result<(), DialFailure> {
     match expected {
-        Some(expected) if expected.peer != actual => Err(DialFailure::PeerMismatch { endpoint, expected, actual }),
+        Some(expected) if expected.peer != actual => Err(DialFailure::PeerMismatch {
+            endpoint,
+            expected,
+            actual,
+        }),
         _ => Ok(()),
     }
 }
@@ -340,7 +433,9 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
             parts.push(text);
         }
         next = match error.downcast_ref::<std::io::Error>() {
-            Some(io) => io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+            Some(io) => io
+                .get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static)),
             None => error.source(),
         };
     }
@@ -357,25 +452,34 @@ fn dial_error_detail(error: &DialError) -> String {
     }
 }
 
-fn tcp_transport(keypair: &Keypair, stage: Arc<Mutex<Stage>>) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+fn tcp_transport(
+    keypair: &Keypair,
+    stage: Arc<Mutex<Stage>>,
+) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
     let security = PqNoiseConfig::new(keypair)?;
     let connected = stage.clone();
-    Ok(libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default())
-        .map(move |stream, _| {
-            set_stage(&connected, Stage::TcpConnected(Instant::now()));
-            stream
-        })
-        .map_err(move |error: std::io::Error| {
-            set_stage(&stage, Stage::Io(error.kind(), error.to_string()));
-            error
-        })
-        .upgrade(Version::V1Lazy)
-        .authenticate(security)
-        .multiplex(libp2p::yamux::Config::default())
-        .boxed())
+    Ok(
+        libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default())
+            .map(move |stream, _| {
+                set_stage(&connected, Stage::TcpConnected(Instant::now()));
+                stream
+            })
+            .map_err(move |error: std::io::Error| {
+                set_stage(&stage, Stage::Io(error.kind(), error.to_string()));
+                error
+            })
+            .upgrade(Version::V1Lazy)
+            .authenticate(security)
+            .multiplex(libp2p::yamux::Config::default())
+            .boxed(),
+    )
 }
 
-fn quic_transport(keypair: &Keypair, timeout: Duration, stage: Arc<Mutex<Stage>>) -> Boxed<(PeerId, StreamMuxerBox)> {
+fn quic_transport(
+    keypair: &Keypair,
+    timeout: Duration,
+    stage: Arc<Mutex<Stage>>,
+) -> Boxed<(PeerId, StreamMuxerBox)> {
     // The caller's deadline ends a silent handshake; quinn's own timers stay
     // longer so that they do not cut it short.
     let patience = timeout + Duration::from_secs(5);
@@ -409,14 +513,22 @@ pub(crate) struct Identity {
 
 impl From<identify::Info> for Identity {
     fn from(info: identify::Info) -> Self {
-        let mut protocols: Vec<String> = info.protocols.iter().map(|p| printable(p.as_ref())).collect();
+        let mut protocols: Vec<String> = info
+            .protocols
+            .iter()
+            .map(|p| printable(p.as_ref()))
+            .collect();
         protocols.sort();
         protocols.dedup();
         Identity {
             agent_version: printable(&info.agent_version),
             protocol_version: printable(&info.protocol_version),
             protocols,
-            listen_addrs: info.listen_addrs.iter().map(|addr| addr.to_string()).collect(),
+            listen_addrs: info
+                .listen_addrs
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect(),
             observed_addr: info.observed_addr.to_string(),
         }
     }
@@ -439,7 +551,11 @@ pub(crate) struct Report {
 
 /// Dials `addr` once as a fresh Ed25519 identity and collects what the
 /// peer reports.
-pub(crate) async fn dial(target: &Target, addr: SocketAddr, timeout: Duration) -> Result<Report, DialFailure> {
+pub(crate) async fn dial(
+    target: &Target,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<Report, DialFailure> {
     let carrier = target.carrier;
     let secs = timeout.as_secs();
     let endpoint = carrier.endpoint(addr);
@@ -447,26 +563,38 @@ pub(crate) async fn dial(target: &Target, addr: SocketAddr, timeout: Duration) -
     let local = keypair.public().to_peer_id();
     let stage = Arc::new(Mutex::new(Stage::Dialing));
     let transport = match carrier {
-        Carrier::Tcp => tcp_transport(&keypair, stage.clone())
-            .map_err(|e| DialFailure::Other { endpoint: endpoint.clone(), detail: e.to_string() })?,
+        Carrier::Tcp => tcp_transport(&keypair, stage.clone()).map_err(|e| DialFailure::Other {
+            endpoint: endpoint.clone(),
+            detail: e.to_string(),
+        })?,
         Carrier::Quic => quic_transport(&keypair, timeout, stage.clone()),
     };
     let behaviour = DialBehaviour {
         identify: identify::Behaviour::new(
             identify::Config::new(PROTOCOL_VERSION.to_string(), keypair.public())
-                .with_agent_version(format!("qclient/{} diagnostics dial", env!("CARGO_PKG_VERSION")))
+                .with_agent_version(format!(
+                    "qclient/{} diagnostics dial",
+                    env!("CARGO_PKG_VERSION")
+                ))
                 .with_push_listen_addr_updates(false)
                 .with_cache_size(0),
         ),
         ping: ping::Behaviour::new(ping::Config::new().with_timeout(timeout)),
     };
-    let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(timeout * 2);
+    let config =
+        libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(timeout * 2);
     let mut swarm = Swarm::new(transport, behaviour, local, config);
 
     let dialed = dial_multiaddr(addr, carrier);
     let started = Instant::now();
     if let Err(error) = swarm.dial(dialed.clone()) {
-        return Err(classify(carrier, &stage_of(&stage), addr, secs, &dial_error_detail(&error)));
+        return Err(classify(
+            carrier,
+            &stage_of(&stage),
+            addr,
+            secs,
+            &dial_error_detail(&error),
+        ));
     }
     let mut deadline = started + timeout;
     let mut connection: Option<(PeerId, Duration)> = None;
@@ -474,7 +602,8 @@ pub(crate) async fn dial(target: &Target, addr: SocketAddr, timeout: Duration) -
     let mut rtt: Option<Result<Duration, String>> = None;
     let mut closed = None;
     while connection.is_none() || identity.is_none() || rtt.is_none() {
-        let Ok(event) = tokio::time::timeout_at(deadline.into(), swarm.select_next_some()).await else {
+        let Ok(event) = tokio::time::timeout_at(deadline.into(), swarm.select_next_some()).await
+        else {
             break;
         };
         match event {
@@ -484,13 +613,27 @@ pub(crate) async fn dial(target: &Target, addr: SocketAddr, timeout: Duration) -
                 deadline = Instant::now() + timeout;
             }
             SwarmEvent::OutgoingConnectionError { error, .. } => {
-                return Err(classify(carrier, &stage_of(&stage), addr, secs, &dial_error_detail(&error)));
+                return Err(classify(
+                    carrier,
+                    &stage_of(&stage),
+                    addr,
+                    secs,
+                    &dial_error_detail(&error),
+                ));
             }
-            SwarmEvent::Behaviour(DialBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+            SwarmEvent::Behaviour(DialBehaviourEvent::Identify(identify::Event::Received {
+                info,
+                ..
+            })) => {
                 identity = Some(Ok(info.into()));
             }
-            SwarmEvent::Behaviour(DialBehaviourEvent::Identify(identify::Event::Error { error, .. })) => {
-                identity.get_or_insert_with(|| Err(format!("failed: {}", printable(&error_chain(&error)))));
+            SwarmEvent::Behaviour(DialBehaviourEvent::Identify(identify::Event::Error {
+                error,
+                ..
+            })) => {
+                identity.get_or_insert_with(|| {
+                    Err(format!("failed: {}", printable(&error_chain(&error))))
+                });
             }
             SwarmEvent::Behaviour(DialBehaviourEvent::Ping(ping::Event { result, .. })) => {
                 rtt.get_or_insert_with(|| {
@@ -560,7 +703,11 @@ pub(crate) fn render(report: &Report) -> String {
     };
     row(&mut out, "peer", &format!("{}  {check}", report.peer));
     let connected = match report.tcp_connect {
-        Some(tcp) => format!("{} (TCP {}, then the libp2p handshake)", duration(report.established), duration(tcp)),
+        Some(tcp) => format!(
+            "{} (TCP {}, then the libp2p handshake)",
+            duration(report.established),
+            duration(tcp)
+        ),
         None => format!("{} (QUIC handshake)", duration(report.established)),
     };
     row(&mut out, "connected", &connected);
@@ -571,14 +718,32 @@ pub(crate) fn render(report: &Report) -> String {
     match &report.identify {
         Err(why) => row(&mut out, "identify", why),
         Ok(id) => {
-            let or_dash = |text: &str| if text.is_empty() { "-".to_string() } else { text.to_string() };
+            let or_dash = |text: &str| {
+                if text.is_empty() {
+                    "-".to_string()
+                } else {
+                    text.to_string()
+                }
+            };
             row(&mut out, "agent", &or_dash(&id.agent_version));
             row(&mut out, "protocol", &or_dash(&id.protocol_version));
             row(&mut out, "observed", &or_dash(&id.observed_addr));
-            let private = id.listen_addrs.iter().filter(|addr| address_reach(addr) == Reach::Private).count();
-            row(&mut out, "listen", &format!("{} addresses, {private} private", id.listen_addrs.len()));
+            let private = id
+                .listen_addrs
+                .iter()
+                .filter(|addr| address_reach(addr) == Reach::Private)
+                .count();
+            row(
+                &mut out,
+                "listen",
+                &format!("{} addresses, {private} private", id.listen_addrs.len()),
+            );
             for addr in &id.listen_addrs {
-                row(&mut out, "", &format!("{:<9}{addr}", address_reach(addr).label()));
+                row(
+                    &mut out,
+                    "",
+                    &format!("{:<9}{addr}", address_reach(addr).label()),
+                );
             }
             row(&mut out, "protocols", &id.protocols.len().to_string());
             for protocol in &id.protocols {
@@ -587,7 +752,11 @@ pub(crate) fn render(report: &Report) -> String {
         }
     }
     if let Some(cause) = &report.closed {
-        row(&mut out, "closed", &format!("the connection closed early: {cause}"));
+        row(
+            &mut out,
+            "closed",
+            &format!("the connection closed early: {cause}"),
+        );
     }
     out
 }
@@ -644,7 +813,8 @@ fn ipv6_reach(ip: Ipv6Addr) -> Reach {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return ipv4_reach(v4);
     }
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local() {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
+    {
         Reach::Private
     } else {
         Reach::Public
@@ -653,7 +823,11 @@ fn ipv6_reach(ip: Ipv6Addr) -> Reach {
 
 /// `text` without control characters, cut to [`MAX_TEXT_CHARS`].
 fn printable(text: &str) -> String {
-    let mut out: String = text.chars().filter(|c| !c.is_control()).take(MAX_TEXT_CHARS + 1).collect();
+    let mut out: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TEXT_CHARS + 1)
+        .collect();
     if out.chars().count() > MAX_TEXT_CHARS {
         out = out.chars().take(MAX_TEXT_CHARS).collect::<String>() + "…";
     }

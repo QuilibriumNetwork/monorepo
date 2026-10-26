@@ -19,14 +19,14 @@ use quil_types::error::{QuilError, Result};
 use super::{
     hyperedge_ops::{
         hyperedge_add_domain_separator, hyperedge_add_signing_message,
-        hyperedge_remove_domain_separator, hyperedge_remove_signing_message,
-        HYPEREDGE_ID_LEN, HYPEREDGE_MIN_VALUE_LEN,
+        hyperedge_remove_domain_separator, hyperedge_remove_signing_message, HYPEREDGE_ID_LEN,
+        HYPEREDGE_MIN_VALUE_LEN,
     },
     split_vertex_add_proof_chunks,
     types::{HyperedgeAdd, HyperedgeRemove, VertexAdd, VertexRemove},
     vertex_ops::{
-        vertex_add_domain_separator, vertex_add_signing_message,
-        vertex_remove_domain_separator, vertex_remove_signing_message,
+        vertex_add_domain_separator, vertex_add_signing_message, vertex_remove_domain_separator,
+        vertex_remove_signing_message,
     },
 };
 
@@ -41,9 +41,12 @@ pub trait HypergraphConfigResolver: Send + Sync {
     /// Rebind state-dependent lookups to a separate execution context. An
     /// unknown resolver must opt in; cloning its Arc could retain primary state.
     fn for_execution_context(
-        &self, _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> Result<Arc<dyn HypergraphConfigResolver>> {
-        Err(QuilError::ExecutionUnavailable("hypergraph resolver cannot rebind execution state".into()))
+        Err(QuilError::ExecutionUnavailable(
+            "hypergraph resolver cannot rebind execution state".into(),
+        ))
     }
 
     fn write_public_key(&self, domain: &[u8]) -> Option<Vec<u8>>;
@@ -82,11 +85,15 @@ impl CrdtHypergraphConfigResolver {
 
     fn metadata(&self, domain: &[u8]) -> Option<quil_tries::VectorCommitmentTree> {
         let app_address: [u8; 32] = domain.get(..32)?.try_into().ok()?;
-        let blob = self.crdt.get_vertex_data(&quil_hypergraph::addressing::Location {
-            app_address,
-            data_address: crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS,
-        })?;
-        let tree = quil_tries::VectorCommitmentTree { root: quil_tries::deserialize_go_tree(&blob).ok()? };
+        let blob = self
+            .crdt
+            .get_vertex_data(&quil_hypergraph::addressing::Location {
+                app_address,
+                data_address: crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS,
+            })?;
+        let tree = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(&blob).ok()?,
+        };
         let type_domain = tree.get(&[0xff; 32])?;
         (type_domain.get(..32)? == super::hypergraph_base_domain().as_slice()).then_some(tree)
     }
@@ -94,7 +101,8 @@ impl CrdtHypergraphConfigResolver {
 
 impl HypergraphConfigResolver for CrdtHypergraphConfigResolver {
     fn for_execution_context(
-        &self, crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> Result<Arc<dyn HypergraphConfigResolver>> {
         Ok(Arc::new(Self::new(crdt)))
     }
@@ -104,11 +112,16 @@ impl HypergraphConfigResolver for CrdtHypergraphConfigResolver {
         let config = quil_tries::VectorCommitmentTree {
             root: quil_tries::deserialize_go_tree(metadata.get(&[16u8 << 2])?).ok()?,
         };
-        config.get(&[1u8 << 2]).map(|key| key.to_vec()).filter(|key| !key.is_empty())
+        config
+            .get(&[1u8 << 2])
+            .map(|key| key.to_vec())
+            .filter(|key| !key.is_empty())
     }
 
     fn prior_rdf_schema(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.metadata(domain)?.get(&[2u8 << 2]).map(|schema| schema.to_vec())
+        self.metadata(domain)?
+            .get(&[2u8 << 2])
+            .map(|schema| schema.to_vec())
     }
 }
 
@@ -275,7 +288,10 @@ pub fn verify_update_signature(
 pub enum OpForAuth<'a> {
     VertexAdd(&'a VertexAdd),
     VertexRemove(&'a VertexRemove),
-    HyperedgeAdd { op: &'a HyperedgeAdd, commit: &'a [u8] },
+    HyperedgeAdd {
+        op: &'a HyperedgeAdd,
+        commit: &'a [u8],
+    },
     HyperedgeRemove(&'a HyperedgeRemove),
 }
 
@@ -326,23 +342,40 @@ mod tests {
             write_public_key: signer.public_key().to_vec(),
             owner_public_key: Vec::new(),
         };
-        let schema = b"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n:Note a rdfs:Class .\n";
+        let schema =
+            b"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n:Note a rdfs:Class .\n";
         let domain = crate::hypergraph_intrinsic::materialize_hypergraph_deploy_init(
-            &state, &config, schema, 1, &quil_types::crypto::NoopInclusionProver).unwrap();
+            &state,
+            &config,
+            schema,
+            1,
+            &quil_types::crypto::NoopInclusionProver,
+        )
+        .unwrap();
         let resolver = CrdtHypergraphConfigResolver::new(crdt.clone());
         // Pending (uncommitted) deploys do not resolve.
         assert!(resolver.write_public_key(&domain).is_none());
         state.commit().unwrap();
         state.abort();
-        assert_eq!(resolver.write_public_key(&domain).unwrap(), signer.public_key().to_vec());
+        assert_eq!(
+            resolver.write_public_key(&domain).unwrap(),
+            signer.public_key().to_vec()
+        );
         assert_eq!(resolver.prior_rdf_schema(&domain).unwrap(), schema.to_vec());
         assert!(resolver.write_public_key(&[9; 32]).is_none());
         // A signed vertex removal now verifies through the resolver.
         let data_address = vec![0x42u8; 32];
         let msg = vertex_remove_signing_message(&domain, &data_address).unwrap();
-        let op = VertexRemove { domain: domain.to_vec(), data_address, signature: falcon_signed(&signer, &domain, b"VERTEX_REMOVE", &msg) };
+        let op = VertexRemove {
+            domain: domain.to_vec(),
+            data_address,
+            signature: falcon_signed(&signer, &domain, b"VERTEX_REMOVE", &msg),
+        };
         let resolver: Arc<dyn HypergraphConfigResolver> = Arc::new(resolver);
-        assert_eq!(verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap(), AuthCheck::Verified);
+        assert_eq!(
+            verify_op_signature(&resolver, &OpForAuth::VertexRemove(&op)).unwrap(),
+            AuthCheck::Verified
+        );
     }
 
     #[test]

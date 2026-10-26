@@ -105,9 +105,11 @@ pub fn falcon_identity_self_check() -> Result<(), String> {
         )
     })?;
     if decoded != kp.public() {
-        return Err("Falcon (KeyType=5) self-check FAILED: public-key round-trip \
+        return Err(
+            "Falcon (KeyType=5) self-check FAILED: public-key round-trip \
                     mismatch — Falcon support in this build is broken (fn-dsa?)."
-            .to_string());
+                .to_string(),
+        );
     }
     Ok(())
 }

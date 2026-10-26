@@ -35,7 +35,13 @@ impl GlobalProposer for TestProposer {
         let digest = h.finalize();
         Some((digest, digest.as_ref().to_vec()))
     }
-    fn verify(&self, view: u64, parent: Sha256Digest, digest: Sha256Digest, bytes: Option<Vec<u8>>) -> bool {
+    fn verify(
+        &self,
+        view: u64,
+        parent: Sha256Digest,
+        digest: Sha256Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
         let mut h = Sha256::default();
         h.update(&view.to_be_bytes());
         h.update(parent.as_ref());
@@ -53,7 +59,14 @@ struct SignalFinalizer {
 }
 impl FrameFinalizer for SignalFinalizer {
     fn on_notarized(&self, _v: u64, _d: Sha256Digest, _b: Option<Vec<u8>>) {}
-    fn on_finalized(&self, view: u64, _d: Sha256Digest, _b: Option<Vec<u8>>, _c: Option<Vec<u8>>, _lv: bool) {
+    fn on_finalized(
+        &self,
+        view: u64,
+        _d: Sha256Digest,
+        _b: Option<Vec<u8>>,
+        _c: Option<Vec<u8>>,
+        _lv: bool,
+    ) {
         let _ = self.tx.send(view);
     }
 }
@@ -65,8 +78,9 @@ fn falcon_tokio_router_finalizes() {
     let n: usize = 4;
     let namespace = b"global".to_vec();
 
-    let sks: Vec<FalconPrivateKey> =
-        (0..n).map(|_| FalconPrivateKey::random(commonware_utils::test_rng())).collect();
+    let sks: Vec<FalconPrivateKey> = (0..n)
+        .map(|_| FalconPrivateKey::random(commonware_utils::test_rng()))
+        .collect();
     let participants: Vec<FalconPublicKey> = sks.iter().map(|s| s.public_key()).collect();
     let peers: Arc<[FalconPublicKey]> = Arc::from(participants.clone());
     let part_set: Set<FalconPublicKey> = participants.clone().try_into().unwrap();
@@ -88,9 +102,12 @@ fn falcon_tokio_router_finalizes() {
         let genesis = mocks::application::genesis::<Sha256>(epoch);
 
         // Per-node inbound senders (3 channels each) + outbound receivers.
-        let mut inbound: HashMap<FalconPublicKey, [mpsc::UnboundedSender<InMsg>; 3]> = HashMap::new();
-        let mut node_outs: Vec<(FalconPublicKey, mpsc::UnboundedReceiver<Outbound<FalconPublicKey>>)> =
-            Vec::new();
+        let mut inbound: HashMap<FalconPublicKey, [mpsc::UnboundedSender<InMsg>; 3]> =
+            HashMap::new();
+        let mut node_outs: Vec<(
+            FalconPublicKey,
+            mpsc::UnboundedReceiver<Outbound<FalconPublicKey>>,
+        )> = Vec::new();
         let mut handlers = Vec::new();
 
         for (idx, pk) in participants.iter().enumerate() {
@@ -103,7 +120,11 @@ fn falcon_tokio_router_finalizes() {
 
             inbound.insert(
                 pk.clone(),
-                [ch0.inbound_tx.clone(), ch1.inbound_tx.clone(), ch2.inbound_tx.clone()],
+                [
+                    ch0.inbound_tx.clone(),
+                    ch1.inbound_tx.clone(),
+                    ch2.inbound_tx.clone(),
+                ],
             );
             node_outs.push((pk.clone(), out_rx));
 

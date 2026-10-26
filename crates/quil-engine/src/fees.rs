@@ -112,9 +112,7 @@ impl DynamicFeeManager for InMemoryDynamicFeeManager {
     fn get_next_fee_multiplier(&self, filter: &[u8]) -> Result<u64> {
         let map = self.filter_data.read().unwrap();
         match map.get(filter) {
-            Some(data) if !data.votes.is_empty() => {
-                Ok(data.sum_votes / data.votes.len() as u64)
-            }
+            Some(data) if !data.votes.is_empty() => Ok(data.sum_votes / data.votes.len() as u64),
             _ => Ok(DEFAULT_FEE_MULTIPLIER),
         }
     }
@@ -229,8 +227,7 @@ pub fn adjust_fee_for_traffic(
 
     if time_diff < TARGET_FRAME_TIME_MS {
         // Frames are faster than target → decrease fee
-        let mut percent_faster =
-            (TARGET_FRAME_TIME_MS - time_diff) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_faster = (TARGET_FRAME_TIME_MS - time_diff) * 100 / TARGET_FRAME_TIME_MS;
         if percent_faster > MAX_ADJUSTMENT_PERCENT {
             percent_faster = MAX_ADJUSTMENT_PERCENT;
         }
@@ -239,8 +236,7 @@ pub fn adjust_fee_for_traffic(
         adjusted.max(1) // minimum fee is 1
     } else if time_diff > TARGET_FRAME_TIME_MS {
         // Frames are slower than target → increase fee
-        let mut percent_slower =
-            (time_diff - TARGET_FRAME_TIME_MS) * 100 / TARGET_FRAME_TIME_MS;
+        let mut percent_slower = (time_diff - TARGET_FRAME_TIME_MS) * 100 / TARGET_FRAME_TIME_MS;
         if percent_slower > MAX_ADJUSTMENT_PERCENT {
             percent_slower = MAX_ADJUSTMENT_PERCENT;
         }
@@ -266,7 +262,12 @@ pub fn compute_fee_multiplier_vote(
     let base = fee_manager
         .get_next_fee_multiplier(filter)
         .unwrap_or(DEFAULT_FEE_MULTIPLIER);
-    adjust_fee_for_traffic(base, current_timestamp_ms, previous_timestamp_ms, reward_greedy)
+    adjust_fee_for_traffic(
+        base,
+        current_timestamp_ms,
+        previous_timestamp_ms,
+        reward_greedy,
+    )
 }
 
 #[cfg(test)]
@@ -313,10 +314,7 @@ mod tests {
         m.add_frame_fee_vote(&[0x01], 4, 400).unwrap();
         assert_eq!(m.get_average_window_size(&[0x01]).unwrap(), 3);
         assert_eq!(m.get_next_fee_multiplier(&[0x01]).unwrap(), 300);
-        assert_eq!(
-            m.get_vote_history(&[0x01]).unwrap(),
-            vec![200u64, 300, 400]
-        );
+        assert_eq!(m.get_vote_history(&[0x01]).unwrap(), vec![200u64, 300, 400]);
     }
 
     #[test]
@@ -327,10 +325,7 @@ mod tests {
         }
         let removed = m.rewind_to_frame(&[0x01], 3).unwrap();
         assert_eq!(removed, 2);
-        assert_eq!(
-            m.get_vote_history(&[0x01]).unwrap(),
-            vec![100u64, 200, 300]
-        );
+        assert_eq!(m.get_vote_history(&[0x01]).unwrap(), vec![100u64, 200, 300]);
         assert_eq!(m.get_next_fee_multiplier(&[0x01]).unwrap(), 200);
     }
 
@@ -474,7 +469,10 @@ mod tests {
         let prev_slow = 30_000i64; // 20s gap
         let rg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, true);
         let dg_slow = compute_fee_multiplier_vote(&m, &[7], now_slow, prev_slow, false);
-        assert_eq!(rg_slow, 550, "reward_greedy raises 500 → 550 on slow cadence");
+        assert_eq!(
+            rg_slow, 550,
+            "reward_greedy raises 500 → 550 on slow cadence"
+        );
         assert_eq!(dg_slow, 500, "data_greedy untouched on slow cadence");
     }
 

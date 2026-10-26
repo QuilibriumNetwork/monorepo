@@ -44,7 +44,9 @@ pub(crate) struct WarnLimiter<K> {
 
 impl<K: Ord + Clone> WarnLimiter<K> {
     pub(crate) const fn new() -> Self {
-        Self { streams: BTreeMap::new() }
+        Self {
+            streams: BTreeMap::new(),
+        }
     }
 
     /// An attempt for `key` failed at `now`.
@@ -71,15 +73,30 @@ impl<K: Ord + Clone> WarnLimiter<K> {
             });
         }
         if self.streams.len() >= MAX_STREAMS {
-            let oldest = self.streams.iter().min_by_key(|(_, s)| s.last_failure).map(|(k, _)| k.clone());
+            let oldest = self
+                .streams
+                .iter()
+                .min_by_key(|(_, s)| s.last_failure)
+                .map(|(k, _)| k.clone());
             if let Some(oldest) = oldest {
                 self.streams.remove(&oldest);
             }
         }
-        self.streams.insert(key.clone(), Stream {
-            since: now, last_failure: now, warned: now, unreported: 0, attempts: 1, position,
-        });
-        Some(Report::Failing { attempts: 1, duration: Duration::ZERO })
+        self.streams.insert(
+            key.clone(),
+            Stream {
+                since: now,
+                last_failure: now,
+                warned: now,
+                unreported: 0,
+                attempts: 1,
+                position,
+            },
+        );
+        Some(Report::Failing {
+            attempts: 1,
+            duration: Duration::ZERO,
+        })
     }
 
     /// An attempt for `key` succeeded at `now`: the end of its condition.
@@ -112,12 +129,18 @@ static CONDITIONS: Mutex<WarnLimiter<Key>> = Mutex::new(WarnLimiter::new());
 
 /// [`WarnLimiter::failed_at`] on the process-wide conditions, at the current time.
 pub(crate) fn failed(key: &Key, position: u64) -> Option<Report> {
-    CONDITIONS.lock().unwrap_or_else(|e| e.into_inner()).failed_at(key, position, Instant::now())
+    CONDITIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .failed_at(key, position, Instant::now())
 }
 
 /// [`WarnLimiter::succeeded_at`] on the process-wide conditions, at the current time.
 pub(crate) fn succeeded(key: &Key, position: u64) -> Option<Report> {
-    CONDITIONS.lock().unwrap_or_else(|e| e.into_inner()).succeeded_at(key, position, Instant::now())
+    CONDITIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .succeeded_at(key, position, Instant::now())
 }
 
 #[cfg(test)]
@@ -130,7 +153,13 @@ mod tests {
     fn onset_warns_once_and_repeats_are_suppressed() {
         let t0 = Instant::now();
         let mut limiter = WarnLimiter::new();
-        assert_eq!(limiter.failed(&"a", t0), Some(Report::Failing { attempts: 1, duration: Duration::ZERO }));
+        assert_eq!(
+            limiter.failed(&"a", t0),
+            Some(Report::Failing {
+                attempts: 1,
+                duration: Duration::ZERO
+            })
+        );
         for i in 1..60 {
             assert_eq!(limiter.failed(&"a", t0 + 10 * S * i), None, "retry {i}");
         }
@@ -146,12 +175,18 @@ mod tests {
         }
         assert_eq!(
             limiter.failed(&"a", t0 + WARN_REPEAT),
-            Some(Report::Failing { attempts: 60, duration: WARN_REPEAT }),
+            Some(Report::Failing {
+                attempts: 60,
+                duration: WARN_REPEAT
+            }),
         );
         assert_eq!(limiter.failed(&"a", t0 + WARN_REPEAT + 10 * S), None);
         assert_eq!(
             limiter.failed(&"a", t0 + 2 * WARN_REPEAT),
-            Some(Report::Failing { attempts: 2, duration: 2 * WARN_REPEAT }),
+            Some(Report::Failing {
+                attempts: 2,
+                duration: 2 * WARN_REPEAT
+            }),
         );
     }
 
@@ -164,12 +199,18 @@ mod tests {
         limiter.failed(&"a", t0 + 30 * S);
         assert_eq!(
             limiter.succeeded(&"a", t0 + 90 * S),
-            Some(Report::Recovered { attempts: 2, duration: 90 * S }),
+            Some(Report::Recovered {
+                attempts: 2,
+                duration: 90 * S
+            }),
         );
         assert_eq!(limiter.succeeded(&"a", t0 + 100 * S), None);
         assert_eq!(
             limiter.failed(&"a", t0 + 110 * S),
-            Some(Report::Failing { attempts: 1, duration: Duration::ZERO }),
+            Some(Report::Failing {
+                attempts: 1,
+                duration: Duration::ZERO
+            }),
         );
     }
 
@@ -178,23 +219,50 @@ mod tests {
         let t0 = Instant::now();
         let mut limiter = WarnLimiter::new();
         limiter.failed(&"a", t0);
-        assert_eq!(limiter.failed(&"b", t0 + S), Some(Report::Failing { attempts: 1, duration: Duration::ZERO }));
+        assert_eq!(
+            limiter.failed(&"b", t0 + S),
+            Some(Report::Failing {
+                attempts: 1,
+                duration: Duration::ZERO
+            })
+        );
         assert_eq!(limiter.failed(&"a", t0 + 2 * S), None);
-        assert_eq!(limiter.succeeded(&"b", t0 + 3 * S), Some(Report::Recovered { attempts: 1, duration: 2 * S }));
-        assert_eq!(limiter.failed(&"a", t0 + WARN_REPEAT), Some(Report::Failing { attempts: 2, duration: WARN_REPEAT }));
+        assert_eq!(
+            limiter.succeeded(&"b", t0 + 3 * S),
+            Some(Report::Recovered {
+                attempts: 1,
+                duration: 2 * S
+            })
+        );
+        assert_eq!(
+            limiter.failed(&"a", t0 + WARN_REPEAT),
+            Some(Report::Failing {
+                attempts: 2,
+                duration: WARN_REPEAT
+            })
+        );
     }
 
     #[test]
     fn a_pass_below_the_highest_failure_does_not_end_the_condition() {
         let t0 = Instant::now();
         let mut limiter = WarnLimiter::new();
-        assert_eq!(limiter.failed_at(&"a", 10, t0), Some(Report::Failing { attempts: 1, duration: Duration::ZERO }));
+        assert_eq!(
+            limiter.failed_at(&"a", 10, t0),
+            Some(Report::Failing {
+                attempts: 1,
+                duration: Duration::ZERO
+            })
+        );
         assert_eq!(limiter.succeeded_at(&"a", 9, t0 + S), None);
         assert_eq!(limiter.failed_at(&"a", 11, t0 + 2 * S), None);
         assert_eq!(limiter.succeeded_at(&"a", 10, t0 + 3 * S), None);
         assert_eq!(
             limiter.succeeded_at(&"a", 12, t0 + 4 * S),
-            Some(Report::Recovered { attempts: 2, duration: 4 * S }),
+            Some(Report::Recovered {
+                attempts: 2,
+                duration: 4 * S
+            }),
         );
         assert_eq!(limiter.succeeded_at(&"a", 13, t0 + 5 * S), None);
     }

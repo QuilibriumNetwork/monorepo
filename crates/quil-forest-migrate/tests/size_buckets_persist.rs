@@ -14,13 +14,42 @@ use quil_types::store::HypergraphStore;
 
 struct StubProver;
 impl quil_types::crypto::InclusionProver for StubProver {
-    fn commit_raw(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> quil_types::error::Result<bool> { Ok(true) }
-    fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> quil_types::error::Result<Box<dyn quil_types::crypto::Multiproof>> {
+    fn commit_raw(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> {
+        Ok(vec![0u8; 64])
+    }
+    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> quil_types::error::Result<Vec<u8>> {
+        Ok(vec![0u8; 64])
+    }
+    fn verify_raw(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: u64,
+        _: &[u8],
+        _: u64,
+    ) -> quil_types::error::Result<bool> {
+        Ok(true)
+    }
+    fn prove_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+    ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Multiproof>> {
         Err(quil_types::error::QuilError::Internal("stub".into()))
     }
-    fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+    fn verify_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+        _: &[u8],
+        _: &[u8],
+    ) -> bool {
+        true
+    }
 }
 
 fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
@@ -32,7 +61,10 @@ fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
 fn crdt(db: quil_forest::CoordinatedDb, app: [u8; 32]) -> HypergraphCrdt {
     let hg = Arc::new(RocksHypergraphStore::new(db));
     let c = HypergraphCrdt::new(hg.clone() as Arc<dyn HypergraphStore>, Arc::new(StubProver));
-    c.set_forest(Forest::with_namespace(hg.raw_db(), FOREST_NAMESPACE.to_vec()));
+    c.set_forest(Forest::with_namespace(
+        hg.raw_db(),
+        FOREST_NAMESPACE.to_vec(),
+    ));
     c.set_shard_partition(app, 1);
     c
 }
@@ -41,7 +73,10 @@ fn loc(app: [u8; 32], d0: u8, tag: u8) -> Location {
     let mut d = [0u8; 32];
     d[0] = d0;
     d[31] = tag;
-    Location { app_address: app, data_address: d }
+    Location {
+        app_address: app,
+        data_address: d,
+    }
 }
 
 #[test]
@@ -63,10 +98,18 @@ fn size_buckets_persist_across_restart() {
     {
         let c = crdt(open_db(dir.path()), app);
         c.warm_sizes(&[]).unwrap();
-        assert_eq!(c.total_size(), BigInt::from(14), "buckets loaded from persistence");
-        let s0 = c.sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat()).unwrap();
+        assert_eq!(
+            c.total_size(),
+            BigInt::from(14),
+            "buckets loaded from persistence"
+        );
+        let s0 = c
+            .sub_shard_metadata_for_filter(&[app.as_slice(), &[0u8]].concat())
+            .unwrap();
         assert_eq!((s0.leaf_count, s0.size), (1, BigInt::from(8)));
-        let s63 = c.sub_shard_metadata_for_filter(&[app.as_slice(), &[63u8]].concat()).unwrap();
+        let s63 = c
+            .sub_shard_metadata_for_filter(&[app.as_slice(), &[63u8]].concat())
+            .unwrap();
         assert_eq!((s63.leaf_count, s63.size), (1, BigInt::from(6)));
     }
 }

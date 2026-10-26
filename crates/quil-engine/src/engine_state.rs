@@ -139,15 +139,8 @@ impl EngineStateMachine {
             // All "active" states (Collecting through Verifying) can
             // transition to each other freely, or into Stopping.
             (
-                Collecting | LivenessCheck | Proving | Publishing | Voting | Finalizing
-                | Verifying,
-                Collecting
-                | LivenessCheck
-                | Proving
-                | Publishing
-                | Voting
-                | Finalizing
-                | Verifying
+                Collecting | LivenessCheck | Proving | Publishing | Voting | Finalizing | Verifying,
+                Collecting | LivenessCheck | Proving | Publishing | Voting | Finalizing | Verifying
                 | Stopping,
             ) => true,
             (_, _) => false,
@@ -205,10 +198,7 @@ mod tests {
         assert_eq!(EngineState::Starting.to_string(), "starting");
         assert_eq!(EngineState::Loading.to_string(), "loading");
         assert_eq!(EngineState::Collecting.to_string(), "collecting");
-        assert_eq!(
-            EngineState::LivenessCheck.to_string(),
-            "liveness_check"
-        );
+        assert_eq!(EngineState::LivenessCheck.to_string(), "liveness_check");
         assert_eq!(EngineState::Proving.to_string(), "proving");
         assert_eq!(EngineState::Publishing.to_string(), "publishing");
         assert_eq!(EngineState::Voting.to_string(), "voting");
@@ -351,10 +341,7 @@ mod tests {
         // Final state should be one of Proving or Voting.
         let final_state = sm.current();
         assert!(
-            matches!(
-                final_state,
-                EngineState::Proving | EngineState::Voting
-            ),
+            matches!(final_state, EngineState::Proving | EngineState::Voting),
             "final state was {:?}",
             final_state
         );

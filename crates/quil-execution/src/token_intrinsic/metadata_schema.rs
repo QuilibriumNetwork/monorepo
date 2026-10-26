@@ -88,9 +88,7 @@ pub fn load_token_config_tree(
         None => return Ok(None),
     };
     let outer_root = quil_tries::deserialize_go_tree(&outer_bytes).map_err(|e| {
-        QuilError::InvalidArgument(format!(
-            "token config: outer tree deserialize failed: {e}"
-        ))
+        QuilError::InvalidArgument(format!("token config: outer tree deserialize failed: {e}"))
     })?;
     let outer_tree = quil_tries::VectorCommitmentTree { root: outer_root };
 
@@ -99,9 +97,7 @@ pub fn load_token_config_tree(
         None => return Ok(None),
     };
     let inner_root = quil_tries::deserialize_go_tree(&inner_bytes).map_err(|e| {
-        QuilError::InvalidArgument(format!(
-            "token config: inner tree deserialize failed: {e}"
-        ))
+        QuilError::InvalidArgument(format!("token config: inner tree deserialize failed: {e}"))
     })?;
     Ok(Some(quil_tries::VectorCommitmentTree { root: inner_root }))
 }
@@ -118,10 +114,9 @@ pub fn decode_token_config_from_tree(
 ) -> quil_types::error::Result<super::config::TokenConfiguration> {
     use quil_types::error::QuilError;
 
-    let behavior_bytes = tree.get(&field_key(field::BEHAVIOR))
-        .ok_or_else(|| QuilError::InvalidArgument(
-            "token config: missing Behavior field".into(),
-        ))?;
+    let behavior_bytes = tree
+        .get(&field_key(field::BEHAVIOR))
+        .ok_or_else(|| QuilError::InvalidArgument("token config: missing Behavior field".into()))?;
     if behavior_bytes.len() < 2 {
         return Err(QuilError::InvalidArgument(
             "token config: Behavior field < 2 bytes".into(),
@@ -129,27 +124,38 @@ pub fn decode_token_config_from_tree(
     }
     let behavior = u16::from_be_bytes([behavior_bytes[0], behavior_bytes[1]]) as u32;
 
-    let mint_strategy = tree.get(&field_key(field::MINT_STRATEGY))
+    let mint_strategy = tree
+        .get(&field_key(field::MINT_STRATEGY))
         .map(|b| super::config::decode_mint_strategy_packed(b))
         .transpose()?
         .map(|s| s.to_canonical_bytes())
         .transpose()?
         .unwrap_or_default();
 
-    let units = tree.get(&field_key(field::UNITS))
-        .map(|b| b.to_vec()).unwrap_or_default();
-    let supply = tree.get(&field_key(field::SUPPLY))
-        .map(|b| b.to_vec()).unwrap_or_default();
-    let name = tree.get(&field_key(field::NAME))
-        .map(|b| b.to_vec()).unwrap_or_default();
-    let symbol = tree.get(&field_key(field::SYMBOL))
-        .map(|b| b.to_vec()).unwrap_or_default();
+    let units = tree
+        .get(&field_key(field::UNITS))
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    let supply = tree
+        .get(&field_key(field::SUPPLY))
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    let name = tree
+        .get(&field_key(field::NAME))
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
+    let symbol = tree
+        .get(&field_key(field::SYMBOL))
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
     let additional_reference: Vec<Vec<u8>> = tree
         .get(&field_key(field::ADDITIONAL_REFERENCE))
         .map(|b| vec![b.to_vec()])
         .unwrap_or_default();
-    let owner_public_key = tree.get(&field_key(field::OWNER_PUBLIC_KEY))
-        .map(|b| b.to_vec()).unwrap_or_default();
+    let owner_public_key = tree
+        .get(&field_key(field::OWNER_PUBLIC_KEY))
+        .map(|b| b.to_vec())
+        .unwrap_or_default();
 
     Ok(super::config::TokenConfiguration {
         behavior,
@@ -391,7 +397,8 @@ mod tests {
     fn encode_decode_mint_strategy_packed_round_trip_minimal() {
         use super::super::config::TokenMintStrategy;
         let m = TokenMintStrategy {
-            mint_behavior: 1, proof_basis: 1,
+            mint_behavior: 1,
+            proof_basis: 1,
             verkle_root: vec![],
             authority: vec![],
             payment_address: vec![],
@@ -496,30 +503,34 @@ mod tests {
         // A Falcon-512 authority fits, which is what the field must hold:
         // application authority keys are post-quantum only.
         let falcon = TokenMintStrategy {
-            mint_behavior: 0, proof_basis: 0, verkle_root: vec![0xAAu8; 32],
+            mint_behavior: 0,
+            proof_basis: 0,
+            verkle_root: vec![0xAAu8; 32],
             authority: super::super::config::Authority {
                 key_type: quil_types::crypto::KeyType::Falcon512 as u32,
                 public_key: vec![0xBBu8; quil_crypto::FALCON_PUBLIC_KEY_LEN],
                 can_burn: false,
-            }.to_canonical_bytes().unwrap(),
+            }
+            .to_canonical_bytes()
+            .unwrap(),
             payment_address: vec![0xCCu8; 32],
             fee_basis: super::super::config::FeeBasisStruct {
-                fee_type: 1, baseline: vec![0xDDu8; 32],
-            }.to_canonical_bytes().unwrap(),
+                fee_type: 1,
+                baseline: vec![0xDDu8; 32],
+            }
+            .to_canonical_bytes()
+            .unwrap(),
         };
         assert!(encode_mint_strategy_packed(&falcon).unwrap().len() <= MAX_MINT_STRATEGY_BYTES);
     }
 
     #[test]
     fn load_token_config_tree_returns_none_for_missing_vertex() {
-        use std::sync::Arc;
-        use quil_hypergraph::HypergraphCrdt;
         use quil_hypergraph::testing::MemStore;
+        use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::NoopInclusionProver;
-        let crdt = HypergraphCrdt::new(
-            Arc::new(MemStore::new()),
-            Arc::new(NoopInclusionProver),
-        );
+        use std::sync::Arc;
+        let crdt = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(NoopInclusionProver));
         let domain = [0x42u8; 32];
         let r = load_token_config_tree(&crdt, &domain).unwrap();
         assert!(r.is_none());

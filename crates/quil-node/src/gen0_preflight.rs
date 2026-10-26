@@ -81,8 +81,9 @@ impl Store {
 
     /// Open a running node's store: read-only, no lock, every file held open.
     pub fn open_live(label: &str, path: &Path, network: u8) -> anyhow::Result<Self> {
-        let db = quil_store::RocksDb::open_for_read_only_live(path)
-            .map_err(|e| anyhow::anyhow!("open {} read-only beside its node: {e}", path.display()))?;
+        let db = quil_store::RocksDb::open_for_read_only_live(path).map_err(|e| {
+            anyhow::anyhow!("open {} read-only beside its node: {e}", path.display())
+        })?;
         Ok(Self::from_db(label, db, network))
     }
 
@@ -94,7 +95,13 @@ impl Store {
             Arc::new(quil_tries::ShaInclusionProver),
         ));
         quil_forest_migrate::install_forest_boot(crdt.as_ref(), hg.as_ref(), false, network == 0);
-        Self { label: label.to_string(), clock: quil_store::RocksClockStore::new(raw.clone()), raw, crdt, _db: db }
+        Self {
+            label: label.to_string(),
+            clock: quil_store::RocksClockStore::new(raw.clone()),
+            raw,
+            crdt,
+            _db: db,
+        }
     }
 }
 
@@ -136,7 +143,10 @@ struct NodeDiagnose<'a> {
 
 /// One allocation as `<filter suffix>:<raw status>/<effective status at the
 /// anchor>/epoch <registered epoch>/confirmed <join confirm frame>`.
-fn describe_allocation(allocation: &quil_types::consensus::ProverAllocationInfo, anchor: u64) -> String {
+fn describe_allocation(
+    allocation: &quil_types::consensus::ProverAllocationInfo,
+    anchor: u64,
+) -> String {
     let filter = &allocation.confirmation_filter;
     let suffix = match filter.len() {
         0 => "global".to_string(),
@@ -166,13 +176,20 @@ fn falcon_keys(keys: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
 
 /// Shallower filters holding `filter`'s range, nearest first.
 fn ancestors(filter: &[u8]) -> Vec<Vec<u8>> {
-    let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return Vec::new() };
-    (1..bits.len()).rev().map(|depth| quil_forest::encode_shard_bit_path(&app, &bits[..depth])).collect()
+    let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else {
+        return Vec::new();
+    };
+    (1..bits.len())
+        .rev()
+        .map(|depth| quil_forest::encode_shard_bit_path(&app, &bits[..depth]))
+        .collect()
 }
 
 /// The two filters one level below `filter`.
 fn children(filter: &[u8]) -> Vec<Vec<u8>> {
-    let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return Vec::new() };
+    let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else {
+        return Vec::new();
+    };
     [false, true]
         .map(|bit| quil_forest::encode_shard_bit_path(&app, &[bits.as_slice(), &[bit]].concat()))
         .to_vec()
@@ -182,28 +199,52 @@ impl Diagnose for NodeDiagnose<'_> {
     fn candidates(&self, filter: &[u8], anchor: u64) -> Vec<(&'static str, Vec<Vec<u8>>)> {
         let active = |filter: &[u8]| schedule::desired_members(self.scan, filter, anchor);
         let allocated = |filter: &[u8]| -> Vec<Vec<u8>> {
-            self.scan.all_on_filter(filter).into_iter().map(|(key, _)| key).collect()
+            self.scan
+                .all_on_filter(filter)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
         };
         let ancestors = ancestors(filter);
         let parent = ancestors.first().cloned();
         let mut out = Vec::new();
         if let Ok(registry) = &self.registry {
             use quil_types::consensus::ProverRegistry as _;
-            let members = registry.get_active_provers(filter, anchor).unwrap_or_default();
-            out.push(("registry_at_anchor", falcon_keys(members.into_iter().map(|prover| prover.public_key))));
+            let members = registry
+                .get_active_provers(filter, anchor)
+                .unwrap_or_default();
+            out.push((
+                "registry_at_anchor",
+                falcon_keys(members.into_iter().map(|prover| prover.public_key)),
+            ));
         }
         out.push(("all_allocations", falcon_keys(allocated(filter))));
         if let Some(parent) = parent.as_ref() {
-            out.push(("with_parent_at_anchor", falcon_keys([active(filter), active(parent)].concat())));
-            out.push(("with_parent_all_allocations", falcon_keys([allocated(filter), allocated(parent)].concat())));
+            out.push((
+                "with_parent_at_anchor",
+                falcon_keys([active(filter), active(parent)].concat()),
+            ));
+            out.push((
+                "with_parent_all_allocations",
+                falcon_keys([allocated(filter), allocated(parent)].concat()),
+            ));
         }
         if ancestors.len() > 1 {
-            let all: Vec<Vec<u8>> = std::iter::once(filter.to_vec()).chain(ancestors).flat_map(|f| active(&f)).collect();
+            let all: Vec<Vec<u8>> = std::iter::once(filter.to_vec())
+                .chain(ancestors)
+                .flat_map(|f| active(&f))
+                .collect();
             out.push(("with_ancestors_at_anchor", falcon_keys(all)));
         }
-        let below: Vec<Vec<u8>> = children(filter).iter().flat_map(|child| active(child)).collect();
+        let below: Vec<Vec<u8>> = children(filter)
+            .iter()
+            .flat_map(|child| active(child))
+            .collect();
         if !below.is_empty() {
-            out.push(("with_children_at_anchor", falcon_keys([active(filter), below].concat())));
+            out.push((
+                "with_children_at_anchor",
+                falcon_keys([active(filter), below].concat()),
+            ));
         }
         out
     }
@@ -222,7 +263,9 @@ impl Diagnose for NodeDiagnose<'_> {
     fn signers(&self, certificate: &[u8], namespace: &[u8], anchor: u64) -> serde_json::Value {
         use quil_types::consensus::ProverRegistry as _;
         let keys: Vec<Vec<u8>> = self.provers.iter().map(|(_, key)| key.clone()).collect();
-        let Some(found) = quil_cw_consensus::app_cert::identify_signers(certificate, namespace, &keys) else {
+        let Some(found) =
+            quil_cw_consensus::app_cert::identify_signers(certificate, namespace, &keys)
+        else {
             return json!("undecodable certificate");
         };
         let signers: Vec<serde_json::Value> = found
@@ -272,7 +315,9 @@ fn hex8(bytes: &[u8]) -> String {
 /// reconciles): the grid and every shard any store holds frames of. A regular
 /// node's master keeps its grid read-only, so its workers' shards are found in
 /// their clock stores.
-fn shard_filters(stores: &[&Store]) -> anyhow::Result<(Vec<Vec<u8>>, std::collections::HashSet<Vec<u8>>)> {
+fn shard_filters(
+    stores: &[&Store],
+) -> anyhow::Result<(Vec<Vec<u8>>, std::collections::HashSet<Vec<u8>>)> {
     let shards = quil_store::RocksShardsStore::new(stores[0].raw.clone());
     let grid: std::collections::HashSet<Vec<u8>> = shards
         .range_app_shards()?
@@ -305,7 +350,11 @@ fn shard_filters(stores: &[&Store]) -> anyhow::Result<(Vec<Vec<u8>>, std::collec
 /// The GLOBAL head, cursor and every store's sequence number, hashed: a stopped
 /// store keeps it; any write changes it.
 fn checkpoint(master: &Store, stores: &[&Store]) -> (String, serde_json::Value) {
-    let head = master.clock.get_latest_global_clock_frame().ok().and_then(|f| f.header);
+    let head = master
+        .clock
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header);
     let (number, output) = head.map_or((0, Vec::new()), |h| (h.frame_number, h.output));
     let cursor = master.clock.get_global_materialized_cursor();
     let mut hash = Sha256::new();
@@ -340,10 +389,19 @@ fn missing_history(store: &Store, filter: &[u8], frame: u64) -> Vec<&'static str
         return Vec::new();
     }
     let checks: [(&str, Vec<u8>); 4] = [
-        ("fee_total", e::clock_shard_frame_fee_total_key(filter, frame)),
-        ("settlements", e::clock_shard_frame_settlements_key(filter, frame)),
+        (
+            "fee_total",
+            e::clock_shard_frame_fee_total_key(filter, frame),
+        ),
+        (
+            "settlements",
+            e::clock_shard_frame_settlements_key(filter, frame),
+        ),
         ("spends", e::clock_shard_frame_spends_key(filter, frame)),
-        ("accumulator", e::clock_shard_frame_accumulator_key(filter, frame)),
+        (
+            "accumulator",
+            e::clock_shard_frame_accumulator_key(filter, frame),
+        ),
     ];
     checks
         .into_iter()
@@ -389,7 +447,13 @@ pub fn shard_report(
     // The store holding the shard's highest local frame.
     let holder = stores
         .iter()
-        .filter_map(|store| store.clock.get_latest_shard_clock_frame(filter).ok().map(|frame| (store, frame)))
+        .filter_map(|store| {
+            store
+                .clock
+                .get_latest_shard_clock_frame(filter)
+                .ok()
+                .map(|frame| (store, frame))
+        })
         .max_by_key(|(_, frame)| frame.header.as_ref().map_or(0, |h| h.frame_number));
     let (eligible, registry_active) = committee(filter, census_frame);
     // Only a shard with legacy history migrates: no session yet, and local
@@ -406,7 +470,9 @@ pub fn shard_report(
         (None, false) => "no-legacy-history",
     };
     if off_grid {
-        notes.push("not in the registered grid: GLOBAL never registers it as generation zero".into());
+        notes.push(
+            "not in the registered grid: GLOBAL never registers it as generation zero".into(),
+        );
     }
     if migrates && eligible.is_empty() {
         blockers.push("no eligible committee: generation zero cannot be registered".into());
@@ -428,7 +494,9 @@ pub fn shard_report(
         // GLOBAL registers a shard only from a tip anchored in the registering
         // epoch. Before activation no tip is recorded, so the local head
         // stands in for it.
-        let tip_anchor = tip.as_ref().map_or(header.global_frame_number, |tip| tip.anchor);
+        let tip_anchor = tip
+            .as_ref()
+            .map_or(header.global_frame_number, |tip| tip.anchor);
         use quil_types::consensus::epoch_for_frame;
         d4_pending = migrates && epoch_for_frame(tip_anchor) != epoch_for_frame(census_frame);
         if d4_pending {
@@ -448,16 +516,19 @@ pub fn shard_report(
                     let namespace = [b"appshard".as_slice(), filter].concat();
                     let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
                     let verifies = |members: &[Vec<u8>]| {
-                        quil_cw_consensus::app_cert::check_finalization(cert, members, &namespace, digest)
-                            .map(|_| ())
-                            .map_err(|reason| format!("{reason:?}"))
+                        quil_cw_consensus::app_cert::check_finalization(
+                            cert, members, &namespace, digest,
+                        )
+                        .map(|_| ())
+                        .map_err(|reason| format!("{reason:?}"))
                     };
                     let at_census = verifies(&eligible);
                     let at_anchor = verifies(&committee(filter, header.global_frame_number).0);
                     // Decoding is bounded by the rebuilt committee's size, so an
                     // `Encoding` failure hides how many members really signed.
-                    let signers = quil_cw_consensus::app_cert::unverified_signers(cert)
-                        .map(|(committee, signed)| json!({ "committee": committee, "signed": signed }));
+                    let signers = quil_cw_consensus::app_cert::unverified_signers(cert).map(
+                        |(committee, signed)| json!({ "committee": committee, "signed": signed }),
+                    );
                     if migrates && !d4_pending {
                         if let Err(reason) = &at_census {
                             blockers.push(format!(
@@ -473,20 +544,26 @@ pub fn shard_report(
                                 .candidates(filter, header.global_frame_number)
                                 .into_iter()
                                 .map(|(name, members)| {
-                                    let result = verifies(&members).err().unwrap_or_else(|| "verifies".into());
+                                    let result = verifies(&members)
+                                        .err()
+                                        .unwrap_or_else(|| "verifies".into());
                                     (name, json!({ "size": members.len(), "result": result }))
                                 })
                                 .collect();
-                            let matched: Vec<&str> = tried.iter()
+                            let matched: Vec<&str> = tried
+                                .iter()
                                 .filter(|(_, tried)| tried["result"] == "verifies")
                                 .map(|(name, _)| *name)
                                 .collect();
-                            let tried: serde_json::Map<_, _> =
-                                tried.into_iter().map(|(name, tried)| (name.to_string(), tried)).collect();
+                            let tried: serde_json::Map<_, _> = tried
+                                .into_iter()
+                                .map(|(name, tried)| (name.to_string(), tried))
+                                .collect();
                             // Naming the signers checks every registered key against
                             // every signature: only for heads recent enough that
                             // their committee still bears on registration.
-                            let recent = epoch_for_frame(header.global_frame_number) + IDENTIFY_EPOCHS
+                            let recent = epoch_for_frame(header.global_frame_number)
+                                + IDENTIFY_EPOCHS
                                 >= epoch_for_frame(census_frame);
                             let signers = if matched.is_empty() && recent {
                                 diagnose.signers(cert, &namespace, header.global_frame_number)
@@ -497,11 +574,13 @@ pub fn shard_report(
                         }
                         _ => serde_json::Value::Null,
                     };
-                    ("cw-epoch-0 (legacy namespace)".to_string(),
-                     json!({ "eligible_committee": at_census.err().unwrap_or_else(|| "verifies".into()),
+                    (
+                        "cw-epoch-0 (legacy namespace)".to_string(),
+                        json!({ "eligible_committee": at_census.err().unwrap_or_else(|| "verifies".into()),
                              "committee_at_anchor": at_anchor.err().unwrap_or_else(|| "verifies".into()),
                              "certificate_signers": signers,
-                             "committee_search": search }))
+                             "committee_search": search }),
+                    )
                 }
                 Some(epoch) => (format!("cw-session-epoch-{epoch}"), serde_json::Value::Null),
                 None => ("cw-malformed".into(), serde_json::Value::Null),
@@ -518,16 +597,26 @@ pub fn shard_report(
 
         let cursor = store
             .crdt
-            .read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))
+            .read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(
+                filter,
+            ))
             .ok();
         if cursor != Some(number) && migrates {
             let item = format!(
                 "materialized cursor {cursor:?} is not the head frame {number}: a seal needs its checkpoint materialized"
             );
-            if archive { notes.push(item) } else { blockers.push(item) }
+            if archive {
+                notes.push(item)
+            } else {
+                blockers.push(item)
+            }
         }
         let roots = match store.crdt.capture_committed_shard(filter) {
-            Ok(snapshot) => json!(snapshot.roots.iter().map(|root| hex8(root)).collect::<Vec<_>>()),
+            Ok(snapshot) => json!(snapshot
+                .roots
+                .iter()
+                .map(|root| hex8(root))
+                .collect::<Vec<_>>()),
             Err(error) => json!(format!("unavailable: {error}")),
         };
 
@@ -547,7 +636,11 @@ pub fn shard_report(
                 "{missing} of the last {checked} frames lack outgoing-history records: this node cannot vote a \
                  generation-0 seal until they are recovered"
             );
-            if archive { notes.push(item) } else { blockers.push(item) }
+            if archive {
+                notes.push(item)
+            } else {
+                blockers.push(item)
+            }
         }
         local = json!({
             "store": store.label,
@@ -616,33 +709,56 @@ pub fn run_diagnosed(
     // Application state has lived in unified per-application trees since the
     // cutover. A view left in the per-shard layout resolves only the genesis
     // paths, and reads empty trees there.
-    let unified = census_frame >= quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame();
+    let unified =
+        census_frame >= quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame();
     for store in &stores {
         store.crdt.set_unified_tree(unified);
     }
     let (filters, grid) = shard_filters(&stores)?;
-    let relay_activation_frame = quil_execution::token_intrinsic::global_commit::relay_activation_frame();
-    writeln!(out, "{}", json!({ "gen0_preflight": { "checkpoint": id, "detail": detail,
+    let relay_activation_frame =
+        quil_execution::token_intrinsic::global_commit::relay_activation_frame();
+    writeln!(
+        out,
+        "{}",
+        json!({ "gen0_preflight": { "checkpoint": id, "detail": detail,
         "window": options.window, "shards": filters.len(), "unified_tree": unified,
         "census_epoch": quil_types::consensus::epoch_for_frame(census_frame),
         "diagnostics": diagnose.map(|diagnose| diagnose.describe()),
         "relay_activation_frame": relay_activation_frame.to_string(),
-        "resume_after": options.resume_after.as_ref().map(hex::encode) } }))?;
-    let mut summary = Summary { checkpoint: id, ..Default::default() };
+        "resume_after": options.resume_after.as_ref().map(hex::encode) } })
+    )?;
+    let mut summary = Summary {
+        checkpoint: id,
+        ..Default::default()
+    };
     for filter in filters {
-        if options.resume_after.as_ref().is_some_and(|after| filter <= *after) {
+        if options
+            .resume_after
+            .as_ref()
+            .is_some_and(|after| filter <= *after)
+        {
             continue;
         }
         // Only an archive's grid is authoritative: a regular's lists no
         // shard its workers found after a split.
         let in_grid = options.archive.then(|| grid.contains(&filter));
         let (report, blockers) = shard_report(
-            master, &stores, committee, census_frame, &filter, in_grid, options.window, options.archive, diagnose,
+            master,
+            &stores,
+            committee,
+            census_frame,
+            &filter,
+            in_grid,
+            options.window,
+            options.archive,
+            diagnose,
         )?;
         summary.shards += 1;
         match report["status"].as_str() {
             Some("managed") => summary.managed += 1,
-            Some("legacy") if blockers.is_empty() && report["d4_pending"] == true => summary.pending += 1,
+            Some("legacy") if blockers.is_empty() && report["d4_pending"] == true => {
+                summary.pending += 1
+            }
             Some("legacy") if blockers.is_empty() => summary.ready += 1,
             Some("legacy") => summary.blocked += 1,
             Some("off-grid") => summary.off_grid += 1,
@@ -650,10 +766,14 @@ pub fn run_diagnosed(
         }
         writeln!(out, "{report}")?;
     }
-    writeln!(out, "{}", json!({ "summary": { "checkpoint": summary.checkpoint, "shards": summary.shards,
+    writeln!(
+        out,
+        "{}",
+        json!({ "summary": { "checkpoint": summary.checkpoint, "shards": summary.shards,
         "ready": summary.ready, "blocked": summary.blocked, "already_managed": summary.managed,
         "without_legacy_history": summary.without_history, "off_grid": summary.off_grid,
-        "pending_d4": summary.pending } }))?;
+        "pending_d4": summary.pending } })
+    )?;
     Ok(summary)
 }
 
@@ -665,9 +785,15 @@ pub fn run(master_path: &Path, options: &Options) -> anyhow::Result<Summary> {
     run_to(master_path, options, &mut out)
 }
 
-pub fn run_to(master_path: &Path, options: &Options, out: &mut dyn Write) -> anyhow::Result<Summary> {
+pub fn run_to(
+    master_path: &Path,
+    options: &Options,
+    out: &mut dyn Write,
+) -> anyhow::Result<Summary> {
     if options.live && options.expect_checkpoint.is_some() {
-        anyhow::bail!("a live preflight cannot resume: the running node moves its checkpoint; rerun it whole");
+        anyhow::bail!(
+            "a live preflight cannot resume: the running node moves its checkpoint; rerun it whole"
+        );
     }
     let open = |label: &str, path: &Path| match options.live {
         true => Store::open_live(label, path, options.network),
@@ -682,18 +808,26 @@ pub fn run_to(master_path: &Path, options: &Options, out: &mut dyn Write) -> any
         .collect::<anyhow::Result<Vec<_>>>()?;
     let scan = quil_execution::prover_registry::CommittedProverScan::try_scan(&master.crdt)?;
     let committee = |filter: &[u8], frame: u64| {
-        (schedule::desired_members(&scan, filter, frame), scan.active_on_filter(filter, frame).len())
+        (
+            schedule::desired_members(&scan, filter, frame),
+            scan.active_on_filter(filter, frame).len(),
+        )
     };
     let registry = quil_execution::prover_registry::SharedProverRegistry::new();
     let refreshed = registry
         .refresh_from_store(&quil_store::RocksHypergraphStore::new(master.raw.clone()))
         .map(|()| registry)
         .map_err(|error| error.to_string());
-    let provers = quil_execution::prover_registry::all_provers_with_allocations_committed(&master.crdt)
-        .into_iter()
-        .map(|(address, key, _)| (address, key))
-        .collect();
-    let diagnose = NodeDiagnose { scan: &scan, registry: refreshed, provers };
+    let provers =
+        quil_execution::prover_registry::all_provers_with_allocations_committed(&master.crdt)
+            .into_iter()
+            .map(|(address, key, _)| (address, key))
+            .collect();
+    let diagnose = NodeDiagnose {
+        scan: &scan,
+        registry: refreshed,
+        provers,
+    };
     run_diagnosed(&master, &workers, &committee, Some(&diagnose), options, out)
 }
 
@@ -709,14 +843,31 @@ pub fn prover_shard_dump(
     show: &[Vec<u8>],
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
-    let store = if live { Store::open_live("master", path, network)? } else { Store::open_read_only("master", path, network)? };
-    let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+    let store = if live {
+        Store::open_live("master", path, network)?
+    } else {
+        Store::open_read_only("master", path, network)?
+    };
+    let global_shard = quil_types::store::ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
     let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    store.crdt.for_each_vertex_underlying_shard("vertex", "adds", &global_shard, &mut |key, blob| {
-        records.push((key, blob));
-    })?;
+    store.crdt.for_each_vertex_underlying_shard(
+        "vertex",
+        "adds",
+        &global_shard,
+        &mut |key, blob| {
+            records.push((key, blob));
+        },
+    )?;
     records.sort();
-    let head = store.clock.get_latest_global_clock_frame().ok().and_then(|f| f.header).map(|h| h.frame_number);
+    let head = store
+        .clock
+        .get_latest_global_clock_frame()
+        .ok()
+        .and_then(|f| f.header)
+        .map(|h| h.frame_number);
     if !show.is_empty() {
         for (key, blob) in &records {
             let address = &key[key.len().saturating_sub(32)..];
@@ -729,13 +880,22 @@ pub fn prover_shard_dump(
                 .into_iter()
                 .map(|(field, value)| json!([hex::encode(field), hex::encode(value)]))
                 .collect();
-            writeln!(out, "{}", json!({ "address": hex::encode(address), "length": blob.len(), "fields": fields }))?;
+            writeln!(
+                out,
+                "{}",
+                json!({ "address": hex::encode(address), "length": blob.len(), "fields": fields })
+            )?;
         }
         return Ok(());
     }
     let mut all = Sha256::new();
     for (key, blob) in &records {
-        let line = format!("{} {} {}", hex::encode(&key[key.len().saturating_sub(32)..]), blob.len(), hex::encode(Sha256::digest(blob)));
+        let line = format!(
+            "{} {} {}",
+            hex::encode(&key[key.len().saturating_sub(32)..]),
+            blob.len(),
+            hex::encode(Sha256::digest(blob))
+        );
         all.update(line.as_bytes());
         all.update(b"\n");
         writeln!(out, "{line}")?;
@@ -745,7 +905,9 @@ pub fn prover_shard_dump(
     // bound, so compare them across archives here.
     // A head marker an old reset left on an emptied phase reads as zeros
     // above but stops this build's commits until the master drops it at boot.
-    let orphaned: Vec<String> = store.crdt.orphaned_phase_heads(&global_shard.l2)?
+    let orphaned: Vec<String> = store
+        .crdt
+        .orphaned_phase_heads(&global_shard.l2)?
         .iter()
         .map(|(phase, version)| format!("{phase}@{version}"))
         .collect();
@@ -784,13 +946,29 @@ pub fn global_frame_history(
 ) -> anyhow::Result<()> {
     use prost::Message as _;
     use quil_types::store::HypergraphStore as _;
-    let store = if live { Store::open_live("master", path, network)? } else { Store::open_read_only("master", path, network)? };
-    let head = store.clock.get_latest_global_clock_frame()?.header.map(|h| h.frame_number).unwrap_or(0);
+    let store = if live {
+        Store::open_live("master", path, network)?
+    } else {
+        Store::open_read_only("master", path, network)?
+    };
+    let head = store
+        .clock
+        .get_latest_global_clock_frame()?
+        .header
+        .map(|h| h.frame_number)
+        .unwrap_or(0);
     let from = from.unwrap_or(head.saturating_sub(7)).min(head);
     let hg_store = quil_store::RocksHypergraphStore::new(store.raw.clone());
-    let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+    let global_shard = quil_types::store::ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
     let version_of = |root: &[u8]| -> Option<u64> {
-        hg_store.get_root_version("vertex", "adds", &global_shard.l2, root).ok().flatten().map(|(version, _)| version)
+        hg_store
+            .get_root_version("vertex", "adds", &global_shard.l2, root)
+            .ok()
+            .flatten()
+            .map(|(version, _)| version)
     };
     // (state after frame, forest version holding it)
     let mut states: Vec<(u64, Option<u64>)> = Vec::new();
@@ -799,7 +977,10 @@ pub fn global_frame_history(
         let header = frame.header.clone().unwrap_or_default();
         let parent_version = version_of(&header.prover_tree_commitment);
         states.push((number.saturating_sub(1), parent_version));
-        let outcomes = store.clock.get_global_clock_frame_outcomes(number).unwrap_or_default();
+        let outcomes = store
+            .clock
+            .get_global_clock_frame_outcomes(number)
+            .unwrap_or_default();
         let requests: Vec<serde_json::Value> = frame
             .requests
             .iter()
@@ -815,16 +996,22 @@ pub fn global_frame_history(
                 })
             })
             .collect();
-        writeln!(out, "{}", json!({
-            "frame": number,
-            "prover": hex8(&header.prover),
-            "parent_prover_root": hex::encode(&header.prover_tree_commitment),
-            "parent_version": parent_version,
-            "outcomes_recorded": outcomes.len(),
-            "requests": requests,
-        }))?;
+        writeln!(
+            out,
+            "{}",
+            json!({
+                "frame": number,
+                "prover": hex8(&header.prover),
+                "parent_prover_root": hex::encode(&header.prover_tree_commitment),
+                "parent_version": parent_version,
+                "outcomes_recorded": outcomes.len(),
+                "requests": requests,
+            })
+        )?;
     }
-    let live_root = store.crdt.compute_shard_root("vertex", "adds", &global_shard);
+    let live_root = store
+        .crdt
+        .compute_shard_root("vertex", "adds", &global_shard);
     states.push((head, version_of(&live_root)));
     for address in records {
         let mut vertex = global_shard.l2.to_vec();
@@ -832,32 +1019,47 @@ pub fn global_frame_history(
         let mut previous: Option<Vec<u8>> = None;
         for &(after_frame, version) in &states {
             let Some(version) = version else {
-                writeln!(out, "{}", json!({ "record": hex::encode(address), "after_frame": after_frame, "version": null }))?;
+                writeln!(
+                    out,
+                    "{}",
+                    json!({ "record": hex::encode(address), "after_frame": after_frame, "version": null })
+                )?;
                 continue;
             };
-            let blob = hg_store.load_vertex_underlying_at("vertex", "adds", &global_shard, &vertex, version)?.unwrap_or_default();
+            let blob = hg_store
+                .load_vertex_underlying_at("vertex", "adds", &global_shard, &vertex, version)?
+                .unwrap_or_default();
             if previous.as_ref() == Some(&blob) {
                 continue;
             }
-            let fields: Vec<serde_json::Value> = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob)
-                .leaves()
-                .into_iter()
-                .map(|(field, value)| {
-                    let value = if value.len() > 64 {
-                        format!("{} bytes sha256 {}", value.len(), hex8(&Sha256::digest(&value)))
-                    } else {
-                        hex::encode(&value)
-                    };
-                    json!([hex::encode(field), value])
+            let fields: Vec<serde_json::Value> =
+                quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob)
+                    .leaves()
+                    .into_iter()
+                    .map(|(field, value)| {
+                        let value = if value.len() > 64 {
+                            format!(
+                                "{} bytes sha256 {}",
+                                value.len(),
+                                hex8(&Sha256::digest(&value))
+                            )
+                        } else {
+                            hex::encode(&value)
+                        };
+                        json!([hex::encode(field), value])
+                    })
+                    .collect();
+            writeln!(
+                out,
+                "{}",
+                json!({
+                    "record": hex::encode(address),
+                    "after_frame": after_frame,
+                    "version": version,
+                    "length": blob.len(),
+                    "fields": fields,
                 })
-                .collect();
-            writeln!(out, "{}", json!({
-                "record": hex::encode(address),
-                "after_frame": after_frame,
-                "version": version,
-                "length": blob.len(),
-                "fields": fields,
-            }))?;
+            )?;
             previous = Some(blob);
         }
     }
@@ -869,7 +1071,9 @@ pub fn global_frame_history(
 /// A confirm or reject also shows its deprecated single filter, which older
 /// clients still set.
 #[allow(deprecated)]
-fn describe_request(request: &quil_types::proto::global::message_request::Request) -> serde_json::Value {
+fn describe_request(
+    request: &quil_types::proto::global::message_request::Request,
+) -> serde_json::Value {
     use quil_types::proto::global::message_request::Request;
     let prover_of = |public_key: &[u8]| {
         quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(public_key)
@@ -878,7 +1082,10 @@ fn describe_request(request: &quil_types::proto::global::message_request::Reques
     };
     let hexes = |values: &[Vec<u8>]| values.iter().map(hex::encode).collect::<Vec<_>>();
     let signer = |signature: &Option<quil_types::proto::keys::Bls48581AddressedSignature>| {
-        signature.as_ref().map(|s| hex::encode(&s.address)).unwrap_or_default()
+        signature
+            .as_ref()
+            .map(|s| hex::encode(&s.address))
+            .unwrap_or_default()
     };
     match request {
         Request::Join(op) => json!({
@@ -891,9 +1098,15 @@ fn describe_request(request: &quil_types::proto::global::message_request::Reques
             "frame": op.frame_number,
             "merge_targets": op.merge_targets.len(),
         }),
-        Request::Leave(op) => json!({ "kind": "leave", "prover": signer(&op.public_key_signature_bls48581), "filters": hexes(&op.filters), "frame": op.frame_number }),
-        Request::Pause(op) => json!({ "kind": "pause", "prover": signer(&op.public_key_signature_bls48581), "filters": [hex::encode(&op.filter)], "frame": op.frame_number }),
-        Request::Resume(op) => json!({ "kind": "resume", "prover": signer(&op.public_key_signature_bls48581), "filters": [hex::encode(&op.filter)], "frame": op.frame_number }),
+        Request::Leave(op) => {
+            json!({ "kind": "leave", "prover": signer(&op.public_key_signature_bls48581), "filters": hexes(&op.filters), "frame": op.frame_number })
+        }
+        Request::Pause(op) => {
+            json!({ "kind": "pause", "prover": signer(&op.public_key_signature_bls48581), "filters": [hex::encode(&op.filter)], "frame": op.frame_number })
+        }
+        Request::Resume(op) => {
+            json!({ "kind": "resume", "prover": signer(&op.public_key_signature_bls48581), "filters": [hex::encode(&op.filter)], "frame": op.frame_number })
+        }
         Request::Confirm(op) => json!({
             "kind": "confirm",
             "prover": signer(&op.public_key_signature_bls48581),
@@ -909,11 +1122,21 @@ fn describe_request(request: &quil_types::proto::global::message_request::Reques
             "filter": hex::encode(&op.filter),
             "frame": op.frame_number,
         }),
-        Request::Kick(op) => json!({ "kind": "kick", "kicked": prover_of(&op.kicked_prover_public_key), "frame": op.frame_number }),
-        Request::Update(op) => json!({ "kind": "update", "prover": signer(&op.public_key_signature_bls48581) }),
-        Request::SeniorityMerge(op) => json!({ "kind": "seniority_merge", "prover": signer(&op.public_key_signature_bls48581), "targets": op.merge_targets.len() }),
-        Request::ShardSplit(op) => json!({ "kind": "shard_split", "parent": hex::encode(&op.shard_address), "children": hexes(&op.proposed_shards), "frame": op.frame_number }),
-        Request::ShardMerge(op) => json!({ "kind": "shard_merge", "parent": hex::encode(&op.parent_address), "children": hexes(&op.shard_addresses), "frame": op.frame_number }),
+        Request::Kick(op) => {
+            json!({ "kind": "kick", "kicked": prover_of(&op.kicked_prover_public_key), "frame": op.frame_number })
+        }
+        Request::Update(op) => {
+            json!({ "kind": "update", "prover": signer(&op.public_key_signature_bls48581) })
+        }
+        Request::SeniorityMerge(op) => {
+            json!({ "kind": "seniority_merge", "prover": signer(&op.public_key_signature_bls48581), "targets": op.merge_targets.len() })
+        }
+        Request::ShardSplit(op) => {
+            json!({ "kind": "shard_split", "parent": hex::encode(&op.shard_address), "children": hexes(&op.proposed_shards), "frame": op.frame_number })
+        }
+        Request::ShardMerge(op) => {
+            json!({ "kind": "shard_merge", "parent": hex::encode(&op.parent_address), "children": hexes(&op.shard_addresses), "frame": op.frame_number })
+        }
         Request::Shard(header) => json!({
             "kind": "shard",
             "address": hex::encode(&header.address),
@@ -969,7 +1192,10 @@ fn request_kind(request: &quil_types::proto::global::message_request::Request) -
 /// 256 global commitments (which carry the subtree sizes). The world size
 /// needs the node's size index, which a read-only open does not load.
 fn next_frame_binds(crdt: &quil_hypergraph::HypergraphCrdt) -> serde_json::Value {
-    let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+    let global_shard = quil_types::store::ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
     let mut commitments = Sha256::new();
     for commitment in crdt.global_commitments() {
         commitments.update((commitment.len() as u64).to_be_bytes());
@@ -991,9 +1217,18 @@ fn next_frame_binds(crdt: &quil_hypergraph::HypergraphCrdt) -> serde_json::Value
 /// Run it on every archive stopped at the same head and compare: parent
 /// records that differ are a fork no restart resolves; a committee below
 /// quorum cannot finalize.
-pub fn global_halt_report(path: &Path, network: u8, live: bool, out: &mut impl Write) -> anyhow::Result<()> {
+pub fn global_halt_report(
+    path: &Path,
+    network: u8,
+    live: bool,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
     use quil_types::consensus::ProverRegistry as _;
-    let store = if live { Store::open_live("master", path, network)? } else { Store::open_read_only("master", path, network)? };
+    let store = if live {
+        Store::open_live("master", path, network)?
+    } else {
+        Store::open_read_only("master", path, network)?
+    };
     let head = store.clock.get_latest_global_clock_frame()?;
     let header = head.header.clone().unwrap_or_default();
     let number = header.frame_number;
@@ -1003,14 +1238,16 @@ pub fn global_halt_report(path: &Path, network: u8, live: bool, out: &mut impl W
         .range_global_clock_frame_candidates(next, next + 63, 256)?
         .iter()
         .filter_map(|frame| frame.header.as_ref())
-        .map(|h| json!({
-            "frame": h.frame_number,
-            "rank": h.rank,
-            "prover": hex8(&h.prover),
-            "output": hex8(&h.output),
-            "parent": hex8(&h.parent_selector),
-            "prover_tree_commitment": hex::encode(&h.prover_tree_commitment),
-        }))
+        .map(|h| {
+            json!({
+                "frame": h.frame_number,
+                "rank": h.rank,
+                "prover": hex8(&h.prover),
+                "output": hex8(&h.output),
+                "parent": hex8(&h.parent_selector),
+                "prover_tree_commitment": hex::encode(&h.prover_tree_commitment),
+            })
+        })
         .collect();
     let registry = quil_execution::prover_registry::SharedProverRegistry::new();
     registry.refresh_from_store(&quil_store::RocksHypergraphStore::new(store.raw.clone()))?;
@@ -1022,46 +1259,58 @@ pub fn global_halt_report(path: &Path, network: u8, live: bool, out: &mut impl W
             .collect();
         members.sort();
         let size = members.len();
-        Ok(json!({ "frame": frame, "size": size, "quorum": size - size.saturating_sub(1) / 3, "members": members }))
+        Ok(
+            json!({ "frame": frame, "size": size, "quorum": size - size.saturating_sub(1) / 3, "members": members }),
+        )
     };
     let mut allocations: Vec<serde_json::Value> = registry
         .get_provers(&[])?
         .iter()
         .flat_map(|prover| {
-            prover.allocations.iter().filter(|a| a.confirmation_filter.is_empty()).map(move |a| json!({
-                "prover": hex::encode(&prover.address),
-                "prover_status": format!("{:?}", prover.status),
-                "status": format!("{:?}", a.status),
-                "effective_at_next": format!("{:?}", a.effective_status(next)),
-                "epoch": a.epoch,
-                "confirmed": a.join_confirm_frame_number,
-                "leave_frame": a.leave_frame_number,
-                "kick_frame": a.kick_frame_number,
-                "last_active": a.last_active_frame_number,
-            }))
+            prover
+                .allocations
+                .iter()
+                .filter(|a| a.confirmation_filter.is_empty())
+                .map(move |a| {
+                    json!({
+                        "prover": hex::encode(&prover.address),
+                        "prover_status": format!("{:?}", prover.status),
+                        "status": format!("{:?}", a.status),
+                        "effective_at_next": format!("{:?}", a.effective_status(next)),
+                        "epoch": a.epoch,
+                        "confirmed": a.join_confirm_frame_number,
+                        "leave_frame": a.leave_frame_number,
+                        "kick_frame": a.kick_frame_number,
+                        "last_active": a.last_active_frame_number,
+                    })
+                })
         })
         .collect();
     allocations.sort_by_key(|a| a["prover"].as_str().unwrap_or_default().to_string());
-    writeln!(out, "{}", json!({ "global_halt": {
-        "store": path.display().to_string(),
-        "epoch_length": quil_types::consensus::epoch_length_frames(),
-        "head": {
-            "frame": number,
-            "epoch": quil_types::consensus::epoch_for_frame(number),
-            "rank": header.rank,
-            "prover": hex::encode(&header.prover),
-            "output": hex8(&header.output),
-            "parent": hex8(&header.parent_selector),
-            "prover_tree_commitment": hex::encode(&header.prover_tree_commitment),
-            "timestamp": header.timestamp,
-        },
-        "materialized_cursor": store.clock.get_global_materialized_cursor(),
-        "next_frame_binds": next_frame_binds(&store.crdt),
-        "candidates_above_head": candidates,
-        "committee_at_head": committee(number)?,
-        "committee_at_next": committee(next)?,
-        "global_allocations": allocations,
-    }}))?;
+    writeln!(
+        out,
+        "{}",
+        json!({ "global_halt": {
+            "store": path.display().to_string(),
+            "epoch_length": quil_types::consensus::epoch_length_frames(),
+            "head": {
+                "frame": number,
+                "epoch": quil_types::consensus::epoch_for_frame(number),
+                "rank": header.rank,
+                "prover": hex::encode(&header.prover),
+                "output": hex8(&header.output),
+                "parent": hex8(&header.parent_selector),
+                "prover_tree_commitment": hex::encode(&header.prover_tree_commitment),
+                "timestamp": header.timestamp,
+            },
+            "materialized_cursor": store.clock.get_global_materialized_cursor(),
+            "next_frame_binds": next_frame_binds(&store.crdt),
+            "candidates_above_head": candidates,
+            "committee_at_head": committee(number)?,
+            "committee_at_next": committee(next)?,
+            "global_allocations": allocations,
+        }})
+    )?;
     Ok(())
 }
 

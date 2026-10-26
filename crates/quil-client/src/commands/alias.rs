@@ -74,7 +74,8 @@ fn list(store: &Store) -> anyhow::Result<()> {
 }
 
 fn add(store: &mut Store, name: &str, address: &str, type_str: &str) -> anyhow::Result<()> {
-    let addr = parse_address_literal(address).map_err(|e| anyhow::anyhow!("invalid address hex: {e}"))?;
+    let addr =
+        parse_address_literal(address).map_err(|e| anyhow::anyhow!("invalid address hex: {e}"))?;
     store.put(name, &addr, type_str)?;
     println!("Added alias {name:?} for address {}", hex::encode(&addr));
     if !type_str.is_empty() {
@@ -121,7 +122,8 @@ fn resolve(store: &Store, input: &str) -> anyhow::Result<()> {
 }
 
 fn find(store: &Store, address: &str) -> anyhow::Result<()> {
-    let addr = parse_address_literal(address).map_err(|e| anyhow::anyhow!("invalid address hex: {e}"))?;
+    let addr =
+        parse_address_literal(address).map_err(|e| anyhow::anyhow!("invalid address hex: {e}"))?;
     match store.find_by_address(&addr) {
         None => println!("No alias found for address {}", hex::encode(&addr)),
         Some((name, typ)) => {

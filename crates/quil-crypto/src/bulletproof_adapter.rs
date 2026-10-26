@@ -25,11 +25,7 @@ impl BulletproofProver for Decaf448BulletproofProver {
         })
     }
 
-    fn generate_input_commitments(
-        &self,
-        values: &[Vec<u8>],
-        blinding: &[u8],
-    ) -> Vec<u8> {
+    fn generate_input_commitments(&self, values: &[Vec<u8>], blinding: &[u8]) -> Vec<u8> {
         bulletproofs::uniffi_bulletproofs::generate_input_commitments(
             values.to_vec(),
             blinding.to_vec(),
@@ -38,7 +34,9 @@ impl BulletproofProver for Decaf448BulletproofProver {
 
     fn verify_range_proof(&self, proof: &[u8], commitment: &[u8], bit_size: u64) -> bool {
         bulletproofs::uniffi_bulletproofs::verify_range_proof(
-            proof.to_vec(), commitment.to_vec(), bit_size,
+            proof.to_vec(),
+            commitment.to_vec(),
+            bit_size,
         )
     }
 
@@ -50,36 +48,52 @@ impl BulletproofProver for Decaf448BulletproofProver {
         additional_outputs: &[Vec<u8>],
     ) -> bool {
         bulletproofs::uniffi_bulletproofs::sum_check(
-            inputs.to_vec(), additional_inputs.to_vec(),
-            outputs.to_vec(), additional_outputs.to_vec(),
+            inputs.to_vec(),
+            additional_inputs.to_vec(),
+            outputs.to_vec(),
+            additional_outputs.to_vec(),
         )
     }
 
     fn sign_hidden(&self, x: &[u8], t: &[u8], a: &[u8], r: &[u8]) -> Vec<u8> {
         bulletproofs::uniffi_bulletproofs::sign_hidden(
-            x.to_vec(), t.to_vec(), a.to_vec(), r.to_vec(),
+            x.to_vec(),
+            t.to_vec(),
+            a.to_vec(),
+            r.to_vec(),
         )
     }
 
     fn verify_hidden(
-        &self, c: &[u8], t: &[u8], s1: &[u8], s2: &[u8], s3: &[u8],
-        point: &[u8], commitment: &[u8],
+        &self,
+        c: &[u8],
+        t: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        point: &[u8],
+        commitment: &[u8],
     ) -> bool {
         bulletproofs::uniffi_bulletproofs::verify_hidden(
-            c.to_vec(), t.to_vec(), s1.to_vec(), s2.to_vec(),
-            s3.to_vec(), point.to_vec(), commitment.to_vec(),
+            c.to_vec(),
+            t.to_vec(),
+            s1.to_vec(),
+            s2.to_vec(),
+            s3.to_vec(),
+            point.to_vec(),
+            commitment.to_vec(),
         )
     }
 
     fn simple_sign(&self, secret_key: &[u8], message: &[u8]) -> Vec<u8> {
-        bulletproofs::uniffi_bulletproofs::sign_simple(
-            secret_key.to_vec(), message.to_vec(),
-        )
+        bulletproofs::uniffi_bulletproofs::sign_simple(secret_key.to_vec(), message.to_vec())
     }
 
     fn simple_verify(&self, message: &[u8], signature: &[u8], point: &[u8]) -> bool {
         bulletproofs::uniffi_bulletproofs::verify_simple(
-            message.to_vec(), signature.to_vec(), point.to_vec(),
+            message.to_vec(),
+            signature.to_vec(),
+            point.to_vec(),
         )
     }
 }

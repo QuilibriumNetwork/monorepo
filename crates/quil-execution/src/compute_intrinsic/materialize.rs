@@ -13,12 +13,9 @@ use quil_types::error::{QuilError, Result};
 use quil_types::execution::CircuitCompiler;
 
 use crate::compute_intrinsic::intrinsic::{
-    code_deployment_address, verify_code_deployment, verify_code_execute,
-    verify_code_finalize,
+    code_deployment_address, verify_code_deployment, verify_code_execute, verify_code_finalize,
 };
-use crate::compute_intrinsic::ops::{
-    CodeDeployment, CodeExecute, CodeFinalize, StateTransition,
-};
+use crate::compute_intrinsic::ops::{CodeDeployment, CodeExecute, CodeFinalize, StateTransition};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 
 // =====================================================================
@@ -27,10 +24,7 @@ use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 
 /// Compute the execution request address from domain + rendezvous.
 /// `poseidon(domain || rendezvous)` -> 32 bytes.
-pub fn execution_request_address(
-    domain: &[u8; 32],
-    rendezvous: &[u8; 32],
-) -> Result<[u8; 32]> {
+pub fn execution_request_address(domain: &[u8; 32], rendezvous: &[u8; 32]) -> Result<[u8; 32]> {
     let mut preimage = Vec::with_capacity(64);
     preimage.extend_from_slice(domain);
     preimage.extend_from_slice(rendezvous);
@@ -68,13 +62,7 @@ pub fn materialize_code_deploy(
     )?;
 
     let blob = quil_tries::serialize_go_tree(tree.root.as_ref())?;
-    state.set(
-        &deployment.domain,
-        &addr,
-        &va_disc,
-        frame_number,
-        blob,
-    )?;
+    state.set(&deployment.domain, &addr, &va_disc, frame_number, blob)?;
     Ok(addr)
 }
 
@@ -90,8 +78,18 @@ pub fn build_compute_configuration_metadata_tree(
 ) -> Result<quil_tries::VectorCommitmentTree> {
     use num_bigint::BigInt;
     let mut tree = quil_tries::VectorCommitmentTree::new();
-    tree.insert(&[0u8 << 2], &config.read_public_key, &[], &BigInt::from(config.read_public_key.len()))?;
-    tree.insert(&[1u8 << 2], &config.write_public_key, &[], &BigInt::from(57))?;
+    tree.insert(
+        &[0u8 << 2],
+        &config.read_public_key,
+        &[],
+        &BigInt::from(config.read_public_key.len()),
+    )?;
+    tree.insert(
+        &[1u8 << 2],
+        &config.write_public_key,
+        &[],
+        &BigInt::from(57),
+    )?;
     Ok(tree)
 }
 
@@ -128,8 +126,9 @@ pub fn materialize_compute_deploy_init(
     // Go's newComputeRDFHypergraphSchema gate. Same structural validator
     // the hypergraph deploy uses.
     crate::hypergraph_intrinsic::dispatch::validate_rdf_schema_bytes(rdf_schema)?;
-    let rdf = std::str::from_utf8(rdf_schema)
-        .map_err(|_| QuilError::InvalidArgument("compute deploy: rdf schema not valid UTF-8".into()))?;
+    let rdf = std::str::from_utf8(rdf_schema).map_err(|_| {
+        QuilError::InvalidArgument("compute deploy: rdf schema not valid UTF-8".into())
+    })?;
 
     let mut consensus = quil_tries::VectorCommitmentTree::new();
     let mut sumcheck = quil_tries::VectorCommitmentTree::new();
@@ -199,7 +198,12 @@ pub fn materialize_compute_update(
             crate::hypergraph_intrinsic::dispatch::validate_rdf_schema_evolution(old, rdf_schema)?;
         }
         outer
-            .insert(&[3u8 << 2], rdf_schema, &[], &BigInt::from(rdf_schema.len()))
+            .insert(
+                &[3u8 << 2],
+                rdf_schema,
+                &[],
+                &BigInt::from(rdf_schema.len()),
+            )
             .map_err(|e| QuilError::Internal(format!("compute update: rdf insert: {e}")))?;
     }
 
@@ -286,12 +290,7 @@ pub fn materialize_code_execute(
         let stage = *dag.op_stage.get(&op.identifier).unwrap_or(&0u32);
         let op_bytes = serialize_operation(&app, &op.identifier, stage);
         let key = [(((i + 3) as u8) << 2) as u8];
-        tree.insert(
-            &key,
-            &op_bytes,
-            &[],
-            &BigInt::from(op_bytes.len() as u64),
-        )?;
+        tree.insert(&key, &op_bytes, &[], &BigInt::from(op_bytes.len() as u64))?;
     }
 
     let blob = quil_tries::serialize_go_tree(tree.root.as_ref())?;
@@ -300,13 +299,7 @@ pub fn materialize_code_execute(
     // `poseidon(domain || rendezvous)`.
     let addr = execute.rendezvous;
     let va_disc = vertex_adds_discriminator()?;
-    state.set(
-        &execute.domain,
-        &addr,
-        &va_disc,
-        frame_number,
-        blob,
-    )?;
+    state.set(&execute.domain, &addr, &va_disc, frame_number, blob)?;
     Ok(addr)
 }
 
@@ -348,11 +341,7 @@ fn serialize_stages(dag: &super::intrinsic::ExecutionDagValidated) -> Vec<u8> {
 /// Layout: u32 addr_len || addr || u8 exec_ctx || u32 id_len || id ||
 /// u32 stage || u32 read_set_count || ... || u32 write_set_count ...
 /// Read/write sets are always empty for intrinsic contexts.
-fn serialize_operation(
-    app: &super::ops::Application,
-    identifier: &[u8],
-    stage: u32,
-) -> Vec<u8> {
+fn serialize_operation(app: &super::ops::Application, identifier: &[u8], stage: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     write_lp(&mut buf, &app.address);
     buf.push(app.execution_context as u8);
@@ -454,12 +443,7 @@ pub fn materialize_code_finalize(
     // 2. Build and write the results vertex.
     let mut results_tree = quil_tries::VectorCommitmentTree::new();
     // Index 0: rendezvous
-    results_tree.insert(
-        &[0u8 << 2],
-        &finalize.rendezvous,
-        &[],
-        &BigInt::from(32),
-    )?;
+    results_tree.insert(&[0u8 << 2], &finalize.rendezvous, &[], &BigInt::from(32))?;
     // Index 1: serialized results
     let results_bytes = serialize_finalize_results(&finalize.results)?;
     results_tree.insert(
@@ -469,8 +453,7 @@ pub fn materialize_code_finalize(
         &BigInt::from(results_bytes.len() as u64),
     )?;
     // Index 2: serialized state-change summary
-    let state_changes_bytes =
-        serialize_finalize_state_changes(&finalize.state_changes)?;
+    let state_changes_bytes = serialize_finalize_state_changes(&finalize.state_changes)?;
     results_tree.insert(
         &[2u8 << 2],
         &state_changes_bytes,
@@ -678,9 +661,15 @@ mod tests {
         // Index 0 == rendezvous
         assert_eq!(res_tree.get(&[0u8 << 2]).unwrap(), &finalize.rendezvous[..]);
         // Index 1 starts with u32 BE count = 0 (no results)
-        assert_eq!(&res_tree.get(&[1u8 << 2]).unwrap()[..4], &0u32.to_be_bytes()[..]);
+        assert_eq!(
+            &res_tree.get(&[1u8 << 2]).unwrap()[..4],
+            &0u32.to_be_bytes()[..]
+        );
         // Index 2 starts with u32 BE count = 1 state change
-        assert_eq!(&res_tree.get(&[2u8 << 2]).unwrap()[..4], &1u32.to_be_bytes()[..]);
+        assert_eq!(
+            &res_tree.get(&[2u8 << 2]).unwrap()[..4],
+            &1u32.to_be_bytes()[..]
+        );
 
         // State changes vertex
         let changes_addr = state_changes_address(&finalize.rendezvous).unwrap();
@@ -690,8 +679,7 @@ mod tests {
         let ctree = quil_tries::VectorCommitmentTree { root: croot };
         // Index uint16 BE 0 holds the canonical-bytes StateTransition
         let stored_change = ctree.get(&0u16.to_be_bytes()).unwrap();
-        let round_tripped =
-            StateTransition::from_canonical_bytes(stored_change).unwrap();
+        let round_tripped = StateTransition::from_canonical_bytes(stored_change).unwrap();
         assert_eq!(round_tripped, transition);
     }
 

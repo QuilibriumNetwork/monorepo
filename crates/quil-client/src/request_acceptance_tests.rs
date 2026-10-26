@@ -17,7 +17,9 @@ use std::sync::Arc;
 use sha3::{Digest, Sha3_256};
 
 use quil_crypto::FalconKeyConstructor;
-use quil_execution::compute_intrinsic::conversions::{code_execute_from_proto, compute_update_from_proto};
+use quil_execution::compute_intrinsic::conversions::{
+    code_execute_from_proto, compute_update_from_proto,
+};
 use quil_execution::compute_intrinsic::intrinsic::verify_code_execute;
 // Internal (canonical) hypergraph op types the node verifies against; the engine
 // converts the proto ops the client emits into these via `from_proto` before
@@ -54,11 +56,7 @@ const TEST_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f10111213141516171819
 /// created (`q-prover-key` Falcon, `q-onion-key` sntrup761, Decaf448 view/spend).
 fn make_km() -> FileKeyManager {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "quil-client-acc-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("quil-client-acc-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let km = FileKeyManager::new(

@@ -52,7 +52,10 @@ fn size_limit_triggers_rotation_and_gzip() {
             let mut gz = flate2::read::GzDecoder::new(&data[..]);
             let mut decoded = String::new();
             gz.read_to_string(&mut decoded).unwrap();
-            assert!(decoded.contains("hello"), "rotated gz should contain a log line");
+            assert!(
+                decoded.contains("hello"),
+                "rotated gz should contain a log line"
+            );
         } else if name.starts_with("master.log.") {
             plain_count += 1;
         }
@@ -80,7 +83,10 @@ fn size_limit_without_compression_rotates_plain_files() {
     );
 
     for i in 0..10 {
-        let line = format!("2026-04-22T03:00:{:02}Z\tinfo\tsrc/main.rs:1\tmsg\t{{\"coreId\":1}}\n", i);
+        let line = format!(
+            "2026-04-22T03:00:{:02}Z\tinfo\tsrc/main.rs:1\tmsg\t{{\"coreId\":1}}\n",
+            i
+        );
         rotate.write_all(line.as_bytes()).unwrap();
     }
     drop(rotate);
@@ -93,7 +99,11 @@ fn size_limit_without_compression_rotates_plain_files() {
         if name == "worker-1.log" {
             continue;
         }
-        assert!(!name.ends_with(".gz"), "compress=None should not produce .gz, got {}", name);
+        assert!(
+            !name.ends_with(".gz"),
+            "compress=None should not produce .gz, got {}",
+            name
+        );
         if name.starts_with("worker-1.log.") {
             has_rotated = true;
         }

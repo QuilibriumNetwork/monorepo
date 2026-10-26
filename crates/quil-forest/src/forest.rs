@@ -18,8 +18,8 @@ use jmt::storage::{
 use jmt::{KeyHash, OwnedValue, Sha256Jmt, Version};
 use sha2::{Digest, Sha256};
 
-use crate::store::SizeIndex;
 use crate::overlay::KvStore;
+use crate::store::SizeIndex;
 use crate::{commit_pruning, ForestStore, MemTreeStore, RocksTreeStore, TreeId};
 
 /// A per-tree store the forest opens on demand, over either RocksDB or an
@@ -66,8 +66,12 @@ impl TreeStore {
         max_bytes: usize,
     ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
         match self {
-            TreeStore::Rocks(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
-            TreeStore::Mem(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
+            TreeStore::Rocks(s) => {
+                s.leaves_between(version, first, last, after, max_leaves, max_bytes)
+            }
+            TreeStore::Mem(s) => {
+                s.leaves_between(version, first, last, after, max_leaves, max_bytes)
+            }
         }
     }
 }
@@ -114,10 +118,16 @@ pub struct StagedForestSync {
 }
 
 impl StagedForestSync {
-    pub fn root(&self) -> [u8; 32] { self.root }
-    pub fn puts(&self) -> &[(Vec<u8>, Vec<u8>)] { &self.puts }
+    pub fn root(&self) -> [u8; 32] {
+        self.root
+    }
+    pub fn puts(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.puts
+    }
     pub fn publish_memory(self) -> Result<()> {
-        if let Some((store, batch)) = self.memory { store.apply_update(&batch)?; }
+        if let Some((store, batch)) = self.memory {
+            store.apply_update(&batch)?;
+        }
         Ok(())
     }
 }
@@ -181,7 +191,10 @@ impl ForestStore for TreeStore {
 /// The forest's storage backend.
 #[derive(Clone)]
 enum Backend {
-    Rocks { db: KvStore, namespace: Vec<u8> },
+    Rocks {
+        db: KvStore,
+        namespace: Vec<u8>,
+    },
     /// In-memory: one [`MemTreeStore`] per tree-id prefix (tests/benches).
     Mem(Arc<Mutex<HashMap<Vec<u8>, Arc<MemTreeStore>>>>),
 }
@@ -473,21 +486,39 @@ impl Forest {
     /// A standalone forest DB (no namespace) — e.g. the converter's fresh
     /// destination DB.
     pub fn new(db: crate::CoordinatedDb) -> Self {
-        Forest { backend: Backend::Rocks { db: KvStore::Rocks(db), namespace: Vec::new() } }
+        Forest {
+            backend: Backend::Rocks {
+                db: KvStore::Rocks(db),
+                namespace: Vec::new(),
+            },
+        }
     }
 
     /// A forest embedded in a shared DB under `namespace` (a reserved prefix
     /// the surrounding schema never emits).
     pub fn with_namespace(db: crate::CoordinatedDb, namespace: impl Into<Vec<u8>>) -> Self {
-        Forest { backend: Backend::Rocks { db: KvStore::Rocks(db), namespace: namespace.into() } }
+        Forest {
+            backend: Backend::Rocks {
+                db: KvStore::Rocks(db),
+                namespace: namespace.into(),
+            },
+        }
     }
 
     /// Use an already captured execution branch. Forest nodes, head versions,
     /// preimages, size memos and pruning all stay inside this overlay. Other
     /// stores in the same tentative execution must share this exact overlay.
     /// This does not by itself fork a CRDT or an execution engine.
-    pub fn on_overlay(overlay: Arc<crate::ExecutionOverlay>, namespace: impl Into<Vec<u8>>) -> Self {
-        Forest { backend: Backend::Rocks { db: KvStore::Overlay(overlay), namespace: namespace.into() } }
+    pub fn on_overlay(
+        overlay: Arc<crate::ExecutionOverlay>,
+        namespace: impl Into<Vec<u8>>,
+    ) -> Self {
+        Forest {
+            backend: Backend::Rocks {
+                db: KvStore::Overlay(overlay),
+                namespace: namespace.into(),
+            },
+        }
     }
 
     /// Identify the record store this forest can atomically commit alongside.
@@ -495,31 +526,48 @@ impl Forest {
     pub fn backing_store_identity(&self) -> Option<quil_types::store::BackingStoreIdentity> {
         use quil_types::store::BackingStoreIdentity;
         match &self.backend {
-            Backend::Rocks { db: KvStore::Rocks(db), .. } => Some(db.backing_store_identity()),
-            Backend::Rocks { db: KvStore::Overlay(overlay), .. } => Some(BackingStoreIdentity::of(overlay)),
+            Backend::Rocks {
+                db: KvStore::Rocks(db),
+                ..
+            } => Some(db.backing_store_identity()),
+            Backend::Rocks {
+                db: KvStore::Overlay(overlay),
+                ..
+            } => Some(BackingStoreIdentity::of(overlay)),
             Backend::Mem(_) => None,
         }
     }
 
     /// Capture this backend's current generation, retaining its namespace.
     /// The caller must exclude CRDT writes/metadata changes during capture.
-    pub fn fork_execution_overlay(&self, limits: crate::OverlayLimits) -> Result<(Self, Arc<crate::ExecutionOverlay>)> {
+    pub fn fork_execution_overlay(
+        &self,
+        limits: crate::OverlayLimits,
+    ) -> Result<(Self, Arc<crate::ExecutionOverlay>)> {
         let Backend::Rocks { db, namespace } = &self.backend else {
             anyhow::bail!("execution capture requires a versioned database backend");
         };
-        anyhow::ensure!(namespace.len() <= limits.max_record_bytes, "forest namespace byte limit");
+        anyhow::ensure!(
+            namespace.len() <= limits.max_record_bytes,
+            "forest namespace byte limit"
+        );
         let overlay = Arc::new(match db {
             KvStore::Rocks(db) => crate::ExecutionOverlay::capture(db.clone(), limits)?,
             KvStore::Overlay(parent) => parent.fork(limits)?,
         });
-        Ok((Self::on_overlay(overlay.clone(), namespace.clone()), overlay))
+        Ok((
+            Self::on_overlay(overlay.clone(), namespace.clone()),
+            overlay,
+        ))
     }
 
     /// An in-memory forest — for unit tests / benches that construct a
     /// forest-backed CRDT without a RocksDB. Each tree gets its own
     /// [`MemTreeStore`], keyed by tree-id prefix so they never collide.
     pub fn in_memory() -> Self {
-        Forest { backend: Backend::Mem(Arc::new(Mutex::new(HashMap::new()))) }
+        Forest {
+            backend: Backend::Mem(Arc::new(Mutex::new(HashMap::new()))),
+        }
     }
 
     /// The RocksDB handle, if this forest is RocksDB-backed (`None` for
@@ -596,7 +644,9 @@ impl Forest {
     /// sync). Such a tree is empty; the checked root read, which cannot tell
     /// it from lost state, refuses it. Returns the orphaned version.
     pub fn orphaned_phase_head(&self, shard_id: &[u8], phase: Phase) -> Result<Option<u64>> {
-        let Some(head) = self.read_head_version(shard_id, phase)? else { return Ok(None) };
+        let Some(head) = self.read_head_version(shard_id, phase)? else {
+            return Ok(None);
+        };
         if self.shard_phase_root(shard_id, phase, head)?.is_some() {
             return Ok(None);
         }
@@ -610,7 +660,9 @@ impl Forest {
     /// tree as the reset now leaves it: never committed, read as empty, and
     /// rebuilt from version 0 by its next commit. Returns the dropped version.
     pub fn drop_orphaned_phase_head(&self, shard_id: &[u8], phase: Phase) -> Result<Option<u64>> {
-        let Some(head) = self.orphaned_phase_head(shard_id, phase)? else { return Ok(None) };
+        let Some(head) = self.orphaned_phase_head(shard_id, phase)? else {
+            return Ok(None);
+        };
         TREE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if let Backend::Rocks { db, namespace } = &self.backend {
             db.delete(Self::head_version_key(namespace, shard_id, phase))?;
@@ -742,7 +794,10 @@ impl Forest {
             phase_roots[phase as usize] =
                 self.commit_shard_phase(shard_id, phase, version, leaves)?;
         }
-        Ok(ShardRoots { commitment: rollup_phase_roots(&phase_roots), phase_roots })
+        Ok(ShardRoots {
+            commitment: rollup_phase_roots(&phase_roots),
+            phase_roots,
+        })
     }
 
     /// Like [`commit_shard`] but positions every phase's leaves by RAW address
@@ -761,7 +816,10 @@ impl Forest {
             phase_roots[phase as usize] =
                 self.commit_shard_phase_raw(shard_id, phase, version, leaves)?;
         }
-        Ok(ShardRoots { commitment: rollup_phase_roots(&phase_roots), phase_roots })
+        Ok(ShardRoots {
+            commitment: rollup_phase_roots(&phase_roots),
+            phase_roots,
+        })
     }
 
     // ---- Address-path forest (D-4): raw-key shards + app aggregation ------
@@ -857,7 +915,10 @@ impl Forest {
     ) -> Result<()> {
         let store = self.store(&TreeId::shard_phase(shard_id, phase));
         let root = crate::sync::preview_subtree_root(&store, version, leaves, bits)?;
-        anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        anyhow::ensure!(
+            root == expected,
+            "reconstructed subtree differs from the authenticated source"
+        );
         Ok(())
     }
 
@@ -877,10 +938,16 @@ impl Forest {
     ) -> Result<StagedForestSync> {
         let store = self.store(&TreeId::shard_phase(shard_id, phase));
         let (_, batch) = Sha256Jmt::new(&store).put_value_set(leaves, version)?;
-        let preview = UpdatedTree { base: &store, batch: &batch.node_batch };
+        let preview = UpdatedTree {
+            base: &store,
+            batch: &batch.node_batch,
+        };
         let root = crate::sync::subtree_root(&preview, version, bits)?;
         if let Some(expected) = expected {
-            anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+            anyhow::ensure!(
+                root == expected,
+                "reconstructed subtree differs from the authenticated source"
+            );
         }
         let (puts, memory) = match store {
             TreeStore::Rocks(store) => (store.update_puts(&batch)?, None),
@@ -903,9 +970,15 @@ impl Forest {
     ) -> Result<([u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> {
         let store = self.store(&TreeId::shard_phase(app, phase));
         let (_, batch) = crate::commit_update_keyhash(&store, version, leaves)?;
-        let preview = UpdatedTree { base: &store, batch: &batch.node_batch };
+        let preview = UpdatedTree {
+            base: &store,
+            batch: &batch.node_batch,
+        };
         let root = crate::sync::subtree_root(&preview, version, bits)?;
-        anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        anyhow::ensure!(
+            root == expected,
+            "reconstructed subtree differs from the authenticated source"
+        );
         match &store {
             TreeStore::Rocks(s) => Ok((root, s.update_puts(&batch)?)),
             TreeStore::Mem(_) => {
@@ -927,9 +1000,14 @@ impl Forest {
     /// `borsh(Node)`, or `None` if the node is absent. Pure proxy over the store —
     /// authentication is the client's (the diff walk is rooted at the trusted
     /// header root), so the server holds no secrets here.
-    pub fn serve_node(&self, shard_id: &[u8], phase: Phase, node_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let key: NodeKey = borsh::from_slice(node_key)
-            .map_err(|e| anyhow::anyhow!("decode NodeKey: {e}"))?;
+    pub fn serve_node(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        node_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let key: NodeKey =
+            borsh::from_slice(node_key).map_err(|e| anyhow::anyhow!("decode NodeKey: {e}"))?;
         let store = self.store(&TreeId::shard_phase(shard_id, phase));
         match store.get_node_option(&key)? {
             Some(node) => Ok(Some(
@@ -1007,7 +1085,10 @@ impl Forest {
         }
         Ok((
             AppCommit {
-                roots: ShardRoots { commitment: rollup_phase_roots(&phase_roots), phase_roots },
+                roots: ShardRoots {
+                    commitment: rollup_phase_roots(&phase_roots),
+                    phase_roots,
+                },
                 num_leaves,
                 total_size,
             },
@@ -1074,7 +1155,10 @@ impl Forest {
             phase_roots[p] = crate::app_root_from_shard_paths(shards_p);
         }
         Ok(AppCommit {
-            roots: ShardRoots { commitment: rollup_phase_roots(&phase_roots), phase_roots },
+            roots: ShardRoots {
+                commitment: rollup_phase_roots(&phase_roots),
+                phase_roots,
+            },
             num_leaves,
             total_size,
         })
@@ -1123,7 +1207,9 @@ impl Forest {
         version: u64,
         bit_path: &[bool],
     ) -> Result<[u8; 32]> {
-        Ok(self.app_subtree_root_changed(app_address, phase, version, bit_path)?.0)
+        Ok(self
+            .app_subtree_root_changed(app_address, phase, version, bit_path)?
+            .0)
     }
 
     /// [`Self::app_subtree_root`] and the version, at or below `version`, at
@@ -1202,7 +1288,8 @@ impl Forest {
                     // version behind: a search can step over the state before
                     // that removal, never return a wrong version.)
                     let range = start as usize..(start + width) as usize;
-                    let changed = int.children_sorted()
+                    let changed = int
+                        .children_sorted()
                         .filter(|(nibble, _)| range.contains(&nibble.as_usize()))
                         .map(|(_, child)| child.version)
                         .max()
@@ -1229,7 +1316,9 @@ impl Forest {
     ) -> Option<u64> {
         let mut version = head;
         for _ in 0..max_changes {
-            let (found, changed) = self.app_subtree_root_changed(app_address, phase, version, bit_path).ok()?;
+            let (found, changed) = self
+                .app_subtree_root_changed(app_address, phase, version, bit_path)
+                .ok()?;
             if found == root {
                 return Some(version);
             }
@@ -1428,9 +1517,10 @@ impl Forest {
     /// Without it, migrated state has no head marker and reads as empty once the
     /// live forest version advances past the migration version. No-op for mem.
     pub fn write_head_version(&self, shard_id: &[u8], phase: Phase, version: u64) -> Result<()> {
-        if let (Some((k, v)), Backend::Rocks { db, .. }) =
-            (self.head_version_put(shard_id, phase, version), &self.backend)
-        {
+        if let (Some((k, v)), Backend::Rocks { db, .. }) = (
+            self.head_version_put(shard_id, phase, version),
+            &self.backend,
+        ) {
             db.put(&k, &v)?;
         }
         Ok(())
@@ -1446,7 +1536,9 @@ impl Forest {
                     Some(v) if v.len() == 8 => {
                         Ok(Some(u64::from_be_bytes(v[..8].try_into().unwrap())))
                     }
-                    Some(_) => Err(anyhow::anyhow!("invalid persisted forest head-version length")),
+                    Some(_) => Err(anyhow::anyhow!(
+                        "invalid persisted forest head-version length"
+                    )),
                     None => Ok(None),
                 }
             }
@@ -1471,13 +1563,21 @@ impl Forest {
     /// (fold into the commit txn). `None` for a mem forest. Live-path analogue
     /// of [`head_version_put`](Self::head_version_put).
     pub fn global_head_version_put(&self, index: u8, version: u64) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.head_version_put(&Self::global_head_shard_id(index), Phase::VertexAdds, version)
+        self.head_version_put(
+            &Self::global_head_shard_id(index),
+            Phase::VertexAdds,
+            version,
+        )
     }
 
     /// Persist global bucket `index`'s head version DIRECTLY — for the
     /// migration converter (mirrors [`write_head_version`](Self::write_head_version)).
     pub fn write_global_head_version(&self, index: u8, version: u64) -> Result<()> {
-        self.write_head_version(&Self::global_head_shard_id(index), Phase::VertexAdds, version)
+        self.write_head_version(
+            &Self::global_head_shard_id(index),
+            Phase::VertexAdds,
+            version,
+        )
     }
 
     /// Read global bucket `index`'s persisted head version. `None` if the
@@ -1499,7 +1599,9 @@ impl Forest {
         entries: impl IntoIterator<Item = (Vec<u8>, crate::ShardEntry)>,
     ) -> Result<[u8; 32]> {
         let store = self.store(&TreeId::app(app_address));
-        let leaves = entries.into_iter().map(|(shard_id, e)| (shard_id, e.to_bytes()));
+        let leaves = entries
+            .into_iter()
+            .map(|(shard_id, e)| (shard_id, e.to_bytes()));
         Ok(commit_pruning(&store, version, leaves)?.0)
     }
 
@@ -1610,12 +1712,24 @@ mod tests {
         left[31] = 1;
         let mut right = left.clone();
         right[0] = 0x80;
-        forest.commit_shard_phase_raw(&app, phase, 0,
-            vec![(left, vec![1]), (right, vec![2])]).unwrap();
-        assert_ne!(forest.app_subtree_root(&app, phase, 0, &[false; 4]).unwrap(), [0; 32]);
+        forest
+            .commit_shard_phase_raw(&app, phase, 0, vec![(left, vec![1]), (right, vec![2])])
+            .unwrap();
+        assert_ne!(
+            forest
+                .app_subtree_root(&app, phase, 0, &[false; 4])
+                .unwrap(),
+            [0; 32]
+        );
         let root_key = NodeKey::new(0, NibblePath::new(vec![]));
-        let Node::Internal(root) = forest.shard_phase_reader(&app, phase)
-            .get_node_option(&root_key).unwrap().unwrap() else { panic!("expected branch"); };
+        let Node::Internal(root) = forest
+            .shard_phase_reader(&app, phase)
+            .get_node_option(&root_key)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected branch");
+        };
         let (nibble, child) = root.children_sorted().next().unwrap();
         let key = root_key.gen_child_node_key(child.version, nibble);
         let mut encoded = namespace.to_vec();
@@ -1624,9 +1738,16 @@ mod tests {
         encoded.extend_from_slice(&borsh::to_vec(&key).unwrap());
         assert!(db.get(&encoded).unwrap().is_some());
         db.delete(encoded).unwrap();
-        assert!(forest.app_subtree_root(&app, phase, 0, &[false; 4]).is_err());
+        assert!(forest
+            .app_subtree_root(&app, phase, 0, &[false; 4])
+            .is_err());
         // A path with no referenced child is still an honestly empty subtree.
-        assert_eq!(forest.app_subtree_root(&app, phase, 0, &[false, true, false, false]).unwrap(), [0; 32]);
+        assert_eq!(
+            forest
+                .app_subtree_root(&app, phase, 0, &[false, true, false, false])
+                .unwrap(),
+            [0; 32]
+        );
     }
 
     /// Unified tree: `app_subtree_root` reads per-shard commitments as
@@ -1658,7 +1779,9 @@ mod tests {
             (key(0x10, 0x00, 3), vec![0xDD, 3]),
             (key(0x10, 0x22, 4), vec![0xDD, 4]),
         ];
-        forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+        forest
+            .commit_shard_phase_raw(&app, phase, 0, leaves)
+            .unwrap();
 
         // Whole app (shard_bits = []): the branch is at bit 3 (top 3 bits uniform).
         let children = forest
@@ -1677,27 +1800,48 @@ mod tests {
         // uniform-false, diverging at bit 3), each holding 2 leaves.
         assert_eq!(children[0], vec![false, false, false, false]);
         assert_eq!(children[1], vec![false, false, false, true]);
-        assert_eq!(forest.app_subtree_leaf_count(&app, phase, 0, &children[0]).unwrap(), 2);
-        assert_eq!(forest.app_subtree_leaf_count(&app, phase, 0, &children[1]).unwrap(), 2);
+        assert_eq!(
+            forest
+                .app_subtree_leaf_count(&app, phase, 0, &children[0])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            forest
+                .app_subtree_leaf_count(&app, phase, 0, &children[1])
+                .unwrap(),
+            2
+        );
 
         // Empty-split guard: a shard with a single leaf is unsplittable → None.
         let single = Forest::in_memory();
-        single.commit_shard_phase_raw(&app, phase, 0, vec![(key(0x00, 0x00, 1), vec![0xAB])]).unwrap();
-        assert_eq!(single.app_subtree_leaf_count(&app, phase, 0, &[]).unwrap(), 1);
+        single
+            .commit_shard_phase_raw(&app, phase, 0, vec![(key(0x00, 0x00, 1), vec![0xAB])])
+            .unwrap();
+        assert_eq!(
+            single.app_subtree_leaf_count(&app, phase, 0, &[]).unwrap(),
+            1
+        );
         assert!(
-            single.first_split_bifurcation(&app, phase, 0, &[], 16).unwrap().is_none(),
+            single
+                .first_split_bifurcation(&app, phase, 0, &[], 16)
+                .unwrap()
+                .is_none(),
             "empty-split guard: a single-leaf shard does not split"
         );
         // An empty shard is likewise unsplittable.
         assert!(
-            single.first_split_bifurcation(&app, phase, 0, &[true], 16).unwrap().is_none(),
+            single
+                .first_split_bifurcation(&app, phase, 0, &[true], 16)
+                .unwrap()
+                .is_none(),
             "empty-split guard: an empty shard does not split"
         );
     }
 
     #[test]
     fn app_subtree_root_reads_unified_shard_commitments() {
-        use jmt::storage::{Node, NodeKey, NibblePath, TreeReader};
+        use jmt::storage::{NibblePath, Node, NodeKey, TreeReader};
         use sha2::Sha256;
 
         let forest = Forest::in_memory();
@@ -1718,10 +1862,15 @@ mod tests {
             leaves.push((key(b), vec![0xCC, b]));
         }
         leaves.push((key(0x80), vec![0xDD, 0]));
-        let app_root = forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+        let app_root = forest
+            .commit_shard_phase_raw(&app, phase, 0, leaves)
+            .unwrap();
 
         // (1) Empty path ⇒ the whole app-phase root (JMT root over ALL shards).
-        assert_eq!(forest.app_subtree_root(&app, phase, 0, &[]).unwrap(), app_root);
+        assert_eq!(
+            forest.app_subtree_root(&app, phase, 0, &[]).unwrap(),
+            app_root
+        );
 
         // (2) The two 6-bit shards X=000000, Y=000001 read as distinct, non-empty
         //     subtree roots via the non-nibble-aligned descent.
@@ -1754,18 +1903,30 @@ mod tests {
             Node::Internal(n) => n,
             o => panic!("2nd-nibble not internal: {o:?}"),
         };
-        assert_eq!(sx, n2.subtree_hash::<Sha256>(0, 4), "shard X == subtree [0,4)");
-        assert_eq!(sy, n2.subtree_hash::<Sha256>(4, 4), "shard Y == subtree [4,8)");
+        assert_eq!(
+            sx,
+            n2.subtree_hash::<Sha256>(0, 4),
+            "shard X == subtree [0,4)"
+        );
+        assert_eq!(
+            sy,
+            n2.subtree_hash::<Sha256>(4, 4),
+            "shard Y == subtree [4,8)"
+        );
 
         // (3) Nibble-aligned 4-bit prefix (1st-nibble 0) == the 2nd-nibble node
         //     hash — the child the root commits to.
-        let n0 = forest.app_subtree_root(&app, phase, 0, &[false; 4]).unwrap();
+        let n0 = forest
+            .app_subtree_root(&app, phase, 0, &[false; 4])
+            .unwrap();
         assert_eq!(n0, n2.hash::<Sha256>(), "nibble-aligned shard == node hash");
 
         // (4) Empty shard (6-bit prefix 111111 = 63, no data) → placeholder.
         let bits_empty = crate::prefix_to_bits(&[63u32], 6);
         assert_eq!(
-            forest.app_subtree_root(&app, phase, 0, &bits_empty).unwrap(),
+            forest
+                .app_subtree_root(&app, phase, 0, &bits_empty)
+                .unwrap(),
             [0u8; 32],
             "empty shard → all-zero placeholder"
         );
@@ -1785,28 +1946,69 @@ mod tests {
             k[31] = b0;
             k
         };
-        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = (0u8..8).map(|b| (key(b), vec![0xCC, b])).collect();
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> =
+            (0u8..8).map(|b| (key(b), vec![0xCC, b])).collect();
         leaves.push((key(0x80), vec![0xDD, 0]));
-        forest.commit_shard_phase_raw(&app, phase, 0, leaves).unwrap();
+        forest
+            .commit_shard_phase_raw(&app, phase, 0, leaves)
+            .unwrap();
         // X = 000000 (byte0 0x00..0x03), Y = 000001 (0x04..0x07): one node.
         let bits_x = crate::prefix_to_bits(&[0u32], 6);
         let bits_y = crate::prefix_to_bits(&[1u32], 6);
         let before = forest.app_subtree_root(&app, phase, 0, &bits_x).unwrap();
-        forest.commit_shard_phase_raw(&app, phase, 1, vec![(key(1), vec![0xEE])]).unwrap();
+        forest
+            .commit_shard_phase_raw(&app, phase, 1, vec![(key(1), vec![0xEE])])
+            .unwrap();
         let after = forest.app_subtree_root(&app, phase, 1, &bits_x).unwrap();
         assert_ne!(before, after);
         let head = 1_000u64;
         for version in 2..=head {
-            forest.commit_shard_phase_raw(&app, phase, version, vec![(key(5), version.to_be_bytes().to_vec())]).unwrap();
+            forest
+                .commit_shard_phase_raw(
+                    &app,
+                    phase,
+                    version,
+                    vec![(key(5), version.to_be_bytes().to_vec())],
+                )
+                .unwrap();
         }
-        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &bits_x).unwrap(), (after, 1));
-        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &bits_y).unwrap().1, head);
-        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, after, 1), Some(head));
-        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 2), Some(0));
-        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 1), None);
-        assert_eq!(forest.app_subtree_version_of(&app, phase, head, &bits_x, [7; 32], 720), None);
+        assert_eq!(
+            forest
+                .app_subtree_root_changed(&app, phase, head, &bits_x)
+                .unwrap(),
+            (after, 1)
+        );
+        assert_eq!(
+            forest
+                .app_subtree_root_changed(&app, phase, head, &bits_y)
+                .unwrap()
+                .1,
+            head
+        );
+        assert_eq!(
+            forest.app_subtree_version_of(&app, phase, head, &bits_x, after, 1),
+            Some(head)
+        );
+        assert_eq!(
+            forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 2),
+            Some(0)
+        );
+        assert_eq!(
+            forest.app_subtree_version_of(&app, phase, head, &bits_x, before, 1),
+            None
+        );
+        assert_eq!(
+            forest.app_subtree_version_of(&app, phase, head, &bits_x, [7; 32], 720),
+            None
+        );
         // The nibble-aligned parent holds both shards: it changes with Y.
-        assert_eq!(forest.app_subtree_root_changed(&app, phase, head, &[false; 4]).unwrap().1, head);
+        assert_eq!(
+            forest
+                .app_subtree_root_changed(&app, phase, head, &[false; 4])
+                .unwrap()
+                .1,
+            head
+        );
     }
 
     /// CRUX of shard-prover subtree-range sync: a PARTIAL app tree holding only
@@ -1839,7 +2041,8 @@ mod tests {
         for b0 in [0x40u8, 0x80, 0xFC] {
             full_leaves.push((key(b0, b0), vec![0xDD, b0]));
         }
-        full.commit_shard_phase_raw(&app, phase, 0, full_leaves).unwrap();
+        full.commit_shard_phase_raw(&app, phase, 0, full_leaves)
+            .unwrap();
 
         // PARTIAL tree: ONLY shard X's 3 leaves.
         let partial = Forest::in_memory();
@@ -1847,7 +2050,9 @@ mod tests {
             .iter()
             .map(|(b0, tag)| (key(*b0, *tag), vec![0xCC, *b0]))
             .collect();
-        partial.commit_shard_phase_raw(&app, phase, 0, x_leaves).unwrap();
+        partial
+            .commit_shard_phase_raw(&app, phase, 0, x_leaves)
+            .unwrap();
 
         // Shard X's 6-bit and nibble-aligned commitments must match across the
         // full and partial trees.
@@ -1896,26 +2101,43 @@ mod tests {
             s
         };
         let shards = || -> BTreeMap<Vec<u32>, [Vec<(Vec<u8>, Vec<u8>)>; 4]> {
-            [(vec![0u32], build(&addr_a, &val_a)), (vec![63u32], build(&addr_b, &val_b))]
-                .into_iter()
-                .collect()
+            [
+                (vec![0u32], build(&addr_a, &val_a)),
+                (vec![63u32], build(&addr_b, &val_b)),
+            ]
+            .into_iter()
+            .collect()
         };
 
         let app_commit = forest.commit_app_shards(&app, 0, bpl, shards()).unwrap();
         let roots = &app_commit.roots;
         // Branch metadata: 2 leaves (native JMT count), size = 6+6 (the `size`
         // fields of the two per-vertex leaves, via `vertex_leaf_size`).
-        assert_eq!(app_commit.num_leaves, 2, "num_leaves from JMT get_leaf_count");
+        assert_eq!(
+            app_commit.num_leaves, 2,
+            "num_leaves from JMT get_leaf_count"
+        );
         assert_eq!(app_commit.total_size, 6 + 6);
         // Deterministic re-commit into a fresh forest gives the same app root.
-        let app2 = Forest::in_memory().commit_app_shards(&app, 0, bpl, shards()).unwrap();
-        assert_eq!(roots.commitment, app2.roots.commitment, "app commitment is deterministic");
+        let app2 = Forest::in_memory()
+            .commit_app_shards(&app, 0, bpl, shards())
+            .unwrap();
+        assert_eq!(
+            roots.commitment, app2.roots.commitment,
+            "app commitment is deterministic"
+        );
 
         // Read shard roots for the VertexAdds phase (shards keyed by prefix).
         let sid0 = Forest::addr_path_shard_id(&app, &[0]);
         let sid63 = Forest::addr_path_shard_id(&app, &[63]);
-        let r0 = forest.shard_phase_root(&sid0, Phase::VertexAdds, 0).unwrap().unwrap();
-        let r63 = forest.shard_phase_root(&sid63, Phase::VertexAdds, 0).unwrap().unwrap();
+        let r0 = forest
+            .shard_phase_root(&sid0, Phase::VertexAdds, 0)
+            .unwrap()
+            .unwrap();
+        let r63 = forest
+            .shard_phase_root(&sid63, Phase::VertexAdds, 0)
+            .unwrap()
+            .unwrap();
 
         // (1) coin-A is in shard [0]'s raw-key JMT (leaf → shard root).
         let (val, proof) = forest
@@ -1954,7 +2176,9 @@ mod tests {
     }
 
     fn leaves(n: u32, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
-        (0..n).map(|i| (i.to_be_bytes().to_vec(), vec![tag ^ i as u8; 40])).collect()
+        (0..n)
+            .map(|i| (i.to_be_bytes().to_vec(), vec![tag ^ i as u8; 40]))
+            .collect()
     }
 
     /// The batched boot seed (`seed_size_index` on RocksDB → `seed_size_index_batched`)
@@ -1978,18 +2202,25 @@ mod tests {
             .map(|i| {
                 let mut vk = [0u8; 64];
                 vk[..4].copy_from_slice(&i.to_be_bytes());
-                (crate::l3_leaf_key(&vk, &[0x04]), vec![(i % 251) as u8; 1 + (i % 50) as usize])
+                (
+                    crate::l3_leaf_key(&vk, &[0x04]),
+                    vec![(i % 251) as u8; 1 + (i % 50) as usize],
+                )
             })
             .collect();
         for f in [&gen, &bat] {
-            let (_r, puts) = f.commit_shard_phase_staged(&app, Phase::VertexAdds, 0, ls.clone()).unwrap();
+            let (_r, puts) = f
+                .commit_shard_phase_staged(&app, Phase::VertexAdds, 0, ls.clone())
+                .unwrap();
             apply_puts(f, puts);
             // The commit warms the index at write time; strip it so both forests
             // start COLD — the legacy-archive scenario the boot backfill exists for.
             f.clear_size_index(&app, Phase::VertexAdds).unwrap();
         }
         // Reference: the generic memoizing walk (individual puts), cold.
-        let g = gen.app_subtree_size(&app, Phase::VertexAdds, 0, &[]).unwrap();
+        let g = gen
+            .app_subtree_size(&app, Phase::VertexAdds, 0, &[])
+            .unwrap();
         // The batched boot seed — capture the progress heartbeat's reported count.
         let reported = std::sync::atomic::AtomicU64::new(0);
         let b = bat
@@ -2005,15 +2236,25 @@ mod tests {
         assert!(b > 0, "non-empty tree seeds a non-zero size");
         // The memo is populated: a whole-tree read now returns the seeded total,
         // and a sub-path read is consistent with the generic forest's.
-        assert_eq!(bat.app_subtree_size(&app, Phase::VertexAdds, 0, &[]).unwrap(), b);
+        assert_eq!(
+            bat.app_subtree_size(&app, Phase::VertexAdds, 0, &[])
+                .unwrap(),
+            b
+        );
         let sub = &[false, true];
         assert_eq!(
-            bat.app_subtree_size(&app, Phase::VertexAdds, 0, sub).unwrap(),
-            gen.app_subtree_size(&app, Phase::VertexAdds, 0, sub).unwrap(),
+            bat.app_subtree_size(&app, Phase::VertexAdds, 0, sub)
+                .unwrap(),
+            gen.app_subtree_size(&app, Phase::VertexAdds, 0, sub)
+                .unwrap(),
             "sub-path size matches after batched seed"
         );
         // Idempotent (crash-resume): a second seed returns the same total via memo hits.
-        assert_eq!(bat.seed_size_index(&app, Phase::VertexAdds, 0, &|_| {}).unwrap(), b);
+        assert_eq!(
+            bat.seed_size_index(&app, Phase::VertexAdds, 0, &|_| {})
+                .unwrap(),
+            b
+        );
     }
 
     /// The option-B sync loop end to end at the forest level: a behind target
@@ -2093,16 +2334,29 @@ mod tests {
         let forest = Forest::new(open_db(dir.path()));
         let shard = [0xffu8; 32];
         let leaves = vec![(crate::l3_leaf_key(&[0x11u8; 64], &[0x04u8]), b"v1".to_vec())];
-        forest.commit_shard_phase(&shard, Phase::VertexAdds, 3, leaves).unwrap();
-        forest.write_head_version(&shard, Phase::VertexAdds, 3).unwrap();
-        assert_eq!(forest.read_head_version(&shard, Phase::VertexAdds).unwrap(), Some(3));
-        assert!(forest.shard_phase_root(&shard, Phase::VertexAdds, 3).unwrap().is_some());
+        forest
+            .commit_shard_phase(&shard, Phase::VertexAdds, 3, leaves)
+            .unwrap();
+        forest
+            .write_head_version(&shard, Phase::VertexAdds, 3)
+            .unwrap();
+        assert_eq!(
+            forest.read_head_version(&shard, Phase::VertexAdds).unwrap(),
+            Some(3)
+        );
+        assert!(forest
+            .shard_phase_root(&shard, Phase::VertexAdds, 3)
+            .unwrap()
+            .is_some());
 
         forest.reset_shard_phase_trees(&shard).unwrap();
         for phase in PHASES {
             assert_eq!(forest.read_head_version(&shard, phase).unwrap(), None);
         }
-        assert!(forest.shard_phase_root(&shard, Phase::VertexAdds, 3).unwrap().is_none());
+        assert!(forest
+            .shard_phase_root(&shard, Phase::VertexAdds, 3)
+            .unwrap()
+            .is_none());
     }
 
     /// An older reset could clear a phase tree but keep its head marker,
@@ -2117,28 +2371,94 @@ mod tests {
         let forest = Forest::new(open_db(dir.path()));
         let shard = [0xffu8; 32];
         let leaves = || vec![(crate::l3_leaf_key(&[0x11u8; 64], &[0x04u8]), b"v1".to_vec())];
-        forest.commit_shard_phase(&shard, Phase::VertexRemoves, 3, leaves()).unwrap();
-        forest.write_head_version(&shard, Phase::VertexRemoves, 3).unwrap();
-        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), None, "a live tree");
+        forest
+            .commit_shard_phase(&shard, Phase::VertexRemoves, 3, leaves())
+            .unwrap();
+        forest
+            .write_head_version(&shard, Phase::VertexRemoves, 3)
+            .unwrap();
+        assert_eq!(
+            forest
+                .orphaned_phase_head(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            None,
+            "a live tree"
+        );
 
         // The old reset: clear the tree's keys, keep the marker.
-        forest.store(&TreeId::shard_phase(&shard, Phase::VertexRemoves)).clear().unwrap();
-        assert_eq!(forest.read_head_version(&shard, Phase::VertexRemoves).unwrap(), Some(3));
-        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), Some(3));
-        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexAdds).unwrap(), None, "no marker");
+        forest
+            .store(&TreeId::shard_phase(&shard, Phase::VertexRemoves))
+            .clear()
+            .unwrap();
+        assert_eq!(
+            forest
+                .read_head_version(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            forest
+                .orphaned_phase_head(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            forest
+                .orphaned_phase_head(&shard, Phase::VertexAdds)
+                .unwrap(),
+            None,
+            "no marker"
+        );
 
-        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), Some(3));
-        assert_eq!(forest.read_head_version(&shard, Phase::VertexRemoves).unwrap(), None);
-        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), None, "idempotent");
-        let root = forest.commit_shard_phase(&shard, Phase::VertexRemoves, 0, leaves()).unwrap();
-        assert_eq!(forest.shard_phase_root(&shard, Phase::VertexRemoves, 0).unwrap(), Some(root));
+        assert_eq!(
+            forest
+                .drop_orphaned_phase_head(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            forest
+                .read_head_version(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            forest
+                .drop_orphaned_phase_head(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            None,
+            "idempotent"
+        );
+        let root = forest
+            .commit_shard_phase(&shard, Phase::VertexRemoves, 0, leaves())
+            .unwrap();
+        assert_eq!(
+            forest
+                .shard_phase_root(&shard, Phase::VertexRemoves, 0)
+                .unwrap(),
+            Some(root)
+        );
 
         // A marker whose root was pruned while other versions' keys remain is
         // lost state, not an empty tree: never dropped.
-        forest.commit_shard_phase(&shard, Phase::HyperedgeAdds, 1, leaves()).unwrap();
-        forest.write_head_version(&shard, Phase::HyperedgeAdds, 2).unwrap();
-        assert_eq!(forest.orphaned_phase_head(&shard, Phase::HyperedgeAdds).unwrap(), None);
-        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::HyperedgeAdds).unwrap(), None);
+        forest
+            .commit_shard_phase(&shard, Phase::HyperedgeAdds, 1, leaves())
+            .unwrap();
+        forest
+            .write_head_version(&shard, Phase::HyperedgeAdds, 2)
+            .unwrap();
+        assert_eq!(
+            forest
+                .orphaned_phase_head(&shard, Phase::HyperedgeAdds)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            forest
+                .drop_orphaned_phase_head(&shard, Phase::HyperedgeAdds)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2166,7 +2486,10 @@ mod tests {
         for k in [&k1, &k2] {
             let kh = KeyHash::with::<Sha256>(k).0;
             assert_eq!(
-                forest.get_preimage(&shard, Phase::VertexAdds, kh).unwrap().as_deref(),
+                forest
+                    .get_preimage(&shard, Phase::VertexAdds, kh)
+                    .unwrap()
+                    .as_deref(),
                 Some(&k[..]),
                 "preimage recovers the raw l3 key"
             );
@@ -2180,10 +2503,15 @@ mod tests {
         // Client-side re-record (write_preimage) round-trips too — this is what a
         // synced node does so it can re-serve preimages downstream.
         let synced_key = crate::l3_leaf_key(&[0x55u8; 64], &[0x0c]);
-        forest.write_preimage(&shard, Phase::VertexAdds, &synced_key).unwrap();
+        forest
+            .write_preimage(&shard, Phase::VertexAdds, &synced_key)
+            .unwrap();
         let kh = KeyHash::with::<Sha256>(&synced_key).0;
         assert_eq!(
-            forest.get_preimage(&shard, Phase::VertexAdds, kh).unwrap().as_deref(),
+            forest
+                .get_preimage(&shard, Phase::VertexAdds, kh)
+                .unwrap()
+                .as_deref(),
             Some(&synced_key[..]),
             "write_preimage is recoverable by get_preimage"
         );
@@ -2194,7 +2522,11 @@ mod tests {
         let a = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
         let b = [[2u8; 32], [1u8; 32], [3u8; 32], [4u8; 32]];
         assert_eq!(rollup_phase_roots(&a), rollup_phase_roots(&a));
-        assert_ne!(rollup_phase_roots(&a), rollup_phase_roots(&b), "order matters");
+        assert_ne!(
+            rollup_phase_roots(&a),
+            rollup_phase_roots(&b),
+            "order matters"
+        );
     }
 
     #[test]
@@ -2210,7 +2542,12 @@ mod tests {
             .commit_shard(
                 &shard,
                 0,
-                [leaves(30, 0x10), leaves(5, 0x20), leaves(12, 0x30), leaves(2, 0x40)],
+                [
+                    leaves(30, 0x10),
+                    leaves(5, 0x20),
+                    leaves(12, 0x30),
+                    leaves(2, 0x40),
+                ],
             )
             .unwrap();
         assert_eq!(sr.commitment, rollup_phase_roots(&sr.phase_roots));
@@ -2224,7 +2561,11 @@ mod tests {
                 0,
                 vec![(
                     shard.clone(),
-                    ShardEntry { shard_commitment: sr.commitment, num_leaves: 49, total_size: 1960 },
+                    ShardEntry {
+                        shard_commitment: sr.commitment,
+                        num_leaves: 49,
+                        total_size: 1960,
+                    },
                 )],
             )
             .unwrap();
@@ -2238,7 +2579,12 @@ mod tests {
                 0,
                 vec![(
                     app_address.clone(),
-                    AppEntry { app_root, num_leaves: 49, total_size: 1960, metadata: b"QUIL".to_vec() },
+                    AppEntry {
+                        app_root,
+                        num_leaves: 49,
+                        total_size: 1960,
+                        metadata: b"QUIL".to_vec(),
+                    },
                 )],
             )
             .unwrap();
@@ -2268,72 +2614,151 @@ mod tests {
         let other = Forest::with_namespace(db.clone(), vec![0xf8]);
         let shard = b"tentative";
         let phase = Phase::VertexAdds;
-        let base_root = canonical.commit_shard_phase(shard, phase, 0, leaves(24, 7)).unwrap();
+        let base_root = canonical
+            .commit_shard_phase(shard, phase, 0, leaves(24, 7))
+            .unwrap();
         canonical.write_head_version(shard, phase, 0).unwrap();
-        let other_root = other.commit_shard_phase(shard, phase, 0, leaves(8, 3)).unwrap();
+        let other_root = other
+            .commit_shard_phase(shard, phase, 0, leaves(8, 3))
+            .unwrap();
         canonical.clear_size_index(shard, phase).unwrap();
-        let rows = || db.iterator(rocksdb::IteratorMode::Start)
-            .collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let rows = || {
+            db.iterator(rocksdb::IteratorMode::Start)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
         let original_rows = rows();
-        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), OverlayLimits {
-            max_delta_bytes: 4 << 20, max_delta_entries: 100_000,
-            max_record_bytes: 1 << 20, max_read_bytes: 64 << 20,
-            max_read_operations: 1_000_000, max_cursors: 8,
-        }).unwrap());
+        let overlay = Arc::new(
+            ExecutionOverlay::capture(
+                db.clone(),
+                OverlayLimits {
+                    max_delta_bytes: 4 << 20,
+                    max_delta_entries: 100_000,
+                    max_record_bytes: 1 << 20,
+                    max_read_bytes: 64 << 20,
+                    max_read_operations: 1_000_000,
+                    max_cursors: 8,
+                },
+            )
+            .unwrap(),
+        );
         let branch = Forest::on_overlay(overlay.clone(), vec![0xf7]);
         assert!(branch.db().is_none());
         // Whole-tree bootstrap cannot allocate its large maps in a branch.
         assert!(branch.seed_size_index(shard, phase, 0, &|_| {}).is_err());
         assert!(branch.app_subtree_size(shard, phase, 0, &[]).unwrap() > 0);
-        assert!(overlay.stats().delta_entries > 0, "lazy memos stay in the overlay");
+        assert!(
+            overlay.stats().delta_entries > 0,
+            "lazy memos stay in the overlay"
+        );
         assert_eq!(rows(), original_rows);
 
         let changed_key = 3u32.to_be_bytes().to_vec();
         let changed_value = vec![0x55; 40];
-        let (root, puts) = branch.commit_shard_phase_staged(shard, phase, 1,
-            vec![(changed_key.clone(), changed_value.clone())]).unwrap();
+        let (root, puts) = branch
+            .commit_shard_phase_staged(
+                shard,
+                phase,
+                1,
+                vec![(changed_key.clone(), changed_value.clone())],
+            )
+            .unwrap();
         assert_eq!(branch.shard_phase_root(shard, phase, 1).unwrap(), None);
-        let mut batch: Vec<_> = puts.into_iter().map(|(k, v)| OverlayMutation::Put(k, v)).collect();
+        let mut batch: Vec<_> = puts
+            .into_iter()
+            .map(|(k, v)| OverlayMutation::Put(k, v))
+            .collect();
         let (head_key, head_value) = branch.head_version_put(shard, phase, 1).unwrap();
         batch.push(OverlayMutation::Put(head_key, head_value));
-        batch.push(OverlayMutation::Put(b"execution/cursor".to_vec(), 1u64.to_be_bytes().to_vec()));
+        batch.push(OverlayMutation::Put(
+            b"execution/cursor".to_vec(),
+            1u64.to_be_bytes().to_vec(),
+        ));
         overlay.apply(&batch).unwrap();
         assert_eq!(branch.read_head_version(shard, phase).unwrap(), Some(1));
-        assert_eq!(overlay.get(b"execution/cursor").unwrap(), Some(1u64.to_be_bytes().to_vec()));
-        let (value, proof) = branch.shard_phase_get_with_proof(shard, phase, 1, &changed_key).unwrap();
+        assert_eq!(
+            overlay.get(b"execution/cursor").unwrap(),
+            Some(1u64.to_be_bytes().to_vec())
+        );
+        let (value, proof) = branch
+            .shard_phase_get_with_proof(shard, phase, 1, &changed_key)
+            .unwrap();
         assert_eq!(value, Some(changed_value.clone()));
-        proof.verify_existence(jmt::RootHash(root), KeyHash::with::<Sha256>(&changed_key), &changed_value).unwrap();
-        assert_eq!(branch.get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0).unwrap(), Some(changed_key.clone()));
+        proof
+            .verify_existence(
+                jmt::RootHash(root),
+                KeyHash::with::<Sha256>(&changed_key),
+                &changed_value,
+            )
+            .unwrap();
+        assert_eq!(
+            branch
+                .get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0)
+                .unwrap(),
+            Some(changed_key.clone())
+        );
         let store = branch.store(&TreeId::shard_phase(shard, phase));
-        let (deleted_root, deletion) = Sha256Jmt::new(&store).put_value_set(
-            vec![(KeyHash::with::<Sha256>(&changed_key), None)], 2).unwrap();
+        let (deleted_root, deletion) = Sha256Jmt::new(&store)
+            .put_value_set(vec![(KeyHash::with::<Sha256>(&changed_key), None)], 2)
+            .unwrap();
         store.apply_update(&deletion).unwrap();
         branch.write_head_version(shard, phase, 2).unwrap();
-        let (value, proof) = branch.shard_phase_get_with_proof(shard, phase, 2, &changed_key).unwrap();
+        let (value, proof) = branch
+            .shard_phase_get_with_proof(shard, phase, 2, &changed_key)
+            .unwrap();
         assert!(value.is_none());
-        proof.verify_nonexistence(deleted_root, KeyHash::with::<Sha256>(&changed_key)).unwrap();
+        proof
+            .verify_nonexistence(deleted_root, KeyHash::with::<Sha256>(&changed_key))
+            .unwrap();
         assert!(branch.prune_shard_phase(shard, phase, 2).unwrap() > 0);
-        assert_eq!(rows(), original_rows, "all forest writes, including prune, remain tentative");
-        assert_eq!(canonical.shard_phase_root(shard, phase, 0).unwrap(), Some(base_root));
+        assert_eq!(
+            rows(),
+            original_rows,
+            "all forest writes, including prune, remain tentative"
+        );
+        assert_eq!(
+            canonical.shard_phase_root(shard, phase, 0).unwrap(),
+            Some(base_root)
+        );
         assert_eq!(canonical.read_head_version(shard, phase).unwrap(), Some(0));
 
         // Canonical writes after capture are invisible even at an untouched key.
-        canonical.commit_shard_phase(shard, phase, 1, leaves(2, 0x99)).unwrap();
+        canonical
+            .commit_shard_phase(shard, phase, 1, leaves(2, 0x99))
+            .unwrap();
         canonical.write_head_version(shard, phase, 1).unwrap();
         assert_eq!(branch.read_head_version(shard, phase).unwrap(), Some(2));
         branch.reset_shard_phase_trees(shard).unwrap();
         assert_eq!(branch.read_head_version(shard, phase).unwrap(), None);
         assert_eq!(branch.shard_phase_root(shard, phase, 0).unwrap(), None);
-        assert_eq!(branch.get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0).unwrap(), None);
+        assert_eq!(
+            branch
+                .get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0)
+                .unwrap(),
+            None
+        );
         let scoped = Forest::on_overlay(overlay.clone(), vec![0xf8]);
-        assert_eq!(scoped.shard_phase_root(shard, phase, 0).unwrap(), Some(other_root));
+        assert_eq!(
+            scoped.shard_phase_root(shard, phase, 0).unwrap(),
+            Some(other_root)
+        );
         assert_eq!(canonical.read_head_version(shard, phase).unwrap(), Some(1));
         // Reset followed by version zero is a fresh tree in this branch only.
-        let rebuilt = branch.commit_shard_phase(shard, phase, 0, leaves(2, 1)).unwrap();
-        assert_eq!(branch.shard_phase_root(shard, phase, 0).unwrap(), Some(rebuilt));
+        let rebuilt = branch
+            .commit_shard_phase(shard, phase, 0, leaves(2, 1))
+            .unwrap();
+        assert_eq!(
+            branch.shard_phase_root(shard, phase, 0).unwrap(),
+            Some(rebuilt)
+        );
         let mut external_batch = rocksdb::WriteBatch::default();
-        assert!(branch.stage_shard_phase(&mut external_batch, shard, phase, 1, leaves(1, 2)).is_err());
-        assert!(external_batch.is_empty(), "overlay cannot leak writes through a canonical batch");
+        assert!(branch
+            .stage_shard_phase(&mut external_batch, shard, phase, 1, leaves(1, 2))
+            .is_err());
+        assert!(
+            external_batch.is_empty(),
+            "overlay cannot leak writes through a canonical batch"
+        );
         overlay.close();
         assert!(branch.read_head_version(shard, phase).is_err());
         assert!(db.get(b"execution/cursor").unwrap().is_none());
@@ -2344,18 +2769,32 @@ mod tests {
         use crate::{ExecutionOverlay, OverlayLimits, OverlayMutation};
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(dir.path());
-        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), OverlayLimits {
-            max_delta_bytes: 1 << 20, max_delta_entries: 2,
-            max_record_bytes: 1 << 20, max_read_bytes: 1 << 20,
-            max_read_operations: 10_000, max_cursors: 4,
-        }).unwrap());
+        let overlay = Arc::new(
+            ExecutionOverlay::capture(
+                db.clone(),
+                OverlayLimits {
+                    max_delta_bytes: 1 << 20,
+                    max_delta_entries: 2,
+                    max_record_bytes: 1 << 20,
+                    max_read_bytes: 1 << 20,
+                    max_read_operations: 10_000,
+                    max_cursors: 4,
+                },
+            )
+            .unwrap(),
+        );
         let branch = Forest::on_overlay(overlay.clone(), vec![0xf7]);
-        let (_, puts) = branch.commit_shard_phase_staged(b"S", Phase::VertexAdds, 0, leaves(8, 2)).unwrap();
+        let (_, puts) = branch
+            .commit_shard_phase_staged(b"S", Phase::VertexAdds, 0, leaves(8, 2))
+            .unwrap();
         let mut batch = vec![OverlayMutation::Put(b"cursor".to_vec(), b"1".to_vec())];
         batch.extend(puts.into_iter().map(|(k, v)| OverlayMutation::Put(k, v)));
         assert!(overlay.apply(&batch).is_err());
         assert_eq!(overlay.get(b"cursor").unwrap(), None);
-        assert_eq!(branch.shard_phase_root(b"S", Phase::VertexAdds, 0).unwrap(), None);
+        assert_eq!(
+            branch.shard_phase_root(b"S", Phase::VertexAdds, 0).unwrap(),
+            None
+        );
         assert_eq!(overlay.stats().delta_entries, 0);
         assert!(db.iterator(rocksdb::IteratorMode::Start).next().is_none());
     }
@@ -2405,7 +2844,9 @@ mod tests {
         let shard = b"S".to_vec();
         // No state yet → None.
         assert_eq!(
-            forest.shard_phase_root(&shard, Phase::VertexAdds, 0).unwrap(),
+            forest
+                .shard_phase_root(&shard, Phase::VertexAdds, 0)
+                .unwrap(),
             None
         );
         // Commit, then the read-side root matches the commit's returned root.
@@ -2413,7 +2854,9 @@ mod tests {
             .commit_shard_phase(&shard, Phase::VertexAdds, 0, leaves(15, 0x9))
             .unwrap();
         assert_eq!(
-            forest.shard_phase_root(&shard, Phase::VertexAdds, 0).unwrap(),
+            forest
+                .shard_phase_root(&shard, Phase::VertexAdds, 0)
+                .unwrap(),
             Some(committed),
             "read side sees the committed root"
         );
@@ -2432,7 +2875,10 @@ mod tests {
             .stage_shard_phase(&mut wb, &shard, Phase::VertexAdds, 0, ls.clone())
             .unwrap();
         // Before flush, the tree is unreadable (no root committed).
-        let store = RocksTreeStore::new(forest.db().unwrap().clone(), &TreeId::shard_phase(&shard, Phase::VertexAdds));
+        let store = RocksTreeStore::new(
+            forest.db().unwrap().clone(),
+            &TreeId::shard_phase(&shard, Phase::VertexAdds),
+        );
         assert!(
             Sha256Jmt::new(&store)
                 .get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 0)
@@ -2443,7 +2889,9 @@ mod tests {
         // Flush → durable, and the leaf reads back.
         forest.db().unwrap().write(wb).unwrap();
         assert_eq!(
-            Sha256Jmt::new(&store).get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 0).unwrap(),
+            Sha256Jmt::new(&store)
+                .get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 0)
+                .unwrap(),
             Some(vec![0x55u8 ^ 3u8; 40])
         );
 
@@ -2462,14 +2910,31 @@ mod tests {
         let forest = Forest::new(open_db(dir.path()));
         let shard = b"S".to_vec();
         // Commit vertex-adds at version 7, then persist its head version.
-        forest.commit_shard_phase(&shard, Phase::VertexAdds, 7, leaves(5, 1)).unwrap();
-        let (k, v) = forest.head_version_put(&shard, Phase::VertexAdds, 7).unwrap();
+        forest
+            .commit_shard_phase(&shard, Phase::VertexAdds, 7, leaves(5, 1))
+            .unwrap();
+        let (k, v) = forest
+            .head_version_put(&shard, Phase::VertexAdds, 7)
+            .unwrap();
         forest.db().unwrap().put(&k, &v).unwrap();
 
-        assert_eq!(forest.read_head_version(&shard, Phase::VertexAdds).unwrap(), Some(7));
+        assert_eq!(
+            forest.read_head_version(&shard, Phase::VertexAdds).unwrap(),
+            Some(7)
+        );
         // Distinct phase / shard have no head version recorded.
-        assert_eq!(forest.read_head_version(&shard, Phase::VertexRemoves).unwrap(), None);
-        assert_eq!(forest.read_head_version(b"other", Phase::VertexAdds).unwrap(), None);
+        assert_eq!(
+            forest
+                .read_head_version(&shard, Phase::VertexRemoves)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            forest
+                .read_head_version(b"other", Phase::VertexAdds)
+                .unwrap(),
+            None
+        );
 
         // The head-version key never collides with a JMT node/value key: the
         // committed leaf still reads back after the head-version put.
@@ -2486,8 +2951,13 @@ mod tests {
     #[test]
     fn head_version_mem_forest_is_none() {
         let forest = Forest::in_memory();
-        assert!(forest.head_version_put(b"S", Phase::VertexAdds, 3).is_none());
-        assert_eq!(forest.read_head_version(b"S", Phase::VertexAdds).unwrap(), None);
+        assert!(forest
+            .head_version_put(b"S", Phase::VertexAdds, 3)
+            .is_none());
+        assert_eq!(
+            forest.read_head_version(b"S", Phase::VertexAdds).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2511,7 +2981,9 @@ mod tests {
 
         let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
         let jmt_tree = Sha256Jmt::new(&store);
-        let got = jmt_tree.get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 2).unwrap();
+        let got = jmt_tree
+            .get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 2)
+            .unwrap();
         assert_eq!(got, Some(vec![2u8 ^ 3u8; 40]), "head read survives pruning");
 
         // A second prune at the same watermark reclaims nothing new.
@@ -2534,13 +3006,27 @@ mod tests {
         let tree = TreeId::shard_phase(&shard, Phase::VertexAdds);
         let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
         let mut batches = Vec::new();
-        let reclaimed = store.prune_in_batches(3, 4, |records| batches.push(records)).unwrap();
-        assert!(reclaimed > 8, "the backlog must span several batches, got {reclaimed}");
-        assert!(batches.iter().all(|&records| records <= 4), "batches {batches:?} exceed 4 records");
+        let reclaimed = store
+            .prune_in_batches(3, 4, |records| batches.push(records))
+            .unwrap();
+        assert!(
+            reclaimed > 8,
+            "the backlog must span several batches, got {reclaimed}"
+        );
+        assert!(
+            batches.iter().all(|&records| records <= 4),
+            "batches {batches:?} exceed 4 records"
+        );
         assert_eq!(batches.iter().sum::<usize>(), reclaimed);
-        let got = Sha256Jmt::new(&store).get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 3).unwrap();
+        let got = Sha256Jmt::new(&store)
+            .get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 3)
+            .unwrap();
         assert_eq!(got, Some(vec![3u8 ^ 3u8; 40]), "head read survives pruning");
-        assert_eq!(forest.prune_tree(&tree, 3).unwrap(), 0, "nothing below the watermark is left");
+        assert_eq!(
+            forest.prune_tree(&tree, 3).unwrap(),
+            0,
+            "nothing below the watermark is left"
+        );
     }
 
     #[test]
@@ -2559,7 +3045,9 @@ mod tests {
         let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
         let jmt_tree = Sha256Jmt::new(&store);
         // A read pinned at version 1 still resolves (its nodes were retained).
-        let got = jmt_tree.get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 1).unwrap();
+        let got = jmt_tree
+            .get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 1)
+            .unwrap();
         assert_eq!(got, Some(vec![1u8 ^ 3u8; 40]));
     }
 
@@ -2573,14 +3061,24 @@ mod tests {
         let shard = b"L".to_vec();
         let tree = TreeId::shard_phase(&shard, Phase::VertexAdds);
         let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
-        let key = |i: u8| { let mut k = [0u8; 32]; k[0] = i; k[31] = i; KeyHash(k) };
+        let key = |i: u8| {
+            let mut k = [0u8; 32];
+            k[0] = i;
+            k[31] = i;
+            KeyHash(k)
+        };
         let write = |version: u64, writes: Vec<(KeyHash, Option<Vec<u8>>)>| {
-            let (_, batch) = Sha256Jmt::new(&store).put_value_set(writes, version).unwrap();
+            let (_, batch) = Sha256Jmt::new(&store)
+                .put_value_set(writes, version)
+                .unwrap();
             store.apply_update(&batch).unwrap();
         };
         write(0, (0..40u8).map(|i| (key(i), Some(vec![i; 40]))).collect());
         // Version 1 rewrites the even keys, removes key 7 and adds key 200.
-        let mut changes: Vec<_> = (0..40u8).step_by(2).map(|i| (key(i), Some(vec![i ^ 0xff; 40]))).collect();
+        let mut changes: Vec<_> = (0..40u8)
+            .step_by(2)
+            .map(|i| (key(i), Some(vec![i ^ 0xff; 40])))
+            .collect();
         changes.push((key(7), None));
         changes.push((key(200), Some(vec![9; 40])));
         write(1, changes);
@@ -2592,34 +3090,92 @@ mod tests {
             let mut after = None;
             loop {
                 let (leaves, more) = forest
-                    .serve_leaves(&shard, Phase::VertexAdds, version, first, last, after.as_ref(), page, usize::MAX)
+                    .serve_leaves(
+                        &shard,
+                        Phase::VertexAdds,
+                        version,
+                        first,
+                        last,
+                        after.as_ref(),
+                        page,
+                        usize::MAX,
+                    )
                     .unwrap();
                 assert!(leaves.len() <= page);
-                after = leaves.last().map(|(k, _): &(KeyHash, OwnedValue)| k.0).or(after);
+                after = leaves
+                    .last()
+                    .map(|(k, _): &(KeyHash, OwnedValue)| k.0)
+                    .or(after);
                 out.extend(leaves);
-                if !more { return out; }
+                if !more {
+                    return out;
+                }
             }
         };
         let everything = ([0u8; 32], [0xffu8; 32]);
         let at0 = all(0, &everything.0, &everything.1, 7);
-        assert_eq!(at0, (0..40u8).map(|i| (key(i), vec![i; 40])).collect::<Vec<_>>());
+        assert_eq!(
+            at0,
+            (0..40u8).map(|i| (key(i), vec![i; 40])).collect::<Vec<_>>()
+        );
         let at1 = all(1, &everything.0, &everything.1, 3);
-        let mut expected: Vec<_> = (0..40u8).filter(|i| *i != 7)
-            .map(|i| (key(i), if i % 2 == 0 { vec![i ^ 0xff; 40] } else { vec![i; 40] }))
+        let mut expected: Vec<_> = (0..40u8)
+            .filter(|i| *i != 7)
+            .map(|i| {
+                (
+                    key(i),
+                    if i % 2 == 0 {
+                        vec![i ^ 0xff; 40]
+                    } else {
+                        vec![i; 40]
+                    },
+                )
+            })
             .collect();
         expected.push((key(200), vec![9; 40]));
-        assert_eq!(at1, expected, "newest value at or below the version; removed keys omitted");
+        assert_eq!(
+            at1, expected,
+            "newest value at or below the version; removed keys omitted"
+        );
         // Every leaf read at version 1 is the tree's own value there.
         for (k, v) in &at1 {
             assert_eq!(store.get_value_option(1, *k).unwrap().as_ref(), Some(v));
         }
         // A key range bounds the listing at both ends.
         let (first, last) = (key(10).0, key(12).0);
-        assert_eq!(all(1, &first, &last, 100).iter().map(|(k, _)| k.0[0]).collect::<Vec<_>>(), vec![10, 11, 12]);
+        assert_eq!(
+            all(1, &first, &last, 100)
+                .iter()
+                .map(|(k, _)| k.0[0])
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
         // A byte budget stops a page early, but never before its first leaf.
-        let (leaves, more) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 100).unwrap();
+        let (leaves, more) = forest
+            .serve_leaves(
+                &shard,
+                Phase::VertexAdds,
+                1,
+                &everything.0,
+                &everything.1,
+                None,
+                100,
+                100,
+            )
+            .unwrap();
         assert_eq!((leaves.len(), more), (2, true));
-        let (leaves, _) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 1).unwrap();
+        let (leaves, _) = forest
+            .serve_leaves(
+                &shard,
+                Phase::VertexAdds,
+                1,
+                &everything.0,
+                &everything.1,
+                None,
+                100,
+                1,
+            )
+            .unwrap();
         assert_eq!(leaves.len(), 1);
     }
 }

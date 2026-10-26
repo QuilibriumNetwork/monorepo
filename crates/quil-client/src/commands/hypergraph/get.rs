@@ -44,7 +44,11 @@ async fn vertex(hc: &HypergraphCtx, address: &str) -> anyhow::Result<()> {
     );
     println!("Entries ({}):", resp.entries.len());
     for (i, entry) in resp.entries.iter().enumerate() {
-        println!("  [{i}] {} = {}", hex::encode(&entry.key), hex::encode(&entry.value));
+        println!(
+            "  [{i}] {} = {}",
+            hex::encode(&entry.key),
+            hex::encode(&entry.value)
+        );
     }
     Ok(())
 }
@@ -70,7 +74,11 @@ async fn hyperedge(hc: &HypergraphCtx, address: &str) -> anyhow::Result<()> {
     );
     println!("Entries ({}):", resp.entries.len());
     for (i, entry) in resp.entries.iter().enumerate() {
-        println!("  [{i}] {} = {}", hex::encode(&entry.key), hex::encode(&entry.value));
+        println!(
+            "  [{i}] {} = {}",
+            hex::encode(&entry.key),
+            hex::encode(&entry.value)
+        );
     }
     Ok(())
 }

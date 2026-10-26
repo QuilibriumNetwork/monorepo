@@ -105,8 +105,7 @@ pub async fn run(global: GlobalArgs, args: &MessageArgs) -> anyhow::Result<()> {
     }
 
     let mc = MessageCtx::load(global, &args.rpc)?;
-    let mut client =
-        rpc::connect_dispatch_mtls(&mc.dispatch_addr, mc.falcon_key.clone()).await?;
+    let mut client = rpc::connect_dispatch_mtls(&mc.dispatch_addr, mc.falcon_key.clone()).await?;
 
     match &args.command {
         MessageCommand::Retrieve {
@@ -244,6 +243,10 @@ async fn send(
         .await
         .map_err(|e| anyhow::anyhow!("PutInboxMessage: {e}"))?;
 
-    println!("Sent {} bytes to {}", msg.len(), hex::encode(&recipient_addr));
+    println!(
+        "Sent {} bytes to {}",
+        msg.len(),
+        hex::encode(&recipient_addr)
+    );
     Ok(())
 }

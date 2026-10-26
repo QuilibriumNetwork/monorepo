@@ -271,13 +271,25 @@ fn receipt_less_certified_head_is_authenticated_by_its_certified_child() {
     assert!(rig.executor.finalize_frame(&old, &rig.verifier).is_err());
     let mut substituted = next.clone();
     substituted.header.as_mut().unwrap().prover_tree_commitment[0] ^= 1;
-    certify_parent(&mut substituted, &rig.signer, 0, old.header.as_ref().unwrap().rank);
-    assert!(rig.executor.finalize_frame(&substituted, &rig.verifier).is_err());
+    certify_parent(
+        &mut substituted,
+        &rig.signer,
+        0,
+        old.header.as_ref().unwrap().rank,
+    );
+    assert!(rig
+        .executor
+        .finalize_frame(&substituted, &rig.verifier)
+        .is_err());
     assert_eq!(rig.db.inner().latest_sequence_number(), before);
     assert_eq!(rig.source.last_materialized_frame(), 1);
     // The certified child whose parent roots equal the local state publishes
     // and leaves a receipt.
-    assert!(rig.executor.finalize_frame(&next, &rig.verifier).unwrap().is_some());
+    assert!(rig
+        .executor
+        .finalize_frame(&next, &rig.verifier)
+        .unwrap()
+        .is_some());
     assert_eq!(rig.source.last_materialized_frame(), 2);
     assert!(rig
         .db
@@ -285,7 +297,11 @@ fn receipt_less_certified_head_is_authenticated_by_its_certified_child() {
         .get(quil_store::encoding::global_execution_checkpoint_key())
         .unwrap()
         .is_some());
-    assert!(rig.executor.finalize_frame(&next, &rig.verifier).unwrap().is_none());
+    assert!(rig
+        .executor
+        .finalize_frame(&next, &rig.verifier)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -380,12 +396,20 @@ fn consensus_candidate_writes_during_execution_do_not_abandon_publication() {
     );
     // A general write in the same window still abandons the attempt.
     let mut later = state_frame(&rig.source, 2, 73, id(&input));
-    certify_parent(&mut later, &rig.signer, 0, input.header.as_ref().unwrap().rank);
+    certify_parent(
+        &mut later,
+        &rig.signer,
+        0,
+        input.header.as_ref().unwrap().rank,
+    );
     let before = rig.db.inner().latest_sequence_number();
     assert!(rig
         .source
         .materialize_atomically(&later, limits(), |_| {
-            rig.db.inner().put(b"external-maintenance", b"changed").unwrap();
+            rig.db
+                .inner()
+                .put(b"external-maintenance", b"changed")
+                .unwrap();
             Ok(true)
         })
         .is_err());
@@ -401,10 +425,19 @@ fn application_data_ingested_between_global_frames_keeps_the_executed_base() {
     let rig = Rig::new();
     let mut input = rig.deploy();
     certify(&mut input, &rig.signer, 0);
-    assert!(rig.executor.finalize_frame(&input, &rig.verifier).unwrap().is_some());
+    assert!(rig
+        .executor
+        .finalize_frame(&input, &rig.verifier)
+        .unwrap()
+        .is_some());
     // The next leader declared its state before the ingest reached it.
     let mut next = state_frame(&rig.source, 2, 73, id(&input));
-    certify_parent(&mut next, &rig.signer, 0, input.header.as_ref().unwrap().rank);
+    certify_parent(
+        &mut next,
+        &rig.signer,
+        0,
+        input.header.as_ref().unwrap().rank,
+    );
     let buckets = rig.source.hypergraph.global_commitments_checked().unwrap();
     let size = rig.source.hypergraph.total_size();
     let location = quil_hypergraph::addressing::Location {
@@ -425,7 +458,11 @@ fn application_data_ingested_between_global_frames_keeps_the_executed_base() {
         .executor
         .prepare(rig.context(&input), 1, &rig.blocks, &rig.verifier, false)
         .is_ok());
-    assert!(rig.executor.finalize_frame(&next, &rig.verifier).unwrap().is_some());
+    assert!(rig
+        .executor
+        .finalize_frame(&next, &rig.verifier)
+        .unwrap()
+        .is_some());
     assert_eq!(rig.source.last_materialized_frame(), 2);
 }
 
@@ -437,25 +474,42 @@ fn a_prover_tree_reconciled_after_divergence_keeps_the_certified_base_usable() {
     let rig = Rig::new();
     let mut input = rig.deploy();
     certify(&mut input, &rig.signer, 0);
-    assert!(rig.executor.finalize_frame(&input, &rig.verifier).unwrap().is_some());
+    assert!(rig
+        .executor
+        .finalize_frame(&input, &rig.verifier)
+        .unwrap()
+        .is_some());
     let key = quil_crypto::FalconSigner::generate().public_key().to_vec();
-    crate::genesis::seed_active_prover_on_filter(&rig.source.hypergraph, &key, 1000, 2, &[]).unwrap();
+    crate::genesis::seed_active_prover_on_filter(&rig.source.hypergraph, &key, 1000, 2, &[])
+        .unwrap();
     // As the reconcile does once converged.
     rig.source.record_current_prover_root();
     // The network's next frame declares the reconciled prover tree.
     let mut next = state_frame(&rig.source, 2, 73, id(&input));
-    certify_parent(&mut next, &rig.signer, 0, input.header.as_ref().unwrap().rank);
+    certify_parent(
+        &mut next,
+        &rig.signer,
+        0,
+        input.header.as_ref().unwrap().rank,
+    );
     assert!(rig
         .executor
         .prepare(rig.context(&input), 1, &rig.blocks, &rig.verifier, false)
         .is_ok());
-    assert!(rig.executor.finalize_frame(&next, &rig.verifier).unwrap().is_some());
+    assert!(rig
+        .executor
+        .finalize_frame(&next, &rig.verifier)
+        .unwrap()
+        .is_some());
     assert_eq!(rig.source.last_materialized_frame(), 2);
 }
 
 fn store_canonical(fixture: &Fixture, frame: &GlobalFrame) {
     let txn = fixture.clock.new_transaction(false).unwrap();
-    fixture.clock.put_global_clock_frame(frame, txn.as_ref()).unwrap();
+    fixture
+        .clock
+        .put_global_clock_frame(frame, txn.as_ref())
+        .unwrap();
     txn.commit().unwrap();
 }
 
@@ -476,40 +530,74 @@ fn a_canonical_frame_executes_atomically_and_then_replays() {
         .current_forest_phase_root(&[0xff; 32], 0)
         .unwrap();
     let input = frame(1, root);
-    assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&input, limits()),
-        CanonicalAttempt::Unavailable(_)
-    ), "a frame that is not canonical is not executed");
+    assert!(
+        matches!(
+            fixture
+                .source
+                .materialize_canonical_atomically(&input, limits()),
+            CanonicalAttempt::Unavailable(_)
+        ),
+        "a frame that is not canonical is not executed"
+    );
     store_canonical(&fixture, &input);
     // The canonical clock is ahead of execution, as after a sync.
     store_canonical(&fixture, &frame(2, [7; 32]));
     let mut other = input.clone();
     other.header.as_mut().unwrap().output = vec![9; 516];
-    assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&other, limits()),
-        CanonicalAttempt::Unavailable(_)
-    ), "another body at the canonical height is refused");
-    assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&frame(2, [7; 32]), limits()),
-        CanonicalAttempt::Unavailable(_)
-    ), "only the next height executes");
-    match fixture.source.materialize_canonical_atomically(&input, limits()) {
+    assert!(
+        matches!(
+            fixture
+                .source
+                .materialize_canonical_atomically(&other, limits()),
+            CanonicalAttempt::Unavailable(_)
+        ),
+        "another body at the canonical height is refused"
+    );
+    assert!(
+        matches!(
+            fixture
+                .source
+                .materialize_canonical_atomically(&frame(2, [7; 32]), limits()),
+            CanonicalAttempt::Unavailable(_)
+        ),
+        "only the next height executes"
+    );
+    match fixture
+        .source
+        .materialize_canonical_atomically(&input, limits())
+    {
         CanonicalAttempt::Published(result) => assert_eq!(result.skipped, 0),
         other => panic!("expected publication, got {other:?}"),
     }
     assert_eq!(fixture.source.last_materialized_frame(), 1);
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
     assert_eq!(fixture.current.materialized(), 1);
-    assert!(execution_record(&fixture, quil_store::encoding::global_execution_checkpoint_key()).is_some());
-    assert!(execution_record(&fixture, quil_store::encoding::global_execution_pending_key()).is_none());
+    assert!(execution_record(
+        &fixture,
+        quil_store::encoding::global_execution_checkpoint_key()
+    )
+    .is_some());
+    assert!(execution_record(
+        &fixture,
+        quil_store::encoding::global_execution_pending_key()
+    )
+    .is_none());
     assert_eq!(fixture.clock.get_global_clock_frame(1).unwrap(), input);
     assert_eq!(
-        fixture.clock.get_latest_global_clock_frame().unwrap().header.unwrap().frame_number,
+        fixture
+            .clock
+            .get_latest_global_clock_frame()
+            .unwrap()
+            .header
+            .unwrap()
+            .frame_number,
         2,
         "the canonical clock is not rewritten"
     );
     assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&input, limits()),
+        fixture
+            .source
+            .materialize_canonical_atomically(&input, limits()),
         CanonicalAttempt::Replayed
     ));
 }
@@ -525,9 +613,17 @@ fn a_canonical_frame_on_another_parent_root_is_refused_without_a_capture() {
     store_canonical(&fixture, &input);
     // A capture would wait out the held frame lock and report it instead.
     let held = fixture.source.frame_execution.lock().unwrap();
-    match fixture.source.materialize_canonical_atomically(&input, limits()) {
+    match fixture
+        .source
+        .materialize_canonical_atomically(&input, limits())
+    {
         CanonicalAttempt::Unavailable(error) => {
-            assert!(error.to_string().contains("tentative parent prover root mismatch"), "{error}")
+            assert!(
+                error
+                    .to_string()
+                    .contains("tentative parent prover root mismatch"),
+                "{error}"
+            )
         }
         other => panic!("expected the recorded root to refuse the frame, got {other:?}"),
     }
@@ -552,16 +648,28 @@ fn a_failed_canonical_attempt_leaves_nothing_to_recover() {
     {
         let _held = fixture.clock.prepare_execution_publication().unwrap();
         assert!(matches!(
-            fixture.source.materialize_canonical_atomically(&input, limits()),
+            fixture
+                .source
+                .materialize_canonical_atomically(&input, limits()),
             CanonicalAttempt::Unavailable(_)
         ));
     }
     assert_eq!(fixture.source.last_materialized_frame(), 0);
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 0);
-    assert!(execution_record(&fixture, quil_store::encoding::global_execution_pending_key()).is_none());
-    assert!(execution_record(&fixture, quil_store::encoding::global_execution_checkpoint_key()).is_none());
+    assert!(execution_record(
+        &fixture,
+        quil_store::encoding::global_execution_pending_key()
+    )
+    .is_none());
+    assert!(execution_record(
+        &fixture,
+        quil_store::encoding::global_execution_checkpoint_key()
+    )
+    .is_none());
     assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&input, limits()),
+        fixture
+            .source
+            .materialize_canonical_atomically(&input, limits()),
         CanonicalAttempt::Published(_)
     ));
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
@@ -582,17 +690,30 @@ fn a_finalized_frame_is_not_refused_for_what_it_reads() {
     store_canonical(&fixture, &input);
     let mut capped = limits();
     capped.execution.state.overlay.max_read_bytes = 64;
-    match fixture.source.materialize_canonical_atomically(&input, capped) {
+    match fixture
+        .source
+        .materialize_canonical_atomically(&input, capped)
+    {
         CanonicalAttempt::Unavailable(error) => {
-            assert!(error.to_string().contains("overlay read byte limit: 64 bytes allowed"), "{error}")
+            assert!(
+                error
+                    .to_string()
+                    .contains("overlay read byte limit: 64 bytes allowed"),
+                "{error}"
+            )
         }
         other => panic!("expected the read cap to refuse the frame, got {other:?}"),
     }
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 0);
     let lifted = capped.for_finalized_frame();
-    assert_eq!(lifted.execution.state.overlay.max_delta_bytes, capped.execution.state.overlay.max_delta_bytes);
+    assert_eq!(
+        lifted.execution.state.overlay.max_delta_bytes,
+        capped.execution.state.overlay.max_delta_bytes
+    );
     assert!(matches!(
-        fixture.source.materialize_canonical_atomically(&input, lifted),
+        fixture
+            .source
+            .materialize_canonical_atomically(&input, lifted),
         CanonicalAttempt::Published(_)
     ));
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
@@ -622,9 +743,18 @@ fn a_canonical_attempt_waits_out_a_brief_lock_holder() {
     });
     held_rx.recv().unwrap();
     let started = std::time::Instant::now();
-    let attempt = fixture.source.materialize_canonical_atomically(&input, limits());
-    assert!(matches!(attempt, CanonicalAttempt::Published(_)), "{attempt:?} after {:?}", started.elapsed());
-    assert!(started.elapsed() >= std::time::Duration::from_millis(100), "the lock was contended");
+    let attempt = fixture
+        .source
+        .materialize_canonical_atomically(&input, limits());
+    assert!(
+        matches!(attempt, CanonicalAttempt::Published(_)),
+        "{attempt:?} after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(100),
+        "the lock was contended"
+    );
     holder.join().unwrap();
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
 }

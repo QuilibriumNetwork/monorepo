@@ -100,7 +100,9 @@ pub(crate) async fn init(
     // GLOBAL_CONSENSUS/GLOBAL_PROVER + the bulk-shard subscribes remain archive-
     // only — their bandwidth rationale (vote firehose, all-shard coverage) still
     // holds and non-archives don't need them.
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec()).await;
+    p2p_handle
+        .subscribe(quil_engine::bitmasks::GLOBAL_FRAME.to_vec())
+        .await;
     // Mesh-level gate on GLOBAL_FRAME: shed wrong-type garbage and rate-limit
     // per peer BEFORE delivery/forward, so a peer flooding the topic (the CPU-DoS
     // vector — each frame otherwise forces a downstream VDF verify) is penalised
@@ -113,8 +115,12 @@ pub(crate) async fn init(
         )
         .await;
     if archive_mode {
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec()).await;
-        p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec()).await;
+        p2p_handle
+            .subscribe(quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec())
+            .await;
+        p2p_handle
+            .subscribe(quil_engine::bitmasks::GLOBAL_PROVER.to_vec())
+            .await;
         // Bulk shard subscription — an all-ones bitmask bit-COVERS every
         // specific per-shard bloom, so coverage classification meshes the
         // archive with the provers. The four per-shard channels are different
@@ -128,18 +134,20 @@ pub(crate) async fn init(
             p2p_handle.subscribe(vec![0xFFu8; len]).await;
         }
     }
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
+    p2p_handle
+        .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
+        .await;
     // Drop stale PeerInfo/KeyRegistry at the MESH (before forward), not just at
     // the app router. Both ride the GLOBAL_PEER_INFO bitmask; without this the
     // composite broker re-gossips millions of already-stale PeerInfo/KeyRegistry
     // per hour (`*_ts_too_old`), self-amplifying the flood and bloating the
     // gossip dedup caches. The app router still fully validates the fresh ones.
     p2p_handle
-        .register_peer_info_staleness_validator(
-            quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec(),
-        )
+        .register_peer_info_staleness_validator(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
         .await;
-    p2p_handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
+    p2p_handle
+        .subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
+        .await;
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
     } else {

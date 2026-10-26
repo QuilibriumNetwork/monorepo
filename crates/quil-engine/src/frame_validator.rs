@@ -62,21 +62,41 @@ pub(crate) fn validate_archive_replay_chain(
     certified: impl FnOnce(&AppShardFrame) -> Result<bool>,
     mut linked: impl FnMut(&AppShardFrame) -> Result<bool>,
 ) -> Result<()> {
-    if descendants.is_empty() || descendants.len() > MAX_REPLAY_DESCENDANTS
-        || descendants.iter().fold(frame.encoded_len(), |bytes, child| bytes.saturating_add(child.encoded_len()))
-            > MAX_REPLAY_CHAIN_BYTES {
-        return Err(QuilError::InvalidArgument("invalid archive replay chain bounds".into()));
+    if descendants.is_empty()
+        || descendants.len() > MAX_REPLAY_DESCENDANTS
+        || descendants
+            .iter()
+            .fold(frame.encoded_len(), |bytes, child| {
+                bytes.saturating_add(child.encoded_len())
+            })
+            > MAX_REPLAY_CHAIN_BYTES
+    {
+        return Err(QuilError::InvalidArgument(
+            "invalid archive replay chain bounds".into(),
+        ));
     }
     let terminal = descendants.last().unwrap();
     if !certified(terminal)? {
-        return Err(QuilError::InvalidSignature("archive replay descendant certificate rejected".into()));
+        return Err(QuilError::InvalidSignature(
+            "archive replay descendant certificate rejected".into(),
+        ));
     }
     let mut child = terminal;
-    for parent in descendants[..descendants.len() - 1].iter().rev().chain(std::iter::once(frame)) {
-        if !parent.header.as_ref().zip(child.header.as_ref())
+    for parent in descendants[..descendants.len() - 1]
+        .iter()
+        .rev()
+        .chain(std::iter::once(frame))
+    {
+        if !parent
+            .header
+            .as_ref()
+            .zip(child.header.as_ref())
             .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child))
-            || !linked(parent)? {
-            return Err(QuilError::InvalidSignature("archive replay ancestor chain rejected".into()));
+            || !linked(parent)?
+        {
+            return Err(QuilError::InvalidSignature(
+                "archive replay ancestor chain rejected".into(),
+            ));
         }
         child = parent;
     }
@@ -95,17 +115,25 @@ pub(crate) async fn prepare_archive_replay_anchors(
     frame: &AppShardFrame,
     descendants: &[AppShardFrame],
 ) -> Result<()> {
-    let Some((mut child, linked)) = descendants.split_last() else { return Ok(()) };
+    let Some((mut child, linked)) = descendants.split_last() else {
+        return Ok(());
+    };
     if descendants.len() > MAX_REPLAY_DESCENDANTS {
         return Ok(());
     }
     for parent in linked.iter().rev().chain(std::iter::once(frame)) {
-        if !parent.header.as_ref().zip(child.header.as_ref())
-            .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child)) {
+        if !parent
+            .header
+            .as_ref()
+            .zip(child.header.as_ref())
+            .is_some_and(|(parent, child)| app_frame_links_to_child(parent, child))
+        {
             break;
         }
-        if validator.missing_global_anchor(parent)
-            .is_some_and(|(wanted, latest)| latest.is_some_and(|latest| wanted < latest)) {
+        if validator
+            .missing_global_anchor(parent)
+            .is_some_and(|(wanted, latest)| latest.is_some_and(|latest| wanted < latest))
+        {
             validator.prepare_global_anchor(parent).await?;
         }
         child = parent;
@@ -131,7 +159,13 @@ pub fn global_frame_body_matches_requests_root(
     // judges the same body.
     let canonical: Vec<Vec<u8>> = requests
         .iter()
-        .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(b, Some(header.frame_number)).ok())
+        .filter_map(|b| {
+            crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                b,
+                Some(header.frame_number),
+            )
+            .ok()
+        })
         .collect();
     if canonical.len() != requests.len() {
         return false;
@@ -151,7 +185,8 @@ const NEWER_COMMITTEE_WARN_SECS: u64 = 600;
 /// network moved to a successor committee this build does not know. Read
 /// before any verification, so it is a hint, never an acceptance.
 fn newer_certificate_epoch(expected_epoch: u64, cert: &[u8]) -> Option<u64> {
-    quil_cw_consensus::app_cert::unverified_finalization_epoch(cert).filter(|epoch| *epoch > expected_epoch)
+    quil_cw_consensus::app_cert::unverified_finalization_epoch(cert)
+        .filter(|epoch| *epoch > expected_epoch)
 }
 
 /// GLOBAL frames refused while their certificate claims a newer committee,
@@ -164,7 +199,10 @@ struct NewerCommitteeFrames {
 
 impl NewerCommitteeFrames {
     const fn new() -> Self {
-        Self { last_warn_secs: std::sync::atomic::AtomicU64::new(0), frames: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            last_warn_secs: std::sync::atomic::AtomicU64::new(0),
+            frames: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Count one refused frame; when the warning is due at `now_secs` (first
@@ -177,7 +215,9 @@ impl NewerCommitteeFrames {
         if last != 0 && now_secs < last.saturating_add(NEWER_COMMITTEE_WARN_SECS) {
             return None;
         }
-        self.last_warn_secs.compare_exchange(last, now_secs.max(1), Relaxed, Relaxed).ok()?;
+        self.last_warn_secs
+            .compare_exchange(last, now_secs.max(1), Relaxed, Relaxed)
+            .ok()?;
         Some(self.frames.swap(0, Relaxed))
     }
 }
@@ -189,7 +229,9 @@ static NEWER_COMMITTEE_FRAMES: NewerCommitteeFrames = NewerCommitteeFrames::new(
 /// follow GLOBAL until it is upgraded to a release that knows the successor
 /// committee. The refusal itself is unchanged.
 fn warn_if_newer_committee(frame: u64, expected_epoch: u64, cert: &[u8]) {
-    let Some(certificate_epoch) = newer_certificate_epoch(expected_epoch, cert) else { return };
+    let Some(certificate_epoch) = newer_certificate_epoch(expected_epoch, cert) else {
+        return;
+    };
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
@@ -208,11 +250,19 @@ fn warn_if_newer_committee(frame: u64, expected_epoch: u64, cert: &[u8]) {
 
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
-        Self { frame_prover, bls_constructor: None, global_committee: Vec::new(), successor_committee: Vec::new() }
+        Self {
+            frame_prover,
+            bls_constructor: None,
+            global_committee: Vec::new(),
+            successor_committee: Vec::new(),
+        }
     }
 
     /// Create with BLS signature verification enabled.
-    pub fn with_bls(frame_prover: Arc<dyn FrameProver>, bls_constructor: Arc<dyn BlsConstructor>) -> Self {
+    pub fn with_bls(
+        frame_prover: Arc<dyn FrameProver>,
+        bls_constructor: Arc<dyn BlsConstructor>,
+    ) -> Self {
         Self {
             frame_prover,
             bls_constructor: Some(bls_constructor),
@@ -380,14 +430,21 @@ impl GlobalFrameVerifier {
                     // Named here, on the authenticated archive path with the
                     // VDF already checked, not on gossip: anyone can gossip a
                     // certificate that claims a later epoch.
-                    warn_if_newer_committee(header.frame_number, self.committee_for_frame(header.frame_number).0, cert);
+                    warn_if_newer_committee(
+                        header.frame_number,
+                        self.committee_for_frame(header.frame_number).0,
+                        cert,
+                    );
                     warn!(
                         frame = header.frame_number,
                         "global CW finalization cert verification failed",
                     );
                     return Ok(false);
                 }
-                debug!(frame = header.frame_number, "global CW finalization cert verified");
+                debug!(
+                    frame = header.frame_number,
+                    "global CW finalization cert verified"
+                );
                 return Ok(true);
             }
         }
@@ -395,7 +452,8 @@ impl GlobalFrameVerifier {
         // Verify BLS aggregate signature if verifier is configured
         if let Some(ref bls) = self.bls_constructor {
             if let Some(ref agg_sig) = header.public_key_signature_bls48581 {
-                let pubkey_bytes = agg_sig.public_key
+                let pubkey_bytes = agg_sig
+                    .public_key
                     .as_ref()
                     .map(|pk| pk.key_value.clone())
                     .unwrap_or_default();
@@ -408,12 +466,17 @@ impl GlobalFrameVerifier {
                     // `String`, which would require valid UTF-8 — the
                     // raw poseidon bytes aren't, so we build the
                     // message manually here.
-                    let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                        .unwrap_or_default();
+                    let selector =
+                        quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap_or_default();
                     let mut vote_msg = Vec::with_capacity(selector.len() + 8);
                     vote_msg.extend_from_slice(&selector);
                     vote_msg.extend_from_slice(&header.rank.to_be_bytes());
-                    if bls.verify_signature_raw(&pubkey_bytes, &agg_sig.signature, &vote_msg, b"global") {
+                    if bls.verify_signature_raw(
+                        &pubkey_bytes,
+                        &agg_sig.signature,
+                        &vote_msg,
+                        b"global",
+                    ) {
                         debug!(frame = header.frame_number, "BLS signature valid");
                     } else {
                         warn!(frame = header.frame_number, "BLS signature INVALID");
@@ -465,11 +528,7 @@ impl FramePipeline {
     pub fn process_raw_frame(&self, data: &[u8]) -> Result<u64> {
         // 1. Decode
         let frame = GlobalFrameVerifier::decode_frame(data)?;
-        let frame_number = frame
-            .header
-            .as_ref()
-            .map(|h| h.frame_number)
-            .unwrap_or(0);
+        let frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
 
         // 2. Validate header fields
         if let Some(header) = &frame.header {
@@ -621,7 +680,9 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
         // Go uses `proverRegistry.GetActiveProvers(nil)` for the
         // global filter case, which for our Rust impl means an
         // empty byte slice.
-        let active = self.prover_registry.get_active_provers(&[], header.frame_number)?;
+        let active = self
+            .prover_registry
+            .get_active_provers(&[], header.frame_number)?;
         let mut active_public_keys: Vec<&[u8]> = Vec::new();
         let mut throwaway: Vec<&[u8]> = Vec::new();
         for (i, prover) in active.iter().enumerate() {
@@ -646,9 +707,7 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
                 actual = %hex::encode(&aggregate.public_key),
                 "could not verify aggregated keys"
             );
-            return Err(QuilError::Crypto(
-                "could not verify aggregated keys".into(),
-            ));
+            return Err(QuilError::Crypto("could not verify aggregated keys".into()));
         }
 
         // 3. BLS signature verification. The aggregate-key check
@@ -701,7 +760,11 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
 
 /// The latest GLOBAL frame number `clock` holds.
 fn latest_global_frame_number(clock: &dyn quil_types::store::ClockStore) -> Option<u64> {
-    clock.get_latest_global_clock_frame().ok()?.header.map(|header| header.frame_number)
+    clock
+        .get_latest_global_clock_frame()
+        .ok()?
+        .header
+        .map(|header| header.frame_number)
 }
 
 /// Validates an `AppShardFrame` by:
@@ -765,8 +828,12 @@ impl BlsAppFrameValidator {
     /// its anchor, so `validate` can try them. Session certificates, frames
     /// the live committee verifies, and nodes without a source are untouched.
     pub async fn prepare_historical_committee(&self, frame: &AppShardFrame) -> Result<()> {
-        let Some(source) = self.historical_committee_source.as_ref() else { return Ok(()) };
-        let Some(header) = frame.header.as_ref() else { return Ok(()) };
+        let Some(source) = self.historical_committee_source.as_ref() else {
+            return Ok(());
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return Ok(());
+        };
         let Some(cert) = header
             .public_key_signature_bls48581
             .as_ref()
@@ -774,7 +841,9 @@ impl BlsAppFrameValidator {
         else {
             return Ok(());
         };
-        if header.frame_number == 0 || quil_cw_consensus::app_cert::unverified_finalization_epoch(cert) != Some(0) {
+        if header.frame_number == 0
+            || quil_cw_consensus::app_cert::unverified_finalization_epoch(cert) != Some(0)
+        {
             return Ok(());
         }
         // A certificate no committee could decide (a generation-0 wrapper
@@ -783,19 +852,33 @@ impl BlsAppFrameValidator {
             return Ok(());
         }
         let anchor = legacy_committee_frame(header);
-        if self.historical_committees.get(&header.address, anchor).is_some() {
+        if self
+            .historical_committees
+            .get(&header.address, anchor)
+            .is_some()
+        {
             return Ok(());
         }
         // A reconstruction of this anchor failed a short while ago: in-actor
         // callers (sync anchors, engine start) get that answer at once.
-        if let Some(ago) = self.historical_committees.failed_ago(&header.address, anchor) {
+        if let Some(ago) = self
+            .historical_committees
+            .failed_ago(&header.address, anchor)
+        {
             return Err(QuilError::ExecutionUnavailable(format!(
                 "the historical committee of GLOBAL frame {anchor} could not be rebuilt {}s ago; tried again after {}s",
                 ago.as_secs(), crate::historical_committee::FAILED_KEPT_FOR.as_secs())));
         }
         let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
         let live = self.live_legacy_committee(header)?;
-        if quil_cw_consensus::app_cert::verify_finalization_details(cert, &live, &legacy_namespace(header), digest).is_some() {
+        if quil_cw_consensus::app_cert::verify_finalization_details(
+            cert,
+            &live,
+            &legacy_namespace(header),
+            digest,
+        )
+        .is_some()
+        {
             return Ok(());
         }
         let _rebuilding = match self.historical_committees.begin(&header.address, anchor) {
@@ -803,38 +886,58 @@ impl BlsAppFrameValidator {
             // Another frame or copy is rebuilding them: wait on it, as on a
             // reconstruction of one's own, and take what it found.
             crate::historical_committee::Begun::Wait(mut done) => {
-                let _ = tokio::time::timeout(crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT, done.changed()).await;
+                let _ = tokio::time::timeout(
+                    crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
+                    done.changed(),
+                )
+                .await;
                 return match self.historical_committees.get(&header.address, anchor) {
                     Some(_) => Ok(()),
                     None => Err(QuilError::ExecutionUnavailable(format!(
-                        "the historical committee of GLOBAL frame {anchor} could not be rebuilt"))),
+                        "the historical committee of GLOBAL frame {anchor} could not be rebuilt"
+                    ))),
                 };
             }
         };
         // Rebuilt by another just before this one began.
-        if self.historical_committees.get(&header.address, anchor).is_some() {
+        if self
+            .historical_committees
+            .get(&header.address, anchor)
+            .is_some()
+        {
             return Ok(());
         }
         // At most a few reconstructions node-wide at a time, the wait for one
         // within the reconstruction's own time.
-        let rebuilt = tokio::time::timeout(crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT, async {
-            let _permit = crate::historical_committee::REBUILDS.acquire().await
-                .map_err(|_| QuilError::Internal("historical committee rebuilds closed".into()))?;
-            source(header.address.clone(), anchor).await
-        })
+        let rebuilt = tokio::time::timeout(
+            crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
+            async {
+                let _permit = crate::historical_committee::REBUILDS
+                    .acquire()
+                    .await
+                    .map_err(|_| {
+                        QuilError::Internal("historical committee rebuilds closed".into())
+                    })?;
+                source(header.address.clone(), anchor).await
+            },
+        )
         .await
-        .map_err(|_| QuilError::ExecutionUnavailable("historical committee reconstruction timed out".into()))
+        .map_err(|_| {
+            QuilError::ExecutionUnavailable("historical committee reconstruction timed out".into())
+        })
         .and_then(|candidates| candidates)
         .and_then(|candidates| match candidates.is_empty() {
             // Nothing found is no answer, kept as a failure.
             true => Err(QuilError::ExecutionUnavailable(format!(
-                "no historical committee of GLOBAL frame {anchor} could be rebuilt"))),
+                "no historical committee of GLOBAL frame {anchor} could be rebuilt"
+            ))),
             false => Ok(candidates),
         });
         let candidates = match rebuilt {
             Ok(candidates) => candidates,
             Err(error) => {
-                self.historical_committees.failed(header.address.clone(), anchor);
+                self.historical_committees
+                    .failed(header.address.clone(), anchor);
                 return Err(error);
             }
         };
@@ -845,7 +948,8 @@ impl BlsAppFrameValidator {
             candidates = candidates.len(),
             "reconstructed historical committees for a legacy certificate",
         );
-        self.historical_committees.put(header.address.clone(), anchor, candidates);
+        self.historical_committees
+            .put(header.address.clone(), anchor, candidates);
         Ok(())
     }
 
@@ -857,7 +961,10 @@ impl BlsAppFrameValidator {
     /// stands whatever committee could be had: a generation-0 wrapper on a
     /// managed shard ("generation has no authorization"), or one past the
     /// flag day.
-    pub fn legacy_committee_applies(&self, header: &quil_types::proto::global::FrameHeader) -> bool {
+    pub fn legacy_committee_applies(
+        &self,
+        header: &quil_types::proto::global::FrameHeader,
+    ) -> bool {
         let Some(cert) = header
             .public_key_signature_bls48581
             .as_ref()
@@ -879,7 +986,9 @@ impl BlsAppFrameValidator {
             None => None,
         };
         let Some(view) = view else { return true };
-        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return false;
+        };
         use quil_execution::global_intrinsic::handoff::frames;
         let claim = frames::FrameClaim {
             filter: &header.address,
@@ -895,15 +1004,27 @@ impl BlsAppFrameValidator {
     /// on (`frames::refuse_legacy_after_flag_day`): neither a frame anchored
     /// at or after activation nor any legacy frame once this node's GLOBAL
     /// chain has reached activation, when it discards its legacy history.
-    fn refuse_legacy_after_flag_day(&self, header: &quil_types::proto::global::FrameHeader) -> Result<()> {
-        let local = self.clock_store.as_ref().and_then(|clock| latest_global_frame_number(clock.as_ref())).unwrap_or(0);
+    fn refuse_legacy_after_flag_day(
+        &self,
+        header: &quil_types::proto::global::FrameHeader,
+    ) -> Result<()> {
+        let local = self
+            .clock_store
+            .as_ref()
+            .and_then(|clock| latest_global_frame_number(clock.as_ref()))
+            .unwrap_or(0);
         quil_execution::global_intrinsic::handoff::frames::refuse_legacy_after_flag_day(
             header.global_frame_number.max(local),
         )
     }
 
-    fn live_legacy_committee(&self, header: &quil_types::proto::global::FrameHeader) -> Result<Vec<Vec<u8>>> {
-        let active = self.prover_registry.get_active_provers(&header.address, legacy_committee_frame(header))?;
+    fn live_legacy_committee(
+        &self,
+        header: &quil_types::proto::global::FrameHeader,
+    ) -> Result<Vec<Vec<u8>>> {
+        let active = self
+            .prover_registry
+            .get_active_provers(&header.address, legacy_committee_frame(header))?;
         Ok(active.iter().map(|p| p.public_key.clone()).collect())
     }
 
@@ -918,27 +1039,34 @@ impl BlsAppFrameValidator {
         let namespace = legacy_namespace(header);
         let live = self.live_legacy_committee(header)?;
         if let Some(verified) = quil_cw_consensus::app_cert::verify_finalization_details(
-            cert_bytes, &live, &namespace, output_digest,
+            cert_bytes,
+            &live,
+            &namespace,
+            output_digest,
         ) {
             return Ok(verified);
         }
-        let historical = self.historical_committees.get(&header.address, legacy_committee_frame(header));
+        let historical = self
+            .historical_committees
+            .get(&header.address, legacy_committee_frame(header));
         for committee in historical.iter().flat_map(|c| c.iter()) {
             if let Some(verified) = quil_cw_consensus::app_cert::verify_finalization_details(
-                cert_bytes, committee, &namespace, output_digest,
+                cert_bytes,
+                committee,
+                &namespace,
+                output_digest,
             ) {
                 return Ok(verified);
             }
         }
-        Err(QuilError::InvalidSignature("app shard frame CW finalization cert verification failed".into()))
+        Err(QuilError::InvalidSignature(
+            "app shard frame CW finalization cert verification failed".into(),
+        ))
     }
 
     /// Attach a clock store so storage attestations can be verified (supplies
     /// the global VDF output for the per-frame beacon).
-    pub fn with_clock_store(
-        mut self,
-        clock_store: Arc<dyn quil_types::store::ClockStore>,
-    ) -> Self {
+    pub fn with_clock_store(mut self, clock_store: Arc<dyn quil_types::store::ClockStore>) -> Self {
         self.clock_store = Some(clock_store);
         self
     }
@@ -948,12 +1076,18 @@ impl BlsAppFrameValidator {
         self
     }
 
-    pub fn with_storage_history_source(mut self, source: crate::storage_history::GlobalVertexProofSource) -> Self {
+    pub fn with_storage_history_source(
+        mut self,
+        source: crate::storage_history::GlobalVertexProofSource,
+    ) -> Self {
         self.storage_history_source = Some(source);
         self
     }
 
-    pub fn with_global_anchor_source(mut self, source: crate::global_anchor::GlobalAnchorSource) -> Self {
+    pub fn with_global_anchor_source(
+        mut self,
+        source: crate::global_anchor::GlobalAnchorSource,
+    ) -> Self {
         self.global_anchor_source = Some(source);
         self
     }
@@ -976,23 +1110,40 @@ impl BlsAppFrameValidator {
     }
 
     fn storage_registration(
-        &self, root: Option<[u8; 32]>, member: &[u8], leaf: &[u8], epoch: u64,
+        &self,
+        root: Option<[u8; 32]>,
+        member: &[u8],
+        leaf: &[u8],
+        epoch: u64,
     ) -> Result<Option<crate::storage_history::Registration>> {
         if let Some(root) = root {
-            let address = quil_execution::global_intrinsic::materialize::leaf_root_address(member, leaf)?;
-            if let Some(value) = self.storage_history.get(root, address, epoch) { return Ok(value); }
+            let address =
+                quil_execution::global_intrinsic::materialize::leaf_root_address(member, leaf)?;
+            if let Some(value) = self.storage_history.get(root, address, epoch) {
+                return Ok(value);
+            }
             if let Some(global) = self.handoff_authority.as_ref() {
                 if global.global_root_available(&root)? {
-                    let Some(proof) = global.global_vertex_membership_at_root(&root, &address)? else { return Ok(None); };
-                    let bytes = quil_forest::MembershipProof { inputs: vec![proof] }.to_bytes();
-                    return self.storage_history.insert(root, member, leaf, epoch, &bytes);
+                    let Some(proof) = global.global_vertex_membership_at_root(&root, &address)?
+                    else {
+                        return Ok(None);
+                    };
+                    let bytes = quil_forest::MembershipProof {
+                        inputs: vec![proof],
+                    }
+                    .to_bytes();
+                    return self
+                        .storage_history
+                        .insert(root, member, leaf, epoch, &bytes);
                 }
             }
         }
         // Preserve the live registry path when this node did not sync the
         // exact anchor. Old registrations can instead be recovered by prepare.
         let current = self.prover_registry.get_leaf_root(member, leaf, epoch)?;
-        if current.is_none() && (self.handoff_authority.is_some() || self.storage_history_source.is_some()) {
+        if current.is_none()
+            && (self.handoff_authority.is_some() || self.storage_history_source.is_some())
+        {
             return Err(QuilError::ExecutionUnavailable(format!(
                 "{HISTORY_UNAVAILABLE} at epoch {epoch}"
             )));
@@ -1021,22 +1172,50 @@ impl BlsAppFrameValidator {
     /// frame's output is checked against it. Without an anchor source the
     /// clock is used as it is.
     pub async fn prepare_global_anchor(&self, frame: &AppShardFrame) -> Result<()> {
-        if let (Some(source), Some(header)) = (self.global_anchor_source.as_ref(), frame.header.as_ref()) {
-            let store = self.clock_store.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("GLOBAL anchor has no clock store".into()))?;
-            crate::global_anchor::ensure_global_anchor(store.as_ref(), source, header.global_frame_number).await?;
+        if let (Some(source), Some(header)) =
+            (self.global_anchor_source.as_ref(), frame.header.as_ref())
+        {
+            let store = self.clock_store.as_ref().ok_or_else(|| {
+                QuilError::ExecutionUnavailable("GLOBAL anchor has no clock store".into())
+            })?;
+            crate::global_anchor::ensure_global_anchor(
+                store.as_ref(),
+                source,
+                header.global_frame_number,
+            )
+            .await?;
         }
         Ok(())
     }
 
-    async fn prepare_storage_history_with(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
+    async fn prepare_storage_history_with(
+        &self,
+        frame: &AppShardFrame,
+        certified: bool,
+    ) -> Result<()> {
         self.prepare_global_anchor(frame).await?;
-        let Some(source) = self.storage_history_source.as_ref() else { return Ok(()); };
-        let (Some(header), Some(attestation)) = (frame.header.as_ref(), frame.storage_attestation.as_ref()) else { return Ok(()); };
-        if attestation.openings.is_empty() { return Ok(()); }
-        let global = self.clock_store.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("storage history has no clock source".into()))?
+        let Some(source) = self.storage_history_source.as_ref() else {
+            return Ok(());
+        };
+        let (Some(header), Some(attestation)) =
+            (frame.header.as_ref(), frame.storage_attestation.as_ref())
+        else {
+            return Ok(());
+        };
+        if attestation.openings.is_empty() {
+            return Ok(());
+        }
+        let global = self
+            .clock_store
+            .as_ref()
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable("storage history has no clock source".into())
+            })?
             .get_global_clock_frame(header.global_frame_number)?;
-        let global_header = global.header.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("storage history anchor lacks header".into()))?;
-        let Ok(root) = <[u8;32]>::try_from(global_header.prover_tree_commitment.as_slice()) else {
+        let global_header = global.header.as_ref().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("storage history anchor lacks header".into())
+        })?;
+        let Ok(root) = <[u8; 32]>::try_from(global_header.prover_tree_commitment.as_slice()) else {
             // Historical proofs apply to forest roots. Legacy commitments
             // retain their existing live-registry validation path.
             return Ok(());
@@ -1049,27 +1228,58 @@ impl BlsAppFrameValidator {
             let mut attempted = std::collections::BTreeSet::new();
             for opening in &attestation.openings {
                 // The ordinary validator reports malformed epoch bindings.
-                if opening.epoch != epoch { continue; }
-                let existing = self.storage_registration(Some(root), &opening.member_id, &opening.shard_id, epoch);
+                if opening.epoch != epoch {
+                    continue;
+                }
+                let existing = self.storage_registration(
+                    Some(root),
+                    &opening.member_id,
+                    &opening.shard_id,
+                    epoch,
+                );
                 match existing {
                     Ok(Some((registered, blocks, registered_epoch)))
-                        if registered == opening.leaf_root && blocks == opening.num_blocks && registered_epoch == epoch => continue,
+                        if registered == opening.leaf_root
+                            && blocks == opening.num_blocks
+                            && registered_epoch == epoch =>
+                    {
+                        continue
+                    }
                     Ok(None) => continue, // authenticated absence: reject in validate
                     _ => {}
                 }
-                let address = quil_execution::global_intrinsic::materialize::leaf_root_address(&opening.member_id, &opening.shard_id)?;
-                if !attempted.insert(address) { continue; }
-                if attempted.len() > 128 {
-                    return Err(QuilError::ExecutionUnavailable("storage history fetch budget exceeded".into()));
+                let address = quil_execution::global_intrinsic::materialize::leaf_root_address(
+                    &opening.member_id,
+                    &opening.shard_id,
+                )?;
+                if !attempted.insert(address) {
+                    continue;
                 }
-                let bytes = source(root, address).await?.ok_or_else(|| QuilError::ExecutionUnavailable("peer lacks historical storage registration".into()))?;
-                self.storage_history.insert(root, &opening.member_id, &opening.shard_id, epoch, &bytes)?;
+                if attempted.len() > 128 {
+                    return Err(QuilError::ExecutionUnavailable(
+                        "storage history fetch budget exceeded".into(),
+                    ));
+                }
+                let bytes = source(root, address).await?.ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(
+                        "peer lacks historical storage registration".into(),
+                    )
+                })?;
+                self.storage_history.insert(
+                    root,
+                    &opening.member_id,
+                    &opening.shard_id,
+                    epoch,
+                    &bytes,
+                )?;
                 info!(frame = header.frame_number, global_anchor = header.global_frame_number,
                     epoch, record = %hex::encode(address), proof_bytes = bytes.len(),
                     "recovered authenticated historical storage registration");
             }
             Ok(())
-        }).await.map_err(|_| QuilError::ExecutionUnavailable("storage history fetch timed out".into()))?
+        })
+        .await
+        .map_err(|_| QuilError::ExecutionUnavailable("storage history fetch timed out".into()))?
     }
 }
 
@@ -1085,7 +1295,12 @@ impl BlsAppFrameValidator {
         self.validate_with_mode(frame, require_signature, true)
     }
 
-    fn validate_with_mode(&self, frame: &AppShardFrame, require_signature: bool, verify_storage: bool) -> Result<bool> {
+    fn validate_with_mode(
+        &self,
+        frame: &AppShardFrame,
+        require_signature: bool,
+        verify_storage: bool,
+    ) -> Result<bool> {
         let header = frame
             .header
             .as_ref()
@@ -1159,7 +1374,9 @@ impl BlsAppFrameValidator {
                 header.fee_multiplier_vote,
                 header.timestamp,
                 &header.storage_attestation_root,
-                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(
+                    &header.fee_total,
+                ),
                 &header.settlements,
                 &header.accumulator,
                 &header.spends,
@@ -1231,7 +1448,9 @@ impl BlsAppFrameValidator {
                 header.fee_multiplier_vote,
                 header.timestamp,
                 &header.storage_attestation_root,
-                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(
+                    &header.fee_total,
+                ),
                 &header.settlements,
                 &header.accumulator,
                 &header.spends,
@@ -1275,11 +1494,16 @@ impl BlsAppFrameValidator {
             Some(crdt) => crate::app_handoff::committed_view(crdt),
             None => Ok(None),
         };
-        if cw_cert.is_none() && (require_signature || header.public_key_signature_bls48581.is_some()) {
+        if cw_cert.is_none()
+            && (require_signature || header.public_key_signature_bls48581.is_some())
+        {
             self.refuse_legacy_after_flag_day(header)?;
             if let Some(view) = handoff_view()? {
                 quil_execution::global_intrinsic::handoff::frames::require_legacy_allowed(
-                    &view, &header.address, header.frame_number)?;
+                    &view,
+                    &header.address,
+                    header.frame_number,
+                )?;
             }
         }
         if let Some(cert_bytes) = cw_cert {
@@ -1296,14 +1520,17 @@ impl BlsAppFrameValidator {
                         digest: output_digest,
                     },
                     cert_bytes,
-                )?.is_some()
+                )?
+                .is_some()
             } else {
                 false
             };
             if !authorized {
-                if quil_cw_consensus::app_cert::unverified_finalization_epoch(cert_bytes) != Some(0) {
+                if quil_cw_consensus::app_cert::unverified_finalization_epoch(cert_bytes) != Some(0)
+                {
                     return Err(QuilError::ExecutionUnavailable(
-                        "app session certificate requires authenticated global authorization".into(),
+                        "app session certificate requires authenticated global authorization"
+                            .into(),
                     ));
                 }
                 self.refuse_legacy_after_flag_day(header)?;
@@ -1334,16 +1561,18 @@ impl BlsAppFrameValidator {
             } else {
                 header.frame_number // genesis/legacy: no anchor, epoch 0 either way
             };
-            let active = self.prover_registry.get_active_provers(&header.address, committee_frame)?;
+            let active = self
+                .prover_registry
+                .get_active_provers(&header.address, committee_frame)?;
 
             // Generate a throwaway key pair once — Go does this via
             // `blsConstructor.New()`. The throwaway signature bytes
             // are used as placeholder signatures in the aggregation
             // call because it only consumes them to derive keys.
-            let (_throwaway_signer, throwaway_public) =
-                self.bls_constructor
-                    .new_key()
-                    .map_err(|e| QuilError::Crypto(format!("throwaway key: {}", e)))?;
+            let (_throwaway_signer, throwaway_public) = self
+                .bls_constructor
+                .new_key()
+                .map_err(|e| QuilError::Crypto(format!("throwaway key: {}", e)))?;
 
             let mut active_public_keys: Vec<&[u8]> = Vec::new();
             let mut throwaway_list: Vec<&[u8]> = Vec::new();
@@ -1367,9 +1596,7 @@ impl BlsAppFrameValidator {
                     bitmask = %hex::encode(&sig.bitmask),
                     "could not verify aggregated keys"
                 );
-                return Err(QuilError::Crypto(
-                    "could not verify aggregated keys".into(),
-                ));
+                return Err(QuilError::Crypto("could not verify aggregated keys".into()));
             }
 
             // BLS signature verification. See the matching comment in
@@ -1426,9 +1653,13 @@ impl BlsAppFrameValidator {
             );
         if hash_epoch {
             let canonical = quil_execution::global_intrinsic::storage_seat::commitment_acceptable(
-                &header.storage_attestation_root, header.global_frame_number,
+                &header.storage_attestation_root,
+                header.global_frame_number,
             );
-            let carries_openings = frame.storage_attestation.as_ref().is_some_and(|a| !a.openings.is_empty());
+            let carries_openings = frame
+                .storage_attestation
+                .as_ref()
+                .is_some_and(|a| !a.openings.is_empty());
             if !canonical || carries_openings {
                 return Err(QuilError::Crypto(
                     "app shard frame storage attestation rejected: a hash-proof epoch's frame commits one \
@@ -1439,60 +1670,73 @@ impl BlsAppFrameValidator {
         }
         if verify_storage && !hash_epoch && !header.storage_attestation_root.is_empty() {
             if let Some(clock_store) = self.clock_store.as_ref() {
-            let global = clock_store
-                .get_global_clock_frame(header.global_frame_number)
-                .map_err(|e| QuilError::Crypto(format!(
-                    "storage attestation: global frame {} unavailable: {}",
-                    header.global_frame_number, e
-                )))?;
-            let global_output = global
-                .header
-                .as_ref()
-                .map(|h| h.output.clone())
-                .unwrap_or_default();
-            let rho_n = quil_crypto::porep::derive_storage_beacon(
-                header.global_frame_number,
-                &global_output,
-            );
-            let active_epoch =
-                quil_types::consensus::epoch_for_frame(header.global_frame_number);
-            let attestation = frame.storage_attestation.clone().unwrap_or_default();
-            let bitmask = header
-                .public_key_signature_bls48581
-                .as_ref()
-                .map(|s| s.bitmask.clone())
-                .unwrap_or_default();
-            let registration_root = global.header.as_ref().and_then(|h| h.prover_tree_commitment.as_slice().try_into().ok());
-            let lookup_error = std::cell::RefCell::new(None);
-            let verdict = quil_crypto::porep::explain_frame_storage_attestation_registered(
-                &header.storage_attestation_root,
-                &attestation,
-                header.frame_number,
-                &rho_n,
-                &bitmask,
-                // Must match the poly_size every producer/audit/encode site
-                // uses (app_glue, app_shard_metadata, prover_pipeline,
-                // intrinsic reward audit). derive_challenge_index folds
-                // poly_size into both the challenge point and the modulus, so
-                // a mismatch here re-derives different points than the producer
-                // and rejects every storage-bearing frame. The crypto-layer
-                // sdr::BLOCK_POLY_SIZE (256) is the SDR block partition, NOT the
-                // consensus opening domain.
-                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
-                active_epoch,
-                |member: &[u8], leaf_id: &[u8], epoch: u64| {
-                    match self.storage_registration(registration_root, member, leaf_id, epoch) {
+                let global = clock_store
+                    .get_global_clock_frame(header.global_frame_number)
+                    .map_err(|e| {
+                        QuilError::Crypto(format!(
+                            "storage attestation: global frame {} unavailable: {}",
+                            header.global_frame_number, e
+                        ))
+                    })?;
+                let global_output = global
+                    .header
+                    .as_ref()
+                    .map(|h| h.output.clone())
+                    .unwrap_or_default();
+                let rho_n = quil_crypto::porep::derive_storage_beacon(
+                    header.global_frame_number,
+                    &global_output,
+                );
+                let active_epoch =
+                    quil_types::consensus::epoch_for_frame(header.global_frame_number);
+                let attestation = frame.storage_attestation.clone().unwrap_or_default();
+                let bitmask = header
+                    .public_key_signature_bls48581
+                    .as_ref()
+                    .map(|s| s.bitmask.clone())
+                    .unwrap_or_default();
+                let registration_root = global
+                    .header
+                    .as_ref()
+                    .and_then(|h| h.prover_tree_commitment.as_slice().try_into().ok());
+                let lookup_error = std::cell::RefCell::new(None);
+                let verdict = quil_crypto::porep::explain_frame_storage_attestation_registered(
+                    &header.storage_attestation_root,
+                    &attestation,
+                    header.frame_number,
+                    &rho_n,
+                    &bitmask,
+                    // Must match the poly_size every producer/audit/encode site
+                    // uses (app_glue, app_shard_metadata, prover_pipeline,
+                    // intrinsic reward audit). derive_challenge_index folds
+                    // poly_size into both the challenge point and the modulus, so
+                    // a mismatch here re-derives different points than the producer
+                    // and rejects every storage-bearing frame. The crypto-layer
+                    // sdr::BLOCK_POLY_SIZE (256) is the SDR block partition, NOT the
+                    // consensus opening domain.
+                    quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                    active_epoch,
+                    |member: &[u8], leaf_id: &[u8], epoch: u64| match self.storage_registration(
+                        registration_root,
+                        member,
+                        leaf_id,
+                        epoch,
+                    ) {
                         Ok(value) => value,
-                        Err(error) => { *lookup_error.borrow_mut() = Some(error); None }
-                    }
-                },
-            );
-            if let Some(error) = lookup_error.into_inner() { return Err(error); }
-            if let Err(reason) = verdict {
-                return Err(QuilError::Crypto(format!(
-                    "app shard frame storage attestation rejected: {reason}"
-                )));
-            }
+                        Err(error) => {
+                            *lookup_error.borrow_mut() = Some(error);
+                            None
+                        }
+                    },
+                );
+                if let Some(error) = lookup_error.into_inner() {
+                    return Err(error);
+                }
+                if let Err(reason) = verdict {
+                    return Err(QuilError::Crypto(format!(
+                        "app shard frame storage attestation rejected: {reason}"
+                    )));
+                }
             } else {
                 // No beacon source (e.g. the archive-ingest validator): skip —
                 // the storage attestation is verified by full-frame holders on
@@ -1548,12 +1792,21 @@ impl BlsAppFrameValidator {
     /// final, so it is authenticated without a certificate of its own.
     /// False without a handoff authority.
     pub fn committed_by_global(&self, frame: &AppShardFrame) -> bool {
-        let (Some(global), Some(header)) = (self.handoff_authority.as_ref(), frame.header.as_ref()) else {
+        let (Some(global), Some(header)) = (self.handoff_authority.as_ref(), frame.header.as_ref())
+        else {
             return false;
         };
-        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
-        crate::app_handoff::committed_frame_digest_looked_through(global, &header.address, header.frame_number)
-            .ok().flatten() == Some(digest)
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return false;
+        };
+        crate::app_handoff::committed_frame_digest_looked_through(
+            global,
+            &header.address,
+            header.frame_number,
+        )
+        .ok()
+        .flatten()
+            == Some(digest)
     }
 
     /// A notarized frame used as the parent of the next proposal (a private
@@ -1565,7 +1818,9 @@ impl BlsAppFrameValidator {
     /// unavailable") and abstains.
     pub fn validate_notarized_parent(&self, frame: &AppShardFrame) -> Result<bool> {
         match self.validate_with(frame, false) {
-            Err(QuilError::ExecutionUnavailable(message)) if message.starts_with(HISTORY_UNAVAILABLE) => {
+            Err(QuilError::ExecutionUnavailable(message))
+                if message.starts_with(HISTORY_UNAVAILABLE) =>
+            {
                 self.validate_with_mode(frame, false, false)
             }
             other => other,
@@ -1593,7 +1848,10 @@ pub(crate) fn commits_no_requests(root: &[u8]) -> bool {
 pub(crate) fn empty_without_attestation(frame: &AppShardFrame) -> bool {
     frame.storage_attestation.is_none()
         && frame.requests.is_empty()
-        && frame.header.as_ref().is_some_and(|header| commits_no_requests(&header.requests_root))
+        && frame
+            .header
+            .as_ref()
+            .is_some_and(|header| commits_no_requests(&header.requests_root))
 }
 
 impl AppFrameValidator for BlsAppFrameValidator {
@@ -1610,15 +1868,41 @@ mod tests {
     #[test]
     fn an_app_frame_links_only_to_the_parent_its_selector_names() {
         use quil_types::proto::global::FrameHeader;
-        let parent = FrameHeader { address: vec![1; 32], frame_number: 66, rank: 66, output: vec![6; 32], ..Default::default() };
-        let selector = quil_crypto::poseidon::hash_bytes_to_32(&parent.output).unwrap().to_vec();
-        let child = FrameHeader { address: vec![1; 32], frame_number: 67, rank: 68, parent_selector: selector, ..Default::default() };
+        let parent = FrameHeader {
+            address: vec![1; 32],
+            frame_number: 66,
+            rank: 66,
+            output: vec![6; 32],
+            ..Default::default()
+        };
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+            .unwrap()
+            .to_vec();
+        let child = FrameHeader {
+            address: vec![1; 32],
+            frame_number: 67,
+            rank: 68,
+            parent_selector: selector,
+            ..Default::default()
+        };
         assert!(app_frame_links_to_child(&parent, &child));
         for bad in [
-            FrameHeader { address: vec![2; 32], ..child.clone() },
-            FrameHeader { frame_number: 68, ..child.clone() },
-            FrameHeader { rank: 66, ..child.clone() },
-            FrameHeader { parent_selector: vec![0; 32], ..child.clone() },
+            FrameHeader {
+                address: vec![2; 32],
+                ..child.clone()
+            },
+            FrameHeader {
+                frame_number: 68,
+                ..child.clone()
+            },
+            FrameHeader {
+                rank: 66,
+                ..child.clone()
+            },
+            FrameHeader {
+                parent_selector: vec![0; 32],
+                ..child.clone()
+            },
         ] {
             assert!(!app_frame_links_to_child(&parent, &bad));
         }
@@ -1627,13 +1911,25 @@ mod tests {
     fn replay_chain() -> Vec<AppShardFrame> {
         let mut frames = Vec::new();
         for number in 10..14 {
-            let selector = frames.last().map(|parent: &AppShardFrame|
-                quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output).unwrap().to_vec())
+            let selector = frames
+                .last()
+                .map(|parent: &AppShardFrame| {
+                    quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output)
+                        .unwrap()
+                        .to_vec()
+                })
                 .unwrap_or_default();
-            frames.push(AppShardFrame { header: Some(quil_types::proto::global::FrameHeader {
-                address: vec![1; 32], frame_number: number, rank: number * 2,
-                output: vec![number as u8; 32], parent_selector: selector, ..Default::default()
-            }), ..Default::default() });
+            frames.push(AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    address: vec![1; 32],
+                    frame_number: number,
+                    rank: number * 2,
+                    output: vec![number as u8; 32],
+                    parent_selector: selector,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
         }
         frames
     }
@@ -1642,15 +1938,33 @@ mod tests {
     fn replay_chain_authenticates_all_ancestors_before_replay() {
         let frames = replay_chain();
         let mut seen = Vec::new();
-        validate_archive_replay_chain(&frames[0], &frames[1..],
+        validate_archive_replay_chain(
+            &frames[0],
+            &frames[1..],
             |terminal| Ok(terminal.header.as_ref().unwrap().frame_number == 13),
-            |parent| { seen.push(parent.header.as_ref().unwrap().frame_number); Ok(true) }).unwrap();
+            |parent| {
+                seen.push(parent.header.as_ref().unwrap().frame_number);
+                Ok(true)
+            },
+        )
+        .unwrap();
         assert_eq!(seen, [12, 11, 10]);
-        assert!(validate_archive_replay_chain(&frames[0], &frames[1..],
-            |_| Ok(false), |_| panic!("must not trust ancestors without a certificate")).is_err());
-        assert!(validate_archive_replay_chain(&frames[0], &frames[1..],
-            |_| Err(QuilError::InvalidSignature("wrong historical session".into())),
-            |_| panic!("must not trust a wrong-session certificate")).is_err());
+        assert!(validate_archive_replay_chain(
+            &frames[0],
+            &frames[1..],
+            |_| Ok(false),
+            |_| panic!("must not trust ancestors without a certificate")
+        )
+        .is_err());
+        assert!(validate_archive_replay_chain(
+            &frames[0],
+            &frames[1..],
+            |_| Err(QuilError::InvalidSignature(
+                "wrong historical session".into()
+            )),
+            |_| panic!("must not trust a wrong-session certificate")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1666,26 +1980,50 @@ mod tests {
                     2 => header.rank = 0,
                     _ => header.parent_selector = vec![0; 32],
                 }
-                assert!(validate_archive_replay_chain(&bad[0], &bad[1..], |_| Ok(true), |_| Ok(true)).is_err());
+                assert!(validate_archive_replay_chain(
+                    &bad[0],
+                    &bad[1..],
+                    |_| Ok(true),
+                    |_| Ok(true)
+                )
+                .is_err());
             }
         }
         for invalid in 10..13 {
-            assert!(validate_archive_replay_chain(&frames[0], &frames[1..], |_| Ok(true),
-                |parent| Ok(parent.header.as_ref().unwrap().frame_number != invalid)).is_err());
+            assert!(validate_archive_replay_chain(
+                &frames[0],
+                &frames[1..],
+                |_| Ok(true),
+                |parent| Ok(parent.header.as_ref().unwrap().frame_number != invalid)
+            )
+            .is_err());
         }
     }
 
     #[test]
     fn replay_chain_rejects_empty_overlong_and_oversized_inputs_before_verification() {
         let frames = replay_chain();
-        for descendants in [Vec::new(), vec![frames[1].clone(); MAX_REPLAY_DESCENDANTS + 1]] {
-            assert!(validate_archive_replay_chain(&frames[0], &descendants,
-                |_| panic!("bounds checked first"), |_| panic!("bounds checked first")).is_err());
+        for descendants in [
+            Vec::new(),
+            vec![frames[1].clone(); MAX_REPLAY_DESCENDANTS + 1],
+        ] {
+            assert!(validate_archive_replay_chain(
+                &frames[0],
+                &descendants,
+                |_| panic!("bounds checked first"),
+                |_| panic!("bounds checked first")
+            )
+            .is_err());
         }
         let mut oversized = frames[0].clone();
         oversized.header.as_mut().unwrap().output = vec![0; MAX_REPLAY_CHAIN_BYTES];
-        assert!(validate_archive_replay_chain(&oversized, &frames[1..],
-            |_| panic!("byte limit checked first"), |_| panic!("byte limit checked first")).is_err());
+        assert!(validate_archive_replay_chain(
+            &oversized,
+            &frames[1..],
+            |_| panic!("byte limit checked first"),
+            |_| panic!("byte limit checked first")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1801,7 +2139,9 @@ mod tests {
             frame_number: 5,
             public_key_signature_bls48581: Some(Bls48581AggregateSignature {
                 signature: Vec::new(), // empty signature
-                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                public_key: Some(Bls48581g2PublicKey {
+                    key_value: vec![0x01u8; 96],
+                }),
                 bitmask: vec![0x01],
             }),
             ..Default::default()
@@ -1828,7 +2168,9 @@ mod tests {
             frame_number: 5,
             public_key_signature_bls48581: Some(Bls48581AggregateSignature {
                 signature: vec![0xAAu8; 74],
-                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                public_key: Some(Bls48581g2PublicKey {
+                    key_value: vec![0x01u8; 96],
+                }),
                 bitmask: Vec::new(), // empty bitmask
             }),
             ..Default::default()
@@ -1947,7 +2289,10 @@ mod tests {
         };
         let err = v.validate(&frame).unwrap_err();
         assert!(err.to_string().contains("missing BLS signature"));
-        assert!(err.to_string().contains("app shard frame 3 "), "the error names the frame: {err}");
+        assert!(
+            err.to_string().contains("app shard frame 3 "),
+            "the error names the frame: {err}"
+        );
     }
 
     #[test]
@@ -2058,7 +2403,9 @@ mod tests {
             output: vec![0x01u8; 516],
             prover: vec![0x01u8; 32],
             public_key_signature_bls48581: Some(Bls48581AggregateSignature {
-                public_key: Some(Bls48581g2PublicKey { key_value: Vec::new() }),
+                public_key: Some(Bls48581g2PublicKey {
+                    key_value: Vec::new(),
+                }),
                 signature: vec![0xAAu8; 128],
                 bitmask: Vec::new(),
             }),
@@ -2074,7 +2421,10 @@ mod tests {
     fn a_certificate_of_a_later_epoch_is_named_and_still_refused() {
         use quil_cw_consensus::{
             _codec::Encode as _,
-            _consensus::{simplex::types::Proposal, types::{Epoch, Round, View}},
+            _consensus::{
+                simplex::types::Proposal,
+                types::{Epoch, Round, View},
+            },
             _crypto::sha256::Digest,
             app_cert::wrap_cert_for_header,
         };
@@ -2082,14 +2432,30 @@ mod tests {
         // The epoch lookup reads the proposal prefix, which is all a
         // certificate of an unknown committee can be checked for.
         let cert = |epoch| {
-            Proposal::new(Round::new(Epoch::new(epoch), View::new(43)), View::new(42), Digest([9; 32]))
-                .encode()
-                .to_vec()
+            Proposal::new(
+                Round::new(Epoch::new(epoch), View::new(43)),
+                View::new(42),
+                Digest([9; 32]),
+            )
+            .encode()
+            .to_vec()
         };
-        assert_eq!(newer_certificate_epoch(0, &cert(1)), Some(1), "the succession, on a build without it");
+        assert_eq!(
+            newer_certificate_epoch(0, &cert(1)),
+            Some(1),
+            "the succession, on a build without it"
+        );
         assert_eq!(newer_certificate_epoch(1, &cert(2)), Some(2));
-        assert_eq!(newer_certificate_epoch(0, &cert(0)), None, "an invalid certificate of the expected epoch");
-        assert_eq!(newer_certificate_epoch(1, &cert(0)), None, "an older epoch is not an upgrade");
+        assert_eq!(
+            newer_certificate_epoch(0, &cert(0)),
+            None,
+            "an invalid certificate of the expected epoch"
+        );
+        assert_eq!(
+            newer_certificate_epoch(1, &cert(0)),
+            None,
+            "an older epoch is not an upgrade"
+        );
         assert_eq!(newer_certificate_epoch(0, &[0xAA; 128]), None, "garbage");
 
         // The frame is refused as before.
@@ -2118,7 +2484,11 @@ mod tests {
         assert_eq!(frames.note(1_000), Some(1), "the first refusal warns");
         assert_eq!(frames.note(1_001), None);
         assert_eq!(frames.note(1_599), None);
-        assert_eq!(frames.note(1_600), Some(3), "ten minutes later, with the refusals since");
+        assert_eq!(
+            frames.note(1_600),
+            Some(3),
+            "ten minutes later, with the refusals since"
+        );
         assert_eq!(frames.note(1_601), None);
         assert_eq!(frames.note(2_200), Some(2));
     }
@@ -2176,20 +2546,10 @@ mod tests {
         fn new_key(&self) -> Result<(Box<dyn quil_types::crypto::Signer>, Vec<u8>)> {
             Err(QuilError::Internal("stub".into()))
         }
-        fn from_bytes(
-            &self,
-            _: &[u8],
-            _: &[u8],
-        ) -> Result<Box<dyn quil_types::crypto::Signer>> {
+        fn from_bytes(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::crypto::Signer>> {
             Err(QuilError::Internal("stub".into()))
         }
-        fn verify_signature_raw(
-            &self,
-            _: &[u8],
-            _: &[u8],
-            _: &[u8],
-            _: &[u8],
-        ) -> bool {
+        fn verify_signature_raw(&self, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> bool {
             false
         }
         fn verify_multi_message_signature_raw(
@@ -2274,7 +2634,11 @@ mod tests {
 /// The GLOBAL frame a legacy app frame's committee is read at: its anchor,
 /// or its own number for a frame without one.
 fn legacy_committee_frame(header: &quil_types::proto::global::FrameHeader) -> u64 {
-    if header.global_frame_number > 0 { header.global_frame_number } else { header.frame_number }
+    if header.global_frame_number > 0 {
+        header.global_frame_number
+    } else {
+        header.frame_number
+    }
 }
 
 /// The signing namespace of a legacy app shard's certificates.

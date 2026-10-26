@@ -32,7 +32,8 @@ const MAX_SEEN: usize = 8;
 
 pub(crate) const MESSAGE_LOOP_IMPACT: &str =
     "inbound gossip (GLOBAL frames, peer info, consensus messages) waits and 'node status' lines stop while it lasts";
-pub(crate) const POLLER_IMPACT: &str = "this node fetches and executes no GLOBAL frame from archives while it lasts";
+pub(crate) const POLLER_IMPACT: &str =
+    "this node fetches and executes no GLOBAL frame from archives while it lasts";
 
 /// Where a blocked task was seen: the step it last entered and its
 /// innermost and outermost synchronous sections.
@@ -48,7 +49,9 @@ impl Place {
         Place {
             step: snapshot.step,
             section: snapshot.section,
-            outer: snapshot.outer.filter(|outer| Some(outer.section) != snapshot.section.map(|s| s.section)),
+            outer: snapshot
+                .outer
+                .filter(|outer| Some(outer.section) != snapshot.section.map(|s| s.section)),
         }
     }
 
@@ -79,9 +82,21 @@ impl Place {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StallReport {
     /// The task's beat became overdue (`repeat: false`) or is still overdue.
-    Blocked { task: Section, impact: &'static str, blocked: Duration, place: Place, at_ms: u64, repeat: bool },
+    Blocked {
+        task: Section,
+        impact: &'static str,
+        blocked: Duration,
+        place: Place,
+        at_ms: u64,
+        repeat: bool,
+    },
     /// The task beat again, or ended.
-    Unblocked { task: Section, blocked: Duration, seen: Vec<String>, exited: bool },
+    Unblocked {
+        task: Section,
+        blocked: Duration,
+        seen: Vec<String>,
+        exited: bool,
+    },
 }
 
 struct Stall {
@@ -115,11 +130,20 @@ pub(crate) struct StallWatch {
 
 impl StallWatch {
     pub(crate) fn new(repeat: Duration) -> Self {
-        Self { repeat_ms: repeat.as_millis() as u64, watched: Vec::new() }
+        Self {
+            repeat_ms: repeat.as_millis() as u64,
+            watched: Vec::new(),
+        }
     }
 
     /// Watch `task`'s probe until it is dropped.
-    pub(crate) fn add(&mut self, task: Section, impact: &'static str, stall_after: Duration, probe: &Arc<ThreadProbe>) {
+    pub(crate) fn add(
+        &mut self,
+        task: Section,
+        impact: &'static str,
+        stall_after: Duration,
+        probe: &Arc<ThreadProbe>,
+    ) {
         self.watched.push(Watched {
             task,
             impact,
@@ -149,11 +173,17 @@ impl StallWatch {
             if let Some(stall) = watched.stall.as_mut() {
                 if snapshot.last_beat_ms != stall.last_beat_ms {
                     // It beat, or moved on to a wait without a deadline.
-                    let resumed_ms = if snapshot.idle() { now_ms } else { snapshot.last_beat_ms };
+                    let resumed_ms = if snapshot.idle() {
+                        now_ms
+                    } else {
+                        snapshot.last_beat_ms
+                    };
                     let stall = watched.stall.take().expect("a resumed task was blocked");
                     reports.push(StallReport::Unblocked {
                         task: watched.task,
-                        blocked: Duration::from_millis(resumed_ms.saturating_sub(stall.last_beat_ms)),
+                        blocked: Duration::from_millis(
+                            resumed_ms.saturating_sub(stall.last_beat_ms),
+                        ),
                         seen: stall.seen,
                         exited: false,
                     });
@@ -165,16 +195,24 @@ impl StallWatch {
                         reports.push(StallReport::Blocked {
                             task: watched.task,
                             impact: watched.impact,
-                            blocked: Duration::from_millis(now_ms.saturating_sub(stall.last_beat_ms)),
+                            blocked: Duration::from_millis(
+                                now_ms.saturating_sub(stall.last_beat_ms),
+                            ),
                             place,
                             at_ms: now_ms,
                             repeat: true,
                         });
                     }
                 }
-            } else if !snapshot.idle() && now_ms.saturating_sub(snapshot.last_beat_ms) >= watched.stall_after_ms {
+            } else if !snapshot.idle()
+                && now_ms.saturating_sub(snapshot.last_beat_ms) >= watched.stall_after_ms
+            {
                 let place = Place::of(&snapshot);
-                let mut stall = Stall { last_beat_ms: snapshot.last_beat_ms, reported_ms: now_ms, seen: Vec::new() };
+                let mut stall = Stall {
+                    last_beat_ms: snapshot.last_beat_ms,
+                    reported_ms: now_ms,
+                    seen: Vec::new(),
+                };
                 stall.see(&place);
                 watched.stall = Some(stall);
                 reports.push(StallReport::Blocked {
@@ -212,19 +250,39 @@ fn watchdog() -> &'static Mutex<StallWatch> {
 /// A probe for `task`, watched from the watchdog thread until it is
 /// dropped; run the task under
 /// [`task_probed`](quil_types::thread_probe::task_probed) with it.
-pub(crate) fn watch(task: Section, impact: &'static str, stall_after: Duration) -> Arc<ThreadProbe> {
+pub(crate) fn watch(
+    task: Section,
+    impact: &'static str,
+    stall_after: Duration,
+) -> Arc<ThreadProbe> {
     let probe = ThreadProbe::new();
-    watchdog().lock().unwrap_or_else(|e| e.into_inner()).add(task, impact, stall_after, &probe);
+    watchdog()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(task, impact, stall_after, &probe);
     probe
 }
 
 fn log(report: &StallReport) {
-    let secs = |mark: Option<Mark>, now: u64| mark.map_or(0, |mark| now.saturating_sub(mark.since_ms) / 1000);
+    let secs = |mark: Option<Mark>, now: u64| {
+        mark.map_or(0, |mark| now.saturating_sub(mark.since_ms) / 1000)
+    };
     let label = |mark: Option<Mark>| mark.map_or("none", |mark| mark.section.label());
     let pid = std::process::id();
     match report {
-        StallReport::Blocked { task, impact, blocked, place, at_ms, repeat } => {
-            let message = if *repeat { "master task still blocked" } else { "master task blocked" };
+        StallReport::Blocked {
+            task,
+            impact,
+            blocked,
+            place,
+            at_ms,
+            repeat,
+        } => {
+            let message = if *repeat {
+                "master task still blocked"
+            } else {
+                "master task blocked"
+            };
             let action = format!(
                 "this node's master process, not the network: {impact}. One warning after a slow epoch step \
                  (prover registry refresh, epoch-boundary execution) is expected; if this warning repeats, \
@@ -239,7 +297,12 @@ fn log(report: &StallReport) {
                 pid, scope = "this node's master process", action = %action,
                 "{message}: {} / {} has not returned for {}s", task.label(), place.describe(), blocked.as_secs());
         }
-        StallReport::Unblocked { task, blocked, seen, exited } => {
+        StallReport::Unblocked {
+            task,
+            blocked,
+            seen,
+            exited,
+        } => {
             info!(task = task.label(), blocked_secs = blocked.as_secs(), seen = %seen.join("; "), exited,
                 scope = "this node's master process",
                 "master task unblocked after {}s: {}", blocked.as_secs(), task.label());
@@ -256,8 +319,13 @@ mod tests {
         reports
             .iter()
             .filter_map(|report| match report {
-                StallReport::Blocked { task, blocked, place, repeat, .. } =>
-                    Some((*task, blocked.as_secs(), place.describe(), *repeat)),
+                StallReport::Blocked {
+                    task,
+                    blocked,
+                    place,
+                    repeat,
+                    ..
+                } => Some((*task, blocked.as_secs(), place.describe(), *repeat)),
                 StallReport::Unblocked { .. } => None,
             })
             .collect()
@@ -269,8 +337,14 @@ mod tests {
         let t0 = now_ms();
         probe.beat_at(t0);
         let mut watch = StallWatch::new(REPEAT);
-        watch.add(Section::MessageLoop, MESSAGE_LOOP_IMPACT, MESSAGE_LOOP_STALL_AFTER, &probe);
-        let place = "inbound GLOBAL frame / GLOBAL frame cache lock wait within GLOBAL frame execution";
+        watch.add(
+            Section::MessageLoop,
+            MESSAGE_LOOP_IMPACT,
+            MESSAGE_LOOP_STALL_AFTER,
+            &probe,
+        );
+        let place =
+            "inbound GLOBAL frame / GLOBAL frame cache lock wait within GLOBAL frame execution";
         {
             let _installed = install(probe.clone());
             step(Section::LoopGlobalFrame);
@@ -278,24 +352,33 @@ mod tests {
             let _wait = section(Section::ClockCacheWait);
             assert_eq!(watch.poll(t0 + 59_999), Vec::new());
             let reports = watch.poll(t0 + 60_000);
-            assert_eq!(blocked(&reports), vec![(Section::MessageLoop, 60, place.to_string(), false)]);
+            assert_eq!(
+                blocked(&reports),
+                vec![(Section::MessageLoop, 60, place.to_string(), false)]
+            );
             // Every five seconds the watchdog looks again; it warns again
             // only after the repeat interval.
             for later in (65_000..120_000).step_by(5_000) {
                 assert_eq!(watch.poll(t0 + later), Vec::new(), "{later}");
             }
             let reports = watch.poll(t0 + 120_000);
-            assert_eq!(blocked(&reports), vec![(Section::MessageLoop, 120, place.to_string(), true)]);
+            assert_eq!(
+                blocked(&reports),
+                vec![(Section::MessageLoop, 120, place.to_string(), true)]
+            );
         }
         // The call returned and the loop came round.
         probe.beat_at(t0 + 125_000);
         let reports = watch.poll(t0 + 126_000);
-        assert_eq!(reports, vec![StallReport::Unblocked {
-            task: Section::MessageLoop,
-            blocked: Duration::from_secs(125),
-            seen: vec![place.to_string()],
-            exited: false,
-        }]);
+        assert_eq!(
+            reports,
+            vec![StallReport::Unblocked {
+                task: Section::MessageLoop,
+                blocked: Duration::from_secs(125),
+                seen: vec![place.to_string()],
+                exited: false,
+            }]
+        );
         assert_eq!(watch.poll(t0 + 184_000), Vec::new());
     }
 
@@ -306,27 +389,64 @@ mod tests {
         message_loop.beat_at(t0);
         poller.beat_at(t0);
         let mut watch = StallWatch::new(REPEAT);
-        watch.add(Section::MessageLoop, MESSAGE_LOOP_IMPACT, MESSAGE_LOOP_STALL_AFTER, &message_loop);
-        watch.add(Section::ArchivePoller, POLLER_IMPACT, POLLER_STALL_AFTER, &poller);
+        watch.add(
+            Section::MessageLoop,
+            MESSAGE_LOOP_IMPACT,
+            MESSAGE_LOOP_STALL_AFTER,
+            &message_loop,
+        );
+        watch.add(
+            Section::ArchivePoller,
+            POLLER_IMPACT,
+            POLLER_STALL_AFTER,
+            &poller,
+        );
         {
             let _installed = install(poller.clone());
             step(Section::PollerConnect);
         }
         assert_eq!(watch.poll(t0 + 59_999), Vec::new());
         let reports = watch.poll(t0 + 60_000);
-        assert_eq!(blocked(&reports), vec![(Section::MessageLoop, 60, "awaiting its next event".to_string(), false)]);
+        assert_eq!(
+            blocked(&reports),
+            vec![(
+                Section::MessageLoop,
+                60,
+                "awaiting its next event".to_string(),
+                false
+            )]
+        );
         let reports = watch.poll(t0 + 90_000);
-        assert_eq!(blocked(&reports), vec![(Section::ArchivePoller, 90, "archive connect".to_string(), false)]);
+        assert_eq!(
+            blocked(&reports),
+            vec![(
+                Section::ArchivePoller,
+                90,
+                "archive connect".to_string(),
+                false
+            )]
+        );
         let reports = watch.poll(t0 + 120_000);
-        assert_eq!(blocked(&reports), vec![(Section::MessageLoop, 120, "awaiting its next event".to_string(), true)]);
+        assert_eq!(
+            blocked(&reports),
+            vec![(
+                Section::MessageLoop,
+                120,
+                "awaiting its next event".to_string(),
+                true
+            )]
+        );
         drop(poller);
         let reports = watch.poll(t0 + 125_000);
-        assert_eq!(reports, vec![StallReport::Unblocked {
-            task: Section::ArchivePoller,
-            blocked: Duration::from_secs(125),
-            seen: vec!["archive connect".to_string()],
-            exited: true,
-        }]);
+        assert_eq!(
+            reports,
+            vec![StallReport::Unblocked {
+                task: Section::ArchivePoller,
+                blocked: Duration::from_secs(125),
+                seen: vec!["archive connect".to_string()],
+                exited: true,
+            }]
+        );
         assert_eq!(watch.watched.len(), 1);
     }
 
@@ -336,7 +456,12 @@ mod tests {
         let t0 = now_ms();
         probe.idle();
         let mut watch = StallWatch::new(REPEAT);
-        watch.add(Section::ArchivePoller, POLLER_IMPACT, POLLER_STALL_AFTER, &probe);
+        watch.add(
+            Section::ArchivePoller,
+            POLLER_IMPACT,
+            POLLER_STALL_AFTER,
+            &probe,
+        );
         assert_eq!(watch.poll(t0 + 3_600_000), Vec::new());
         // Its next beat starts the clock again.
         probe.beat_at(t0 + 3_600_000);

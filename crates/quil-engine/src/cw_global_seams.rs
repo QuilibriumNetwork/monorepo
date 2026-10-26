@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::{
     digest_from_identity, digest_to_identity, Digest, FrameFinalizer, FrameSink, GlobalProposer,
-    Recipients, ProposalContext,
+    ProposalContext, Recipients,
 };
 use quil_cw_consensus::falcon_base::FalconPublicKey;
 
@@ -168,13 +168,22 @@ impl GlobalSeamProposer {
     /// on the single execution lease. At most [`PUBLICATION_PRIORITY`] per
     /// view, so a finalizer that cannot publish (an application-frame gap)
     /// never holds a vote or proposal back for long.
-    fn yield_to_publication(&self, executor: &crate::frame_materializer::GlobalParentExecutor, view: u64, number: u64) -> bool {
+    fn yield_to_publication(
+        &self,
+        executor: &crate::frame_materializer::GlobalParentExecutor,
+        view: u64,
+        number: u64,
+    ) -> bool {
         if !executor.publication_pending(number) {
             return false;
         }
-        let Ok(mut waiting) = self.publication_wait.lock() else { return false };
+        let Ok(mut waiting) = self.publication_wait.lock() else {
+            return false;
+        };
         match *waiting {
-            Some((waited_view, since)) if waited_view == view => since.elapsed() < self.publication_priority,
+            Some((waited_view, since)) if waited_view == view => {
+                since.elapsed() < self.publication_priority
+            }
             _ => {
                 *waiting = Some((view, std::time::Instant::now()));
                 true
@@ -192,8 +201,12 @@ impl GlobalSeamProposer {
                 tracing::debug!("cw block ingress: undecodable frame, dropping");
                 return;
             };
-            let Some(header) = frame.header.as_ref() else { return };
-            let Some(digest) = frame_digest(header) else { return };
+            let Some(header) = frame.header.as_ref() else {
+                return;
+            };
+            let Some(digest) = frame_digest(header) else {
+                return;
+            };
             let frame_number = header.frame_number;
             store.put(digest, bytes);
             tracing::debug!(frame = frame_number, "cw block ingress: stored peer frame");
@@ -210,13 +223,18 @@ impl GlobalSeamProposer {
         self
     }
 
-    pub fn with_selected_execution(mut self, execution: Arc<crate::frame_materializer::GlobalParentExecutor>) -> Self {
+    pub fn with_selected_execution(
+        mut self,
+        execution: Arc<crate::frame_materializer::GlobalParentExecutor>,
+    ) -> Self {
         self.selected_execution = Some(execution);
         self
     }
 
     fn selected_parent_number(&self, digest: Digest) -> Option<u64> {
-        if let Some(number) = self.block_meta.lock().ok()?.get(&digest).copied() { return Some(number); }
+        if let Some(number) = self.block_meta.lock().ok()?.get(&digest).copied() {
+            return Some(number);
+        }
         let frame = self.clock_store.get_latest_global_clock_frame().ok()?;
         let header = frame.header.as_ref()?;
         (frame_digest(header) == Some(digest)).then_some(header.frame_number)
@@ -233,7 +251,11 @@ impl GlobalSeamProposer {
                 .filter(|h| h.frame_number == number && frame_digest(h) == Some(digest))
                 .map(|h| h.timestamp)
         };
-        if let Some(bytes) = self.block_store.as_ref().and_then(|store| store.get(&digest)) {
+        if let Some(bytes) = self
+            .block_store
+            .as_ref()
+            .and_then(|store| store.get(&digest))
+        {
             if let Some(timestamp) = decode_global_frame(&bytes).ok().and_then(recorded) {
                 return Some(timestamp);
             }
@@ -242,22 +264,43 @@ impl GlobalSeamProposer {
             .get_global_clock_frame_candidate(number, digest.as_ref())
             .ok()
             .and_then(recorded)
-            .or_else(|| self.clock_store.get_global_clock_frame(number).ok().and_then(recorded))
+            .or_else(|| {
+                self.clock_store
+                    .get_global_clock_frame(number)
+                    .ok()
+                    .and_then(recorded)
+            })
     }
 
     fn persist_selected_parent(&self, digest: Digest, number: u64) -> bool {
-        let Some(store) = self.block_store.as_ref() else { return true };
-        let matches = |frame: &GlobalFrame| frame.header.as_ref()
-            .is_some_and(|header| header.frame_number == number && frame_digest(header) == Some(digest));
-        if self.clock_store.get_global_clock_frame_candidate(number, digest.as_ref())
+        let Some(store) = self.block_store.as_ref() else {
+            return true;
+        };
+        let matches = |frame: &GlobalFrame| {
+            frame.header.as_ref().is_some_and(|header| {
+                header.frame_number == number && frame_digest(header) == Some(digest)
+            })
+        };
+        if self
+            .clock_store
+            .get_global_clock_frame_candidate(number, digest.as_ref())
             .or_else(|_| self.clock_store.get_global_clock_frame(number))
-            .is_ok_and(|frame| matches(&frame)) {
+            .is_ok_and(|frame| matches(&frame))
+        {
             return true;
         }
-        let Some(bytes) = store.get(&digest) else { return false };
-        let Ok(frame) = decode_global_frame(&bytes) else { return false };
-        if !matches(&frame) || !self.verifier.validate(&frame).unwrap_or(false)
-            || !self.verifier.verify_global_requests_root(frame.header.as_ref().unwrap(), &frame.requests) {
+        let Some(bytes) = store.get(&digest) else {
+            return false;
+        };
+        let Ok(frame) = decode_global_frame(&bytes) else {
+            return false;
+        };
+        if !matches(&frame)
+            || !self.verifier.validate(&frame).unwrap_or(false)
+            || !self
+                .verifier
+                .verify_global_requests_root(frame.header.as_ref().unwrap(), &frame.requests)
+        {
             return false;
         }
         self.persist_candidate(&frame)
@@ -267,14 +310,21 @@ impl GlobalSeamProposer {
     /// journal replay. Bounds apply to the unresolved tail, never to the full
     /// chain. A tail exceeding the budget refuses activation instead of
     /// silently dropping a parent the journal may have selected.
-    pub fn recover_pending(&self, store: &BlockStore) -> quil_types::error::Result<Vec<(u64, Digest, Vec<u8>)>> {
+    pub fn recover_pending(
+        &self,
+        store: &BlockStore,
+    ) -> quil_types::error::Result<Vec<(u64, Digest, Vec<u8>)>> {
         use quil_types::error::QuilError;
         let head = match self.clock_store.get_latest_global_clock_frame() {
             Ok(frame) => frame,
             Err(QuilError::NotFound(_)) => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let height = head.header.as_ref().ok_or_else(|| QuilError::Store("GLOBAL head has no header".into()))?.frame_number;
+        let height = head
+            .header
+            .as_ref()
+            .ok_or_else(|| QuilError::Store("GLOBAL head has no header".into()))?
+            .frame_number;
         // Candidate bodies are a cache: a body not restored here is fetched
         // from or re-advertised by peers, or this member abstains and catches
         // up. A long halt persists a proposal per view; refusing activation
@@ -283,29 +333,52 @@ impl GlobalSeamProposer {
         let mut frames = Vec::new();
         if let Some(next) = height.checked_add(1) {
             for limit in [65usize, 16, 4, 1] {
-                match self.clock_store.range_global_clock_frame_candidates(next, u64::MAX, limit) {
+                match self
+                    .clock_store
+                    .range_global_clock_frame_candidates(next, u64::MAX, limit)
+                {
                     Ok(found) => {
                         frames = found;
                         break;
                     }
-                    Err(error) => tracing::warn!(limit, %error, "GLOBAL candidate recovery over budget; restoring fewer"),
+                    Err(error) => {
+                        tracing::warn!(limit, %error, "GLOBAL candidate recovery over budget; restoring fewer")
+                    }
                 }
             }
         }
         if frames.len() > 64 {
-            tracing::warn!(found = frames.len(), "GLOBAL recovery restores the lowest 64 unresolved candidates");
+            tracing::warn!(
+                found = frames.len(),
+                "GLOBAL recovery restores the lowest 64 unresolved candidates"
+            );
             frames.truncate(64);
         }
-        let head_digest = frame_digest(head.header.as_ref().ok_or_else(|| QuilError::Store("GLOBAL head has no header".into()))?)
-            .ok_or_else(|| QuilError::Store("GLOBAL head has no identity".into()))?;
+        let head_digest = frame_digest(
+            head.header
+                .as_ref()
+                .ok_or_else(|| QuilError::Store("GLOBAL head has no header".into()))?,
+        )
+        .ok_or_else(|| QuilError::Store("GLOBAL head has no identity".into()))?;
         if height > 0 {
             match self.verifier.validate(&head) {
                 Ok(true) => {}
-                Ok(false) => return Err(QuilError::Store(
-                    "invalid canonical GLOBAL head: its header or certificate does not verify".into())),
-                Err(error) => return Err(QuilError::Store(format!("invalid canonical GLOBAL head: {error}"))),
+                Ok(false) => {
+                    return Err(QuilError::Store(
+                        "invalid canonical GLOBAL head: its header or certificate does not verify"
+                            .into(),
+                    ))
+                }
+                Err(error) => {
+                    return Err(QuilError::Store(format!(
+                        "invalid canonical GLOBAL head: {error}"
+                    )))
+                }
             }
-            if !self.verifier.verify_global_requests_root(head.header.as_ref().unwrap(), &head.requests) {
+            if !self
+                .verifier
+                .verify_global_requests_root(head.header.as_ref().unwrap(), &head.requests)
+            {
                 return Err(QuilError::Store(
                     "invalid canonical GLOBAL head: its request body does not match its requests root".into()));
             }
@@ -316,18 +389,30 @@ impl GlobalSeamProposer {
         store.put(head_digest, head_bytes);
         let mut recovered = Vec::new();
         for frame in frames {
-            let Some(header) = frame.header.as_ref() else { continue };
-            let Some(digest) = frame_digest(header) else { continue };
+            let Some(header) = frame.header.as_ref() else {
+                continue;
+            };
+            let Some(digest) = frame_digest(header) else {
+                continue;
+            };
             if !self.verifier.validate(&frame).unwrap_or(false)
-                || !self.verifier.verify_global_requests_root(header, &frame.requests)
+                || !self
+                    .verifier
+                    .verify_global_requests_root(header, &frame.requests)
             {
-                tracing::warn!(frame = header.frame_number, "skipping an invalid GLOBAL recovery candidate");
+                tracing::warn!(
+                    frame = header.frame_number,
+                    "skipping an invalid GLOBAL recovery candidate"
+                );
                 continue;
             }
             let bytes = encode_global_frame(&frame)?;
             bytes_used = bytes_used.saturating_add(bytes.len());
             if bytes_used > 64 * 1024 * 1024 {
-                tracing::warn!(frame = header.frame_number, "GLOBAL recovery byte budget reached; skipping the rest");
+                tracing::warn!(
+                    frame = header.frame_number,
+                    "GLOBAL recovery byte budget reached; skipping the rest"
+                );
                 break;
             }
             self.note_frame(digest, header.frame_number);
@@ -351,12 +436,20 @@ impl GlobalProposer for GlobalSeamProposer {
         let Some(executor) = self.selected_execution.as_ref() else {
             return self.propose(context.view, context.parent);
         };
-        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return None; }
+        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) {
+            return None;
+        }
         let number = self.selected_parent_number(context.parent)?;
         if self.yield_to_publication(executor, context.view, number) {
             return None; // retried by `propose_retry`
         }
-        let prepared = match executor.prepare(context, number, self.block_store.as_ref()?, &self.verifier, true) {
+        let prepared = match executor.prepare(
+            context,
+            number,
+            self.block_store.as_ref()?,
+            &self.verifier,
+            true,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL parent execution unavailable");
@@ -369,51 +462,100 @@ impl GlobalProposer for GlobalSeamProposer {
         let header = frame.header.as_ref()?;
         let state_matches = prepared.matches_child(header);
         let proof_matches = self.verifier.validate(&frame).ok()?;
-        let body_matches = self.verifier.verify_global_requests_root(header, &frame.requests);
+        let body_matches = self
+            .verifier
+            .verify_global_requests_root(header, &frame.requests);
         if !state_matches || !proof_matches || !body_matches {
-            tracing::warn!(view = context.view, state_matches, proof_matches, body_matches,
-                "private GLOBAL proposal does not reproduce selected parent state or valid input");
+            tracing::warn!(
+                view = context.view,
+                state_matches,
+                proof_matches,
+                body_matches,
+                "private GLOBAL proposal does not reproduce selected parent state or valid input"
+            );
             return None;
         }
         let digest = frame_digest(header)?;
         let bytes = encode_global_frame(&frame).ok()?;
-        if bytes.len() > executor.max_frame_bytes() || prepared.check().is_err() { return None; }
-        for ancestor in prepared.ancestors() {
-            if !self.persist_candidate(ancestor) { return None; }
+        if bytes.len() > executor.max_frame_bytes() || prepared.check().is_err() {
+            return None;
         }
-        if !self.persist_candidate(&frame) { return None; }
+        for ancestor in prepared.ancestors() {
+            if !self.persist_candidate(ancestor) {
+                return None;
+            }
+        }
+        if !self.persist_candidate(&frame) {
+            return None;
+        }
         prepared.check().ok()?;
         self.note_frame(digest, header.frame_number);
         // One line per leader turn this node wins; the other members vote.
-        tracing::info!(view = context.view, frame = header.frame_number, "cw propose: proposed GLOBAL frame as leader");
+        tracing::info!(
+            view = context.view,
+            frame = header.frame_number,
+            "cw propose: proposed GLOBAL frame as leader"
+        );
         Some((digest, bytes))
     }
 
-    fn verify_with_context(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
-        self.verify_or_defer(context, digest, bytes).unwrap_or(false)
+    fn verify_with_context(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool {
+        self.verify_or_defer(context, digest, bytes)
+            .unwrap_or(false)
     }
 
     /// Defers only while this node's own execution is busy (publishing the
     /// previous frame, proposing, or checking another proposal). Answering then
     /// nullified valid proposals at once, and a view needs 4 of 5 votes.
-    fn verify_or_defer(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> Result<bool, std::time::Duration> {
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<bool, std::time::Duration> {
         const DEFER: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(executor) = self.selected_execution.as_ref() else {
             return Ok(self.verify(context.view, context.parent, digest, bytes));
         };
-        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) { return Ok(false); }
-        if executor.busy() { return Err(DEFER); }
-        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else { return Ok(false) };
-        let Ok(frame) = decode_global_frame(&bytes) else { return Ok(false) };
-        let Some(header) = frame.header.as_ref() else { return Ok(false) };
-        if header.rank != context.view || header.parent_selector != context.parent.as_ref()
-            || frame_digest(header) != Some(digest) || !self.verifier.validate(&frame).unwrap_or(false)
-            || !self.verifier.verify_global_requests_root(header, &frame.requests) { return Ok(false); }
-        let Some(number) = self.selected_parent_number(context.parent) else { return Ok(false) };
+        if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) {
+            return Ok(false);
+        }
+        if executor.busy() {
+            return Err(DEFER);
+        }
+        let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else {
+            return Ok(false);
+        };
+        let Ok(frame) = decode_global_frame(&bytes) else {
+            return Ok(false);
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return Ok(false);
+        };
+        if header.rank != context.view
+            || header.parent_selector != context.parent.as_ref()
+            || frame_digest(header) != Some(digest)
+            || !self.verifier.validate(&frame).unwrap_or(false)
+            || !self
+                .verifier
+                .verify_global_requests_root(header, &frame.requests)
+        {
+            return Ok(false);
+        }
+        let Some(number) = self.selected_parent_number(context.parent) else {
+            return Ok(false);
+        };
         if self.yield_to_publication(executor, context.view, number) {
             return Err(DEFER);
         }
-        let Some(blocks) = self.block_store.as_ref() else { return Ok(false) };
+        let Some(blocks) = self.block_store.as_ref() else {
+            return Ok(false);
+        };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,
             Err(_) if executor.busy() => return Err(DEFER),
@@ -437,12 +579,20 @@ impl GlobalProposer for GlobalSeamProposer {
             }
             return Ok(false);
         }
-        if prepared.check().is_err() { return Ok(false); }
-        for ancestor in prepared.ancestors() {
-            if !self.persist_candidate(ancestor) { return Ok(false); }
+        if prepared.check().is_err() {
+            return Ok(false);
         }
-        if !self.persist_candidate(&frame) { return Ok(false); }
-        if prepared.check().is_err() { return Ok(false); }
+        for ancestor in prepared.ancestors() {
+            if !self.persist_candidate(ancestor) {
+                return Ok(false);
+            }
+        }
+        if !self.persist_candidate(&frame) {
+            return Ok(false);
+        }
+        if prepared.check().is_err() {
+            return Ok(false);
+        }
         self.note_frame(digest, header.frame_number);
         Ok(true)
     }
@@ -465,11 +615,16 @@ impl GlobalProposer for GlobalSeamProposer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        Some(crate::leader_provider::proposal_pacing_wait(timestamp, now_ms)).filter(|wait| !wait.is_zero())
+        Some(crate::leader_provider::proposal_pacing_wait(
+            timestamp, now_ms,
+        ))
+        .filter(|wait| !wait.is_zero())
     }
     fn propose(&self, view: u64, parent_digest: Digest) -> Option<(Digest, Vec<u8>)> {
-        if self.selected_execution.is_some() { return None; } // Full context is mandatory.
-        // parent digest bytes == prior frame identity (Poseidon(output)).
+        if self.selected_execution.is_some() {
+            return None;
+        } // Full context is mandatory.
+          // parent digest bytes == prior frame identity (Poseidon(output)).
         let meta_hit = self.block_meta.lock().unwrap().get(&parent_digest).copied();
         let (prior_frame_number, prior_state_id): (u64, Vec<u8>) = match meta_hit {
             Some(n) => (n, digest_to_identity(&parent_digest).to_vec()),
@@ -482,7 +637,10 @@ impl GlobalProposer for GlobalSeamProposer {
                     return None;
                 }
                 self.note_frame(parent_digest, header.frame_number);
-                (header.frame_number, digest_to_identity(&parent_digest).to_vec())
+                (
+                    header.frame_number,
+                    digest_to_identity(&parent_digest).to_vec(),
+                )
             }
         };
 
@@ -520,22 +678,33 @@ impl GlobalProposer for GlobalSeamProposer {
         let frame = global_frame_from_state(&state);
         let header = frame.header.as_ref()?;
         if header.rank != view || header.parent_selector != parent_digest.as_ref() {
-            tracing::warn!(view, "cw propose: assembled frame changed the selected view or parent");
+            tracing::warn!(
+                view,
+                "cw propose: assembled frame changed the selected view or parent"
+            );
             return None;
         }
         let digest = frame_digest(header)?;
         let frame_number = header.frame_number;
         let bytes = encode_global_frame(&frame).ok()?;
-        if !self.persist_candidate(&frame) { return None; }
+        if !self.persist_candidate(&frame) {
+            return None;
+        }
 
         self.block_meta.lock().unwrap().insert(digest, frame_number);
         // One line per leader turn this node wins; the other members vote.
-        tracing::info!(view, frame = frame_number, "cw propose: proposed GLOBAL frame as leader");
+        tracing::info!(
+            view,
+            frame = frame_number,
+            "cw propose: proposed GLOBAL frame as leader"
+        );
         Some((digest, bytes))
     }
 
     fn verify(&self, view: u64, parent: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
-        if self.selected_execution.is_some() { return false; }
+        if self.selected_execution.is_some() {
+            return false;
+        }
         let Some(bytes) = bytes else {
             // Block not yet delivered — nullify rather than vote blind.
             tracing::warn!(view, "cw verify: block not delivered (nullify)");
@@ -549,12 +718,20 @@ impl GlobalProposer for GlobalSeamProposer {
             return false;
         };
         if header.rank != view || header.parent_selector != parent.as_ref() {
-            tracing::warn!(view, rank = header.rank, "cw verify: view or parent mismatch (nullify)");
+            tracing::warn!(
+                view,
+                rank = header.rank,
+                "cw verify: view or parent mismatch (nullify)"
+            );
             return false;
         }
         // The digest must bind to this frame's identity.
         if frame_digest(header) != Some(digest) {
-            tracing::warn!(view, frame = header.frame_number, "cw verify: digest mismatch (nullify)");
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                "cw verify: digest mismatch (nullify)"
+            );
             return false;
         }
         // Structural + VDF/BLS validation.
@@ -571,7 +748,10 @@ impl GlobalProposer for GlobalSeamProposer {
                 // `requests_root` (state divergence / halt). Recompute + reject on
                 // mismatch, mirroring the app-shard seam (`app_engine`) and the
                 // gossip receive path.
-                if !self.verifier.verify_global_requests_root(header, &frame.requests) {
+                if !self
+                    .verifier
+                    .verify_global_requests_root(header, &frame.requests)
+                {
                     tracing::warn!(
                         view,
                         frame = header.frame_number,
@@ -645,8 +825,13 @@ impl GlobalProposer for GlobalSeamProposer {
                         }
                     }
                 }
-                if !self.persist_candidate(&frame) { return false; }
-                self.block_meta.lock().unwrap().insert(digest, header.frame_number);
+                if !self.persist_candidate(&frame) {
+                    return false;
+                }
+                self.block_meta
+                    .lock()
+                    .unwrap()
+                    .insert(digest, header.frame_number);
                 tracing::debug!(view, frame = header.frame_number, "cw verify: OK (vote)");
                 true
             }
@@ -677,7 +862,10 @@ pub struct GlobalSeamSink {
 }
 
 impl GlobalSeamSink {
-    pub fn new(transport: Arc<dyn GlobalConsensusTransport>, peers: Arc<[FalconPublicKey]>) -> Self {
+    pub fn new(
+        transport: Arc<dyn GlobalConsensusTransport>,
+        peers: Arc<[FalconPublicKey]>,
+    ) -> Self {
         Self { transport, peers }
     }
 }
@@ -757,10 +945,18 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // `propose` can build on this tip before it finalizes (the leader
         // provider resolves the parent from committed-or-candidate).
         let Some(bytes) = bytes else { return };
-        let Ok(frame) = decode_global_frame(&bytes) else { return };
-        let Some(header) = frame.header.as_ref() else { return };
-        if header.rank != view || frame_digest(header) != Some(digest)
-            || !crate::frame_validator::global_frame_body_matches_requests_root(header, &frame.requests)
+        let Ok(frame) = decode_global_frame(&bytes) else {
+            return;
+        };
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        if header.rank != view
+            || frame_digest(header) != Some(digest)
+            || !crate::frame_validator::global_frame_body_matches_requests_root(
+                header,
+                &frame.requests,
+            )
         {
             tracing::warn!(view, "cw notarize: frame differs from reported proposal");
             return;
@@ -785,14 +981,19 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // so retain the context-free body re-bind check below at the persistence
         // boundary regardless of `_locally_verified`.
         let Some(bytes) = bytes else {
-            tracing::warn!(view, "cw finalize: finalized block body not held locally; relying on peers");
+            tracing::warn!(
+                view,
+                "cw finalize: finalized block body not held locally; relying on peers"
+            );
             return;
         };
         let Ok(mut frame) = decode_global_frame(&bytes) else {
             tracing::warn!(view, "cw finalize: finalized block body does not decode");
             return;
         };
-        let Some(header) = frame.header.as_ref() else { return };
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
         if header.rank != view || frame_digest(header) != Some(digest) {
             tracing::warn!(view, "cw finalize: frame differs from finalized proposal");
             return;
@@ -803,7 +1004,8 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // materialized. Recompute the requests root and drop on mismatch — the
         // "post-verification body swap" guard the app-shard seam also has.
         if let Some(h) = frame.header.as_ref() {
-            if !crate::frame_validator::global_frame_body_matches_requests_root(h, &frame.requests) {
+            if !crate::frame_validator::global_frame_body_matches_requests_root(h, &frame.requests)
+            {
                 tracing::warn!(
                     frame = h.frame_number,
                     "cw finalize: request body does not match certified requests_root — dropping"
@@ -858,18 +1060,28 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // certified frame replaces it, loudly.
         if let Ok(stored) = self.clock_store.get_global_clock_frame(frame_number) {
             let identity = |frame: &GlobalFrame| {
-                frame.header.as_ref().and_then(|h| quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok())
+                frame
+                    .header
+                    .as_ref()
+                    .and_then(|h| quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok())
             };
             if identity(&stored).is_some() && identity(&stored) == identity(&frame) {
-                tracing::debug!(frame = frame_number, view, "finalized GLOBAL frame is already canonical (journal replay)");
+                tracing::debug!(
+                    frame = frame_number,
+                    view,
+                    "finalized GLOBAL frame is already canonical (journal replay)"
+                );
                 let _ = self.mat_job_tx.send((frame, frame_number));
                 return;
             }
             tracing::error!(frame = frame_number, view,
                 "finalized GLOBAL frame differs from the canonical record at its height; replacing the record");
         } else if self.pipeline.is_some() {
-            tracing::warn!(frame = frame_number, view,
-                "finalized GLOBAL frame beyond the admission window: writing it canonically");
+            tracing::warn!(
+                frame = frame_number,
+                view,
+                "finalized GLOBAL frame beyond the admission window: writing it canonically"
+            );
         }
         // Durable commit, bump head atomics and gossip (proposer only), then
         // hand off to the materialize worker (non-blocking send; the worker
@@ -912,7 +1124,9 @@ pub trait GlobalConsensusTransport: Send + Sync + 'static {
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
 /// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
 pub struct GlobalConsensusCwHandle {
-    pub inbound: [tokio::sync::mpsc::UnboundedSender<quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>>; 3],
+    pub inbound: [tokio::sync::mpsc::UnboundedSender<
+        quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
+    >; 3],
     /// Feed a peer-delivered frame's canonical bytes into the engine's
     /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
     /// leave its parent-height metadata untouched. Drops malformed bytes.
@@ -973,18 +1187,34 @@ pub fn activate_global_consensus_cw(
         use quil_cw_consensus::_crypto::certificate::Scheme as _;
         use quil_cw_consensus::_utils::ordered::Quorum as _;
         let participants = scheme.participants();
-        let labels = participants.iter().map(|member| {
-            peers.iter().position(|peer| peer == member).and_then(|index| member_labels.get(index).cloned())
-                .unwrap_or_else(|| crate::global_stall::tail(&hex::encode(member)))
-        }).collect();
+        let labels = participants
+            .iter()
+            .map(|member| {
+                peers
+                    .iter()
+                    .position(|peer| peer == member)
+                    .and_then(|index| member_labels.get(index).cloned())
+                    .unwrap_or_else(|| crate::global_stall::tail(&hex::encode(member)))
+            })
+            .collect();
         // The quorum consensus counts votes against (`batcher/round.rs`).
         let quorum = participants.quorum::<quil_cw_consensus::_utils::N3f1>() as usize;
         let timeouts = GlobalEngineParams::new("global", epoch, genesis_digest)
             .with_leader_timeout_secs(leader_timeout_secs);
         let watch = crate::global_stall::GlobalWatch::new(
-            labels, scheme.me().map(usize::from), quorum, epoch, timeouts.leader_timeout, timeouts.timeout_retry,
+            labels,
+            scheme.me().map(usize::from),
+            quorum,
+            epoch,
+            timeouts.leader_timeout,
+            timeouts.timeout_retry,
         );
-        (Arc::new(crate::global_stall::GlobalContact::new(participants.iter().cloned())), watch)
+        (
+            Arc::new(crate::global_stall::GlobalContact::new(
+                participants.iter().cloned(),
+            )),
+            watch,
+        )
     };
     // Shared block store: `propose` inserts our own frame; the node inserts
     // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
@@ -1000,14 +1230,19 @@ pub fn activate_global_consensus_cw(
         filter,
         clock_store.clone(),
         on_prover_fork,
-    ).with_block_store(store.clone()).with_selected_execution(selected_execution);
+    )
+    .with_block_store(store.clone())
+    .with_selected_execution(selected_execution);
     let proposer = Arc::new(proposer);
     // Seed the parent map so the FIRST proposal resolves the genesis parent's
     // frame number (block_meta is otherwise empty → prior_frame_number 0).
     proposer.note_frame(genesis_digest, genesis_frame_number);
     let sink = Arc::new(GlobalSeamSink::new(transport.clone(), peers.clone()));
     let mut recovered = proposer.recover_pending(&store)?;
-    tracing::info!(candidates = recovered.len(), "restored GLOBAL consensus bodies before journal replay");
+    tracing::info!(
+        candidates = recovered.len(),
+        "restored GLOBAL consensus bodies before journal replay"
+    );
     let finalizer = Arc::new(
         GlobalSeamFinalizer::new(
             clock_store.clone(),
@@ -1021,29 +1256,39 @@ pub fn activate_global_consensus_cw(
 
     // Rebuild a failed host only after it joins. The transport routes, fixed
     // committee, body store and on-disk journal survive every replacement.
-    let inbound = crate::cw_host_supervisor::supervise_global_host({
-        let proposer = proposer.clone();
-        let sink = sink.clone();
-        let store = store.clone();
-        let liveness = liveness.clone();
-        move |shutdown| spawn_global_host(
-            scheme.clone(),
-            peers.clone(),
-            proposer.clone(),
-            sink.clone(),
-            finalizer.clone(),
-            store.clone(),
-            {
-                let mut params = GlobalEngineParams::new("global", epoch, genesis_digest)
-                    .with_leader_timeout_secs(leader_timeout_secs);
-                params.liveness = Some(liveness.clone());
-                params
-            },
-            Some(storage_directory.clone()),
-            Some(shutdown),
-        )
-    }, transport);
-    crate::global_stall::spawn(watch, Arc::downgrade(&contact), liveness, clock_store.clone());
+    let inbound = crate::cw_host_supervisor::supervise_global_host(
+        {
+            let proposer = proposer.clone();
+            let sink = sink.clone();
+            let store = store.clone();
+            let liveness = liveness.clone();
+            move |shutdown| {
+                spawn_global_host(
+                    scheme.clone(),
+                    peers.clone(),
+                    proposer.clone(),
+                    sink.clone(),
+                    finalizer.clone(),
+                    store.clone(),
+                    {
+                        let mut params = GlobalEngineParams::new("global", epoch, genesis_digest)
+                            .with_leader_timeout_secs(leader_timeout_secs);
+                        params.liveness = Some(liveness.clone());
+                        params
+                    },
+                    Some(storage_directory.clone()),
+                    Some(shutdown),
+                )
+            }
+        },
+        transport,
+    );
+    crate::global_stall::spawn(
+        watch,
+        Arc::downgrade(&contact),
+        liveness,
+        clock_store.clone(),
+    );
 
     // Another member may have stopped after voting but before keeping the old
     // candidate. Re-advertise this bounded recovered tail until finalized. The
@@ -1059,7 +1304,9 @@ pub fn activate_global_consensus_cw(
                     recovered.retain(|(number, _, _)| *number > header.frame_number);
                 }
             }
-            if recovered.is_empty() { break; }
+            if recovered.is_empty() {
+                break;
+            }
             index %= recovered.len();
             let (_, digest, bytes) = &recovered[index];
             sink.broadcast(*digest, bytes.clone(), Recipients::All);
@@ -1070,7 +1317,11 @@ pub fn activate_global_consensus_cw(
     // Peer ingress can store candidates, but cannot change trusted heights.
     let ingest_block = proposer.peer_ingress(store.clone());
 
-    Ok(GlobalConsensusCwHandle { inbound, ingest_block, contact })
+    Ok(GlobalConsensusCwHandle {
+        inbound,
+        ingest_block,
+        contact,
+    })
 }
 
 #[cfg(test)]
@@ -1079,10 +1330,19 @@ mod ingress_tests {
 
     struct NoProposal;
     impl LeaderProvider<GlobalState> for NoProposal {
-        fn get_next_leaders(&self, _: Option<&State<GlobalState>>) -> quil_types::error::Result<Vec<Vec<u8>>> {
+        fn get_next_leaders(
+            &self,
+            _: Option<&State<GlobalState>>,
+        ) -> quil_types::error::Result<Vec<Vec<u8>>> {
             unreachable!()
         }
-        fn prove_next_state(&self, _: u64, _: &[u8], _: u64, _: &Vec<u8>) -> quil_types::error::Result<State<GlobalState>> {
+        fn prove_next_state(
+            &self,
+            _: u64,
+            _: &[u8],
+            _: u64,
+            _: &Vec<u8>,
+        ) -> quil_types::error::Result<State<GlobalState>> {
             unreachable!()
         }
     }
@@ -1091,14 +1351,23 @@ mod ingress_tests {
     fn peer_ingress_preserves_validated_parent_height() {
         let proposer = Arc::new(GlobalSeamProposer::new(
             Arc::new(NoProposal),
-            Arc::new(GlobalFrameVerifier::new(Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)))),
-            vec![], Arc::new(quil_store::testing::InMemoryClockStore::new()), None,
+            Arc::new(GlobalFrameVerifier::new(Arc::new(
+                quil_crypto::WesolowskiFrameProver::new(2048),
+            ))),
+            vec![],
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            None,
         ));
         let store = BlockStore::new();
         let ingress = proposer.peer_ingress(store.clone());
-        let mut frame = GlobalFrame { header: Some(GlobalFrameHeader {
-            frame_number: 7, output: vec![3; 516], ..Default::default()
-        }), ..Default::default() };
+        let mut frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 7,
+                output: vec![3; 516],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let digest = frame_digest(frame.header.as_ref().unwrap()).unwrap();
         let honest = encode_global_frame(&frame).unwrap();
         proposer.note_frame(digest, 7);

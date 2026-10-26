@@ -24,9 +24,7 @@ use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use quil_types::proto::proxy::{
-    self as pb, pub_sub_proxy_server::PubSubProxy,
-};
+use quil_types::proto::proxy::{self as pb, pub_sub_proxy_server::PubSubProxy};
 
 /// Closure that signs a message with the master's Ed448 key.
 pub type Ed448Signer = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
@@ -158,17 +156,14 @@ impl PubSubProxyServer {
     }
 }
 
-type SubscribeStream = Pin<
-    Box<dyn Stream<Item = Result<pb::MessageEvent, Status>> + Send + 'static>,
->;
+type SubscribeStream =
+    Pin<Box<dyn Stream<Item = Result<pb::MessageEvent, Status>> + Send + 'static>>;
 
-type MultiaddrStream = Pin<
-    Box<dyn Stream<Item = Result<pb::GetMultiaddrOfPeerResponse, Status>> + Send + 'static>,
->;
+type MultiaddrStream =
+    Pin<Box<dyn Stream<Item = Result<pb::GetMultiaddrOfPeerResponse, Status>> + Send + 'static>>;
 
-type ValidatorStreamOut = Pin<
-    Box<dyn Stream<Item = Result<pb::ValidationStreamMessage, Status>> + Send + 'static>,
->;
+type ValidatorStreamOut =
+    Pin<Box<dyn Stream<Item = Result<pb::ValidationStreamMessage, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl PubSubProxy for PubSubProxyServer {
@@ -184,10 +179,7 @@ impl PubSubProxy for PubSubProxyServer {
         Ok(Response::new(()))
     }
 
-    async fn publish(
-        &self,
-        _request: Request<pb::PublishRequest>,
-    ) -> Result<Response<()>, Status> {
+    async fn publish(&self, _request: Request<pb::PublishRequest>) -> Result<Response<()>, Status> {
         // `Publish` (by address) is the direct-send path in Go. The
         // Rust P2P stack does not yet expose address-targeted sends;
         // accept and drop until that primitive lands.
@@ -414,10 +406,7 @@ impl PubSubProxy for PubSubProxyServer {
         Ok(Response::new(()))
     }
 
-    async fn bootstrap(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<()>, Status> {
+    async fn bootstrap(&self, request: Request<()>) -> Result<Response<()>, Status> {
         self.require_self_identity(request.extensions())?;
         (self.p2p.bootstrap)()
             .await
@@ -425,10 +414,7 @@ impl PubSubProxy for PubSubProxyServer {
         Ok(Response::new(()))
     }
 
-    async fn discover_peers(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<()>, Status> {
+    async fn discover_peers(&self, request: Request<()>) -> Result<Response<()>, Status> {
         self.require_self_identity(request.extensions())?;
         (self.p2p.discover_peers)()
             .await
@@ -451,13 +437,12 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::GetNetworkResponse>, Status> {
-        Ok(Response::new(pb::GetNetworkResponse { network: self.network }))
+        Ok(Response::new(pb::GetNetworkResponse {
+            network: self.network,
+        }))
     }
 
-    async fn reachability(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<bool>, Status> {
+    async fn reachability(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
         Ok(Response::new(self.reachable))
     }
 
@@ -479,11 +464,7 @@ impl PubSubProxy for PubSubProxyServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::GetPublicKeyResponse>, Status> {
-        let pk = self
-            .pubkey
-            .as_ref()
-            .map(|f| f())
-            .unwrap_or_default();
+        let pk = self.pubkey.as_ref().map(|f| f()).unwrap_or_default();
         Ok(Response::new(pb::GetPublicKeyResponse { public_key: pk }))
     }
 }
@@ -543,7 +524,9 @@ mod self_identity_gate_tests {
         let denied = srv.require_self_identity(&ext_with(other)).unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
         // No AuthenticatedPeer in extensions → PermissionDenied (fail closed).
-        let empty = srv.require_self_identity(&tonic::Extensions::new()).unwrap_err();
+        let empty = srv
+            .require_self_identity(&tonic::Extensions::new())
+            .unwrap_err();
         assert_eq!(empty.code(), tonic::Code::PermissionDenied);
     }
 
@@ -553,6 +536,8 @@ mod self_identity_gate_tests {
         // (they never expose the proxy on the network anyway).
         let srv = server(Vec::new());
         assert!(srv.require_self_identity(&tonic::Extensions::new()).is_ok());
-        assert!(srv.require_self_identity(&ext_with(PeerId::random())).is_ok());
+        assert!(srv
+            .require_self_identity(&ext_with(PeerId::random()))
+            .is_ok());
     }
 }

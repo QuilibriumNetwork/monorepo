@@ -25,13 +25,16 @@ pub fn witness(
     // Without a shard view, fall back to a lag behind the global head.
     let cap = match shard_anchor {
         Some(anchor) => anchor,
-        None => clock.get_latest_global_clock_frame()?.header
+        None => clock
+            .get_latest_global_clock_frame()?
+            .header
             .map(|h| h.frame_number)
             .unwrap_or(0)
             .saturating_sub(super::constants::MINT_CLAIM_CITATION_LAG),
     };
-    let (root, header) = super::reward_witness::newest_retained_global_root(state, clock, Some(cap))
-        .map_err(|e| unavailable(&e.to_string()))?;
+    let (root, header) =
+        super::reward_witness::newest_retained_global_root(state, clock, Some(cap))
+            .map_err(|e| unavailable(&e.to_string()))?;
     let Some(proof) = state
         .crdt()
         .global_vertex_membership_at_root(&root, receipt)?

@@ -65,7 +65,12 @@ mod tests {
         let mut cache = ShardSenderKeys::default();
         assert!(cache.resolve(&peer, None, || None).is_empty());
         assert_eq!(cache.resolve(&peer, None, || Some(vec![key.clone()])), key);
-        assert_eq!(cache.resolve(&peer, None, || panic!("positive cache avoids another state read")), key);
+        assert_eq!(
+            cache.resolve(&peer, None, || panic!(
+                "positive cache avoids another state read"
+            )),
+            key
+        );
         assert!(cache.resolve(&[0; 34], None, || Some(vec![key])).is_empty());
         assert_eq!((cache.session, cache.cached, cache.unresolved), (1, 1, 2));
     }
@@ -76,9 +81,18 @@ mod tests {
         let key = signer.public_key().to_vec();
         let peer = quil_p2p::peer_id_from_falcon_pubkey(&key);
         let mut cache = ShardSenderKeys::default();
-        assert!(cache.resolve(&[0; 34], Some(key.clone()), || None).is_empty());
-        assert!(cache.resolve(&peer, Some(vec![1]), || Some(vec![vec![1]])).is_empty());
-        assert_eq!(cache.resolve(&peer, Some(key.clone()), || panic!("valid PeerInfo needs no fallback")), key);
+        assert!(cache
+            .resolve(&[0; 34], Some(key.clone()), || None)
+            .is_empty());
+        assert!(cache
+            .resolve(&peer, Some(vec![1]), || Some(vec![vec![1]]))
+            .is_empty());
+        assert_eq!(
+            cache.resolve(&peer, Some(key.clone()), || panic!(
+                "valid PeerInfo needs no fallback"
+            )),
+            key
+        );
         assert_eq!(cache.peer_info, 1);
         assert!(cache.keys.is_empty());
     }
@@ -92,7 +106,9 @@ mod tests {
         for i in 0..MAX_KEYS {
             cache.keys.insert(i.to_be_bytes().to_vec(), key.clone());
         }
-        assert!(cache.resolve(&[0; 34], None, || Some(vec![key.clone()])).is_empty());
+        assert!(cache
+            .resolve(&[0; 34], None, || Some(vec![key.clone()]))
+            .is_empty());
         assert_eq!(cache.keys.len(), MAX_KEYS);
         assert_eq!(cache.resolve(&peer, None, || Some(vec![key.clone()])), key);
         assert_eq!(cache.keys.len(), MAX_KEYS);

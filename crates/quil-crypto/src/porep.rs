@@ -297,7 +297,9 @@ pub fn audit_storage_possession(
     let hash = quil_types::consensus::hash_storage_proofs_at(active_epoch);
     let verified: Vec<bool> = audited
         .par_iter()
-        .map(|(o, registry_ok)| *registry_ok && opening_possession_verifies(o, rho_n, poly_size, hash))
+        .map(|(o, registry_ok)| {
+            *registry_ok && opening_possession_verifies(o, rho_n, poly_size, hash)
+        })
         .collect();
     // Failed members in opening order, as before: every node kicks the same
     // members in the same order.
@@ -319,7 +321,12 @@ pub fn audit_storage_possession(
 /// function of the scheme, the opening, `rho_n` and `poly_size`, and the key
 /// hashes all of them, so a remembered verdict is the verdict the check would
 /// return.
-fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64, hash: bool) -> bool {
+fn opening_possession_verifies(
+    o: &StorageOpening,
+    rho_n: &[u8],
+    poly_size: u64,
+    hash: bool,
+) -> bool {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     /// A frame carries a few thousand openings: a few frames' worth, about
@@ -328,7 +335,11 @@ fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64,
     static REMEMBERED: LazyLock<Mutex<HashMap<[u8; 32], bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let key = possession_check_key(o, rho_n, poly_size, hash);
-    if let Some(ok) = REMEMBERED.lock().ok().and_then(|seen| seen.get(&key).copied()) {
+    if let Some(ok) = REMEMBERED
+        .lock()
+        .ok()
+        .and_then(|seen| seen.get(&key).copied())
+    {
         return ok;
     }
     let ok = if hash {
@@ -483,8 +494,11 @@ pub fn verify_frame_storage_attestation_proto(
     bitmask: &[u8],
     poly_size: u64,
 ) -> bool {
-    let openings: Vec<StorageOpening> =
-        attestation.openings.iter().map(StorageOpening::from_proto).collect();
+    let openings: Vec<StorageOpening> = attestation
+        .openings
+        .iter()
+        .map(StorageOpening::from_proto)
+        .collect();
     verify_frame_storage_attestation(root, &openings, frame_number, rho_n, bitmask, poly_size)
 }
 
@@ -518,7 +532,14 @@ where
     F: Fn(&[u8], &[u8], u64) -> Option<(Vec<u8>, u64, u64)>,
 {
     explain_frame_storage_attestation_registered(
-        root, attestation, frame_number, rho_n, bitmask, poly_size, active_epoch, lookup,
+        root,
+        attestation,
+        frame_number,
+        rho_n,
+        bitmask,
+        poly_size,
+        active_epoch,
+        lookup,
     )
     .is_ok()
 }
@@ -546,7 +567,10 @@ where
         if o.epoch != active_epoch {
             return Err(format!(
                 "opening by {} for leaf {} is epoch {}, active epoch {}",
-                short(&o.member_id), short(&o.shard_id), o.epoch, active_epoch
+                short(&o.member_id),
+                short(&o.shard_id),
+                o.epoch,
+                active_epoch
             ));
         }
         match lookup(&o.member_id, &o.shard_id, o.epoch) {
@@ -579,7 +603,14 @@ where
             }
         }
     }
-    if !verify_frame_storage_attestation_proto(root, attestation, frame_number, rho_n, bitmask, poly_size) {
+    if !verify_frame_storage_attestation_proto(
+        root,
+        attestation,
+        frame_number,
+        rho_n,
+        bitmask,
+        poly_size,
+    ) {
         return Err(format!(
             "possession proof failed over {} opening(s) at frame {frame_number}",
             attestation.openings.len()
@@ -742,10 +773,22 @@ fn canonical_indexed<'a>(
     let mut v: Vec<(&'a StorageOpening, u64, u64)> = openings
         .iter()
         .map(|o| {
-            let block =
-                derive_block_index(rho_n, &o.shard_id, o.epoch, &o.member_id, o.query, o.num_blocks);
-            let point =
-                derive_challenge_index(rho_n, &o.shard_id, o.epoch, &o.member_id, o.query, poly_size);
+            let block = derive_block_index(
+                rho_n,
+                &o.shard_id,
+                o.epoch,
+                &o.member_id,
+                o.query,
+                o.num_blocks,
+            );
+            let point = derive_challenge_index(
+                rho_n,
+                &o.shard_id,
+                o.epoch,
+                &o.member_id,
+                o.query,
+                poly_size,
+            );
             (o, block, point)
         })
         .collect();
@@ -809,7 +852,9 @@ fn update_frame_transcript(
 /// is at or after `quil_types::consensus::hash_storage_proof_epoch()`. A set
 /// mixing schemes fails verification either way.
 fn uses_hash_proofs(openings: &[StorageOpening]) -> bool {
-    openings.first().is_some_and(|o| quil_types::consensus::hash_storage_proofs_at(o.epoch))
+    openings
+        .first()
+        .is_some_and(|o| quil_types::consensus::hash_storage_proofs_at(o.epoch))
 }
 
 /// The committee's `storage_attestation_root` for the FrameHeader: the 74-byte
@@ -866,7 +911,8 @@ pub fn verify_storage_attestation(
     }
     if uses_hash_proofs(openings) {
         return openings.iter().all(|o| {
-            quil_types::consensus::hash_storage_proofs_at(o.epoch) && crate::storage_proof::verify_opening(o, rho_n)
+            quil_types::consensus::hash_storage_proofs_at(o.epoch)
+                && crate::storage_proof::verify_opening(o, rho_n)
         });
     }
     if poly_size == 0 {
@@ -918,7 +964,11 @@ pub fn verify_storage_attestation(
         let mut idx = *block as usize;
         for lvl in 0..levels {
             let child_idx = idx % poly;
-            let below = if lvl == 0 { &o.commitment } else { &o.path_commits[lvl - 1] };
+            let below = if lvl == 0 {
+                &o.commitment
+            } else {
+                &o.path_commits[lvl - 1]
+            };
             // The parent holds the field-reduced child commitment in the low 32
             // bytes of a full-width (73-byte) scalar — matching `node_poly`'s
             // packing exactly, so the verifier reconstructs the opened value.
@@ -932,14 +982,7 @@ pub fn verify_storage_attestation(
         }
     }
 
-    bls48581::aggregate_verify_openings(
-        &commitments,
-        &indices,
-        &values,
-        &proofs,
-        poly_size,
-        &gamma,
-    )
+    bls48581::aggregate_verify_openings(&commitments, &indices, &values, &proofs, poly_size, &gamma)
 }
 
 /// Full frame-level check for a global validator: the supplied `openings` must
@@ -956,7 +999,8 @@ pub fn verify_frame_storage_attestation(
     bitmask: &[u8],
     poly_size: u64,
 ) -> bool {
-    let recomputed = compute_storage_attestation_root(openings, frame_number, rho_n, bitmask, poly_size);
+    let recomputed =
+        compute_storage_attestation_root(openings, frame_number, rho_n, bitmask, poly_size);
     if root != recomputed.as_slice() {
         return false;
     }
@@ -1006,8 +1050,7 @@ mod tests {
         let replica = replica_bytes(seed, num_blocks, block_poly_size);
         let leaf = crate::sdr::commit_leaf(&replica, block_poly_size);
 
-        let block =
-            derive_block_index(rho_n, shard_id, epoch, member_id, query, num_blocks);
+        let block = derive_block_index(rho_n, shard_id, epoch, member_id, query, num_blocks);
         let point =
             derive_challenge_index(rho_n, shard_id, epoch, member_id, query, block_poly_size);
 
@@ -1041,7 +1084,14 @@ mod tests {
         for (m, id) in [b"m0".as_slice(), b"m1", b"m2"].iter().enumerate() {
             for q in 0..2u32 {
                 out.push(make_opening(
-                    0x20 + m as u8, SHARD, EPOCH, id, q, rho_n, NUM_BLOCKS, poly_size,
+                    0x20 + m as u8,
+                    SHARD,
+                    EPOCH,
+                    id,
+                    q,
+                    rho_n,
+                    NUM_BLOCKS,
+                    poly_size,
                 ));
             }
         }
@@ -1072,11 +1122,13 @@ mod tests {
         let root = compute_storage_attestation_root(&openings, 100, &rho_n, &bitmask, poly_size);
         // The root is the aggregate proof point — a compressed BLS48-581 G1
         // element, NOT a 32-byte hash.
-        assert_eq!(root.len(), 74, "root must be a 74-byte compressed G1 element");
-        // An empty opening set has no aggregate → empty root.
-        assert!(
-            compute_storage_attestation_root(&[], 100, &rho_n, &bitmask, poly_size).is_empty()
+        assert_eq!(
+            root.len(),
+            74,
+            "root must be a 74-byte compressed G1 element"
         );
+        // An empty opening set has no aggregate → empty root.
+        assert!(compute_storage_attestation_root(&[], 100, &rho_n, &bitmask, poly_size).is_empty());
     }
 
     #[test]
@@ -1139,7 +1191,10 @@ mod tests {
         let block = derive_block_index(&rho_n, SHARD, EPOCH, id, 0, NUM_BLOCKS);
         let derived = derive_challenge_index(&rho_n, SHARD, EPOCH, id, 0, poly_size);
         let chosen = if derived == 0 { 1u64 } else { 0u64 };
-        assert_ne!(chosen, derived, "test setup: chosen point must differ from derived");
+        assert_ne!(
+            chosen, derived,
+            "test setup: chosen point must differ from derived"
+        );
 
         let replica = replica_bytes(0x99, NUM_BLOCKS, poly_size);
         let leaf = crate::sdr::commit_leaf(&replica, poly_size);
@@ -1177,7 +1232,9 @@ mod tests {
         let rho_n = [0xA1u8; 32];
         let bitmask = [0x07u8];
         // An opening built for shard A (its challenge index derived with shard=A).
-        let o = make_opening(0x33, b"shardA", EPOCH, b"m0", 0, &rho_n, NUM_BLOCKS, poly_size);
+        let o = make_opening(
+            0x33, b"shardA", EPOCH, b"m0", 0, &rho_n, NUM_BLOCKS, poly_size,
+        );
         // Re-label it as shard B: the verifier re-derives the index with shard=B,
         // which differs, so the proof (built for shard A's index) no longer opens.
         let mut relabelled = o.clone();
@@ -1249,7 +1306,9 @@ mod tests {
         // A wrong/forged root is rejected even for honest openings.
         let wrong = [0u8; 32];
         assert!(
-            !verify_frame_storage_attestation(&wrong, &openings, frame, &rho_n, &bitmask, poly_size),
+            !verify_frame_storage_attestation(
+                &wrong, &openings, frame, &rho_n, &bitmask, poly_size
+            ),
             "a root that doesn't commit the openings must be rejected"
         );
     }
@@ -1285,8 +1344,7 @@ mod tests {
         let block_bytes = poly_size as usize * NB;
         let off = other_block as usize * block_bytes;
         let full = crate::sdr::pack_block(&replica[off..off + block_bytes], poly_size);
-        let point =
-            derive_challenge_index(&rho_n, SHARD, EPOCH, id, 0, poly_size);
+        let point = derive_challenge_index(&rho_n, SHARD, EPOCH, id, 0, poly_size);
         let proof = bls48581::prove_raw_full(&full, point, poly_size);
         let value = full[point as usize * MB..point as usize * MB + MB].to_vec();
         let other_path = crate::sdr::leaf_path(&leaf, other_block);
@@ -1359,19 +1417,35 @@ mod tests {
         // Verifier side: the global validator re-derives the root from the wire
         // openings and re-verifies possession.
         assert!(
-            verify_frame_storage_attestation_proto(&root, &attestation, frame, &rho_n, &bitmask, poly_size),
+            verify_frame_storage_attestation_proto(
+                &root,
+                &attestation,
+                frame,
+                &rho_n,
+                &bitmask,
+                poly_size
+            ),
             "wire attestation must verify against its header root"
         );
         // A wrong root is rejected.
         assert!(
-            !verify_frame_storage_attestation_proto(&[0u8; 32], &attestation, frame, &rho_n, &bitmask, poly_size),
+            !verify_frame_storage_attestation_proto(
+                &[0u8; 32],
+                &attestation,
+                frame,
+                &rho_n,
+                &bitmask,
+                poly_size
+            ),
             "wire attestation must not verify against a mismatched root"
         );
         // A dropped opening changes the root → rejected.
         let mut short = attestation.clone();
         short.openings.pop();
         assert!(
-            !verify_frame_storage_attestation_proto(&root, &short, frame, &rho_n, &bitmask, poly_size),
+            !verify_frame_storage_attestation_proto(
+                &root, &short, frame, &rho_n, &bitmask, poly_size
+            ),
             "dropping a carried opening must break the root binding"
         );
     }
@@ -1381,7 +1455,11 @@ mod tests {
         let out = vec![0xABu8; 516];
         let a = derive_storage_beacon(42, &out);
         assert_eq!(a, derive_storage_beacon(42, &out), "deterministic");
-        assert_ne!(a, derive_storage_beacon(43, &out), "binds global frame number");
+        assert_ne!(
+            a,
+            derive_storage_beacon(43, &out),
+            "binds global frame number"
+        );
         let mut out2 = out.clone();
         out2[0] ^= 1;
         assert_ne!(a, derive_storage_beacon(42, &out2), "binds global output");
@@ -1410,12 +1488,15 @@ mod tests {
                 .map(|i| (i as u8).wrapping_mul(31).wrapping_add(m as u8))
                 .collect();
 
-            let (replica, leaf) = crate::sdr::build_leaf_replica(
-                &leaf_data, id, &leaf_id, epoch, poly_size, &params,
-            );
+            let (replica, leaf) =
+                crate::sdr::build_leaf_replica(&leaf_data, id, &leaf_id, epoch, poly_size, &params);
             reg.insert(
                 (id.to_vec(), leaf_id.clone(), epoch),
-                (leaf.root.clone(), leaf.block_commitments().len() as u64, epoch),
+                (
+                    leaf.root.clone(),
+                    leaf.block_commitments().len() as u64,
+                    epoch,
+                ),
             );
             for q in 0..2u32 {
                 openings.push(build_storage_opening(
@@ -1429,7 +1510,14 @@ mod tests {
         let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             verify_frame_storage_attestation_registered(
-                &root, &attestation, frame, &rho_n, &bitmask, poly_size, epoch, good,
+                &root,
+                &attestation,
+                frame,
+                &rho_n,
+                &bitmask,
+                poly_size,
+                epoch,
+                good,
             ),
             "producer-built replica + openings must verify against the registry"
         );
@@ -1461,18 +1549,37 @@ mod tests {
 
         // Honest: registered, current epoch, matching roots → accept.
         assert!(verify_frame_storage_attestation_registered(
-            &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch, good,
+            &root,
+            &attestation,
+            frame,
+            &rho_n,
+            &bitmask,
+            poly_size,
+            active_epoch,
+            good,
         ));
 
         // Unregistered leaf (lookup always None) → reject.
         assert!(!verify_frame_storage_attestation_registered(
-            &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch,
+            &root,
+            &attestation,
+            frame,
+            &rho_n,
+            &bitmask,
+            poly_size,
+            active_epoch,
             |_m: &[u8], _l: &[u8], _e: u64| None,
         ));
 
         // Stale epoch (active epoch advanced; opening still at EPOCH) → reject.
         assert!(!verify_frame_storage_attestation_registered(
-            &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch + 1,
+            &root,
+            &attestation,
+            frame,
+            &rho_n,
+            &bitmask,
+            poly_size,
+            active_epoch + 1,
             |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned(),
         ));
 
@@ -1482,7 +1589,14 @@ mod tests {
                 .map(|(_r, b, ep)| (vec![0u8; 74], *b, *ep))
         };
         assert!(!verify_frame_storage_attestation_registered(
-            &root, &attestation, frame, &rho_n, &bitmask, poly_size, active_epoch, wrong,
+            &root,
+            &attestation,
+            frame,
+            &rho_n,
+            &bitmask,
+            poly_size,
+            active_epoch,
+            wrong,
         ));
     }
 
@@ -1494,40 +1608,354 @@ mod tests {
         let rho = [0x55u8; 32];
         let prover = [0x66u8; 32];
         let sar = [0x99u8; 32];
-        let a = deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]);
+        let a = deterministic_app_frame_output(
+            &parent,
+            &rr,
+            &srs,
+            &rho,
+            7,
+            0,
+            &prover,
+            5,
+            3,
+            100,
+            &sar,
+            9,
+            &[],
+            &[],
+            &[],
+        );
         // 516-byte layout: 32-byte digest then zeros (so poseidon(output) +
         // output[..516] parent derivations are unchanged downstream).
         assert_eq!(a.len(), 516);
         assert!(a[..32].iter().any(|&b| b != 0), "digest must be non-zero");
         assert!(a[32..].iter().all(|&b| b == 0), "tail must be zero-padded");
         // Deterministic.
-        assert_eq!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_eq!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
         // Binds every input: a different beacon, frame, rank, or content changes it.
         let rho2 = [0x56u8; 32];
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho2, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 8, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 1, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &[0x23u8; 64], &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho2,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                8,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                1,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &[0x23u8; 64],
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
         // Now-bound header metadata: difficulty, fee vote, timestamp, and the
         // storage-attestation root each change it.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 6, 3, 100, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 4, 100, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 101, &sar, 9, &[], &[], &[]));
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[0x9Au8; 32], 9, &[], &[], &[]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                6,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                4,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                101,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &[0x9Au8; 32],
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
         // Stripping the attestation (empty root) must change the output too.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &[], 9, &[], &[], &[]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &[],
+                9,
+                &[],
+                &[],
+                &[]
+            )
+        );
         // The previous-frame fee total is bound too.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 10, &[], &[], &[]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                10,
+                &[],
+                &[],
+                &[]
+            )
+        );
         // The settlement relay is bound too.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[1], &[], &[]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[1],
+                &[],
+                &[]
+            )
+        );
         // The spend relay is bound too.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[], &[1]));
+        assert_ne!(
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[],
+                &[1]
+            )
+        );
         // So is the accumulator report, and it cannot trade places with the
         // relay: the same bytes in the other field give a different output.
-        assert_ne!(a, deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[1], &[]));
         assert_ne!(
-            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[1], &[], &[]),
-            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 0, &prover, 5, 3, 100, &sar, 9, &[], &[1], &[]),
+            a,
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[1],
+                &[]
+            )
+        );
+        assert_ne!(
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[1],
+                &[],
+                &[]
+            ),
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                0,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                9,
+                &[],
+                &[1],
+                &[]
+            ),
         );
     }
 
@@ -1536,8 +1964,14 @@ mod tests {
     /// upgrade; any relay field, behind its tag, changes it.
     #[test]
     fn an_output_without_relays_is_the_mainnet_output() {
-        let (parent, rr, srs, rho, prover, sar) =
-            ([0x11u8; 32], [0x22u8; 64], vec![vec![0x33u8; 64]; 4], [0x55u8; 32], [0x66u8; 32], [0x99u8; 32]);
+        let (parent, rr, srs, rho, prover, sar) = (
+            [0x11u8; 32],
+            [0x22u8; 64],
+            vec![vec![0x33u8; 64]; 4],
+            [0x55u8; 32],
+            [0x66u8; 32],
+            [0x99u8; 32],
+        );
         let mainnet = {
             let mut h = Sha3_256::new();
             h.update(DST_FRAME_OUTPUT);
@@ -1566,10 +2000,31 @@ mod tests {
             out
         };
         let output = |fee: u128, settlements: &[u8], accumulator: &[u8], spends: &[u8]| {
-            deterministic_app_frame_output(&parent, &rr, &srs, &rho, 7, 2, &prover, 5, 3, 100, &sar, fee, settlements, accumulator, spends)
+            deterministic_app_frame_output(
+                &parent,
+                &rr,
+                &srs,
+                &rho,
+                7,
+                2,
+                &prover,
+                5,
+                3,
+                100,
+                &sar,
+                fee,
+                settlements,
+                accumulator,
+                spends,
+            )
         };
         assert_eq!(output(0, &[], &[], &[]), mainnet);
-        for relayed in [output(1, &[], &[], &[]), output(0, &[1], &[], &[]), output(0, &[], &[1], &[]), output(0, &[], &[], &[1])] {
+        for relayed in [
+            output(1, &[], &[], &[]),
+            output(0, &[1], &[], &[]),
+            output(0, &[], &[1], &[]),
+            output(0, &[], &[], &[1]),
+        ] {
             assert_ne!(relayed, mainnet);
         }
     }
@@ -1596,14 +2051,26 @@ mod tests {
         // Audit everything (sample ≥ total): all honest + registered → no failures.
         let failed =
             audit_frame_storage_attestations(&openings, &rho_n, poly_size, epoch, u64::MAX, &good);
-        assert!(failed.is_empty(), "honest registered openings must pass: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "honest registered openings must pass: {failed:?}"
+        );
 
         // A member whose leaf isn't registered for this epoch is flagged.
         let good_no_m1 = |m: &[u8], l: &[u8]| {
-            if m == b"m1" { None } else { reg.get(&(m.to_vec(), l.to_vec())).cloned() }
+            if m == b"m1" {
+                None
+            } else {
+                reg.get(&(m.to_vec(), l.to_vec())).cloned()
+            }
         };
         let failed = audit_frame_storage_attestations(
-            &openings, &rho_n, poly_size, epoch, u64::MAX, &good_no_m1,
+            &openings,
+            &rho_n,
+            poly_size,
+            epoch,
+            u64::MAX,
+            &good_no_m1,
         );
         assert_eq!(failed, vec![b"m1".to_vec()]);
 
@@ -1616,27 +2083,54 @@ mod tests {
         }
         let failed =
             audit_frame_storage_attestations(&tampered, &rho_n, poly_size, epoch, u64::MAX, &good);
-        assert!(failed.contains(&b"m2".to_vec()), "tampered possession must flag m2");
+        assert!(
+            failed.contains(&b"m2".to_vec()),
+            "tampered possession must flag m2"
+        );
 
         // Checked in parallel, the result is exactly the one-at-a-time result:
         // the same members, first failure first.
-        let sequential = |openings: &[StorageOpening], lookup: &dyn Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>| {
-            let mut failed: Vec<Vec<u8>> = Vec::new();
-            for o in openings {
-                let registry_ok = lookup(&o.member_id, &o.shard_id).is_some_and(|(root, blocks, e)| {
-                    e == epoch && o.epoch == epoch && root == o.leaf_root && blocks == o.num_blocks
-                });
-                let ok = registry_ok && verify_storage_attestation(std::slice::from_ref(o), 0, &rho_n, &[], poly_size);
-                if !ok && !failed.contains(&o.member_id) {
-                    failed.push(o.member_id.clone());
+        let sequential =
+            |openings: &[StorageOpening],
+             lookup: &dyn Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>| {
+                let mut failed: Vec<Vec<u8>> = Vec::new();
+                for o in openings {
+                    let registry_ok =
+                        lookup(&o.member_id, &o.shard_id).is_some_and(|(root, blocks, e)| {
+                            e == epoch
+                                && o.epoch == epoch
+                                && root == o.leaf_root
+                                && blocks == o.num_blocks
+                        });
+                    let ok = registry_ok
+                        && verify_storage_attestation(
+                            std::slice::from_ref(o),
+                            0,
+                            &rho_n,
+                            &[],
+                            poly_size,
+                        );
+                    if !ok && !failed.contains(&o.member_id) {
+                        failed.push(o.member_id.clone());
+                    }
                 }
-            }
-            failed
-        };
+                failed
+            };
         let mixed: Vec<StorageOpening> = tampered.iter().rev().cloned().collect();
-        let parallel = audit_frame_storage_attestations(&mixed, &rho_n, poly_size, epoch, u64::MAX, &good_no_m1);
+        let parallel = audit_frame_storage_attestations(
+            &mixed,
+            &rho_n,
+            poly_size,
+            epoch,
+            u64::MAX,
+            &good_no_m1,
+        );
         assert_eq!(parallel, sequential(&mixed, &good_no_m1));
-        assert_eq!(parallel.len(), 2, "m1 unregistered and m2 tampered: {parallel:?}");
+        assert_eq!(
+            parallel.len(),
+            2,
+            "m1 unregistered and m2 tampered: {parallel:?}"
+        );
     }
 
     /// A registered member's opening with a field too short to decode is
@@ -1653,7 +2147,12 @@ mod tests {
         let epoch = openings[0].epoch;
         let reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = openings
             .iter()
-            .map(|o| ((o.member_id.clone(), o.shard_id.clone()), (o.leaf_root.clone(), o.num_blocks, epoch)))
+            .map(|o| {
+                (
+                    (o.member_id.clone(), o.shard_id.clone()),
+                    (o.leaf_root.clone(), o.num_blocks, epoch),
+                )
+            })
             .collect();
         let lookup = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
         let truncations: [fn(&mut StorageOpening); 6] = [
@@ -1661,16 +2160,32 @@ mod tests {
             |o| o.proof.truncate(10),
             |o| o.value.clear(),
             |o| o.commitment = [&[0x04u8][..], &o.commitment[1..]].concat(),
-            |o| if let Some(c) = o.path_commits.first_mut() { c.truncate(1) } else { o.proof.clear() },
-            |o| if let Some(p) = o.path_proofs.first_mut() { p.clear() } else { o.commitment.truncate(73) },
+            |o| {
+                if let Some(c) = o.path_commits.first_mut() {
+                    c.truncate(1)
+                } else {
+                    o.proof.clear()
+                }
+            },
+            |o| {
+                if let Some(p) = o.path_proofs.first_mut() {
+                    p.clear()
+                } else {
+                    o.commitment.truncate(73)
+                }
+            },
         ];
         for (case, truncate) in truncations.iter().enumerate() {
             let mut bad = openings.clone();
             truncate(&mut bad[0]);
-            let failed = audit_frame_storage_attestations(&bad, &rho_n, poly_size, epoch, u64::MAX, &lookup);
+            let failed =
+                audit_frame_storage_attestations(&bad, &rho_n, poly_size, epoch, u64::MAX, &lookup);
             assert_eq!(failed.first(), Some(&bad[0].member_id), "case {case}");
             let root = compute_storage_attestation_root(&bad, 1, &rho_n, &[], poly_size);
-            assert!(!verify_frame_storage_attestation(&root, &bad, 1, &rho_n, &[], poly_size), "case {case}");
+            assert!(
+                !verify_frame_storage_attestation(&root, &bad, 1, &rho_n, &[], poly_size),
+                "case {case}"
+            );
         }
     }
 
@@ -1683,7 +2198,7 @@ mod tests {
         assert!(is_audited(&rho, id, 1000, 1000));
         assert!(is_audited(&rho, id, 2000, 1000));
         assert!(is_audited(&rho, id, 5, 0)); // den==0 → audit all
-        // Deterministic for fixed inputs.
+                                             // Deterministic for fixed inputs.
         let a = is_audited(&rho, id, 500, 1000);
         let b = is_audited(&rho, id, 500, 1000);
         assert_eq!(a, b);
@@ -1692,8 +2207,7 @@ mod tests {
     #[test]
     fn audit_selector_is_beacon_dependent_and_roughly_rated() {
         // 4000 distinct leaf ids; ~25% target sample rate.
-        let ids: Vec<Vec<u8>> =
-            (0u32..4000).map(|i| i.to_be_bytes().to_vec()).collect();
+        let ids: Vec<Vec<u8>> = (0u32..4000).map(|i| i.to_be_bytes().to_vec()).collect();
         let rho_a = [0x22u8; 32];
         let rho_b = [0x33u8; 32];
 
@@ -1750,7 +2264,9 @@ mod tests {
     fn two_leaf_attestation(rho_n: &[u8], poly_size: u64) -> (Vec<StorageOpening>, Registry) {
         let mut openings = build_attestation(rho_n, poly_size);
         for q in 0..2u32 {
-            openings.push(make_opening(0x40, b"shardB", EPOCH, b"m0", q, rho_n, NUM_BLOCKS, poly_size));
+            openings.push(make_opening(
+                0x40, b"shardB", EPOCH, b"m0", q, rho_n, NUM_BLOCKS, poly_size,
+            ));
         }
         let mut registry = Registry::new();
         for o in &openings {
@@ -1774,11 +2290,24 @@ mod tests {
             reads.set(reads.get() + 1);
             registry.get(&(m.to_vec(), l.to_vec())).cloned()
         };
-        let failed =
-            audit_frame_storage_attestations(&openings, &rho_n, poly_size, EPOCH, u64::MAX, &lookup);
-        assert!(failed.is_empty(), "honest registered openings must pass: {failed:?}");
+        let failed = audit_frame_storage_attestations(
+            &openings,
+            &rho_n,
+            poly_size,
+            EPOCH,
+            u64::MAX,
+            &lookup,
+        );
+        assert!(
+            failed.is_empty(),
+            "honest registered openings must pass: {failed:?}"
+        );
         assert_eq!(openings.len(), 8);
-        assert_eq!(reads.get(), 4, "one registry read per (member, leaf), not per query");
+        assert_eq!(
+            reads.get(),
+            4,
+            "one registry read per (member, leaf), not per query"
+        );
     }
 
     fn registry_key(member: &[u8], leaf: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -1821,7 +2350,12 @@ mod tests {
         });
         reversed.reverse();
         let cases: Vec<(&str, Vec<StorageOpening>, Registry, Vec<Vec<u8>>)> = vec![
-            ("honest, m0 on two leaves", honest.clone(), registry.clone(), vec![]),
+            (
+                "honest, m0 on two leaves",
+                honest.clone(),
+                registry.clone(),
+                vec![],
+            ),
             (
                 "m1 registered another leaf root",
                 honest.clone(),
@@ -1840,7 +2374,9 @@ mod tests {
             ),
             (
                 "an opening of m0's second leaf claims another epoch",
-                edited(&honest, b"m0", b"shardB", 1, &|o: &mut StorageOpening| o.epoch = EPOCH + 1),
+                edited(&honest, b"m0", b"shardB", 1, &|o: &mut StorageOpening| {
+                    o.epoch = EPOCH + 1
+                }),
                 registry.clone(),
                 vec![b"m0".to_vec()],
             ),
@@ -1854,7 +2390,9 @@ mod tests {
             ),
             (
                 "m2 opens with another opening's proof",
-                edited(&honest, b"m2", SHARD, 1, &|o: &mut StorageOpening| o.proof = other_proof.clone()),
+                edited(&honest, b"m2", SHARD, 1, &|o: &mut StorageOpening| {
+                    o.proof = other_proof.clone()
+                }),
                 registry.clone(),
                 vec![b"m2".to_vec()],
             ),
@@ -1869,8 +2407,14 @@ mod tests {
         ];
         for (name, openings, registry, expected) in cases {
             let lookup = |m: &[u8], l: &[u8]| registry.get(&registry_key(m, l)).cloned();
-            let failed =
-                audit_frame_storage_attestations(&openings, &rho_n, poly_size, EPOCH, u64::MAX, &lookup);
+            let failed = audit_frame_storage_attestations(
+                &openings,
+                &rho_n,
+                poly_size,
+                EPOCH,
+                u64::MAX,
+                &lookup,
+            );
             assert_eq!(
                 failed,
                 audit_reading_per_opening(&openings, &rho_n, poly_size, EPOCH, &lookup),
@@ -1908,13 +2452,21 @@ mod tests {
             }
             variants.push((o.clone(), &other_rho[..]));
             for (v, rho) in &variants {
-                let expected = verify_storage_attestation(std::slice::from_ref(v), 0, rho, &[], poly_size);
+                let expected =
+                    verify_storage_attestation(std::slice::from_ref(v), 0, rho, &[], poly_size);
                 verdicts[usize::from(expected)] += 1;
                 for _ in 0..2 {
-                    assert_eq!(opening_possession_verifies(v, rho, poly_size, false), expected, "opening {i}");
+                    assert_eq!(
+                        opening_possession_verifies(v, rho, poly_size, false),
+                        expected,
+                        "opening {i}"
+                    );
                 }
             }
         }
-        assert!(verdicts[0] > 0 && verdicts[1] >= openings.len(), "{verdicts:?}");
+        assert!(
+            verdicts[0] > 0 && verdicts[1] >= openings.len(),
+            "{verdicts:?}"
+        );
     }
 }

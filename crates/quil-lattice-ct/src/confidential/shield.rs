@@ -1,5 +1,6 @@
 //! Legacy-coin shield encoding and amount relation. The execution
 //! layer must authenticate the legacy owner, source value and unspent state.
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::{CompiledAmountRelation, PublicAmountRelation},
     transfer::{
@@ -7,7 +8,6 @@ use super::{
     },
     AmountCommitment, AmountOpening, CommitmentKey, COMMITMENT_BYTES, MAX_PRIVATE_COINS,
 };
-use super::relation::membership::IDENTITY_BYTES;
 
 const PREFIX: [u8; 4] = 0x0516u32.to_be_bytes();
 const VERSION: &[u8; 8] = b"QCT3SH\0\x02";
@@ -164,25 +164,35 @@ pub struct BatchShield {
 impl BatchShieldStatement {
     /// The sources' total, or an error if it overflows.
     pub fn total(&self) -> Result<u128, TransferError> {
-        self.sources.iter().try_fold(0u128, |sum, source| sum.checked_add(source.amount))
+        self.sources
+            .iter()
+            .try_fold(0u128, |sum, source| sum.checked_add(source.amount))
             .ok_or(TransferError::Noncanonical)
     }
 
     /// The legacy owner signs these exact bytes, and the amount proof binds
     /// them: every source, its amount, the fee and every output.
     pub fn context_bytes(&self) -> Result<Vec<u8>, TransferError> {
-        if self.outputs.is_empty() || self.outputs.len() > MAX_PRIVATE_COINS
-            || self.sources.is_empty() || self.sources.len() > MAX_SHIELD_SOURCES
+        if self.outputs.is_empty()
+            || self.outputs.len() > MAX_PRIVATE_COINS
+            || self.sources.is_empty()
+            || self.sources.len() > MAX_SHIELD_SOURCES
         {
             return Err(TransferError::Dimensions);
         }
-        if !self.sources.windows(2).all(|pair| pair[0].address < pair[1].address) {
+        if !self
+            .sources
+            .windows(2)
+            .all(|pair| pair[0].address < pair[1].address)
+        {
             return Err(TransferError::Noncanonical);
         }
         if self.fee > self.total()? {
             return Err(TransferError::Noncanonical);
         }
-        let len = BATCH_HEADER_BYTES + self.sources.len() * SOURCE_BYTES + self.outputs.len() * OUTPUT_BYTES;
+        let len = BATCH_HEADER_BYTES
+            + self.sources.len() * SOURCE_BYTES
+            + self.outputs.len() * OUTPUT_BYTES;
         if len + 114 + 4 + 40 >= MAX_TRANSACTION_BYTES {
             return Err(TransferError::Length);
         }
@@ -207,7 +217,10 @@ impl BatchShieldStatement {
         Ok(bytes)
     }
 
-    pub fn public_relation(&self, max_outputs: usize) -> Result<PublicAmountRelation, TransferError> {
+    pub fn public_relation(
+        &self,
+        max_outputs: usize,
+    ) -> Result<PublicAmountRelation, TransferError> {
         if self.outputs.len() > max_outputs {
             return Err(TransferError::ResourceLimit);
         }
@@ -249,8 +262,12 @@ impl BatchShield {
             return Err(TransferError::Noncanonical);
         }
         let mut bytes = self.statement.context_bytes()?;
-        if bytes.len().checked_add(114 + 4).and_then(|n| n.checked_add(self.proof.len()))
-            .filter(|&n| n < MAX_TRANSACTION_BYTES).is_none()
+        if bytes
+            .len()
+            .checked_add(114 + 4)
+            .and_then(|n| n.checked_add(self.proof.len()))
+            .filter(|&n| n < MAX_TRANSACTION_BYTES)
+            .is_none()
         {
             return Err(TransferError::Length);
         }
@@ -260,7 +277,11 @@ impl BatchShield {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: &[u8], network: &[u8; 32], application: &[u8; 32]) -> Result<Self, TransferError> {
+    pub fn decode(
+        bytes: &[u8],
+        network: &[u8; 32],
+        application: &[u8; 32],
+    ) -> Result<Self, TransferError> {
         if bytes.len() >= MAX_TRANSACTION_BYTES {
             return Err(TransferError::Length);
         }
@@ -280,7 +301,10 @@ impl BatchShield {
         }
         let mut sources = Vec::with_capacity(count);
         for _ in 0..count {
-            sources.push(ShieldSource { address: r.array()?, amount: u128::from_le_bytes(r.array()?) });
+            sources.push(ShieldSource {
+                address: r.array()?,
+                amount: u128::from_le_bytes(r.array()?),
+            });
         }
         let fee = u128::from_le_bytes(r.array()?);
         let outputs_count = u16::from_le_bytes(r.array()?) as usize;
@@ -313,7 +337,11 @@ impl BatchShield {
             outputs,
         };
         statement.context_bytes()?;
-        Ok(Self { statement, signature, proof: r.0.to_vec() })
+        Ok(Self {
+            statement,
+            signature,
+            proof: r.0.to_vec(),
+        })
     }
 }
 
@@ -326,9 +354,15 @@ pub enum AnyShield {
 }
 
 impl AnyShield {
-    pub fn decode(bytes: &[u8], network: &[u8; 32], application: &[u8; 32]) -> Result<Self, TransferError> {
+    pub fn decode(
+        bytes: &[u8],
+        network: &[u8; 32],
+        application: &[u8; 32],
+    ) -> Result<Self, TransferError> {
         match bytes.get(4..12) {
-            Some(version) if version == BATCH_VERSION => BatchShield::decode(bytes, network, application).map(Self::Batch),
+            Some(version) if version == BATCH_VERSION => {
+                BatchShield::decode(bytes, network, application).map(Self::Batch)
+            }
             _ => Shield::decode(bytes, network, application).map(Self::Single),
         }
     }
@@ -347,7 +381,10 @@ impl AnyShield {
     /// Every legacy coin consumed, ascending for a batch.
     pub fn sources(&self) -> Vec<ShieldSource> {
         match self {
-            Self::Single(s) => vec![ShieldSource { address: s.statement.transparent_address, amount: s.statement.amount }],
+            Self::Single(s) => vec![ShieldSource {
+                address: s.statement.transparent_address,
+                amount: s.statement.amount,
+            }],
             Self::Batch(b) => b.statement.sources.clone(),
         }
     }
@@ -374,7 +411,10 @@ impl AnyShield {
         }
     }
 
-    pub fn public_relation(&self, max_outputs: usize) -> Result<PublicAmountRelation, TransferError> {
+    pub fn public_relation(
+        &self,
+        max_outputs: usize,
+    ) -> Result<PublicAmountRelation, TransferError> {
         match self {
             Self::Single(s) => s.statement.public_relation(max_outputs),
             Self::Batch(b) => b.statement.public_relation(max_outputs),
@@ -526,7 +566,10 @@ mod tests {
         assert!(Shield::decode(&bytes, &[9; 32], &application).is_err());
         assert!(Shield::decode(&bytes, &network, &[9; 32]).is_err());
         // Routing reads the source without decoding the rest.
-        assert_eq!(source_address(&bytes), Some(shield.statement.transparent_address));
+        assert_eq!(
+            source_address(&bytes),
+            Some(shield.statement.transparent_address)
+        );
         assert_eq!(source_address(&bytes[..107]), None);
         let mut other = bytes.clone();
         other[11] = 0x09;
@@ -569,7 +612,11 @@ mod tests {
                 owner_public_key: [4; 57],
                 sources,
                 fee,
-                outputs: vec![Output { commitment: key.commit(5, &opening), owner: [6; IDENTITY_BYTES], memo: [7; MEMO_BYTES] }],
+                outputs: vec![Output {
+                    commitment: key.commit(5, &opening),
+                    owner: [6; IDENTITY_BYTES],
+                    memo: [7; MEMO_BYTES],
+                }],
             },
             signature: [8; 114],
             proof,
@@ -577,19 +624,30 @@ mod tests {
     }
 
     fn sources(n: usize) -> Vec<ShieldSource> {
-        (0..n).map(|i| {
-            let mut address = [0u8; 32];
-            address[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
-            ShieldSource { address, amount: 1_000 + i as u128 }
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let mut address = [0u8; 32];
+                address[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                ShieldSource {
+                    address,
+                    amount: 1_000 + i as u128,
+                }
+            })
+            .collect()
     }
 
     #[test]
     fn batch_shield_codec_binds_every_source_and_bounds_them() {
         let shield = batch(sources(MAX_SHIELD_SOURCES), 7);
-        assert_eq!(shield.statement.total().unwrap(), (0..96u128).map(|i| 1_000 + i).sum::<u128>());
+        assert_eq!(
+            shield.statement.total().unwrap(),
+            (0..96u128).map(|i| 1_000 + i).sum::<u128>()
+        );
         let bytes = shield.encode().unwrap();
-        assert_eq!(BatchShield::decode(&bytes, &[1; 32], &[2; 32]).unwrap(), shield);
+        assert_eq!(
+            BatchShield::decode(&bytes, &[1; 32], &[2; 32]).unwrap(),
+            shield
+        );
         assert!(BatchShield::decode(&bytes, &[9; 32], &[2; 32]).is_err());
         match AnyShield::decode(&bytes, &[1; 32], &[2; 32]).unwrap() {
             AnyShield::Batch(decoded) => assert_eq!(decoded, shield),
@@ -597,10 +655,19 @@ mod tests {
         }
         let any = AnyShield::Batch(shield.clone());
         assert_eq!(any.sources(), shield.statement.sources);
-        assert_eq!((any.fee(), any.outputs().len(), any.proof().len()), (7, 1, 64));
-        assert!(Shield::decode(&bytes, &[1; 32], &[2; 32]).is_err(), "a batch is not a single shield");
+        assert_eq!(
+            (any.fee(), any.outputs().len(), any.proof().len()),
+            (7, 1, 64)
+        );
+        assert!(
+            Shield::decode(&bytes, &[1; 32], &[2; 32]).is_err(),
+            "a batch is not a single shield"
+        );
         // Routing reads the first source.
-        assert_eq!(source_address(&bytes), Some(shield.statement.sources[0].address));
+        assert_eq!(
+            source_address(&bytes),
+            Some(shield.statement.sources[0].address)
+        );
         for end in [0, 12, 134, 166, bytes.len() - 1] {
             assert!(BatchShield::decode(&bytes[..end], &[1; 32], &[2; 32]).is_err());
         }
@@ -619,21 +686,47 @@ mod tests {
 
         // Bounds: 1 to 96 sources, strictly ascending, a total that fits and
         // covers the fee.
-        assert_eq!(batch(sources(MAX_SHIELD_SOURCES + 1), 0).encode(), Err(TransferError::Dimensions));
-        assert_eq!(batch(Vec::new(), 0).encode(), Err(TransferError::Dimensions));
+        assert_eq!(
+            batch(sources(MAX_SHIELD_SOURCES + 1), 0).encode(),
+            Err(TransferError::Dimensions)
+        );
+        assert_eq!(
+            batch(Vec::new(), 0).encode(),
+            Err(TransferError::Dimensions)
+        );
         let mut unsorted = sources(3);
         unsorted.swap(0, 1);
-        assert_eq!(batch(unsorted, 0).encode(), Err(TransferError::Noncanonical));
+        assert_eq!(
+            batch(unsorted, 0).encode(),
+            Err(TransferError::Noncanonical)
+        );
         let mut repeated = sources(3);
         repeated[2] = repeated[1];
-        assert_eq!(batch(repeated, 0).encode(), Err(TransferError::Noncanonical));
+        assert_eq!(
+            batch(repeated, 0).encode(),
+            Err(TransferError::Noncanonical)
+        );
         let mut huge = sources(2);
         huge[0].amount = u128::MAX;
-        assert_eq!(batch(huge, 0).encode(), Err(TransferError::Noncanonical), "the total overflows");
-        assert_eq!(batch(sources(2), 2_002).encode(), Err(TransferError::Noncanonical), "the fee exceeds the total");
-        assert!(batch(sources(2), 2_001).encode().is_ok(), "the fee may take the whole total");
+        assert_eq!(
+            batch(huge, 0).encode(),
+            Err(TransferError::Noncanonical),
+            "the total overflows"
+        );
+        assert_eq!(
+            batch(sources(2), 2_002).encode(),
+            Err(TransferError::Noncanonical),
+            "the fee exceeds the total"
+        );
+        assert!(
+            batch(sources(2), 2_001).encode().is_ok(),
+            "the fee may take the whole total"
+        );
         // A one-source batch is still version 3.
         let one = batch(sources(1), 0).encode().unwrap();
-        assert!(matches!(AnyShield::decode(&one, &[1; 32], &[2; 32]).unwrap(), AnyShield::Batch(_)));
+        assert!(matches!(
+            AnyShield::decode(&one, &[1; 32], &[2; 32]).unwrap(),
+            AnyShield::Batch(_)
+        ));
     }
 }

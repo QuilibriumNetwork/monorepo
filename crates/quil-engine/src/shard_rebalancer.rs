@@ -256,7 +256,11 @@ mod tests {
         fn sign(&self, _msg: &[u8]) -> quil_types::error::Result<Vec<u8>> {
             Ok(make_sig_bytes())
         }
-        fn sign_with_domain(&self, _msg: &[u8], _domain: &[u8]) -> quil_types::error::Result<Vec<u8>> {
+        fn sign_with_domain(
+            &self,
+            _msg: &[u8],
+            _domain: &[u8],
+        ) -> quil_types::error::Result<Vec<u8>> {
             Ok(make_sig_bytes())
         }
     }
@@ -270,9 +274,7 @@ mod tests {
             frame_number: 100,
         }];
         let signer = DummySigner;
-        let out = reb
-            .propose(100, &[0x99; 32], &actions, &signer)
-            .unwrap();
+        let out = reb.propose(100, &[0x99; 32], &actions, &signer).unwrap();
         assert!(out.is_empty(), "non-leader must not emit");
     }
 
@@ -285,21 +287,22 @@ mod tests {
             frame_number: 100,
         }];
         let signer = DummySigner;
-        let out = reb
-            .propose(100, &[0x11; 32], &actions, &signer)
-            .unwrap();
+        let out = reb.propose(100, &[0x11; 32], &actions, &signer).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, ProposalKind::Split);
 
         // Second call within cooldown: nothing emitted.
-        let out2 = reb
-            .propose(200, &[0x11; 32], &actions, &signer)
-            .unwrap();
+        let out2 = reb.propose(200, &[0x11; 32], &actions, &signer).unwrap();
         assert!(out2.is_empty(), "cooldown must suppress");
 
         // After cooldown passes, emit again.
         let out3 = reb
-            .propose(100 + SHARD_ACTION_COOLDOWN_FRAMES, &[0x11; 32], &actions, &signer)
+            .propose(
+                100 + SHARD_ACTION_COOLDOWN_FRAMES,
+                &[0x11; 32],
+                &actions,
+                &signer,
+            )
             .unwrap();
         assert_eq!(out3.len(), 1, "cooldown expired");
     }

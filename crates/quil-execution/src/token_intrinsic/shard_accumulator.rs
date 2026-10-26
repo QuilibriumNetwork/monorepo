@@ -44,9 +44,11 @@ pub const ATTESTING_REPORT_VERSION: &[u8; 8] = b"QCT3AR\0\x02";
 pub const LAYER_BYTES: usize = 1 + 8 + NODE_BYTES;
 const ATTESTATION_BYTES: usize = 8 + 8 + 8;
 /// Width layers a report can hold: one per block width the accumulator allows.
-pub const MAX_LAYERS: usize = (coin_blocks::MAX_BLOCK_BITS - coin_blocks::INITIAL_BLOCK_BITS + 1) as usize;
+pub const MAX_LAYERS: usize =
+    (coin_blocks::MAX_BLOCK_BITS - coin_blocks::INITIAL_BLOCK_BITS + 1) as usize;
 /// Longest a report can be. A shard attests at most one block per width.
-pub const MAX_REPORT_BYTES: usize = 8 + 32 + 1 + MAX_LAYERS * LAYER_BYTES + 1 + MAX_LAYERS * ATTESTATION_BYTES;
+pub const MAX_REPORT_BYTES: usize =
+    8 + 32 + 1 + MAX_LAYERS * LAYER_BYTES + 1 + MAX_LAYERS * ATTESTATION_BYTES;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("accumulator report: {message}"))
@@ -83,7 +85,11 @@ impl ShardReport {
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut bytes = Vec::with_capacity(8 + 32 + 1 + self.subtrees.len() * LAYER_BYTES);
-        bytes.extend_from_slice(if self.attestations.is_empty() { REPORT_VERSION } else { ATTESTING_REPORT_VERSION });
+        bytes.extend_from_slice(if self.attestations.is_empty() {
+            REPORT_VERSION
+        } else {
+            ATTESTING_REPORT_VERSION
+        });
         bytes.extend_from_slice(&self.context);
         bytes.push(self.subtrees.len() as u8);
         for subtree in &self.subtrees {
@@ -104,14 +110,21 @@ impl ShardReport {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let attesting = bytes.get(..8) == Some(ATTESTING_REPORT_VERSION.as_slice());
-        if bytes.len() < 8 + 32 + 1 || bytes.len() > MAX_REPORT_BYTES || (&bytes[..8] != REPORT_VERSION && !attesting) {
+        if bytes.len() < 8 + 32 + 1
+            || bytes.len() > MAX_REPORT_BYTES
+            || (&bytes[..8] != REPORT_VERSION && !attesting)
+        {
             return Err(invalid("malformed envelope"));
         }
         let context: [u8; 32] = bytes[8..40].try_into().unwrap();
         let layers = usize::from(bytes[40]);
         let layers_end = 41 + layers * LAYER_BYTES;
         let attestations = if attesting {
-            let count = usize::from(*bytes.get(layers_end).ok_or_else(|| invalid("length does not match its layer count"))?);
+            let count = usize::from(
+                *bytes
+                    .get(layers_end)
+                    .ok_or_else(|| invalid("length does not match its layer count"))?,
+            );
             if count == 0 || bytes.len() != layers_end + 1 + count * ATTESTATION_BYTES {
                 return Err(invalid("length does not match its attestation count"));
             }
@@ -139,27 +152,48 @@ impl ShardReport {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let report = Self { context, subtrees, attestations };
+        let report = Self {
+            context,
+            subtrees,
+            attestations,
+        };
         report.validate()?;
         Ok(report)
     }
 
     fn validate(&self) -> Result<()> {
-        if (self.subtrees.is_empty() && self.attestations.is_empty()) || self.subtrees.len() > MAX_LAYERS {
-            return Err(invalid("a report carries 1..=MAX_LAYERS layers, or only attestations"));
+        if (self.subtrees.is_empty() && self.attestations.is_empty())
+            || self.subtrees.len() > MAX_LAYERS
+        {
+            return Err(invalid(
+                "a report carries 1..=MAX_LAYERS layers, or only attestations",
+            ));
         }
         if self.attestations.len() > MAX_LAYERS
-            || self.attestations.windows(2).any(|pair| pair[0].block >= pair[1].block)
-            || self.attestations.iter().any(|a| !coin_blocks::is_allocated_width(coin_blocks::MAX_BLOCK_BITS, a.block))
+            || self
+                .attestations
+                .windows(2)
+                .any(|pair| pair[0].block >= pair[1].block)
+            || self
+                .attestations
+                .iter()
+                .any(|a| !coin_blocks::is_allocated_width(coin_blocks::MAX_BLOCK_BITS, a.block))
         {
-            return Err(invalid("attestations name distinct valid blocks in ascending order"));
+            return Err(invalid(
+                "attestations name distinct valid blocks in ascending order",
+            ));
         }
-        if self.subtrees.windows(2).any(|pair| pair[0].width >= pair[1].width) {
+        if self
+            .subtrees
+            .windows(2)
+            .any(|pair| pair[0].width >= pair[1].width)
+        {
             return Err(invalid("layers must be in strictly ascending width"));
         }
         if self.subtrees.iter().any(|subtree| {
             subtree.coins == 0
-                || !(coin_blocks::INITIAL_BLOCK_BITS..=coin_blocks::MAX_BLOCK_BITS).contains(&subtree.width)
+                || !(coin_blocks::INITIAL_BLOCK_BITS..=coin_blocks::MAX_BLOCK_BITS)
+                    .contains(&subtree.width)
         }) {
             return Err(invalid("every layer holds coins at a valid width"));
         }
@@ -182,9 +216,13 @@ pub fn subtree_position(width: u8, shard: &[bool]) -> Result<(usize, u64)> {
         return Err(invalid("width outside the accumulator's range"));
     }
     if depth > usize::from(width) {
-        return Err(invalid("a shard deeper than a layer's width owns part of a block"));
+        return Err(invalid(
+            "a shard deeper than a layer's width owns part of a block",
+        ));
     }
-    let path = shard.iter().fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
+    let path = shard
+        .iter()
+        .fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
     Ok((
         usize::from(coin_blocks::SUBTREE_BITS) + usize::from(width) - depth,
         (1u64 << depth) | path,
@@ -201,27 +239,42 @@ fn attestations(
     mut read: impl FnMut(&[u8; 32]) -> Result<Option<Vec<u8>>>,
 ) -> Result<Vec<BlockAttestation>> {
     use super::state::{block_record_address, BLOCK_ESCROW_COUNT_TAG, BLOCK_FRONTIER_TAG};
-    let top = shard.len().min(usize::from(coin_blocks::MAX_BLOCK_BITS) + 1);
+    let top = shard
+        .len()
+        .min(usize::from(coin_blocks::MAX_BLOCK_BITS) + 1);
     let mut held = Vec::new();
     for width in usize::from(coin_blocks::INITIAL_BLOCK_BITS)..top {
-        let path = shard[..width].iter().fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
+        let path = shard[..width]
+            .iter()
+            .fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
         let block = coin_blocks::block_id(width as u8, path)?;
         if !super::global_commit::holds_block_records(shard, block) {
             continue;
         }
         let coins = match read(&block_record_address(BLOCK_FRONTIER_TAG, block))? {
             Some(bytes) => quil_lattice_ct::confidential::coin_tree::Frontier::decode(
-                &bytes, context, usize::from(coin_blocks::SUBTREE_BITS),
+                &bytes,
+                context,
+                usize::from(coin_blocks::SUBTREE_BITS),
             )
             .map_err(|_| invalid("malformed block frontier"))?
             .count(),
             None => 0,
         };
         let escrows = match read(&block_record_address(BLOCK_ESCROW_COUNT_TAG, block))? {
-            Some(bytes) => u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| invalid("malformed escrow count"))?),
+            Some(bytes) => u64::from_be_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("malformed escrow count"))?,
+            ),
             None => 0,
         };
-        held.push(BlockAttestation { block, coins, escrows });
+        held.push(BlockAttestation {
+            block,
+            coins,
+            escrows,
+        });
     }
     Ok(held)
 }
@@ -243,7 +296,9 @@ pub fn shard_report(
     let context = parameter_context(network, application);
     let attestations = if attest {
         let disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-        attestations(&context, shard, |address| state.get(application, address, &disc))?
+        attestations(&context, shard, |address| {
+            state.get(application, address, &disc)
+        })?
     } else {
         Vec::new()
     };
@@ -260,13 +315,21 @@ pub fn shard_report(
         }
         let (level, index) = subtree_position(width, shard)?;
         if let Some(node) = super::summary_tree::subtree(state, application, level, index)? {
-            subtrees.push(SubtreeReport { width, coins: node.coins, root: node.node });
+            subtrees.push(SubtreeReport {
+                width,
+                coins: node.coins,
+                root: node.node,
+            });
         }
     }
     if subtrees.is_empty() && attestations.is_empty() {
         return Ok(None);
     }
-    Ok(Some(ShardReport { context, subtrees, attestations }))
+    Ok(Some(ShardReport {
+        context,
+        subtrees,
+        attestations,
+    }))
 }
 
 /// Derive a report exclusively from the same committed snapshot as the
@@ -280,7 +343,9 @@ pub fn snapshot_report(
     attest: bool,
 ) -> Result<Option<ShardReport>> {
     if !snapshot.has_snapshot_vertex_reads() {
-        return Err(QuilError::ExecutionUnavailable("accumulator recovery needs isolated vertex reads".into()));
+        return Err(QuilError::ExecutionUnavailable(
+            "accumulator recovery needs isolated vertex reads".into(),
+        ));
     }
     let context = parameter_context(network, application);
     let key = quil_types::store::ShardKey {
@@ -289,13 +354,22 @@ pub fn snapshot_report(
     };
     let read = |address: &[u8; 32]| -> Result<Option<Vec<u8>>> {
         let id = [application.as_slice(), address.as_slice()].concat();
-        if snapshot.load_vertex_underlying_raw("vertex", "removes", &key, &id)?.is_some() {
+        if snapshot
+            .load_vertex_underlying_raw("vertex", "removes", &key, &id)?
+            .is_some()
+        {
             return Ok(None);
         }
-        Ok(snapshot.load_vertex_underlying_raw("vertex", "adds", &key, &id)?.filter(|v| !v.is_empty()))
+        Ok(snapshot
+            .load_vertex_underlying_raw("vertex", "adds", &key, &id)?
+            .filter(|v| !v.is_empty()))
     };
     let summary = super::roots::block_summary_from_records(&context, shard, read)?;
-    let attestations = if attest { attestations(&context, shard, read)? } else { Vec::new() };
+    let attestations = if attest {
+        attestations(&context, shard, read)?
+    } else {
+        Vec::new()
+    };
     report_from_summary(context, shard, &summary, attestations)
 }
 
@@ -337,19 +411,28 @@ fn report_from_summary(
                 .map_err(|e| invalid(&format!("fold: {e:?}")))?
         };
         let coins = blocks.iter().try_fold(0u64, |total, (_, coins, _)| {
-            total.checked_add(*coins).ok_or_else(|| invalid("coin count overflow"))
+            total
+                .checked_add(*coins)
+                .ok_or_else(|| invalid("coin count overflow"))
         })?;
         subtrees.push(SubtreeReport { width, coins, root });
     }
     if subtrees.is_empty() && attestations.is_empty() {
         return Ok(None);
     }
-    Ok(Some(ShardReport { context, subtrees, attestations }))
+    Ok(Some(ShardReport {
+        context,
+        subtrees,
+        attestations,
+    }))
 }
 
 /// The application root from its shards' subtrees: `(width, shard path, root)`
 /// each. Subtrees must not overlap; an absent one folds as zeros.
-pub fn fold_application_root(context: &[u8; 32], subtrees: &[(u8, Vec<bool>, Node)]) -> Result<Node> {
+pub fn fold_application_root(
+    context: &[u8; 32],
+    subtrees: &[(u8, Vec<bool>, Node)],
+) -> Result<Node> {
     let nodes = subtrees
         .iter()
         .map(|(width, shard, root)| {
@@ -384,41 +467,79 @@ mod tests {
         let state = mem_state();
         let (network, application) = ([31u8; 32], [32u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = super::super::state::SnapshotLimits { max_coins: 64, max_depth: 32, max_nodes: 1 << 16 };
+        let limits = super::super::state::SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         let key = CommitmentKey::derive(&context);
         let mut staged = BTreeMap::new();
         for seed in 1..=24u8 {
             let output = Output {
                 owner: [seed; IDENTITY_BYTES],
-                commitment: key.commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: key.commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
                 memo: [seed; 1115],
             };
             let (address, tree) = super::super::roots::stage_coin(
-                &state, &network, &application, &context, 1, &output, &mut staged, limits,
+                &state,
+                &network,
+                &application,
+                &context,
+                1,
+                &output,
+                &mut staged,
+                limits,
             )
             .unwrap();
             state
-                .set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap())
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
                 .unwrap();
         }
-        let published = super::super::roots::refresh_root(&state, &network, &application, limits).unwrap();
+        let published =
+            super::super::roots::refresh_root(&state, &network, &application, limits).unwrap();
 
         // Partitions: the whole application, halves, quarters, and a deep split
         // with its spine (prefix-free and complete).
         let partitions: Vec<Vec<Vec<bool>>> = vec![
             vec![vec![]],
             vec![vec![false], vec![true]],
-            vec![vec![false, false], vec![false, true], vec![true, false], vec![true, true]],
-            vec![vec![true], vec![false, true], vec![false, false, false], vec![false, false, true]],
+            vec![
+                vec![false, false],
+                vec![false, true],
+                vec![true, false],
+                vec![true, true],
+            ],
+            vec![
+                vec![true],
+                vec![false, true],
+                vec![false, false, false],
+                vec![false, false, true],
+            ],
         ];
         for shards in partitions {
             let mut subtrees = Vec::new();
             let mut coins = 0;
             for shard in &shards {
-                let Some(report) = shard_report(&state, &network, &application, shard, false).unwrap() else { continue };
+                let Some(report) =
+                    shard_report(&state, &network, &application, shard, false).unwrap()
+                else {
+                    continue;
+                };
                 // A report round-trips through its header encoding.
-                assert_eq!(ShardReport::decode(&report.encode().unwrap()).unwrap(), report);
+                assert_eq!(
+                    ShardReport::decode(&report.encode().unwrap()).unwrap(),
+                    report
+                );
                 assert_eq!(report.context, context);
                 for subtree in report.subtrees {
                     coins += subtree.coins;
@@ -441,8 +562,16 @@ mod tests {
         let report = ShardReport {
             context,
             subtrees: vec![
-                SubtreeReport { width: 6, coins: 3, root: root.clone() },
-                SubtreeReport { width: 8, coins: 1, root: root.clone() },
+                SubtreeReport {
+                    width: 6,
+                    coins: 3,
+                    root: root.clone(),
+                },
+                SubtreeReport {
+                    width: 8,
+                    coins: 1,
+                    root: root.clone(),
+                },
             ],
             attestations: Vec::new(),
         };
@@ -454,10 +583,28 @@ mod tests {
         extended.push(0);
         assert!(ShardReport::decode(&extended).is_err());
         for bad in [
-            ShardReport { subtrees: vec![report.subtrees[1].clone(), report.subtrees[0].clone()], ..report.clone() },
-            ShardReport { subtrees: vec![], ..report.clone() },
-            ShardReport { subtrees: vec![SubtreeReport { coins: 0, ..report.subtrees[0].clone() }], ..report.clone() },
-            ShardReport { subtrees: vec![SubtreeReport { width: 5, ..report.subtrees[0].clone() }], ..report.clone() },
+            ShardReport {
+                subtrees: vec![report.subtrees[1].clone(), report.subtrees[0].clone()],
+                ..report.clone()
+            },
+            ShardReport {
+                subtrees: vec![],
+                ..report.clone()
+            },
+            ShardReport {
+                subtrees: vec![SubtreeReport {
+                    coins: 0,
+                    ..report.subtrees[0].clone()
+                }],
+                ..report.clone()
+            },
+            ShardReport {
+                subtrees: vec![SubtreeReport {
+                    width: 5,
+                    ..report.subtrees[0].clone()
+                }],
+                ..report.clone()
+            },
         ] {
             assert!(bad.encode().is_err());
         }
@@ -466,7 +613,10 @@ mod tests {
         // refused.
         assert_eq!(subtree_position(6, &[]).unwrap(), (22, 1));
         assert_eq!(subtree_position(6, &[true]).unwrap(), (21, 3));
-        assert_eq!(subtree_position(6, &[false, true, true, false, false, true]).unwrap(), (16, 0b1_011001));
+        assert_eq!(
+            subtree_position(6, &[false, true, true, false, false, true]).unwrap(),
+            (16, 0b1_011001)
+        );
         assert!(subtree_position(6, &[true; 7]).is_err());
     }
 
@@ -483,26 +633,67 @@ mod tests {
         let key = MembershipKey::derive(&context);
         let mut root = Node::zero();
         let mut flat = BlockSummary::default();
-        for (seed, (width, path)) in [(6u8, 0u64), (6, 1), (6, 45), (7, 3), (8, 0), (8, 255), (9, 130), (12, 7)]
-            .into_iter()
-            .enumerate()
+        for (seed, (width, path)) in [
+            (6u8, 0u64),
+            (6, 1),
+            (6, 45),
+            (7, 3),
+            (8, 0),
+            (8, 255),
+            (9, 130),
+            (12, 7),
+        ]
+        .into_iter()
+        .enumerate()
         {
             root = key.parent(&root, &Node::zero());
-            flat.put(coin_blocks::block_id(width, path).unwrap(), 1 + seed as u64, root.clone()).unwrap();
+            flat.put(
+                coin_blocks::block_id(width, path).unwrap(),
+                1 + seed as u64,
+                root.clone(),
+            )
+            .unwrap();
         }
         let tree_state = mem_state();
-        SummaryTree::new(&tree_state, &context, &application).replace(&flat.blocks).unwrap();
+        SummaryTree::new(&tree_state, &context, &application)
+            .replace(&flat.blocks)
+            .unwrap();
         let flat_state = mem_state();
-        flat_state.set(&application, &super::super::state::BLOCK_SUMMARY_ADDRESS, &vertex_adds_discriminator().unwrap(),
-            0, flat.encode()).unwrap();
+        flat_state
+            .set(
+                &application,
+                &super::super::state::BLOCK_SUMMARY_ADDRESS,
+                &vertex_adds_discriminator().unwrap(),
+                0,
+                flat.encode(),
+            )
+            .unwrap();
         let bits = |text: &str| text.chars().map(|c| c == '1').collect::<Vec<bool>>();
-        for shard in ["", "0", "1", "00", "000000", "000001", "0000000", "00000000", "101101", "1111111", "000000000111"] {
+        for shard in [
+            "",
+            "0",
+            "1",
+            "00",
+            "000000",
+            "000001",
+            "0000000",
+            "00000000",
+            "101101",
+            "1111111",
+            "000000000111",
+        ] {
             let shard = bits(shard);
             let expected = report_from_summary(context, &shard, &flat, Vec::new()).unwrap();
-            assert_eq!(shard_report(&tree_state, &network, &application, &shard, false).unwrap(), expected,
-                "shard {shard:?}");
-            assert_eq!(shard_report(&flat_state, &network, &application, &shard, false).unwrap(), expected,
-                "a flat summary still reports as before");
+            assert_eq!(
+                shard_report(&tree_state, &network, &application, &shard, false).unwrap(),
+                expected,
+                "shard {shard:?}"
+            );
+            assert_eq!(
+                shard_report(&flat_state, &network, &application, &shard, false).unwrap(),
+                expected,
+                "a flat summary still reports as before"
+            );
         }
     }
 }

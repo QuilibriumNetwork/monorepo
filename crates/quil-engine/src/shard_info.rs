@@ -21,9 +21,7 @@ use std::collections::{HashMap, HashSet};
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
 
-use quil_types::consensus::{
-    ProverInfo, ProverRegistry, ShardDetail,
-};
+use quil_types::consensus::{ProverInfo, ProverRegistry, ShardDetail};
 use quil_types::error::Result;
 use quil_types::store::{ShardInfo, ShardsStore};
 
@@ -213,7 +211,11 @@ pub fn compute_shard_reward(
     data_shards: u64,
 ) -> BigInt {
     quil_execution::pricing::allocation_prover_reward(
-        basis, shard_size, world_bytes, ring, data_shards,
+        basis,
+        shard_size,
+        world_bytes,
+        ring,
+        data_shards,
     )
 }
 
@@ -303,13 +305,21 @@ where
 
             // Keep the displayed membership count, but derive reward position
             // from the shared issuance ordering and explicit projections.
-            let live: Vec<_> = prs.iter().filter(|p| p.allocations.iter()
-                .any(|a| a.confirmation_filter == bp && a.is_live(frame_number))).collect();
+            let live: Vec<_> = prs
+                .iter()
+                .filter(|p| {
+                    p.allocations
+                        .iter()
+                        .any(|a| a.confirmation_filter == bp && a.is_live(frame_number))
+                })
+                .collect();
             let in_candidates = live.iter().any(|p| p.address == self_address);
             // One phase per prover: a stale record on the same filter yields none.
             let mut prover_counts = quil_types::consensus::PhaseCounts::default();
             for p in &prs {
-                if let Some(phase) = p.allocations.iter()
+                if let Some(phase) = p
+                    .allocations
+                    .iter()
                     .filter(|a| a.confirmation_filter == bp)
                     .find_map(|a| a.phase(frame_number))
                 {
@@ -317,8 +327,10 @@ where
                 }
             }
             let real_is_alloc = is_alloc || in_candidates;
-            let estimate = prover_registry.get_reward_ring_estimate(
-                self_address, &bp, frame_number).ok().flatten();
+            let estimate = prover_registry
+                .get_reward_ring_estimate(self_address, &bp, frame_number)
+                .ok()
+                .flatten();
             let ring = estimate.map(|e| e.ring);
             let on_ring = estimate.map_or(0, |e| e.provers_on_ring);
 
@@ -381,7 +393,9 @@ where
     // Consolidate into high-level L2 shards (dedup by shard_key).
     let mut shard_map: HashMap<Vec<u8>, ShardInfo> = HashMap::new();
     for s in &app_shards {
-        shard_map.entry(s.shard_key.clone()).or_insert_with(|| s.clone());
+        shard_map
+            .entry(s.shard_key.clone())
+            .or_insert_with(|| s.clone());
     }
     let shards: Vec<ShardInfo> = shard_map.into_values().collect();
 
@@ -396,16 +410,27 @@ where
     );
 
     if world_bytes.is_zero() {
-        return Ok((Vec::new(), difficulty, BigInt::zero(), frame_number, world_bytes));
+        return Ok((
+            Vec::new(),
+            difficulty,
+            BigInt::zero(),
+            frame_number,
+            world_bytes,
+        ));
     }
 
-    let basis = pomw_basis(difficulty, world_bytes.to_u64_saturating(), QUIL_TOKEN_UNITS);
+    let basis = pomw_basis(
+        difficulty,
+        world_bytes.to_u64_saturating(),
+        QUIL_TOKEN_UNITS,
+    );
 
     let details: Vec<ShardDetail> = entries
         .iter()
         .map(|entry| {
-            let est = entry.ring.map_or_else(BigInt::zero, |ring| compute_shard_reward(
-                &basis, &entry.size, &world_bytes, ring, entry.data_shards));
+            let est = entry.ring.map_or_else(BigInt::zero, |ring| {
+                compute_shard_reward(&basis, &entry.size, &world_bytes, ring, entry.data_shards)
+            });
             ShardDetail {
                 allocation_reason: None,
                 filter: entry.filter.clone(),
@@ -482,7 +507,10 @@ pub fn reported_shard_size(
         return size;
     }
     match committed_deliveries(crdt, shard_key, prefix).filter(|n| *n > 0) {
-        Some(waiting) => waiting.saturating_mul(NOMINAL_DELIVERY_BYTES).to_be_bytes().to_vec(),
+        Some(waiting) => waiting
+            .saturating_mul(NOMINAL_DELIVERY_BYTES)
+            .to_be_bytes()
+            .to_vec(),
         None => size,
     }
 }
@@ -525,7 +553,9 @@ struct Kept {
 
 impl Kept {
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Vec<u8>, KeptSize>> {
-        self.sizes.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -551,7 +581,11 @@ impl Default for CommittedShardSizes {
 
 impl CommittedShardSizes {
     fn with_spacing(spacing: std::time::Duration) -> Self {
-        Self { kept: Default::default(), recounts: std::sync::OnceLock::new(), spacing }
+        Self {
+            kept: Default::default(),
+            recounts: std::sync::OnceLock::new(),
+            spacing,
+        }
     }
 
     /// The size to report for `(shard_key, prefix)` measured at `size`, at
@@ -570,7 +604,9 @@ impl CommittedShardSizes {
         let mut key = shard_key.to_vec();
         key.extend(prefix.iter().flat_map(|part| part.to_be_bytes()));
         let (crdt, shard_key, prefix) = (crdt.clone(), shard_key.to_vec(), prefix.to_vec());
-        self.kept_or(committed, key, move || reported_shard_size(&crdt, &shard_key, &prefix, size))
+        self.kept_or(committed, key, move || {
+            reported_shard_size(&crdt, &shard_key, &prefix, size)
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Vec<u8>, KeptSize>> {
@@ -589,9 +625,15 @@ impl CommittedShardSizes {
         drop(lock_wait);
         let first_count_wait = section("size: first count wait");
         loop {
-            let Some(entry) = kept.get_mut(&key) else { break };
+            let Some(entry) = kept.get_mut(&key) else {
+                break;
+            };
             let Some(size) = entry.size.clone() else {
-                kept = self.kept.first_counted.wait(kept).unwrap_or_else(|poisoned| poisoned.into_inner());
+                kept = self
+                    .kept
+                    .first_counted
+                    .wait(kept)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 continue;
             };
             drop(first_count_wait);
@@ -600,14 +642,23 @@ impl CommittedShardSizes {
             if due && !entry.recounting {
                 entry.recounting = true;
                 drop(kept);
-                self.recount(Recount { key, committed, count: Box::new(count) });
+                self.recount(Recount {
+                    key,
+                    committed,
+                    count: Box::new(count),
+                });
             }
             return size;
         }
         drop(first_count_wait);
         kept.insert(
             key.clone(),
-            KeptSize { committed, size: None, counted: std::time::Instant::now(), recounting: false },
+            KeptSize {
+                committed,
+                size: None,
+                counted: std::time::Instant::now(),
+                recounting: false,
+            },
         );
         drop(kept);
         let counted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -688,17 +739,40 @@ mod committed_shard_sizes_tests {
     fn a_moved_frame_serves_the_last_count_while_one_recount_runs_behind() {
         let sizes = CommittedShardSizes::with_spacing(std::time::Duration::ZERO);
         let counted = Arc::new(AtomicUsize::new(0));
-        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 1)), vec![1], "first count is inline");
-        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 2)), vec![1], "kept within the frame");
-        assert_eq!(sizes.kept_or(7, vec![2], counter(&counted, 3)), vec![3], "per shard");
+        assert_eq!(
+            sizes.kept_or(7, vec![1], counter(&counted, 1)),
+            vec![1],
+            "first count is inline"
+        );
+        assert_eq!(
+            sizes.kept_or(7, vec![1], counter(&counted, 2)),
+            vec![1],
+            "kept within the frame"
+        );
+        assert_eq!(
+            sizes.kept_or(7, vec![2], counter(&counted, 3)),
+            vec![3],
+            "per shard"
+        );
         assert_eq!(counted.load(Ordering::SeqCst), 2);
-        assert_eq!(sizes.kept_or(8, vec![1], counter(&counted, 4)), vec![1], "the last count, at once");
+        assert_eq!(
+            sizes.kept_or(8, vec![1], counter(&counted, 4)),
+            vec![1],
+            "the last count, at once"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while sizes.kept_or(8, vec![1], counter(&counted, 5)) != vec![4] {
-            assert!(std::time::Instant::now() < deadline, "the recount never landed");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recount never landed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(counted.load(Ordering::SeqCst), 3, "one recount; callers meanwhile did not count");
+        assert_eq!(
+            counted.load(Ordering::SeqCst),
+            3,
+            "one recount; callers meanwhile did not count"
+        );
     }
 
     #[test]
@@ -737,7 +811,11 @@ mod committed_shard_sizes_tests {
         };
         std::thread::sleep(std::time::Duration::from_millis(20));
         let counted = Arc::new(AtomicUsize::new(0));
-        assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 3)), vec![3], "the waiter counts");
+        assert_eq!(
+            sizes.kept_or(7, vec![1], counter(&counted, 3)),
+            vec![3],
+            "the waiter counts"
+        );
         assert!(first.join().is_err());
         assert_eq!(counted.load(Ordering::SeqCst), 1);
     }
@@ -749,7 +827,11 @@ mod committed_shard_sizes_tests {
         assert_eq!(sizes.kept_or(7, vec![1], counter(&counted, 1)), vec![1]);
         assert_eq!(sizes.kept_or(8, vec![1], counter(&counted, 2)), vec![1]);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(counted.load(Ordering::SeqCst), 1, "no recount inside the spacing");
+        assert_eq!(
+            counted.load(Ordering::SeqCst),
+            1,
+            "no recount inside the spacing"
+        );
     }
 }
 
@@ -765,7 +847,8 @@ fn committed_deliveries(
     let filter = quil_forest::shard_prefix_to_filter(&application, prefix);
     let (_, bits) = quil_forest::decode_shard_filter_or_root(&filter, 32)?;
     let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
-    quil_execution::token_intrinsic::global_commit::committed_to_shard(&state, &application, &bits).ok()
+    quil_execution::token_intrinsic::global_commit::committed_to_shard(&state, &application, &bits)
+        .ok()
 }
 
 /// Extension trait on BigInt for saturating u64 conversion.
@@ -788,10 +871,7 @@ impl BigIntSaturatingU64 for BigInt {
 /// allocated to, mirroring the Go logic in `GetShardInfo` that
 /// skips joining allocations older than 720 frames and leaving
 /// allocations older than 720 frames.
-pub fn build_allocated_filters(
-    prover: &ProverInfo,
-    current_frame: u64,
-) -> HashSet<Vec<u8>> {
+pub fn build_allocated_filters(prover: &ProverInfo, current_frame: u64) -> HashSet<Vec<u8>> {
     prover
         .allocations
         .iter()
@@ -1182,7 +1262,9 @@ mod tests {
 
     impl E2EShardsStore {
         fn new() -> Self {
-            Self { shards: Mutex::new(Vec::new()) }
+            Self {
+                shards: Mutex::new(Vec::new()),
+            }
         }
         fn push(&self, info: ShardInfo) {
             self.shards.lock().unwrap().push(info);
@@ -1207,7 +1289,12 @@ mod tests {
             self.shards.lock().unwrap().push(shard.clone());
             Ok(())
         }
-        fn delete_app_shard(&self, _: &dyn Transaction, _key: &[u8], _prefix: &[u32]) -> QResult<()> {
+        fn delete_app_shard(
+            &self,
+            _: &dyn Transaction,
+            _key: &[u8],
+            _prefix: &[u32],
+        ) -> QResult<()> {
             Ok(())
         }
     }
@@ -1232,45 +1319,161 @@ mod tests {
     }
     struct NoopTxn;
     impl Transaction for NoopTxn {
-        fn get(&self, _: &[u8]) -> QResult<Option<Vec<u8>>> { Ok(None) }
-        fn set(&self, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
-        fn commit(self: Box<Self>) -> QResult<()> { Ok(()) }
-        fn delete(&self, _: &[u8]) -> QResult<()> { Ok(()) }
-        fn abort(self: Box<Self>) -> QResult<()> { Ok(()) }
+        fn get(&self, _: &[u8]) -> QResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn set(&self, _: &[u8], _: &[u8]) -> QResult<()> {
+            Ok(())
+        }
+        fn commit(self: Box<Self>) -> QResult<()> {
+            Ok(())
+        }
+        fn delete(&self, _: &[u8]) -> QResult<()> {
+            Ok(())
+        }
+        fn abort(self: Box<Self>) -> QResult<()> {
+            Ok(())
+        }
         fn new_iter(&self, _: &[u8], _: &[u8]) -> QResult<Box<dyn quil_types::store::Iterator>> {
             Err(QuilError::Internal("noop".into()))
         }
-        fn delete_range(&self, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn delete_range(&self, _: &[u8], _: &[u8]) -> QResult<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
     impl HypergraphStore for E2EHgStore {
-        fn new_transaction(&self, _: bool) -> QResult<Box<dyn Transaction>> { Ok(Box::new(NoopTxn)) }
-        fn get_node_by_key(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
-            Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
+        fn new_transaction(&self, _: bool) -> QResult<Box<dyn Transaction>> {
+            Ok(Box::new(NoopTxn))
         }
-        fn get_node_by_path(&self, _: &str, _: &str, _: &TypedShardKey, _: &[i32]) -> QResult<Option<Vec<u8>>> { Ok(None) }
-        fn insert_node(&self, _: &dyn Transaction, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], _: &[i32], data: &[u8]) -> QResult<()> {
-            self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), data.to_vec());
+        fn get_node_by_key(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &TypedShardKey,
+            k: &[u8],
+        ) -> QResult<Option<Vec<u8>>> {
+            Ok(self
+                .nodes
+                .lock()
+                .unwrap()
+                .get(&Self::key(set, phase, shard, k))
+                .cloned())
+        }
+        fn get_node_by_path(
+            &self,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+            _: &[i32],
+        ) -> QResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn insert_node(
+            &self,
+            _: &dyn Transaction,
+            set: &str,
+            phase: &str,
+            shard: &TypedShardKey,
+            k: &[u8],
+            _: &[i32],
+            data: &[u8],
+        ) -> QResult<()> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(Self::key(set, phase, shard, k), data.to_vec());
             if k != [0xFFu8; 32] {
-                self.per_vertex.lock().unwrap().insert((Self::scope(set, phase, shard), k.to_vec()), data.to_vec());
+                self.per_vertex
+                    .lock()
+                    .unwrap()
+                    .insert((Self::scope(set, phase, shard), k.to_vec()), data.to_vec());
             }
             Ok(())
         }
-        fn save_root(&self, _: &dyn Transaction, _: &str, _: &str, _: &TypedShardKey, _: &[u8]) -> QResult<()> { Ok(()) }
-        fn delete_node(&self, _: &dyn Transaction, _: &str, _: &str, _: &TypedShardKey, _: &[u8], _: &[i32]) -> QResult<()> { Ok(()) }
-        fn set_covered_prefix(&self, _: &[i32]) -> QResult<()> { Ok(()) }
-        fn set_shard_commit(&self, _: &dyn Transaction, _: u64, _: &str, _: &str, _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
-        fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> QResult<Vec<u8>> { Ok(vec![]) }
-        fn get_root_commits(&self, _: u64) -> QResult<HashMap<TypedShardKey, Vec<Vec<u8>>>> { Ok(HashMap::new()) }
-        fn load_vertex_underlying_raw(&self, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8]) -> QResult<Option<Vec<u8>>> {
-            Ok(self.nodes.lock().unwrap().get(&Self::key(set, phase, shard, k)).cloned())
-        }
-        fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, set: &str, phase: &str, shard: &TypedShardKey, k: &[u8], d: &[u8]) -> QResult<()> {
-            self.nodes.lock().unwrap().insert(Self::key(set, phase, shard, k), d.to_vec());
-            self.per_vertex.lock().unwrap().insert((Self::scope(set, phase, shard), k.to_vec()), d.to_vec());
+        fn save_root(
+            &self,
+            _: &dyn Transaction,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+            _: &[u8],
+        ) -> QResult<()> {
             Ok(())
         }
-        fn for_each_vertex_underlying(&self, set: &str, phase: &str, shard: &TypedShardKey, callback: &mut dyn FnMut(Vec<u8>, Vec<u8>)) -> QResult<usize> {
+        fn delete_node(
+            &self,
+            _: &dyn Transaction,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+            _: &[u8],
+            _: &[i32],
+        ) -> QResult<()> {
+            Ok(())
+        }
+        fn set_covered_prefix(&self, _: &[i32]) -> QResult<()> {
+            Ok(())
+        }
+        fn set_shard_commit(
+            &self,
+            _: &dyn Transaction,
+            _: u64,
+            _: &str,
+            _: &str,
+            _: &[u8],
+            _: &[u8],
+        ) -> QResult<()> {
+            Ok(())
+        }
+        fn get_shard_commit(&self, _: u64, _: &str, _: &str, _: &[u8]) -> QResult<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn get_root_commits(&self, _: u64) -> QResult<HashMap<TypedShardKey, Vec<Vec<u8>>>> {
+            Ok(HashMap::new())
+        }
+        fn load_vertex_underlying_raw(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &TypedShardKey,
+            k: &[u8],
+        ) -> QResult<Option<Vec<u8>>> {
+            Ok(self
+                .nodes
+                .lock()
+                .unwrap()
+                .get(&Self::key(set, phase, shard, k))
+                .cloned())
+        }
+        fn save_vertex_underlying(
+            &self,
+            _txn: &dyn quil_types::store::Transaction,
+            set: &str,
+            phase: &str,
+            shard: &TypedShardKey,
+            k: &[u8],
+            d: &[u8],
+        ) -> QResult<()> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .insert(Self::key(set, phase, shard, k), d.to_vec());
+            self.per_vertex
+                .lock()
+                .unwrap()
+                .insert((Self::scope(set, phase, shard), k.to_vec()), d.to_vec());
+            Ok(())
+        }
+        fn for_each_vertex_underlying(
+            &self,
+            set: &str,
+            phase: &str,
+            shard: &TypedShardKey,
+            callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+        ) -> QResult<usize> {
             let scope = Self::scope(set, phase, shard);
             let mut count = 0usize;
             for ((s, vk), v) in self.per_vertex.lock().unwrap().iter() {
@@ -1281,14 +1484,66 @@ mod tests {
             }
             Ok(count)
         }
-        fn apply_snapshot(&self, _: &str) -> QResult<()> { Ok(()) }
-        fn set_alt_shard_commit(&self, _: &dyn Transaction, _: u64, _: &[u8], _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> QResult<()> { Ok(()) }
-        fn get_latest_alt_shard_commit(&self, _: &[u8]) -> QResult<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> { Ok((vec![], vec![], vec![], vec![])) }
-        fn range_alt_shard_addresses(&self) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn reap_old_changesets(&self, _: &dyn Transaction, _: u64) -> QResult<()> { Ok(()) }
-        fn track_change(&self, _: &dyn Transaction, _: &[u8], _: Option<&[u8]>, _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<()> { Ok(()) }
-        fn get_changes(&self, _: u64, _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<Vec<ChangeRecord>> { Ok(vec![]) }
-        fn untrack_change(&self, _: &dyn Transaction, _: &[u8], _: u64, _: &str, _: &str, _: &TypedShardKey) -> QResult<()> { Ok(()) }
+        fn apply_snapshot(&self, _: &str) -> QResult<()> {
+            Ok(())
+        }
+        fn set_alt_shard_commit(
+            &self,
+            _: &dyn Transaction,
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> QResult<()> {
+            Ok(())
+        }
+        fn get_latest_alt_shard_commit(
+            &self,
+            _: &[u8],
+        ) -> QResult<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+            Ok((vec![], vec![], vec![], vec![]))
+        }
+        fn range_alt_shard_addresses(&self) -> QResult<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn reap_old_changesets(&self, _: &dyn Transaction, _: u64) -> QResult<()> {
+            Ok(())
+        }
+        fn track_change(
+            &self,
+            _: &dyn Transaction,
+            _: &[u8],
+            _: Option<&[u8]>,
+            _: u64,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+        ) -> QResult<()> {
+            Ok(())
+        }
+        fn get_changes(
+            &self,
+            _: u64,
+            _: u64,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+        ) -> QResult<Vec<ChangeRecord>> {
+            Ok(vec![])
+        }
+        fn untrack_change(
+            &self,
+            _: &dyn Transaction,
+            _: &[u8],
+            _: u64,
+            _: &str,
+            _: &str,
+            _: &TypedShardKey,
+        ) -> QResult<()> {
+            Ok(())
+        }
     }
 
     struct StubInclusion;
@@ -1303,12 +1558,32 @@ mod tests {
             out[..8].copy_from_slice(&hash);
             Ok(out)
         }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> QResult<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> QResult<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> QResult<Box<dyn Multiproof>> {
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> QResult<Vec<u8>> {
+            Ok(vec![0u8; 64])
+        }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> QResult<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> QResult<Box<dyn Multiproof>> {
             Err(QuilError::Internal("nope".into()))
         }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     struct StubRegistry {
@@ -1317,18 +1592,36 @@ mod tests {
         prover_pubkey: Vec<u8>,
     }
     impl ProverRegistry for StubRegistry {
-        fn get_reward_ring_estimate(&self, owner: &[u8], filter: &[u8], frame: u64)
-            -> QResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
-            if !self.ring_known { return Ok(None); }
+        fn get_reward_ring_estimate(
+            &self,
+            owner: &[u8],
+            filter: &[u8],
+            frame: u64,
+        ) -> QResult<Option<quil_types::reward_ring::RewardRingEstimate>> {
+            if !self.ring_known {
+                return Ok(None);
+            }
             let members = self.get_provers(filter)?;
             let refs: Vec<_> = members.iter().collect();
-            Ok(quil_types::reward_ring::estimate_reward_ring(&refs, &refs, owner, filter, frame))
+            Ok(quil_types::reward_ring::estimate_reward_ring(
+                &refs, &refs, owner, filter, frame,
+            ))
         }
-        fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> { Ok(vec![]) }
-        fn get_active_provers(&self, filter: &[u8], _: u64) -> QResult<Vec<ProverInfo>> { self.get_provers(filter) }
-        fn get_prover_count(&self, _: &[u8]) -> QResult<usize> { Ok(0) }
+        fn get_prover_info(&self, _: &[u8]) -> QResult<Option<ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> QResult<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+        fn get_active_provers(&self, filter: &[u8], _: u64) -> QResult<Vec<ProverInfo>> {
+            self.get_provers(filter)
+        }
+        fn get_prover_count(&self, _: &[u8]) -> QResult<usize> {
+            Ok(0)
+        }
         fn get_provers(&self, filter: &[u8]) -> QResult<Vec<ProverInfo>> {
             // Single Active prover on every queried filter.
             Ok(vec![ProverInfo {
@@ -1360,8 +1653,12 @@ mod tests {
                 delegate_address: vec![],
             }])
         }
-        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> { Ok(vec![]) }
-        fn get_prover_shard_summaries(&self, _: u64) -> QResult<Vec<ProverShardSummary>> { Ok(vec![]) }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> QResult<Vec<ProverInfo>> {
+            Ok(vec![])
+        }
+        fn get_prover_shard_summaries(&self, _: u64) -> QResult<Vec<ProverShardSummary>> {
+            Ok(vec![])
+        }
     }
 
     #[test]
@@ -1399,7 +1696,8 @@ mod tests {
 
         // Stub a registry that returns 1 Active prover for any filter.
         let prover_addr = vec![0x77u8; 32];
-        let registry = StubRegistry { ring_known: true,
+        let registry = StubRegistry {
+            ring_known: true,
             prover_addr: prover_addr.clone(),
             prover_pubkey: vec![0xBBu8; 74],
         };
@@ -1414,15 +1712,14 @@ mod tests {
         // single allocated prover, so include the shard via
         // allocated_filters. (`include_all=false` would also include
         // it; `include_all=true` includes everything.)
-        let allocated_filters: HashSet<Vec<u8>> =
-            std::iter::once(typed_key.l2.to_vec()).collect();
+        let allocated_filters: HashSet<Vec<u8>> = std::iter::once(typed_key.l2.to_vec()).collect();
 
         let (details, difficulty, basis, frame_number, _world) = get_shard_info(
-            true,           // include_all
+            true, // include_all
             &prover_addr,
             &allocated_filters,
-            10_000,         // difficulty (non-zero so basis > 0)
-            123,            // frame_number
+            10_000, // difficulty (non-zero so basis > 0)
+            123,    // frame_number
             shards_store.as_ref(),
             &registry,
             &get_sizes,
@@ -1482,7 +1779,10 @@ mod tests {
         // Insert vertex on one shard.
         let mut a1 = [0xCDu8; 32];
         a1[0] = 0xAB;
-        let loc_a = Location { app_address: a1, data_address: [0x11u8; 32] };
+        let loc_a = Location {
+            app_address: a1,
+            data_address: [0x11u8; 32],
+        };
         crdt.add_vertex(&loc_a, b"data-a").unwrap();
 
         // Persist three shard entries — only the first has trie data.
@@ -1513,7 +1813,8 @@ mod tests {
         }
 
         let prover_addr = vec![0x77u8; 32];
-        let registry = StubRegistry { ring_known: true,
+        let registry = StubRegistry {
+            ring_known: true,
             prover_addr: prover_addr.clone(),
             prover_pubkey: vec![0xBBu8; 74],
         };
@@ -1545,7 +1846,10 @@ mod tests {
             .map(|s| s.shard_key.clone())
             .collect();
         assert_eq!(unique_shard_keys.len(), 3);
-        assert!(!basis.is_zero(), "basis must be non-zero (one shard has data)");
+        assert!(
+            !basis.is_zero(),
+            "basis must be non-zero (one shard has data)"
+        );
         assert!(
             details.len() < unique_shard_keys.len(),
             "details ({}) must be fewer than shards ({}) — this is the \
@@ -1560,20 +1864,38 @@ mod tests {
     fn owned_and_all_shards_share_the_full_world_reward_denominator() {
         let store = E2EShardsStore::new();
         for id in [1u8, 2] {
-            store.push(ShardInfo { shard_key: vec![id; 35], prefix: vec![],
-                size: vec![], data_shards: 1, commitment: vec![] });
+            store.push(ShardInfo {
+                shard_key: vec![id; 35],
+                prefix: vec![],
+                size: vec![],
+                data_shards: 1,
+                commitment: vec![],
+            });
         }
         let owner = vec![77; 32];
-        let registry = StubRegistry { ring_known: true, prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
+        let registry = StubRegistry {
+            ring_known: true,
+            prover_addr: owner.clone(),
+            prover_pubkey: vec![88; 74],
+        };
         let allocated = HashSet::from([quil_forest::shard_prefix_to_filter(&[1; 32], &[])]);
-        let sizes = |key: &[u8], _: &ShardInfo| Ok(vec![ShardSizeEntry {
-            prefix: vec![], size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
-            data_shards: 1, materialized_frame: 0, latest_frame: 0,
-        }]);
-        let (owned, _, owned_basis, _, owned_world) = get_shard_info(false, &owner, &allocated,
-            10000, 123, &store, &registry, &sizes).unwrap();
-        let (all, _, all_basis, _, all_world) = get_shard_info(true, &owner, &allocated,
-            10000, 123, &store, &registry, &sizes).unwrap();
+        let sizes = |key: &[u8], _: &ShardInfo| {
+            Ok(vec![ShardSizeEntry {
+                prefix: vec![],
+                size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
+                data_shards: 1,
+                materialized_frame: 0,
+                latest_frame: 0,
+            }])
+        };
+        let (owned, _, owned_basis, _, owned_world) = get_shard_info(
+            false, &owner, &allocated, 10000, 123, &store, &registry, &sizes,
+        )
+        .unwrap();
+        let (all, _, all_basis, _, all_world) = get_shard_info(
+            true, &owner, &allocated, 10000, 123, &store, &registry, &sizes,
+        )
+        .unwrap();
         assert_eq!(owned.len(), 1);
         assert_eq!(all.len(), 2);
         assert_eq!(owned_world, BigInt::from(3000));
@@ -1588,20 +1910,35 @@ mod tests {
     fn unknown_ring_retains_shard_and_full_world_without_zero_ring_reward() {
         let store = E2EShardsStore::new();
         for id in [1u8, 2] {
-            store.push(ShardInfo { shard_key: vec![id; 35], prefix: vec![],
-                size: vec![], data_shards: 1, commitment: vec![] });
+            store.push(ShardInfo {
+                shard_key: vec![id; 35],
+                prefix: vec![],
+                size: vec![],
+                data_shards: 1,
+                commitment: vec![],
+            });
         }
         let owner = vec![77; 32];
         let allocated = HashSet::from([quil_forest::shard_prefix_to_filter(&[1; 32], &[])]);
-        let sizes = |key: &[u8], _: &ShardInfo| Ok(vec![ShardSizeEntry {
-            prefix: vec![], size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
-            data_shards: 1, materialized_frame: 0, latest_frame: 0,
-        }]);
+        let sizes = |key: &[u8], _: &ShardInfo| {
+            Ok(vec![ShardSizeEntry {
+                prefix: vec![],
+                size: BigInt::from(u64::from(key[0]) * 1000).to_bytes_be().1,
+                data_shards: 1,
+                materialized_frame: 0,
+                latest_frame: 0,
+            }])
+        };
         for known in [false, true] {
-            let registry = StubRegistry { ring_known: known,
-                prover_addr: owner.clone(), prover_pubkey: vec![88; 74] };
-            let (details, _, _, _, world) = get_shard_info(false, &owner, &allocated,
-                10000, 123, &store, &registry, &sizes).unwrap();
+            let registry = StubRegistry {
+                ring_known: known,
+                prover_addr: owner.clone(),
+                prover_pubkey: vec![88; 74],
+            };
+            let (details, _, _, _, world) = get_shard_info(
+                false, &owner, &allocated, 10000, 123, &store, &registry, &sizes,
+            )
+            .unwrap();
             assert_eq!(world, BigInt::from(3000));
             assert_eq!(details.len(), 1);
             assert!(details[0].is_allocated);
@@ -1634,11 +1971,22 @@ mod tests {
                     shards,
                 );
                 let mut m = HashMap::new();
-                m.insert("s".to_string(), ProverAllocation { ring, shards, state_size: size });
-                let mint =
-                    &OptRewardIssuance.calculate(difficulty, world, units, &[m]).unwrap()[0]
-                        / 8;
-                assert_eq!(est, mint, "ring={ring} shards={shards}: estimate != minted/8");
+                m.insert(
+                    "s".to_string(),
+                    ProverAllocation {
+                        ring,
+                        shards,
+                        state_size: size,
+                    },
+                );
+                let mint = &OptRewardIssuance
+                    .calculate(difficulty, world, units, &[m])
+                    .unwrap()[0]
+                    / 8;
+                assert_eq!(
+                    est, mint,
+                    "ring={ring} shards={shards}: estimate != minted/8"
+                );
             }
         }
     }
@@ -1662,7 +2010,10 @@ mod committed_delivery_size_tests {
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         let app = [7u8; 32];
         let mut output = [9u8; 32];
         output[0] = 0b0010_0011;
@@ -1680,16 +2031,38 @@ mod committed_delivery_size_tests {
             settlement: None,
         };
         let state = HypergraphState::new(crdt.clone());
-        let outcome = commit_entry(&state, 5, &app, &entry, quil_types::execution::ShardPath::WHOLE).unwrap();
+        let outcome = commit_entry(
+            &state,
+            5,
+            &app,
+            &entry,
+            quil_types::execution::ShardPath::WHOLE,
+        )
+        .unwrap();
         assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
         state.commit().unwrap();
 
         let shard_key: Vec<u8> = [0u8; 3].into_iter().chain(app).collect();
         let size = |bits: &[bool], measured: Vec<u8>| {
-            reported_shard_size(&crdt, &shard_key, &quil_forest::bit_path_to_prefix(bits), measured)
+            reported_shard_size(
+                &crdt,
+                &shard_key,
+                &quil_forest::bit_path_to_prefix(bits),
+                measured,
+            )
         };
-        assert!(size(&[false, false, true], vec![]).iter().any(|b| *b != 0), "the empty shard owning the output");
-        assert!(size(&[true], vec![]).iter().all(|b| *b == 0), "an empty shard with nothing waiting");
-        assert_eq!(size(&[false, false, true], vec![0, 5]), vec![0, 5], "a measured size is kept");
+        assert!(
+            size(&[false, false, true], vec![]).iter().any(|b| *b != 0),
+            "the empty shard owning the output"
+        );
+        assert!(
+            size(&[true], vec![]).iter().all(|b| *b == 0),
+            "an empty shard with nothing waiting"
+        );
+        assert_eq!(
+            size(&[false, false, true], vec![0, 5]),
+            vec![0, 5],
+            "a measured size is kept"
+        );
     }
 }

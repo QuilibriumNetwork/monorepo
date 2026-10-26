@@ -376,7 +376,9 @@ impl ExecutionPublicationGuard<'_> {
         // if the branch's once-per-epoch maintenance refresh preceded it. Only
         // the records the branch's registry rows feed are re-read.
         let refreshed = branch.overlay().delta_generation();
-        branch.registry.update_written_rows(branch.store.as_ref(), branch.overlay())?;
+        branch
+            .registry
+            .update_written_rows(branch.store.as_ref(), branch.overlay())?;
         timing.mark("update registry");
         let branch_engines = branch.manager.engines.try_read().map_err(|_| {
             QuilError::ExecutionUnavailable("private execution engines are busy or poisoned".into())
@@ -485,12 +487,17 @@ struct PublicationSteps {
 impl PublicationSteps {
     fn start() -> Self {
         let now = std::time::Instant::now();
-        Self { started: now, last: now, steps: Vec::new() }
+        Self {
+            started: now,
+            last: now,
+            steps: Vec::new(),
+        }
     }
 
     fn mark(&mut self, step: &'static str) {
         let now = std::time::Instant::now();
-        self.steps.push((step, now.duration_since(self.last).as_millis()));
+        self.steps
+            .push((step, now.duration_since(self.last).as_millis()));
         self.last = now;
     }
 }

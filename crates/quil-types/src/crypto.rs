@@ -81,19 +81,12 @@ pub trait BlsConstructor: Send + Sync {
     /// IS that per-signature loop; curves with a batched pairing check
     /// (BLS48-581) override it with a random-linear-combination verify
     /// that collapses N final exponentiations into one.
-    fn verify_signatures_batch(
-        &self,
-        items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)],
-    ) -> bool {
+    fn verify_signatures_batch(&self, items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)]) -> bool {
         items
             .iter()
             .all(|(pk, sig, msg, ctx)| self.verify_signature_raw(pk, sig, msg, ctx))
     }
-    fn aggregate(
-        &self,
-        public_keys: &[&[u8]],
-        signatures: &[&[u8]],
-    ) -> Result<BlsAggregateOutput>;
+    fn aggregate(&self, public_keys: &[&[u8]], signatures: &[&[u8]]) -> Result<BlsAggregateOutput>;
 
     /// Aggregate G2 public keys ONLY into a single aggregate public key —
     /// the pubkey half of [`aggregate`], with no signatures involved. Used to
@@ -121,11 +114,15 @@ pub trait InclusionProver: Send + Sync {
     /// commitments need coarse work to amortize Rayon overhead; expensive
     /// provers can opt into parallel traversal at a smaller leaf count.
     /// This affects scheduling only, never commitment contents.
-    fn commit_parallel_threshold(&self) -> usize { 256 }
+    fn commit_parallel_threshold(&self) -> usize {
+        256
+    }
 
     /// Upper budget for independently scheduled trie subtrees. Expensive
     /// commitment arithmetic can justify more work units for load balancing.
-    fn commit_parallel_budget(&self) -> usize { 8 }
+    fn commit_parallel_budget(&self) -> usize {
+        8
+    }
 
     fn commit_raw(&self, data: &[u8], poly_size: u64) -> Result<Vec<u8>>;
     fn prove_raw(&self, data: &[u8], index: u64, poly_size: u64) -> Result<Vec<u8>>;
@@ -160,13 +157,37 @@ pub trait InclusionProver: Send + Sync {
 pub struct NoopInclusionProver;
 
 impl InclusionProver for NoopInclusionProver {
-    fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-    fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
-        Err(crate::error::QuilError::Internal("batch multiproof generation not supported".into()))
+    fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+        Ok(vec![0u8; 64])
     }
-    fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+        Ok(vec![])
+    }
+    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+        Ok(true)
+    }
+    fn prove_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+    ) -> Result<Box<dyn Multiproof>> {
+        Err(crate::error::QuilError::Internal(
+            "batch multiproof generation not supported".into(),
+        ))
+    }
+    fn verify_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+        _: &[u8],
+        _: &[u8],
+    ) -> bool {
+        true
+    }
 }
 
 /// Key manager for multi-algorithm signature verification. Dispatches
@@ -348,19 +369,10 @@ pub trait BulletproofProver: Send + Sync {
     ) -> Result<RangeProofResult>;
 
     /// Generate input commitments from 56-byte scalar values.
-    fn generate_input_commitments(
-        &self,
-        values: &[Vec<u8>],
-        blinding: &[u8],
-    ) -> Vec<u8>;
+    fn generate_input_commitments(&self, values: &[Vec<u8>], blinding: &[u8]) -> Vec<u8>;
 
     /// Verify a range proof against commitments.
-    fn verify_range_proof(
-        &self,
-        proof: &[u8],
-        commitment: &[u8],
-        bit_size: u64,
-    ) -> bool;
+    fn verify_range_proof(&self, proof: &[u8], commitment: &[u8], bit_size: u64) -> bool;
 
     /// Verify that inputs sum to outputs (+ fees).
     fn sum_check(
@@ -372,13 +384,7 @@ pub trait BulletproofProver: Send + Sync {
     ) -> bool;
 
     /// Create a hidden signature (4 DECAF448 scalars: x, t, a, r).
-    fn sign_hidden(
-        &self,
-        x: &[u8],
-        t: &[u8],
-        a: &[u8],
-        r: &[u8],
-    ) -> Vec<u8>;
+    fn sign_hidden(&self, x: &[u8], t: &[u8], a: &[u8], r: &[u8]) -> Vec<u8>;
 
     /// Verify a hidden signature.
     fn verify_hidden(
@@ -396,12 +402,7 @@ pub trait BulletproofProver: Send + Sync {
     fn simple_sign(&self, secret_key: &[u8], message: &[u8]) -> Vec<u8>;
 
     /// Verify a simple Schnorr signature.
-    fn simple_verify(
-        &self,
-        message: &[u8],
-        signature: &[u8],
-        point: &[u8],
-    ) -> bool;
+    fn simple_verify(&self, message: &[u8], signature: &[u8], point: &[u8]) -> bool;
 }
 
 /// Decaf448 elliptic curve agreement.

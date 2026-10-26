@@ -13,19 +13,19 @@ use sha3::{
 };
 use zeroize::Zeroize;
 
-pub mod relation;
-pub mod transfer;
-pub mod shield;
-pub mod mint;
+pub mod address;
+pub mod coin_tree;
 pub mod custom_mint;
+pub mod memo;
+pub mod mint;
 pub mod mint_claim;
 pub mod pending_claim;
 pub mod pending_create;
+pub mod relation;
 pub mod settlement;
-pub mod memo;
-pub mod address;
-pub mod coin_tree;
 pub mod sharded_tree;
+pub mod shield;
+pub mod transfer;
 
 pub const BINDING_RANK: usize = 8;
 pub const SECRET_RANK: usize = 9;

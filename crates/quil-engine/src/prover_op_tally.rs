@@ -76,10 +76,20 @@ impl ProverOpTally {
 fn prover_op_filters(inner: &[u8]) -> Option<(MessageKindGlobal, u64)> {
     let kind = peek_global_message_kind(inner).ok()?;
     let filters = match kind {
-        MessageKindGlobal::ProverJoin => ProverJoin::from_canonical_bytes(inner).ok()?.filters.len(),
-        MessageKindGlobal::ProverLeave => ProverLeave::from_canonical_bytes(inner).ok()?.filters.len(),
-        MessageKindGlobal::ProverConfirm => ProverConfirm::from_canonical_bytes(inner).ok()?.filters.len(),
-        MessageKindGlobal::ProverReject => ProverReject::from_canonical_bytes(inner).ok()?.filters.len(),
+        MessageKindGlobal::ProverJoin => {
+            ProverJoin::from_canonical_bytes(inner).ok()?.filters.len()
+        }
+        MessageKindGlobal::ProverLeave => {
+            ProverLeave::from_canonical_bytes(inner).ok()?.filters.len()
+        }
+        MessageKindGlobal::ProverConfirm => ProverConfirm::from_canonical_bytes(inner)
+            .ok()?
+            .filters
+            .len(),
+        MessageKindGlobal::ProverReject => ProverReject::from_canonical_bytes(inner)
+            .ok()?
+            .filters
+            .len(),
         MessageKindGlobal::ProverKick => 1,
         _ => return None,
     };
@@ -111,13 +121,19 @@ mod tests {
     #[test]
     fn prover_ops_are_counted_in_filters_by_outcome() {
         let leave = |n: u8| {
-            ProverLeave { filters: (0..n).map(|i| vec![i; 32]).collect(), ..Default::default() }
-                .to_canonical_bytes()
-                .unwrap()
-        };
-        let confirm = ProverConfirm { filters: vec![vec![7; 32]], ..Default::default() }
+            ProverLeave {
+                filters: (0..n).map(|i| vec![i; 32]).collect(),
+                ..Default::default()
+            }
             .to_canonical_bytes()
-            .unwrap();
+            .unwrap()
+        };
+        let confirm = ProverConfirm {
+            filters: vec![vec![7; 32]],
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         let mut tally = ProverOpTally::default();
         assert!(tally.is_empty());
         tally.record(&bundle(&[leave(3)]), true);
@@ -126,7 +142,10 @@ mod tests {
         tally.record(b"not a bundle", true);
         assert_eq!(
             tally.ops,
-            vec![(MessageKindGlobal::ProverLeave, 3, 2), (MessageKindGlobal::ProverConfirm, 1, 1)],
+            vec![
+                (MessageKindGlobal::ProverLeave, 3, 2),
+                (MessageKindGlobal::ProverConfirm, 1, 1)
+            ],
         );
     }
 }

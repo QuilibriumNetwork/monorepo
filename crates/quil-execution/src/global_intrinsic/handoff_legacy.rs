@@ -38,7 +38,10 @@ use quil_types::error::{QuilError, Result};
 use sha2::{Digest as _, Sha256};
 
 use super::schedule::{desired_members, reserve, reserved};
-use super::{atomic, create_session, head, invalid, read, record_member_rings, record_session_tip, schedule, set_status, write, DesiredCommittee, Records};
+use super::{
+    atomic, create_session, head, invalid, read, record_member_rings, record_session_tip, schedule,
+    set_status, write, DesiredCommittee, Records,
+};
 use crate::hypergraph_state::HypergraphState;
 use crate::prover_registry::CommittedProverScan;
 
@@ -81,10 +84,22 @@ pub mod defaults {
     // here: `--gen0-preflight` reports each one as a blocker; such a shard
     // cannot seal until it finalizes a Simplex frame.
 
-    const _: () = assert!(DEAD_LEGACY_SHARDS_GET_A_FRESH_SESSION, "D2 alternatives are not implemented");
-    const _: () = assert!(GENERATION_ONE_KEEPS_THE_ELIGIBLE_SET, "D3 alternative is not implemented");
-    const _: () = assert!(WAIT_FOR_A_CURRENT_EPOCH_TIP, "D4 alternative is not implemented");
-    const _: () = assert!(LEGACY_VERIFIER_SUNSET_EPOCHS.is_none(), "D5 sunset is not implemented");
+    const _: () = assert!(
+        DEAD_LEGACY_SHARDS_GET_A_FRESH_SESSION,
+        "D2 alternatives are not implemented"
+    );
+    const _: () = assert!(
+        GENERATION_ONE_KEEPS_THE_ELIGIBLE_SET,
+        "D3 alternative is not implemented"
+    );
+    const _: () = assert!(
+        WAIT_FOR_A_CURRENT_EPOCH_TIP,
+        "D4 alternative is not implemented"
+    );
+    const _: () = assert!(
+        LEGACY_VERIFIER_SUNSET_EPOCHS.is_none(),
+        "D5 sunset is not implemented"
+    );
 }
 
 pub use defaults::LEGACY_TIP_LEAD;
@@ -139,17 +154,26 @@ pub fn records_tips(policy: &CommitteeHandoffPolicy, frame: u64) -> bool {
 }
 
 pub fn tip(state: &impl Records, filter: &[u8]) -> Result<Option<LegacyTip>> {
-    read(state, b"legacy-tip", filter)?.map(|bytes| LegacyTip::decode(&bytes)).transpose()
+    read(state, b"legacy-tip", filter)?
+        .map(|bytes| LegacyTip::decode(&bytes))
+        .transpose()
 }
 
 /// Advance `filter`'s legacy tip to `tip` if it is higher. Called for headers
 /// the legacy verifier accepted; a shard already in the protocol has a session
 /// and keeps its tip where registration found it.
-pub fn record_tip(state: &HypergraphState, frame: u64, filter: &[u8], tip: &LegacyTip) -> Result<()> {
+pub fn record_tip(
+    state: &HypergraphState,
+    frame: u64,
+    filter: &[u8],
+    tip: &LegacyTip,
+) -> Result<()> {
     if head(state, filter)?.is_some() {
         return Ok(());
     }
-    if self::tip(state, filter)?.is_some_and(|current| current.checkpoint.frame >= tip.checkpoint.frame) {
+    if self::tip(state, filter)?
+        .is_some_and(|current| current.checkpoint.frame >= tip.checkpoint.frame)
+    {
         return Ok(());
     }
     write(state, frame, b"legacy-tip", filter, &tip.encode())
@@ -167,7 +191,10 @@ pub fn source(state: &impl Records, id: &[u8; 32]) -> Result<Option<LegacySource
             let (at, rest) = bytes
                 .split_first_chunk::<8>()
                 .ok_or_else(|| QuilError::Store("corrupt legacy source record".into()))?;
-            Ok(LegacySource { registered_at: u64::from_be_bytes(*at), tip: LegacyTip::decode(rest)? })
+            Ok(LegacySource {
+                registered_at: u64::from_be_bytes(*at),
+                tip: LegacyTip::decode(rest)?,
+            })
         })
         .transpose()
 }
@@ -250,9 +277,13 @@ pub fn migrate(
         if head(state, filter)?.is_some() || reserved(state, filter)? {
             continue;
         }
-        let Some(tip) = tip(state, filter)? else { continue };
+        let Some(tip) = tip(state, filter)? else {
+            continue;
+        };
         // Wait for a tip its current committee certified.
-        if defaults::WAIT_FOR_A_CURRENT_EPOCH_TIP && quil_types::consensus::epoch_for_frame(tip.anchor) != epoch {
+        if defaults::WAIT_FOR_A_CURRENT_EPOCH_TIP
+            && quil_types::consensus::epoch_for_frame(tip.anchor) != epoch
+        {
             continue;
         }
         let members = desired_members(scan, filter, frame);
@@ -262,7 +293,10 @@ pub fn migrate(
         atomic(state, || {
             let source = register_source(state, frame, policy, filter, members.clone(), &tip)?;
             // Generation 1 keeps the eligible set.
-            let targets = vec![DesiredCommittee { filter: filter.clone(), members }];
+            let targets = vec![DesiredCommittee {
+                filter: filter.clone(),
+                members,
+            }];
             let request = schedule(state, frame, vec![filter.clone()], targets.clone())?;
             reserve(state, frame, &targets, &request.id()?)?;
             tracing::info!(
@@ -282,7 +316,9 @@ pub fn migrate(
 /// Refuse a generation-0 session anywhere but [`register_source`].
 pub(super) fn refuse_unaudited_generation_zero(session: &Session) -> Result<()> {
     if session.generation == 0 {
-        return Err(invalid("generation zero is only registered from a legacy tip"));
+        return Err(invalid(
+            "generation zero is only registered from a legacy tip",
+        ));
     }
     Ok(())
 }

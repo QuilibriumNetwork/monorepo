@@ -1,5 +1,6 @@
 //! Reward-backed mint encoding. Execution must authenticate the cited reward
 //! root, signatures and current balances, and record authorization consumption.
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::{CompiledAmountRelation, PublicAmountRelation},
     transfer::{
@@ -7,7 +8,6 @@ use super::{
     },
     AmountCommitment, AmountOpening, CommitmentKey, COMMITMENT_BYTES, MAX_PRIVATE_COINS,
 };
-use super::relation::membership::IDENTITY_BYTES;
 use std::collections::BTreeSet;
 
 pub const FALCON_PUBLIC_BYTES: usize = 897;

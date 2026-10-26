@@ -11,7 +11,7 @@
 
 use quil_types::error::{QuilError, Result};
 
-use crate::canonical_cursor::{put_u32, read_u32, read_bytes};
+use crate::canonical_cursor::{put_u32, read_bytes, read_u32};
 
 pub const TYPE_BLS48581_SIG_WITH_POP: u32 = 0x011A;
 
@@ -178,6 +178,9 @@ mod tests {
         let s = sample_sig_with_pop();
         let bytes = s.to_canonical_bytes().unwrap();
         // 4 type + (4+666) sig + (4+901) pubkey + (4+666) pop = 2249
-        assert_eq!(bytes.len(), 4 + (4 + SIG_LEN) + (4 + WRAPPED_PUBKEY_LEN) + (4 + SIG_LEN));
+        assert_eq!(
+            bytes.len(),
+            4 + (4 + SIG_LEN) + (4 + WRAPPED_PUBKEY_LEN) + (4 + SIG_LEN)
+        );
     }
 }

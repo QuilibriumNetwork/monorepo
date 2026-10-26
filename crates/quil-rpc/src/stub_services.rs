@@ -17,15 +17,12 @@ use tonic::{Request, Response, Status};
 
 use quil_types::consensus::ProverRegistry;
 use quil_types::proto::global::{
-    self,
-    app_shard_service_server::AppShardService,
+    self, app_shard_service_server::AppShardService,
     key_registry_service_server::KeyRegistryService,
 };
-use quil_types::proto::node::{
-    self, connectivity_service_server::ConnectivityService,
-};
-use quil_types::store::ClockStore;
 use quil_types::proto::node::node_service_server::NodeService as _;
+use quil_types::proto::node::{self, connectivity_service_server::ConnectivityService};
+use quil_types::store::ClockStore;
 
 // =====================================================================
 // AppShardService — shard frame/proposal reads
@@ -56,7 +53,9 @@ pub trait AppShardFrameProvider: Send + Sync {
         _from: u64,
         _through: u64,
     ) -> Result<Vec<global::ShardFrameOutgoing>, Status> {
-        Err(Status::unimplemented("outgoing history is served by archives"))
+        Err(Status::unimplemented(
+            "outgoing history is served by archives",
+        ))
     }
 }
 
@@ -123,7 +122,9 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
     ) -> Result<Option<global::AppShardFrame>, Status> {
         let clock_store = self.clock_store.clone();
         // Only a numbered frame of a filter of a shard's length is reported.
-        let report = self.missing.clone()
+        let report = self
+            .missing
+            .clone()
             .filter(|_| frame_number != 0 && REPORTED_FILTER_LENGTHS.contains(&filter.len()))
             .map(|missing| (missing, filter.clone()));
         let reporting = report.is_some();
@@ -137,9 +138,15 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
                 Ok(frame) => Ok((Some(frame), false)),
                 // A hole only below the latest frame stored for the filter:
                 // frames above it are routine reads of frames not made yet.
-                Err(quil_types::error::QuilError::NotFound(_)) => Ok((None, reporting && clock_store
-                    .get_latest_shard_clock_frame_number(&filter).ok().flatten()
-                    .is_some_and(|latest| frame_number < latest))),
+                Err(quil_types::error::QuilError::NotFound(_)) => Ok((
+                    None,
+                    reporting
+                        && clock_store
+                            .get_latest_shard_clock_frame_number(&filter)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|latest| frame_number < latest),
+                )),
                 Err(e) => Err(Status::internal(format!(
                     "app-shard frame store read failed: {e}"
                 ))),
@@ -230,7 +237,10 @@ impl AppShardRpcServer {
     /// Construct with an explicit provider — the worker-routing
     /// `AppShardFrameRouter` on prover/cluster nodes.
     pub fn with_provider(provider: Arc<dyn AppShardFrameProvider>) -> Self {
-        Self { provider, reads: crate::node_service::NodeRpcServer::new() }
+        Self {
+            provider,
+            reads: crate::node_service::NodeRpcServer::new(),
+        }
     }
 
     /// Serve peer coin scans from `coins`, for applications `coverage` admits.
@@ -239,7 +249,9 @@ impl AppShardRpcServer {
         coins: Arc<dyn quil_types::store::CoinWitnessProvider>,
         coverage: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) -> Self {
-        self.reads = self.reads.with_coin_witness_provider(coins)
+        self.reads = self
+            .reads
+            .with_coin_witness_provider(coins)
             .with_application_coverage(coverage);
         self
     }
@@ -249,7 +261,9 @@ impl AppShardRpcServer {
         master: Arc<dyn quil_types::store::HypergraphStore>,
         workers: crate::node_service::AppHypergraphStores,
     ) -> Self {
-        self.reads = self.reads.with_hypergraph_store(master)
+        self.reads = self
+            .reads
+            .with_hypergraph_store(master)
             .with_app_hypergraph_stores(workers);
         self
     }
@@ -281,13 +295,17 @@ impl AppShardService for AppShardRpcServer {
     ) -> Result<Response<global::GetShardOutgoingHistoryResponse>, Status> {
         let req = request.into_inner();
         if req.filter.len() < 32 || req.from_frame == 0 || req.through_frame < req.from_frame {
-            return Err(Status::invalid_argument("filter and a frame range starting above zero required"));
+            return Err(Status::invalid_argument(
+                "filter and a frame range starting above zero required",
+            ));
         }
         let frames = self
             .provider
             .get_shard_outgoing_history(req.filter, req.from_frame, req.through_frame)
             .await?;
-        Ok(Response::new(global::GetShardOutgoingHistoryResponse { frames }))
+        Ok(Response::new(global::GetShardOutgoingHistoryResponse {
+            frames,
+        }))
     }
 
     async fn list_shard_coins(
@@ -295,16 +313,33 @@ impl AppShardService for AppShardRpcServer {
         request: Request<global::ListShardCoinsRequest>,
     ) -> Result<Response<global::ListShardCoinsResponse>, Status> {
         let req = request.into_inner();
-        let page = self.reads.list_coins(Request::new(node::ListCoinsRequest {
-            domain: req.domain, snapshot_id: req.snapshot_id, after: req.after,
-        })).await?.into_inner();
+        let page = self
+            .reads
+            .list_coins(Request::new(node::ListCoinsRequest {
+                domain: req.domain,
+                snapshot_id: req.snapshot_id,
+                after: req.after,
+            }))
+            .await?
+            .into_inner();
         Ok(Response::new(global::ListShardCoinsResponse {
-            network: page.network, snapshot_id: page.snapshot_id, root_record: page.root_record,
-            coins: page.coins.into_iter().map(|c| global::ShardCoin {
-                address: c.address, frame_number: c.frame_number, owner: c.owner,
-                commitment: c.commitment, memo: c.memo, position: c.position,
-            }).collect(),
-            cursor: page.cursor, has_more: page.has_more,
+            network: page.network,
+            snapshot_id: page.snapshot_id,
+            root_record: page.root_record,
+            coins: page
+                .coins
+                .into_iter()
+                .map(|c| global::ShardCoin {
+                    address: c.address,
+                    frame_number: c.frame_number,
+                    owner: c.owner,
+                    commitment: c.commitment,
+                    memo: c.memo,
+                    position: c.position,
+                })
+                .collect(),
+            cursor: page.cursor,
+            has_more: page.has_more,
         }))
     }
 
@@ -312,10 +347,16 @@ impl AppShardService for AppShardRpcServer {
         &self,
         request: Request<global::ListLegacyCoinsRequest>,
     ) -> Result<Response<global::ListLegacyCoinsResponse>, Status> {
-        let (domain, owner, after) = crate::node_service::legacy_coins_request(request.into_inner())?;
-        let page = self.reads.legacy_coins_local(domain, owner, after).await?
+        let (domain, owner, after) =
+            crate::node_service::legacy_coins_request(request.into_inner())?;
+        let page = self
+            .reads
+            .legacy_coins_local(domain, owner, after)
+            .await?
             .ok_or_else(|| Status::unavailable("this node keeps no complete legacy coin index"))?;
-        Ok(Response::new(crate::node_service::legacy_coins_response(page, after)?))
+        Ok(Response::new(crate::node_service::legacy_coins_response(
+            page, after,
+        )?))
     }
 
     async fn list_shard_escrows(
@@ -323,15 +364,28 @@ impl AppShardService for AppShardRpcServer {
         request: Request<global::ListShardCoinsRequest>,
     ) -> Result<Response<global::ListShardEscrowsResponse>, Status> {
         let req = request.into_inner();
-        let page = self.reads.list_escrows(Request::new(node::ListCoinsRequest {
-            domain: req.domain, snapshot_id: req.snapshot_id, after: req.after,
-        })).await?.into_inner();
+        let page = self
+            .reads
+            .list_escrows(Request::new(node::ListCoinsRequest {
+                domain: req.domain,
+                snapshot_id: req.snapshot_id,
+                after: req.after,
+            }))
+            .await?
+            .into_inner();
         Ok(Response::new(global::ListShardEscrowsResponse {
-            network: page.network, snapshot_id: page.snapshot_id,
-            escrows: page.escrows.into_iter().map(|e| global::ShardEscrow {
-                address: e.address, raw_data: e.raw_data,
-            }).collect(),
-            cursor: page.cursor, has_more: page.has_more,
+            network: page.network,
+            snapshot_id: page.snapshot_id,
+            escrows: page
+                .escrows
+                .into_iter()
+                .map(|e| global::ShardEscrow {
+                    address: e.address,
+                    raw_data: e.raw_data,
+                })
+                .collect(),
+            cursor: page.cursor,
+            has_more: page.has_more,
         }))
     }
 
@@ -340,16 +394,30 @@ impl AppShardService for AppShardRpcServer {
         request: Request<global::GetShardCoinWitnessesRequest>,
     ) -> Result<Response<global::GetShardCoinWitnessesResponse>, Status> {
         let req = request.into_inner();
-        let bundle = self.reads.get_coin_witnesses(Request::new(node::GetCoinWitnessesRequest {
-            domain: req.domain, addresses: req.addresses,
-        })).await?.into_inner();
+        let bundle = self
+            .reads
+            .get_coin_witnesses(Request::new(node::GetCoinWitnessesRequest {
+                domain: req.domain,
+                addresses: req.addresses,
+            }))
+            .await?
+            .into_inner();
         // NodeService validates the root record and witness dimensions.
         let depth = u32::from(bundle.root_record[40]);
         Ok(Response::new(global::GetShardCoinWitnessesResponse {
-            network: bundle.network, root_record: bundle.root_record, depth,
-            witnesses: bundle.witnesses.into_iter().map(|w| global::ShardCoinWitness {
-                address: w.address, found: w.found, siblings: w.siblings, right: w.right,
-            }).collect(),
+            network: bundle.network,
+            root_record: bundle.root_record,
+            depth,
+            witnesses: bundle
+                .witnesses
+                .into_iter()
+                .map(|w| global::ShardCoinWitness {
+                    address: w.address,
+                    found: w.found,
+                    siblings: w.siblings,
+                    right: w.right,
+                })
+                .collect(),
         }))
     }
 
@@ -357,11 +425,17 @@ impl AppShardService for AppShardRpcServer {
         &self,
         request: Request<global::GetShardVertexRequest>,
     ) -> Result<Response<global::GetShardVertexResponse>, Status> {
-        let vertex = self.reads.get_vertex_data(Request::new(node::GetVertexDataRequest {
-            address: request.into_inner().address, full_data: true,
-        })).await?.into_inner();
+        let vertex = self
+            .reads
+            .get_vertex_data(Request::new(node::GetVertexDataRequest {
+                address: request.into_inner().address,
+                full_data: true,
+            }))
+            .await?
+            .into_inner();
         Ok(Response::new(global::GetShardVertexResponse {
-            found: vertex.present.unwrap_or(false), blob: vertex.raw_data,
+            found: vertex.present.unwrap_or(false),
+            blob: vertex.raw_data,
         }))
     }
 
@@ -372,7 +446,9 @@ impl AppShardService for AppShardRpcServer {
         // AppShardProposal is the uncommitted leader proposal — only
         // the leader for that rank has it; peers don't persist them.
         // Return None: valid response shape, no data.
-        Ok(Response::new(global::AppShardProposalResponse { proposal: None }))
+        Ok(Response::new(global::AppShardProposalResponse {
+            proposal: None,
+        }))
     }
 }
 
@@ -587,24 +663,70 @@ mod outgoing_history_tests {
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let filter = vec![0x21; 32];
         for frame in [1u64, 2, 3, 5] {
-            clock.put_shard_frame_fee_total(&filter, frame, frame as u128).unwrap();
-            clock.put_shard_frame_settlements(&filter, frame, &[]).unwrap();
+            clock
+                .put_shard_frame_fee_total(&filter, frame, frame as u128)
+                .unwrap();
+            clock
+                .put_shard_frame_settlements(&filter, frame, &[])
+                .unwrap();
             clock.put_shard_frame_spends(&filter, frame, &[]).unwrap();
             let report = vec![frame as u8; 8];
-            let digest = if frame == 2 { quil_execution::token_intrinsic::accumulator_header::report_digest(&report) } else { Vec::new() };
-            clock.put_shard_frame_accumulator(&filter, frame, &digest, &report).unwrap();
+            let digest = if frame == 2 {
+                quil_execution::token_intrinsic::accumulator_header::report_digest(&report)
+            } else {
+                Vec::new()
+            };
+            clock
+                .put_shard_frame_accumulator(&filter, frame, &digest, &report)
+                .unwrap();
         }
         let server = AppShardRpcServer::new(clock);
-        let request = |from, through| Request::new(global::GetShardOutgoingHistoryRequest { filter: filter.clone(), from_frame: from, through_frame: through });
-        let frames = server.get_shard_outgoing_history(request(1, 9)).await.unwrap().into_inner().frames;
-        assert_eq!(frames.iter().map(|f| f.frame_number).collect::<Vec<_>>(), vec![1, 2, 3], "stops before the gap at 4");
+        let request = |from, through| {
+            Request::new(global::GetShardOutgoingHistoryRequest {
+                filter: filter.clone(),
+                from_frame: from,
+                through_frame: through,
+            })
+        };
+        let frames = server
+            .get_shard_outgoing_history(request(1, 9))
+            .await
+            .unwrap()
+            .into_inner()
+            .frames;
+        assert_eq!(
+            frames.iter().map(|f| f.frame_number).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "stops before the gap at 4"
+        );
         assert_eq!(frames[1].fee_total, 2u128.to_be_bytes().to_vec());
         assert_eq!(frames[1].accumulator_report, vec![2; 8]);
         assert!(frames[0].accumulator_report.is_empty());
-        assert_eq!(server.get_shard_outgoing_history(request(2, 2)).await.unwrap().into_inner().frames.len(), 1);
-        assert!(server.get_shard_outgoing_history(request(4, 9)).await.unwrap().into_inner().frames.is_empty());
-        assert!(server.get_shard_outgoing_history(request(0, 3)).await.is_err());
-        assert!(server.get_shard_outgoing_history(request(3, 2)).await.is_err());
+        assert_eq!(
+            server
+                .get_shard_outgoing_history(request(2, 2))
+                .await
+                .unwrap()
+                .into_inner()
+                .frames
+                .len(),
+            1
+        );
+        assert!(server
+            .get_shard_outgoing_history(request(4, 9))
+            .await
+            .unwrap()
+            .into_inner()
+            .frames
+            .is_empty());
+        assert!(server
+            .get_shard_outgoing_history(request(0, 3))
+            .await
+            .is_err());
+        assert!(server
+            .get_shard_outgoing_history(request(3, 2))
+            .await
+            .is_err());
     }
 }
 
@@ -618,33 +740,64 @@ mod frame_read_tests {
     /// refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn numbered_app_shard_frames_wait_for_a_frame_read_slot() {
-        static READS: FrameReadBound = FrameReadBound::new(1, 1, std::time::Duration::from_millis(20));
+        static READS: FrameReadBound =
+            FrameReadBound::new(1, 1, std::time::Duration::from_millis(20));
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let filter = vec![0x21; 32];
         let frame = global::AppShardFrame {
-            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 3, ..Default::default() }),
+            header: Some(global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 3,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let selector = [3u8; 32];
         let txn = clock.new_transaction(false).unwrap();
-        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        clock
+            .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
         let txn = clock.new_transaction(false).unwrap();
-        clock.commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false).unwrap();
+        clock
+            .commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false)
+            .unwrap();
         txn.commit().unwrap();
-        let provider = ClockStoreAppShardFrameProvider { clock_store: clock, reads: &READS, missing: None };
+        let provider = ClockStoreAppShardFrameProvider {
+            clock_store: clock,
+            reads: &READS,
+            missing: None,
+        };
 
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let held = READS.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        let held = READS
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
         assert_eq!(
-            provider.get_app_shard_frame(filter.clone(), 3).await.unwrap_err().code(),
+            provider
+                .get_app_shard_frame(filter.clone(), 3)
+                .await
+                .unwrap_err()
+                .code(),
             tonic::Code::ResourceExhausted,
         );
-        assert_eq!(provider.get_app_shard_frame(filter.clone(), 0).await.unwrap(), Some(frame.clone()));
+        assert_eq!(
+            provider
+                .get_app_shard_frame(filter.clone(), 0)
+                .await
+                .unwrap(),
+            Some(frame.clone())
+        );
         release_tx.send(()).unwrap();
         held.await.unwrap();
-        assert_eq!(provider.get_app_shard_frame(filter, 3).await.unwrap(), Some(frame));
+        assert_eq!(
+            provider.get_app_shard_frame(filter, 3).await.unwrap(),
+            Some(frame)
+        );
     }
 
     /// An archive reports each numbered frame a peer asks for and its store
@@ -658,27 +811,75 @@ mod frame_read_tests {
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let filter = vec![0x21; 32];
         let frame = global::AppShardFrame {
-            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 3, ..Default::default() }),
+            header: Some(global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 3,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let selector = [3u8; 32];
         let txn = clock.new_transaction(false).unwrap();
-        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        clock
+            .stage_shard_clock_frame(&selector, &frame, txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
         let txn = clock.new_transaction(false).unwrap();
-        clock.commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false).unwrap();
+        clock
+            .commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false)
+            .unwrap();
         txn.commit().unwrap();
         let (missing, mut reports) = tokio::sync::mpsc::channel(8);
-        let provider = ClockStoreAppShardFrameProvider { clock_store: clock, reads: &READS, missing: Some(missing) };
+        let provider = ClockStoreAppShardFrameProvider {
+            clock_store: clock,
+            reads: &READS,
+            missing: Some(missing),
+        };
 
-        assert_eq!(provider.get_app_shard_frame(filter.clone(), 3).await.unwrap(), Some(frame.clone()));
-        assert_eq!(provider.get_app_shard_frame(filter.clone(), 0).await.unwrap(), Some(frame));
-        assert!(reports.try_recv().is_err(), "a stored frame is not reported");
-        assert_eq!(provider.get_app_shard_frame(filter.clone(), 4).await.unwrap(), None);
-        assert!(reports.try_recv().is_err(), "a frame above the latest is not made yet");
-        assert_eq!(provider.get_app_shard_frame(vec![0x21; 31], 2).await.unwrap(), None);
+        assert_eq!(
+            provider
+                .get_app_shard_frame(filter.clone(), 3)
+                .await
+                .unwrap(),
+            Some(frame.clone())
+        );
+        assert_eq!(
+            provider
+                .get_app_shard_frame(filter.clone(), 0)
+                .await
+                .unwrap(),
+            Some(frame)
+        );
+        assert!(
+            reports.try_recv().is_err(),
+            "a stored frame is not reported"
+        );
+        assert_eq!(
+            provider
+                .get_app_shard_frame(filter.clone(), 4)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            reports.try_recv().is_err(),
+            "a frame above the latest is not made yet"
+        );
+        assert_eq!(
+            provider
+                .get_app_shard_frame(vec![0x21; 31], 2)
+                .await
+                .unwrap(),
+            None
+        );
         assert!(reports.try_recv().is_err(), "no shard's filter");
-        assert_eq!(provider.get_app_shard_frame(filter.clone(), 2).await.unwrap(), None);
+        assert_eq!(
+            provider
+                .get_app_shard_frame(filter.clone(), 2)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(reports.try_recv().ok(), Some((filter, 2)));
     }
 }

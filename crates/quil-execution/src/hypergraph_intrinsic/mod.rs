@@ -37,15 +37,27 @@ pub fn build_hypergraph_configuration_metadata_tree(
 ) -> quil_types::error::Result<quil_tries::VectorCommitmentTree> {
     use num_bigint::BigInt;
     let mut tree = quil_tries::VectorCommitmentTree::new();
-    tree.insert(&[0u8 << 2], &config.read_public_key, &[], &BigInt::from(config.read_public_key.len()))?;
-    tree.insert(&[1u8 << 2], &config.write_public_key, &[], &BigInt::from(57))?;
+    tree.insert(
+        &[0u8 << 2],
+        &config.read_public_key,
+        &[],
+        &BigInt::from(config.read_public_key.len()),
+    )?;
+    tree.insert(
+        &[1u8 << 2],
+        &config.write_public_key,
+        &[],
+        &BigInt::from(57),
+    )?;
     Ok(tree)
 }
 
 /// The domain a HypergraphDeploy of `config` creates:
 /// `poseidon(prefix ‖ SHA-512(config content))` — retired from the KZG commit;
 /// PQ-safe, no BLS48-581. Mirrors the token/compute deploy domains.
-pub fn hypergraph_deploy_domain(config: &types::HypergraphConfiguration) -> quil_types::error::Result<[u8; 32]> {
+pub fn hypergraph_deploy_domain(
+    config: &types::HypergraphConfiguration,
+) -> quil_types::error::Result<[u8; 32]> {
     let config_tree = build_hypergraph_configuration_metadata_tree(config)?;
     let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
     let mut preimage = Vec::with_capacity(RAW_HYPERGRAPH_PREFIX.len() + config_commit.len());
@@ -148,7 +160,12 @@ pub fn materialize_hypergraph_update(
             dispatch::validate_rdf_schema_evolution(old, rdf_schema)?;
         }
         outer
-            .insert(&[3u8 << 2], rdf_schema, &[], &BigInt::from(rdf_schema.len()))
+            .insert(
+                &[3u8 << 2],
+                rdf_schema,
+                &[],
+                &BigInt::from(rdf_schema.len()),
+            )
             .map_err(|e| {
                 quil_types::error::QuilError::Internal(format!(
                     "hypergraph update: rdf insert: {e}"
@@ -165,8 +182,8 @@ pub fn materialize_hypergraph_update(
 }
 
 pub use types::{
-    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy,
-    HypergraphUpdate, VertexAdd, VertexRemove,
+    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy, HypergraphUpdate,
+    VertexAdd, VertexRemove,
 };
 
 pub use canonical::{
@@ -182,31 +199,32 @@ pub use conversions::{
 };
 
 pub use vertex_ops::{
-    encrypted_to_vertex_tree, vertex_tree_to_plaintext, vertex_add_cost_from_proof_count,
-    vertex_add_cost_from_raw_len, vertex_add_domain_separator,
-    vertex_add_signing_message, vertex_read_addresses, vertex_remove_cost,
-    vertex_remove_domain_separator, vertex_remove_signing_message,
-    vertex_write_addresses, CONFIDENTIAL_FIELD_CHARGE_BYTES, MAX_VERTEX_ADD_DISK_SIZE,
-    VERTEX_ADD_TAG, VERTEX_REMOVE_COST, VERTEX_REMOVE_TAG,
+    encrypted_to_vertex_tree, vertex_add_cost_from_proof_count, vertex_add_cost_from_raw_len,
+    vertex_add_domain_separator, vertex_add_signing_message, vertex_read_addresses,
+    vertex_remove_cost, vertex_remove_domain_separator, vertex_remove_signing_message,
+    vertex_tree_to_plaintext, vertex_write_addresses, CONFIDENTIAL_FIELD_CHARGE_BYTES,
+    MAX_VERTEX_ADD_DISK_SIZE, VERTEX_ADD_TAG, VERTEX_REMOVE_COST, VERTEX_REMOVE_TAG,
 };
 
 pub use dispatch::{
     check_sufficient_fee, decode_and_validate, decode_and_validate_deploy,
     decode_and_validate_update, decode_message, dispatch_cost, is_mutating_op,
-    lock_addresses_for_input, peek_message_kind, validate_rdf_schema_evolution,
-    DispatchedDeploy, DispatchedDeployOrUpdate, DispatchedMessage, DispatchedUpdate,
-    HypergraphLockState, MessageKind,
+    lock_addresses_for_input, peek_message_kind, validate_rdf_schema_evolution, DispatchedDeploy,
+    DispatchedDeployOrUpdate, DispatchedMessage, DispatchedUpdate, HypergraphLockState,
+    MessageKind,
 };
 
-pub use auth::{verify_op_signature, AuthCheck, CrdtHypergraphConfigResolver, HypergraphConfigResolver, OpForAuth};
+pub use auth::{
+    verify_op_signature, AuthCheck, CrdtHypergraphConfigResolver, HypergraphConfigResolver,
+    OpForAuth,
+};
 
 pub use hyperedge_ops::{
     assert_hyperedge_domain_matches, build_hyperedge_add_value, extract_hyperedge_id,
     hyperedge_add_cost_from_atom_count, hyperedge_add_domain_separator,
     hyperedge_add_signing_message, hyperedge_extrinsic_commit, hyperedge_id_app_address,
     hyperedge_id_data_address, hyperedge_read_addresses, hyperedge_remove_cost,
-    hyperedge_remove_domain_separator, hyperedge_remove_signing_message,
-    hyperedge_write_addresses, HYPEREDGE_ADD_TAG, HYPEREDGE_ATOM_TYPE_BYTE,
-    HYPEREDGE_ID_LEN, HYPEREDGE_ID_OFFSET, HYPEREDGE_MIN_VALUE_LEN,
-    HYPEREDGE_REMOVE_COST, HYPEREDGE_REMOVE_TAG,
+    hyperedge_remove_domain_separator, hyperedge_remove_signing_message, hyperedge_write_addresses,
+    HYPEREDGE_ADD_TAG, HYPEREDGE_ATOM_TYPE_BYTE, HYPEREDGE_ID_LEN, HYPEREDGE_ID_OFFSET,
+    HYPEREDGE_MIN_VALUE_LEN, HYPEREDGE_REMOVE_COST, HYPEREDGE_REMOVE_TAG,
 };

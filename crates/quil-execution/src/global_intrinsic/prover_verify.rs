@@ -158,8 +158,7 @@ pub fn prover_join_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Ve
 /// coverage stuck unable to shed workers). Keep this in lockstep with the
 /// builder.
 pub fn prover_leave_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Vec<u8> {
-    let total: usize =
-        4 + filters.iter().map(|f| 4 + f.len()).sum::<usize>() + 8;
+    let total: usize = 4 + filters.iter().map(|f| 4 + f.len()).sum::<usize>() + 8;
     let mut msg = Vec::with_capacity(total);
     msg.extend_from_slice(&(filters.len() as u32).to_be_bytes());
     for f in filters {
@@ -224,7 +223,10 @@ mod tests {
 
     #[test]
     fn domains_are_deterministic() {
-        assert_eq!(prover_pause_domain().unwrap(), prover_pause_domain().unwrap());
+        assert_eq!(
+            prover_pause_domain().unwrap(),
+            prover_pause_domain().unwrap()
+        );
         assert_eq!(prover_join_domain().unwrap(), prover_join_domain().unwrap());
     }
 

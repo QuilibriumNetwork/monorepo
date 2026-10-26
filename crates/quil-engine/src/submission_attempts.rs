@@ -42,9 +42,18 @@ impl Attempt {
     /// `kind`: as [`Self::owns`], except that an epoch fence past the retry
     /// fence holds off only its own kind. A renewal fenced for the epoch
     /// must not keep the seat from being left.
-    fn holds_off(&self, attempt_kind: OpKind, kind: OpKind, attempt_epoch: u64, epoch: u64, frame: u64) -> bool {
+    fn holds_off(
+        &self,
+        attempt_kind: OpKind,
+        kind: OpKind,
+        attempt_epoch: u64,
+        epoch: u64,
+        frame: u64,
+    ) -> bool {
         self.owns(attempt_epoch, epoch, frame)
-            && (attempt_kind == kind || self.in_flight || frame.saturating_sub(self.frame) < RETRY_FRAMES)
+            && (attempt_kind == kind
+                || self.in_flight
+                || frame.saturating_sub(self.frame) < RETRY_FRAMES)
     }
 }
 
@@ -62,18 +71,22 @@ impl SubmissionAttempts {
     /// its retry fence, or an epoch fence of the same kind.
     pub(crate) fn owned(&self, filter: &[u8], frame: u64, kind: OpKind) -> bool {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        self.0.lock().is_ok_and(|attempts| attempts.iter().any(|((e, owned, k), a)| {
-            owned.as_slice() == filter && a.holds_off(*k, kind, *e, epoch, frame)
-        }))
+        self.0.lock().is_ok_and(|attempts| {
+            attempts.iter().any(|((e, owned, k), a)| {
+                owned.as_slice() == filter && a.holds_off(*k, kind, *e, epoch, frame)
+            })
+        })
     }
 
     /// Whether a local confirm still owns `filter` at `frame`: one in
     /// flight, or fenced. A leave or another kind does not count.
     pub(crate) fn confirming(&self, filter: &[u8], frame: u64) -> bool {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        self.0.lock().is_ok_and(|attempts| attempts.iter().any(|((e, owned, k), a)| {
-            *k == OpKind::Confirm && owned.as_slice() == filter && a.owns(*e, epoch, frame)
-        }))
+        self.0.lock().is_ok_and(|attempts| {
+            attempts.iter().any(|((e, owned, k), a)| {
+                *k == OpKind::Confirm && owned.as_slice() == filter && a.owns(*e, epoch, frame)
+            })
+        })
     }
 
     pub(crate) fn begin(
@@ -89,9 +102,9 @@ impl SubmissionAttempts {
         let mut attempts = self.0.lock().ok()?;
         attempts.retain(|(e, _, _), a| a.owns(*e, epoch, frame));
         if filters.iter().any(|f| {
-            attempts
-                .iter()
-                .any(|((e, existing, k), a)| existing == f && a.holds_off(*k, kind, *e, epoch, frame))
+            attempts.iter().any(|((e, existing, k), a)| {
+                existing == f && a.holds_off(*k, kind, *e, epoch, frame)
+            })
         }) {
             return None;
         }
@@ -200,10 +213,16 @@ mod tests {
         let first = attempts.begin(&filters, 10, OpKind::Confirm).unwrap();
         assert!(attempts.begin(&filters, 100, OpKind::Confirm).is_none());
         drop(first); // Cancellation/failure releases the reservation.
-        attempts.begin(&filters, 100, OpKind::Confirm).unwrap().published(100);
+        attempts
+            .begin(&filters, 100, OpKind::Confirm)
+            .unwrap()
+            .published(100);
         assert!(attempts.begin(&filters, 101, OpKind::Confirm).is_none());
         assert!(attempts.begin(&filters, 130, OpKind::Confirm).is_some());
-        attempts.begin(&filters, 719, OpKind::Confirm).unwrap().published(719);
+        attempts
+            .begin(&filters, 719, OpKind::Confirm)
+            .unwrap()
+            .published(719);
         assert!(attempts.begin(&filters, 720, OpKind::Confirm).is_some());
     }
 
@@ -211,7 +230,10 @@ mod tests {
     fn cooldown_starts_when_preparation_and_publication_finish() {
         let attempts = Arc::new(SubmissionAttempts::default());
         let filters = vec![vec![1]];
-        attempts.begin(&filters, 10, OpKind::Confirm).unwrap().published(50);
+        attempts
+            .begin(&filters, 10, OpKind::Confirm)
+            .unwrap()
+            .published(50);
         assert!(attempts.begin(&filters, 79, OpKind::Confirm).is_none());
         assert!(attempts.begin(&filters, 80, OpKind::Confirm).is_some());
     }
@@ -219,7 +241,9 @@ mod tests {
     #[test]
     fn later_chunk_failure_keeps_published_subset_reserved() {
         let attempts = Arc::new(SubmissionAttempts::default());
-        let mut guard = attempts.begin(&[vec![1], vec![2]], 10, OpKind::Confirm).unwrap();
+        let mut guard = attempts
+            .begin(&[vec![1], vec![2]], 10, OpKind::Confirm)
+            .unwrap();
         guard.published_subset(&[vec![1]], 12);
         drop(guard); // The other chunk failed before publication.
         assert!(attempts.begin(&[vec![1]], 13, OpKind::Confirm).is_none());
@@ -230,27 +254,55 @@ mod tests {
     #[test]
     fn a_released_filter_is_free_while_the_rest_stays_reserved() {
         let attempts = Arc::new(SubmissionAttempts::default());
-        let mut guard = attempts.begin(&[vec![1], vec![2]], 10, OpKind::Confirm).unwrap();
+        let mut guard = attempts
+            .begin(&[vec![1], vec![2]], 10, OpKind::Confirm)
+            .unwrap();
         guard.release(&[vec![2]]);
-        assert!(attempts.begin(&[vec![2]], 11, OpKind::Confirm).is_some(), "released at once");
-        assert!(attempts.begin(&[vec![1]], 11, OpKind::Confirm).is_none(), "still in flight");
+        assert!(
+            attempts.begin(&[vec![2]], 11, OpKind::Confirm).is_some(),
+            "released at once"
+        );
+        assert!(
+            attempts.begin(&[vec![1]], 11, OpKind::Confirm).is_none(),
+            "still in flight"
+        );
         guard.published(12);
-        assert!(attempts.begin(&[vec![1]], 13, OpKind::Confirm).is_none(), "published: fenced");
-        assert!(attempts.begin(&[vec![2]], 13, OpKind::Confirm).is_some(), "released: not fenced");
+        assert!(
+            attempts.begin(&[vec![1]], 13, OpKind::Confirm).is_none(),
+            "published: fenced"
+        );
+        assert!(
+            attempts.begin(&[vec![2]], 13, OpKind::Confirm).is_some(),
+            "released: not fenced"
+        );
     }
 
     #[test]
     fn an_epoch_fence_lasts_until_the_epoch_ends() {
         let attempts = Arc::new(SubmissionAttempts::default());
-        let mut guard = attempts.begin(&[vec![1], vec![2]], 10, OpKind::Confirm).unwrap();
+        let mut guard = attempts
+            .begin(&[vec![1], vec![2]], 10, OpKind::Confirm)
+            .unwrap();
         guard.fence_for_epoch(&[vec![1]], 12);
         guard.fence(&[vec![2]], 12);
         drop(guard);
-        assert!(attempts.begin(&[vec![2]], 42, OpKind::Confirm).is_some(), "the retry fence lapses");
-        assert!(attempts.owned(&[1], 719, OpKind::Confirm), "the epoch fence holds to the epoch's last frame");
+        assert!(
+            attempts.begin(&[vec![2]], 42, OpKind::Confirm).is_some(),
+            "the retry fence lapses"
+        );
+        assert!(
+            attempts.owned(&[1], 719, OpKind::Confirm),
+            "the epoch fence holds to the epoch's last frame"
+        );
         assert!(attempts.begin(&[vec![1]], 719, OpKind::Confirm).is_none());
-        assert!(!attempts.owned(&[1], 720, OpKind::Confirm), "and lapses with it");
-        assert!(attempts.begin(&[vec![1]], 720, OpKind::Confirm).is_some(), "the next epoch retries it");
+        assert!(
+            !attempts.owned(&[1], 720, OpKind::Confirm),
+            "and lapses with it"
+        );
+        assert!(
+            attempts.begin(&[vec![1]], 720, OpKind::Confirm).is_some(),
+            "the next epoch retries it"
+        );
     }
 
     #[test]
@@ -267,18 +319,28 @@ mod tests {
     fn ownership_covers_running_and_fenced_attempts() {
         let attempts = Arc::new(SubmissionAttempts::default());
         let running = attempts.begin(&[vec![1]], 10, OpKind::Confirm).unwrap();
-        assert!(attempts.owned(&[1], 2000, OpKind::Confirm), "a running attempt owns its filter across epochs");
+        assert!(
+            attempts.owned(&[1], 2000, OpKind::Confirm),
+            "a running attempt owns its filter across epochs"
+        );
         assert!(!attempts.owned(&[2], 10, OpKind::Confirm));
         running.published(20);
         assert!(attempts.owned(&[1], 49, OpKind::Confirm));
-        assert!(!attempts.owned(&[1], 50, OpKind::Confirm), "the fence ends ownership");
+        assert!(
+            !attempts.owned(&[1], 50, OpKind::Confirm),
+            "the fence ends ownership"
+        );
     }
 
     #[test]
     fn overlapping_batches_cannot_encode_the_same_filter_concurrently() {
         let attempts = Arc::new(SubmissionAttempts::default());
-        let guard = attempts.begin(&[vec![1], vec![2]], 10, OpKind::Confirm).unwrap();
-        assert!(attempts.begin(&[vec![2], vec![3]], 11, OpKind::Confirm).is_none());
+        let guard = attempts
+            .begin(&[vec![1], vec![2]], 10, OpKind::Confirm)
+            .unwrap();
+        assert!(attempts
+            .begin(&[vec![2], vec![3]], 11, OpKind::Confirm)
+            .is_none());
         assert!(attempts.begin(&[vec![3]], 11, OpKind::Confirm).is_some());
         drop(guard);
         assert!(attempts.begin(&[vec![2]], 12, OpKind::Confirm).is_some());
@@ -291,21 +353,38 @@ mod tests {
     fn an_epoch_fence_holds_off_only_its_own_kind() {
         let attempts = Arc::new(SubmissionAttempts::default());
         let running = attempts.begin(&[vec![1]], 10, OpKind::Confirm).unwrap();
-        assert!(attempts.begin(&[vec![1]], 11, OpKind::Leave).is_none(), "a running confirm holds off a leave");
+        assert!(
+            attempts.begin(&[vec![1]], 11, OpKind::Leave).is_none(),
+            "a running confirm holds off a leave"
+        );
         assert!(attempts.owned(&[1], 11, OpKind::Leave));
         drop(running);
         let mut renewal = attempts.begin(&[vec![1]], 12, OpKind::Confirm).unwrap();
         renewal.fence_for_epoch(&[vec![1]], 12);
         drop(renewal);
-        assert!(attempts.owned(&[1], 41, OpKind::Leave), "inside the retry fence");
+        assert!(
+            attempts.owned(&[1], 41, OpKind::Leave),
+            "inside the retry fence"
+        );
         assert!(attempts.begin(&[vec![1]], 41, OpKind::Leave).is_none());
-        assert!(attempts.owned(&[1], 42, OpKind::Confirm), "the epoch fence holds the renewal off");
+        assert!(
+            attempts.owned(&[1], 42, OpKind::Confirm),
+            "the epoch fence holds the renewal off"
+        );
         assert!(attempts.begin(&[vec![1]], 42, OpKind::Confirm).is_none());
         assert!(!attempts.owned(&[1], 42, OpKind::Leave), "but not a leave");
-        let leave = attempts.begin(&[vec![1]], 42, OpKind::Leave).expect("the seat can be left");
-        assert!(attempts.begin(&[vec![1]], 43, OpKind::Confirm).is_none(), "the running leave holds off a confirm");
+        let leave = attempts
+            .begin(&[vec![1]], 42, OpKind::Leave)
+            .expect("the seat can be left");
+        assert!(
+            attempts.begin(&[vec![1]], 43, OpKind::Confirm).is_none(),
+            "the running leave holds off a confirm"
+        );
         drop(leave);
-        assert!(attempts.confirming(&[1], 719), "the renewal's epoch fence is kept beside the leave");
+        assert!(
+            attempts.confirming(&[1], 719),
+            "the renewal's epoch fence is kept beside the leave"
+        );
         assert!(!attempts.confirming(&[1], 720), "until its epoch ends");
     }
 
@@ -314,11 +393,17 @@ mod tests {
     fn only_a_confirm_is_confirming() {
         let attempts = Arc::new(SubmissionAttempts::default());
         let leave = attempts.begin(&[vec![1]], 10, OpKind::Leave).unwrap();
-        assert!(attempts.owned(&[1], 10, OpKind::Confirm), "the leave owns the filter");
+        assert!(
+            attempts.owned(&[1], 10, OpKind::Confirm),
+            "the leave owns the filter"
+        );
         assert!(!attempts.confirming(&[1], 10), "but is no renewal");
         drop(leave);
         let confirm = attempts.begin(&[vec![1]], 11, OpKind::Confirm).unwrap();
-        assert!(attempts.confirming(&[1], 2000), "a running confirm counts across epochs");
+        assert!(
+            attempts.confirming(&[1], 2000),
+            "a running confirm counts across epochs"
+        );
         confirm.published(20);
         assert!(attempts.confirming(&[1], 49));
         assert!(!attempts.confirming(&[1], 50), "the fence ends it");

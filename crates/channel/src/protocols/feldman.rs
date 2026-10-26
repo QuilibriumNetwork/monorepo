@@ -1,9 +1,13 @@
 use base64::prelude::*;
-use std::collections::HashMap;
+use ed448_goldilocks_plus::{
+    elliptic_curve::{group::GroupEncoding, Group},
+    subtle::ConstantTimeEq,
+    EdwardsPoint, Scalar,
+};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use ed448_goldilocks_plus::{elliptic_curve::{group::GroupEncoding, Group}, subtle::ConstantTimeEq, EdwardsPoint, Scalar};
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -94,13 +98,13 @@ pub struct FeldmanFrag {
 }
 
 pub fn vec_to_array<const N: usize>(v: Vec<u8>) -> Result<[u8; N], Box<dyn std::error::Error>> {
-  if v.len() != N {
-      return Err(format!("Invalid length: expected {}, got {}", N, v.len()).into());
-  }
-  
-  let mut arr: [u8; N] = [0u8; N];
-  arr.copy_from_slice(&v);
-  Ok(arr)
+    if v.len() != N {
+        return Err(format!("Invalid length: expected {}, got {}", N, v.len()).into());
+    }
+
+    let mut arr: [u8; N] = [0u8; N];
+    arr.copy_from_slice(&v);
+    Ok(arr)
 }
 
 /// Wipe the secret share and intermediate scalars on drop. The public
@@ -109,10 +113,18 @@ impl Drop for Feldman {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.secret.zeroize();
-        if let Some(s) = self.scalar.as_mut() { s.zeroize(); }
-        if let Some(z) = self.zkpok.as_mut() { z.zeroize(); }
-        for v in self.frags_for_counterparties.values_mut() { v.zeroize(); }
-        for s in self.frags_from_counterparties.values_mut() { s.zeroize(); }
+        if let Some(s) = self.scalar.as_mut() {
+            s.zeroize();
+        }
+        if let Some(z) = self.zkpok.as_mut() {
+            z.zeroize();
+        }
+        for v in self.frags_for_counterparties.values_mut() {
+            v.zeroize();
+        }
+        for s in self.frags_from_counterparties.values_mut() {
+            s.zeroize();
+        }
     }
 }
 
@@ -150,32 +162,59 @@ impl Feldman {
             threshold: self.threshold,
             total: self.total,
             id: self.id,
-            frags_for_counterparties: self.frags_for_counterparties.iter()
+            frags_for_counterparties: self
+                .frags_for_counterparties
+                .iter()
                 .map(|(&k, v)| (k, BASE64_STANDARD.encode(v)))
                 .collect(),
-            frags_from_counterparties: self.frags_from_counterparties.iter()
+            frags_from_counterparties: self
+                .frags_from_counterparties
+                .iter()
                 .map(|(&k, v)| (k, BASE64_STANDARD.encode(v.to_bytes())))
                 .collect(),
-            zkpok: self.zkpok.as_ref().map(|s| BASE64_STANDARD.encode(s.to_bytes())),
+            zkpok: self
+                .zkpok
+                .as_ref()
+                .map(|s| BASE64_STANDARD.encode(s.to_bytes())),
             secret: BASE64_STANDARD.encode(self.secret.to_bytes()),
-            scalar: self.scalar.as_ref().map(|s| BASE64_STANDARD.encode(s.to_bytes())),
+            scalar: self
+                .scalar
+                .as_ref()
+                .map(|s| BASE64_STANDARD.encode(s.to_bytes())),
             generator: BASE64_STANDARD.encode(self.generator.compress().to_bytes()),
             public_key: BASE64_STANDARD.encode(self.public_key.compress().to_bytes()),
             point: BASE64_STANDARD.encode(self.point.compress().to_bytes()),
-            random_commitment_point: self.random_commitment_point.as_ref()
+            random_commitment_point: self
+                .random_commitment_point
+                .as_ref()
                 .map(|p| BASE64_STANDARD.encode(p.compress().to_bytes())),
             round: self.round as usize,
-            zkcommits_from_counterparties: self.zkcommits_from_counterparties.iter()
+            zkcommits_from_counterparties: self
+                .zkcommits_from_counterparties
+                .iter()
                 .map(|(&k, v)| (k, BASE64_STANDARD.encode(v)))
                 .collect(),
-            points_from_counterparties: self.points_from_counterparties.iter()
+            points_from_counterparties: self
+                .points_from_counterparties
+                .iter()
                 .map(|(&k, v)| (k, BASE64_STANDARD.encode(v.compress().to_bytes())))
                 .collect(),
-            commitments: self.commitments.iter()
+            commitments: self
+                .commitments
+                .iter()
                 .map(|c| BASE64_STANDARD.encode(c.compress().to_bytes()))
                 .collect(),
-            commitments_from_counterparties: self.commitments_from_counterparties.iter()
-                .map(|(&k, v)| (k, v.iter().map(|c| BASE64_STANDARD.encode(c.compress().to_bytes())).collect()))
+            commitments_from_counterparties: self
+                .commitments_from_counterparties
+                .iter()
+                .map(|(&k, v)| {
+                    (
+                        k,
+                        v.iter()
+                            .map(|c| BASE64_STANDARD.encode(c.compress().to_bytes()))
+                            .collect(),
+                    )
+                })
                 .collect(),
         };
 
@@ -185,11 +224,15 @@ impl Feldman {
     pub fn from_json(json: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let feldman_json: FeldmanJson = serde_json::from_str(json)?;
 
-        let frags_for_counterparties = feldman_json.frags_for_counterparties.into_iter()
+        let frags_for_counterparties = feldman_json
+            .frags_for_counterparties
+            .into_iter()
             .map(|(k, v)| Ok((k, BASE64_STANDARD.decode(v)?)))
             .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
 
-        let frags_from_counterparties = feldman_json.frags_from_counterparties.into_iter()
+        let frags_from_counterparties = feldman_json
+            .frags_from_counterparties
+            .into_iter()
             .map(|(k, v)| {
                 let bytes = BASE64_STANDARD.decode(v)?;
                 Ok((k, Scalar::from_bytes(&vec_to_array::<56>(bytes)?)))
@@ -212,27 +255,48 @@ impl Feldman {
         }
 
         let generator_bytes = BASE64_STANDARD.decode(feldman_json.generator)?;
-        let generator = EdwardsPoint::from_bytes(&vec_to_array::<57>(generator_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+        let generator = EdwardsPoint::from_bytes(&vec_to_array::<57>(generator_bytes)?.into())
+            .into_option()
+            .ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
 
         let public_key_bytes = BASE64_STANDARD.decode(feldman_json.public_key)?;
-        let public_key = EdwardsPoint::from_bytes(&vec_to_array::<57>(public_key_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+        let public_key = EdwardsPoint::from_bytes(&vec_to_array::<57>(public_key_bytes)?.into())
+            .into_option()
+            .ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
 
         let point_bytes = BASE64_STANDARD.decode(feldman_json.point)?;
-        let point = EdwardsPoint::from_bytes(&vec_to_array::<57>(point_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+        let point = EdwardsPoint::from_bytes(&vec_to_array::<57>(point_bytes)?.into())
+            .into_option()
+            .ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
 
         let mut random_commitment_point: Option<EdwardsPoint> = None;
         if feldman_json.random_commitment_point.is_some() {
             let bytes = BASE64_STANDARD.decode(feldman_json.random_commitment_point.unwrap())?;
-            random_commitment_point = Some(EdwardsPoint::from_bytes(&vec_to_array::<57>(bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?);
+            random_commitment_point = Some(
+                EdwardsPoint::from_bytes(&vec_to_array::<57>(bytes)?.into())
+                    .into_option()
+                    .ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?,
+            );
         }
 
-        let zkcommits_from_counterparties = feldman_json.zkcommits_from_counterparties.into_iter()
+        let zkcommits_from_counterparties = feldman_json
+            .zkcommits_from_counterparties
+            .into_iter()
             .map(|(k, v)| Ok((k, BASE64_STANDARD.decode(v)?)))
             .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
 
-        let points_from_counterparties = feldman_json.points_from_counterparties.into_iter()
+        let points_from_counterparties = feldman_json
+            .points_from_counterparties
+            .into_iter()
             .map(|(k, v)| {
-                Ok((k, EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(v)?)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?))
+                Ok((
+                    k,
+                    EdwardsPoint::from_bytes(
+                        &vec_to_array::<57>(BASE64_STANDARD.decode(v)?)?.into(),
+                    )
+                    .into_option()
+                    .ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?,
+                ))
             })
             .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
 
@@ -250,29 +314,40 @@ impl Feldman {
             point,
             random_commitment_point,
             round: match feldman_json.round {
-              0 => FeldmanRound::Uninitialized,
-              1 => FeldmanRound::Initialized,
-              2 => FeldmanRound::Committed,
-              3 => FeldmanRound::Revealed,
-              4 => FeldmanRound::Reconstructed,
-              _ => FeldmanRound::Uninitialized,
+                0 => FeldmanRound::Uninitialized,
+                1 => FeldmanRound::Initialized,
+                2 => FeldmanRound::Committed,
+                3 => FeldmanRound::Revealed,
+                4 => FeldmanRound::Reconstructed,
+                _ => FeldmanRound::Uninitialized,
             },
             zkcommits_from_counterparties,
             points_from_counterparties,
-            commitments: feldman_json.commitments.into_iter()
+            commitments: feldman_json
+                .commitments
+                .into_iter()
                 .map(|c| {
-                    EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into())
-                        .into_option()
-                        .ok_or_else(|| FeldmanError::InvalidData("invalid commitment".into()).into())
+                    EdwardsPoint::from_bytes(
+                        &vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into(),
+                    )
+                    .into_option()
+                    .ok_or_else(|| FeldmanError::InvalidData("invalid commitment".into()).into())
                 })
                 .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
-            commitments_from_counterparties: feldman_json.commitments_from_counterparties.into_iter()
+            commitments_from_counterparties: feldman_json
+                .commitments_from_counterparties
+                .into_iter()
                 .map(|(k, v)| {
-                    let pts = v.into_iter()
+                    let pts = v
+                        .into_iter()
                         .map(|c| {
-                            EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into())
-                                .into_option()
-                                .ok_or_else(|| FeldmanError::InvalidData("invalid commitment".into()).into())
+                            EdwardsPoint::from_bytes(
+                                &vec_to_array::<57>(BASE64_STANDARD.decode(c)?)?.into(),
+                            )
+                            .into_option()
+                            .ok_or_else(|| {
+                                FeldmanError::InvalidData("invalid commitment".into()).into()
+                            })
                         })
                         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
                     Ok((k, pts))
@@ -282,10 +357,13 @@ impl Feldman {
     }
 
     pub fn set_id(&mut self, id: usize) {
-      self.id = id;
+        self.id = id;
     }
 
-    pub fn sample_polynomial<R: RngCore + CryptoRng>(&mut self, rng: &mut R) -> Result<(), FeldmanError> {
+    pub fn sample_polynomial<R: RngCore + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+    ) -> Result<(), FeldmanError> {
         if self.round != FeldmanRound::Uninitialized {
             return Err(FeldmanError::WrongRound);
         }
@@ -300,9 +378,10 @@ impl Feldman {
 
         for i in 1..=self.total {
             if i == self.id {
-                self.scalar = Some(samples[i-1]);
+                self.scalar = Some(samples[i - 1]);
             } else {
-                self.frags_for_counterparties.insert(i, samples[i-1].to_bytes().to_vec());
+                self.frags_for_counterparties
+                    .insert(i, samples[i - 1].to_bytes().to_vec());
             }
         }
 
@@ -310,7 +389,12 @@ impl Feldman {
         Ok(())
     }
 
-    fn construct_polynomial_samples<R: RngCore + CryptoRng>(rng: &mut R, secret: Scalar, threshold: usize, total: usize) -> (Vec<Scalar>, Vec<Scalar>) {
+    fn construct_polynomial_samples<R: RngCore + CryptoRng>(
+        rng: &mut R,
+        secret: Scalar,
+        threshold: usize,
+        total: usize,
+    ) -> (Vec<Scalar>, Vec<Scalar>) {
         let mut coeffs = vec![secret];
 
         for _ in 1..threshold {
@@ -340,7 +424,11 @@ impl Feldman {
         if self.round == FeldmanRound::Uninitialized {
             return Err(FeldmanError::WrongRound);
         }
-        Ok(self.commitments.iter().map(|c| c.compress().to_bytes().to_vec()).collect())
+        Ok(self
+            .commitments
+            .iter()
+            .map(|c| c.compress().to_bytes().to_vec())
+            .collect())
     }
 
     /// Verify a counterparty fragment `f(self.id)` lies on the polynomial the
@@ -348,11 +436,7 @@ impl Feldman {
     /// This is the Feldman VSS share check — without it a malicious dealer can
     /// hand out a share inconsistent with its commitments and silently bias the
     /// shared secret. `commitments` are the dealer's `get_commitments()` bytes.
-    fn verify_frag_against_commitments(
-        &self,
-        frag: &Scalar,
-        commitments: &[EdwardsPoint],
-    ) -> bool {
+    fn verify_frag_against_commitments(&self, frag: &Scalar, commitments: &[EdwardsPoint]) -> bool {
         if commitments.len() != self.threshold {
             return false;
         }
@@ -366,7 +450,7 @@ impl Feldman {
         let lhs = self.generator * frag;
         lhs.ct_eq(&expected).into()
     }
-    
+
     // Accessor for embedders that drive Feldman VSS directly.
     #[allow(dead_code)]
     pub fn scalar(&self) -> Option<&Scalar> {
@@ -390,7 +474,8 @@ impl Feldman {
             return Err(FeldmanError::WrongRound);
         }
 
-        let frag_arr: [u8; 56] = frag.try_into()
+        let frag_arr: [u8; 56] = frag
+            .try_into()
             .map_err(|_| FeldmanError::InvalidData("fragment must be 56 bytes".into()))?;
         let scalar = Scalar::from_bytes(&frag_arr);
 
@@ -398,7 +483,8 @@ impl Feldman {
         // committed polynomial. Reject an inconsistent share rather than fold it
         // into our combined secret (a malicious dealer would otherwise bias the
         // group key). Decode + retain the dealer's commitments for the record.
-        let decoded: Vec<EdwardsPoint> = commitments.iter()
+        let decoded: Vec<EdwardsPoint> = commitments
+            .iter()
             .map(|c| {
                 let arr = vec_to_array::<57>(c.clone())
                     .map_err(|_| FeldmanError::InvalidData("commitment must be 57 bytes".into()))?;
@@ -428,7 +514,8 @@ impl Feldman {
             let rand_commitment = Scalar::random(&mut rand::thread_rng());
             self.random_commitment_point = Some(self.generator * rand_commitment);
 
-            let random_commitment_point_bytes = self.random_commitment_point.unwrap().compress().to_bytes();
+            let random_commitment_point_bytes =
+                self.random_commitment_point.unwrap().compress().to_bytes();
             let public_point_bytes = self.point.compress().to_bytes();
 
             let mut hasher = Sha512::new();
@@ -453,16 +540,22 @@ impl Feldman {
         Ok(None)
     }
 
-    pub fn receive_commitments(&mut self, id: usize, zkcommit: &[u8]) -> Result<Option<FeldmanReveal>, FeldmanError> {
+    pub fn receive_commitments(
+        &mut self,
+        id: usize,
+        zkcommit: &[u8],
+    ) -> Result<Option<FeldmanReveal>, FeldmanError> {
         if self.round != FeldmanRound::Committed {
             return Err(FeldmanError::WrongRound);
         }
 
-        self.zkcommits_from_counterparties.insert(id, zkcommit.to_vec());
+        self.zkcommits_from_counterparties
+            .insert(id, zkcommit.to_vec());
 
         if self.zkcommits_from_counterparties.len() == self.total - 1 {
             let public_point_bytes = self.point.compress().to_bytes();
-            let random_commitment_point_bytes = self.random_commitment_point.unwrap().compress().to_bytes();
+            let random_commitment_point_bytes =
+                self.random_commitment_point.unwrap().compress().to_bytes();
             self.round = FeldmanRound::Revealed;
             let zkpok_bytes = self.zkpok.unwrap().to_bytes();
 
@@ -483,20 +576,33 @@ impl Feldman {
 
         let counterparty_point = EdwardsPoint::from_bytes(reveal.point.as_slice().into()).unwrap();
 
-        if counterparty_point.eq(&EdwardsPoint::generator()).into() || counterparty_point == self.generator {
-            return Err(FeldmanError::InvalidData("Counterparty sent generator".into()));
+        if counterparty_point.eq(&EdwardsPoint::generator()).into()
+            || counterparty_point == self.generator
+        {
+            return Err(FeldmanError::InvalidData(
+                "Counterparty sent generator".into(),
+            ));
         }
 
-        let counterparty_random_commitment_point = EdwardsPoint::from_bytes(reveal.random_commitment_point.as_slice().into()).unwrap();
+        let counterparty_random_commitment_point =
+            EdwardsPoint::from_bytes(reveal.random_commitment_point.as_slice().into()).unwrap();
 
-        if counterparty_random_commitment_point.eq(&EdwardsPoint::generator()).into() || counterparty_random_commitment_point == self.generator {
-            return Err(FeldmanError::InvalidData("Counterparty sent generator".into()));
+        if counterparty_random_commitment_point
+            .eq(&EdwardsPoint::generator())
+            .into()
+            || counterparty_random_commitment_point == self.generator
+        {
+            return Err(FeldmanError::InvalidData(
+                "Counterparty sent generator".into(),
+            ));
         }
 
         let counterparty_zkpok = Scalar::from_bytes(reveal.zk_pok.as_slice().try_into().unwrap());
 
-        let counterparty_zkcommit = self.zkcommits_from_counterparties.get(&id)
-            .ok_or_else(|| FeldmanError::InvalidData("Missing ZK commit for counterparty".into()))?;
+        let counterparty_zkcommit =
+            self.zkcommits_from_counterparties.get(&id).ok_or_else(|| {
+                FeldmanError::InvalidData("Missing ZK commit for counterparty".into())
+            })?;
 
         let mut hasher = Sha512::new();
         hasher.update(&reveal.point);
@@ -506,10 +612,14 @@ impl Feldman {
         let challenge_scalar = Scalar::from_bytes(challenge[..56].try_into().unwrap());
 
         let proof = self.generator * counterparty_zkpok;
-        let expected_proof = counterparty_random_commitment_point + (counterparty_point * challenge_scalar);
+        let expected_proof =
+            counterparty_random_commitment_point + (counterparty_point * challenge_scalar);
 
         if proof != expected_proof {
-            return Err(FeldmanError::InvalidData(format!("Invalid proof from {}", id)));
+            return Err(FeldmanError::InvalidData(format!(
+                "Invalid proof from {}",
+                id
+            )));
         }
 
         let mut hasher = Sha512::new();
@@ -518,10 +628,14 @@ impl Feldman {
         let verifier = hasher.finalize();
 
         if &verifier[..56] != counterparty_zkcommit {
-            return Err(FeldmanError::InvalidData(format!("{} changed zkpok after commit", id)));
+            return Err(FeldmanError::InvalidData(format!(
+                "{} changed zkpok after commit",
+                id
+            )));
         }
 
-        self.points_from_counterparties.insert(id, counterparty_point);
+        self.points_from_counterparties
+            .insert(id, counterparty_point);
 
         if self.points_from_counterparties.len() == self.total - 1 {
             self.points_from_counterparties.insert(self.id, self.point);
@@ -544,11 +658,13 @@ impl Feldman {
                     }
 
                     let den_inv = den.invert();
-                    let reconstructed_fragment = self.points_from_counterparties[&j] * (num * den_inv);
+                    let reconstructed_fragment =
+                        self.points_from_counterparties[&j] * (num * den_inv);
                     reconstructed_sum += reconstructed_fragment;
                 }
 
-                if self.public_key == EdwardsPoint::generator() || self.public_key == self.generator {
+                if self.public_key == EdwardsPoint::generator() || self.public_key == self.generator
+                {
                     self.public_key = reconstructed_sum;
                 } else if self.public_key != reconstructed_sum {
                     return Err(FeldmanError::InvalidData("Recombination mismatch".into()));
@@ -578,21 +694,29 @@ impl Feldman {
         return Ok(result.compress().to_bytes().to_vec());
     }
 
-    pub fn combine_mul_share(&mut self, shares: Vec<&[u8]>, ids: &[usize]) -> Result<Vec<u8>, FeldmanError> {
+    pub fn combine_mul_share(
+        &mut self,
+        shares: Vec<&[u8]>,
+        ids: &[usize],
+    ) -> Result<Vec<u8>, FeldmanError> {
         if shares.len() != ids.len() {
-            return Err(FeldmanError::InvalidData("mismatch of shares and ids len".to_string()));
+            return Err(FeldmanError::InvalidData(
+                "mismatch of shares and ids len".to_string(),
+            ));
         }
 
         let mut points = HashMap::<usize, EdwardsPoint>::new();
         for (i, share) in shares.iter().enumerate() {
             let point = EdwardsPoint::from_bytes((*share).into());
             if point.is_none().into() {
-                return Err(FeldmanError::InvalidData(format!("invalid pubkey for {}", ids[i]).to_string()));
+                return Err(FeldmanError::InvalidData(
+                    format!("invalid pubkey for {}", ids[i]).to_string(),
+                ));
             }
 
             points.insert(ids[i], point.unwrap());
         }
-      
+
         let mut reconstructed_sum = EdwardsPoint::generator();
 
         for j in ids {
@@ -627,21 +751,31 @@ impl Feldman {
         self.public_key.to_bytes().to_vec()
     }
 
-    pub fn redistribute<R: RngCore + CryptoRng>(rng: &mut R, shares: Vec<Vec<u8>>, ids: &[usize], threshold: usize, total: usize) -> Result<Vec<Vec<u8>>, FeldmanError> {
+    pub fn redistribute<R: RngCore + CryptoRng>(
+        rng: &mut R,
+        shares: Vec<Vec<u8>>,
+        ids: &[usize],
+        threshold: usize,
+        total: usize,
+    ) -> Result<Vec<Vec<u8>>, FeldmanError> {
         if shares.len() != ids.len() {
-            return Err(FeldmanError::InvalidData("mismatch of shares and ids len".to_string()));
+            return Err(FeldmanError::InvalidData(
+                "mismatch of shares and ids len".to_string(),
+            ));
         }
 
         let mut points = HashMap::<usize, Scalar>::new();
         for (i, share) in shares.iter().enumerate() {
             let point = Scalar::from_bytes(&(*share).clone().try_into().unwrap());
             if point.is_zero().into() {
-                return Err(FeldmanError::InvalidData(format!("invalid pubkey for {}", ids[i]).to_string()));
+                return Err(FeldmanError::InvalidData(
+                    format!("invalid pubkey for {}", ids[i]).to_string(),
+                ));
             }
 
             points.insert(ids[i], point);
         }
-      
+
         let mut reconstructed_sum = Scalar::ZERO;
 
         for j in ids {
@@ -663,15 +797,21 @@ impl Feldman {
             reconstructed_sum += reconstructed_fragment;
         }
 
-        return Ok(Feldman::construct_polynomial_samples(rng, reconstructed_sum, threshold, total).0.iter().map(|s| s.to_bytes().to_vec()).collect())
+        return Ok(
+            Feldman::construct_polynomial_samples(rng, reconstructed_sum, threshold, total)
+                .0
+                .iter()
+                .map(|s| s.to_bytes().to_vec())
+                .collect(),
+        );
     }
 
     pub fn get_scalar(&self) -> Scalar {
-      return self.scalar.unwrap();
+        return self.scalar.unwrap();
     }
 
     pub fn get_id(&self) -> usize {
-      return self.id;
+        return self.id;
     }
 }
 
@@ -693,14 +833,19 @@ mod feldman_vss_tests {
         let mut dealer = Feldman::new(threshold, total, 1, Scalar::random(&mut OsRng), gen);
         dealer.sample_polynomial(&mut OsRng).unwrap();
         let commitments = dealer.get_commitments().unwrap();
-        assert_eq!(commitments.len(), threshold, "one commitment per coefficient");
+        assert_eq!(
+            commitments.len(),
+            threshold,
+            "one commitment per coefficient"
+        );
         let honest = dealer.get_poly_frags().unwrap().get(&2).unwrap().clone();
 
         // Honest fragment for party 2 verifies.
         let mut recv = Feldman::new(threshold, total, 2, Scalar::random(&mut OsRng), gen);
         recv.sample_polynomial(&mut OsRng).unwrap();
         assert!(
-            recv.set_poly_frag_for_party(1, &honest, &commitments).is_ok(),
+            recv.set_poly_frag_for_party(1, &honest, &commitments)
+                .is_ok(),
             "honest fragment on the committed polynomial must verify",
         );
 
@@ -710,7 +855,9 @@ mod feldman_vss_tests {
         let mut tampered = honest.clone();
         tampered[0] ^= 0x01;
         assert!(
-            recv2.set_poly_frag_for_party(1, &tampered, &commitments).is_err(),
+            recv2
+                .set_poly_frag_for_party(1, &tampered, &commitments)
+                .is_err(),
             "a share off the committed polynomial must be rejected",
         );
 

@@ -2,32 +2,63 @@
 //! `manageModel` (`client/cmd/node/prover/manage_model.go`) — the state
 //! struct, data-refresh processing, and the filter/sort derivations.
 
-use std::collections::{HashMap, HashSet};
 use super::super::local_execution::{execution_label, local_execution_state, state_at};
+use std::collections::{HashMap, HashSet};
 
 use num_bigint::{BigInt, Sign};
 
 use quil_types::proto::node::{
-    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardProverCounts, WorkerInfoResponse,
+    GetShardInfoResponse, NodeInfoResponse, ShardAllocationInfo, ShardProverCounts,
+    WorkerInfoResponse,
 };
 
 use super::super::epoch::{
-    action_hints, compute_effective_status, confirmed_phase, epoch_len, ActionHint, AllocationTiming, ConfirmWindow,
-    EffectiveStatus, ThresholdClock, ThresholdUnit, WindowState,
+    action_hints, compute_effective_status, confirmed_phase, epoch_len, ActionHint,
+    AllocationTiming, ConfirmWindow, EffectiveStatus, ThresholdClock, ThresholdUnit, WindowState,
 };
 
 // ── Column metadata (shared between rendering and filtering) ─────────────
 
 pub const ALLOC_COL_NAMES: [&str; 18] = [
-    "Select", "Filter", "Provers", "Ring", "Size [GB]", "Shards", "LocalMat", "PeerHead", "GlobalHead", "Execution",
-    "Reward [~Q/d]", "Worker", "Status", "Mode", "NextAction", "DefaultAction", "Interval [s]", "ProverPhases",
+    "Select",
+    "Filter",
+    "Provers",
+    "Ring",
+    "Size [GB]",
+    "Shards",
+    "LocalMat",
+    "PeerHead",
+    "GlobalHead",
+    "Execution",
+    "Reward [~Q/d]",
+    "Worker",
+    "Status",
+    "Mode",
+    "NextAction",
+    "DefaultAction",
+    "Interval [s]",
+    "ProverPhases",
 ];
-pub const AVAIL_COL_NAMES: [&str; 13] = ["Select", "Filter", "Provers", "Ring", "Size [GB]", "Shards", "PeerMat", "PeerHead",
-    "GlobalHead", "PeerState", "Reward [~Q/d]", "Interval [s]", "ProverPhases"];
+pub const AVAIL_COL_NAMES: [&str; 13] = [
+    "Select",
+    "Filter",
+    "Provers",
+    "Ring",
+    "Size [GB]",
+    "Shards",
+    "PeerMat",
+    "PeerHead",
+    "GlobalHead",
+    "PeerState",
+    "Reward [~Q/d]",
+    "Interval [s]",
+    "ProverPhases",
+];
 
 // Keep the new measurement beside its committed source without renumbering action columns,
 // and ProverPhases beside the Provers count it breaks down.
-pub const ALLOC_DISPLAY_COLS: &[usize] = &[0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
+pub const ALLOC_DISPLAY_COLS: &[usize] =
+    &[0, 1, 2, 17, 3, 4, 5, 6, 7, 8, 16, 9, 10, 11, 12, 13, 14, 15];
 pub const AVAIL_DISPLAY_COLS: &[usize] = &[0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 11, 9, 10];
 
 /// The optional ProverPhases column in each panel; one visibility setting,
@@ -48,10 +79,30 @@ pub const INTERVAL_WINDOW_NAMES: &[&str] = &["  60m window", "  24h window"];
 pub const GLOBAL_FIELD_NAMES: &[&str] = &["  frame", "  epoch", "  next boundary"];
 pub const REWARD_ESTIMATE_NAMES: &[&str] = &["60m window", "24h window", "Theory (T): 10s/frame"];
 
-pub const TOP_KPI_NAMES: &[&str] = &["Peer ID", "Strategy", "Seniority", "Global", "Global interval", "World size", "RPC"];
-pub const ALLOC_KPI_NAMES: &[&str] = &["Workers", "Status", "Claimable", "Reward", "Allocation GLOBAL snapshot", "Shown allocations", "Selected allocations"];
+pub const TOP_KPI_NAMES: &[&str] = &[
+    "Peer ID",
+    "Strategy",
+    "Seniority",
+    "Global",
+    "Global interval",
+    "World size",
+    "RPC",
+];
+pub const ALLOC_KPI_NAMES: &[&str] = &[
+    "Workers",
+    "Status",
+    "Claimable",
+    "Reward",
+    "Allocation GLOBAL snapshot",
+    "Shown allocations",
+    "Selected allocations",
+];
 pub const NOTICE_KPI_NAMES: &[&str] = &["Notification level", "Notification position"];
-pub const AVAIL_KPI_NAMES: &[&str] = &["Available count", "Available GLOBAL snapshot", "Selected shards"];
+pub const AVAIL_KPI_NAMES: &[&str] = &[
+    "Available count",
+    "Available GLOBAL snapshot",
+    "Selected shards",
+];
 
 pub const ALLOC_FILTERABLE_COLS: [usize; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16];
 pub const AVAIL_FILTERABLE_COLS: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
@@ -126,19 +177,36 @@ pub const ALLOC_FIXED_WIDTH: usize = SELECT_WIDTH
     + RING_WIDTH
     + SIZE_WIDTH
     + SHARDS_WIDTH
-    + MAT_WIDTH + HEAD_WIDTH + GLOBAL_HEAD_WIDTH + STATE_WIDTH + ALLOC_REWARD_WIDTH
+    + MAT_WIDTH
+    + HEAD_WIDTH
+    + GLOBAL_HEAD_WIDTH
+    + STATE_WIDTH
+    + ALLOC_REWARD_WIDTH
     + WORKER_WIDTH
     + STATUS_WIDTH
     + MODE_WIDTH
     + NEXT_ACTION_WIDTH
     + DEFAULT_ACTION_WIDTH
-    + 16 + 12
+    + 16
+    + 12
     + 2
     + 1;
 // 11 spaces between 12 columns, 2 external borders, 1-char sort arrow;
 // ProverPhases likewise.
-pub const AVAIL_FIXED_WIDTH: usize =
-    SELECT_WIDTH + PROVERS_WIDTH + RING_WIDTH + SIZE_WIDTH + SHARDS_WIDTH + MAT_WIDTH + HEAD_WIDTH + GLOBAL_HEAD_WIDTH + STATE_WIDTH + REWARD_WIDTH + 11 + 12 + 2 + 1;
+pub const AVAIL_FIXED_WIDTH: usize = SELECT_WIDTH
+    + PROVERS_WIDTH
+    + RING_WIDTH
+    + SIZE_WIDTH
+    + SHARDS_WIDTH
+    + MAT_WIDTH
+    + HEAD_WIDTH
+    + GLOBAL_HEAD_WIDTH
+    + STATE_WIDTH
+    + REWARD_WIDTH
+    + 11
+    + 12
+    + 2
+    + 1;
 
 /// Floor for the Filter column in either layout. Filter is what gives way
 /// when the pane cannot hold the table, being the only column whose content
@@ -193,16 +261,27 @@ impl AllocationRow {
         if self.worker_id < 0 || self.status == 0 {
             return None;
         }
-        let status = compute_effective_status(&AllocationTiming {
-            raw_status: self.status,
-            filter: &self.filter,
-            join_frame: self.join_frame,
-            join_confirm_frame: self.confirm_frame,
-            leave_frame: self.leave_frame,
-            leave_confirm_frame: self.leave_confirm_frame,
-            epoch: self.epoch,
-        }, frame, epoch_length);
-        matches!(status, EffectiveStatus::Active | EffectiveStatus::Joining | EffectiveStatus::Paused | EffectiveStatus::Leaving).then_some(status)
+        let status = compute_effective_status(
+            &AllocationTiming {
+                raw_status: self.status,
+                filter: &self.filter,
+                join_frame: self.join_frame,
+                join_confirm_frame: self.confirm_frame,
+                leave_frame: self.leave_frame,
+                leave_confirm_frame: self.leave_confirm_frame,
+                epoch: self.epoch,
+            },
+            frame,
+            epoch_length,
+        );
+        matches!(
+            status,
+            EffectiveStatus::Active
+                | EffectiveStatus::Joining
+                | EffectiveStatus::Paused
+                | EffectiveStatus::Leaving
+        )
+        .then_some(status)
     }
 
     /// The Mode cell — `m` when the row's worker is managed by hand, `a` when
@@ -238,9 +317,9 @@ pub struct ShardRow {
 
 #[derive(Debug, Clone, Default)]
 pub struct ColumnFilter {
-    pub text: String,               // substring match (Filter column)
-    pub values: HashSet<String>,    // selected values (empty = all = no filter)
-    pub expr: String,               // numeric expression like "> 47" or "1,5,7"
+    pub text: String,            // substring match (Filter column)
+    pub values: HashSet<String>, // selected values (empty = all = no filter)
+    pub expr: String,            // numeric expression like "> 47" or "1,5,7"
 }
 
 impl ColumnFilter {
@@ -481,10 +560,18 @@ pub enum NoticeSeverity {
 
 impl NoticeSeverity {
     pub fn next(self) -> Self {
-        match self { Self::Info => Self::Warning, Self::Warning => Self::Error, Self::Error => Self::Info }
+        match self {
+            Self::Info => Self::Warning,
+            Self::Warning => Self::Error,
+            Self::Error => Self::Info,
+        }
     }
     pub fn label(self) -> &'static str {
-        match self { Self::Info => "all", Self::Warning => "warnings+", Self::Error => "errors" }
+        match self {
+            Self::Info => "all",
+            Self::Warning => "warnings+",
+            Self::Error => "errors",
+        }
     }
 }
 
@@ -497,9 +584,27 @@ pub enum PanelFocus {
 }
 
 impl PanelFocus {
-    pub fn index(self) -> usize { match self { Self::Allocations => 0, Self::Available => 1, Self::Notifications => 2 } }
-    pub fn next(self) -> Self { match self { Self::Allocations => Self::Available, Self::Available => Self::Notifications, Self::Notifications => Self::Allocations } }
-    pub fn previous(self) -> Self { match self { Self::Allocations => Self::Notifications, Self::Available => Self::Allocations, Self::Notifications => Self::Available } }
+    pub fn index(self) -> usize {
+        match self {
+            Self::Allocations => 0,
+            Self::Available => 1,
+            Self::Notifications => 2,
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::Allocations => Self::Available,
+            Self::Available => Self::Notifications,
+            Self::Notifications => Self::Allocations,
+        }
+    }
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Allocations => Self::Notifications,
+            Self::Available => Self::Allocations,
+            Self::Notifications => Self::Available,
+        }
+    }
     pub fn is_alloc(self) -> bool {
         matches!(self, PanelFocus::Allocations)
     }
@@ -531,17 +636,29 @@ impl Model {
     /// Joining allocations have no execution requirement before admission.
     /// Retain observed states and unknown telemetry for admitted allocations.
     pub fn allocation_execution_state<'a>(&self, row: &'a AllocationRow) -> &'a str {
-        if row.execution.is_none() && matches!(row.status_name.as_str(), "joining" | "activating") { "-" }
-        else { execution_label(self.execution_state(row.execution.as_ref())) }
+        if row.execution.is_none() && matches!(row.status_name.as_str(), "joining" | "activating") {
+            "-"
+        } else {
+            execution_label(self.execution_state(row.execution.as_ref()))
+        }
     }
 
     /// Classify node observation age at receipt, separately from client cache age.
-    pub fn execution_state<'a>(&self, execution: Option<&'a quil_types::proto::node::WorkerExecution>) -> &'a str {
+    pub fn execution_state<'a>(
+        &self,
+        execution: Option<&'a quil_types::proto::node::WorkerExecution>,
+    ) -> &'a str {
         self.execution_state_at(execution, std::time::Instant::now())
     }
 
-    fn execution_state_at<'a>(&self, execution: Option<&'a quil_types::proto::node::WorkerExecution>, now: std::time::Instant) -> &'a str {
-        if execution.is_none() { return "unknown"; }
+    fn execution_state_at<'a>(
+        &self,
+        execution: Option<&'a quil_types::proto::node::WorkerExecution>,
+        now: std::time::Instant,
+    ) -> &'a str {
+        if execution.is_none() {
+            return "unknown";
+        }
         let Some((received, wall_ms)) = self.worker_snapshot_received else {
             return local_execution_state(execution);
         };
@@ -560,49 +677,148 @@ impl Model {
         }
     }
 
-    pub fn cadence_window<'a>(&self, cadence: &'a quil_types::proto::node::FrameCadence, day: bool) -> Option<&'a quil_types::proto::node::FrameWindow> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 { return None; }
-        let w = if day { cadence.day.as_ref()? } else { cadence.hour.as_ref()? };
+    pub fn cadence_window<'a>(
+        &self,
+        cadence: &'a quil_types::proto::node::FrameCadence,
+        day: bool,
+    ) -> Option<&'a quil_types::proto::node::FrameWindow> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90
+        {
+            return None;
+        }
+        let w = if day {
+            cadence.day.as_ref()?
+        } else {
+            cadence.hour.as_ref()?
+        };
         (w.observed_seconds >= 60 && w.observed_seconds <= w.window_seconds).then_some(w)
     }
-    pub fn interval_mask(&self) -> u8 { let mask = self.interval_windows & 3; if mask == 0 { 1 } else { mask } }
-    pub fn global_interval_mask(&self) -> u8 { let mask = self.global_interval_windows & 3; if mask == 0 { 1 } else { mask } }
-    pub fn global_field_mask(&self) -> u8 { let mask = self.global_fields & 7; if mask == 0 { 1 } else { mask } }
+    pub fn interval_mask(&self) -> u8 {
+        let mask = self.interval_windows & 3;
+        if mask == 0 {
+            1
+        } else {
+            mask
+        }
+    }
+    pub fn global_interval_mask(&self) -> u8 {
+        let mask = self.global_interval_windows & 3;
+        if mask == 0 {
+            1
+        } else {
+            mask
+        }
+    }
+    pub fn global_field_mask(&self) -> u8 {
+        let mask = self.global_fields & 7;
+        if mask == 0 {
+            1
+        } else {
+            mask
+        }
+    }
     /// Measured mean seconds per received GLOBAL frame: the 60m window when it
     /// has advances, else the 24h one; `None` without a fresh measurement.
     pub fn global_seconds_per_frame(&self) -> Option<f64> {
         let cadence = self.node_global_cadence.as_ref()?;
-        [false, true].into_iter().find_map(|day| self.cadence_window(cadence, day)
-            .filter(|w| w.advanced_frames > 0).map(|w| w.observed_seconds as f64 / w.advanced_frames as f64))
+        [false, true].into_iter().find_map(|day| {
+            self.cadence_window(cadence, day)
+                .filter(|w| w.advanced_frames > 0)
+                .map(|w| w.observed_seconds as f64 / w.advanced_frames as f64)
+        })
     }
     /// What Next/Default Action thresholds count from; expanded mode adds the
     /// `~` time estimate.
     pub fn threshold_clock(&self) -> ThresholdClock {
-        ThresholdClock { frame: self.epoch_frame(), seconds_per_frame: if self.compact_actions { None } else { self.global_seconds_per_frame() } }
+        ThresholdClock {
+            frame: self.epoch_frame(),
+            seconds_per_frame: if self.compact_actions {
+                None
+            } else {
+                self.global_seconds_per_frame()
+            },
+        }
     }
     pub fn global_interval_labels(&self) -> String {
-        ["60m", "24h"].iter().enumerate().filter(|(i, _)| self.global_interval_mask() & (1 << i) != 0).map(|(_, label)| *label).collect::<Vec<_>>().join("/")
+        ["60m", "24h"]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.global_interval_mask() & (1 << i) != 0)
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>()
+            .join("/")
     }
     pub fn interval_labels(&self) -> String {
-        ["60m", "24h"].iter().enumerate().filter(|(i, _)| self.interval_mask() & (1 << i) != 0).map(|(_, label)| *label).collect::<Vec<_>>().join("/")
+        ["60m", "24h"]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.interval_mask() & (1 << i) != 0)
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>()
+            .join("/")
     }
-    pub fn reward_mask(&self) -> u8 { if self.reward_windows == 0 { 4 } else { self.reward_windows & 7 } }
+    pub fn reward_mask(&self) -> u8 {
+        if self.reward_windows == 0 {
+            4
+        } else {
+            self.reward_windows & 7
+        }
+    }
     pub fn reward_labels(&self) -> String {
-        ["60m", "24h", if self.compact_units { "T" } else { "theory" }].iter().enumerate().filter(|(i, _)| self.reward_mask() & (1 << i) != 0).map(|(_, s)| *s).collect::<Vec<_>>().join("/")
+        [
+            "60m",
+            "24h",
+            if self.compact_units { "T" } else { "theory" },
+        ]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| self.reward_mask() & (1 << i) != 0)
+        .map(|(_, s)| *s)
+        .collect::<Vec<_>>()
+        .join("/")
     }
     pub fn daily_reward(&self, per_frame: &BigInt, filter: &[u8], index: usize) -> Option<BigInt> {
-        if index == 2 { return Some(per_frame * BigInt::from(8640)); }
-        if self.shard_error.is_some() { return None; }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        super::super::observed_quil_daily(per_frame, self.node_app_cadence.get(filter)?, index == 1, now)
+        if index == 2 {
+            return Some(per_frame * BigInt::from(8640));
+        }
+        if self.shard_error.is_some() {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        super::super::observed_quil_daily(
+            per_frame,
+            self.node_app_cadence.get(filter)?,
+            index == 1,
+            now,
+        )
     }
     pub fn app_interval(&self, filter: &[u8]) -> Option<f64> {
-        self.cadence_window(self.node_app_cadence.get(filter)?, self.interval_mask() == 2).and_then(|w| (w.advanced_frames > 0).then(|| w.observed_seconds as f64 / w.advanced_frames as f64))
+        self.cadence_window(
+            self.node_app_cadence.get(filter)?,
+            self.interval_mask() == 2,
+        )
+        .and_then(|w| {
+            (w.advanced_frames > 0).then(|| w.observed_seconds as f64 / w.advanced_frames as f64)
+        })
     }
     /// RPC values are node-owned; cached refreshes never invent observations.
-    pub fn observe_app_intervals(&mut self, shards: &GetShardInfoResponse, _now: std::time::Instant) {
-        self.node_app_cadence = shards.shards.iter().filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c))).collect();
+    pub fn observe_app_intervals(
+        &mut self,
+        shards: &GetShardInfoResponse,
+        _now: std::time::Instant,
+    ) {
+        self.node_app_cadence = shards
+            .shards
+            .iter()
+            .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
+            .collect();
     }
 
     /// Track only fresh node responses; shard-cache refreshes cannot reset this clock.
@@ -615,45 +831,80 @@ impl Model {
     }
 
     /// Record peer-head progress once per fresh shard RPC, never on cache reuse.
-    pub fn observe_reported_app_heads(&mut self, shards: &GetShardInfoResponse, now: std::time::Instant) {
+    pub fn observe_reported_app_heads(
+        &mut self,
+        shards: &GetShardInfoResponse,
+        now: std::time::Instant,
+    ) {
         let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
         let window = std::time::Duration::from_secs(60.max(self.refresh_seconds * 3));
         let mut known = HashSet::new();
         for shard in &shards.shards {
             // Empty/unknown peer metadata and unstaffed shards cannot establish a stall.
-            if shard.active_provers == 0 || (shard.latest_frame == 0 && shard.materialized_frame == 0) { continue; }
-            if !known.insert(shard.filter.clone()) { continue; }
+            if shard.active_provers == 0
+                || (shard.latest_frame == 0 && shard.materialized_frame == 0)
+            {
+                continue;
+            }
+            if !known.insert(shard.filter.clone()) {
+                continue;
+            }
             let generation = shard.global_head.as_ref().map(|h| h.generation);
-            let progress = self.reported_app_progress.entry(shard.filter.clone()).or_insert(ReportedAppProgress {
-                frame: shard.latest_frame, generation, last_change: now, last_seen: now,
-                observations: 0, stalled: false,
-            });
-            if progress.frame != shard.latest_frame || progress.generation != generation
+            let progress = self
+                .reported_app_progress
+                .entry(shard.filter.clone())
+                .or_insert(ReportedAppProgress {
+                    frame: shard.latest_frame,
+                    generation,
+                    last_change: now,
+                    last_seen: now,
+                    observations: 0,
+                    stalled: false,
+                });
+            if progress.frame != shard.latest_frame
+                || progress.generation != generation
                 || now.saturating_duration_since(progress.last_seen) > budget
             {
-                *progress = ReportedAppProgress { frame: shard.latest_frame, generation,
-                    last_change: now, last_seen: now, observations: 0, stalled: false };
+                *progress = ReportedAppProgress {
+                    frame: shard.latest_frame,
+                    generation,
+                    last_change: now,
+                    last_seen: now,
+                    observations: 0,
+                    stalled: false,
+                };
             }
             progress.last_seen = now;
             progress.observations = progress.observations.saturating_add(1);
-            if progress.observations >= 3 && now.saturating_duration_since(progress.last_change) >= window {
+            if progress.observations >= 3
+                && now.saturating_duration_since(progress.last_change) >= window
+            {
                 progress.stalled = true;
             }
         }
-        self.reported_app_progress.retain(|filter, _| known.contains(filter));
+        self.reported_app_progress
+            .retain(|filter, _| known.contains(filter));
     }
 
     pub fn reported_app_stalled(&self, filter: &[u8]) -> bool {
-        if self.shard_error.is_some() { return false; }
-        self.reported_app_progress.get(filter).is_some_and(|p| p.stalled
-            && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30)
+        if self.shard_error.is_some() {
+            return false;
+        }
+        self.reported_app_progress.get(filter).is_some_and(|p| {
+            p.stalled && p.last_seen.elapsed().as_secs() <= self.refresh_seconds * 2 + 30
+        })
     }
 
     pub fn reported_app_stall_counts(&self, now: std::time::Instant) -> Option<(usize, usize)> {
-        if self.shard_error.is_some() { return None; }
+        if self.shard_error.is_some() {
+            return None;
+        }
         let budget = std::time::Duration::from_secs(self.refresh_seconds * 2 + 30);
-        let known: Vec<_> = self.reported_app_progress.values()
-            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget).collect();
+        let known: Vec<_> = self
+            .reported_app_progress
+            .values()
+            .filter(|p| now.saturating_duration_since(p.last_seen) <= budget)
+            .collect();
         let stalled = known.iter().filter(|p| p.stalled).count();
         (stalled > 0).then_some((stalled, known.len()))
     }
@@ -684,9 +935,13 @@ impl Model {
         };
         let worker_info = match worker_info {
             Some(w) => {
-                self.worker_snapshot_received = Some((std::time::Instant::now(),
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default().as_millis() as u64));
+                self.worker_snapshot_received = Some((
+                    std::time::Instant::now(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                ));
                 self.cached_worker_info = Some(w.clone());
                 Some(w)
             }
@@ -695,7 +950,13 @@ impl Model {
 
         // Header.
         self.node_global_cadence = node_info.frame_cadence.clone();
-        if let Some(shards) = &shard_info { self.node_app_cadence = shards.shards.iter().filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c))).collect(); }
+        if let Some(shards) = &shard_info {
+            self.node_app_cadence = shards
+                .shards
+                .iter()
+                .filter_map(|s| s.frame_cadence.clone().map(|c| (s.filter.clone(), c)))
+                .collect();
+        }
         self.peer_id = node_info.peer_id.clone();
         if !node_info.peer_seniority.is_empty() {
             self.seniority =
@@ -762,7 +1023,9 @@ impl Model {
 
             let filter_hex = hex::encode(&a.filter);
             allocated_filters.insert(filter_hex.clone());
-            let status_name = confirmed_phase(&t, eff, el).map_or(eff.label(), |(name, _)| name).to_string();
+            let status_name = confirmed_phase(&t, eff, el)
+                .map_or(eff.label(), |(name, _)| name)
+                .to_string();
 
             let (next_action, default_action) = action_hints(&t, eff, el, ef, next_boundary);
 
@@ -771,8 +1034,14 @@ impl Model {
                 .map(|(id, m)| (*id as i64, *m))
                 .unwrap_or((-1, false));
 
-            let execution = worker_info.as_ref().and_then(|wi| wi.worker_info.iter().find(|w|
-                w.core_id as i64 == wid && w.filter == a.filter)).and_then(|w| w.execution.clone());
+            let execution = worker_info
+                .as_ref()
+                .and_then(|wi| {
+                    wi.worker_info
+                        .iter()
+                        .find(|w| w.core_id as i64 == wid && w.filter == a.filter)
+                })
+                .and_then(|w| w.execution.clone());
             let mut row = AllocationRow {
                 global_head: None,
                 execution,
@@ -814,8 +1083,7 @@ impl Model {
                 row.data_shards = info.data_shards;
                 row.materialized_frame = info.materialized_frame;
                 row.latest_frame = info.latest_frame;
-                row.estimated_reward =
-                    BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
+                row.estimated_reward = BigInt::from_bytes_be(Sign::Plus, &info.estimated_reward);
             }
             allocs.push(row);
         }
@@ -823,15 +1091,20 @@ impl Model {
         // Every reported worker stays visible, including a nonempty binding
         // whose allocation was retired or omitted from this registry snapshot.
         // Such a worker is bound, not idle, and has no allocation reward totals.
-        let represented_workers: HashSet<i64> = allocs.iter()
-            .filter(|a| a.worker_id >= 0).map(|a| a.worker_id).collect();
+        let represented_workers: HashSet<i64> = allocs
+            .iter()
+            .filter(|a| a.worker_id >= 0)
+            .map(|a| a.worker_id)
+            .collect();
         if let Some(wi) = &worker_info {
             for w in &wi.worker_info {
                 if !represented_workers.contains(&(w.core_id as i64)) {
                     let idle = w.filter.is_empty();
                     let filter_hex = hex::encode(&w.filter);
                     allocs.push(AllocationRow {
-                        global_head: reward_by_filter.get(&filter_hex).and_then(|info| info.global_head.clone()),
+                        global_head: reward_by_filter
+                            .get(&filter_hex)
+                            .and_then(|info| info.global_head.clone()),
                         execution: w.execution.clone(),
                         shard_info_known: false,
                         allocation_reason: None,
@@ -982,24 +1255,53 @@ impl Model {
         let asc = self.alloc_sort_asc;
         let sel = &self.alloc_selected;
         // Thresholds sort by verb, then frame, whichever way they are displayed.
-        let hint_order = |a: &ActionHint, b: &ActionHint| a.label.cmp(&b.label).then(a.at_frame.cmp(&b.at_frame));
+        let hint_order = |a: &ActionHint, b: &ActionHint| {
+            a.label.cmp(&b.label).then(a.at_frame.cmp(&b.at_frame))
+        };
         rows.sort_by(|a, b| {
             let ord = match col {
-                0 => sel.contains(&a.filter_key).cmp(&sel.contains(&b.filter_key)),
+                0 => sel
+                    .contains(&a.filter_key)
+                    .cmp(&sel.contains(&b.filter_key)),
                 1 => a.filter_hex.cmp(&b.filter_hex),
                 2 => a.active_provers.cmp(&b.active_provers),
                 3 => a.ring.cmp(&b.ring),
                 4 => a.shard_size.cmp(&b.shard_size),
                 5 => a.data_shards.cmp(&b.data_shards),
-                6 => a.execution.as_ref().and_then(|s| s.materialized_frame).cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
+                6 => a
+                    .execution
+                    .as_ref()
+                    .and_then(|s| s.materialized_frame)
+                    .cmp(&b.execution.as_ref().and_then(|s| s.materialized_frame)),
                 7 => a.latest_frame.cmp(&b.latest_frame),
-                8 => a.global_head.as_ref().map(|h| h.frame).cmp(&b.global_head.as_ref().map(|h| h.frame)),
-                9 => self.allocation_execution_state(a).cmp(self.allocation_execution_state(b)),
-                10 => self.daily_reward(&a.estimated_reward, &a.filter, self.reward_mask().trailing_zeros() as usize).cmp(&self.daily_reward(&b.estimated_reward, &b.filter, self.reward_mask().trailing_zeros() as usize)),
-                16 => self.app_interval(&a.filter).partial_cmp(&self.app_interval(&b.filter)).unwrap_or(std::cmp::Ordering::Equal),
+                8 => a
+                    .global_head
+                    .as_ref()
+                    .map(|h| h.frame)
+                    .cmp(&b.global_head.as_ref().map(|h| h.frame)),
+                9 => self
+                    .allocation_execution_state(a)
+                    .cmp(self.allocation_execution_state(b)),
+                10 => self
+                    .daily_reward(
+                        &a.estimated_reward,
+                        &a.filter,
+                        self.reward_mask().trailing_zeros() as usize,
+                    )
+                    .cmp(&self.daily_reward(
+                        &b.estimated_reward,
+                        &b.filter,
+                        self.reward_mask().trailing_zeros() as usize,
+                    )),
+                16 => self
+                    .app_interval(&a.filter)
+                    .partial_cmp(&self.app_interval(&b.filter))
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 // ALLOC_PROVER_PHASES_COL; the sort column is an i32.
-                17 => prover_phase_order(a.prover_counts.as_ref()).cmp(&prover_phase_order(b.prover_counts.as_ref())),
-                11 => a.worker_id.cmp(&b.worker_id), 12 => a.status.cmp(&b.status),
+                17 => prover_phase_order(a.prover_counts.as_ref())
+                    .cmp(&prover_phase_order(b.prover_counts.as_ref())),
+                11 => a.worker_id.cmp(&b.worker_id),
+                12 => a.status.cmp(&b.status),
                 13 => a.manually_managed.cmp(&b.manually_managed),
                 14 => hint_order(&a.next_action, &b.next_action),
                 15 => hint_order(&a.default_action, &b.default_action),
@@ -1024,7 +1326,9 @@ impl Model {
         let sel = &self.avail_selected;
         rows.sort_by(|a, b| {
             let ord = match col {
-                0 => sel.contains(&a.filter_key).cmp(&sel.contains(&b.filter_key)),
+                0 => sel
+                    .contains(&a.filter_key)
+                    .cmp(&sel.contains(&b.filter_key)),
                 1 => a.filter_hex.cmp(&b.filter_hex),
                 2 => a.active_provers.cmp(&b.active_provers),
                 3 => a.ring.cmp(&b.ring),
@@ -1032,12 +1336,31 @@ impl Model {
                 5 => a.data_shards.cmp(&b.data_shards),
                 6 => a.materialized_frame.cmp(&b.materialized_frame),
                 7 => a.latest_frame.cmp(&b.latest_frame),
-                8 => a.global_head.as_ref().map(|h| h.frame).cmp(&b.global_head.as_ref().map(|h| h.frame)),
-                9 => materialization_state(a.materialized_frame, a.latest_frame).cmp(materialization_state(b.materialized_frame, b.latest_frame)),
-                10 => self.daily_reward(&a.estimated_reward, &a.filter, self.reward_mask().trailing_zeros() as usize).cmp(&self.daily_reward(&b.estimated_reward, &b.filter, self.reward_mask().trailing_zeros() as usize)),
-                11 => self.app_interval(&a.filter).partial_cmp(&self.app_interval(&b.filter)).unwrap_or(std::cmp::Ordering::Equal),
+                8 => a
+                    .global_head
+                    .as_ref()
+                    .map(|h| h.frame)
+                    .cmp(&b.global_head.as_ref().map(|h| h.frame)),
+                9 => materialization_state(a.materialized_frame, a.latest_frame)
+                    .cmp(materialization_state(b.materialized_frame, b.latest_frame)),
+                10 => self
+                    .daily_reward(
+                        &a.estimated_reward,
+                        &a.filter,
+                        self.reward_mask().trailing_zeros() as usize,
+                    )
+                    .cmp(&self.daily_reward(
+                        &b.estimated_reward,
+                        &b.filter,
+                        self.reward_mask().trailing_zeros() as usize,
+                    )),
+                11 => self
+                    .app_interval(&a.filter)
+                    .partial_cmp(&self.app_interval(&b.filter))
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 // AVAIL_PROVER_PHASES_COL; the sort column is an i32.
-                12 => prover_phase_order(a.prover_counts.as_ref()).cmp(&prover_phase_order(b.prover_counts.as_ref())),
+                12 => prover_phase_order(a.prover_counts.as_ref())
+                    .cmp(&prover_phase_order(b.prover_counts.as_ref())),
                 _ => std::cmp::Ordering::Equal,
             };
             if asc {
@@ -1099,8 +1422,15 @@ impl Model {
 
     /// Free workers already managed manually, eligible for operator joins.
     pub fn manual_free_workers(&self) -> Vec<u32> {
-        self.free_workers.iter().copied().filter(|id| self.allocations.iter()
-            .any(|r| r.worker_id == i64::from(*id) && r.status == 0 && r.manually_managed)).collect()
+        self.free_workers
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.allocations
+                    .iter()
+                    .any(|r| r.worker_id == i64::from(*id) && r.status == 0 && r.manually_managed)
+            })
+            .collect()
     }
 
     /// `applicableAllocActions` — action names valid for the current
@@ -1177,12 +1507,24 @@ impl Model {
     // ── Filter mode helpers ──────────────────────────────────────────────
 
     pub fn active_panel_filter_cols(&self) -> Vec<usize> {
-        let cols: &[usize] = if self.focus.is_alloc() { &ALLOC_FILTERABLE_COLS } else { &AVAIL_FILTERABLE_COLS };
-        self.display_columns().iter().copied().filter(|col| cols.contains(col) && self.column_visible(*col)).collect()
+        let cols: &[usize] = if self.focus.is_alloc() {
+            &ALLOC_FILTERABLE_COLS
+        } else {
+            &AVAIL_FILTERABLE_COLS
+        };
+        self.display_columns()
+            .iter()
+            .copied()
+            .filter(|col| cols.contains(col) && self.column_visible(*col))
+            .collect()
     }
 
     pub fn column_visibility_key(&self, col: usize) -> usize {
-        if self.focus.is_alloc() { col } else { avail_visibility_key(col) }
+        if self.focus.is_alloc() {
+            col
+        } else {
+            avail_visibility_key(col)
+        }
     }
 
     pub fn alloc_column_visible(&self, col: usize) -> bool {
@@ -1194,26 +1536,58 @@ impl Model {
     }
 
     pub fn column_visible(&self, col: usize) -> bool {
-        if self.focus.is_alloc() { self.alloc_column_visible(col) } else { self.avail_column_visible(col) }
+        if self.focus.is_alloc() {
+            self.alloc_column_visible(col)
+        } else {
+            self.avail_column_visible(col)
+        }
     }
 
-    pub fn alloc_display_columns(&self) -> &[usize] { if self.alloc_column_order.is_empty() { ALLOC_DISPLAY_COLS } else { &self.alloc_column_order } }
-    pub fn avail_display_columns(&self) -> &[usize] { if self.avail_column_order.is_empty() { AVAIL_DISPLAY_COLS } else { &self.avail_column_order } }
-    pub fn display_columns(&self) -> &[usize] { if self.focus.is_alloc() { self.alloc_display_columns() } else { self.avail_display_columns() } }
+    pub fn alloc_display_columns(&self) -> &[usize] {
+        if self.alloc_column_order.is_empty() {
+            ALLOC_DISPLAY_COLS
+        } else {
+            &self.alloc_column_order
+        }
+    }
+    pub fn avail_display_columns(&self) -> &[usize] {
+        if self.avail_column_order.is_empty() {
+            AVAIL_DISPLAY_COLS
+        } else {
+            &self.avail_column_order
+        }
+    }
+    pub fn display_columns(&self) -> &[usize] {
+        if self.focus.is_alloc() {
+            self.alloc_display_columns()
+        } else {
+            self.avail_display_columns()
+        }
+    }
     fn column_children(&self, col: usize) -> usize {
-        if col == 10 { 3 } else if col == if self.focus.is_alloc() { 16 } else { 11 } { 2 } else { 0 }
+        if col == 10 {
+            3
+        } else if col == if self.focus.is_alloc() { 16 } else { 11 } {
+            2
+        } else {
+            0
+        }
     }
     fn picker_column(&self, index: usize) -> Option<(usize, usize)> {
         let mut row = 0;
         for &col in self.display_columns() {
             let count = 1 + self.column_children(col);
-            if index < row + count { return Some((col, index - row)); }
+            if index < row + count {
+                return Some((col, index - row));
+            }
             row += count;
         }
         None
     }
     pub fn visibility_column_index(&self, index: usize) -> Option<usize> {
-        self.picker_column(index).filter(|(_, child)| *child == 0).map(|(col, _)| col)
+        self.picker_column(index)
+            .filter(|(_, child)| *child == 0)
+            .map(|(col, _)| col)
     }
     /// The top-header picker row `index` as its KPI and child number; child 0
     /// is the KPI itself.
@@ -1221,50 +1595,93 @@ impl Model {
         let mut row = 0;
         for &name in TOP_KPI_NAMES {
             let children = top_kpi_children(name).len();
-            if index <= row + children { return Some((name, index - row)); }
+            if index <= row + children {
+                return Some((name, index - row));
+            }
             row += children + 1;
         }
         None
     }
     /// The Global KPI field at top-header picker row `index`.
     pub fn visibility_global_field(&self, section: usize, index: usize) -> Option<usize> {
-        match Self::top_picker_item(index) { Some(("Global", child)) if section == 1 && child > 0 => Some(child - 1), _ => None }
+        match Self::top_picker_item(index) {
+            Some(("Global", child)) if section == 1 && child > 0 => Some(child - 1),
+            _ => None,
+        }
     }
-    pub fn visibility_interval_window(&self, section: usize, index: usize) -> Option<(bool, usize)> {
+    pub fn visibility_interval_window(
+        &self,
+        section: usize,
+        index: usize,
+    ) -> Option<(bool, usize)> {
         if section == 1 {
-            return match Self::top_picker_item(index) { Some(("Global interval", child)) if child > 0 => Some((true, child - 1)), _ => None };
+            return match Self::top_picker_item(index) {
+                Some(("Global interval", child)) if child > 0 => Some((true, child - 1)),
+                _ => None,
+            };
         }
         if section == 0 {
             let (col, child) = self.picker_column(index)?;
-            if col == (if self.focus.is_alloc() { 16 } else { 11 }) && child > 0 { return Some((false, child - 1)); }
+            if col == (if self.focus.is_alloc() { 16 } else { 11 }) && child > 0 {
+                return Some((false, child - 1));
+            }
         }
         None
     }
     pub fn visibility_reward_window(&self, section: usize, index: usize) -> Option<usize> {
         if section == 0 {
             let (col, child) = self.picker_column(index)?;
-            if col == 10 && child > 0 { return Some(child - 1); }
-        } else if section == 2 && (4..7).contains(&index) { return Some(index - 4); }
+            if col == 10 && child > 0 {
+                return Some(child - 1);
+            }
+        } else if section == 2 && (4..7).contains(&index) {
+            return Some(index - 4);
+        }
         None
     }
     pub fn move_picker_column(&mut self, up: bool) {
-        let Some((col, child)) = self.picker_column(self.column_picker_cursor) else { return; };
+        let Some((col, child)) = self.picker_column(self.column_picker_cursor) else {
+            return;
+        };
         let mut order = self.display_columns().to_vec();
-        let Some(pos) = order.iter().position(|&c| c == col) else { return; };
+        let Some(pos) = order.iter().position(|&c| c == col) else {
+            return;
+        };
         let next = if up { pos.saturating_sub(1) } else { pos + 1 };
-        if pos < 2 || next < 2 || next >= order.len() { return; }
+        if pos < 2 || next < 2 || next >= order.len() {
+            return;
+        }
         order.swap(pos, next);
-        self.column_picker_cursor = order[..next].iter().map(|&c| 1 + self.column_children(c)).sum::<usize>() + child;
-        if self.focus.is_alloc() { self.alloc_column_order = order; } else { self.avail_column_order = order; }
-        self.column_picker_offset = 0; self.horizontal_offsets[usize::from(!self.focus.is_alloc())] = 0;
+        self.column_picker_cursor = order[..next]
+            .iter()
+            .map(|&c| 1 + self.column_children(c))
+            .sum::<usize>()
+            + child;
+        if self.focus.is_alloc() {
+            self.alloc_column_order = order;
+        } else {
+            self.avail_column_order = order;
+        }
+        self.column_picker_offset = 0;
+        self.horizontal_offsets[usize::from(!self.focus.is_alloc())] = 0;
     }
     pub fn reset_picker_column_order(&mut self) {
-        if self.focus.is_alloc() { self.alloc_column_order = ALLOC_DISPLAY_COLS.to_vec(); } else { self.avail_column_order = AVAIL_DISPLAY_COLS.to_vec(); }
-        self.column_picker_cursor = 2; self.column_picker_offset = 0; self.horizontal_offsets[usize::from(!self.focus.is_alloc())] = 0;
+        if self.focus.is_alloc() {
+            self.alloc_column_order = ALLOC_DISPLAY_COLS.to_vec();
+        } else {
+            self.avail_column_order = AVAIL_DISPLAY_COLS.to_vec();
+        }
+        self.column_picker_cursor = 2;
+        self.column_picker_offset = 0;
+        self.horizontal_offsets[usize::from(!self.focus.is_alloc())] = 0;
     }
 
     pub fn active_visible_columns(&self) -> Vec<usize> {
-        self.display_columns().iter().copied().filter(|&col| self.column_visible(col)).collect()
+        self.display_columns()
+            .iter()
+            .copied()
+            .filter(|&col| self.column_visible(col))
+            .collect()
     }
 
     pub fn is_filter_mode_active(&self) -> bool {
@@ -1349,17 +1766,56 @@ impl Model {
         vals
     }
 
-    pub fn visibility_names(&self) -> Vec<&'static str> { self.visibility_names_for(self.visibility_section) }
+    pub fn visibility_names(&self) -> Vec<&'static str> {
+        self.visibility_names_for(self.visibility_section)
+    }
     pub fn visibility_names_for(&self, section: usize) -> Vec<&'static str> {
         match section {
             4 => NOTICE_KPI_NAMES.to_vec(),
             3 => AVAIL_KPI_NAMES.to_vec(),
-            1 => TOP_KPI_NAMES.iter().flat_map(|&name| std::iter::once(name).chain(top_kpi_children(name).iter().copied())).collect(),
-            2 => ALLOC_KPI_NAMES.iter().flat_map(|&name| if name == "Reward" { std::iter::once(name).chain(REWARD_ESTIMATE_NAMES.iter().copied()).collect::<Vec<_>>() } else { vec![name] }).collect(),
+            1 => TOP_KPI_NAMES
+                .iter()
+                .flat_map(|&name| {
+                    std::iter::once(name).chain(top_kpi_children(name).iter().copied())
+                })
+                .collect(),
+            2 => ALLOC_KPI_NAMES
+                .iter()
+                .flat_map(|&name| {
+                    if name == "Reward" {
+                        std::iter::once(name)
+                            .chain(REWARD_ESTIMATE_NAMES.iter().copied())
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![name]
+                    }
+                })
+                .collect(),
             _ => {
-                let names = if self.focus.is_alloc() { &ALLOC_COL_NAMES[..] } else { &AVAIL_COL_NAMES[..] };
+                let names = if self.focus.is_alloc() {
+                    &ALLOC_COL_NAMES[..]
+                } else {
+                    &AVAIL_COL_NAMES[..]
+                };
                 let interval = if self.focus.is_alloc() { 16 } else { 11 };
-                self.display_columns().iter().flat_map(|&col| if col == interval { vec![names[col], INTERVAL_WINDOW_NAMES[0], INTERVAL_WINDOW_NAMES[1]] } else if col == 10 { std::iter::once(names[col]).chain(REWARD_ESTIMATE_NAMES.iter().copied()).collect() } else { vec![names[col]] }).collect()
+                self.display_columns()
+                    .iter()
+                    .flat_map(|&col| {
+                        if col == interval {
+                            vec![
+                                names[col],
+                                INTERVAL_WINDOW_NAMES[0],
+                                INTERVAL_WINDOW_NAMES[1],
+                            ]
+                        } else if col == 10 {
+                            std::iter::once(names[col])
+                                .chain(REWARD_ESTIMATE_NAMES.iter().copied())
+                                .collect()
+                        } else {
+                            vec![names[col]]
+                        }
+                    })
+                    .collect()
             }
         }
     }
@@ -1369,14 +1825,26 @@ impl Model {
     }
 
     pub fn visibility_item_visible_in(&self, section: usize, index: usize) -> bool {
-        if let Some((global, window)) = self.visibility_interval_window(section, index) { (if global { self.global_interval_mask() } else { self.interval_mask() }) & (1 << window) != 0 }
-        else if let Some(field) = self.visibility_global_field(section, index) { self.global_field_mask() & (1 << field) != 0 }
-        else if let Some(window) = self.visibility_reward_window(section, index) { self.reward_mask() & (1 << window) != 0 }
-        else if section == 0 { self.visibility_column_index(index).is_some_and(|col| self.column_visible(col)) }
-        else { self.visibility_names_for(section).get(index).is_some_and(|name| self.header_kpi_visible(name)) }
+        if let Some((global, window)) = self.visibility_interval_window(section, index) {
+            (if global {
+                self.global_interval_mask()
+            } else {
+                self.interval_mask()
+            }) & (1 << window)
+                != 0
+        } else if let Some(field) = self.visibility_global_field(section, index) {
+            self.global_field_mask() & (1 << field) != 0
+        } else if let Some(window) = self.visibility_reward_window(section, index) {
+            self.reward_mask() & (1 << window) != 0
+        } else if section == 0 {
+            self.visibility_column_index(index)
+                .is_some_and(|col| self.column_visible(col))
+        } else {
+            self.visibility_names_for(section)
+                .get(index)
+                .is_some_and(|name| self.header_kpi_visible(name))
+        }
     }
-
-
 }
 
 /// The picker sub-items nested beneath a top-header KPI.
@@ -1391,20 +1859,48 @@ fn top_kpi_children(name: &str) -> &'static [&'static str] {
 // ── Row value accessors (for filtering + sorting) ────────────────────────
 
 pub fn alloc_row_numeric_val(m: &Model, row: &AllocationRow, col: usize) -> f64 {
-    if !row.shard_info_known && matches!(col, 2..=5 | 7 | 10) { return f64::NAN; }
+    if !row.shard_info_known && matches!(col, 2..=5 | 7 | 10) {
+        return f64::NAN;
+    }
     match col {
         2 => row.active_provers as f64,
-        3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
+        3 => {
+            if row.ring == UNKNOWN_REWARD_RING {
+                f64::NAN
+            } else {
+                row.ring as f64
+            }
+        }
         4 => bigint_to_f64(&row.shard_size) / 1_000_000_000.0,
         5 => row.data_shards as f64,
-        6 => row.execution.as_ref().and_then(|s| s.materialized_frame).map_or(f64::NAN, |h| h as f64),
-        7 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.latest_frame as f64 },
-        8 => row.global_head.as_ref().map_or(f64::NAN, |h| h.frame as f64),
+        6 => row
+            .execution
+            .as_ref()
+            .and_then(|s| s.materialized_frame)
+            .map_or(f64::NAN, |h| h as f64),
+        7 => {
+            if row.materialized_frame == 0 && row.latest_frame == 0 {
+                f64::NAN
+            } else {
+                row.latest_frame as f64
+            }
+        }
+        8 => row
+            .global_head
+            .as_ref()
+            .map_or(f64::NAN, |h| h.frame as f64),
         10 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else {
-                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64)
+                m.daily_reward(
+                    &row.estimated_reward,
+                    &row.filter,
+                    m.reward_mask().trailing_zeros() as usize,
+                )
+                .map_or(f64::NAN, |v| {
+                    bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64
+                })
             }
         }
         11 => row.worker_id as f64,
@@ -1426,17 +1922,45 @@ pub fn alloc_row_text_val(m: &Model, row: &AllocationRow, col: usize) -> String 
 pub fn avail_row_numeric_val(m: &Model, row: &ShardRow, col: usize) -> f64 {
     match col {
         2 => row.active_provers as f64,
-        3 => if row.ring == UNKNOWN_REWARD_RING { f64::NAN } else { row.ring as f64 },
+        3 => {
+            if row.ring == UNKNOWN_REWARD_RING {
+                f64::NAN
+            } else {
+                row.ring as f64
+            }
+        }
         4 => bigint_to_f64(&row.shard_size) / 1_000_000_000.0,
         5 => row.data_shards as f64,
-        6 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.materialized_frame as f64 },
-        7 => if row.materialized_frame == 0 && row.latest_frame == 0 { f64::NAN } else { row.latest_frame as f64 },
-        8 => row.global_head.as_ref().map_or(f64::NAN, |h| h.frame as f64),
+        6 => {
+            if row.materialized_frame == 0 && row.latest_frame == 0 {
+                f64::NAN
+            } else {
+                row.materialized_frame as f64
+            }
+        }
+        7 => {
+            if row.materialized_frame == 0 && row.latest_frame == 0 {
+                f64::NAN
+            } else {
+                row.latest_frame as f64
+            }
+        }
+        8 => row
+            .global_head
+            .as_ref()
+            .map_or(f64::NAN, |h| h.frame as f64),
         10 => {
             if row.ring == UNKNOWN_REWARD_RING {
                 f64::NAN
             } else {
-                m.daily_reward(&row.estimated_reward, &row.filter, m.reward_mask().trailing_zeros() as usize).map_or(f64::NAN, |v| bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64)
+                m.daily_reward(
+                    &row.estimated_reward,
+                    &row.filter,
+                    m.reward_mask().trailing_zeros() as usize,
+                )
+                .map_or(f64::NAN, |v| {
+                    bigint_to_f64(&v) / crate::util::UNITS_PER_QUIL as f64
+                })
             }
         }
         11 => m.app_interval(&row.filter).unwrap_or(f64::NAN),
@@ -1448,12 +1972,19 @@ pub fn avail_row_numeric_val(m: &Model, row: &ShardRow, col: usize) -> f64 {
 pub const UNKNOWN_REWARD_RING: u32 = u32::MAX;
 
 pub fn reward_ring(info: &quil_types::proto::node::ShardRewardInfo) -> u32 {
-    if info.ring_known == Some(false) { UNKNOWN_REWARD_RING } else { info.ring }
+    if info.ring_known == Some(false) {
+        UNKNOWN_REWARD_RING
+    } else {
+        info.ring
+    }
 }
 
 pub fn materialization_state(materialized: u64, latest: u64) -> &'static str {
     match (materialized, latest) {
-        (_, 0) => "unknown", (0, _) => "unmat", (mat, head) if mat >= head => "current", _ => "lag",
+        (_, 0) => "unknown",
+        (0, _) => "unmat",
+        (mat, head) if mat >= head => "current",
+        _ => "lag",
     }
 }
 
@@ -1477,7 +2008,9 @@ pub fn serving_after_boundary(counts: &ShardProverCounts) -> u32 {
 /// [`HALT_RISK_PROVER_COUNT`] of its provers are active or activating.
 /// Unreported counts establish nothing.
 pub fn prover_halt_risk(counts: Option<&ShardProverCounts>, size: &BigInt) -> bool {
-    counts.is_some_and(|c| size.sign() == Sign::Plus && serving_after_boundary(c) <= HALT_RISK_PROVER_COUNT)
+    counts.is_some_and(|c| {
+        size.sign() == Sign::Plus && serving_after_boundary(c) <= HALT_RISK_PROVER_COUNT
+    })
 }
 
 /// ProverPhases sorts by the provers serving after the next boundary, then
@@ -1510,7 +2043,10 @@ mod readability_tests {
         let eff = compute_effective_status(&t, current_frame, EL);
         let next_boundary = (current_frame / EL + 1) * EL;
         let (n, d) = action_hints(&t, eff, EL, current_frame, next_boundary);
-        let clock = ThresholdClock { frame: current_frame, seconds_per_frame: None };
+        let clock = ThresholdClock {
+            frame: current_frame,
+            seconds_per_frame: None,
+        };
         (n.render(unit, clock), d.render(unit, clock))
     }
 
@@ -1550,7 +2086,10 @@ mod readability_tests {
         );
         // An unbounded hint is unit-independent.
         let free = ActionHint::text("(pause|leave)");
-        let clock = ThresholdClock { frame: 1117 * EL, seconds_per_frame: Some(10.0) };
+        let clock = ThresholdClock {
+            frame: 1117 * EL,
+            seconds_per_frame: Some(10.0),
+        };
         assert_eq!(free.render(ThresholdUnit::Relative, clock), "(pause|leave)");
         assert_eq!(free.render(ThresholdUnit::Absolute, clock), "(pause|leave)");
     }
@@ -1652,53 +2191,105 @@ mod tests {
 
     #[test]
     fn reported_heads_track_individual_shards_and_ignore_unknown_or_unstaffed_rows() {
-        use std::time::{Duration, Instant};
         use quil_types::proto::node::ShardRewardInfo;
+        use std::time::{Duration, Instant};
         let start = Instant::now();
         let mut m = Model::new();
-        let mut shards = GetShardInfoResponse { shards: vec![
-            ShardRewardInfo { filter: vec![1], active_provers: 1, latest_frame: 10, ..Default::default() },
-            ShardRewardInfo { filter: vec![2], active_provers: 1, latest_frame: 20, ..Default::default() },
-            ShardRewardInfo { filter: vec![3], active_provers: 1, ..Default::default() },
-            ShardRewardInfo { filter: vec![4], latest_frame: 30, ..Default::default() },
-        ], ..Default::default() };
+        let mut shards = GetShardInfoResponse {
+            shards: vec![
+                ShardRewardInfo {
+                    filter: vec![1],
+                    active_provers: 1,
+                    latest_frame: 10,
+                    ..Default::default()
+                },
+                ShardRewardInfo {
+                    filter: vec![2],
+                    active_provers: 1,
+                    latest_frame: 20,
+                    ..Default::default()
+                },
+                ShardRewardInfo {
+                    filter: vec![3],
+                    active_provers: 1,
+                    ..Default::default()
+                },
+                ShardRewardInfo {
+                    filter: vec![4],
+                    latest_frame: 30,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
         for secs in [0, 30, 60] {
             shards.shards[1].latest_frame += 1;
             m.observe_reported_app_heads(&shards, start + Duration::from_secs(secs));
         }
         assert_eq!(m.reported_app_progress.len(), 2);
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(60)), Some((1, 2)));
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(60)),
+            Some((1, 2))
+        );
         // Row filtering and cache-backed local-status refreshes do not affect tracking.
-        m.allocations.clear(); m.available.clear();
+        m.allocations.clear();
+        m.available.clear();
         m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
         assert_eq!(m.reported_app_progress[&vec![1]].observations, 3);
         m.refresh_seconds = 60;
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), Some((1, 2)));
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(61)),
+            Some((1, 2))
+        );
         shards.shards[0].latest_frame += 1;
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(62));
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(62)), None);
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(62)),
+            None
+        );
     }
 
     #[test]
     fn reported_heads_require_fresh_confirmations_and_reset_on_missing_data_or_generation() {
-        use std::time::{Duration, Instant};
         use quil_types::proto::node::{GlobalAppFrameHead, ShardRewardInfo};
-        let start = Instant::now(); let mut m = Model::new();
-        let mut shards = GetShardInfoResponse { shards: vec![ShardRewardInfo {
-            filter: vec![1], active_provers: 1, latest_frame: 10,
-            global_head: Some(GlobalAppFrameHead { generation: 1, ..Default::default() }),
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut m = Model::new();
+        let mut shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 1,
+                latest_frame: 10,
+                global_head: Some(GlobalAppFrameHead {
+                    generation: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
             ..Default::default()
-        }], ..Default::default() };
+        };
         m.observe_reported_app_heads(&shards, start);
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(60));
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(60)), None);
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(60)),
+            None
+        );
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(61));
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), Some((1, 1)));
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(61)),
+            Some((1, 1))
+        );
         m.shard_error = Some("fetch failed".into());
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(61)), None);
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(61)),
+            None
+        );
         m.shard_error = None;
-        assert_eq!(m.reported_app_stall_counts(start + Duration::from_secs(122)), None);
+        assert_eq!(
+            m.reported_app_stall_counts(start + Duration::from_secs(122)),
+            None
+        );
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(122));
         assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
         assert!(!m.reported_app_progress[&vec![1]].stalled);
@@ -1708,7 +2299,10 @@ mod tests {
         shards.shards[0].latest_frame = 9;
         m.observe_reported_app_heads(&shards, start + Duration::from_secs(124));
         assert_eq!(m.reported_app_progress[&vec![1]].observations, 1);
-        m.observe_reported_app_heads(&GetShardInfoResponse::default(), start + Duration::from_secs(125));
+        m.observe_reported_app_heads(
+            &GetShardInfoResponse::default(),
+            start + Duration::from_secs(125),
+        );
         assert!(m.reported_app_progress.is_empty());
     }
     use super::*;
@@ -1750,22 +2344,55 @@ mod tests {
     #[test]
     fn prover_phase_counts_reach_allocation_and_available_rows() {
         use quil_types::proto::node::{ShardProverCounts, ShardRewardInfo};
-        let counts = ShardProverCounts { joining: 3, activating: 1, active: 12, paused: 0, leaving: 2, departing: 1 };
+        let counts = ShardProverCounts {
+            joining: 3,
+            activating: 1,
+            active: 12,
+            paused: 0,
+            leaving: 2,
+            departing: 1,
+        };
         let mut shards = shard_info(vec![0xab], 1);
         shards.shards[0].prover_counts = Some(counts.clone());
-        shards.shards.push(ShardRewardInfo { ring_known: Some(true), filter: vec![0xcd], prover_counts: Some(counts.clone()), ..Default::default() });
+        shards.shards.push(ShardRewardInfo {
+            ring_known: Some(true),
+            filter: vec![0xcd],
+            prover_counts: Some(counts.clone()),
+            ..Default::default()
+        });
         // An older server leaves the counts absent.
-        shards.shards.push(ShardRewardInfo { ring_known: Some(true), filter: vec![0xef], active_provers: 4, ..Default::default() });
+        shards.shards.push(ShardRewardInfo {
+            ring_known: Some(true),
+            filter: vec![0xef],
+            active_provers: 4,
+            ..Default::default()
+        });
         let mut model = Model::new();
-        model.process_refresh_data(Some(node_info(allocation(vec![0xab], 3))), Some(shards), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0xab], 3))),
+            Some(shards),
+            None,
+        );
         assert_eq!(model.allocations.len(), 1);
         assert_eq!(model.allocations[0].prover_counts, Some(counts.clone()));
-        let available = |filter: u8| model.available.iter().find(|row| row.filter == vec![filter]).unwrap().prover_counts.clone();
+        let available = |filter: u8| {
+            model
+                .available
+                .iter()
+                .find(|row| row.filter == vec![filter])
+                .unwrap()
+                .prover_counts
+                .clone()
+        };
         assert_eq!(available(0xcd), Some(counts));
         assert_eq!(available(0xef), None, "absent counts are not zero counts");
         // An allocation without a shard-info row has none either.
         let mut model = Model::new();
-        model.process_refresh_data(Some(node_info(allocation(vec![0x01], 3))), Some(GetShardInfoResponse::default()), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(vec![0x01], 3))),
+            Some(GetShardInfoResponse::default()),
+            None,
+        );
         assert_eq!(model.allocations[0].prover_counts, None);
     }
 
@@ -1773,18 +2400,43 @@ mod tests {
     fn absent_shard_metadata_does_not_match_measured_zero_filters() {
         let filter = vec![0xab];
         let mut model = Model::new();
-        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
-            Some(GetShardInfoResponse::default()), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(GetShardInfoResponse::default()),
+            None,
+        );
         assert!(!model.allocations[0].shard_info_known);
         for col in [2, 3, 4, 5, 6, 7, 10] {
             assert!(!super::super::filter::matches_numeric_expr(
-                alloc_row_numeric_val(&Model { reward_windows: 4, ..Model::new() }, &model.allocations[0], col), "=0"));
+                alloc_row_numeric_val(
+                    &Model {
+                        reward_windows: 4,
+                        ..Model::new()
+                    },
+                    &model.allocations[0],
+                    col
+                ),
+                "=0"
+            ));
         }
-        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))),
-            Some(shard_info(filter, 0)), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(shard_info(filter, 0)),
+            None,
+        );
         assert!(model.allocations[0].shard_info_known);
         for col in [2, 3, 4, 5, 10] {
-            assert_eq!(alloc_row_numeric_val(&Model { reward_windows: 4, ..Model::new() }, &model.allocations[0], col), 0.0);
+            assert_eq!(
+                alloc_row_numeric_val(
+                    &Model {
+                        reward_windows: 4,
+                        ..Model::new()
+                    },
+                    &model.allocations[0],
+                    col
+                ),
+                0.0
+            );
         }
     }
 
@@ -1794,28 +2446,73 @@ mod tests {
         let mut model = Model::new();
         let mut info = shard_info(filter.clone(), 0);
         info.shards[0].ring_known = Some(false);
-        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(info.clone()),
+            None,
+        );
         assert_eq!(model.allocations[0].ring, UNKNOWN_REWARD_RING);
         for col in [3, 6, 7, 10] {
-            assert!(!super::super::filter::matches_numeric_expr(alloc_row_numeric_val(&Model { reward_windows: 4, ..Model::new() }, &model.allocations[0], col), "=0"));
+            assert!(!super::super::filter::matches_numeric_expr(
+                alloc_row_numeric_val(
+                    &Model {
+                        reward_windows: 4,
+                        ..Model::new()
+                    },
+                    &model.allocations[0],
+                    col
+                ),
+                "=0"
+            ));
         }
         info.shards[0].ring_known = Some(true);
         info.shards[0].latest_frame = 20;
-        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info.clone()), None);
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(info.clone()),
+            None,
+        );
         assert_eq!(model.allocations[0].ring, 0);
-        assert_eq!(alloc_row_numeric_val(&Model { reward_windows: 4, ..Model::new() }, &model.allocations[0], 3), 0.0);
-        assert_eq!(alloc_row_numeric_val(&Model { reward_windows: 4, ..Model::new() }, &model.allocations[0], 10), 0.0);
+        assert_eq!(
+            alloc_row_numeric_val(
+                &Model {
+                    reward_windows: 4,
+                    ..Model::new()
+                },
+                &model.allocations[0],
+                3
+            ),
+            0.0
+        );
+        assert_eq!(
+            alloc_row_numeric_val(
+                &Model {
+                    reward_windows: 4,
+                    ..Model::new()
+                },
+                &model.allocations[0],
+                10
+            ),
+            0.0
+        );
         assert_eq!(materialization_state(0, 20), "unmat");
         info.shards[0].ring_known = None;
         info.shards[0].ring = 2;
-        model.process_refresh_data(Some(node_info(allocation(filter.clone(), 3))), Some(info), None);
-        assert_eq!(model.allocations[0].ring, 2, "older servers remain compatible");
+        model.process_refresh_data(
+            Some(node_info(allocation(filter.clone(), 3))),
+            Some(info),
+            None,
+        );
+        assert_eq!(
+            model.allocations[0].ring, 2,
+            "older servers remain compatible"
+        );
         assert_eq!(materialization_state(10, 0), "unknown");
     }
 
     #[test]
     fn refresh_keeps_bound_workers_without_live_allocations_visible() {
-        use quil_types::proto::node::{WorkerInfo, WorkerExecution};
+        use quil_types::proto::node::{WorkerExecution, WorkerInfo};
         let parent = vec![0xaa];
         let child = vec![0xbb];
         let unassigned = vec![0xcc];
@@ -1824,32 +2521,90 @@ mod tests {
         let mut node = node_info(allocation(child.clone(), 3));
         node.running_workers = 3;
         node.allocated_workers = 2;
-        node.shard_allocations.extend([allocation(unassigned.clone(), 3), retired]);
-        let mut workers = WorkerInfoResponse { worker_info: vec![
-            WorkerInfo { core_id: 6, filter: parent.clone(), manually_managed: true,
-                execution: Some(WorkerExecution { state: "blocked".into(),
-                    blocker: "closing session".into(), materialized_frame: Some(12), ..Default::default() }),
-                ..Default::default() },
-            WorkerInfo { core_id: 7, filter: child.clone(), ..Default::default() },
-            WorkerInfo { core_id: 8, ..Default::default() },
-        ] };
+        node.shard_allocations
+            .extend([allocation(unassigned.clone(), 3), retired]);
+        let mut workers = WorkerInfoResponse {
+            worker_info: vec![
+                WorkerInfo {
+                    core_id: 6,
+                    filter: parent.clone(),
+                    manually_managed: true,
+                    execution: Some(WorkerExecution {
+                        state: "blocked".into(),
+                        blocker: "closing session".into(),
+                        materialized_frame: Some(12),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                WorkerInfo {
+                    core_id: 7,
+                    filter: child.clone(),
+                    ..Default::default()
+                },
+                WorkerInfo {
+                    core_id: 8,
+                    ..Default::default()
+                },
+            ],
+        };
         let mut model = Model::new();
-        model.process_refresh_data(Some(node.clone()), Some(shard_info(parent.clone(), 42)), Some(workers.clone()));
-        assert_eq!(model.allocations.len(), 4, "three workers and one unassigned live allocation");
+        model.process_refresh_data(
+            Some(node.clone()),
+            Some(shard_info(parent.clone(), 42)),
+            Some(workers.clone()),
+        );
+        assert_eq!(
+            model.allocations.len(),
+            4,
+            "three workers and one unassigned live allocation"
+        );
         for id in [6, 7, 8] {
-            assert_eq!(model.allocations.iter().filter(|a| a.worker_id == id).count(), 1);
+            assert_eq!(
+                model
+                    .allocations
+                    .iter()
+                    .filter(|a| a.worker_id == id)
+                    .count(),
+                1
+            );
         }
         let bound = model.allocations.iter().find(|a| a.worker_id == 6).unwrap();
         assert_eq!(bound.status_name, "bound");
-        assert_eq!(bound.status, 0, "worker rows cannot submit allocation actions");
+        assert_eq!(
+            bound.status, 0,
+            "worker rows cannot submit allocation actions"
+        );
         assert_eq!(bound.filter, parent);
         assert!(bound.manually_managed);
-        assert_eq!(bound.execution.as_ref().unwrap().materialized_frame, Some(12));
+        assert_eq!(
+            bound.execution.as_ref().unwrap().materialized_frame,
+            Some(12)
+        );
         assert_eq!(bound.execution.as_ref().unwrap().blocker, "closing session");
-        assert!(!bound.shard_info_known, "a retired filter estimate is not a live worker reward");
+        assert!(
+            !bound.shard_info_known,
+            "a retired filter estimate is not a live worker reward"
+        );
         assert_eq!(bound.reward_status(2160, 720), None);
-        assert_eq!(model.allocations.iter().find(|a| a.worker_id == 8).unwrap().status_name, "idle");
-        assert_eq!(model.allocations.iter().find(|a| a.filter == unassigned).unwrap().worker_id, -1);
+        assert_eq!(
+            model
+                .allocations
+                .iter()
+                .find(|a| a.worker_id == 8)
+                .unwrap()
+                .status_name,
+            "idle"
+        );
+        assert_eq!(
+            model
+                .allocations
+                .iter()
+                .find(|a| a.filter == unassigned)
+                .unwrap()
+                .worker_id,
+            -1
+        );
         // Once reconciliation binds the workers, their synthetic rows disappear.
         workers.worker_info[0].filter = child;
         workers.worker_info[1].filter = unassigned;
@@ -1903,12 +2658,11 @@ mod tests {
         assert_eq!(unassigned.allocations[0].estimated_reward, BigInt::from(42));
         assert_eq!(unassigned.allocations[0].reward_status(2160, 720), None);
         assert_eq!(expired_epoch.allocations[0].reward_status(2160, 720), None);
-        assert_eq!(active.allocations[0].reward_status(2160, 720), Some(EffectiveStatus::Active));
+        assert_eq!(
+            active.allocations[0].reward_status(2160, 720),
+            Some(EffectiveStatus::Active)
+        );
     }
-
-
-
-
 
     #[test]
     fn joining_allocations_show_projected_rewards_before_worker_assignment() {
@@ -1939,7 +2693,10 @@ mod tests {
                 );
                 assert_eq!(model.allocations[0].status_name, label);
                 assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
-                assert_eq!(model.allocations[0].reward_status(2160, 720), assigned.then_some(EffectiveStatus::Joining));
+                assert_eq!(
+                    model.allocations[0].reward_status(2160, 720),
+                    assigned.then_some(EffectiveStatus::Joining)
+                );
                 // Expired joins lose their forecast, but their bound worker stays visible.
                 model.process_refresh_data(
                     Some(node_info({
@@ -2000,11 +2757,15 @@ mod tests {
             assert_eq!(row.status_name, label);
             assert_eq!(row.worker_id, 0);
             assert_eq!(row.estimated_reward, BigInt::from(42), "{label}");
-            assert_eq!(row.reward_status(2160, 720), match status {
-                raw_status::PAUSED => Some(EffectiveStatus::Paused),
-                raw_status::LEAVING => Some(EffectiveStatus::Leaving),
-                _ => None,
-            }, "{label}");
+            assert_eq!(
+                row.reward_status(2160, 720),
+                match status {
+                    raw_status::PAUSED => Some(EffectiveStatus::Paused),
+                    raw_status::LEAVING => Some(EffectiveStatus::Leaving),
+                    _ => None,
+                },
+                "{label}"
+            );
             assert_eq!(row.ring, 7);
             assert_eq!(row.active_provers, 9);
             assert_eq!(row.shard_size, BigInt::from(64));
@@ -2038,7 +2799,9 @@ mod tests {
         model.process_refresh_data(
             Some(node_info(allocation(filter.clone(), 3))),
             None,
-            Some(WorkerInfoResponse { worker_info: vec![] }),
+            Some(WorkerInfoResponse {
+                worker_info: vec![],
+            }),
         );
         assert_eq!(model.allocations[0].worker_id, -1);
         assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
@@ -2052,45 +2815,74 @@ mod tests {
         assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
 
         // Cached row estimates must not contribute after expiry.
-        model.process_refresh_data(
-            Some(node_info(allocation(filter, 2))),
-            None,
-            None,
-        );
+        model.process_refresh_data(Some(node_info(allocation(filter, 2))), None, None);
         assert_eq!(model.allocations[0].status_name, "re-confirm!");
         assert_eq!(model.allocations[0].estimated_reward, BigInt::from(42));
         assert_eq!(model.allocations[0].reward_status(2160, 720), None);
     }
-
 }
 
 #[cfg(test)]
 mod execution_freshness_tests {
     use super::*;
-    use std::time::{Duration, Instant};
     use quil_types::proto::node::WorkerExecution;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn all_poll_options_preserve_fresh_received_state_and_bound_cached_data() {
         let received = Instant::now();
-        let fresh = WorkerExecution { state: "blocked".into(), observed_unix_ms: 99_000, ..Default::default() };
-        let old = WorkerExecution { state: "running".into(), observed_unix_ms: 69_999, ..Default::default() };
+        let fresh = WorkerExecution {
+            state: "blocked".into(),
+            observed_unix_ms: 99_000,
+            ..Default::default()
+        };
+        let old = WorkerExecution {
+            state: "running".into(),
+            observed_unix_ms: 69_999,
+            ..Default::default()
+        };
         for seconds in [5, 15, 30, 60] {
-            let mut m = Model::new(); m.refresh_seconds = seconds;
+            let mut m = Model::new();
+            m.refresh_seconds = seconds;
             m.worker_snapshot_received = Some((received, 100_000));
-            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds + 15)), "blocked");
-            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds * 2 + 30)), "blocked");
-            assert_eq!(m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds * 2 + 31)), "cached");
+            assert_eq!(
+                m.execution_state_at(Some(&fresh), received + Duration::from_secs(seconds + 15)),
+                "blocked"
+            );
+            assert_eq!(
+                m.execution_state_at(
+                    Some(&fresh),
+                    received + Duration::from_secs(seconds * 2 + 30)
+                ),
+                "blocked"
+            );
+            assert_eq!(
+                m.execution_state_at(
+                    Some(&fresh),
+                    received + Duration::from_secs(seconds * 2 + 31)
+                ),
+                "cached"
+            );
             assert_eq!(m.execution_state_at(Some(&old), received), "stale");
-            assert_eq!(m.execution_state_at(Some(&WorkerExecution::default()), received), "stale");
-            assert_eq!(m.execution_state_at(None, received + Duration::from_secs(500)), "unknown");
+            assert_eq!(
+                m.execution_state_at(Some(&WorkerExecution::default()), received),
+                "stale"
+            );
+            assert_eq!(
+                m.execution_state_at(None, received + Duration::from_secs(500)),
+                "unknown"
+            );
         }
     }
 
     #[test]
     fn cache_reuse_does_not_renew_worker_receipt_clock() {
         let mut m = Model::new();
-        m.process_refresh_data(Some(NodeInfoResponse::default()), None, Some(WorkerInfoResponse::default()));
+        m.process_refresh_data(
+            Some(NodeInfoResponse::default()),
+            None,
+            Some(WorkerInfoResponse::default()),
+        );
         let clock = m.worker_snapshot_received.unwrap();
         m.process_refresh_data(Some(NodeInfoResponse::default()), None, None);
         assert_eq!(m.worker_snapshot_received, Some(clock));
@@ -2105,22 +2897,53 @@ mod frame_interval_tests {
     use quil_types::proto::node::{FrameCadence, FrameWindow, ShardRewardInfo};
     #[test]
     fn server_windows_ignore_peer_heads_and_client_start_time() {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut m = Model::new();
-        let mut shards = GetShardInfoResponse { shards: vec![ShardRewardInfo { filter: vec![1], latest_frame: 1000,
-            frame_cadence: Some(FrameCadence { last_observed_unix_seconds: now,
-                hour: Some(FrameWindow { window_seconds: 3600, observed_seconds: 600, advanced_frames: 30 }), day: None }),
-            ..Default::default() }], ..Default::default() };
-        m.observe_app_intervals(&shards, std::time::Instant::now()); assert_eq!(m.app_interval(&[1]), Some(20.0));
-        shards.shards[0].latest_frame = 2000; m.observe_app_intervals(&shards, std::time::Instant::now()); assert_eq!(m.app_interval(&[1]), Some(20.0));
-        shards.shards[0].frame_cadence = None; m.observe_app_intervals(&shards, std::time::Instant::now()); assert_eq!(m.app_interval(&[1]), None);
+        let mut shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                latest_frame: 1000,
+                frame_cadence: Some(FrameCadence {
+                    last_observed_unix_seconds: now,
+                    hour: Some(FrameWindow {
+                        window_seconds: 3600,
+                        observed_seconds: 600,
+                        advanced_frames: 30,
+                    }),
+                    day: None,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+        shards.shards[0].latest_frame = 2000;
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.app_interval(&[1]), Some(20.0));
+        shards.shards[0].frame_cadence = None;
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.app_interval(&[1]), None);
     }
     #[test]
     fn a_received_head_alone_cannot_create_a_node_cadence_measurement() {
         let mut m = Model::new();
-        let shards = GetShardInfoResponse { shards: vec![ShardRewardInfo { filter: vec![1],
-            global_head: Some(quil_types::proto::node::GlobalAppFrameHead { frame: 2456, generation: 5, ..Default::default() }),
-            ..Default::default() }], ..Default::default() };
-        m.observe_app_intervals(&shards, std::time::Instant::now()); assert_eq!(m.app_interval(&[1]), None);
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                global_head: Some(quil_types::proto::node::GlobalAppFrameHead {
+                    frame: 2456,
+                    generation: 5,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        m.observe_app_intervals(&shards, std::time::Instant::now());
+        assert_eq!(m.app_interval(&[1]), None);
     }
 }

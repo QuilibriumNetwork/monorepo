@@ -107,8 +107,15 @@ pub fn seal(
     let mut opening = Vec::with_capacity(SALT_LEN + plaintext.len());
     opening.extend_from_slice(salt);
     opening.extend_from_slice(plaintext);
-    let aead_ct = cipher.encrypt(Nonce::from_slice(nonce), opening.as_ref()).ok()?;
-    Some(ConfidentialField { commitment, kem_ct, nonce: *nonce, aead_ct })
+    let aead_ct = cipher
+        .encrypt(Nonce::from_slice(nonce), opening.as_ref())
+        .ok()?;
+    Some(ConfidentialField {
+        commitment,
+        kem_ct,
+        nonce: *nonce,
+        aead_ct,
+    })
 }
 
 /// OPEN (reader side): decapsulate, decrypt, and verify the recovered opening
@@ -144,7 +151,8 @@ pub fn verify_structural(field: &ConfidentialField) -> bool {
 
 /// Canonical encoding: `[commitment 32][kem_ct 1039][nonce 12][u32 LE aead_len][aead_ct]`.
 pub fn encode(field: &ConfidentialField) -> Vec<u8> {
-    let mut out = Vec::with_capacity(COMMITMENT_LEN + KEM_CT_LEN + NONCE_LEN + 4 + field.aead_ct.len());
+    let mut out =
+        Vec::with_capacity(COMMITMENT_LEN + KEM_CT_LEN + NONCE_LEN + 4 + field.aead_ct.len());
     out.extend_from_slice(&field.commitment);
     out.extend_from_slice(&field.kem_ct);
     out.extend_from_slice(&field.nonce);
@@ -177,7 +185,12 @@ pub fn decode(bytes: &[u8]) -> Option<ConfidentialField> {
     if c != bytes.len() {
         return None; // no trailing garbage
     }
-    Some(ConfidentialField { commitment, kem_ct, nonce, aead_ct })
+    Some(ConfidentialField {
+        commitment,
+        kem_ct,
+        nonce,
+        aead_ct,
+    })
 }
 
 #[cfg(test)]
@@ -223,7 +236,10 @@ mod tests {
         let kp = reader();
         let other = reader();
         let field = seal(b"secret", &kp.public, &[1u8; 32], &[2u8; 12]).unwrap();
-        assert!(open(&field, &other.secret).is_none(), "wrong KEM key must fail");
+        assert!(
+            open(&field, &other.secret).is_none(),
+            "wrong KEM key must fail"
+        );
     }
 
     #[test]
@@ -233,7 +249,10 @@ mod tests {
         let kp = reader();
         let mut field = seal(b"real", &kp.public, &[3u8; 32], &[4u8; 12]).unwrap();
         field.commitment[0] ^= 0xFF; // simulate a mismatched on-chain commitment
-        assert!(open(&field, &kp.secret).is_none(), "commitment mismatch must reject");
+        assert!(
+            open(&field, &kp.secret).is_none(),
+            "commitment mismatch must reject"
+        );
     }
 
     #[test]
@@ -241,7 +260,10 @@ mod tests {
         let kp = reader();
         let mut field = seal(b"payload", &kp.public, &[5u8; 32], &[6u8; 12]).unwrap();
         *field.aead_ct.last_mut().unwrap() ^= 0x01; // flip a tag/ciphertext bit
-        assert!(open(&field, &kp.secret).is_none(), "AEAD tag must reject tampering");
+        assert!(
+            open(&field, &kp.secret).is_none(),
+            "AEAD tag must reject tampering"
+        );
     }
 
     #[test]

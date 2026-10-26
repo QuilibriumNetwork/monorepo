@@ -66,7 +66,11 @@ fn parse_prometheus_text(text: &str) -> Vec<Sample> {
                 None => continue,
             }
         };
-        let value = match rest.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()) {
+        let value = match rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
             Some(v) => v,
             None => continue,
         };
@@ -74,7 +78,11 @@ fn parse_prometheus_text(text: &str) -> Vec<Sample> {
             Some((n, l)) => (n.to_string(), format!("{{{}", l)),
             None => (series.to_string(), String::new()),
         };
-        out.push(Sample { name, labels, value });
+        out.push(Sample {
+            name,
+            labels,
+            value,
+        });
     }
     out
 }
@@ -116,9 +124,7 @@ impl Section {
             Section::P2p => name.starts_with("libp2p_"),
             Section::Blossomsub => name.starts_with("blossomsub_"),
             Section::Rpc => name.starts_with("rpc_"),
-            Section::Engine => {
-                name.starts_with("engine_") || name.starts_with("execution_")
-            }
+            Section::Engine => name.starts_with("engine_") || name.starts_with("execution_"),
             Section::Other => {
                 !name.starts_with("libp2p_")
                     && !name.starts_with("blossomsub_")
@@ -279,7 +285,9 @@ async fn fetch(
         .await
         .map_err(|e| e.to_string())?
         .into_inner();
-    Ok(parse_prometheus_text(&String::from_utf8_lossy(&resp.metrics)))
+    Ok(parse_prometheus_text(&String::from_utf8_lossy(
+        &resp.metrics,
+    )))
 }
 
 /// Restore the terminal even if the draw loop errors/panics.
@@ -303,7 +311,11 @@ pub async fn run_metrics_tui(
             .split('/')
             .collect();
         if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
-            let host = if parts[1] == "0.0.0.0" { "127.0.0.1" } else { parts[1] };
+            let host = if parts[1] == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                parts[1]
+            };
             format!("{}:{}", host, parts[3])
         } else {
             "127.0.0.1:8337".to_string()
@@ -315,8 +327,7 @@ pub async fn run_metrics_tui(
         // Lazy: keep retrying inside the poll loop so the TUI can start
         // before/across node restarts.
         .connect_lazy();
-    let mut client =
-        quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
+    let mut client = quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
 
     crossterm::terminal::enable_raw_mode()?;
     crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
@@ -356,7 +367,9 @@ pub async fn run_metrics_tui(
         terminal.draw(|f| draw(f, &app))?;
 
         // Wait for a key or the next poll tick.
-        let wait = next_poll.saturating_duration_since(Instant::now()).min(Duration::from_millis(250));
+        let wait = next_poll
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
         tokio::select! {
             ev = events.next() => {
                 let Some(Ok(Event::Key(key))) = ev else { continue };
@@ -421,7 +434,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     // Header: endpoint + sections with current highlighted.
     let mut header_spans = vec![
-        Span::styled(" quil metrics ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " quil metrics ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("{}  ", app.endpoint)),
     ];
     let mut s = Section::All;
@@ -454,7 +470,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     ))];
     if app.editing_filter || !app.filter.is_empty() {
         status.push(Span::styled(
-            format!("  filter: {}{}", app.filter, if app.editing_filter { "▏" } else { "" }),
+            format!(
+                "  filter: {}{}",
+                app.filter,
+                if app.editing_filter { "▏" } else { "" }
+            ),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -522,7 +542,11 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &App) {
         " {}/{} series{} ",
         shown,
         rows_all.len(),
-        if scroll > 0 { format!(" (scrolled {})", scroll) } else { String::new() },
+        if scroll > 0 {
+            format!(" (scrolled {})", scroll)
+        } else {
+            String::new()
+        },
     )));
     f.render_widget(table, area);
 }

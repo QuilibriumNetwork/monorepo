@@ -72,8 +72,8 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
     for arg in args {
         if let Some((k, v)) = arg.split_once('=') {
             if k.eq_ignore_ascii_case("rdf") {
-                rdf_schema = std::fs::read(v)
-                    .map_err(|e| anyhow::anyhow!("read rdf schema {v:?}: {e}"))?;
+                rdf_schema =
+                    std::fs::read(v).map_err(|e| anyhow::anyhow!("read rdf schema {v:?}: {e}"))?;
             } else {
                 anyhow::bail!("unknown hypergraph-update arg: {k} (only rdf=<path>)");
             }

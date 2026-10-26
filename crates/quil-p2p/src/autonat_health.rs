@@ -157,16 +157,21 @@ impl FailureCounts {
 
     /// The most frequent class; `last` wins a tie.
     fn dominant(&self, last: ProbeFailure) -> ProbeFailure {
-        CLASSES
-            .into_iter()
-            .fold(last, |best, c| if self.get(c) > self.get(best) { c } else { best })
+        CLASSES.into_iter().fold(last, |best, c| {
+            if self.get(c) > self.get(best) {
+                c
+            } else {
+                best
+            }
+        })
     }
 }
 
 /// `timeout=4 io=1`, most frequent first; `none` when empty.
 impl fmt::Display for FailureCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut counted: Vec<ProbeFailure> = CLASSES.into_iter().filter(|c| self.get(*c) > 0).collect();
+        let mut counted: Vec<ProbeFailure> =
+            CLASSES.into_iter().filter(|c| self.get(*c) > 0).collect();
         if counted.is_empty() {
             return f.write_str("none");
         }
@@ -211,7 +216,11 @@ pub(crate) enum AutonatNotice {
         hint: &'static str,
     },
     /// A probe brought a dial-back after a reported run.
-    Recovered { probes: u32, secs: u64, failures: FailureCounts },
+    Recovered {
+        probes: u32,
+        secs: u64,
+        failures: FailureCounts,
+    },
 }
 
 /// The current run of probes without a dial-back.
@@ -299,11 +308,15 @@ impl Run {
 
 /// The hint of a failing run: with servers registered, `no_server` means
 /// that every one was used in the last 90 s, typically by retries.
-pub(crate) fn hint_for(dominant: ProbeFailure, hint: &'static str, servers: usize) -> Cow<'static, str> {
+pub(crate) fn hint_for(
+    dominant: ProbeFailure,
+    hint: &'static str,
+    servers: usize,
+) -> Cow<'static, str> {
     match dominant {
-        ProbeFailure::NoServer if servers > 0 => {
-            Cow::Owned(format!("all {servers} servers used in the last 90 s; see the other classes"))
-        }
+        ProbeFailure::NoServer if servers > 0 => Cow::Owned(format!(
+            "all {servers} servers used in the last 90 s; see the other classes"
+        )),
         _ => Cow::Borrowed(hint),
     }
 }
@@ -416,7 +429,11 @@ impl AutonatHealth {
 
     /// AutoNAT's status flipped to `new`: a line, unless one was logged in
     /// the last [`STATUS_LINE_EVERY`].
-    pub(crate) fn on_status_changed(&mut self, new: &NatStatus, now: Instant) -> Option<AutonatNotice> {
+    pub(crate) fn on_status_changed(
+        &mut self,
+        new: &NatStatus,
+        now: Instant,
+    ) -> Option<AutonatNotice> {
         if self.status_line_due(now) {
             return Some(self.status_line(status_str(new), now));
         }
@@ -453,7 +470,9 @@ impl AutonatHealth {
     /// The failure counts of the probes since the last dial-back
     /// (`dial_error=6`), `none` when the latest probe brought one.
     pub(crate) fn run_failures(&self) -> String {
-        self.run.as_ref().map_or_else(|| "none".to_string(), |run| run.failures.to_string())
+        self.run
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |run| run.failures.to_string())
     }
 
     /// AutoNAT's view for the PeerInfo publisher.
@@ -492,7 +511,14 @@ fn failing_is_warning(repeat: bool, dominant: ProbeFailure) -> bool {
 /// Log `notice`. These lines concern this node's own reachability.
 pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
     match notice {
-        AutonatNotice::StatusChanged { old, new, previous_secs, probes, failures, suppressed_flips } => info!(
+        AutonatNotice::StatusChanged {
+            old,
+            new,
+            previous_secs,
+            probes,
+            failures,
+            suppressed_flips,
+        } => info!(
             old,
             new,
             confidence = ctx.confidence,
@@ -504,7 +530,17 @@ pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
             servers = ctx.servers,
             "AutoNAT status of this node changed"
         ),
-        AutonatNotice::Failing { repeat, probes, aborted, secs, failures, dominant, last, server_ips, hint } => {
+        AutonatNotice::Failing {
+            repeat,
+            probes,
+            aborted,
+            secs,
+            failures,
+            dominant,
+            last,
+            server_ips,
+            hint,
+        } => {
             let hint = hint_for(*dominant, *hint, ctx.servers);
             macro_rules! failing {
                 ($level:ident, $msg:literal) => {
@@ -532,7 +568,11 @@ pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
                 failing!(info, "AutoNAT probes of this node are failing")
             }
         }
-        AutonatNotice::Recovered { probes, secs, failures } => info!(
+        AutonatNotice::Recovered {
+            probes,
+            secs,
+            failures,
+        } => info!(
             probes,
             failing_secs = secs,
             failures = %failures,
@@ -555,15 +595,44 @@ mod tests {
         let cases = [
             (OutboundProbeError::NoServer, NoServer),
             (OutboundProbeError::NoAddresses, NoAddresses),
-            (OutboundProbeError::OutboundRequest(OutboundFailure::Timeout), Timeout),
-            (OutboundProbeError::OutboundRequest(OutboundFailure::DialFailure), DialFailure),
-            (OutboundProbeError::OutboundRequest(OutboundFailure::ConnectionClosed), ConnectionClosed),
-            (OutboundProbeError::OutboundRequest(OutboundFailure::UnsupportedProtocols), UnsupportedProtocol),
-            (OutboundProbeError::OutboundRequest(OutboundFailure::Io(std::io::Error::other("closed"))), Io),
-            (OutboundProbeError::Response(ResponseError::DialError), DialError),
-            (OutboundProbeError::Response(ResponseError::DialRefused), DialRefused),
-            (OutboundProbeError::Response(ResponseError::BadRequest), BadRequest),
-            (OutboundProbeError::Response(ResponseError::InternalError), Internal),
+            (
+                OutboundProbeError::OutboundRequest(OutboundFailure::Timeout),
+                Timeout,
+            ),
+            (
+                OutboundProbeError::OutboundRequest(OutboundFailure::DialFailure),
+                DialFailure,
+            ),
+            (
+                OutboundProbeError::OutboundRequest(OutboundFailure::ConnectionClosed),
+                ConnectionClosed,
+            ),
+            (
+                OutboundProbeError::OutboundRequest(OutboundFailure::UnsupportedProtocols),
+                UnsupportedProtocol,
+            ),
+            (
+                OutboundProbeError::OutboundRequest(OutboundFailure::Io(std::io::Error::other(
+                    "closed",
+                ))),
+                Io,
+            ),
+            (
+                OutboundProbeError::Response(ResponseError::DialError),
+                DialError,
+            ),
+            (
+                OutboundProbeError::Response(ResponseError::DialRefused),
+                DialRefused,
+            ),
+            (
+                OutboundProbeError::Response(ResponseError::BadRequest),
+                BadRequest,
+            ),
+            (
+                OutboundProbeError::Response(ResponseError::InternalError),
+                Internal,
+            ),
         ];
         for (error, class) in cases {
             assert_eq!(ProbeFailure::of(&error), class, "{error:?}");
@@ -605,16 +674,35 @@ mod tests {
         let times: Vec<u64> = lines.iter().map(|(t, _)| *t).collect();
         assert_eq!(times, vec![60, 660, 1_260]);
         match &lines[0].1 {
-            AutonatNotice::Failing { repeat, probes, secs, failures, dominant, server_ips, hint, .. } => {
+            AutonatNotice::Failing {
+                repeat,
+                probes,
+                secs,
+                failures,
+                dominant,
+                server_ips,
+                hint,
+                ..
+            } => {
                 assert!(!repeat);
                 assert_eq!((*probes, *secs, *server_ips), (3, 60, 1));
                 assert_eq!(failures.to_string(), "timeout=3");
                 assert_eq!(*dominant, Timeout);
-                assert!(hint.contains("check the port forward of the p2p port first"), "{hint}");
+                assert!(
+                    hint.contains("check the port forward of the p2p port first"),
+                    "{hint}"
+                );
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(lines[1].1, AutonatNotice::Failing { repeat: true, probes: 23, .. }));
+        assert!(matches!(
+            lines[1].1,
+            AutonatNotice::Failing {
+                repeat: true,
+                probes: 23,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -634,7 +722,11 @@ mod tests {
         };
         assert_eq!(
             health.on_success(t0 + Duration::from_secs(100)),
-            Some(AutonatNotice::Recovered { probes: 4, secs: 90, failures })
+            Some(AutonatNotice::Recovered {
+                probes: 4,
+                secs: 90,
+                failures
+            })
         );
         assert_eq!(health.on_success(t0 + Duration::from_secs(200)), None);
     }
@@ -649,7 +741,8 @@ mod tests {
         let mut lines = Vec::new();
         for i in 0..40u64 {
             let server = ip(servers[(i as usize).min(2)]);
-            if let Some(n) = health.on_failure(DialError, server, t0 + Duration::from_secs(90 * i)) {
+            if let Some(n) = health.on_failure(DialError, server, t0 + Duration::from_secs(90 * i))
+            {
                 lines.push(n);
             }
         }
@@ -661,7 +754,10 @@ mod tests {
         let summary = health.summary(&NatStatus::Private);
         assert_eq!(summary.nat_status, "private");
         let failing = summary.probe_failure.unwrap();
-        assert_eq!((failing.class, failing.probes, failing.unreachable), ("dial_error", 40, true));
+        assert_eq!(
+            (failing.class, failing.probes, failing.unreachable),
+            ("dial_error", 40, true)
+        );
     }
 
     /// A NAT that drops dial-backs silently gives timeouts, not dial errors:
@@ -673,7 +769,11 @@ mod tests {
         let mut health = AutonatHealth::new(t0);
         let mut lines = Vec::new();
         for i in 0..30u64 {
-            let server = if i % 2 == 0 { ip("192.0.2.1") } else { ip("198.51.100.2") };
+            let server = if i % 2 == 0 {
+                ip("192.0.2.1")
+            } else {
+                ip("198.51.100.2")
+            };
             if let Some(n) = health.on_failure(Timeout, server, t0 + Duration::from_secs(30 * i)) {
                 lines.push(n);
             }
@@ -696,17 +796,28 @@ mod tests {
     fn only_request_defects_rule_out_a_port_forward() {
         for class in [Io, BadRequest, Internal, UnsupportedProtocol] {
             let mut health = AutonatHealth::new(Instant::now());
-            let notice = (0..3).find_map(|_| health.on_failure(class, ip("192.0.2.1"), Instant::now()));
+            let notice =
+                (0..3).find_map(|_| health.on_failure(class, ip("192.0.2.1"), Instant::now()));
             match notice {
                 Some(AutonatNotice::Failing { hint, .. }) => {
-                    assert!(hint.contains("a port forward does not help"), "{class:?}: {hint}")
+                    assert!(
+                        hint.contains("a port forward does not help"),
+                        "{class:?}: {hint}"
+                    )
                 }
                 other => panic!("{class:?}: {other:?}"),
             }
         }
-        for class in [Timeout, ConnectionClosed, DialFailure, DialRefused, DialError] {
+        for class in [
+            Timeout,
+            ConnectionClosed,
+            DialFailure,
+            DialRefused,
+            DialError,
+        ] {
             let mut health = AutonatHealth::new(Instant::now());
-            let notice = (0..3).find_map(|_| health.on_failure(class, ip("192.0.2.1"), Instant::now()));
+            let notice =
+                (0..3).find_map(|_| health.on_failure(class, ip("192.0.2.1"), Instant::now()));
             match notice {
                 Some(AutonatNotice::Failing { hint, .. }) => {
                     assert!(!hint.contains("does not help"), "{class:?}: {hint}")
@@ -725,10 +836,14 @@ mod tests {
         assert!(failing_is_warning(true, Timeout));
         assert!(!failing_is_warning(false, Timeout));
         let mut health = AutonatHealth::new(Instant::now());
-        let notice = (0..3).find_map(|_| health.on_failure(DialRefused, ip("192.0.2.1"), Instant::now()));
+        let notice =
+            (0..3).find_map(|_| health.on_failure(DialRefused, ip("192.0.2.1"), Instant::now()));
         match notice {
             Some(AutonatNotice::Failing { hint, .. }) => {
-                assert!(hint.contains("no action needed") && !hint.contains("report"), "{hint}")
+                assert!(
+                    hint.contains("no action needed") && !hint.contains("report"),
+                    "{hint}"
+                )
             }
             other => panic!("{other:?}"),
         }
@@ -743,7 +858,14 @@ mod tests {
         assert_eq!(health.on_failure(Timeout, ip("192.0.2.1"), t0), None);
         assert_eq!(health.on_failure(NoServer, None, t0), None);
         assert_eq!(health.on_failure(NoServer, None, t0), None);
-        assert_eq!(health.summary(&NatStatus::Unknown).probe_failure.unwrap().probes, 1);
+        assert_eq!(
+            health
+                .summary(&NatStatus::Unknown)
+                .probe_failure
+                .unwrap()
+                .probes,
+            1
+        );
         match health.on_failure(Timeout, ip("198.51.100.2"), t0) {
             None => {}
             other => panic!("two probes only: {other:?}"),
@@ -753,7 +875,11 @@ mod tests {
         assert_eq!(alone.on_failure(NoServer, None, t0), None);
         assert_eq!(alone.on_failure(NoServer, None, t0), None);
         match alone.on_failure(NoServer, None, t0) {
-            Some(AutonatNotice::Failing { probes: 0, aborted: 3, .. }) => {}
+            Some(AutonatNotice::Failing {
+                probes: 0,
+                aborted: 3,
+                ..
+            }) => {}
             other => panic!("{other:?}"),
         }
     }
@@ -834,7 +960,12 @@ mod tests {
         // A flip after the interval logs at once.
         assert!(matches!(
             health.on_status_changed(&NatStatus::Private, at(2_100)),
-            Some(AutonatNotice::StatusChanged { old: "public", new: "private", suppressed_flips: 0, .. })
+            Some(AutonatNotice::StatusChanged {
+                old: "public",
+                new: "private",
+                suppressed_flips: 0,
+                ..
+            })
         ));
     }
 

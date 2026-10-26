@@ -33,7 +33,10 @@ impl Directory {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("quil-host-{}-{suffix}-{sequence}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "quil-host-{}-{suffix}-{sequence}",
+            std::process::id()
+        ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -147,7 +150,8 @@ async fn phase(
         // committee may have to time out the view it resumes in. At the
         // standard 30 s leader timeout two such views exceed the phase budget;
         // what is tested here is the reopened journal, not that timeout.
-        let mut params = GlobalEngineParams::new("journal", 17, Digest([0; 32])).with_leader_timeout_secs(2);
+        let mut params =
+            GlobalEngineParams::new("journal", 17, Digest([0; 32])).with_leader_timeout_secs(2);
         if let Some(floor) = &floor {
             params = params.with_finalized_floor(floor.clone()).unwrap();
         }
@@ -354,7 +358,8 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
             threads.push(thread);
         }
         let inbound = Arc::new(inbound);
-        let votes: Arc<Vec<AtomicU64>> = Arc::new(running.iter().map(|_| AtomicU64::new(0)).collect());
+        let votes: Arc<Vec<AtomicU64>> =
+            Arc::new(running.iter().map(|_| AtomicU64::new(0)).collect());
         let routers: Vec<_> = outbound
             .into_iter()
             .map(|(member, sender, mut rx)| {
@@ -368,8 +373,10 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
                         for recipient in message.recipients {
                             if recipient != sender {
                                 if let Some(inputs) = inbound.get(&recipient) {
-                                    let _ = inputs[message.channel as usize]
-                                        .send(inbound_message(sender.clone(), message.bytes.clone()));
+                                    let _ = inputs[message.channel as usize].send(inbound_message(
+                                        sender.clone(),
+                                        message.bytes.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -377,7 +384,12 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
                 })
             })
             .collect();
-        let counts = || votes.iter().map(|count| count.load(Ordering::Relaxed)).collect::<Vec<u64>>();
+        let counts = || {
+            votes
+                .iter()
+                .map(|count| count.load(Ordering::Relaxed))
+                .collect::<Vec<u64>>()
+        };
         tokio::time::sleep(Duration::from_secs(25)).await;
         let before_timeout = counts();
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -388,7 +400,9 @@ fn present_members_of_a_stalled_committee_send_votes_within_a_view_timeout() {
             router.await.unwrap();
         }
         assert!(
-            sent.iter().zip(&before_timeout).all(|(after, before)| after > before),
+            sent.iter()
+                .zip(&before_timeout)
+                .all(|(after, before)| after > before),
             "each running member sends a vote when the view times out, within 45 s: \
              {before_timeout:?} after 25 s, {sent:?} after 45 s"
         );

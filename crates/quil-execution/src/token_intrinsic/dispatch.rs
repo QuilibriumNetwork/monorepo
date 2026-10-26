@@ -1,20 +1,22 @@
 //! Explicit token-suite policy for token-engine integration.
 //! There is no default policy and no fallback to the old confidential suite.
 use super::{custom_mint, state::SnapshotLimits};
+use crate::{domains, hypergraph_state::HypergraphState, token_engine::*};
+use quil_lattice_ct::confidential::relation::backend::{
+    worker_client::WorkerVerifier, worker_request::WorkerRequest,
+};
 #[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
-use crate::{domains, hypergraph_state::HypergraphState, token_engine::*};
 use quil_lattice_ct::confidential::{
     custom_mint::CustomMint,
     mint::Mint,
     mint_claim::MintClaim,
-    pending_create::PendingCreate,
     pending_claim::PendingClaim,
+    pending_create::PendingCreate,
     relation::backend::native::NativeBudget,
     shield::AnyShield,
     transfer::{CompileLimits, Transfer},
 };
-use quil_lattice_ct::confidential::relation::backend::{worker_client::WorkerVerifier, worker_request::WorkerRequest};
 use quil_types::error::{QuilError, Result};
 
 #[derive(Clone, Copy)]
@@ -34,13 +36,19 @@ impl TokenPolicy {
     pub fn for_network(network: u8) -> Self {
         Self {
             network: super::state::network_identifier(network),
-            limits: CompileLimits { max_inputs: 4, max_outputs: 2, max_depth: 32 },
+            limits: CompileLimits {
+                max_inputs: 4,
+                max_outputs: 2,
+                max_depth: 32,
+            },
             snapshots: SnapshotLimits {
                 max_coins: 1 << 32,
                 max_depth: 32,
                 max_nodes: 1 << 34,
             },
-            native_budget: NativeBudget { max_native_bytes: 24 << 30 },
+            native_budget: NativeBudget {
+                max_native_bytes: 24 << 30,
+            },
         }
     }
 }
@@ -54,11 +62,17 @@ mod tests {
     #[test]
     fn a_refused_admission_is_recognizably_busy() {
         use quil_lattice_ct::confidential::relation::backend::worker_client::ClientError;
-        let busy = QuilError::ExecutionUnavailable(format!("token proof worker: {:?}", ClientError::Busy));
+        let busy =
+            QuilError::ExecutionUnavailable(format!("token proof worker: {:?}", ClientError::Busy));
         assert!(super::super::is_proof_worker_busy(&busy));
-        let crashed = QuilError::ExecutionUnavailable(format!("token proof worker: {:?}", ClientError::Poisoned));
+        let crashed = QuilError::ExecutionUnavailable(format!(
+            "token proof worker: {:?}",
+            ClientError::Poisoned
+        ));
         assert!(!super::super::is_proof_worker_busy(&crashed));
-        assert!(!super::super::is_proof_worker_busy(&QuilError::InvalidArgument(super::super::PROOF_WORKER_BUSY.into())));
+        assert!(!super::super::is_proof_worker_busy(
+            &QuilError::InvalidArgument(super::super::PROOF_WORKER_BUSY.into())
+        ));
     }
 
     /// Callers verifying one operation at the same time share a single
@@ -71,11 +85,15 @@ mod tests {
         let key = [0xa5; 32];
         let results: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| verdict_once(key, || {
-                    runs.fetch_add(1, SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    Ok::<bool, &str>(true)
-                })))
+                .map(|_| {
+                    scope.spawn(|| {
+                        verdict_once(key, || {
+                            runs.fetch_add(1, SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            Ok::<bool, &str>(true)
+                        })
+                    })
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -86,29 +104,70 @@ mod tests {
         let key = [0x5a; 32];
         let results: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..4)
-                .map(|_| scope.spawn(|| verdict_once(key, || {
-                    let attempt = attempts.fetch_add(1, SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                    if attempt == 0 { Err("busy") } else { Ok(false) }
-                })))
+                .map(|_| {
+                    scope.spawn(|| {
+                        verdict_once(key, || {
+                            let attempt = attempts.fetch_add(1, SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                            if attempt == 0 {
+                                Err("busy")
+                            } else {
+                                Ok(false)
+                            }
+                        })
+                    })
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        assert_eq!(attempts.load(SeqCst), 2, "the failed attempt, then one more");
+        assert_eq!(
+            attempts.load(SeqCst),
+            2,
+            "the failed attempt, then one more"
+        );
         assert_eq!(results.iter().filter(|r| **r == Err("busy")).count(), 1);
         assert_eq!(results.iter().filter(|r| **r == Ok(false)).count(), 3);
     }
 
     #[test]
     fn verdict_cache_keys_every_input_and_capacity_follows_budget_and_ewma() {
-        let limits = CompileLimits { max_inputs: 4, max_outputs: 2, max_depth: 32 };
-        let budget = NativeBudget { max_native_bytes: 1 << 30 };
+        let limits = CompileLimits {
+            max_inputs: 4,
+            max_outputs: 2,
+            max_depth: 32,
+        };
+        let budget = NativeBudget {
+            max_native_bytes: 1 << 30,
+        };
         let key = verdict_key(&[1; 32], &[2; 32], b"tx", limits, budget);
         assert_ne!(key, verdict_key(&[3; 32], &[2; 32], b"tx", limits, budget));
         assert_ne!(key, verdict_key(&[1; 32], &[4; 32], b"tx", limits, budget));
         assert_ne!(key, verdict_key(&[1; 32], &[2; 32], b"ty", limits, budget));
-        assert_ne!(key, verdict_key(&[1; 32], &[2; 32], b"tx", CompileLimits { max_depth: 1, ..limits }, budget));
-        assert_ne!(key, verdict_key(&[1; 32], &[2; 32], b"tx", limits, NativeBudget { max_native_bytes: 1 }));
+        assert_ne!(
+            key,
+            verdict_key(
+                &[1; 32],
+                &[2; 32],
+                b"tx",
+                CompileLimits {
+                    max_depth: 1,
+                    ..limits
+                },
+                budget
+            )
+        );
+        assert_ne!(
+            key,
+            verdict_key(
+                &[1; 32],
+                &[2; 32],
+                b"tx",
+                limits,
+                NativeBudget {
+                    max_native_bytes: 1
+                }
+            )
+        );
         assert_eq!(cached_verdict(&key), None);
         record_verdict(key, false);
         assert_eq!(cached_verdict(&key), Some(false));
@@ -128,10 +187,27 @@ mod tests {
         // shields/claims/custom mints single-input depth-1 shapes.
         let policy = TokenPolicy::for_network(1);
         let quil = domains::QUIL_TOKEN;
-        assert_eq!(policy.worker_request_shape(&quil, TYPE_LATTICE_TRANSACTION).map(|s| s.1), Some(policy.limits));
-        assert_eq!(policy.worker_request_shape(&quil, TYPE_LATTICE_SHIELD).map(|s| s.1.max_depth), Some(1));
-        assert_eq!(policy.worker_request_shape(&quil, TYPE_LATTICE_MINT).map(|s| s.1.max_inputs), Some(policy.limits.max_inputs));
-        assert!(policy.worker_request_shape(&quil, TYPE_LATTICE_MINT_CLAIM).is_none());
+        assert_eq!(
+            policy
+                .worker_request_shape(&quil, TYPE_LATTICE_TRANSACTION)
+                .map(|s| s.1),
+            Some(policy.limits)
+        );
+        assert_eq!(
+            policy
+                .worker_request_shape(&quil, TYPE_LATTICE_SHIELD)
+                .map(|s| s.1.max_depth),
+            Some(1)
+        );
+        assert_eq!(
+            policy
+                .worker_request_shape(&quil, TYPE_LATTICE_MINT)
+                .map(|s| s.1.max_inputs),
+            Some(policy.limits.max_inputs)
+        );
+        assert!(policy
+            .worker_request_shape(&quil, TYPE_LATTICE_MINT_CLAIM)
+            .is_none());
     }
     use quil_lattice_ct::confidential::{
         shield::{Shield, ShieldStatement},
@@ -141,66 +217,165 @@ mod tests {
 
     #[test]
     fn self_paid_quil_fee_rejects_underpayment_before_dispatch_in_both_venues() {
+        use crate::{
+            engines::{ExecutionMode, TokenExecutionEngine},
+            message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest},
+        };
         use num_bigint::BigInt;
-        use std::sync::Arc;
         use quil_types::{crypto::NoopInclusionProver, execution::ShardExecutionEngine};
-        use crate::{engines::{ExecutionMode, TokenExecutionEngine},
-            message_envelope::{CanonicalMessageRequest, CanonicalMessageBundle}};
+        use std::sync::Arc;
         let policy = TokenPolicy::for_network(1);
         let application = domains::QUIL_TOKEN;
         let context = parameter_context(&policy.network, &application);
-        let mut proof = vec![0; 40]; proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let mut proof = vec![0; 40];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
         // Structural fixture only. It must never reach proof verification on
         // an insufficient fee, and a sufficient claimed fee cannot admit it.
-        let mut tx = Shield { statement: ShieldStatement {
-            network: policy.network, application, transparent_address: [3; 32],
-            owner_public_key: [4; 57], amount: 1_000_000, fee: 2,
-            outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(10,
-                &AmountOpening::from_seed(&context, &[2; 32])), owner: [5; IDENTITY_BYTES], memo: [6; MEMO_BYTES] }],
-        }, signature: [0; 114], proof };
+        let mut tx = Shield {
+            statement: ShieldStatement {
+                network: policy.network,
+                application,
+                transparent_address: [3; 32],
+                owner_public_key: [4; 57],
+                amount: 1_000_000,
+                fee: 2,
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context)
+                        .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+                    owner: [5; IDENTITY_BYTES],
+                    memo: [6; MEMO_BYTES],
+                }],
+            },
+            signature: [0; 114],
+            proof,
+        };
         let bytes = tx.encode().unwrap();
-        assert!(policy.check_self_paid_fee(&application, &bytes, TYPE_LATTICE_SHIELD, &BigInt::from(0)).is_ok());
-        for multiplier in [BigInt::from(-1), BigInt::from(1), BigInt::from(u128::MAX) + 1u8] {
-            assert!(policy.check_self_paid_fee(&application, &bytes, TYPE_LATTICE_SHIELD, &multiplier).is_err());
+        assert!(policy
+            .check_self_paid_fee(&application, &bytes, TYPE_LATTICE_SHIELD, &BigInt::from(0))
+            .is_ok());
+        for multiplier in [
+            BigInt::from(-1),
+            BigInt::from(1),
+            BigInt::from(u128::MAX) + 1u8,
+        ] {
+            assert!(policy
+                .check_self_paid_fee(&application, &bytes, TYPE_LATTICE_SHIELD, &multiplier)
+                .is_err());
         }
         // The charge is the staged state growth (one coin and one marker), not
         // the payload length.
         let cost = u128::from(super::super::cost::state_growth(&bytes).unwrap());
-        assert_eq!(cost, u128::from(super::super::cost::shape_growth(&context,
-            super::super::cost::Shape { coins: 1, markers: 1, escrow: false }).unwrap()));
-        for (fee, accepted) in [(cost * 3 - 1, false), (cost * 3, true), (cost * 3 + 1, true)] {
+        assert_eq!(
+            cost,
+            u128::from(
+                super::super::cost::shape_growth(
+                    &context,
+                    super::super::cost::Shape {
+                        coins: 1,
+                        markers: 1,
+                        escrow: false
+                    }
+                )
+                .unwrap()
+            )
+        );
+        for (fee, accepted) in [
+            (cost * 3 - 1, false),
+            (cost * 3, true),
+            (cost * 3 + 1, true),
+        ] {
             tx.statement.fee = fee;
             let encoded = tx.encode().unwrap();
             assert_eq!(encoded.len(), bytes.len());
-            assert_eq!(policy.check_self_paid_fee(&application, &encoded, TYPE_LATTICE_SHIELD, &BigInt::from(3)).is_ok(), accepted);
+            assert_eq!(
+                policy
+                    .check_self_paid_fee(
+                        &application,
+                        &encoded,
+                        TYPE_LATTICE_SHIELD,
+                        &BigInt::from(3)
+                    )
+                    .is_ok(),
+                accepted
+            );
         }
         // Mint claims cannot turn a historical fee into a new debit; the mint
         // itself is charged (it pays out of the minted amount).
-        assert!(policy.check_self_paid_fee(&application, &[], TYPE_LATTICE_MINT, &BigInt::from(1)).is_err());
+        assert!(policy
+            .check_self_paid_fee(&application, &[], TYPE_LATTICE_MINT, &BigInt::from(1))
+            .is_err());
         for tp in [TYPE_LATTICE_MINT_CLAIM] {
-            assert!(policy.check_self_paid_fee(&application, &[], tp, &BigInt::from(1)).is_ok());
+            assert!(policy
+                .check_self_paid_fee(&application, &[], tp, &BigInt::from(1))
+                .is_ok());
         }
         for mode in [ExecutionMode::Application, ExecutionMode::Global] {
             let db = quil_store::RocksDb::open_in_memory().unwrap();
             let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-                Arc::new(quil_store::RocksHypergraphStore::new(db.inner())), Arc::new(NoopInclusionProver)));
+                Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+                Arc::new(NoopInclusionProver),
+            ));
             let state = HypergraphState::new(crdt.clone());
             let stubs = crate::testing::NoopExecutionCrypto::new();
-            let engine = TokenExecutionEngine::new_with_state(mode, Arc::new(NoopInclusionProver), crdt,
-                stubs.key_manager, stubs.clock_store).with_token_proofs(policy).unwrap();
+            let engine = TokenExecutionEngine::new_with_state(
+                mode,
+                Arc::new(NoopInclusionProver),
+                crdt,
+                stubs.key_manager,
+                stubs.clock_store,
+            )
+            .with_token_proofs(policy)
+            .unwrap();
             let request = CanonicalMessageRequest::wrap(bytes.clone()).unwrap();
-            let bundle = CanonicalMessageBundle { requests: vec![Some(request.clone())], timestamp: 0 };
-            for message in [request.to_canonical_bytes().unwrap(), bundle.to_canonical_bytes().unwrap()] {
-                let error = engine.process_message(1, &BigInt::from(1), &application, &message).unwrap_err();
-                assert!(error.to_string().contains("QUIL fee below operation's dynamic cost"), "{error}");
-                let output_address = crate::token_intrinsic::state::create_coin(&context, 1, &tx.statement.outputs[0], 0).unwrap().0;
-                assert!(state.get(&application, &output_address,
-                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap()).unwrap().is_none());
-                assert!(crate::token_intrinsic::roots::read_current(&state, &policy.network, &application).unwrap().is_none());
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(request.clone())],
+                timestamp: 0,
+            };
+            for message in [
+                request.to_canonical_bytes().unwrap(),
+                bundle.to_canonical_bytes().unwrap(),
+            ] {
+                let error = engine
+                    .process_message(1, &BigInt::from(1), &application, &message)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("QUIL fee below operation's dynamic cost"),
+                    "{error}"
+                );
+                let output_address = crate::token_intrinsic::state::create_coin(
+                    &context,
+                    1,
+                    &tx.statement.outputs[0],
+                    0,
+                )
+                .unwrap()
+                .0;
+                assert!(state
+                    .get(
+                        &application,
+                        &output_address,
+                        &crate::hypergraph_state::vertex_adds_discriminator().unwrap()
+                    )
+                    .unwrap()
+                    .is_none());
+                assert!(crate::token_intrinsic::roots::read_current(
+                    &state,
+                    &policy.network,
+                    &application
+                )
+                .unwrap()
+                .is_none());
             }
             // Overpayment is not proof verification: this fixture still fails.
-            let funded = CanonicalMessageRequest::wrap(tx.encode().unwrap()).unwrap().to_canonical_bytes().unwrap();
-            assert!(engine.process_message(1, &BigInt::from(1), &application, &funded).is_err());
+            let funded = CanonicalMessageRequest::wrap(tx.encode().unwrap())
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap();
+            assert!(engine
+                .process_message(1, &BigInt::from(1), &application, &funded)
+                .is_err());
         }
     }
 
@@ -220,30 +395,60 @@ mod tests {
         let policy = TokenPolicy::for_network(1);
         let application = domains::QUIL_TOKEN;
         // The types `check_self_paid_fee` prices (its own match arm).
-        for tp in [TYPE_LATTICE_TRANSACTION, TYPE_LATTICE_PENDING, TYPE_LATTICE_MINT,
-                   TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SHIELD, TYPE_LATTICE_SETTLEMENT] {
+        for tp in [
+            TYPE_LATTICE_TRANSACTION,
+            TYPE_LATTICE_PENDING,
+            TYPE_LATTICE_MINT,
+            TYPE_LATTICE_PENDING_CLAIM,
+            TYPE_LATTICE_SHIELD,
+            TYPE_LATTICE_SETTLEMENT,
+        ] {
             let relayed = super::super::spend_entries::commits_globally(&application, tp);
-            let app_venue_barred = policy.check_venue(ExecutionMode::Application, &application, tp).is_err();
+            let app_venue_barred = policy
+                .check_venue(ExecutionMode::Application, &application, tp)
+                .is_err();
             assert!(relayed || app_venue_barred,
                 "QUIL type {tp:#06x} is priced but executes in the app venue at that shard's own fee vote");
         }
         // The QUIL reward mint is the barred one, and it is barred everywhere
         // but the global venue.
-        assert!(!super::super::spend_entries::commits_globally(&application, TYPE_LATTICE_MINT));
-        assert!(policy.check_venue(ExecutionMode::Application, &application, TYPE_LATTICE_MINT).is_err());
-        assert!(policy.check_venue(ExecutionMode::Global, &application, TYPE_LATTICE_MINT).is_ok());
+        assert!(!super::super::spend_entries::commits_globally(
+            &application,
+            TYPE_LATTICE_MINT
+        ));
+        assert!(policy
+            .check_venue(ExecutionMode::Application, &application, TYPE_LATTICE_MINT)
+            .is_err());
+        assert!(policy
+            .check_venue(ExecutionMode::Global, &application, TYPE_LATTICE_MINT)
+            .is_ok());
         // A settlement is the converse: app-venue only, yet relayed, so the
         // global commit still prices it.
-        assert!(super::super::spend_entries::commits_globally(&application, TYPE_LATTICE_SETTLEMENT));
-        assert!(policy.check_venue(ExecutionMode::Global, &application, TYPE_LATTICE_SETTLEMENT).is_err());
+        assert!(super::super::spend_entries::commits_globally(
+            &application,
+            TYPE_LATTICE_SETTLEMENT
+        ));
+        assert!(policy
+            .check_venue(ExecutionMode::Global, &application, TYPE_LATTICE_SETTLEMENT)
+            .is_err());
     }
 
     #[test]
     fn network_policy_is_compiled_per_network_and_matches_wallet_limits() {
         for network in [0u8, 1, 7] {
             let policy = TokenPolicy::for_network(network);
-            assert_eq!(policy.network, super::super::state::network_identifier(network));
-            assert_eq!((policy.limits.max_inputs, policy.limits.max_outputs, policy.limits.max_depth), (4, 2, 32));
+            assert_eq!(
+                policy.network,
+                super::super::state::network_identifier(network)
+            );
+            assert_eq!(
+                (
+                    policy.limits.max_inputs,
+                    policy.limits.max_outputs,
+                    policy.limits.max_depth
+                ),
+                (4, 2, 32)
+            );
             assert_eq!(policy.snapshots.max_depth, 32);
             assert!(policy.snapshots.max_coins >= 1 << 32);
             // A stateless engine still refuses the policy: token admission needs state.
@@ -256,48 +461,121 @@ mod tests {
             );
             assert!(stateless.with_token_proofs(policy).is_err());
         }
-        assert_ne!(TokenPolicy::for_network(0).network, TokenPolicy::for_network(1).network);
+        assert_ne!(
+            TokenPolicy::for_network(0).network,
+            TokenPolicy::for_network(1).network
+        );
     }
 
     #[test]
     fn pending_preflight_checks_domain_dimensions_and_fee() {
         use quil_lattice_ct::confidential::{
-            memo::EscrowRecoveryMemo, mint::FALCON_PUBLIC_BYTES, pending_claim::EscrowPolicy,
+            memo::EscrowRecoveryMemo,
+            mint::FALCON_PUBLIC_BYTES,
+            pending_claim::EscrowPolicy,
             pending_create::PendingCreateStatement,
-            relation::membership::{Node, NODE_BYTES}, transfer::TransferStatement,
+            relation::membership::{Node, NODE_BYTES},
+            transfer::TransferStatement,
         };
-        let network = [1; 32]; let application = domains::QUIL_TOKEN;
+        let network = [1; 32];
+        let application = domains::QUIL_TOKEN;
         let context = parameter_context(&network, &application);
-        let policy = TokenPolicy { network,
-            limits: CompileLimits { max_inputs: 2, max_outputs: 2, max_depth: 3 },
-            snapshots: SnapshotLimits { max_coins: 8, max_depth: 3, max_nodes: 24 },
-            native_budget: NativeBudget { max_native_bytes: 0 } };
-        let output = Output { owner: [2; IDENTITY_BYTES], memo: [3; MEMO_BYTES],
-            commitment: CommitmentKey::derive(&context).commit(4, &AmountOpening::from_seed(&context, &[5; 32])) };
-        let mut proof = vec![0; 40]; proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        let mut tx = PendingCreate { statement: PendingCreateStatement {
-            funding: TransferStatement { network, application, depth: 1, root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
-                images: vec![[6; IDENTITY_BYTES]], fee: 2, outputs: vec![output] },
-            policy: EscrowPolicy { recipient: [7; FALCON_PUBLIC_BYTES], refund: [8; FALCON_PUBLIC_BYTES], refund_after_global_frame: 100 },
-            refund_recovery: EscrowRecoveryMemo { owner: [9; IDENTITY_BYTES], ciphertext: [10; MEMO_BYTES] },
-        }, proof };
+        let policy = TokenPolicy {
+            network,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 3,
+            },
+            snapshots: SnapshotLimits {
+                max_coins: 8,
+                max_depth: 3,
+                max_nodes: 24,
+            },
+            native_budget: NativeBudget {
+                max_native_bytes: 0,
+            },
+        };
+        let output = Output {
+            owner: [2; IDENTITY_BYTES],
+            memo: [3; MEMO_BYTES],
+            commitment: CommitmentKey::derive(&context)
+                .commit(4, &AmountOpening::from_seed(&context, &[5; 32])),
+        };
+        let mut proof = vec![0; 40];
+        proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
+        let mut tx = PendingCreate {
+            statement: PendingCreateStatement {
+                funding: TransferStatement {
+                    network,
+                    application,
+                    depth: 1,
+                    root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+                    images: vec![[6; IDENTITY_BYTES]],
+                    fee: 2,
+                    outputs: vec![output],
+                },
+                policy: EscrowPolicy {
+                    recipient: [7; FALCON_PUBLIC_BYTES],
+                    refund: [8; FALCON_PUBLIC_BYTES],
+                    refund_after_global_frame: 100,
+                },
+                refund_recovery: EscrowRecoveryMemo {
+                    owner: [9; IDENTITY_BYTES],
+                    ciphertext: [10; MEMO_BYTES],
+                },
+            },
+            proof,
+        };
         // Framing/policy only: the placeholder proof is not admitted here.
         let bytes = tx.encode().unwrap();
-        assert!(policy.preflight(&application, &bytes, TYPE_LATTICE_PENDING).is_ok());
-        assert!(policy.preflight(&application, &bytes, TYPE_LATTICE_TRANSACTION).is_err());
-        assert!(policy.preflight(&[11; 32], &bytes, TYPE_LATTICE_PENDING).is_err());
-        assert!(TokenPolicy { network: [12; 32], ..policy }.preflight(&application, &bytes, TYPE_LATTICE_PENDING).is_err());
-        for limits in [CompileLimits { max_inputs: 0, ..policy.limits }, CompileLimits { max_outputs: 0, ..policy.limits }, CompileLimits { max_depth: 0, ..policy.limits }] {
-            assert!(TokenPolicy { limits, ..policy }.preflight(&application, &bytes, TYPE_LATTICE_PENDING).is_err());
+        assert!(policy
+            .preflight(&application, &bytes, TYPE_LATTICE_PENDING)
+            .is_ok());
+        assert!(policy
+            .preflight(&application, &bytes, TYPE_LATTICE_TRANSACTION)
+            .is_err());
+        assert!(policy
+            .preflight(&[11; 32], &bytes, TYPE_LATTICE_PENDING)
+            .is_err());
+        assert!(TokenPolicy {
+            network: [12; 32],
+            ..policy
+        }
+        .preflight(&application, &bytes, TYPE_LATTICE_PENDING)
+        .is_err());
+        for limits in [
+            CompileLimits {
+                max_inputs: 0,
+                ..policy.limits
+            },
+            CompileLimits {
+                max_outputs: 0,
+                ..policy.limits
+            },
+            CompileLimits {
+                max_depth: 0,
+                ..policy.limits
+            },
+        ] {
+            assert!(TokenPolicy { limits, ..policy }
+                .preflight(&application, &bytes, TYPE_LATTICE_PENDING)
+                .is_err());
         }
         // QUIL fees have no compiled minimum: the dynamic charge is checked at
         // execution against the staged state growth, so a fee of 1 preflights.
         tx.statement.funding.fee = 1;
-        assert!(policy.preflight(&application, &tx.encode().unwrap(), TYPE_LATTICE_PENDING).is_ok());
+        assert!(policy
+            .preflight(&application, &tx.encode().unwrap(), TYPE_LATTICE_PENDING)
+            .is_ok());
         tx.statement.funding.application = [11; 32];
-        assert!(policy.preflight(&[11; 32], &tx.encode().unwrap(), TYPE_LATTICE_PENDING).is_err());
+        assert!(policy
+            .preflight(&[11; 32], &tx.encode().unwrap(), TYPE_LATTICE_PENDING)
+            .is_err());
         tx.statement.funding.fee = 0;
-        assert!(policy.preflight(&[11; 32], &tx.encode().unwrap(), TYPE_LATTICE_PENDING).is_ok());
+        assert!(policy
+            .preflight(&[11; 32], &tx.encode().unwrap(), TYPE_LATTICE_PENDING)
+            .is_ok());
     }
 
     #[test]
@@ -423,7 +701,8 @@ static VERDICTS: std::sync::Mutex<Option<std::collections::HashMap<[u8; 32], boo
 const VERDICT_CACHE_ENTRIES: usize = 4096;
 /// Exponentially weighted mean of one worker verification's wall time, in
 /// microseconds; seeds at 8 s until measured.
-static VERIFY_EWMA_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8_000_000);
+static VERIFY_EWMA_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(8_000_000);
 /// Proof-verification seconds a shard proposal may schedule per frame.
 static VERIFY_BUDGET_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6);
 
@@ -444,13 +723,24 @@ pub fn frame_verification_capacity(concurrency: usize) -> usize {
     ((concurrency.max(1) as f64 * budget / per_op).floor() as usize).max(1)
 }
 
-fn verdict_key(network: &[u8; 32], application: &[u8; 32], bytes: &[u8], limits: CompileLimits, budget: NativeBudget) -> [u8; 32] {
+fn verdict_key(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    bytes: &[u8],
+    limits: CompileLimits,
+    budget: NativeBudget,
+) -> [u8; 32] {
     use sha3::Digest;
     let mut hash = sha3::Sha3_256::new();
     hash.update(b"quil/token/verdict/v1\0");
     hash.update(network);
     hash.update(application);
-    for value in [limits.max_inputs, limits.max_outputs, limits.max_depth, budget.max_native_bytes] {
+    for value in [
+        limits.max_inputs,
+        limits.max_outputs,
+        limits.max_depth,
+        budget.max_native_bytes,
+    ] {
         hash.update((value as u64).to_le_bytes());
     }
     hash.update((bytes.len() as u64).to_le_bytes());
@@ -465,7 +755,9 @@ fn cached_verdict(key: &[u8; 32]) -> Option<bool> {
 fn record_verdict(key: [u8; 32], accepted: bool) {
     if let Ok(mut cache) = VERDICTS.lock() {
         let map = cache.get_or_insert_with(std::collections::HashMap::new);
-        if map.len() >= VERDICT_CACHE_ENTRIES { map.clear(); }
+        if map.len() >= VERDICT_CACHE_ENTRIES {
+            map.clear();
+        }
         map.insert(key, accepted);
     }
 }
@@ -476,13 +768,17 @@ fn record_verdict(key: [u8; 32], accepted: bool) {
 /// moment; each would take its own worker slot, and those left waiting give
 /// up as `Busy` and fail their frames. The first verifies; the rest wait for
 /// its verdict.
-static IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<[u8; 32]>>> = std::sync::Mutex::new(None);
+static IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<[u8; 32]>>> =
+    std::sync::Mutex::new(None);
 static IN_FLIGHT_DONE: std::sync::Condvar = std::sync::Condvar::new();
 
 /// The cached verdict for `key`, or `verify`'s, run by one caller at a time.
 /// A caller that finds it running waits, and runs it itself only if that
 /// attempt produced no verdict (a busy worker, say).
-fn verdict_once<E>(key: [u8; 32], verify: impl FnOnce() -> std::result::Result<bool, E>) -> std::result::Result<bool, E> {
+fn verdict_once<E>(
+    key: [u8; 32],
+    verify: impl FnOnce() -> std::result::Result<bool, E>,
+) -> std::result::Result<bool, E> {
     struct Claim([u8; 32]);
     impl Drop for Claim {
         fn drop(&mut self) {
@@ -503,7 +799,9 @@ fn verdict_once<E>(key: [u8; 32], verify: impl FnOnce() -> std::result::Result<b
             if flight.get_or_insert_with(Default::default).insert(key) {
                 break Claim(key);
             }
-            flight = IN_FLIGHT_DONE.wait(flight).unwrap_or_else(|e| e.into_inner());
+            flight = IN_FLIGHT_DONE
+                .wait(flight)
+                .unwrap_or_else(|e| e.into_inner());
         }
     };
     let accepted = verify()?;
@@ -533,14 +831,23 @@ pub(crate) fn verify_in_worker(
     let key = verdict_key(network, application, bytes, limits, budget);
     let accepted = verdict_once(key, || {
         let start = std::time::Instant::now();
-        let accepted = worker.verify(&WorkerRequest {
-            network: *network, application: *application, limits,
-            submission_bytes: budget.max_native_bytes, transaction: bytes,
-        }).map_err(|error| QuilError::ExecutionUnavailable(format!("token proof worker: {error:?}")))?;
+        let accepted = worker
+            .verify(&WorkerRequest {
+                network: *network,
+                application: *application,
+                limits,
+                submission_bytes: budget.max_native_bytes,
+                transaction: bytes,
+            })
+            .map_err(|error| {
+                QuilError::ExecutionUnavailable(format!("token proof worker: {error:?}"))
+            })?;
         record_duration(start.elapsed());
         Ok::<bool, QuilError>(accepted)
     })?;
-    if !accepted { return Err(invalid("invalid amount proof")); }
+    if !accepted {
+        return Err(invalid("invalid amount proof"));
+    }
     Ok(())
 }
 
@@ -548,13 +855,31 @@ impl TokenPolicy {
     /// The worker request `dispatch` would issue for one confidential
     /// operation, so a pre-pass fills the verdict cache with the same key.
     /// Operations without a proof (mint claims) and unknown types yield `None`.
-    pub(crate) fn worker_request_shape(&self, address: &[u8], tp: u32) -> Option<([u8; 32], CompileLimits)> {
+    pub(crate) fn worker_request_shape(
+        &self,
+        address: &[u8],
+        tp: u32,
+    ) -> Option<([u8; 32], CompileLimits)> {
         let application = self.application(address).ok()?;
         let limits = match tp {
-            TYPE_LATTICE_TRANSACTION | TYPE_LATTICE_PENDING | TYPE_LATTICE_SETTLEMENT => self.limits,
-            TYPE_LATTICE_SHIELD | TYPE_LATTICE_PENDING_CLAIM => CompileLimits { max_inputs: 1, max_outputs: self.limits.max_outputs, max_depth: 1 },
-            TYPE_LATTICE_MINT if application != domains::QUIL_TOKEN => CompileLimits { max_inputs: 1, max_outputs: self.limits.max_outputs, max_depth: 1 },
-            TYPE_LATTICE_MINT => CompileLimits { max_inputs: self.limits.max_inputs, max_outputs: self.limits.max_outputs, max_depth: 1 },
+            TYPE_LATTICE_TRANSACTION | TYPE_LATTICE_PENDING | TYPE_LATTICE_SETTLEMENT => {
+                self.limits
+            }
+            TYPE_LATTICE_SHIELD | TYPE_LATTICE_PENDING_CLAIM => CompileLimits {
+                max_inputs: 1,
+                max_outputs: self.limits.max_outputs,
+                max_depth: 1,
+            },
+            TYPE_LATTICE_MINT if application != domains::QUIL_TOKEN => CompileLimits {
+                max_inputs: 1,
+                max_outputs: self.limits.max_outputs,
+                max_depth: 1,
+            },
+            TYPE_LATTICE_MINT => CompileLimits {
+                max_inputs: self.limits.max_inputs,
+                max_outputs: self.limits.max_outputs,
+                max_depth: 1,
+            },
             _ => return None,
         };
         Some((application, limits))
@@ -565,13 +890,25 @@ impl TokenPolicy {
     /// invalid proofs and unknown types are all re-handled by `dispatch`.
     pub fn preverify(&self, worker: &WorkerVerifier, address: &[u8], bytes: &[u8], tp: u32) {
         if let Some((application, limits)) = self.worker_request_shape(address, tp) {
-            let _ = verify_in_worker(worker, &self.network, &application, bytes, limits, self.native_budget);
+            let _ = verify_in_worker(
+                worker,
+                &self.network,
+                &application,
+                bytes,
+                limits,
+                self.native_budget,
+            );
         }
     }
 }
 
 impl TokenPolicy {
-    pub(crate) fn check_venue(&self, mode: crate::engines::ExecutionMode, address: &[u8], tp: u32) -> Result<()> {
+    pub(crate) fn check_venue(
+        &self,
+        mode: crate::engines::ExecutionMode,
+        address: &[u8],
+        tp: u32,
+    ) -> Result<()> {
         // Claims mutate application state. Like transfers, they may execute
         // through the global materializer's uncovered-application route. Only
         // the QUIL reward mint debits global rewards and needs the global venue;
@@ -589,7 +926,9 @@ impl TokenPolicy {
         }
         // A globally executed application's outputs are placed inline; only an
         // app shard takes deliveries.
-        if tp == super::constants::TYPE_COIN_DELIVERY && mode != crate::engines::ExecutionMode::Application {
+        if tp == super::constants::TYPE_COIN_DELIVERY
+            && mode != crate::engines::ExecutionMode::Application
+        {
             return Err(invalid("deliveries are applied by app shards"));
         }
         Ok(())
@@ -615,16 +954,27 @@ impl TokenPolicy {
     /// prover with no coins can still mint; the mint claim is exempt because
     /// the authorization already paid. Cross-domain settlement is separate.
     pub(crate) fn check_self_paid_fee(
-        &self, address: &[u8], bytes: &[u8], tp: u32,
+        &self,
+        address: &[u8],
+        bytes: &[u8],
+        tp: u32,
         multiplier: &num_bigint::BigInt,
     ) -> Result<()> {
         use num_bigint::{BigInt, Sign};
         if multiplier.sign() == Sign::Minus {
             return Err(invalid("negative fee multiplier"));
         }
-        if address != domains::QUIL_TOKEN.as_slice() || !matches!(tp,
-            TYPE_LATTICE_TRANSACTION | TYPE_LATTICE_PENDING | TYPE_LATTICE_MINT
-            | TYPE_LATTICE_PENDING_CLAIM | TYPE_LATTICE_SHIELD | TYPE_LATTICE_SETTLEMENT) {
+        if address != domains::QUIL_TOKEN.as_slice()
+            || !matches!(
+                tp,
+                TYPE_LATTICE_TRANSACTION
+                    | TYPE_LATTICE_PENDING
+                    | TYPE_LATTICE_MINT
+                    | TYPE_LATTICE_PENDING_CLAIM
+                    | TYPE_LATTICE_SHIELD
+                    | TYPE_LATTICE_SETTLEMENT
+            )
+        {
             return Ok(());
         }
         // Keep arbitrary-precision multiplication: a charge beyond u128 must
@@ -658,7 +1008,9 @@ impl TokenPolicy {
             TYPE_LATTICE_PENDING_CLAIM => {
                 let tx = PendingClaim::decode(bytes, &self.network, &application)
                     .map_err(|_| invalid("invalid pending claim encoding or context"))?;
-                if self.limits.max_inputs < 1 || tx.statement.outputs.len() > self.limits.max_outputs {
+                if self.limits.max_inputs < 1
+                    || tx.statement.outputs.len() > self.limits.max_outputs
+                {
                     return Err(invalid("pending claim exceeds configured dimensions"));
                 }
                 self.check_fee(&application, tx.statement.fee)
@@ -666,7 +1018,8 @@ impl TokenPolicy {
             TYPE_LATTICE_MINT_CLAIM => {
                 let tx = MintClaim::decode(bytes, &self.network, &application)
                     .map_err(|_| invalid("invalid mint claim encoding or context"))?;
-                if application != domains::QUIL_TOKEN || tx.outputs.len() > self.limits.max_outputs {
+                if application != domains::QUIL_TOKEN || tx.outputs.len() > self.limits.max_outputs
+                {
                     return Err(invalid("unsupported mint claim application or dimensions"));
                 }
                 // The fee was paid by the globally authorized mint. Do not
@@ -728,8 +1081,12 @@ impl TokenPolicy {
                 self.check_fee(&application, tx.fee())
             }
             TYPE_LATTICE_SETTLEMENT => {
-                let tx = quil_lattice_ct::confidential::settlement::Settlement::decode(bytes, &self.network, &application)
-                    .map_err(|_| invalid("invalid settlement encoding or context"))?;
+                let tx = quil_lattice_ct::confidential::settlement::Settlement::decode(
+                    bytes,
+                    &self.network,
+                    &application,
+                )
+                .map_err(|_| invalid("invalid settlement encoding or context"))?;
                 let s = &tx.statement.funding;
                 if application != domains::QUIL_TOKEN
                     || s.images.len() > self.limits.max_inputs
@@ -764,18 +1121,34 @@ impl TokenPolicy {
         self.preflight(address, bytes, tp)?;
         let application = self.application(address)?;
         if !super::spend_entries::commits_globally(&application, tp) {
-            return Err(invalid("operation does not commit through the global frame"));
+            return Err(invalid(
+                "operation does not commit through the global frame",
+            ));
         }
         if tp == TYPE_LATTICE_MINT {
             custom_mint::verify_custom_mint_with_worker(
-                state, &self.network, &application, bytes, self.limits.max_outputs,
-                self.native_budget, worker, paid,
+                state,
+                &self.network,
+                &application,
+                bytes,
+                self.limits.max_outputs,
+                self.native_budget,
+                worker,
+                paid,
             )?;
             return Ok(());
         }
         super::commit_verify::verify_for_commit(
-            state, clock, context, &self.network, &application, tp, bytes,
-            self.limits, self.native_budget, worker,
+            state,
+            clock,
+            context,
+            &self.network,
+            &application,
+            tp,
+            bytes,
+            self.limits,
+            self.native_budget,
+            worker,
         )
     }
 
@@ -797,7 +1170,13 @@ impl TokenPolicy {
         self.dispatch_for_commit(state, context, clock, address, bytes, tp, worker, paid)?;
         let application = self.application(address)?;
         super::commit_apply::commit_and_place(
-            state, context.frame_number, &self.network, &application, tp, bytes, self.snapshots,
+            state,
+            context.frame_number,
+            &self.network,
+            &application,
+            tp,
+            bytes,
+            self.snapshots,
         )?;
         Ok(())
     }
@@ -812,7 +1191,15 @@ impl TokenPolicy {
         bytes: &[u8],
     ) -> Result<()> {
         let application = self.application(address)?;
-        super::delivery::verify_and_apply(state, context, clock, &self.network, &application, bytes, self.snapshots)?;
+        super::delivery::verify_and_apply(
+            state,
+            context,
+            clock,
+            &self.network,
+            &application,
+            bytes,
+            self.snapshots,
+        )?;
         Ok(())
     }
 
@@ -852,5 +1239,4 @@ impl TokenPolicy {
         .authorize_global(state, frame)?;
         Ok(())
     }
-
 }

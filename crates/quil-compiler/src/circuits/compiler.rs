@@ -245,10 +245,7 @@ impl Compiler {
         let mut new_gates = Vec::with_capacity(live.len());
         for &idx in &live {
             // Move gates — safe because we process in order
-            let g = std::mem::replace(
-                &mut self.gates[idx],
-                Gate::new(Operation::Xor, 0, 0, 0),
-            );
+            let g = std::mem::replace(&mut self.gates[idx], Gate::new(Operation::Xor, 0, 0, 0));
             new_gates.push(g);
         }
         self.gates = new_gates;
@@ -388,14 +385,7 @@ pub fn new_half_adder(cc: &mut Compiler, a: usize, b: usize, sum: usize, carry: 
 }
 
 /// Full adder: a + b + cin = (sum, carry).
-pub fn new_full_adder(
-    cc: &mut Compiler,
-    a: usize,
-    b: usize,
-    cin: usize,
-    sum: usize,
-    carry: usize,
-) {
+pub fn new_full_adder(cc: &mut Compiler, a: usize, b: usize, cin: usize, sum: usize, carry: usize) {
     let w1 = cc.allocator.wire();
     let w2 = cc.allocator.wire();
     let w3 = cc.allocator.wire();
@@ -564,14 +554,18 @@ mod tests {
         let c = make_adder_circuit(8);
         // 100 + 200 = 300, but 300 doesn't fit in 8 bits (overflow).
         // Use values that fit: 50 + 100 = 150.
-        let r = c.compute(&[BigInt::from(50u32), BigInt::from(100u32)]).unwrap();
+        let r = c
+            .compute(&[BigInt::from(50u32), BigInt::from(100u32)])
+            .unwrap();
         assert_eq!(r[0], BigInt::from(150u32));
     }
 
     #[test]
     fn adder_small() {
         let c = make_adder_circuit(8);
-        let r = c.compute(&[BigInt::from(1u32), BigInt::from(2u32)]).unwrap();
+        let r = c
+            .compute(&[BigInt::from(1u32), BigInt::from(2u32)])
+            .unwrap();
         assert_eq!(r[0], BigInt::from(3u32));
     }
 
@@ -604,7 +598,9 @@ mod tests {
     #[test]
     fn subtractor_basic() {
         let c = make_sub_circuit(8);
-        let r = c.compute(&[BigInt::from(200u32), BigInt::from(100u32)]).unwrap();
+        let r = c
+            .compute(&[BigInt::from(200u32), BigInt::from(100u32)])
+            .unwrap();
         assert_eq!(r[0], BigInt::from(100u32));
     }
 }

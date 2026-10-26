@@ -26,7 +26,9 @@ use quil_types::error::Result;
 /// committee public keys), every one authenticated by the GLOBAL prover tree
 /// at a frame near the anchor.
 pub type HistoricalCommitteeSource = Arc<
-    dyn Fn(Vec<u8>, u64) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<Vec<u8>>>>> + Send>> + Send + Sync,
+    dyn Fn(Vec<u8>, u64) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<Vec<u8>>>>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// How long one reconstruction may take: it can sync a historical prover
@@ -70,7 +72,11 @@ pub(crate) struct Rebuilding<'a> {
 
 impl Drop for Rebuilding<'_> {
     fn drop(&mut self) {
-        self.committees.rebuilding.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
+        self.committees
+            .rebuilding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -97,21 +103,32 @@ impl HistoricalCommittees {
         }
         let (done, waiting) = tokio::sync::watch::channel(());
         rebuilding.insert(key.clone(), waiting);
-        Begun::Rebuild(Rebuilding { committees: self, key, _done: done })
+        Begun::Rebuild(Rebuilding {
+            committees: self,
+            key,
+            _done: done,
+        })
     }
 
     pub(crate) fn get(&self, filter: &[u8], anchor: u64) -> Option<Arc<Vec<Vec<Vec<u8>>>>> {
         let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries
             .iter()
-            .find(|((f, a), at, _)| f.as_slice() == filter && *a == anchor && at.elapsed() < KEPT_FOR)
+            .find(|((f, a), at, _)| {
+                f.as_slice() == filter && *a == anchor && at.elapsed() < KEPT_FOR
+            })
             .map(|(_, _, committees)| committees.clone())
     }
 
     pub(crate) fn put(&self, filter: Vec<u8>, anchor: u64, committees: Vec<Vec<Vec<u8>>>) {
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        entries.retain(|((f, a), at, _)| !(f == &filter && *a == anchor) && at.elapsed() < KEPT_FOR);
-        entries.push_back(((filter, anchor), std::time::Instant::now(), Arc::new(committees)));
+        entries
+            .retain(|((f, a), at, _)| !(f == &filter && *a == anchor) && at.elapsed() < KEPT_FOR);
+        entries.push_back((
+            (filter, anchor),
+            std::time::Instant::now(),
+            Arc::new(committees),
+        ));
         while entries.len() > KEPT {
             entries.pop_front();
         }
@@ -120,7 +137,9 @@ impl HistoricalCommittees {
     /// Record that rebuilding `(filter, anchor)`'s committees failed now.
     pub(crate) fn failed(&self, filter: Vec<u8>, anchor: u64) {
         let mut failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
-        failures.retain(|((f, a), at)| !(f == &filter && *a == anchor) && at.elapsed() < FAILED_KEPT_FOR);
+        failures.retain(|((f, a), at)| {
+            !(f == &filter && *a == anchor) && at.elapsed() < FAILED_KEPT_FOR
+        });
         failures.push_back(((filter, anchor), std::time::Instant::now()));
         while failures.len() > KEPT {
             failures.pop_front();
@@ -131,8 +150,11 @@ impl HistoricalCommittees {
     /// [`FAILED_KEPT_FOR`].
     pub(crate) fn failed_ago(&self, filter: &[u8], anchor: u64) -> Option<std::time::Duration> {
         let failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
-        failures.iter()
-            .find(|((f, a), at)| f.as_slice() == filter && *a == anchor && at.elapsed() < FAILED_KEPT_FOR)
+        failures
+            .iter()
+            .find(|((f, a), at)| {
+                f.as_slice() == filter && *a == anchor && at.elapsed() < FAILED_KEPT_FOR
+            })
             .map(|(_, at)| at.elapsed())
     }
 
@@ -140,11 +162,23 @@ impl HistoricalCommittees {
     /// [`FAILED_KEPT_FOR`], as time would.
     #[cfg(test)]
     pub(crate) fn expire(&self) {
-        let Some(past) = std::time::Instant::now().checked_sub(KEPT_FOR) else { return };
-        for (_, at, _) in self.entries.lock().unwrap_or_else(|p| p.into_inner()).iter_mut() {
+        let Some(past) = std::time::Instant::now().checked_sub(KEPT_FOR) else {
+            return;
+        };
+        for (_, at, _) in self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter_mut()
+        {
             *at = past;
         }
-        for (_, at) in self.failures.lock().unwrap_or_else(|p| p.into_inner()).iter_mut() {
+        for (_, at) in self
+            .failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter_mut()
+        {
             *at = past;
         }
     }
@@ -157,12 +191,22 @@ mod tests {
     #[tokio::test]
     async fn one_reconstruction_per_anchor_at_a_time_and_the_others_wait_on_it() {
         let kept = HistoricalCommittees::default();
-        let Begun::Rebuild(first) = kept.begin(b"shard", 5) else { panic!("nothing under way") };
-        let Begun::Wait(mut waiting) = kept.begin(b"shard", 5) else { panic!("under way") };
-        assert!(matches!(kept.begin(b"shard", 6), Begun::Rebuild(_)), "another anchor");
+        let Begun::Rebuild(first) = kept.begin(b"shard", 5) else {
+            panic!("nothing under way")
+        };
+        let Begun::Wait(mut waiting) = kept.begin(b"shard", 5) else {
+            panic!("under way")
+        };
+        assert!(
+            matches!(kept.begin(b"shard", 6), Begun::Rebuild(_)),
+            "another anchor"
+        );
         drop(first);
         assert!(waiting.changed().await.is_err(), "woken when it ends");
-        assert!(matches!(kept.begin(b"shard", 5), Begun::Rebuild(_)), "ended");
+        assert!(
+            matches!(kept.begin(b"shard", 5), Begun::Rebuild(_)),
+            "ended"
+        );
     }
 
     #[test]
@@ -173,7 +217,10 @@ mod tests {
         assert!(kept.failed_ago(b"shard", 5).is_some());
         assert!(kept.failed_ago(b"shard", 6).is_none());
         kept.expire();
-        assert!(kept.failed_ago(b"shard", 5).is_none(), "tried again after a while");
+        assert!(
+            kept.failed_ago(b"shard", 5).is_none(),
+            "tried again after a while"
+        );
     }
 
     #[test]
@@ -182,7 +229,10 @@ mod tests {
         kept.put(b"shard".to_vec(), 5, vec![vec![vec![1u8; 897]]]);
         assert!(kept.get(b"shard", 5).is_some());
         kept.expire();
-        assert!(kept.get(b"shard", 5).is_none(), "rebuilt again after a while");
+        assert!(
+            kept.get(b"shard", 5).is_none(),
+            "rebuilt again after a while"
+        );
     }
 
     #[test]
@@ -193,12 +243,23 @@ mod tests {
         kept.put(b"other".to_vec(), 5, vec![]);
         assert_eq!(kept.get(b"shard", 5).unwrap().len(), 1);
         assert!(kept.get(b"shard", 6).is_none());
-        kept.put(b"shard".to_vec(), 5, vec![vec![vec![2u8; 897]], vec![vec![3u8; 897]]]);
-        assert_eq!(kept.get(b"shard", 5).unwrap().len(), 2, "replaced, not duplicated");
+        kept.put(
+            b"shard".to_vec(),
+            5,
+            vec![vec![vec![2u8; 897]], vec![vec![3u8; 897]]],
+        );
+        assert_eq!(
+            kept.get(b"shard", 5).unwrap().len(),
+            2,
+            "replaced, not duplicated"
+        );
         for anchor in 0..(KEPT as u64 + 10) {
             kept.put(b"many".to_vec(), anchor + 100, vec![]);
         }
-        assert!(kept.get(b"shard", 5).is_none(), "oldest dropped past the bound");
+        assert!(
+            kept.get(b"shard", 5).is_none(),
+            "oldest dropped past the bound"
+        );
         assert!(kept.get(b"many", 100 + KEPT as u64 + 9).is_some());
     }
 }

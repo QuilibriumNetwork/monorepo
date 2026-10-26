@@ -20,7 +20,8 @@ use clap::{Args, Subcommand};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
-    Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase, WorkerHealth,
+    Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase,
+    WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -220,7 +221,9 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
         }
         None => (own, "this node".to_string()),
     };
-    let addr = super::diagnostics_logs::target_addr(node.as_ref(), &target, &own, args.addr.as_deref()).await?;
+    let addr =
+        super::diagnostics_logs::target_addr(node.as_ref(), &target, &own, args.addr.as_deref())
+            .await?;
     let mut client = diag::connect_peer(&addr, &requester.key, target)
         .await
         .map_err(|e| anyhow::anyhow!("connect to {label} at {addr}: {}", error_chain(&*e)))?;
@@ -230,7 +233,10 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
             Ok(())
         }
         Err(status) => {
-            eprint!("{}", render_refusal(&label, &status, &own.to_base58(), requester.whose));
+            eprint!(
+                "{}",
+                render_refusal(&label, &status, &own.to_base58(), requester.whose)
+            );
             anyhow::bail!("no health report from {label}")
         }
     }
@@ -238,8 +244,11 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
 
 async fn resolve(global: GlobalArgs, args: &ResolveArgs) -> anyhow::Result<()> {
     let target = parse_peer(&args.peer)?;
-    let node = super::diagnostics_logs::NodeSide::load(global)
-        .map_err(|e| e.context("resolve reads this node's peer info: run qclient where it finds this node's config"))?;
+    let node = super::diagnostics_logs::NodeSide::load(global).map_err(|e| {
+        e.context(
+            "resolve reads this node's peer info: run qclient where it finds this node's config",
+        )
+    })?;
     let label = diag::peer_tail(&target);
     let peers = super::diagnostics_logs::local_peer_info(&node, &label).await?;
     if args.all {
@@ -271,7 +280,9 @@ const MASTER_FILTER: [u8; 32] = [0xff; 32];
 fn known_peer<'a>(peers: &'a [PeerInfo], target: &PeerId) -> anyhow::Result<&'a PeerInfo> {
     let id = target.to_bytes();
     peers.iter().find(|info| info.peer_id == id).ok_or_else(|| {
-        anyhow::anyhow!("this node has no peer info for {target} (it learns peers from their announcements)")
+        anyhow::anyhow!(
+            "this node has no peer info for {target} (it learns peers from their announcements)"
+        )
     })
 }
 
@@ -290,10 +301,14 @@ pub(crate) fn resolve_stream_addr(peers: &[PeerInfo], target: &PeerId) -> anyhow
     let Some(first) = addrs.first() else {
         anyhow::bail!("{target} publishes no stream address");
     };
-    match addrs.iter().find(|addr| address_reach(addr) != Reach::Private) {
+    match addrs
+        .iter()
+        .find(|addr| address_reach(addr) != Reach::Private)
+    {
         Some(addr) => rpc::grpc_multiaddr_to_host_port(addr),
         None => {
-            let shown = rpc::grpc_multiaddr_to_host_port(first).map_or_else(|_| printable(first), |a| printable(&a));
+            let shown = rpc::grpc_multiaddr_to_host_port(first)
+                .map_or_else(|_| printable(first), |a| printable(&a));
             anyhow::bail!(
                 "{target} publishes only a private stream address ({shown}), unreachable from outside its \
                  network; ask its operator for a reachable host:port"
@@ -354,7 +369,8 @@ fn ipv6_reach(ip: Ipv6Addr) -> Reach {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return ipv4_reach(v4);
     }
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local() {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
+    {
         Reach::Private
     } else {
         Reach::Public
@@ -371,7 +387,11 @@ pub(crate) fn published_stream_addr(peers: &[PeerInfo], target: &PeerId) -> anyh
 /// line per address with its kind, `host:port` (`-` when it has none),
 /// [`Reach`], multiaddr and filter. The addresses are the peer's text,
 /// printed without control characters.
-pub(crate) fn render_addresses(peers: &[PeerInfo], target: &PeerId, label: &str) -> anyhow::Result<String> {
+pub(crate) fn render_addresses(
+    peers: &[PeerInfo],
+    target: &PeerId,
+    label: &str,
+) -> anyhow::Result<String> {
     let mut rows = Vec::new();
     for reachability in &known_peer(peers, target)?.reachability {
         let filter = match reachability.filter.as_slice() {
@@ -379,16 +399,29 @@ pub(crate) fn render_addresses(peers: &[PeerInfo], target: &PeerId, label: &str)
             [] => "-".to_string(),
             filter => hex::encode(filter),
         };
-        for (kind, addrs) in [("stream", &reachability.stream_multiaddrs), ("pubsub", &reachability.pubsub_multiaddrs)] {
+        for (kind, addrs) in [
+            ("stream", &reachability.stream_multiaddrs),
+            ("pubsub", &reachability.pubsub_multiaddrs),
+        ] {
             for addr in addrs.iter().filter(|addr| !addr.is_empty()) {
-                let host_port = rpc::grpc_multiaddr_to_host_port(addr).map_or_else(|_| "-".to_string(), |a| printable(&a));
+                let host_port = rpc::grpc_multiaddr_to_host_port(addr)
+                    .map_or_else(|_| "-".to_string(), |a| printable(&a));
                 let reach = address_reach(addr).label().to_string();
-                rows.push([kind.to_string(), host_port, reach, printable(addr), filter.clone()]);
+                rows.push([
+                    kind.to_string(),
+                    host_port,
+                    reach,
+                    printable(addr),
+                    filter.clone(),
+                ]);
             }
         }
     }
     anyhow::ensure!(!rows.is_empty(), "{target} publishes no addresses");
-    let private = rows.iter().filter(|row| row[2] == Reach::Private.label()).count();
+    let private = rows
+        .iter()
+        .filter(|row| row[2] == Reach::Private.label())
+        .count();
     let header = ["KIND", "ADDRESS", "REACH", "MULTIADDR", "FILTER"].map(String::from);
     let mut widths = header.clone().map(|title| title.len());
     for row in &rows {
@@ -396,7 +429,10 @@ pub(crate) fn render_addresses(peers: &[PeerInfo], target: &PeerId, label: &str)
             *width = (*width).max(cell.chars().count());
         }
     }
-    let mut out = format!("Addresses {label} publishes in this node's peer info: {} ({private} private).\n", rows.len());
+    let mut out = format!(
+        "Addresses {label} publishes in this node's peer info: {} ({private} private).\n",
+        rows.len()
+    );
     for cells in std::iter::once(&header).chain(&rows) {
         let [kind, host_port, reach, multiaddr, filter] = cells;
         let [kind_width, host_port_width, reach_width, multiaddr_width, _] = widths;
@@ -412,7 +448,11 @@ fn release(report: &HealthReport) -> String {
     if report.version.len() != 3 {
         return "unknown".into();
     }
-    let mut release = format!("{}.{}", quil_config::format_version(&report.version), report.patch);
+    let mut release = format!(
+        "{}.{}",
+        quil_config::format_version(&report.version),
+        report.patch
+    );
     if report.subpatch > 0 {
         release += &format!(".{}", report.subpatch);
     }
@@ -433,7 +473,9 @@ fn optional(value: Option<u64>) -> String {
 }
 
 fn phase(worker: &WorkerHealth, now: u64) -> String {
-    let Ok(phase) = Phase::try_from(worker.phase) else { return "unrecognized".into() };
+    let Ok(phase) = Phase::try_from(worker.phase) else {
+        return "unrecognized".into();
+    };
     if phase == Phase::Unspecified {
         return "unobserved".into();
     }
@@ -448,7 +490,8 @@ fn phase(worker: &WorkerHealth, now: u64) -> String {
 }
 
 fn recovery(worker: &WorkerHealth, now: u64) -> String {
-    let phase = RecoveryPhase::try_from(worker.recovery_phase).map_or("unrecognized", diag::recovery_phase_name);
+    let phase = RecoveryPhase::try_from(worker.recovery_phase)
+        .map_or("unrecognized", diag::recovery_phase_name);
     if worker.recovery_phase == RecoveryPhase::None as i32 && worker.recovery_attempts == 0 {
         return "-".into();
     }
@@ -458,17 +501,29 @@ fn recovery(worker: &WorkerHealth, now: u64) -> String {
         worker.recovery_attempts,
         worker.recovery_consecutive_failures
     );
-    let name = |class: i32| RecoveryFailure::try_from(class).map_or("unrecognized", diag::recovery_failure_name);
+    let name = |class: i32| {
+        RecoveryFailure::try_from(class).map_or("unrecognized", diag::recovery_failure_name)
+    };
     if !worker.recovery_failures.is_empty() {
-        let failures: Vec<String> =
-            worker.recovery_failures.iter().map(|f| format!("{}:{}", name(f.class), f.count)).collect();
+        let failures: Vec<String> = worker
+            .recovery_failures
+            .iter()
+            .map(|f| format!("{}:{}", name(f.class), f.count))
+            .collect();
         text += &format!(", failed {}", failures.join(" "));
     }
     if worker.last_failure != RecoveryFailure::None as i32 {
-        text += &format!(", last failure {} {}", name(worker.last_failure), age(worker.last_failure_unix_ms, now));
+        text += &format!(
+            ", last failure {} {}",
+            name(worker.last_failure),
+            age(worker.last_failure_unix_ms, now)
+        );
     }
     if worker.longest_permit_wait_ms > 0 {
-        text += &format!(", longest turn wait {}s", worker.longest_permit_wait_ms / 1000);
+        text += &format!(
+            ", longest turn wait {}s",
+            worker.longest_permit_wait_ms / 1000
+        );
     }
     text
 }
@@ -504,14 +559,21 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
         (Some(join), _) if worker.phase == Phase::Joining as i32 => join,
         _ if blocker.is_empty() => "-".into(),
         // Refused only its committee seat, which committed GLOBAL state grants.
-        (_, Some(frame)) if waiting && worker.blocker == Blocker::CommitteeAdmissionUnavailable as i32 =>
-            format!("awaiting a committee seat (by frame {frame})"),
+        (_, Some(frame))
+            if waiting && worker.blocker == Blocker::CommitteeAdmissionUnavailable as i32 =>
+        {
+            format!("awaiting a committee seat (by frame {frame})")
+        }
         (_, Some(frame)) if waiting => format!("{blocker} (by frame {frame})"),
         _ => blocker.into(),
     };
     // Above the configured count: the phase stays the engine's.
     if worker.draining {
-        reason = if reason == "-" { "draining".into() } else { format!("draining; {reason}") };
+        reason = if reason == "-" {
+            "draining".into()
+        } else {
+            format!("draining; {reason}")
+        };
     }
     let seal = worker.seal_generation.map_or_else(
         || "-".into(),
@@ -530,29 +592,42 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
         reason,
         optional(worker.materialized_frame),
         optional(worker.committee_head_frame),
-        worker.committed_generation.map_or_else(|| "-".into(), |generation| format!("g{generation}")),
+        worker
+            .committed_generation
+            .map_or_else(|| "-".into(), |generation| format!("g{generation}")),
         age(worker.last_advance_unix_ms, now).into(),
         seal,
-        if worker.filter.is_empty() { "-".into() } else { hex::encode(&worker.filter) },
+        if worker.filter.is_empty() {
+            "-".into()
+        } else {
+            hex::encode(&worker.filter)
+        },
         recovery(worker, now),
     ]
 }
 
 /// The report's line for a master store that refuses writes.
-const MASTER_STORE_WRITE_FAILED: &str = "Master store stopped writing (a failed write, or free space below the \
+const MASTER_STORE_WRITE_FAILED: &str =
+    "Master store stopped writing (a failed write, or free space below the \
     floor): this node cannot follow GLOBAL until the store is reopened.";
 
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     let mut out = String::new();
-    let build = report.build_fingerprint.get(..4).map_or_else(|| "unknown".into(), hex::encode);
+    let build = report
+        .build_fingerprint
+        .get(..4)
+        .map_or_else(|| "unknown".into(), hex::encode);
     let omitted = match report.omitted_workers {
         0 => String::new(),
         n => format!(", {n} more not sent (report size bound)"),
     };
     // Against the configured count, from nodes that report it.
-    let configured = match (report.worker_capacity, report.workers.iter().filter(|w| w.draining).count()) {
+    let configured = match (
+        report.worker_capacity,
+        report.workers.iter().filter(|w| w.draining).count(),
+    ) {
         (0, _) => String::new(),
         (count, 0) => format!(" of {count} configured"),
         (count, draining) => format!(" of {count} configured, {draining} draining"),
@@ -571,7 +646,11 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         let _ = writeln!(out, "No data workers reported.");
         return out;
     }
-    let rows: Vec<[String; 11]> = report.workers.iter().map(|w| row(w, report.generated_unix_ms)).collect();
+    let rows: Vec<[String; 11]> = report
+        .workers
+        .iter()
+        .map(|w| row(w, report.generated_unix_ms))
+        .collect();
     let mut widths = COLUMNS.map(|(title, _)| title.len());
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -600,7 +679,11 @@ const MAX_MESSAGE_CHARS: usize = 200;
 /// A target's status message without control characters (it is remote
 /// text printed to a terminal), at most [`MAX_MESSAGE_CHARS`] long.
 pub(crate) fn printable(message: &str) -> String {
-    let mut text: String = message.chars().filter(|c| !c.is_control()).take(MAX_MESSAGE_CHARS + 1).collect();
+    let mut text: String = message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_MESSAGE_CHARS + 1)
+        .collect();
     if text.chars().count() > MAX_MESSAGE_CHARS {
         text = text.chars().take(MAX_MESSAGE_CHARS).collect::<String>() + "…";
     }
@@ -608,7 +691,12 @@ pub(crate) fn printable(message: &str) -> String {
 }
 
 /// Why `target` did not send a report, and what would change that.
-pub(crate) fn render_refusal(target: &str, status: &tonic::Status, own: &str, whose: &str) -> String {
+pub(crate) fn render_refusal(
+    target: &str,
+    status: &tonic::Status,
+    own: &str,
+    whose: &str,
+) -> String {
     let message = printable(status.message());
     match status.code() {
         tonic::Code::PermissionDenied => format!(
@@ -680,8 +768,14 @@ mod tests {
             recovery_attempts: 5,
             recovery_consecutive_failures: 2,
             recovery_failures: vec![
-                FailureCount { class: RecoveryFailure::Connect as i32, count: 2 },
-                FailureCount { class: RecoveryFailure::ArchiveState as i32, count: 1 },
+                FailureCount {
+                    class: RecoveryFailure::Connect as i32,
+                    count: 2,
+                },
+                FailureCount {
+                    class: RecoveryFailure::ArchiveState as i32,
+                    count: 1,
+                },
             ],
             last_failure_unix_ms: NOW - 30_000,
             longest_permit_wait_ms: 95_000,
@@ -712,10 +806,17 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
     fn stale_unobserved_and_unallocated_workers_say_so() {
         let mut stale = two_workers().remove(0);
         stale.observed_unix_ms = NOW - 31_000;
-        let unallocated = WorkerHealth { core_id: 3, ..Default::default() };
+        let unallocated = WorkerHealth {
+            core_id: 3,
+            ..Default::default()
+        };
         let text = render_report("this node", &report(vec![stale, unallocated], 4));
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[0].ends_with("; 2 workers, 4 more not sent (report size bound)."), "{}", lines[0]);
+        assert!(
+            lines[0].ends_with("; 2 workers, 4 more not sent (report size bound)."),
+            "{}",
+            lines[0]
+        );
         assert!(lines[2].contains(" stale "), "{}", lines[2]);
         assert_eq!(lines[3], "   3  no     unobserved  -           -          -  -    unobserved  -     -                                                                 -");
     }
@@ -739,18 +840,37 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         activating.activation_frame = Some(918_720);
         let text = render_report("this node", &report(vec![unconfirmed, activating], 0));
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[2].starts_with("   4  yes    joining  awaiting join confirmation (epoch 1276)  "), "{}", lines[2]);
-        assert!(lines[3].starts_with("  12  yes    joining  awaiting activation at frame 918720      "), "{}", lines[3]);
-        assert!(lines[3].ends_with("installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 \
-            archive_state:1, last failure connect <60s, longest turn wait 95s"), "{}", lines[3]);
+        assert!(
+            lines[2].starts_with("   4  yes    joining  awaiting join confirmation (epoch 1276)  "),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[3].starts_with("  12  yes    joining  awaiting activation at frame 918720      "),
+            "{}",
+            lines[3]
+        );
+        assert!(
+            lines[3].ends_with(
+                "installing_leaves >60s, attempts 5 (2 failing in a row), failed connect:2 \
+            archive_state:1, last failure connect <60s, longest turn wait 95s"
+            ),
+            "{}",
+            lines[3]
+        );
 
         let mut seat = two_workers().remove(1);
         seat.set_phase(Phase::Waiting);
         seat.set_blocker(Blocker::CommitteeAdmissionUnavailable);
         seat.awaited_frame = Some(919_440);
         let text = render_report("this node", &report(vec![seat], 0));
-        assert!(text.lines().nth(2).unwrap().starts_with("  12  yes    wait   awaiting a committee seat (by frame 919440)  "),
-            "{text}");
+        assert!(
+            text.lines()
+                .nth(2)
+                .unwrap()
+                .starts_with("  12  yes    wait   awaiting a committee seat (by frame 919440)  "),
+            "{text}"
+        );
     }
 
     /// A node running more workers than configured names the count and its
@@ -762,11 +882,22 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let mut with_count = report(workers, 0);
         with_count.worker_capacity = 1;
         let text = render_report("…Ab12cd", &with_count);
-        assert!(text.starts_with("Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame \
-            90001; 2 workers of 1 configured, 1 draining.\n"), "{text}");
-        assert!(text.contains("  blocked  draining; state unavailable"), "{text}");
+        assert!(
+            text.starts_with(
+                "Health report of …Ab12cd: release 2.1.0.25.88, build abababab, GLOBAL head frame \
+            90001; 2 workers of 1 configured, 1 draining.\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  blocked  draining; state unavailable"),
+            "{text}"
+        );
         let older = render_report("…Ab12cd", &report(two_workers(), 0));
-        assert!(older.contains("; 2 workers.\n") && !older.contains("draining"), "{older}");
+        assert!(
+            older.contains("; 2 workers.\n") && !older.contains("draining"),
+            "{older}"
+        );
     }
 
     #[test]
@@ -774,8 +905,15 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let mut latched = report(Vec::new(), 0);
         latched.master_store_write_failed = true;
         let text = render_report("this node", &latched);
-        assert_eq!(text.lines().nth(1), Some(MASTER_STORE_WRITE_FAILED), "{text}");
-        assert!(MASTER_STORE_WRITE_FAILED.contains("free space below the floor"), "{MASTER_STORE_WRITE_FAILED}");
+        assert_eq!(
+            text.lines().nth(1),
+            Some(MASTER_STORE_WRITE_FAILED),
+            "{text}"
+        );
+        assert!(
+            MASTER_STORE_WRITE_FAILED.contains("free space below the floor"),
+            "{MASTER_STORE_WRITE_FAILED}"
+        );
         assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Master store"));
     }
 
@@ -789,7 +927,9 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
     #[test]
     fn a_refusal_names_what_the_target_operator_must_configure() {
         let denied = tonic::Status::permission_denied(diag::DENIED);
-        assert_eq!(render_refusal("…Ab12cd", &denied, "QmOwnPeerId", "this node's"), "\
+        assert_eq!(
+            render_refusal("…Ab12cd", &denied, "QmOwnPeerId", "this node's"),
+            "\
 …Ab12cd refused the health report (diagnostics unavailable).
 Its operator serves it only to peers listed in that node's config:
   diagnostics:
@@ -798,9 +938,15 @@ Its operator serves it only to peers listed in that node's config:
       allowedPeers:
         - QmOwnPeerId
 and a restart of that node. QmOwnPeerId is this node's peer ID.
-");
-        let limited = tonic::Status::resource_exhausted("a health report was served to this peer less than 60s ago");
-        assert!(render_refusal("…Ab12cd", &limited, "QmOwnPeerId", "this node's").contains("minIntervalSecs"));
+"
+        );
+        let limited = tonic::Status::resource_exhausted(
+            "a health report was served to this peer less than 60s ago",
+        );
+        assert!(
+            render_refusal("…Ab12cd", &limited, "QmOwnPeerId", "this node's")
+                .contains("minIntervalSecs")
+        );
         let old = tonic::Status::unimplemented("");
         assert!(render_refusal("…Ab12cd", &old, "QmOwnPeerId", "this node's").contains("predates"));
     }
@@ -809,18 +955,30 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
     /// and within a bounded length.
     #[test]
     fn a_refusal_message_is_printable_and_bounded() {
-        let hostile = tonic::Status::unavailable(format!("\x1b]0;owned\x07\x1b[2Jbusy\r\nretry{}", "x".repeat(500)));
+        let hostile = tonic::Status::unavailable(format!(
+            "\x1b]0;owned\x07\x1b[2Jbusy\r\nretry{}",
+            "x".repeat(500)
+        ));
         let text = render_refusal("…Ab12cd", &hostile, "QmOwnPeerId", "this node's");
         assert!(text.starts_with("…Ab12cd did not answer the health report request: Unavailable: ]0;owned[2Jbusyretryxxx"), "{text}");
-        assert!(!text.trim_end_matches('\n').chars().any(char::is_control), "{text:?}");
-        assert_eq!(printable(hostile.message()).chars().count(), MAX_MESSAGE_CHARS + 1);
+        assert!(
+            !text.trim_end_matches('\n').chars().any(char::is_control),
+            "{text:?}"
+        );
+        assert_eq!(
+            printable(hostile.message()).chars().count(),
+            MAX_MESSAGE_CHARS + 1
+        );
         assert_eq!(printable("short"), "short");
     }
 
     #[test]
     fn the_published_master_stream_address_is_dialed() {
-        let key = |n: u8| quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
-            .map(|k| (k.public().to_peer_id(), n)).unwrap();
+        let key = |n: u8| {
+            quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+                .map(|k| (k.public().to_peer_id(), n))
+                .unwrap()
+        };
         let ((target, _), (other, _), (silent, _)) = (key(1), key(2), key(3));
         let reach = |filter: Vec<u8>, stream: &str| Reachability {
             filter,
@@ -828,22 +986,45 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
             stream_multiaddrs: vec![stream.into()],
         };
         let peers = vec![
-            PeerInfo { peer_id: other.to_bytes(), reachability: vec![reach(vec![0xff; 32], "/ip4/192.0.2.9/tcp/8340")], ..Default::default() },
             PeerInfo {
-                peer_id: target.to_bytes(),
-                reachability: vec![reach(vec![0x01; 32], "/ip4/192.0.2.5/tcp/50001"), reach(vec![0xff; 32], "/ip4/192.0.2.4/tcp/8340")],
+                peer_id: other.to_bytes(),
+                reachability: vec![reach(vec![0xff; 32], "/ip4/192.0.2.9/tcp/8340")],
                 ..Default::default()
             },
-            PeerInfo { peer_id: silent.to_bytes(), reachability: vec![reach(vec![0xff; 32], "")], ..Default::default() },
+            PeerInfo {
+                peer_id: target.to_bytes(),
+                reachability: vec![
+                    reach(vec![0x01; 32], "/ip4/192.0.2.5/tcp/50001"),
+                    reach(vec![0xff; 32], "/ip4/192.0.2.4/tcp/8340"),
+                ],
+                ..Default::default()
+            },
+            PeerInfo {
+                peer_id: silent.to_bytes(),
+                reachability: vec![reach(vec![0xff; 32], "")],
+                ..Default::default()
+            },
         ];
-        assert_eq!(published_stream_addr(&peers, &target).unwrap(), "192.0.2.4:8340");
-        assert!(published_stream_addr(&peers, &silent).unwrap_err().to_string().contains("publishes no stream address"));
+        assert_eq!(
+            published_stream_addr(&peers, &target).unwrap(),
+            "192.0.2.4:8340"
+        );
+        assert!(published_stream_addr(&peers, &silent)
+            .unwrap_err()
+            .to_string()
+            .contains("publishes no stream address"));
         let unknown = key(4).0;
-        assert!(published_stream_addr(&peers, &unknown).unwrap_err().to_string().contains("no peer info"));
+        assert!(published_stream_addr(&peers, &unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("no peer info"));
     }
 
     fn peer() -> PeerId {
-        quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key()).unwrap().public().to_peer_id()
+        quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id()
     }
 
     fn reach(filter: Vec<u8>, stream: &[&str], pubsub: &[&str]) -> Reachability {
@@ -855,29 +1036,59 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
     }
 
     fn info(peer: &PeerId, reachability: Vec<Reachability>) -> PeerInfo {
-        PeerInfo { peer_id: peer.to_bytes(), reachability, ..Default::default() }
+        PeerInfo {
+            peer_id: peer.to_bytes(),
+            reachability,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn resolve_prints_the_master_stream_address_or_says_what_is_missing() {
         let (target, workers_only, silent, unknown) = (peer(), peer(), peer(), peer());
         let peers = vec![
-            info(&workers_only, vec![reach(vec![0x01; 32], &["/ip4/192.0.2.5/tcp/50001"], &[])]),
+            info(
+                &workers_only,
+                vec![reach(vec![0x01; 32], &["/ip4/192.0.2.5/tcp/50001"], &[])],
+            ),
             info(
                 &target,
                 vec![
-                    reach(vec![0x01; 32], &["/ip4/192.0.2.5/tcp/50001"], &["/ip4/192.0.2.4/udp/8336/quic-v1"]),
-                    reach(vec![0xff; 32], &["", "/ip4/192.0.2.4/tcp/8340", "/ip4/192.0.2.6/tcp/8340"], &[]),
+                    reach(
+                        vec![0x01; 32],
+                        &["/ip4/192.0.2.5/tcp/50001"],
+                        &["/ip4/192.0.2.4/udp/8336/quic-v1"],
+                    ),
+                    reach(
+                        vec![0xff; 32],
+                        &["", "/ip4/192.0.2.4/tcp/8340", "/ip4/192.0.2.6/tcp/8340"],
+                        &[],
+                    ),
                 ],
             ),
             info(&silent, Vec::new()),
         ];
-        assert_eq!(resolve_stream_addr(&peers, &target).unwrap(), "192.0.2.4:8340");
-        for (who, why) in [(&workers_only, "publishes no stream address"), (&silent, "publishes no stream address"), (&unknown, "no peer info")] {
+        assert_eq!(
+            resolve_stream_addr(&peers, &target).unwrap(),
+            "192.0.2.4:8340"
+        );
+        for (who, why) in [
+            (&workers_only, "publishes no stream address"),
+            (&silent, "publishes no stream address"),
+            (&unknown, "no peer info"),
+        ] {
             let error = resolve_stream_addr(&peers, who).unwrap_err().to_string();
-            assert!(error.contains(why) && error.contains(&who.to_base58()) && !error.contains("--addr"), "{error}");
+            assert!(
+                error.contains(why)
+                    && error.contains(&who.to_base58())
+                    && !error.contains("--addr"),
+                "{error}"
+            );
             let error = published_stream_addr(&peers, who).unwrap_err().to_string();
-            assert!(error.contains(why) && error.ends_with("; pass --addr host:port"), "{error}");
+            assert!(
+                error.contains(why) && error.ends_with("; pass --addr host:port"),
+                "{error}"
+            );
         }
     }
 
@@ -885,18 +1096,32 @@ and a restart of that node. QmOwnPeerId is this node's peer ID.
     fn all_lists_every_published_address_with_its_kind_and_filter() {
         let (target, other) = (peer(), peer());
         let peers = vec![
-            info(&other, vec![reach(vec![0xff; 32], &["/ip4/192.0.2.9/tcp/8340"], &[])]),
+            info(
+                &other,
+                vec![reach(vec![0xff; 32], &["/ip4/192.0.2.9/tcp/8340"], &[])],
+            ),
             info(
                 &target,
                 vec![
-                    reach(vec![0xff; 32], &["/ip4/192.0.2.4/tcp/8340"], &["/ip4/192.0.2.4/udp/8336/quic-v1"]),
+                    reach(
+                        vec![0xff; 32],
+                        &["/ip4/192.0.2.4/tcp/8340"],
+                        &["/ip4/192.0.2.4/udp/8336/quic-v1"],
+                    ),
                     reach(vec![0x01; 32], &["/ip4/192.0.2.5/tcp/50001", ""], &[]),
-                    reach(Vec::new(), &[], &["/ip6/2001:db8::1/udp/8336/quic-v1", "/p2p-circuit"]),
+                    reach(
+                        Vec::new(),
+                        &[],
+                        &["/ip6/2001:db8::1/udp/8336/quic-v1", "/p2p-circuit"],
+                    ),
                 ],
             ),
         ];
         let w = "01".repeat(32);
-        assert_eq!(render_addresses(&peers, &target, "…Ab12cd").unwrap(), format!("\
+        assert_eq!(
+            render_addresses(&peers, &target, "…Ab12cd").unwrap(),
+            format!(
+                "\
 Addresses …Ab12cd publishes in this node's peer info: 5 (0 private).
 KIND    ADDRESS             REACH   MULTIADDR                          FILTER
 stream  192.0.2.4:8340      public  /ip4/192.0.2.4/tcp/8340            master
@@ -904,7 +1129,9 @@ pubsub  192.0.2.4:8336      public  /ip4/192.0.2.4/udp/8336/quic-v1    master
 stream  192.0.2.5:50001     public  /ip4/192.0.2.5/tcp/50001           {w}
 pubsub  [2001:db8::1]:8336  public  /ip6/2001:db8::1/udp/8336/quic-v1  -
 pubsub  -                   -       /p2p-circuit                       -
-"));
+"
+            )
+        );
     }
 
     #[test]
@@ -916,10 +1143,18 @@ pubsub  -                   -       /p2p-circuit                       -
             info(&silent, vec![reach(vec![0xff; 32], &[""], &[""])]),
         ];
         let text = render_addresses(&peers, &target, "…Ab12cd").unwrap();
-        assert!(text.contains("/ip4/192.0.2.7/tcp/8340[2J") && !text.chars().any(|c| c.is_control() && c != '\n'), "{text:?}");
-        let error = render_addresses(&peers, &silent, "…Ab12cd").unwrap_err().to_string();
+        assert!(
+            text.contains("/ip4/192.0.2.7/tcp/8340[2J")
+                && !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let error = render_addresses(&peers, &silent, "…Ab12cd")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("publishes no addresses"), "{error}");
-        let error = render_addresses(&peers, &unknown, "…Ab12cd").unwrap_err().to_string();
+        let error = render_addresses(&peers, &unknown, "…Ab12cd")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no peer info"), "{error}");
     }
 
@@ -977,20 +1212,49 @@ pubsub  -                   -       /p2p-circuit                       -
             info(
                 &mixed,
                 vec![
-                    reach(vec![0xff; 32], &["/ip4/192.168.1.5/tcp/8340", "/ip6/fd00::5/tcp/8340"], &["/ip4/192.168.1.5/tcp/8336"]),
+                    reach(
+                        vec![0xff; 32],
+                        &["/ip4/192.168.1.5/tcp/8340", "/ip6/fd00::5/tcp/8340"],
+                        &["/ip4/192.168.1.5/tcp/8336"],
+                    ),
                     reach(vec![0xff; 32], &["/ip4/192.0.2.4/tcp/8340"], &[]),
                 ],
             ),
             info(
                 &private_only,
-                vec![reach(vec![0xff; 32], &["", "/ip4/10.1.2.3/tcp/8340", "/ip4/100.64.0.1/tcp/8340"], &["/ip4/192.0.2.8/tcp/8336"])],
+                vec![reach(
+                    vec![0xff; 32],
+                    &["", "/ip4/10.1.2.3/tcp/8340", "/ip4/100.64.0.1/tcp/8340"],
+                    &["/ip4/192.0.2.8/tcp/8336"],
+                )],
             ),
-            info(&named, vec![reach(vec![0xff; 32], &["/ip4/127.0.0.1/tcp/8340", "/dns4/node.example.invalid/tcp/8340"], &[])]),
+            info(
+                &named,
+                vec![reach(
+                    vec![0xff; 32],
+                    &[
+                        "/ip4/127.0.0.1/tcp/8340",
+                        "/dns4/node.example.invalid/tcp/8340",
+                    ],
+                    &[],
+                )],
+            ),
         ];
-        assert_eq!(resolve_stream_addr(&peers, &mixed).unwrap(), "192.0.2.4:8340");
-        assert_eq!(published_stream_addr(&peers, &mixed).unwrap(), "192.0.2.4:8340");
-        assert_eq!(resolve_stream_addr(&peers, &named).unwrap(), "node.example.invalid:8340");
-        let error = resolve_stream_addr(&peers, &private_only).unwrap_err().to_string();
+        assert_eq!(
+            resolve_stream_addr(&peers, &mixed).unwrap(),
+            "192.0.2.4:8340"
+        );
+        assert_eq!(
+            published_stream_addr(&peers, &mixed).unwrap(),
+            "192.0.2.4:8340"
+        );
+        assert_eq!(
+            resolve_stream_addr(&peers, &named).unwrap(),
+            "node.example.invalid:8340"
+        );
+        let error = resolve_stream_addr(&peers, &private_only)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             error,
             format!(
@@ -998,8 +1262,14 @@ pubsub  -                   -       /p2p-circuit                       -
                  network; ask its operator for a reachable host:port"
             )
         );
-        let error = published_stream_addr(&peers, &private_only).unwrap_err().to_string();
-        assert!(error.contains("publishes only a private stream address") && error.ends_with("; pass --addr host:port"), "{error}");
+        let error = published_stream_addr(&peers, &private_only)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("publishes only a private stream address")
+                && error.ends_with("; pass --addr host:port"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1008,11 +1278,24 @@ pubsub  -                   -       /p2p-circuit                       -
         let peers = vec![info(
             &target,
             vec![
-                reach(vec![0xff; 32], &["/ip4/192.0.2.4/tcp/8340", "/ip4/192.168.1.5/tcp/8340"], &["/ip4/172.16.0.1/tcp/8336"]),
-                reach(Vec::new(), &[], &["/ip6/fe80::1/udp/8336/quic-v1", "/dns4/node.example.invalid/tcp/8336"]),
+                reach(
+                    vec![0xff; 32],
+                    &["/ip4/192.0.2.4/tcp/8340", "/ip4/192.168.1.5/tcp/8340"],
+                    &["/ip4/172.16.0.1/tcp/8336"],
+                ),
+                reach(
+                    Vec::new(),
+                    &[],
+                    &[
+                        "/ip6/fe80::1/udp/8336/quic-v1",
+                        "/dns4/node.example.invalid/tcp/8336",
+                    ],
+                ),
             ],
         )];
-        assert_eq!(render_addresses(&peers, &target, "…Ab12cd").unwrap(), "\
+        assert_eq!(
+            render_addresses(&peers, &target, "…Ab12cd").unwrap(),
+            "\
 Addresses …Ab12cd publishes in this node's peer info: 5 (3 private).
 KIND    ADDRESS                    REACH    MULTIADDR                            FILTER
 stream  192.0.2.4:8340             public   /ip4/192.0.2.4/tcp/8340              master
@@ -1020,6 +1303,7 @@ stream  192.168.1.5:8340           private  /ip4/192.168.1.5/tcp/8340           
 pubsub  172.16.0.1:8336            private  /ip4/172.16.0.1/tcp/8336             master
 pubsub  [fe80::1]:8336             private  /ip6/fe80::1/udp/8336/quic-v1        -
 pubsub  node.example.invalid:8336  -        /dns4/node.example.invalid/tcp/8336  -
-");
+"
+        );
     }
 }

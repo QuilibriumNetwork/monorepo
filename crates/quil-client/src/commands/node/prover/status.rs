@@ -7,8 +7,8 @@ use num_bigint::{BigInt, Sign};
 use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAllocationInfo};
 
 use super::epoch::{
-    action_hints, compute_effective_status, confirmed_phase, epoch_for_frame, epoch_len, AllocationTiming,
-    ThresholdClock, ThresholdUnit,
+    action_hints, compute_effective_status, confirmed_phase, epoch_for_frame, epoch_len,
+    AllocationTiming, ThresholdClock, ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
 
@@ -66,11 +66,22 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     println!("Peer Score:         {}", info.peer_score);
-    let draining = match client.get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default())).await {
-        Ok(workers) => workers.into_inner().worker_info.iter().filter(|w| w.draining).count(),
+    let draining = match client
+        .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
+        .await
+    {
+        Ok(workers) => workers
+            .into_inner()
+            .worker_info
+            .iter()
+            .filter(|w| w.draining)
+            .count(),
         Err(_) => 0,
     };
-    println!("Running Workers:    {}", running_workers(info.running_workers, info.worker_capacity, draining));
+    println!(
+        "Running Workers:    {}",
+        running_workers(info.running_workers, info.worker_capacity, draining)
+    );
     println!("Allocated Workers:  {}", info.allocated_workers);
     println!("Last Received:      {}", info.last_received_frame);
     println!("Last Global Head:   {}", info.last_global_head_frame);
@@ -91,7 +102,10 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         .await
         .map(|response| response.into_inner().worker_info);
     let workers_listed = worker_info.as_deref().unwrap_or_default();
-    println!("\n{}", super::gossip_traffic::render(info.gossip_traffic.as_ref(), workers_listed));
+    println!(
+        "\n{}",
+        super::gossip_traffic::render(info.gossip_traffic.as_ref(), workers_listed)
+    );
 
     if info.shard_allocations.is_empty() {
         println!("\nNo shard allocations");
@@ -120,7 +134,13 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         // frames left from the received frame, without a time estimate.
         let (next, default) = action_hints(&t, eff, epoch_length, current_frame, next_boundary);
         if !next.is_empty() || !default.is_empty() {
-            let (unit, clock) = (ThresholdUnit::Relative, ThresholdClock { frame: current_frame, seconds_per_frame: None });
+            let (unit, clock) = (
+                ThresholdUnit::Relative,
+                ThresholdClock {
+                    frame: current_frame,
+                    seconds_per_frame: None,
+                },
+            );
             println!(
                 "      Next Action: {}  Default Action: {}",
                 next.render(unit, clock),
@@ -166,9 +186,16 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                     hex::encode(&w.filter),
                     format_storage(w.available_storage),
                     format_storage(w.total_storage),
-                    if w.draining { "  Draining: above the configured count; stops once its seat departs" } else { "" }
+                    if w.draining {
+                        "  Draining: above the configured count; stops once its seat departs"
+                    } else {
+                        ""
+                    }
                 );
-                println!("    {}", super::local_execution::detail(w.execution.as_ref()));
+                println!(
+                    "    {}",
+                    super::local_execution::detail(w.execution.as_ref())
+                );
             }
         }
     }
@@ -184,6 +211,10 @@ mod tests {
     fn running_workers_name_the_configured_count_and_the_draining_ones() {
         assert_eq!(running_workers(9, 6, 3), "9 of 6 configured | draining 3");
         assert_eq!(running_workers(6, 6, 0), "6 of 6 configured");
-        assert_eq!(running_workers(9, 0, 0), "9", "a node that predates the configured count");
+        assert_eq!(
+            running_workers(9, 0, 0),
+            "9",
+            "a node that predates the configured count"
+        );
     }
 }

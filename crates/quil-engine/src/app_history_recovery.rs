@@ -59,7 +59,9 @@ static WALKS: Mutex<BTreeMap<Vec<u8>, (Instant, (u64, u64, u64))>> = Mutex::new(
 /// Record a committed batch of `filter`'s walk at `now`: whether it is
 /// logged at info. A finished walk is forgotten.
 fn walk_batch(filter: &[u8], progress: (u64, u64, u64), now: Instant) -> bool {
-    let mut walks = WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut walks = WALKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (done, _, target) = progress;
     if done == target {
         walks.remove(filter);
@@ -67,13 +69,20 @@ fn walk_batch(filter: &[u8], progress: (u64, u64, u64), now: Instant) -> bool {
     }
     let last = walks.get(filter).map(|(at, _)| *at);
     let due = last.is_none_or(|at| now.saturating_duration_since(at) >= WALK_PROGRESS_REPEAT);
-    walks.insert(filter.to_vec(), (if due { now } else { last.unwrap_or(now) }, progress));
+    walks.insert(
+        filter.to_vec(),
+        (if due { now } else { last.unwrap_or(now) }, progress),
+    );
     due
 }
 
 /// `filter`'s running walk in this process, `(done, next, target)`.
 pub(crate) fn walk_progress(filter: &[u8]) -> Option<(u64, u64, u64)> {
-    WALKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(filter).map(|(_, progress)| *progress)
+    WALKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(filter)
+        .map(|(_, progress)| *progress)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -160,9 +169,17 @@ impl Progress {
             Some("too many report states")
         } else if self.last_report.len() > shard_accumulator::MAX_REPORT_BYTES {
             Some("last report exceeds byte limit")
-        } else if self.implied.as_ref().is_some_and(|(low, _)| *low < self.done || *low >= self.next) {
+        } else if self
+            .implied
+            .as_ref()
+            .is_some_and(|(low, _)| *low < self.done || *low >= self.next)
+        {
             Some("implied report range is outside the remaining audit")
-        } else if self.implied.as_ref().is_some_and(|(_, report)| report.len() > shard_accumulator::MAX_REPORT_BYTES) {
+        } else if self
+            .implied
+            .as_ref()
+            .is_some_and(|(_, report)| report.len() > shard_accumulator::MAX_REPORT_BYTES)
+        {
             Some("implied report exceeds byte limit")
         } else {
             None
@@ -174,7 +191,11 @@ impl Progress {
                 self.carry, self.reports.len(), self.last_report.len(),
             )));
         }
-        if let Some((_, report)) = self.implied.as_ref().filter(|(_, report)| !report.is_empty()) {
+        if let Some((_, report)) = self
+            .implied
+            .as_ref()
+            .filter(|(_, report)| !report.is_empty())
+        {
             shard_accumulator::ShardReport::decode(report)?;
         }
         for (_, report) in &self.reports {
@@ -233,7 +254,9 @@ pub(crate) fn committed_digest(
     number: u64,
 ) -> Result<Option<[u8; 32]>> {
     match global {
-        Some(global) => crate::app_handoff::committed_frame_digest_looked_through(global, filter, number),
+        Some(global) => {
+            crate::app_handoff::committed_frame_digest_looked_through(global, filter, number)
+        }
         None => Ok(None),
     }
 }
@@ -293,7 +316,11 @@ fn validate_linked(validator: &BlsAppFrameValidator, frame: &AppShardFrame) -> R
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         validator.validate_linked_without_storage(frame)
     }))
-    .unwrap_or_else(|_| Err(QuilError::Internal("linked frame validation panicked".into())))
+    .unwrap_or_else(|_| {
+        Err(QuilError::Internal(
+            "linked frame validation panicked".into(),
+        ))
+    })
 }
 
 /// Whether `child` names the last frame of `run` as its parent.
@@ -340,7 +367,12 @@ impl<'a> Headers<'a> {
         let mut authenticated = self.authenticated.lock().unwrap_or_else(|e| e.into_inner());
         authenticated.insert(number, header);
         while authenticated.len() > MAX_AUTHENTICATED {
-            let Some(highest) = authenticated.keys().rev().copied().find(|key| *key != number) else {
+            let Some(highest) = authenticated
+                .keys()
+                .rev()
+                .copied()
+                .find(|key| *key != number)
+            else {
                 break;
             };
             authenticated.remove(&highest);
@@ -375,9 +407,9 @@ impl<'a> Headers<'a> {
         let frame = match stored {
             Some(frame) => frame,
             None => {
-                let source = self
-                    .source
-                    .ok_or_else(|| unavailable(format!("no source for historical frame {number}")))?;
+                let source = self.source.ok_or_else(|| {
+                    unavailable(format!("no source for historical frame {number}"))
+                })?;
                 if self.peer_fetches.fetch_add(1, Ordering::Relaxed) >= MAX_PEER_FETCHES {
                     return Err(unavailable(format!(
                         "historical frame {number}: this batch already asked peers for {MAX_PEER_FETCHES} \
@@ -387,9 +419,15 @@ impl<'a> Headers<'a> {
                 let budget = FRAME_FETCH_BUDGET.min(self.remaining(number)?);
                 tokio::time::timeout(budget, source(self.filter.to_vec(), number))
                     .await
-                    .map_err(|_| unavailable(format!(
-                        "fetching historical frame {number} timed out after {} ms", budget.as_millis())))?
-                    .ok_or_else(|| unavailable(format!("no peer served historical frame {number}")))?
+                    .map_err(|_| {
+                        unavailable(format!(
+                            "fetching historical frame {number} timed out after {} ms",
+                            budget.as_millis()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        unavailable(format!("no peer served historical frame {number}"))
+                    })?
             }
         };
         if frame.encoded_len() > MAX_FRAME_BYTES
@@ -398,7 +436,9 @@ impl<'a> Headers<'a> {
                 .as_ref()
                 .is_none_or(|h| h.address != self.filter || h.frame_number != number)
         {
-            return Err(unavailable(format!("historical frame {number} is the wrong frame or oversized")));
+            return Err(unavailable(format!(
+                "historical frame {number} is the wrong frame or oversized"
+            )));
         }
         Ok((frame, local))
     }
@@ -412,7 +452,11 @@ impl<'a> Headers<'a> {
         let prepared = if certified {
             tokio::time::timeout(budget, self.validator.prepare_storage_history(frame)).await
         } else {
-            tokio::time::timeout(budget, self.validator.prepare_storage_history_of_linked(frame)).await
+            tokio::time::timeout(
+                budget,
+                self.validator.prepare_storage_history_of_linked(frame),
+            )
+            .await
         };
         prepared
             .map_err(|_| unavailable(format!(
@@ -430,12 +474,17 @@ impl<'a> Headers<'a> {
     /// tip, whose certificate GLOBAL verified). False for a frame with
     /// neither, which only a certified descendant can authenticate.
     async fn authenticate(&self, frame: &AppShardFrame) -> Result<bool> {
-        let header = frame.header.as_ref().ok_or_else(|| unavailable("historical frame has no header"))?;
+        let header = frame
+            .header
+            .as_ref()
+            .ok_or_else(|| unavailable("historical frame has no header"))?;
         let number = header.frame_number;
         if header.public_key_signature_bls48581.is_some() {
             self.prepare(frame, true).await?;
             if !crate::app_engine::validate_app_frame_panic_safe(self.validator, frame, false)? {
-                return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
+                return Err(QuilError::InvalidSignature(format!(
+                    "historical frame {number} rejected"
+                )));
             }
             return Ok(true);
         }
@@ -446,7 +495,9 @@ impl<'a> Headers<'a> {
         let body = header_only(header);
         self.prepare(&body, false).await?;
         if !validate_linked(self.validator, &body)? {
-            return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
+            return Err(QuilError::InvalidSignature(format!(
+                "historical frame {number} rejected"
+            )));
         }
         Ok(true)
     }
@@ -454,7 +505,9 @@ impl<'a> Headers<'a> {
     /// Why frame `number`, which has no certificate of its own, was not
     /// authenticated through a descendant.
     fn unlinked(&self, number: u64, reason: impl std::fmt::Display) -> QuilError {
-        let generation = self.generation.map_or_else(String::new, |g| format!(" of generation {g}"));
+        let generation = self
+            .generation
+            .map_or_else(String::new, |g| format!(" of generation {g}"));
         unavailable(format!(
             "historical frame {number}{generation} (filter {}) has no certificate of its own, and {reason}",
             hex::encode(self.filter),
@@ -476,12 +529,15 @@ impl<'a> Headers<'a> {
             self.remaining(number)?;
             let next = run.last().expect("the run holds the frame").0.frame_number + 1;
             if run.len() > MAX_REPLAY_DESCENDANTS {
-                return Err(self.unlinked(number, format!(
+                return Err(self.unlinked(
+                    number,
+                    format!(
                     "frames {}-{} above it carry none (nearest certified descendant: none within \
                      {MAX_REPLAY_DESCENDANTS} frames)",
                     number + 1,
                     next - 1,
-                )));
+                ),
+                ));
             }
             let cached = self.known(next);
             let (mut child, mut child_stored) = match &cached {
@@ -495,7 +551,10 @@ impl<'a> Headers<'a> {
                     child_stored = false;
                 }
             }
-            if !extends(&run, &child) && run.last().is_some_and(|(_, stored)| *stored) && self.source.is_some() {
+            if !extends(&run, &child)
+                && run.last().is_some_and(|(_, stored)| *stored)
+                && self.source.is_some()
+            {
                 if let Ok((fetched, _)) = self.fetch(next - 1, true).await {
                     let parent = fetched.header.expect("fetch checked the header");
                     let below = run.len().checked_sub(2).map(|i| &run[i].0);
@@ -522,7 +581,8 @@ impl<'a> Headers<'a> {
                 break child_header;
             }
         };
-        let frames: Vec<AppShardFrame> = run.iter().map(|(header, _)| header_only(header)).collect();
+        let frames: Vec<AppShardFrame> =
+            run.iter().map(|(header, _)| header_only(header)).collect();
         for frame in frames[..frames.len() - 1].iter().rev() {
             self.prepare(frame, false).await?;
         }
@@ -602,21 +662,25 @@ fn outflows(header: &FrameHeader, frame: u64) -> Result<(Vec<u8>, Vec<u8>, Vec<u
 ///
 /// Any other state (a sync jump, an audit in progress, a concurrent write)
 /// leaves the prefix unchanged, and the next recovery audits the difference.
-pub fn extend_audited(manager: &ExecutionEngineManager, session: &Session, frame: u64) -> Result<bool> {
+pub fn extend_audited(
+    manager: &ExecutionEngineManager,
+    session: &Session,
+    frame: u64,
+) -> Result<bool> {
     if frame <= session.base_frame {
         return Ok(false);
     }
     let shard = manager.crdt();
     let snapshot = shard.capture_committed_shard(&session.filter)?;
     let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
-    if snapshot.records.read_record(&cursor_key)?.as_deref() != Some(frame.to_be_bytes().as_slice()) {
+    if snapshot.records.read_record(&cursor_key)?.as_deref() != Some(frame.to_be_bytes().as_slice())
+    {
         return Ok(false);
     }
     let progress_key = encoding::app_history_recovery_key(&session.filter, &session.id()?);
     let mut progress: Progress = match snapshot.records.read_record(&progress_key)? {
-        Some(bytes) if bytes.len() <= MAX_PROGRESS_BYTES => {
-            serde_json::from_slice(&bytes).map_err(|_| unavailable("malformed recovery progress"))?
-        }
+        Some(bytes) if bytes.len() <= MAX_PROGRESS_BYTES => serde_json::from_slice(&bytes)
+            .map_err(|_| unavailable("malformed recovery progress"))?,
         Some(_) => return Err(unavailable("oversized recovery progress")),
         None => Progress {
             version: 1,
@@ -631,7 +695,10 @@ pub fn extend_audited(manager: &ExecutionEngineManager, session: &Session, frame
         },
     };
     progress.validate(session, frame)?;
-    if progress.done + 1 != frame || progress.next != progress.done || progress.target != progress.done {
+    if progress.done + 1 != frame
+        || progress.next != progress.done
+        || progress.target != progress.done
+    {
         return Ok(false);
     }
     for key in [
@@ -648,7 +715,13 @@ pub fn extend_audited(manager: &ExecutionEngineManager, session: &Session, frame
     progress.target = frame;
     progress.next = frame;
     let encoded = serde_json::to_vec(&progress).map_err(|e| unavailable(e.to_string()))?;
-    shard.checkpoint_shard_records(&session.filter, &snapshot.roots, &cursor_key, frame, &[(progress_key, encoded)])?;
+    shard.checkpoint_shard_records(
+        &session.filter,
+        &snapshot.roots,
+        &cursor_key,
+        frame,
+        &[(progress_key, encoded)],
+    )?;
     Ok(true)
 }
 
@@ -700,10 +773,14 @@ fn recorded_report(records: &dyn SnapshotReadable, filter: &[u8], frame: u64) ->
         return Ok(Vec::new());
     }
     let report = records
-        .read_record(&encoding::clock_shard_accumulator_report_key(filter, &digest))?
+        .read_record(&encoding::clock_shard_accumulator_report_key(
+            filter, &digest,
+        ))?
         .ok_or_else(|| unavailable(format!("audited frame {frame} lacks its report")))?;
     if accumulator_header::report_digest(&report) != digest {
-        return Err(unavailable(format!("audited frame {frame} report does not match its digest")));
+        return Err(unavailable(format!(
+            "audited frame {frame} report does not match its digest"
+        )));
     }
     Ok(report)
 }
@@ -859,14 +936,9 @@ async fn recover_with_headers(
                 report = implied.clone();
             }
             if report.is_none() {
-                if let Some((low, earlier)) = earlier_report(
-                    headers,
-                    &progress,
-                    snapshot.records.as_ref(),
-                    session,
-                    n,
-                )
-                .await?
+                if let Some((low, earlier)) =
+                    earlier_report(headers, &progress, snapshot.records.as_ref(), session, n)
+                        .await?
                 {
                     progress.implied = Some((low, earlier.clone()));
                     report = Some(earlier);
@@ -927,7 +999,11 @@ async fn recover_with_headers(
         };
         progress.last_report = report;
         progress.next -= 1;
-        if progress.implied.as_ref().is_some_and(|(low, _)| *low >= progress.next) {
+        if progress
+            .implied
+            .as_ref()
+            .is_some_and(|(low, _)| *low >= progress.next)
+        {
             progress.implied = None;
         }
         processed += 1;
@@ -963,7 +1039,11 @@ async fn recover_with_headers(
         expected_cursor,
         &records,
     )?;
-    if walk_batch(&session.filter, (progress.done, progress.next, progress.target), Instant::now()) {
+    if walk_batch(
+        &session.filter,
+        (progress.done, progress.next, progress.target),
+        Instant::now(),
+    ) {
         tracing::info!(
             filter = hex::encode(&session.filter),
             generation = session.generation,
@@ -1022,7 +1102,14 @@ pub async fn recover_carry_window(
     cursor: u64,
 ) -> Result<(usize, Option<u64>)> {
     let committed = |number: u64| committed_digest(global, filter, number);
-    let headers = Headers::new(filter, None, clock.as_ref(), validator.as_ref(), source, &committed);
+    let headers = Headers::new(
+        filter,
+        None,
+        clock.as_ref(),
+        validator.as_ref(),
+        source,
+        &committed,
+    );
     recover_carry_window_with_headers(filter, manager, clock.as_ref(), &headers, cursor).await
 }
 
@@ -1040,7 +1127,9 @@ async fn recover_carry_window_with_headers(
     let shard = manager.crdt();
     let snapshot = shard.capture_committed_shard(filter)?;
     let cursor_key = encoding::consensus_materialized_cursor_key(filter);
-    if snapshot.records.read_record(&cursor_key)?.as_deref() != Some(cursor.to_be_bytes().as_slice()) {
+    if snapshot.records.read_record(&cursor_key)?.as_deref()
+        != Some(cursor.to_be_bytes().as_slice())
+    {
         return Err(unavailable("engine cursor differs from committed state"));
     }
     let digest_of = |frame: u64| {
@@ -1650,7 +1739,11 @@ mod tests {
         let (a, b) = (report(1), report(2));
         let frames: BTreeMap<u64, FrameHeader> = (78..=95)
             .map(|n| {
-                let roots = if n == 95 { [[0; 32]; 4] } else { [[n as u8; 32]; 4] };
+                let roots = if n == 95 {
+                    [[0; 32]; 4]
+                } else {
+                    [[n as u8; 32]; 4]
+                };
                 let mut h = header(&session, n, roots);
                 match n {
                     94 => h.accumulator = b.clone(),
@@ -1676,7 +1769,12 @@ mod tests {
         }
         assert!(complete);
         assert!(
-            headers.reads.lock().unwrap().iter().all(|n| *n > session.base_frame),
+            headers
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|n| *n > session.base_frame),
             "no header before the session base is fetched"
         );
         let snapshot = manager
@@ -1710,27 +1808,57 @@ mod tests {
         let session = session();
         let (_, _, manager) = open(&directory.0);
         let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
-        let progress_key = encoding::app_history_recovery_key(&session.filter, &session.id().unwrap());
+        let progress_key =
+            encoding::app_history_recovery_key(&session.filter, &session.id().unwrap());
         let mut saved = progress(&session);
         saved.done = 95;
         saved.next = 95;
         let encoded = serde_json::to_vec(&saved).unwrap();
         let mut records = tip(&session, 94);
         records.push((progress_key.clone(), encoded.clone()));
-        manager.crdt().commit_with_frame_cursor_and_records(94, &cursor_key, &records).unwrap();
+        manager
+            .crdt()
+            .commit_with_frame_cursor_and_records(94, &cursor_key, &records)
+            .unwrap();
         let headers = VerifiedFixture {
-            frames: BTreeMap::new(), fail_at: Mutex::new(None), reads: Mutex::new(vec![]),
+            frames: BTreeMap::new(),
+            fail_at: Mutex::new(None),
+            reads: Mutex::new(vec![]),
         };
-        let error = recover_with_headers(&session, manager.clone(), &headers, 94).await.unwrap_err();
-        assert!(error.to_string().contains("target exceeds cursor"), "{error}");
-        assert!(error.to_string().contains("target=95, cursor=94"), "{error}");
-        let snapshot = manager.crdt().capture_committed_shard(&session.filter).unwrap();
-        assert_eq!(snapshot.records.read_record(&progress_key).unwrap(), Some(encoded));
-        assert_eq!(snapshot.records.read_record(&cursor_key).unwrap(), Some(94u64.to_be_bytes().to_vec()));
+        let error = recover_with_headers(&session, manager.clone(), &headers, 94)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("target exceeds cursor"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("target=95, cursor=94"),
+            "{error}"
+        );
+        let snapshot = manager
+            .crdt()
+            .capture_committed_shard(&session.filter)
+            .unwrap();
+        assert_eq!(
+            snapshot.records.read_record(&progress_key).unwrap(),
+            Some(encoded)
+        );
+        assert_eq!(
+            snapshot.records.read_record(&cursor_key).unwrap(),
+            Some(94u64.to_be_bytes().to_vec())
+        );
         assert!(headers.reads.lock().unwrap().is_empty());
         // The same audited prefix is valid when the committed cursor reaches it.
-        manager.crdt().commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95)).unwrap();
-        assert!(recover_with_headers(&session, manager.clone(), &headers, 95).await.unwrap());
+        manager
+            .crdt()
+            .commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95))
+            .unwrap();
+        assert!(
+            recover_with_headers(&session, manager.clone(), &headers, 95)
+                .await
+                .unwrap()
+        );
         assert!(headers.reads.lock().unwrap().is_empty());
     }
 
@@ -1741,7 +1869,9 @@ mod tests {
         let (_, _, manager) = open(&directory.0);
         let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
         let headers = VerifiedFixture {
-            frames: (78..=82).map(|n| (n, header(&session, n, [[0; 32]; 4]))).collect(),
+            frames: (78..=82)
+                .map(|n| (n, header(&session, n, [[0; 32]; 4])))
+                .collect(),
             fail_at: Mutex::new(None),
             reads: Mutex::new(vec![]),
         };
@@ -1752,9 +1882,19 @@ mod tests {
                 .unwrap();
             assert!(extend_audited(&manager, &session, n).unwrap(), "frame {n}");
         }
-        assert!(!extend_audited(&manager, &session, 79).unwrap(), "already audited");
-        assert!(recover_with_headers(&session, manager.clone(), &headers, 79).await.unwrap());
-        assert!(headers.reads.lock().unwrap().is_empty(), "executed frames need no audit");
+        assert!(
+            !extend_audited(&manager, &session, 79).unwrap(),
+            "already audited"
+        );
+        assert!(
+            recover_with_headers(&session, manager.clone(), &headers, 79)
+                .await
+                .unwrap()
+        );
+        assert!(
+            headers.reads.lock().unwrap().is_empty(),
+            "executed frames need no audit"
+        );
 
         // A frame the member did not execute (a sync jump) is not extended over.
         manager
@@ -1764,13 +1904,19 @@ mod tests {
         assert!(!extend_audited(&manager, &session, 81).unwrap());
         let mut complete = false;
         for _ in 0..3 {
-            complete = recover_with_headers(&session, manager.clone(), &headers, 81).await.unwrap();
+            complete = recover_with_headers(&session, manager.clone(), &headers, 81)
+                .await
+                .unwrap();
             if complete {
                 break;
             }
         }
         assert!(complete);
-        assert_eq!(*headers.reads.lock().unwrap(), vec![81, 81], "only the jumped frames are audited");
+        assert_eq!(
+            *headers.reads.lock().unwrap(),
+            vec![81, 81],
+            "only the jumped frames are audited"
+        );
         manager
             .crdt()
             .commit_with_frame_cursor_and_records(82, &cursor_key, &tip(&session, 82))
@@ -1905,7 +2051,9 @@ mod tests {
             .unwrap_err();
             if variant == 0 {
                 assert!(
-                    error.to_string().contains("historical frame 95 of generation 2 ")
+                    error
+                        .to_string()
+                        .contains("historical frame 95 of generation 2 ")
                         && error.to_string().contains("no certificate of its own"),
                     "{error}"
                 );
@@ -1947,16 +2095,18 @@ mod tests {
     fn validator_trusting(signer: &quil_crypto::FalconSigner) -> BlsAppFrameValidator {
         use quil_types::consensus::{ProverInfo, ProverStatus};
         BlsAppFrameValidator::new(
-            Arc::new(crate::test_support::TestProverRegistry::with_prover(ProverInfo {
-                public_key: signer.public_key().to_vec(),
-                address: vec![7; 32],
-                status: ProverStatus::Active,
-                kick_frame_number: 0,
-                allocations: vec![],
-                available_storage: 0,
-                seniority: 0,
-                delegate_address: vec![],
-            })),
+            Arc::new(crate::test_support::TestProverRegistry::with_prover(
+                ProverInfo {
+                    public_key: signer.public_key().to_vec(),
+                    address: vec![7; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            )),
             Arc::new(quil_crypto::FalconKeyConstructor),
             Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
         )
@@ -1990,14 +2140,22 @@ mod tests {
             Digest(digest(header)),
         );
         let vote = scheme
-            .sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal })
+            .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                proposal: &proposal,
+            })
             .unwrap();
-        let certificate = scheme.assemble::<SimplexFalconScheme, _, N3f1>(vec![vote]).unwrap();
-        header.public_key_signature_bls48581 = Some(quil_types::proto::keys::Bls48581AggregateSignature {
-            signature: wrap_cert_for_header(&encode_finalization(&Finalization { proposal, certificate })),
-            bitmask: vec![1],
-            ..Default::default()
-        });
+        let certificate = scheme
+            .assemble::<SimplexFalconScheme, _, N3f1>(vec![vote])
+            .unwrap();
+        header.public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: wrap_cert_for_header(&encode_finalization(&Finalization {
+                    proposal,
+                    certificate,
+                })),
+                bitmask: vec![1],
+                ..Default::default()
+            });
     }
 
     fn digest(header: &FrameHeader) -> [u8; 32] {
@@ -2026,7 +2184,9 @@ mod tests {
                     h.fee_multiplier_vote,
                     h.timestamp,
                     &h.storage_attestation_root,
-                    quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&h.fee_total),
+                    quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(
+                        &h.fee_total,
+                    ),
                     &h.settlements,
                     &h.accumulator,
                     &h.spends,
@@ -2040,11 +2200,19 @@ mod tests {
     fn store(clock: &quil_store::RocksClockStore, header: &FrameHeader) {
         let selector = digest(header).to_vec();
         let txn = clock.new_transaction(false).unwrap();
-        clock.stage_shard_clock_frame(&selector, &header_only(header), txn.as_ref()).unwrap();
+        clock
+            .stage_shard_clock_frame(&selector, &header_only(header), txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
         let txn = clock.new_transaction(false).unwrap();
         clock
-            .commit_shard_clock_frame(&header.address, header.frame_number, &selector, txn.as_ref(), false)
+            .commit_shard_clock_frame(
+                &header.address,
+                header.frame_number,
+                &selector,
+                txn.as_ref(),
+                false,
+            )
             .unwrap();
         txn.commit().unwrap();
     }
@@ -2055,7 +2223,11 @@ mod tests {
         (directory, db)
     }
 
-    fn stored(session: &Session, from: u64, to: u64) -> (Directory, quil_store::RocksDb, Vec<FrameHeader>) {
+    fn stored(
+        session: &Session,
+        from: u64,
+        to: u64,
+    ) -> (Directory, quil_store::RocksDb, Vec<FrameHeader>) {
         let (directory, db) = opened();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let chain = uncertified_chain(session, from, to, [[0; 32]; 4]);
@@ -2067,7 +2239,8 @@ mod tests {
 
     /// A peer source serving `frames` by number, counting requests.
     fn serving(frames: &[FrameHeader], calls: Arc<AtomicUsize>) -> DeliveryFrameSource {
-        let frames: BTreeMap<u64, FrameHeader> = frames.iter().map(|h| (h.frame_number, h.clone())).collect();
+        let frames: BTreeMap<u64, FrameHeader> =
+            frames.iter().map(|h| (h.frame_number, h.clone())).collect();
         Arc::new(move |_, number| {
             calls.fetch_add(1, Ordering::SeqCst);
             let frame = frames.get(&number).map(header_only);
@@ -2081,7 +2254,14 @@ mod tests {
         validator: &'a BlsAppFrameValidator,
         committed: CommittedDigest<'a>,
     ) -> Headers<'a> {
-        Headers::new(&session.filter, Some(session.generation), clock, validator, None, committed)
+        Headers::new(
+            &session.filter,
+            Some(session.generation),
+            clock,
+            validator,
+            None,
+            committed,
+        )
     }
 
     // Simplex finalizes a view's ancestors with it, so they carry no
@@ -2108,17 +2288,29 @@ mod tests {
             .commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95))
             .unwrap();
         let mut batches = 0;
-        while !recover_with_headers(&session, manager.clone(), &read(&session, &clock, &validator, &committed), 95)
-            .await
-            .unwrap()
+        while !recover_with_headers(
+            &session,
+            manager.clone(),
+            &read(&session, &clock, &validator, &committed),
+            95,
+        )
+        .await
+        .unwrap()
         {
             batches += 1;
             assert!(batches < 20, "recovery stalls");
         }
-        let complete = manager.crdt().capture_committed_shard(&session.filter).unwrap();
+        let complete = manager
+            .crdt()
+            .capture_committed_shard(&session.filter)
+            .unwrap();
         for n in 78..=95 {
             for (key, value) in tip(&session, n).into_iter().take(3) {
-                assert_eq!(complete.records.read_record(&key).unwrap(), Some(value), "frame {n}");
+                assert_eq!(
+                    complete.records.read_record(&key).unwrap(),
+                    Some(value),
+                    "frame {n}"
+                );
             }
         }
     }
@@ -2140,8 +2332,13 @@ mod tests {
         assert_eq!(headers.get(93).await.unwrap(), chain[3]);
         assert_eq!(headers.get(96).await.unwrap(), chain[6]);
         let stranger = validator_trusting(&quil_crypto::FalconSigner::generate());
-        assert!(read(&session, &clock, &stranger, &committed).get(93).await.is_err(),
-            "a certificate of another committee authenticates nothing");
+        assert!(
+            read(&session, &clock, &stranger, &committed)
+                .get(93)
+                .await
+                .is_err(),
+            "a certificate of another committee authenticates nothing"
+        );
     }
 
     #[tokio::test]
@@ -2158,7 +2355,10 @@ mod tests {
         let top = digest(&chain[6]);
         let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 96).then_some(top)) };
         let validator = validator_trusting(&signer);
-        let error = read(&session, &clock, &validator, &committed).get(94).await.unwrap_err();
+        let error = read(&session, &clock, &validator, &committed)
+            .get(94)
+            .await
+            .unwrap_err();
         assert!(matches!(error, QuilError::InvalidSignature(_)), "{error}");
     }
 
@@ -2184,7 +2384,10 @@ mod tests {
                 && text.contains("frame 95 does not name frame 94 as its parent"),
             "{text}"
         );
-        assert!(headers.get(93).await.is_err(), "nothing below the other frame is authenticated");
+        assert!(
+            headers.get(93).await.is_err(),
+            "nothing below the other frame is authenticated"
+        );
     }
 
     // The store can hold a frame of another chain at a height (a member
@@ -2200,14 +2403,27 @@ mod tests {
             store(&clock, other.last().unwrap());
             let committed_frame = wrong + 1;
             let top = digest(&chain[(committed_frame - 90) as usize]);
-            let committed =
-                move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == committed_frame).then_some(top)) };
+            let committed = move |n: u64| -> Result<Option<[u8; 32]>> {
+                Ok((n == committed_frame).then_some(top))
+            };
             let source = serving(&chain, Arc::new(AtomicUsize::new(0)));
             let headers = Headers::new(
-                &session.filter, Some(session.generation), &clock, &validator, Some(&source), &committed,
+                &session.filter,
+                Some(session.generation),
+                &clock,
+                &validator,
+                Some(&source),
+                &committed,
             );
-            assert_eq!(headers.get(committed_frame).await.unwrap(), chain[(committed_frame - 90) as usize]);
-            assert_eq!(headers.get(94).await.unwrap(), chain[4], "the local frame {wrong} is another chain's");
+            assert_eq!(
+                headers.get(committed_frame).await.unwrap(),
+                chain[(committed_frame - 90) as usize]
+            );
+            assert_eq!(
+                headers.get(94).await.unwrap(),
+                chain[4],
+                "the local frame {wrong} is another chain's"
+            );
         }
     }
 
@@ -2219,7 +2435,10 @@ mod tests {
         let validator = validator();
         for answer in [None, Some([1; 32])] {
             let committed = move |_: u64| -> Result<Option<[u8; 32]>> { Ok(answer) };
-            let error = read(&session, &clock, &validator, &committed).get(95).await.unwrap_err();
+            let error = read(&session, &clock, &validator, &committed)
+                .get(95)
+                .await
+                .unwrap_err();
             let text = error.to_string();
             assert!(
                 matches!(error, QuilError::ExecutionUnavailable(_))
@@ -2231,7 +2450,13 @@ mod tests {
         }
         let top = digest(&chain[5]);
         let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 95).then_some(top)) };
-        assert_eq!(read(&session, &clock, &validator, &committed).get(95).await.unwrap(), chain[5]);
+        assert_eq!(
+            read(&session, &clock, &validator, &committed)
+                .get(95)
+                .await
+                .unwrap(),
+            chain[5]
+        );
     }
 
     #[tokio::test]
@@ -2242,16 +2467,28 @@ mod tests {
         let validator = validator();
         let far = digest(&chain[33]);
         let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 128).then_some(far)) };
-        let error = read(&session, &clock, &validator, &committed).get(95).await.unwrap_err();
+        let error = read(&session, &clock, &validator, &committed)
+            .get(95)
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, QuilError::ExecutionUnavailable(_))
-                && error.to_string().contains("frames 96-127 above it carry none")
+                && error
+                    .to_string()
+                    .contains("frames 96-127 above it carry none")
                 && error.to_string().contains("none within 32 frames"),
             "{error}"
         );
         let near = digest(&chain[32]);
-        let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 127).then_some(near)) };
-        assert_eq!(read(&session, &clock, &validator, &committed).get(95).await.unwrap(), chain[0]);
+        let committed =
+            move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 127).then_some(near)) };
+        assert_eq!(
+            read(&session, &clock, &validator, &committed)
+                .get(95)
+                .await
+                .unwrap(),
+            chain[0]
+        );
     }
 
     #[tokio::test]
@@ -2264,12 +2501,26 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let source = serving(&chain, calls.clone());
         let committed = |_: u64| -> Result<Option<[u8; 32]>> { Ok(None) };
-        let headers =
-            Headers::new(&session.filter, Some(session.generation), &clock, &validator, Some(&source), &committed);
+        let headers = Headers::new(
+            &session.filter,
+            Some(session.generation),
+            &clock,
+            &validator,
+            Some(&source),
+            &committed,
+        );
         let first = headers.get(100).await.unwrap_err();
-        assert!(first.to_string().contains("none within 32 frames"), "{first}");
+        assert!(
+            first.to_string().contains("none within 32 frames"),
+            "{first}"
+        );
         let second = headers.get(99).await.unwrap_err();
-        assert!(second.to_string().contains("already asked peers for 64 frames"), "{second}");
+        assert!(
+            second
+                .to_string()
+                .contains("already asked peers for 64 frames"),
+            "{second}"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 64);
     }
 
@@ -2284,20 +2535,40 @@ mod tests {
         }
         let top = digest(&chain[6]);
         let committed = move |n: u64| -> Result<Option<[u8; 32]>> { Ok((n == 96).then_some(top)) };
-        let silent: DeliveryFrameSource = Arc::new(|_, _| Box::pin(std::future::pending::<Option<AppShardFrame>>()));
+        let silent: DeliveryFrameSource =
+            Arc::new(|_, _| Box::pin(std::future::pending::<Option<AppShardFrame>>()));
         let validator = validator();
-        let mut headers =
-            Headers::new(&session.filter, Some(session.generation), &clock, &validator, Some(&silent), &committed);
+        let mut headers = Headers::new(
+            &session.filter,
+            Some(session.generation),
+            &clock,
+            &validator,
+            Some(&silent),
+            &committed,
+        );
         headers.deadline = Instant::now() + Duration::from_millis(300);
         let started = Instant::now();
         let error = headers.get(94).await.unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(4), "the deadline bounds the read");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the deadline bounds the read"
+        );
         assert!(
             matches!(error, QuilError::ExecutionUnavailable(_))
-                && error.to_string().contains("descendant frame 95 is unavailable"),
+                && error
+                    .to_string()
+                    .contains("descendant frame 95 is unavailable"),
             "{error}"
         );
-        assert!(headers.get(93).await.unwrap_err().to_string().contains("budget"), "a spent budget reads nothing");
+        assert!(
+            headers
+                .get(93)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget"),
+            "a spent budget reads nothing"
+        );
     }
 
     #[tokio::test]
@@ -2336,7 +2607,10 @@ mod tests {
         assert_eq!(headers.get(70).await.unwrap(), chain[6]);
         assert_eq!(headers.get(71).await.unwrap(), chain[7]);
         assert!(
-            read(&session, &clock, &validator, &committed).get(70).await.is_err(),
+            read(&session, &clock, &validator, &committed)
+                .get(70)
+                .await
+                .is_err(),
             "without the earlier header nothing authenticates it"
         );
     }
@@ -2352,12 +2626,22 @@ mod tests {
         let filter = &session.filter;
         let digest = accumulator_header::report_digest(tip_report);
         let accumulator = encoding::clock_shard_frame_accumulator_key(filter, cursor);
-        let mut records: Vec<_> = tip(session, cursor).into_iter().filter(|(key, _)| *key != accumulator).collect();
+        let mut records: Vec<_> = tip(session, cursor)
+            .into_iter()
+            .filter(|(key, _)| *key != accumulator)
+            .collect();
         records.push((accumulator, digest.clone()));
-        records.push((encoding::clock_shard_accumulator_report_key(filter, &digest), tip_report.to_vec()));
+        records.push((
+            encoding::clock_shard_accumulator_report_key(filter, &digest),
+            tip_report.to_vec(),
+        ));
         manager
             .crdt()
-            .commit_with_frame_cursor_and_records(cursor, &encoding::consensus_materialized_cursor_key(filter), &records)
+            .commit_with_frame_cursor_and_records(
+                cursor,
+                &encoding::consensus_materialized_cursor_key(filter),
+                &records,
+            )
             .unwrap();
     }
 
@@ -2366,7 +2650,9 @@ mod tests {
     // frames 91..=98 hold it too. Before, the member nullified header 101.
     #[tokio::test]
     async fn the_carry_window_below_a_joined_tip_is_recovered_from_certified_headers() {
-        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(Some(0));
+        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(
+            Some(0),
+        );
         let directory = Directory::new();
         let session = session();
         let filter = session.filter.clone();
@@ -2376,36 +2662,86 @@ mod tests {
         let digest = accumulator_header::report_digest(&tip_report);
         joined_at_tip(&manager, &session, 100, &tip_report);
         let field = || {
-            crate::app_engine::accumulator_field(&crate::app_engine::FrameOutflows::default(), &clock, &filter, 101)
+            crate::app_engine::accumulator_field(
+                &crate::app_engine::FrameOutflows::default(),
+                &clock,
+                &filter,
+                101,
+            )
         };
-        assert_eq!(field(), None, "without the window the next field is unknown");
+        assert_eq!(
+            field(),
+            None,
+            "without the window the next field is unknown"
+        );
         let headers = VerifiedFixture {
             frames: (90..=100)
-                .map(|n| (n, header(&session, n, if n == 100 { [[0; 32]; 4] } else { [[n as u8; 32]; 4] })))
+                .map(|n| {
+                    (
+                        n,
+                        header(
+                            &session,
+                            n,
+                            if n == 100 {
+                                [[0; 32]; 4]
+                            } else {
+                                [[n as u8; 32]; 4]
+                            },
+                        ),
+                    )
+                })
                 .collect(),
             fail_at: Mutex::new(None),
             reads: Mutex::new(vec![]),
         };
         assert_eq!(
-            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100).await.unwrap(),
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100)
+                .await
+                .unwrap(),
             (8, None)
         );
-        assert_eq!(*headers.reads.lock().unwrap(), vec![100], "the omission at header 100 decides the rest");
-        for n in 92..=99 {
-            assert_eq!(clock.get_shard_frame_accumulator(&filter, n).unwrap(), Some(digest.clone()), "frame {n}");
-        }
-        assert!(clock.get_shard_frame_accumulator(&filter, 91).unwrap().is_none(), "nothing below the window");
-        assert_eq!(field(), Some(vec![]), "an unchanged report off the heartbeat is not carried");
         assert_eq!(
-            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100).await.unwrap(),
+            *headers.reads.lock().unwrap(),
+            vec![100],
+            "the omission at header 100 decides the rest"
+        );
+        for n in 92..=99 {
+            assert_eq!(
+                clock.get_shard_frame_accumulator(&filter, n).unwrap(),
+                Some(digest.clone()),
+                "frame {n}"
+            );
+        }
+        assert!(
+            clock
+                .get_shard_frame_accumulator(&filter, 91)
+                .unwrap()
+                .is_none(),
+            "nothing below the window"
+        );
+        assert_eq!(
+            field(),
+            Some(vec![]),
+            "an unchanged report off the heartbeat is not carried"
+        );
+        assert_eq!(
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &headers, 100)
+                .await
+                .unwrap(),
             (0, None)
         );
-        assert_eq!(headers.reads.lock().unwrap().len(), 1, "a complete window reads no header");
+        assert_eq!(
+            headers.reads.lock().unwrap().len(),
+            1,
+            "a complete window reads no header"
+        );
     }
 
     #[tokio::test]
     async fn an_undecided_or_contradicted_carry_window_stays_unknown() {
-        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(Some(0));
+        quil_execution::token_intrinsic::global_commit::set_relay_activation_frame_for_thread(
+            Some(0),
+        );
         let directory = Directory::new();
         let session = session();
         let filter = session.filter.clone();
@@ -2413,16 +2749,25 @@ mod tests {
         let clock = quil_store::RocksClockStore::new(db.inner());
         joined_at_tip(&manager, &session, 100, &report(1));
         let field = || {
-            crate::app_engine::accumulator_field(&crate::app_engine::FrameOutflows::default(), &clock, &filter, 101)
+            crate::app_engine::accumulator_field(
+                &crate::app_engine::FrameOutflows::default(),
+                &clock,
+                &filter,
+                101,
+            )
         };
         // The tip frame changed the state: frame 99's report is not known.
         let changed = VerifiedFixture {
-            frames: (90..=100).map(|n| (n, header(&session, n, [[n as u8; 32]; 4]))).collect(),
+            frames: (90..=100)
+                .map(|n| (n, header(&session, n, [[n as u8; 32]; 4])))
+                .collect(),
             fail_at: Mutex::new(None),
             reads: Mutex::new(vec![]),
         };
         assert_eq!(
-            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &changed, 100).await.unwrap(),
+            recover_carry_window_with_headers(&filter, manager.clone(), &clock, &changed, 100)
+                .await
+                .unwrap(),
             (0, Some(99))
         );
         assert_eq!(field(), None);
@@ -2438,21 +2783,54 @@ mod tests {
                 &encoding::consensus_materialized_cursor_key(&filter),
                 100,
                 &[
-                    (encoding::clock_shard_frame_accumulator_key(&filter, 95), other_digest.clone()),
-                    (encoding::clock_shard_accumulator_report_key(&filter, &other_digest), other),
+                    (
+                        encoding::clock_shard_frame_accumulator_key(&filter, 95),
+                        other_digest.clone(),
+                    ),
+                    (
+                        encoding::clock_shard_accumulator_report_key(&filter, &other_digest),
+                        other,
+                    ),
                 ],
             )
             .unwrap();
         let unchanged = VerifiedFixture {
             frames: (90..=100)
-                .map(|n| (n, header(&session, n, if n == 100 { [[0; 32]; 4] } else { [[n as u8; 32]; 4] })))
+                .map(|n| {
+                    (
+                        n,
+                        header(
+                            &session,
+                            n,
+                            if n == 100 {
+                                [[0; 32]; 4]
+                            } else {
+                                [[n as u8; 32]; 4]
+                            },
+                        ),
+                    )
+                })
                 .collect(),
             fail_at: Mutex::new(None),
             reads: Mutex::new(vec![]),
         };
-        assert!(recover_carry_window_with_headers(&filter, manager.clone(), &clock, &unchanged, 100).await.is_err());
-        assert_eq!(clock.get_shard_frame_accumulator(&filter, 95).unwrap(), Some(other_digest));
-        assert!(clock.get_shard_frame_accumulator(&filter, 99).unwrap().is_none());
+        assert!(recover_carry_window_with_headers(
+            &filter,
+            manager.clone(),
+            &clock,
+            &unchanged,
+            100
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            clock.get_shard_frame_accumulator(&filter, 95).unwrap(),
+            Some(other_digest)
+        );
+        assert!(clock
+            .get_shard_frame_accumulator(&filter, 99)
+            .unwrap()
+            .is_none());
         assert_eq!(field(), None);
     }
 
@@ -2463,10 +2841,22 @@ mod tests {
         let filter = [0x5a; 35];
         let start = Instant::now();
         assert!(walk_batch(&filter, (10, 95, 100), start));
-        assert!(!walk_batch(&filter, (10, 87, 100), start + Duration::from_secs(10)));
+        assert!(!walk_batch(
+            &filter,
+            (10, 87, 100),
+            start + Duration::from_secs(10)
+        ));
         assert_eq!(walk_progress(&filter), Some((10, 87, 100)));
-        assert!(walk_batch(&filter, (10, 40, 100), start + WALK_PROGRESS_REPEAT));
-        assert!(walk_batch(&filter, (100, 100, 100), start + WALK_PROGRESS_REPEAT + Duration::from_secs(10)));
+        assert!(walk_batch(
+            &filter,
+            (10, 40, 100),
+            start + WALK_PROGRESS_REPEAT
+        ));
+        assert!(walk_batch(
+            &filter,
+            (100, 100, 100),
+            start + WALK_PROGRESS_REPEAT + Duration::from_secs(10)
+        ));
         assert_eq!(walk_progress(&filter), None);
     }
 }

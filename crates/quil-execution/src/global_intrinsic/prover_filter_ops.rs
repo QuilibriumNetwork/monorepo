@@ -26,7 +26,9 @@
 use quil_types::error::{QuilError, Result};
 
 use super::addressed_signature::AddressedSignature;
-use crate::canonical_cursor::{put_u32, put_u64, put_lp as put_len_prefixed, read_u32, read_u64, read_bytes};
+use crate::canonical_cursor::{
+    put_lp as put_len_prefixed, put_u32, put_u64, read_bytes, read_u32, read_u64,
+};
 
 // =====================================================================
 // Type-prefix constants (from protobufs/canonical_types.go)
@@ -47,8 +49,7 @@ pub const MAX_PROVER_FILTER_LEN: u32 = super::prover_ops::MAX_FILTER_LEN as u32;
 /// envelope is 710 bytes and the one-extra-signer aggregate is 1226.
 /// We reuse the shared [`MAX_ADDRESSED_SIG_LEN`] so the cap tracks the
 /// signature scheme.
-pub const MAX_FILTER_OP_SIG_LEN: u32 =
-    super::addressed_signature::MAX_ADDRESSED_SIG_LEN as u32;
+pub const MAX_FILTER_OP_SIG_LEN: u32 = super::addressed_signature::MAX_ADDRESSED_SIG_LEN as u32;
 
 /// Read an optional `AddressedSignature` — a length prefix followed
 /// by that many bytes of nested canonical-bytes. Length 0 → `None`.
@@ -73,10 +74,7 @@ fn read_optional_addressed_sig(
 }
 
 /// Write an optional `AddressedSignature` with the length prefix.
-fn write_optional_addressed_sig(
-    out: &mut Vec<u8>,
-    sig: Option<&AddressedSignature>,
-) -> Result<()> {
+fn write_optional_addressed_sig(out: &mut Vec<u8>, sig: Option<&AddressedSignature>) -> Result<()> {
     match sig {
         Some(s) => {
             let bytes = s.to_canonical_bytes()?;
@@ -119,10 +117,7 @@ impl ProverLeave {
         put_u64(&mut out, self.frame_number);
 
         // Optional signature.
-        write_optional_addressed_sig(
-            &mut out,
-            self.public_key_signature_bls48581.as_ref(),
-        )?;
+        write_optional_addressed_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
 
         Ok(out)
     }
@@ -188,10 +183,7 @@ impl ProverPause {
         put_u32(&mut out, TYPE_PROVER_PAUSE);
         put_len_prefixed(&mut out, &self.filter);
         put_u64(&mut out, self.frame_number);
-        write_optional_addressed_sig(
-            &mut out,
-            self.public_key_signature_bls48581.as_ref(),
-        )?;
+        write_optional_addressed_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
         Ok(out)
     }
 
@@ -244,10 +236,7 @@ impl ProverResume {
         put_u32(&mut out, TYPE_PROVER_RESUME);
         put_len_prefixed(&mut out, &self.filter);
         put_u64(&mut out, self.frame_number);
-        write_optional_addressed_sig(
-            &mut out,
-            self.public_key_signature_bls48581.as_ref(),
-        )?;
+        write_optional_addressed_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
         Ok(out)
     }
 
@@ -303,11 +292,7 @@ mod tests {
 
     fn sample_leave() -> ProverLeave {
         ProverLeave {
-            filters: vec![
-                vec![0x11u8; 32],
-                vec![0x22u8; 24],
-                vec![0x33u8; 1],
-            ],
+            filters: vec![vec![0x11u8; 32], vec![0x22u8; 24], vec![0x33u8; 1]],
             frame_number: 0xCAFEBABE_DEADBEEF,
             public_key_signature_bls48581: Some(sample_addressed_sig()),
         }

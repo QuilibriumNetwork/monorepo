@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DbConfig, DiagnosticsConfig, EngineConfig, ExplorerConfig, KeyConfig, LogConfig, P2PConfig, ProofWorkerConfig,
+    DbConfig, DiagnosticsConfig, EngineConfig, ExplorerConfig, KeyConfig, LogConfig, P2PConfig,
+    ProofWorkerConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +91,17 @@ mod tests {
             "proofWorker:\n  path: /opt/quil/quil-amount-proof-worker\n  cpuSeconds: 900\n  wallTimeoutSecs: 1200\n  disabled: true\n",
         )
         .unwrap();
-        assert_eq!(explicit.proof_worker.path, "/opt/quil/quil-amount-proof-worker");
-        assert_eq!((explicit.proof_worker.cpu_seconds, explicit.proof_worker.wall_timeout_secs), (900, 1200));
+        assert_eq!(
+            explicit.proof_worker.path,
+            "/opt/quil/quil-amount-proof-worker"
+        );
+        assert_eq!(
+            (
+                explicit.proof_worker.cpu_seconds,
+                explicit.proof_worker.wall_timeout_secs
+            ),
+            (900, 1200)
+        );
         assert!(explicit.proof_worker.disabled);
         let encoded = serde_yaml::to_string(&explicit).unwrap();
         assert!(encoded.contains("proofWorker:"));
@@ -101,7 +111,11 @@ mod tests {
 
     #[test]
     fn diagnostics_are_off_unless_configured_and_their_interval_is_clamped() {
-        for yaml in ["p2p:\n  network: 1\n", "diagnostics: null\n", "diagnostics:\n  healthReport: null\n"] {
+        for yaml in [
+            "p2p:\n  network: 1\n",
+            "diagnostics: null\n",
+            "diagnostics:\n  healthReport: null\n",
+        ] {
             let mut config: Config = serde_yaml::from_str(yaml).unwrap();
             config.apply_defaults();
             assert_eq!(config.diagnostics, DiagnosticsConfig::default(), "{yaml}");
@@ -115,8 +129,12 @@ mod tests {
         config.apply_defaults();
         let report = &config.diagnostics.health_report;
         assert!(report.enabled);
-        assert_eq!((report.allowed_peers.as_slice(), report.min_interval_secs), (["QmPeer".to_string()].as_slice(), 10));
-        let decoded: Config = serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            (report.allowed_peers.as_slice(), report.min_interval_secs),
+            (["QmPeer".to_string()].as_slice(), 10)
+        );
+        let decoded: Config =
+            serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
         assert_eq!(decoded.diagnostics, config.diagnostics);
     }
 }

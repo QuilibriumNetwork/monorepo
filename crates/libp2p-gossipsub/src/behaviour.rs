@@ -53,6 +53,8 @@ use web_time::{Instant, SystemTime};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::{Churn, Config as MetricsConfig, Inclusion, Metrics, Penalty};
+#[cfg(test)]
+use crate::rpc_proto::proto;
 use crate::{
     backoff::BackoffStorage,
     config::{Config, ValidationMode},
@@ -73,8 +75,6 @@ use crate::{
     },
     FailedMessages, PublishError, SubscriptionError, TopicScoreParams, ValidationError,
 };
-#[cfg(test)]
-use crate::rpc_proto::proto;
 
 #[cfg(test)]
 mod tests;
@@ -824,7 +824,12 @@ where
         // the memcache takes it (the checks below fail the publish otherwise).
         if !publish_failed {
             if let Some(traffic) = &self.traffic {
-                traffic.observe(TrafficKind::Published, &raw_message.topic, &raw_message.data, raw_protobuf_len);
+                traffic.observe(
+                    TrafficKind::Published,
+                    &raw_message.topic,
+                    &raw_message.data,
+                    raw_protobuf_len,
+                );
             }
         }
         self.mcache.put(&msg_id, raw_message);
@@ -1830,7 +1835,12 @@ where
             metrics.msg_recvd_unfiltered(&raw_message.topic, raw_protobuf_len);
         }
         if let Some(traffic) = &self.traffic {
-            traffic.observe(TrafficKind::Received, &raw_message.topic, &raw_message.data, raw_protobuf_len);
+            traffic.observe(
+                TrafficKind::Received,
+                &raw_message.topic,
+                &raw_message.data,
+                raw_protobuf_len,
+            );
         }
 
         // Try and perform the data transform to the message. If it fails, consider it invalid.
@@ -1920,7 +1930,12 @@ where
             metrics.msg_recvd(&message.topic);
         }
         if let Some(traffic) = &self.traffic {
-            traffic.observe(TrafficKind::FirstReceived, &message.topic, &message.data, raw_protobuf_len);
+            traffic.observe(
+                TrafficKind::FirstReceived,
+                &message.topic,
+                &message.data,
+                raw_protobuf_len,
+            );
         }
 
         // Tells score that message arrived (but is maybe not fully validated yet).

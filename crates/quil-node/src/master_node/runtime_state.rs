@@ -18,9 +18,11 @@ pub(crate) struct RuntimeState {
 pub(crate) fn init(
     sup: &mut Supervisor<anyhow::Error>,
     hg_store: Arc<quil_store::RocksHypergraphStore>,
-    shard_engines: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >>,
+    shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
 ) -> RuntimeState {
     // ---------------------------------------------------------------
     // 5c. Message collector + consensus event loop
@@ -279,9 +281,7 @@ pub(crate) fn init(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            mc_prover_only.set_prover_only_mode(
-                pof.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            mc_prover_only.set_prover_only_mode(pof.load(std::sync::atomic::Ordering::Relaxed));
         }
     });
 

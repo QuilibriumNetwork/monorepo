@@ -44,7 +44,8 @@ pub struct RingKey {
 /// Whether the seniority ring rule governs `frame`: from the committee-handoff
 /// activation, the flag day that also snapshots every allocation's key.
 pub fn governs(frame: u64) -> bool {
-    quil_types::consensus::committee_handoff_policy().is_some_and(|policy| frame >= policy.activation_frame)
+    quil_types::consensus::committee_handoff_policy()
+        .is_some_and(|policy| frame >= policy.activation_frame)
 }
 
 fn be_u64(bytes: &[u8]) -> Option<u64> {
@@ -61,14 +62,27 @@ pub fn read_key(allocation: &quil_tries::VectorCommitmentTree) -> Option<RingKey
 
 /// Record `key` on an allocation.
 pub fn write_key(allocation: &mut quil_tries::VectorCommitmentTree, key: RingKey) -> Result<()> {
-    write_field(allocation, ALLOCATION, "RingEpoch", &key.cohort.to_be_bytes())?;
-    write_field(allocation, ALLOCATION, "RingSeniority", &key.seniority.to_be_bytes())
+    write_field(
+        allocation,
+        ALLOCATION,
+        "RingEpoch",
+        &key.cohort.to_be_bytes(),
+    )?;
+    write_field(
+        allocation,
+        ALLOCATION,
+        "RingSeniority",
+        &key.seniority.to_be_bytes(),
+    )
 }
 
 /// The key a join confirm at `frame` records for a prover of `seniority`:
 /// its cohort is the epoch the confirm activates it (E+2 of the join).
 pub fn joined(frame: u64, seniority: u64) -> RingKey {
-    RingKey { cohort: quil_types::consensus::epoch_for_frame(frame) + 1, seniority }
+    RingKey {
+        cohort: quil_types::consensus::epoch_for_frame(frame) + 1,
+        seniority,
+    }
 }
 
 /// The key of an allocation confirmed before the rule, recorded at the flag
@@ -85,12 +99,21 @@ pub fn preexisting(join_confirm_frame: u64, seniority: u64) -> RingKey {
 /// The key of an allocation a topology change moves at `frame`: a new cohort
 /// in its new shard, its seniority kept.
 pub fn moved(key: RingKey, frame: u64) -> RingKey {
-    RingKey { cohort: quil_types::consensus::epoch_for_frame(frame), seniority: key.seniority }
+    RingKey {
+        cohort: quil_types::consensus::epoch_for_frame(frame),
+        seniority: key.seniority,
+    }
 }
 
 fn rank(a: (&[u8], RingKey), b: (&[u8], RingKey), one_cohort: bool) -> Ordering {
-    let cohort = if one_cohort { Ordering::Equal } else { a.1.cohort.cmp(&b.1.cohort) };
-    cohort.then(b.1.seniority.cmp(&a.1.seniority)).then_with(|| a.0.cmp(b.0))
+    let cohort = if one_cohort {
+        Ordering::Equal
+    } else {
+        a.1.cohort.cmp(&b.1.cohort)
+    };
+    cohort
+        .then(b.1.seniority.cmp(&a.1.seniority))
+        .then_with(|| a.0.cmp(b.0))
 }
 
 /// The ring of each of `members` (prover address, key), in input order.
@@ -111,7 +134,11 @@ pub fn assign(members: &[(&[u8], RingKey)], one_cohort: bool) -> Vec<u8> {
 pub fn children_by_value(children: &[Vec<u8>], size: impl Fn(&[u8]) -> u128) -> Vec<usize> {
     let sizes: Vec<u128> = children.iter().map(|child| size(child)).collect();
     let mut order: Vec<usize> = (0..children.len()).collect();
-    order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]).then_with(|| children[a].cmp(&children[b])));
+    order.sort_by(|&a, &b| {
+        sizes[b]
+            .cmp(&sizes[a])
+            .then_with(|| children[a].cmp(&children[b]))
+    });
     order
 }
 
@@ -127,7 +154,13 @@ pub fn split_groups<T>(mut provers: Vec<(T, &[u8], RingKey)>, k: usize) -> Resul
     let (base, extra) = (provers.len() / k, provers.len() % k);
     let mut provers = provers.into_iter();
     Ok((0..k)
-        .map(|group| provers.by_ref().take(base + usize::from(group < extra)).map(|p| p.0).collect())
+        .map(|group| {
+            provers
+                .by_ref()
+                .take(base + usize::from(group < extra))
+                .map(|p| p.0)
+                .collect()
+        })
         .collect())
 }
 
@@ -145,9 +178,16 @@ mod tests {
         // more senior than D–H. A ring holds eight.
         let names: Vec<[u8; 1]> = (b'A'..=b'J').map(|c| [c]).collect();
         let keys = [
-            key(0, 0), key(0, 0), key(0, 0),
-            key(1, 5), key(1, 5), key(1, 5), key(1, 5), key(1, 5),
-            key(1, 900), key(1, 800),
+            key(0, 0),
+            key(0, 0),
+            key(0, 0),
+            key(1, 5),
+            key(1, 5),
+            key(1, 5),
+            key(1, 5),
+            key(1, 5),
+            key(1, 900),
+            key(1, 800),
         ];
         let members: Vec<(&[u8], RingKey)> = names.iter().map(|n| n.as_slice()).zip(keys).collect();
         let rings = assign(&members, false);
@@ -165,7 +205,10 @@ mod tests {
 
         // A later cohort never displaces an earlier one, however senior.
         let full: Vec<[u8; 1]> = (0u8..9).map(|i| [i]).collect();
-        let mut members: Vec<(&[u8], RingKey)> = full[..8].iter().map(|n| (n.as_slice(), key(0, 0))).collect();
+        let mut members: Vec<(&[u8], RingKey)> = full[..8]
+            .iter()
+            .map(|n| (n.as_slice(), key(0, 0)))
+            .collect();
         members.push((full[8].as_slice(), key(1, u64::MAX)));
         assert_eq!(assign(&members, false)[8], 1);
         // A split or merge re-ranks as one cohort.
@@ -192,7 +235,13 @@ mod tests {
         assert!(split_groups(Vec::<(u8, &[u8], RingKey)>::new(), 0).is_err());
 
         let children = vec![vec![0xa1], vec![0xa0], vec![0xa2]];
-        let sizes = |child: &[u8]| -> u128 { if child == [0xa2] { 5 } else { 9 } };
+        let sizes = |child: &[u8]| -> u128 {
+            if child == [0xa2] {
+                5
+            } else {
+                9
+            }
+        };
         // Equal sizes fall back to filter order.
         assert_eq!(children_by_value(&children, sizes), vec![1, 0, 2]);
     }
@@ -200,8 +249,16 @@ mod tests {
     #[test]
     fn keys_round_trip_and_cohorts_follow_the_epoch() {
         let epoch = quil_types::consensus::epoch_length_frames();
-        assert_eq!(joined(epoch * 3 + 5, 77), key(4, 77), "a confirm in E activates at E+1's boundary");
-        assert_eq!(preexisting(0, 9), key(0, 9), "genesis allocations are the first cohort");
+        assert_eq!(
+            joined(epoch * 3 + 5, 77),
+            key(4, 77),
+            "a confirm in E activates at E+1's boundary"
+        );
+        assert_eq!(
+            preexisting(0, 9),
+            key(0, 9),
+            "genesis allocations are the first cohort"
+        );
         assert_eq!(preexisting(epoch * 2, 9), key(3, 9));
         assert_eq!(moved(key(1, 9), epoch * 7), key(7, 9));
         let mut tree = quil_tries::VectorCommitmentTree::new();

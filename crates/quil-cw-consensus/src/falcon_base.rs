@@ -27,9 +27,7 @@ use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_math::algebra::Random;
 use commonware_utils::{union_unique, Array, Span};
 use core::ops::Deref;
-use quil_crypto::{
-    falcon_verify, FalconSigner, FALCON_PUBLIC_KEY_LEN, FALCON_SIGNATURE_LEN,
-};
+use quil_crypto::{falcon_verify, FalconSigner, FALCON_PUBLIC_KEY_LEN, FALCON_SIGNATURE_LEN};
 use quil_types::crypto::Signer as QuilSigner;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -82,7 +80,11 @@ macro_rules! byte_array_newtype {
 /// example by every blocked consensus message), and the derived form printed
 /// all 897 key bytes as decimals, about 3.5 KB per line; `Display` still
 /// gives the full hex.
-fn fmt_fingerprint(name: &str, bytes: &[u8], f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+fn fmt_fingerprint(
+    name: &str,
+    bytes: &[u8],
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
     write!(f, "{name}(")?;
     for b in bytes.iter().skip(1).take(8) {
         write!(f, "{:02x}", b)?;
@@ -317,11 +319,17 @@ mod tests {
         let pk = sk.public_key();
         let other = FalconPrivateKey::random(test_rng()).public_key();
         let debug = format!("{pk:?}");
-        assert!(debug.starts_with("FalconPublicKey(") && debug.len() < 40, "{debug}");
+        assert!(
+            debug.starts_with("FalconPublicKey(") && debug.len() < 40,
+            "{debug}"
+        );
         assert_ne!(debug, format!("{other:?}"));
         assert_eq!(format!("{pk}").len(), 2 * FALCON_PUBLIC_KEY_LEN);
         let sig = format!("{:?}", sk.sign(b"global", b"message"));
-        assert!(sig.starts_with("FalconSignature(") && sig.len() < 40, "{sig}");
+        assert!(
+            sig.starts_with("FalconSignature(") && sig.len() < 40,
+            "{sig}"
+        );
     }
 
     #[test]
@@ -351,7 +359,10 @@ mod tests {
         let msg = b"view-7-nullify";
         let a = sk.sign(ns, msg);
         let b = sk.sign(ns, msg);
-        assert_eq!(a, b, "re-sign of the same payload must return the cached signature");
+        assert_eq!(
+            a, b,
+            "re-sign of the same payload must return the cached signature"
+        );
         // A clone shares the cache (commonware clones the signer).
         let b2 = sk.clone().sign(ns, msg);
         assert_eq!(a, b2, "cache is shared across clones");
@@ -374,7 +385,10 @@ mod tests {
         let decoded = FalconSignature::decode(encoded).unwrap();
         assert_eq!(decoded, sig);
         let copy = sig.clone();
-        assert!(Arc::ptr_eq(&copy.0, &sig.0), "clones share one copy of the bytes");
+        assert!(
+            Arc::ptr_eq(&copy.0, &sig.0),
+            "clones share one copy of the bytes"
+        );
         assert!(std::mem::size_of::<FalconSignature>() <= 8);
         assert!(
             std::mem::size_of::<commonware_codec::types::lazy::Lazy<FalconSignature>>() <= 64,

@@ -1,4 +1,3 @@
-
 use prost::Message;
 
 use quil_types::error::{QuilError, Result};
@@ -33,7 +32,9 @@ impl RocksTokenStore {
         read_opts.set_iterate_lower_bound(lower.to_vec());
         read_opts.set_iterate_upper_bound(upper.to_vec());
 
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         let mut entries = Vec::new();
         for item in iter {
             match item {
@@ -161,8 +162,8 @@ impl store::TokenStore for RocksTokenStore {
             ));
         }
         let frame_number = u64::from_be_bytes(value[..8].try_into().unwrap());
-        let coin = node::Coin::decode(&value[8..])
-            .map_err(|e| QuilError::Serialization(e.to_string()))?;
+        let coin =
+            node::Coin::decode(&value[8..]).map_err(|e| QuilError::Serialization(e.to_string()))?;
 
         Ok((frame_number, coin))
     }
@@ -181,10 +182,7 @@ impl store::TokenStore for RocksTokenStore {
         data.extend_from_slice(&coin_bytes);
 
         let owner_addr = Self::owner_address(coin);
-        txn.set(
-            &encoding::coin_by_owner_key(owner_addr, address),
-            &data,
-        )?;
+        txn.set(&encoding::coin_by_owner_key(owner_addr, address), &data)?;
         txn.set(&encoding::coin_key(address), &data)?;
 
         Ok(())
@@ -428,10 +426,7 @@ mod tests {
         let (frame, got) = store.get_coin_by_address(&addr).unwrap();
         assert_eq!(frame, 42);
         assert_eq!(got.amount, coin.amount);
-        assert_eq!(
-            RocksTokenStore::owner_address(&got),
-            &owner[..],
-        );
+        assert_eq!(RocksTokenStore::owner_address(&got), &owner[..],);
     }
 
     #[test]

@@ -1,28 +1,34 @@
-mod rocksdb_store;
 mod clock;
 mod clock_codec;
 mod clock_overlay;
-mod token;
-mod key;
-mod shards;
-mod hypergraph;
-mod retention;
-mod overlay;
+pub mod disk_monitor;
 mod dispatch;
 pub mod encoding;
-mod worker;
-pub mod replica_store;
+mod hypergraph;
 pub mod import;
+mod key;
 pub mod migration;
-pub mod disk_monitor;
+mod overlay;
+pub mod replica_store;
+mod retention;
+mod rocksdb_store;
+mod shards;
 pub mod testing;
+mod token;
+mod worker;
 
-pub use rocksdb_store::{RocksDb, RocksDbHealth, RocksDbMemory, RocksTransaction, RocksIterator, StoreFormat, detect_store_format};
 pub use clock::{CandidatePrune, RocksClockStore, StagedFrameCleanup};
 pub use clock_overlay::OverlayClockStore;
-pub use token::RocksTokenStore;
-pub use key::RocksKeyStore;
-pub use shards::{OverlayShardsStore, RocksShardsStore, ShardMetadataBatch};
-pub use hypergraph::{OverlayHypergraphStore, RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite, FOREST_NAMESPACE};
 pub use dispatch::RocksInboxStore;
+pub use hypergraph::{
+    OverlayHypergraphStore, RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite,
+    FOREST_NAMESPACE,
+};
+pub use key::RocksKeyStore;
+pub use rocksdb_store::{
+    detect_store_format, RocksDb, RocksDbHealth, RocksDbMemory, RocksIterator, RocksTransaction,
+    StoreFormat,
+};
+pub use shards::{OverlayShardsStore, RocksShardsStore, ShardMetadataBatch};
+pub use token::RocksTokenStore;
 pub use worker::RocksWorkerStore;

@@ -15,7 +15,8 @@ pub async fn download_signatures(version: Option<&str>) -> anyhow::Result<()> {
     };
     let dest = system::client_data_path().join(&version);
     println!("Downloading signatures for qclient {version}...");
-    let (digest, sigs) = release::download_signatures(system::RELEASE_TYPE_QCLIENT, &version, &dest).await?;
+    let (digest, sigs) =
+        release::download_signatures(system::RELEASE_TYPE_QCLIENT, &version, &dest).await?;
     let count = release::verify_quorum(&digest, &sigs)?;
     println!(
         "{count}/{} signatures valid (quorum {})",

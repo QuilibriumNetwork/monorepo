@@ -20,7 +20,9 @@ pub async fn run(pc: &ProverCtx, filters: &[String], delegate: &str) -> anyhow::
     } else {
         filters
             .iter()
-            .map(|arg| hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid filter hex {arg:?}: {e}")))
+            .map(|arg| {
+                hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid filter hex {arg:?}: {e}"))
+            })
             .collect::<anyhow::Result<_>>()?
     };
 

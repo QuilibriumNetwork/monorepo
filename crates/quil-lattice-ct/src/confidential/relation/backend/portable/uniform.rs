@@ -17,7 +17,11 @@ pub fn uniform_polynomials(
 }
 
 /// Reference private-mask stream; public transcript expansion is AES-256 as well.
-pub fn uniform_polynomials_private(seed: &[u8; 32], nonce: u64, count: usize) -> Result<Vec<ProofPolynomial>, ExpansionError> {
+pub fn uniform_polynomials_private(
+    seed: &[u8; 32],
+    nonce: u64,
+    count: usize,
+) -> Result<Vec<ProofPolynomial>, ExpansionError> {
     let mut stream = CounterExpander::aes256(seed, nonce);
     sample(count, |bytes| stream.squeeze(bytes))
 }

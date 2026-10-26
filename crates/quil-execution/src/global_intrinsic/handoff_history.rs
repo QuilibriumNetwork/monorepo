@@ -20,10 +20,17 @@ fn unavailable(message: &str) -> QuilError {
     QuilError::ExecutionUnavailable(format!("handoff outgoing history: {message}"))
 }
 
-fn required(snapshot: &dyn SnapshotReadable, key: &[u8], what: &str, frame: u64) -> Result<Vec<u8>> {
-    snapshot
-        .read_record(key)?
-        .ok_or_else(|| unavailable(&format!("required committed record absent ({what}, frame {frame})")))
+fn required(
+    snapshot: &dyn SnapshotReadable,
+    key: &[u8],
+    what: &str,
+    frame: u64,
+) -> Result<Vec<u8>> {
+    snapshot.read_record(key)?.ok_or_else(|| {
+        unavailable(&format!(
+            "required committed record absent ({what}, frame {frame})"
+        ))
+    })
 }
 
 fn field(hash: &mut Sha256, bytes: &[u8]) -> Result<()> {
@@ -52,13 +59,28 @@ impl FrameOutgoing {
     /// The records as stored under `filter`, the shape the chain reads.
     pub fn records(&self, filter: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut records = vec![
-            (encoding::clock_shard_frame_fee_total_key(filter, self.frame), self.fees.clone()),
-            (encoding::clock_shard_frame_settlements_key(filter, self.frame), self.settlements.clone()),
-            (encoding::clock_shard_frame_spends_key(filter, self.frame), self.spends.clone()),
-            (encoding::clock_shard_frame_accumulator_key(filter, self.frame), self.digest.clone()),
+            (
+                encoding::clock_shard_frame_fee_total_key(filter, self.frame),
+                self.fees.clone(),
+            ),
+            (
+                encoding::clock_shard_frame_settlements_key(filter, self.frame),
+                self.settlements.clone(),
+            ),
+            (
+                encoding::clock_shard_frame_spends_key(filter, self.frame),
+                self.spends.clone(),
+            ),
+            (
+                encoding::clock_shard_frame_accumulator_key(filter, self.frame),
+                self.digest.clone(),
+            ),
         ];
         if !self.digest.is_empty() {
-            records.push((encoding::clock_shard_accumulator_report_key(filter, &self.digest), self.report.clone()));
+            records.push((
+                encoding::clock_shard_accumulator_report_key(filter, &self.digest),
+                self.report.clone(),
+            ));
         }
         records
     }
@@ -77,7 +99,8 @@ pub fn link(root: [u8; 32], outgoing: &FrameOutgoing) -> Result<[u8; 32]> {
     settlement_record::decode_entries(&outgoing.settlements)
         .map_err(|_| unavailable("malformed settlements"))?;
     field(&mut hash, &outgoing.settlements)?;
-    spend_relay::decode_frame_entries(&outgoing.spends).map_err(|_| unavailable("malformed spends"))?;
+    spend_relay::decode_frame_entries(&outgoing.spends)
+        .map_err(|_| unavailable("malformed spends"))?;
     field(&mut hash, &outgoing.spends)?;
     if !outgoing.digest.is_empty() && outgoing.digest.len() != 32 {
         return Err(unavailable("malformed accumulator digest"));
@@ -109,7 +132,13 @@ pub fn root(snapshot: &dyn SnapshotReadable, session: &Session, through: u64) ->
     if through < session.base_frame {
         return Err(unavailable("tip precedes session genesis"));
     }
-    extend(snapshot, session, session.base_frame, start(session)?, through)
+    extend(
+        snapshot,
+        session,
+        session.base_frame,
+        start(session)?,
+        through,
+    )
 }
 
 /// Continue the chain from `root`, its value through frame `from`, to `through`.
@@ -128,7 +157,8 @@ pub fn extend(
     let cursor = required(
         snapshot,
         &encoding::consensus_materialized_cursor_key(&session.filter),
-        "materialized cursor", through,
+        "materialized cursor",
+        through,
     )?;
     let cursor: [u8; 8] = cursor
         .try_into()
@@ -142,22 +172,26 @@ pub fn extend(
         let fees = required(
             snapshot,
             &encoding::clock_shard_frame_fee_total_key(&session.filter, frame),
-            "fee total", frame,
+            "fee total",
+            frame,
         )?;
         let settlements = required(
             snapshot,
             &encoding::clock_shard_frame_settlements_key(&session.filter, frame),
-            "settlements", frame,
+            "settlements",
+            frame,
         )?;
         let spends = required(
             snapshot,
             &encoding::clock_shard_frame_spends_key(&session.filter, frame),
-            "spends", frame,
+            "spends",
+            frame,
         )?;
         let digest = required(
             snapshot,
             &encoding::clock_shard_frame_accumulator_key(&session.filter, frame),
-            "accumulator digest", frame,
+            "accumulator digest",
+            frame,
         )?;
         let report = if digest.is_empty() {
             Vec::new()
@@ -165,10 +199,21 @@ pub fn extend(
             required(
                 snapshot,
                 &encoding::clock_shard_accumulator_report_key(&session.filter, &digest),
-                "accumulator report", frame,
+                "accumulator report",
+                frame,
             )?
         };
-        root = link(root, &FrameOutgoing { frame, fees, settlements, spends, digest, report })?;
+        root = link(
+            root,
+            &FrameOutgoing {
+                frame,
+                fees,
+                settlements,
+                spends,
+                digest,
+                report,
+            },
+        )?;
     }
     Ok(root)
 }

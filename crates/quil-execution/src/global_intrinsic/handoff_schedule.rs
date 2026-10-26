@@ -27,8 +27,8 @@ use quil_types::error::{QuilError, Result};
 use quil_types::store::{PendingShardChange, ShardChangeKind};
 
 use super::{
-    activate_with, head, initialize, invalid, origins, read, request, schedule, seal_key, session_tip,
-    status, write, DesiredCommittee, Records, Status,
+    activate_with, head, initialize, invalid, origins, read, request, schedule, seal_key,
+    session_tip, status, write, DesiredCommittee, Records, Status,
 };
 use crate::hypergraph_state::HypergraphState;
 use crate::prover_registry::CommittedProverScan;
@@ -68,7 +68,9 @@ pub fn desired_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) ->
         return members_where(scan, filter, frame, |_| true);
     }
     let releases = scan.releases_on_filter(filter);
-    members_where(scan, filter, frame, |address| seat_eligible(releases.get(address), frame))
+    members_where(scan, filter, frame, |address| {
+        seat_eligible(releases.get(address), frame)
+    })
 }
 
 /// [`desired_members`] without the release gate: the committee a merge's
@@ -135,13 +137,18 @@ pub fn split_assignment_sized(
             .iter()
             .map(|(public_key, address)| {
                 let key = scan.ring_key(address, &change.parent).unwrap_or(
-                    super::super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 },
+                    super::super::prover_rings::RingKey {
+                        cohort: u64::MAX,
+                        seniority: 0,
+                    },
                 );
                 (public_key.clone(), address.as_slice(), key)
             })
             .collect();
         let order = super::super::prover_rings::children_by_value(&change.children, size);
-        let Ok(groups) = super::super::prover_rings::split_groups(keyed, k) else { return children };
+        let Ok(groups) = super::super::prover_rings::split_groups(keyed, k) else {
+            return children;
+        };
         for (group, index) in groups.into_iter().zip(order) {
             children[index] = group;
         }
@@ -249,7 +256,9 @@ pub fn seal_submitted(state: &impl Records, session: &Session) -> Result<bool> {
 pub fn genesis_output(state: &impl Records, session: &Session) -> Result<Vec<u8>> {
     let output = read(state, b"genesis-output", &session.id()?)?.unwrap_or_else(|| vec![0; 32]);
     if output.len() != 32 || quil_crypto::poseidon::hash_bytes_to_32(&output)? != session.genesis {
-        return Err(QuilError::Store("session genesis output does not match its identity".into()));
+        return Err(QuilError::Store(
+            "session genesis output does not match its identity".into(),
+        ));
     }
     Ok(output)
 }
@@ -260,29 +269,54 @@ pub fn genesis_output(state: &impl Records, session: &Session) -> Result<Vec<u8>
 /// removes exactly the shards it names; only that complete set covers the same
 /// address range on both sides.
 fn change_topology(change: &PendingShardChange) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-    let bit_path_mode = change.proposed_frame >= super::super::materialize::unified_tree_cutover_frame();
-    let bits = |filter: &[u8]| quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits);
+    let bit_path_mode =
+        change.proposed_frame >= super::super::materialize::unified_tree_cutover_frame();
+    let bits =
+        |filter: &[u8]| quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits);
     Ok(match change.kind {
         ShardChangeKind::Split => {
             let output = super::super::materialize::materialize_shard_split(
-                &change.parent, &change.children, bit_path_mode)?;
-            let registered = output.new_shards.iter()
+                &change.parent,
+                &change.children,
+                bit_path_mode,
+            )?;
+            let registered = output
+                .new_shards
+                .iter()
                 .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path));
             // Allocations move to `change.children` byte for byte; keep that
             // spelling for the shards they name.
-            let new = registered.map(|filter| {
-                change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
-            }).collect();
+            let new = registered
+                .map(|filter| {
+                    change
+                        .children
+                        .iter()
+                        .find(|child| bits(child) == bits(&filter))
+                        .cloned()
+                        .unwrap_or(filter)
+                })
+                .collect();
             (vec![change.parent.clone()], new)
         }
         ShardChangeKind::Merge => {
             let output = super::super::materialize::materialize_shard_merge(
-                &change.children, &change.parent, bit_path_mode)?;
-            let old = output.removed_shards.iter()
+                &change.children,
+                &change.parent,
+                bit_path_mode,
+            )?;
+            let old = output
+                .removed_shards
+                .iter()
                 .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path))
                 .map(|filter| {
-                    change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
-                }).collect();
+                    change
+                        .children
+                        .iter()
+                        .find(|child| bits(child) == bits(&filter))
+                        .cloned()
+                        .unwrap_or(filter)
+                })
+                .collect();
             (old, vec![change.parent.clone()])
         }
     })
@@ -307,7 +341,15 @@ pub fn gate_topology_change(
     even: bool,
 ) -> Result<TopologyGate> {
     let ready = scan.map(|scan| move || Ok(scan));
-    gate_topology_change_sized(state, frame, policy, change, ready.as_ref().map(|f| f as _), even, &|_| 0)
+    gate_topology_change_sized(
+        state,
+        frame,
+        policy,
+        change,
+        ready.as_ref().map(|f| f as _),
+        even,
+        &|_| 0,
+    )
 }
 
 /// [`gate_topology_change`] with each split child's reward basis (`size`),
@@ -370,18 +412,31 @@ pub fn gate_topology_change_sized<'s>(
     let targets: Vec<DesiredCommittee> = match change.kind {
         ShardChangeKind::Split => {
             let assigned = split_assignment_sized(scan, change, frame, even, size);
-            new.into_iter().map(|filter| {
-                let members = change.children.iter().position(|child| *child == filter)
-                    .map(|index| assigned[index].clone()).unwrap_or_default();
-                DesiredCommittee { filter, members }
-            }).collect()
+            new.into_iter()
+                .map(|filter| {
+                    let members = change
+                        .children
+                        .iter()
+                        .position(|child| *child == filter)
+                        .map(|index| assigned[index].clone())
+                        .unwrap_or_default();
+                    DesiredCommittee { filter, members }
+                })
+                .collect()
         }
         ShardChangeKind::Merge => {
-            let mut members: Vec<Vec<u8>> = sources.iter()
-                .flat_map(|source| merge_members(scan, source, frame)).collect();
+            let mut members: Vec<Vec<u8>> = sources
+                .iter()
+                .flat_map(|source| merge_members(scan, source, frame))
+                .collect();
             members.sort();
             members.dedup();
-            new.into_iter().map(|filter| DesiredCommittee { filter, members: members.clone() }).collect()
+            new.into_iter()
+                .map(|filter| DesiredCommittee {
+                    filter,
+                    members: members.clone(),
+                })
+                .collect()
         }
     };
     if targets.iter().all(|target| target.members.is_empty()) {
@@ -414,23 +469,39 @@ pub fn gate_topology_change_sized<'s>(
 
 /// The committees a topology change's request authorized, once scheduled:
 /// the split's or merge's allocations follow them when the change applies.
-pub fn topology_targets(state: &impl Records, change: &PendingShardChange) -> Result<Option<Vec<DesiredCommittee>>> {
-    let Some(bytes) = read(state, b"topology", &topology_key(change))? else { return Ok(None) };
+pub fn topology_targets(
+    state: &impl Records,
+    change: &PendingShardChange,
+) -> Result<Option<Vec<DesiredCommittee>>> {
+    let Some(bytes) = read(state, b"topology", &topology_key(change))? else {
+        return Ok(None);
+    };
     let id = request_id(bytes)?;
     Ok(super::request(state, &id)?.map(|request| {
-        request.targets.into_iter().map(|target| target.committee).collect()
+        request
+            .targets
+            .into_iter()
+            .map(|target| target.committee)
+            .collect()
     }))
 }
 
 /// The request a scheduled topology change waits for, once scheduled.
-pub fn topology_request(state: &impl Records, change: &PendingShardChange) -> Result<Option<[u8; 32]>> {
-    read(state, b"topology", &topology_key(change))?.map(request_id).transpose()
+pub fn topology_request(
+    state: &impl Records,
+    change: &PendingShardChange,
+) -> Result<Option<[u8; 32]>> {
+    read(state, b"topology", &topology_key(change))?
+        .map(request_id)
+        .transpose()
 }
 
 /// The request `filter`'s head session is closing, or has closed, for: `None`
 /// when the shard has no session or its session is active.
 pub fn retiring_request(state: &impl Records, filter: &[u8]) -> Result<Option<[u8; 32]>> {
-    let Some(bytes) = read(state, b"head", filter)? else { return Ok(None) };
+    let Some(bytes) = read(state, b"head", filter)? else {
+        return Ok(None);
+    };
     Ok(match status(state, &request_id(bytes)?)? {
         Status::Active => None,
         Status::Sealing(request) | Status::Closed(request) => Some(request),
@@ -527,8 +598,16 @@ pub fn recover_topology_change(
     if scheduled.frame < floor.request_frame {
         return Ok(Recovery::Never);
     }
-    let sources: Vec<Vec<u8>> = scheduled.sources.iter().map(|source| source.filter.clone()).collect();
-    let targets: Vec<Vec<u8>> = scheduled.targets.iter().map(|target| target.committee.filter.clone()).collect();
+    let sources: Vec<Vec<u8>> = scheduled
+        .sources
+        .iter()
+        .map(|source| source.filter.clone())
+        .collect();
+    let targets: Vec<Vec<u8>> = scheduled
+        .targets
+        .iter()
+        .map(|target| target.committee.filter.clone())
+        .collect();
     let split = sources.len() == 1
         && scheduled.vacant.is_empty()
         && targets.len() >= 2
@@ -545,11 +624,23 @@ pub fn recover_topology_change(
     // a healthy store never reports one.
     // - Before its flip, a prefix-free grid that holds the sources holds none
     //   of the shards the flip registers, and nothing else in their ranges.
-    if scheduled.targets.iter().any(|target| !target.committee.members.is_empty() && in_grid(&target.committee.filter)) {
-        return Ok(Recovery::Applied("a shard the change registers is in the grid"));
+    if scheduled
+        .targets
+        .iter()
+        .any(|target| !target.committee.members.is_empty() && in_grid(&target.committee.filter))
+    {
+        return Ok(Recovery::Applied(
+            "a shard the change registers is in the grid",
+        ));
     }
-    if scheduled.sources.iter().any(|source| overlapped(&source.filter)) {
-        return Ok(Recovery::Applied("a shard overlapping a source is in the grid"));
+    if scheduled
+        .sources
+        .iter()
+        .any(|source| overlapped(&source.filter))
+    {
+        return Ok(Recovery::Applied(
+            "a shard overlapping a source is in the grid",
+        ));
     }
     // - Once the request activated, a staffed target's session came from it.
     //   Until the flip the target is outside the grid and nothing closes it
@@ -559,13 +650,24 @@ pub fn recover_topology_change(
     //   target's head is an older session that earlier changes may have
     //   closed.)
     if activated(state, id)? {
-        for target in scheduled.targets.iter().filter(|target| !target.committee.members.is_empty()) {
-            let Some(closing) = retiring_request(state, &target.committee.filter)? else { continue };
+        for target in scheduled
+            .targets
+            .iter()
+            .filter(|target| !target.committee.members.is_empty())
+        {
+            let Some(closing) = retiring_request(state, &target.committee.filter)? else {
+                continue;
+            };
             let named = request(state, &closing)?.is_some_and(|later| {
-                later.targets.iter().any(|next| next.committee.filter == target.committee.filter)
+                later
+                    .targets
+                    .iter()
+                    .any(|next| next.committee.filter == target.committee.filter)
             });
             if !named {
-                return Ok(Recovery::Applied("a staffed target was split or merged away"));
+                return Ok(Recovery::Applied(
+                    "a staffed target was split or merged away",
+                ));
             }
         }
     }
@@ -582,24 +684,39 @@ pub fn recover_topology_change(
             return Ok(Recovery::Applied("a source's head moved on"));
         }
         if let Some(bytes) = read(state, b"reserved", &source.filter)? {
-            let later = request(state, &request_id(bytes)?)?.map_or(true, |named| named.frame >= scheduled.frame);
+            let later = request(state, &request_id(bytes)?)?
+                .map_or(true, |named| named.frame >= scheduled.frame);
             if later {
-                return Ok(Recovery::Applied("a later request names a source as a target"));
+                return Ok(Recovery::Applied(
+                    "a later request names a source as a target",
+                ));
             }
         }
     }
     let (kind, parent, mut children) = if split {
-        let crowded = scheduled.targets.iter().any(|target| target.committee.members.len() >= 2);
-        let unmanned = scheduled.targets.iter().any(|target| target.committee.members.is_empty());
+        let crowded = scheduled
+            .targets
+            .iter()
+            .any(|target| target.committee.members.len() >= 2);
+        let unmanned = scheduled
+            .targets
+            .iter()
+            .any(|target| target.committee.members.is_empty());
         if unmanned && !crowded {
-            return Ok(Recovery::Unresolved("a split child may have received no members"));
+            return Ok(Recovery::Unresolved(
+                "a split child may have received no members",
+            ));
         }
-        let children: Vec<Vec<u8>> = scheduled.targets.iter()
+        let children: Vec<Vec<u8>> = scheduled
+            .targets
+            .iter()
             .filter(|target| !target.committee.members.is_empty())
             .map(|target| target.committee.filter.clone())
             .collect();
         if children.len() > 8 {
-            return Ok(Recovery::Unresolved("a split names more than eight children"));
+            return Ok(Recovery::Unresolved(
+                "a split names more than eight children",
+            ));
         }
         (ShardChangeKind::Split, sources[0].clone(), children)
     } else {
@@ -608,7 +725,8 @@ pub fn recover_topology_change(
         (ShardChangeKind::Merge, targets[0].clone(), children)
     };
     children.sort();
-    let mut shards: Vec<_> = children.iter()
+    let mut shards: Vec<_> = children
+        .iter()
         .map(|child| quil_forest::decode_shard_filter_or_root(child, 32))
         .collect();
     shards.sort();
@@ -618,11 +736,24 @@ pub fn recover_topology_change(
     }
     let cutover = super::super::materialize::unified_tree_cutover_frame();
     let first_frame = floor.proposed_frame.max(cutover);
-    let mut change = PendingShardChange { kind, parent, children, effective_epoch: 0, proposed_frame: first_frame };
-    let sorted = |mut filters: Vec<Vec<u8>>| { filters.sort(); filters };
+    let mut change = PendingShardChange {
+        kind,
+        parent,
+        children,
+        effective_epoch: 0,
+        proposed_frame: first_frame,
+    };
+    let sorted = |mut filters: Vec<Vec<u8>>| {
+        filters.sort();
+        filters
+    };
     let (old, new) = match change_topology(&change) {
         Ok((old, new)) => (sorted(old), sorted(new)),
-        Err(QuilError::InvalidArgument(_)) => return Ok(Recovery::Unresolved("the rebuilt change does not materialize")),
+        Err(QuilError::InvalidArgument(_)) => {
+            return Ok(Recovery::Unresolved(
+                "the rebuilt change does not materialize",
+            ))
+        }
         Err(error) => return Err(error),
     };
     let expected = match kind {
@@ -630,15 +761,20 @@ pub fn recover_topology_change(
         ShardChangeKind::Merge => (change.children.clone(), vec![change.parent.clone()]),
     };
     if (old, new) != expected {
-        return Ok(Recovery::Unresolved("the rebuilt change does not cover the request's shards"));
+        return Ok(Recovery::Unresolved(
+            "the rebuilt change does not cover the request's shards",
+        ));
     }
     // Due at the request's frame: proposed two or more epochs before it.
     let length = quil_types::consensus::epoch_length_frames();
-    let Some(proposal_epoch) = quil_types::consensus::epoch_for_frame(scheduled.frame).checked_sub(2) else {
+    let Some(proposal_epoch) =
+        quil_types::consensus::epoch_for_frame(scheduled.frame).checked_sub(2)
+    else {
         return Ok(Recovery::Never);
     };
     let last = (proposal_epoch + 1) * length - 1;
-    let first = (proposal_epoch.saturating_sub(RECOVERY_SEARCH_EPOCHS - 1) * length).max(first_frame);
+    let first =
+        (proposal_epoch.saturating_sub(RECOVERY_SEARCH_EPOCHS - 1) * length).max(first_frame);
     if last < first {
         return Ok(Recovery::Never);
     }
@@ -653,7 +789,9 @@ pub fn recover_topology_change(
             return Ok(Recovery::Restore(change));
         }
     }
-    Ok(Recovery::Unresolved("no topology record of the searched proposal frames names the request"))
+    Ok(Recovery::Unresolved(
+        "no topology record of the searched proposal frames names the request",
+    ))
 }
 
 /// Epochs a closing session may take to seal before GLOBAL fences it.
@@ -680,7 +818,8 @@ pub fn fence_after_epochs(request_frame: u64) -> u64 {
 /// so they and GLOBAL agree on it.
 pub fn fence_due_frame(request_frame: u64) -> u64 {
     request_frame.saturating_add(
-        fence_after_epochs(request_frame).saturating_mul(quil_types::consensus::epoch_length_frames()),
+        fence_after_epochs(request_frame)
+            .saturating_mul(quil_types::consensus::epoch_length_frames()),
     )
 }
 
@@ -713,9 +852,13 @@ pub fn fence_stalled_sources(
 ) -> Result<usize> {
     let mut fenced = 0;
     for filter in filters {
-        let Some(session) = head(state, filter)? else { continue };
+        let Some(session) = head(state, filter)? else {
+            continue;
+        };
         let id = session.id()?;
-        let Status::Sealing(request_id) = status(state, &id)? else { continue };
+        let Status::Sealing(request_id) = status(state, &id)? else {
+            continue;
+        };
         let key = seal_key(&request_id, &id);
         if read(state, b"seal", &key)?.is_some() || read(state, b"fence", &key)?.is_some() {
             continue;
@@ -743,8 +886,11 @@ pub fn fence_stalled_sources(
             _ => None,
         };
         if activate_with(state, frame, &pending, members)? {
-            tracing::info!(frame, request = hex::encode(request_id),
-                "committee handoff: successors authorized from fenced sources");
+            tracing::info!(
+                frame,
+                request = hex::encode(request_id),
+                "committee handoff: successors authorized from fenced sources"
+            );
         }
     }
     Ok(fenced)
@@ -767,11 +913,16 @@ fn write_fence(
         // after it. The fence names the frame and leaves the roots zero;
         // the successor committee's first header attests them, since each
         // of its voters checks that header's pre-state against its own.
-        Some(tip) => quil_cw_consensus::handoff::Checkpoint { state_roots: [[0; 32]; 4], ..tip },
+        Some(tip) => quil_cw_consensus::handoff::Checkpoint {
+            state_roots: [[0; 32]; 4],
+            ..tip
+        },
         None => {
             let predecessor = origins(state, id)?
                 .into_iter()
-                .find(|(source, checkpoint)| source.filter == session.filter && checkpoint.frame == session.base_frame);
+                .find(|(source, checkpoint)| {
+                    source.filter == session.filter && checkpoint.frame == session.base_frame
+                });
             let state_roots = match predecessor {
                 Some((_, origin)) => origin.state_roots,
                 None => {
@@ -790,7 +941,10 @@ fn write_fence(
             }
         }
     };
-    let checkpoint = quil_cw_consensus::handoff::Checkpoint { history_root: [0; 32], ..checkpoint };
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint {
+        history_root: [0; 32],
+        ..checkpoint
+    };
     let mut bytes = Vec::new();
     checkpoint.write(&mut bytes);
     write(state, frame, b"fence", &seal_key(request_id, id), &bytes)?;
@@ -824,7 +978,9 @@ pub fn fence_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
 pub(super) fn membership_request(request: &super::Request, filter: &[u8]) -> bool {
     match (request.sources.as_slice(), request.targets.as_slice()) {
         ([source], [target]) => {
-            source.filter == filter && target.committee.filter == filter && request.vacant.is_empty()
+            source.filter == filter
+                && target.committee.filter == filter
+                && request.vacant.is_empty()
         }
         _ => false,
     }
@@ -845,7 +1001,11 @@ pub(super) fn membership_request(request: &super::Request, filter: &[u8]) -> boo
 /// sessions were fenced. A decision refused by a rule (an `InvalidArgument`
 /// error) is undone whole and logged, and the others stand; any other error
 /// (a store failure) fails the whole frame, on every node alike.
-pub fn fence_absent(state: &HypergraphState, frame: u64, decisions: &[super::exclusion::Decision]) -> Result<usize> {
+pub fn fence_absent(
+    state: &HypergraphState,
+    frame: u64,
+    decisions: &[super::exclusion::Decision],
+) -> Result<usize> {
     let mut fenced = 0;
     for decision in decisions {
         let checkpoint = state.changeset_len();
@@ -863,9 +1023,15 @@ pub fn fence_absent(state: &HypergraphState, frame: u64, decisions: &[super::exc
     Ok(fenced)
 }
 
-fn fence_absent_session(state: &HypergraphState, frame: u64, decision: &super::exclusion::Decision) -> Result<bool> {
+fn fence_absent_session(
+    state: &HypergraphState,
+    frame: u64,
+    decision: &super::exclusion::Decision,
+) -> Result<bool> {
     let filter = &decision.filter;
-    let Some(session) = head(state, filter)? else { return Ok(false) };
+    let Some(session) = head(state, filter)? else {
+        return Ok(false);
+    };
     let id = session.id()?;
     if id != decision.session {
         return Ok(false);
@@ -881,7 +1047,10 @@ fn fence_absent_session(state: &HypergraphState, frame: u64, decision: &super::e
                     "committee presence: stalled session's shard is reserved by a pending split or merge; no early fence");
                 return Ok(false);
             }
-            let targets = vec![DesiredCommittee { filter: filter.clone(), members: decision.committee.clone() }];
+            let targets = vec![DesiredCommittee {
+                filter: filter.clone(),
+                members: decision.committee.clone(),
+            }];
             let request = schedule(state, frame, vec![filter.clone()], targets.clone())?;
             let request_id = request.id()?;
             reserve(state, frame, &targets, &request_id)?;
@@ -899,7 +1068,8 @@ fn fence_absent_session(state: &HypergraphState, frame: u64, decision: &super::e
         return Ok(false);
     }
     let target = &pending.targets[0];
-    let members = (decision.committee != target.committee.members).then(|| decision.committee.clone());
+    let members =
+        (decision.committee != target.committee.members).then(|| decision.committee.clone());
     if let Some(members) = &members {
         Session {
             chain_id: session.chain_id,
@@ -935,8 +1105,11 @@ fn fence_absent_session(state: &HypergraphState, frame: u64, decision: &super::e
         "committee presence: stalled session fenced early at its executed tip; its successor seats its present \
          members and excludes its absent ones",
     );
-    tracing::info!(frame, request = hex::encode(request_id),
-        "committee handoff: successors authorized from fenced sources");
+    tracing::info!(
+        frame,
+        request = hex::encode(request_id),
+        "committee handoff: successors authorized from fenced sources"
+    );
     Ok(true)
 }
 
@@ -1004,7 +1177,8 @@ pub fn reconcile_membership(
     for filter in filters {
         // From the presence exclusion frame, less the members excluded for
         // absence (`exclusion::seated`).
-        let members = super::exclusion::seated(state, frame, filter, desired_members(scan, filter, frame))?;
+        let members =
+            super::exclusion::seated(state, frame, filter, desired_members(scan, filter, frame))?;
         if members.is_empty() {
             continue;
         }
@@ -1034,7 +1208,11 @@ pub fn reconcile_membership(
                     members,
                 },
             )?;
-            tracing::info!(frame, filter = hex::encode(filter), "committee handoff: first session authorized");
+            tracing::info!(
+                frame,
+                filter = hex::encode(filter),
+                "committee handoff: first session authorized"
+            );
             created += 1;
             continue;
         };

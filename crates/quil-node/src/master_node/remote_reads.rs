@@ -52,7 +52,11 @@ where
 }
 
 /// [`retry_within`], keeping the last attempt's error.
-async fn retry_until_ok<T, E, F, Fut>(budget: Duration, delay: Duration, mut attempt: F) -> Result<T, E>
+async fn retry_until_ok<T, E, F, Fut>(
+    budget: Duration,
+    delay: Duration,
+    mut attempt: F,
+) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -116,13 +120,20 @@ impl Declines {
         if total == 0 {
             return "no covering node or archive is known".into();
         }
-        let mut parts: Vec<_> = self.0.iter().take(MAX_REASONS)
+        let mut parts: Vec<_> = self
+            .0
+            .iter()
+            .take(MAX_REASONS)
             .map(|(reason, count)| format!("{count}x {reason}"))
             .collect();
         if self.0.len() > MAX_REASONS {
             parts.push(format!("and {} other reasons", self.0.len() - MAX_REASONS));
         }
-        format!("{total} {} declined: {}", if total == 1 { "peer" } else { "peers" }, parts.join("; "))
+        format!(
+            "{total} {} declined: {}",
+            if total == 1 { "peer" } else { "peers" },
+            parts.join("; ")
+        )
     }
 }
 
@@ -138,8 +149,7 @@ enum ScanKind {
 
 type ScanKey = (ScanKind, [u8; 32], [u8; 32]);
 
-type PeerInfoCache =
-    Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>;
+type PeerInfoCache = Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>;
 
 /// Reads an application's coins from whichever node holds it.
 pub struct PeerCoinReader {
@@ -193,21 +203,30 @@ impl PeerCoinReader {
             for reach in &info.reachability {
                 // A shard partitions a 256-bit data address. Reject longer
                 // advertised paths before decoding or recursive coverage work.
-                if !reach.filter.starts_with(domain.as_slice()) || reach.filter.len() > 32 + 2 + 32 {
+                if !reach.filter.starts_with(domain.as_slice()) || reach.filter.len() > 32 + 2 + 32
+                {
                     continue;
                 }
-                let Some((_, path)) = quil_forest::decode_shard_filter_or_root(&reach.filter, 32) else {
+                let Some((_, path)) = quil_forest::decode_shard_filter_or_root(&reach.filter, 32)
+                else {
                     continue;
                 };
                 for endpoint in reach.stream_multiaddrs.iter().filter_map(|ma| {
                     crate::util::multiaddr::archive_multiaddr_to_host_port(ma, self.network)
                 }) {
-                    paths_by_endpoint.entry(endpoint).or_default().push(path.clone());
+                    paths_by_endpoint
+                        .entry(endpoint)
+                        .or_default()
+                        .push(path.clone());
                 }
             }
-            endpoints.extend(paths_by_endpoint.into_iter().filter_map(|(endpoint, paths)| {
-                super::grpc::shard_paths_cover_application(&paths).then_some(endpoint)
-            }));
+            endpoints.extend(
+                paths_by_endpoint
+                    .into_iter()
+                    .filter_map(|(endpoint, paths)| {
+                        super::grpc::shard_paths_cover_application(&paths).then_some(endpoint)
+                    }),
+            );
         }
         endpoints.sort();
         endpoints.dedup();
@@ -217,12 +236,20 @@ impl PeerCoinReader {
     /// Bounded attempts in preference order, with room reserved for archives
     /// even when every advertised covering peer is stale or unreachable.
     async fn read_endpoints(&self, domain: &[u8; 32]) -> Vec<String> {
-        let mut endpoints: Vec<_> = self.covering_endpoints(domain)
-            .into_iter().take(MAX_ATTEMPTS).collect();
+        let mut endpoints: Vec<_> = self
+            .covering_endpoints(domain)
+            .into_iter()
+            .take(MAX_ATTEMPTS)
+            .collect();
         let mut seen: HashSet<_> = endpoints.iter().cloned().collect();
-        endpoints.extend(self.archive_pool.get_all().await.into_iter()
-            .filter(|endpoint| seen.insert(endpoint.clone()))
-            .take(MAX_ATTEMPTS));
+        endpoints.extend(
+            self.archive_pool
+                .get_all()
+                .await
+                .into_iter()
+                .filter(|endpoint| seen.insert(endpoint.clone()))
+                .take(MAX_ATTEMPTS),
+        );
         endpoints
     }
 
@@ -234,7 +261,14 @@ impl PeerCoinReader {
         Some(endpoint.clone())
     }
 
-    fn remember_scan(&self, kind: ScanKind, domain: [u8; 32], id: [u8; 32], endpoint: String, has_more: bool) {
+    fn remember_scan(
+        &self,
+        kind: ScanKind,
+        domain: [u8; 32],
+        id: [u8; 32],
+        endpoint: String,
+        has_more: bool,
+    ) {
         let mut pins = self.served_by.lock();
         pins.retain(|_, (_, used)| used.elapsed() < SCAN_PIN_TTL);
         if !has_more {
@@ -242,7 +276,11 @@ impl PeerCoinReader {
             return;
         }
         if pins.len() >= MAX_PINNED_SCANS && !pins.contains_key(&(kind, domain, id)) {
-            if let Some(oldest) = pins.iter().min_by_key(|(_, (_, used))| *used).map(|(key, _)| *key) {
+            if let Some(oldest) = pins
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| *key)
+            {
                 pins.remove(&oldest);
             }
         }
@@ -297,7 +335,9 @@ impl PeerCoinReader {
             )
             .await
             .map_err(|error| match error {
-                quil_rpc::ArchiveClientError::Rpc(status) => format!("{:?}: {}", status.code(), status.message()),
+                quil_rpc::ArchiveClientError::Rpc(status) => {
+                    format!("{:?}: {}", status.code(), status.message())
+                }
                 other => with_causes(&other),
             })?;
         let malformed = || "malformed coin page".to_string();
@@ -344,7 +384,10 @@ impl PeerCoinReader {
         addresses: Vec<[u8; 32]>,
     ) -> Option<quil_types::store::CoinWitnessBundle> {
         let (budget, delay) = self.read_retry;
-        retry_within(budget, delay, || self.coin_witnesses_once(domain, &addresses)).await
+        retry_within(budget, delay, || {
+            self.coin_witnesses_once(domain, &addresses)
+        })
+        .await
     }
 
     async fn coin_witnesses_once(
@@ -353,11 +396,16 @@ impl PeerCoinReader {
         addresses: &[[u8; 32]],
     ) -> Option<quil_types::store::CoinWitnessBundle> {
         for endpoint in self.read_endpoints(&domain).await {
-            let Ok(mut client) = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await else {
+            let Ok(mut client) =
+                quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await
+            else {
                 continue;
             };
             let bundle = match client
-                .get_shard_coin_witnesses(domain.to_vec(), addresses.iter().map(|a| a.to_vec()).collect())
+                .get_shard_coin_witnesses(
+                    domain.to_vec(),
+                    addresses.iter().map(|a| a.to_vec()).collect(),
+                )
                 .await
             {
                 Ok(bundle) => bundle,
@@ -366,19 +414,30 @@ impl PeerCoinReader {
                     continue;
                 }
             };
-            let Ok(network) = <[u8; 32]>::try_from(bundle.network) else { continue };
-            let Ok(depth) = u8::try_from(bundle.depth) else { continue };
-            let witnesses: Option<Vec<_>> = bundle.witnesses.into_iter()
-                .map(|w| Some(quil_types::store::CoinWitnessData {
-                    address: w.address.try_into().ok()?,
-                    found: w.found,
-                    siblings: w.siblings,
-                    right: w.right,
-                }))
+            let Ok(network) = <[u8; 32]>::try_from(bundle.network) else {
+                continue;
+            };
+            let Ok(depth) = u8::try_from(bundle.depth) else {
+                continue;
+            };
+            let witnesses: Option<Vec<_>> = bundle
+                .witnesses
+                .into_iter()
+                .map(|w| {
+                    Some(quil_types::store::CoinWitnessData {
+                        address: w.address.try_into().ok()?,
+                        found: w.found,
+                        siblings: w.siblings,
+                        right: w.right,
+                    })
+                })
                 .collect();
             let Some(witnesses) = witnesses else { continue };
             return Some(quil_types::store::CoinWitnessBundle {
-                network, root_record: bundle.root_record, depth, witnesses,
+                network,
+                root_record: bundle.root_record,
+                depth,
+                witnesses,
             });
         }
         None
@@ -396,7 +455,9 @@ impl PeerCoinReader {
         let mut vertex_id = domain.to_vec();
         vertex_id.extend_from_slice(data_address);
         for endpoint in self.read_endpoints(&domain).await {
-            let Ok(mut client) = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await else {
+            let Ok(mut client) =
+                quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await
+            else {
                 continue;
             };
             match client.get_shard_vertex(vertex_id.clone()).await {
@@ -425,10 +486,14 @@ impl PeerCoinReader {
         // Continuing a scan goes back to the peer whose snapshot it names; no
         // retry brings back a pin that is gone.
         if let Some(id) = snapshot_id {
-            self.pinned_endpoint(ScanKind::Coins, domain, id).ok_or_else(lost_pin)?;
+            self.pinned_endpoint(ScanKind::Coins, domain, id)
+                .ok_or_else(lost_pin)?;
         }
         let (budget, delay) = self.read_retry;
-        retry_until_ok(budget, delay, || self.coin_page_once(domain, snapshot_id, after)).await
+        retry_until_ok(budget, delay, || {
+            self.coin_page_once(domain, snapshot_id, after)
+        })
+        .await
     }
 
     async fn coin_page_once(
@@ -438,7 +503,9 @@ impl PeerCoinReader {
         after: Option<[u8; 32]>,
     ) -> Result<CoinPageData, String> {
         let endpoints = match snapshot_id {
-            Some(id) => vec![self.pinned_endpoint(ScanKind::Coins, domain, id).ok_or_else(lost_pin)?],
+            Some(id) => vec![self
+                .pinned_endpoint(ScanKind::Coins, domain, id)
+                .ok_or_else(lost_pin)?],
             None => self.read_endpoints(&domain).await,
         };
         let mut declines = Declines::default();
@@ -447,7 +514,10 @@ impl PeerCoinReader {
         // withholding peer must not hide what another can show.
         let mut rootless = None;
         for endpoint in endpoints {
-            match self.page_from(&endpoint, &domain, snapshot_id.as_ref(), after.as_ref()).await {
+            match self
+                .page_from(&endpoint, &domain, snapshot_id.as_ref(), after.as_ref())
+                .await
+            {
                 Ok(page) if page.root_record.is_empty() => {
                     if rootless.is_none() {
                         rootless = Some(page);
@@ -458,7 +528,13 @@ impl PeerCoinReader {
                         %endpoint, application = %hex::encode(domain),
                         "served a coin page from a covering node or archive"
                     );
-                    self.remember_scan(ScanKind::Coins, domain, page.snapshot_id, endpoint, page.has_more);
+                    self.remember_scan(
+                        ScanKind::Coins,
+                        domain,
+                        page.snapshot_id,
+                        endpoint,
+                        page.has_more,
+                    );
                     return Ok(page);
                 }
                 Err(reason) => {
@@ -480,7 +556,10 @@ impl PeerCoinReader {
         after: Option<[u8; 32]>,
     ) -> Option<quil_types::store::LegacyCoinPageData> {
         let (budget, delay) = self.read_retry;
-        retry_within(budget, delay, || self.legacy_coins_once(domain, owner, after)).await
+        retry_within(budget, delay, || {
+            self.legacy_coins_once(domain, owner, after)
+        })
+        .await
     }
 
     async fn legacy_coins_once(
@@ -489,29 +568,54 @@ impl PeerCoinReader {
         owner: [u8; 32],
         after: Option<[u8; 32]>,
     ) -> Option<quil_types::store::LegacyCoinPageData> {
-        for endpoint in self.archive_pool.get_all().await.into_iter().take(MAX_ATTEMPTS) {
-            let Ok(mut client) = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await else {
+        for endpoint in self
+            .archive_pool
+            .get_all()
+            .await
+            .into_iter()
+            .take(MAX_ATTEMPTS)
+        {
+            let Ok(mut client) =
+                quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await
+            else {
                 continue;
             };
-            let page = match client.list_shard_legacy_coins(
-                domain.to_vec(), owner.to_vec(), after.map(|a| a.to_vec()).unwrap_or_default(),
-            ).await {
+            let page = match client
+                .list_shard_legacy_coins(
+                    domain.to_vec(),
+                    owner.to_vec(),
+                    after.map(|a| a.to_vec()).unwrap_or_default(),
+                )
+                .await
+            {
                 Ok(page) => page,
                 Err(error) => {
                     tracing::debug!(%endpoint, %error, "remote legacy coins: archive declined");
                     continue;
                 }
             };
-            let decoded = (|| Some(quil_types::store::LegacyCoinPageData {
-                coins: page.coins.into_iter().map(|coin| Some(quil_types::store::LegacyCoinData {
-                    address: coin.address.try_into().ok()?,
-                    amount: u128::from_le_bytes(coin.amount.try_into().ok()?),
-                    origin: coin.origin.try_into().ok()?,
-                    shielded: coin.shielded,
-                })).collect::<Option<Vec<_>>>()?,
-                cursor: if page.cursor.is_empty() { None } else { Some(page.cursor.try_into().ok()?) },
-                has_more: page.has_more,
-            }))();
+            let decoded = (|| {
+                Some(quil_types::store::LegacyCoinPageData {
+                    coins: page
+                        .coins
+                        .into_iter()
+                        .map(|coin| {
+                            Some(quil_types::store::LegacyCoinData {
+                                address: coin.address.try_into().ok()?,
+                                amount: u128::from_le_bytes(coin.amount.try_into().ok()?),
+                                origin: coin.origin.try_into().ok()?,
+                                shielded: coin.shielded,
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                    cursor: if page.cursor.is_empty() {
+                        None
+                    } else {
+                        Some(page.cursor.try_into().ok()?)
+                    },
+                    has_more: page.has_more,
+                })
+            })();
             if decoded.is_some() {
                 return decoded;
             }
@@ -529,7 +633,10 @@ impl PeerCoinReader {
             self.pinned_endpoint(ScanKind::Escrows, domain, id)?;
         }
         let (budget, delay) = self.read_retry;
-        retry_within(budget, delay, || self.escrow_page_once(domain, snapshot_id, after)).await
+        retry_within(budget, delay, || {
+            self.escrow_page_once(domain, snapshot_id, after)
+        })
+        .await
     }
 
     async fn escrow_page_once(
@@ -543,29 +650,50 @@ impl PeerCoinReader {
             None => self.read_endpoints(&domain).await,
         };
         for endpoint in endpoints {
-            let Ok(mut client) = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await else {
+            let Ok(mut client) =
+                quil_rpc::ArchiveClient::connect_mtls(&endpoint, &self.falcon_key).await
+            else {
                 continue;
             };
-            let page = match client.list_shard_escrows(
-                domain.to_vec(), snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
-                after.map(|id| id.to_vec()).unwrap_or_default(),
-            ).await {
+            let page = match client
+                .list_shard_escrows(
+                    domain.to_vec(),
+                    snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
+                    after.map(|id| id.to_vec()).unwrap_or_default(),
+                )
+                .await
+            {
                 Ok(page) => page,
                 Err(error) => {
                     tracing::debug!(%endpoint, %error, "remote escrow scan: peer declined");
                     continue;
                 }
             };
-            let decoded = (|| Some(EscrowPageData {
-                network: page.network.try_into().ok()?,
-                snapshot_id: page.snapshot_id.try_into().ok()?,
-                escrows: page.escrows.into_iter().map(|e| Some((e.address.try_into().ok()?, e.raw_data)))
-                    .collect::<Option<Vec<_>>>()?,
-                cursor: if page.cursor.is_empty() { None } else { Some(page.cursor.try_into().ok()?) },
-                has_more: page.has_more,
-            }))();
+            let decoded = (|| {
+                Some(EscrowPageData {
+                    network: page.network.try_into().ok()?,
+                    snapshot_id: page.snapshot_id.try_into().ok()?,
+                    escrows: page
+                        .escrows
+                        .into_iter()
+                        .map(|e| Some((e.address.try_into().ok()?, e.raw_data)))
+                        .collect::<Option<Vec<_>>>()?,
+                    cursor: if page.cursor.is_empty() {
+                        None
+                    } else {
+                        Some(page.cursor.try_into().ok()?)
+                    },
+                    has_more: page.has_more,
+                })
+            })();
             if let Some(page) = decoded {
-                self.remember_scan(ScanKind::Escrows, domain, page.snapshot_id, endpoint, page.has_more);
+                self.remember_scan(
+                    ScanKind::Escrows,
+                    domain,
+                    page.snapshot_id,
+                    endpoint,
+                    page.has_more,
+                );
                 return Some(page);
             }
         }
@@ -604,12 +732,16 @@ mod tests {
         );
         cache.insert(
             vec![3],
-            peer(quil_forest::encode_shard_bit_path(&domain, &[false]),
-                vec!["/ip4/10.0.0.3/tcp/8340".into()]),
+            peer(
+                quil_forest::encode_shard_bit_path(&domain, &[false]),
+                vec!["/ip4/10.0.0.3/tcp/8340".into()],
+            ),
         );
         let reader = PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(cache)),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO)),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::ZERO,
+            )),
             vec![0; 32],
             1,
         );
@@ -625,8 +757,12 @@ mod tests {
     fn covering_partition_must_share_an_endpoint_and_peer() {
         let domain = [0xAB; 32];
         let reach = |path: &[bool], host: &str| {
-            peer(quil_forest::encode_shard_bit_path(&domain, path),
-                vec![format!("/ip4/{host}/tcp/8340")]).reachability.remove(0)
+            peer(
+                quil_forest::encode_shard_bit_path(&domain, path),
+                vec![format!("/ip4/{host}/tcp/8340")],
+            )
+            .reachability
+            .remove(0)
         };
         let mut complete = quil_p2p::CanonicalPeerInfo::default();
         complete.reachability = vec![
@@ -635,29 +771,50 @@ mod tests {
             reach(&[true], "10.0.0.1"),
         ];
         let mut separate_workers = quil_p2p::CanonicalPeerInfo::default();
-        separate_workers.reachability = vec![
-            reach(&[false], "10.0.0.2"),
-            reach(&[true], "10.0.0.3"),
-        ];
+        separate_workers.reachability =
+            vec![reach(&[false], "10.0.0.2"), reach(&[true], "10.0.0.3")];
         let cache = HashMap::from([
             (vec![1], complete),
             (vec![2], separate_workers),
             // Even if different peers advertise the same endpoint, neither
             // individually claims it can answer a complete scan.
-            (vec![3], peer(quil_forest::encode_shard_bit_path(&domain, &[false]),
-                vec!["/ip4/10.0.0.4/tcp/8340".into()])),
-            (vec![4], peer(quil_forest::encode_shard_bit_path(&domain, &[true]),
-                vec!["/ip4/10.0.0.4/tcp/8340".into()])),
+            (
+                vec![3],
+                peer(
+                    quil_forest::encode_shard_bit_path(&domain, &[false]),
+                    vec!["/ip4/10.0.0.4/tcp/8340".into()],
+                ),
+            ),
+            (
+                vec![4],
+                peer(
+                    quil_forest::encode_shard_bit_path(&domain, &[true]),
+                    vec!["/ip4/10.0.0.4/tcp/8340".into()],
+                ),
+            ),
             // Malformed suffixes must not count as a root advertisement.
-            (vec![5], peer([domain.to_vec(), vec![0x01, 0x02]].concat(),
-                vec!["/ip4/10.0.0.5/tcp/8340".into()])),
-            (vec![6], peer(quil_forest::encode_shard_bit_path(&domain, &vec![false; 65535]),
-                vec!["/ip4/10.0.0.6/tcp/8340".into()])),
+            (
+                vec![5],
+                peer(
+                    [domain.to_vec(), vec![0x01, 0x02]].concat(),
+                    vec!["/ip4/10.0.0.5/tcp/8340".into()],
+                ),
+            ),
+            (
+                vec![6],
+                peer(
+                    quil_forest::encode_shard_bit_path(&domain, &vec![false; 65535]),
+                    vec!["/ip4/10.0.0.6/tcp/8340".into()],
+                ),
+            ),
         ]);
         let reader = PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(cache)),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO)),
-            vec![0; 32], 1,
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::ZERO,
+            )),
+            vec![0; 32],
+            1,
         );
         assert_eq!(reader.covering_endpoints(&domain), vec!["10.0.0.1:8340"]);
     }
@@ -665,31 +822,56 @@ mod tests {
     #[tokio::test]
     async fn covering_peer_failures_leave_a_separate_archive_budget() {
         let domain = [0xAB; 32];
-        let cache = (1..=4).map(|i| (
-            vec![i], peer(domain.to_vec(), vec![format!("/ip4/10.0.0.{i}/tcp/8340")]),
-        )).collect();
-        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::ZERO));
+        let cache = (1..=4)
+            .map(|i| {
+                (
+                    vec![i],
+                    peer(domain.to_vec(), vec![format!("/ip4/10.0.0.{i}/tcp/8340")]),
+                )
+            })
+            .collect();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
+            std::time::Duration::ZERO,
+        ));
         // A duplicate must not use an archive attempt, regardless of where
         // it appears in the pool. Distinct archives still get all three.
         for endpoint in [
-            "10.0.0.1:8340", "10.0.1.1:8340", "10.0.0.2:8340",
-            "10.0.1.2:8340", "10.0.1.3:8340", "10.0.1.4:8340",
+            "10.0.0.1:8340",
+            "10.0.1.1:8340",
+            "10.0.0.2:8340",
+            "10.0.1.2:8340",
+            "10.0.1.3:8340",
+            "10.0.1.4:8340",
         ] {
             pool.add(endpoint.into()).await;
         }
         let reader = PeerCoinReader::new(
-            Arc::new(parking_lot::RwLock::new(cache)), pool, vec![0; 32], 1,
+            Arc::new(parking_lot::RwLock::new(cache)),
+            pool,
+            vec![0; 32],
+            1,
         );
         let endpoints = reader.read_endpoints(&domain).await;
-        assert_eq!(endpoints, vec![
-            "10.0.0.1:8340", "10.0.0.2:8340", "10.0.0.3:8340",
-            "10.0.1.1:8340", "10.0.1.2:8340", "10.0.1.3:8340",
-        ]);
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.1:8340",
+                "10.0.0.2:8340",
+                "10.0.0.3:8340",
+                "10.0.1.1:8340",
+                "10.0.1.2:8340",
+                "10.0.1.3:8340",
+            ]
+        );
         // Model three declining peers: an archive must still be attempted.
-        let successful = endpoints.iter().find(|endpoint| endpoint.starts_with("10.0.1."));
+        let successful = endpoints
+            .iter()
+            .find(|endpoint| endpoint.starts_with("10.0.1."));
         assert_eq!(successful.map(String::as_str), Some("10.0.1.1:8340"));
-        assert_eq!(reader.read_endpoints(&[0xEE; 32]).await,
-            vec!["10.0.0.1:8340", "10.0.1.1:8340", "10.0.0.2:8340"]);
+        assert_eq!(
+            reader.read_endpoints(&[0xEE; 32]).await,
+            vec!["10.0.0.1:8340", "10.0.1.1:8340", "10.0.0.2:8340"]
+        );
     }
 
     #[tokio::test]
@@ -698,17 +880,23 @@ mod tests {
         let served = retry_within(Duration::from_millis(500), Duration::from_millis(5), || {
             let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { (n >= 2).then_some(n) }
-        }).await;
+        })
+        .await;
         assert_eq!(served, Some(2), "busy twice, then served");
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let started = Instant::now();
-        let refused: Option<()> = retry_within(Duration::from_millis(50), Duration::from_millis(10), || {
-            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { None }
-        }).await;
+        let refused: Option<()> =
+            retry_within(Duration::from_millis(50), Duration::from_millis(10), || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { None }
+            })
+            .await;
         assert!(refused.is_none());
-        assert!(started.elapsed() < Duration::from_millis(500), "the budget bounds the wait");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the budget bounds the wait"
+        );
         assert!((2..=6).contains(&attempts.load(std::sync::atomic::Ordering::SeqCst)));
     }
 
@@ -721,18 +909,33 @@ mod tests {
     async fn forwarded_scans_and_vertex_reads_retry_within_the_budget() {
         let reader = PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO)), vec![], 1,
-        ).with_read_retry(Duration::from_millis(60), Duration::from_millis(10));
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO)),
+            vec![],
+            1,
+        )
+        .with_read_retry(Duration::from_millis(60), Duration::from_millis(10));
         let domain = [3; 32];
         let started = Instant::now();
         assert!(reader.coin_page(domain, None, None).await.is_err());
         assert!(reader.escrow_page(domain, None, None).await.is_none());
         assert!(reader.vertex(domain, vec![4; 32]).await.is_none());
-        assert!(started.elapsed() >= Duration::from_millis(150), "each read kept asking");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "each read kept asking"
+        );
         let started = Instant::now();
-        assert!(reader.coin_page(domain, Some([5; 32]), Some([6; 32])).await.is_err());
-        assert!(reader.escrow_page(domain, Some([5; 32]), None).await.is_none());
-        assert!(started.elapsed() < Duration::from_millis(50), "a lost pin fails at once");
+        assert!(reader
+            .coin_page(domain, Some([5; 32]), Some([6; 32]))
+            .await
+            .is_err());
+        assert!(reader
+            .escrow_page(domain, Some([5; 32]), None)
+            .await
+            .is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "a lost pin fails at once"
+        );
     }
 
     /// When no peer answers a forwarded scan, the wallet's status says why
@@ -743,7 +946,10 @@ mod tests {
         let mut declines = Declines::default();
         assert_eq!(declines.summary(), "no covering node or archive is known");
         declines.push("Unavailable: coin scan: no root in snapshot");
-        assert_eq!(declines.summary(), "1 peer declined: 1x Unavailable: coin scan: no root in snapshot");
+        assert_eq!(
+            declines.summary(),
+            "1 peer declined: 1x Unavailable: coin scan: no root in snapshot"
+        );
         for _ in 0..2 {
             declines.push("Unavailable: coin scan: no root in snapshot");
         }
@@ -755,9 +961,15 @@ mod tests {
             declines.push(&format!("reason {i}"));
         }
         let summary = declines.summary();
-        assert!(summary.starts_with("13 peers declined: 3x Unavailable"), "{summary}");
+        assert!(
+            summary.starts_with("13 peers declined: 3x Unavailable"),
+            "{summary}"
+        );
         assert!(summary.ends_with("; and 7 other reasons"), "{summary}");
-        assert!(summary.len() < 4 * (MAX_REASON_CHARS + 16) + 64, "{summary}");
+        assert!(
+            summary.len() < 4 * (MAX_REASON_CHARS + 16) + 64,
+            "{summary}"
+        );
     }
 
     #[tokio::test]
@@ -767,8 +979,13 @@ mod tests {
         for endpoint in ["127.0.0.1:1", "127.0.0.1:2"] {
             pool.add(endpoint.into()).await;
         }
-        let reader = PeerCoinReader::new(Arc::new(parking_lot::RwLock::new(HashMap::new())), pool, vec![0; 32], 1)
-            .with_read_retry(Duration::ZERO, Duration::from_millis(1));
+        let reader = PeerCoinReader::new(
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            pool,
+            vec![0; 32],
+            1,
+        )
+        .with_read_retry(Duration::ZERO, Duration::from_millis(1));
         let Err(reasons) = reader.coin_page([3; 32], None, None).await else {
             panic!("nobody serves the application");
         };
@@ -780,26 +997,50 @@ mod tests {
     fn scan_pins_are_scoped_bounded_and_expire() {
         let reader = PeerCoinReader::new(
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO)), vec![], 1,
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO)),
+            vec![],
+            1,
         );
         let domain = [1; 32];
         let id = [2; 32];
         reader.remember_scan(ScanKind::Coins, domain, id, "coins".into(), true);
         reader.remember_scan(ScanKind::Escrows, domain, id, "escrows".into(), true);
-        assert_eq!(reader.pinned_endpoint(ScanKind::Coins, domain, id).as_deref(), Some("coins"));
-        assert_eq!(reader.pinned_endpoint(ScanKind::Escrows, domain, id).as_deref(), Some("escrows"));
-        assert!(reader.pinned_endpoint(ScanKind::Coins, [3; 32], id).is_none());
+        assert_eq!(
+            reader
+                .pinned_endpoint(ScanKind::Coins, domain, id)
+                .as_deref(),
+            Some("coins")
+        );
+        assert_eq!(
+            reader
+                .pinned_endpoint(ScanKind::Escrows, domain, id)
+                .as_deref(),
+            Some("escrows")
+        );
+        assert!(reader
+            .pinned_endpoint(ScanKind::Coins, [3; 32], id)
+            .is_none());
         reader.remember_scan(ScanKind::Coins, domain, id, "coins".into(), false);
-        assert!(reader.pinned_endpoint(ScanKind::Coins, domain, id).is_none());
-        reader.served_by.lock().get_mut(&(ScanKind::Escrows, domain, id)).unwrap().1 =
-            Instant::now() - SCAN_PIN_TTL;
-        assert!(reader.pinned_endpoint(ScanKind::Escrows, domain, id).is_none());
+        assert!(reader
+            .pinned_endpoint(ScanKind::Coins, domain, id)
+            .is_none());
+        reader
+            .served_by
+            .lock()
+            .get_mut(&(ScanKind::Escrows, domain, id))
+            .unwrap()
+            .1 = Instant::now() - SCAN_PIN_TTL;
+        assert!(reader
+            .pinned_endpoint(ScanKind::Escrows, domain, id)
+            .is_none());
         for i in 0..=MAX_PINNED_SCANS {
             let mut id = [0; 32];
             id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             reader.remember_scan(ScanKind::Coins, domain, id, "peer".into(), true);
         }
         assert_eq!(reader.served_by.lock().len(), MAX_PINNED_SCANS);
-        assert!(reader.pinned_endpoint(ScanKind::Coins, domain, [0; 32]).is_none());
+        assert!(reader
+            .pinned_endpoint(ScanKind::Coins, domain, [0; 32])
+            .is_none());
     }
 }
