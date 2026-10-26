@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 #[cfg(all(test, feature = "confidential-tokens"))]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use num_bigint::BigInt;
@@ -78,7 +78,9 @@ impl ExecutionEngineManager {
     /// constructing this context and calling this method.
     pub fn fork_with_context(&self, context: ExecutionForkContext) -> Result<Self> {
         if Arc::ptr_eq(&self.crdt, &context.crdt) {
-            return Err(QuilError::InvalidArgument("execution fork requires a separate CRDT".into()));
+            return Err(QuilError::InvalidArgument(
+                "execution fork requires a separate CRDT".into(),
+            ));
         }
         let source = self.engines.write().map_err(|_| {
             QuilError::ExecutionUnavailable("execution manager lock poisoned".into())
@@ -97,44 +99,78 @@ impl ExecutionEngineManager {
                 QuilError::ExecutionUnavailable("summary rebuild lock poisoned".into())
             })?;
             if max_summary_rebuilds.is_some_and(|limit| source.len() > limit) {
-                return Err(QuilError::ExecutionUnavailable("execution branch summary metadata limit".into()));
+                return Err(QuilError::ExecutionUnavailable(
+                    "execution branch summary metadata limit".into(),
+                ));
             }
             source.iter().copied().collect()
         };
         for name in ["token", "compute", "hypergraph"] {
             if !source.contains_key(name) {
-                return Err(QuilError::ExecutionUnavailable(format!("execution fork requires {name} engine")));
+                return Err(QuilError::ExecutionUnavailable(format!(
+                    "execution fork requires {name} engine"
+                )));
             }
         }
         let shards_store = if self.shards_store.is_some() {
             Some(context.shards_store.clone().ok_or_else(|| {
-                QuilError::ExecutionUnavailable("execution fork requires shard metadata store".into())
+                QuilError::ExecutionUnavailable(
+                    "execution fork requires shard metadata store".into(),
+                )
             })?)
-        } else { None };
+        } else {
+            None
+        };
         let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
         for (name, engine) in source.iter() {
             let any = engine.as_any().ok_or_else(|| {
-                QuilError::ExecutionUnavailable(format!("execution fork cannot reconstruct engine {name}"))
+                QuilError::ExecutionUnavailable(format!(
+                    "execution fork cannot reconstruct engine {name}"
+                ))
             })?;
             let fork: Box<dyn ShardExecutionEngine> = match name.as_str() {
-                "global" => Box::new(any.downcast_ref::<GlobalExecutionEngine>()
-                    .ok_or_else(|| QuilError::ExecutionUnavailable("unexpected global engine type".into()))?
-                    .fork_with_context(&context)?),
-                "token" => Box::new(any.downcast_ref::<TokenExecutionEngine>()
-                    .ok_or_else(|| QuilError::ExecutionUnavailable("unexpected token engine type".into()))?
-                    .fork_with_context(&context)?),
-                "compute" => Box::new(any.downcast_ref::<ComputeExecutionEngine>()
-                    .ok_or_else(|| QuilError::ExecutionUnavailable("unexpected compute engine type".into()))?
-                    .fork_with_context(&context)?),
-                "hypergraph" => Box::new(any.downcast_ref::<HypergraphExecutionEngine>()
-                    .ok_or_else(|| QuilError::ExecutionUnavailable("unexpected hypergraph engine type".into()))?
-                    .fork_with_context(&context)?),
-                _ => return Err(QuilError::ExecutionUnavailable(format!("unsupported execution fork engine {name}"))),
+                "global" => Box::new(
+                    any.downcast_ref::<GlobalExecutionEngine>()
+                        .ok_or_else(|| {
+                            QuilError::ExecutionUnavailable("unexpected global engine type".into())
+                        })?
+                        .fork_with_context(&context)?,
+                ),
+                "token" => Box::new(
+                    any.downcast_ref::<TokenExecutionEngine>()
+                        .ok_or_else(|| {
+                            QuilError::ExecutionUnavailable("unexpected token engine type".into())
+                        })?
+                        .fork_with_context(&context)?,
+                ),
+                "compute" => Box::new(
+                    any.downcast_ref::<ComputeExecutionEngine>()
+                        .ok_or_else(|| {
+                            QuilError::ExecutionUnavailable("unexpected compute engine type".into())
+                        })?
+                        .fork_with_context(&context)?,
+                ),
+                "hypergraph" => Box::new(
+                    any.downcast_ref::<HypergraphExecutionEngine>()
+                        .ok_or_else(|| {
+                            QuilError::ExecutionUnavailable(
+                                "unexpected hypergraph engine type".into(),
+                            )
+                        })?
+                        .fork_with_context(&context)?,
+                ),
+                _ => {
+                    return Err(QuilError::ExecutionUnavailable(format!(
+                        "unsupported execution fork engine {name}"
+                    )))
+                }
             };
             engines.insert(name.clone(), fork);
         }
         Ok(Self {
-            engines: RwLock::new(engines), crdt: context.crdt, shards_store,
+            engines: RwLock::new(engines),
+            crdt: context.crdt,
+            shards_store,
             global_quil_fee: RwLock::new(*self.global_quil_fee.read().map_err(|_| {
                 QuilError::ExecutionUnavailable("fee snapshot lock poisoned".into())
             })?),
@@ -159,10 +195,13 @@ impl ExecutionEngineManager {
         let engines = self.engines.get_mut().map_err(|_| {
             QuilError::ExecutionUnavailable("execution manager lock poisoned".into())
         })?;
-        let token = engines.get_mut("token")
+        let token = engines
+            .get_mut("token")
             .and_then(|engine| engine.as_any_mut())
             .and_then(|engine| engine.downcast_mut::<TokenExecutionEngine>())
-            .ok_or_else(|| QuilError::InvalidArgument("manager requires a concrete token engine".into()))?;
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("manager requires a concrete token engine".into())
+            })?;
         token.configure_token_worker(policy, worker)?;
         Ok(self)
     }
@@ -176,10 +215,13 @@ impl ExecutionEngineManager {
         let engines = self.engines.get_mut().map_err(|_| {
             QuilError::ExecutionUnavailable("execution manager lock poisoned".into())
         })?;
-        let token = engines.get_mut("token")
+        let token = engines
+            .get_mut("token")
             .and_then(|engine| engine.as_any_mut())
             .and_then(|engine| engine.downcast_mut::<TokenExecutionEngine>())
-            .ok_or_else(|| QuilError::InvalidArgument("manager requires a concrete token engine".into()))?;
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("manager requires a concrete token engine".into())
+            })?;
         token.set_mode(crate::engines::ExecutionMode::Application);
         Ok(self)
     }
@@ -188,22 +230,30 @@ impl ExecutionEngineManager {
     /// Required for managers whose own clock store holds only an app-shard
     /// chain (thread workers): a claim citing a global frame the store lacks
     /// is an infrastructure failure that holds the shard frame for retry.
-    pub fn with_global_clock_store(mut self, store: Arc<dyn quil_types::store::ClockStore>) -> Result<Self> {
+    pub fn with_global_clock_store(
+        mut self,
+        store: Arc<dyn quil_types::store::ClockStore>,
+    ) -> Result<Self> {
         let engines = self.engines.get_mut().map_err(|_| {
             QuilError::ExecutionUnavailable("execution manager lock poisoned".into())
         })?;
-        let token = engines.get_mut("token")
+        let token = engines
+            .get_mut("token")
             .and_then(|engine| engine.as_any_mut())
             .and_then(|engine| engine.downcast_mut::<TokenExecutionEngine>())
-            .ok_or_else(|| QuilError::InvalidArgument("manager requires a concrete token engine".into()))?;
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("manager requires a concrete token engine".into())
+            })?;
         token.set_global_clock_store(store.clone());
-        if let Some(compute) = engines.get_mut("compute")
+        if let Some(compute) = engines
+            .get_mut("compute")
             .and_then(|engine| engine.as_any_mut())
             .and_then(|engine| engine.downcast_mut::<ComputeExecutionEngine>())
         {
             compute.set_global_clock_store(store.clone());
         }
-        if let Some(hypergraph) = engines.get_mut("hypergraph")
+        if let Some(hypergraph) = engines
+            .get_mut("hypergraph")
             .and_then(|engine| engine.as_any_mut())
             .and_then(|engine| engine.downcast_mut::<HypergraphExecutionEngine>())
         {
@@ -232,12 +282,25 @@ impl ExecutionEngineManager {
         {
             let routed: Vec<(Vec<u8>, Vec<u8>)> = bundles
                 .iter()
-                .filter(|(address, _)| self.select_engine(address).map(|name| name == "token").unwrap_or(false))
+                .filter(|(address, _)| {
+                    self.select_engine(address)
+                        .map(|name| name == "token")
+                        .unwrap_or(false)
+                })
                 .cloned()
                 .collect();
-            if routed.is_empty() { return; }
-            let engines = match self.engines.read() { Ok(engines) => engines, Err(_) => return };
-            if let Some(token) = engines.get("token").and_then(|e| e.as_any()).and_then(|e| e.downcast_ref::<TokenExecutionEngine>()) {
+            if routed.is_empty() {
+                return;
+            }
+            let engines = match self.engines.read() {
+                Ok(engines) => engines,
+                Err(_) => return,
+            };
+            if let Some(token) = engines
+                .get("token")
+                .and_then(|e| e.as_any())
+                .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+            {
                 token.preverify_bundles(&routed);
             }
         }
@@ -250,9 +313,16 @@ impl ExecutionEngineManager {
     pub fn token_verification_capacity(&self) -> usize {
         #[cfg(feature = "native-proof")]
         {
-            let engines = match self.engines.read() { Ok(engines) => engines, Err(_) => return usize::MAX };
-            return engines.get("token").and_then(|e| e.as_any()).and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                .map(|token| token.verification_capacity()).unwrap_or(usize::MAX);
+            let engines = match self.engines.read() {
+                Ok(engines) => engines,
+                Err(_) => return usize::MAX,
+            };
+            return engines
+                .get("token")
+                .and_then(|e| e.as_any())
+                .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                .map(|token| token.verification_capacity())
+                .unwrap_or(usize::MAX);
         }
         #[cfg(not(feature = "native-proof"))]
         usize::MAX
@@ -263,10 +333,17 @@ impl ExecutionEngineManager {
     pub fn confidential_operation_count(address: &[u8], bundle_bytes: &[u8]) -> usize {
         #[cfg(feature = "native-proof")]
         {
-            return TokenExecutionEngine::confidential_operations(&[(address.to_vec(), bundle_bytes.to_vec())]).len();
+            return TokenExecutionEngine::confidential_operations(&[(
+                address.to_vec(),
+                bundle_bytes.to_vec(),
+            )])
+            .len();
         }
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (address, bundle_bytes); 0 }
+        {
+            let _ = (address, bundle_bytes);
+            0
+        }
     }
 
     /// The legacy coin the first shield of a canonical bundle consumes. Only
@@ -275,13 +352,25 @@ impl ExecutionEngineManager {
     pub fn shield_source(bundle_bytes: &[u8]) -> Option<[u8; 32]> {
         #[cfg(feature = "native-proof")]
         {
-            let bundle = crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes).ok()?;
-            return bundle.requests.into_iter().flatten()
-                .filter(|request| request.inner_type_prefix == crate::token_engine::TYPE_LATTICE_SHIELD)
-                .find_map(|request| quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes));
+            let bundle =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+                    .ok()?;
+            return bundle
+                .requests
+                .into_iter()
+                .flatten()
+                .filter(|request| {
+                    request.inner_type_prefix == crate::token_engine::TYPE_LATTICE_SHIELD
+                })
+                .find_map(|request| {
+                    quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes)
+                });
         }
         #[cfg(not(feature = "native-proof"))]
-        { let _ = bundle_bytes; None }
+        {
+            let _ = bundle_bytes;
+            None
+        }
     }
 
     /// Whether the global commit has decided every request of a canonical
@@ -289,24 +378,42 @@ impl ExecutionEngineManager {
     /// operations are ever decided, so a bundle holding anything else never
     /// is. `global` holds GLOBAL state; false when it cannot say. `address`
     /// is the application, or a shard filter under it (its first 32 bytes).
-    pub fn decided_globally(global: Arc<quil_hypergraph::HypergraphCrdt>, address: &[u8], bundle_bytes: &[u8]) -> bool {
+    pub fn decided_globally(
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+        address: &[u8],
+        bundle_bytes: &[u8],
+    ) -> bool {
         #[cfg(feature = "native-proof")]
         {
             use crate::token_intrinsic::global_commit;
-            let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else { return false };
-            let Ok(bundle) = crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes) else { return false };
+            let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
+                return false;
+            };
+            let Ok(bundle) =
+                crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
+            else {
+                return false;
+            };
             if bundle.requests.is_empty() {
                 return false;
             }
             let state = crate::hypergraph_state::HypergraphState::new(global);
             return bundle.requests.iter().all(|request| {
                 request.as_ref().is_some_and(|request| {
-                    global_commit::is_decided(&state, &application, &global_commit::tx_id(&request.inner_bytes)).unwrap_or(false)
+                    global_commit::is_decided(
+                        &state,
+                        &application,
+                        &global_commit::tx_id(&request.inner_bytes),
+                    )
+                    .unwrap_or(false)
                 })
             });
         }
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (global, address, bundle_bytes); false }
+        {
+            let _ = (global, address, bundle_bytes);
+            false
+        }
     }
 
     /// Build a manager with all engines initialized. Every engine is
@@ -321,9 +428,7 @@ impl ExecutionEngineManager {
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
         circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
-        hypergraph_config_resolver: Arc<
-            dyn crate::hypergraph_intrinsic::HypergraphConfigResolver,
-        >,
+        hypergraph_config_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>,
         include_global: bool,
     ) -> Self {
         Self::new_with_shards(
@@ -353,9 +458,7 @@ impl ExecutionEngineManager {
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
         circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
-        hypergraph_config_resolver: Arc<
-            dyn crate::hypergraph_intrinsic::HypergraphConfigResolver,
-        >,
+        hypergraph_config_resolver: Arc<dyn crate::hypergraph_intrinsic::HypergraphConfigResolver>,
         include_global: bool,
         shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
         shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
@@ -405,18 +508,16 @@ impl ExecutionEngineManager {
         engines.insert("compute".into(), Box::new(compute));
         engines.insert(
             "hypergraph".into(),
-            Box::new(
-                {
-                    let mut hypergraph = HypergraphExecutionEngine::new_with_state(
-                        mode,
-                        crdt.clone(),
-                        hypergraph_config_resolver,
-                    )
-                    .with_key_manager(key_manager);
-                    hypergraph.set_global_clock_store(clock_store.clone());
-                    hypergraph
-                },
-            ),
+            Box::new({
+                let mut hypergraph = HypergraphExecutionEngine::new_with_state(
+                    mode,
+                    crdt.clone(),
+                    hypergraph_config_resolver,
+                )
+                .with_key_manager(key_manager);
+                hypergraph.set_global_clock_store(clock_store.clone());
+                hypergraph
+            }),
         );
 
         Self {
@@ -460,7 +561,7 @@ impl ExecutionEngineManager {
         for (app, prefixes) in by_app {
             match self.crdt.refresh_app_shard_prefixes(app, prefixes) {
                 Ok(true) => changed += 1,
-                Ok(false) => {},
+                Ok(false) => {}
                 Err(e) => tracing::warn!(app = %hex::encode(app), error = %e,
                     "refresh_shard_prefixes: layout unchanged after rebuild failure; will retry"),
             }
@@ -471,13 +572,20 @@ impl ExecutionEngineManager {
     /// Checked refresh for tentative execution. A failure may follow earlier
     /// in-memory layout changes, so the owner must discard the whole branch.
     pub fn try_refresh_shard_prefixes(&self) -> Result<usize> {
-        let Some(store) = &self.shards_store else { return Ok(0); };
+        let Some(store) = &self.shards_store else {
+            return Ok(0);
+        };
         let mut by_app = std::collections::BTreeMap::<[u8; 32], Vec<Vec<u32>>>::new();
         for row in store.range_app_shards()? {
             if row.shard_key.len() != 35 {
-                return Err(QuilError::ExecutionUnavailable("invalid captured shard metadata key".into()));
+                return Err(QuilError::ExecutionUnavailable(
+                    "invalid captured shard metadata key".into(),
+                ));
             }
-            by_app.entry(row.shard_key[3..].try_into().unwrap()).or_default().push(row.prefix);
+            by_app
+                .entry(row.shard_key[3..].try_into().unwrap())
+                .or_default()
+                .push(row.prefix);
         }
         let mut changed = 0;
         for (app, prefixes) in by_app {
@@ -488,24 +596,46 @@ impl ExecutionEngineManager {
 
     /// Publish only after global state/cursor commit. None invalidates quotes
     /// when QUIL no longer uses this venue. This cache is not persisted.
-    pub fn publish_global_quil_fee_snapshot(&self, snapshot: Option<crate::pricing::GlobalQuilFeeSnapshot>) {
-        *self.global_quil_fee.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
+    pub fn publish_global_quil_fee_snapshot(
+        &self,
+        snapshot: Option<crate::pricing::GlobalQuilFeeSnapshot>,
+    ) {
+        *self
+            .global_quil_fee
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 
     /// Publish the global venue's pricing inputs after the global state and
     /// cursor commit (every frame, independent of QUIL routing).
-    pub fn publish_global_venue_fee_snapshot(&self, snapshot: crate::pricing::GlobalQuilFeeSnapshot) {
-        *self.global_venue_fee.write().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
+    pub fn publish_global_venue_fee_snapshot(
+        &self,
+        snapshot: crate::pricing::GlobalQuilFeeSnapshot,
+    ) {
+        *self
+            .global_venue_fee
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
     }
 
     /// The global venue snapshot, only while it is the current materialized frame's.
-    pub fn global_venue_fee_snapshot(&self, materialized_frame: u64) -> Result<Option<crate::pricing::GlobalQuilFeeSnapshot>> {
-        self.global_venue_fee.read().map(|snapshot| snapshot.filter(|s| s.frame_number == materialized_frame))
+    pub fn global_venue_fee_snapshot(
+        &self,
+        materialized_frame: u64,
+    ) -> Result<Option<crate::pricing::GlobalQuilFeeSnapshot>> {
+        self.global_venue_fee
+            .read()
+            .map(|snapshot| snapshot.filter(|s| s.frame_number == materialized_frame))
             .map_err(|_| QuilError::ExecutionUnavailable("fee snapshot lock poisoned".into()))
     }
 
-    pub fn global_quil_fee_snapshot(&self, materialized_frame: u64) -> Result<Option<crate::pricing::GlobalQuilFeeSnapshot>> {
-        self.global_quil_fee.read().map(|snapshot| snapshot.filter(|s| s.frame_number == materialized_frame))
+    pub fn global_quil_fee_snapshot(
+        &self,
+        materialized_frame: u64,
+    ) -> Result<Option<crate::pricing::GlobalQuilFeeSnapshot>> {
+        self.global_quil_fee
+            .read()
+            .map(|snapshot| snapshot.filter(|s| s.frame_number == materialized_frame))
             .map_err(|_| QuilError::ExecutionUnavailable("fee snapshot lock poisoned".into()))
     }
 
@@ -552,7 +682,9 @@ impl ExecutionEngineManager {
     pub fn commit_frame_with_global_cursor(&self, frame_number: u64) -> Result<()> {
         let cursor_key = quil_store::encoding::global_materialized_cursor_key();
         let start = std::time::Instant::now();
-        let res = self.crdt.commit_with_global_cursor(frame_number, &cursor_key);
+        let res = self
+            .crdt
+            .commit_with_global_cursor(frame_number, &cursor_key);
         crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
         res?;
         Ok(())
@@ -591,30 +723,56 @@ impl ExecutionEngineManager {
         let report = self.shard_accumulator_report(filter, anchor)?;
         let digest = accumulator_header::report_digest(&report);
         let mut records = vec![
-            (encoding::clock_shard_frame_fee_total_key(filter, frame_number), fee_total.to_be_bytes().to_vec()),
-            (encoding::clock_shard_frame_settlements_key(filter, frame_number), settlements),
-            (encoding::clock_shard_frame_spends_key(filter, frame_number), spends),
-            (encoding::clock_shard_frame_accumulator_key(filter, frame_number), digest.clone()),
+            (
+                encoding::clock_shard_frame_fee_total_key(filter, frame_number),
+                fee_total.to_be_bytes().to_vec(),
+            ),
+            (
+                encoding::clock_shard_frame_settlements_key(filter, frame_number),
+                settlements,
+            ),
+            (
+                encoding::clock_shard_frame_spends_key(filter, frame_number),
+                spends,
+            ),
+            (
+                encoding::clock_shard_frame_accumulator_key(filter, frame_number),
+                digest.clone(),
+            ),
         ];
         if !digest.is_empty() {
-            records.push((encoding::clock_shard_accumulator_report_key(filter, &digest), report.clone()));
+            records.push((
+                encoding::clock_shard_accumulator_report_key(filter, &digest),
+                report.clone(),
+            ));
         }
         let cursor = encoding::consensus_materialized_cursor_key(filter);
         let start = std::time::Instant::now();
-        let result = self.crdt.commit_with_frame_cursor_and_records(frame_number, &cursor, &records);
+        let result =
+            self.crdt
+                .commit_with_frame_cursor_and_records(frame_number, &cursor, &records);
         crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
         result?;
         Ok(report)
     }
 
     /// Checkpoint completed shard sync without flushing unrelated pending state.
-    pub fn checkpoint_app_materialized_cursor(&self, frame_number: u64, filter: &[u8]) -> Result<()> {
-        self.crdt.checkpoint_frame_cursor(frame_number,
-            &quil_store::encoding::consensus_materialized_cursor_key(filter))
+    pub fn checkpoint_app_materialized_cursor(
+        &self,
+        frame_number: u64,
+        filter: &[u8],
+    ) -> Result<()> {
+        self.crdt.checkpoint_frame_cursor(
+            frame_number,
+            &quil_store::encoding::consensus_materialized_cursor_key(filter),
+        )
     }
 
     pub fn read_app_materialized_cursor(&self, filter: &[u8]) -> Result<u64> {
-        self.crdt.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))
+        self.crdt
+            .read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(
+                filter,
+            ))
     }
 
     /// Apply epoch-aligned shard topology changes (split/merge) due at this GLOBAL
@@ -701,14 +859,10 @@ impl ExecutionEngineManager {
             .get_mut("global")
             .ok_or_else(|| QuilError::NotFound("engine 'global' not found".into()))?;
         let any = engine.as_any_mut().ok_or_else(|| {
-            QuilError::Internal(
-                "global engine does not support as_any_mut downcast".into(),
-            )
+            QuilError::Internal("global engine does not support as_any_mut downcast".into())
         })?;
         let global = any.downcast_mut::<GlobalExecutionEngine>().ok_or_else(|| {
-            QuilError::Internal(
-                "global engine is not a GlobalExecutionEngine".into(),
-            )
+            QuilError::Internal("global engine is not a GlobalExecutionEngine".into())
         })?;
         global.install_frame_header_deps(
             prover_registry,
@@ -738,14 +892,10 @@ impl ExecutionEngineManager {
             .get_mut("global")
             .ok_or_else(|| QuilError::NotFound("engine 'global' not found".into()))?;
         let any = engine.as_any_mut().ok_or_else(|| {
-            QuilError::Internal(
-                "global engine does not support as_any_mut downcast".into(),
-            )
+            QuilError::Internal("global engine does not support as_any_mut downcast".into())
         })?;
         let global = any.downcast_mut::<GlobalExecutionEngine>().ok_or_else(|| {
-            QuilError::Internal(
-                "global engine is not a GlobalExecutionEngine".into(),
-            )
+            QuilError::Internal("global engine is not a GlobalExecutionEngine".into())
         })?;
         global.install_frame_prover(frame_prover);
         Ok(())
@@ -802,7 +952,11 @@ impl ExecutionEngineManager {
                 engine_name
             )))
         };
-        crate::metrics::observe_execution_duration(label, "validate", start.elapsed().as_secs_f64());
+        crate::metrics::observe_execution_duration(
+            label,
+            "validate",
+            start.elapsed().as_secs_f64(),
+        );
         if res.is_err() {
             crate::metrics::inc_execution_errors(label, "validate");
         }
@@ -818,8 +972,15 @@ impl ExecutionEngineManager {
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
         self.process_message_with_context(
-            quil_types::execution::FrameExecutionContext { frame_number, finalized_global_frame: None, venue: None, shard: quil_types::execution::ShardPath::WHOLE },
-            fee_multiplier, address, message,
+            quil_types::execution::FrameExecutionContext {
+                frame_number,
+                finalized_global_frame: None,
+                venue: None,
+                shard: quil_types::execution::ShardPath::WHOLE,
+            },
+            fee_multiplier,
+            address,
+            message,
         )
     }
 
@@ -853,12 +1014,7 @@ impl ExecutionEngineManager {
     /// Acquire address locks for a message by routing to the
     /// appropriate engine. Used by app shard frame production to build
     /// the per-message `tx_map` that feeds `requests_root`.
-    pub fn lock(
-        &self,
-        frame_number: u64,
-        address: &[u8],
-        message: &[u8],
-    ) -> Result<Vec<Vec<u8>>> {
+    pub fn lock(&self, frame_number: u64, address: &[u8], message: &[u8]) -> Result<Vec<Vec<u8>>> {
         let engine_name = self.select_engine(address)?;
         let engines = self.engines.read().unwrap();
         if let Some(engine) = engines.get(&engine_name) {
@@ -895,7 +1051,9 @@ impl ExecutionEngineManager {
         // settlement claim's consumption marker), paid by the settlement the
         // bundle consumes.
         #[cfg(feature = "confidential-tokens")]
-        let consumer = BigInt::from(crate::token_intrinsic::settlement_claim::message_cost(message)?);
+        let consumer = BigInt::from(crate::token_intrinsic::settlement_claim::message_cost(
+            message,
+        )?);
         #[cfg(not(feature = "confidential-tokens"))]
         let consumer = BigInt::from(0);
         if let Some(token) = engines.get("token") {
@@ -951,17 +1109,33 @@ impl ExecutionEngineManager {
         anchor: u64,
     ) -> Result<Vec<u8>> {
         #[cfg(not(feature = "confidential-tokens"))]
-        { let _ = (snapshot, filter, anchor); Ok(Vec::new()) }
+        {
+            let _ = (snapshot, filter, anchor);
+            Ok(Vec::new())
+        }
         #[cfg(feature = "confidential-tokens")]
         {
             let (application, shard) = quil_forest::decode_shard_filter_or_root(filter, 32)
-                .ok_or_else(|| QuilError::InvalidArgument("snapshot report: invalid filter".into()))?;
-            let application: [u8; 32] = application.try_into()
-                .map_err(|_| QuilError::InvalidArgument("snapshot report: invalid application".into()))?;
-            let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
-            let attest = anchor >= crate::token_intrinsic::global_commit::orphan_replacement_frame();
-            crate::token_intrinsic::shard_accumulator::snapshot_report(snapshot, &network, &application, &shard, attest)?
-                .map(|report| report.encode()).transpose().map(Option::unwrap_or_default)
+                .ok_or_else(|| {
+                    QuilError::InvalidArgument("snapshot report: invalid filter".into())
+                })?;
+            let application: [u8; 32] = application.try_into().map_err(|_| {
+                QuilError::InvalidArgument("snapshot report: invalid application".into())
+            })?;
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+            let attest =
+                anchor >= crate::token_intrinsic::global_commit::orphan_replacement_frame();
+            crate::token_intrinsic::shard_accumulator::snapshot_report(
+                snapshot,
+                &network,
+                &application,
+                &shard,
+                attest,
+            )?
+            .map(|report| report.encode())
+            .transpose()
+            .map(Option::unwrap_or_default)
         }
     }
 
@@ -969,24 +1143,41 @@ impl ExecutionEngineManager {
     /// re-placement frame the report also attests held blocks.
     pub fn shard_accumulator_report(&self, filter: &[u8], anchor: u64) -> Result<Vec<u8>> {
         #[cfg(not(feature = "confidential-tokens"))]
-        { let _ = (filter, anchor); Ok(Vec::new()) }
+        {
+            let _ = (filter, anchor);
+            Ok(Vec::new())
+        }
         #[cfg(feature = "confidential-tokens")]
         {
             use crate::token_intrinsic::roots;
             let (application, shard) = quil_forest::decode_shard_filter_or_root(filter, 32)
-                .ok_or_else(|| QuilError::InvalidArgument("accumulator report: filter names no shard".into()))?;
-            let application: [u8; 32] = application.as_slice().try_into()
-                .map_err(|_| QuilError::InvalidArgument("accumulator report: malformed application".into()))?;
-            let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+                .ok_or_else(|| {
+                    QuilError::InvalidArgument("accumulator report: filter names no shard".into())
+                })?;
+            let application: [u8; 32] = application.as_slice().try_into().map_err(|_| {
+                QuilError::InvalidArgument("accumulator report: malformed application".into())
+            })?;
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
             let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
             if self.summary_rebuilds.read().unwrap().contains(&application) {
                 roots::rebuild_block_summary(&state, &network, &application, &shard)?;
                 state.commit()?;
                 self.summary_rebuilds.write().unwrap().remove(&application);
-                tracing::info!(filter = hex::encode(filter), "rebuilt the local block summary from covered block records");
+                tracing::info!(
+                    filter = hex::encode(filter),
+                    "rebuilt the local block summary from covered block records"
+                );
             }
-            let attest = anchor >= crate::token_intrinsic::global_commit::orphan_replacement_frame();
-            match crate::token_intrinsic::shard_accumulator::shard_report(&state, &network, &application, &shard, attest)? {
+            let attest =
+                anchor >= crate::token_intrinsic::global_commit::orphan_replacement_frame();
+            match crate::token_intrinsic::shard_accumulator::shard_report(
+                &state,
+                &network,
+                &application,
+                &shard,
+                attest,
+            )? {
                 Some(report) => report.encode(),
                 None => Ok(Vec::new()),
             }
@@ -1016,55 +1207,102 @@ impl ExecutionEngineManager {
     /// venue, the whole message keeps the app vote (the higher price).
     pub fn message_commits_globally(&self, address: &[u8], message: &[u8]) -> bool {
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (address, message); false }
+        {
+            let _ = (address, message);
+            false
+        }
         #[cfg(feature = "native-proof")]
         {
-            use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
-            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) else { return false };
+            use crate::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
+            };
+            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                return false;
+            };
             if message.len() < 4 {
                 return false;
             }
             let requests = match u32::from_be_bytes(message[..4].try_into().unwrap()) {
-                TYPE_MESSAGE_REQUEST => match CanonicalMessageRequest::from_canonical_bytes(message) {
-                    Ok(request) => vec![request],
-                    Err(_) => return false,
-                },
-                TYPE_MESSAGE_BUNDLE => match CanonicalMessageBundle::from_canonical_bytes(message) {
-                    Ok(bundle) => bundle.requests.into_iter().flatten().collect(),
-                    Err(_) => return false,
-                },
+                TYPE_MESSAGE_REQUEST => {
+                    match CanonicalMessageRequest::from_canonical_bytes(message) {
+                        Ok(request) => vec![request],
+                        Err(_) => return false,
+                    }
+                }
+                TYPE_MESSAGE_BUNDLE => {
+                    match CanonicalMessageBundle::from_canonical_bytes(message) {
+                        Ok(bundle) => bundle.requests.into_iter().flatten().collect(),
+                        Err(_) => return false,
+                    }
+                }
                 _ => return false,
             };
-            !requests.is_empty() && requests.iter().all(|request|
-                crate::token_intrinsic::spend_entries::commits_globally(&application, request.inner_type_prefix))
+            !requests.is_empty()
+                && requests.iter().all(|request| {
+                    crate::token_intrinsic::spend_entries::commits_globally(
+                        &application,
+                        request.inner_type_prefix,
+                    )
+                })
         }
     }
 
-    pub fn message_spend_entries(&self, address: &[u8], message: &[u8], source_frame: u64) -> Result<Vec<Vec<u8>>> {
+    pub fn message_spend_entries(
+        &self,
+        address: &[u8],
+        message: &[u8],
+        source_frame: u64,
+    ) -> Result<Vec<Vec<u8>>> {
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (address, message, source_frame); Ok(Vec::new()) }
+        {
+            let _ = (address, message, source_frame);
+            Ok(Vec::new())
+        }
         #[cfg(feature = "native-proof")]
         {
-            use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
-            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) else { return Ok(Vec::new()) };
+            use crate::message_envelope::{
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
+            };
+            let Some(application) = address.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                return Ok(Vec::new());
+            };
             if message.len() < 4 {
                 return Ok(Vec::new());
             }
             let requests = match u32::from_be_bytes(message[..4].try_into().unwrap()) {
-                TYPE_MESSAGE_REQUEST => vec![CanonicalMessageRequest::from_canonical_bytes(message)?],
-                TYPE_MESSAGE_BUNDLE => CanonicalMessageBundle::from_canonical_bytes(message)?.requests.into_iter().flatten().collect(),
+                TYPE_MESSAGE_REQUEST => {
+                    vec![CanonicalMessageRequest::from_canonical_bytes(message)?]
+                }
+                TYPE_MESSAGE_BUNDLE => CanonicalMessageBundle::from_canonical_bytes(message)?
+                    .requests
+                    .into_iter()
+                    .flatten()
+                    .collect(),
                 _ => return Ok(Vec::new()),
             };
-            let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
             let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
             let mut entries = Vec::new();
             for request in requests {
-                if !crate::token_intrinsic::spend_entries::commits_globally(&application, request.inner_type_prefix) {
+                if !crate::token_intrinsic::spend_entries::commits_globally(
+                    &application,
+                    request.inner_type_prefix,
+                ) {
                     continue;
                 }
                 // A custom mint's consumptions depend on the deployed policy.
                 let entry = crate::token_intrinsic::spend_entries::commit_entry(
-                    &state, &network, &application, request.inner_type_prefix, &request.inner_bytes, source_frame,
+                    &state,
+                    &network,
+                    &application,
+                    request.inner_type_prefix,
+                    &request.inner_bytes,
+                    source_frame,
                 )?;
                 entries.push(entry.encode()?);
             }
@@ -1093,14 +1331,24 @@ impl ExecutionEngineManager {
         filter: &[u8],
     ) -> Result<Vec<(Vec<u8>, u64)>> {
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (global, filter); Ok(Vec::new()) }
+        {
+            let _ = (global, filter);
+            Ok(Vec::new())
+        }
         #[cfg(feature = "native-proof")]
         {
-            let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return Ok(Vec::new()) };
-            let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else { return Ok(Vec::new()) };
+            let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32)
+            else {
+                return Ok(Vec::new());
+            };
+            let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
+                return Ok(Vec::new());
+            };
             let mut sources: Vec<(Vec<u8>, u64)> = Vec::new();
             for item in self.pending_deliveries(global, filter)? {
-                let Some(bits) = item.source_shard.bits() else { continue };
+                let Some(bits) = item.source_shard.bits() else {
+                    continue;
+                };
                 let source = (executing_filter(&application, &bits), item.source_frame);
                 if !sources.contains(&source) {
                     sources.push(source);
@@ -1117,14 +1365,26 @@ impl ExecutionEngineManager {
         filter: &[u8],
     ) -> Result<Vec<crate::token_intrinsic::delivery::PendingDelivery>> {
         use crate::token_intrinsic::{delivery, dispatch::TokenPolicy};
-        let Some((application, shard)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return Ok(Vec::new()) };
-        let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else { return Ok(Vec::new()) };
-        let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+        let Some((application, shard)) = quil_forest::decode_shard_filter_or_root(filter, 32)
+        else {
+            return Ok(Vec::new());
+        };
+        let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
+            return Ok(Vec::new());
+        };
+        let network =
+            quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
         let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
         let global = crate::hypergraph_state::HypergraphState::new(global);
         let local = crate::hypergraph_state::HypergraphState::new(self.crdt());
         delivery::pending_deliveries(
-            &global, &local, &network, &application, &shard, limits, delivery::MAX_DELIVERIES_PER_FRAME,
+            &global,
+            &local,
+            &network,
+            &application,
+            &shard,
+            limits,
+            delivery::MAX_DELIVERIES_PER_FRAME,
         )
     }
 
@@ -1141,13 +1401,22 @@ impl ExecutionEngineManager {
         operation: &dyn Fn(&[u8], u64, &[u8; 32]) -> Option<(u32, Vec<u8>)>,
     ) -> Result<Vec<Vec<u8>>> {
         #[cfg(not(feature = "native-proof"))]
-        { let _ = (global, clock, filter, anchor, operation); Ok(Vec::new()) }
+        {
+            let _ = (global, clock, filter, anchor, operation);
+            Ok(Vec::new())
+        }
         #[cfg(feature = "native-proof")]
         {
             use crate::token_intrinsic::delivery;
-            let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return Ok(Vec::new()) };
-            let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else { return Ok(Vec::new()) };
-            let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+            let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32)
+            else {
+                return Ok(Vec::new());
+            };
+            let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
+                return Ok(Vec::new());
+            };
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
             let pending = self.pending_deliveries(global.clone(), filter)?;
             let global = crate::hypergraph_state::HypergraphState::new(global);
             let mut deliveries = Vec::with_capacity(pending.len());
@@ -1157,18 +1426,34 @@ impl ExecutionEngineManager {
                     continue;
                 }
                 // Where it ran is where its bytes are: the commit recorded it.
-                let Some(source) = item.source_shard.bits() else { continue };
+                let Some(source) = item.source_shard.bits() else {
+                    continue;
+                };
                 let source_filter = executing_filter(&application, &source);
-                let delivered = operation(&source_filter, item.source_frame, &item.tx_id).and_then(|(tp, bytes)| {
-                    delivery::find_delivered(&network, &application, tp, &bytes, &item).ok().flatten()
-                });
+                let delivered = operation(&source_filter, item.source_frame, &item.tx_id).and_then(
+                    |(tp, bytes)| {
+                        delivery::find_delivered(&network, &application, tp, &bytes, &item)
+                            .ok()
+                            .flatten()
+                    },
+                );
                 let built = match delivered {
-                    Some(delivered) => delivery::build_delivery(&global, clock, &network, &application, anchor, &item, delivered)?,
+                    Some(delivered) => delivery::build_delivery(
+                        &global,
+                        clock,
+                        &network,
+                        &application,
+                        anchor,
+                        &item,
+                        delivered,
+                    )?,
                     None => None,
                 };
                 match built {
                     Some(bytes) => deliveries.push(bytes),
-                    None => { stalled.insert((item.escrow, item.block)); }
+                    None => {
+                        stalled.insert((item.escrow, item.block));
+                    }
                 }
             }
             Ok(deliveries)
@@ -1180,11 +1465,18 @@ impl ExecutionEngineManager {
     /// against the canonical root the global materializer folds from reports.
     pub fn local_application_root_digest(&self, filter: &[u8]) -> Result<Option<[u8; 32]>> {
         #[cfg(not(feature = "confidential-tokens"))]
-        { let _ = filter; Ok(None) }
+        {
+            let _ = filter;
+            Ok(None)
+        }
         #[cfg(feature = "confidential-tokens")]
         {
-            let Some(application) = filter.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) else { return Ok(None) };
-            let network = quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
+            let Some(application) = filter.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                return Ok(None);
+            };
+            let network =
+                quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
             let state = crate::hypergraph_state::HypergraphState::new(self.crdt());
             crate::token_intrinsic::roots::read_current(&state, &network, &application)?
                 .map(|record| quil_crypto::poseidon::hash_bytes_to_32(&record.root.to_bytes()))
@@ -1194,17 +1486,23 @@ impl ExecutionEngineManager {
 
     pub fn message_token_fees(&self, address: &[u8], message: &[u8]) -> Result<u128> {
         #[cfg(not(feature = "confidential-tokens"))]
-        { let _ = (address, message); Ok(0) }
+        {
+            let _ = (address, message);
+            Ok(0)
+        }
         #[cfg(feature = "confidential-tokens")]
         {
             use crate::message_envelope::{
-                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
             };
             if message.len() < 4 || address.len() < 32 || address[..32] == domains::GLOBAL {
                 return Ok(0);
             }
             if address[..32] != domains::QUIL_TOKEN {
-                return Ok(crate::token_intrinsic::settlement_claim::message_settlement_amount(message));
+                return Ok(
+                    crate::token_intrinsic::settlement_claim::message_settlement_amount(message),
+                );
             }
             // Operations that commit through the global frame are credited
             // there, and only if they commit (`global_commit::materialize_relay`).
@@ -1212,7 +1510,9 @@ impl ExecutionEngineManager {
                 let self_paid = (0x0512..=0x0518).contains(&tp)
                     && tp != crate::token_engine::TYPE_LATTICE_MINT_CLAIM
                     && !crate::token_intrinsic::spend_entries_relayed(tp);
-                if self_paid && crate::token_intrinsic::wire::domain(bytes).ok() == Some(domains::QUIL_TOKEN) {
+                if self_paid
+                    && crate::token_intrinsic::wire::domain(bytes).ok() == Some(domains::QUIL_TOKEN)
+                {
                     crate::token_intrinsic::wire::fee(bytes).unwrap_or(0)
                 } else {
                     0
@@ -1225,8 +1525,9 @@ impl ExecutionEngineManager {
                 }
                 TYPE_MESSAGE_BUNDLE => {
                     let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                    bundle.requests.iter().flatten()
-                        .fold(0u128, |sum, r| sum.saturating_add(fee_of(r.inner_type_prefix, &r.inner_bytes)))
+                    bundle.requests.iter().flatten().fold(0u128, |sum, r| {
+                        sum.saturating_add(fee_of(r.inner_type_prefix, &r.inner_bytes))
+                    })
                 }
                 _ => 0,
             })
@@ -1242,11 +1543,15 @@ impl ExecutionEngineManager {
         message: &[u8],
     ) -> Result<Vec<crate::token_intrinsic::settlement_record::SettlementEntry>> {
         #[cfg(not(feature = "confidential-tokens"))]
-        { let _ = message; Ok(Vec::new()) }
+        {
+            let _ = message;
+            Ok(Vec::new())
+        }
         #[cfg(feature = "confidential-tokens")]
         {
             use crate::message_envelope::{
-                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
+                CanonicalMessageBundle, CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE,
+                TYPE_MESSAGE_REQUEST,
             };
             use crate::token_intrinsic::settlement_record::operation_entry;
             // Settlements commit through the global frame, which records them
@@ -1264,7 +1569,12 @@ impl ExecutionEngineManager {
                 }
                 TYPE_MESSAGE_BUNDLE => {
                     let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                    for request in bundle.requests.iter().flatten().filter(|r| r.inner_type_prefix == 0x0518) {
+                    for request in bundle
+                        .requests
+                        .iter()
+                        .flatten()
+                        .filter(|r| r.inner_type_prefix == 0x0518)
+                    {
                         entries.extend(operation_entry(&request.inner_bytes)?);
                     }
                 }
@@ -1408,10 +1718,15 @@ mod tests {
         let manager = build_manager(true);
         assert_eq!(manager.global_quil_fee_snapshot(42).unwrap(), None);
         let snapshot = crate::pricing::GlobalQuilFeeSnapshot {
-            frame_number: 42, difficulty: 50_000, world_state_bytes: 123_456,
+            frame_number: 42,
+            difficulty: 50_000,
+            world_state_bytes: 123_456,
         };
         manager.publish_global_quil_fee_snapshot(Some(snapshot));
-        assert_eq!(manager.global_quil_fee_snapshot(42).unwrap(), Some(snapshot));
+        assert_eq!(
+            manager.global_quil_fee_snapshot(42).unwrap(),
+            Some(snapshot)
+        );
         assert_eq!(manager.global_quil_fee_snapshot(41).unwrap(), None);
         assert_eq!(manager.global_quil_fee_snapshot(43).unwrap(), None);
         manager.publish_global_quil_fee_snapshot(None);
@@ -1419,7 +1734,10 @@ mod tests {
         // The global venue snapshot is independent of QUIL routing.
         assert_eq!(manager.global_venue_fee_snapshot(42).unwrap(), None);
         manager.publish_global_venue_fee_snapshot(snapshot);
-        assert_eq!(manager.global_venue_fee_snapshot(42).unwrap(), Some(snapshot));
+        assert_eq!(
+            manager.global_venue_fee_snapshot(42).unwrap(),
+            Some(snapshot)
+        );
         assert_eq!(manager.global_venue_fee_snapshot(43).unwrap(), None);
         assert_eq!(manager.global_quil_fee_snapshot(42).unwrap(), None);
     }
@@ -1428,13 +1746,29 @@ mod tests {
     fn application_venue_switches_the_token_engine_only() {
         let mut manager = build_manager(true).with_application_venue().unwrap();
         let engines = manager.engines.get_mut().unwrap();
-        assert!(engines.contains_key("global"), "the global engine stays installed");
-        let token = engines.get_mut("token").unwrap().as_any_mut().unwrap()
-            .downcast_mut::<TokenExecutionEngine>().unwrap();
+        assert!(
+            engines.contains_key("global"),
+            "the global engine stays installed"
+        );
+        let token = engines
+            .get_mut("token")
+            .unwrap()
+            .as_any_mut()
+            .unwrap()
+            .downcast_mut::<TokenExecutionEngine>()
+            .unwrap();
         assert_eq!(token.mode(), crate::engines::ExecutionMode::Application);
         let mut global = build_manager(true);
-        let token = global.engines.get_mut().unwrap().get_mut("token").unwrap().as_any_mut().unwrap()
-            .downcast_mut::<TokenExecutionEngine>().unwrap();
+        let token = global
+            .engines
+            .get_mut()
+            .unwrap()
+            .get_mut("token")
+            .unwrap()
+            .as_any_mut()
+            .unwrap()
+            .downcast_mut::<TokenExecutionEngine>()
+            .unwrap();
         assert_eq!(token.mode(), crate::engines::ExecutionMode::Global);
     }
 
@@ -1447,13 +1781,21 @@ mod tests {
         use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         use crate::token_intrinsic::global_commit;
         let app = crate::domains::QUIL_TOKEN;
-        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(NoopInclusionProver)));
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
         let op = |tp: u32, tag: u8| CanonicalMessageRequest {
             inner_type_prefix: tp,
             inner_bytes: [tp.to_be_bytes().as_slice(), &[tag; 40]].concat(),
         };
         let bundle = |requests: Vec<Option<CanonicalMessageRequest>>| {
-            CanonicalMessageBundle { requests, timestamp: 1 }.to_canonical_bytes().unwrap()
+            CanonicalMessageBundle {
+                requests,
+                timestamp: 1,
+            }
+            .to_canonical_bytes()
+            .unwrap()
         };
         let (first, second) = (op(0x0512, 1), op(0x0512, 2));
         let both = bundle(vec![Some(first.clone()), Some(second.clone())]);
@@ -1472,32 +1814,79 @@ mod tests {
                 settlement: None,
             };
             let state = crate::hypergraph_state::HypergraphState::new(global.clone());
-            global_commit::commit_entry(&state, 100, &app, &entry, quil_types::execution::ShardPath::WHOLE).unwrap();
+            global_commit::commit_entry(
+                &state,
+                100,
+                &app,
+                &entry,
+                quil_types::execution::ShardPath::WHOLE,
+            )
+            .unwrap();
             state.commit().unwrap();
         };
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app, &both));
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &both
+        ));
         decide(&first, 20);
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app, &both), "one still undecided");
-        assert!(ExecutionEngineManager::decided_globally(global.clone(), &app, &bundle(vec![Some(first.clone())])));
+        assert!(
+            !ExecutionEngineManager::decided_globally(global.clone(), &app, &both),
+            "one still undecided"
+        );
+        assert!(ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &bundle(vec![Some(first.clone())])
+        ));
         decide(&second, 21);
-        assert!(ExecutionEngineManager::decided_globally(global.clone(), &app, &both));
+        assert!(ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &both
+        ));
         // Anything the global commit does not decide keeps the bundle pending.
         let mixed = bundle(vec![Some(first.clone()), Some(op(0x0404, 3))]);
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app, &mixed));
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app, &bundle(vec![Some(first), None])));
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app, &bundle(Vec::new())));
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &[7; 32], &both), "decisions are per application");
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &mixed
+        ));
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &bundle(vec![Some(first), None])
+        ));
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app,
+            &bundle(Vec::new())
+        ));
+        assert!(
+            !ExecutionEngineManager::decided_globally(global.clone(), &[7; 32], &both),
+            "decisions are per application"
+        );
         // A shard engine passes its filter, the application plus its bit path.
         let shard_filter = quil_forest::encode_shard_bit_path(&app, &[true, false, true]);
-        assert!(ExecutionEngineManager::decided_globally(global.clone(), &shard_filter, &both), "a shard filter names its application");
-        assert!(!ExecutionEngineManager::decided_globally(global.clone(), &app[..31], &both));
-        assert!(!ExecutionEngineManager::decided_globally(global, &app, b"not a bundle"));
+        assert!(
+            ExecutionEngineManager::decided_globally(global.clone(), &shard_filter, &both),
+            "a shard filter names its application"
+        );
+        assert!(!ExecutionEngineManager::decided_globally(
+            global.clone(),
+            &app[..31],
+            &both
+        ));
+        assert!(!ExecutionEngineManager::decided_globally(
+            global,
+            &app,
+            b"not a bundle"
+        ));
     }
 
     fn build_manager(include_global: bool) -> ExecutionEngineManager {
         let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
-        let mem_store: Arc<dyn quil_types::store::HypergraphStore> =
-            Arc::new(MemStore::new());
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             mem_store,
             inclusion_prover.clone(),
@@ -1522,8 +1911,8 @@ mod tests {
         use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
         use crate::token_intrinsic::{accumulator_header, roots, settlement_record, spend_relay};
         use quil_lattice_ct::confidential::{
-            AmountOpening, CommitmentKey,
             transfer::{network_identifier, parameter_context, Output},
+            AmountOpening, CommitmentKey,
         };
         use quil_types::store::ClockStore;
 
@@ -1532,8 +1921,14 @@ mod tests {
         let network = network_identifier(crate::pricing::MAINNET_NETWORK);
         let context = parameter_context(&network, &application);
         let settlements = vec![settlement_record::SettlementEntry {
-            receipt: [1; 32], parameter_context: context, destination: [2; 32],
-            context: [3; 32], settlement: 41, payment_address: [0; 32], payment: 0, claimant: [0; 32],
+            receipt: [1; 32],
+            parameter_context: context,
+            destination: [2; 32],
+            context: [3; 32],
+            settlement: 41,
+            payment_address: [0; 32],
+            payment: 0,
+            claimant: [0; 32],
         }];
         // Spend framing is opaque at this persistence boundary.
         let spends = vec![vec![4; 24]];
@@ -1542,82 +1937,236 @@ mod tests {
             let db = quil_store::RocksDb::open(directory.path()).unwrap();
             let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
             let prover = Arc::new(NoopInclusionProver);
-            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), prover.clone()));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                store.clone(),
+                prover.clone(),
+            ));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
             let stubs = crate::testing::NoopExecutionCrypto::new();
             let manager = ExecutionEngineManager::new(
-                prover, stubs.key_manager, crdt.clone(), stubs.circuit_compiler,
-                clock.clone(), Arc::new(crate::testing::NoopHypergraphConfigResolver), false,
+                prover,
+                stubs.key_manager,
+                crdt.clone(),
+                stubs.circuit_compiler,
+                clock.clone(),
+                Arc::new(crate::testing::NoopHypergraphConfigResolver),
+                false,
             );
             let state = HypergraphState::new(crdt.clone());
             let empty_snapshot = crdt.capture_committed_shard(&application).unwrap();
-            assert!(manager.snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0).unwrap().is_empty());
-            assert!(manager.snapshot_accumulator_report(store.as_ref(), &application, 0).is_err(),
-                "a live-store adapter cannot supply isolated recovery reads");
+            assert!(manager
+                .snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0)
+                .unwrap()
+                .is_empty());
+            assert!(
+                manager
+                    .snapshot_accumulator_report(store.as_ref(), &application, 0)
+                    .is_err(),
+                "a live-store adapter cannot supply isolated recovery reads"
+            );
             let output = Output {
                 owner: [7; IDENTITY_BYTES],
-                commitment: CommitmentKey::derive(&context).commit(7, &AmountOpening::from_seed(&context, &[8; 32])),
+                commitment: CommitmentKey::derive(&context)
+                    .commit(7, &AmountOpening::from_seed(&context, &[8; 32])),
                 memo: [0; 1115],
             };
-            let limits = crate::token_intrinsic::state::SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 1 << 12 };
+            let limits = crate::token_intrinsic::state::SnapshotLimits {
+                max_coins: 8,
+                max_depth: 32,
+                max_nodes: 1 << 12,
+            };
             let (address, tree) = roots::stage_coin(
-                &state, &network, &application, &context, 1, &output, &mut Default::default(), limits,
-            ).unwrap();
-            state.set(&application, &address, &vertex_adds_discriminator().unwrap(), 1,
-                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+                &state,
+                &network,
+                &application,
+                &context,
+                1,
+                &output,
+                &mut Default::default(),
+                limits,
+            )
+            .unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &vertex_adds_discriminator().unwrap(),
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
             roots::refresh_root(&state, &network, &application, limits).unwrap();
             state.commit().unwrap();
             state.abort();
             expected_report = manager.shard_accumulator_report(&application, 0).unwrap();
-            assert!(!expected_report.is_empty(), "the report must include uncommitted coin state");
-            assert!(manager.snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0).unwrap().is_empty(),
-                "snapshot reports must not include staged coins or the private summary");
+            assert!(
+                !expected_report.is_empty(),
+                "the report must include uncommitted coin state"
+            );
+            assert!(
+                manager
+                    .snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0)
+                    .unwrap()
+                    .is_empty(),
+                "snapshot reports must not include staged coins or the private summary"
+            );
 
             // Malformed history cannot commit the already-staged state/cursor.
-            assert!(manager.commit_frame_with_app_history(1, &application, 123, &settlements, &[vec![]], 0).is_err());
-            assert_eq!(manager.read_app_materialized_cursor(&application).unwrap(), 0);
+            assert!(manager
+                .commit_frame_with_app_history(1, &application, 123, &settlements, &[vec![]], 0)
+                .is_err());
+            assert_eq!(
+                manager.read_app_materialized_cursor(&application).unwrap(),
+                0
+            );
             store.fail_commit_for_test(true);
-            assert!(manager.commit_frame_with_app_history(1, &application, 123, &settlements, &spends, 0).is_err());
-            assert_eq!(manager.read_app_materialized_cursor(&application).unwrap(), 0);
-            assert!(clock.get_shard_frame_fee_total(&application, 1).unwrap().is_none());
-            assert!(clock.get_shard_frame_settlements(&application, 1).unwrap().is_none());
-            assert!(clock.get_shard_frame_spends(&application, 1).unwrap().is_none());
-            assert!(clock.get_shard_frame_accumulator(&application, 1).unwrap().is_none());
-            assert!(clock.get_shard_accumulator_report(&application, &accumulator_header::report_digest(&expected_report)).unwrap().is_none());
+            assert!(manager
+                .commit_frame_with_app_history(1, &application, 123, &settlements, &spends, 0)
+                .is_err());
+            assert_eq!(
+                manager.read_app_materialized_cursor(&application).unwrap(),
+                0
+            );
+            assert!(clock
+                .get_shard_frame_fee_total(&application, 1)
+                .unwrap()
+                .is_none());
+            assert!(clock
+                .get_shard_frame_settlements(&application, 1)
+                .unwrap()
+                .is_none());
+            assert!(clock
+                .get_shard_frame_spends(&application, 1)
+                .unwrap()
+                .is_none());
+            assert!(clock
+                .get_shard_frame_accumulator(&application, 1)
+                .unwrap()
+                .is_none());
+            assert!(clock
+                .get_shard_accumulator_report(
+                    &application,
+                    &accumulator_header::report_digest(&expected_report)
+                )
+                .unwrap()
+                .is_none());
             store.fail_commit_for_test(false);
-            assert_eq!(manager.commit_frame_with_app_history(1, &application, 123, &settlements, &spends, 0).unwrap(), expected_report);
-            assert_eq!(manager.shard_accumulator_report(&application, 0).unwrap(), expected_report,
-                "the report calculated before commit must match committed state");
+            assert_eq!(
+                manager
+                    .commit_frame_with_app_history(1, &application, 123, &settlements, &spends, 0)
+                    .unwrap(),
+                expected_report
+            );
+            assert_eq!(
+                manager.shard_accumulator_report(&application, 0).unwrap(),
+                expected_report,
+                "the report calculated before commit must match committed state"
+            );
             let committed = crdt.capture_committed_shard(&application).unwrap();
-            assert_eq!(manager.snapshot_accumulator_report(committed.records.as_ref(), &application, 0).unwrap(), expected_report);
-            assert!(manager.snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0).unwrap().is_empty(),
-                "an earlier snapshot stays empty after the live commit");
-            state.set(&application, &crate::token_intrinsic::state::BLOCK_SUMMARY_ADDRESS,
-                &vertex_adds_discriminator().unwrap(), 2, b"broken private summary".to_vec()).unwrap();
+            assert_eq!(
+                manager
+                    .snapshot_accumulator_report(committed.records.as_ref(), &application, 0)
+                    .unwrap(),
+                expected_report
+            );
+            assert!(
+                manager
+                    .snapshot_accumulator_report(empty_snapshot.records.as_ref(), &application, 0)
+                    .unwrap()
+                    .is_empty(),
+                "an earlier snapshot stays empty after the live commit"
+            );
+            state
+                .set(
+                    &application,
+                    &crate::token_intrinsic::state::BLOCK_SUMMARY_ADDRESS,
+                    &vertex_adds_discriminator().unwrap(),
+                    2,
+                    b"broken private summary".to_vec(),
+                )
+                .unwrap();
             state.commit().unwrap();
             state.abort();
             assert!(manager.shard_accumulator_report(&application, 0).is_err());
-            assert_eq!(manager.snapshot_accumulator_report(committed.records.as_ref(), &application, 0).unwrap(), expected_report,
-                "recovery reads block records and ignores live private-summary corruption");
+            assert_eq!(
+                manager
+                    .snapshot_accumulator_report(committed.records.as_ref(), &application, 0)
+                    .unwrap(),
+                expected_report,
+                "recovery reads block records and ignores live private-summary corruption"
+            );
         }
         // Every previous handle is dropped: reopen the real database, with no
         // outflow cache, and recover both the state and all future-header inputs.
         let db = quil_store::RocksDb::open(directory.path()).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = quil_hypergraph::HypergraphCrdt::new(store, Arc::new(NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
-        assert_eq!(crdt.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(&application)).unwrap(), 1);
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        assert_eq!(
+            crdt.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(
+                &application
+            ))
+            .unwrap(),
+            1
+        );
         let clock = quil_store::RocksClockStore::new(db.inner());
-        assert_eq!(clock.get_shard_frame_fee_total(&application, 1).unwrap(), Some(123));
-        assert_eq!(settlement_record::decode_entries(&clock.get_shard_frame_settlements(&application, 1).unwrap().unwrap()).unwrap(), settlements);
-        assert_eq!(spend_relay::decode_frame_entries(&clock.get_shard_frame_spends(&application, 1).unwrap().unwrap()).unwrap(), spends);
-        let digest = clock.get_shard_frame_accumulator(&application, 1).unwrap().unwrap();
+        assert_eq!(
+            clock.get_shard_frame_fee_total(&application, 1).unwrap(),
+            Some(123)
+        );
+        assert_eq!(
+            settlement_record::decode_entries(
+                &clock
+                    .get_shard_frame_settlements(&application, 1)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            settlements
+        );
+        assert_eq!(
+            spend_relay::decode_frame_entries(
+                &clock
+                    .get_shard_frame_spends(&application, 1)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            spends
+        );
+        let digest = clock
+            .get_shard_frame_accumulator(&application, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(digest, accumulator_header::report_digest(&expected_report));
-        assert_eq!(clock.get_shard_accumulator_report(&application, &digest).unwrap(), Some(expected_report.clone()));
+        assert_eq!(
+            clock
+                .get_shard_accumulator_report(&application, &digest)
+                .unwrap(),
+            Some(expected_report.clone())
+        );
         let state = HypergraphState::new(Arc::new(crdt));
-        assert_eq!(crate::token_intrinsic::shard_accumulator::shard_report(&state, &network, &application, &[], false)
-            .unwrap().unwrap().encode().unwrap(), expected_report);
+        assert_eq!(
+            crate::token_intrinsic::shard_accumulator::shard_report(
+                &state,
+                &network,
+                &application,
+                &[],
+                false
+            )
+            .unwrap()
+            .unwrap()
+            .encode()
+            .unwrap(),
+            expected_report
+        );
     }
 
     // =================================================================
@@ -1630,8 +2179,9 @@ mod tests {
         use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
         use crate::token_intrinsic::{coin_blocks, roots, state};
         use quil_lattice_ct::confidential::{
-            coin_tree::Frontier, AmountOpening, CommitmentKey,
+            coin_tree::Frontier,
             transfer::{network_identifier, parameter_context},
+            AmountOpening, CommitmentKey,
         };
         let source = build_manager(false);
         let recovered = build_manager(false);
@@ -1650,58 +2200,142 @@ mod tests {
         // and stale data outside this shard, as after reassignment or a split.
         for (seed, width, path) in [(1u8, 6, 0), (2, 8, 1), (3, 8, 128)] {
             let block = coin_blocks::block_id(width, path).unwrap();
-            let mut frontier = Frontier::new(&context, usize::from(coin_blocks::SUBTREE_BITS)).unwrap();
-            let commitment = key.commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32]));
-            frontier.append(&[seed; IDENTITY_BYTES], &commitment).unwrap();
-            let root = frontier.root_at_depth(usize::from(coin_blocks::SUBTREE_BITS)).unwrap().root;
+            let mut frontier =
+                Frontier::new(&context, usize::from(coin_blocks::SUBTREE_BITS)).unwrap();
+            let commitment = key.commit(
+                u128::from(seed),
+                &AmountOpening::from_seed(&context, &[seed; 32]),
+            );
+            frontier
+                .append(&[seed; IDENTITY_BYTES], &commitment)
+                .unwrap();
+            let root = frontier
+                .root_at_depth(usize::from(coin_blocks::SUBTREE_BITS))
+                .unwrap()
+                .root;
             summary.put(block, frontier.count(), root.clone()).unwrap();
-            for (tag, bytes) in [(state::BLOCK_FRONTIER_TAG, frontier.encode()),
-                                 (state::BLOCK_ROOT_TAG, root.to_bytes().to_vec())] {
+            for (tag, bytes) in [
+                (state::BLOCK_FRONTIER_TAG, frontier.encode()),
+                (state::BLOCK_ROOT_TAG, root.to_bytes().to_vec()),
+            ] {
                 let address = state::block_record_address(tag, block);
-                before.set(&application, &address, &disc, 0, bytes.clone()).unwrap();
-                imported.set(&application, &address, &disc, 0, bytes.clone()).unwrap();
+                before
+                    .set(&application, &address, &disc, 0, bytes.clone())
+                    .unwrap();
+                imported
+                    .set(&application, &address, &disc, 0, bytes.clone())
+                    .unwrap();
                 saved.push((address, bytes));
             }
         }
-        before.set(&application, &state::BLOCK_SUMMARY_ADDRESS, &disc, 0, summary.encode()).unwrap();
+        before
+            .set(
+                &application,
+                &state::BLOCK_SUMMARY_ADDRESS,
+                &disc,
+                0,
+                summary.encode(),
+            )
+            .unwrap();
         before.commit().unwrap();
         imported.commit().unwrap();
         imported.abort();
         let expected = source.shard_accumulator_report(&filter, 0).unwrap();
         assert!(!expected.is_empty());
-        assert!(recovered.shard_accumulator_report(&filter, 0).unwrap().is_empty(),
-            "imported block data alone did not populate the private summary");
+        assert!(
+            recovered
+                .shard_accumulator_report(&filter, 0)
+                .unwrap()
+                .is_empty(),
+            "imported block data alone did not populate the private summary"
+        );
         recovered.rebuild_block_summary_before_report(&filter);
-        assert_eq!(recovered.commit_frame_with_app_history(76, &filter, 0, &[], &[], 0).unwrap(), expected,
-            "the first replay after sync must record the inherited coins");
-        assert_eq!(roots::block_summary(&imported, &application).unwrap().blocks.len(), 2,
-            "the rebuilt private summary excludes stale data outside the covered range");
+        assert_eq!(
+            recovered
+                .commit_frame_with_app_history(76, &filter, 0, &[], &[], 0)
+                .unwrap(),
+            expected,
+            "the first replay after sync must record the inherited coins"
+        );
+        assert_eq!(
+            roots::block_summary(&imported, &application)
+                .unwrap()
+                .blocks
+                .len(),
+            2,
+            "the rebuilt private summary excludes stale data outside the covered range"
+        );
 
         // A nonempty summary from the old allocation must be rebuilt as well.
-        summary.blocks.retain(|(block, _, _)| !coin_blocks::shard_owns_block(&shard, *block));
-        imported.set(&application, &state::BLOCK_SUMMARY_ADDRESS, &disc, 0, summary.encode()).unwrap();
+        summary
+            .blocks
+            .retain(|(block, _, _)| !coin_blocks::shard_owns_block(&shard, *block));
+        imported
+            .set(
+                &application,
+                &state::BLOCK_SUMMARY_ADDRESS,
+                &disc,
+                0,
+                summary.encode(),
+            )
+            .unwrap();
         imported.commit().unwrap();
         imported.abort();
-        assert!(recovered.shard_accumulator_report(&filter, 0).unwrap().is_empty());
+        assert!(recovered
+            .shard_accumulator_report(&filter, 0)
+            .unwrap()
+            .is_empty());
         recovered.rebuild_block_summary_before_report(&filter);
-        assert_eq!(recovered.shard_accumulator_report(&filter, 0).unwrap(), expected);
+        assert_eq!(
+            recovered.shard_accumulator_report(&filter, 0).unwrap(),
+            expected
+        );
 
         // A damaged import must fail before replacing the summary. Retrying
         // after its block is repaired needs no second invalidation signal.
-        let (address, bytes) = saved.iter().find(|(address, _)| *address ==
-            state::block_record_address(state::BLOCK_ROOT_TAG, coin_blocks::block_id(6, 0).unwrap())).unwrap();
-        let previous = roots::block_summary(&imported, &application).unwrap().encode();
-        imported.set(&application, address, &disc, 0,
-            quil_lattice_ct::confidential::relation::membership::Node::zero().to_bytes().to_vec()).unwrap();
+        let (address, bytes) = saved
+            .iter()
+            .find(|(address, _)| {
+                *address
+                    == state::block_record_address(
+                        state::BLOCK_ROOT_TAG,
+                        coin_blocks::block_id(6, 0).unwrap(),
+                    )
+            })
+            .unwrap();
+        let previous = roots::block_summary(&imported, &application)
+            .unwrap()
+            .encode();
+        imported
+            .set(
+                &application,
+                address,
+                &disc,
+                0,
+                quil_lattice_ct::confidential::relation::membership::Node::zero()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
         imported.commit().unwrap();
         imported.abort();
         recovered.rebuild_block_summary_before_report(&filter);
         assert!(recovered.shard_accumulator_report(&filter, 0).is_err());
-        assert_eq!(roots::block_summary(&imported, &application).unwrap().encode(), previous);
-        imported.set(&application, address, &disc, 0, bytes.clone()).unwrap();
+        assert_eq!(
+            roots::block_summary(&imported, &application)
+                .unwrap()
+                .encode(),
+            previous
+        );
+        imported
+            .set(&application, address, &disc, 0, bytes.clone())
+            .unwrap();
         imported.commit().unwrap();
         imported.abort();
-        assert_eq!(recovered.shard_accumulator_report(&filter, 0).unwrap(), expected);
+        assert_eq!(
+            recovered.shard_accumulator_report(&filter, 0).unwrap(),
+            expected
+        );
     }
 
     #[cfg(feature = "confidential-tokens")]
@@ -1713,11 +2347,20 @@ mod tests {
         let application = [99; 32];
         let filter = quil_forest::encode_shard_bit_path(&application, &[true, false, true]);
         manager.rebuild_block_summary_before_report(&filter);
-        assert!(manager.shard_accumulator_report(&filter, 0).unwrap().is_empty());
+        assert!(manager
+            .shard_accumulator_report(&filter, 0)
+            .unwrap()
+            .is_empty());
         let state = HypergraphState::new(manager.crdt());
         let disc = vertex_adds_discriminator().unwrap();
-        assert!(state.get(&application, &BLOCK_SUMMARY_ADDRESS, &disc).unwrap().is_none());
-        assert!(state.get(&application, &ROOT_ADDRESS, &disc).unwrap().is_none());
+        assert!(state
+            .get(&application, &BLOCK_SUMMARY_ADDRESS, &disc)
+            .unwrap()
+            .is_none());
+        assert!(state
+            .get(&application, &ROOT_ADDRESS, &disc)
+            .unwrap()
+            .is_none());
     }
 
     /// The frames of a shard holding the whole application are stored under
@@ -1728,7 +2371,10 @@ mod tests {
     #[test]
     fn the_executing_filter_of_a_whole_application_is_its_address() {
         let application = [3u8; 32];
-        assert_eq!(super::executing_filter(&application, &[]), application.to_vec());
+        assert_eq!(
+            super::executing_filter(&application, &[]),
+            application.to_vec()
+        );
         for shard in [vec![false], vec![true, false, true]] {
             let filter = super::executing_filter(&application, &shard);
             assert_eq!(
@@ -1738,7 +2384,10 @@ mod tests {
         }
         // Both forms decode to the same application, and only the bare one is
         // what a whole-application shard files its frames under.
-        assert_ne!(super::executing_filter(&application, &[]), quil_forest::encode_shard_bit_path(&application, &[]));
+        assert_ne!(
+            super::executing_filter(&application, &[]),
+            quil_forest::encode_shard_bit_path(&application, &[])
+        );
     }
 
     /// A bundle whose operations all commit through the global frame must be
@@ -1759,25 +2408,57 @@ mod tests {
         let context = parameter_context(&network, &application);
         let mut proof = vec![0; 40];
         proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        let transfer = Transfer { statement: TransferStatement { network, application, depth: 1,
-            root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(), images: vec![[5; IDENTITY_BYTES]], fee: 7,
-            outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
-                owner: [3; IDENTITY_BYTES], memo: [4; MEMO_BYTES] }] }, proof }.encode().unwrap();
+        let transfer = Transfer {
+            statement: TransferStatement {
+                network,
+                application,
+                depth: 1,
+                root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+                images: vec![[5; IDENTITY_BYTES]],
+                fee: 7,
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context)
+                        .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+                    owner: [3; IDENTITY_BYTES],
+                    memo: [4; MEMO_BYTES],
+                }],
+            },
+            proof,
+        }
+        .encode()
+        .unwrap();
         // Something that is not relayed: an app-venue operation of another kind.
         let mut app_venue = vec![0u8; 16];
         app_venue[..4].copy_from_slice(&0x0999u32.to_be_bytes());
-        assert!(!crate::token_intrinsic::spend_entries::commits_globally(&application, 0x0999));
-        let bundle = |requests: Vec<Vec<u8>>| CanonicalMessageBundle {
-            requests: requests.into_iter().map(|r| Some(CanonicalMessageRequest::wrap(r).unwrap())).collect(), timestamp: 0,
-        }.to_canonical_bytes().unwrap();
+        assert!(!crate::token_intrinsic::spend_entries::commits_globally(
+            &application,
+            0x0999
+        ));
+        let bundle = |requests: Vec<Vec<u8>>| {
+            CanonicalMessageBundle {
+                requests: requests
+                    .into_iter()
+                    .map(|r| Some(CanonicalMessageRequest::wrap(r).unwrap()))
+                    .collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
         let manager = build_manager(true);
 
         assert!(manager.message_commits_globally(&application, &bundle(vec![transfer.clone()])));
         // A single request, not wrapped in a bundle, is the wallet's own shape.
-        let single = CanonicalMessageRequest::wrap(transfer.clone()).unwrap().to_canonical_bytes().unwrap();
+        let single = CanonicalMessageRequest::wrap(transfer.clone())
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
         assert!(manager.message_commits_globally(&application, &single));
         // Mixed, empty and malformed stay on the app vote.
-        assert!(!manager.message_commits_globally(&application, &bundle(vec![transfer.clone(), app_venue.clone()])));
+        assert!(!manager.message_commits_globally(
+            &application,
+            &bundle(vec![transfer.clone(), app_venue.clone()])
+        ));
         assert!(!manager.message_commits_globally(&application, &bundle(vec![])));
         assert!(!manager.message_commits_globally(&application, &[0, 1]));
     }
@@ -1799,17 +2480,54 @@ mod tests {
         let context = parameter_context(&network, &domains::QUIL_TOKEN);
         let mut proof = vec![0; 40];
         proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        let transfer = Transfer { statement: TransferStatement { network, application: domains::QUIL_TOKEN, depth: 1,
-            root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(), images: vec![[5; IDENTITY_BYTES]], fee: 7,
-            outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
-                owner: [3; IDENTITY_BYTES], memo: [4; MEMO_BYTES] }] }, proof }.encode().unwrap();
+        let transfer = Transfer {
+            statement: TransferStatement {
+                network,
+                application: domains::QUIL_TOKEN,
+                depth: 1,
+                root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+                images: vec![[5; IDENTITY_BYTES]],
+                fee: 7,
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context)
+                        .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+                    owner: [3; IDENTITY_BYTES],
+                    memo: [4; MEMO_BYTES],
+                }],
+            },
+            proof,
+        }
+        .encode()
+        .unwrap();
         let app = [0x44; 32];
-        let claim = SettlementClaim { network, application: app, cited_global_frame: 1, global_root: [0; 32], receipt: [9; 32],
-            settlement: 500, context: [8; 32], payment_address: [0; 32], payment: 0, forest_proof: vec![1; 8],
-            claimant_key_type: 0, claimant_public_key: Vec::new(), claimant_signature: Vec::new() }.encode().unwrap();
-        let bundle = |requests: Vec<Vec<u8>>| CanonicalMessageBundle {
-            requests: requests.into_iter().map(|r| Some(CanonicalMessageRequest::wrap(r).unwrap())).collect(), timestamp: 0,
-        }.to_canonical_bytes().unwrap();
+        let claim = SettlementClaim {
+            network,
+            application: app,
+            cited_global_frame: 1,
+            global_root: [0; 32],
+            receipt: [9; 32],
+            settlement: 500,
+            context: [8; 32],
+            payment_address: [0; 32],
+            payment: 0,
+            forest_proof: vec![1; 8],
+            claimant_key_type: 0,
+            claimant_public_key: Vec::new(),
+            claimant_signature: Vec::new(),
+        }
+        .encode()
+        .unwrap();
+        let bundle = |requests: Vec<Vec<u8>>| {
+            CanonicalMessageBundle {
+                requests: requests
+                    .into_iter()
+                    .map(|r| Some(CanonicalMessageRequest::wrap(r).unwrap()))
+                    .collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
         let manager = build_manager(true);
         let mixed = bundle(vec![claim.clone(), transfer.clone()]);
         // Native-proof builds relay the transfer and credit its fee only at
@@ -1819,17 +2537,45 @@ mod tests {
         let expected_transfer_fee = 0;
         #[cfg(not(feature = "native-proof"))]
         let expected_transfer_fee = 7;
-        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &mixed).unwrap(), expected_transfer_fee);
+        assert_eq!(
+            manager
+                .message_token_fees(&domains::QUIL_TOKEN, &mixed)
+                .unwrap(),
+            expected_transfer_fee
+        );
         // An unverified settlement claim never contributes QUIL-venue fees.
-        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &bundle(vec![claim.clone()])).unwrap(), 0);
+        assert_eq!(
+            manager
+                .message_token_fees(&domains::QUIL_TOKEN, &bundle(vec![claim.clone()]))
+                .unwrap(),
+            0
+        );
         // Exercise single-request framing as well as a mixed bundle.
-        let single = CanonicalMessageRequest::wrap(transfer.clone()).unwrap().to_canonical_bytes().unwrap();
-        assert_eq!(manager.message_token_fees(&domains::QUIL_TOKEN, &single).unwrap(), expected_transfer_fee);
+        let single = CanonicalMessageRequest::wrap(transfer.clone())
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        assert_eq!(
+            manager
+                .message_token_fees(&domains::QUIL_TOKEN, &single)
+                .unwrap(),
+            expected_transfer_fee
+        );
         // Another application: only the claim it verified, never QUIL fees it skipped.
         assert_eq!(manager.message_token_fees(&app, &mixed).unwrap(), 500);
-        assert_eq!(manager.message_token_fees(&app, &bundle(vec![transfer.clone()])).unwrap(), 0);
+        assert_eq!(
+            manager
+                .message_token_fees(&app, &bundle(vec![transfer.clone()]))
+                .unwrap(),
+            0
+        );
         // The global intrinsic credits nothing for application operations it skips.
-        assert_eq!(manager.message_token_fees(&domains::GLOBAL, &mixed).unwrap(), 0);
+        assert_eq!(
+            manager
+                .message_token_fees(&domains::GLOBAL, &mixed)
+                .unwrap(),
+            0
+        );
     }
 
     #[cfg(feature = "confidential-tokens")]
@@ -1847,32 +2593,97 @@ mod tests {
         let mut proof = vec![0; 40];
         proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
         // Structural fixture: framing only, no valid proof.
-        let inner = Transfer { statement: TransferStatement { network, application, depth: 1,
-            root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(), images: vec![[5; IDENTITY_BYTES]], fee: 7,
-            outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
-                owner: [3; IDENTITY_BYTES], memo: [4; MEMO_BYTES] }] }, proof }.encode().unwrap();
+        let inner = Transfer {
+            statement: TransferStatement {
+                network,
+                application,
+                depth: 1,
+                root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+                images: vec![[5; IDENTITY_BYTES]],
+                fee: 7,
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context)
+                        .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+                    owner: [3; IDENTITY_BYTES],
+                    memo: [4; MEMO_BYTES],
+                }],
+            },
+            proof,
+        }
+        .encode()
+        .unwrap();
         let request = CanonicalMessageRequest::wrap(inner.clone()).unwrap();
-        let other = CanonicalMessageRequest::wrap(vec![0x00, 0x04, 0x04, 0x00, 1, 2, 3, 4]).unwrap();
-        let bundle = |requests: Vec<CanonicalMessageRequest>| CanonicalMessageBundle {
-            requests: requests.into_iter().map(Some).collect(), timestamp: 0,
-        }.to_canonical_bytes().unwrap();
+        let other =
+            CanonicalMessageRequest::wrap(vec![0x00, 0x04, 0x04, 0x00, 1, 2, 3, 4]).unwrap();
+        let bundle = |requests: Vec<CanonicalMessageRequest>| {
+            CanonicalMessageBundle {
+                requests: requests.into_iter().map(Some).collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
         for include_global in [true, false] {
             let manager = build_manager(include_global);
             // Token cost is the staged state growth, not the payload length.
-            let expected = BigInt::from(crate::token_intrinsic::cost::state_growth(&inner).unwrap());
+            let expected =
+                BigInt::from(crate::token_intrinsic::cost::state_growth(&inner).unwrap());
             assert!(expected > BigInt::from(0));
-            assert_eq!(manager.get_cost(&request.to_canonical_bytes().unwrap()).unwrap(), expected);
-            assert_eq!(manager.get_cost(&bundle(vec![request.clone(), request.clone()])).unwrap(), &expected * 2u8);
+            assert_eq!(
+                manager
+                    .get_cost(&request.to_canonical_bytes().unwrap())
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                manager
+                    .get_cost(&bundle(vec![request.clone(), request.clone()]))
+                    .unwrap(),
+                &expected * 2u8
+            );
             // Non-token requests retain their current cost, in either order.
-            assert_eq!(manager.get_cost(&other.to_canonical_bytes().unwrap()).unwrap(), BigInt::from(0));
-            assert_eq!(manager.get_cost(&bundle(vec![request.clone(), other.clone()])).unwrap(), expected);
-            assert_eq!(manager.get_cost(&bundle(vec![other.clone(), request.clone()])).unwrap(), expected);
-            assert_eq!(manager.get_cost(&bundle(vec![request.clone(), other.clone(), request.clone()])).unwrap(), &expected * 2u8);
-            let with_empty_slots = CanonicalMessageBundle { requests: vec![None, Some(other.clone()), Some(request.clone()), None], timestamp: 0 }.to_canonical_bytes().unwrap();
+            assert_eq!(
+                manager
+                    .get_cost(&other.to_canonical_bytes().unwrap())
+                    .unwrap(),
+                BigInt::from(0)
+            );
+            assert_eq!(
+                manager
+                    .get_cost(&bundle(vec![request.clone(), other.clone()]))
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                manager
+                    .get_cost(&bundle(vec![other.clone(), request.clone()]))
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                manager
+                    .get_cost(&bundle(vec![
+                        request.clone(),
+                        other.clone(),
+                        request.clone()
+                    ]))
+                    .unwrap(),
+                &expected * 2u8
+            );
+            let with_empty_slots = CanonicalMessageBundle {
+                requests: vec![None, Some(other.clone()), Some(request.clone()), None],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
             assert_eq!(manager.get_cost(&with_empty_slots).unwrap(), expected);
-            let mut malformed = bundle(vec![request.clone()]); malformed.pop();
+            let mut malformed = bundle(vec![request.clone()]);
+            malformed.pop();
             assert!(manager.get_cost(&malformed).is_err());
-            assert_eq!(manager.get_cost(&bundle(Vec::new())).unwrap(), BigInt::from(0));
+            assert_eq!(
+                manager.get_cost(&bundle(Vec::new())).unwrap(),
+                BigInt::from(0)
+            );
             assert_eq!(manager.get_cost(b"\x00\x00").unwrap(), BigInt::from(0));
         }
     }
@@ -1897,24 +2708,51 @@ mod tests {
         // Structural validation only: no valid signature or native proof.
         let tx = Shield {
             statement: ShieldStatement {
-                network, application, transparent_address: [3; 32],
-                owner_public_key: [4; 57], amount: 12, fee: 2,
-                outputs: vec![Output { commitment: key.commit(10, &opening),
-                    owner: [5; IDENTITY_BYTES], memo: [6; MEMO_BYTES] }],
+                network,
+                application,
+                transparent_address: [3; 32],
+                owner_public_key: [4; 57],
+                amount: 12,
+                fee: 2,
+                outputs: vec![Output {
+                    commitment: key.commit(10, &opening),
+                    owner: [5; IDENTITY_BYTES],
+                    memo: [6; MEMO_BYTES],
+                }],
             },
-            signature: [0; 114], proof,
+            signature: [0; 114],
+            proof,
         };
-        let wrap = |bytes| crate::message_envelope::CanonicalMessageRequest::wrap(bytes)
-            .unwrap().to_canonical_bytes().unwrap();
+        let wrap = |bytes| {
+            crate::message_envelope::CanonicalMessageRequest::wrap(bytes)
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap()
+        };
         let bytes = wrap(tx.encode().unwrap());
         let policy = TokenPolicy {
-            network, limits: CompileLimits { max_inputs: 2, max_outputs: 2, max_depth: 3 },
-            snapshots: SnapshotLimits { max_coins: 8, max_depth: 3, max_nodes: 24 },
-            native_budget: NativeBudget { max_native_bytes: 0 },
+            network,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 3,
+            },
+            snapshots: SnapshotLimits {
+                max_coins: 8,
+                max_depth: 3,
+                max_nodes: 24,
+            },
+            native_budget: NativeBudget {
+                max_native_bytes: 0,
+            },
         };
         let directory = tempfile::tempdir().unwrap();
-        let worker = WorkerVerifier::new(directory.path().join("absent-worker"), 1,
-            std::time::Duration::from_secs(2)).unwrap();
+        let worker = WorkerVerifier::new(
+            directory.path().join("absent-worker"),
+            1,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
         for global in [false, true] {
             let manager = build_manager(global);
             assert!(manager.validate_message(2, &application, &bytes).is_err());
@@ -1924,19 +2762,31 @@ mod tests {
             let mut other = tx.clone();
             other.statement.network = [9; 32];
             let wrong_context = wrap(other.encode().unwrap());
-            assert!(manager.validate_message(2, &application, &wrong_context).is_err());
+            assert!(manager
+                .validate_message(2, &application, &wrong_context)
+                .is_err());
             // Configuration must preserve the original execution venue.
             let mut mint = tx.encode().unwrap();
             mint[..4].copy_from_slice(&crate::token_engine::TYPE_LATTICE_MINT.to_be_bytes());
-            let error = manager.validate_message(2, &application, &wrap(mint)).unwrap_err().to_string();
-            assert_eq!(error.contains("requires serialized global execution"), !global);
+            let error = manager
+                .validate_message(2, &application, &wrap(mint))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error.contains("requires serialized global execution"),
+                !global
+            );
         }
         let mut missing = build_manager(true);
         missing.engines.get_mut().unwrap().remove("token");
         assert!(missing.with_token_worker(policy, worker.clone()).is_err());
         let mut wrong = build_manager(true);
         let compute = wrong.engines.get_mut().unwrap().remove("compute").unwrap();
-        wrong.engines.get_mut().unwrap().insert("token".into(), compute);
+        wrong
+            .engines
+            .get_mut()
+            .unwrap()
+            .insert("token".into(), compute);
         assert!(wrong.with_token_worker(policy, worker).is_err());
     }
 
@@ -2112,10 +2962,16 @@ mod tests {
         // at 0xff*32; select_engine must route each to the right engine.
         // Covers token/compute/hypergraph deployed-app routing.
         use crate::hypergraph_state::HypergraphState;
-        let cases: [( [u8; 32], &str); 3] = [
-            (crate::token_intrinsic::constants::token_base_domain(), "token"),
+        let cases: [([u8; 32], &str); 3] = [
+            (
+                crate::token_intrinsic::constants::token_base_domain(),
+                "token",
+            ),
             (crate::domains::COMPUTE, "compute"),
-            (crate::hypergraph_intrinsic::hypergraph_base_domain(), "hypergraph"),
+            (
+                crate::hypergraph_intrinsic::hypergraph_base_domain(),
+                "hypergraph",
+            ),
         ];
         for (i, (type_domain, expected_engine)) in cases.iter().enumerate() {
             let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
@@ -2240,32 +3096,87 @@ mod tests {
             seen: Arc<std::sync::Mutex<Vec<FrameExecutionContext>>>,
         }
         impl ShardExecutionEngine for Recorder {
-            fn get_name(&self) -> &str { self.inner.get_name() }
-            fn validate_message(&self,f:u64,a:&[u8],m:&[u8])->Result<()> { self.inner.validate_message(f,a,m) }
-            fn process_message(&self,_:u64,_:&BigInt,_:&[u8],_:&[u8])->Result<ProcessMessageResult> {
+            fn get_name(&self) -> &str {
+                self.inner.get_name()
+            }
+            fn validate_message(&self, f: u64, a: &[u8], m: &[u8]) -> Result<()> {
+                self.inner.validate_message(f, a, m)
+            }
+            fn process_message(
+                &self,
+                _: u64,
+                _: &BigInt,
+                _: &[u8],
+                _: &[u8],
+            ) -> Result<ProcessMessageResult> {
                 panic!("manager must forward explicit execution context")
             }
-            fn process_message_with_context(&self,c:FrameExecutionContext,fee:&BigInt,a:&[u8],m:&[u8])->Result<ProcessMessageResult> {
+            fn process_message_with_context(
+                &self,
+                c: FrameExecutionContext,
+                fee: &BigInt,
+                a: &[u8],
+                m: &[u8],
+            ) -> Result<ProcessMessageResult> {
                 self.seen.lock().unwrap().push(c);
-                self.inner.process_message_with_context(c,fee,a,m)
+                self.inner.process_message_with_context(c, fee, a, m)
             }
-            fn prove(&self,a:&[u8],f:u64,m:&[u8])->Result<quil_types::proto::global::MessageRequest> { self.inner.prove(a,f,m) }
-            fn lock(&self,f:u64,a:&[u8],m:&[u8])->Result<Vec<Vec<u8>>> { self.inner.lock(f,a,m) }
-            fn unlock(&self)->Result<()> { self.inner.unlock() }
-            fn get_cost(&self,m:&[u8])->Result<BigInt> { self.inner.get_cost(m) }
-            fn get_capabilities(&self)->Vec<node::Capability> { self.inner.get_capabilities() }
+            fn prove(
+                &self,
+                a: &[u8],
+                f: u64,
+                m: &[u8],
+            ) -> Result<quil_types::proto::global::MessageRequest> {
+                self.inner.prove(a, f, m)
+            }
+            fn lock(&self, f: u64, a: &[u8], m: &[u8]) -> Result<Vec<Vec<u8>>> {
+                self.inner.lock(f, a, m)
+            }
+            fn unlock(&self) -> Result<()> {
+                self.inner.unlock()
+            }
+            fn get_cost(&self, m: &[u8]) -> Result<BigInt> {
+                self.inner.get_cost(m)
+            }
+            fn get_capabilities(&self) -> Vec<node::Capability> {
+                self.inner.get_capabilities()
+            }
         }
-        let m=build_manager(false);
-        let seen=Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m = build_manager(false);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         {
-            let mut engines=m.engines.write().unwrap();
-            let inner=engines.remove("token").unwrap();
-            engines.insert("token".into(),Box::new(Recorder { inner,seen:seen.clone() }));
+            let mut engines = m.engines.write().unwrap();
+            let inner = engines.remove("token").unwrap();
+            engines.insert(
+                "token".into(),
+                Box::new(Recorder {
+                    inner,
+                    seen: seen.clone(),
+                }),
+            );
         }
-        let context=FrameExecutionContext { frame_number:7,finalized_global_frame:Some(913), venue: None, shard: quil_types::execution::ShardPath::WHOLE };
-        m.process_message_with_context(context,&BigInt::from(0),&domains::QUIL_TOKEN,b"").unwrap();
-        m.process_message(8,&BigInt::from(0),&domains::QUIL_TOKEN,b"").unwrap();
-        assert_eq!(*seen.lock().unwrap(),vec![context,FrameExecutionContext { frame_number:8,finalized_global_frame:None, venue: None, shard: quil_types::execution::ShardPath::WHOLE }]);
+        let context = FrameExecutionContext {
+            frame_number: 7,
+            finalized_global_frame: Some(913),
+            venue: None,
+            shard: quil_types::execution::ShardPath::WHOLE,
+        };
+        m.process_message_with_context(context, &BigInt::from(0), &domains::QUIL_TOKEN, b"")
+            .unwrap();
+        m.process_message(8, &BigInt::from(0), &domains::QUIL_TOKEN, b"")
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                context,
+                FrameExecutionContext {
+                    frame_number: 8,
+                    finalized_global_frame: None,
+                    venue: None,
+                    shard: quil_types::execution::ShardPath::WHOLE
+                }
+            ]
+        );
     }
 
     #[test]
@@ -2307,8 +3218,7 @@ mod tests {
         let cfg = crate::token_intrinsic::config::TokenConfiguration {
             behavior: (crate::token_intrinsic::constants::DIVISIBLE
                 | crate::token_intrinsic::constants::ACCEPTABLE
-                | crate::token_intrinsic::constants::EXPIRABLE)
-                as u32,
+                | crate::token_intrinsic::constants::EXPIRABLE) as u32,
             owner_public_key: vec![0x01u8; 32],
             ..Default::default()
         };

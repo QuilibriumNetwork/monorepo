@@ -364,7 +364,10 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
         // Signed far outside the inclusion epoch.
         frame_number: 10_000_000,
         public_key_signature_bls48581: Some(quil_execution::global_intrinsic::AddressedSignature {
-            signature: vec![0; quil_execution::global_intrinsic::AddressedSignature::SIG_LEN_SINGLE],
+            signature: vec![
+                0;
+                quil_execution::global_intrinsic::AddressedSignature::SIG_LEN_SINGLE
+            ],
             address: vec![9; 32],
         }),
         filters: vec![vec![1; 32]],
@@ -373,9 +376,13 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
     };
     let bundle = quil_types::proto::global::MessageBundle {
         requests: vec![quil_types::proto::global::MessageRequest {
-            request: Some(quil_types::proto::global::message_request::Request::Confirm(
-                quil_execution::global_intrinsic::conversions::prover_confirm_to_proto(&confirm),
-            )),
+            request: Some(
+                quil_types::proto::global::message_request::Request::Confirm(
+                    quil_execution::global_intrinsic::conversions::prover_confirm_to_proto(
+                        &confirm,
+                    ),
+                ),
+            ),
             ..Default::default()
         }],
         ..Default::default()
@@ -392,9 +399,16 @@ fn a_refusal_in_one_proposal_spares_the_next_on_the_same_parent() {
             .unwrap();
         let state = lease.prove(&[]).unwrap();
         assert!(state.state.messages.is_empty());
-        let reason = rig.leader.refused_message(&raw).expect("the branch's refusal is the node's");
+        let reason = rig
+            .leader
+            .refused_message(&raw)
+            .expect("the branch's refusal is the node's");
         assert!(reason.contains("inclusion epoch"), "{reason}");
-        assert_eq!(rig.leader.refusals_reused(), proposal, "validated only by the first proposal");
+        assert_eq!(
+            rig.leader.refusals_reused(),
+            proposal,
+            "validated only by the first proposal"
+        );
     }
     assert_eq!(rig.collector.total_pending(), 1, "the public pool keeps it");
 }
@@ -453,12 +467,21 @@ fn selected_parent_rejects_context_ancestry_body_and_state_substitution() {
     }
     // Once authenticated, the parent is used as it is: a substituted body
     // at its identity is never read.
-    assert!(rig.executor.prepare(context, 1, &rig.blocks, &rig.verifier, false).is_ok());
+    assert!(rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .is_ok());
     let mut bad = parent.clone();
     bad.requests.clear();
     let blocks = BlockStore::new();
-    blocks.put(context.parent, crate::consensus_wire::encode_global_frame(&bad).unwrap());
-    assert!(rig.executor.prepare(context, 1, &blocks, &rig.verifier, false).is_ok());
+    blocks.put(
+        context.parent,
+        crate::consensus_wire::encode_global_frame(&bad).unwrap(),
+    );
+    assert!(rig
+        .executor
+        .prepare(context, 1, &blocks, &rig.verifier, false)
+        .is_ok());
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
 }
 
@@ -482,10 +505,25 @@ fn proposal_pacing_runs_until_the_parent_timestamp_and_no_longer_than_an_interva
         seam.proposal_pacing(rig.context(&paced))
     };
     let wait = pacing(now_ms + 5_000).expect("a parent five seconds ahead");
-    assert!(wait > std::time::Duration::from_millis(4_000) && wait <= std::time::Duration::from_millis(5_000), "{wait:?}");
-    assert_eq!(pacing(now_ms + 60_000), Some(std::time::Duration::from_millis(10_000)), "one interval at most");
-    assert_eq!(pacing(now_ms - 1_000), None, "a parent in the past needs none");
-    assert_eq!(crate::leader_provider::proposal_pacing_wait(0, 5), std::time::Duration::ZERO);
+    assert!(
+        wait > std::time::Duration::from_millis(4_000)
+            && wait <= std::time::Duration::from_millis(5_000),
+        "{wait:?}"
+    );
+    assert_eq!(
+        pacing(now_ms + 60_000),
+        Some(std::time::Duration::from_millis(10_000)),
+        "one interval at most"
+    );
+    assert_eq!(
+        pacing(now_ms - 1_000),
+        None,
+        "a parent in the past needs none"
+    );
+    assert_eq!(
+        crate::leader_provider::proposal_pacing_wait(0, 5),
+        std::time::Duration::ZERO
+    );
 }
 
 /// A voter whose own execution is busy (a proposal, verification or
@@ -504,23 +542,39 @@ fn a_busy_voter_defers_and_then_votes_on_the_same_proposal() {
     let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
     let seam = rig.seam(&parent);
 
-    let lease = rig.executor.prepare(context, 1, &rig.blocks, &rig.verifier, false).unwrap();
+    let lease = rig
+        .executor
+        .prepare(context, 1, &rig.blocks, &rig.verifier, false)
+        .unwrap();
     assert!(rig.executor.busy());
-    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err());
-    assert!(!seam.verify_with_context(context, id(&child), Some(encoded.clone())), "no deferral: no vote");
+    assert!(seam
+        .verify_or_defer(context, id(&child), Some(encoded.clone()))
+        .is_err());
+    assert!(
+        !seam.verify_with_context(context, id(&child), Some(encoded.clone())),
+        "no deferral: no vote"
+    );
     drop(lease);
 
     let frame_lock = rig.source.frame_execution.lock().unwrap();
     assert!(rig.executor.busy());
-    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err());
+    assert!(seam
+        .verify_or_defer(context, id(&child), Some(encoded.clone()))
+        .is_err());
     drop(frame_lock);
 
     assert!(!rig.executor.busy());
     let mut bad = child.clone();
     bad.header.as_mut().unwrap().frame_number += 1;
     let bad_bytes = crate::consensus_wire::encode_global_frame(&bad).unwrap();
-    assert_eq!(seam.verify_or_defer(context, id(&bad), Some(bad_bytes)), Ok(false));
-    assert_eq!(seam.verify_or_defer(context, id(&child), Some(encoded)), Ok(true));
+    assert_eq!(
+        seam.verify_or_defer(context, id(&bad), Some(bad_bytes)),
+        Ok(false)
+    );
+    assert_eq!(
+        seam.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true)
+    );
     assert!(!rig.executor.busy(), "a vote releases the lease");
 }
 
@@ -540,17 +594,39 @@ fn a_voter_lets_its_finalized_parent_publish_before_executing_it_privately() {
     let child = state_frame(&expected.source, 2, context.view, context.parent);
     let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
 
-    assert!(!rig.executor.publication_pending(1), "nothing finalized yet");
+    assert!(
+        !rig.executor.publication_pending(1),
+        "nothing finalized yet"
+    );
     rig.executor.note_finalized(1);
     assert!(rig.executor.publication_pending(1));
     let seam = rig.seam(&parent);
-    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "defers to publication");
-    assert!(seam.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "within the view's wait");
+    assert!(
+        seam.verify_or_defer(context, id(&child), Some(encoded.clone()))
+            .is_err(),
+        "defers to publication"
+    );
+    assert!(
+        seam.verify_or_defer(context, id(&child), Some(encoded.clone()))
+            .is_err(),
+        "within the view's wait"
+    );
     assert!(!rig.executor.busy(), "deferring takes no lease");
 
-    let impatient = rig.seam(&parent).with_publication_priority(std::time::Duration::ZERO);
-    assert!(impatient.verify_or_defer(context, id(&child), Some(encoded.clone())).is_err(), "the wait starts");
-    assert_eq!(impatient.verify_or_defer(context, id(&child), Some(encoded)), Ok(true), "then it votes");
+    let impatient = rig
+        .seam(&parent)
+        .with_publication_priority(std::time::Duration::ZERO);
+    assert!(
+        impatient
+            .verify_or_defer(context, id(&child), Some(encoded.clone()))
+            .is_err(),
+        "the wait starts"
+    );
+    assert_eq!(
+        impatient.verify_or_defer(context, id(&child), Some(encoded)),
+        Ok(true),
+        "then it votes"
+    );
 }
 
 #[test]
@@ -626,15 +702,29 @@ fn a_parent_outside_the_window_is_refused_without_a_capture() {
     );
     let refusal = |number| {
         executor
-            .prepare(rig.context(&parent), number, &rig.blocks, &rig.verifier, false)
+            .prepare(
+                rig.context(&parent),
+                number,
+                &rig.blocks,
+                &rig.verifier,
+                false,
+            )
             .err()
             .map(|error| error.to_string())
             .unwrap_or_default()
     };
     // A capture reports the held frame lock.
     let held = rig.source.frame_execution.lock().unwrap();
-    assert!(refusal(2).contains("outside the execution window"), "{}", refusal(2));
-    assert!(refusal(1).contains("busy"), "inside the window it captures: {}", refusal(1));
+    assert!(
+        refusal(2).contains("outside the execution window"),
+        "{}",
+        refusal(2)
+    );
+    assert!(
+        refusal(1).contains("busy"),
+        "inside the window it captures: {}",
+        refusal(1)
+    );
     drop(held);
     assert!(executor
         .prepare(rig.context(&parent), 1, &rig.blocks, &rig.verifier, false)
@@ -663,7 +753,15 @@ fn an_unfinalized_ancestry_is_executed_once_and_extended_in_children() {
     }
     let prepare = |executor: &GlobalParentExecutor, parent: &GlobalFrame, for_proposal: bool| {
         let number = parent.header.as_ref().unwrap().frame_number;
-        executor.prepare(rig.context(parent), number, &rig.blocks, &rig.verifier, for_proposal).unwrap()
+        executor
+            .prepare(
+                rig.context(parent),
+                number,
+                &rig.blocks,
+                &rig.verifier,
+                for_proposal,
+            )
+            .unwrap()
     };
     let kept = |parent: &GlobalFrame, child: &GlobalFrame| {
         let lease = prepare(&rig.executor, parent, false);
@@ -671,19 +769,49 @@ fn an_unfinalized_ancestry_is_executed_once_and_extended_in_children() {
         lease.kept_ancestors()
     };
 
-    assert_eq!(kept(&second, &child_of_second), 0, "executed the first time");
+    assert_eq!(
+        kept(&second, &child_of_second),
+        0,
+        "executed the first time"
+    );
     assert_eq!(kept(&second, &child_of_second), 2, "then kept");
     let proposal = prepare(&rig.executor, &second, true);
     assert_eq!(proposal.kept_ancestors(), 2);
     let proved = proposal.prove(&[]).unwrap();
-    assert_eq!(proved.state.prover_tree_commitment, child_of_second.header.as_ref().unwrap().prover_tree_commitment);
-    assert_eq!(proved.state.prover_tree_aux_roots, child_of_second.header.as_ref().unwrap().prover_tree_aux_roots);
+    assert_eq!(
+        proved.state.prover_tree_commitment,
+        child_of_second
+            .header
+            .as_ref()
+            .unwrap()
+            .prover_tree_commitment
+    );
+    assert_eq!(
+        proved.state.prover_tree_aux_roots,
+        child_of_second
+            .header
+            .as_ref()
+            .unwrap()
+            .prover_tree_aux_roots
+    );
     drop(proposal);
-    assert_eq!(kept(&second, &child_of_second), 2, "proving leaves the kept execution unchanged");
+    assert_eq!(
+        kept(&second, &child_of_second),
+        2,
+        "proving leaves the kept execution unchanged"
+    );
 
-    assert_eq!(kept(&third, &child_of_third), 2, "a longer chain executes only its new frame");
+    assert_eq!(
+        kept(&third, &child_of_third),
+        2,
+        "a longer chain executes only its new frame"
+    );
     assert_eq!(kept(&third, &child_of_third), 3);
-    assert_eq!(kept(&second, &child_of_second), 0, "a chain the kept one runs past is executed again");
+    assert_eq!(
+        kept(&second, &child_of_second),
+        0,
+        "a chain the kept one runs past is executed again"
+    );
 
     // The kept execution is used only for exactly the frames it executed: a
     // substituted body at the same identity is executed, and refused.
@@ -691,10 +819,23 @@ fn an_unfinalized_ancestry_is_executed_once_and_extended_in_children() {
     let mut forged = second.clone();
     forged.header.as_mut().unwrap().prover_tree_commitment[7] ^= 1;
     let blocks = BlockStore::new();
-    blocks.put(id(&first), crate::consensus_wire::encode_global_frame(&first).unwrap());
-    blocks.put(id(&second), crate::consensus_wire::encode_global_frame(&forged).unwrap());
-    assert!(rig.executor.prepare(rig.context(&second), 2, &blocks, &rig.verifier, false).is_err());
-    assert_eq!(kept(&second, &child_of_second), 2, "a refused preparation leaves it");
+    blocks.put(
+        id(&first),
+        crate::consensus_wire::encode_global_frame(&first).unwrap(),
+    );
+    blocks.put(
+        id(&second),
+        crate::consensus_wire::encode_global_frame(&forged).unwrap(),
+    );
+    assert!(rig
+        .executor
+        .prepare(rig.context(&second), 2, &blocks, &rig.verifier, false)
+        .is_err());
+    assert_eq!(
+        kept(&second, &child_of_second),
+        2,
+        "a refused preparation leaves it"
+    );
 
     let unkept = GlobalParentExecutor::new(
         rig.source.clone(),
@@ -709,7 +850,11 @@ fn an_unfinalized_ancestry_is_executed_once_and_extended_in_children() {
         },
     );
     for _ in 0..2 {
-        assert_eq!(prepare(&unkept, &second, false).kept_ancestors(), 0, "past its age it is executed again");
+        assert_eq!(
+            prepare(&unkept, &second, false).kept_ancestors(),
+            0,
+            "past its age it is executed again"
+        );
     }
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
 }
@@ -718,7 +863,12 @@ fn certify(frame: &mut GlobalFrame, signer: &quil_crypto::FalconSigner, epoch: u
     certify_parent(frame, signer, epoch, 0);
 }
 
-fn certify_parent(frame: &mut GlobalFrame, signer: &quil_crypto::FalconSigner, epoch: u64, parent_view: u64) {
+fn certify_parent(
+    frame: &mut GlobalFrame,
+    signer: &quil_crypto::FalconSigner,
+    epoch: u64,
+    parent_view: u64,
+) {
     use quil_cw_consensus::{
         _consensus::{
             simplex::{
@@ -761,7 +911,8 @@ fn certify_parent(frame: &mut GlobalFrame, signer: &quil_crypto::FalconSigner, e
 }
 
 #[test]
-fn canonical_execution_base_requires_a_certificate_in_the_current_epoch_and_a_matching_or_absent_receipt() {
+fn canonical_execution_base_requires_a_certificate_in_the_current_epoch_and_a_matching_or_absent_receipt(
+) {
     let rig = Rig::new();
     let mut parent = rig.deploy();
     save(rig.clock.as_ref(), &parent);
@@ -813,7 +964,11 @@ fn canonical_execution_base_requires_a_certificate_in_the_current_epoch_and_a_ma
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
     // Without its certificate the receipt-less head is not a base.
     let mut uncertified = parent.clone();
-    uncertified.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    uncertified
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     save(rig.clock.as_ref(), &uncertified);
     assert!(
         rig.executor
@@ -824,8 +979,11 @@ fn canonical_execution_base_requires_a_certificate_in_the_current_epoch_and_a_ma
     save(rig.clock.as_ref(), &parent);
     // An unfinished attempt, or a receipt for another input, still refuses.
     let txn = rig.source.hypergraph_store.new_transaction(false).unwrap();
-    txn.set(&quil_store::encoding::global_execution_pending_key(), b"attempt")
-        .unwrap();
+    txn.set(
+        &quil_store::encoding::global_execution_pending_key(),
+        b"attempt",
+    )
+    .unwrap();
     txn.commit().unwrap();
     assert!(
         rig.executor
@@ -851,7 +1009,12 @@ fn a_global_frame_verifies_only_against_the_committee_of_its_frame() {
         .with_global_committee_successor(vec![successor.public_key().to_vec()]);
     let signed = |number: u64, signer: &quil_crypto::FalconSigner, epoch: u64| {
         let mut frame = GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: number, rank: 9, output: vec![3; 32], ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                rank: 9,
+                output: vec![3; 32],
+                ..Default::default()
+            }),
             requests: Vec::new(),
         };
         certify_parent(&mut frame, signer, epoch, 8);
@@ -859,9 +1022,15 @@ fn a_global_frame_verifies_only_against_the_committee_of_its_frame() {
     };
     let last = TEST_SUCCESSION - 1;
     assert!(verifier.verify_global_finalization_cert(&signed(last, &genesis, 0)));
-    assert_eq!(verifier.global_finalization_parent(&signed(last, &genesis, 0)), Some(8));
+    assert_eq!(
+        verifier.global_finalization_parent(&signed(last, &genesis, 0)),
+        Some(8)
+    );
     assert!(verifier.verify_global_finalization_cert(&signed(TEST_SUCCESSION, &successor, 1)));
-    assert_eq!(verifier.global_finalization_parent(&signed(TEST_SUCCESSION, &successor, 1)), Some(8));
+    assert_eq!(
+        verifier.global_finalization_parent(&signed(TEST_SUCCESSION, &successor, 1)),
+        Some(8)
+    );
     for (number, signer, epoch) in [
         (last, &genesis, 1),
         (last, &successor, 0),
@@ -870,7 +1039,10 @@ fn a_global_frame_verifies_only_against_the_committee_of_its_frame() {
         (TEST_SUCCESSION, &genesis, 1),
         (TEST_SUCCESSION, &successor, 0),
     ] {
-        assert!(!verifier.verify_global_finalization_cert(&signed(number, signer, epoch)), "frame {number} epoch {epoch}");
+        assert!(
+            !verifier.verify_global_finalization_cert(&signed(number, signer, epoch)),
+            "frame {number} epoch {epoch}"
+        );
     }
     let no_successor = GlobalFrameVerifier::new(Arc::new(TestFrameProver))
         .with_global_committee(vec![genesis.public_key().to_vec()]);
@@ -890,25 +1062,66 @@ fn a_consensus_instance_starts_at_view_zero_on_its_first_frame_and_keeps_to_its_
     certify(&mut parent, &rig.signer, 0);
     save(rig.clock.as_ref(), &parent);
     let number = parent.header.as_ref().unwrap().frame_number;
-    let instance = |epoch: u64| GlobalParentExecutor::new(
-        rig.source.clone(), rig.leader.clone(), epoch, number, id(&parent),
-        GlobalParentLimits { branch: limits(), ..GlobalParentLimits::default() },
-    );
+    let instance = |epoch: u64| {
+        GlobalParentExecutor::new(
+            rig.source.clone(),
+            rig.leader.clone(),
+            epoch,
+            number,
+            id(&parent),
+            GlobalParentLimits {
+                branch: limits(),
+                ..GlobalParentLimits::default()
+            },
+        )
+    };
     let at_rank = rig.context(&parent);
-    let at_view_zero = ProposalContext { parent_view: 0, ..at_rank };
+    let at_view_zero = ProposalContext {
+        parent_view: 0,
+        ..at_rank
+    };
     let seeded = instance(0);
-    assert!(seeded.prepare(at_rank, number, &rig.blocks, &rig.verifier, false).is_err());
-    assert!(seeded.prepare(at_view_zero, number, &rig.blocks, &rig.verifier, false).is_ok());
-    assert!(rig.executor.prepare(at_rank, number, &rig.blocks, &rig.verifier, false).is_ok(),
-        "an instance started elsewhere sees the frame at its rank");
+    assert!(seeded
+        .prepare(at_rank, number, &rig.blocks, &rig.verifier, false)
+        .is_err());
+    assert!(seeded
+        .prepare(at_view_zero, number, &rig.blocks, &rig.verifier, false)
+        .is_ok());
+    assert!(
+        rig.executor
+            .prepare(at_rank, number, &rig.blocks, &rig.verifier, false)
+            .is_ok(),
+        "an instance started elsewhere sees the frame at its rank"
+    );
 
     fn refused<T>(result: Result<T>) -> bool {
-        result.err().is_some_and(|error: QuilError| error.to_string().contains("another committee"))
+        result
+            .err()
+            .is_some_and(|error: QuilError| error.to_string().contains("another committee"))
     }
-    assert!(refused(rig.executor.prepare(at_rank, TEST_SUCCESSION - 1, &rig.blocks, &rig.verifier, false)),
-        "epoch 0 builds nothing from the succession frame on");
-    assert!(refused(instance(1).prepare(ProposalContext { epoch: 1, ..at_view_zero }, number, &rig.blocks, &rig.verifier, false)),
-        "epoch 1 builds nothing below it");
+    assert!(
+        refused(rig.executor.prepare(
+            at_rank,
+            TEST_SUCCESSION - 1,
+            &rig.blocks,
+            &rig.verifier,
+            false
+        )),
+        "epoch 0 builds nothing from the succession frame on"
+    );
+    assert!(
+        refused(instance(1).prepare(
+            ProposalContext {
+                epoch: 1,
+                ..at_view_zero
+            },
+            number,
+            &rig.blocks,
+            &rig.verifier,
+            false
+        )),
+        "epoch 1 builds nothing below it"
+    );
 }
 
 #[test]
@@ -1090,9 +1303,18 @@ fn private_snapshot_and_failed_budget_checks_preserve_public_retention_until_fin
     );
     // Over the budget the copy keeps the newest messages that fit, in
     // collection order, and still leaves the public buffers untouched.
-    assert_eq!(collector.snapshot_for_execution(51, 1, 100).unwrap(), Vec::<Vec<u8>>::new());
-    assert_eq!(collector.snapshot_for_execution(51, 8, 100).unwrap(), vec![b"boundary".to_vec()]);
-    assert_eq!(collector.snapshot_for_execution(51, 4096, 1).unwrap(), vec![b"boundary".to_vec()]);
+    assert_eq!(
+        collector.snapshot_for_execution(51, 1, 100).unwrap(),
+        Vec::<Vec<u8>>::new()
+    );
+    assert_eq!(
+        collector.snapshot_for_execution(51, 8, 100).unwrap(),
+        vec![b"boundary".to_vec()]
+    );
+    assert_eq!(
+        collector.snapshot_for_execution(51, 4096, 1).unwrap(),
+        vec![b"boundary".to_vec()]
+    );
     assert_eq!(collector.total_pending(), 3);
     // Retention counts finalized frames: ten after rank 41 keep it.
     for rank in 41..51 {
@@ -1115,7 +1337,12 @@ fn only_an_unreceipted_voter_reconciles_toward_the_proposers_parent_root() {
     let context = rig.context(&parent);
     let mut child = state_frame(&rig.source, 2, context.view, context.parent);
     child.header.as_mut().unwrap().prover_tree_commitment[0] ^= 1;
-    let declared = child.header.as_ref().unwrap().prover_tree_commitment.clone();
+    let declared = child
+        .header
+        .as_ref()
+        .unwrap()
+        .prover_tree_commitment
+        .clone();
     let encoded = crate::consensus_wire::encode_global_frame(&child).unwrap();
     let flagged = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
     let seam = GlobalSeamProposer::new(

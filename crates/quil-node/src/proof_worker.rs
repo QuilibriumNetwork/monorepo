@@ -54,8 +54,12 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
     }
     config.validate().map_err(anyhow::Error::msg)?;
     let (path, own_executable) = resolve_worker_path(config)?;
-    let mut worker = WorkerVerifier::new(path.clone(), config.cpu_seconds, Duration::from_secs(config.wall_timeout_secs))
-        .map_err(|e| anyhow::anyhow!("token proof worker configuration rejected: {e:?}"))?;
+    let mut worker = WorkerVerifier::new(
+        path.clone(),
+        config.cpu_seconds,
+        Duration::from_secs(config.wall_timeout_secs),
+    )
+    .map_err(|e| anyhow::anyhow!("token proof worker configuration rejected: {e:?}"))?;
     if own_executable {
         worker = worker.with_worker_mode_arg(WORKER_MODE_ARG);
     }
@@ -65,7 +69,9 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
                 .with_address_space_limit(config.address_space_bytes)
                 .map_err(|e| anyhow::anyhow!("proofWorker.addressSpaceBytes rejected: {e:?}"))?;
         } else {
-            tracing::warn!("proofWorker.addressSpaceBytes is Linux-only and is ignored on this platform");
+            tracing::warn!(
+                "proofWorker.addressSpaceBytes is Linux-only and is ignored on this platform"
+            );
         }
     }
     worker = worker
@@ -82,9 +88,15 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
             tracing::warn!("proofWorker.maxResidentBytes is not enforced on this platform");
         }
     }
-    quil_execution::token_intrinsic::dispatch::set_verification_budget_secs(config.verify_budget_secs);
-    worker.check_ready().map_err(|e| anyhow::anyhow!(
-        "token proof worker at {} failed startup/ABI check: {e:?}", path.display()))?;
+    quil_execution::token_intrinsic::dispatch::set_verification_budget_secs(
+        config.verify_budget_secs,
+    );
+    worker.check_ready().map_err(|e| {
+        anyhow::anyhow!(
+            "token proof worker at {} failed startup/ABI check: {e:?}",
+            path.display()
+        )
+    })?;
     tracing::info!(
         worker = %path.display(),
         cpu_seconds = config.cpu_seconds,
@@ -102,13 +114,22 @@ pub(crate) fn build_worker(config: &ProofWorkerConfig) -> anyhow::Result<Option<
 /// All processes of one node use its base DB directory for verifier admission,
 /// even when remote workers store their shard data in separate directories.
 /// Readiness is checked first, before creating the directory or lock file.
-pub(crate) fn build_node_worker(config: &quil_config::Config) -> anyhow::Result<Option<WorkerVerifier>> {
-    let Some(worker) = build_worker(&config.proof_worker)? else { return Ok(None); };
-    let base = if config.db.path.is_empty() { PathBuf::from(".config/store") }
-        else { PathBuf::from(&config.db.path) };
+pub(crate) fn build_node_worker(
+    config: &quil_config::Config,
+) -> anyhow::Result<Option<WorkerVerifier>> {
+    let Some(worker) = build_worker(&config.proof_worker)? else {
+        return Ok(None);
+    };
+    let base = if config.db.path.is_empty() {
+        PathBuf::from(".config/store")
+    } else {
+        PathBuf::from(&config.db.path)
+    };
     std::fs::create_dir_all(&base)?;
     let lock = std::fs::canonicalize(base)?.join(".proof-worker-admission.lock");
-    worker.with_shared_admission(lock.clone()).map(Some)
+    worker
+        .with_shared_admission(lock.clone())
+        .map(Some)
         .map_err(|e| anyhow::anyhow!("proof worker admission file {}: {e:?}", lock.display()))
 }
 
@@ -141,7 +162,12 @@ mod tests {
     #[ignore = "requires the Taskfile-built native worker"]
     fn native_worker_passes_startup_check() {
         let path = std::env::var("QUIL_AMOUNT_WORKER_PATH").expect("built worker path");
-        assert!(build_worker(&ProofWorkerConfig { path, ..Default::default() }).unwrap().is_some());
+        assert!(build_worker(&ProofWorkerConfig {
+            path,
+            ..Default::default()
+        })
+        .unwrap()
+        .is_some());
     }
 
     #[tokio::test]
@@ -150,9 +176,20 @@ mod tests {
         let store = directory.path().join("must-not-be-created");
         let mut config = quil_config::Config::default();
         config.db.path = store.to_string_lossy().into_owned();
-        config.proof_worker.path = directory.path().join("absent-worker").to_string_lossy().into_owned();
-        let result = crate::master_node::start(quil_lifecycle::Supervisor::new(),
-            &config, directory.path(), true, 0, None).await;
+        config.proof_worker.path = directory
+            .path()
+            .join("absent-worker")
+            .to_string_lossy()
+            .into_owned();
+        let result = crate::master_node::start(
+            quil_lifecycle::Supervisor::new(),
+            &config,
+            directory.path(),
+            true,
+            0,
+            None,
+        )
+        .await;
         assert!(result.is_err());
         assert!(!store.exists());
     }
@@ -163,8 +200,13 @@ mod tests {
         let store = directory.path().join("must-not-be-created");
         let mut config = quil_config::Config::default();
         config.db.worker_paths = vec![store.to_string_lossy().into_owned()];
-        config.proof_worker.path = directory.path().join("absent-worker").to_string_lossy().into_owned();
-        let result = crate::worker_node::start(quil_lifecycle::Supervisor::new(), &config, 1, 0).await;
+        config.proof_worker.path = directory
+            .path()
+            .join("absent-worker")
+            .to_string_lossy()
+            .into_owned();
+        let result =
+            crate::worker_node::start(quil_lifecycle::Supervisor::new(), &config, 1, 0).await;
         assert!(result.is_err());
         assert!(!store.exists());
     }
@@ -174,47 +216,96 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let worker = directory.path().join(WORKER_FILE_NAME);
         std::fs::write(&worker, b"#!/bin/sh\ncat >/dev/null\nexit 80\n").unwrap();
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let explicit = ProofWorkerConfig { path: worker.to_string_lossy().into_owned(), ..Default::default() };
-        assert_eq!(resolve_worker_path(&explicit).unwrap(), (std::fs::canonicalize(&worker).unwrap(), false));
+        let explicit = ProofWorkerConfig {
+            path: worker.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_worker_path(&explicit).unwrap(),
+            (std::fs::canonicalize(&worker).unwrap(), false)
+        );
         assert_eq!(
             resolve_worker_path(&ProofWorkerConfig::default()).unwrap(),
-            (std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(), true),
+            (
+                std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+                true
+            ),
             "with nothing configured the node runs itself as the worker"
         );
-        let missing = ProofWorkerConfig { path: directory.path().join("absent").to_string_lossy().into_owned(), ..Default::default() };
+        let missing = ProofWorkerConfig {
+            path: directory
+                .path()
+                .join("absent")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
         assert!(resolve_worker_path(&missing).is_err());
-        let directory_path = ProofWorkerConfig { path: directory.path().to_string_lossy().into_owned(), ..Default::default() };
+        let directory_path = ProofWorkerConfig {
+            path: directory.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         assert!(resolve_worker_path(&directory_path).is_err());
         // A disabled suite never resolves or builds a worker.
-        assert!(build_worker(&ProofWorkerConfig { disabled: true, ..missing.clone() }).unwrap().is_none());
+        assert!(build_worker(&ProofWorkerConfig {
+            disabled: true,
+            ..missing.clone()
+        })
+        .unwrap()
+        .is_none());
         assert!(build_worker(&missing).is_err());
-        assert!(build_worker(&ProofWorkerConfig { cpu_seconds: 0, ..explicit.clone() }).is_err());
+        assert!(build_worker(&ProofWorkerConfig {
+            cpu_seconds: 0,
+            ..explicit.clone()
+        })
+        .is_err());
         let built = build_worker(&explicit).unwrap();
         assert!(built.is_some());
         let mut node_config = quil_config::Config::default();
-        node_config.db.path = directory.path().join("base-store").to_string_lossy().into_owned();
-        node_config.db.worker_paths = vec![directory.path().join("shard-store").to_string_lossy().into_owned()];
+        node_config.db.path = directory
+            .path()
+            .join("base-store")
+            .to_string_lossy()
+            .into_owned();
+        node_config.db.worker_paths = vec![directory
+            .path()
+            .join("shard-store")
+            .to_string_lossy()
+            .into_owned()];
         node_config.proof_worker = explicit.clone();
         assert!(build_node_worker(&node_config).unwrap().is_some());
-        assert!(PathBuf::from(&node_config.db.path).join(".proof-worker-admission.lock").is_file());
+        assert!(PathBuf::from(&node_config.db.path)
+            .join(".proof-worker-admission.lock")
+            .is_file());
         assert!(!PathBuf::from(&node_config.db.worker_paths[0]).exists());
         #[cfg(not(target_os = "linux"))]
-        assert!(build_worker(&ProofWorkerConfig { address_space_bytes: 1 << 30, ..explicit.clone() }).unwrap().is_some());
+        assert!(build_worker(&ProofWorkerConfig {
+            address_space_bytes: 1 << 30,
+            ..explicit.clone()
+        })
+        .unwrap()
+        .is_some());
         std::fs::write(&worker, b"#!/bin/sh\ncat >/dev/null\nexit 82\n").unwrap();
         assert!(build_worker(&explicit).is_err());
         // A stalled executable is reaped by the same bounded transport used
         // for proofs; it cannot hold startup indefinitely.
         std::fs::write(&worker, b"#!/bin/sh\nexec sleep 30\n").unwrap();
-        let stalled = WorkerVerifier::new(std::fs::canonicalize(&worker).unwrap(), 1,
-            Duration::from_millis(50)).unwrap();
+        let stalled = WorkerVerifier::new(
+            std::fs::canonicalize(&worker).unwrap(),
+            1,
+            Duration::from_millis(50),
+        )
+        .unwrap();
         assert!(matches!(stalled.check_ready(), Err(
             quil_lattice_ct::confidential::relation::backend::worker_client::ClientError::Process(
                 quil_lattice_ct::confidential::relation::backend::worker_process::WorkerError::Timeout))));
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(build_worker(&explicit).is_err());

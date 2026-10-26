@@ -45,7 +45,9 @@
 use quil_cw_consensus::handoff::{put_bytes, Cursor, Session, MAX_FILTER_BYTES};
 use quil_types::error::{QuilError, Result};
 
-use super::{head, presence, read, session_tip_frame, status, write, Records, Status, TYPE_PRESENCE_REPORT};
+use super::{
+    head, presence, read, session_tip_frame, status, write, Records, Status, TYPE_PRESENCE_REPORT,
+};
 use crate::hypergraph_state::HypergraphState;
 
 /// The smallest committee an exclusion may leave: the consensus minimum.
@@ -126,7 +128,11 @@ impl Exclusion {
         if strikes == 0 || until <= from {
             return Err(corrupt());
         }
-        Ok(Self { strikes, from, until })
+        Ok(Self {
+            strikes,
+            from,
+            until,
+        })
     }
 }
 
@@ -141,10 +147,16 @@ pub fn exclusion_epochs(strikes: u32) -> u64 {
 /// exclusion's end, else the first.
 pub fn strike(previous: Option<Exclusion>, epoch: u64) -> Exclusion {
     let strikes = match previous {
-        Some(previous) if epoch < previous.until.saturating_add(RELAPSE_EPOCHS) => previous.strikes.saturating_add(1),
+        Some(previous) if epoch < previous.until.saturating_add(RELAPSE_EPOCHS) => {
+            previous.strikes.saturating_add(1)
+        }
         _ => 1,
     };
-    Exclusion { strikes, from: epoch, until: epoch.saturating_add(exclusion_epochs(strikes)) }
+    Exclusion {
+        strikes,
+        from: epoch,
+        until: epoch.saturating_add(exclusion_epochs(strikes)),
+    }
 }
 
 fn record_key(filter: &[u8], member: &[u8]) -> Result<Vec<u8>> {
@@ -157,7 +169,9 @@ fn record_key(filter: &[u8], member: &[u8]) -> Result<Vec<u8>> {
 /// The latest exclusion of `member` from `filter`'s sessions, in effect or
 /// not.
 pub fn exclusion(state: &impl Records, filter: &[u8], member: &[u8]) -> Result<Option<Exclusion>> {
-    read(state, EXCLUSION, &record_key(filter, member)?)?.map(|bytes| Exclusion::decode(&bytes)).transpose()
+    read(state, EXCLUSION, &record_key(filter, member)?)?
+        .map(|bytes| Exclusion::decode(&bytes))
+        .transpose()
 }
 
 pub(super) fn set_exclusion(
@@ -167,7 +181,13 @@ pub(super) fn set_exclusion(
     member: &[u8],
     value: &Exclusion,
 ) -> Result<()> {
-    write(state, frame, EXCLUSION, &record_key(filter, member)?, &value.encode())
+    write(
+        state,
+        frame,
+        EXCLUSION,
+        &record_key(filter, member)?,
+        &value.encode(),
+    )
 }
 
 /// `desired`, the provers eligible for `filter`'s next session at GLOBAL
@@ -175,7 +195,12 @@ pub(super) fn set_exclusion(
 /// [`super::presence_exclusion_frame`], and unchanged if the exclusions
 /// would leave fewer than [`MIN_COMMITTEE`] members: the floor suspends
 /// them rather than seat too small a committee.
-pub fn seated(state: &impl Records, frame: u64, filter: &[u8], desired: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+pub fn seated(
+    state: &impl Records,
+    frame: u64,
+    filter: &[u8],
+    desired: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>> {
     if frame < super::presence_exclusion_frame() {
         return Ok(desired);
     }
@@ -217,14 +242,23 @@ impl Decision {
             .iter()
             .zip(&self.strikes)
             .take(LOGGED_MEMBERS)
-            .map(|(member, next)| format!("{} (strike {}, until epoch {})", describe(member), next.strikes, next.until))
+            .map(|(member, next)| {
+                format!(
+                    "{} (strike {}, until epoch {})",
+                    describe(member),
+                    next.strikes,
+                    next.until
+                )
+            })
             .collect()
     }
 }
 
 /// A prover address for logs: the Poseidon of the member's key.
 fn describe(member: &[u8]) -> String {
-    crate::global_intrinsic::materialize::prover_address_from_pubkey(member).map(hex::encode).unwrap_or_default()
+    crate::global_intrinsic::materialize::prover_address_from_pubkey(member)
+        .map(hex::encode)
+        .unwrap_or_default()
 }
 
 /// Members named in one log line at most.
@@ -278,7 +312,9 @@ pub fn evaluate(
     };
     let previous_start = previous.saturating_mul(quil_types::consensus::epoch_length_frames());
     for filter in filters {
-        let Some(session) = head(state, filter)? else { continue };
+        let Some(session) = head(state, filter)? else {
+            continue;
+        };
         let id = session.id()?;
         // Present: a notarize or, protecting its signer only, a nullify of
         // the session recorded in the previous epoch.
@@ -288,32 +324,54 @@ pub fn evaluate(
             continue;
         }
         let marked = |marks: &Option<Vec<bool>>, index: usize| {
-            marks.as_ref().is_some_and(|marks| marks.get(index).copied().unwrap_or(false))
+            marks
+                .as_ref()
+                .is_some_and(|marks| marks.get(index).copied().unwrap_or(false))
         };
-        let marks: Vec<bool> =
-            (0..session.members.len()).map(|index| marked(&notarized, index) || marked(&nullified, index)).collect();
+        let marks: Vec<bool> = (0..session.members.len())
+            .map(|index| marked(&notarized, index) || marked(&nullified, index))
+            .collect();
         let voters = marks.iter().filter(|&&mark| mark).count();
         match status(state, &id)? {
             Status::Closed(_) => continue,
             Status::Active => {}
             Status::Sealing(request_id) => {
-                let pending = super::request(state, &request_id)?
-                    .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
+                let pending = super::request(state, &request_id)?.ok_or_else(|| {
+                    QuilError::Store("closing session's request is absent".into())
+                })?;
                 if !super::schedule::membership_request(&pending, filter) {
-                    skip(frame, filter, &session, voters, "closing for a split or merge");
+                    skip(
+                        frame,
+                        filter,
+                        &session,
+                        voters,
+                        "closing for a split or merge",
+                    );
                     continue;
                 }
             }
         }
         if session_tip_frame(state, &id)?.is_some_and(|tip| tip > previous_start) {
-            skip(frame, filter, &session, voters, "its executed tip advanced, or it started, during the epoch");
+            skip(
+                frame,
+                filter,
+                &session,
+                voters,
+                "its executed tip advanced, or it started, during the epoch",
+            );
             continue;
         }
         // With present members to spare beyond its quorum, absence alone
         // does not stall the session; at its quorum exactly, any one more
         // failure does.
         if voters > quorum(session.members.len()) {
-            skip(frame, filter, &session, voters, "its present members exceed its quorum: absence does not stall it");
+            skip(
+                frame,
+                filter,
+                &session,
+                voters,
+                "its present members exceed its quorum: absence does not stall it",
+            );
             continue;
         }
         // One reporter's view decides nothing: a submitter that saw few
@@ -322,7 +380,13 @@ pub fn evaluate(
         // session's, whom every member may report itself
         // (`quil_engine::presence_reports`).
         if voters * 2 <= session.members.len() {
-            skip(frame, filter, &session, voters, "its present members are not a majority of its members");
+            skip(
+                frame,
+                filter,
+                &session,
+                voters,
+                "its present members are not a majority of its members",
+            );
             continue;
         }
         let eligible = desired(filter.as_slice())?;
@@ -330,7 +394,13 @@ pub fn evaluate(
             skip(frame, filter, &session, voters, "no prover is eligible");
             continue;
         }
-        let mark = |member: &[u8]| session.members.binary_search_by(|probe| probe.as_slice().cmp(member)).ok().map(|index| marks[index]);
+        let mark = |member: &[u8]| {
+            session
+                .members
+                .binary_search_by(|probe| probe.as_slice().cmp(member))
+                .ok()
+                .map(|index| marks[index])
+        };
         let mut committee = Vec::with_capacity(eligible.len());
         let mut absent = Vec::new();
         for member in eligible {
@@ -343,14 +413,29 @@ pub fn evaluate(
             }
         }
         if absent.is_empty() {
-            skip(frame, filter, &session, voters, "no eligible member is absent");
+            skip(
+                frame,
+                filter,
+                &session,
+                voters,
+                "no eligible member is absent",
+            );
             continue;
         }
         if committee.len() < MIN_COMMITTEE {
-            skip(frame, filter, &session, voters, "the committee without its absent members would fall below the consensus minimum");
+            skip(
+                frame,
+                filter,
+                &session,
+                voters,
+                "the committee without its absent members would fall below the consensus minimum",
+            );
             continue;
         }
-        let present = committee.iter().filter(|member| mark(member.as_slice()) == Some(true)).count();
+        let present = committee
+            .iter()
+            .filter(|member| mark(member.as_slice()) == Some(true))
+            .count();
         if present < quorum(committee.len()) {
             skip(frame, filter, &session, voters, "its present members would not reach quorum of the committee without its absent members");
             continue;
@@ -359,7 +444,13 @@ pub fn evaluate(
         for member in &absent {
             strikes.push(strike(exclusion(state, filter, member)?, epoch));
         }
-        decisions.push(Decision { filter: filter.clone(), session: id, committee, excluded: absent, strikes });
+        decisions.push(Decision {
+            filter: filter.clone(),
+            session: id,
+            committee,
+            excluded: absent,
+            strikes,
+        });
     }
     Ok(decisions)
 }
@@ -388,7 +479,10 @@ pub fn claim_message(filter: &[u8], anchor: u64, anchor_output: &[u8]) -> Result
     let mut out = Vec::new();
     put_bytes(&mut out, filter)?;
     out.extend_from_slice(&anchor.to_be_bytes());
-    out.extend_from_slice(&quil_crypto::porep::derive_storage_beacon(anchor, anchor_output));
+    out.extend_from_slice(&quil_crypto::porep::derive_storage_beacon(
+        anchor,
+        anchor_output,
+    ));
     Ok(out)
 }
 
@@ -415,7 +509,12 @@ impl PresenceClaim {
         let anchor = c.u64()?;
         let signature = c.take(quil_crypto::FALCON_SIGNATURE_LEN)?.to_vec();
         c.finish()?;
-        let claim = Self { filter, member, anchor, signature };
+        let claim = Self {
+            filter,
+            member,
+            anchor,
+            signature,
+        };
         claim.validate()?;
         Ok(claim)
     }
@@ -439,7 +538,9 @@ impl PresenceClaim {
 /// Refuse every claim before [`super::presence_exclusion_frame`].
 pub fn require_claims_active(frame: u64) -> Result<()> {
     if frame < super::presence_exclusion_frame() {
-        return Err(invalid("claims are not accepted before the presence exclusion frame"));
+        return Err(invalid(
+            "claims are not accepted before the presence exclusion frame",
+        ));
     }
     Ok(())
 }
@@ -458,15 +559,21 @@ pub fn verify_claim(
     claim.validate()?;
     let epoch = quil_types::consensus::epoch_for_frame(frame);
     if claim.anchor >= frame || quil_types::consensus::epoch_for_frame(claim.anchor) != epoch {
-        return Err(invalid("anchor is not an earlier frame of the inclusion epoch"));
+        return Err(invalid(
+            "anchor is not an earlier frame of the inclusion epoch",
+        ));
     }
     let current = exclusion(state, &claim.filter, &claim.member)?
         .filter(|excluded| excluded.covers(epoch) && excluded.until > epoch.saturating_add(1))
-        .ok_or_else(|| invalid("no exclusion of the member on the filter lasts past the next epoch boundary"))?;
+        .ok_or_else(|| {
+            invalid("no exclusion of the member on the filter lasts past the next epoch boundary")
+        })?;
     let output = anchor_output(claim.anchor)?;
     let message = claim_message(&claim.filter, claim.anchor, &output)?;
     if !quil_crypto::falcon_verify(&claim.member, &claim.signature, &message, CLAIM_DOMAIN) {
-        return Err(invalid("claim signature does not verify under the member's key"));
+        return Err(invalid(
+            "claim signature does not verify under the member's key",
+        ));
     }
     Ok(current)
 }
@@ -481,8 +588,13 @@ pub fn apply_claim(
 ) -> Result<()> {
     let current = verify_claim(state, frame, claim, anchor_output)?;
     let epoch = quil_types::consensus::epoch_for_frame(frame);
-    let cleared = Exclusion { until: epoch.saturating_add(1), ..current };
-    super::atomic(state, || set_exclusion(state, frame, &claim.filter, &claim.member, &cleared))?;
+    let cleared = Exclusion {
+        until: epoch.saturating_add(1),
+        ..current
+    };
+    super::atomic(state, || {
+        set_exclusion(state, frame, &claim.filter, &claim.member, &cleared)
+    })?;
     tracing::info!(
         frame,
         filter = hex::encode(&claim.filter),

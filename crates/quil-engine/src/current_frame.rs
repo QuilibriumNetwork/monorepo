@@ -121,7 +121,11 @@ impl CurrentFrame {
             return;
         }
         if epoch > current {
-            if self.rank_epoch.compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if self
+                .rank_epoch
+                .compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 self.rank.store(rank, Ordering::Release);
                 return;
             }
@@ -136,7 +140,10 @@ impl CurrentFrame {
     pub fn enter_rank_epoch(&self, epoch: u64) -> bool {
         let current = self.rank_epoch.load(Ordering::Acquire);
         if epoch <= current
-            || self.rank_epoch.compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire).is_err()
+            || self
+                .rank_epoch
+                .compare_exchange(current, epoch, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return false;
         }
@@ -210,7 +217,11 @@ mod tests {
         let fresh = CurrentFrame::new();
         fresh.observe_frame_rank(TEST_SUCCESSION - 1, 408_626);
         fresh.observe_frame_rank(TEST_SUCCESSION, 1);
-        assert_eq!((fresh.rank_epoch(), fresh.effective_rank()), (1, 1), "a later epoch's rank replaces it");
+        assert_eq!(
+            (fresh.rank_epoch(), fresh.effective_rank()),
+            (1, 1),
+            "a later epoch's rank replaces it"
+        );
     }
 
     #[test]

@@ -236,9 +236,14 @@ fn direct_candidate_writes_leave_an_untouching_publication_valid() {
         .unwrap();
     assert_eq!(read_cursor(fixture.store.as_ref()).unwrap(), 1);
     let candidate = frame(50, [0; 32]);
-    let selector = quil_crypto::poseidon::hash_bytes_to_32(&candidate.header.as_ref().unwrap().output).unwrap();
+    let selector =
+        quil_crypto::poseidon::hash_bytes_to_32(&candidate.header.as_ref().unwrap().output)
+            .unwrap();
     assert_eq!(
-        fixture.clock.get_global_clock_frame_candidate(50, &selector).unwrap(),
+        fixture
+            .clock
+            .get_global_clock_frame_candidate(50, &selector)
+            .unwrap(),
         candidate
     );
 }

@@ -91,10 +91,7 @@ impl AppShardState {
     }
 
     /// Create from a proto FrameHeader (used by both global and app shard frames).
-    pub fn from_header(
-        header: &quil_types::proto::global::FrameHeader,
-        filter: &[u8],
-    ) -> Self {
+    pub fn from_header(header: &quil_types::proto::global::FrameHeader, filter: &[u8]) -> Self {
         let identity_cache = compute_output_identity(&header.output);
         Self {
             filter: filter.to_vec(),
@@ -115,7 +112,9 @@ impl AppShardState {
             fee_multiplier: header.fee_multiplier_vote,
             storage_attestation_root: header.storage_attestation_root.clone(),
             global_frame_number: header.global_frame_number,
-            fee_total: quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+            fee_total: quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(
+                &header.fee_total,
+            ),
             settlements: header.settlements.clone(),
             accumulator: header.accumulator.clone(),
             spends: header.spends.clone(),
@@ -172,14 +171,38 @@ mod tests {
     #[test]
     fn app_shard_state_identity_is_deterministic() {
         let s1 = AppShardState::new(
-            vec![1], 10, 0, 1000, 50000,
-            vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
-            vec![], 0, 0,
+            vec![1],
+            10,
+            0,
+            1000,
+            50000,
+            vec![0xAAu8; 64],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            vec![],
+            0,
+            0,
         );
         let s2 = AppShardState::new(
-            vec![1], 10, 0, 1000, 50000,
-            vec![0xAAu8; 64], vec![], vec![], vec![], vec![], vec![], 0,
-            vec![], 0, 0,
+            vec![1],
+            10,
+            0,
+            1000,
+            50000,
+            vec![0xAAu8; 64],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            0,
+            vec![],
+            0,
+            0,
         );
         assert_eq!(s1.identity(), s2.identity());
         assert!(!s1.identity().is_empty());
@@ -188,10 +211,21 @@ mod tests {
     #[test]
     fn app_shard_state_unique_trait() {
         let s = AppShardState::new(
-            vec![1, 2], 42, 5, 1000, 100000,
-            vec![0xBBu8; 64], vec![], vec![0xCCu8; 585], vec![], vec![],
-            vec![0xDDu8; 74], 100,
-            vec![], 0, 0,
+            vec![1, 2],
+            42,
+            5,
+            1000,
+            100000,
+            vec![0xBBu8; 64],
+            vec![],
+            vec![0xCCu8; 585],
+            vec![],
+            vec![],
+            vec![0xDDu8; 74],
+            100,
+            vec![],
+            0,
+            0,
         );
         assert_eq!(s.rank(), 5);
         assert_eq!(s.timestamp(), 1000);

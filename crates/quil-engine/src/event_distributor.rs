@@ -136,9 +136,18 @@ mod tests {
         let mut rx_b = d.subscribe("b");
         let mut rx_c = d.subscribe("c");
         d.publish(fresh_event(ControlEventType::GlobalNewHead));
-        assert_eq!(rx_a.recv().await.unwrap().event_type, ControlEventType::GlobalNewHead);
-        assert_eq!(rx_b.recv().await.unwrap().event_type, ControlEventType::GlobalNewHead);
-        assert_eq!(rx_c.recv().await.unwrap().event_type, ControlEventType::GlobalNewHead);
+        assert_eq!(
+            rx_a.recv().await.unwrap().event_type,
+            ControlEventType::GlobalNewHead
+        );
+        assert_eq!(
+            rx_b.recv().await.unwrap().event_type,
+            ControlEventType::GlobalNewHead
+        );
+        assert_eq!(
+            rx_c.recv().await.unwrap().event_type,
+            ControlEventType::GlobalNewHead
+        );
     }
 
     #[tokio::test]

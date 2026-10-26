@@ -177,7 +177,8 @@ const OWED_BODY_ASKS_PER_PASS: usize = 16;
 /// by then, it is forgotten until a peer asks for the frame again.
 const OWED_BODY_ASKS: u32 = 288;
 const OWED_BODY_TTL: Duration = Duration::from_secs(24 * 3600);
-const _: () = assert!(OWED_BODY_ASKS as u64 * COMMITTED_TIP_ASK.as_secs() == OWED_BODY_TTL.as_secs());
+const _: () =
+    assert!(OWED_BODY_ASKS as u64 * COMMITTED_TIP_ASK.as_secs() == OWED_BODY_TTL.as_secs());
 /// How long a reported frame found not to be owed is not looked into again,
 /// and how many such frames are remembered.
 const NOT_OWED_TTL: Duration = Duration::from_secs(3600);
@@ -316,7 +317,10 @@ impl ArchiveAppShardIngest {
     /// never stored, so every node replaying the shard from archives stops
     /// there. Such a frame is owed and asked for ([`Self::request_owed_bodies`])
     /// when the stored frame after it names its output.
-    pub fn with_missing_frame_reports(mut self, reports: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>) -> Self {
+    pub fn with_missing_frame_reports(
+        mut self,
+        reports: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
+    ) -> Self {
         self.missing_frame_reports = Some(reports);
         self
     }
@@ -337,7 +341,10 @@ impl ArchiveAppShardIngest {
     /// ("historical storage registration unavailable at epoch 1208"). The
     /// gap fetch prepares them ([`Self::validator`]); each proof is checked
     /// against the root the anchor frame declares.
-    pub fn with_storage_history_source(mut self, source: crate::storage_history::GlobalVertexProofSource) -> Self {
+    pub fn with_storage_history_source(
+        mut self,
+        source: crate::storage_history::GlobalVertexProofSource,
+    ) -> Self {
         self.validator = match Arc::try_unwrap(self.validator) {
             Ok(validator) => Arc::new(validator.with_storage_history_source(source)),
             Err(shared) => shared,
@@ -372,10 +379,16 @@ impl ArchiveAppShardIngest {
     /// the shard's members: an archive missing GLOBAL frames 907,473–907,511
     /// fetched and refused about 200 frames a second (2026-10-20).
     pub fn await_anchor(&mut self, address: &[u8], number: u64, anchor: u64) {
-        if self.materialized_height(address).is_ok_and(|height| number <= height) {
+        if self
+            .materialized_height(address)
+            .is_ok_and(|height| number <= height)
+        {
             return;
         }
-        self.awaiting_anchor.entry(address.to_vec()).or_default().insert(number, anchor);
+        self.awaiting_anchor
+            .entry(address.to_vec())
+            .or_default()
+            .insert(number, anchor);
         if self.anchors_noted.insert(anchor) {
             info!(anchor, frame = number, address = %hex::encode(address),
                 "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
@@ -399,7 +412,13 @@ impl ArchiveAppShardIngest {
     /// Refused instead, such frames were fetched again and again: an archive
     /// 510 frames behind refused 9870 of them on 83 shards in 24 minutes, and
     /// its gap fetch recovered 3677 (2026-10-25).
-    pub fn await_execution(&mut self, address: &[u8], number: u64, anchor: u64, executed: u64) -> bool {
+    pub fn await_execution(
+        &mut self,
+        address: &[u8],
+        number: u64,
+        anchor: u64,
+        executed: u64,
+    ) -> bool {
         match self.materialized_height(address) {
             Ok(height) if height > 0 && number > height => {}
             _ => return false,
@@ -423,7 +442,8 @@ impl ArchiveAppShardIngest {
             return false;
         }
         let shards = self.awaiting_execution.len();
-        self.execution_deferrals.deferred(address, number, anchor, executed, Some(shards));
+        self.execution_deferrals
+            .deferred(address, number, anchor, executed, Some(shards));
         true
     }
 
@@ -471,7 +491,11 @@ impl ArchiveAppShardIngest {
                 self.awaiting_anchor.remove(address);
             }
             let awaiting = &self.awaiting_anchor;
-            self.anchors_noted.retain(|anchor| awaiting.values().any(|waiting| waiting.values().any(|a| a == anchor)));
+            self.anchors_noted.retain(|anchor| {
+                awaiting
+                    .values()
+                    .any(|waiting| waiting.values().any(|a| a == anchor))
+            });
         }
         if let Some(waiting) = self.awaiting_execution.get_mut(address) {
             *waiting = waiting.split_off(&(frame + 1));
@@ -489,13 +513,18 @@ impl ArchiveAppShardIngest {
     /// discard every application frame chain this archive holds (frames,
     /// per-frame records and cursors; application state kept) and what this
     /// ingest remembers of them. Runs once per store. Returns whether it did.
-    pub fn discard_legacy_history_at(&mut self, global_frame: u64) -> quil_types::error::Result<bool> {
-        let Some(policy) = quil_types::consensus::committee_handoff_policy()
-            .filter(|policy| policy.legacy_history == quil_types::consensus::LegacyHistory::Discard)
-        else {
+    pub fn discard_legacy_history_at(
+        &mut self,
+        global_frame: u64,
+    ) -> quil_types::error::Result<bool> {
+        let Some(policy) = quil_types::consensus::committee_handoff_policy().filter(|policy| {
+            policy.legacy_history == quil_types::consensus::LegacyHistory::Discard
+        }) else {
             return Ok(false);
         };
-        if global_frame < policy.activation_frame || self.clock_store.app_frame_history_discarded()?.is_some() {
+        if global_frame < policy.activation_frame
+            || self.clock_store.app_frame_history_discarded()?.is_some()
+        {
             return Ok(false);
         }
         self.clock_store.discard_app_frame_history(global_frame)?;
@@ -505,7 +534,10 @@ impl ArchiveAppShardIngest {
         self.requested.clear();
         self.owed_bodies.clear();
         crate::app_engine::forget_legacy_relay_boundaries();
-        tracing::info!(global_frame, "committee-handoff flag day: archive discarded its legacy app frame history");
+        tracing::info!(
+            global_frame,
+            "committee-handoff flag day: archive discarded its legacy app frame history"
+        );
         Ok(true)
     }
 
@@ -596,7 +628,9 @@ impl ArchiveAppShardIngest {
     /// does. The gap fetch verifies the frames it recovers without holding the
     /// ingest or the message loop, which used to run every check in turn.
     pub fn admit_verified(&mut self, frame: AppShardFrame, certified: bool) {
-        let Some((address, frame_number)) = frame.header.as_ref()
+        let Some((address, frame_number)) = frame
+            .header
+            .as_ref()
             .filter(|header| !header.address.is_empty())
             .map(|header| (header.address.clone(), header.frame_number))
         else {
@@ -631,18 +665,26 @@ impl ArchiveAppShardIngest {
     /// forever and halts GLOBAL's sequenced ingest.
     fn admit(&mut self, address: &[u8], frame: AppShardFrame, certified: bool) {
         use crate::frame_validator::app_frame_links_to_child;
-        let Some(header) = frame.header.clone() else { return };
+        let Some(header) = frame.header.clone() else {
+            return;
+        };
         let number = header.frame_number;
-        let linked = self.buffered.get(address)
+        let linked = self
+            .buffered
+            .get(address)
             .and_then(|buffered| buffered.get(&(number + 1)))
             .and_then(|child| child.header.as_ref())
             .is_some_and(|child| app_frame_links_to_child(&header, child));
         if !certified && !linked {
-            let Ok(identity) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return };
+            let Ok(identity) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+                return;
+            };
             let held = self.held.entry(address.to_vec()).or_default();
             held.insert((number, identity), frame);
             while held.len() > MAX_HELD_FRAMES_PER_SHARD {
-                let Some(farthest) = held.keys().next_back().copied() else { break };
+                let Some(farthest) = held.keys().next_back().copied() else {
+                    break;
+                };
                 held.remove(&farthest);
             }
             return;
@@ -653,8 +695,14 @@ impl ArchiveAppShardIngest {
         if let Some(held) = self.held.get_mut(address) {
             while child.frame_number > 0 {
                 let below = child.frame_number - 1;
-                let parent = held.range((below, [0; 32])..=(below, [0xff; 32]))
-                    .find(|(_, parent)| parent.header.as_ref().is_some_and(|p| app_frame_links_to_child(p, &child)))
+                let parent = held
+                    .range((below, [0; 32])..=(below, [0xff; 32]))
+                    .find(|(_, parent)| {
+                        parent
+                            .header
+                            .as_ref()
+                            .is_some_and(|p| app_frame_links_to_child(p, &child))
+                    })
                     .map(|(key, _)| *key);
                 let Some(key) = parent else { break };
                 let parent = held.remove(&key).expect("found above");
@@ -664,7 +712,10 @@ impl ArchiveAppShardIngest {
         }
         for (number, frame) in authenticated {
             self.store_for_serving(&frame);
-            self.buffered.entry(address.to_vec()).or_default().insert(number, frame);
+            self.buffered
+                .entry(address.to_vec())
+                .or_default()
+                .insert(number, frame);
         }
         let buffered = self.buffered.entry(address.to_vec()).or_default();
         if buffered.len() > MAX_BUFFERED_FRAMES_PER_SHARD {
@@ -684,23 +735,39 @@ impl ArchiveAppShardIngest {
     /// stays held: serving it neither buffers nor materializes it, which
     /// only a certified child or GLOBAL's sequencing does.
     fn serve_committed_held(&self, address: &[u8]) {
-        let Some(held) = self.held.get(address) else { return };
-        let Ok(Some(tip)) = crate::app_handoff::committed_tip(&self.hypergraph, address) else { return };
+        let Some(held) = self.held.get(address) else {
+            return;
+        };
+        let Ok(Some(tip)) = crate::app_handoff::committed_tip(&self.hypergraph, address) else {
+            return;
+        };
         let at_tip = |identity: [u8; 32]| held.contains_key(&(tip, identity));
-        if held.range((tip, [0; 32])..=(tip, [0xff; 32])).next().is_none() {
+        if held
+            .range((tip, [0; 32])..=(tip, [0xff; 32]))
+            .next()
+            .is_none()
+        {
             return;
         }
-        let served = self.clock_store.get_shard_clock_frame(address, tip, false).ok()
+        let served = self
+            .clock_store
+            .get_shard_clock_frame(address, tip, false)
+            .ok()
             .and_then(|frame| frame.header)
             .and_then(|header| quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok());
         if served.is_some_and(at_tip) {
             return;
         }
-        let Ok(Some(digest)) = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, address, tip)
-        else {
+        let Ok(Some(digest)) = crate::app_handoff::committed_frame_digest_looked_through(
+            &self.hypergraph,
+            address,
+            tip,
+        ) else {
             return;
         };
-        let Some(frame) = held.get(&(tip, digest)) else { return };
+        let Some(frame) = held.get(&(tip, digest)) else {
+            return;
+        };
         self.store_for_serving(frame);
         info!(address = %hex::encode(address), frame = tip, digest = %hex::encode(&digest[..4]),
             "archive serves the frame GLOBAL committed without a certificate of its own (a sealed session's last frame)");
@@ -719,21 +786,45 @@ impl ArchiveAppShardIngest {
     /// most every [`COMMITTED_TIP_ASK`]; a frame still missing after
     /// [`COMMITTED_TIP_WARN`] is warned about once per that interval.
     fn request_committed_tips(&mut self) {
-        let Some(sender) = self.gap_requests.clone() else { return };
-        if self.last_tip_scan.is_some_and(|at| at.elapsed() < COMMITTED_TIP_SCAN) {
+        let Some(sender) = self.gap_requests.clone() else {
+            return;
+        };
+        if self
+            .last_tip_scan
+            .is_some_and(|at| at.elapsed() < COMMITTED_TIP_SCAN)
+        {
             return;
         }
         self.last_tip_scan = Some(Instant::now());
-        let global_frame = self.clock_store.get_latest_global_clock_frame().ok()
-            .and_then(|frame| frame.header).map_or(0, |header| header.frame_number);
-        let Ok(summaries) = self.prover_registry.get_prover_shard_summaries(global_frame) else { return };
-        let filters: Vec<Vec<u8>> = summaries.into_iter().map(|summary| summary.filter)
-            .filter(|filter| !filter.is_empty()).collect();
-        let Ok(tips) = crate::app_handoff::committed_tips(&self.hypergraph, &filters) else { return };
+        let global_frame = self
+            .clock_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header)
+            .map_or(0, |header| header.frame_number);
+        let Ok(summaries) = self
+            .prover_registry
+            .get_prover_shard_summaries(global_frame)
+        else {
+            return;
+        };
+        let filters: Vec<Vec<u8>> = summaries
+            .into_iter()
+            .map(|summary| summary.filter)
+            .filter(|filter| !filter.is_empty())
+            .collect();
+        let Ok(tips) = crate::app_handoff::committed_tips(&self.hypergraph, &filters) else {
+            return;
+        };
         let mut missing = HashMap::new();
         for (filter, tip) in tips {
             let tracked = self.missing_tips.remove(&filter);
-            let served = self.clock_store.get_latest_shard_clock_frame_number(&filter).ok().flatten().unwrap_or(0);
+            let served = self
+                .clock_store
+                .get_latest_shard_clock_frame_number(&filter)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
             if tip == 0 || served >= tip {
                 if let Some(found) = tracked.filter(|found| found.asks > 0) {
                     info!(filter = %hex::encode(&filter), committed_tip = found.tip, asks = found.asks,
@@ -743,16 +834,30 @@ impl ArchiveAppShardIngest {
                 continue;
             }
             let now = Instant::now();
-            let mut entry = tracked.filter(|entry| entry.tip == tip)
-                .unwrap_or(MissingTip { tip, served, since: now, asked: None, asks: 0, warned: None });
+            let mut entry = tracked
+                .filter(|entry| entry.tip == tip)
+                .unwrap_or(MissingTip {
+                    tip,
+                    served,
+                    since: now,
+                    asked: None,
+                    asks: 0,
+                    warned: None,
+                });
             entry.served = served;
-            if entry.asked.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK)
+            if entry
+                .asked
+                .is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK)
                 && sender.try_send((filter.clone(), tip)).is_ok()
             {
                 entry.asked = Some(now);
                 entry.asks += 1;
             }
-            if entry.since.elapsed() >= COMMITTED_TIP_WARN && entry.warned.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN) {
+            if entry.since.elapsed() >= COMMITTED_TIP_WARN
+                && entry
+                    .warned
+                    .is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN)
+            {
                 entry.warned = Some(now);
                 warn!(filter = %hex::encode(&filter), committed_tip = tip, served_tip = entry.served, asks = entry.asks,
                     missing_secs = entry.since.elapsed().as_secs(),
@@ -775,18 +880,29 @@ impl ArchiveAppShardIngest {
     /// GLOBAL frame carries fills and no certificate binds, is stored empty.
     /// Returns whether the frame was stored.
     fn store_for_serving(&self, frame: &AppShardFrame) -> bool {
-        if frame.header.as_ref().is_some_and(|header| !header.storage_attestation.is_empty()) {
+        if frame
+            .header
+            .as_ref()
+            .is_some_and(|header| !header.storage_attestation.is_empty())
+        {
             let mut cleared = frame.clone();
             if let Some(header) = cleared.header.as_mut() {
                 header.storage_attestation.clear();
             }
             return self.store_for_serving(&cleared);
         }
-        let Some(header) = frame.header.as_ref() else { return false };
-        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return false;
+        };
         // Outside every GLOBAL execution footprint, so it does not make a
         // concurrent atomic execution stale.
-        if let Err(error) = self.clock_store.store_shard_clock_frame_for_serving(&selector, frame) {
+        if let Err(error) = self
+            .clock_store
+            .store_shard_clock_frame_for_serving(&selector, frame)
+        {
             warn!(frame = header.frame_number, %error,
                 address = %hex::encode(&header.address),
                 "archive ingest: storing a verified shard frame for serving failed");
@@ -797,7 +913,9 @@ impl ArchiveAppShardIngest {
 
     /// Whether this archive owes the body of frame `number` of `address`.
     pub(crate) fn owes_body(&self, address: &[u8], number: u64) -> bool {
-        self.owed_bodies.get(address).is_some_and(|owed| owed.contains_key(&number))
+        self.owed_bodies
+            .get(address)
+            .is_some_and(|owed| owed.contains_key(&number))
     }
 
     /// Whether `frame` has the output of a body this archive owes and could
@@ -805,32 +923,59 @@ impl ArchiveAppShardIngest {
     /// a frame is. A copy without its own certificate cannot replace the one
     /// already served.
     fn wants_owed_body(&self, address: &[u8], frame: &AppShardFrame) -> bool {
-        let Some(header) = frame.header.as_ref() else { return false };
-        let Some(owed) = self.owed_bodies.get(address).and_then(|owed| owed.get(&header.frame_number)) else {
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        let Some(owed) = self
+            .owed_bodies
+            .get(address)
+            .and_then(|owed| owed.get(&header.frame_number))
+        else {
             return false;
         };
         (has_certificate(frame) || !owed.uncertified_served)
-            && quil_crypto::poseidon::hash_bytes_to_32(&header.output).is_ok_and(|selector| selector == owed.selector)
+            && quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                .is_ok_and(|selector| selector == owed.selector)
     }
 
     /// Owe the body of frame `number` of `address`, whose output hashes to
     /// `selector` by `origin`, so [`Self::request_owed_bodies`] asks for it
     /// until it is stored. Returns whether it was newly owed.
-    fn owe_body(&mut self, address: &[u8], number: u64, selector: [u8; 32], origin: OwedOrigin) -> bool {
+    fn owe_body(
+        &mut self,
+        address: &[u8],
+        number: u64,
+        selector: [u8; 32],
+        origin: OwedOrigin,
+    ) -> bool {
         let owed: usize = self.owed_bodies.values().map(BTreeMap::len).sum();
         if owed >= MAX_OWED_BODIES || self.owes_body(address, number) {
             return false;
         }
-        self.owed_bodies.entry(address.to_vec()).or_default().insert(number, OwedBody {
-            selector, origin, since: Instant::now(), asked: None, asks: 0, uncertified_served: false, mismatch_warns: 0,
-        });
+        self.owed_bodies
+            .entry(address.to_vec())
+            .or_default()
+            .insert(
+                number,
+                OwedBody {
+                    selector,
+                    origin,
+                    since: Instant::now(),
+                    asked: None,
+                    asks: 0,
+                    uncertified_served: false,
+                    mismatch_warns: 0,
+                },
+            );
         true
     }
 
     /// Whether the report of frame `number` of `address` was found not to be
     /// owed within [`NOT_OWED_TTL`].
     fn not_owed(&self, address: &[u8], number: u64) -> bool {
-        self.not_owed.get(&(address.to_vec(), number)).is_some_and(|at| at.elapsed() < NOT_OWED_TTL)
+        self.not_owed
+            .get(&(address.to_vec(), number))
+            .is_some_and(|at| at.elapsed() < NOT_OWED_TTL)
     }
 
     /// Remember that frame `number` of `address` is not owed, within
@@ -838,15 +983,23 @@ impl ArchiveAppShardIngest {
     fn note_not_owed(&mut self, address: &[u8], number: u64) {
         self.not_owed.retain(|_, at| at.elapsed() < NOT_OWED_TTL);
         if self.not_owed.len() >= MAX_NOT_OWED {
-            if let Some(oldest) = self.not_owed.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()) {
+            if let Some(oldest) = self
+                .not_owed
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| key.clone())
+            {
                 self.not_owed.remove(&oldest);
             }
         }
-        self.not_owed.insert((address.to_vec(), number), Instant::now());
+        self.not_owed
+            .insert((address.to_vec(), number), Instant::now());
     }
 
     fn forget_owed_body(&mut self, address: &[u8], number: u64) {
-        let Some(owed) = self.owed_bodies.get_mut(address) else { return };
+        let Some(owed) = self.owed_bodies.get_mut(address) else {
+            return;
+        };
         owed.remove(&number);
         if owed.is_empty() {
             self.owed_bodies.remove(address);
@@ -868,11 +1021,27 @@ impl ArchiveAppShardIngest {
     /// replaying …d9000a1b40 stopped at frame 5577 ("archive replay is
     /// missing shard frame 5577"), while its members held the body
     /// (2026-10-23).
-    fn store_owed_body(&mut self, address: &[u8], frame: &AppShardFrame, certified: bool, via: &'static str) {
-        let Some(header) = frame.header.as_ref() else { return };
+    fn store_owed_body(
+        &mut self,
+        address: &[u8],
+        frame: &AppShardFrame,
+        certified: bool,
+        via: &'static str,
+    ) {
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
         let number = header.frame_number;
-        let Some(owed) = self.owed_bodies.get_mut(address).and_then(|owed| owed.get_mut(&number)) else { return };
-        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return };
+        let Some(owed) = self
+            .owed_bodies
+            .get_mut(address)
+            .and_then(|owed| owed.get_mut(&number))
+        else {
+            return;
+        };
+        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return;
+        };
         if selector != owed.selector {
             let (origin, expected) = (owed.origin, owed.selector);
             if !certified {
@@ -907,7 +1076,11 @@ impl ArchiveAppShardIngest {
             return;
         }
         if !complete {
-            if let Some(owed) = self.owed_bodies.get_mut(address).and_then(|owed| owed.get_mut(&number)) {
+            if let Some(owed) = self
+                .owed_bodies
+                .get_mut(address)
+                .and_then(|owed| owed.get_mut(&number))
+            {
                 owed.uncertified_served = true;
             }
             info!(filter = %hex::encode(address), frame = number, via, asks, owed_secs = since.elapsed().as_secs(),
@@ -927,8 +1100,12 @@ impl ArchiveAppShardIngest {
     /// `number`'s output. `Err` when GLOBAL's records cannot be read.
     fn opens_session_after(&self, address: &[u8], number: u64) -> quil_types::error::Result<bool> {
         use quil_execution::global_intrinsic::handoff;
-        let Some(view) = crate::app_handoff::committed_view(&self.hypergraph)? else { return Ok(false) };
-        let Some(head) = handoff::head(&view, address)? else { return Ok(false) };
+        let Some(view) = crate::app_handoff::committed_view(&self.hypergraph)? else {
+            return Ok(false);
+        };
+        let Some(head) = handoff::head(&view, address)? else {
+            return Ok(false);
+        };
         // A successor's base is its predecessor's closing checkpoint, never
         // below that predecessor's base (`app_engine::session_based_at`).
         for generation in (1..=head.generation).rev() {
@@ -956,28 +1133,46 @@ impl ArchiveAppShardIngest {
         let mut reports = Vec::new();
         if let Some(receiver) = self.missing_frame_reports.as_mut() {
             while reports.len() < MISSING_FRAME_REPORTS_PER_PASS {
-                let Ok(report) = receiver.try_recv() else { break };
+                let Ok(report) = receiver.try_recv() else {
+                    break;
+                };
                 reports.push(report);
             }
         }
         for (address, number) in reports {
-            if number == 0 || self.owes_body(&address, number) || self.not_owed(&address, number)
-                || self.clock_store.get_shard_clock_frame(&address, number, false).is_ok()
+            if number == 0
+                || self.owes_body(&address, number)
+                || self.not_owed(&address, number)
+                || self
+                    .clock_store
+                    .get_shard_clock_frame(&address, number, false)
+                    .is_ok()
             {
                 continue;
             }
             // Read before the cursor, which is cached per address: only a
             // shard this archive stores frames of gets that far.
-            let Some(child) = self.clock_store.get_shard_clock_frame(&address, number + 1, false).ok()
+            let Some(child) = self
+                .clock_store
+                .get_shard_clock_frame(&address, number + 1, false)
+                .ok()
                 .and_then(|child| child.header)
             else {
                 continue;
             };
-            if !self.materialized_height(&address).is_ok_and(|height| number <= height) {
+            if !self
+                .materialized_height(&address)
+                .is_ok_and(|height| number <= height)
+            {
                 continue;
             }
-            let committed = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, &address, number)
-                .ok().flatten();
+            let committed = crate::app_handoff::committed_frame_digest_looked_through(
+                &self.hypergraph,
+                &address,
+                number,
+            )
+            .ok()
+            .flatten();
             let (selector, origin) = match committed {
                 Some(digest) => (digest, OwedOrigin::Committed),
                 // Records unreadable now: the next report looks again.
@@ -1026,32 +1221,60 @@ impl ArchiveAppShardIngest {
                  served one (the gap fetch's line for each frame names each answer); nodes replaying such a \
                  shard from archives stop at the frame, which is owed again once one asks for it");
         }
-        let Some(sender) = self.prefetch_requests.clone() else { return };
-        let due: Vec<(Vec<u8>, u64)> = self.owed_bodies.iter()
-            .flat_map(|(address, owed)| owed.iter()
-                .filter(|(_, body)| body.asked.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK))
-                .map(move |(&number, _)| (address.clone(), number)))
+        let Some(sender) = self.prefetch_requests.clone() else {
+            return;
+        };
+        let due: Vec<(Vec<u8>, u64)> = self
+            .owed_bodies
+            .iter()
+            .flat_map(|(address, owed)| {
+                owed.iter()
+                    .filter(|(_, body)| {
+                        body.asked
+                            .is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK)
+                    })
+                    .map(move |(&number, _)| (address.clone(), number))
+            })
             .take(OWED_BODY_ASKS_PER_PASS)
             .collect();
         for (address, number) in due {
-            if self.clock_store.get_shard_clock_frame(&address, number, false).is_ok_and(|stored| has_certificate(&stored)) {
+            if self
+                .clock_store
+                .get_shard_clock_frame(&address, number, false)
+                .is_ok_and(|stored| has_certificate(&stored))
+            {
                 self.forget_owed_body(&address, number);
                 continue;
             }
             if sender.try_send((address.clone(), number)).is_err() {
                 break;
             }
-            if let Some(body) = self.owed_bodies.get_mut(&address).and_then(|owed| owed.get_mut(&number)) {
+            if let Some(body) = self
+                .owed_bodies
+                .get_mut(&address)
+                .and_then(|owed| owed.get_mut(&number))
+            {
                 body.asked = Some(Instant::now());
                 body.asks += 1;
             }
         }
-        let oldest = self.owed_bodies.iter()
-            .flat_map(|(address, owed)| owed.iter().map(move |(&number, body)| (body.since, address, number)))
+        let oldest = self
+            .owed_bodies
+            .iter()
+            .flat_map(|(address, owed)| {
+                owed.iter()
+                    .map(move |(&number, body)| (body.since, address, number))
+            })
             .min_by_key(|(since, _, _)| *since)
             .map(|(since, address, number)| (since, hex::encode(address), number));
-        let Some((since, filter, frame)) = oldest else { return };
-        if since.elapsed() >= COMMITTED_TIP_WARN && self.owed_warned.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN) {
+        let Some((since, filter, frame)) = oldest else {
+            return;
+        };
+        if since.elapsed() >= COMMITTED_TIP_WARN
+            && self
+                .owed_warned
+                .is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN)
+        {
             self.owed_warned = Some(Instant::now());
             let owed: usize = self.owed_bodies.values().map(BTreeMap::len).sum();
             warn!(owed, shards = self.owed_bodies.len(), oldest_filter = %filter, oldest_frame = frame,
@@ -1078,7 +1301,11 @@ impl ArchiveAppShardIngest {
     /// makes up, so every archive must hold exactly the frames the GLOBAL chain
     /// has referenced when it executes a frame: never materialize ahead of
     /// that, never execute behind it.
-    pub fn materialize_through(&mut self, address: &[u8], through: u64) -> quil_types::error::Result<bool> {
+    pub fn materialize_through(
+        &mut self,
+        address: &[u8],
+        through: u64,
+    ) -> quil_types::error::Result<bool> {
         self.materialize_in_order(address, through, &HashMap::new())
     }
 
@@ -1107,7 +1334,9 @@ impl ArchiveAppShardIngest {
             if last >= through {
                 break true;
             }
-            let Some(next) = last.checked_add(1) else { break true };
+            let Some(next) = last.checked_add(1) else {
+                break true;
+            };
             // `rebuilt`: rebuilt from its header, and whether whole.
             let (frame, rebuilt) = match self.buffered.get(address).and_then(|m| m.get(&next)) {
                 Some(f) => (f.clone(), None),
@@ -1130,10 +1359,15 @@ impl ArchiveAppShardIngest {
                 .map(|h| h.fee_multiplier_vote)
                 .unwrap_or(0);
             let global_frame_number = frame.header.as_ref().map_or(0, |h| h.global_frame_number);
-            let world_size = crate::app_engine::certified_world_size(self.clock_store.as_ref(), global_frame_number)
-                .map_err(|e| quil_types::error::QuilError::ExecutionUnavailable(format!(
+            let world_size = crate::app_engine::certified_world_size(
+                self.clock_store.as_ref(),
+                global_frame_number,
+            )
+            .map_err(|e| {
+                quil_types::error::QuilError::ExecutionUnavailable(format!(
                     "archive materialize of frame {next}: certified world size unavailable: {e}"
-                )))?;
+                ))
+            })?;
             // Fees decide whether a token operation is admitted, so the archive
             // prices exactly as the committee did: certified header difficulty,
             // vote and anchored world size.
@@ -1158,8 +1392,9 @@ impl ArchiveAppShardIngest {
                     self.store_for_serving(&frame);
                 }
                 Some(false) => {
-                    let selector = frame.header.as_ref()
-                        .and_then(|header| quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok());
+                    let selector = frame.header.as_ref().and_then(|header| {
+                        quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok()
+                    });
                     if let Some(selector) = selector {
                         self.owe_body(address, next, selector, OwedOrigin::Executed);
                     }
@@ -1185,8 +1420,14 @@ impl ArchiveAppShardIngest {
         // carries a frame once.
         let last = *self.last_materialized.get(address).unwrap_or(&0);
         let next_needed = last + 1;
-        let ahead = self.buffered.get(address).map_or(0, |m| m.keys().filter(|&&f| f > next_needed).count());
-        let missing = !self.buffered.get(address).is_some_and(|m| m.contains_key(&next_needed));
+        let ahead = self
+            .buffered
+            .get(address)
+            .map_or(0, |m| m.keys().filter(|&&f| f > next_needed).count());
+        let missing = !self
+            .buffered
+            .get(address)
+            .is_some_and(|m| m.contains_key(&next_needed));
         let waiting = !reached && through != u64::MAX;
         if missing && (ahead > 0 || waiting) {
             // A frame already held without a certificate needs its certified
@@ -1198,7 +1439,10 @@ impl ArchiveAppShardIngest {
             // While a GLOBAL frame waits, every missing frame it needs is asked
             // for at once, up to the window; otherwise the first missing frame.
             let (upto, interval) = if waiting {
-                (through.min(last.saturating_add(GAP_WINDOW)).max(wanted), GLOBAL_WAIT_RETRY_INTERVAL)
+                (
+                    through.min(last.saturating_add(GAP_WINDOW)).max(wanted),
+                    GLOBAL_WAIT_RETRY_INTERVAL,
+                )
             } else {
                 (wanted, GAP_RETRY_INTERVAL)
             };
@@ -1239,7 +1483,11 @@ impl ArchiveAppShardIngest {
     /// frames this reads ahead in are not verified against executed state yet,
     /// and a header naming any other address may be forged. Returns how many
     /// frames were asked for.
-    pub fn prefetch_through(&mut self, address: &[u8], through: u64) -> quil_types::error::Result<usize> {
+    pub fn prefetch_through(
+        &mut self,
+        address: &[u8],
+        through: u64,
+    ) -> quil_types::error::Result<usize> {
         let last = self.materialized_height(address)?;
         let upto = through.min(last.saturating_add(PREFETCH_DEPTH));
         if last == 0 || upto <= last {
@@ -1262,20 +1510,35 @@ impl ArchiveAppShardIngest {
         global_waits: bool,
         interval: Duration,
     ) -> usize {
-        let sender = if urgent { self.gap_requests.clone() } else { self.prefetch_requests.clone() };
+        let sender = if urgent {
+            self.gap_requests.clone()
+        } else {
+            self.prefetch_requests.clone()
+        };
         let Some(sender) = sender else { return 0 };
         let mut sent = 0;
         let mut stored: HashMap<u64, bool> = HashMap::new();
         let mut executed: Option<Option<u64>> = None;
         for number in frames {
-            if self.buffered.get(address).is_some_and(|buffered| buffered.contains_key(&number))
+            if self
+                .buffered
+                .get(address)
+                .is_some_and(|buffered| buffered.contains_key(&number))
                 || self.is_held(address, number)
             {
                 continue;
             }
-            if let Some(anchor) = self.awaiting_anchor.get(address).and_then(|waiting| waiting.get(&number)).copied() {
+            if let Some(anchor) = self
+                .awaiting_anchor
+                .get(address)
+                .and_then(|waiting| waiting.get(&number))
+                .copied()
+            {
                 let clock = &self.clock_store;
-                if !*stored.entry(anchor).or_insert_with(|| clock.get_global_clock_frame_header(anchor).is_ok()) {
+                if !*stored
+                    .entry(anchor)
+                    .or_insert_with(|| clock.get_global_clock_frame_header(anchor).is_ok())
+                {
                     continue;
                 }
                 // The anchor arrived: the frame can validate now, so ask at once.
@@ -1290,16 +1553,22 @@ impl ArchiveAppShardIngest {
                     requested.remove(&number);
                 }
             }
-            if let Some((anchor, since)) = self.awaiting_execution.get(address).and_then(|waiting| waiting.get(&number)).copied() {
+            if let Some((anchor, since)) = self
+                .awaiting_execution
+                .get(address)
+                .and_then(|waiting| waiting.get(&number))
+                .copied()
+            {
                 // A GLOBAL frame waiting for this one sequences only a frame
                 // anchored at or below the executed frame, so the parked copy
                 // is not it: ask at once. A gap alone does not (unsequenced
                 // ingest asks for the first missing frame urgently too).
                 // Unreadable, the cursor holds nothing back: verification then
                 // refuses as before.
-                let reached = global_waits || executed
-                    .get_or_insert_with(|| self.executed_global_frame())
-                    .is_none_or(|executed| executed >= anchor);
+                let reached = global_waits
+                    || executed
+                        .get_or_insert_with(|| self.executed_global_frame())
+                        .is_none_or(|executed| executed >= anchor);
                 if !reached && since.elapsed() < AWAIT_EXECUTION_TTL {
                     continue;
                 }
@@ -1314,15 +1583,23 @@ impl ArchiveAppShardIngest {
                     requested.remove(&number);
                 }
             }
-            let due = self.requested.get(address).and_then(|requested| requested.get(&number))
-                .is_none_or(|&(at, was_urgent)| (urgent && !was_urgent) || at.elapsed() >= interval);
+            let due = self
+                .requested
+                .get(address)
+                .and_then(|requested| requested.get(&number))
+                .is_none_or(|&(at, was_urgent)| {
+                    (urgent && !was_urgent) || at.elapsed() >= interval
+                });
             if !due {
                 continue;
             }
             if sender.try_send((address.to_vec(), number)).is_err() {
                 break;
             }
-            self.requested.entry(address.to_vec()).or_default().insert(number, (Instant::now(), urgent));
+            self.requested
+                .entry(address.to_vec())
+                .or_default()
+                .insert(number, (Instant::now(), urgent));
             sent += 1;
         }
         if let Some(Some(executed)) = executed {
@@ -1340,17 +1617,25 @@ impl ArchiveAppShardIngest {
     /// is the same on every archive, so every archive takes the same frame.
     fn committed_held(&self, address: &[u8], number: u64) -> Option<AppShardFrame> {
         let held = self.held.get(address)?;
-        held.range((number, [0; 32])..=(number, [0xff; 32])).next()?;
-        let digest = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, address, number)
-            .ok()
-            .flatten()?;
+        held.range((number, [0; 32])..=(number, [0xff; 32]))
+            .next()?;
+        let digest = crate::app_handoff::committed_frame_digest_looked_through(
+            &self.hypergraph,
+            address,
+            number,
+        )
+        .ok()
+        .flatten()?;
         held.get(&(number, digest)).cloned()
     }
 
     /// Whether a frame `number` of `address` is held without a certificate.
     fn is_held(&self, address: &[u8], number: u64) -> bool {
-        self.held.get(address)
-            .is_some_and(|held| held.range((number, [0; 32])..=(number, [0xff; 32])).next().is_some())
+        self.held.get(address).is_some_and(|held| {
+            held.range((number, [0; 32])..=(number, [0xff; 32]))
+                .next()
+                .is_some()
+        })
     }
 
     /// The frame `number` of `address`, rebuilt from the certified header the
@@ -1379,7 +1664,8 @@ impl ArchiveAppShardIngest {
         number: u64,
         vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
     ) -> Option<(AppShardFrame, bool)> {
-        let header = vouched.get(&number)
+        let header = vouched
+            .get(&number)
             .filter(|header| header.address == address && header.frame_number == number)?;
         if !requests_root_is_empty(&header.requests_root) {
             return None;
@@ -1387,7 +1673,8 @@ impl ArchiveAppShardIngest {
         let since = match self.missing_since.get(address) {
             Some(&(frame, since, _)) if frame == number => since,
             _ => {
-                self.missing_since.insert(address.to_vec(), (number, Instant::now(), false));
+                self.missing_since
+                    .insert(address.to_vec(), (number, Instant::now(), false));
                 return None;
             }
         };
@@ -1410,7 +1697,10 @@ impl ArchiveAppShardIngest {
             }
             Err(reason) => reason,
         };
-        let frame = AppShardFrame { storage_attestation: None, ..frame };
+        let frame = AppShardFrame {
+            storage_attestation: None,
+            ..frame
+        };
         if let Err(refused) = self.authenticate_header(&frame) {
             if let Some(entry) = self.missing_since.get_mut(address).filter(|entry| !entry.2) {
                 entry.2 = true;
@@ -1489,7 +1779,12 @@ impl ArchiveFrameVerifier {
     /// frame, so it cannot pass before the GLOBAL frame is stored.
     pub fn missing_anchor(&self, frame: &AppShardFrame) -> Option<u64> {
         let anchor = frame.header.as_ref()?.global_frame_number;
-        (anchor > 0 && self.clock_store.get_global_clock_frame_header(anchor).is_err()).then_some(anchor)
+        (anchor > 0
+            && self
+                .clock_store
+                .get_global_clock_frame_header(anchor)
+                .is_err())
+        .then_some(anchor)
     }
 
     /// `Some(certified)` when `frame` may be admitted, `certified` saying
@@ -1505,16 +1800,25 @@ impl ArchiveFrameVerifier {
     /// Whether `frame` may be admitted, waits for GLOBAL execution to reach
     /// its anchor, or is refused (logged).
     pub fn check(&self, frame: &AppShardFrame) -> FrameCheck {
-        let Some(header) = frame.header.as_ref().filter(|header| !header.address.is_empty()) else {
+        let Some(header) = frame
+            .header
+            .as_ref()
+            .filter(|header| !header.address.is_empty())
+        else {
             return FrameCheck::Refused;
         };
-        let (address, frame_number, requests_root) = (&header.address, header.frame_number, &header.requests_root);
+        let (address, frame_number, requests_root) =
+            (&header.address, header.frame_number, &header.requests_root);
         // 1. Quorum BLS cert + VDF against the shard committee. A frame with
         // no certificate of its own is one a certified descendant finalized
         // (see `admit`): it gets every check but the quorum here, and is only
         // ever materialized once a certified frame links to it.
         let certified = has_certificate(frame);
-        let validated = if certified { self.validator.validate(frame) } else { self.validator.validate_proposal(frame) };
+        let validated = if certified {
+            self.validator.validate(frame)
+        } else {
+            self.validator.validate_proposal(frame)
+        };
         match validated {
             Ok(true) => {}
             Ok(false) => {
@@ -1531,14 +1835,22 @@ impl ArchiveFrameVerifier {
                     .hypergraph
                     .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
                     .ok()
-                    .filter(|&executed| crate::execution_deferral::awaits_execution(&e, anchor, executed))
+                    .filter(|&executed| {
+                        crate::execution_deferral::awaits_execution(&e, anchor, executed)
+                    })
                     // Only the shard's next generation can be authorized by
                     // GLOBAL frames not yet executed; any other is refused, so a
                     // header naming an arbitrary generation is not parked.
                     .filter(|_| {
-                        let claimed = header.public_key_signature_bls48581.as_ref()
-                            .and_then(|s| crate::execution_deferral::claimed_generation(&s.signature));
-                        claimed.is_some() && claimed == crate::execution_deferral::next_generation(&self.hypergraph, address)
+                        let claimed = header.public_key_signature_bls48581.as_ref().and_then(|s| {
+                            crate::execution_deferral::claimed_generation(&s.signature)
+                        });
+                        claimed.is_some()
+                            && claimed
+                                == crate::execution_deferral::next_generation(
+                                    &self.hypergraph,
+                                    address,
+                                )
                     });
                 if let Some(executed) = executed {
                     debug!(frame = frame_number, address = %hex::encode(address), anchor, executed, error = %e,
@@ -1667,7 +1979,9 @@ fn requests_root_is_empty(root: &[u8]) -> bool {
 const MAX_LINKED_RUN: usize = MAX_HELD_FRAMES_PER_SHARD;
 
 fn has_certificate(frame: &AppShardFrame) -> bool {
-    frame.header.as_ref()
+    frame
+        .header
+        .as_ref()
         .and_then(|header| header.public_key_signature_bls48581.as_ref())
         .is_some_and(|signature| !signature.signature.is_empty())
 }
@@ -1706,32 +2020,58 @@ where
         return (vec![frame], prepared);
     }
     let mut run = vec![frame];
-    while let Some(parent) = run.last().filter(|frame| !has_certificate(frame)).and_then(|frame| frame.header.clone()) {
+    while let Some(parent) = run
+        .last()
+        .filter(|frame| !has_certificate(frame))
+        .and_then(|frame| frame.header.clone())
+    {
         if run.len() > MAX_LINKED_RUN {
-            return (run, Err(QuilError::ExecutionUnavailable(format!(
-                "no certified descendant within {MAX_LINKED_RUN} frames"))));
+            return (
+                run,
+                Err(QuilError::ExecutionUnavailable(format!(
+                    "no certified descendant within {MAX_LINKED_RUN} frames"
+                ))),
+            );
         }
         let Some(child) = fetch(parent.frame_number + 1).await else {
-            return (run, Err(QuilError::ExecutionUnavailable(format!(
-                "certified descendant unavailable: frame {} not fetched", parent.frame_number + 1))));
+            return (
+                run,
+                Err(QuilError::ExecutionUnavailable(format!(
+                    "certified descendant unavailable: frame {} not fetched",
+                    parent.frame_number + 1
+                ))),
+            );
         };
-        if !child.header.as_ref().is_some_and(|child| crate::frame_validator::app_frame_links_to_child(&parent, child)) {
-            return (run, Err(QuilError::InvalidArgument(format!(
-                "fetched frame {} does not link to frame {}", parent.frame_number + 1, parent.frame_number))));
+        if !child
+            .header
+            .as_ref()
+            .is_some_and(|child| crate::frame_validator::app_frame_links_to_child(&parent, child))
+        {
+            return (
+                run,
+                Err(QuilError::InvalidArgument(format!(
+                    "fetched frame {} does not link to frame {}",
+                    parent.frame_number + 1,
+                    parent.frame_number
+                ))),
+            );
         }
         run.push(child);
     }
     let prepared = async {
         let (descendant, linked) = run.split_last().expect("the run holds the fetched frame");
         if !linked.is_empty() && !validator.validate_certified_without_storage(descendant)? {
-            return Err(QuilError::InvalidSignature("certified descendant of a gap-fetched frame is invalid".into()));
+            return Err(QuilError::InvalidSignature(
+                "certified descendant of a gap-fetched frame is invalid".into(),
+            ));
         }
         validator.prepare_storage_history(descendant).await?;
         for frame in linked.iter().rev() {
             validator.prepare_storage_history_of_linked(frame).await?;
         }
         Ok(())
-    }.await;
+    }
+    .await;
     (run, prepared)
 }
 
@@ -1740,17 +2080,26 @@ mod tests {
     use super::*;
     use quil_types::proto::global::FrameHeader;
 
-    fn fixture() -> (ArchiveAppShardIngest, Arc<quil_hypergraph::testing::MemStore>) {
+    fn fixture() -> (
+        ArchiveAppShardIngest,
+        Arc<quil_hypergraph::testing::MemStore>,
+    ) {
         fixture_with_clock(None)
     }
 
     /// The fixture, serving from `clock` when given.
     fn fixture_with_clock(
         clock: Option<Arc<dyn quil_types::store::ClockStore>>,
-    ) -> (ArchiveAppShardIngest, Arc<quil_hypergraph::testing::MemStore>) {
+    ) -> (
+        ArchiveAppShardIngest,
+        Arc<quil_hypergraph::testing::MemStore>,
+    ) {
         let store = Arc::new(quil_hypergraph::testing::MemStore::new());
         let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), inclusion));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            inclusion,
+        ));
         (fixture_over(crdt, clock), store)
     }
 
@@ -1759,7 +2108,11 @@ mod tests {
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
         clock: Option<Arc<dyn quil_types::store::ClockStore>>,
     ) -> ArchiveAppShardIngest {
-        fixture_with_registry(crdt, clock, Arc::new(crate::test_support::TestProverRegistry::new()))
+        fixture_with_registry(
+            crdt,
+            clock,
+            Arc::new(crate::test_support::TestProverRegistry::new()),
+        )
     }
 
     /// [`fixture_over`] with the prover registry `registry`.
@@ -1771,59 +2124,109 @@ mod tests {
         let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
         let crypto = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-            inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
-            crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+            inclusion.clone(),
+            crypto.key_manager,
+            crdt.clone(),
+            crypto.circuit_compiler,
+            crypto.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            false,
         ));
         ArchiveAppShardIngest::new(
             registry,
             Arc::new(quil_crypto::FalconKeyConstructor),
             Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
-            manager, inclusion, crdt, clock.unwrap_or(crypto.clock_store),
+            manager,
+            inclusion,
+            crdt,
+            clock.unwrap_or(crypto.clock_store),
         )
     }
 
     /// GLOBAL state in which `filter`'s first session sealed at frame
     /// `frame` with checkpoint digest `digest`, and its successor is based
     /// there without a frame of its own.
-    fn sealed_global(filter: &[u8], frame: u64, digest: [u8; 32]) -> Arc<quil_hypergraph::HypergraphCrdt> {
+    fn sealed_global(
+        filter: &[u8],
+        frame: u64,
+        digest: [u8; 32],
+    ) -> Arc<quil_hypergraph::HypergraphCrdt> {
         use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
-        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
+        use quil_execution::global_intrinsic::handoff::{
+            self, CertificateSubmission, DesiredCommittee,
+        };
         use quil_types::crypto::Signer as _;
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
-        let signers: Vec<_> = (0..3).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let signers: Vec<_> = (0..3)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
         let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
         members.sort();
         let source = Session {
-            chain_id: [7; 32], filter: filter.to_vec(), generation: 1,
-            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(), base_frame: 0,
-            authorization: [0; 32], members: members.clone(),
+            chain_id: [7; 32],
+            filter: filter.to_vec(),
+            generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0,
+            authorization: [0; 32],
+            members: members.clone(),
         };
         let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
         let commit = |number| {
             state.commit().unwrap();
             state.abort();
-            global.commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            global
+                .commit_with_global_cursor(
+                    number,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
         };
         commit(1);
         handoff::initialize(&state, 2, &source).unwrap();
         commit(2);
-        let request = handoff::schedule(&state, 3, vec![filter.to_vec()],
-            vec![DesiredCommittee { filter: filter.to_vec(), members }]).unwrap();
+        let request = handoff::schedule(
+            &state,
+            3,
+            vec![filter.to_vec()],
+            vec![DesiredCommittee {
+                filter: filter.to_vec(),
+                members,
+            }],
+        )
+        .unwrap();
         commit(3);
         let seal = Seal {
-            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
-            checkpoint: Checkpoint { frame, view: 5, digest, state_roots: [[1; 32]; 4], history_root: [0; 32] },
+            request: request.id().unwrap(),
+            session: source.id().unwrap(),
+            view: 9,
+            checkpoint: Checkpoint {
+                frame,
+                view: 5,
+                digest,
+                state_roots: [[1; 32]; 4],
+                history_root: [0; 32],
+            },
         };
         let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
         handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
-        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        assert!(
+            handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate })
+                .unwrap()
+        );
         commit(4);
-        assert_eq!(crate::app_handoff::committed_tip(&global, filter).unwrap(), Some(frame));
+        assert_eq!(
+            crate::app_handoff::committed_tip(&global, filter).unwrap(),
+            Some(frame)
+        );
         global
     }
 
@@ -1831,7 +2234,11 @@ mod tests {
     // queue and the actual materializer/cursor commit independently of crypto.
     fn verified_frame(filter: &[u8], number: u64) -> AppShardFrame {
         AppShardFrame {
-            header: Some(FrameHeader { address: filter.to_vec(), frame_number: number, ..Default::default() }),
+            header: Some(FrameHeader {
+                address: filter.to_vec(),
+                frame_number: number,
+                ..Default::default()
+            }),
             requests: Vec::new(),
             storage_attestation: None,
         }
@@ -1846,8 +2253,11 @@ mod tests {
             header.rank = number * 2;
             header.output = vec![number as u8; 32];
             if let Some(parent) = frames.last() {
-                header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output)
-                    .unwrap().to_vec();
+                header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(
+                    &parent.header.as_ref().unwrap().output,
+                )
+                .unwrap()
+                .to_vec();
             }
             frames.push(frame);
         }
@@ -1862,7 +2272,10 @@ mod tests {
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 5);
         let buffered = |ingest: &ArchiveAppShardIngest| {
-            let mut numbers: Vec<u64> = ingest.buffered.get(&filter).map_or(Vec::new(), |m| m.keys().copied().collect());
+            let mut numbers: Vec<u64> = ingest
+                .buffered
+                .get(&filter)
+                .map_or(Vec::new(), |m| m.keys().copied().collect());
             numbers.sort();
             numbers
         };
@@ -1931,7 +2344,10 @@ mod tests {
         ingest.admit(&filter, frames[2].clone(), true);
         assert_eq!(served(2), Some(frames[1].clone()));
         assert_eq!(served(3), Some(frames[2].clone()));
-        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frames[2]);
+        assert_eq!(
+            clock.get_latest_shard_clock_frame(&filter).unwrap(),
+            frames[2]
+        );
     }
 
     /// A sealed session's last frame has no certificate of its own and no
@@ -1945,9 +2361,12 @@ mod tests {
         use quil_types::store::ClockStore as _;
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 3);
-        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        let mut ingest =
+            fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
         let served = |number| clock.get_shard_clock_frame(&filter, number, false).ok();
         ingest.admit(&filter, frames[0].clone(), true);
         ingest.admit(&filter, frames[1].clone(), true);
@@ -1955,20 +2374,34 @@ mod tests {
         impostor.header.as_mut().unwrap().output = vec![0xee; 32];
         ingest.admit(&filter, impostor, false);
         ingest.retry_pending();
-        assert_eq!(served(3), None, "an impostor at the committed tip is never served");
+        assert_eq!(
+            served(3),
+            None,
+            "an impostor at the committed tip is never served"
+        );
         ingest.admit(&filter, frames[2].clone(), false);
         assert_eq!(served(3), None, "held");
         ingest.retry_pending();
         assert_eq!(served(3), Some(frames[2].clone()));
-        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frames[2]);
+        assert_eq!(
+            clock.get_latest_shard_clock_frame(&filter).unwrap(),
+            frames[2]
+        );
         assert!(ingest.is_held(&filter, 3), "still held");
-        assert!(ingest.buffered.get(&filter).is_some_and(|buffered| !buffered.contains_key(&3)), "never buffered");
+        assert!(
+            ingest
+                .buffered
+                .get(&filter)
+                .is_some_and(|buffered| !buffered.contains_key(&3)),
+            "never buffered"
+        );
         ingest.retry_pending();
         assert_eq!(served(3), Some(frames[2].clone()));
 
         // Under any other committed digest, nothing held is served.
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let mut ingest = fixture_over(sealed_global(&filter, 3, [0x33; 32]), Some(clock.clone())).sequenced();
+        let mut ingest =
+            fixture_over(sealed_global(&filter, 3, [0x33; 32]), Some(clock.clone())).sequenced();
         ingest.admit(&filter, frames[2].clone(), false);
         ingest.retry_pending();
         assert!(clock.get_shard_clock_frame(&filter, 3, false).is_err());
@@ -1986,22 +2419,31 @@ mod tests {
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let mut frames = chain(&filter, 4);
         frames[3].header.as_mut().unwrap().parent_selector = vec![0x5e; 32];
-        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        let mut ingest =
+            fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
         ingest.admit(&filter, frames[0].clone(), true);
         ingest.admit(&filter, frames[1].clone(), true);
         let mut impostor = frames[2].clone();
         impostor.header.as_mut().unwrap().output = vec![0xee; 32];
         ingest.admit(&filter, impostor, false);
         ingest.admit(&filter, frames[3].clone(), true);
-        assert!(!ingest.materialize_through(&filter, 4).unwrap(), "an impostor is never sequenced");
+        assert!(
+            !ingest.materialize_through(&filter, 4).unwrap(),
+            "an impostor is never sequenced"
+        );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
         ingest.admit(&filter, frames[2].clone(), false);
         assert!(ingest.is_held(&filter, 3), "no certified frame links to it");
         assert!(ingest.materialize_through(&filter, 4).unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
-        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 3, false).ok(),
+            Some(frames[2].clone())
+        );
         assert!(!ingest.is_held(&filter, 3));
     }
 
@@ -2016,30 +2458,52 @@ mod tests {
         use quil_types::store::ClockStore as _;
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 3);
-        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
         let registry = Arc::new(crate::test_support::TestProverRegistry::new());
         registry.set_summaries(vec![quil_types::consensus::ProverShardSummary {
-            filter: filter.clone(), status_counts: HashMap::new(), total_size: 1,
+            filter: filter.clone(),
+            status_counts: HashMap::new(),
+            total_size: 1,
         }]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let mut ingest = fixture_with_registry(sealed_global(&filter, 3, sealed), Some(clock.clone()), registry)
-            .with_gap_fetch(tx).sequenced();
+        let mut ingest = fixture_with_registry(
+            sealed_global(&filter, 3, sealed),
+            Some(clock.clone()),
+            registry,
+        )
+        .with_gap_fetch(tx)
+        .sequenced();
         ingest.admit(&filter, frames[0].clone(), true);
         ingest.admit(&filter, frames[1].clone(), true);
         ingest.retry_pending();
-        assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 3), "the committed tip above the served frame 2");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (filter.clone(), 3),
+            "the committed tip above the served frame 2"
+        );
         ingest.last_tip_scan = None;
         ingest.retry_pending();
         assert!(rx.try_recv().is_err(), "asked at most once per interval");
-        assert_eq!(ingest.missing_tips.get(&filter).map(|missing| (missing.tip, missing.served, missing.asks)),
-            Some((3, 2, 1)));
+        assert_eq!(
+            ingest.missing_tips.get(&filter).map(|missing| (
+                missing.tip,
+                missing.served,
+                missing.asks
+            )),
+            Some((3, 2, 1))
+        );
 
         // The fetched frame, without a certificate of its own, is served
         // under the committed digest; then nothing is missing.
         ingest.admit(&filter, frames[2].clone(), false);
         ingest.retry_pending();
-        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 3, false).ok(),
+            Some(frames[2].clone())
+        );
         ingest.last_tip_scan = None;
         ingest.retry_pending();
         assert!(rx.try_recv().is_err());
@@ -2057,9 +2521,12 @@ mod tests {
         use quil_types::store::ClockStore as _;
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 3);
-        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        let mut ingest =
+            fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
         let validator = ingest.validator();
         let asked = std::sync::Mutex::new(Vec::new());
         let fetch = |number: u64| {
@@ -2068,20 +2535,30 @@ mod tests {
         };
         let (run, prepared) = prepare_gap_fetched(&validator, frames[2].clone(), fetch).await;
         assert!(prepared.is_ok(), "{prepared:?}");
-        assert!(asked.lock().unwrap().is_empty(), "no descendant is asked for");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "no descendant is asked for"
+        );
         ingest.admit(&filter, frames[0].clone(), true);
         ingest.admit(&filter, frames[1].clone(), true);
         for frame in run {
             ingest.admit(&filter, frame, false);
         }
         ingest.retry_pending();
-        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 3, false).ok(),
+            Some(frames[2].clone())
+        );
 
         let mut impostor = frames[2].clone();
         impostor.header.as_mut().unwrap().output = vec![0xee; 32];
         let (_, prepared) = prepare_gap_fetched(&validator, impostor, fetch).await;
         assert!(prepared.is_err());
-        assert_eq!(*asked.lock().unwrap(), vec![4], "any other frame still needs its certified descendant");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![4],
+            "any other frame still needs its certified descendant"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2090,22 +2567,44 @@ mod tests {
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         ingest = ingest.with_gap_fetch(tx);
-        ingest.buffered.entry(filter.clone()).or_default().insert(2, verified_frame(&filter, 2));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(2, verified_frame(&filter, 2));
         ingest.retry_pending();
         assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 1));
         ingest.retry_pending();
         assert!(rx.try_recv().is_err(), "one active request per gap");
         // The peer had no frame / connection failed. No new gossip arrives.
-        ingest.requested.get_mut(&filter).unwrap().get_mut(&1).unwrap().0 = Instant::now() - GAP_RETRY_INTERVAL;
+        ingest
+            .requested
+            .get_mut(&filter)
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .0 = Instant::now() - GAP_RETRY_INTERVAL;
         ingest.retry_pending();
-        assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 1), "timer retries without inbound frames");
-        ingest.buffered.get_mut(&filter).unwrap().insert(1, verified_frame(&filter, 1));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (filter.clone(), 1),
+            "timer retries without inbound frames"
+        );
+        ingest
+            .buffered
+            .get_mut(&filter)
+            .unwrap()
+            .insert(1, verified_frame(&filter, 1));
         ingest.retry_pending();
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
         assert!(ingest.buffered.is_empty());
         assert!(ingest.requested.is_empty());
         ingest.last_materialized.clear();
-        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2, "recover the co-committed cursor");
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            2,
+            "recover the co-committed cursor"
+        );
     }
 
     /// Sequenced ingest materializes only when GLOBAL execution asks, in
@@ -2118,29 +2617,65 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut ingest = ingest.with_gap_fetch(tx).sequenced();
         for number in 1..=3 {
-            ingest.buffered.entry(filter.clone()).or_default().insert(number, verified_frame(&filter, number));
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
         }
         ingest.retry_pending();
-        assert_eq!(ingest.materialized_height(&filter).unwrap(), 0, "nothing on arrival or on the timer");
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            0,
+            "nothing on arrival or on the timer"
+        );
 
         assert!(ingest.materialize_through(&filter, 2).unwrap());
-        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2, "exactly through the frame asked for");
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            2,
+            "exactly through the frame asked for"
+        );
         assert!(ingest.buffered[&filter].contains_key(&3));
 
-        assert!(!ingest.materialize_through(&filter, 4).unwrap(), "frame 4 is missing");
+        assert!(
+            !ingest.materialize_through(&filter, 4).unwrap(),
+            "frame 4 is missing"
+        );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
-        assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 4), "requested with nothing buffered past it");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (filter.clone(), 4),
+            "requested with nothing buffered past it"
+        );
         assert!(!ingest.materialize_through(&filter, 4).unwrap());
         assert!(rx.try_recv().is_err(), "one active request per gap");
         // GLOBAL execution is waiting: the request is repeated sooner than an
         // ordinary gap's.
-        ingest.requested.get_mut(&filter).unwrap().get_mut(&4).unwrap().0 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
+        ingest
+            .requested
+            .get_mut(&filter)
+            .unwrap()
+            .get_mut(&4)
+            .unwrap()
+            .0 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
         assert!(!ingest.materialize_through(&filter, 4).unwrap());
-        assert_eq!(rx.try_recv().unwrap(), (filter.clone(), 4), "retried while GLOBAL waits");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            (filter.clone(), 4),
+            "retried while GLOBAL waits"
+        );
 
-        ingest.buffered.entry(filter.clone()).or_default().insert(4, verified_frame(&filter, 4));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(4, verified_frame(&filter, 4));
         assert!(ingest.materialize_through(&filter, 4).unwrap());
-        assert!(ingest.materialize_through(&filter, 1).unwrap(), "behind the cursor is already there");
+        assert!(
+            ingest.materialize_through(&filter, 1).unwrap(),
+            "behind the cursor is already there"
+        );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
     }
 
@@ -2156,7 +2691,10 @@ mod tests {
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
-        let mut ingest = ingest.with_gap_fetch(tx).with_prefetch(prefetch_tx).sequenced();
+        let mut ingest = ingest
+            .with_gap_fetch(tx)
+            .with_prefetch(prefetch_tx)
+            .sequenced();
         let drain = |rx: &mut tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>| {
             let mut frames = Vec::new();
             while let Ok((address, number)) = rx.try_recv() {
@@ -2166,34 +2704,77 @@ mod tests {
             frames
         };
 
-        assert_eq!(ingest.prefetch_through(&filter, 50).unwrap(), 0, "no frame of this shard held yet");
-        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
-        ingest.buffered.entry(filter.clone()).or_default().insert(5, verified_frame(&filter, 5));
+        assert_eq!(
+            ingest.prefetch_through(&filter, 50).unwrap(),
+            0,
+            "no frame of this shard held yet"
+        );
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(1, verified_frame(&filter, 1));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(5, verified_frame(&filter, 5));
         assert!(!ingest.materialize_through(&filter, 200).unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
         let window: Vec<u64> = (2..=1 + GAP_WINDOW).filter(|&number| number != 5).collect();
-        assert_eq!(drain(&mut rx), window, "the window above the cursor, less what is buffered");
+        assert_eq!(
+            drain(&mut rx),
+            window,
+            "the window above the cursor, less what is buffered"
+        );
         assert!(!ingest.materialize_through(&filter, 200).unwrap());
         assert!(drain(&mut rx).is_empty(), "each asked once per interval");
 
-        assert_eq!(ingest.prefetch_through(&filter, 500).unwrap(), (PREFETCH_DEPTH - GAP_WINDOW) as usize);
-        assert_eq!(drain(&mut prefetch_rx), (2 + GAP_WINDOW..=1 + PREFETCH_DEPTH).collect::<Vec<_>>(),
-            "behind the window, to the prefetch depth");
+        assert_eq!(
+            ingest.prefetch_through(&filter, 500).unwrap(),
+            (PREFETCH_DEPTH - GAP_WINDOW) as usize
+        );
+        assert_eq!(
+            drain(&mut prefetch_rx),
+            (2 + GAP_WINDOW..=1 + PREFETCH_DEPTH).collect::<Vec<_>>(),
+            "behind the window, to the prefetch depth"
+        );
         assert_eq!(ingest.prefetch_through(&filter, 500).unwrap(), 0);
 
         for number in 2..=40 {
-            ingest.buffered.entry(filter.clone()).or_default().insert(number, verified_frame(&filter, number));
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
         }
         assert!(ingest.materialize_through(&filter, 20).unwrap());
-        assert_eq!(ingest.materialized_height(&filter).unwrap(), 20, "prefetched frames wait for their GLOBAL frame");
-        assert!(ingest.requested[&filter].keys().all(|&number| number > 20), "requests at or below the cursor are dropped");
+        assert_eq!(
+            ingest.materialized_height(&filter).unwrap(),
+            20,
+            "prefetched frames wait for their GLOBAL frame"
+        );
+        assert!(
+            ingest.requested[&filter].keys().all(|&number| number > 20),
+            "requests at or below the cursor are dropped"
+        );
         assert!(!ingest.materialize_through(&filter, 60).unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 40);
-        assert_eq!(drain(&mut rx), (41..=60).collect::<Vec<_>>(), "prefetched frames a GLOBAL frame waits on");
+        assert_eq!(
+            drain(&mut rx),
+            (41..=60).collect::<Vec<_>>(),
+            "prefetched frames a GLOBAL frame waits on"
+        );
         assert!(drain(&mut prefetch_rx).is_empty());
 
         ingest.admit_verified(verified_frame(&filter, 3), true);
-        assert!(ingest.buffered.get(&filter).is_none_or(|buffered| !buffered.contains_key(&3)), "below the cursor");
+        assert!(
+            ingest
+                .buffered
+                .get(&filter)
+                .is_none_or(|buffered| !buffered.contains_key(&3)),
+            "below the cursor"
+        );
         ingest.admit_verified(verified_frame(&filter, 41), true);
         assert!(ingest.buffered[&filter].contains_key(&41));
     }
@@ -2205,7 +2786,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_frame_anchored_to_a_missing_global_frame_is_asked_for_once_that_frame_is_stored() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
-        let clock: Arc<dyn quil_types::store::ClockStore> = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let clock: Arc<dyn quil_types::store::ClockStore> =
+            Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let (ingest, _) = fixture_with_clock(Some(clock.clone()));
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
@@ -2222,7 +2804,11 @@ mod tests {
                 request.0 = Instant::now() - GLOBAL_WAIT_RETRY_INTERVAL;
             }
         };
-        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(1, verified_frame(&filter, 1));
         assert!(!ingest.materialize_through(&filter, 3).unwrap());
         assert_eq!(drain(&mut rx), vec![2, 3]);
 
@@ -2230,33 +2816,66 @@ mod tests {
         anchored.header.as_mut().unwrap().global_frame_number = 907_473;
         let verifier = ingest.verifier();
         assert_eq!(verifier.missing_anchor(&anchored), Some(907_473));
-        assert_eq!(verifier.missing_anchor(&verified_frame(&filter, 2)), None, "a frame anchored to no GLOBAL frame");
+        assert_eq!(
+            verifier.missing_anchor(&verified_frame(&filter, 2)),
+            None,
+            "a frame anchored to no GLOBAL frame"
+        );
         ingest.await_anchor(&filter, 2, 907_473);
         ingest.await_anchor(&filter, 1, 907_473);
-        assert_eq!(ingest.awaiting_anchor[&filter].keys().copied().collect::<Vec<_>>(), vec![2], "not at or below the cursor");
+        assert_eq!(
+            ingest.awaiting_anchor[&filter]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2],
+            "not at or below the cursor"
+        );
 
         all_due(&mut ingest);
         assert!(!ingest.materialize_through(&filter, 3).unwrap());
-        assert_eq!(drain(&mut rx), vec![3], "the parked frame is not asked for again");
+        assert_eq!(
+            drain(&mut rx),
+            vec![3],
+            "the parked frame is not asked for again"
+        );
 
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame(&quil_types::proto::global::GlobalFrame {
-            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: 907_473, ..Default::default() }),
-            requests: Vec::new(),
-        }, txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame(
+                &quil_types::proto::global::GlobalFrame {
+                    header: Some(quil_types::proto::global::GlobalFrameHeader {
+                        frame_number: 907_473,
+                        ..Default::default()
+                    }),
+                    requests: Vec::new(),
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
         txn.commit().unwrap();
         assert_eq!(verifier.missing_anchor(&anchored), None);
         assert!(!ingest.materialize_through(&filter, 3).unwrap());
-        assert_eq!(drain(&mut rx), vec![2], "asked for at once, ahead of its retry interval");
+        assert_eq!(
+            drain(&mut rx),
+            vec![2],
+            "asked for at once, ahead of its retry interval"
+        );
         assert!(ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty());
 
         ingest.await_anchor(&filter, 3, 907_480);
         for number in 2..=3 {
-            ingest.buffered.entry(filter.clone()).or_default().insert(number, verified_frame(&filter, number));
+            ingest
+                .buffered
+                .entry(filter.clone())
+                .or_default()
+                .insert(number, verified_frame(&filter, number));
         }
         assert!(ingest.materialize_through(&filter, 3).unwrap());
-        assert!(ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty(),
-            "frames at or below the cursor no longer wait");
+        assert!(
+            ingest.awaiting_anchor.is_empty() && ingest.anchors_noted.is_empty(),
+            "frames at or below the cursor no longer wait"
+        );
     }
 
     /// A frame that waits for GLOBAL execution to reach its anchor is not asked
@@ -2272,9 +2891,17 @@ mod tests {
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         let execute = |number: u64| {
-            global.commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            global
+                .commit_with_global_cursor(
+                    number,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
         };
         execute(907_000);
         let filter = vec![0x5c; 32];
@@ -2287,11 +2914,19 @@ mod tests {
         ingest.last_materialized.insert(filter.clone(), 1);
         // `urgent` asks on the gap fetch, `waits` for a waiting GLOBAL frame.
         let mut ask_for = |ingest: &mut ArchiveAppShardIngest, urgent: bool, waits: bool| {
-            for request in ingest.requested.values_mut().flat_map(|requested| requested.values_mut()) {
+            for request in ingest
+                .requested
+                .values_mut()
+                .flat_map(|requested| requested.values_mut())
+            {
                 request.0 = Instant::now() - GAP_RETRY_INTERVAL;
             }
             ingest.request_frames(&filter, 2..=4, urgent, waits, GLOBAL_WAIT_RETRY_INTERVAL);
-            let rx = if urgent { &mut urgent_rx } else { &mut prefetch_rx };
+            let rx = if urgent {
+                &mut urgent_rx
+            } else {
+                &mut prefetch_rx
+            };
             let mut frames = Vec::new();
             while let Ok((_, number)) = rx.try_recv() {
                 frames.push(number);
@@ -2300,26 +2935,54 @@ mod tests {
         };
         assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4]);
         assert!(ingest.await_execution(&filter, 3, 907_473, 907_000));
-        assert!(!ingest.await_execution(&filter, 1, 907_473, 907_000), "at or below the cursor");
-        assert!(!ingest.await_execution(&[0x5d; 32], 3, 907_473, 907_000), "a shard this archive holds no frames of");
+        assert!(
+            !ingest.await_execution(&filter, 1, 907_473, 907_000),
+            "at or below the cursor"
+        );
+        assert!(
+            !ingest.await_execution(&[0x5d; 32], 3, 907_473, 907_000),
+            "a shard this archive holds no frames of"
+        );
         assert!(ingest.execution_deferrals.waiting());
-        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4], "frame 3 waits for execution");
+        assert_eq!(
+            ask_for(&mut ingest, false, false),
+            vec![2, 4],
+            "frame 3 waits for execution"
+        );
         let first = ingest.awaiting_execution[&filter][&3];
         assert!(ingest.await_execution(&filter, 3, 907_480, 907_000));
-        assert_eq!(ingest.awaiting_execution[&filter][&3], first, "a copy received again keeps the first wait");
+        assert_eq!(
+            ingest.awaiting_execution[&filter][&3], first,
+            "a copy received again keeps the first wait"
+        );
         execute(907_472);
         assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
         execute(907_473);
-        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4], "asked for again once execution reached its anchor");
+        assert_eq!(
+            ask_for(&mut ingest, false, false),
+            vec![2, 3, 4],
+            "asked for again once execution reached its anchor"
+        );
         assert!(ingest.awaiting_execution.is_empty());
-        assert!(!ingest.execution_deferrals.waiting(), "the wait's end is logged");
+        assert!(
+            !ingest.execution_deferrals.waiting(),
+            "the wait's end is logged"
+        );
 
         // A forged copy anchored far ahead cannot hold back a GLOBAL frame
         // that waits for the real one.
         assert!(ingest.await_execution(&filter, 3, 908_000, 907_473));
         assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
-        assert_eq!(ask_for(&mut ingest, true, false), vec![2, 4], "a gap alone does not release it");
-        assert_eq!(ask_for(&mut ingest, true, true), vec![2, 3, 4], "asked for at once for a waiting GLOBAL frame");
+        assert_eq!(
+            ask_for(&mut ingest, true, false),
+            vec![2, 4],
+            "a gap alone does not release it"
+        );
+        assert_eq!(
+            ask_for(&mut ingest, true, true),
+            vec![2, 3, 4],
+            "asked for at once for a waiting GLOBAL frame"
+        );
         assert!(ingest.awaiting_execution.is_empty());
 
         let cap = MAX_AWAITING_EXECUTION_PER_SHARD as u64;
@@ -2328,7 +2991,11 @@ mod tests {
         }
         let waiting = &ingest.awaiting_execution[&filter];
         assert_eq!(waiting.len(), MAX_AWAITING_EXECUTION_PER_SHARD);
-        assert_eq!(waiting.keys().next_back().copied(), Some(cap + 1), "the farthest frames are forgotten");
+        assert_eq!(
+            waiting.keys().next_back().copied(),
+            Some(cap + 1),
+            "the farthest frames are forgotten"
+        );
         let shards = MAX_AWAITING_EXECUTION / MAX_AWAITING_EXECUTION_PER_SHARD;
         for shard in 1..shards {
             let address = vec![shard as u8; 32];
@@ -2339,7 +3006,10 @@ mod tests {
         }
         let address = vec![0xfe; 32];
         ingest.last_materialized.insert(address.clone(), 1);
-        assert!(!ingest.await_execution(&address, 2, 908_000, 907_473), "the overall cap");
+        assert!(
+            !ingest.await_execution(&address, 2, 908_000, 907_473),
+            "the overall cap"
+        );
         assert!(!ingest.awaiting_execution.contains_key(&address));
     }
 
@@ -2354,33 +3024,67 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let mut ingest = ingest.with_gap_fetch(tx).sequenced();
         ingest.skip_header_authentication = true;
-        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(1, verified_frame(&filter, 1));
         let header = |number: u64, requests_root: Vec<u8>| quil_types::proto::global::FrameHeader {
             requests_root,
             ..verified_frame(&filter, number).header.unwrap()
         };
-        let vouched = |header: quil_types::proto::global::FrameHeader| HashMap::from([(header.frame_number, header)]);
+        let vouched = |header: quil_types::proto::global::FrameHeader| {
+            HashMap::from([(header.frame_number, header)])
+        };
 
         let empty = vouched(header(2, vec![0; 32]));
-        assert!(!ingest.materialize_through_vouched(&filter, 2, &empty).unwrap(), "the body is sought first");
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 2, &empty)
+                .unwrap(),
+            "the body is sought first"
+        );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);
         ingest.missing_since.get_mut(&filter).unwrap().1 = Instant::now() - EMPTY_FRAME_BODY_GRACE;
-        assert!(!ingest.materialize_through(&filter, 2).unwrap(), "only a header the GLOBAL frame carries");
-        assert!(ingest.materialize_through_vouched(&filter, 2, &empty).unwrap());
+        assert!(
+            !ingest.materialize_through(&filter, 2).unwrap(),
+            "only a header the GLOBAL frame carries"
+        );
+        assert!(ingest
+            .materialize_through_vouched(&filter, 2, &empty)
+            .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
         assert!(ingest.missing_since.is_empty());
 
         let with_requests = vouched(header(3, vec![7; 32]));
-        assert!(!ingest.materialize_through_vouched(&filter, 3, &with_requests).unwrap());
-        assert!(ingest.missing_since.is_empty(), "a frame with requests is never rebuilt");
+        assert!(!ingest
+            .materialize_through_vouched(&filter, 3, &with_requests)
+            .unwrap());
+        assert!(
+            ingest.missing_since.is_empty(),
+            "a frame with requests is never rebuilt"
+        );
         let legacy_empty = vouched(header(3, vec![0; 64]));
-        assert!(!ingest.materialize_through_vouched(&filter, 3, &legacy_empty).unwrap());
+        assert!(!ingest
+            .materialize_through_vouched(&filter, 3, &legacy_empty)
+            .unwrap());
         ingest.missing_since.get_mut(&filter).unwrap().1 = Instant::now() - EMPTY_FRAME_BODY_GRACE;
-        let elsewhere = HashMap::from([(3, quil_types::proto::global::FrameHeader {
-            address: vec![9; 32], ..header(3, vec![0; 64])
-        })]);
-        assert!(!ingest.materialize_through_vouched(&filter, 3, &elsewhere).unwrap(), "another shard's header");
-        assert!(ingest.materialize_through_vouched(&filter, 3, &legacy_empty).unwrap());
+        let elsewhere = HashMap::from([(
+            3,
+            quil_types::proto::global::FrameHeader {
+                address: vec![9; 32],
+                ..header(3, vec![0; 64])
+            },
+        )]);
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 3, &elsewhere)
+                .unwrap(),
+            "another shard's header"
+        );
+        assert!(ingest
+            .materialize_through_vouched(&filter, 3, &legacy_empty)
+            .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
     }
 
@@ -2413,16 +3117,34 @@ mod tests {
         header.requests_root = vec![0; 32];
         header.storage_attestation_root = vec![1; 32];
         let vouched = HashMap::from([(2, body.header.clone().unwrap())]);
-        assert!(!ingest.materialize_through_vouched(&filter, 2, &vouched).unwrap(), "the body is sought first");
-        assert!(ingest.materialize_through_vouched(&filter, 2, &vouched).unwrap());
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 2, &vouched)
+                .unwrap(),
+            "the body is sought first"
+        );
+        assert!(ingest
+            .materialize_through_vouched(&filter, 2, &vouched)
+            .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
-        assert_eq!(served(2), None, "a frame rebuilt without its attestation is not served");
+        assert_eq!(
+            served(2),
+            None,
+            "a frame rebuilt without its attestation is not served"
+        );
         while gaps.try_recv().is_ok() {}
         while rx.try_recv().is_ok() {}
 
         ingest.retry_pending();
-        assert_eq!(rx.try_recv().ok(), Some((filter.clone(), 2)), "the body is asked for again");
-        assert!(gaps.try_recv().is_err(), "not ahead of the frames GLOBAL execution waits on");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some((filter.clone(), 2)),
+            "the body is asked for again"
+        );
+        assert!(
+            gaps.try_recv().is_err(),
+            "not ahead of the frames GLOBAL execution waits on"
+        );
         ingest.retry_pending();
         assert!(rx.try_recv().is_err(), "at most once per interval");
 
@@ -2432,18 +3154,43 @@ mod tests {
         assert_eq!(served(2), None, "a body with another output is refused");
 
         ingest.admit_verified(body.clone(), false);
-        assert_eq!(served(2), Some(body.clone()), "a copy without its certificate is served meanwhile");
-        assert!(ingest.owes_body(&filter, 2), "a certified one is still asked for");
+        assert_eq!(
+            served(2),
+            Some(body.clone()),
+            "a copy without its certificate is served meanwhile"
+        );
+        assert!(
+            ingest.owes_body(&filter, 2),
+            "a certified one is still asked for"
+        );
         let mut certified = body.clone();
         let header = certified.header.as_mut().unwrap();
         header.public_key_signature_bls48581 =
-            Some(quil_types::proto::keys::Bls48581AggregateSignature { signature: vec![1], ..Default::default() });
+            Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: vec![1],
+                ..Default::default()
+            });
         header.storage_attestation = vec![0xaa; 8];
         ingest.admit_verified(certified.clone(), true);
-        certified.header.as_mut().unwrap().storage_attestation.clear();
-        assert_eq!(served(2), Some(certified), "replaced, without the header's uncertified attestation field");
+        certified
+            .header
+            .as_mut()
+            .unwrap()
+            .storage_attestation
+            .clear();
+        assert_eq!(
+            served(2),
+            Some(certified),
+            "replaced, without the header's uncertified attestation field"
+        );
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
-        assert!(ingest.buffered.get(&filter).is_none_or(|buffered| !buffered.contains_key(&2)), "never buffered");
+        assert!(
+            ingest
+                .buffered
+                .get(&filter)
+                .is_none_or(|buffered| !buffered.contains_key(&2)),
+            "never buffered"
+        );
         assert!(ingest.owed_bodies.is_empty());
         ingest.retry_pending();
         assert!(rx.try_recv().is_err(), "a stored body is not asked for");
@@ -2451,9 +3198,17 @@ mod tests {
         let mut whole = frames[2].clone();
         whole.header.as_mut().unwrap().requests_root = vec![0; 32];
         let vouched = HashMap::from([(3, whole.header.clone().unwrap())]);
-        assert!(!ingest.materialize_through_vouched(&filter, 3, &vouched).unwrap());
-        assert!(ingest.materialize_through_vouched(&filter, 3, &vouched).unwrap());
-        assert_eq!(served(3), Some(whole), "rebuilt whole, it is served at once");
+        assert!(!ingest
+            .materialize_through_vouched(&filter, 3, &vouched)
+            .unwrap());
+        assert!(ingest
+            .materialize_through_vouched(&filter, 3, &vouched)
+            .unwrap());
+        assert_eq!(
+            served(3),
+            Some(whole),
+            "rebuilt whole, it is served at once"
+        );
         assert!(ingest.owed_bodies.is_empty());
     }
 
@@ -2475,7 +3230,11 @@ mod tests {
         let (gap, _gaps) = tokio::sync::mpsc::channel(64);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let (report, reports) = tokio::sync::mpsc::channel(8);
-        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        let mut ingest = ingest
+            .with_gap_fetch(gap)
+            .with_prefetch(tx)
+            .with_missing_frame_reports(reports)
+            .sequenced();
         for index in [0, 2, 3] {
             ingest.admit(&filter, frames[index].clone(), true);
         }
@@ -2493,13 +3252,25 @@ mod tests {
         assert_eq!(asked, vec![(filter.clone(), 2)]);
 
         ingest.admit_verified(frames[1].clone(), false);
-        assert_eq!(clock.get_shard_clock_frame(&filter, 2, false).ok(), Some(frames[1].clone()));
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 2, false).ok(),
+            Some(frames[1].clone())
+        );
         assert!(ingest.owed_bodies.is_empty());
 
         assert!(ingest.owe_body(&filter, 7, [7; 32], OwedOrigin::Successor));
-        ingest.owed_bodies.get_mut(&filter).unwrap().get_mut(&7).unwrap().asks = OWED_BODY_ASKS;
+        ingest
+            .owed_bodies
+            .get_mut(&filter)
+            .unwrap()
+            .get_mut(&7)
+            .unwrap()
+            .asks = OWED_BODY_ASKS;
         ingest.retry_pending();
-        assert!(ingest.owed_bodies.is_empty(), "asked for its whole allowance");
+        assert!(
+            ingest.owed_bodies.is_empty(),
+            "asked for its whole allowance"
+        );
         assert!(rx.try_recv().is_err());
     }
 
@@ -2518,7 +3289,11 @@ mod tests {
         let (gap, _gaps) = tokio::sync::mpsc::channel(64);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let (report, reports) = tokio::sync::mpsc::channel(8);
-        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        let mut ingest = ingest
+            .with_gap_fetch(gap)
+            .with_prefetch(tx)
+            .with_missing_frame_reports(reports)
+            .sequenced();
         for index in [0, 2, 3] {
             ingest.admit(&filter, frames[index].clone(), true);
         }
@@ -2529,26 +3304,52 @@ mod tests {
         let mut other = frames[1].clone();
         other.header.as_mut().unwrap().output = vec![0xee; 32];
         ingest.admit_verified(other.clone(), true);
-        assert!(!ingest.owes_body(&filter, 2), "the digest owed is no frame's");
+        assert!(
+            !ingest.owes_body(&filter, 2),
+            "the digest owed is no frame's"
+        );
         report.try_send((filter.clone(), 2)).unwrap();
         ingest.retry_pending();
-        assert!(!ingest.owes_body(&filter, 2) && rx.try_recv().is_err(), "nor owed again for a while");
+        assert!(
+            !ingest.owes_body(&filter, 2) && rx.try_recv().is_err(),
+            "nor owed again for a while"
+        );
 
-        let selector = quil_crypto::poseidon::hash_bytes_to_32(&frames[1].header.as_ref().unwrap().output).unwrap();
+        let selector =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[1].header.as_ref().unwrap().output)
+                .unwrap();
         assert!(ingest.owe_body(&filter, 2, selector, OwedOrigin::Executed));
         let warns = |ingest: &ArchiveAppShardIngest| ingest.owed_bodies[&filter][&2].mismatch_warns;
         ingest.admit_verified(other.clone(), false);
-        assert_eq!(warns(&ingest), 0, "another output without a certificate is no defect");
+        assert_eq!(
+            warns(&ingest),
+            0,
+            "another output without a certificate is no defect"
+        );
         ingest.admit_verified(other.clone(), true);
         ingest.admit_verified(other, true);
-        assert_eq!(warns(&ingest), 1, "two certified frames at one height: warned once, and still owed");
+        assert_eq!(
+            warns(&ingest),
+            1,
+            "two certified frames at one height: warned once, and still owed"
+        );
 
         let mut certified = frames[1].clone();
-        certified.header.as_mut().unwrap().public_key_signature_bls48581 =
-            Some(quil_types::proto::keys::Bls48581AggregateSignature { signature: vec![1], ..Default::default() });
+        certified
+            .header
+            .as_mut()
+            .unwrap()
+            .public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: vec![1],
+                ..Default::default()
+            });
         assert!(ingest.wants_owed_body(&filter, &frames[1]));
         ingest.admit_verified(frames[1].clone(), false);
-        assert!(!ingest.wants_owed_body(&filter, &frames[1]), "one copy without its certificate is served");
+        assert!(
+            !ingest.wants_owed_body(&filter, &frames[1]),
+            "one copy without its certificate is served"
+        );
         assert!(ingest.wants_owed_body(&filter, &certified));
     }
 
@@ -2562,12 +3363,17 @@ mod tests {
         use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
         struct RestorePolicy(Option<CommitteeHandoffPolicy>);
         impl Drop for RestorePolicy {
-            fn drop(&mut self) { quil_types::consensus::set_committee_handoff_policy(self.0); }
+            fn drop(&mut self) {
+                quil_types::consensus::set_committee_handoff_policy(self.0);
+            }
         }
         let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
         quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
-            activation_frame: 0, chain_id: [1; 32], legacy_history: LegacyHistory::Discard,
-            membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX,
+            activation_frame: 0,
+            chain_id: [1; 32],
+            legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX,
+            first_session_boundary_frame: u64::MAX,
         }));
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 4);
@@ -2576,15 +3382,25 @@ mod tests {
         let (gap, _gaps) = tokio::sync::mpsc::channel(64);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let (report, reports) = tokio::sync::mpsc::channel(8);
-        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        let mut ingest = ingest
+            .with_gap_fetch(gap)
+            .with_prefetch(tx)
+            .with_missing_frame_reports(reports)
+            .sequenced();
         for index in [0, 2, 3] {
             ingest.admit(&filter, frames[index].clone(), true);
         }
         ingest.last_materialized.insert(filter.clone(), 4);
-        assert!(ingest.opens_session_after(&filter, 2).is_err(), "GLOBAL's records cannot be read");
+        assert!(
+            ingest.opens_session_after(&filter, 2).is_err(),
+            "GLOBAL's records cannot be read"
+        );
         report.try_send((filter.clone(), 2)).unwrap();
         ingest.retry_pending();
-        assert!(!ingest.owes_body(&filter, 2) && rx.try_recv().is_err(), "not owed");
+        assert!(
+            !ingest.owes_body(&filter, 2) && rx.try_recv().is_err(),
+            "not owed"
+        );
         assert!(!ingest.not_owed(&filter, 2), "nor remembered as not owed");
     }
 
@@ -2598,13 +3414,18 @@ mod tests {
         use quil_types::store::ClockStore as _;
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         let frames = chain(&filter, 4);
-        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let sealed =
+            quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output)
+                .unwrap();
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
         let (gap, _gaps) = tokio::sync::mpsc::channel(64);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let (report, reports) = tokio::sync::mpsc::channel(8);
         let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone()))
-            .with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+            .with_gap_fetch(gap)
+            .with_prefetch(tx)
+            .with_missing_frame_reports(reports)
+            .sequenced();
         assert!(ingest.opens_session_after(&filter, 3).unwrap());
         assert!(!ingest.opens_session_after(&filter, 2).unwrap());
         let mut opening = frames[3].clone();
@@ -2617,8 +3438,14 @@ mod tests {
         ingest.retry_pending();
         assert_eq!(rx.try_recv().ok(), Some((filter.clone(), 3)));
         ingest.admit_verified(frames[2].clone(), false);
-        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
-        assert!(ingest.owed_bodies.is_empty(), "final through the seal, it owes nothing more");
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 3, false).ok(),
+            Some(frames[2].clone())
+        );
+        assert!(
+            ingest.owed_bodies.is_empty(),
+            "final through the seal, it owes nothing more"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2626,13 +3453,20 @@ mod tests {
         let (mut ingest, store) = fixture();
         let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 0);
-        ingest.buffered.entry(filter.clone()).or_default().insert(1, verified_frame(&filter, 1));
+        ingest
+            .buffered
+            .entry(filter.clone())
+            .or_default()
+            .insert(1, verified_frame(&filter, 1));
         store.fail_commit_setup(true, false);
         ingest.retry_pending();
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 0);
         assert!(ingest.buffered[&filter].contains_key(&1));
         ingest.last_materialized.clear();
-        assert!(ingest.materialized_height(&filter).is_err(), "a failed cursor read is not genesis");
+        assert!(
+            ingest.materialized_height(&filter).is_err(),
+            "a failed cursor read is not genesis"
+        );
         store.fail_commit_setup(false, false);
         ingest.retry_pending();
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 1);

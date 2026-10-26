@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
+use super::super::sign;
 use super::model::{
     AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
 };
 use super::msg::Msg;
-use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
-use super::super::sign;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -56,7 +56,10 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::ShardRefresh(result) => {
             m.shard_loading = false;
             m.shard_message_time = Some(std::time::SystemTime::now());
-            let elapsed = m.shard_fetch_started.take().map(|started| started.elapsed());
+            let elapsed = m
+                .shard_fetch_started
+                .take()
+                .map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
                     m.observe_app_intervals(&shards, Instant::now());
@@ -196,8 +199,10 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                     return vec![Cmd::ScheduleAwaitCheck(backoff)];
                 }
                 let failed = failed_suffix(m);
-                m.status_msg =
-                    format!("{action} check failed after {} retries: {e}{failed}", m.await_retries);
+                m.status_msg = format!(
+                    "{action} check failed after {} retries: {e}{failed}",
+                    m.await_retries
+                );
                 finish_await(m);
                 m.status_is_error = true;
                 m.status_sticky = true;
@@ -482,17 +487,24 @@ fn is_quit(ev: &KeyEvent) -> bool {
 }
 
 pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
-    if ev.kind != KeyEventKind::Press { return vec![]; }
-    if m.column_picker_active { return handle_column_picker_key(m, ev); }
+    if ev.kind != KeyEventKind::Press {
+        return vec![];
+    }
+    if m.column_picker_active {
+        return handle_column_picker_key(m, ev);
+    }
     if m.operation_confirmation.is_some() {
-        if is_quit(&ev) { return vec![Cmd::Quit]; }
+        if is_quit(&ev) {
+            return vec![Cmd::Quit];
+        }
         if ev.code == KeyCode::Esc {
             m.operation_confirmation = None;
             m.status_msg.clear();
         } else if ev.code == KeyCode::Enter {
             let (command, targets) = m.operation_confirmation.take().unwrap();
             if targets != operation_targets(m, command) {
-                m.status_msg = "Allocation selection or state changed; request the action again.".into();
+                m.status_msg =
+                    "Allocation selection or state changed; request the action again.".into();
                 m.status_is_error = true;
                 m.status_sticky = true;
                 return vec![];
@@ -502,22 +514,47 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         return vec![];
     }
-    if m.filter_edit_active && ev.code == KeyCode::Char('h') && ev.modifiers == KeyModifiers::CONTROL {
+    if m.filter_edit_active
+        && ev.code == KeyCode::Char('h')
+        && ev.modifiers == KeyModifiers::CONTROL
+    {
         return handle_filter_edit_key(m, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
     }
     // Modifier chords never fall through into ordinary navigation or text input.
     if ev.modifiers.contains(KeyModifiers::CONTROL) && !is_quit(&ev) {
-        if ev.modifiers != KeyModifiers::CONTROL || m.join_picker_active || m.show_help
-            || m.filter_edit_active || m.is_filter_mode_active() || m.sort_mode
-            || m.focus == PanelFocus::Notifications || m.action_in_flight { return vec![]; }
+        if ev.modifiers != KeyModifiers::CONTROL
+            || m.join_picker_active
+            || m.show_help
+            || m.filter_edit_active
+            || m.is_filter_mode_active()
+            || m.sort_mode
+            || m.focus == PanelFocus::Notifications
+            || m.action_in_flight
+        {
+            return vec![];
+        }
         if let KeyCode::Char(command @ ('g' | 'l' | 'y' | 'r' | 'p' | 'u' | 'o')) = ev.code {
-            if matches!(command, 'l' | 'y' | 'r') && !manual_actions_allowed(m) { return vec![]; }
+            if matches!(command, 'l' | 'y' | 'r') && !manual_actions_allowed(m) {
+                return vec![];
+            }
             if matches!(command, 'l' | 'r' | 'p' | 'o') {
-                if !m.focus.is_alloc() { return wrong_panel(m, "Allocation action"); }
+                if !m.focus.is_alloc() {
+                    return wrong_panel(m, "Allocation action");
+                }
                 let targets = operation_targets(m, command);
-                if targets.is_empty() { return vec![]; }
-                let label = match command { 'l' => "Leave", 'r' => "Reject", 'p' => "Pause", _ => "Change worker mode" };
-                m.status_msg = format!("{label} for {} allocation(s)? Enter confirms; Esc cancels.", targets.len());
+                if targets.is_empty() {
+                    return vec![];
+                }
+                let label = match command {
+                    'l' => "Leave",
+                    'r' => "Reject",
+                    'p' => "Pause",
+                    _ => "Change worker mode",
+                };
+                m.status_msg = format!(
+                    "{label} for {} allocation(s)? Enter confirms; Esc cancels.",
+                    targets.len()
+                );
                 m.status_is_error = false;
                 m.operation_confirmation = Some((command, targets));
                 return vec![];
@@ -575,15 +612,25 @@ fn handle_help_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 /// Move exactly one shared boundary; outer edges stay fixed.
 fn move_panel_boundary(m: &mut Model, upper: bool, down: bool) {
     let focused = m.focus.index();
-    let boundary = if upper { focused.checked_sub(1) } else if focused < 2 { Some(focused) } else { None };
+    let boundary = if upper {
+        focused.checked_sub(1)
+    } else if focused < 2 {
+        Some(focused)
+    } else {
+        None
+    };
     let Some(i) = boundary else { return };
     let minimum = [3, 2, 1];
     let donor = if down { i + 1 } else { i };
-    if m.panel_content_heights[donor] <= minimum[donor] { return; }
+    if m.panel_content_heights[donor] <= minimum[donor] {
+        return;
+    }
     let movement = if down { 1 } else { -1 };
     m.panel_boundary_offsets[i] = m.panel_boundary_offsets[i].saturating_add(movement);
-    m.panel_content_heights[i] = (i32::from(m.panel_content_heights[i]) + i32::from(movement)) as u16;
-    m.panel_content_heights[i + 1] = (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
+    m.panel_content_heights[i] =
+        (i32::from(m.panel_content_heights[i]) + i32::from(movement)) as u16;
+    m.panel_content_heights[i + 1] =
+        (i32::from(m.panel_content_heights[i + 1]) - i32::from(movement)) as u16;
 }
 
 fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
@@ -593,7 +640,9 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let c = ch(&ev);
     match ev.code {
         KeyCode::Char('b') => {
-            if m.focus == PanelFocus::Notifications { return vec![]; }
+            if m.focus == PanelFocus::Notifications {
+                return vec![];
+            }
             m.column_picker_active = true;
             m.visibility_section = 0;
             m.column_picker_cursor = 2;
@@ -606,7 +655,12 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             return vec![];
         }
         KeyCode::Char('t') => {
-            m.refresh_seconds = match m.refresh_seconds { 5 => 15, 15 => 30, 30 => 60, _ => 5 };
+            m.refresh_seconds = match m.refresh_seconds {
+                5 => 15,
+                15 => 30,
+                30 => 60,
+                _ => 5,
+            };
             m.refresh_changed_at = Some(Instant::now());
             return vec![];
         }
@@ -624,7 +678,10 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 .min(m.notice_lines.saturating_sub(m.notice_visible));
             return vec![];
         }
-        KeyCode::Home => { m.notice_offset = 0; return vec![]; }
+        KeyCode::Home => {
+            m.notice_offset = 0;
+            return vec![];
+        }
         KeyCode::End => {
             m.notice_offset = m.notice_lines.saturating_sub(m.notice_visible);
             return vec![];
@@ -647,39 +704,75 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.filter_edit_active = false;
             return vec![];
         }
-        KeyCode::BackTab => { m.focus = m.focus.previous(); return vec![]; }
-        KeyCode::Left | KeyCode::Right => {
-            let i = m.focus.index();
-            if i < 2 { m.horizontal_offsets[i] = if ev.code == KeyCode::Left { m.horizontal_offsets[i].saturating_sub(8) } else { m.horizontal_offsets[i].saturating_add(8).min(m.horizontal_limits[i]) }; }
+        KeyCode::BackTab => {
+            m.focus = m.focus.previous();
             return vec![];
         }
-        KeyCode::Char('[') => { move_panel_boundary(m, true, false); return vec![]; }
-        KeyCode::Char(']') => { move_panel_boundary(m, true, true); return vec![]; }
-        KeyCode::Char('{') => { move_panel_boundary(m, false, false); return vec![]; }
-        KeyCode::Char('}') => { move_panel_boundary(m, false, true); return vec![]; }
+        KeyCode::Left | KeyCode::Right => {
+            let i = m.focus.index();
+            if i < 2 {
+                m.horizontal_offsets[i] = if ev.code == KeyCode::Left {
+                    m.horizontal_offsets[i].saturating_sub(8)
+                } else {
+                    m.horizontal_offsets[i]
+                        .saturating_add(8)
+                        .min(m.horizontal_limits[i])
+                };
+            }
+            return vec![];
+        }
+        KeyCode::Char('[') => {
+            move_panel_boundary(m, true, false);
+            return vec![];
+        }
+        KeyCode::Char(']') => {
+            move_panel_boundary(m, true, true);
+            return vec![];
+        }
+        KeyCode::Char('{') => {
+            move_panel_boundary(m, false, false);
+            return vec![];
+        }
+        KeyCode::Char('}') => {
+            move_panel_boundary(m, false, true);
+            return vec![];
+        }
         KeyCode::Char(' ') => {
-            if m.focus == PanelFocus::Notifications { return vec![]; }
+            if m.focus == PanelFocus::Notifications {
+                return vec![];
+            }
             toggle_select(m);
             return vec![];
         }
         KeyCode::Char('a') => {
-            if m.focus == PanelFocus::Notifications { return vec![]; }
+            if m.focus == PanelFocus::Notifications {
+                return vec![];
+            }
             select_all(m);
             return vec![];
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if m.focus == PanelFocus::Notifications { m.notice_offset = m.notice_offset.saturating_sub(1); }
-            else { cursor_up(m); }
+            if m.focus == PanelFocus::Notifications {
+                m.notice_offset = m.notice_offset.saturating_sub(1);
+            } else {
+                cursor_up(m);
+            }
             return vec![];
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if m.focus == PanelFocus::Notifications { m.notice_offset = (m.notice_offset + 1).min(m.notice_lines.saturating_sub(m.notice_visible)); }
-            else { cursor_down(m); }
+            if m.focus == PanelFocus::Notifications {
+                m.notice_offset =
+                    (m.notice_offset + 1).min(m.notice_lines.saturating_sub(m.notice_visible));
+            } else {
+                cursor_down(m);
+            }
             return vec![];
         }
         _ => {}
     }
-    if m.focus == PanelFocus::Notifications { return vec![]; }
+    if m.focus == PanelFocus::Notifications {
+        return vec![];
+    }
     match c {
         Some('s') => {
             m.sort_mode = true;
@@ -703,42 +796,99 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 }
 
 fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
-    if is_quit(&ev) { return vec![Cmd::Quit]; }
-    if ev.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) { return vec![]; }
+    if is_quit(&ev) {
+        return vec![Cmd::Quit];
+    }
+    if ev
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return vec![];
+    }
     match ev.code {
-        KeyCode::Up if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 => m.move_picker_column(true),
-        KeyCode::Down if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 => m.move_picker_column(false),
+        KeyCode::Up if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 => {
+            m.move_picker_column(true)
+        }
+        KeyCode::Down
+            if ev.modifiers.contains(KeyModifiers::SHIFT) && m.visibility_section == 0 =>
+        {
+            m.move_picker_column(false)
+        }
         KeyCode::Char('r') if m.visibility_section == 0 => m.reset_picker_column_order(),
-        KeyCode::Up | KeyCode::Char('k') => m.column_picker_cursor = m.column_picker_cursor.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => m.column_picker_cursor = (m.column_picker_cursor + 1).min(m.visibility_names().len() - 1),
+        KeyCode::Up | KeyCode::Char('k') => {
+            m.column_picker_cursor = m.column_picker_cursor.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            m.column_picker_cursor =
+                (m.column_picker_cursor + 1).min(m.visibility_names().len() - 1)
+        }
         KeyCode::Tab | KeyCode::BackTab => {
-            m.visibility_section = (m.visibility_section + if ev.code == KeyCode::BackTab { 4 } else { 1 }) % 5;
+            m.visibility_section =
+                (m.visibility_section + if ev.code == KeyCode::BackTab { 4 } else { 1 }) % 5;
             m.column_picker_cursor = if m.visibility_section == 0 { 2 } else { 0 };
             m.column_picker_offset = 0;
         }
         KeyCode::Char(' ') => {
-            if let Some((global, window)) = m.visibility_interval_window(m.visibility_section, m.column_picker_cursor) {
-                let next = (if global { m.global_interval_mask() } else { m.interval_mask() }) ^ (1 << window);
-                if next != 0 { if global { m.global_interval_windows = next; } else { m.interval_windows = next; } }
-            } else if let Some(window) = m.visibility_reward_window(m.visibility_section, m.column_picker_cursor) {
+            if let Some((global, window)) =
+                m.visibility_interval_window(m.visibility_section, m.column_picker_cursor)
+            {
+                let next = (if global {
+                    m.global_interval_mask()
+                } else {
+                    m.interval_mask()
+                }) ^ (1 << window);
+                if next != 0 {
+                    if global {
+                        m.global_interval_windows = next;
+                    } else {
+                        m.interval_windows = next;
+                    }
+                }
+            } else if let Some(window) =
+                m.visibility_reward_window(m.visibility_section, m.column_picker_cursor)
+            {
                 let next = m.reward_mask() ^ (1 << window);
-                if next != 0 { m.reward_windows = next; }
-            } else if let Some(field) = m.visibility_global_field(m.visibility_section, m.column_picker_cursor) {
+                if next != 0 {
+                    m.reward_windows = next;
+                }
+            } else if let Some(field) =
+                m.visibility_global_field(m.visibility_section, m.column_picker_cursor)
+            {
                 let next = m.global_field_mask() ^ (1 << field);
-                if next != 0 { m.global_fields = next; }
+                if next != 0 {
+                    m.global_fields = next;
+                }
             } else if m.visibility_section == 0 {
                 let col = m.visibility_column_index(m.column_picker_cursor).unwrap();
                 let key = m.column_visibility_key(col);
-                if col >= 2 && !m.hidden_columns.remove(&key) { m.hidden_columns.insert(key); }
+                if col >= 2 && !m.hidden_columns.remove(&key) {
+                    m.hidden_columns.insert(key);
+                }
             } else {
                 let name = m.visibility_names()[m.column_picker_cursor];
-                if !m.hidden_header_kpis.remove(name) { m.hidden_header_kpis.insert(name.into()); }
+                if !m.hidden_header_kpis.remove(name) {
+                    m.hidden_header_kpis.insert(name.into());
+                }
             }
         }
         KeyCode::Char('c') if m.visibility_section == 0 => m.hidden_columns.extend([2, 4, 5]),
         KeyCode::Char('a') => {
-            if m.visibility_section == 0 { m.hidden_columns.clear(); m.interval_windows = 3; m.reward_windows = 7; }
-            else { for name in m.visibility_names() { m.hidden_header_kpis.remove(name); } if m.visibility_section == 1 { m.global_interval_windows = 3; m.global_fields = 7; } if m.visibility_section == 2 { m.reward_windows = 7; } }
+            if m.visibility_section == 0 {
+                m.hidden_columns.clear();
+                m.interval_windows = 3;
+                m.reward_windows = 7;
+            } else {
+                for name in m.visibility_names() {
+                    m.hidden_header_kpis.remove(name);
+                }
+                if m.visibility_section == 1 {
+                    m.global_interval_windows = 3;
+                    m.global_fields = 7;
+                }
+                if m.visibility_section == 2 {
+                    m.reward_windows = 7;
+                }
+            }
         }
         KeyCode::Enter | KeyCode::Esc | KeyCode::Char('b') => m.column_picker_active = false,
         _ => {}
@@ -748,14 +898,31 @@ fn handle_column_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
 
 fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> {
     let rows = if command == 'o' {
-        m.sorted_allocations().get(m.alloc_cursor).cloned().into_iter().collect()
-    } else { m.selected_alloc_rows() };
-    let mut targets: Vec<_> = rows.into_iter().filter(|row| match command {
-        'l' | 'p' => row.status == 2,
-        'r' => row.status == 1 || row.status == 4,
-        'o' => row.worker_id >= 0,
-        _ => false,
-    }).map(|row| (row.filter_key, row.status, row.worker_id, row.manually_managed)).collect();
+        m.sorted_allocations()
+            .get(m.alloc_cursor)
+            .cloned()
+            .into_iter()
+            .collect()
+    } else {
+        m.selected_alloc_rows()
+    };
+    let mut targets: Vec<_> = rows
+        .into_iter()
+        .filter(|row| match command {
+            'l' | 'p' => row.status == 2,
+            'r' => row.status == 1 || row.status == 4,
+            'o' => row.worker_id >= 0,
+            _ => false,
+        })
+        .map(|row| {
+            (
+                row.filter_key,
+                row.status,
+                row.worker_id,
+                row.manually_managed,
+            )
+        })
+        .collect();
     targets.sort();
     targets
 }
@@ -771,11 +938,18 @@ fn manual_actions_allowed(m: &mut Model) -> bool {
 }
 
 fn dispatch_operation(m: &mut Model, command: char) -> Vec<Cmd> {
-    if matches!(command, 'l' | 'y' | 'r') && !manual_actions_allowed(m) { return vec![]; }
+    if matches!(command, 'l' | 'y' | 'r') && !manual_actions_allowed(m) {
+        return vec![];
+    }
     match command {
-        'g' => action_join(m), 'l' => action_leave(m), 'y' => action_confirm(m),
-        'r' => action_reject(m), 'p' => action_pause(m), 'u' => action_resume(m),
-        'o' => action_toggle_manual(m), _ => vec![],
+        'g' => action_join(m),
+        'l' => action_leave(m),
+        'y' => action_confirm(m),
+        'r' => action_reject(m),
+        'p' => action_pause(m),
+        'u' => action_resume(m),
+        'o' => action_toggle_manual(m),
+        _ => vec![],
     }
 }
 
@@ -870,12 +1044,15 @@ fn action_join(m: &mut Model) -> Vec<Cmd> {
         return vec![];
     }
     if m.focus != PanelFocus::Available {
-        m.status_msg = "Join is only available in the Available Shards panel (Tab to switch)".into();
+        m.status_msg =
+            "Join is only available in the Available Shards panel (Tab to switch)".into();
         m.status_is_error = true;
         return vec![];
     }
     if m.manual_free_workers().is_empty() {
-        m.status_msg = "Join requires at least one free manual worker; switch an idle worker with Ctrl+O".into();
+        m.status_msg =
+            "Join requires at least one free manual worker; switch an idle worker with Ctrl+O"
+                .into();
         m.status_is_error = true;
         return vec![];
     }
@@ -1034,14 +1211,22 @@ fn start_multi_filter_action(
     m.alloc_selected.clear();
     // One op carries at most the filters every node decodes: a longer
     // selection goes out as several messages, sent in turn like a batch.
-    let mut chunks: Vec<Vec<Vec<u8>>> = sign::op_chunks(&filters).map(<[Vec<u8>]>::to_vec).collect();
+    let mut chunks: Vec<Vec<Vec<u8>>> =
+        sign::op_chunks(&filters).map(<[Vec<u8>]>::to_vec).collect();
     let first = chunks.remove(0);
     if chunks.is_empty() {
-        m.status_msg = format!("Creating {action} message for {} allocation(s)...", filters.len());
+        m.status_msg = format!(
+            "Creating {action} message for {} allocation(s)...",
+            filters.len()
+        );
     } else {
         m.action_queue = chunks
             .into_iter()
-            .map(|filters| PendingAction { action: action.to_string(), filters, status })
+            .map(|filters| PendingAction {
+                action: action.to_string(),
+                filters,
+                status,
+            })
             .collect();
         m.action_total = m.action_queue.len() + 1;
         m.action_index = 1;
@@ -1106,7 +1291,10 @@ fn start_batch_action(
 
 fn handle_sort_mode_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     let cols = m.active_visible_columns();
-    let index = cols.iter().position(|&col| col == m.sort_highlight_col).unwrap_or(0);
+    let index = cols
+        .iter()
+        .position(|&col| col == m.sort_highlight_col)
+        .unwrap_or(0);
     let num_cols = cols.len();
     match ev.code {
         KeyCode::Right => {
@@ -1308,7 +1496,11 @@ fn handle_filter_select_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             }
         }
         KeyCode::Char(' ') => {
-            if let Some(v) = m.filter_edit_select_items.get(m.filter_edit_select_cursor).cloned() {
+            if let Some(v) = m
+                .filter_edit_select_items
+                .get(m.filter_edit_select_cursor)
+                .cloned()
+            {
                 let e = m.filter_edit_select_state.entry(v).or_insert(false);
                 *e = !*e;
             }
@@ -1374,7 +1566,9 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             let worker_ids: Vec<u32> = m.join_picker_selected.iter().copied().collect();
             let free = m.manual_free_workers();
             if worker_ids.is_empty() || worker_ids.iter().any(|id| !free.contains(id)) {
-                m.status_msg = "Select a free manual worker; worker state may have changed. Esc cancels.".into();
+                m.status_msg =
+                    "Select a free manual worker; worker state may have changed. Esc cancels."
+                        .into();
                 m.status_is_error = true;
                 return vec![];
             }
@@ -1408,19 +1602,26 @@ fn handle_join_picker_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     vec![]
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::super::model::FilterOutcome;
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
-    use super::super::model::FilterOutcome;
 
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();
-        m.process_refresh_data(Some(NodeInfoResponse {
-            shard_allocations: vec![ShardAllocationInfo { filter: vec![1], status, ..Default::default() }],
-            ..Default::default()
-        }), None, None);
+        m.process_refresh_data(
+            Some(NodeInfoResponse {
+                shard_allocations: vec![ShardAllocationInfo {
+                    filter: vec![1],
+                    status,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         m.allocations[0].manually_managed = true;
         m
     }
@@ -1431,46 +1632,85 @@ mod tests {
     fn a_long_multi_filter_action_is_sent_as_several_messages() {
         let mut m = Model::new();
         let filter = |n: u16| [n.to_be_bytes().as_slice(), &[0xC0; 30]].concat();
-        m.process_refresh_data(Some(NodeInfoResponse {
-            shard_allocations: (0..250).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
-            ..Default::default()
-        }), None, None);
+        m.process_refresh_data(
+            Some(NodeInfoResponse {
+                shard_allocations: (0..250)
+                    .map(|n| ShardAllocationInfo {
+                        filter: filter(n),
+                        status: 2,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         let rows = m.allocations.clone();
         let sent = |cmds: &[Cmd]| match cmds.first() {
-            Some(Cmd::Lifecycle { action, filters, .. }) if action == "Leave" => filters.clone(),
+            Some(Cmd::Lifecycle {
+                action, filters, ..
+            }) if action == "Leave" => filters.clone(),
             _ => panic!("a Leave message"),
         };
-        let mut filters = sent(&start_multi_filter_action(&mut m, "Leave", rows, |s| s == 2));
+        let mut filters = sent(&start_multi_filter_action(&mut m, "Leave", rows, |s| {
+            s == 2
+        }));
         assert_eq!(filters.len(), 100);
-        assert_eq!(m.status_msg, "Creating Leave message (1/3) for 250 allocation(s)...");
+        assert_eq!(
+            m.status_msg,
+            "Creating Leave message (1/3) for 250 allocation(s)..."
+        );
         let broadcast = |filters: Vec<Vec<u8>>| Msg::ActionBroadcast {
-            action: "Leave".into(), filters_raw: filters, send_frame: 9, original_status: 2, err: None,
+            action: "Leave".into(),
+            filters_raw: filters,
+            send_frame: 9,
+            original_status: 2,
+            err: None,
         };
         for expected in [100, 50] {
             let next = sent(&apply_msg(&mut m, broadcast(filters.clone())));
             assert_eq!(next.len(), expected);
             filters = next;
         }
-        assert!(matches!(apply_msg(&mut m, broadcast(filters)).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert!(matches!(
+            apply_msg(&mut m, broadcast(filters)).as_slice(),
+            [Cmd::ScheduleAwaitCheck(_)]
+        ));
         assert_eq!(m.await_filters.len(), 250);
-        assert_eq!(m.status_msg, "3/3 Leave messages broadcast (frame 9). Awaiting inclusion for 250 filter(s)...");
+        assert_eq!(
+            m.status_msg,
+            "3/3 Leave messages broadcast (frame 9). Awaiting inclusion for 250 filter(s)..."
+        );
     }
 
     /// A model with 250 operational allocations whose Leave was started:
     /// three messages of 100, 100 and 50 filters.
     fn leaving_250(m: &mut Model) -> Vec<Vec<u8>> {
         let filter = |n: u16| [n.to_be_bytes().as_slice(), &[0xC0; 30]].concat();
-        m.process_refresh_data(Some(NodeInfoResponse {
-            shard_allocations: (0..250).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
-            ..Default::default()
-        }), None, None);
+        m.process_refresh_data(
+            Some(NodeInfoResponse {
+                shard_allocations: (0..250)
+                    .map(|n| ShardAllocationInfo {
+                        filter: filter(n),
+                        status: 2,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         let rows = m.allocations.clone();
         lifecycle_filters(&start_multi_filter_action(m, "Leave", rows, |s| s == 2))
     }
 
     fn lifecycle_filters(cmds: &[Cmd]) -> Vec<Vec<u8>> {
         match cmds.first() {
-            Some(Cmd::Lifecycle { action, filters, .. }) if action == "Leave" => filters.clone(),
+            Some(Cmd::Lifecycle {
+                action, filters, ..
+            }) if action == "Leave" => filters.clone(),
             _ => panic!("a Leave message"),
         }
     }
@@ -1494,23 +1734,60 @@ mod tests {
         let second = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(first.clone(), None)));
         let third = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(second, Some("boom"))));
         assert_eq!(third.len(), 50);
-        assert_eq!(m.status_msg, "Creating Leave message (3/3)...; 1/3 messages failed (100 filter(s)): boom");
+        assert_eq!(
+            m.status_msg,
+            "Creating Leave message (3/3)...; 1/3 messages failed (100 filter(s)): boom"
+        );
         assert!(m.status_is_error);
-        assert!(matches!(apply_msg(&mut m, leave_broadcast(third.clone(), None)).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert!(matches!(
+            apply_msg(&mut m, leave_broadcast(third.clone(), None)).as_slice(),
+            [Cmd::ScheduleAwaitCheck(_)]
+        ));
         assert_eq!(m.await_filters.len(), 150);
         assert_eq!(
             m.status_msg,
             "2/3 Leave messages broadcast (frame 9). Awaiting inclusion for 150 filter(s); 1/3 messages failed (100 filter(s)): boom"
         );
         assert!(m.status_is_error);
-        apply_msg(&mut m, Msg::AwaitResult { action: "Leave".into(), frame: 10, err: Some("rpc".into()), per_filter: Vec::new() });
-        assert_eq!(m.status_msg, "Leave check transient error (1/3): rpc; 1/3 messages failed (100 filter(s)): boom");
+        apply_msg(
+            &mut m,
+            Msg::AwaitResult {
+                action: "Leave".into(),
+                frame: 10,
+                err: Some("rpc".into()),
+                per_filter: Vec::new(),
+            },
+        );
+        assert_eq!(
+            m.status_msg,
+            "Leave check transient error (1/3): rpc; 1/3 messages failed (100 filter(s)): boom"
+        );
         assert!(m.status_is_error);
-        let per_filter = first.iter().chain(&third).map(|f| FilterOutcome { filter: f.clone(), outcome: "left".into(), settled: true }).collect();
-        apply_msg(&mut m, Msg::AwaitResult { action: "Leave".into(), frame: 12, err: None, per_filter });
+        let per_filter = first
+            .iter()
+            .chain(&third)
+            .map(|f| FilterOutcome {
+                filter: f.clone(),
+                outcome: "left".into(),
+                settled: true,
+            })
+            .collect();
+        apply_msg(
+            &mut m,
+            Msg::AwaitResult {
+                action: "Leave".into(),
+                frame: 12,
+                err: None,
+                per_filter,
+            },
+        );
         assert_eq!(m.status_msg, "Leave confirmed at frame 12 (150 filter(s)); 1/3 messages failed (100 filter(s)): boom");
         assert!(m.status_is_error && !m.action_in_flight);
-        assert_eq!((m.broadcasted_filters.len(), m.action_total), (0, 0), "nothing carries over");
+        assert_eq!(
+            (m.broadcasted_filters.len(), m.action_total),
+            (0, 0),
+            "nothing carries over"
+        );
     }
 
     /// When the last message fails, the filters of the earlier ones are
@@ -1521,7 +1798,10 @@ mod tests {
         let first = leaving_250(&mut m);
         let second = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(first, None)));
         let third = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(second, None)));
-        assert!(matches!(apply_msg(&mut m, leave_broadcast(third, Some("boom"))).as_slice(), [Cmd::ScheduleAwaitCheck(_)]));
+        assert!(matches!(
+            apply_msg(&mut m, leave_broadcast(third, Some("boom"))).as_slice(),
+            [Cmd::ScheduleAwaitCheck(_)]
+        ));
         assert!(m.action_in_flight);
         assert_eq!(m.await_filters.len(), 200);
         assert_eq!(
@@ -1534,8 +1814,14 @@ mod tests {
         for _ in 0..2 {
             filters = lifecycle_filters(&apply_msg(&mut m, leave_broadcast(filters, Some("boom"))));
         }
-        assert!(matches!(apply_msg(&mut m, leave_broadcast(filters, Some("late"))).as_slice(), [Cmd::Fetch]));
-        assert_eq!(m.status_msg, "0/3 Leave messages broadcast; 3/3 messages failed (250 filter(s)): boom");
+        assert!(matches!(
+            apply_msg(&mut m, leave_broadcast(filters, Some("late"))).as_slice(),
+            [Cmd::Fetch]
+        ));
+        assert_eq!(
+            m.status_msg,
+            "0/3 Leave messages broadcast; 3/3 messages failed (250 filter(s)): boom"
+        );
         assert!(m.status_is_error && !m.action_in_flight && m.await_filters.is_empty());
     }
 
@@ -1545,20 +1831,38 @@ mod tests {
     fn a_new_action_does_not_inherit_the_previous_actions_counts() {
         let mut m = Model::new();
         let filter = |n: u8| vec![n; 32];
-        m.process_refresh_data(Some(NodeInfoResponse {
-            shard_allocations: (0..2).map(|n| ShardAllocationInfo { filter: filter(n), status: 2, ..Default::default() }).collect(),
-            ..Default::default()
-        }), None, None);
+        m.process_refresh_data(
+            Some(NodeInfoResponse {
+                shard_allocations: (0..2)
+                    .map(|n| ShardAllocationInfo {
+                        filter: filter(n),
+                        status: 2,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         m.action_total = 3;
         m.action_index = 3;
         m.broadcasted_filters = vec![filter(7); 100];
         m.broadcasted_statuses = vec![2; 100];
         let rows = m.allocations.clone();
-        let filters = lifecycle_filters(&start_multi_filter_action(&mut m, "Leave", rows, |s| s == 2));
-        assert_eq!(m.status_msg, "Creating Leave message for 2 allocation(s)...");
+        let filters = lifecycle_filters(&start_multi_filter_action(&mut m, "Leave", rows, |s| {
+            s == 2
+        }));
+        assert_eq!(
+            m.status_msg,
+            "Creating Leave message for 2 allocation(s)..."
+        );
         apply_msg(&mut m, leave_broadcast(filters, None));
         assert_eq!(m.await_filters.len(), 2);
-        assert_eq!(m.status_msg, "Leave broadcast (frame 9). Awaiting inclusion for 2 filter(s)...");
+        assert_eq!(
+            m.status_msg,
+            "Leave broadcast (frame 9). Awaiting inclusion for 2 filter(s)..."
+        );
         assert!(!m.status_is_error);
     }
 
@@ -1592,14 +1896,18 @@ mod tests {
         assert!(handle_key(&mut m, key(KeyCode::Char('b'))).is_empty());
         assert!(m.column_picker_active);
         handle_key(&mut m, key(KeyCode::Char('c')));
-        for col in [2, 4, 5] { assert!(!m.column_visible(col)); }
+        for col in [2, 4, 5] {
+            assert!(!m.column_visible(col));
+        }
         m.column_picker_cursor = 1;
         handle_key(&mut m, key(KeyCode::Char(' ')));
         assert!(m.column_visible(0) && m.column_visible(1));
         handle_key(&mut m, key(KeyCode::Esc));
         handle_key(&mut m, key(KeyCode::Char('s')));
-        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.sort_highlight_col, 1);
-        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.sort_highlight_col, 3);
+        handle_key(&mut m, key(KeyCode::Right));
+        assert_eq!(m.sort_highlight_col, 1);
+        handle_key(&mut m, key(KeyCode::Right));
+        assert_eq!(m.sort_highlight_col, 3);
         handle_key(&mut m, key(KeyCode::Esc));
         assert!(!m.active_panel_filter_cols().contains(&2));
         m.focus = PanelFocus::Available;
@@ -1612,24 +1920,45 @@ mod tests {
 
     #[test]
     fn auto_workers_reject_manual_only_commands_and_allow_mode_changes() {
-        for (status, keys) in [(1, vec!['y', 'r']), (2, vec!['l']), (3, vec!['l']), (4, vec!['y', 'r'])] {
+        for (status, keys) in [
+            (1, vec!['y', 'r']),
+            (2, vec!['l']),
+            (3, vec!['l']),
+            (4, vec!['y', 'r']),
+        ] {
             let mut m = operational_model(status);
             m.allocations[0].manually_managed = false;
             m.allocations[0].worker_id = 1;
             for c in keys {
-                assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)).is_empty());
+                assert!(handle_key(
+                    &mut m,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+                )
+                .is_empty());
                 assert!(!m.action_in_flight && m.operation_confirmation.is_none());
-                assert!(!m.applicable_alloc_actions().contains(match c { 'l' => "Leave", 'y' => "Confirm", _ => "Reject" }));
+                assert!(!m.applicable_alloc_actions().contains(match c {
+                    'l' => "Leave",
+                    'y' => "Confirm",
+                    _ => "Reject",
+                }));
             }
-            handle_key(&mut m, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+            handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            );
             assert!(m.operation_confirmation.is_some());
-            assert!(matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).as_slice(), [Cmd::ToggleManual { manual: true, .. }]));
+            assert!(matches!(
+                handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).as_slice(),
+                [Cmd::ToggleManual { manual: true, .. }]
+            ));
         }
         let mut m = operational_model(2);
         let mut auto = m.allocations[0].clone();
-        auto.filter_key = "auto".into(); auto.manually_managed = false;
+        auto.filter_key = "auto".into();
+        auto.manually_managed = false;
         m.allocations.push(auto);
-        m.alloc_selected.extend([m.allocations[0].filter_key.clone(), "auto".into()]);
+        m.alloc_selected
+            .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
         assert!(dispatch_operation(&mut m, 'l').is_empty());
         assert!(!m.action_in_flight);
     }
@@ -1639,22 +1968,42 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
         let mut m = operational_model(2);
         m.allocations[0].manually_managed = false;
-        assert_eq!(m.applicable_alloc_actions(), ["Pause".to_string()].into_iter().collect());
+        assert_eq!(
+            m.applicable_alloc_actions(),
+            ["Pause".to_string()].into_iter().collect()
+        );
         assert!(handle_key(&mut m, key(KeyCode::Char('p'))).is_empty());
         assert!(m.operation_confirmation.is_some() && !m.action_in_flight);
         let commands = handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(commands.as_slice(), [Cmd::Lifecycle { action, filters, .. }] if action == "Pause" && filters == &vec![vec![1]]));
+        assert!(
+            matches!(commands.as_slice(), [Cmd::Lifecycle { action, filters, .. }] if action == "Pause" && filters == &vec![vec![1]])
+        );
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(3);
         m.allocations[0].manually_managed = false;
-        assert_eq!(m.applicable_alloc_actions(), ["Resume".to_string()].into_iter().collect());
-        assert!(matches!(handle_key(&mut m, key(KeyCode::Char('u'))).as_slice(), [Cmd::Lifecycle { action, .. }] if action == "Resume"));
+        assert_eq!(
+            m.applicable_alloc_actions(),
+            ["Resume".to_string()].into_iter().collect()
+        );
+        assert!(
+            matches!(handle_key(&mut m, key(KeyCode::Char('u'))).as_slice(), [Cmd::Lifecycle { action, .. }] if action == "Resume")
+        );
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(2);
-        let mut auto = m.allocations[0].clone(); auto.filter_key = "auto".into(); auto.filter = vec![2]; auto.manually_managed = false;
-        m.allocations.push(auto); m.alloc_selected.extend([m.allocations[0].filter_key.clone(), "auto".into()]);
-        assert_eq!(m.applicable_alloc_actions(), ["Pause".to_string()].into_iter().collect());
-        assert!(matches!(dispatch_operation(&mut m, 'p').as_slice(), [Cmd::Lifecycle { action, filters, .. }] if action == "Pause" && filters.len() == 1));
+        let mut auto = m.allocations[0].clone();
+        auto.filter_key = "auto".into();
+        auto.filter = vec![2];
+        auto.manually_managed = false;
+        m.allocations.push(auto);
+        m.alloc_selected
+            .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
+        assert_eq!(
+            m.applicable_alloc_actions(),
+            ["Pause".to_string()].into_iter().collect()
+        );
+        assert!(
+            matches!(dispatch_operation(&mut m, 'p').as_slice(), [Cmd::Lifecycle { action, filters, .. }] if action == "Pause" && filters.len() == 1)
+        );
         assert_eq!(m.action_total, 2);
         assert_eq!(m.action_queue.len(), 1);
     }
@@ -1662,9 +2011,20 @@ mod tests {
     #[test]
     fn lowercase_color_toggle_is_distinct_from_ctrl_c_quit() {
         let mut m = Model::new();
-        assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)).is_empty());
+        assert!(handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+        )
+        .is_empty());
         assert!(!m.color_coding && !m.action_in_flight);
-        assert!(matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_slice(), [Cmd::Quit]));
+        assert!(matches!(
+            handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .as_slice(),
+            [Cmd::Quit]
+        ));
     }
 
     #[test]
@@ -1677,7 +2037,10 @@ mod tests {
         m.join_picker_active = true;
         m.join_picker_selected.insert(2);
         m.allocations[0].manually_managed = false;
-        assert!(handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_empty());
+        assert!(
+            handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_empty()
+        );
         assert!(!m.action_in_flight && m.join_picker_active);
         assert!(m.manual_free_workers().is_empty());
     }
@@ -1687,7 +2050,11 @@ mod tests {
         let mut m = Model::new();
         assert_eq!(m.refresh_seconds, 15);
         for expected in [30, 60, 5, 15] {
-            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)).is_empty());
+            assert!(handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)
+            )
+            .is_empty());
             assert_eq!(m.refresh_seconds, expected);
             assert!(!m.action_in_flight);
             assert!(m.refresh_changed_at.is_some());
@@ -1698,13 +2065,21 @@ mod tests {
     fn operational_keys_require_control_and_disruptive_actions_require_confirmation() {
         let mut m = operational_model(2);
         for command in ['J', 'l', 'c', 'r', 'p', 'u', 'M'] {
-            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(command), KeyModifiers::NONE)).is_empty());
+            assert!(handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char(command), KeyModifiers::NONE)
+            )
+            .is_empty());
             assert!(!m.action_in_flight && m.operation_confirmation.is_none());
         }
         let ctrl_pause = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(handle_key(&mut m, ctrl_pause).is_empty());
         assert!(m.operation_confirmation.is_some());
-        assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).is_empty());
+        assert!(handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+        )
+        .is_empty());
         assert_eq!(m.alloc_cursor, 0);
         handle_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(m.operation_confirmation.is_none() && !m.action_in_flight);
@@ -1732,13 +2107,27 @@ mod tests {
         let mut m = operational_model(2);
         m.filter_edit_active = true;
         for c in ['g', 'l', 'y', 'r', 'p', 'u', 'o'] {
-            assert!(handle_key(&mut m, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)).is_empty());
+            assert!(handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+            )
+            .is_empty());
         }
         assert!(m.filter_edit_input.is_empty() && m.operation_confirmation.is_none());
         m.filter_edit_active = false;
-        handle_key(&mut m, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
         assert!(!m.show_help);
-        assert!(matches!(handle_key(&mut m, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).as_slice(), [Cmd::Quit]));
+        assert!(matches!(
+            handle_key(
+                &mut m,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .as_slice(),
+            [Cmd::Quit]
+        ));
     }
 
     #[test]
@@ -1749,7 +2138,14 @@ mod tests {
         m.observe_global_head(10, Instant::now());
         m.observe_global_head(9, Instant::now());
         assert_eq!(m.global_last_advance, Some(before));
-        m.process_refresh_data(Some(NodeInfoResponse { last_received_frame: 10, ..Default::default() }), None, None);
+        m.process_refresh_data(
+            Some(NodeInfoResponse {
+                last_received_frame: 10,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
         assert_eq!(m.global_last_advance, Some(before));
         let now = Instant::now();
         m.observe_global_head(11, now);
@@ -1758,45 +2154,69 @@ mod tests {
 
     #[test]
     fn tab_cycles_three_panels_and_notifications_only_scroll() {
-        let mut m = Model::new(); m.notice_lines = 10; m.notice_visible = 3;
+        let mut m = Model::new();
+        m.notice_lines = 10;
+        m.notice_visible = 3;
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
         for focus in [PanelFocus::Available, PanelFocus::Notifications] {
-            assert!(handle_key(&mut m, key(KeyCode::Tab)).is_empty()); assert_eq!(m.focus, focus);
+            assert!(handle_key(&mut m, key(KeyCode::Tab)).is_empty());
+            assert_eq!(m.focus, focus);
         }
-        handle_key(&mut m, key(KeyCode::Down)); assert_eq!(m.notice_offset, 1);
-        handle_key(&mut m, key(KeyCode::Up)); assert_eq!(m.notice_offset, 0);
-        for c in [' ', 'a', 'J', 'l', 's', 'f'] { assert!(handle_key(&mut m, key(KeyCode::Char(c))).is_empty()); }
-        assert!(!m.sort_mode); assert!(!m.avail_filter_mode); assert!(!m.join_picker_active);
+        handle_key(&mut m, key(KeyCode::Down));
+        assert_eq!(m.notice_offset, 1);
+        handle_key(&mut m, key(KeyCode::Up));
+        assert_eq!(m.notice_offset, 0);
+        for c in [' ', 'a', 'J', 'l', 's', 'f'] {
+            assert!(handle_key(&mut m, key(KeyCode::Char(c))).is_empty());
+        }
+        assert!(!m.sort_mode);
+        assert!(!m.avail_filter_mode);
+        assert!(!m.join_picker_active);
         assert!(m.avail_selected.is_empty());
-        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.focus, PanelFocus::Allocations);
-        handle_key(&mut m, key(KeyCode::BackTab)); assert_eq!(m.focus, PanelFocus::Notifications);
+        handle_key(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.focus, PanelFocus::Allocations);
+        handle_key(&mut m, key(KeyCode::BackTab));
+        assert_eq!(m.focus, PanelFocus::Notifications);
     }
 
     #[test]
     fn horizontal_navigation_is_bounded_and_notification_actions_stay_inert() {
-        let mut m = Model::new(); m.horizontal_limits = [12, 20];
+        let mut m = Model::new();
+        m.horizontal_limits = [12, 20];
         let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [8, 0]);
-        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [12, 0]);
-        handle_key(&mut m, key(KeyCode::Left)); assert_eq!(m.horizontal_offsets, [4, 0]);
+        handle_key(&mut m, key(KeyCode::Right));
+        assert_eq!(m.horizontal_offsets, [8, 0]);
+        handle_key(&mut m, key(KeyCode::Right));
+        assert_eq!(m.horizontal_offsets, [12, 0]);
+        handle_key(&mut m, key(KeyCode::Left));
+        assert_eq!(m.horizontal_offsets, [4, 0]);
         m.focus = PanelFocus::Notifications;
-        handle_key(&mut m, key(KeyCode::Right)); assert_eq!(m.horizontal_offsets, [4, 0]);
+        handle_key(&mut m, key(KeyCode::Right));
+        assert_eq!(m.horizontal_offsets, [4, 0]);
     }
 
     #[test]
     fn boundary_keys_move_only_neighboring_panels_and_preserve_outer_edges() {
-        let mut m = Model::new(); m.panel_content_heights = [10, 10, 3];
+        let mut m = Model::new();
+        m.panel_content_heights = [10, 10, 3];
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        handle_key(&mut m, key('[')); assert_eq!(m.panel_boundary_offsets, [0, 0]);
-        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [11, 9, 3]);
+        handle_key(&mut m, key('['));
+        assert_eq!(m.panel_boundary_offsets, [0, 0]);
+        handle_key(&mut m, key('}'));
+        assert_eq!(m.panel_content_heights, [11, 9, 3]);
         assert_eq!(m.panel_boundary_offsets, [1, 0]);
         m.focus = PanelFocus::Available;
-        handle_key(&mut m, key('[')); assert_eq!(m.panel_content_heights, [10, 10, 3]);
-        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [10, 11, 2]);
+        handle_key(&mut m, key('['));
+        assert_eq!(m.panel_content_heights, [10, 10, 3]);
+        handle_key(&mut m, key('}'));
+        assert_eq!(m.panel_content_heights, [10, 11, 2]);
         m.focus = PanelFocus::Notifications;
-        handle_key(&mut m, key('}')); assert_eq!(m.panel_content_heights, [10, 11, 2]);
-        handle_key(&mut m, key(']')); assert_eq!(m.panel_content_heights, [10, 12, 1]);
-        handle_key(&mut m, key(']')); assert_eq!(m.panel_content_heights, [10, 12, 1]);
+        handle_key(&mut m, key('}'));
+        assert_eq!(m.panel_content_heights, [10, 11, 2]);
+        handle_key(&mut m, key(']'));
+        assert_eq!(m.panel_content_heights, [10, 12, 1]);
+        handle_key(&mut m, key(']'));
+        assert_eq!(m.panel_content_heights, [10, 12, 1]);
         assert_eq!(m.panel_content_heights.iter().sum::<u16>(), 23);
     }
 
@@ -1818,7 +2238,11 @@ mod tests {
         assert_eq!(m.notice_offset, 4);
         handle_key(&mut m, key(KeyCode::Home));
         assert_eq!(m.notice_offset, 0);
-        for minimum in [NoticeSeverity::Error, NoticeSeverity::Info, NoticeSeverity::Warning] {
+        for minimum in [
+            NoticeSeverity::Error,
+            NoticeSeverity::Info,
+            NoticeSeverity::Warning,
+        ] {
             m.notice_offset = 7;
             handle_key(&mut m, key(KeyCode::Char('v')));
             assert_eq!(m.notice_minimum, minimum);
@@ -1906,25 +2330,37 @@ mod tests {
                         alloc.leave_frame_number = el + el / 4;
                     }
                     let mut model = Model::new();
-                    model.process_refresh_data(Some(NodeInfoResponse {
-                        shard_allocations: vec![alloc],
-                        current_epoch: frame / el,
-                        epoch_length_frames: epoch_length,
-                        last_received_frame: frame,
-                        ..Default::default()
-                    }), None, None);
+                    model.process_refresh_data(
+                        Some(NodeInfoResponse {
+                            shard_allocations: vec![alloc],
+                            current_epoch: frame / el,
+                            epoch_length_frames: epoch_length,
+                            last_received_frame: frame,
+                            ..Default::default()
+                        }),
+                        None,
+                        None,
+                    );
                     // ShardInfo may lag; lifecycle decisions use NodeInfo's frame.
                     assert_eq!(model.frame_number, 0);
                     if expected {
                         assert_eq!(model.allocations[0].next_action.label, "(reject|confirm)");
                         assert_eq!(model.allocations[0].next_action.at_frame, None);
                     }
-                    for row in &mut model.allocations { row.manually_managed = true; }
-                    let cmds = handle_key(&mut model, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+                    for row in &mut model.allocations {
+                        row.manually_managed = true;
+                    }
+                    let cmds = handle_key(
+                        &mut model,
+                        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                    );
                     let sent = cmds.iter().any(|cmd| matches!(cmd,
                         Cmd::Lifecycle { action, filters, .. } if action == "Confirm" && filters == &vec![filter.clone()]
                     ));
-                    assert_eq!(sent, expected, "epoch length {epoch_length}, status {status}, frame {frame}");
+                    assert_eq!(
+                        sent, expected,
+                        "epoch length {epoch_length}, status {status}, frame {frame}"
+                    );
                     if frame < 2 * el {
                         assert!(model.status_msg.contains(&format!("opens at: {}", 2 * el)));
                     }
@@ -1936,26 +2372,55 @@ mod tests {
     fn nested_intervals_have_independent_masks_and_preserve_parent_visibility() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         for focus in [PanelFocus::Allocations, PanelFocus::Available] {
-            let mut m = Model::new(); m.focus = focus; m.column_picker_active = true;
+            let mut m = Model::new();
+            m.focus = focus;
+            m.column_picker_active = true;
             let interval = if focus.is_alloc() { 16 } else { 11 };
-            let parent = m.display_columns().iter().position(|&col| col == interval).unwrap();
-            m.column_picker_cursor = parent + 1; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.interval_mask(), 2);
-            m.column_picker_cursor += 1; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.interval_mask(), 2);
-            assert_eq!(m.global_interval_mask(), 3); assert!(m.column_visible(interval));
-            m.column_picker_cursor = parent; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.column_visible(interval));
+            let parent = m
+                .display_columns()
+                .iter()
+                .position(|&col| col == interval)
+                .unwrap();
+            m.column_picker_cursor = parent + 1;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
             assert_eq!(m.interval_mask(), 2);
-            handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+            m.column_picker_cursor += 1;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.interval_mask(), 2);
+            assert_eq!(m.global_interval_mask(), 3);
+            assert!(m.column_visible(interval));
+            m.column_picker_cursor = parent;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert!(!m.column_visible(interval));
+            assert_eq!(m.interval_mask(), 2);
+            handle_key(&mut m, key(KeyCode::Tab));
+            assert_eq!(m.visibility_section, 1);
             // Top header rows: Global 3, its fields 4-6, Global interval 7, its windows 8-9.
-            m.column_picker_cursor = 9; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
-            m.column_picker_cursor = 8; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_interval_mask(), 1);
-            assert_eq!(m.interval_mask(), 2); assert!(m.header_kpi_visible("Global interval"));
-            m.column_picker_cursor = 7; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global interval"));
-            m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), 5);
-            assert_eq!(m.global_interval_mask(), 1); assert!(m.header_kpi_visible("Global"));
-            handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.global_interval_mask(), 3); assert!(m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 9;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.global_interval_mask(), 1);
+            m.column_picker_cursor = 8;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.global_interval_mask(), 1);
+            assert_eq!(m.interval_mask(), 2);
+            assert!(m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 7;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert!(!m.header_kpi_visible("Global interval"));
+            m.column_picker_cursor = 5;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.global_field_mask(), 5);
+            assert_eq!(m.global_interval_mask(), 1);
+            assert!(m.header_kpi_visible("Global"));
+            handle_key(&mut m, key(KeyCode::Char('a')));
+            assert_eq!(m.global_interval_mask(), 3);
+            assert!(m.header_kpi_visible("Global interval"));
             assert_eq!(m.global_field_mask(), 7);
-            assert_eq!(m.interval_mask(), 2); assert_eq!(m.reward_mask(), 7);
-            handle_key(&mut m, key(KeyCode::BackTab)); handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.interval_mask(), 3);
+            assert_eq!(m.interval_mask(), 2);
+            assert_eq!(m.reward_mask(), 7);
+            handle_key(&mut m, key(KeyCode::BackTab));
+            handle_key(&mut m, key(KeyCode::Char('a')));
+            assert_eq!(m.interval_mask(), 3);
         }
     }
     /// The Global KPI's frame/epoch/next fields nest beneath it in the Top
@@ -1964,24 +2429,53 @@ mod tests {
     #[test]
     fn global_fields_toggle_in_the_top_header_picker() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let mut m = Model::new(); m.column_picker_active = true;
-        handle_key(&mut m, key(KeyCode::Tab)); assert_eq!(m.visibility_section, 1);
+        let mut m = Model::new();
+        m.column_picker_active = true;
+        handle_key(&mut m, key(KeyCode::Tab));
+        assert_eq!(m.visibility_section, 1);
         let names = m.visibility_names();
-        assert_eq!(&names[3..10], &["Global", "  frame", "  epoch", "  next boundary", "Global interval", "  60m window", "  24h window"]);
-        assert_eq!((4..7).map(|i| m.visibility_global_field(1, i)).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(m.visibility_global_field(1, 3), None); assert_eq!(m.visibility_global_field(1, 7), None);
+        assert_eq!(
+            &names[3..10],
+            &[
+                "Global",
+                "  frame",
+                "  epoch",
+                "  next boundary",
+                "Global interval",
+                "  60m window",
+                "  24h window"
+            ]
+        );
+        assert_eq!(
+            (4..7)
+                .map(|i| m.visibility_global_field(1, i))
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(m.visibility_global_field(1, 3), None);
+        assert_eq!(m.visibility_global_field(1, 7), None);
         assert_eq!(m.visibility_global_field(0, 4), None);
-        assert_eq!(m.visibility_interval_window(1, 8), Some((true, 0))); assert_eq!(m.visibility_interval_window(1, 6), None);
+        assert_eq!(m.visibility_interval_window(1, 8), Some((true, 0)));
+        assert_eq!(m.visibility_interval_window(1, 6), None);
         assert_eq!(m.global_field_mask(), 7);
         for (cursor, mask) in [(4, 6), (6, 2)] {
-            m.column_picker_cursor = cursor; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), mask);
+            m.column_picker_cursor = cursor;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.global_field_mask(), mask);
             assert!(!m.visibility_item_visible_in(1, cursor));
         }
-        m.column_picker_cursor = 5; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.global_field_mask(), 2, "one field stays");
+        m.column_picker_cursor = 5;
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert_eq!(m.global_field_mask(), 2, "one field stays");
         assert!(m.visibility_item_visible_in(1, 5));
-        m.column_picker_cursor = 3; handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Global"));
-        assert_eq!(m.global_field_mask(), 2); assert_eq!(m.global_interval_mask(), 3);
-        handle_key(&mut m, key(KeyCode::Char('a'))); assert!(m.header_kpi_visible("Global")); assert_eq!(m.global_field_mask(), 7);
+        m.column_picker_cursor = 3;
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert!(!m.header_kpi_visible("Global"));
+        assert_eq!(m.global_field_mask(), 2);
+        assert_eq!(m.global_interval_mask(), 3);
+        handle_key(&mut m, key(KeyCode::Char('a')));
+        assert!(m.header_kpi_visible("Global"));
+        assert_eq!(m.global_field_mask(), 7);
     }
 
     /// ‹e› switches thresholds between relative and absolute and leaves the
@@ -1992,66 +2486,119 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut m = Model::new();
         assert_eq!(m.threshold_unit, ThresholdUnit::Relative);
-        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty()); assert_eq!(m.threshold_unit, ThresholdUnit::Absolute);
-        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty()); assert_eq!(m.threshold_unit, ThresholdUnit::Relative);
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
+        assert_eq!(m.threshold_unit, ThresholdUnit::Absolute);
+        assert!(handle_key(&mut m, key(KeyCode::Char('e'))).is_empty());
+        assert_eq!(m.threshold_unit, ThresholdUnit::Relative);
         assert_eq!(m.global_field_mask(), 7);
     }
 
     #[test]
     fn shifted_arrows_move_columns_with_children_and_preserve_identity_and_other_panel() {
         use super::super::model::{ALLOC_DISPLAY_COLS, AVAIL_DISPLAY_COLS};
-        let mut m = Model::new(); m.column_picker_active = true;
+        let mut m = Model::new();
+        m.column_picker_active = true;
         let shifted = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
         m.column_picker_cursor = 11;
         handle_key(&mut m, shifted(KeyCode::Down));
-        assert_eq!(m.alloc_display_columns()[11], 16); assert_eq!(m.column_picker_cursor, 12);
+        assert_eq!(m.alloc_display_columns()[11], 16);
+        assert_eq!(m.column_picker_cursor, 12);
         assert_eq!(m.visibility_interval_window(0, 12), Some((false, 0)));
         assert_eq!(m.avail_display_columns(), AVAIL_DISPLAY_COLS);
-        m.column_picker_cursor = 13; handle_key(&mut m, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)); assert_eq!(m.interval_mask(), 1);
-        m.column_picker_cursor = 0; handle_key(&mut m, shifted(KeyCode::Down)); assert_eq!(&m.alloc_display_columns()[..2], &[0,1]);
-        m.column_picker_cursor = 2; handle_key(&mut m, shifted(KeyCode::Up)); assert_eq!(&m.alloc_display_columns()[..2], &[0,1]);
-        handle_key(&mut m, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)); assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
+        m.column_picker_cursor = 13;
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
         assert_eq!(m.interval_mask(), 1);
-        m.focus = PanelFocus::Available; m.column_picker_cursor = 10; handle_key(&mut m, shifted(KeyCode::Up));
-        assert_eq!(m.avail_display_columns()[9], 11); assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
+        m.column_picker_cursor = 0;
+        handle_key(&mut m, shifted(KeyCode::Down));
+        assert_eq!(&m.alloc_display_columns()[..2], &[0, 1]);
+        m.column_picker_cursor = 2;
+        handle_key(&mut m, shifted(KeyCode::Up));
+        assert_eq!(&m.alloc_display_columns()[..2], &[0, 1]);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
+        assert_eq!(m.interval_mask(), 1);
+        m.focus = PanelFocus::Available;
+        m.column_picker_cursor = 10;
+        handle_key(&mut m, shifted(KeyCode::Up));
+        assert_eq!(m.avail_display_columns()[9], 11);
+        assert_eq!(m.alloc_display_columns(), ALLOC_DISPLAY_COLS);
         assert_eq!(m.active_visible_columns()[8], 11);
-        m.focus = PanelFocus::Notifications; m.column_picker_cursor = 2; m.horizontal_offsets = [1,12];
-        handle_key(&mut m, shifted(KeyCode::Down)); assert_eq!(m.horizontal_offsets, [1,0]);
+        m.focus = PanelFocus::Notifications;
+        m.column_picker_cursor = 2;
+        m.horizontal_offsets = [1, 12];
+        handle_key(&mut m, shifted(KeyCode::Down));
+        assert_eq!(m.horizontal_offsets, [1, 0]);
     }
     #[test]
     fn reward_visibility_selects_any_nonempty_subset_for_both_panels() {
-        let mut m = Model::new(); m.column_picker_active = true; m.visibility_section = 2; m.column_picker_cursor = 6;
+        let mut m = Model::new();
+        m.column_picker_active = true;
+        m.visibility_section = 2;
+        m.column_picker_cursor = 6;
         let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        handle_key(&mut m, space); assert_eq!(m.reward_mask(), 3);
-        m.column_picker_cursor = 4; handle_key(&mut m, space); assert_eq!(m.reward_mask(), 2);
-        m.column_picker_cursor = 5; handle_key(&mut m, space); assert_eq!(m.reward_mask(), 2);
-        handle_key(&mut m, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)); assert_eq!(m.reward_mask(), 7);
+        handle_key(&mut m, space);
+        assert_eq!(m.reward_mask(), 3);
+        m.column_picker_cursor = 4;
+        handle_key(&mut m, space);
+        assert_eq!(m.reward_mask(), 2);
+        m.column_picker_cursor = 5;
+        handle_key(&mut m, space);
+        assert_eq!(m.reward_mask(), 2);
+        handle_key(
+            &mut m,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(m.reward_mask(), 7);
     }
 
     #[test]
     fn reward_children_follow_reordered_columns_and_share_the_header_selection() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let mut m = Model::new(); m.column_picker_active = true;
+        let mut m = Model::new();
+        m.column_picker_active = true;
         for focus in [PanelFocus::Allocations, PanelFocus::Available] {
-            m.focus = focus; m.visibility_section = 0; m.reward_windows = 7;
-            m.column_picker_cursor = m.visibility_names().iter().position(|&name| name == "Reward [~Q/d]").unwrap() + 1;
+            m.focus = focus;
+            m.visibility_section = 0;
+            m.reward_windows = 7;
+            m.column_picker_cursor = m
+                .visibility_names()
+                .iter()
+                .position(|&name| name == "Reward [~Q/d]")
+                .unwrap()
+                + 1;
             handle_key(&mut m, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
-            assert_eq!(m.visibility_reward_window(0, m.column_picker_cursor), Some(0));
-            handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.reward_mask(), 6);
+            assert_eq!(
+                m.visibility_reward_window(0, m.column_picker_cursor),
+                Some(0)
+            );
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert_eq!(m.reward_mask(), 6);
             m.visibility_section = 2;
             assert!(!m.visibility_item_visible_in(2, 4));
-            m.column_picker_cursor = 6; handle_key(&mut m, key(KeyCode::Char(' '))); assert_eq!(m.reward_mask(), 2);
-            m.column_picker_cursor = 3; handle_key(&mut m, key(KeyCode::Char(' ')));
-            assert!(!m.header_kpi_visible("Reward")); assert!(m.column_visible(10));
+            m.column_picker_cursor = 6;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
             assert_eq!(m.reward_mask(), 2);
-            handle_key(&mut m, key(KeyCode::Char('a'))); assert_eq!(m.reward_mask(), 7);
+            m.column_picker_cursor = 3;
+            handle_key(&mut m, key(KeyCode::Char(' ')));
+            assert!(!m.header_kpi_visible("Reward"));
+            assert!(m.column_visible(10));
+            assert_eq!(m.reward_mask(), 2);
+            handle_key(&mut m, key(KeyCode::Char('a')));
+            assert_eq!(m.reward_mask(), 7);
         }
         m.focus = PanelFocus::Notifications;
         assert_eq!(m.visibility_names_for(2)[0], "Workers");
         assert_eq!(m.visibility_names_for(3)[0], "Available count");
-        m.visibility_section = 4; m.column_picker_cursor = 0;
-        handle_key(&mut m, key(KeyCode::Char(' '))); assert!(!m.header_kpi_visible("Notification level"));
+        m.visibility_section = 4;
+        m.column_picker_cursor = 0;
+        handle_key(&mut m, key(KeyCode::Char(' ')));
+        assert!(!m.header_kpi_visible("Notification level"));
         assert!(m.header_kpi_visible("Notification position"));
     }
-
 }

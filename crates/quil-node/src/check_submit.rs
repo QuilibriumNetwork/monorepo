@@ -41,17 +41,13 @@ const ATTEMPTS: usize = 4;
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// Run the submit probe against `addr` (e.g. `192.69.222.130:8340`).
-pub async fn run_check_submit(
-    addr: &str,
-    config: &quil_config::Config,
-) -> anyhow::Result<()> {
+pub async fn run_check_submit(addr: &str, config: &quil_config::Config) -> anyhow::Result<()> {
     quil_crypto::init();
 
     // mTLS client identity: the node's Ed448 peer key (first 57 bytes of
     // the configured seed). This is the same identity the running node
     // presents to archives, so a handshake result here matches production.
-    let key_bytes = hex::decode(&config.p2p.peer_priv_key)
-        .context("decode p2p.peerPrivKey hex")?;
+    let key_bytes = hex::decode(&config.p2p.peer_priv_key).context("decode p2p.peerPrivKey hex")?;
     anyhow::ensure!(
         key_bytes.len() >= 57,
         "p2p.peerPrivKey must be >= 57 bytes (Ed448); got {}",
@@ -73,8 +69,14 @@ pub async fn run_check_submit(
 
     println!("[check-submit] target archive : {addr}");
     println!("[check-submit] our ed448 peer : {}", hex::encode(&peer_id));
-    println!("[check-submit] prover address : {}", hex::encode(&prover_address));
-    println!("[check-submit] prover pubkey  : {}", hex::encode(&bls_pubkey));
+    println!(
+        "[check-submit] prover address : {}",
+        hex::encode(&prover_address)
+    );
+    println!(
+        "[check-submit] prover pubkey  : {}",
+        hex::encode(&bls_pubkey)
+    );
 
     // The :8340 network identity is the node's Falcon q-prover-key (loaded
     // from the keystore), not the Ed448 seed. If the keystore has no Falcon
@@ -116,7 +118,10 @@ pub async fn run_check_submit(
             c
         }
         Err(e) => {
-            println!("[check-submit]   FAIL connect_mtls after {:?}", t0.elapsed());
+            println!(
+                "[check-submit]   FAIL connect_mtls after {:?}",
+                t0.elapsed()
+            );
             print_error_chain(&e);
             println!(
                 "[check-submit] VERDICT: transport/handshake to {addr} is broken — \
@@ -185,7 +190,10 @@ pub async fn run_check_submit(
                 f
             }
             Err(e) => {
-                println!("[check-submit]   get_global_frame FAILED after {:?}", tf.elapsed());
+                println!(
+                    "[check-submit]   get_global_frame FAILED after {:?}",
+                    tf.elapsed()
+                );
                 print_error_chain(&e);
                 if attempt < ATTEMPTS {
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -251,7 +259,9 @@ pub async fn run_check_submit(
              attempts, the gap is in collector→frame→materialize, not the connection or \
              message validity.",
             hex::encode(&prover_address),
-            built_frame.map(|f| f.to_string()).unwrap_or_else(|| "?".into()),
+            built_frame
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "?".into()),
         );
         Ok(())
     } else {
@@ -264,7 +274,6 @@ pub async fn run_check_submit(
         anyhow::bail!("all {ATTEMPTS} submissions failed");
     }
 }
-
 
 /// Build a `MessageBundle` carrying one fully-signed `ProverJoin`.
 ///
@@ -281,7 +290,9 @@ fn build_join_bundle(
     addr: &[u8; 32],
     proof: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
-    use quil_execution::global_intrinsic::{prover_join::ProverJoin, sig_with_pop::SignatureWithPop};
+    use quil_execution::global_intrinsic::{
+        prover_join::ProverJoin, sig_with_pop::SignatureWithPop,
+    };
     use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
     // Go signs the FULL ProverJoin canonical bytes with signature=nil

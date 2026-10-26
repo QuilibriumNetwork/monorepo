@@ -32,7 +32,13 @@ fn falcon(c: &mut Criterion) {
         })
     });
     c.bench_function("falcon512_sign", |b| {
-        b.iter(|| black_box(signer.sign_with_domain(black_box(&msg[..]), black_box(&domain[..])).unwrap()))
+        b.iter(|| {
+            black_box(
+                signer
+                    .sign_with_domain(black_box(&msg[..]), black_box(&domain[..]))
+                    .unwrap(),
+            )
+        })
     });
 }
 

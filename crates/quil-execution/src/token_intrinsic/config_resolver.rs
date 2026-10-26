@@ -18,9 +18,9 @@
 //! install a richer resolver.
 
 use super::constants::{
-    MINT_WITH_AUTHORITY, MINT_WITH_PAYMENT, MINT_WITH_PROOF,
-    MERKLE_ENTITLEMENT_WITH_SIGNATURE, MINT_WITH_SIGNATURE, NO_MINT_BEHAVIOR,
-    PROOF_OF_MEANINGFUL_WORK, VERKLE_MULTIPROOF_WITH_SIGNATURE,
+    MERKLE_ENTITLEMENT_WITH_SIGNATURE, MINT_WITH_AUTHORITY, MINT_WITH_PAYMENT, MINT_WITH_PROOF,
+    MINT_WITH_SIGNATURE, NO_MINT_BEHAVIOR, PROOF_OF_MEANINGFUL_WORK,
+    VERKLE_MULTIPROOF_WITH_SIGNATURE,
 };
 
 /// Routing decision for a MintTransaction's `MintBehavior`+`ProofBasis`
@@ -59,9 +59,7 @@ impl MintVariant {
             MINT_WITH_PAYMENT => MintVariant::Payment,
             MINT_WITH_PROOF => match proof_basis {
                 PROOF_OF_MEANINGFUL_WORK => MintVariant::ProofOfMeaningfulWork,
-                VERKLE_MULTIPROOF_WITH_SIGNATURE => {
-                    MintVariant::VerkleMultiproofWithSignature
-                }
+                VERKLE_MULTIPROOF_WITH_SIGNATURE => MintVariant::VerkleMultiproofWithSignature,
                 MERKLE_ENTITLEMENT_WITH_SIGNATURE => MintVariant::MerkleEntitlementWithSignature,
                 _ => MintVariant::Unknown,
             },
@@ -81,7 +79,8 @@ pub trait TokenConfigResolver: Send + Sync {
     /// Create independent state lookups/cache for the supplied execution view.
     /// Unknown implementations must opt in rather than sharing mutable state.
     fn for_execution_context(
-        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
         Err(quil_types::error::QuilError::ExecutionUnavailable(
             "token resolver cannot rebind execution state".into(),
@@ -120,7 +119,8 @@ pub struct QuilOnlyConfigResolver;
 
 impl TokenConfigResolver for QuilOnlyConfigResolver {
     fn for_execution_context(
-        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
         Ok(std::sync::Arc::new(Self))
     }
@@ -132,11 +132,21 @@ impl TokenConfigResolver for QuilOnlyConfigResolver {
             None
         }
     }
-    fn authority_key_type(&self, _domain: &[u8]) -> Option<u32> { None }
-    fn authority_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> { None }
-    fn verkle_root(&self, _domain: &[u8]) -> Option<Vec<u8>> { None }
-    fn payment_fee_baseline(&self, _domain: &[u8]) -> Option<num_bigint::BigInt> { None }
-    fn payment_address(&self, _domain: &[u8]) -> Option<Vec<u8>> { None }
+    fn authority_key_type(&self, _domain: &[u8]) -> Option<u32> {
+        None
+    }
+    fn authority_public_key(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn verkle_root(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn payment_fee_baseline(&self, _domain: &[u8]) -> Option<num_bigint::BigInt> {
+        None
+    }
+    fn payment_address(&self, _domain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Per-domain mint config entry. Populates a `StaticTokenConfigResolver`
@@ -153,7 +163,9 @@ pub struct StaticTokenEntry {
 }
 
 impl Default for MintVariant {
-    fn default() -> Self { MintVariant::Unknown }
+    fn default() -> Self {
+        MintVariant::Unknown
+    }
 }
 
 /// In-memory resolver that looks up configs from a pre-populated map.
@@ -166,7 +178,9 @@ pub struct StaticTokenConfigResolver {
 
 impl StaticTokenConfigResolver {
     pub fn new() -> Self {
-        Self { entries: std::collections::HashMap::new() }
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
     }
 
     /// Seed the resolver with the baked-in QUIL config.
@@ -214,10 +228,8 @@ impl StaticTokenConfigResolver {
     ) -> Result<StaticTokenEntry, quil_types::error::QuilError> {
         use num_bigint::{BigInt, Sign};
 
-        let variant = MintVariant::from_flags(
-            strategy.mint_behavior as u16,
-            strategy.proof_basis as u16,
-        );
+        let variant =
+            MintVariant::from_flags(strategy.mint_behavior as u16, strategy.proof_basis as u16);
 
         let mut authority_key_type = None;
         let mut authority_public_key = None;
@@ -281,9 +293,12 @@ impl Default for StaticTokenConfigResolver {
 
 impl TokenConfigResolver for StaticTokenConfigResolver {
     fn for_execution_context(
-        &self, _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        _crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
-        Ok(std::sync::Arc::new(Self { entries: self.entries.clone() }))
+        Ok(std::sync::Arc::new(Self {
+            entries: self.entries.clone(),
+        }))
     }
 
     fn mint_variant_for_domain(&self, domain: &[u8]) -> Option<MintVariant> {
@@ -293,16 +308,24 @@ impl TokenConfigResolver for StaticTokenConfigResolver {
         self.entries.get(domain).and_then(|e| e.authority_key_type)
     }
     fn authority_public_key(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.entries.get(domain).and_then(|e| e.authority_public_key.clone())
+        self.entries
+            .get(domain)
+            .and_then(|e| e.authority_public_key.clone())
     }
     fn verkle_root(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.entries.get(domain).and_then(|e| e.entitlement_root.clone())
+        self.entries
+            .get(domain)
+            .and_then(|e| e.entitlement_root.clone())
     }
     fn payment_fee_baseline(&self, domain: &[u8]) -> Option<num_bigint::BigInt> {
-        self.entries.get(domain).and_then(|e| e.payment_fee_baseline.clone())
+        self.entries
+            .get(domain)
+            .and_then(|e| e.payment_fee_baseline.clone())
     }
     fn payment_address(&self, domain: &[u8]) -> Option<Vec<u8>> {
-        self.entries.get(domain).and_then(|e| e.payment_address.clone())
+        self.entries
+            .get(domain)
+            .and_then(|e| e.payment_address.clone())
     }
 }
 
@@ -364,9 +387,8 @@ impl HypergraphTokenConfigResolver {
         if config.mint_strategy.is_empty() {
             return None;
         }
-        let strategy = super::config::TokenMintStrategy::from_canonical_bytes(
-            &config.mint_strategy,
-        ).ok()?;
+        let strategy =
+            super::config::TokenMintStrategy::from_canonical_bytes(&config.mint_strategy).ok()?;
         let entry = Self::entry_from_strategy(&strategy).ok()?;
         if let Ok(mut c) = self.cache.write() {
             c.insert(domain.to_vec(), entry.clone());
@@ -383,7 +405,8 @@ impl HypergraphTokenConfigResolver {
 
 impl TokenConfigResolver for HypergraphTokenConfigResolver {
     fn for_execution_context(
-        &self, crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+        &self,
+        crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> quil_types::error::Result<std::sync::Arc<dyn TokenConfigResolver>> {
         // A cached deployment may belong to a different fork or a newer head.
         Ok(std::sync::Arc::new(Self::new(crdt)))
@@ -452,10 +475,7 @@ mod tests {
             MintVariant::Unknown,
         );
         // Unknown MintBehavior bit pattern
-        assert_eq!(
-            MintVariant::from_flags(0xFF, 0),
-            MintVariant::Unknown,
-        );
+        assert_eq!(MintVariant::from_flags(0xFF, 0), MintVariant::Unknown,);
     }
 
     #[test]
@@ -472,28 +492,52 @@ mod tests {
     fn fork_static_resolver_owns_its_configuration_entries() {
         let mut source = StaticTokenConfigResolver::with_quil_default();
         let app = vec![11; 32];
-        source.insert(app.clone(), StaticTokenEntry { variant: MintVariant::Payment, ..Default::default() });
+        source.insert(
+            app.clone(),
+            StaticTokenEntry {
+                variant: MintVariant::Payment,
+                ..Default::default()
+            },
+        );
         let crdt = std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
             std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
             std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
         ));
         let branch = source.for_execution_context(crdt).unwrap();
-        source.insert(app.clone(), StaticTokenEntry { variant: MintVariant::NoMint, ..Default::default() });
-        assert_eq!(branch.mint_variant_for_domain(&app), Some(MintVariant::Payment));
-        assert_eq!(source.mint_variant_for_domain(&app), Some(MintVariant::NoMint));
-        assert_eq!(branch.mint_variant_for_domain(&crate::domains::QUIL_TOKEN), Some(MintVariant::ProofOfMeaningfulWork));
+        source.insert(
+            app.clone(),
+            StaticTokenEntry {
+                variant: MintVariant::NoMint,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            branch.mint_variant_for_domain(&app),
+            Some(MintVariant::Payment)
+        );
+        assert_eq!(
+            source.mint_variant_for_domain(&app),
+            Some(MintVariant::NoMint)
+        );
+        assert_eq!(
+            branch.mint_variant_for_domain(&crate::domains::QUIL_TOKEN),
+            Some(MintVariant::ProofOfMeaningfulWork)
+        );
     }
 
     #[test]
     fn static_resolver_routes_registered_domain() {
         let mut r = StaticTokenConfigResolver::new();
         let custom_domain = vec![0xCCu8; 32];
-        r.insert(custom_domain.clone(), StaticTokenEntry {
-            variant: MintVariant::Authority,
-            authority_key_type: Some(1),
-            authority_public_key: Some(vec![0xAAu8; 57]),
-            ..Default::default()
-        });
+        r.insert(
+            custom_domain.clone(),
+            StaticTokenEntry {
+                variant: MintVariant::Authority,
+                authority_key_type: Some(1),
+                authority_public_key: Some(vec![0xAAu8; 57]),
+                ..Default::default()
+            },
+        );
         assert_eq!(
             r.mint_variant_for_domain(&custom_domain),
             Some(MintVariant::Authority),
@@ -503,10 +547,10 @@ mod tests {
 
     #[test]
     fn hypergraph_resolver_returns_pomw_for_quil_without_on_chain_data() {
-        use std::sync::Arc;
-        use quil_hypergraph::HypergraphCrdt;
         use quil_hypergraph::testing::MemStore;
+        use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::NoopInclusionProver;
+        use std::sync::Arc;
 
         let crdt = Arc::new(HypergraphCrdt::new(
             Arc::new(MemStore::new()),
@@ -521,10 +565,10 @@ mod tests {
 
     #[test]
     fn hypergraph_resolver_invalidate_drops_cached_entry() {
-        use std::sync::Arc;
-        use quil_hypergraph::HypergraphCrdt;
         use quil_hypergraph::testing::MemStore;
+        use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::NoopInclusionProver;
+        use std::sync::Arc;
 
         let crdt = Arc::new(HypergraphCrdt::new(
             Arc::new(MemStore::new()),
@@ -536,10 +580,13 @@ mod tests {
         let domain = vec![0x77u8; 32];
         {
             let mut c = r.cache.write().unwrap();
-            c.insert(domain.clone(), StaticTokenEntry {
-                variant: MintVariant::Authority,
-                ..Default::default()
-            });
+            c.insert(
+                domain.clone(),
+                StaticTokenEntry {
+                    variant: MintVariant::Authority,
+                    ..Default::default()
+                },
+            );
         }
         assert_eq!(
             r.mint_variant_for_domain(&domain),
@@ -553,10 +600,10 @@ mod tests {
 
     #[test]
     fn hypergraph_resolver_returns_none_for_unknown_domain() {
-        use std::sync::Arc;
-        use quil_hypergraph::HypergraphCrdt;
         use quil_hypergraph::testing::MemStore;
+        use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::NoopInclusionProver;
+        use std::sync::Arc;
 
         let crdt = Arc::new(HypergraphCrdt::new(
             Arc::new(MemStore::new()),
@@ -576,7 +623,9 @@ mod tests {
                 key_type: 5,
                 public_key: vec![0xBBu8; 97],
                 can_burn: true,
-            }.to_canonical_bytes().unwrap(),
+            }
+            .to_canonical_bytes()
+            .unwrap(),
             payment_address: vec![],
             fee_basis: vec![],
         };

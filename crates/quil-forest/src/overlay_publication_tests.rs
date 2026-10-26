@@ -112,7 +112,10 @@ fn disjoint_writes_outside_the_branch_footprint_do_not_invalidate_publication() 
         assert!(cursor.valid());
     }
     overlay
-        .apply(&[put(b"\x00\x00frame", b"executed"), put(b"\x00\x09cursor", b"1")])
+        .apply(&[
+            put(b"\x00\x00frame", b"executed"),
+            put(b"\x00\x09cursor", b"1"),
+        ])
         .unwrap();
     candidate_write(&db, b"\x00\x0fnext").unwrap();
     candidate_write(&db, b"\x00\xf8next-body").unwrap();
@@ -134,7 +137,10 @@ fn disjoint_writes_outside_the_branch_footprint_do_not_invalidate_publication() 
         overlay.prepare_commit().unwrap().commit(&db),
         Err(DatabaseCommitError::Stale { .. })
     ));
-    assert_eq!(db.get(b"\x00\x09cursor").unwrap().as_deref(), Some(b"1".as_slice()));
+    assert_eq!(
+        db.get(b"\x00\x09cursor").unwrap().as_deref(),
+        Some(b"1".as_slice())
+    );
 }
 
 #[test]
@@ -150,7 +156,10 @@ fn disjoint_write_to_a_read_scanned_written_or_inherited_prefix_rejects_publicat
     };
     let write = |overlay: &ExecutionOverlay| {
         overlay
-            .apply(&[OverlayMutation::DeleteRange(b"\x00\x0e".to_vec(), b"\x00\x0fzz".to_vec())])
+            .apply(&[OverlayMutation::DeleteRange(
+                b"\x00\x0e".to_vec(),
+                b"\x00\x0fzz".to_vec(),
+            )])
             .unwrap();
     };
     let touches: [&dyn Fn(&ExecutionOverlay); 3] = [&read, &scan, &write];
@@ -185,8 +194,14 @@ fn disjoint_batches_refuse_keys_and_ranges_outside_their_prefixes() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     let mut batch = crate::DisjointBatch::new(CANDIDATES);
-    assert!(matches!(batch.put(b"\x00\x00frame", b"x"), Err(DatabaseCommitError::OutsideKeyspace)));
-    assert!(matches!(batch.delete(b"\x00"), Err(DatabaseCommitError::OutsideKeyspace)));
+    assert!(matches!(
+        batch.put(b"\x00\x00frame", b"x"),
+        Err(DatabaseCommitError::OutsideKeyspace)
+    ));
+    assert!(matches!(
+        batch.delete(b"\x00"),
+        Err(DatabaseCommitError::OutsideKeyspace)
+    ));
     assert!(matches!(
         batch.delete_range(b"\x00\x0f", b"\x00\x10"),
         Err(DatabaseCommitError::OutsideKeyspace)
@@ -197,7 +212,8 @@ fn disjoint_batches_refuse_keys_and_ranges_outside_their_prefixes() {
     ));
     assert!(batch.is_empty());
     batch.delete_range(b"\x00\xf8a", b"\x00\xf8\xff").unwrap();
-    db.write_disjoint(batch, &rocksdb::WriteOptions::default()).unwrap();
+    db.write_disjoint(batch, &rocksdb::WriteOptions::default())
+        .unwrap();
     assert!(rows(&db).is_empty());
 }
 

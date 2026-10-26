@@ -27,9 +27,8 @@ impl Keypair {
 
     /// Construct from raw private key bytes (57 bytes).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodingError> {
-        let private = ed448_rust::PrivateKey::try_from(bytes).map_err(|_| {
-            DecodingError::missing_feature("ed448")
-        })?;
+        let private = ed448_rust::PrivateKey::try_from(bytes)
+            .map_err(|_| DecodingError::missing_feature("ed448"))?;
         let public = PublicKey::from_inner(ed448_rust::PublicKey::from(&private));
         Ok(Self { private, public })
     }

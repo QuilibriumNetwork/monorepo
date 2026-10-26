@@ -6,15 +6,15 @@ use quil_types::proto::global as pb;
 use quil_types::proto::keys as keys_pb;
 
 use super::addressed_signature::AddressedSignature;
+use super::consensus_types::AltShardUpdate;
+use super::frame_header::FrameHeader;
 use super::prover_filter_ops::{ProverLeave, ProverPause, ProverResume};
 use super::prover_join::ProverJoin;
 use super::prover_ops::{
     ProverConfirm, ProverKick, ProverReject, ProverSeniorityMerge, ProverUpdate, ShardMerge,
     ShardSplit,
 };
-use super::consensus_types::AltShardUpdate;
 use super::seniority_merge::SeniorityMerge;
-use super::frame_header::FrameHeader;
 use super::sig_with_pop::SignatureWithPop;
 use crate::hypergraph_intrinsic::canonical::{
     AggregateSignature as CanonicalAggregateSignature, Bls48581G2PublicKey,
@@ -24,18 +24,14 @@ use crate::hypergraph_intrinsic::canonical::{
 // AddressedSignature ↔ Bls48581AddressedSignature
 // =====================================================================
 
-pub fn addressed_sig_from_proto(
-    pb: &keys_pb::Bls48581AddressedSignature,
-) -> AddressedSignature {
+pub fn addressed_sig_from_proto(pb: &keys_pb::Bls48581AddressedSignature) -> AddressedSignature {
     AddressedSignature {
         signature: pb.signature.clone(),
         address: pb.address.clone(),
     }
 }
 
-pub fn addressed_sig_to_proto(
-    s: &AddressedSignature,
-) -> keys_pb::Bls48581AddressedSignature {
+pub fn addressed_sig_to_proto(s: &AddressedSignature) -> keys_pb::Bls48581AddressedSignature {
     keys_pb::Bls48581AddressedSignature {
         signature: s.signature.clone(),
         address: s.address.clone(),
@@ -61,9 +57,12 @@ pub fn sig_with_pop_to_proto(
 ) -> keys_pb::Bls48581SignatureWithProofOfPossession {
     keys_pb::Bls48581SignatureWithProofOfPossession {
         signature: s.signature.clone(),
-        public_key: s.public_key.as_ref().map(|kv| keys_pb::Bls48581g2PublicKey {
-            key_value: kv.clone(),
-        }),
+        public_key: s
+            .public_key
+            .as_ref()
+            .map(|kv| keys_pb::Bls48581g2PublicKey {
+                key_value: kv.clone(),
+            }),
         pop_signature: s.pop_signature.clone(),
     }
 }
@@ -100,7 +99,11 @@ pub fn prover_seniority_merge_from_proto(pb: &pb::ProverSeniorityMerge) -> Prove
             .public_key_signature_bls48581
             .as_ref()
             .map(addressed_sig_from_proto),
-        merge_targets: pb.merge_targets.iter().map(seniority_merge_from_proto).collect(),
+        merge_targets: pb
+            .merge_targets
+            .iter()
+            .map(seniority_merge_from_proto)
+            .collect(),
     }
 }
 
@@ -111,7 +114,11 @@ pub fn prover_seniority_merge_to_proto(s: &ProverSeniorityMerge) -> pb::ProverSe
             .public_key_signature_bls48581
             .as_ref()
             .map(addressed_sig_to_proto),
-        merge_targets: s.merge_targets.iter().map(seniority_merge_to_proto).collect(),
+        merge_targets: s
+            .merge_targets
+            .iter()
+            .map(seniority_merge_to_proto)
+            .collect(),
     }
 }
 
@@ -364,7 +371,11 @@ pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
             .as_ref()
             .map(addressed_sig_from_proto),
         filters: pb.filters.clone(),
-        leaf_roots: pb.leaf_roots.iter().map(confirm_leaf_roots_from_proto).collect(),
+        leaf_roots: pb
+            .leaf_roots
+            .iter()
+            .map(confirm_leaf_roots_from_proto)
+            .collect(),
         // As in the canonical decoder: ignored before the release frame.
         release: pb
             .release
@@ -402,7 +413,11 @@ pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
             .as_ref()
             .map(addressed_sig_to_proto),
         filters: c.filters.clone(),
-        leaf_roots: c.leaf_roots.iter().map(confirm_leaf_roots_to_proto).collect(),
+        leaf_roots: c
+            .leaf_roots
+            .iter()
+            .map(confirm_leaf_roots_to_proto)
+            .collect(),
         release: c.release.as_ref().map(release_to_proto),
     }
 }
@@ -519,15 +534,13 @@ mod tests {
         let pb = pb::ProverJoin {
             filters: vec![vec![0x11u8; 32]],
             frame_number: 42,
-            public_key_signature_bls48581: Some(
-                keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 666],
-                    public_key: Some(keys_pb::Bls48581g2PublicKey {
-                        key_value: vec![0xBBu8; 897],
-                    }),
-                    pop_signature: vec![0xCCu8; 666],
-                },
-            ),
+            public_key_signature_bls48581: Some(keys_pb::Bls48581SignatureWithProofOfPossession {
+                signature: vec![0xAAu8; 666],
+                public_key: Some(keys_pb::Bls48581g2PublicKey {
+                    key_value: vec![0xBBu8; 897],
+                }),
+                pop_signature: vec![0xCCu8; 666],
+            }),
             delegate_address: vec![0xDDu8; 32],
             merge_targets: vec![pb::SeniorityMerge {
                 signature: vec![0x11u8; 74],
@@ -597,7 +610,11 @@ mod tests {
     #[allow(deprecated)] // deprecated `filter` is part of what round-trips
     fn prover_confirm_release_round_trips_and_an_invalid_one_is_none() {
         use super::super::prover_release::set_confirm_release_frame_for_thread;
-        let release = pb::ReleaseInfo { version: vec![2, 1, 0], patch_number: 25, subpatch: 92 };
+        let release = pb::ReleaseInfo {
+            version: vec![2, 1, 0],
+            patch_number: 25,
+            subpatch: 92,
+        };
         let pb = pb::ProverConfirm {
             filter: vec![],
             frame_number: 50,
@@ -608,17 +625,37 @@ mod tests {
         };
         for frame in [None, Some(51)] {
             set_confirm_release_frame_for_thread(frame);
-            assert_eq!(prover_confirm_from_proto(&pb).release, None, "ignored before the release frame");
+            assert_eq!(
+                prover_confirm_from_proto(&pb).release,
+                None,
+                "ignored before the release frame"
+            );
         }
         set_confirm_release_frame_for_thread(Some(50));
         let c = prover_confirm_from_proto(&pb);
         set_confirm_release_frame_for_thread(None);
-        assert_eq!(c.release, Some(super::super::prover_release::Release { version: [2, 1, 0], patch: 25, subpatch: 92 }));
+        assert_eq!(
+            c.release,
+            Some(super::super::prover_release::Release {
+                version: [2, 1, 0],
+                patch: 25,
+                subpatch: 92
+            })
+        );
         assert_eq!(prover_confirm_to_proto(&c), pb);
         for invalid in [
-            pb::ReleaseInfo { version: vec![2, 1], ..release.clone() },
-            pb::ReleaseInfo { patch_number: 256, ..release.clone() },
-            pb::ReleaseInfo { subpatch: 65_536, ..release.clone() },
+            pb::ReleaseInfo {
+                version: vec![2, 1],
+                ..release.clone()
+            },
+            pb::ReleaseInfo {
+                patch_number: 256,
+                ..release.clone()
+            },
+            pb::ReleaseInfo {
+                subpatch: 65_536,
+                ..release.clone()
+            },
         ] {
             assert_eq!(release_from_proto(&invalid), None);
         }
@@ -654,13 +691,11 @@ mod tests {
         let pb = pb::ProverJoin {
             filters: vec![vec![0x01u8; 32], vec![0x02u8; 48]],
             frame_number: 0xCAFE,
-            public_key_signature_bls48581: Some(
-                keys_pb::Bls48581SignatureWithProofOfPossession {
-                    signature: vec![0xAAu8; 666],
-                    public_key: None,
-                    pop_signature: vec![0xBBu8; 666],
-                },
-            ),
+            public_key_signature_bls48581: Some(keys_pb::Bls48581SignatureWithProofOfPossession {
+                signature: vec![0xAAu8; 666],
+                public_key: None,
+                pop_signature: vec![0xBBu8; 666],
+            }),
             delegate_address: vec![0xDDu8; 32],
             merge_targets: vec![],
             proof: vec![0xEEu8; 64],
@@ -759,15 +794,11 @@ pub fn frame_header_to_proto(h: &FrameHeader) -> pb::FrameHeader {
     } else {
         // Canonical sig bytes decode → split into signature/pubkey/bitmask
         // for the proto. If decoding fails, treat as no signature.
-        match CanonicalAggregateSignature::from_canonical_bytes(
-            &h.public_key_signature_bls48581,
-        ) {
+        match CanonicalAggregateSignature::from_canonical_bytes(&h.public_key_signature_bls48581) {
             Ok(canon) => Some(keys_pb::Bls48581AggregateSignature {
                 signature: canon.signature,
-                public_key: canon.public_key.map(|pk| {
-                    keys_pb::Bls48581g2PublicKey {
-                        key_value: pk.key_value,
-                    }
+                public_key: canon.public_key.map(|pk| keys_pb::Bls48581g2PublicKey {
+                    key_value: pk.key_value,
                 }),
                 bitmask: canon.bitmask,
             }),

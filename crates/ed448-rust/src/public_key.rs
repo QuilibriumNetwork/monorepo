@@ -171,7 +171,7 @@ impl From<[u8; KEY_LENGTH]> for PublicKey {
 impl From<&'_ [u8; KEY_LENGTH]> for PublicKey {
     #[inline]
     fn from(array: &'_ [u8; KEY_LENGTH]) -> Self {
-       Self(Point::decode(array).expect("bad ed448 public key")) 
+        Self(Point::decode(array).expect("bad ed448 public key"))
     }
 }
 

@@ -98,7 +98,8 @@ impl MaterializerBranch {
         let stats = self.execution.overlay().stats();
         let caps = self.limits.execution.state.overlay;
         let read_cap_mb = (caps.max_read_bytes != u64::MAX).then_some(caps.max_read_bytes >> 20);
-        let read_cap_operations = (caps.max_read_operations != u64::MAX).then_some(caps.max_read_operations);
+        let read_cap_operations =
+            (caps.max_read_operations != u64::MAX).then_some(caps.max_read_operations);
         if stats.read_bytes >= LOGGED_EXECUTION_READ_BYTES
             || stats.read_operations >= LOGGED_EXECUTION_READ_OPERATIONS
         {
@@ -106,8 +107,13 @@ impl MaterializerBranch {
                 read_cap_mb = ?read_cap_mb, read_cap_operations = ?read_cap_operations,
                 "large GLOBAL execution read");
         } else {
-            debug!(what, frame, read_bytes = stats.read_bytes, read_operations = stats.read_operations,
-                "GLOBAL execution read");
+            debug!(
+                what,
+                frame,
+                read_bytes = stats.read_bytes,
+                read_operations = stats.read_operations,
+                "GLOBAL execution read"
+            );
         }
     }
 
@@ -248,7 +254,10 @@ fn read_cursor(store: &dyn HypergraphStore) -> Result<u64> {
 impl FrameMaterializer {
     /// Another materialization, publication or capture holds the frame lock.
     pub(crate) fn frame_execution_busy(&self) -> bool {
-        matches!(self.frame_execution.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+        matches!(
+            self.frame_execution.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 
     /// Capture a complete materializer over one same-store checkpoint. The

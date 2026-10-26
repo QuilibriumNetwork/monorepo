@@ -1,7 +1,6 @@
 //! KeyManager implementation that dispatches signature verification
 //! to the appropriate algorithm based on KeyType.
 
-
 use quil_types::crypto::{KeyManager, KeyType};
 use quil_types::error::{QuilError, Result};
 
@@ -93,15 +92,33 @@ mod tests {
         let signer = crate::FalconSigner::generate();
         let sig = signer.sign_with_domain(b"consensus", b"global").unwrap();
         assert!(m
-            .validate_signature(KeyType::Falcon512, signer.public_key(), b"consensus", &sig, b"global")
+            .validate_signature(
+                KeyType::Falcon512,
+                signer.public_key(),
+                b"consensus",
+                &sig,
+                b"global"
+            )
             .unwrap());
         // Wrong domain → false (domain separation), no error.
         assert!(!m
-            .validate_signature(KeyType::Falcon512, signer.public_key(), b"consensus", &sig, b"other")
+            .validate_signature(
+                KeyType::Falcon512,
+                signer.public_key(),
+                b"consensus",
+                &sig,
+                b"other"
+            )
             .unwrap());
         // Malformed pubkey → false, no panic.
         assert!(!m
-            .validate_signature(KeyType::Falcon512, &[0u8; 10], b"consensus", &sig, b"global")
+            .validate_signature(
+                KeyType::Falcon512,
+                &[0u8; 10],
+                b"consensus",
+                &sig,
+                b"global"
+            )
             .unwrap());
     }
 
@@ -112,7 +129,8 @@ mod tests {
         let m = km(false);
         for kt in [KeyType::Bls48581G1, KeyType::Bls48581G2] {
             assert!(
-                m.validate_signature(kt, &[0u8; 585], b"msg", &[0u8; 74], b"domain").is_err(),
+                m.validate_signature(kt, &[0u8; 585], b"msg", &[0u8; 74], b"domain")
+                    .is_err(),
                 "BLS key type {kt:?} must be rejected (retired)"
             );
         }
@@ -121,26 +139,30 @@ mod tests {
     #[test]
     fn ed448_rejects_wrong_key_length() {
         let m = km(false);
-        let err = m.validate_signature(
-            KeyType::Ed448,
-            &[0u8; 56], // should be 57
-            b"msg",
-            &[0u8; 114],
-            b"",
-        ).unwrap_err();
+        let err = m
+            .validate_signature(
+                KeyType::Ed448,
+                &[0u8; 56], // should be 57
+                b"msg",
+                &[0u8; 114],
+                b"",
+            )
+            .unwrap_err();
         assert!(matches!(err, QuilError::InvalidArgument(_)));
     }
 
     #[test]
     fn ed448_rejects_wrong_sig_length() {
         let m = km(false);
-        let err = m.validate_signature(
-            KeyType::Ed448,
-            &[0u8; 57],
-            b"msg",
-            &[0u8; 100], // should be 114
-            b"",
-        ).unwrap_err();
+        let err = m
+            .validate_signature(
+                KeyType::Ed448,
+                &[0u8; 57],
+                b"msg",
+                &[0u8; 100], // should be 114
+                b"",
+            )
+            .unwrap_err();
         assert!(matches!(err, QuilError::InvalidArgument(_)));
     }
 
@@ -149,13 +171,8 @@ mod tests {
         let m = km(false);
         // Random bytes won't form a valid Ed448 key — should return
         // an error or false.
-        let result = m.validate_signature(
-            KeyType::Ed448,
-            &[0x01u8; 57],
-            b"msg",
-            &[0x02u8; 114],
-            b"",
-        );
+        let result =
+            m.validate_signature(KeyType::Ed448, &[0x01u8; 57], b"msg", &[0x02u8; 114], b"");
         // Either Ok(false) or Err — both acceptable for garbage input.
         match result {
             Ok(false) => {}
@@ -202,12 +219,8 @@ mod tests {
     #[test]
     fn unsupported_key_type_returns_error() {
         let m = km(false);
-        assert!(m.validate_signature(
-            KeyType::X448,
-            &[0u8; 57],
-            b"msg",
-            &[0u8; 114],
-            b"",
-        ).is_err());
+        assert!(m
+            .validate_signature(KeyType::X448, &[0u8; 57], b"msg", &[0u8; 114], b"",)
+            .is_err());
     }
 }

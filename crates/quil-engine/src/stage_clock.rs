@@ -29,13 +29,21 @@ impl StageClock {
     /// Logs when the work took longer than `slow`.
     pub(crate) fn start_after(what: &'static str, frame: u64, slow: Duration) -> Self {
         let now = Instant::now();
-        Self { what, frame, started: now, last: now, steps: Vec::new(), slow }
+        Self {
+            what,
+            frame,
+            started: now,
+            last: now,
+            steps: Vec::new(),
+            slow,
+        }
     }
 
     /// Close the step that ends now.
     pub(crate) fn mark(&mut self, step: &'static str) {
         let now = Instant::now();
-        self.steps.push((step, now.duration_since(self.last).as_millis()));
+        self.steps
+            .push((step, now.duration_since(self.last).as_millis()));
         self.last = now;
     }
 }
@@ -68,6 +76,9 @@ mod tests {
         clock.mark("second");
         let names: Vec<_> = clock.steps.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ["first", "second"]);
-        assert!(clock.started.elapsed() < SLOW, "a fast clock logs nothing when dropped");
+        assert!(
+            clock.started.elapsed() < SLOW,
+            "a fast clock logs nothing when dropped"
+        );
     }
 }

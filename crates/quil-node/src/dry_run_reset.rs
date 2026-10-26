@@ -47,7 +47,11 @@ pub fn run_dry_run_reset(
         .unwrap_or(0);
     // Default the simulated cutover to just past head so the reseed's
     // frame-numbered writes are ahead of the snapshot.
-    let cutover_frame = if cutover_frame_arg == 0 { head + 1 } else { cutover_frame_arg };
+    let cutover_frame = if cutover_frame_arg == 0 {
+        head + 1
+    } else {
+        cutover_frame_arg
+    };
     println!("head frame: {head}   simulated cutover frame: {cutover_frame}");
 
     if !hg_store.has_forest_data() {
@@ -72,7 +76,10 @@ pub fn run_dry_run_reset(
     let mut grid_key = Vec::with_capacity(3 + 32);
     grid_key.extend_from_slice(&l1);
     grid_key.extend_from_slice(&quil);
-    let prover_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+    let prover_shard = ShardKey {
+        l1: [0u8; 3],
+        l2: [0xffu8; 32],
+    };
 
     // ---- BEFORE ----
     let before_rows: Vec<ShardInfo> = shards_store
@@ -101,9 +108,7 @@ pub fn run_dry_run_reset(
     println!("QUIL shard rows:        {}", before_rows.len());
     println!("QUIL pending changes:   {before_pending}");
     println!("global prover records:  {}", before_provers.len());
-    println!(
-        "legacy whole-app aggregate over this grid PANICS (non-prefix-free): {legacy_panics}"
-    );
+    println!("legacy whole-app aggregate over this grid PANICS (non-prefix-free): {legacy_panics}");
     if before_prefixes.len() <= 40 {
         println!("QUIL prefixes: {before_prefixes:?}");
     }
@@ -131,11 +136,18 @@ pub fn run_dry_run_reset(
     }
     for pc in shards_store.all_pending_shard_changes()? {
         if pc.parent.len() >= 32 && pc.parent[..32] == quil {
-            shards_store.delete_pending_shard_change(txn.as_ref(), &pc.parent, pc.effective_epoch)?;
+            shards_store.delete_pending_shard_change(
+                txn.as_ref(),
+                &pc.parent,
+                pc.effective_epoch,
+            )?;
         }
     }
     txn.commit()?;
-    println!("(1) QUIL grid reset to genesis topology ({} rows)", genesis_prefixes.len());
+    println!(
+        "(1) QUIL grid reset to genesis topology ({} rows)",
+        genesis_prefixes.len()
+    );
 
     // (2) Prover-tree wipe + rebuild from the genesis committee.
     let seeded = quil_engine::genesis::reset_prover_tree_to_genesis(
@@ -167,15 +179,27 @@ pub fn run_dry_run_reset(
     let prover_root = crdt.compute_shard_root("vertex", "adds", &prover_shard);
 
     println!("\n--- AFTER reset ---");
-    println!("QUIL shard rows:        {} (was {})", after_rows.len(), before_rows.len());
-    println!("global prover records:  {} (was {})", after_provers.len(), before_provers.len());
+    println!(
+        "QUIL shard rows:        {} (was {})",
+        after_rows.len(),
+        before_rows.len()
+    );
+    println!(
+        "global prover records:  {} (was {})",
+        after_provers.len(),
+        before_provers.len()
+    );
     println!("legacy aggregate PANICS: {after_panics}  (expect false ⇒ prefix-free)");
     println!("prover-shard adds root:  {}", hex::encode(&prover_root));
 
     let ok = after_provers.len() == seeded && !after_panics;
     println!(
         "\n=== DRY-RUN {} ===",
-        if ok { "PASS" } else { "CHECK OUTPUT — unexpected result" }
+        if ok {
+            "PASS"
+        } else {
+            "CHECK OUTPUT — unexpected result"
+        }
     );
     Ok(())
 }

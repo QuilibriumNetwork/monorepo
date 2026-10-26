@@ -15,7 +15,9 @@ use p3_koala_bear::{
     KOALABEAR_POSEIDON2_RC_24_EXTERNAL_INITIAL, KOALABEAR_POSEIDON2_RC_24_INTERNAL,
 };
 use p3_poseidon2::GenericPoseidon2LinearLayers;
-use p3_poseidon2_air::{generate_trace_rows_for_perm, num_cols, FullRound, PartialRound, Poseidon2Cols, RoundConstants};
+use p3_poseidon2_air::{
+    generate_trace_rows_for_perm, num_cols, FullRound, PartialRound, Poseidon2Cols, RoundConstants,
+};
 
 use crate::config::Val;
 
@@ -25,15 +27,18 @@ const SBOX_REGISTERS: usize = 0;
 const HALF_FULL_ROUNDS: usize = 4;
 const PARTIAL_ROUNDS: usize = 23;
 
-pub type Cols<T> = Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>;
+pub type Cols<T> =
+    Poseidon2Cols<T, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>;
 type Layers = GenericPoseidon2LinearLayersKoalaBear;
 
 /// Columns of one permutation.
-pub const NUM_COLS: usize = num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>();
+pub const NUM_COLS: usize =
+    num_cols::<WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>();
 
 fn round_constants() -> &'static RoundConstants<Val, WIDTH, HALF_FULL_ROUNDS, PARTIAL_ROUNDS> {
-    static CONSTANTS: std::sync::OnceLock<RoundConstants<Val, WIDTH, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>> =
-        std::sync::OnceLock::new();
+    static CONSTANTS: std::sync::OnceLock<
+        RoundConstants<Val, WIDTH, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>,
+    > = std::sync::OnceLock::new();
     CONSTANTS.get_or_init(|| {
         RoundConstants::new(
             KOALABEAR_POSEIDON2_RC_24_EXTERNAL_INITIAL,
@@ -52,11 +57,15 @@ pub fn fill(row: &mut [Val], input: [Val; WIDTH]) -> [Val; WIDTH] {
     let uninit: &mut [MaybeUninit<Val>] =
         unsafe { core::slice::from_raw_parts_mut(row.as_mut_ptr().cast(), row.len()) };
     let cols: &mut Cols<MaybeUninit<Val>> = uninit.borrow_mut();
-    generate_trace_rows_for_perm::<Val, Layers, WIDTH, SBOX_DEGREE, SBOX_REGISTERS, HALF_FULL_ROUNDS, PARTIAL_ROUNDS>(
-        cols,
-        input,
-        round_constants(),
-    );
+    generate_trace_rows_for_perm::<
+        Val,
+        Layers,
+        WIDTH,
+        SBOX_DEGREE,
+        SBOX_REGISTERS,
+        HALF_FULL_ROUNDS,
+        PARTIAL_ROUNDS,
+    >(cols, input, round_constants());
     output(row)
 }
 
@@ -67,20 +76,41 @@ pub fn output(row: &[Val]) -> [Val; WIDTH] {
 }
 
 /// Constrain `cols` to one permutation; returns its input and output.
-pub fn eval<AB: AirBuilder<F = Val>>(builder: &mut AB, cols: &Cols<AB::Var>) -> ([AB::Var; WIDTH], [AB::Var; WIDTH]) {
+pub fn eval<AB: AirBuilder<F = Val>>(
+    builder: &mut AB,
+    cols: &Cols<AB::Var>,
+) -> ([AB::Var; WIDTH], [AB::Var; WIDTH]) {
     let constants = PlainConstants::get();
     let mut state: [AB::Expr; WIDTH] = cols.inputs.map(Into::into);
     Layers::external_linear_layer(&mut state);
     for round in 0..HALF_FULL_ROUNDS {
-        full_round(builder, &mut state, &cols.beginning_full_rounds[round], &constants.beginning[round]);
+        full_round(
+            builder,
+            &mut state,
+            &cols.beginning_full_rounds[round],
+            &constants.beginning[round],
+        );
     }
     for round in 0..PARTIAL_ROUNDS {
-        partial_round(builder, &mut state, &cols.partial_rounds[round], constants.partial[round]);
+        partial_round(
+            builder,
+            &mut state,
+            &cols.partial_rounds[round],
+            constants.partial[round],
+        );
     }
     for round in 0..HALF_FULL_ROUNDS {
-        full_round(builder, &mut state, &cols.ending_full_rounds[round], &constants.ending[round]);
+        full_round(
+            builder,
+            &mut state,
+            &cols.ending_full_rounds[round],
+            &constants.ending[round],
+        );
     }
-    (cols.inputs, cols.ending_full_rounds[HALF_FULL_ROUNDS - 1].post)
+    (
+        cols.inputs,
+        cols.ending_full_rounds[HALF_FULL_ROUNDS - 1].post,
+    )
 }
 
 /// The round constants as plain arrays (the `RoundConstants` fields are
@@ -141,7 +171,8 @@ mod tests {
     fn the_columns_compute_the_native_permutation() {
         let mut row = vec![Val::ZERO; NUM_COLS];
         for seed in 0u32..4 {
-            let input: [Val; WIDTH] = core::array::from_fn(|i| hash::felt(seed * 1000 + i as u32 * 7 + 1));
+            let input: [Val; WIDTH] =
+                core::array::from_fn(|i| hash::felt(seed * 1000 + i as u32 * 7 + 1));
             let mut native = input;
             hash::permute(&mut native);
             assert_eq!(fill(&mut row, input), native);

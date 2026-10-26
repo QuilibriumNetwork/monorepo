@@ -22,8 +22,13 @@ pub(crate) struct CommitteePeers {
 }
 
 impl CommitteePeers {
-    pub(crate) fn new(peer_info: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>) -> Self {
-        Self { peer_info, known: Default::default() }
+    pub(crate) fn new(
+        peer_info: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
+    ) -> Self {
+        Self {
+            peer_info,
+            known: Default::default(),
+        }
     }
 
     pub(crate) fn peer(&self, key: &[u8]) -> Option<quil_p2p::PeerId> {
@@ -65,8 +70,14 @@ pub(crate) async fn deliver_direct(
         return false;
     }
     for key in recipients {
-        let Some(peer) = peers.peer(key) else { return false };
-        if p2p.send_direct(peer, topic.to_vec(), payload.to_vec()).await != quil_p2p::DirectOutcome::Delivered {
+        let Some(peer) = peers.peer(key) else {
+            return false;
+        };
+        if p2p
+            .send_direct(peer, topic.to_vec(), payload.to_vec())
+            .await
+            != quil_p2p::DirectOutcome::Delivered
+        {
             peers.forget(key);
             return false;
         }
@@ -85,10 +96,14 @@ mod tests {
     async fn resolver_messages_go_direct_only_when_every_recipient_can_be_served() {
         let member = quil_p2p::PeerId::random();
         let key = vec![7u8; 897];
-        let cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>> = Default::default();
+        let cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>> =
+            Default::default();
         cache.write().insert(
             member.to_bytes(),
-            quil_p2p::CanonicalPeerInfo { public_key: key.clone(), ..Default::default() },
+            quil_p2p::CanonicalPeerInfo {
+                public_key: key.clone(),
+                ..Default::default()
+            },
         );
         let peers = CommitteePeers::new(cache.clone());
         assert_eq!(peers.peer(&key), Some(member));
@@ -100,14 +115,31 @@ mod tests {
         // The stub swarm never answers a direct send: every attempt fails.
         let p2p = quil_p2p::node::P2PHandle::for_test(false);
         let topic = quil_engine::bitmasks::shard_cw_bitmask(&[1; 32]);
-        assert!(!deliver_direct(&p2p, &peers, &[vec![9u8; 897]], &topic, b"x").await, "unmapped");
-        let many: Vec<Vec<u8>> = (0..=MAX_DIRECT_RECIPIENTS as u8).map(|n| vec![n; 897]).collect();
-        assert!(!deliver_direct(&p2p, &peers, &many, &topic, b"x").await, "too many recipients");
+        assert!(
+            !deliver_direct(&p2p, &peers, &[vec![9u8; 897]], &topic, b"x").await,
+            "unmapped"
+        );
+        let many: Vec<Vec<u8>> = (0..=MAX_DIRECT_RECIPIENTS as u8)
+            .map(|n| vec![n; 897])
+            .collect();
+        assert!(
+            !deliver_direct(&p2p, &peers, &many, &topic, b"x").await,
+            "too many recipients"
+        );
         cache.write().insert(
             member.to_bytes(),
-            quil_p2p::CanonicalPeerInfo { public_key: key.clone(), ..Default::default() },
+            quil_p2p::CanonicalPeerInfo {
+                public_key: key.clone(),
+                ..Default::default()
+            },
         );
-        assert!(!deliver_direct(&p2p, &peers, &[key.clone()], &topic, b"x").await, "a failed send");
-        assert!(peers.known.lock().is_empty(), "a failed recipient is looked up again next time");
+        assert!(
+            !deliver_direct(&p2p, &peers, &[key.clone()], &topic, b"x").await,
+            "a failed send"
+        );
+        assert!(
+            peers.known.lock().is_empty(),
+            "a failed recipient is looked up again next time"
+        );
     }
 }

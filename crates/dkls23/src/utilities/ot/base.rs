@@ -199,11 +199,7 @@ impl OTReceiver {
     /// Given a choice bit, returns a secret scalar (to be kept)
     /// and an encryption proof (to be sent to the sender).
     #[must_use]
-    pub fn run_phase1<C: DklsCurve>(
-        &self,
-        session_id: &[u8],
-        bit: bool,
-    ) -> (C::Scalar, EncProof<C>)
+    pub fn run_phase1<C: DklsCurve>(&self, session_id: &[u8], bit: bool) -> (C::Scalar, EncProof<C>)
     where
         C::Scalar: Reduce<U256> + PrimeField,
         C::AffinePoint: GroupEncoding,

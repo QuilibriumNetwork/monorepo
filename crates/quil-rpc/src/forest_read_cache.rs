@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 pub const FOREST_READ_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 fn cache_budget() -> usize {
-    std::env::var("QUIL_FOREST_READ_CACHE_MB").ok()
+    std::env::var("QUIL_FOREST_READ_CACHE_MB")
+        .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map_or(FOREST_READ_CACHE_BYTES, |mb| mb.saturating_mul(1024 * 1024))
 }
@@ -57,7 +58,10 @@ pub(crate) struct Origin {
 
 impl Origin {
     pub(crate) fn of<T: ?Sized>(server: &Arc<T>) -> Self {
-        Self { server: Arc::as_ptr(server) as *const () as usize, generation: quil_forest::tree_generation() }
+        Self {
+            server: Arc::as_ptr(server) as *const () as usize,
+            generation: quil_forest::tree_generation(),
+        }
     }
 }
 
@@ -72,21 +76,51 @@ pub(crate) struct CacheKey {
 
 impl CacheKey {
     pub(crate) fn node(origin: Origin, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Self {
-        Self { origin, kind: Kind::Node, shard_id: shard_id.to_vec(), phase, key: node_key.to_vec() }
+        Self {
+            origin,
+            kind: Kind::Node,
+            shard_id: shard_id.to_vec(),
+            phase,
+            key: node_key.to_vec(),
+        }
     }
 
-    pub(crate) fn value(origin: Origin, shard_id: &[u8], phase: u32, version: u64, key_hash: &[u8; 32]) -> Self {
+    pub(crate) fn value(
+        origin: Origin,
+        shard_id: &[u8],
+        phase: u32,
+        version: u64,
+        key_hash: &[u8; 32],
+    ) -> Self {
         let mut key = version.to_be_bytes().to_vec();
         key.extend_from_slice(key_hash);
-        Self { origin, kind: Kind::Value, shard_id: shard_id.to_vec(), phase, key }
+        Self {
+            origin,
+            kind: Kind::Value,
+            shard_id: shard_id.to_vec(),
+            phase,
+            key,
+        }
     }
 
     /// A vertex blob `id` under the app ShardKey bytes `shard_key`, read as
     /// of tree `version`.
-    pub(crate) fn blob(origin: Origin, shard_key: &[u8], phase: u32, version: u64, id: &[u8]) -> Self {
+    pub(crate) fn blob(
+        origin: Origin,
+        shard_key: &[u8],
+        phase: u32,
+        version: u64,
+        id: &[u8],
+    ) -> Self {
         let mut key = version.to_be_bytes().to_vec();
         key.extend_from_slice(id);
-        Self { origin, kind: Kind::Blob, shard_id: shard_key.to_vec(), phase, key }
+        Self {
+            origin,
+            kind: Kind::Blob,
+            shard_id: shard_key.to_vec(),
+            phase,
+            key,
+        }
     }
 
     fn size(&self) -> usize {
@@ -131,7 +165,12 @@ impl ForestReadCache {
     pub(crate) fn new(budget: usize, ttl: Duration) -> Self {
         Self {
             shards: (0..SHARDS)
-                .map(|_| parking_lot::Mutex::new(Shard { entries: lru::LruCache::unbounded(), bytes: 0 }))
+                .map(|_| {
+                    parking_lot::Mutex::new(Shard {
+                        entries: lru::LruCache::unbounded(),
+                        bytes: 0,
+                    })
+                })
                 .collect(),
             budget_per_shard: budget / SHARDS,
             ttl,
@@ -149,7 +188,11 @@ impl ForestReadCache {
 
     pub(crate) fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
         let found = self.lookup(key);
-        let counter = if found.is_some() { &self.hits } else { &self.misses };
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         found
     }
@@ -188,14 +231,21 @@ impl ForestReadCache {
             return;
         }
         let mut shard = self.shards[key.shard()].lock();
-        let entry = Entry { data: Arc::new(data), stored: Instant::now() };
+        let entry = Entry {
+            data: Arc::new(data),
+            stored: Instant::now(),
+        };
         if let Some(old) = shard.entries.put(key.clone(), entry) {
             shard.bytes = shard.bytes.saturating_sub(key.size() + old.data.len());
         }
         shard.bytes += size;
         while shard.bytes > self.budget_per_shard {
-            let Some((evicted, entry)) = shard.entries.pop_lru() else { break };
-            shard.bytes = shard.bytes.saturating_sub(evicted.size() + entry.data.len());
+            let Some((evicted, entry)) = shard.entries.pop_lru() else {
+                break;
+            };
+            shard.bytes = shard
+                .bytes
+                .saturating_sub(evicted.size() + entry.data.len());
         }
     }
 
@@ -222,24 +272,48 @@ mod tests {
     #[test]
     fn entries_are_served_until_evicted_or_expired() {
         let cache = ForestReadCache::new(SHARDS * 4096, Duration::from_secs(60));
-        let origin = Origin { server: 1, generation: 0 };
+        let origin = Origin {
+            server: 1,
+            generation: 0,
+        };
         let key = CacheKey::node(origin, &[0xff; 32], 0, b"node key");
         assert!(cache.get(&key).is_none());
         cache.put(key.clone(), vec![7; 100]);
         assert_eq!(cache.get(&key).as_deref(), Some(&vec![7; 100]));
         let value = CacheKey::value(origin, &[0xff; 32], 0, 9, &[1; 32]);
-        assert_ne!(value, CacheKey::value(origin, &[0xff; 32], 0, 10, &[1; 32]), "a value is keyed by its version");
+        assert_ne!(
+            value,
+            CacheKey::value(origin, &[0xff; 32], 0, 10, &[1; 32]),
+            "a value is keyed by its version"
+        );
         assert_ne!(value, CacheKey::node(origin, &[0xff; 32], 0, &value.key));
-        let other_forest = Origin { server: 2, generation: 0 };
-        assert!(cache.get(&CacheKey::node(other_forest, &[0xff; 32], 0, b"node key")).is_none(),
-            "another forest's node under the same key");
-        let rebuilt = Origin { server: 1, generation: 1 };
-        assert!(cache.get(&CacheKey::node(rebuilt, &[0xff; 32], 0, b"node key")).is_none(),
-            "a node cached before the tree was wiped and rebuilt");
+        let other_forest = Origin {
+            server: 2,
+            generation: 0,
+        };
+        assert!(
+            cache
+                .get(&CacheKey::node(other_forest, &[0xff; 32], 0, b"node key"))
+                .is_none(),
+            "another forest's node under the same key"
+        );
+        let rebuilt = Origin {
+            server: 1,
+            generation: 1,
+        };
+        assert!(
+            cache
+                .get(&CacheKey::node(rebuilt, &[0xff; 32], 0, b"node key"))
+                .is_none(),
+            "a node cached before the tree was wiped and rebuilt"
+        );
 
         // The byte budget evicts least recently used entries.
         for i in 0..2000u32 {
-            cache.put(CacheKey::node(origin, &[0xff; 32], 0, &i.to_be_bytes()), vec![0; 100]);
+            cache.put(
+                CacheKey::node(origin, &[0xff; 32], 0, &i.to_be_bytes()),
+                vec![0; 100],
+            );
         }
         let stats = cache.stats();
         assert!(stats.bytes <= (SHARDS * 4096) as u64, "{stats:?}");

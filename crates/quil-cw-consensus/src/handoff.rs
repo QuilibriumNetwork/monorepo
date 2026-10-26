@@ -225,7 +225,12 @@ impl Seal {
     /// seal at the session base: the genesis at the view of the notarized
     /// seal it extends (`automaton::HandoffProposer::with_seal_parents`).
     /// Generation zero's base is a certified legacy frame no seal names.
-    pub fn validate_with(&self, session: &Session, request: &[u8; 32], base_reseal: bool) -> Result<()> {
+    pub fn validate_with(
+        &self,
+        session: &Session,
+        request: &[u8; 32],
+        base_reseal: bool,
+    ) -> Result<()> {
         if self.session != session.id()? || &self.request != request {
             return Err(invalid("seal belongs to another request or session"));
         }
@@ -323,7 +328,8 @@ impl SessionVotes {
         signature: &[u8],
     ) -> bool {
         let mut bytes = signature;
-        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &()) else {
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &())
+        else {
             return false;
         };
         if !bytes.is_empty() {
@@ -346,7 +352,8 @@ impl SessionVotes {
     /// any view once the session exists; the namespace binds the session.
     pub fn verify_nullify(&self, epoch: u64, view: u64, signer: u32, signature: &[u8]) -> bool {
         let mut bytes = signature;
-        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &()) else {
+        let Ok(signature) = <FalconSignature as commonware_codec::Read>::read_cfg(&mut bytes, &())
+        else {
             return false;
         };
         if !bytes.is_empty() {
@@ -354,7 +361,10 @@ impl SessionVotes {
         }
         let vote = commonware_consensus::simplex::types::Nullify::<SimplexFalconScheme> {
             round: Round::new(Epoch::new(epoch), View::new(view)),
-            attestation: Attestation { signer: Participant::new(signer), signature: signature.into() },
+            attestation: Attestation {
+                signer: Participant::new(signer),
+                signature: signature.into(),
+            },
         };
         self.scheme.verify_nullify(&vote)
     }
@@ -579,17 +589,48 @@ mod tests {
         let keys = keys();
         let session = session(&keys);
         let request = [5; 32];
-        let data = Checkpoint { frame: 19, view: 40, digest: [6; 32], state_roots: [[7; 32]; 4], history_root: [8; 32] };
-        let reseal = Seal { request, session: session.id().unwrap(), view: 61, checkpoint: Checkpoint { view: 44, ..data.clone() } };
+        let data = Checkpoint {
+            frame: 19,
+            view: 40,
+            digest: [6; 32],
+            state_roots: [[7; 32]; 4],
+            history_root: [8; 32],
+        };
+        let reseal = Seal {
+            request,
+            session: session.id().unwrap(),
+            view: 61,
+            checkpoint: Checkpoint {
+                view: 44,
+                ..data.clone()
+            },
+        };
         let certificate = certify(&keys, &session, &reseal, 7, 61, 44);
         assert!(verify_seal(&session, &request, &reseal, &certificate).is_some());
-        let as_data_child = Seal { checkpoint: data, ..reseal.clone() };
-        assert!(verify_seal(&session, &request, &as_data_child, &certify(&keys, &session, &as_data_child, 7, 61, 44)).is_none());
+        let as_data_child = Seal {
+            checkpoint: data,
+            ..reseal.clone()
+        };
+        assert!(verify_seal(
+            &session,
+            &request,
+            &as_data_child,
+            &certify(&keys, &session, &as_data_child, 7, 61, 44)
+        )
+        .is_none());
         // A re-seal of a seal at the base names the genesis at that seal's
         // view: refused unless base re-seals are accepted, and then only at
         // the genesis itself.
-        let base = Checkpoint { frame: session.base_frame, view: 44, digest: session.genesis, ..reseal.checkpoint.clone() };
-        let at_base = Seal { checkpoint: base, ..reseal };
+        let base = Checkpoint {
+            frame: session.base_frame,
+            view: 44,
+            digest: session.genesis,
+            ..reseal.checkpoint.clone()
+        };
+        let at_base = Seal {
+            checkpoint: base,
+            ..reseal
+        };
         let certificate = certify(&keys, &session, &at_base, 7, 61, 44);
         assert!(verify_seal(&session, &request, &at_base, &certificate).is_none());
         assert!(verify_seal_with(&session, &request, &at_base, &certificate, true).is_some());
@@ -599,7 +640,10 @@ mod tests {
         assert!(verify_seal_with(&session, &request, &not_genesis, &certificate, true).is_none());
         let mut legacy = session.clone();
         legacy.generation = 0;
-        let at_legacy_base = Seal { session: legacy.id().unwrap(), ..at_base };
+        let at_legacy_base = Seal {
+            session: legacy.id().unwrap(),
+            ..at_base
+        };
         let certificate = certify(&keys, &legacy, &at_legacy_base, 0, 61, 44);
         assert!(verify_seal_with(&legacy, &request, &at_legacy_base, &certificate, true).is_none());
     }
@@ -686,7 +730,11 @@ mod tests {
             View::new(11),
             Digest([9; 32]),
         );
-        let notarize = scheme.sign(Subject::Notarize { proposal: &proposal }).unwrap();
+        let notarize = scheme
+            .sign(Subject::Notarize {
+                proposal: &proposal,
+            })
+            .unwrap();
         let signer = notarize.signer.get();
         let signature = notarize.signature.get().unwrap().to_vec();
         let votes = SessionVotes::new(&session).unwrap();
@@ -701,10 +749,18 @@ mod tests {
         assert!(!votes.verify_notarize(7, 12, 11, [8; 32], signer, &signature));
         assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &signature[1..]));
         // A finalize or a nullify of the same round is not a notarize.
-        let finalize = scheme.sign(Subject::Finalize { proposal: &proposal }).unwrap();
+        let finalize = scheme
+            .sign(Subject::Finalize {
+                proposal: &proposal,
+            })
+            .unwrap();
         let finalize = finalize.signature.get().unwrap().to_vec();
         assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &finalize));
-        let nullify = scheme.sign::<Digest>(Subject::Nullify { round: proposal.round }).unwrap();
+        let nullify = scheme
+            .sign::<Digest>(Subject::Nullify {
+                round: proposal.round,
+            })
+            .unwrap();
         let nullify = nullify.signature.get().unwrap().to_vec();
         assert!(!votes.verify_notarize(7, 12, 11, [9; 32], signer, &nullify));
         // The same members in another session sign under another namespace.

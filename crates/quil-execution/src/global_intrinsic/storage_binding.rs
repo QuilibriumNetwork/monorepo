@@ -23,8 +23,8 @@
 //! of its entries with probability ε, by entry rather than by byte (sizes are
 //! not authenticated), every epoch it is sealed.
 
-use quil_crypto::storage_proof::{verify_path, Node, Tree, MIN_NODES};
 use quil_crypto::storage_hash::{self, DATA_BYTES_PER_NODE};
+use quil_crypto::storage_proof::{verify_path, Node, Tree, MIN_NODES};
 use quil_forest::subtree_proof::{same_root, subtree_root, CompactProof};
 use sha3::{Digest as _, Sha3_256};
 
@@ -71,7 +71,9 @@ impl Record {
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != RECORD_NODES as usize * DATA_BYTES_PER_NODE || bytes[RECORD_BYTES..].iter().any(|&b| b != 0) {
+        if bytes.len() != RECORD_NODES as usize * DATA_BYTES_PER_NODE
+            || bytes[RECORD_BYTES..].iter().any(|&b| b != 0)
+        {
             return None;
         }
         Some(Self {
@@ -111,7 +113,12 @@ pub fn leaf_data(filter: &[u8], prefix: &[u32], entries: &[Entry]) -> Vec<u8> {
     let mut out = header_bytes(filter, prefix, entries.len() as u32);
     let mut offset = 0u64;
     for entry in entries {
-        let record = Record { phase: entry.phase, address: entry.address, offset, len: entry.value.len() as u32 };
+        let record = Record {
+            phase: entry.phase,
+            address: entry.address,
+            offset,
+            len: entry.value.len() as u32,
+        };
         out.extend_from_slice(&record.encode());
         offset += entry.value.len() as u64;
     }
@@ -124,7 +131,8 @@ pub fn leaf_data(filter: &[u8], prefix: &[u32], entries: &[Entry]) -> Vec<u8> {
 /// The data nodes of a leaf of `header` nodes and `entries` whose values
 /// total `values` bytes.
 pub fn node_count(header: u64, entries: u64, values: u64) -> u64 {
-    (header + RECORD_NODES * entries + values.div_ceil(DATA_BYTES_PER_NODE as u64)).max(MIN_NODES as u64)
+    (header + RECORD_NODES * entries + values.div_ceil(DATA_BYTES_PER_NODE as u64))
+        .max(MIN_NODES as u64)
 }
 
 /// The leaf a binding is for, and where its data is read from.
@@ -163,12 +171,20 @@ impl LeafClaim<'_> {
 
     /// The record a record check opens, of `entries`.
     pub fn record_index(&self, sample: usize, entries: u64) -> u64 {
-        u64::from_be_bytes(self.challenge(0, sample as u64)[..8].try_into().expect("8 bytes")) % entries.max(1)
+        u64::from_be_bytes(
+            self.challenge(0, sample as u64)[..8]
+                .try_into()
+                .expect("8 bytes"),
+        ) % entries.max(1)
     }
 
     /// The byte of the record's value a record check opens, of `len`.
     pub fn value_byte(&self, sample: usize, len: u32) -> u64 {
-        u64::from_be_bytes(self.challenge(1, sample as u64)[..8].try_into().expect("8 bytes")) % (len.max(1) as u64)
+        u64::from_be_bytes(
+            self.challenge(1, sample as u64)[..8]
+                .try_into()
+                .expect("8 bytes"),
+        ) % (len.max(1) as u64)
     }
 
     /// The address and phase a coverage check proves: random, under the
@@ -183,7 +199,8 @@ impl LeafClaim<'_> {
                 point[i / 8] &= !mask;
             }
         }
-        let phase = BOUND_PHASES[(self.challenge(3, sample as u64)[0] % BOUND_PHASES.len() as u8) as usize];
+        let phase =
+            BOUND_PHASES[(self.challenge(3, sample as u64)[0] % BOUND_PHASES.len() as u8) as usize];
         (phase, point)
     }
 
@@ -193,7 +210,14 @@ impl LeafClaim<'_> {
     }
 
     fn open(&self, opening: &Opening, index: u64) -> Option<[u8; DATA_BYTES_PER_NODE]> {
-        if !verify_path(Tree::Data, self.n, &self.comm_d, index, &opening.node, &opening.path) {
+        if !verify_path(
+            Tree::Data,
+            self.n,
+            &self.comm_d,
+            index,
+            &opening.node,
+            &opening.path,
+        ) {
             return None;
         }
         storage_hash::unpack_node(&storage_hash::from_bytes(&opening.node)?)
@@ -202,7 +226,11 @@ impl LeafClaim<'_> {
 
 /// Whether `address` starts with `bits`.
 pub fn under(address: &[u8; 32], bits: &[bool]) -> bool {
-    bits.len() <= 256 && bits.iter().enumerate().all(|(i, &bit)| (address[i / 8] & (0x80 >> (i % 8)) != 0) == bit)
+    bits.len() <= 256
+        && bits
+            .iter()
+            .enumerate()
+            .all(|(i, &bit)| (address[i / 8] & (0x80 >> (i % 8)) != 0) == bit)
 }
 
 /// Whether leaves at these bits below a shard's tile it: none is under
@@ -211,10 +239,16 @@ pub fn tiles(leaves: &[Vec<bool>]) -> bool {
     use num_bigint::BigUint;
     let mut sorted = leaves.to_vec();
     sorted.sort();
-    if sorted.is_empty() || sorted.iter().any(|leaf| leaf.len() > 256) || sorted.windows(2).any(|pair| pair[1].starts_with(&pair[0])) {
+    if sorted.is_empty()
+        || sorted.iter().any(|leaf| leaf.len() > 256)
+        || sorted.windows(2).any(|pair| pair[1].starts_with(&pair[0]))
+    {
         return false;
     }
-    let total: BigUint = sorted.iter().map(|leaf| BigUint::from(1u8) << (256 - leaf.len())).sum();
+    let total: BigUint = sorted
+        .iter()
+        .map(|leaf| BigUint::from(1u8) << (256 - leaf.len()))
+        .sum();
     total == BigUint::from(1u8) << 256usize
 }
 
@@ -268,9 +302,19 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
     }
     let mut header = Vec::with_capacity(header_count as usize * DATA_BYTES_PER_NODE);
     for (index, opening) in binding.header.iter().enumerate() {
-        header.extend_from_slice(&claim.open(opening, index as u64).ok_or("storage binding: a header node does not open")?);
+        header.extend_from_slice(
+            &claim
+                .open(opening, index as u64)
+                .ok_or("storage binding: a header node does not open")?,
+        );
     }
-    let entries = u32::from_be_bytes(header.get(1..5).ok_or("storage binding: short header")?.try_into().expect("4 bytes"));
+    let entries = u32::from_be_bytes(
+        header
+            .get(1..5)
+            .ok_or("storage binding: short header")?
+            .try_into()
+            .expect("4 bytes"),
+    );
     if header != header_bytes(claim.filter, claim.prefix, entries) {
         return fail("the header names another leaf");
     }
@@ -279,7 +323,11 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
         let first = header_count + RECORD_NODES * index;
         let mut bytes = Vec::with_capacity(RECORD_NODES as usize * DATA_BYTES_PER_NODE);
         for (k, opening) in openings.iter().enumerate() {
-            bytes.extend_from_slice(&claim.open(opening, first + k as u64).ok_or("storage binding: a record node does not open")?);
+            bytes.extend_from_slice(
+                &claim
+                    .open(opening, first + k as u64)
+                    .ok_or("storage binding: a record node does not open")?,
+            );
         }
         let record = Record::decode(&bytes).ok_or("storage binding: a malformed record")?;
         if !BOUND_PHASES.contains(&record.phase) || !under(&record.address, &claim.bits) {
@@ -289,7 +337,10 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
     };
     let values_start = header_count + RECORD_NODES * entries;
     if entries == 0 {
-        if !binding.last.is_empty() || !binding.records.is_empty() || claim.n != node_count(header_count, 0, 0) {
+        if !binding.last.is_empty()
+            || !binding.records.is_empty()
+            || claim.n != node_count(header_count, 0, 0)
+        {
             return fail("an empty leaf's size");
         }
     } else {
@@ -305,7 +356,11 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
         }
         for (sample, check) in binding.records.iter().enumerate() {
             let j = claim.record_index(sample, entries);
-            let pair = if j + 1 < entries { 2 * RECORD_NODES } else { RECORD_NODES } as usize;
+            let pair = if j + 1 < entries {
+                2 * RECORD_NODES
+            } else {
+                RECORD_NODES
+            } as usize;
             if check.records.len() != pair {
                 return fail("record check nodes");
             }
@@ -316,11 +371,15 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
                     return fail("records out of order or not contiguous");
                 }
             }
-            let (source_bits, roots) = claim.source_of(&record.address).ok_or("storage binding: a record no source holds")?;
-            let root = subtree_root(&check.proof, &record.address, source_bits.len()).ok_or("storage binding: a malformed proof")?;
+            let (source_bits, roots) = claim
+                .source_of(&record.address)
+                .ok_or("storage binding: a record no source holds")?;
+            let root = subtree_root(&check.proof, &record.address, source_bits.len())
+                .ok_or("storage binding: a malformed proof")?;
             let value_hash: [u8; 32] = {
                 use sha2::Digest as _;
-                let leaf_value = quil_tries::vertex_leaf_value(&check.value).map_err(|e| format!("storage binding: {e}"))?;
+                let leaf_value = quil_tries::vertex_leaf_value(&check.value)
+                    .map_err(|e| format!("storage binding: {e}"))?;
                 sha2::Sha256::digest(&leaf_value).into()
             };
             if !same_root(&root, &roots[record.phase as usize])
@@ -334,11 +393,16 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
                 (Some(opening), len) if len > 0 => {
                     let byte = record.offset + claim.value_byte(sample, len);
                     let node = values_start + byte / DATA_BYTES_PER_NODE as u64;
-                    let bytes = claim.open(opening, node).ok_or("storage binding: a value node does not open")?;
+                    let bytes = claim
+                        .open(opening, node)
+                        .ok_or("storage binding: a value node does not open")?;
                     let node_start = (node - values_start) * DATA_BYTES_PER_NODE as u64;
                     for (k, &b) in bytes.iter().enumerate() {
                         let at = node_start + k as u64;
-                        if at >= record.offset && at < record.offset + len as u64 && b != check.value[(at - record.offset) as usize] {
+                        if at >= record.offset
+                            && at < record.offset + len as u64
+                            && b != check.value[(at - record.offset) as usize]
+                        {
                             return fail("a value the data does not hold");
                         }
                     }
@@ -352,12 +416,19 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
     }
     for (sample, check) in binding.coverage.iter().enumerate() {
         let (phase, point) = claim.coverage_point(sample);
-        let (source_bits, roots) = claim.source_of(&point).ok_or("storage binding: a point no source holds")?;
-        let root = subtree_root(&check.proof, &point, source_bits.len()).ok_or("storage binding: a malformed proof")?;
+        let (source_bits, roots) = claim
+            .source_of(&point)
+            .ok_or("storage binding: a point no source holds")?;
+        let root = subtree_root(&check.proof, &point, source_bits.len())
+            .ok_or("storage binding: a malformed proof")?;
         if !same_root(&root, &roots[phase as usize]) {
             return fail("a coverage proof the state does not hold");
         }
-        let found = check.proof.leaf.map(|(key, _)| key).filter(|key| under(key, &claim.bits));
+        let found = check
+            .proof
+            .leaf
+            .map(|(key, _)| key)
+            .filter(|key| under(key, &claim.bits));
         match (found, &check.record) {
             (None, None) => {}
             (Some(key), Some((index, openings))) => {
@@ -391,12 +462,18 @@ pub fn prove(
         return fail("the registration is not this snapshot's data");
     }
     let open = |index: u64| Opening {
-        node: nodes[index as usize * NODE_BYTES..][..NODE_BYTES].try_into().expect("a node"),
+        node: nodes[index as usize * NODE_BYTES..][..NODE_BYTES]
+            .try_into()
+            .expect("a node"),
         path: tree.path(index),
     };
     let header = header_nodes(claim.filter, claim.prefix);
     let count = entries.len() as u64;
-    let record_nodes = |j: u64| (0..RECORD_NODES).map(|k| open(header + RECORD_NODES * j + k)).collect::<Vec<_>>();
+    let record_nodes = |j: u64| {
+        (0..RECORD_NODES)
+            .map(|k| open(header + RECORD_NODES * j + k))
+            .collect::<Vec<_>>()
+    };
     let mut offsets = Vec::with_capacity(entries.len());
     let mut offset = 0u64;
     for entry in entries {
@@ -406,7 +483,11 @@ pub fn prove(
     let values_start = header + RECORD_NODES * count;
     let mut proved = LeafBinding {
         header: (0..header).map(open).collect(),
-        last: if count > 0 { record_nodes(count - 1) } else { Vec::new() },
+        last: if count > 0 {
+            record_nodes(count - 1)
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     if count > 0 {
@@ -433,10 +514,17 @@ pub fn prove(
     for sample in 0..BINDING_SAMPLES {
         let (phase, point) = claim.coverage_point(sample);
         let proof = proof_of(phase, &point)?;
-        let record = match proof.leaf.map(|(key, _)| key).filter(|key| under(key, &claim.bits)) {
+        let record = match proof
+            .leaf
+            .map(|(key, _)| key)
+            .filter(|key| under(key, &claim.bits))
+        {
             Some(key) => {
-                let j = entries.binary_search_by(|entry| (entry.phase, entry.address).cmp(&(phase, key)))
-                    .map_err(|_| "storage binding: a key the snapshot does not index".to_string())?;
+                let j = entries
+                    .binary_search_by(|entry| (entry.phase, entry.address).cmp(&(phase, key)))
+                    .map_err(|_| {
+                        "storage binding: a key the snapshot does not index".to_string()
+                    })?;
                 Some((j as u64, record_nodes(j as u64)))
             }
             None => None,
@@ -504,7 +592,10 @@ impl Reader<'_> {
             .map(|_| {
                 let node = self.node()?;
                 let depth = self.u8()? as usize;
-                Some(Opening { node, path: (0..depth).map(|_| self.node()).collect::<Option<_>>()? })
+                Some(Opening {
+                    node,
+                    path: (0..depth).map(|_| self.node()).collect::<Option<_>>()?,
+                })
             })
             .collect()
     }
@@ -560,7 +651,12 @@ impl LeafBinding {
             if value_node.len() > 1 {
                 return None;
             }
-            records.push(RecordCheck { records: nodes, proof, value, value_node: value_node.into_iter().next() });
+            records.push(RecordCheck {
+                records: nodes,
+                proof,
+                value,
+                value_node: value_node.into_iter().next(),
+            });
         }
         let coverage_count = r.u16()?;
         if coverage_count > BINDING_SAMPLES {
@@ -576,6 +672,11 @@ impl LeafBinding {
             };
             coverage.push(CoverageCheck { proof, record });
         }
-        (r.at == data.len()).then_some(Self { header, last, records, coverage })
+        (r.at == data.len()).then_some(Self {
+            header,
+            last,
+            records,
+            coverage,
+        })
     }
 }

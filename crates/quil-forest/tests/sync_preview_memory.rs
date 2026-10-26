@@ -22,7 +22,9 @@ fn account(delta: isize) {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() { account(layout.size() as isize); }
+        if !ptr.is_null() {
+            account(layout.size() as isize);
+        }
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -31,7 +33,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let new = unsafe { System.realloc(ptr, layout, size) };
-        if !new.is_null() { account(size as isize - layout.size() as isize); }
+        if !new.is_null() {
+            account(size as isize - layout.size() as isize);
+        }
         new
     }
 }
@@ -53,27 +57,59 @@ fn root_preview_auxiliary_memory_stays_bounded_as_plan_grows() {
     let app = [7; 32];
     for count in [8_192u64, 65_536] {
         let forest = Forest::in_memory();
-        let mut leaves: Vec<_> = (0..count).map(|i| {
-            (Sha256::digest(i.to_be_bytes()).into(), Some(vec![i as u8; 40]))
-        }).collect();
+        let mut leaves: Vec<_> = (0..count)
+            .map(|i| {
+                (
+                    Sha256::digest(i.to_be_bytes()).into(),
+                    Some(vec![i as u8; 40]),
+                )
+            })
+            .collect();
         leaves.sort_by_key(|(key, _)| *key);
-        let (staged, old_peak) = measured(|| forest.stage_synced_phase(
-            &app, Phase::VertexAdds, 0,
-            leaves.iter().map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
-            &[], None,
-        ).unwrap());
+        let (staged, old_peak) = measured(|| {
+            forest
+                .stage_synced_phase(
+                    &app,
+                    Phase::VertexAdds,
+                    0,
+                    leaves
+                        .iter()
+                        .map(|(key, value)| (quil_forest::KeyHash(*key), value.clone())),
+                    &[],
+                    None,
+                )
+                .unwrap()
+        });
         let root = staged.root();
         drop(staged);
-        let (_, new_peak) = measured(|| forest.preview_synced_phase(
-            &app, Phase::VertexAdds, 0, &leaves, &[], root,
-        ).unwrap());
-        println!("leaves={count} old_preview_peak_bytes={old_peak} root_only_peak_bytes={new_peak}");
+        let (_, new_peak) = measured(|| {
+            forest
+                .preview_synced_phase(&app, Phase::VertexAdds, 0, &leaves, &[], root)
+                .unwrap()
+        });
+        println!(
+            "leaves={count} old_preview_peak_bytes={old_peak} root_only_peak_bytes={new_peak}"
+        );
         // At most 64 trie levels, each holding 16 children and leaf summaries.
         // The allowance includes transient nodes; input leaves are preallocated.
-        assert!(new_peak < 512 * 1024, "root-only preview allocated {new_peak} bytes");
-        assert!(old_peak > new_peak * 20, "baseline must expose full-batch retention");
-        assert!(forest.shard_phase_reader(&app, Phase::VertexAdds)
-            .get_node_option(&jmt::storage::NodeKey::new(0, jmt::storage::NibblePath::new(vec![])))
-            .unwrap().is_none(), "neither preview publishes state");
+        assert!(
+            new_peak < 512 * 1024,
+            "root-only preview allocated {new_peak} bytes"
+        );
+        assert!(
+            old_peak > new_peak * 20,
+            "baseline must expose full-batch retention"
+        );
+        assert!(
+            forest
+                .shard_phase_reader(&app, Phase::VertexAdds)
+                .get_node_option(&jmt::storage::NodeKey::new(
+                    0,
+                    jmt::storage::NibblePath::new(vec![])
+                ))
+                .unwrap()
+                .is_none(),
+            "neither preview publishes state"
+        );
     }
 }

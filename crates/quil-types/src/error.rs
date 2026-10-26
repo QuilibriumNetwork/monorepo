@@ -119,7 +119,10 @@ impl QuilError {
     /// A local infrastructure/backend failure is not evidence against the
     /// transaction. Callers must propagate it before advancing frame state.
     pub fn is_execution_unavailable(&self) -> bool {
-        matches!(self, Self::Store(_) | Self::Io(_) | Self::ExecutionUnavailable(_))
+        matches!(
+            self,
+            Self::Store(_) | Self::Io(_) | Self::ExecutionUnavailable(_)
+        )
     }
 
     pub fn is_no_vote(&self) -> bool {

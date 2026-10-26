@@ -80,7 +80,8 @@ impl CoinDelivery {
         if self.forest_proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES {
             return Err(invalid("oversized proof"));
         }
-        let mut bytes = Vec::with_capacity(HEADER_BYTES + OUTPUT_BYTES + 4 + self.forest_proof.len());
+        let mut bytes =
+            Vec::with_capacity(HEADER_BYTES + OUTPUT_BYTES + 4 + self.forest_proof.len());
         bytes.extend_from_slice(&TYPE_COIN_DELIVERY.to_be_bytes());
         bytes.extend_from_slice(match self.delivered {
             Delivered::Coin(_) => DELIVERY_VERSION,
@@ -153,9 +154,14 @@ impl CoinDelivery {
             Delivered::Escrow(take(len)?.to_vec())
         } else {
             let owner: [u8; IDENTITY_BYTES] = take(IDENTITY_BYTES)?.try_into().unwrap();
-            let commitment = AmountCommitment::from_bytes(take(COMMITMENT_BYTES)?).map_err(|_| invalid("malformed commitment"))?;
+            let commitment = AmountCommitment::from_bytes(take(COMMITMENT_BYTES)?)
+                .map_err(|_| invalid("malformed commitment"))?;
             let memo: [u8; MEMO_BYTES] = take(MEMO_BYTES)?.try_into().unwrap();
-            Delivered::Coin(Output { owner, commitment, memo })
+            Delivered::Coin(Output {
+                owner,
+                commitment,
+                memo,
+            })
         };
         let proof_len = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
         if proof_len > super::reward_witness::MAX_REWARD_PROOF_BYTES {
@@ -190,7 +196,10 @@ fn record_fields(
     source_shard: quil_types::execution::ShardPath,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(vec![
-        (vec![0xff; 32], super::global_accumulator::kind(kind)?.to_vec()),
+        (
+            vec![0xff; 32],
+            super::global_accumulator::kind(kind)?.to_vec(),
+        ),
         (vec![0], address.to_vec()),
         (vec![4], source_frame.to_be_bytes().to_vec()),
         (vec![8], tx_id.to_vec()),
@@ -201,11 +210,15 @@ fn record_fields(
 /// Escrows of `block` this shard has taken delivery of.
 pub fn escrow_count(state: &HypergraphState, application: &[u8; 32], block: u64) -> Result<u64> {
     let disc = vertex_adds_discriminator()?;
-    match state.get(application, &super::state::block_record_address(super::state::BLOCK_ESCROW_COUNT_TAG, block), &disc)? {
+    match state.get(
+        application,
+        &super::state::block_record_address(super::state::BLOCK_ESCROW_COUNT_TAG, block),
+        &disc,
+    )? {
         None => Ok(0),
-        Some(bytes) => Ok(u64::from_be_bytes(
-            bytes.as_slice().try_into().map_err(|_| QuilError::Store("coin delivery: malformed escrow count".into()))?,
-        )),
+        Some(bytes) => Ok(u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+            |_| QuilError::Store("coin delivery: malformed escrow count".into()),
+        )?)),
     }
 }
 
@@ -222,39 +235,68 @@ pub fn verify_and_apply(
     limits: SnapshotLimits,
 ) -> Result<[u8; 32]> {
     let delivery = CoinDelivery::decode(bytes, network, application)?;
-    let shard = context.shard.bits().ok_or_else(|| invalid("the executing shard is undecodable"))?;
+    let shard = context
+        .shard
+        .bits()
+        .ok_or_else(|| invalid("the executing shard is undecodable"))?;
     if !coin_blocks::shard_owns_block(&shard, delivery.block) {
         return Err(invalid("block is not this shard's"));
     }
     let anchor = context
         .finalized_global_frame
         .ok_or_else(|| invalid("delivery requires the frame's global anchor"))?;
-    let root = super::mint_authorization::clock_reward_root(clock, delivery.cited_global_frame, anchor)?;
+    let root =
+        super::mint_authorization::clock_reward_root(clock, delivery.cited_global_frame, anchor)?;
     if root != delivery.global_root {
         return Err(invalid("cited global root mismatch"));
     }
     let parameters = parameter_context(network, application);
-    let membership = quil_forest::MembershipProof::from_bytes(&delivery.forest_proof).map_err(|_| invalid("malformed proof"))?;
+    let membership = quil_forest::MembershipProof::from_bytes(&delivery.forest_proof)
+        .map_err(|_| invalid("malformed proof"))?;
     let proven = |record: [u8; 32], kind: &str, address: &[u8; 32]| -> Result<()> {
         let mut vertex = crate::domains::GLOBAL.to_vec();
         vertex.extend_from_slice(&record);
         if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != vertex {
             return Err(invalid("proof does not address this delivery"));
         }
-        quil_forest::verify_vertex_membership(&root, &membership.inputs[0],
-            &record_fields(kind, address, delivery.source_frame, &delivery.tx_id, delivery.source_shard)?)
-            .map_err(|_| invalid("delivery record not proven at the cited root"))
+        quil_forest::verify_vertex_membership(
+            &root,
+            &membership.inputs[0],
+            &record_fields(
+                kind,
+                address,
+                delivery.source_frame,
+                &delivery.tx_id,
+                delivery.source_shard,
+            )?,
+        )
+        .map_err(|_| invalid("delivery record not proven at the cited root"))
     };
     match &delivery.delivered {
         Delivered::Coin(output) => {
             let (address, tree) = coin_identity(&parameters, delivery.source_frame, output)?;
-            proven(global_commit::delivery_address(application, delivery.block, delivery.seq)?, global_commit::KIND_DELIVERY, &address)?;
-            place_committed(state, context.frame_number, network, application, &address, tree, delivery.block, delivery.seq, limits)?;
+            proven(
+                global_commit::delivery_address(application, delivery.block, delivery.seq)?,
+                global_commit::KIND_DELIVERY,
+                &address,
+            )?;
+            place_committed(
+                state,
+                context.frame_number,
+                network,
+                application,
+                &address,
+                tree,
+                delivery.block,
+                delivery.seq,
+                limits,
+            )?;
             Ok(address)
         }
         Delivered::Escrow(blob) => {
             let tree = quil_tries::VectorCommitmentTree {
-                root: quil_tries::deserialize_go_tree(blob).map_err(|_| invalid("malformed escrow record"))?,
+                root: quil_tries::deserialize_go_tree(blob)
+                    .map_err(|_| invalid("malformed escrow record"))?,
             };
             let address = super::materialize::coin_content_address(&tree)?;
             let escrow = super::escrow::decode_escrow_blob(blob, &parameters, &address)?;
@@ -267,8 +309,20 @@ pub fn verify_and_apply(
             {
                 return Err(invalid("escrow record does not match its delivery"));
             }
-            proven(global_commit::escrow_delivery_address(application, delivery.block, delivery.seq)?, global_commit::KIND_ESCROW_DELIVERY, &address)?;
-            place_committed_escrow(state, context.frame_number, application, &address, blob, delivery.block, delivery.seq)?;
+            proven(
+                global_commit::escrow_delivery_address(application, delivery.block, delivery.seq)?,
+                global_commit::KIND_ESCROW_DELIVERY,
+                &address,
+            )?;
+            place_committed_escrow(
+                state,
+                context.frame_number,
+                application,
+                &address,
+                blob,
+                delivery.block,
+                delivery.seq,
+            )?;
             Ok(address)
         }
     }
@@ -292,7 +346,9 @@ pub(crate) fn place_committed(
     // Exactly the block's next index: deliveries land in commit order.
     let count = roots::block_count(state, network, application, block, limits)?;
     if count != seq {
-        return Err(invalid(&format!("out of sequence: block {block} seq {seq}, local count {count}")));
+        return Err(invalid(&format!(
+            "out of sequence: block {block} seq {seq}, local count {count}"
+        )));
     }
     let disc = vertex_adds_discriminator()?;
     if state.get(application, address, &disc)?.is_some() {
@@ -338,7 +394,9 @@ pub(crate) fn place_committed_escrow(
 ) -> Result<()> {
     let count = escrow_count(state, application, block)?;
     if count != seq {
-        return Err(invalid(&format!("escrow out of sequence: block {block} seq {seq}, local count {count}")));
+        return Err(invalid(&format!(
+            "escrow out of sequence: block {block} seq {seq}, local count {count}"
+        )));
     }
     let disc = vertex_adds_discriminator()?;
     if state.get(application, address, &disc)?.is_some() {
@@ -371,9 +429,16 @@ pub(crate) fn escrow_record(
     operation: &[u8],
     source_frame: u64,
 ) -> Result<([u8; 32], Vec<u8>)> {
-    let tx = quil_lattice_ct::confidential::pending_create::PendingCreate::decode(operation, network, application)
-        .map_err(|_| invalid("invalid escrow operation"))?;
-    let (escrowed, _) = tx.statement.split_outputs().map_err(|_| invalid("missing escrow output"))?;
+    let tx = quil_lattice_ct::confidential::pending_create::PendingCreate::decode(
+        operation,
+        network,
+        application,
+    )
+    .map_err(|_| invalid("invalid escrow operation"))?;
+    let (escrowed, _) = tx
+        .statement
+        .split_outputs()
+        .map_err(|_| invalid("missing escrow output"))?;
     super::escrow::StoredEscrow {
         frame_number: source_frame,
         output: escrowed.clone(),
@@ -419,9 +484,15 @@ pub fn pending_deliveries(
         debug_assert!(coin_blocks::shard_owns_block(shard, block));
         for escrow in [false, true] {
             let (committed, mut seq) = if escrow {
-                (global_commit::escrow_sequence(global, application, block)?, escrow_count(local, application, block)?)
+                (
+                    global_commit::escrow_sequence(global, application, block)?,
+                    escrow_count(local, application, block)?,
+                )
             } else {
-                (global_commit::block_sequence(global, application, block)?, roots::block_count(local, network, application, block, limits)?)
+                (
+                    global_commit::block_sequence(global, application, block)?,
+                    roots::block_count(local, network, application, block, limits)?,
+                )
             };
             while seq < committed && pending.len() < cap {
                 let record = if escrow {
@@ -431,7 +502,9 @@ pub fn pending_deliveries(
                 };
                 let Some(record) = record else { break };
                 pending.push(PendingDelivery {
-                    escrow, block, seq,
+                    escrow,
+                    block,
+                    seq,
                     address: record.address,
                     source_frame: record.source_frame,
                     tx_id: record.tx_id,
@@ -484,16 +557,23 @@ pub fn build_delivery(
     pending: &PendingDelivery,
     delivered: Delivered,
 ) -> Result<Option<Vec<u8>>> {
-    let (root, header) = super::reward_witness::newest_retained_global_root(global, clock, Some(anchor))?;
+    let (root, header) =
+        super::reward_witness::newest_retained_global_root(global, clock, Some(anchor))?;
     let record = if pending.escrow {
         global_commit::escrow_delivery_address(application, pending.block, pending.seq)?
     } else {
         global_commit::delivery_address(application, pending.block, pending.seq)?
     };
-    let Some(proof) = global.crdt().global_vertex_membership_at_root(&root, &record)? else {
+    let Some(proof) = global
+        .crdt()
+        .global_vertex_membership_at_root(&root, &record)?
+    else {
         return Ok(None);
     };
-    let forest_proof = quil_forest::MembershipProof { inputs: vec![proof] }.to_bytes();
+    let forest_proof = quil_forest::MembershipProof {
+        inputs: vec![proof],
+    }
+    .to_bytes();
     CoinDelivery {
         network: *network,
         application: *application,
@@ -521,18 +601,28 @@ mod tests {
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
         let delivery = CoinDelivery {
-            network, application, cited_global_frame: 90, global_root: [3; 32],
-            block: coin_blocks::block_id(coin_blocks::INITIAL_BLOCK_BITS, 5).unwrap(), seq: 7,
-            source_frame: 40, tx_id: [4; 32], source_shard: quil_types::execution::ShardPath::from_bits(&[true, false]),
+            network,
+            application,
+            cited_global_frame: 90,
+            global_root: [3; 32],
+            block: coin_blocks::block_id(coin_blocks::INITIAL_BLOCK_BITS, 5).unwrap(),
+            seq: 7,
+            source_frame: 40,
+            tx_id: [4; 32],
+            source_shard: quil_types::execution::ShardPath::from_bits(&[true, false]),
             delivered: Delivered::Coin(Output {
                 owner: [5; IDENTITY_BYTES],
-                commitment: CommitmentKey::derive(&context).commit(9, &AmountOpening::from_seed(&context, &[6; 32])),
+                commitment: CommitmentKey::derive(&context)
+                    .commit(9, &AmountOpening::from_seed(&context, &[6; 32])),
                 memo: [7; MEMO_BYTES],
             }),
             forest_proof: vec![8; 123],
         };
         let bytes = delivery.encode().unwrap();
-        assert_eq!(CoinDelivery::decode(&bytes, &network, &application).unwrap(), delivery);
+        assert_eq!(
+            CoinDelivery::decode(&bytes, &network, &application).unwrap(),
+            delivery
+        );
         assert!(CoinDelivery::decode(&bytes, &[9; 32], &application).is_err());
         assert!(CoinDelivery::decode(&bytes, &network, &[9; 32]).is_err());
         assert!(CoinDelivery::decode(&bytes[..bytes.len() - 1], &network, &application).is_err());
@@ -540,10 +630,16 @@ mod tests {
         extended.push(0);
         assert!(CoinDelivery::decode(&extended, &network, &application).is_err());
         // An escrow delivery round-trips under its own version.
-        let escrow = CoinDelivery { delivered: Delivered::Escrow(vec![9; 500]), ..delivery };
+        let escrow = CoinDelivery {
+            delivered: Delivered::Escrow(vec![9; 500]),
+            ..delivery
+        };
         let bytes = escrow.encode().unwrap();
         assert_eq!(&bytes[4..12], ESCROW_DELIVERY_VERSION);
-        assert_eq!(CoinDelivery::decode(&bytes, &network, &application).unwrap(), escrow);
+        assert_eq!(
+            CoinDelivery::decode(&bytes, &network, &application).unwrap(),
+            escrow
+        );
         assert!(CoinDelivery::decode(&bytes[..bytes.len() - 1], &network, &application).is_err());
     }
 
@@ -555,32 +651,57 @@ mod tests {
     fn a_coin_delivered_into_a_block_wider_than_six_bits_is_placed() {
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
-        let state = HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
-            std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
-        )));
-        let limits = SnapshotLimits { max_coins: 64, max_depth: 32, max_nodes: 1 << 14 };
+        let state =
+            HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
+                std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+            )));
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
         let coin = |seed: u8| {
             let output = Output {
                 owner: [seed; IDENTITY_BYTES],
-                commitment: CommitmentKey::derive(&context).commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: CommitmentKey::derive(&context).commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
                 memo: [seed; MEMO_BYTES],
             };
             coin_identity(&context, 5, &output).unwrap()
         };
         let place = |address: &[u8; 32], tree, block, seq| {
-            place_committed(&state, 5, &network, &application, address, tree, block, seq, limits)
+            place_committed(
+                &state,
+                5,
+                &network,
+                &application,
+                address,
+                tree,
+                block,
+                seq,
+                limits,
+            )
         };
-        assert_eq!(roots::block_width(&state, &application).unwrap(), coin_blocks::INITIAL_BLOCK_BITS);
+        assert_eq!(
+            roots::block_width(&state, &application).unwrap(),
+            coin_blocks::INITIAL_BLOCK_BITS
+        );
 
         let (first, tree) = coin(3);
         let wide = coin_blocks::block_for_address(9, &first).unwrap();
         place(&first, tree, wide, 0).expect("a nine-bit block is accepted");
-        assert_eq!(roots::block_count(&state, &network, &application, wide, limits).unwrap(), 1);
+        assert_eq!(
+            roots::block_count(&state, &network, &application, wide, limits).unwrap(),
+            1
+        );
 
         // A six-bit coin lives beside it.
         let (second, tree) = coin(4);
-        let narrow = coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &second).unwrap();
+        let narrow =
+            coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &second).unwrap();
         place(&second, tree, narrow, 0).expect("a six-bit block is accepted");
 
         // Out of sequence, or in a block its address does not select, is refused.
@@ -590,7 +711,12 @@ mod tests {
         assert_ne!(own, wide);
         let (_, tree) = coin(5);
         let wrong = place(&third, tree, wide, 1).unwrap_err();
-        assert!(wrong.to_string().contains("does not sit in its delivered block"), "{wrong}");
+        assert!(
+            wrong
+                .to_string()
+                .contains("does not sit in its delivered block"),
+            "{wrong}"
+        );
     }
 
     /// After a split past a block's width, the shard holding the block's
@@ -601,45 +727,106 @@ mod tests {
         use super::super::shard_accumulator::{self, BlockAttestation, ShardReport};
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
-        let state = HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
-            std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
-        )));
-        let limits = SnapshotLimits { max_coins: 64, max_depth: 32, max_nodes: 1 << 14 };
+        let state =
+            HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(quil_hypergraph::testing::MemStore::new()),
+                std::sync::Arc::new(quil_types::crypto::NoopInclusionProver),
+            )));
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 14,
+        };
         let coin = |seed: u8| {
             let output = Output {
                 owner: [seed; IDENTITY_BYTES],
-                commitment: CommitmentKey::derive(&context).commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: CommitmentKey::derive(&context).commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
                 memo: [seed; MEMO_BYTES],
             };
             coin_identity(&context, 5, &output).unwrap()
         };
         let (delivered, tree) = coin(3);
         let narrow = coin_blocks::block_for_address(7, &delivered).unwrap();
-        place_committed(&state, 5, &network, &application, &delivered, tree, narrow, 0, limits).unwrap();
+        place_committed(
+            &state,
+            5,
+            &network,
+            &application,
+            &delivered,
+            tree,
+            narrow,
+            0,
+            limits,
+        )
+        .unwrap();
 
         let path = coin_blocks::block_path(narrow);
         let holder: Vec<bool> = path.iter().copied().chain([false]).collect();
         let sibling: Vec<bool> = path.iter().copied().chain([true]).collect();
-        let report = shard_accumulator::shard_report(&state, &network, &application, &holder, true).unwrap().unwrap();
-        assert!(report.attestations.contains(&BlockAttestation { block: narrow, coins: 1, escrows: 0 }));
-        assert!(report.attestations.iter().all(|a| a.block == narrow || a.coins == 0), "{:?}", report.attestations);
+        let report = shard_accumulator::shard_report(&state, &network, &application, &holder, true)
+            .unwrap()
+            .unwrap();
+        assert!(report.attestations.contains(&BlockAttestation {
+            block: narrow,
+            coins: 1,
+            escrows: 0
+        }));
+        assert!(
+            report
+                .attestations
+                .iter()
+                .all(|a| a.block == narrow || a.coins == 0),
+            "{:?}",
+            report.attestations
+        );
         let bytes = report.encode().unwrap();
         assert_eq!(&bytes[..8], shard_accumulator::ATTESTING_REPORT_VERSION);
         assert_eq!(ShardReport::decode(&bytes).unwrap(), report);
-        let other = shard_accumulator::shard_report(&state, &network, &application, &sibling, true).unwrap();
+        let other = shard_accumulator::shard_report(&state, &network, &application, &sibling, true)
+            .unwrap();
         assert!(other.is_none_or(|report| report.attestations.iter().all(|a| a.block != narrow)));
-        assert!(shard_accumulator::shard_report(&state, &network, &application, &holder, false).unwrap().is_none(),
-            "before the re-placement frame nothing is attested");
+        assert!(
+            shard_accumulator::shard_report(&state, &network, &application, &holder, false)
+                .unwrap()
+                .is_none(),
+            "before the re-placement frame nothing is attested"
+        );
 
         // GLOBAL moved everything past the attested count to width eight.
         let (again, tree) = coin(3);
-        let refused = place_committed(&state, 9, &network, &application, &again,
-            tree, coin_blocks::block_for_address(8, &again).unwrap(), 0, limits).unwrap_err();
-        assert!(refused.to_string().contains("coin already present"), "{refused}");
+        let refused = place_committed(
+            &state,
+            9,
+            &network,
+            &application,
+            &again,
+            tree,
+            coin_blocks::block_for_address(8, &again).unwrap(),
+            0,
+            limits,
+        )
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("coin already present"),
+            "{refused}"
+        );
         let (moved, tree) = coin(4);
         let target = coin_blocks::block_for_address(8, &moved).unwrap();
         let seq = roots::block_count(&state, &network, &application, target, limits).unwrap();
-        place_committed(&state, 9, &network, &application, &moved, tree, target, seq, limits).unwrap();
+        place_committed(
+            &state,
+            9,
+            &network,
+            &application,
+            &moved,
+            tree,
+            target,
+            seq,
+            limits,
+        )
+        .unwrap();
     }
 }

@@ -58,7 +58,10 @@ impl Rng {
                     bytes[i] = self.next() as u8;
                 }
                 2 => bytes.truncate(self.below(bytes.len())),
-                3 => { let extra = self.bytes_between(1, 16); bytes.extend(extra) }
+                3 => {
+                    let extra = self.bytes_between(1, 16);
+                    bytes.extend(extra)
+                }
                 4 => {
                     let i = self.below(bytes.len() + 1);
                     bytes.insert(i, self.next() as u8);
@@ -74,7 +77,10 @@ impl Rng {
 }
 
 fn iterations() -> usize {
-    std::env::var("QUIL_FUZZ_ITERATIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000)
+    std::env::var("QUIL_FUZZ_ITERATIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000)
 }
 
 /// Run `decode` over random and mutated inputs. A panic is reported with the
@@ -144,16 +150,30 @@ fn committee_session_and_seal_codecs_survive_arbitrary_bytes_and_round_trip() {
         let members = 1 + rng.below(6);
         let session = session(&mut rng, members);
         let encoded = session.encode().unwrap();
-        assert_eq!(Session::decode(&encoded).unwrap(), session, "session round trip");
+        assert_eq!(
+            Session::decode(&encoded).unwrap(),
+            session,
+            "session round trip"
+        );
         sessions.push(encoded);
-        let seal = Seal { request: rng.array(), session: rng.array(), view: rng.next(), checkpoint: checkpoint(&mut rng) };
+        let seal = Seal {
+            request: rng.array(),
+            session: rng.array(),
+            view: rng.next(),
+            checkpoint: checkpoint(&mut rng),
+        };
         let encoded = seal.encode();
         assert!(Seal::is_encoding(&encoded));
         assert_eq!(Seal::decode(&encoded).unwrap(), seal, "seal round trip");
         seals.push(encoded);
     }
-    survives("session", &sessions, |bytes| { let _ = Session::decode(bytes); });
-    survives("seal", &seals, |bytes| { let _ = Seal::decode(bytes); let _ = Seal::is_encoding(bytes); });
+    survives("session", &sessions, |bytes| {
+        let _ = Session::decode(bytes);
+    });
+    survives("seal", &seals, |bytes| {
+        let _ = Seal::decode(bytes);
+        let _ = Seal::is_encoding(bytes);
+    });
 }
 
 #[test]
@@ -176,31 +196,74 @@ fn handoff_request_and_submission_codecs_survive_arbitrary_bytes_and_round_trip(
             s.filter = filter.clone();
             s
         };
-        let members = |rng: &mut Rng| { let mut m: Vec<Vec<u8>> = (0..1 + rng.below(3)).map(|_| rng.bytes(897)).collect(); m.sort(); m.dedup(); m };
+        let members = |rng: &mut Rng| {
+            let mut m: Vec<Vec<u8>> = (0..1 + rng.below(3)).map(|_| rng.bytes(897)).collect();
+            m.sort();
+            m.dedup();
+            m
+        };
         let target = |filter: &Vec<u8>, rng: &mut Rng| Target {
-            committee: DesiredCommittee { filter: filter.clone(), members: members(rng) },
+            committee: DesiredCommittee {
+                filter: filter.clone(),
+                members: members(rng),
+            },
             generation: 1 + rng.next() % 100,
-            previous: if rng.below(2) == 0 { None } else { Some(rng.array()) },
+            previous: if rng.below(2) == 0 {
+                None
+            } else {
+                Some(rng.array())
+            },
         };
         let (sources, targets) = if rng.below(2) == 0 {
-            (vec![member_session(&root, &mut rng)], vec![target(&leaf0, &mut rng), target(&leaf1, &mut rng)])
+            (
+                vec![member_session(&root, &mut rng)],
+                vec![target(&leaf0, &mut rng), target(&leaf1, &mut rng)],
+            )
         } else {
-            (vec![member_session(&leaf0, &mut rng), member_session(&leaf1, &mut rng)], vec![target(&root, &mut rng)])
+            (
+                vec![
+                    member_session(&leaf0, &mut rng),
+                    member_session(&leaf1, &mut rng),
+                ],
+                vec![target(&root, &mut rng)],
+            )
         };
-        let request = Request { frame: 1 + rng.next() % 1_000_000, sources, vacant: Vec::new(), targets };
+        let request = Request {
+            frame: 1 + rng.next() % 1_000_000,
+            sources,
+            vacant: Vec::new(),
+            targets,
+        };
         let encoded = request.encode().unwrap();
-        assert_eq!(Request::decode(&encoded).unwrap(), request, "request round trip");
+        assert_eq!(
+            Request::decode(&encoded).unwrap(),
+            request,
+            "request round trip"
+        );
         requests.push(encoded);
         let submission = CertificateSubmission {
-            seal: Seal { request: rng.array(), session: rng.array(), view: rng.next(), checkpoint: checkpoint(&mut rng) },
+            seal: Seal {
+                request: rng.array(),
+                session: rng.array(),
+                view: rng.next(),
+                checkpoint: checkpoint(&mut rng),
+            },
             certificate: rng.bytes_between(0, 600),
         };
         let encoded = submission.to_canonical_bytes().unwrap();
-        assert_eq!(CertificateSubmission::from_canonical_bytes(&encoded).unwrap(), submission, "submission round trip");
+        assert_eq!(
+            CertificateSubmission::from_canonical_bytes(&encoded).unwrap(),
+            submission,
+            "submission round trip"
+        );
         submissions.push(encoded);
     }
-    survives("request", &requests, |bytes| { let _ = Request::decode(bytes); });
-    survives("submission", &submissions, |bytes| { let _ = CertificateSubmission::from_canonical_bytes(bytes); });
+    survives("request", &requests, |bytes| {
+        let _ = Request::decode(bytes);
+    });
+    survives("submission", &submissions, |bytes| {
+        let _ = CertificateSubmission::from_canonical_bytes(bytes);
+    });
 }
 
 #[test]
@@ -210,7 +273,9 @@ fn relay_and_accumulator_codecs_survive_arbitrary_bytes_and_round_trip() {
         let paid = rng.below(2) == 0;
         let funded = rng.below(2) == 0;
         settlement_record::SettlementEntry {
-            receipt: rng.array(), parameter_context: rng.array(), destination: rng.array(),
+            receipt: rng.array(),
+            parameter_context: rng.array(),
+            destination: rng.array(),
             context: if funded { rng.array() } else { [0; 32] },
             settlement: 1 + rng.next() as u128,
             payment_address: if paid { rng.array() } else { [0; 32] },
@@ -236,16 +301,25 @@ fn relay_and_accumulator_codecs_survive_arbitrary_bytes_and_round_trip() {
         for frame in settlement_record::relay_window(header_frame) {
             if rng.below(4) == 0 {
                 let e = entry(&mut rng);
-                frames.push((frame, settlement_record::canonical_frame_entries(&[e]).unwrap()));
+                frames.push((
+                    frame,
+                    settlement_record::canonical_frame_entries(&[e]).unwrap(),
+                ));
             }
         }
         let encoded = settlement_record::encode_relay(&frames).unwrap();
-        assert_eq!(settlement_record::decode_relay(header_frame, &encoded).unwrap(), frames);
+        assert_eq!(
+            settlement_record::decode_relay(header_frame, &encoded).unwrap(),
+            frames
+        );
         settlement_relays.push(encoded);
 
         let spend_entries: Vec<Vec<u8>> = (0..rng.below(4)).map(|_| rng.bytes(32)).collect();
         let encoded = spend_relay::encode_frame_entries(&spend_entries).unwrap();
-        assert_eq!(spend_relay::decode_frame_entries(&encoded).unwrap(), spend_entries);
+        assert_eq!(
+            spend_relay::decode_frame_entries(&encoded).unwrap(),
+            spend_entries
+        );
         spends.push(encoded);
         let mut frames: Vec<(u64, Vec<Vec<u8>>)> = Vec::new();
         for frame in spend_relay::relay_window(header_frame) {
@@ -254,28 +328,42 @@ fn relay_and_accumulator_codecs_survive_arbitrary_bytes_and_round_trip() {
             }
         }
         let encoded = spend_relay::encode_relay(&frames).unwrap();
-        assert_eq!(spend_relay::decode_relay(header_frame, &encoded).unwrap(), frames);
+        assert_eq!(
+            spend_relay::decode_relay(header_frame, &encoded).unwrap(),
+            frames
+        );
         spend_relays.push(encoded);
 
-        let node = |rng: &mut Rng| Node::from_bytes(&Node::zero().to_bytes()).unwrap_or_else(|_| {
-            let _ = rng.next();
-            Node::zero()
-        });
+        let node = |rng: &mut Rng| {
+            Node::from_bytes(&Node::zero().to_bytes()).unwrap_or_else(|_| {
+                let _ = rng.next();
+                Node::zero()
+            })
+        };
         let report = shard_accumulator::ShardReport {
             context: rng.array(),
             subtrees: (1..=1 + rng.below(3) as u8)
-                .map(|i| shard_accumulator::SubtreeReport { width: 6 + i, coins: 1 + rng.next() % 1_000, root: node(&mut rng) })
+                .map(|i| shard_accumulator::SubtreeReport {
+                    width: 6 + i,
+                    coins: 1 + rng.next() % 1_000,
+                    root: node(&mut rng),
+                })
                 .collect(),
             attestations: Vec::new(),
         };
         let encoded = report.encode().unwrap();
-        assert_eq!(shard_accumulator::ShardReport::decode(&encoded).unwrap(), report);
+        assert_eq!(
+            shard_accumulator::ShardReport::decode(&encoded).unwrap(),
+            report
+        );
         assert_eq!(accumulator_header::report_digest(&encoded).len(), 32);
         reports.push(encoded);
 
         let mut summary = BlockSummary::default();
         for block in 0..rng.below(5) as u64 {
-            summary.put(64 + block, 1 + rng.next() % 100, Node::zero()).unwrap();
+            summary
+                .put(64 + block, 1 + rng.next() % 100, Node::zero())
+                .unwrap();
         }
         let encoded = summary.encode();
         let decoded = BlockSummary::decode(&encoded).unwrap();
@@ -284,23 +372,39 @@ fn relay_and_accumulator_codecs_survive_arbitrary_bytes_and_round_trip() {
 
         let level = rng.below(17) as u8;
         let blocks = 1 + rng.next() % (1u64 << level);
-        let tree_node = TreeNode { coins: blocks + rng.next() % 1_000, blocks, node: node(&mut rng) };
+        let tree_node = TreeNode {
+            coins: blocks + rng.next() % 1_000,
+            blocks,
+            node: node(&mut rng),
+        };
         let encoded = tree_node.encode();
         assert_eq!(TreeNode::decode(&encoded, level).unwrap(), Some(tree_node));
         tree_nodes.push((level, encoded));
     }
-    survives("settlement entries", &settlements, |bytes| { let _ = settlement_record::decode_entries(bytes); });
-    survives("settlement relay", &settlement_relays, |bytes| { let _ = settlement_record::decode_relay(500, bytes); });
-    survives("spend entries", &spends, |bytes| { let _ = spend_relay::decode_frame_entries(bytes); });
-    survives("spend relay", &spend_relays, |bytes| { let _ = spend_relay::decode_relay(500, bytes); });
+    survives("settlement entries", &settlements, |bytes| {
+        let _ = settlement_record::decode_entries(bytes);
+    });
+    survives("settlement relay", &settlement_relays, |bytes| {
+        let _ = settlement_record::decode_relay(500, bytes);
+    });
+    survives("spend entries", &spends, |bytes| {
+        let _ = spend_relay::decode_frame_entries(bytes);
+    });
+    survives("spend relay", &spend_relays, |bytes| {
+        let _ = spend_relay::decode_relay(500, bytes);
+    });
     survives("shard report", &reports, |bytes| {
         let _ = shard_accumulator::ShardReport::decode(bytes);
         let _ = accumulator_header::report_digest(bytes);
     });
-    survives("block summary", &summaries, |bytes| { let _ = BlockSummary::decode(bytes); });
+    survives("block summary", &summaries, |bytes| {
+        let _ = BlockSummary::decode(bytes);
+    });
     for level in [0u8, 5, 16] {
         let encodings: Vec<Vec<u8>> = tree_nodes.iter().map(|(_, bytes)| bytes.clone()).collect();
-        survives("summary tree node", &encodings, |bytes| { let _ = TreeNode::decode(bytes, level); });
+        survives("summary tree node", &encodings, |bytes| {
+            let _ = TreeNode::decode(bytes, level);
+        });
     }
     let _ = NODE_BYTES;
 }

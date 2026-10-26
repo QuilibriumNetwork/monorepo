@@ -13,7 +13,13 @@ pub struct PublicFixtureSink<W: Write>(pub FixtureSink<W>);
 
 impl<W: Write> StatementSink for PublicFixtureSink<W> {
     type Error = io::Error;
-    fn begin(&mut self, modulus: i128, degree: usize, c: SubmissionCounts, n: &[u64]) -> io::Result<()> {
+    fn begin(
+        &mut self,
+        modulus: i128,
+        degree: usize,
+        c: SubmissionCounts,
+        n: &[u64],
+    ) -> io::Result<()> {
         writeln!(self.0.0, "{{\"kind\":\"begin\",\"format\":\"quil-public-statement-fixture-v2\",\"modulus\":{modulus},\"degree\":{degree},\"counts\":{:?},\"short_normsq\":{n:?}}}", counts(c))
     }
     fn binary_domain(&mut self, index: usize) -> io::Result<()> {
@@ -52,7 +58,13 @@ fn counts(c: SubmissionCounts) -> [usize; 6] {
 
 impl<W: Write> RelationSink for FixtureSink<W> {
     type Error = io::Error;
-    fn begin(&mut self, modulus: i128, degree: usize, c: SubmissionCounts, n: &[u64]) -> io::Result<()> {
+    fn begin(
+        &mut self,
+        modulus: i128,
+        degree: usize,
+        c: SubmissionCounts,
+        n: &[u64],
+    ) -> io::Result<()> {
         writeln!(self.0, "{{\"kind\":\"begin\",\"format\":\"quil-public-fixture-v2\",\"modulus\":{modulus},\"degree\":{degree},\"counts\":{:?},\"short_normsq\":{n:?}}}", counts(c))
     }
     fn binary(&mut self, index: usize, values: &[u8]) -> io::Result<()> {
@@ -62,7 +74,10 @@ impl<W: Write> RelationSink for FixtureSink<W> {
         )
     }
     fn short(&mut self, index: usize, values: &[i64]) -> io::Result<()> {
-        writeln!(self.0, "{{\"kind\":\"short\",\"index\":{index},\"values\":{values:?}}}")
+        writeln!(
+            self.0,
+            "{{\"kind\":\"short\",\"index\":{index},\"values\":{values:?}}}"
+        )
     }
     fn scalar(&mut self, row: ScalarRow<'_>) -> io::Result<()> {
         write!(

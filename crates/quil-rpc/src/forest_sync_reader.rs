@@ -112,7 +112,10 @@ where
 /// too slow for a full batch's answer (up to the archive's byte cap) within
 /// the client deadline otherwise fails every attempt the same way. Only a
 /// single-key request is sent again at the same size.
-pub async fn fetch_in_batches<K, V, F, Fut>(keys: Vec<K>, fetch: F) -> std::result::Result<Vec<V>, ArchiveClientError>
+pub async fn fetch_in_batches<K, V, F, Fut>(
+    keys: Vec<K>,
+    fetch: F,
+) -> std::result::Result<Vec<V>, ArchiveClientError>
 where
     K: Clone + Send,
     F: Fn(Vec<K>) -> Fut + Clone,
@@ -212,9 +215,12 @@ impl RemoteTreeReader {
     /// power of two from 1,024 once the walk is long ([`WALK_LOG_READS`]), so
     /// a long walk shows progress in a few lines and a routine one none.
     fn counted(&self, n: usize) {
-        let before = self.reads.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        let before = self
+            .reads
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         let reads = before + n as u64;
-        let crossed = reads >= 1024 && (64 - before.leading_zeros()) != (64 - reads.leading_zeros());
+        let crossed =
+            reads >= 1024 && (64 - before.leading_zeros()) != (64 - reads.leading_zeros());
         if (crossed || (reads >= 1024 && reads.is_power_of_two()))
             && (reads >= WALK_LOG_READS || self.started.elapsed() >= WALK_LOG_AFTER)
         {
@@ -257,7 +263,11 @@ impl TreeReader for RemoteTreeReader {
         let phase = self.phase;
         let kh = key_hash.0.to_vec();
         self.handle
-            .block_on(async move { client.get_forest_value(shard_id, phase, max_version, kh).await })
+            .block_on(async move {
+                client
+                    .get_forest_value(shard_id, phase, max_version, kh)
+                    .await
+            })
             .map_err(|e| anyhow::anyhow!("remote get_forest_value: {e}"))
     }
 
@@ -270,20 +280,30 @@ impl TreeReader for RemoteTreeReader {
 
 impl RemoteTreeReader {
     fn note_unbatched(&self, error: &ArchiveClientError) -> bool {
-        if error.is_unimplemented() && self.batched.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!("archive lacks batched forest reads (older build); reading one key per request");
+        if error.is_unimplemented()
+            && self
+                .batched
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::info!(
+                "archive lacks batched forest reads (older build); reading one key per request"
+            );
             return true;
         }
         error.is_unimplemented()
     }
 
-    async fn nodes(&self, keys: Vec<Vec<u8>>) -> std::result::Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+    async fn nodes(
+        &self,
+        keys: Vec<Vec<u8>>,
+    ) -> std::result::Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
         let (client, shard_id, phase) = (self.client.clone(), self.shard_id.clone(), self.phase);
         if self.batched.load(std::sync::atomic::Ordering::Relaxed) {
             let fetched = fetch_in_batches(keys.clone(), |chunk: Vec<Vec<u8>>| {
                 let (mut client, shard_id) = (client.clone(), shard_id.clone());
                 async move { client.get_forest_nodes(shard_id, phase, chunk).await }
-            }).await;
+            })
+            .await;
             match fetched {
                 Err(e) if self.note_unbatched(&e) => {}
                 other => return other,
@@ -294,9 +314,11 @@ impl RemoteTreeReader {
                 let (client, shard_id) = (client.clone(), shard_id.clone());
                 async move {
                     retry_forest_read(|| {
-                        let (mut client, shard_id, key) = (client.clone(), shard_id.clone(), key.clone());
+                        let (mut client, shard_id, key) =
+                            (client.clone(), shard_id.clone(), key.clone());
                         async move { client.get_forest_node(shard_id, phase, key).await }
-                    }).await
+                    })
+                    .await
                 }
             })
             .buffered(REMOTE_BATCHES_IN_FLIGHT)
@@ -305,19 +327,34 @@ impl RemoteTreeReader {
     }
 
     /// Every leaf in `[first, last]` at `version`, page by page.
-    async fn listed(&self, version: u64, first: [u8; 32], last: [u8; 32])
-        -> std::result::Result<Vec<(KeyHash, OwnedValue)>, ArchiveClientError> {
+    async fn listed(
+        &self,
+        version: u64,
+        first: [u8; 32],
+        last: [u8; 32],
+    ) -> std::result::Result<Vec<(KeyHash, OwnedValue)>, ArchiveClientError> {
         let mut leaves: Vec<(KeyHash, OwnedValue)> = Vec::new();
         let mut after: Option<[u8; 32]> = None;
         loop {
             let (page, more) = retry_forest_read(|| {
                 let (mut client, shard_id) = (self.client.clone(), self.shard_id.clone());
-                async move { client.get_forest_leaves(shard_id, self.phase, version, first, last, after).await }
-            }).await?;
+                async move {
+                    client
+                        .get_forest_leaves(shard_id, self.phase, version, first, last, after)
+                        .await
+                }
+            })
+            .await?;
             // Each page must continue past the last: a listing that does not
             // advance would never end. Its content is checked by the caller.
-            if page.first().is_some_and(|(key, _)| after.is_some_and(|after| *key <= after)) || (more && page.is_empty()) {
-                return Err(ArchiveClientError::MissingField("forest leaf listing did not advance"));
+            if page
+                .first()
+                .is_some_and(|(key, _)| after.is_some_and(|after| *key <= after))
+                || (more && page.is_empty())
+            {
+                return Err(ArchiveClientError::MissingField(
+                    "forest leaf listing did not advance",
+                ));
             }
             self.counted(page.len());
             after = page.last().map(|(key, _)| *key).or(after);
@@ -328,13 +365,17 @@ impl RemoteTreeReader {
         }
     }
 
-    async fn values(&self, reads: Vec<(u64, Vec<u8>)>) -> std::result::Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
+    async fn values(
+        &self,
+        reads: Vec<(u64, Vec<u8>)>,
+    ) -> std::result::Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
         let (client, shard_id, phase) = (self.client.clone(), self.shard_id.clone(), self.phase);
         if self.batched.load(std::sync::atomic::Ordering::Relaxed) {
             let fetched = fetch_in_batches(reads.clone(), |chunk: Vec<(u64, Vec<u8>)>| {
                 let (mut client, shard_id) = (client.clone(), shard_id.clone());
                 async move { client.get_forest_values(shard_id, phase, chunk).await }
-            }).await;
+            })
+            .await;
             match fetched {
                 Err(e) if self.note_unbatched(&e) => {}
                 other => return other,
@@ -345,9 +386,11 @@ impl RemoteTreeReader {
                 let (client, shard_id) = (client.clone(), shard_id.clone());
                 async move {
                     retry_forest_read(|| {
-                        let (mut client, shard_id, key) = (client.clone(), shard_id.clone(), key.clone());
+                        let (mut client, shard_id, key) =
+                            (client.clone(), shard_id.clone(), key.clone());
                         async move { client.get_forest_value(shard_id, phase, version, key).await }
-                    }).await
+                    })
+                    .await
                 }
             })
             .buffered(REMOTE_BATCHES_IN_FLIGHT)
@@ -362,18 +405,30 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             return Ok(Vec::new());
         }
         self.counted(keys.len());
-        let encoded = keys.iter().map(borsh::to_vec).collect::<std::io::Result<Vec<_>>>()?;
+        let encoded = keys
+            .iter()
+            .map(borsh::to_vec)
+            .collect::<std::io::Result<Vec<_>>>()?;
         let answers = self
             .handle
             .block_on(self.nodes(encoded))
             .map_err(|e| anyhow::anyhow!("remote get_forest_nodes: {e}"))?;
         answers
             .into_iter()
-            .map(|bytes| bytes.map(|b| borsh::from_slice(&b)).transpose().map_err(Into::into))
+            .map(|bytes| {
+                bytes
+                    .map(|b| borsh::from_slice(&b))
+                    .transpose()
+                    .map_err(Into::into)
+            })
             .collect()
     }
 
-    fn leaves_under(&self, version: Version, bit_path: &[bool]) -> Result<Option<Vec<(KeyHash, OwnedValue)>>> {
+    fn leaves_under(
+        &self,
+        version: Version,
+        bit_path: &[bool],
+    ) -> Result<Option<Vec<(KeyHash, OwnedValue)>>> {
         if !self.listing.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(None);
         }
@@ -381,7 +436,8 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
         match self.handle.block_on(self.listed(version, first, last)) {
             Ok(leaves) => Ok(Some(leaves)),
             Err(e) if e.is_unimplemented() => {
-                self.listing.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.listing
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!("archive cannot list forest leaves (older build); walking the tree");
                 Ok(None)
             }
@@ -394,7 +450,10 @@ impl quil_forest::BatchTreeReader for RemoteTreeReader {
             return Ok(Vec::new());
         }
         self.counted(reads.len());
-        let reads = reads.iter().map(|(version, key)| (*version, key.0.to_vec())).collect();
+        let reads = reads
+            .iter()
+            .map(|(version, key)| (*version, key.0.to_vec()))
+            .collect();
         self.handle
             .block_on(self.values(reads))
             .map_err(|e| anyhow::anyhow!("remote get_forest_values: {e}"))
@@ -406,7 +465,9 @@ mod tests {
     use super::*;
 
     fn busy() -> ArchiveClientError {
-        ArchiveClientError::Rpc(tonic::Status::resource_exhausted("forest read workers busy; retry later"))
+        ArchiveClientError::Rpc(tonic::Status::resource_exhausted(
+            "forest read workers busy; retry later",
+        ))
     }
 
     /// A read that outruns its deadline goes again a bounded number of
@@ -414,20 +475,33 @@ mod tests {
     #[tokio::test]
     async fn timed_out_reads_are_sent_again_a_few_times() {
         let timeout = || ArchiveClientError::Rpc(tonic::Status::cancelled("Timeout expired"));
-        assert!(timeout().is_timeout() && !timeout().is_busy() && !timeout().is_transport_failure());
+        assert!(
+            timeout().is_timeout() && !timeout().is_busy() && !timeout().is_transport_failure()
+        );
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let answered = retry_forest_read(|| {
             let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move { if n < 2 { Err(timeout()) } else { Ok(n) } }
-        }).await;
+            async move {
+                if n < 2 {
+                    Err(timeout())
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
         assert_eq!(answered.unwrap(), 2);
         calls.store(0, std::sync::atomic::Ordering::SeqCst);
         let failed: std::result::Result<(), _> = retry_forest_read(|| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err(timeout()) }
-        }).await;
+        })
+        .await;
         assert!(failed.unwrap_err().is_timeout());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1 + TIMEOUT_RETRIES);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + TIMEOUT_RETRIES
+        );
     }
 
     /// Partial answers are completed from where they stopped, batches come
@@ -445,7 +519,11 @@ mod tests {
                         return Err(busy());
                     }
                     // Answer at most 100 keys per request.
-                    Ok(chunk.into_iter().take(100).map(|k| k * 2).collect::<Vec<_>>())
+                    Ok(chunk
+                        .into_iter()
+                        .take(100)
+                        .map(|k| k * 2)
+                        .collect::<Vec<_>>())
                 }
             }
         };
@@ -453,11 +531,20 @@ mod tests {
         assert_eq!(answers, keys.iter().map(|k| k * 2).collect::<Vec<_>>());
         assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 8);
 
-        let empty = fetch_in_batches(vec![1u32], |_chunk: Vec<u32>| async { Ok(Vec::<u32>::new()) }).await;
-        assert!(empty.is_err(), "an archive that answers nothing does not loop");
+        let empty = fetch_in_batches(vec![1u32], |_chunk: Vec<u32>| async {
+            Ok(Vec::<u32>::new())
+        })
+        .await;
+        assert!(
+            empty.is_err(),
+            "an archive that answers nothing does not loop"
+        );
         let refused = fetch_in_batches(vec![1u32], |_chunk: Vec<u32>| async {
-            Err::<Vec<u32>, _>(ArchiveClientError::Rpc(tonic::Status::unimplemented("old archive")))
-        }).await;
+            Err::<Vec<u32>, _>(ArchiveClientError::Rpc(tonic::Status::unimplemented(
+                "old archive",
+            )))
+        })
+        .await;
         assert!(refused.unwrap_err().is_unimplemented());
     }
 
@@ -487,22 +574,34 @@ mod tests {
         };
         let answers = fetch_in_batches(keys.clone(), fetch).await.unwrap();
         assert_eq!(answers, keys.iter().map(|k| k * 2).collect::<Vec<_>>());
-        assert_eq!(largest.load(std::sync::atomic::Ordering::SeqCst), REMOTE_BATCH_KEYS / 8);
+        assert_eq!(
+            largest.load(std::sync::atomic::Ordering::SeqCst),
+            REMOTE_BATCH_KEYS / 8
+        );
         // 256 → 128 → 64 → 32: three halvings, a few more from the batches
         // already in flight, not one per batch.
         assert!(timeouts.load(std::sync::atomic::Ordering::SeqCst) <= 3 * REMOTE_BATCHES_IN_FLIGHT);
 
-        let stuck: std::result::Result<Vec<u32>, _> = fetch_in_batches(vec![1u32, 2], move |_chunk: Vec<u32>| async move {
-            Err::<Vec<u32>, _>(timeout())
-        }).await;
-        assert!(stuck.unwrap_err().is_timeout(), "a link that answers not even one key gives up");
+        let stuck: std::result::Result<Vec<u32>, _> =
+            fetch_in_batches(vec![1u32, 2], move |_chunk: Vec<u32>| async move {
+                Err::<Vec<u32>, _>(timeout())
+            })
+            .await;
+        assert!(
+            stuck.unwrap_err().is_timeout(),
+            "a link that answers not even one key gives up"
+        );
     }
 
     /// An archive that stays busy is given up on after a while, so the sync
     /// can move to another archive.
     #[tokio::test]
     async fn a_persistently_busy_archive_is_given_up_on() {
-        let result = retry_forest_read_within(Duration::from_millis(300), TIMEOUT_RETRIES, || async { Err::<(), _>(busy()) }).await;
+        let result =
+            retry_forest_read_within(Duration::from_millis(300), TIMEOUT_RETRIES, || async {
+                Err::<(), _>(busy())
+            })
+            .await;
         assert!(result.unwrap_err().is_busy());
     }
 }

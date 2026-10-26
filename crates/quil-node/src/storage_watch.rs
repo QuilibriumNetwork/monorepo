@@ -23,18 +23,22 @@ static THRESHOLDS: OnceLock<DiskThresholds> = OnceLock::new();
 /// Start this process's storage watch with `db`'s disk usage thresholds,
 /// or the defaults when they are not ordered percentages.
 pub(crate) fn start(db: &quil_config::DbConfig) {
-    let thresholds =
-        DiskThresholds::new(db.notice_percentage, db.warn_percentage, db.terminate_percentage).unwrap_or_else(|error| {
-            let defaults = DiskThresholds::default();
-            warn!(
-                %error,
-                notice_pct = defaults.notice,
-                warn_pct = defaults.warn,
-                terminate_pct = defaults.terminate,
-                "invalid db disk usage thresholds in the node config; using the defaults"
-            );
-            defaults
-        });
+    let thresholds = DiskThresholds::new(
+        db.notice_percentage,
+        db.warn_percentage,
+        db.terminate_percentage,
+    )
+    .unwrap_or_else(|error| {
+        let defaults = DiskThresholds::default();
+        warn!(
+            %error,
+            notice_pct = defaults.notice,
+            warn_pct = defaults.warn,
+            terminate_pct = defaults.terminate,
+            "invalid db disk usage thresholds in the node config; using the defaults"
+        );
+        defaults
+    });
     let _ = THRESHOLDS.set(thresholds);
     storage_health::spawn_storage_watch(thresholds);
 }
@@ -227,7 +231,9 @@ pub(crate) struct WorkerRecovery {
 
 impl WorkerRecovery {
     pub(crate) fn new() -> Self {
-        Self { workers: BTreeMap::new() }
+        Self {
+            workers: BTreeMap::new(),
+        }
     }
 
     /// Whether no worker store is being recovered.
@@ -239,14 +245,25 @@ impl WorkerRecovery {
     /// One look at the worker stores at `now`: stop the worker of a store
     /// whose writes stopped, and restart it once the store closed and its
     /// disk has room, at most [`MAX_RESTARTS`] times in a row.
-    pub(crate) fn tick(&mut self, now: Instant, control: &dyn WorkerControl, probe: &dyn Fn(&Path) -> Option<FsUsage>) {
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        control: &dyn WorkerControl,
+        probe: &dyn Fn(&Path) -> Option<FsUsage>,
+    ) {
         let mut events = Events::default();
         for role in storage_health::latched_stores() {
-            let StoreRole::Worker(core) = role else { continue };
+            let StoreRole::Worker(core) = role else {
+                continue;
+            };
             let restarts = match self.workers.get(&core) {
                 None => 0,
                 // Reopened, or reopened but not serving its shard yet.
-                Some(Recovering { step: Step::Reopened { .. } | Step::Reopening { .. }, restarts, .. }) => *restarts,
+                Some(Recovering {
+                    step: Step::Reopened { .. } | Step::Reopening { .. },
+                    restarts,
+                    ..
+                }) => *restarts,
                 Some(_) => continue,
             };
             if restarts >= MAX_RESTARTS {
@@ -259,17 +276,36 @@ impl WorkerRecovery {
                 }
                 control.release(core);
                 events.exhausted.push(core);
-                self.workers.insert(core, Recovering { path: PathBuf::new(), step: Step::GaveUp { reminded: now }, restarts });
+                self.workers.insert(
+                    core,
+                    Recovering {
+                        path: PathBuf::new(),
+                        step: Step::GaveUp { reminded: now },
+                        restarts,
+                    },
+                );
                 continue;
             }
-            let Some(path) = storage_health::store_path(role) else { continue };
+            let Some(path) = storage_health::store_path(role) else {
+                continue;
+            };
             storage_health::hold_store(role);
             events.stopped.push(core);
             if !control.stop(core) {
                 events.stuck.push(core);
             }
             control.release(core);
-            self.workers.insert(core, Recovering { path, step: Step::Closing { since: now, reminded: now }, restarts });
+            self.workers.insert(
+                core,
+                Recovering {
+                    path,
+                    step: Step::Closing {
+                        since: now,
+                        reminded: now,
+                    },
+                    restarts,
+                },
+            );
         }
 
         for (&core, entry) in &mut self.workers {
@@ -279,22 +315,34 @@ impl WorkerRecovery {
                 Step::Closing { since, reminded } => {
                     if !storage_health::store_open(role) {
                         events.closed.push(core);
-                        entry.step = Step::AwaitingSpace { since: now, reminded: now };
+                        entry.step = Step::AwaitingSpace {
+                            since: now,
+                            reminded: now,
+                        };
                     } else if now.saturating_duration_since(reminded) >= REMIND {
                         // Not final: a holder that outlasts the stop (a long
                         // encode, a stream) lets go eventually.
                         events.still_closing.push((core, since_secs(since)));
-                        entry.step = Step::Closing { since, reminded: now };
+                        entry.step = Step::Closing {
+                            since,
+                            reminded: now,
+                        };
                     }
                 }
                 Step::AwaitingSpace { since, reminded } => {
                     // A master store that stopped writing exits this process
                     // once space returns: no worker store opens before.
                     let master_stopped = storage_health::store_latched(StoreRole::Master);
-                    if !master_stopped && !control.shutting_down() && has_space(probe(&entry.path)) {
+                    if !master_stopped && !control.shutting_down() && has_space(probe(&entry.path))
+                    {
                         entry.restarts += 1;
                         match control.restart(core) {
-                            Ok(()) => entry.step = Step::Reopening { at: now, reminded: now },
+                            Ok(()) => {
+                                entry.step = Step::Reopening {
+                                    at: now,
+                                    reminded: now,
+                                }
+                            }
                             Err(error) if entry.restarts < MAX_RESTARTS => {
                                 events.restart_failed.push((core, error.to_string()))
                             }
@@ -309,7 +357,10 @@ impl WorkerRecovery {
                         } else {
                             events.still_waiting.push((core, since_secs(since)));
                         }
-                        entry.step = Step::AwaitingSpace { since, reminded: now };
+                        entry.step = Step::AwaitingSpace {
+                            since,
+                            reminded: now,
+                        };
                     }
                 }
                 Step::Reopening { at, reminded } => {
@@ -333,7 +384,10 @@ impl WorkerRecovery {
                             entry.step = Step::GaveUp { reminded: now };
                         } else {
                             events.reopen_retry.push(core);
-                            entry.step = Step::Closing { since: now, reminded: now };
+                            entry.step = Step::Closing {
+                                since: now,
+                                reminded: now,
+                            };
                         }
                     } else if open {
                         if now.saturating_duration_since(reminded) >= REMIND {
@@ -356,12 +410,17 @@ impl WorkerRecovery {
                             entry.step = Step::GaveUp { reminded: now };
                         } else {
                             events.reopen_retry.push(core);
-                            entry.step = Step::AwaitingSpace { since: now, reminded: now };
+                            entry.step = Step::AwaitingSpace {
+                                since: now,
+                                reminded: now,
+                            };
                         }
                     }
                 }
                 Step::Reopened { at } => {
-                    if now.saturating_duration_since(at) >= STABLE_AFTER && !storage_health::store_latched(role) {
+                    if now.saturating_duration_since(at) >= STABLE_AFTER
+                        && !storage_health::store_latched(role)
+                    {
                         events.recovered.push(core);
                     }
                 }
@@ -382,17 +441,22 @@ impl WorkerRecovery {
 
 /// Run [`WorkerRecovery`] for this process's thread workers on its own
 /// thread, every [`RECOVERY_INTERVAL`], until `shutdown` is cancelled.
-pub(crate) fn spawn_worker_recovery(control: Arc<dyn WorkerControl>, shutdown: tokio_util::sync::CancellationToken) {
-    let spawned = std::thread::Builder::new().name("storage-recovery".into()).spawn(move || {
-        let mut recovery = WorkerRecovery::new();
-        loop {
-            std::thread::sleep(RECOVERY_INTERVAL);
-            if shutdown.is_cancelled() {
-                return;
+pub(crate) fn spawn_worker_recovery(
+    control: Arc<dyn WorkerControl>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("storage-recovery".into())
+        .spawn(move || {
+            let mut recovery = WorkerRecovery::new();
+            loop {
+                std::thread::sleep(RECOVERY_INTERVAL);
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                recovery.tick(Instant::now(), control.as_ref(), &storage_health::fs_usage);
             }
-            recovery.tick(Instant::now(), control.as_ref(), &storage_health::fs_usage);
-        }
-    });
+        });
     if let Err(error) = spawned {
         warn!(%error, "could not start the recovery of worker stores: a worker store that stops writing stays \
             stopped until the node restarts");
@@ -434,14 +498,23 @@ pub(crate) struct ProcessExit {
 
 impl ProcessExit {
     pub(crate) fn new(role: StoreRole, now: Instant) -> Self {
-        Self { role, latched: None, reminded: now, reserved_at: None, reserve: storage_health::can_reserve }
+        Self {
+            role,
+            latched: None,
+            reminded: now,
+            reserved_at: None,
+            reserve: storage_health::can_reserve,
+        }
     }
 
     /// Whether a test reservation next to the store succeeds at `now`, at
     /// most once per [`RESERVE_INTERVAL`]. Where the filesystem cannot
     /// reserve space without writing it, its headroom is all there is.
     fn reserved(&mut self, now: Instant, path: &Path) -> bool {
-        if self.reserved_at.is_some_and(|at| now.saturating_duration_since(at) < RESERVE_INTERVAL) {
+        if self
+            .reserved_at
+            .is_some_and(|at| now.saturating_duration_since(at) < RESERVE_INTERVAL)
+        {
             return false;
         }
         self.reserved_at = Some(now);
@@ -449,7 +522,11 @@ impl ProcessExit {
     }
 
     /// One look at the store at `now`; the reason to exit, once due.
-    pub(crate) fn tick(&mut self, now: Instant, probe: &dyn Fn(&Path) -> Option<FsUsage>) -> Option<String> {
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        probe: &dyn Fn(&Path) -> Option<FsUsage>,
+    ) -> Option<String> {
         let (store, headroom) = (self.role.to_string(), storage_health::headroom_text());
         let reserve_mb = storage_health::REOPEN_RESERVE_BYTES >> 20;
         if self.latched.is_none() {
@@ -515,7 +592,9 @@ impl ProcessExit {
                 "store stopped writing and its disk has {headroom} again: exiting so that the service manager \
                  restarts this process and reopens the store"
             );
-            return Some(format!("the {store} store stopped writing; exiting to reopen it"));
+            return Some(format!(
+                "the {store} store stopped writing; exiting to reopen it"
+            ));
         }
         if now.saturating_duration_since(self.reminded) >= REMIND {
             self.reminded = now;
@@ -592,7 +671,10 @@ mod tests {
     impl Workers {
         fn new(cores: &[u32]) -> Self {
             let workers = Self {
-                dirs: cores.iter().map(|core| (*core, tempfile::tempdir().unwrap())).collect(),
+                dirs: cores
+                    .iter()
+                    .map(|core| (*core, tempfile::tempdir().unwrap()))
+                    .collect(),
                 open: Mutex::new(BTreeMap::new()),
                 holders: Mutex::new(Vec::new()),
                 reopen: std::sync::atomic::AtomicBool::new(true),
@@ -613,11 +695,16 @@ mod tests {
         }
 
         fn write(&self, core: u32) -> bool {
-            self.open.lock().unwrap()[&core].inner().put([0xee, core as u8], b"v").is_ok()
+            self.open.lock().unwrap()[&core]
+                .inner()
+                .put([0xee, core as u8], b"v")
+                .is_ok()
         }
 
         fn latch(&self, core: u32) {
-            self.open.lock().unwrap()[&core].inner().refuse_writes("IO error: No space left on device");
+            self.open.lock().unwrap()[&core]
+                .inner()
+                .refuse_writes("IO error: No space left on device");
         }
 
         /// Something else keeps `core`'s store open until `let_go`.
@@ -687,15 +774,24 @@ mod tests {
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
         recovery.tick(at(0), &workers, &probe);
-        assert!(workers.calls().is_empty() && recovery.is_idle(), "stores that take writes are left alone");
+        assert!(
+            workers.calls().is_empty() && recovery.is_idle(),
+            "stores that take writes are left alone"
+        );
 
         workers.latch(core);
         assert!(!workers.write(core));
         recovery.tick(at(10), &workers, &probe);
         assert_eq!(workers.calls(), ["stop 8101", "release 8101"]);
-        let held = quil_engine::worker_execution::with_store_state(core, None).expect("a stopped worker is reported");
-        assert_eq!((held.state.as_str(), held.blocker.as_str()),
-            ("stopped", quil_engine::worker_execution::STORAGE_WRITE_FAILED));
+        let held = quil_engine::worker_execution::with_store_state(core, None)
+            .expect("a stopped worker is reported");
+        assert_eq!(
+            (held.state.as_str(), held.blocker.as_str()),
+            (
+                "stopped",
+                quil_engine::worker_execution::STORAGE_WRITE_FAILED
+            )
+        );
         for secs in [20, 30, 700] {
             recovery.tick(at(secs), &workers, &probe);
         }
@@ -705,17 +801,31 @@ mod tests {
 
         free_gib.store(4, Ordering::SeqCst);
         recovery.tick(at(720), &workers, &probe);
-        assert_eq!(workers.calls(), ["stop 8101", "release 8101", "restart 8101"]);
-        assert!(storage_health::store_held(StoreRole::Worker(core)), "held until the store is seen open");
+        assert_eq!(
+            workers.calls(),
+            ["stop 8101", "release 8101", "restart 8101"]
+        );
+        assert!(
+            storage_health::store_held(StoreRole::Worker(core)),
+            "held until the store is seen open"
+        );
         recovery.tick(at(730), &workers, &probe);
         assert!(!storage_health::store_held(StoreRole::Worker(core)));
         assert!(workers.write(core), "the reopened store takes writes");
-        assert_eq!(quil_engine::worker_execution::with_store_state(core, None), None);
+        assert_eq!(
+            quil_engine::worker_execution::with_store_state(core, None),
+            None
+        );
         assert!(workers.write(8_102), "another worker's store is untouched");
-        assert!(master.inner().put([0xee], b"v").is_ok() && !master.inner().write_failed(),
-            "the master's store is untouched");
+        assert!(
+            master.inner().put([0xee], b"v").is_ok() && !master.inner().write_failed(),
+            "the master's store is untouched"
+        );
         recovery.tick(at(730 + STABLE_AFTER.as_secs()), &workers, &probe);
-        assert!(recovery.is_idle(), "a store that has not stopped since it was reopened is recovered");
+        assert!(
+            recovery.is_idle(),
+            "a store that has not stopped since it was reopened is recovered"
+        );
     }
 
     /// A store something still holds after its worker stopped is waited for,
@@ -732,11 +842,18 @@ mod tests {
         for secs in [0, 10, 300, 900, 3_600] {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        assert_eq!(workers.calls(), ["stop 8111", "release 8111"], "no restart while the store is open");
+        assert_eq!(
+            workers.calls(),
+            ["stop 8111", "release 8111"],
+            "no restart while the store is open"
+        );
         workers.let_go();
         recovery.tick(t0 + Duration::from_secs(3_610), &workers, &probe);
         recovery.tick(t0 + Duration::from_secs(3_620), &workers, &probe);
-        assert_eq!(workers.calls().last().map(String::as_str), Some("restart 8111"));
+        assert_eq!(
+            workers.calls().last().map(String::as_str),
+            Some("restart 8111")
+        );
     }
 
     /// A restart that does not reopen the store keeps the worker stopped and
@@ -754,9 +871,16 @@ mod tests {
         for secs in (0..=400).step_by(10) {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        let restarts = workers.calls().iter().filter(|call| call.starts_with("restart")).count();
+        let restarts = workers
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("restart"))
+            .count();
         assert_eq!(restarts, MAX_RESTARTS as usize, "{:?}", workers.calls());
-        assert!(storage_health::store_held(StoreRole::Worker(core)), "it stays stopped");
+        assert!(
+            storage_health::store_held(StoreRole::Worker(core)),
+            "it stays stopped"
+        );
         assert!(!recovery.is_idle());
     }
 
@@ -776,12 +900,27 @@ mod tests {
         for secs in [0, 10, 40, 100, 700, 3_600] {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        let restarts = || workers.calls().iter().filter(|call| call.starts_with("restart")).count();
-        assert_eq!(restarts(), 1, "one restart while its thread runs: {:?}", workers.calls());
+        let restarts = || {
+            workers
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("restart"))
+                .count()
+        };
+        assert_eq!(
+            restarts(),
+            1,
+            "one restart while its thread runs: {:?}",
+            workers.calls()
+        );
         workers.running.store(false, Ordering::SeqCst);
         recovery.tick(t0 + Duration::from_secs(3_610), &workers, &probe);
         recovery.tick(t0 + Duration::from_secs(3_620), &workers, &probe);
-        assert_eq!(restarts(), 2, "restarted again once it ended without its store");
+        assert_eq!(
+            restarts(),
+            2,
+            "restarted again once it ended without its store"
+        );
     }
 
     /// A reopened store stays held, its seat left out, until its worker
@@ -800,7 +939,10 @@ mod tests {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
         assert!(workers.write(core), "the store reopened");
-        assert!(storage_health::store_held(StoreRole::Worker(core)), "but its worker does not serve the shard yet");
+        assert!(
+            storage_health::store_held(StoreRole::Worker(core)),
+            "but its worker does not serve the shard yet"
+        );
         workers.serving.store(true, Ordering::SeqCst);
         recovery.tick(t0 + Duration::from_secs(710), &workers, &probe);
         assert!(!storage_health::store_held(StoreRole::Worker(core)));
@@ -821,11 +963,33 @@ mod tests {
         for secs in (0..=300).step_by(10) {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        let count = |prefix: &str| workers.calls().iter().filter(|call| call.starts_with(prefix)).count();
-        assert_eq!(count("restart"), MAX_RESTARTS as usize, "{:?}", workers.calls());
-        assert_eq!(count("stop"), 1 + MAX_RESTARTS as usize, "each dead thread is stopped: {:?}", workers.calls());
-        assert!(storage_health::store_held(StoreRole::Worker(core)), "it stays stopped");
-        assert!(!storage_health::store_open(StoreRole::Worker(core)), "with its store closed");
+        let count = |prefix: &str| {
+            workers
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with(prefix))
+                .count()
+        };
+        assert_eq!(
+            count("restart"),
+            MAX_RESTARTS as usize,
+            "{:?}",
+            workers.calls()
+        );
+        assert_eq!(
+            count("stop"),
+            1 + MAX_RESTARTS as usize,
+            "each dead thread is stopped: {:?}",
+            workers.calls()
+        );
+        assert!(
+            storage_health::store_held(StoreRole::Worker(core)),
+            "it stays stopped"
+        );
+        assert!(
+            !storage_health::store_open(StoreRole::Worker(core)),
+            "with its store closed"
+        );
     }
 
     /// A store that stops writing again while its worker reopens it (open,
@@ -843,13 +1007,26 @@ mod tests {
         for secs in [0, 10, 20] {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        assert_eq!(workers.calls(), ["stop 8171", "release 8171", "restart 8171"]);
+        assert_eq!(
+            workers.calls(),
+            ["stop 8171", "release 8171", "restart 8171"]
+        );
         workers.latch(core);
         for secs in [30, 40] {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
         }
-        assert_eq!(workers.calls(), ["stop 8171", "release 8171", "restart 8171", "stop 8171", "release 8171",
-            "restart 8171"], "stopped again and restarted as a second, counted restart");
+        assert_eq!(
+            workers.calls(),
+            [
+                "stop 8171",
+                "release 8171",
+                "restart 8171",
+                "stop 8171",
+                "release 8171",
+                "restart 8171"
+            ],
+            "stopped again and restarted as a second, counted restart"
+        );
     }
 
     /// While the master's store has stopped writing, no worker restarts: the
@@ -864,7 +1041,9 @@ mod tests {
         let probe = |_: &Path| Some(usage(500));
         let mut recovery = WorkerRecovery::new();
         let t0 = Instant::now();
-        master.inner().refuse_writes("IO error: No space left on device");
+        master
+            .inner()
+            .refuse_writes("IO error: No space left on device");
         workers.latch(core);
         for secs in [0, 10, 20, 30] {
             recovery.tick(t0 + Duration::from_secs(secs), &workers, &probe);
@@ -884,17 +1063,40 @@ mod tests {
         for round in 0..=MAX_RESTARTS as u64 {
             workers.latch(core);
             for step in 0..3 {
-                recovery.tick(t0 + Duration::from_secs(40 * round + 10 * step), &workers, &probe);
+                recovery.tick(
+                    t0 + Duration::from_secs(40 * round + 10 * step),
+                    &workers,
+                    &probe,
+                );
             }
         }
-        let restarts = workers.calls().iter().filter(|call| call.starts_with("restart")).count();
+        let restarts = workers
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("restart"))
+            .count();
         assert_eq!(restarts, MAX_RESTARTS as usize, "{:?}", workers.calls());
-        assert_eq!(workers.calls().len(), 3 * MAX_RESTARTS as usize + 2, "{:?}", workers.calls());
-        assert_eq!(workers.calls()[3 * MAX_RESTARTS as usize..], ["stop 8201", "release 8201"],
-            "stopped once more and kept stopped");
-        assert!(storage_health::store_held(StoreRole::Worker(core)), "it reads as stopped");
+        assert_eq!(
+            workers.calls().len(),
+            3 * MAX_RESTARTS as usize + 2,
+            "{:?}",
+            workers.calls()
+        );
+        assert_eq!(
+            workers.calls()[3 * MAX_RESTARTS as usize..],
+            ["stop 8201", "release 8201"],
+            "stopped once more and kept stopped"
+        );
+        assert!(
+            storage_health::store_held(StoreRole::Worker(core)),
+            "it reads as stopped"
+        );
         recovery.tick(t0 + Duration::from_secs(10_000), &workers, &probe);
-        assert_eq!(workers.calls().len(), 3 * MAX_RESTARTS as usize + 2, "never restarted");
+        assert_eq!(
+            workers.calls().len(),
+            3 * MAX_RESTARTS as usize + 2,
+            "never restarted"
+        );
         assert!(!recovery.is_idle());
     }
 
@@ -910,14 +1112,24 @@ mod tests {
         let probe = probe_of(&free_gib);
         let t0 = Instant::now();
         let mut exit = ProcessExit::new(role, t0);
-        assert_eq!(exit.tick(t0 + Duration::from_secs(10), &probe), None, "a store that takes writes keeps it");
+        assert_eq!(
+            exit.tick(t0 + Duration::from_secs(10), &probe),
+            None,
+            "a store that takes writes keeps it"
+        );
         // The storage watch stops the store below the floor.
         let mut watch = storage_health::StorageWatch::new(DiskThresholds::default());
         storage_health::check_stores(&mut watch, t0 + Duration::from_secs(15), &probe);
         assert!(store.inner().write_failed());
-        assert_eq!(exit.tick(t0 + Duration::from_secs(20), &probe), None, "no exit while the disk is full");
+        assert_eq!(
+            exit.tick(t0 + Duration::from_secs(20), &probe),
+            None,
+            "no exit while the disk is full"
+        );
         free_gib.store(4, Ordering::SeqCst);
-        let reason = exit.tick(t0 + Duration::from_secs(30), &probe).expect("exits once the disk has room");
+        let reason = exit
+            .tick(t0 + Duration::from_secs(30), &probe)
+            .expect("exits once the disk has room");
         assert!(reason.contains("worker 8301 store"), "{reason}");
     }
 
@@ -926,7 +1138,10 @@ mod tests {
     #[test]
     fn a_process_whose_store_failed_for_another_error_does_not_exit() {
         let probe = |_: &Path| Some(usage(500));
-        for (core, cause) in [(8_311, "IO error: Input/output error"), (8_314, "IO error: Read-only file system")] {
+        for (core, cause) in [
+            (8_311, "IO error: Input/output error"),
+            (8_314, "IO error: Read-only file system"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let store = quil_store::RocksDb::open(dir.path()).unwrap();
             let role = StoreRole::Worker(core);
@@ -935,7 +1150,11 @@ mod tests {
             let t0 = Instant::now();
             let mut exit = ProcessExit::new(role, t0);
             for secs in [10, 20, 700, 3_600] {
-                assert_eq!(exit.tick(t0 + Duration::from_secs(secs), &probe), None, "{cause} at {secs}s");
+                assert_eq!(
+                    exit.tick(t0 + Duration::from_secs(secs), &probe),
+                    None,
+                    "{cause} at {secs}s"
+                );
             }
         }
     }
@@ -947,7 +1166,10 @@ mod tests {
     #[test]
     fn a_process_whose_store_ran_out_of_space_with_room_showing_exits() {
         let probe = |_: &Path| Some(usage(500));
-        for (core, cause) in [(8_321, "IO error: No space left on device"), (8_322, "IO error: Disk quota exceeded")] {
+        for (core, cause) in [
+            (8_321, "IO error: No space left on device"),
+            (8_322, "IO error: Disk quota exceeded"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let store = quil_store::RocksDb::open(dir.path()).unwrap();
             let role = StoreRole::Worker(core);
@@ -961,11 +1183,25 @@ mod tests {
             }
             let t0 = Instant::now();
             let mut exit = ProcessExit::new(role, t0);
-            let reason = exit.tick(t0 + Duration::from_secs(10), &probe).expect("exits once space can be reserved");
+            let reason = exit
+                .tick(t0 + Duration::from_secs(10), &probe)
+                .expect("exits once space can be reserved");
             assert!(reason.contains(&format!("worker {core} store")), "{reason}");
-            assert_eq!(std::fs::read_dir(dir.path()).unwrap().filter(|entry| {
-                entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(".reserve-")
-            }).count(), 0, "the reservation is removed");
+            assert_eq!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter(|entry| {
+                        entry
+                            .as_ref()
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".reserve-")
+                    })
+                    .count(),
+                0,
+                "the reservation is removed"
+            );
         }
     }
 
@@ -973,7 +1209,8 @@ mod tests {
     /// still holds), the process keeps waiting, trying once a minute.
     #[test]
     fn a_process_waits_while_space_cannot_be_reserved_next_to_its_store() {
-        static RESERVABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static RESERVABLE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         static TRIED: AtomicU64 = AtomicU64::new(0);
         fn reserve(_: &Path, bytes: u64) -> Option<bool> {
             assert_eq!(bytes, storage_health::REOPEN_RESERVE_BYTES);
@@ -993,14 +1230,32 @@ mod tests {
         let t0 = Instant::now();
         let mut exit = ProcessExit::new(role, t0);
         exit.reserve = reserve;
-        assert_eq!(exit.tick(t0 + Duration::from_secs(10), &full), None, "no room showing now");
-        assert_eq!(TRIED.load(Ordering::SeqCst), 0, "nothing reserved without room");
-        assert_eq!(exit.tick(t0 + Duration::from_secs(20), &room), None, "the quota still holds");
+        assert_eq!(
+            exit.tick(t0 + Duration::from_secs(10), &full),
+            None,
+            "no room showing now"
+        );
+        assert_eq!(
+            TRIED.load(Ordering::SeqCst),
+            0,
+            "nothing reserved without room"
+        );
+        assert_eq!(
+            exit.tick(t0 + Duration::from_secs(20), &room),
+            None,
+            "the quota still holds"
+        );
         assert_eq!(exit.tick(t0 + Duration::from_secs(30), &room), None);
         assert_eq!(TRIED.load(Ordering::SeqCst), 1, "tried once a minute");
         RESERVABLE.store(true, Ordering::SeqCst);
-        assert_eq!(exit.tick(t0 + Duration::from_secs(40), &room), None, "not before the minute is up");
-        let reason = exit.tick(t0 + Duration::from_secs(80), &room).expect("exits once space can be reserved");
+        assert_eq!(
+            exit.tick(t0 + Duration::from_secs(40), &room),
+            None,
+            "not before the minute is up"
+        );
+        let reason = exit
+            .tick(t0 + Duration::from_secs(80), &room)
+            .expect("exits once space can be reserved");
         assert!(reason.contains("worker 8331 store"), "{reason}");
         assert_eq!(TRIED.load(Ordering::SeqCst), 2);
     }
@@ -1010,6 +1265,9 @@ mod tests {
         assert!(has_space(Some(usage(4))));
         assert!(!has_space(Some(usage(3))));
         assert!(!has_space(None));
-        assert!(!has_space(Some(FsUsage { free_inodes: 19_000, ..usage(500) })));
+        assert!(!has_space(Some(FsUsage {
+            free_inodes: 19_000,
+            ..usage(500)
+        })));
     }
 }

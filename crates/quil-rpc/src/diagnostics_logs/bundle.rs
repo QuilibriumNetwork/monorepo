@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use crate::log_export::{self, Cancelled, Export, ExportOptions, RecordReader, Selection, SourceInfo, BUNDLE_LOG};
+use crate::log_export::{
+    self, Cancelled, Export, ExportOptions, RecordReader, Selection, SourceInfo, BUNDLE_LOG,
+};
 
 /// The plaintext a target seals: these files, in this order.
 const BUNDLE_MAGIC: &[u8; 8] = b"QLOGEXP1";
@@ -41,16 +43,27 @@ pub fn pack_bundle(files: &[(&str, &[u8]); 3]) -> Vec<u8> {
 /// order, checked against its `SHA256SUMS`.
 pub fn unpack_bundle(plaintext: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let malformed = || anyhow::anyhow!("the bundle is not a log export of this version");
-    let mut rest = plaintext.strip_prefix(BUNDLE_MAGIC.as_slice()).ok_or_else(malformed)?;
+    let mut rest = plaintext
+        .strip_prefix(BUNDLE_MAGIC.as_slice())
+        .ok_or_else(malformed)?;
     let mut files = Vec::new();
     for expected in BUNDLE_FILES {
         let (&name_len, after) = rest.split_first().ok_or_else(malformed)?;
         let name = after.get(..name_len as usize).ok_or_else(malformed)?;
-        anyhow::ensure!(name == expected.as_bytes(), "the bundle holds an unexpected file");
+        anyhow::ensure!(
+            name == expected.as_bytes(),
+            "the bundle holds an unexpected file"
+        );
         let after = &after[name_len as usize..];
-        let len: [u8; 8] = after.get(..8).ok_or_else(malformed)?.try_into().map_err(|_| malformed())?;
+        let len: [u8; 8] = after
+            .get(..8)
+            .ok_or_else(malformed)?
+            .try_into()
+            .map_err(|_| malformed())?;
         let len = usize::try_from(u64::from_le_bytes(len)).map_err(|_| malformed())?;
-        let data = after.get(8..8usize.checked_add(len).ok_or_else(malformed)?).ok_or_else(malformed)?;
+        let data = after
+            .get(8..8usize.checked_add(len).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?;
         files.push(data.to_vec());
         rest = &after[8 + len..];
     }
@@ -58,7 +71,10 @@ pub fn unpack_bundle(plaintext: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let sums = String::from_utf8_lossy(&files[2]).into_owned();
     for (name, data) in BUNDLE_FILES[..2].iter().zip(&files) {
         let expected = format!("{}  {name}", hex::encode(Sha256::digest(data)));
-        anyhow::ensure!(sums.lines().any(|line| line == expected), "{name} does not match the bundle's SHA256SUMS");
+        anyhow::ensure!(
+            sums.lines().any(|line| line == expected),
+            "{name} does not match the bundle's SHA256SUMS"
+        );
     }
     Ok(files)
 }
@@ -91,7 +107,10 @@ impl std::error::Error for TooLarge {}
 pub fn is_too_large(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.is::<TooLarge>()
-            || cause.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|inner| inner.is::<TooLarge>())
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|inner| inner.is::<TooLarge>())
     })
 }
 
@@ -105,7 +124,10 @@ pub struct Capped {
 impl std::io::Write for Capped {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.data.len() + buf.len() > self.cap {
-            return Err(std::io::Error::other(TooLarge { cap: self.cap, sealed: None }));
+            return Err(std::io::Error::other(TooLarge {
+                cap: self.cap,
+                sealed: None,
+            }));
         }
         self.data.extend_from_slice(buf);
         Ok(buf.len())
@@ -144,11 +166,23 @@ impl Approval {
 
 /// The export selection of a request: its window and filters, every level,
 /// no text match.
-pub fn request_selection(since_unix: u64, until_unix: u64, filters: &[Vec<u8>]) -> anyhow::Result<Selection> {
-    let since = i64::try_from(since_unix).map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
-    let until = i64::try_from(until_unix).map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
+pub fn request_selection(
+    since_unix: u64,
+    until_unix: u64,
+    filters: &[Vec<u8>],
+) -> anyhow::Result<Selection> {
+    let since = i64::try_from(since_unix)
+        .map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
+    let until = i64::try_from(until_unix)
+        .map_err(|_| anyhow::anyhow!("the request's window is invalid"))?;
     anyhow::ensure!(since < until, "the request's window is invalid");
-    Ok(Selection { since, until, min_level: 0, filters: filters.iter().map(hex::encode).collect(), matches: Vec::new() })
+    Ok(Selection {
+        since,
+        until,
+        min_level: 0,
+        filters: filters.iter().map(hex::encode).collect(),
+        matches: Vec::new(),
+    })
 }
 
 /// The export of request `id` from `requester`, as `node log export` makes
@@ -165,12 +199,17 @@ pub fn request_export(
     max: usize,
     options: &ExportOptions<'_>,
 ) -> anyhow::Result<Export<Capped>> {
-    let out = Capped { data: Vec::new(), cap: max };
-    let options = ExportOptions { keep_self: false, ..*options };
+    let out = Capped {
+        data: Vec::new(),
+        cap: max,
+    };
+    let options = ExportOptions {
+        keep_self: false,
+        ..*options
+    };
     let mut produced = log_export::produce(readers, child, source, selection, out, &options)?;
     produced.manifest["tool"] = approval.tool().into();
-    produced.manifest["request"] =
-        serde_json::json!({ "id": hex::encode(id), "requester": requester, "approval": approval.label() });
+    produced.manifest["request"] = serde_json::json!({ "id": hex::encode(id), "requester": requester, "approval": approval.label() });
     Ok(produced)
 }
 
@@ -185,28 +224,61 @@ pub struct Sealed {
 /// Seal `export` for request `id` to `recipient`, its sntrup761 key,
 /// refusing a sealed bundle over `max` bytes. The gzipped log is dropped
 /// once framed, so at most two copies of the bundle are held at once.
-pub fn seal_export(export: Export<Capped>, id: &[u8], recipient: &[u8], max: usize) -> anyhow::Result<Sealed> {
+pub fn seal_export(
+    export: Export<Capped>,
+    id: &[u8],
+    recipient: &[u8],
+    max: usize,
+) -> anyhow::Result<Sealed> {
     let (manifest_text, sums) = log_export::bundle_texts(&export.manifest, &export.log)?;
-    let Export { out, token_map, stats, .. } = export;
-    let plaintext = pack_bundle(&[(BUNDLE_LOG, &out.data), ("manifest.json", manifest_text.as_bytes()), ("SHA256SUMS", sums.as_bytes())]);
+    let Export {
+        out,
+        token_map,
+        stats,
+        ..
+    } = export;
+    let plaintext = pack_bundle(&[
+        (BUNDLE_LOG, &out.data),
+        ("manifest.json", manifest_text.as_bytes()),
+        ("SHA256SUMS", sums.as_bytes()),
+    ]);
     drop(out);
     let sealed_len = quil_crypto::seal::sealed_len(plaintext.len());
     if sealed_len > max {
-        return Err(TooLarge { cap: max, sealed: Some(sealed_len) }.into());
+        return Err(TooLarge {
+            cap: max,
+            sealed: Some(sealed_len),
+        }
+        .into());
     }
-    let sealed = quil_crypto::seal::seal(&plaintext, recipient, id).map_err(|e| anyhow::anyhow!("seal the bundle: {e}"))?;
-    Ok(Sealed { sealed, token_map, lines_kept: stats.lines_kept })
+    let sealed = quil_crypto::seal::seal(&plaintext, recipient, id)
+        .map_err(|e| anyhow::anyhow!("seal the bundle: {e}"))?;
+    Ok(Sealed {
+        sealed,
+        token_map,
+        lines_kept: stats.lines_kept,
+    })
 }
 
 /// The token map file name of request `id`, written at `now_secs`.
 pub fn token_map_name(id: &[u8], now_secs: i64) -> String {
-    format!("log-request-{}-{}.map.txt", super::short_id(id), log_export::compact_ts(now_secs))
+    format!(
+        "log-request-{}-{}.map.txt",
+        super::short_id(id),
+        log_export::compact_ts(now_secs)
+    )
 }
 
 /// Delete the log request token maps in `dir` older than `keep` at `now`;
 /// how many.
-pub fn prune_token_maps(dir: &Path, now: std::time::SystemTime, keep: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+pub fn prune_token_maps(
+    dir: &Path,
+    now: std::time::SystemTime,
+    keep: std::time::Duration,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     entries
         .flatten()
         .filter(|entry| {
@@ -215,7 +287,10 @@ pub fn prune_token_maps(dir: &Path, now: std::time::SystemTime, keep: std::time:
             name.starts_with("log-request-") && name.ends_with(".map.txt")
         })
         .filter(|entry| {
-            entry.metadata().and_then(|m| m.modified()).is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > keep))
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age > keep))
         })
         .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
         .count()
@@ -267,23 +342,57 @@ pub fn build_automatic(
     salt: Option<[u8; 32]>,
 ) -> anyhow::Result<AutoBundle> {
     let selection = request_selection(request.since_unix, request.until_unix, &request.filters)?;
-    let (readers, names) = log_export::file_readers(&auto.log_dir, selection.since, selection.until)?;
-    anyhow::ensure!(!names.is_empty(), "no node log files in {}", auto.log_dir.display());
+    let (readers, names) =
+        log_export::file_readers(&auto.log_dir, selection.since, selection.until)?;
+    anyhow::ensure!(
+        !names.is_empty(),
+        "no node log files in {}",
+        auto.log_dir.display()
+    );
     let source = SourceInfo::Files(names);
     let home_paths = [auto.log_dir.clone(), auto.token_maps.clone()];
-    let options = ExportOptions { salt, home_paths: &home_paths, cancel: Some(cancel), ..ExportOptions::default() };
-    let export = request_export(readers, None, &source, &selection, &request.id, &request.requester, Approval::Automatic, max, &options)?;
+    let options = ExportOptions {
+        salt,
+        home_paths: &home_paths,
+        cancel: Some(cancel),
+        ..ExportOptions::default()
+    };
+    let export = request_export(
+        readers,
+        None,
+        &source,
+        &selection,
+        &request.id,
+        &request.requester,
+        Approval::Automatic,
+        max,
+        &options,
+    )?;
     let sealed = seal_export(export, &request.id, &request.recipient_kem_public_key, max)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(Cancelled.into());
     }
-    super::mkdir_private(&auto.token_maps).map_err(|e| anyhow::anyhow!("create {}: {e}", auto.token_maps.display()))?;
-    prune_token_maps(&auto.token_maps, std::time::SystemTime::now(), TOKEN_MAP_RETENTION);
+    super::mkdir_private(&auto.token_maps)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", auto.token_maps.display()))?;
+    prune_token_maps(
+        &auto.token_maps,
+        std::time::SystemTime::now(),
+        TOKEN_MAP_RETENTION,
+    );
     let token_map = auto.token_maps.join(token_map_name(&request.id, now_secs));
-    let about = format!("log request {} of {}", super::short_id(&request.id), request.requester);
+    let about = format!(
+        "log request {} of {}",
+        super::short_id(&request.id),
+        request.requester
+    );
     log_export::write_token_map(&token_map, &about, &sealed.token_map)?;
     let sha256 = Sha256::digest(&sealed.sealed).to_vec();
-    Ok(AutoBundle { sealed: sealed.sealed, sha256, token_map, lines_kept: sealed.lines_kept })
+    Ok(AutoBundle {
+        sealed: sealed.sealed,
+        sha256,
+        token_map,
+        lines_kept: sealed.lines_kept,
+    })
 }
 
 #[cfg(test)]
@@ -297,30 +406,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let now = std::time::SystemTime::now();
         let old = now - TOKEN_MAP_RETENTION - std::time::Duration::from_secs(60);
-        for (name, at) in [("log-request-aa-1.map.txt", old), ("log-request-bb-2.map.txt", now), ("notes.txt", old)] {
+        for (name, at) in [
+            ("log-request-aa-1.map.txt", old),
+            ("log-request-bb-2.map.txt", now),
+            ("notes.txt", old),
+        ] {
             let file = std::fs::File::create(dir.path().join(name)).unwrap();
             file.set_modified(at).unwrap();
         }
         assert_eq!(prune_token_maps(dir.path(), now, TOKEN_MAP_RETENTION), 1);
         assert!(!dir.path().join("log-request-aa-1.map.txt").exists());
-        assert!(dir.path().join("log-request-bb-2.map.txt").exists() && dir.path().join("notes.txt").exists());
-        assert_eq!(prune_token_maps(&dir.path().join("absent"), now, TOKEN_MAP_RETENTION), 0);
-        assert_eq!(token_map_name(&[0xab; 16], 1_792_000_000), "log-request-abababab-20261014T174640Z.map.txt");
+        assert!(
+            dir.path().join("log-request-bb-2.map.txt").exists()
+                && dir.path().join("notes.txt").exists()
+        );
+        assert_eq!(
+            prune_token_maps(&dir.path().join("absent"), now, TOKEN_MAP_RETENTION),
+            0
+        );
+        assert_eq!(
+            token_map_name(&[0xab; 16], 1_792_000_000),
+            "log-request-abababab-20261014T174640Z.map.txt"
+        );
     }
 
     /// An export over its cap and a sealed bundle over it are both told
     /// apart from other failures, through the export's I/O errors too.
     #[test]
     fn an_oversized_bundle_is_told_apart_from_other_failures() {
-        let mut capped = Capped { data: Vec::new(), cap: 4 };
+        let mut capped = Capped {
+            data: Vec::new(),
+            cap: 4,
+        };
         assert!(capped.write_all(b"1234").is_ok());
         let io = capped.write_all(b"5").unwrap_err();
         assert!(io.to_string().contains("maxBundleBytes (4 bytes)"), "{io}");
         assert!(is_too_large(&anyhow::Error::from(io).context("export")));
-        let sealed = anyhow::Error::from(TooLarge { cap: 65_536, sealed: Some(70_000) });
-        assert!(is_too_large(&sealed) && sealed.to_string().contains("has 70000 bytes"), "{sealed}");
+        let sealed = anyhow::Error::from(TooLarge {
+            cap: 65_536,
+            sealed: Some(70_000),
+        });
+        assert!(
+            is_too_large(&sealed) && sealed.to_string().contains("has 70000 bytes"),
+            "{sealed}"
+        );
         assert!(!is_too_large(&anyhow::anyhow!("read .log: not found")));
-        assert!(!is_too_large(&anyhow::Error::from(std::io::Error::other("disk full"))));
+        assert!(!is_too_large(&anyhow::Error::from(std::io::Error::other(
+            "disk full"
+        ))));
     }
 
     /// A request's bundle holds what `node log export` makes of its window,
@@ -328,22 +461,50 @@ mod tests {
     #[test]
     fn a_request_export_seals_to_its_key_within_the_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let line = |time: &str, message: &str| format!("2026-10-14T{time}Z\tinfo\tquil_node/src/main.rs:7\t{message}\t{{}}\n");
-        std::fs::write(dir.path().join("master.log"), [line("11:00:00", "early"), line("12:30:00", "inside")].concat()).unwrap();
+        let line = |time: &str, message: &str| {
+            format!("2026-10-14T{time}Z\tinfo\tquil_node/src/main.rs:7\t{message}\t{{}}\n")
+        };
+        std::fs::write(
+            dir.path().join("master.log"),
+            [line("11:00:00", "early"), line("12:30:00", "inside")].concat(),
+        )
+        .unwrap();
         let selection = request_selection(1_791_979_200, 1_791_986_400, &[]).unwrap();
-        assert!(request_selection(5, 5, &[]).is_err() && request_selection(u64::MAX, u64::MAX, &[]).is_err());
+        assert!(
+            request_selection(5, 5, &[]).is_err()
+                && request_selection(u64::MAX, u64::MAX, &[]).is_err()
+        );
         let export = || {
-            let (readers, names) = log_export::file_readers(dir.path(), selection.since, selection.until).unwrap();
-            request_export(readers, None, &SourceInfo::Files(names), &selection, &[0x3f; 16], "…Ab12cd", Approval::Automatic, 1 << 20,
-                &ExportOptions::default())
-                .unwrap()
+            let (readers, names) =
+                log_export::file_readers(dir.path(), selection.since, selection.until).unwrap();
+            request_export(
+                readers,
+                None,
+                &SourceInfo::Files(names),
+                &selection,
+                &[0x3f; 16],
+                "…Ab12cd",
+                Approval::Automatic,
+                1 << 20,
+                &ExportOptions::default(),
+            )
+            .unwrap()
         };
         let kem = quil_crypto::Sntrup761KeyPair::generate();
         let sealed = seal_export(export(), &[0x3f; 16], &kem.public, 1 << 20).unwrap();
         assert_eq!(sealed.lines_kept, 1);
-        let files = unpack_bundle(&quil_crypto::seal::open(&sealed.sealed, &kem.secret, &[0x3f; 16]).unwrap()).unwrap();
+        let files = unpack_bundle(
+            &quil_crypto::seal::open(&sealed.sealed, &kem.secret, &[0x3f; 16]).unwrap(),
+        )
+        .unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&files[1]).unwrap();
-        assert_eq!((manifest["request"]["approval"].as_str(), manifest["lines"]["kept"].as_u64()), (Some("automatic"), Some(1)));
+        assert_eq!(
+            (
+                manifest["request"]["approval"].as_str(),
+                manifest["lines"]["kept"].as_u64()
+            ),
+            (Some("automatic"), Some(1))
+        );
         let small = export().out.data.len();
         let refused = seal_export(export(), &[0x3f; 16], &kem.public, small).unwrap_err();
         assert!(is_too_large(&refused), "{refused}");
@@ -365,8 +526,15 @@ mod tests {
             line("12:20:00", "warn", "store open failed", r#"{"error":"open /home/alice/quil/.config/store: denied"}"#),
             line("12:30:00", "info", "other shard", r#"{"filter":"b2b2"}"#),
         ].concat()).unwrap();
-        std::fs::write(log_dir.join("worker-1.log"), line("12:15:00", "info", "peer /ip4/198.51.100.7/tcp/8336", "{}")).unwrap();
-        let auto = AutoApproval { log_dir: log_dir.clone(), token_maps: dir.path().join("maps") };
+        std::fs::write(
+            log_dir.join("worker-1.log"),
+            line("12:15:00", "info", "peer /ip4/198.51.100.7/tcp/8336", "{}"),
+        )
+        .unwrap();
+        let auto = AutoApproval {
+            log_dir: log_dir.clone(),
+            token_maps: dir.path().join("maps"),
+        };
         let kem = quil_crypto::Sntrup761KeyPair::generate();
         let request = AutoRequest {
             id: vec![0x3f; 16],
@@ -377,32 +545,86 @@ mod tests {
             recipient_kem_public_key: kem.public.clone(),
         };
         let salt = Some([5u8; 32]);
-        let built = build_automatic(&auto, &request, 1 << 20, 1_791_986_400, &AtomicBool::new(false), salt).unwrap();
-        let files = unpack_bundle(&quil_crypto::seal::open(&built.sealed, &kem.secret, &request.id).unwrap()).unwrap();
+        let built = build_automatic(
+            &auto,
+            &request,
+            1 << 20,
+            1_791_986_400,
+            &AtomicBool::new(false),
+            salt,
+        )
+        .unwrap();
+        let files = unpack_bundle(
+            &quil_crypto::seal::open(&built.sealed, &kem.secret, &request.id).unwrap(),
+        )
+        .unwrap();
 
-        let selection = request_selection(request.since_unix, request.until_unix, &request.filters).unwrap();
-        let (readers, names) = log_export::file_readers(&log_dir, selection.since, selection.until).unwrap();
+        let selection =
+            request_selection(request.since_unix, request.until_unix, &request.filters).unwrap();
+        let (readers, names) =
+            log_export::file_readers(&log_dir, selection.since, selection.until).unwrap();
         let home_paths = [auto.log_dir.clone(), auto.token_maps.clone()];
-        let options = ExportOptions { salt, home_paths: &home_paths, ..ExportOptions::default() };
-        let manual = request_export(readers, None, &SourceInfo::Files(names), &selection, &request.id, "…Ab12cd", Approval::Operator,
-            1 << 20, &options).unwrap();
+        let options = ExportOptions {
+            salt,
+            home_paths: &home_paths,
+            ..ExportOptions::default()
+        };
+        let manual = request_export(
+            readers,
+            None,
+            &SourceInfo::Files(names),
+            &selection,
+            &request.id,
+            "…Ab12cd",
+            Approval::Operator,
+            1 << 20,
+            &options,
+        )
+        .unwrap();
         let text = |gz: &[u8]| {
             let mut text = String::new();
-            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut text).unwrap();
+            std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut text)
+                .unwrap();
             text
         };
         let (automatic_text, manual_text) = (text(&files[0]), text(&manual.out.data));
         assert_eq!(automatic_text, manual_text, "the same redacted records");
-        assert_eq!(automatic_text.lines().count(), 2, "the filter's line and the warning: {automatic_text}");
-        assert!(!automatic_text.contains("192.0.2.10") && !automatic_text.contains("alice"), "{automatic_text}");
-        let map: BTreeMap<String, String> = std::fs::read_to_string(&built.token_map).unwrap().lines().skip(1)
-            .filter_map(|l| l.split_once('\t')).map(|(t, v)| (t.to_string(), v.to_string())).collect();
+        assert_eq!(
+            automatic_text.lines().count(),
+            2,
+            "the filter's line and the warning: {automatic_text}"
+        );
+        assert!(
+            !automatic_text.contains("192.0.2.10") && !automatic_text.contains("alice"),
+            "{automatic_text}"
+        );
+        let map: BTreeMap<String, String> = std::fs::read_to_string(&built.token_map)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(t, v)| (t.to_string(), v.to_string()))
+            .collect();
         assert_eq!(map, manual.token_map, "the same token map");
 
         let maps_before = std::fs::read_dir(&auto.token_maps).unwrap().count();
-        let error = build_automatic(&auto, &AutoRequest { id: vec![0x3e; 16], ..request }, 1 << 20, 1_791_986_401,
-            &AtomicBool::new(true), salt).unwrap_err();
+        let error = build_automatic(
+            &auto,
+            &AutoRequest {
+                id: vec![0x3e; 16],
+                ..request
+            },
+            1 << 20,
+            1_791_986_401,
+            &AtomicBool::new(true),
+            salt,
+        )
+        .unwrap_err();
         assert!(log_export::is_cancelled(&error), "{error:#}");
-        assert_eq!(std::fs::read_dir(&auto.token_maps).unwrap().count(), maps_before, "no token map of a cancelled export");
+        assert_eq!(
+            std::fs::read_dir(&auto.token_maps).unwrap().count(),
+            maps_before,
+            "no token map of a cancelled export"
+        );
     }
 }

@@ -66,17 +66,18 @@ impl DirectGlobalConsensusPublisher {
             let self_id = self.self_peer_id.clone();
             let bm = bitmask.clone();
             let d = data.clone();
-            self.spawner.detach("direct-consensus-loopback", async move {
-                let _ = lb
-                    .send(quil_p2p::node::ReceivedMessage {
-                        bitmask: bm,
-                        data: d,
-                        from: self_id,
-                        direct: false,
-                    })
-                    .await;
-                Ok(())
-            });
+            self.spawner
+                .detach("direct-consensus-loopback", async move {
+                    let _ = lb
+                        .send(quil_p2p::node::ReceivedMessage {
+                            bitmask: bm,
+                            data: d,
+                            from: self_id,
+                            direct: false,
+                        })
+                        .await;
+                    Ok(())
+                });
         }
 
         let pool = self.pool.clone();

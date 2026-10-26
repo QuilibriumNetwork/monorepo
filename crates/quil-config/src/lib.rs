@@ -104,7 +104,9 @@ fn parse_go_duration_ms(s: &str) -> Result<u64, String> {
         let unit = &after_num[..unit_end];
         remaining = &after_num[unit_end..];
 
-        let value: f64 = num_str.parse().map_err(|_| format!("invalid number in duration: {}", s))?;
+        let value: f64 = num_str
+            .parse()
+            .map_err(|_| format!("invalid number in duration: {}", s))?;
 
         let ms = match unit {
             "ns" => value / 1_000_000.0,
@@ -115,7 +117,11 @@ fn parse_go_duration_ms(s: &str) -> Result<u64, String> {
             "h" => value * 3_600_000.0,
             "" => {
                 // No unit — treat as nanoseconds if large, ms otherwise
-                if value > 1_000_000.0 { value / 1_000_000.0 } else { value }
+                if value > 1_000_000.0 {
+                    value / 1_000_000.0
+                } else {
+                    value
+                }
             }
             _ => return Err(format!("unknown duration unit '{}' in: {}", unit, s)),
         };
@@ -189,8 +195,7 @@ pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNoti
         config.apply_defaults();
 
         // Set keys path to <config_dir>/keys.yml (matching Go)
-        config.key.key_store_file.path =
-            config_dir.join("keys.yml").to_string_lossy().to_string();
+        config.key.key_store_file.path = config_dir.join("keys.yml").to_string_lossy().to_string();
 
         // Generate random encryption key (matching Go)
         let mut key_bytes = [0u8; 32];
@@ -223,13 +228,15 @@ pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNoti
     config.apply_defaults();
     let notices = ConfigNotices {
         unused_keys: unused_keys(&contents),
-        replaced_bootstrap_peers: replaced_mainnet_bootstrap_peers(config.p2p.network, &configured_bootstrap_peers),
+        replaced_bootstrap_peers: replaced_mainnet_bootstrap_peers(
+            config.p2p.network,
+            &configured_bootstrap_peers,
+        ),
     };
 
     // Fill in defaults for keys path if empty (matching Go)
     if config.key.key_store_file.path.is_empty() {
-        config.key.key_store_file.path =
-            config_dir.join("keys.yml").to_string_lossy().to_string();
+        config.key.key_store_file.path = config_dir.join("keys.yml").to_string_lossy().to_string();
     }
     if config.db.path.is_empty() {
         config.db.path = config_dir.join("store").to_string_lossy().to_string();
@@ -239,8 +246,7 @@ pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNoti
     // That value is cwd-relative and lands worker stores outside the
     // config dir. Promote it to `<config_dir>/worker-store/%d` so it
     // mirrors Go's `LoadConfig` write-time default.
-    if config.db.worker_path_prefix.is_empty()
-        || config.db.worker_path_prefix == "worker-store/%d"
+    if config.db.worker_path_prefix.is_empty() || config.db.worker_path_prefix == "worker-store/%d"
     {
         config.db.worker_path_prefix = config_dir
             .join("worker-store")
@@ -307,7 +313,10 @@ mod tests {
     fn an_empty_grpc_listener_means_the_local_default() {
         let mut c = Config::default();
         c.listen_grpc_multiaddr.clear();
-        assert_eq!(c.effective_listen_grpc_multiaddr(), "/ip4/127.0.0.1/tcp/8337");
+        assert_eq!(
+            c.effective_listen_grpc_multiaddr(),
+            "/ip4/127.0.0.1/tcp/8337"
+        );
         c.listen_grpc_multiaddr = "/ip4/0.0.0.0/tcp/8337".into();
         assert_eq!(c.effective_listen_grpc_multiaddr(), "/ip4/0.0.0.0/tcp/8337");
     }
@@ -365,20 +374,17 @@ rewardStrategy: ""
         assert_eq!(absent.archive_blacklist_ttl_secs, 60);
 
         // Explicit 0 → default.
-        let mut zero: EngineConfig =
-            serde_yaml::from_str("archiveBlacklistTtl: 0").unwrap();
+        let mut zero: EngineConfig = serde_yaml::from_str("archiveBlacklistTtl: 0").unwrap();
         zero.apply_defaults();
         assert_eq!(zero.archive_blacklist_ttl_secs, 60);
 
         // -1 (disabled) → preserved.
-        let mut disabled: EngineConfig =
-            serde_yaml::from_str("archiveBlacklistTtl: -1").unwrap();
+        let mut disabled: EngineConfig = serde_yaml::from_str("archiveBlacklistTtl: -1").unwrap();
         disabled.apply_defaults();
         assert_eq!(disabled.archive_blacklist_ttl_secs, -1);
 
         // Positive value → preserved.
-        let mut custom: EngineConfig =
-            serde_yaml::from_str("archiveBlacklistTtl: 30").unwrap();
+        let mut custom: EngineConfig = serde_yaml::from_str("archiveBlacklistTtl: 30").unwrap();
         custom.apply_defaults();
         assert_eq!(custom.archive_blacklist_ttl_secs, 30);
     }
@@ -463,12 +469,8 @@ rewardStrategy: "custom-strategy"
     #[test]
     fn yaml_round_trip_preserves_vec_fields() {
         let mut c = Config::default();
-        c.engine.data_worker_filters =
-            vec!["shard-a".into(), "shard-b".into(), "shard-c".into()];
-        c.p2p.bootstrap_peers = vec![
-            "/ip4/1.2.3.4/tcp/100".into(),
-            "/ip4/5.6.7.8/tcp/200".into(),
-        ];
+        c.engine.data_worker_filters = vec!["shard-a".into(), "shard-b".into(), "shard-c".into()];
+        c.p2p.bootstrap_peers = vec!["/ip4/1.2.3.4/tcp/100".into(), "/ip4/5.6.7.8/tcp/200".into()];
 
         let yaml = serde_yaml::to_string(&c).unwrap();
         let c2: Config = serde_yaml::from_str(&yaml).unwrap();
@@ -492,9 +494,14 @@ rewardStrategy: "custom-strategy"
             "/dns4/quinoa.quilibrium.com/udp/8336/quic-v1/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH".into(),
         ];
         c.apply_defaults();
-        let expected: Vec<String> =
-            crate::MAINNET_BOOTSTRAP_PEERS.iter().map(|s| s.to_string()).collect();
-        assert_eq!(c.p2p.bootstrap_peers, expected, "mainnet must force the archive list");
+        let expected: Vec<String> = crate::MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            c.p2p.bootstrap_peers, expected,
+            "mainnet must force the archive list"
+        );
         assert!(
             c.p2p
                 .bootstrap_peers
@@ -503,7 +510,10 @@ rewardStrategy: "custom-strategy"
             "must contain the Falcon archive peer IDs"
         );
         assert!(
-            !c.p2p.bootstrap_peers.iter().any(|p| p.contains("quinoa.quilibrium.com")),
+            !c.p2p
+                .bootstrap_peers
+                .iter()
+                .any(|p| p.contains("quinoa.quilibrium.com")),
             "the stale quinoa/qualia hosts must be gone"
         );
 
@@ -512,7 +522,10 @@ rewardStrategy: "custom-strategy"
         t.p2p.network = 7;
         t.p2p.bootstrap_peers = vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".into()];
         t.apply_defaults();
-        assert_eq!(t.p2p.bootstrap_peers, vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".to_string()]);
+        assert_eq!(
+            t.p2p.bootstrap_peers,
+            vec!["/ip4/10.0.0.1/udp/8336/quic-v1/p2p/QmTest".to_string()]
+        );
     }
 
     #[test]
@@ -564,7 +577,7 @@ engine:
         // Generates a random encryption key
         assert!(!c.key.key_store_file.encryption_key.is_empty());
         assert_eq!(c.key.key_store_file.encryption_key.len(), 64); // 32 bytes hex
-        // Sets keys path
+                                                                   // Sets keys path
         assert!(c.key.key_store_file.path.contains("keys.yml"));
         // Sets DB path
         assert!(c.db.path.contains("store"));
@@ -726,16 +739,30 @@ p2p:
     fn loads_actual_go_config_file() {
         // Test loading the real Go-generated config at node/.config-rust/
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
+            .parent()
+            .unwrap()
             .join("quil-node")
-            .join("..").join("..").join("node").join(".config-rust");
+            .join("..")
+            .join("..")
+            .join("node")
+            .join(".config-rust");
         if config_path.join("config.yml").exists() {
             let result = load_config(&config_path);
-            assert!(result.is_ok(), "failed to load Go config: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "failed to load Go config: {:?}",
+                result.err()
+            );
             let config = result.unwrap();
             // Verify it loaded meaningful data
-            assert!(!config.p2p.peer_priv_key.is_empty(), "peer key should be set");
-            assert!(!config.p2p.bootstrap_peers.is_empty(), "bootstrap peers should be set");
+            assert!(
+                !config.p2p.peer_priv_key.is_empty(),
+                "peer key should be set"
+            );
+            assert!(
+                !config.p2p.bootstrap_peers.is_empty(),
+                "bootstrap peers should be set"
+            );
         }
     }
 
@@ -747,10 +774,19 @@ p2p:
     /// only when a non-empty configured list differs from the built-in one.
     #[test]
     fn a_replaced_mainnet_bootstrap_list_is_reported_when_it_differs() {
-        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS.iter().map(|peer| peer.to_string()).collect();
-        let stale = vec!["/ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale".to_string(), built_in[0].clone()];
+        let built_in: Vec<String> = MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|peer| peer.to_string())
+            .collect();
+        let stale = vec![
+            "/ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale".to_string(),
+            built_in[0].clone(),
+        ];
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &stale), Some(2));
-        assert_eq!(replaced_mainnet_bootstrap_peers(0, &built_in[1..]), Some(built_in.len() - 1));
+        assert_eq!(
+            replaced_mainnet_bootstrap_peers(0, &built_in[1..]),
+            Some(built_in.len() - 1)
+        );
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &[]), None);
         assert_eq!(replaced_mainnet_bootstrap_peers(0, &built_in), None);
         let mut reordered = built_in.clone();
@@ -770,7 +806,10 @@ p2p:
                 built_in.len()
             )
         );
-        assert_eq!((notices.unknown_keys_line(), notices.retired_keys_line()), (None, None));
+        assert_eq!(
+            (notices.unknown_keys_line(), notices.retired_keys_line()),
+            (None, None)
+        );
         std::fs::write(dir.join("config.yml"), "p2p:\n  network: 2\n  bootstrapPeers:\n    - /ip4/192.0.2.1/udp/8336/quic-v1/p2p/QmStale\n").unwrap();
         let (_, notices) = load_config_with_notices(&dir).unwrap();
         assert_eq!(notices, ConfigNotices::default());
@@ -782,11 +821,18 @@ p2p:
     #[test]
     fn load_config_reports_unused_keys() {
         let dir = tempdir("unused_keys_notice");
-        std::fs::write(dir.join("config.yml"), "p2p:\n  network: 1\n  d: 8\n  dLo: 6\nengine:\n  archiveMod: true\n").unwrap();
+        std::fs::write(
+            dir.join("config.yml"),
+            "p2p:\n  network: 1\n  d: 8\n  dLo: 6\nengine:\n  archiveMod: true\n",
+        )
+        .unwrap();
         let (_, notices) = load_config_with_notices(&dir).unwrap();
         assert_eq!(
             notices.unused_keys,
-            vec![UnusedKey::Retired("p2p.d".into()), UnusedKey::Unknown("engine.archiveMod".into())]
+            vec![
+                UnusedKey::Retired("p2p.d".into()),
+                UnusedKey::Unknown("engine.archiveMod".into())
+            ]
         );
         assert_eq!(
             notices.unknown_keys_line().unwrap(),
@@ -798,8 +844,14 @@ p2p:
         );
         let generated = tempdir("unused_keys_generated");
         let _ = std::fs::remove_dir_all(&generated);
-        assert_eq!(load_config_with_notices(&generated).unwrap().1, ConfigNotices::default());
-        assert_eq!(load_config_with_notices(&generated).unwrap().1, ConfigNotices::default());
+        assert_eq!(
+            load_config_with_notices(&generated).unwrap().1,
+            ConfigNotices::default()
+        );
+        assert_eq!(
+            load_config_with_notices(&generated).unwrap().1,
+            ConfigNotices::default()
+        );
         cleanup(&dir);
         cleanup(&generated);
     }
@@ -809,8 +861,16 @@ p2p:
     fn devnet_configs_use_every_key() {
         let configs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../devnet/config");
         let mut loaded = 0;
-        for node in ["archive-1", "archive-2", "archive-3", "archive-4", "client-1", "proxy"] {
-            let contents = std::fs::read_to_string(configs.join(format!("{node}-config/config.yml"))).unwrap();
+        for node in [
+            "archive-1",
+            "archive-2",
+            "archive-3",
+            "archive-4",
+            "client-1",
+            "proxy",
+        ] {
+            let contents =
+                std::fs::read_to_string(configs.join(format!("{node}-config/config.yml"))).unwrap();
             serde_yaml::from_str::<Config>(&contents).unwrap_or_else(|e| panic!("{node}: {e}"));
             assert_eq!(unused_keys(&contents), Vec::new(), "{node}");
             loaded += 1;

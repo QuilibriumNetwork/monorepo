@@ -52,16 +52,27 @@ impl SimplexFalconScheme {
         }
     }
 
-    pub(crate) fn verify_nullify(&self, vote: &commonware_consensus::simplex::types::Nullify<Self>) -> bool {
-        self.generic.verify_attestation::<Self, commonware_cryptography::sha256::Digest>(
-            Subject::Nullify { round: vote.round }, &vote.attestation)
+    pub(crate) fn verify_nullify(
+        &self,
+        vote: &commonware_consensus::simplex::types::Nullify<Self>,
+    ) -> bool {
+        self.generic
+            .verify_attestation::<Self, commonware_cryptography::sha256::Digest>(
+                Subject::Nullify { round: vote.round },
+                &vote.attestation,
+            )
     }
 
     /// Verify one member's NOTARIZE vote for `proposal`, outside the engine:
     /// GLOBAL checks the votes a presence report carries. An attestation whose
     /// signer index lies outside the committee fails.
-    pub fn verify_notarize<D: Digest>(&self, proposal: &Proposal<D>, attestation: &Attestation<Self>) -> bool {
-        self.generic.verify_attestation::<Self, D>(Subject::Notarize { proposal }, attestation)
+    pub fn verify_notarize<D: Digest>(
+        &self,
+        proposal: &Proposal<D>,
+        attestation: &Attestation<Self>,
+    ) -> bool {
+        self.generic
+            .verify_attestation::<Self, D>(Subject::Notarize { proposal }, attestation)
     }
 
     /// Verify a FINALIZATION certificate over `proposal` against this committee.
@@ -99,7 +110,8 @@ impl Verifier for SimplexFalconScheme {
         D: Digest,
         M: Faults,
     {
-        self.generic.verify_certificate::<Self, D, M>(subject, certificate)
+        self.generic
+            .verify_certificate::<Self, D, M>(subject, certificate)
     }
 
     fn verify_certificates<'a, R, D, I, M>(
@@ -115,7 +127,10 @@ impl Verifier for SimplexFalconScheme {
         M: Faults,
     {
         for (subject, certificate) in certificates {
-            if !self.generic.verify_certificate::<Self, D, M>(subject, certificate) {
+            if !self
+                .generic
+                .verify_certificate::<Self, D, M>(subject, certificate)
+            {
                 return false;
             }
         }
@@ -156,7 +171,8 @@ impl Scheme for SimplexFalconScheme {
         R: CryptoRng,
         D: Digest,
     {
-        self.generic.verify_attestation::<Self, D>(subject, attestation)
+        self.generic
+            .verify_attestation::<Self, D>(subject, attestation)
     }
     fn verify_attestations<R, D, I>(
         &self,
@@ -171,9 +187,14 @@ impl Scheme for SimplexFalconScheme {
         I: IntoIterator<Item = Attestation<Self>>,
         I::IntoIter: Send,
     {
-        self.generic.verify_attestations::<Self, D, _>(subject, attestations)
+        self.generic
+            .verify_attestations::<Self, D, _>(subject, attestations)
     }
-    fn assemble<I, M>(&self, attestations: I, _strategy: &impl Strategy) -> Option<Self::Certificate>
+    fn assemble<I, M>(
+        &self,
+        attestations: I,
+        _strategy: &impl Strategy,
+    ) -> Option<Self::Certificate>
     where
         I: IntoIterator<Item = Attestation<Self>>,
         I::IntoIter: Send,
@@ -211,7 +232,9 @@ mod tests {
     /// copy the committee or the signing key.
     #[test]
     fn clones_share_the_committee_and_key() {
-        let keys: Vec<_> = (0..4).map(|_| FalconPrivateKey::random(test_rng())).collect();
+        let keys: Vec<_> = (0..4)
+            .map(|_| FalconPrivateKey::random(test_rng()))
+            .collect();
         let participants: Set<FalconPublicKey> = keys
             .iter()
             .map(commonware_cryptography::Signer::public_key)

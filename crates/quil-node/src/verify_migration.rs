@@ -66,15 +66,13 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
     let registry_dyn: Arc<dyn quil_types::consensus::ProverRegistry> = registry.clone();
 
     let mut failures = 0usize;
-    let mut run = |name: &str, f: &mut dyn FnMut() -> anyhow::Result<Outcome>| {
-        match f() {
-            Ok(Outcome::Pass(detail)) => println!("  [PASS] {name:<32} {detail}"),
-            Ok(Outcome::Warn(detail)) => println!("  [WARN] {name:<32} {detail}"),
-            Ok(Outcome::Skip(reason)) => println!("  [SKIP] {name:<32} ({reason})"),
-            Err(e) => {
-                failures += 1;
-                println!("  [FAIL] {name:<32} {e}");
-            }
+    let mut run = |name: &str, f: &mut dyn FnMut() -> anyhow::Result<Outcome>| match f() {
+        Ok(Outcome::Pass(detail)) => println!("  [PASS] {name:<32} {detail}"),
+        Ok(Outcome::Warn(detail)) => println!("  [WARN] {name:<32} {detail}"),
+        Ok(Outcome::Skip(reason)) => println!("  [SKIP] {name:<32} ({reason})"),
+        Err(e) => {
+            failures += 1;
+            println!("  [FAIL] {name:<32} {e}");
         }
     };
 
@@ -113,7 +111,9 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
             .and_then(|f| f.header.as_ref())
             .map(|h| h.frame_number);
         match latest_n {
-            None => run("trie roots", &mut || Ok(Outcome::Skip("no global frames".into()))),
+            None => run("trie roots", &mut || {
+                Ok(Outcome::Skip("no global frames".into()))
+            }),
             Some(n) => {
                 // Accumulate each shard's LATEST stored 0xE0 commit over a
                 // lookback window (per-shard commit cadence varies; an
@@ -137,7 +137,9 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
 
                 if shard_commit.is_empty() {
                     run("trie roots", &mut || {
-                        Ok(Outcome::Skip(format!("no shard commits in frames {lo}..={n}")))
+                        Ok(Outcome::Skip(format!(
+                            "no shard commits in frames {lo}..={n}"
+                        )))
                     });
                 } else {
                     let mut shards: Vec<(ShardKey, (u64, Vec<Vec<u8>>))> =
@@ -274,7 +276,8 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
         if head_is_legacy {
             return Ok(Outcome::Skip(
                 "legacy (pre-migration) head frame — BLS-signed over the old committee; \
-                 Falcon/committee validation N/A until the first Rust-produced frame".into(),
+                 Falcon/committee validation N/A until the first Rust-produced frame"
+                    .into(),
             ));
         }
         let validator = quil_engine::frame_validator::BlsGlobalFrameValidator::new(
@@ -334,10 +337,8 @@ pub fn run_verify_db(db_path: &Path, config: &quil_config::Config) -> anyhow::Re
                 for r in &rows {
                     match quil_engine::app_shard_metadata::get_app_shard_metadata(&crdt, r) {
                         Some(m) => {
-                            let size = num_bigint::BigInt::from_bytes_be(
-                                num_bigint::Sign::Plus,
-                                &m.size,
-                            );
+                            let size =
+                                num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &m.size);
                             total_size += &size;
                             let va = &m.commitments[0]; // vertex_adds commitment
                             let commit = if va.iter().all(|&b| b == 0) {

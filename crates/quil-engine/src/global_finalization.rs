@@ -141,7 +141,8 @@ struct State {
 /// Brings an archive's application state to the point the GLOBAL frame about
 /// to execute requires: every shard's frames through the highest one the frame
 /// references. `Ok(false)` while a needed application frame is missing.
-pub type SequencedIngest = Arc<dyn Fn(&GlobalFrame) -> quil_types::error::Result<bool> + Send + Sync>;
+pub type SequencedIngest =
+    Arc<dyn Fn(&GlobalFrame) -> quil_types::error::Result<bool> + Send + Sync>;
 
 pub struct GlobalFinalizationPipeline {
     executor: Arc<GlobalParentExecutor>,
@@ -180,7 +181,9 @@ impl GlobalFinalizationPipeline {
 
     /// Apply the sequenced ingest `frame` requires. False: wait and retry.
     pub fn ingest_before(&self, frame: &GlobalFrame) -> bool {
-        let Some(ingest) = self.sequenced_ingest.as_ref() else { return true };
+        let Some(ingest) = self.sequenced_ingest.as_ref() else {
+            return true;
+        };
         match ingest(frame) {
             Ok(ready) => ready,
             Err(error) => {
@@ -197,7 +200,9 @@ impl GlobalFinalizationPipeline {
     fn lock(&self) -> MutexGuard<'_, State> {
         // The state is a cache over durable candidates; no invariant spans a
         // panic, so recover from poisoning instead of halting finalization.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Queue a certified body the finalizer has already made durable. The
@@ -245,10 +250,7 @@ impl GlobalFinalizationPipeline {
             return false;
         };
         if !self.admits(header.frame_number)
-            || self
-                .verifier
-                .global_finalization_parent(header)
-                .is_none()
+            || self.verifier.global_finalization_parent(header).is_none()
         {
             return false;
         }
@@ -273,15 +275,21 @@ impl GlobalFinalizationPipeline {
     /// Whether the clock already holds `frame`'s body as a certified candidate
     /// under its identity.
     fn holds_certified_candidate(&self, frame: &GlobalFrame) -> bool {
-        let Some(header) = frame.header.as_ref() else { return false };
-        let Ok(identity) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
+        let Ok(identity) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return false;
+        };
         self.clock
             .get_global_clock_frame_candidate(header.frame_number, &identity)
             .is_ok_and(|stored| {
                 stored.requests == frame.requests
                     && stored.header.as_ref().is_some_and(|h| {
                         h.frame_number == header.frame_number
-                            && h.public_key_signature_bls48581.as_ref().is_some_and(|s| !s.signature.is_empty())
+                            && h.public_key_signature_bls48581
+                                .as_ref()
+                                .is_some_and(|s| !s.signature.is_empty())
                     })
             })
     }
@@ -295,11 +303,15 @@ impl GlobalFinalizationPipeline {
     /// the certificate or admission fails; the caller then stores them
     /// canonically as before.
     pub fn offer_synced_chain(&self, chain: &[GlobalFrame]) -> bool {
-        let Some((top, ancestors)) = chain.split_last() else { return false };
+        let Some((top, ancestors)) = chain.split_last() else {
+            return false;
+        };
         if ancestors.is_empty() {
             return self.offer_synced(top);
         }
-        let Some(header) = top.header.as_ref() else { return false };
+        let Some(header) = top.header.as_ref() else {
+            return false;
+        };
         if !self.admits(header.frame_number)
             || self.verifier.global_finalization_parent(header).is_none()
         {
@@ -307,12 +319,16 @@ impl GlobalFinalizationPipeline {
         }
         let mut child = top;
         for parent in ancestors.iter().rev() {
-            let (Some(child_header), Some(parent_header)) = (child.header.as_ref(), parent.header.as_ref()) else {
+            let (Some(child_header), Some(parent_header)) =
+                (child.header.as_ref(), parent.header.as_ref())
+            else {
                 return false;
             };
-            let links = parent_header.frame_number.checked_add(1) == Some(child_header.frame_number)
-                && quil_crypto::poseidon::hash_bytes_to_32(&parent_header.output)
-                    .is_ok_and(|identity| identity.as_slice() == child_header.parent_selector.as_slice());
+            let links = parent_header.frame_number.checked_add(1)
+                == Some(child_header.frame_number)
+                && quil_crypto::poseidon::hash_bytes_to_32(&parent_header.output).is_ok_and(
+                    |identity| identity.as_slice() == child_header.parent_selector.as_slice(),
+                );
             if !links || !self.admits(parent_header.frame_number) {
                 return false;
             }
@@ -413,20 +429,31 @@ impl GlobalFinalizationPipeline {
             return FinalizationStep::Retry(self.limits.retry);
         }
         if max_attempts == 0 {
-            let implied = implied.as_ref().map(|(chain, descendant)| (chain.as_slice(), descendant));
-            return match self.executor.authenticate_for_legacy(&frame, implied, &self.verifier) {
+            let implied = implied
+                .as_ref()
+                .map(|(chain, descendant)| (chain.as_slice(), descendant));
+            return match self
+                .executor
+                .authenticate_for_legacy(&frame, implied, &self.verifier)
+            {
                 Ok(()) => self.legacy_quietly(next, &frame),
                 Err(error) => self.reject(next, frame, error),
             };
         }
         let attempt = match implied.as_ref() {
             None => self.executor.attempt_finalization(&frame, &self.verifier),
-            Some((chain, descendant)) => {
-                self.executor.attempt_implied_finalization(&frame, chain, descendant, &self.verifier)
-            }
+            Some((chain, descendant)) => self.executor.attempt_implied_finalization(
+                &frame,
+                chain,
+                descendant,
+                &self.verifier,
+            ),
         };
         if implied.is_some() && matches!(attempt, GlobalFinalizationAttempt::Published(_)) {
-            tracing::info!(frame = next, "GLOBAL ancestor finalized by a certified descendant");
+            tracing::info!(
+                frame = next,
+                "GLOBAL ancestor finalized by a certified descendant"
+            );
         }
         match attempt {
             GlobalFinalizationAttempt::Published(result) => {
@@ -476,12 +503,19 @@ impl GlobalFinalizationPipeline {
                     %error,
                     "atomic GLOBAL finalization unavailable; retrying"
                 );
-                FinalizationStep::Retry(self.limits.retry.saturating_mul(1 << (attempts - 1).min(8)))
+                FinalizationStep::Retry(
+                    self.limits.retry.saturating_mul(1 << (attempts - 1).min(8)),
+                )
             }
         }
     }
 
-    fn reject(&self, next: u64, frame: GlobalFrame, error: quil_types::error::QuilError) -> FinalizationStep {
+    fn reject(
+        &self,
+        next: u64,
+        frame: GlobalFrame,
+        error: quil_types::error::QuilError,
+    ) -> FinalizationStep {
         tracing::error!(
             frame = next,
             %error,
@@ -511,7 +545,10 @@ impl GlobalFinalizationPipeline {
     fn legacy_quietly(&self, next: u64, frame: &GlobalFrame) -> FinalizationStep {
         let step = self.write_canonical(next, frame);
         if matches!(step, FinalizationStep::Legacy) {
-            tracing::debug!(frame = next, "GLOBAL execution trails the head; finalized frame executes in place");
+            tracing::debug!(
+                frame = next,
+                "GLOBAL execution trails the head; finalized frame executes in place"
+            );
         }
         step
     }
@@ -556,10 +593,7 @@ impl GlobalFinalizationPipeline {
                     frame.header.as_ref().is_some_and(|h| {
                         h.frame_number > next
                             && !rejected.contains(&(h.frame_number, h.output.clone()))
-                            && self
-                                .verifier
-                                .global_finalization_parent(h)
-                                .is_some()
+                            && self.verifier.global_finalization_parent(h).is_some()
                     })
                 })
                 .min_by_key(|frame| frame.header.as_ref().map_or(u64::MAX, |h| h.frame_number))
@@ -587,7 +621,10 @@ impl GlobalFinalizationPipeline {
     /// A certified candidate the finalizer persisted before a restart or a
     /// queue eviction. Unfinalized (certificate-less) candidates are ignored.
     fn load_durable(&self, next: u64) -> Option<GlobalFrame> {
-        let candidates = match self.clock.range_global_clock_frame_candidates(next, next, 8) {
+        let candidates = match self
+            .clock
+            .range_global_clock_frame_candidates(next, next, 8)
+        {
             Ok(candidates) => candidates,
             Err(error) => {
                 tracing::debug!(frame = next, %error, "GLOBAL candidate scan failed");
@@ -599,10 +636,7 @@ impl GlobalFinalizationPipeline {
             frame.header.as_ref().is_some_and(|h| {
                 h.frame_number == next
                     && !rejected.contains(&(next, h.output.clone()))
-                    && self
-                        .verifier
-                        .global_finalization_parent(h)
-                        .is_some()
+                    && self.verifier.global_finalization_parent(h).is_some()
             })
         })?;
         self.offer(frame.clone());

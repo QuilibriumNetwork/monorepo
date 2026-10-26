@@ -79,7 +79,11 @@ pub(crate) fn handle_diagnostic_flags(
         println!("Version: {}", quil_config::display_version());
         println!("Peer ID: {}", peer_id_b58);
         println!("Prover Address: {}", hex::encode(&prover_address));
-        println!("BLS Public Key: {}...{}", hex::encode(&bls_pubkey[..8]), hex::encode(&bls_pubkey[bls_pubkey.len()-8..]));
+        println!(
+            "BLS Public Key: {}...{}",
+            hex::encode(&bls_pubkey[..8]),
+            hex::encode(&bls_pubkey[bls_pubkey.len() - 8..])
+        );
         println!("Frame Number: {}", frame_number);
         println!("Network: {}", args.network);
         return Ok(true);
@@ -138,8 +142,8 @@ fn latest_global_frame_number(db_path: &Path) -> Result<u64, String> {
     if !db_path.exists() {
         return Err(format!("no store at {}", db_path.display()));
     }
-    let secondary_dir = std::env::temp_dir()
-        .join(format!("quil-node-info-secondary-{}", std::process::id()));
+    let secondary_dir =
+        std::env::temp_dir().join(format!("quil-node-info-secondary-{}", std::process::id()));
     std::fs::create_dir_all(&secondary_dir).ok();
     let result = (|| {
         let db = quil_store::RocksDb::open_as_secondary(db_path, &secondary_dir)
@@ -187,8 +191,7 @@ pub(crate) async fn print_metrics_from_node(
                  is the node running, with listenGrpcMultiaddr enabled?"
             )
         })?;
-    let mut client =
-        quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
+    let mut client = quil_types::proto::node::node_service_client::NodeServiceClient::new(channel);
     let resp = client
         .get_metrics(quil_types::proto::node::GetMetricsRequest {
             filter: filter.unwrap_or_default().to_string(),
@@ -204,9 +207,16 @@ pub(crate) async fn print_metrics_from_node(
 /// bind (0.0.0.0) is dialed via loopback; empty/unparseable falls back to
 /// the default gRPC port.
 fn grpc_dial_addr(listen_multiaddr: &str) -> String {
-    let parts: Vec<&str> = listen_multiaddr.trim_start_matches('/').split('/').collect();
+    let parts: Vec<&str> = listen_multiaddr
+        .trim_start_matches('/')
+        .split('/')
+        .collect();
     if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
-        let host = if parts[1] == "0.0.0.0" { "127.0.0.1" } else { parts[1] };
+        let host = if parts[1] == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            parts[1]
+        };
         format!("{}:{}", host, parts[3])
     } else {
         "127.0.0.1:8337".to_string()
@@ -247,7 +257,10 @@ pub(crate) fn run_import(
 
     info!(
         entries = result.entries,
-        data_gb = format!("{:.2}", result.data_bytes as f64 / (1024.0 * 1024.0 * 1024.0)),
+        data_gb = format!(
+            "{:.2}",
+            result.data_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        ),
         "import complete — start the node normally (without --import-db)"
     );
     Ok(())
@@ -272,10 +285,18 @@ mod tests {
         );
         for number in 928_500..=928_502 {
             let txn = clock.new_transaction(false).unwrap();
-            clock.put_global_clock_frame(&GlobalFrame {
-                header: Some(GlobalFrameHeader { frame_number: number, ..Default::default() }),
-                requests: vec![MessageBundle::default()],
-            }, txn.as_ref()).unwrap();
+            clock
+                .put_global_clock_frame(
+                    &GlobalFrame {
+                        header: Some(GlobalFrameHeader {
+                            frame_number: number,
+                            ..Default::default()
+                        }),
+                        requests: vec![MessageBundle::default()],
+                    },
+                    txn.as_ref(),
+                )
+                .unwrap();
             txn.commit().unwrap();
         }
         assert_eq!(super::latest_global_frame_number(dir.path()), Ok(928_502));

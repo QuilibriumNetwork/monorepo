@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![deny(unsafe_code)]
-use super::ClassGroup;
 use super::gmp::mpz::Mpz;
 use super::gmp::mpz::ProbabPrimeResult::NotPrime;
+use super::ClassGroup;
 use num_traits::{One, Zero};
+use std::convert::TryInto;
 use std::{
     borrow::Borrow,
     cell::RefCell,
     mem::swap,
     ops::{Mul, MulAssign},
 };
-use std::convert::TryInto;
 
 mod congruence;
 pub(super) mod ffi;
@@ -662,7 +662,10 @@ mod test {
     fn native_composition_matches_rust_reduction() {
         for discriminant in discriminants() {
             let generator = GmpClassGroup::generator_for_discriminant(discriminant);
-            assert!(generator.is_well_formed(), "must exercise the native reducer");
+            assert!(
+                generator.is_well_formed(),
+                "must exercise the native reducer"
+            );
             let mut powers = vec![generator.identity(), generator.clone()];
             GmpClassGroup::with_context(|ctx| {
                 for _ in 0..18 {
@@ -700,7 +703,10 @@ mod test {
                     let mut actual = form.clone();
                     actual.b += &(&form.a * &r * &Mpz::from(2u64));
                     actual.c += &(&form.b * &r + &form.a * &r * &r);
-                    assert!(actual.inner_is_well_formed(ctx), "must exercise the native reducer");
+                    assert!(
+                        actual.inner_is_well_formed(ctx),
+                        "must exercise the native reducer"
+                    );
                     let mut expected = actual.clone();
                     actual.inner_reduce_fast(ctx);
                     expected.inner_reduce(ctx);
@@ -711,7 +717,12 @@ mod test {
     }
 
     fn form(a: i64, b: i64, c: i64, discriminant: i64) -> GmpClassGroup {
-        GmpClassGroup { a: a.into(), b: b.into(), c: c.into(), discriminant: discriminant.into() }
+        GmpClassGroup {
+            a: a.into(),
+            b: b.into(),
+            c: c.into(),
+            discriminant: discriminant.into(),
+        }
     }
 
     /// Runs `f` on another thread, failing instead of hanging if it never returns.

@@ -34,9 +34,7 @@ use num_bigint::BigInt;
 use quil_tries::{LazyVectorCommitmentTree, NodeMetadata};
 use quil_types::crypto::{InclusionProver, Multiproof};
 use quil_types::error::{QuilError, Result};
-use quil_types::store::{
-    ChangeRecord, HypergraphStore, ShardKey, SnapshotReadable, Transaction,
-};
+use quil_types::store::{ChangeRecord, HypergraphStore, ShardKey, SnapshotReadable, Transaction};
 use sha2::{Digest as Sha2Digest, Sha512};
 
 // ---------------------------------------------------------------------------
@@ -84,14 +82,7 @@ impl InclusionProver for StubProver {
     fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
         Ok(vec![])
     }
-    fn verify_raw(
-        &self,
-        _: &[u8],
-        _: &[u8],
-        _: u64,
-        _: &[u8],
-        _: u64,
-    ) -> Result<bool> {
+    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
         Ok(true)
     }
     fn prove_multiple(
@@ -188,12 +179,7 @@ impl BTreeStore {
         }
     }
 
-    fn tree_node_by_key_key(
-        set: &str,
-        phase: &str,
-        shard: &ShardKey,
-        node_key: &[u8],
-    ) -> Vec<u8> {
+    fn tree_node_by_key_key(set: &str, phase: &str, shard: &ShardKey, node_key: &[u8]) -> Vec<u8> {
         let mut k = Vec::with_capacity(3 + 32 + node_key.len());
         k.push(0x33);
         k.push(Self::set_byte(set));
@@ -203,11 +189,7 @@ impl BTreeStore {
         k.extend_from_slice(node_key);
         k
     }
-    fn tree_node_by_path_prefix(
-        set: &str,
-        phase: &str,
-        shard: &ShardKey,
-    ) -> Vec<u8> {
+    fn tree_node_by_path_prefix(set: &str, phase: &str, shard: &ShardKey) -> Vec<u8> {
         let mut k = Vec::with_capacity(3 + 32);
         k.push(0x34);
         k.push(Self::set_byte(set));
@@ -216,12 +198,7 @@ impl BTreeStore {
         k.extend_from_slice(&shard.l2);
         k
     }
-    fn tree_node_by_path_key(
-        set: &str,
-        phase: &str,
-        shard: &ShardKey,
-        path: &[i32],
-    ) -> Vec<u8> {
+    fn tree_node_by_path_key(set: &str, phase: &str, shard: &ShardKey, path: &[i32]) -> Vec<u8> {
         let mut k = Self::tree_node_by_path_prefix(set, phase, shard);
         for &p in path {
             k.extend_from_slice(&p.to_be_bytes());
@@ -534,9 +511,7 @@ impl HypergraphStore for BTreeStore {
     ) -> Result<()> {
         Ok(())
     }
-    fn capture_tree_snapshot(
-        &self,
-    ) -> Result<Option<Arc<dyn SnapshotReadable>>> {
+    fn capture_tree_snapshot(&self) -> Result<Option<Arc<dyn SnapshotReadable>>> {
         Ok(None)
     }
 }
@@ -622,10 +597,7 @@ fn run_scenario(seed: &str, n: usize, value_factor: u64) -> CapturedRun {
     let size = tree.get_size();
     let (leaf_count, longest_branch) = tree.get_metadata();
 
-    let gets: Vec<Option<Vec<u8>>> = inserted
-        .iter()
-        .map(|(k, _)| tree.get(k).unwrap())
-        .collect();
+    let gets: Vec<Option<Vec<u8>>> = inserted.iter().map(|(k, _)| tree.get(k).unwrap()).collect();
 
     // Sample paths: empty (root), one nibble, two nibbles. We don't
     // care about the specific nibble values — we just want to confirm
@@ -636,9 +608,8 @@ fn run_scenario(seed: &str, n: usize, value_factor: u64) -> CapturedRun {
         .into_iter()
         .map(|p| {
             let m = tree.get_node_metadata_at_path(&p).unwrap();
-            let summary = m.map(|md: NodeMetadata| {
-                (md.leaf_count as usize, hex::encode(&md.commitment))
-            });
+            let summary =
+                m.map(|md: NodeMetadata| (md.leaf_count as usize, hex::encode(&md.commitment)));
             (p, summary)
         })
         .collect();
@@ -975,10 +946,7 @@ fn assert_persistence_roundtrip(g: &GoldenVector) {
                 "[{}] reload: get key #{} returned wrong value",
                 g.label, i,
             ),
-            None => panic!(
-                "[{}] reload: get key #{} returned None",
-                g.label, i
-            ),
+            None => panic!("[{}] reload: get key #{} returned None", g.label, i),
         }
     }
 }
@@ -1095,4 +1063,3 @@ fn commit_defers_dirty_clear_until_mark_persisted() {
         "after mark_persisted a clean tree must not re-stage node writes",
     );
 }
-

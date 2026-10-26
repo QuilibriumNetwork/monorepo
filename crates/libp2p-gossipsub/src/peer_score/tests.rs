@@ -980,28 +980,48 @@ fn test_score_retention() {
 fn committee_ip_exemption_preserves_invalid_message_and_other_penalties() {
     let topic = Topic::new("committee-score-policy").hash();
     let mut params = PeerScoreParams::default();
-    params.topics.insert(topic.clone(), TopicScoreParams {
-        topic_weight: 1.0, time_in_mesh_weight: 0.0,
-        first_message_deliveries_weight: 0.0, mesh_message_deliveries_weight: 0.0,
-        mesh_failure_penalty_weight: 0.0, invalid_message_deliveries_weight: -50.0,
-        ..Default::default()
-    });
+    params.topics.insert(
+        topic.clone(),
+        TopicScoreParams {
+            topic_weight: 1.0,
+            time_in_mesh_weight: 0.0,
+            first_message_deliveries_weight: 0.0,
+            mesh_message_deliveries_weight: 0.0,
+            mesh_failure_penalty_weight: 0.0,
+            invalid_message_deliveries_weight: -50.0,
+            ..Default::default()
+        },
+    );
     let mut score = PeerScore::new(params, PeerScoreThresholds::default());
-    let member = PeerId::random(); let outsider = PeerId::random();
+    let member = PeerId::random();
+    let outsider = PeerId::random();
     let ip = "192.0.2.1".parse().unwrap();
-    score.add_ip(&member, ip); score.add_ip(&outsider, ip);
-    for _ in 0..136 { score.add_ip(&PeerId::random(), ip); }
+    score.add_ip(&member, ip);
+    score.add_ip(&outsider, ip);
+    for _ in 0..136 {
+        score.add_ip(&PeerId::random(), ip);
+    }
     assert_eq!(score.score_report(&member).score, -81920.0);
     assert_eq!(score.score_report(&outsider).score, -81920.0);
     score.set_ip_colocation_peer_whitelist([member].into_iter().collect());
     assert_eq!(score.score_report(&member).score, 0.0);
     assert_eq!(score.score_report(&outsider).score, -81920.0);
-    for _ in 0..3 { score.reject_invalid_message(&member, &topic); }
-    assert_eq!(score.score_report(&member).score, -450.0, "invalid messages still graylist a member");
+    for _ in 0..3 {
+        score.reject_invalid_message(&member, &topic);
+    }
+    assert_eq!(
+        score.score_report(&member).score,
+        -450.0,
+        "invalid messages still graylist a member"
+    );
     score.set_application_score(&member, -3.0);
     score.add_penalty(&member, 2);
     score.failed_message_slow_peer(&member);
     assert_eq!(score.score_report(&member).score, -520.2);
     score.set_ip_colocation_peer_whitelist(HashSet::new());
-    assert_eq!(score.score_report(&member).score, -82440.2, "departed members regain the IP penalty");
+    assert_eq!(
+        score.score_report(&member).score,
+        -82440.2,
+        "departed members regain the IP penalty"
+    );
 }

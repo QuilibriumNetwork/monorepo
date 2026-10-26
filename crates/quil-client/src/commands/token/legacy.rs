@@ -13,15 +13,18 @@ use quil_types::proto::global::ListLegacyCoinsRequest;
 /// is the 57-byte seed then the 57-byte public key, in hex; only the public
 /// half is decoded.
 fn owner_addresses(tc: &TokenCtx) -> anyhow::Result<Vec<[u8; 32]>> {
-    let no_identity = || anyhow::anyhow!("this node has no Ed448 identity, so it holds no legacy coins");
+    let no_identity =
+        || anyhow::anyhow!("this node has no Ed448 identity, so it holds no legacy coins");
     let key = &tc.node_config.p2p.peer_priv_key;
     anyhow::ensure!(key.len() == 228, no_identity());
     let public = hex::decode(&key[114..]).map_err(|_| no_identity())?;
     let public = public.as_slice();
     let by_key = quil_crypto::poseidon::hash_bytes_to_32(public)
         .map_err(|e| anyhow::anyhow!("owner address: {e}"))?;
-    let by_peer = quil_crypto::poseidon::hash_bytes_to_32(&quil_crypto::peer_id_multihash_from_ed448_pubkey(public))
-        .map_err(|e| anyhow::anyhow!("owner address: {e}"))?;
+    let by_peer = quil_crypto::poseidon::hash_bytes_to_32(
+        &quil_crypto::peer_id_multihash_from_ed448_pubkey(public),
+    )
+    .map_err(|e| anyhow::anyhow!("owner address: {e}"))?;
     let mut owners = vec![by_key, by_peer];
     owners.dedup();
     Ok(owners)
@@ -31,15 +34,22 @@ fn owner_addresses(tc: &TokenCtx) -> anyhow::Result<Vec<[u8; 32]>> {
 /// `(address, amount, shielded)`.
 pub(crate) async fn list(
     tc: &TokenCtx,
-    client: &quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
     application: &[u8; 32],
 ) -> anyhow::Result<Vec<([u8; 32], u128, bool)>> {
     let mut coins = Vec::new();
     for owner in owner_addresses(tc)? {
         let mut after: Vec<u8> = Vec::new();
         loop {
-            let page = match client.clone()
-                .list_legacy_coins(ListLegacyCoinsRequest { domain: application.to_vec(), owner: owner.to_vec(), after: after.clone() })
+            let page = match client
+                .clone()
+                .list_legacy_coins(ListLegacyCoinsRequest {
+                    domain: application.to_vec(),
+                    owner: owner.to_vec(),
+                    after: after.clone(),
+                })
                 .await
             {
                 Ok(page) => page.into_inner(),
@@ -49,9 +59,16 @@ pub(crate) async fn list(
                 Err(status) => return Err(anyhow::anyhow!("legacy coins: {}", status.message())),
             };
             for coin in &page.coins {
-                let amount = u128::from_le_bytes(coin.amount.as_slice().try_into()
-                    .map_err(|_| anyhow::anyhow!("malformed legacy coin amount"))?);
-                let address: [u8; 32] = coin.address.as_slice().try_into()
+                let amount = u128::from_le_bytes(
+                    coin.amount
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("malformed legacy coin amount"))?,
+                );
+                let address: [u8; 32] = coin
+                    .address
+                    .as_slice()
+                    .try_into()
                     .map_err(|_| anyhow::anyhow!("malformed legacy coin address"))?;
                 anyhow::ensure!(coin.address > after, "legacy coins out of order");
                 coins.push((address, amount, coin.shielded));
@@ -60,7 +77,10 @@ pub(crate) async fn list(
             if !page.has_more {
                 break;
             }
-            anyhow::ensure!(!page.coins.is_empty(), "legacy coin listing did not advance");
+            anyhow::ensure!(
+                !page.coins.is_empty(),
+                "legacy coin listing did not advance"
+            );
         }
     }
     Ok(coins)
@@ -74,7 +94,8 @@ fn tally(coins: &[([u8; 32], u128, bool)]) -> anyhow::Result<(u128, usize, usize
             shielded += 1;
         } else {
             unshielded += 1;
-            unshielded_total = unshielded_total.checked_add(*amount)
+            unshielded_total = unshielded_total
+                .checked_add(*amount)
                 .ok_or_else(|| anyhow::anyhow!("legacy total overflows u128"))?;
         }
     }
@@ -86,7 +107,9 @@ fn tally(coins: &[([u8; 32], u128, bool)]) -> anyhow::Result<(u128, usize, usize
 #[cfg(feature = "confidential-tokens")]
 pub(crate) async fn unshielded(
     tc: &TokenCtx,
-    client: &quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
     application: &[u8; 32],
 ) -> anyhow::Result<Option<(u128, usize, usize)>> {
     if owner_addresses(tc).is_err() {
@@ -99,7 +122,12 @@ pub async fn run(tc: &TokenCtx, application: &[u8; 32]) -> anyhow::Result<()> {
     let client = tc.connect().await?;
     let coins = list(tc, &client, application).await?;
     for (address, amount, is_shielded) in &coins {
-        println!("0x{} {}{}", hex::encode(address), amount, if *is_shielded { " (shielded)" } else { "" });
+        println!(
+            "0x{} {}{}",
+            hex::encode(address),
+            amount,
+            if *is_shielded { " (shielded)" } else { "" }
+        );
     }
     let (unshielded_total, unshielded, shielded) = tally(&coins)?;
     println!("{unshielded_total} base units across {unshielded} unshielded legacy coins ({shielded} already shielded)");
@@ -113,7 +141,10 @@ mod tests {
         // The same derivations `shield::check_source` compares against.
         let public = [5u8; 57];
         let by_key = quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap();
-        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(&quil_crypto::peer_id_multihash_from_ed448_pubkey(&public)).unwrap();
+        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(
+            &quil_crypto::peer_id_multihash_from_ed448_pubkey(&public),
+        )
+        .unwrap();
         assert_ne!(by_key, by_peer);
     }
 }

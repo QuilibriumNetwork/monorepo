@@ -1,9 +1,9 @@
 //! Local engine observations, with no allocation or reward inference.
+use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use quil_types::proto::node::{SessionSeal, ShardRecovery, WorkerExecution};
 
 use crate::prover_tree_syncer::{ReplayTurn, ShardRecoveryProgress};
 use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
@@ -15,8 +15,10 @@ tokio::task_local! {
 
 /// Every phase a worker execution record names (`WorkerExecution.state`).
 /// Readers outside the engine map these literals, so add a new one here.
-pub const STATES: [&str; 9] =
-    ["starting", "waiting", "syncing", "serving", "closing", "handoff", "blocked", "stopped", "unknown"];
+pub const STATES: [&str; 9] = [
+    "starting", "waiting", "syncing", "serving", "closing", "handoff", "blocked", "stopped",
+    "unknown",
+];
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
@@ -52,15 +54,24 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 ];
 
 /// Every class [`failure_class`] gives a failed recovery attempt.
-pub const FAILURE_CLASSES: [&str; 6] =
-    [NO_ARCHIVE, "connect", "archive_request", "archive_state", "replay_mismatch", "other"];
+pub const FAILURE_CLASSES: [&str; 6] = [
+    NO_ARCHIVE,
+    "connect",
+    "archive_request",
+    "archive_state",
+    "replay_mismatch",
+    "other",
+];
 
 /// A worker's execution report with its store's state: a worker whose own
 /// store refuses writes after a failed write reads as blocked by it, also
 /// while it runs no engine, since it cannot progress until the store is
 /// reopened, and as stopped by it while the node holds it stopped to reopen
 /// the store. `execution` is what its engine reports, if it runs one.
-pub fn with_store_state(core_id: u32, execution: Option<WorkerExecution>) -> Option<WorkerExecution> {
+pub fn with_store_state(
+    core_id: u32,
+    execution: Option<WorkerExecution>,
+) -> Option<WorkerExecution> {
     let role = quil_forest::StoreRole::Worker(core_id);
     let state = if quil_forest::storage_health::store_held(role) {
         "stopped"
@@ -81,7 +92,8 @@ pub fn with_store_state(core_id: u32, execution: Option<WorkerExecution>) -> Opt
 /// node reopens it. Its shard cannot be prepared and it hosts no new seat.
 pub fn store_stopped(core_id: u32) -> bool {
     let role = quil_forest::StoreRole::Worker(core_id);
-    quil_forest::storage_health::store_held(role) || quil_forest::storage_health::store_latched(role)
+    quil_forest::storage_health::store_held(role)
+        || quil_forest::storage_health::store_latched(role)
 }
 
 /// The report of a worker the node holds stopped to reopen its store, for
@@ -101,7 +113,10 @@ pub fn with_held_stores(
     bound: &[(u32, Vec<u8>)],
 ) -> Vec<(u32, Vec<u8>, WorkerExecution)> {
     for (core_id, filter) in bound {
-        if executions.iter().any(|(id, reported, _)| id == core_id && reported == filter) {
+        if executions
+            .iter()
+            .any(|(id, reported, _)| id == core_id && reported == filter)
+        {
             continue;
         }
         if let Some(held) = held_store_execution(*core_id) {
@@ -112,8 +127,10 @@ pub fn with_held_stores(
 }
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,7 +194,9 @@ impl SharedWorkerExecution {
 
     /// The flag behind [`Self::set_successor_blocked`], read by the recovery
     /// turn queue each time it grants a turn.
-    pub(crate) fn successor_blocked_flag(&self) -> Arc<AtomicBool> { self.successor_blocked.clone() }
+    pub(crate) fn successor_blocked_flag(&self) -> Arc<AtomicBool> {
+        self.successor_blocked.clone()
+    }
 
     /// Whether this worker's shard owes a re-anchor whose requested attempt
     /// waits for a shard sync to take it. That sync takes the next recovery
@@ -188,7 +207,9 @@ impl SharedWorkerExecution {
 
     /// The flag behind [`Self::set_reanchor_armed`], read by the recovery
     /// turn queue each time it grants a turn.
-    pub(crate) fn reanchor_armed_flag(&self) -> Arc<AtomicBool> { self.reanchor_armed.clone() }
+    pub(crate) fn reanchor_armed_flag(&self) -> Arc<AtomicBool> {
+        self.reanchor_armed.clone()
+    }
 
     /// An attempt of the owed re-anchor handed its turn back at the hold
     /// limit: its recovery queues again first, and the engine requests the
@@ -221,38 +242,63 @@ impl SharedWorkerExecution {
 
     /// The flag behind [`Self::set_lagging_voter`], read by the recovery
     /// turn queue each time it grants a turn.
-    pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> { self.lagging_voter.clone() }
+    pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> {
+        self.lagging_voter.clone()
+    }
 
     /// A replay of `filter` ended its turn behind its target: its next
     /// recovery of the shard queues again at `ticket`, its place, rather
     /// than behind every waiter.
     pub(crate) fn keep_replay_ticket(&self, filter: &[u8], ticket: u64) {
-        *self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((filter.to_vec(), ticket));
+        *self
+            .replay_ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((filter.to_vec(), ticket));
     }
 
     /// The place [`Self::keep_replay_ticket`] kept for `filter`; clears it.
     pub(crate) fn take_replay_ticket(&self, filter: &[u8]) -> Option<u64> {
-        self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
-            .filter(|(kept, _)| kept == filter).map(|(_, ticket)| ticket)
+        self.replay_ticket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|(kept, _)| kept == filter)
+            .map(|(_, ticket)| ticket)
     }
 
     /// This worker's recovery holds a turn from `since`, to do `kind`.
     pub(crate) fn hold_turn(&self, kind: RecoveryKind, since: tokio::time::Instant) {
-        *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            TurnHold { since: Some(since), kind, yielding: false };
+        *self
+            .turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = TurnHold {
+            since: Some(since),
+            kind,
+            yielding: false,
+        };
     }
 
     /// The turn this worker's recovery holds, if any.
     pub(crate) fn turn(&self) -> TurnHold {
-        *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self
+            .turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The turn was released: how it was held.
     pub(crate) fn end_turn(&self) -> TurnHold {
-        std::mem::take(&mut *self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        std::mem::take(
+            &mut *self
+                .turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    pub fn snapshot(&self) -> WorkerExecution { self.record.lock().unwrap().clone() }
+    pub fn snapshot(&self) -> WorkerExecution {
+        self.record.lock().unwrap().clone()
+    }
 
     pub fn state(&self, state: &str, blocker: &str) {
         let mut s = self.record.lock().unwrap();
@@ -273,7 +319,13 @@ impl SharedWorkerExecution {
 
     /// Observed host phase, independent of frame progress or voting health.
     /// A retained seal belongs only to its own session, not its successor.
-    pub fn consensus_phase(&self, ready: bool, closing: bool, session: Option<[u8; 32]>, sealed: Option<[u8; 32]>) {
+    pub fn consensus_phase(
+        &self,
+        ready: bool,
+        closing: bool,
+        session: Option<[u8; 32]>,
+        sealed: Option<[u8; 32]>,
+    ) {
         let (state, reason) = if session.is_some() && session == sealed {
             ("handoff", "awaiting successor")
         } else if !ready {
@@ -304,7 +356,9 @@ impl SharedWorkerExecution {
         s.observed_unix_ms = now;
     }
 
-    pub fn observe(&self) { self.record.lock().unwrap().observed_unix_ms = now_ms(); }
+    pub fn observe(&self) {
+        self.record.lock().unwrap().observed_unix_ms = now_ms();
+    }
 
     /// The votes of the running session host (`WorkerExecution.own_votes`
     /// and its companions).
@@ -319,13 +373,21 @@ impl SharedWorkerExecution {
 
     /// The engine this record belongs to started now
     /// (`WorkerExecution.engine_started_unix_ms`).
-    pub fn engine_started(&self) { self.record.lock().unwrap().engine_started_unix_ms = now_ms(); }
+    pub fn engine_started(&self) {
+        self.record.lock().unwrap().engine_started_unix_ms = now_ms();
+    }
 
     /// This member saw its session's terminal seal finalized.
     pub fn sealed(&self, generation: u64, checkpoint: u64, view: u64) {
         let mut s = self.record.lock().unwrap();
         let now = now_ms();
-        s.seal = Some(SessionSeal { generation, checkpoint, view, finalized_unix_ms: now, ..Default::default() });
+        s.seal = Some(SessionSeal {
+            generation,
+            checkpoint,
+            view,
+            finalized_unix_ms: now,
+            ..Default::default()
+        });
         s.observed_unix_ms = now;
     }
 
@@ -405,25 +467,40 @@ impl SharedWorkerExecution {
                     r.last_error = failure.clone();
                     r.last_error_unix_ms = now;
                     r.consecutive_failures += 1;
-                    let count = r.failures_by_class.entry(failure_class(failure).into()).or_default();
+                    let count = r
+                        .failures_by_class
+                        .entry(failure_class(failure).into())
+                        .or_default();
                     *count = count.saturating_add(1);
                 }
                 (None, progress) => {
-                    r.last_outcome = progress.as_ref().map(ToString::to_string).unwrap_or_default();
+                    r.last_outcome = progress
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
                     r.last_outcome_unix_ms = now;
                     r.consecutive_failures = 0;
                 }
             }
             enter(r, "idle", now);
             r.attempts += 1;
-            r.attempt_ms = now.saturating_sub(r.attempt_started_unix_ms).saturating_sub(r.permit_wait_ms);
+            r.attempt_ms = now
+                .saturating_sub(r.attempt_started_unix_ms)
+                .saturating_sub(r.permit_wait_ms);
             ended = r.clone();
         });
         let now = Instant::now();
-        let source = if ended.source.is_empty() { "none" } else { ended.source.as_str() };
+        let source = if ended.source.is_empty() {
+            "none"
+        } else {
+            ended.source.as_str()
+        };
         let class = failure.as_deref().map(failure_class);
         let (logged, classes, failed_before, first_failure) = {
-            let mut streaks = self.streaks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut streaks = self
+                .streaks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let streak = streaks.entry(filter.to_vec()).or_default();
             // The failures a success ends, warned about or not: one or two
             // failures between successes never reach the warning.
@@ -435,7 +512,15 @@ impl SharedWorkerExecution {
             // for all its workers.
             let logged = match class {
                 None => streak.succeeded(now),
-                Some(class) => streak.failed(class, now, if class == NO_ARCHIVE { u64::MAX } else { STREAK_WARN_AFTER }),
+                Some(class) => streak.failed(
+                    class,
+                    now,
+                    if class == NO_ARCHIVE {
+                        u64::MAX
+                    } else {
+                        STREAK_WARN_AFTER
+                    },
+                ),
             };
             let first_failure = logged.is_none()
                 && class.is_some_and(|class| class != NO_ARCHIVE)
@@ -473,7 +558,9 @@ impl SharedWorkerExecution {
                         "archive recovery attempt failed; it retries (installed leaves are kept) and warns if it \
                         keeps failing");
                 }
-                if let (Some(StreakLog::Failing { failures, duration }), Some(class)) = (logged, class) {
+                if let (Some(StreakLog::Failing { failures, duration }), Some(class)) =
+                    (logged, class)
+                {
                     let (scope, action) = failure_guidance(class);
                     tracing::warn!(%filter, consecutive_failures = failures, failing_secs = duration.as_secs(),
                         classes = %classes, last_class = class, last_error = %error, last_source = source,
@@ -524,29 +611,50 @@ pub(crate) enum StreakLog {
 
 impl FailureStreak {
     const fn new() -> Self {
-        Self { since: None, warned: None, reported: false, failures: 0, classes: BTreeMap::new(), noted: None }
+        Self {
+            since: None,
+            warned: None,
+            reported: false,
+            failures: 0,
+            classes: BTreeMap::new(),
+            noted: None,
+        }
     }
 
     /// An attempt failed with `class` at `now`.
-    pub(crate) fn failed(&mut self, class: &'static str, now: Instant, warn_after: u64) -> Option<StreakLog> {
+    pub(crate) fn failed(
+        &mut self,
+        class: &'static str,
+        now: Instant,
+        warn_after: u64,
+    ) -> Option<StreakLog> {
         let since = *self.since.get_or_insert(now);
         self.failures += 1;
         *self.classes.entry(class).or_default() += 1;
         if self.failures < warn_after
-            || self.warned.is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
+            || self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
         {
             return None;
         }
         self.warned = Some(now);
         self.reported = true;
-        Some(StreakLog::Failing { failures: self.failures, duration: now.saturating_duration_since(since) })
+        Some(StreakLog::Failing {
+            failures: self.failures,
+            duration: now.saturating_duration_since(since),
+        })
     }
 
     /// Whether the failure just counted, a streak's first, is noted at info
     /// at `now`: at most once per [`STREAK_REPEAT`], so a flapping recovery
     /// stays bounded.
     pub(crate) fn first_failure_due(&mut self, now: Instant) -> bool {
-        if self.failures != 1 || self.noted.is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT) {
+        if self.failures != 1
+            || self
+                .noted
+                .is_some_and(|at| now.saturating_duration_since(at) < STREAK_REPEAT)
+        {
             return false;
         }
         self.noted = Some(now);
@@ -559,13 +667,19 @@ impl FailureStreak {
         let since = self.since.take()?;
         let failures = std::mem::take(&mut self.failures);
         self.classes.clear();
-        std::mem::take(&mut self.reported)
-            .then(|| StreakLog::Ended { failures, duration: now.saturating_duration_since(since) })
+        std::mem::take(&mut self.reported).then(|| StreakLog::Ended {
+            failures,
+            duration: now.saturating_duration_since(since),
+        })
     }
 
     /// The streak's failures by class, as `class=count` pairs.
     pub(crate) fn classes(&self) -> String {
-        self.classes.iter().map(|(class, n)| format!("{class}={n}")).collect::<Vec<_>>().join(",")
+        self.classes
+            .iter()
+            .map(|(class, n)| format!("{class}={n}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -578,7 +692,10 @@ pub(crate) struct NoArchive {
 
 impl NoArchive {
     const fn new() -> Self {
-        Self { streak: FailureStreak::new(), shards: BTreeSet::new() }
+        Self {
+            streak: FailureStreak::new(),
+            shards: BTreeSet::new(),
+        }
     }
 
     /// A recovery of `filter` found no archive at `now`: warned at once,
@@ -601,17 +718,34 @@ static NO_ARCHIVE_KNOWN: Mutex<NoArchive> = Mutex::new(NoArchive::new());
 /// of `filter` at `now` that did (`reached`) or did not reach one.
 fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: Instant) {
     let logged = {
-        let mut state = NO_ARCHIVE_KNOWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reached { state.resolved(now) } else { state.failed(filter, now) }
+        let mut state = NO_ARCHIVE_KNOWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reached {
+            state.resolved(now)
+        } else {
+            state.failed(filter, now)
+        }
     };
     match logged {
         Some((StreakLog::Failing { failures, duration }, shards)) => {
             let (scope, action) = failure_guidance(NO_ARCHIVE);
-            tracing::warn!(failures, shards, failing_secs = duration.as_secs(), last_error = error.unwrap_or("none"),
-                scope, action, "archive recovery finds no archive; recoveries retry");
+            tracing::warn!(
+                failures,
+                shards,
+                failing_secs = duration.as_secs(),
+                last_error = error.unwrap_or("none"),
+                scope,
+                action,
+                "archive recovery finds no archive; recoveries retry"
+            );
         }
-        Some((StreakLog::Ended { failures, duration }, shards)) => tracing::info!(failures, shards,
-            failing_secs = duration.as_secs(), "archive recovery reaches an archive again"),
+        Some((StreakLog::Ended { failures, duration }, shards)) => tracing::info!(
+            failures,
+            shards,
+            failing_secs = duration.as_secs(),
+            "archive recovery reaches an archive again"
+        ),
         None => {}
     }
 }
@@ -619,11 +753,17 @@ fn note_archive_known(filter: &[u8], reached: bool, error: Option<&str>, now: In
 /// The class of a failed recovery attempt, from its error or not-ready
 /// text: one of [`FAILURE_CLASSES`].
 pub fn failure_class(error: &str) -> &'static str {
-    if error.contains("no archive known") || error.contains("discovered an archive") || error.contains("archive discovery") {
+    if error.contains("no archive known")
+        || error.contains("discovered an archive")
+        || error.contains("archive discovery")
+    {
         NO_ARCHIVE
     } else if error.contains("archive connect") {
         "connect"
-    } else if error.contains("get app-shard frame") || error.contains("get_forest_head") || error.contains("resolve shard subtree") {
+    } else if error.contains("get app-shard frame")
+        || error.contains("get_forest_head")
+        || error.contains("resolve shard subtree")
+    {
         "archive_request"
     } else if error.contains("is missing") || error.contains("the archive") {
         "archive_state"
@@ -670,9 +810,13 @@ pub fn recovery_source(source: &str) {
     if source.is_empty() {
         return;
     }
-    let _ = RECOVERING.try_with(|s| s.recovery(|r, _| {
-        if r.source != source { r.source = source.into(); }
-    }));
+    let _ = RECOVERING.try_with(|s| {
+        s.recovery(|r, _| {
+            if r.source != source {
+                r.source = source.into();
+            }
+        })
+    });
 }
 
 /// `leaves` more leaves installed durably by the recovery on this task;
@@ -690,7 +834,12 @@ pub fn recovery_phase(phase: &'static str) {
 /// sync that takes an owed re-anchor's attempt re-anchors. Elsewhere
 /// nothing.
 pub(crate) fn recovery_kind(kind: RecoveryKind) {
-    let _ = RECOVERING.try_with(|s| s.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).kind = kind);
+    let _ = RECOVERING.try_with(|s| {
+        s.turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .kind = kind
+    });
 }
 
 /// Whether the recovery on this task hands its archive recovery turn back
@@ -699,13 +848,27 @@ pub(crate) fn recovery_kind(kind: RecoveryKind) {
 /// progress and the next resumes from it. Elsewhere, or without a turn,
 /// false.
 pub fn recovery_turn_spent() -> bool {
-    RECOVERING.try_with(|s| {
-        let installed = s.record.lock().unwrap().recovery.as_ref().is_some_and(|r| r.attempt_installed_leaves > 0);
-        let mut turn = s.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let spent = installed && turn.since.is_some_and(|since| since.elapsed() >= MAX_TURN_HOLD);
-        turn.yielding |= spent;
-        spent
-    }).unwrap_or(false)
+    RECOVERING
+        .try_with(|s| {
+            let installed = s
+                .record
+                .lock()
+                .unwrap()
+                .recovery
+                .as_ref()
+                .is_some_and(|r| r.attempt_installed_leaves > 0);
+            let mut turn = s
+                .turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let spent = installed
+                && turn
+                    .since
+                    .is_some_and(|since| since.elapsed() >= MAX_TURN_HOLD);
+            turn.yielding |= spent;
+            spent
+        })
+        .unwrap_or(false)
 }
 
 /// Run `attempt` as the recovery of `execution`'s worker holding a turn
@@ -729,12 +892,14 @@ pub async fn with_recovery_turn<T>(
 /// tree the recovery on this task is installing; elsewhere (prover-tree and
 /// archive syncs) nothing.
 pub fn recovery_leaves(tree_phase: u32, installed: u64, planned: u64) {
-    let _ = RECOVERING.try_with(|s| s.recovery(|r, now| {
-        r.tree_phase = tree_phase;
-        r.installed_leaves = installed;
-        r.planned_leaves = planned;
-        r.leaves_observed_unix_ms = now;
-    }));
+    let _ = RECOVERING.try_with(|s| {
+        s.recovery(|r, now| {
+            r.tree_phase = tree_phase;
+            r.installed_leaves = installed;
+            r.planned_leaves = planned;
+            r.leaves_observed_unix_ms = now;
+        })
+    });
 }
 
 #[cfg(test)]
@@ -747,31 +912,68 @@ mod tests {
     fn a_worker_whose_store_refuses_writes_reads_as_blocked_by_it() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let core = 9_401;
-        assert!(db.inner().register_store(quil_forest::StoreRole::Worker(core)));
-        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 1, ..Default::default() };
-        assert_eq!(with_store_state(core, Some(serving.clone())), Some(serving.clone()));
+        assert!(db
+            .inner()
+            .register_store(quil_forest::StoreRole::Worker(core)));
+        let serving = WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            with_store_state(core, Some(serving.clone())),
+            Some(serving.clone())
+        );
         assert_eq!(with_store_state(core, None), None);
         assert!(!store_stopped(core));
-        db.inner().refuse_writes("IO error: No space left on device");
+        db.inner()
+            .refuse_writes("IO error: No space left on device");
         assert!(store_stopped(core), "a latched store has stopped writing");
         for execution in [Some(serving.clone()), None] {
             let reported = with_store_state(core, execution).expect("a latched store is reported");
-            assert_eq!((reported.state.as_str(), reported.blocker.as_str()), ("blocked", STORAGE_WRITE_FAILED));
+            assert_eq!(
+                (reported.state.as_str(), reported.blocker.as_str()),
+                ("blocked", STORAGE_WRITE_FAILED)
+            );
             assert!(reported.observed_unix_ms > 1);
         }
-        assert_eq!(with_store_state(core + 1, Some(serving.clone())), Some(serving.clone()));
+        assert_eq!(
+            with_store_state(core + 1, Some(serving.clone())),
+            Some(serving.clone())
+        );
         assert_eq!(held_store_execution(core + 1), None);
         quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(core + 1));
         let held = with_store_state(core + 1, Some(serving)).expect("a held store is reported");
-        assert_eq!((held.state.as_str(), held.blocker.as_str()), ("stopped", STORAGE_WRITE_FAILED));
+        assert_eq!(
+            (held.state.as_str(), held.blocker.as_str()),
+            ("stopped", STORAGE_WRITE_FAILED)
+        );
         let for_lifecycle = held_store_execution(core + 1).expect("the lifecycle sees it too");
         assert_eq!(for_lifecycle.state, "stopped");
         let bound = [(core, vec![1]), (core + 1, vec![2])];
-        let running = vec![(core, vec![1], WorkerExecution { state: "serving".into(), ..Default::default() })];
+        let running = vec![(
+            core,
+            vec![1],
+            WorkerExecution {
+                state: "serving".into(),
+                ..Default::default()
+            },
+        )];
         let seen = with_held_stores(running.clone(), &bound);
-        assert_eq!(seen.len(), 2, "the held worker reads as unable to host: {seen:?}");
-        assert_eq!((seen[1].0, seen[1].1.clone(), seen[1].2.state.as_str()), (core + 1, vec![2], "stopped"));
-        assert_eq!(with_held_stores(running.clone(), &bound[..1]), running, "an unbound worker adds nothing");
+        assert_eq!(
+            seen.len(),
+            2,
+            "the held worker reads as unable to host: {seen:?}"
+        );
+        assert_eq!(
+            (seen[1].0, seen[1].1.clone(), seen[1].2.state.as_str()),
+            (core + 1, vec![2], "stopped")
+        );
+        assert_eq!(
+            with_held_stores(running.clone(), &bound[..1]),
+            running,
+            "an unbound worker adds nothing"
+        );
         quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(core + 1));
     }
 
@@ -791,9 +993,16 @@ mod tests {
         assert!(s.snapshot().blocker.is_empty());
         assert!(s.snapshot().observed_unix_ms > 0);
         s.waiting_until("committee admission unavailable", 919_440);
-        assert_eq!((s.snapshot().state.as_str(), s.snapshot().awaited_frame), ("waiting", Some(919_440)));
+        assert_eq!(
+            (s.snapshot().state.as_str(), s.snapshot().awaited_frame),
+            ("waiting", Some(919_440))
+        );
         s.state("serving", "");
-        assert_eq!(s.snapshot().awaited_frame, None, "a later state ends the wait");
+        assert_eq!(
+            s.snapshot().awaited_frame,
+            None,
+            "a later state ends the wait"
+        );
     }
 
     #[test]
@@ -804,16 +1013,28 @@ mod tests {
         assert_eq!(execution.snapshot().state, "syncing");
         execution.consensus_phase(true, false, Some([1; 32]), None);
         assert_eq!(execution.snapshot().state, "serving");
-        assert_eq!(execution.snapshot().last_advance_unix_ms, 0, "serving is not a progress claim");
+        assert_eq!(
+            execution.snapshot().last_advance_unix_ms,
+            0,
+            "serving is not a progress claim"
+        );
         execution.consensus_phase(true, true, Some([1; 32]), None);
         assert_eq!(execution.snapshot().state, "closing");
         execution.consensus_phase(false, true, Some([1; 32]), Some([1; 32]));
         assert_eq!(execution.snapshot().state, "handoff");
         execution.consensus_phase(true, false, Some([2; 32]), Some([1; 32]));
-        assert_eq!(execution.snapshot().state, "serving", "an old seal must not label a successor as waiting");
+        assert_eq!(
+            execution.snapshot().state,
+            "serving",
+            "an old seal must not label a successor as waiting"
+        );
         assert!(execution.snapshot().blocker.is_empty());
         execution.consensus_phase(true, false, None, None);
-        assert_eq!(execution.snapshot().state, "serving", "legacy hosts have no session seal");
+        assert_eq!(
+            execution.snapshot().state,
+            "serving",
+            "legacy hosts have no session seal"
+        );
     }
 
     /// A recovery hands its turn back only once it has held it for the
@@ -822,78 +1043,136 @@ mod tests {
     async fn a_turn_is_spent_after_the_hold_limit_and_an_installed_chunk() {
         assert!(!recovery_turn_spent(), "no recovery runs on this task");
         let worker = SharedWorkerExecution::default();
-        let result = worker.recovering(&[7; 32], async {
-            assert!(!recovery_turn_spent(), "no turn is held");
-            worker.hold_turn(RecoveryKind::Install, tokio::time::Instant::now());
-            tokio::time::advance(MAX_TURN_HOLD).await;
-            assert!(!recovery_turn_spent(), "nothing installed in this turn yet");
-            assert!(!worker.turn().yielding);
-            recovery_installed(1_024);
-            assert!(recovery_turn_spent());
-            assert!(worker.turn().yielding);
-            recovery_kind(RecoveryKind::Reanchor);
-            assert_eq!(worker.turn().kind, RecoveryKind::Reanchor);
-            Ok(ShardRecoveryProgress::Yielded)
-        }).await;
+        let result = worker
+            .recovering(&[7; 32], async {
+                assert!(!recovery_turn_spent(), "no turn is held");
+                worker.hold_turn(RecoveryKind::Install, tokio::time::Instant::now());
+                tokio::time::advance(MAX_TURN_HOLD).await;
+                assert!(!recovery_turn_spent(), "nothing installed in this turn yet");
+                assert!(!worker.turn().yielding);
+                recovery_installed(1_024);
+                assert!(recovery_turn_spent());
+                assert!(worker.turn().yielding);
+                recovery_kind(RecoveryKind::Reanchor);
+                assert_eq!(worker.turn().kind, RecoveryKind::Reanchor);
+                Ok(ShardRecoveryProgress::Yielded)
+            })
+            .await;
         assert_eq!(result.unwrap(), ShardRecoveryProgress::Yielded);
         let r = worker.snapshot().recovery.unwrap();
-        assert_eq!((r.consecutive_failures, r.last_outcome.as_str()), (0, RECOVERY_TURN_SPENT), "a handed-back turn is progress");
+        assert_eq!(
+            (r.consecutive_failures, r.last_outcome.as_str()),
+            (0, RECOVERY_TURN_SPENT),
+            "a handed-back turn is progress"
+        );
         assert!(turn_spent(&turn_spent_error()));
-        assert!(!turn_spent(&quil_types::error::QuilError::ExecutionUnavailable("archive connect: refused".into())));
+        assert!(!turn_spent(
+            &quil_types::error::QuilError::ExecutionUnavailable("archive connect: refused".into())
+        ));
         assert!(worker.end_turn().yielding);
         assert!(worker.turn().since.is_none());
     }
 
     #[tokio::test]
     async fn recovery_is_reported_beside_the_execution_state_for_its_own_worker() {
-        let (worker, other) = (SharedWorkerExecution::default(), SharedWorkerExecution::default());
+        let (worker, other) = (
+            SharedWorkerExecution::default(),
+            SharedWorkerExecution::default(),
+        );
         recovery_phase("installing_leaves");
         recovery_leaves(0, 1, 2);
-        assert!(worker.snapshot().recovery.is_none(), "no recovery runs on this task");
+        assert!(
+            worker.snapshot().recovery.is_none(),
+            "no recovery runs on this task"
+        );
         worker.state("blocked", "state unavailable");
-        let installed = worker.recovering(&[7; 32], async {
-            recovery_phase("waiting_for_permit");
-            assert_eq!(worker.snapshot().recovery.unwrap().phase, "waiting_for_permit");
-            recovery_phase("installing_leaves");
-            recovery_source("198.51.100.7:8340");
-            recovery_source("");
-            recovery_leaves(2, 262_144, 2_517_449);
-            recovery_installed(1_024);
-            recovery_installed(1_024);
-            let r = worker.snapshot().recovery.unwrap();
-            assert_eq!((r.phase.as_str(), r.tree_phase, r.installed_leaves, r.planned_leaves),
-                ("installing_leaves", 2, 262_144, 2_517_449));
-            assert!(r.phase_since_unix_ms > 0 && r.leaves_observed_unix_ms > 0);
-            Ok(ShardRecoveryProgress::Anchored { frame: 7 })
-        }).await;
+        let installed = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                assert_eq!(
+                    worker.snapshot().recovery.unwrap().phase,
+                    "waiting_for_permit"
+                );
+                recovery_phase("installing_leaves");
+                recovery_source("198.51.100.7:8340");
+                recovery_source("");
+                recovery_leaves(2, 262_144, 2_517_449);
+                recovery_installed(1_024);
+                recovery_installed(1_024);
+                let r = worker.snapshot().recovery.unwrap();
+                assert_eq!(
+                    (
+                        r.phase.as_str(),
+                        r.tree_phase,
+                        r.installed_leaves,
+                        r.planned_leaves
+                    ),
+                    ("installing_leaves", 2, 262_144, 2_517_449)
+                );
+                assert!(r.phase_since_unix_ms > 0 && r.leaves_observed_unix_ms > 0);
+                Ok(ShardRecoveryProgress::Anchored { frame: 7 })
+            })
+            .await;
         assert!(installed.is_ok());
         assert!(other.snapshot().recovery.is_none());
         let s = worker.snapshot();
-        assert_eq!((s.state.as_str(), s.blocker.as_str()), ("blocked", "state unavailable"));
+        assert_eq!(
+            (s.state.as_str(), s.blocker.as_str()),
+            ("blocked", "state unavailable")
+        );
         let r = s.recovery.unwrap();
         assert_eq!(r.phase, "idle");
         assert!(r.last_outcome.contains("frame 7") && r.last_outcome_unix_ms > 0);
         assert!(r.last_error.is_empty());
-        assert_eq!(r.installed_leaves, 262_144, "the last leaf counts stay visible");
-        assert_eq!((r.source.as_str(), r.attempt_installed_leaves), ("198.51.100.7:8340", 2_048));
+        assert_eq!(
+            r.installed_leaves, 262_144,
+            "the last leaf counts stay visible"
+        );
+        assert_eq!(
+            (r.source.as_str(), r.attempt_installed_leaves),
+            ("198.51.100.7:8340", 2_048)
+        );
         assert_eq!((r.attempts, r.consecutive_failures), (1, 0));
         assert!(r.attempt_started_unix_ms > 0);
 
-        let _ = worker.recovering(&[7; 32], async { Ok(ShardRecoveryProgress::NotReady("the archive checkpoint failed validation")) }).await;
+        let _ = worker
+            .recovering(&[7; 32], async {
+                Ok(ShardRecoveryProgress::NotReady(
+                    "the archive checkpoint failed validation",
+                ))
+            })
+            .await;
         let r = worker.snapshot().recovery.unwrap();
         assert_eq!(r.last_error, "the archive checkpoint failed validation");
-        assert!(r.last_outcome.contains("frame 7"), "an error keeps the last outcome");
-        assert_eq!((r.attempts, r.consecutive_failures, r.attempt_installed_leaves), (2, 1, 0));
+        assert!(
+            r.last_outcome.contains("frame 7"),
+            "an error keeps the last outcome"
+        );
+        assert_eq!(
+            (
+                r.attempts,
+                r.consecutive_failures,
+                r.attempt_installed_leaves
+            ),
+            (2, 1, 0)
+        );
         assert!(r.source.is_empty(), "each attempt names its own source");
-        let _ = worker.recovering(&[7; 32], async {
-            Err(quil_types::error::QuilError::ExecutionUnavailable("archive discovery timed out".into()))
-        }).await;
+        let _ = worker
+            .recovering(&[7; 32], async {
+                Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    "archive discovery timed out".into(),
+                ))
+            })
+            .await;
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.last_error.contains("archive discovery timed out"));
         assert_eq!(r.consecutive_failures, 2);
         let classes: BTreeMap<String, u32> = r.failures_by_class.into_iter().collect();
-        assert_eq!(classes, BTreeMap::from([("archive_state".into(), 1), ("no_archive_known".into(), 1)]),
-            "failures are counted by class since the engine started");
+        assert_eq!(
+            classes,
+            BTreeMap::from([("archive_state".into(), 1), ("no_archive_known".into(), 1)]),
+            "failures are counted by class since the engine started"
+        );
     }
 
     const MINUTE: Duration = Duration::from_secs(60);
@@ -908,16 +1187,34 @@ mod tests {
         assert_eq!(streak.succeeded(start), None, "no streak, no end");
         assert_eq!(streak.failed("connect", start, 3), None);
         assert_eq!(streak.failed("connect", start, 3), None);
-        assert_eq!(streak.failed("no_archive_known", start + MINUTE, 3),
-            Some(StreakLog::Failing { failures: 3, duration: MINUTE }));
+        assert_eq!(
+            streak.failed("no_archive_known", start + MINUTE, 3),
+            Some(StreakLog::Failing {
+                failures: 3,
+                duration: MINUTE
+            })
+        );
         for minute in 2..11 {
-            assert_eq!(streak.failed("no_archive_known", start + MINUTE * minute, 3), None);
+            assert_eq!(
+                streak.failed("no_archive_known", start + MINUTE * minute, 3),
+                None
+            );
         }
-        assert_eq!(streak.failed("connect", start + MINUTE * 11, 3),
-            Some(StreakLog::Failing { failures: 13, duration: MINUTE * 11 }));
+        assert_eq!(
+            streak.failed("connect", start + MINUTE * 11, 3),
+            Some(StreakLog::Failing {
+                failures: 13,
+                duration: MINUTE * 11
+            })
+        );
         assert_eq!(streak.classes(), "connect=3,no_archive_known=10");
-        assert_eq!(streak.succeeded(start + MINUTE * 20),
-            Some(StreakLog::Ended { failures: 13, duration: MINUTE * 20 }));
+        assert_eq!(
+            streak.succeeded(start + MINUTE * 20),
+            Some(StreakLog::Ended {
+                failures: 13,
+                duration: MINUTE * 20
+            })
+        );
         assert_eq!(streak.succeeded(start + MINUTE * 21), None);
         assert_eq!(streak.classes(), "");
     }
@@ -956,9 +1253,15 @@ mod tests {
         assert!(streak.first_failure_due(start));
         streak.succeeded(start + MINUTE);
         streak.failed("connect", start + MINUTE * 2, 3);
-        assert!(!streak.first_failure_due(start + MINUTE * 2), "within the interval");
+        assert!(
+            !streak.first_failure_due(start + MINUTE * 2),
+            "within the interval"
+        );
         streak.failed("connect", start + MINUTE * 3, 3);
-        assert!(!streak.first_failure_due(start + MINUTE * 3), "not a first failure");
+        assert!(
+            !streak.first_failure_due(start + MINUTE * 3),
+            "not a first failure"
+        );
         streak.succeeded(start + MINUTE * 4);
         streak.failed("connect", start + MINUTE * 12, 3);
         assert!(streak.first_failure_due(start + MINUTE * 12));
@@ -971,14 +1274,39 @@ mod tests {
         let start = Instant::now();
         let mut node = NoArchive::new();
         assert_eq!(node.resolved(start), None);
-        assert_eq!(node.failed(&[1; 32], start), Some((StreakLog::Failing { failures: 1, duration: Duration::ZERO }, 1)));
+        assert_eq!(
+            node.failed(&[1; 32], start),
+            Some((
+                StreakLog::Failing {
+                    failures: 1,
+                    duration: Duration::ZERO
+                },
+                1
+            ))
+        );
         for worker in 2..100u8 {
             assert_eq!(node.failed(&[worker; 32], start + MINUTE), None);
         }
-        assert_eq!(node.failed(&[1; 32], start + MINUTE * 10),
-            Some((StreakLog::Failing { failures: 100, duration: MINUTE * 10 }, 99)));
-        assert_eq!(node.resolved(start + MINUTE * 11),
-            Some((StreakLog::Ended { failures: 100, duration: MINUTE * 11 }, 99)));
+        assert_eq!(
+            node.failed(&[1; 32], start + MINUTE * 10),
+            Some((
+                StreakLog::Failing {
+                    failures: 100,
+                    duration: MINUTE * 10
+                },
+                99
+            ))
+        );
+        assert_eq!(
+            node.resolved(start + MINUTE * 11),
+            Some((
+                StreakLog::Ended {
+                    failures: 100,
+                    duration: MINUTE * 11
+                },
+                99
+            ))
+        );
     }
 
     /// A deferred sync attempted nothing: the record, the shard's streak
@@ -986,20 +1314,34 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_recovery_changes_no_record_or_streak() {
         let worker = SharedWorkerExecution::default();
-        let _ = worker.recovering(&[4; 32], async {
-            Err(quil_types::error::QuilError::Internal("archive connect: refused".into()))
-        }).await;
+        let _ = worker
+            .recovering(&[4; 32], async {
+                Err(quil_types::error::QuilError::Internal(
+                    "archive connect: refused".into(),
+                ))
+            })
+            .await;
         let before = worker.snapshot().recovery.unwrap();
         for _ in 0..5 {
-            let result = worker.recovering(&[4; 32], async {
-                recovery_phase("waiting_for_permit");
-                Ok(ShardRecoveryProgress::Deferred("a re-anchor at the session fence is owed and has its own attempt"))
-            }).await;
+            let result = worker
+                .recovering(&[4; 32], async {
+                    recovery_phase("waiting_for_permit");
+                    Ok(ShardRecoveryProgress::Deferred(
+                        "a re-anchor at the session fence is owed and has its own attempt",
+                    ))
+                })
+                .await;
             assert!(matches!(result, Ok(ShardRecoveryProgress::Deferred(_))));
         }
         assert_eq!(worker.snapshot().recovery.unwrap(), before);
         let streaks = worker.streaks.lock().unwrap();
-        assert_eq!((streaks[&vec![4; 32]].failures, streaks[&vec![4; 32]].reported), (1, false));
+        assert_eq!(
+            (
+                streaks[&vec![4; 32]].failures,
+                streaks[&vec![4; 32]].reported
+            ),
+            (1, false)
+        );
     }
 
     /// Each shard keeps its own streak: another shard's success does not
@@ -1008,14 +1350,26 @@ mod tests {
     #[tokio::test]
     async fn streaks_are_kept_per_shard() {
         let worker = SharedWorkerExecution::default();
-        let fail = || async { Err(quil_types::error::QuilError::Internal("archive connect: refused".into())) };
+        let fail = || async {
+            Err(quil_types::error::QuilError::Internal(
+                "archive connect: refused".into(),
+            ))
+        };
         for _ in 0..2 {
             let _ = worker.recovering(&[1; 32], fail()).await;
         }
-        let _ = worker.recovering(&[2; 32], async { Ok(ShardRecoveryProgress::Anchored { frame: 3 }) }).await;
+        let _ = worker
+            .recovering(&[2; 32], async {
+                Ok(ShardRecoveryProgress::Anchored { frame: 3 })
+            })
+            .await;
         let _ = worker.recovering(&[1; 32], fail()).await;
         let streaks = worker.streaks.lock().unwrap();
-        assert_eq!(streaks[&vec![1; 32]].failures, 3, "the other shard's success must not reset it");
+        assert_eq!(
+            streaks[&vec![1; 32]].failures,
+            3,
+            "the other shard's success must not reset it"
+        );
         assert!(streaks[&vec![1; 32]].reported);
         assert_eq!(streaks[&vec![2; 32]].failures, 0);
     }
@@ -1023,13 +1377,31 @@ mod tests {
     #[test]
     fn failures_are_classed_by_whose_problem_they_are() {
         for (error, class) in [
-            ("execution unavailable: no archive known yet", "no_archive_known"),
-            ("internal error: archive connect: invalid endpoint: invalid URI", "connect"),
-            ("internal error: get app-shard frame: status: Unavailable", "archive_request"),
-            ("invalid argument: wrong-shard archive replay tip", "replay_mismatch"),
-            ("execution unavailable: archive replay pre-state mismatch at phase 0", "replay_mismatch"),
+            (
+                "execution unavailable: no archive known yet",
+                "no_archive_known",
+            ),
+            (
+                "internal error: archive connect: invalid endpoint: invalid URI",
+                "connect",
+            ),
+            (
+                "internal error: get app-shard frame: status: Unavailable",
+                "archive_request",
+            ),
+            (
+                "invalid argument: wrong-shard archive replay tip",
+                "replay_mismatch",
+            ),
+            (
+                "execution unavailable: archive replay pre-state mismatch at phase 0",
+                "replay_mismatch",
+            ),
             ("the archive checkpoint failed validation", "archive_state"),
-            ("execution unavailable: archive replay is missing shard frame 9", "archive_state"),
+            (
+                "execution unavailable: archive replay is missing shard frame 9",
+                "archive_state",
+            ),
             ("actor rejected checkpoint", "other"),
         ] {
             assert_eq!(failure_class(error), class, "{error}");
@@ -1041,42 +1413,68 @@ mod tests {
     #[tokio::test]
     async fn permit_wait_is_measured_apart_from_the_attempt() {
         let worker = SharedWorkerExecution::default();
-        let _ = worker.recovering(&[7; 32], async {
-            recovery_phase("waiting_for_permit");
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            recovery_phase("fetching_checkpoint");
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            Ok(ShardRecoveryProgress::Anchored { frame: 1 })
-        }).await;
+        let _ = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                recovery_phase("fetching_checkpoint");
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(ShardRecoveryProgress::Anchored { frame: 1 })
+            })
+            .await;
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.permit_wait_ms >= 60, "{}", r.permit_wait_ms);
-        assert!(r.attempt_ms >= 30 && r.attempt_ms < r.permit_wait_ms + 30, "{} after {}", r.attempt_ms, r.permit_wait_ms);
+        assert!(
+            r.attempt_ms >= 30 && r.attempt_ms < r.permit_wait_ms + 30,
+            "{} after {}",
+            r.attempt_ms,
+            r.permit_wait_ms
+        );
         let longest = r.longest_permit_wait_ms;
         assert_eq!(longest, r.permit_wait_ms);
-        let _ = worker.recovering(&[7; 32], async {
-            recovery_phase("waiting_for_permit");
-            recovery_phase("fetching_checkpoint");
-            Ok(ShardRecoveryProgress::Anchored { frame: 2 })
-        }).await;
+        let _ = worker
+            .recovering(&[7; 32], async {
+                recovery_phase("waiting_for_permit");
+                recovery_phase("fetching_checkpoint");
+                Ok(ShardRecoveryProgress::Anchored { frame: 2 })
+            })
+            .await;
         let r = worker.snapshot().recovery.unwrap();
         assert!(r.permit_wait_ms < longest);
-        assert_eq!(r.longest_permit_wait_ms, longest, "the longest wait outlasts a shorter one");
+        assert_eq!(
+            r.longest_permit_wait_ms, longest,
+            "the longest wait outlasts a shorter one"
+        );
     }
 
     /// The text between `start` and the next `end` after it in `source`.
     fn region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        let from = source.find(start).unwrap_or_else(|| panic!("{start} not found"));
+        let from = source
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} not found"));
         let rest = &source[from + start.len()..];
-        &rest[..rest.find(end).unwrap_or_else(|| panic!("{end} not found after {start}"))]
+        &rest[..rest
+            .find(end)
+            .unwrap_or_else(|| panic!("{end} not found after {start}"))]
     }
 
     /// The string literals of each `open` … `close` in `source` that starts
-    /// with a literal, e.g. each `state("…", "…")` call.
+    /// with a literal, e.g. each `state("…", "…")` call. Whitespace after
+    /// `open` is skipped, so a line break inserted by rustfmt hides nothing.
     fn literals<'a>(source: &'a str, open: &str, close: char) -> Vec<Vec<&'a str>> {
-        source.match_indices(open).filter_map(|(at, _)| {
-            let rest = &source[at + open.len()..];
-            rest.starts_with('"').then(|| rest[..rest.find(close).unwrap()].split('"').skip(1).step_by(2).collect())
-        }).collect()
+        source
+            .match_indices(open)
+            .filter_map(|(at, _)| {
+                let rest = source[at + open.len()..].trim_start();
+                rest.starts_with('"').then(|| {
+                    rest[..rest.find(close).unwrap()]
+                        .split('"')
+                        .skip(1)
+                        .step_by(2)
+                        .collect()
+                })
+            })
+            .collect()
     }
 
     /// Every phase and reason the engine writes is listed in [`STATES`] and
@@ -1088,26 +1486,43 @@ mod tests {
         let thread = include_str!("thread_worker.rs");
         let syncer = include_str!("prover_tree_syncer.rs");
         let own = include_str!("worker_execution.rs");
-        let own = &own[..own.find("#[cfg(test)]
-mod tests").unwrap()];
+        let own = &own[..own
+            .find(
+                "#[cfg(test)]
+mod tests",
+            )
+            .unwrap()];
         let phase = region(own, "pub fn consensus_phase", "self.state(state, reason)");
         let chain = region(engine, "let blocker = ", ";");
-        let mut written: Vec<Vec<&str>> = [engine, thread].iter().flat_map(|s| literals(s, "state(", ')')).collect();
+        let mut written: Vec<Vec<&str>> = [engine, thread]
+            .iter()
+            .flat_map(|s| literals(s, "state(", ')'))
+            .collect();
         assert!(written.len() >= 10, "{written:?}");
         written.extend(literals(phase, "(", ')'));
-        let chained = literals(chain, "{ ", '}');
+        let chained = literals(chain, "{", '}');
         assert_eq!(chained.len(), 4, "{chain}");
-        written.extend(chained.into_iter().map(|blocker| vec!["blocked", blocker[0]]));
+        written.extend(
+            chained
+                .into_iter()
+                .map(|blocker| vec!["blocked", blocker[0]]),
+        );
         // A store's state, which no engine writes (`with_store_state`).
         written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
         let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();
-        let blockers: BTreeSet<&str> = written.iter().filter_map(|args| args.get(1).copied()).filter(|b| !b.is_empty()).collect();
+        let blockers: BTreeSet<&str> = written
+            .iter()
+            .filter_map(|args| args.get(1).copied())
+            .filter(|b| !b.is_empty())
+            .collect();
         assert_eq!(states, STATES.into_iter().collect::<BTreeSet<_>>());
         assert_eq!(blockers, BLOCKERS.into_iter().collect::<BTreeSet<_>>());
-        let phases: BTreeSet<&str> = [thread, syncer].iter().flat_map(|s| literals(s, "recovery_phase(", ')'))
+        let phases: BTreeSet<&str> = [thread, syncer]
+            .iter()
+            .flat_map(|s| literals(s, "recovery_phase(", ')'))
             .chain(literals(own, "enter(r, ", ','))
-            .map(|args| args[0]).collect();
+            .map(|args| args[0])
+            .collect();
         assert_eq!(phases, RECOVERY_PHASES.into_iter().collect::<BTreeSet<_>>());
     }
-
 }

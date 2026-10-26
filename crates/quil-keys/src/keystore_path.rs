@@ -440,8 +440,14 @@ mod tests {
         let err = resolve(&config, &config_dir, &cwd)
             .expect_err("a keystore beside the config must not be replaced by a new one");
 
-        assert!(err.starts_with("invalid argument: key.keyManagerFile.path"), "{err}");
-        assert!(err.contains(&shown(&cwd.join("./.config/keys.yml"))), "{err}");
+        assert!(
+            err.starts_with("invalid argument: key.keyManagerFile.path"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&shown(&cwd.join("./.config/keys.yml"))),
+            "{err}"
+        );
         assert!(err.contains(&shown(&config_dir.join("keys.yml"))), "{err}");
         assert!(err.contains("move that keystore away"), "{err}");
         let _ = std::fs::remove_dir_all(&cwd);
@@ -478,7 +484,10 @@ mod tests {
             .expect_err("a keystore under the config dir must not be replaced by a new one");
 
         assert!(err.contains(&shown(&cwd.join("keys/node.yml"))), "{err}");
-        assert!(err.contains(&shown(&config_dir.join("keys/node.yml"))), "{err}");
+        assert!(
+            err.contains(&shown(&config_dir.join("keys/node.yml"))),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -525,8 +534,8 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".config/keys.yml")).unwrap();
         let config = keystore_config(".config/keys.yml", true);
 
-        let err = resolve(&config, Path::new(".config"), &cwd)
-            .expect_err("a directory is no keystore");
+        let err =
+            resolve(&config, Path::new(".config"), &cwd).expect_err("a directory is no keystore");
 
         assert!(err.contains(&shown(&cwd.join(".config/keys.yml"))), "{err}");
         assert!(err.contains("names the directory"), "{err}");
@@ -542,7 +551,10 @@ mod tests {
             .expect_err("a tool must not create a prover identity")
             .to_string();
         assert!(err.contains(&shown(&cwd.join(".config/keys.yml"))), "{err}");
-        assert!(err.contains("only uses an existing prover identity"), "{err}");
+        assert!(
+            err.contains("only uses an existing prover identity"),
+            "{err}"
+        );
 
         write_keystore(&cwd.join(".config/keys.yml"));
         let path = resolve_in(&config, Path::new(".config"), &cwd, Creation::Refused).unwrap();

@@ -19,9 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master = quil_store::RocksDb::open_for_read_only(&PathBuf::from(&args[0]))?;
     let worker = quil_store::RocksDb::open_for_read_only(&PathBuf::from(&args[1]))?;
     let registry = Arc::new(quil_execution::prover_registry::SharedProverRegistry::new());
-    registry.refresh_from_store(&quil_store::RocksHypergraphStore::new(
-        master.inner(),
-    ))?;
+    registry.refresh_from_store(&quil_store::RocksHypergraphStore::new(master.inner()))?;
     let filter = hex::decode(&args[2])?;
     let frame =
         quil_store::RocksClockStore::new(worker.inner()).get_latest_shard_clock_frame(&filter)?;

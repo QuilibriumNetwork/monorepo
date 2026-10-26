@@ -39,8 +39,12 @@ fn unavailable(message: &str) -> QuilError {
 
 /// Readers hold these briefly; waiting them out keeps an executed frame
 /// from being discarded. One deadline covers every lock an adoption takes.
-fn write<'a, T>(patience: &quil_types::lock_patience::Patience, lock: &'a RwLock<T>) -> Result<RwLockWriteGuard<'a, T>> {
-    patience.write(lock)
+fn write<'a, T>(
+    patience: &quil_types::lock_patience::Patience,
+    lock: &'a RwLock<T>,
+) -> Result<RwLockWriteGuard<'a, T>> {
+    patience
+        .write(lock)
         .ok_or_else(|| unavailable("execution adoption metadata is busy or poisoned"))
 }
 

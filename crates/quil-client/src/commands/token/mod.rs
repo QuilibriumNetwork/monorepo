@@ -15,9 +15,9 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
-mod legacy;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
+mod legacy;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
 
@@ -293,9 +293,7 @@ impl TokenCtx {
     pub async fn connect(
         &self,
     ) -> anyhow::Result<
-        quil_types::proto::node::node_service_client::NodeServiceClient<
-            tonic::transport::Channel,
-        >,
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
         crate::rpc::connect_node_service(&self.connect_opts).await
     }
@@ -304,9 +302,7 @@ impl TokenCtx {
     pub async fn connect_submit(
         &self,
     ) -> anyhow::Result<
-        quil_types::proto::node::node_service_client::NodeServiceClient<
-            tonic::transport::Channel,
-        >,
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
         crate::rpc::connect_node_service(&self.submit_opts).await
     }
@@ -329,7 +325,10 @@ impl TokenCtx {
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
         match key_manager.get_public_key_bytes_by_id("q-prover-key") {
             Ok(falcon_pub) => {
-                println!("{}", quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub));
+                println!(
+                    "{}",
+                    quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub)
+                );
             }
             // Fall back to the legacy Ed448 peer id only if the Falcon network key
             // is absent (a pre-migration keystore).
@@ -341,7 +340,9 @@ impl TokenCtx {
         let submit_opts = ctx.connect_opts(&node_config, common.public_rpc);
         let connect_opts = match &common.read_rpc {
             Some(multiaddr) => ConnectOpts {
-                public_rpc: false, custom_rpc: String::new(), listen_grpc_multiaddr: multiaddr.clone(),
+                public_rpc: false,
+                custom_rpc: String::new(),
+                listen_grpc_multiaddr: multiaddr.clone(),
             },
             None => submit_opts.clone(),
         };
@@ -352,7 +353,9 @@ impl TokenCtx {
             key_manager,
             connect_opts,
             submit_opts,
-            peer_id_bytes: identity.map(|identity| identity.peer_id_bytes).unwrap_or_default(),
+            peer_id_bytes: identity
+                .map(|identity| identity.peer_id_bytes)
+                .unwrap_or_default(),
         })
     }
 }
@@ -362,7 +365,9 @@ impl TokenCtx {
 /// because coin selection follows the fee; outputs are counted exactly.
 #[cfg(feature = "native-proof")]
 async fn operation_fee(
-    tc: &TokenCtx, application: &str, explicit: Option<u128>,
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
     shape: quil_execution::token_intrinsic::cost::Shape,
 ) -> anyhow::Result<u128> {
     let decoded = hex::decode(application)?;
@@ -373,7 +378,10 @@ async fn operation_fee(
         let fee = explicit.unwrap_or(0);
         // Custom-token outflow carries no token fee; the operation's QUIL fee
         // is paid by a settlement claim submitted with it.
-        anyhow::ensure!(fee == 0, "custom-token operations carry no token fee; their QUIL fee is paid by a settlement");
+        anyhow::ensure!(
+            fee == 0,
+            "custom-token operations carry no token fee; their QUIL fee is paid by a settlement"
+        );
         Ok(fee)
     }
 }
@@ -393,7 +401,11 @@ pub(crate) async fn pay_for_bundle(
     rest: &quil_execution::message_envelope::CanonicalMessageBundle,
     wait: std::time::Duration,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
-    let common = TokenCommonArgs { public_rpc: false, config: String::new(), read_rpc: None };
+    let common = TokenCommonArgs {
+        public_rpc: false,
+        config: String::new(),
+        read_rpc: None,
+    };
     let tc = TokenCtx::load(global, &common)?;
     wallet::pay_for_bundle(&tc, destination, rest, None, wait).await
 }
@@ -405,87 +417,318 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
 
 /// Shared command dispatch after configuration and keys have been loaded.
 async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()> {
-    let application = args.application.clone().unwrap_or_else(|| hex::encode(quil_execution::domains::QUIL_TOKEN));
+    let application = args
+        .application
+        .clone()
+        .unwrap_or_else(|| hex::encode(quil_execution::domains::QUIL_TOKEN));
     let decoded = hex::decode(&application)?;
     anyhow::ensure!(decoded.len() == 32, "application must be exactly 32 bytes");
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
-        TokenCommand::Balance => return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await,
-        TokenCommand::Coins => return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await,
+        TokenCommand::Balance => {
+            return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await
+        }
+        TokenCommand::Coins => {
+            return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await
+        }
         TokenCommand::ConfidentialAddress => {
             wallet::run(&tc, &application, false)?;
             return wallet::run(&tc, &application, true);
         }
-        TokenCommand::Escrows { max_escrows } =>
-            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await,
+        TokenCommand::Escrows { max_escrows } => {
+            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await
+        }
         _ => {}
     }
     #[cfg(feature = "native-proof")]
     {
-        let parse_amount = |value: &str| value.parse::<u128>().map_err(|e| anyhow::anyhow!("amount {value:?}: {e}"));
+        let parse_amount = |value: &str| {
+            value
+                .parse::<u128>()
+                .map_err(|e| anyhow::anyhow!("amount {value:?}: {e}"))
+        };
         let parse_id = |value: &str| -> anyhow::Result<[u8; 32]> {
-            hex::decode(value.trim_start_matches("0x"))?.try_into()
+            hex::decode(value.trim_start_matches("0x"))?
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("{value:?} must be exactly 32 bytes of hex"))
         };
         use quil_execution::token_intrinsic::cost::Shape;
-        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(tc.node_config.p2p.network).limits.max_inputs;
-        let spend = |coins: usize| Shape { coins, markers: max_inputs, escrow: false };
+        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+            tc.node_config.p2p.network,
+        )
+        .limits
+        .max_inputs;
+        let spend = |coins: usize| Shape {
+            coins,
+            markers: max_inputs,
+            escrow: false,
+        };
         match &args.command {
-            TokenCommand::Transfer { recipient, amount, fee } =>
-                return wallet::run_transfer(&tc, &application, recipient, parse_amount(amount)?, *fee, args.max_pages, args.max_coins).await,
-            TokenCommand::Merge { coins, fee } =>
-                return wallet::run_merge(&tc, &application, coins, operation_fee(&tc, &application, *fee, spend(1)).await?, args.max_pages, args.max_coins).await,
-            TokenCommand::Split { coin, amounts, parts, part_amount, fee } => {
+            TokenCommand::Transfer {
+                recipient,
+                amount,
+                fee,
+            } => {
+                return wallet::run_transfer(
+                    &tc,
+                    &application,
+                    recipient,
+                    parse_amount(amount)?,
+                    *fee,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Merge { coins, fee } => {
+                return wallet::run_merge(
+                    &tc,
+                    &application,
+                    coins,
+                    operation_fee(&tc, &application, *fee, spend(1)).await?,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Split {
+                coin,
+                amounts,
+                parts,
+                part_amount,
+                fee,
+            } => {
                 let pieces: Vec<u128> = match (parts, part_amount) {
                     (Some(parts), Some(part_amount)) => {
                         anyhow::ensure!(*parts <= 2, "split supports at most two outputs");
                         vec![parse_amount(part_amount)?; *parts as usize]
                     }
                     (Some(_), None) => anyhow::bail!("--parts requires --part-amount"),
-                    (None, _) => amounts.iter().map(|amount| parse_amount(amount)).collect::<anyhow::Result<_>>()?,
+                    (None, _) => amounts
+                        .iter()
+                        .map(|amount| parse_amount(amount))
+                        .collect::<anyhow::Result<_>>()?,
                 };
-                return wallet::run_split(&tc, &application, coin, &pieces, operation_fee(&tc, &application, *fee, Shape { coins: pieces.len().max(1), markers: 1, escrow: false }).await?, args.max_pages, args.max_coins).await;
+                return wallet::run_split(
+                    &tc,
+                    &application,
+                    coin,
+                    &pieces,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: pieces.len().max(1),
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await;
             }
-            TokenCommand::PendingTransfer { recipient, amount, expiration, fee } =>
-                return wallet::run_pending_create(&tc, &application, recipient, parse_amount(amount)?, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: max_inputs, escrow: true }).await?, *expiration, args.max_pages, args.max_coins).await,
-            TokenCommand::Accept { escrow, fee } =>
-                return wallet::run_claim(&tc, &application, escrow, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?, false).await,
-            TokenCommand::Reject { escrow, fee } =>
-                return wallet::run_claim(&tc, &application, escrow, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?, true).await,
-            TokenCommand::Mint { recipient, fee, claim } => {
-                anyhow::ensure!(decoded == quil_execution::domains::QUIL_TOKEN, "reward mint requires the QUIL application; use custom-mint for custom tokens");
+            TokenCommand::PendingTransfer {
+                recipient,
+                amount,
+                expiration,
+                fee,
+            } => {
+                return wallet::run_pending_create(
+                    &tc,
+                    &application,
+                    recipient,
+                    parse_amount(amount)?,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: max_inputs,
+                            escrow: true,
+                        },
+                    )
+                    .await?,
+                    *expiration,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Accept { escrow, fee } => {
+                return wallet::run_claim(
+                    &tc,
+                    &application,
+                    escrow,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    false,
+                )
+                .await
+            }
+            TokenCommand::Reject { escrow, fee } => {
+                return wallet::run_claim(
+                    &tc,
+                    &application,
+                    escrow,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    true,
+                )
+                .await
+            }
+            TokenCommand::Mint {
+                recipient,
+                fee,
+                claim,
+            } => {
+                anyhow::ensure!(
+                    decoded == quil_execution::domains::QUIL_TOKEN,
+                    "reward mint requires the QUIL application; use custom-mint for custom tokens"
+                );
                 // The mint pays its own state-growth charge (one coin and the
                 // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() { 0 } else {
+                let mint_fee = if claim.is_some() {
+                    0
+                } else {
                     // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(&tc, *fee, Shape { coins: 1, markers: 1, escrow: false }, true).await?
+                    wallet::quoted_quil_fee(
+                        &tc,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                        true,
+                    )
+                    .await?
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref()).await;
+                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
+                    .await;
             }
-            TokenCommand::ShieldAll { max_per_batch } =>
-                return wallet::run_shield_all(&tc, &application, *max_per_batch).await,
-            TokenCommand::Shield { source, amount, fee } =>
-                return wallet::run_shield(&tc, &application, source, *amount, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?).await,
-            TokenCommand::Pay { destination, amount, context, fee } => {
-                wallet::run_pay(&tc, parse_id(destination)?, parse_amount(amount)?,
-                    wallet::SettlementBinding::Bundle(parse_id(context)?), *fee, None,
-                    args.max_pages, args.max_coins).await?;
+            TokenCommand::ShieldAll { max_per_batch } => {
+                return wallet::run_shield_all(&tc, &application, *max_per_batch).await
+            }
+            TokenCommand::Shield {
+                source,
+                amount,
+                fee,
+            } => {
+                return wallet::run_shield(
+                    &tc,
+                    &application,
+                    source,
+                    *amount,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                )
+                .await
+            }
+            TokenCommand::Pay {
+                destination,
+                amount,
+                context,
+                fee,
+            } => {
+                wallet::run_pay(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_amount(amount)?,
+                    wallet::SettlementBinding::Bundle(parse_id(context)?),
+                    *fee,
+                    None,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await?;
                 return Ok(());
             }
-            TokenCommand::Prefund { destination, amount, fee, claimant_key } =>
-                return wallet::run_prefund(&tc, parse_id(destination)?, parse_amount(amount)?, *fee, claimant_key,
-                    args.max_pages, args.max_coins).await,
+            TokenCommand::Prefund {
+                destination,
+                amount,
+                fee,
+                claimant_key,
+            } => {
+                return wallet::run_prefund(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_amount(amount)?,
+                    *fee,
+                    claimant_key,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
             TokenCommand::Prefunded => return wallet::run_prefunded(&tc).await,
-            TokenCommand::SettlementClaim { destination, receipt, amount, context, wait } => {
-                let claim = wallet::settlement_claim(&tc, parse_id(destination)?, parse_id(receipt)?, parse_amount(amount)?,
-                    &wallet::ClaimBinding::Bundle(parse_id(context)?), None, std::time::Duration::from_secs(*wait)).await?;
+            TokenCommand::SettlementClaim {
+                destination,
+                receipt,
+                amount,
+                context,
+                wait,
+            } => {
+                let claim = wallet::settlement_claim(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_id(receipt)?,
+                    parse_amount(amount)?,
+                    &wallet::ClaimBinding::Bundle(parse_id(context)?),
+                    None,
+                    std::time::Duration::from_secs(*wait),
+                )
+                .await?;
                 println!("{}", hex::encode(claim));
                 return Ok(());
             }
             TokenCommand::Entitlements { file } => return wallet::run_entitlements(&tc, file),
-            TokenCommand::CustomMint { amount, recipient, authority_key, permissionless, payee, price, pay_wait, entitlement } => {
+            TokenCommand::CustomMint {
+                amount,
+                recipient,
+                authority_key,
+                permissionless,
+                payee,
+                price,
+                pay_wait,
+                entitlement,
+            } => {
                 let paid = match (payee, price) {
-                    (Some(payee), Some(price)) => Some((payee.as_str(), *price, std::time::Duration::from_secs(*pay_wait))),
+                    (Some(payee), Some(price)) => Some((
+                        payee.as_str(),
+                        *price,
+                        std::time::Duration::from_secs(*pay_wait),
+                    )),
                     (None, None) => None,
                     _ => anyhow::bail!("a paid mint needs both --payee and --price"),
                 };
@@ -493,7 +736,17 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     Some(hex) => hex::decode(hex.strip_prefix("0x").unwrap_or(hex))?,
                     None => Vec::new(),
                 };
-                return wallet::run_custom_mint(&tc, &application, *amount, recipient.as_deref(), authority_key, *permissionless, paid, entitlement).await;
+                return wallet::run_custom_mint(
+                    &tc,
+                    &application,
+                    *amount,
+                    recipient.as_deref(),
+                    authority_key,
+                    *permissionless,
+                    paid,
+                    entitlement,
+                )
+                .await;
             }
             TokenCommand::PaymentAddress => return wallet::run_payment_address(&tc),
             _ => {}
@@ -505,7 +758,9 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run(tc, &application).await
         }
-        _ => anyhow::bail!("this build does not include support for this confidential token operation"),
+        _ => anyhow::bail!(
+            "this build does not include support for this confidential token operation"
+        ),
     }
 }
 
@@ -523,28 +778,82 @@ mod tests {
     #[test]
     fn token_cli_uses_one_command_family_for_all_applications() {
         let app = hex::encode([7; 32]);
-        let parsed = TokenCli::try_parse_from(["token", "transfer", "recipient", "9", "--application", &app,
-            "--fee", "0", "--max-pages", "4", "--max-coins", "8"]).unwrap();
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "transfer",
+            "recipient",
+            "9",
+            "--application",
+            &app,
+            "--fee",
+            "0",
+            "--max-pages",
+            "4",
+            "--max-coins",
+            "8",
+        ])
+        .unwrap();
         assert_eq!(parsed.token.application.as_deref(), Some(app.as_str()));
         assert_eq!((parsed.token.max_pages, parsed.token.max_coins), (4, 8));
-        assert!(matches!(parsed.token.command, TokenCommand::Transfer { fee: Some(0), .. }));
+        assert!(matches!(
+            parsed.token.command,
+            TokenCommand::Transfer { fee: Some(0), .. }
+        ));
         #[cfg(feature = "native-proof")]
         {
             assert!(TokenCli::try_parse_from(["token", "shield", "coin", "9"]).is_ok());
-            assert!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app]).is_ok());
+            assert!(
+                TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
+                    .is_ok()
+            );
             // Paid and proof-basis mints, and the entitlement tree builder.
-            assert!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app,
-                "--payee", "00", "--price", "5"]).is_ok());
-            assert!(matches!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app,
-                "--entitlement", "00"]).unwrap().token.command, TokenCommand::CustomMint { entitlement: Some(_), .. }));
-            assert!(matches!(TokenCli::try_parse_from(["token", "entitlements", "list.txt"]).unwrap().token.command,
-                TokenCommand::Entitlements { .. }));
+            assert!(TokenCli::try_parse_from([
+                "token",
+                "custom-mint",
+                "9",
+                "--application",
+                &app,
+                "--payee",
+                "00",
+                "--price",
+                "5"
+            ])
+            .is_ok());
+            assert!(matches!(
+                TokenCli::try_parse_from([
+                    "token",
+                    "custom-mint",
+                    "9",
+                    "--application",
+                    &app,
+                    "--entitlement",
+                    "00"
+                ])
+                .unwrap()
+                .token
+                .command,
+                TokenCommand::CustomMint {
+                    entitlement: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                TokenCli::try_parse_from(["token", "entitlements", "list.txt"])
+                    .unwrap()
+                    .token
+                    .command,
+                TokenCommand::Entitlements { .. }
+            ));
             assert!(TokenCli::try_parse_from(["token", "payment-address"]).is_ok());
             // Pre-funding: a settlement paid before its bundle exists.
-            assert!(matches!(TokenCli::try_parse_from(["token", "prefund", &app, "500"]).unwrap().token.command,
-                TokenCommand::Prefund { claimant_key, .. } if claimant_key == "q-prover-key"));
+            assert!(
+                matches!(TokenCli::try_parse_from(["token", "prefund", &app, "500"]).unwrap().token.command,
+                TokenCommand::Prefund { claimant_key, .. } if claimant_key == "q-prover-key")
+            );
             assert!(TokenCli::try_parse_from(["token", "prefunded"]).is_ok());
-            assert!(TokenCli::try_parse_from(["token", "mint", "--claim", "authorization.bin"]).is_ok());
+            assert!(
+                TokenCli::try_parse_from(["token", "mint", "--claim", "authorization.bin"]).is_ok()
+            );
         }
     }
 

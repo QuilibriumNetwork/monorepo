@@ -65,7 +65,11 @@ fn check_filters(op: &str, filters: &[Vec<u8>]) -> anyhow::Result<()> {
 }
 
 /// ProverPause signature (single filter).
-pub fn pause_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn pause_sig(
+    km: &FileKeyManager,
+    filter: &[u8],
+    frame: u64,
+) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("pause", &[filter.to_vec()])?;
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_pause_domain().map_err(|e| anyhow::anyhow!("pause domain: {e}"))?;
@@ -73,7 +77,11 @@ pub fn pause_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Resu
 }
 
 /// ProverResume signature (single filter).
-pub fn resume_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn resume_sig(
+    km: &FileKeyManager,
+    filter: &[u8],
+    frame: u64,
+) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("resume", &[filter.to_vec()])?;
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_resume_domain().map_err(|e| anyhow::anyhow!("resume domain: {e}"))?;
@@ -81,7 +89,11 @@ pub fn resume_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Res
 }
 
 /// ProverLeave signature (multi filter).
-pub fn leave_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn leave_sig(
+    km: &FileKeyManager,
+    filters: &[Vec<u8>],
+    frame: u64,
+) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("leave", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_leave_domain().map_err(|e| anyhow::anyhow!("leave domain: {e}"))?;
@@ -96,7 +108,11 @@ pub fn leave_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow
 // `filter` is deprecated in global.proto in favour of the repeated `filters`,
 // but it is still on the wire; it is sent empty, as before.
 #[allow(deprecated)]
-pub fn confirm_op(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<ProverConfirm> {
+pub fn confirm_op(
+    km: &FileKeyManager,
+    filters: &[Vec<u8>],
+    frame: u64,
+) -> anyhow::Result<ProverConfirm> {
     Ok(ProverConfirm {
         filter: Vec::new(),
         frame_number: frame,
@@ -109,7 +125,11 @@ pub fn confirm_op(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyho
 
 /// ProverConfirm signature (multi filter; CLI registers no leaf roots, so
 /// the confirm message is byte-identical to the multi-filter message).
-pub fn confirm_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn confirm_sig(
+    km: &FileKeyManager,
+    filters: &[Vec<u8>],
+    frame: u64,
+) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("confirm", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_confirm_domain().map_err(|e| anyhow::anyhow!("confirm domain: {e}"))?;
@@ -117,7 +137,11 @@ pub fn confirm_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyh
 }
 
 /// ProverReject signature (multi filter).
-pub fn reject_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn reject_sig(
+    km: &FileKeyManager,
+    filters: &[Vec<u8>],
+    frame: u64,
+) -> anyhow::Result<Bls48581AddressedSignature> {
     check_filters("reject", filters)?;
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_reject_domain().map_err(|e| anyhow::anyhow!("reject domain: {e}"))?;
@@ -126,7 +150,10 @@ pub fn reject_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyho
 
 /// ProverUpdate (delegate) signature. The signed message is just the
 /// 32-byte delegate address.
-pub fn update_sig(km: &FileKeyManager, delegate_address: &[u8]) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn update_sig(
+    km: &FileKeyManager,
+    delegate_address: &[u8],
+) -> anyhow::Result<Bls48581AddressedSignature> {
     let domain = prover_update_domain().map_err(|e| anyhow::anyhow!("update domain: {e}"))?;
     addressed_sig(km, delegate_address, &domain)
 }
@@ -161,20 +188,35 @@ mod tests {
 
         let sig = leave_sig(&km, &filters, frame).unwrap();
 
-        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
         let message = multi_filter_signing_message(&filters, frame);
         let domain = prover_leave_domain().unwrap();
 
         let ok = km
-            .validate_signature(KeyType::Falcon512, &pubkey, &message, &sig.signature, &domain)
+            .validate_signature(
+                KeyType::Falcon512,
+                &pubkey,
+                &message,
+                &sig.signature,
+                &domain,
+            )
             .unwrap();
-        assert!(ok, "leave signature must verify against KeyManager::validate_signature");
+        assert!(
+            ok,
+            "leave signature must verify against KeyManager::validate_signature"
+        );
 
         // Address is poseidon(pubkey), 32 bytes.
         assert_eq!(sig.address.len(), 32);
         assert_eq!(
             sig.address,
-            quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap().to_vec()
+            quil_crypto::poseidon::hash_bytes_to_32(&pubkey)
+                .unwrap()
+                .to_vec()
         );
     }
 
@@ -183,7 +225,9 @@ mod tests {
     #[test]
     #[allow(deprecated)] // the legacy encoding writes the deprecated `filter` placeholder
     fn a_qclient_confirm_signs_and_encodes_as_legacy_whatever_the_environment_says() {
-        use quil_execution::global_intrinsic::{addressed_signature::AddressedSignature, conversions, prover_release};
+        use quil_execution::global_intrinsic::{
+            addressed_signature::AddressedSignature, conversions, prover_release,
+        };
         // Nextest runs each test in its own process; qclient calls no `init_*`.
         std::env::set_var("QUIL_CONFIRM_RELEASE_FRAME", "0");
         std::env::set_var("QUIL_RELEASE_ELIGIBILITY", "0=2.1.0.25.0");
@@ -193,13 +237,27 @@ mod tests {
         let op = confirm_op(&km, &filters, frame).unwrap();
         assert_eq!(op.release, None);
         assert!(op.leaf_roots.is_empty() && op.filter.is_empty());
-        assert_eq!(prover_release::confirm_release_frame(), u64::MAX, "the environment is not read");
+        assert_eq!(
+            prover_release::confirm_release_frame(),
+            u64::MAX,
+            "the environment is not read"
+        );
 
-        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
         let sig = op.public_key_signature_bls48581.clone().unwrap();
         let legacy_message = multi_filter_signing_message(&filters, frame);
         assert!(km
-            .validate_signature(KeyType::Falcon512, &pubkey, &legacy_message, &sig.signature, &prover_confirm_domain().unwrap())
+            .validate_signature(
+                KeyType::Falcon512,
+                &pubkey,
+                &legacy_message,
+                &sig.signature,
+                &prover_confirm_domain().unwrap()
+            )
             .unwrap());
 
         let mut legacy = Vec::new();
@@ -207,7 +265,12 @@ mod tests {
         legacy.extend_from_slice(&32u32.to_be_bytes());
         legacy.extend_from_slice(b"reservedreservedreservedreserved");
         legacy.extend_from_slice(&frame.to_be_bytes());
-        let sig_bytes = AddressedSignature { signature: sig.signature, address: sig.address }.to_canonical_bytes().unwrap();
+        let sig_bytes = AddressedSignature {
+            signature: sig.signature,
+            address: sig.address,
+        }
+        .to_canonical_bytes()
+        .unwrap();
         legacy.extend_from_slice(&(sig_bytes.len() as u32).to_be_bytes());
         legacy.extend_from_slice(&sig_bytes);
         legacy.extend_from_slice(&(filters.len() as u32).to_be_bytes());
@@ -215,7 +278,12 @@ mod tests {
             legacy.extend_from_slice(&(filter.len() as u32).to_be_bytes());
             legacy.extend_from_slice(filter);
         }
-        assert_eq!(conversions::prover_confirm_from_proto(&op).to_canonical_bytes().unwrap(), legacy);
+        assert_eq!(
+            conversions::prover_confirm_from_proto(&op)
+                .to_canonical_bytes()
+                .unwrap(),
+            legacy
+        );
     }
 
     /// qclient refuses to sign an op no node decodes instead of reporting
@@ -232,10 +300,17 @@ mod tests {
             pause_sig(&km, &[1; 65], 7).map(drop),
         ] {
             let error = refused.unwrap_err().to_string();
-            assert!(error.contains("one op carries at most 100 filters of at most 64 bytes"), "{error}");
+            assert!(
+                error.contains("one op carries at most 100 filters of at most 64 bytes"),
+                "{error}"
+            );
         }
         let chunks: Vec<usize> = op_chunks(&filters(250)).map(<[Vec<u8>]>::len).collect();
-        assert_eq!(chunks, vec![100, 100, 50], "a longer selection is signed as several ops");
+        assert_eq!(
+            chunks,
+            vec![100, 100, 50],
+            "a longer selection is signed as several ops"
+        );
     }
 
     #[test]
@@ -243,18 +318,34 @@ mod tests {
         let (km, _d) = km_with_prover_key();
         let filter = vec![0xAAu8; 32];
         let frame = 7u64;
-        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
+        let pubkey = km
+            .get_signer_by_id("q-prover-key")
+            .unwrap()
+            .public_key()
+            .to_vec();
 
         let ps = pause_sig(&km, &filter, frame).unwrap();
         let pmsg = single_filter_signing_message(&filter, frame);
         assert!(km
-            .validate_signature(KeyType::Falcon512, &pubkey, &pmsg, &ps.signature, &prover_pause_domain().unwrap())
+            .validate_signature(
+                KeyType::Falcon512,
+                &pubkey,
+                &pmsg,
+                &ps.signature,
+                &prover_pause_domain().unwrap()
+            )
             .unwrap());
 
         let delegate = vec![0x11u8; 32];
         let us = update_sig(&km, &delegate).unwrap();
         assert!(km
-            .validate_signature(KeyType::Falcon512, &pubkey, &delegate, &us.signature, &prover_update_domain().unwrap())
+            .validate_signature(
+                KeyType::Falcon512,
+                &pubkey,
+                &delegate,
+                &us.signature,
+                &prover_update_domain().unwrap()
+            )
             .unwrap());
     }
 }

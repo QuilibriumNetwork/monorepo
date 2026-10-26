@@ -8,7 +8,10 @@
 //! hypergraph write keys, compute write keys, token owner keys, mint claims
 //! and escrow claims. A configuration or statement naming any other key type
 //! is rejected rather than verified.
-use quil_types::{crypto::KeyType, error::{QuilError, Result}};
+use quil_types::{
+    crypto::KeyType,
+    error::{QuilError, Result},
+};
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("signature: {message}"))
@@ -41,4 +44,3 @@ pub fn verify_authority_signature(
     }
     Ok(())
 }
-

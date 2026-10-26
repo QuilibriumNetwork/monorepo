@@ -15,8 +15,8 @@
 
 use std::path::Path;
 
-use quil_execution::token_intrinsic::legacy_migration::LegacyMigrationSummary;
 use quil_execution::token_intrinsic::legacy_migration;
+use quil_execution::token_intrinsic::legacy_migration::LegacyMigrationSummary;
 
 /// Migrate the DB at `target` (empty → `config.db.path`) in place: decrypt every
 /// legacy verenc coin of the QUIL token domain into a transparent entry (and
@@ -93,9 +93,8 @@ pub fn convert_legacy_coins_in_place(
             );
         }
     };
-    let summary =
-        legacy_migration::migrate_all_legacy_coins(&store, domain, 4096, &mut progress)
-            .map_err(|e| anyhow::anyhow!("legacy coin migration failed: {e}"))?;
+    let summary = legacy_migration::migrate_all_legacy_coins(&store, domain, 4096, &mut progress)
+        .map_err(|e| anyhow::anyhow!("legacy coin migration failed: {e}"))?;
 
     // Include coins converted by an earlier interrupted invocation. Its
     // originals have already been deleted, so this invocation's counters alone
@@ -117,17 +116,38 @@ mod tests {
 
     fn put_raw(store: &quil_store::RocksHypergraphStore, address: &[u8; 32], blob: &[u8]) {
         let domain = &quil_execution::domains::QUIL_TOKEN;
-        let mut key = domain.to_vec(); key.extend_from_slice(address);
-        store.migrate_put_vertex_underlying("vertex", "adds", &legacy_migration::coin_domain_shard(domain), &key, blob).unwrap();
+        let mut key = domain.to_vec();
+        key.extend_from_slice(address);
+        store
+            .migrate_put_vertex_underlying(
+                "vertex",
+                "adds",
+                &legacy_migration::coin_domain_shard(domain),
+                &key,
+                blob,
+            )
+            .unwrap();
     }
 
-    fn put_transparent(store: &quil_store::RocksHypergraphStore, id: u8, amount: u128, malformed: bool) {
+    fn put_transparent(
+        store: &quil_store::RocksHypergraphStore,
+        id: u8,
+        amount: u128,
+        malformed: bool,
+    ) {
         let domain = &quil_execution::domains::QUIL_TOKEN;
         let mut tree = legacy_migration::create_transparent_coin_tree(
-            &legacy_migration::TransparentCoin { owner_address: [9; 32], amount },
-            &legacy_migration::transparent_type_hash(domain).unwrap(), &[id; 32]).unwrap();
+            &legacy_migration::TransparentCoin {
+                owner_address: [9; 32],
+                amount,
+            },
+            &legacy_migration::transparent_type_hash(domain).unwrap(),
+            &[id; 32],
+        )
+        .unwrap();
         if malformed {
-            tree.insert(&[4], &[0; 15], &[], &num_bigint::BigInt::from(15)).unwrap();
+            tree.insert(&[4], &[0; 15], &[], &num_bigint::BigInt::from(15))
+                .unwrap();
         }
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
         put_raw(store, &[id; 32], &blob);
@@ -141,10 +161,19 @@ mod tests {
             // Model completed chunks from a prior interrupted invocation.
             put_transparent(&store, 1, 7, false);
             put_transparent(&store, 2, 11, false);
-            if old_root { put_raw(&store, &LEGACY_ACCUMULATOR_ROOT_ADDRESS, b"historical-root"); }
+            if old_root {
+                put_raw(&store, &LEGACY_ACCUMULATOR_ROOT_ADDRESS, b"historical-root");
+            }
             let summary = convert_legacy_coins_in_place(&db).unwrap().unwrap();
             assert_eq!(summary.migrated, 0); // this run had no remaining verenc coins
-            assert_eq!(legacy_migration::read_migration_receipt_raw(&store, &quil_execution::domains::QUIL_TOKEN).unwrap(), Some((2, 18)));
+            assert_eq!(
+                legacy_migration::read_migration_receipt_raw(
+                    &store,
+                    &quil_execution::domains::QUIL_TOKEN
+                )
+                .unwrap(),
+                Some((2, 18))
+            );
             assert!(convert_legacy_coins_in_place(&db).unwrap().is_none());
         }
     }
@@ -156,14 +185,27 @@ mod tests {
             let db = quil_store::RocksDb::open_in_memory().unwrap();
             let store = quil_store::RocksHypergraphStore::new(db.inner());
             match failure {
-                0 => { put_transparent(&store, 1, u128::MAX, false); put_transparent(&store, 2, 1, false); }
+                0 => {
+                    put_transparent(&store, 1, u128::MAX, false);
+                    put_transparent(&store, 2, 1, false);
+                }
                 1 => put_transparent(&store, 1, 7, true),
-                2 => put_raw(&store, &legacy_migration::MIGRATION_RECEIPT_ADDRESS, &[0; 23]),
-                _ => put_raw(&store, &legacy_migration::MIGRATION_RECEIPT_ADDRESS, &[0; 25]),
+                2 => put_raw(
+                    &store,
+                    &legacy_migration::MIGRATION_RECEIPT_ADDRESS,
+                    &[0; 23],
+                ),
+                _ => put_raw(
+                    &store,
+                    &legacy_migration::MIGRATION_RECEIPT_ADDRESS,
+                    &[0; 25],
+                ),
             }
             assert!(convert_legacy_coins_in_place(&db).is_err());
             if failure < 2 {
-                assert!(legacy_migration::read_migration_receipt_raw(&store, domain).unwrap().is_none());
+                assert!(legacy_migration::read_migration_receipt_raw(&store, domain)
+                    .unwrap()
+                    .is_none());
             }
         }
     }

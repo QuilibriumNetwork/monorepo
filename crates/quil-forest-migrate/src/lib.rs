@@ -26,14 +26,14 @@
 use quil_forest::l3_leaf_key;
 use quil_tries::{deserialize_go_tree, VectorCommitmentTree};
 
-mod walk;
 mod consolidation;
+mod walk;
 pub use consolidation::run_unified_consolidation;
 pub use walk::{
     convert_app, convert_app_at_versions, convert_db, convert_shard, install_forest_boot,
     install_forest_for_sync, install_forest_if_migrated, quil_shards_for_app, run_conversion,
-    run_conversion_in_place, run_conversion_in_place_with_shards, run_unified_consolidation_in_place,
-    shards_for_app_from_store, ConvertReport, ShardConversion,
+    run_conversion_in_place, run_conversion_in_place_with_shards,
+    run_unified_consolidation_in_place, shards_for_app_from_store, ConvertReport, ShardConversion,
 };
 
 /// Flatten one legacy per-vertex blob into the forest's flat Level-3 leaves.
@@ -153,7 +153,10 @@ mod tests {
         // property that lets sync verify without touching the live forest.
         let blobs = vec![
             (vec![0x11u8; 64], make_vertex_blob(&[(&[0xAAu8; 32], b"x")])),
-            (vec![0x22u8; 64], make_vertex_blob(&[(&[0xBBu8; 32], b"y"), (&[0xCCu8; 32], b"z")])),
+            (
+                vec![0x22u8; 64],
+                make_vertex_blob(&[(&[0xBBu8; 32], b"y"), (&[0xCCu8; 32], b"z")]),
+            ),
         ];
         let verify_root = forest_root_of_vertex_blobs(blobs.clone()).unwrap();
 
@@ -164,9 +167,17 @@ mod tests {
         let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir.path()).unwrap());
         let forest = quil_forest::Forest::new(db);
         let committed = forest
-            .commit_shard_phase(b"shard", quil_forest::Phase::VertexAdds, 0, flatten_phase_leaves(blobs).unwrap())
+            .commit_shard_phase(
+                b"shard",
+                quil_forest::Phase::VertexAdds,
+                0,
+                flatten_phase_leaves(blobs).unwrap(),
+            )
             .unwrap();
-        assert_eq!(verify_root, committed, "fresh-JMT verify root == persistent commit root");
+        assert_eq!(
+            verify_root, committed,
+            "fresh-JMT verify root == persistent commit root"
+        );
     }
 
     #[test]
@@ -174,16 +185,17 @@ mod tests {
         let vaddr = vec![0xABu8; 64]; // global-shard leaf key width
         let type_key = vec![0xFFu8; 32];
         let status_key = vec![0x00u8; 32];
-        let blob = make_vertex_blob(&[
-            (&type_key, b"prover:Prover"),
-            (&status_key, &[1u8]),
-        ]);
+        let blob = make_vertex_blob(&[(&type_key, b"prover:Prover"), (&status_key, &[1u8])]);
 
         let leaves = flatten_vertex_blob(&vaddr, &blob).unwrap();
         assert_eq!(leaves.len(), 2);
         // Every L3 key is the vertex address followed by the inner field key.
         for (k, _) in &leaves {
-            assert_eq!(&k[..64], &vaddr[..], "L3 key carries the vertex address prefix");
+            assert_eq!(
+                &k[..64],
+                &vaddr[..],
+                "L3 key carries the vertex address prefix"
+            );
             assert_eq!(k.len(), 64 + 32);
         }
         // The type field survived with its value.
@@ -204,7 +216,10 @@ mod tests {
         ]);
         let a = flatten_vertex_blob(&vaddr, &blob).unwrap();
         let b = flatten_vertex_blob(&vaddr, &blob).unwrap();
-        assert_eq!(a, b, "same blob → identical L3 leaves (reproducible migration)");
+        assert_eq!(
+            a, b,
+            "same blob → identical L3 leaves (reproducible migration)"
+        );
         assert_eq!(a.len(), 3);
     }
 
@@ -225,8 +240,7 @@ mod tests {
         let v2 = vec![0x22u8; 64];
         let b1 = make_vertex_blob(&[(&[0xAAu8; 32], b"x")]);
         let b2 = make_vertex_blob(&[(&[0xBBu8; 32], b"y"), (&[0xCCu8; 32], b"z")]);
-        let leaves =
-            flatten_phase_leaves(vec![(v1.clone(), b1), (v2.clone(), b2)]).unwrap();
+        let leaves = flatten_phase_leaves(vec![(v1.clone(), b1), (v2.clone(), b2)]).unwrap();
         assert_eq!(leaves.len(), 3);
         assert!(leaves.iter().any(|(k, _)| k.starts_with(&v1)));
         assert_eq!(leaves.iter().filter(|(k, _)| k.starts_with(&v2)).count(), 2);

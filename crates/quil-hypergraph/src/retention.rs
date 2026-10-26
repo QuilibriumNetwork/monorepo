@@ -41,7 +41,12 @@ impl RetentionPolicy {
     /// `QUIL_PRUNE_INTERVAL_SECS` override the defaults. A retention below
     /// the sync window is refused.
     pub fn from_env(serves_history: bool) -> Option<Self> {
-        if !pruning_enabled(std::env::var("QUIL_PRUNE_RETAINED_VERSIONS").ok().as_deref(), serves_history) {
+        if !pruning_enabled(
+            std::env::var("QUIL_PRUNE_RETAINED_VERSIONS")
+                .ok()
+                .as_deref(),
+            serves_history,
+        ) {
             return None;
         }
         let number = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
@@ -49,10 +54,13 @@ impl RetentionPolicy {
             retain_frames: number("QUIL_PRUNE_RETAIN_FRAMES")
                 .unwrap_or(Self::DEFAULT_RETAIN_FRAMES)
                 .max(crate::SNAPSHOT_MAX_GENERATIONS as u64),
-            interval: Duration::from_secs(number("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10)),
+            interval: Duration::from_secs(
+                number("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10),
+            ),
             max_blob_deletes: 100_000,
-            max_value_deletes: (std::env::var("QUIL_PRUNE_JMT_VALUES").ok().as_deref() != Some("0"))
-                .then_some(100_000),
+            max_value_deletes: (std::env::var("QUIL_PRUNE_JMT_VALUES").ok().as_deref()
+                != Some("0"))
+            .then_some(100_000),
         })
     }
 }
@@ -84,7 +92,11 @@ pub fn snapshot_pin_limit(setting: Option<&str>) -> Option<usize> {
     match setting.map(str::trim) {
         Some("0") | Some("off") => None,
         Some(value) => Some(
-            value.parse::<usize>().map_or(DEFAULT_PINNED_GENERATIONS, |limit| limit.max(MIN_PINNED_GENERATIONS)),
+            value
+                .parse::<usize>()
+                .map_or(DEFAULT_PINNED_GENERATIONS, |limit| {
+                    limit.max(MIN_PINNED_GENERATIONS)
+                }),
         ),
         None => Some(DEFAULT_PINNED_GENERATIONS),
     }
@@ -120,16 +132,27 @@ struct PassSummary {
 
 impl PassSummary {
     fn new(now: std::time::Instant) -> Self {
-        Self { since: now, tally: PassTally::default() }
+        Self {
+            since: now,
+            tally: PassTally::default(),
+        }
     }
 
     /// Count one pass (`None`: it failed). Returns the tally and its window
     /// once the interval has elapsed, and starts the next window.
-    fn record(&mut self, pass: Option<RetentionPass>, now: std::time::Instant) -> Option<(PassTally, Duration)> {
+    fn record(
+        &mut self,
+        pass: Option<RetentionPass>,
+        now: std::time::Instant,
+    ) -> Option<(PassTally, Duration)> {
         let tally = &mut self.tally;
         tally.passes += 1;
         match pass {
-            Some(RetentionPass { trees, nodes, values }) => {
+            Some(RetentionPass {
+                trees,
+                nodes,
+                values,
+            }) => {
                 if trees == 0 && nodes == 0 && values == 0 {
                     tally.empty += 1;
                 }
@@ -205,18 +228,39 @@ mod tests {
         let start = std::time::Instant::now();
         let at = |minutes: u64| start + Duration::from_secs(minutes * 60);
         let mut summary = PassSummary::new(start);
-        let found = RetentionPass { trees: 1, nodes: 2, values: 3 };
+        let found = RetentionPass {
+            trees: 1,
+            nodes: 2,
+            values: 3,
+        };
         assert_eq!(summary.record(Some(RetentionPass::default()), at(10)), None);
         assert_eq!(summary.record(None, at(20)), None);
         assert_eq!(summary.record(Some(found), at(50)), None);
         assert_eq!(
             summary.record(Some(RetentionPass::default()), at(60)),
-            Some((PassTally { passes: 4, empty: 2, failed: 1, trees: 1, nodes: 2, values: 3 }, PASS_SUMMARY_INTERVAL)),
+            Some((
+                PassTally {
+                    passes: 4,
+                    empty: 2,
+                    failed: 1,
+                    trees: 1,
+                    nodes: 2,
+                    values: 3
+                },
+                PASS_SUMMARY_INTERVAL
+            )),
         );
         assert_eq!(summary.record(Some(RetentionPass::default()), at(70)), None);
         assert_eq!(
             summary.record(Some(RetentionPass::default()), at(125)),
-            Some((PassTally { passes: 2, empty: 2, ..PassTally::default() }, Duration::from_secs(65 * 60))),
+            Some((
+                PassTally {
+                    passes: 2,
+                    empty: 2,
+                    ..PassTally::default()
+                },
+                Duration::from_secs(65 * 60)
+            )),
         );
     }
 
@@ -225,7 +269,10 @@ mod tests {
     #[test]
     fn the_snapshot_pin_cap_defaults_on_and_respects_its_floor() {
         assert_eq!(snapshot_pin_limit(None), Some(DEFAULT_PINNED_GENERATIONS));
-        assert_eq!(snapshot_pin_limit(Some("not a number")), Some(DEFAULT_PINNED_GENERATIONS));
+        assert_eq!(
+            snapshot_pin_limit(Some("not a number")),
+            Some(DEFAULT_PINNED_GENERATIONS)
+        );
         assert_eq!(snapshot_pin_limit(Some("0")), None);
         assert_eq!(snapshot_pin_limit(Some("off")), None);
         assert_eq!(snapshot_pin_limit(Some("4")), Some(MIN_PINNED_GENERATIONS));

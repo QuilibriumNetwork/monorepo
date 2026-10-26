@@ -30,7 +30,10 @@ fn commit(state: &HypergraphState, number: u64) {
     state.abort();
     state
         .crdt()
-        .commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key())
+        .commit_with_global_cursor(
+            number,
+            &quil_store::encoding::global_materialized_cursor_key(),
+        )
         .unwrap();
 }
 
@@ -42,7 +45,10 @@ fn seed(crdt: &quil_hypergraph::HypergraphCrdt) {
 }
 
 fn location(d: u8) -> quil_hypergraph::Location {
-    quil_hypergraph::Location { app_address: APP, data_address: [d; 32] }
+    quil_hypergraph::Location {
+        app_address: APP,
+        data_address: [d; 32],
+    }
 }
 
 fn value(d: u8) -> Vec<u8> {
@@ -64,12 +70,20 @@ fn number(frame: &AppShardFrame) -> u64 {
 
 fn certificate(frame: &AppShardFrame) -> Vec<u8> {
     let header = frame.header.as_ref().unwrap();
-    let signature = header.public_key_signature_bls48581.as_ref().expect("finalized frames carry a certificate");
-    quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).unwrap().to_vec()
+    let signature = header
+        .public_key_signature_bls48581
+        .as_ref()
+        .expect("finalized frames carry a certificate");
+    quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature)
+        .unwrap()
+        .to_vec()
 }
 
 /// The session a frame's certificate is authorized by, if any.
-fn session_of(view: &CommittedView, frame: &AppShardFrame) -> Option<quil_cw_consensus::handoff::Session> {
+fn session_of(
+    view: &CommittedView,
+    frame: &AppShardFrame,
+) -> Option<quil_cw_consensus::handoff::Session> {
     let header = frame.header.as_ref().unwrap();
     let claim = frames::FrameClaim {
         filter: &header.address,
@@ -78,7 +92,10 @@ fn session_of(view: &CommittedView, frame: &AppShardFrame) -> Option<quil_cw_con
         parent: &header.parent_selector,
         digest: quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap(),
     };
-    frames::verify(view, &claim, &certificate(frame)).ok().flatten().map(|v| v.session)
+    frames::verify(view, &claim, &certificate(frame))
+        .ok()
+        .flatten()
+        .map(|v| v.session)
 }
 
 async fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
@@ -109,12 +126,16 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
         Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
         Arc::new(quil_hypergraph::testing::StubProver),
     ));
-    global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+    global.set_forest(quil_forest::Forest::with_namespace(
+        db.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
     let state = HypergraphState::new(global.clone());
     commit(&state, 1);
 
     // 1. Legacy: the registry committee certifies frames.
-    let harness = AppShardHarness::build_cw_sessions_seeded(provers.clone(), registry, global.clone(), seed);
+    let harness =
+        AppShardHarness::build_cw_sessions_seeded(provers.clone(), registry, global.clone(), seed);
     let legacy = until(Duration::from_secs(90), || {
         let frames = all_frames(&harness);
         (frames.iter().filter(|f| number(f) >= 3).count() > 0).then_some(frames)
@@ -127,36 +148,66 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: 0,
         chain_id: [0x51; 32],
-        legacy_history: LegacyHistory::Discard, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX
+        legacy_history: LegacyHistory::Discard,
+        membership_boundary_frame: u64::MAX,
+        first_session_boundary_frame: u64::MAX,
     }));
     let discarded = until(Duration::from_secs(60), || {
-        harness.workers.iter().all(|w| {
-            w.clock.as_ref().is_some_and(|clock| clock.app_frame_history_discarded().unwrap().is_some())
-        }).then_some(())
+        harness
+            .workers
+            .iter()
+            .all(|w| {
+                w.clock
+                    .as_ref()
+                    .is_some_and(|clock| clock.app_frame_history_discarded().unwrap().is_some())
+            })
+            .then_some(())
     })
     .await;
-    assert!(discarded.is_some(), "every member discards its legacy history at activation");
+    assert!(
+        discarded.is_some(),
+        "every member discards its legacy history at activation"
+    );
     // A legacy host stops before the discard, but a frame it finalized just
     // before is still in the engine's mailbox. Deliver one (from the first
     // host, epoch 1) and wait for the engine to handle it.
-    let stale = legacy.iter().max_by_key(|f| number(f)).unwrap().encode_to_vec();
+    let stale = legacy
+        .iter()
+        .max_by_key(|f| number(f))
+        .unwrap()
+        .encode_to_vec();
     for worker in &harness.workers {
-        worker.handle.send(quil_engine::app_engine::AppEngineMessage::CwFinalizedFrame {
-            frame: stale.clone(),
-            cert: Vec::new(),
-            locally_verified: true,
-            implied: Vec::new(),
-            host_epoch: 1,
-        });
+        worker.handle.send(
+            quil_engine::app_engine::AppEngineMessage::CwFinalizedFrame {
+                frame: stale.clone(),
+                cert: Vec::new(),
+                locally_verified: true,
+                implied: Vec::new(),
+                host_epoch: 1,
+            },
+        );
         let (reply, handled) = tokio::sync::oneshot::channel();
-        worker.handle.send(quil_engine::app_engine::AppEngineMessage::CommittedTip { reply });
-        handled.await.expect("the engine handles its mailbox in order");
+        worker
+            .handle
+            .send(quil_engine::app_engine::AppEngineMessage::CommittedTip { reply });
+        handled
+            .await
+            .expect("the engine handles its mailbox in order");
     }
     for worker in &harness.workers {
         let clock = worker.clock.as_ref().unwrap();
-        assert!(clock.get_latest_shard_clock_frame(&filter).is_err(), "no legacy frame remains");
-        let cursor = worker.shard.as_ref().unwrap()
-            .read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(&filter)).unwrap();
+        assert!(
+            clock.get_latest_shard_clock_frame(&filter).is_err(),
+            "no legacy frame remains"
+        );
+        let cursor = worker
+            .shard
+            .as_ref()
+            .unwrap()
+            .read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(
+                &filter,
+            ))
+            .unwrap();
         assert_eq!(cursor, 0, "the materialized cursor restarts with the chain");
     }
 
@@ -186,13 +237,22 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
     })
     .await
     .expect("the first session certifies frames from 1");
-    assert_eq!(number(&sessions[0]), 1, "frames number from the session's base");
-    assert_eq!(sessions[0].header.as_ref().unwrap().parent_selector, first.genesis.to_vec());
+    assert_eq!(
+        number(&sessions[0]),
+        1,
+        "frames number from the session's base"
+    );
+    assert_eq!(
+        sessions[0].header.as_ref().unwrap().parent_selector,
+        first.genesis.to_vec()
+    );
     for pair in sessions.windows(2) {
         assert_eq!(number(&pair[1]), number(&pair[0]) + 1);
         assert_eq!(
             pair[1].header.as_ref().unwrap().parent_selector,
-            quil_crypto::poseidon::hash_bytes_to_32(&pair[0].header.as_ref().unwrap().output).unwrap().to_vec(),
+            quil_crypto::poseidon::hash_bytes_to_32(&pair[0].header.as_ref().unwrap().output)
+                .unwrap()
+                .to_vec(),
         );
     }
     assert!(legacy_head >= 3);
@@ -206,7 +266,11 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
         let clock = worker.clock.as_ref().unwrap();
         let head = clock.get_latest_shard_clock_frame(&filter).unwrap();
         let view = CommittedView::capture(&global).unwrap();
-        assert_eq!(session_of(&view, &head).as_ref(), Some(&first), "the stored chain is the session's");
+        assert_eq!(
+            session_of(&view, &head).as_ref(),
+            Some(&first),
+            "the stored chain is the session's"
+        );
     }
     // Join every consensus host before the stores drop: a detached host
     // can close RocksDB while the process exits (`AppShardHarness::shutdown`).

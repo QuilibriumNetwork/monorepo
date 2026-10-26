@@ -137,9 +137,8 @@ where
         let challenge_scalar = C::Scalar::reduce(U256::from_be_slice(&extended));
 
         // We compare the values that should agree.
-        let point_verify =
-            ((C::ProjectivePoint::from(generator) * self.challenge_response)
-                + (C::ProjectivePoint::from(*point) * challenge_scalar))
+        let point_verify = ((C::ProjectivePoint::from(generator) * self.challenge_response)
+            + (C::ProjectivePoint::from(*point) * challenge_scalar))
             .to_affine();
 
         point_verify == *point_rand_commitment
@@ -586,10 +585,10 @@ where
         // We compare the values that should agree.
         let point_verify_g = ((C::ProjectivePoint::from(self.base_g) * self.challenge_response)
             + (C::ProjectivePoint::from(self.point_u) * challenge))
-        .to_affine();
+            .to_affine();
         let point_verify_h = ((C::ProjectivePoint::from(self.base_h) * self.challenge_response)
             + (C::ProjectivePoint::from(self.point_v) * challenge))
-        .to_affine();
+            .to_affine();
 
         (point_verify_g == rand_commitments.rc_g) && (point_verify_h == rand_commitments.rc_h)
     }
@@ -616,10 +615,10 @@ where
         // Now we compute the "random" commitments that work for this challenge.
         let point_rand_commitment_g = ((C::ProjectivePoint::from(*base_g) * challenge_response)
             + (C::ProjectivePoint::from(*point_u) * challenge))
-        .to_affine();
+            .to_affine();
         let point_rand_commitment_h = ((C::ProjectivePoint::from(*base_h) * challenge_response)
             + (C::ProjectivePoint::from(*point_v) * challenge))
-        .to_affine();
+            .to_affine();
 
         let rand_commitments = RandomCommitments {
             rc_g: point_rand_commitment_g,
@@ -947,11 +946,7 @@ mod tests {
         let session_id = rng::get_rng().gen::<[u8; 32]>();
         let (mut proof, commitment) = DLogProof::<C>::prove_commit(&scalar, &session_id);
         proof.proofs[0].challenge_response *= Scalar::from(2u64); //Changing the proof
-        assert!(!(DLogProof::<C>::decommit_verify(
-            &proof,
-            &commitment,
-            &session_id
-        )));
+        assert!(!(DLogProof::<C>::decommit_verify(&proof, &commitment, &session_id)));
     }
 
     /// Generates a [`DLogProof`] with commitment and changes
@@ -966,11 +961,7 @@ mod tests {
         } else {
             commitment[0] -= 1;
         } //Changing the commitment
-        assert!(!(DLogProof::<C>::decommit_verify(
-            &proof,
-            &commitment,
-            &session_id
-        )));
+        assert!(!(DLogProof::<C>::decommit_verify(&proof, &commitment, &session_id)));
     }
 
     // CPProof

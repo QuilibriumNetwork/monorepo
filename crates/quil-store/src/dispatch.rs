@@ -1,4 +1,3 @@
-
 use quil_types::error::{QuilError, Result};
 
 /// Inbox message prefix byte.
@@ -24,12 +23,7 @@ impl RocksInboxStore {
     }
 
     /// Store an inbox message for the given filter at the given timestamp.
-    pub fn put_inbox_message(
-        &self,
-        filter: &[u8],
-        timestamp: u64,
-        data: &[u8],
-    ) -> Result<()> {
+    pub fn put_inbox_message(&self, filter: &[u8], timestamp: u64, data: &[u8]) -> Result<()> {
         let key = inbox_message_key(filter, timestamp);
         self.db
             .put(&key, data)
@@ -55,7 +49,9 @@ impl RocksInboxStore {
         let prefix_len = 1 + filter.len(); // prefix byte + filter
         let mut results = Vec::new();
 
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         for item in iter {
             match item {
                 Ok((k, v)) => {
@@ -77,11 +73,7 @@ impl RocksInboxStore {
     /// Record a hub association (add) for the given filter. Deletes
     /// any tombstone and writes the add entry in a single atomic
     /// batch (mirrors Go's `AddHubInboxAssociation`).
-    pub fn put_hub_add(
-        &self,
-        filter: &[u8],
-        hub_id: &[u8],
-    ) -> Result<()> {
+    pub fn put_hub_add(&self, filter: &[u8], hub_id: &[u8]) -> Result<()> {
         let key = hub_key(HUB_ADD_PREFIX, filter, hub_id);
         let del_key = hub_key(HUB_DELETE_PREFIX, filter, hub_id);
         let mut batch = rocksdb::WriteBatch::default();
@@ -95,11 +87,7 @@ impl RocksInboxStore {
     /// Record a hub disassociation (delete tombstone). Removes the
     /// add entry and writes the tombstone in a single atomic batch
     /// (mirrors Go's `DeleteHubInboxAssociation`).
-    pub fn put_hub_delete(
-        &self,
-        filter: &[u8],
-        hub_id: &[u8],
-    ) -> Result<()> {
+    pub fn put_hub_delete(&self, filter: &[u8], hub_id: &[u8]) -> Result<()> {
         let key = hub_key(HUB_DELETE_PREFIX, filter, hub_id);
         let add_key = hub_key(HUB_ADD_PREFIX, filter, hub_id);
         let mut batch = rocksdb::WriteBatch::default();
@@ -125,7 +113,9 @@ impl RocksInboxStore {
         let prefix_len = prefix.len();
         let mut results = Vec::new();
 
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         for item in iter {
             match item {
                 Ok((k, _v)) => {

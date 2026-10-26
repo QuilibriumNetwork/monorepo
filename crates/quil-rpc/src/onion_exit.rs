@@ -99,7 +99,9 @@ const MAX_CONCURRENT_EXIT_RPCS: usize = 64;
 const UNBOUND_WARN_INTERVAL_SECS: u64 = 60;
 
 fn unix_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The onion exit RPC proxy. Wire [`into_on_data`](Self::into_on_data) as the
@@ -173,7 +175,9 @@ impl OnionExitProxy {
             }
         } else if let Some(dropped) = self.note_unbound(unix_secs()) {
             tracing::warn!(
-                circ_id, dropped, interval_secs = UNBOUND_WARN_INTERVAL_SECS,
+                circ_id,
+                dropped,
+                interval_secs = UNBOUND_WARN_INTERVAL_SECS,
                 "onion exit has no reply handle; proxied replies are dropped and callers time out \
                  (defect on this node: node startup did not bind the onion node to its exit proxy)",
             );
@@ -306,7 +310,10 @@ mod tests {
         );
         let (peer, method, body) = parse_onion_rpc(&payload).unwrap();
         assert_eq!(peer, b"target-peer-id");
-        assert_eq!(method, "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame");
+        assert_eq!(
+            method,
+            "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame"
+        );
         assert_eq!(body, b"protobuf-request-bytes");
     }
 
@@ -335,19 +342,30 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_payload_is_rejected() {
-        let proxy =
-            OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), Arc::new(|_| None), HashSet::new());
+        let proxy = OnionExitProxy::new(
+            quil_p2p::generate_falcon_signing_key(),
+            Arc::new(|_| None),
+            HashSet::new(),
+        );
         let err = proxy.process(vec![0x00]).await.unwrap_err();
         assert!(err.contains("malformed"), "got: {err}");
     }
 
     #[test]
     fn unbound_reply_warns_first_then_once_a_minute_with_a_count() {
-        let proxy = OnionExitProxy::new(quil_p2p::generate_falcon_signing_key(), Arc::new(|_| None), HashSet::new());
+        let proxy = OnionExitProxy::new(
+            quil_p2p::generate_falcon_signing_key(),
+            Arc::new(|_| None),
+            HashSet::new(),
+        );
         assert_eq!(proxy.note_unbound(1_000), Some(1), "the first drop warns");
         assert_eq!(proxy.note_unbound(1_001), None);
         assert_eq!(proxy.note_unbound(1_059), None);
-        assert_eq!(proxy.note_unbound(1_060), Some(3), "a minute on, with the drops since");
+        assert_eq!(
+            proxy.note_unbound(1_060),
+            Some(3),
+            "a minute on, with the drops since"
+        );
         assert_eq!(proxy.note_unbound(1_061), None);
     }
 

@@ -34,7 +34,13 @@ pub mod range_proof_mpc {
 
 pub mod uniffi_bulletproofs;
 
-pub use crate::uniffi_bulletproofs::{RangeProofResult, generate_input_commitments, generate_range_proof, verify_range_proof, sum_check, scalar_mult_point, scalar_mult, scalar_inverse, keygen, scalar_mult_hash_to_scalar, hash_to_scalar, scalar_addition, scalar_subtraction, scalar_to_point, alt_generator, point_addition, point_subtraction, sign_hidden, verify_hidden, sign_simple, verify_simple};
+pub use crate::uniffi_bulletproofs::{
+    alt_generator, generate_input_commitments, generate_range_proof, hash_to_scalar, keygen,
+    point_addition, point_subtraction, scalar_addition, scalar_inverse, scalar_mult,
+    scalar_mult_hash_to_scalar, scalar_mult_point, scalar_subtraction, scalar_to_point,
+    sign_hidden, sign_simple, sum_check, verify_hidden, verify_range_proof, verify_simple,
+    RangeProofResult,
+};
 
 // UniFFI bindings - exclude for WASM targets
 #[cfg(all(feature = "uniffi-bindings", not(target_arch = "wasm32")))]

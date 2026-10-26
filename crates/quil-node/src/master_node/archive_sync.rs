@@ -17,17 +17,23 @@ struct RegistrySyncAnchor {
 }
 
 impl RegistrySyncAnchor {
-    fn capture(
-        clock: &dyn quil_types::store::ClockStore,
-        fork_target: Option<Vec<u8>>,
-    ) -> Self {
-        let header = clock.get_latest_global_clock_frame().ok().and_then(|frame| frame.header);
-        let root = fork_target.filter(|root| !root.is_empty())
-            .or_else(|| header.as_ref().map(|header| header.prover_tree_commitment.clone()))
+    fn capture(clock: &dyn quil_types::store::ClockStore, fork_target: Option<Vec<u8>>) -> Self {
+        let header = clock
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header);
+        let root = fork_target
+            .filter(|root| !root.is_empty())
+            .or_else(|| {
+                header
+                    .as_ref()
+                    .map(|header| header.prover_tree_commitment.clone())
+            })
             .unwrap_or_default();
         // A fork target without a matching authenticated header provides no
         // frame citation. Empty-root bootstrap likewise authenticates none.
-        let cursor = header.filter(|header| !root.is_empty() && header.prover_tree_commitment == root)
+        let cursor = header
+            .filter(|header| !root.is_empty() && header.prover_tree_commitment == root)
             .map(|header| header.frame_number.saturating_sub(1));
         Self { root, cursor }
     }
@@ -44,7 +50,9 @@ fn reconcile_workers_after_registry_sync(
     if archive_mode || anchor.root.is_empty() {
         return Ok(None);
     }
-    let Some(frame) = anchor.cursor else { return Ok(None); };
+    let Some(frame) = anchor.cursor else {
+        return Ok(None);
+    };
     allocator.on_new_frame(frame)?;
     Ok(Some(frame))
 }
@@ -103,7 +111,10 @@ where
         result = jump => result.ok().flatten(),
     };
     if let Some(frame) = completed {
-        info!(frame, "initial prover sync: reusing authenticated startup state jump");
+        info!(
+            frame,
+            "initial prover sync: reusing authenticated startup state jump"
+        );
         Some(true)
     } else {
         Some(fallback().await)
@@ -112,9 +123,15 @@ where
 
 /// Whether `registry` shows `prover` with an allocation on the GLOBAL (empty)
 /// confirmation filter, which makes it a GLOBAL prover.
-fn holds_global_allocation(registry: &dyn quil_types::consensus::ProverRegistry, prover: &[u8]) -> bool {
+fn holds_global_allocation(
+    registry: &dyn quil_types::consensus::ProverRegistry,
+    prover: &[u8],
+) -> bool {
     match registry.get_prover_info(prover) {
-        Ok(Some(info)) => info.allocations.iter().any(|a| a.confirmation_filter.is_empty()),
+        Ok(Some(info)) => info
+            .allocations
+            .iter()
+            .any(|a| a.confirmation_filter.is_empty()),
         _ => false,
     }
 }
@@ -136,7 +153,10 @@ pub(crate) async fn await_registry_load(
         return true;
     }
     let started = std::time::Instant::now();
-    info!(waiter, "waiting for the prover registry's first load from the store");
+    info!(
+        waiter,
+        "waiting for the prover registry's first load from the store"
+    );
     loop {
         tokio::select! {
             biased;
@@ -212,7 +232,12 @@ async fn await_global_allocation(
 /// shard. A flip can also land a few frames past the boundary, after that
 /// refresh: `registry_ahead` (the synced registry shows a live shard the
 /// sizes lack) brings the refresh forward.
-fn shard_info_refresh_due(now_frame: u64, last_refresh_frame: u64, loaded: bool, registry_ahead: bool) -> bool {
+fn shard_info_refresh_due(
+    now_frame: u64,
+    last_refresh_frame: u64,
+    loaded: bool,
+    registry_ahead: bool,
+) -> bool {
     const REFRESH_CADENCE_FRAMES: u64 = 60;
     // The archives commit the flip frame before a regular asks.
     const AFTER_BOUNDARY_FRAMES: u64 = 2;
@@ -271,7 +296,9 @@ pub(crate) fn global_committee_successor(
     committee
         .iter()
         .zip(peer_ids)
-        .filter(|(_, peer_id)| !quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&peer_id.as_str()))
+        .filter(|(_, peer_id)| {
+            !quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&peer_id.as_str())
+        })
         .map(|(key, peer_id)| (key.clone(), peer_id.clone()))
         .unzip()
 }
@@ -292,7 +319,9 @@ fn finalized_global_header(
         .ok()?
         .into_iter()
         .filter_map(|frame| frame.header)
-        .find(|header| header.frame_number == frame_number && verifier.verify_global_finalization_cert(header))
+        .find(|header| {
+            header.frame_number == frame_number && verifier.verify_global_finalization_cert(header)
+        })
 }
 
 /// What, in the GLOBAL frames after `cursor` through `head`, changes this
@@ -333,9 +362,17 @@ fn grid_change_between(
         let Ok(frame) = clock.get_global_frame(number) else {
             return Some(format!("frame {number} is not stored"));
         };
-        if frame.requests.iter().flat_map(|bundle| bundle.requests.iter()).any(|request| {
-            matches!(request.request, Some(Request::ShardSplit(_) | Request::ShardMerge(_)))
-        }) {
+        if frame
+            .requests
+            .iter()
+            .flat_map(|bundle| bundle.requests.iter())
+            .any(|request| {
+                matches!(
+                    request.request,
+                    Some(Request::ShardSplit(_) | Request::ShardMerge(_))
+                )
+            })
+        {
             return Some(format!("frame {number} stages a shard split or merge"));
         }
     }
@@ -385,7 +422,10 @@ fn archive_frame_is_valid(
     match validate_result {
         Ok(Ok(true)) => true,
         Ok(Ok(false)) => {
-            debug!(frame = frame_num, "archive frame rejected by validator — dropping");
+            debug!(
+                frame = frame_num,
+                "archive frame rejected by validator — dropping"
+            );
             false
         }
         Ok(Err(e)) => {
@@ -393,7 +433,10 @@ fn archive_frame_is_valid(
             false
         }
         Err(_) => {
-            debug!(frame = frame_num, "archive frame VDF validation PANIC — dropping");
+            debug!(
+                frame = frame_num,
+                "archive frame VDF validation PANIC — dropping"
+            );
             false
         }
     }
@@ -410,11 +453,15 @@ pub(crate) fn frame_self_certified(
     frame: &quil_types::proto::global::GlobalFrame,
     frame_validator: &quil_engine::frame_validator::GlobalFrameVerifier,
 ) -> bool {
-    let Some(header) = frame.header.as_ref() else { return false };
+    let Some(header) = frame.header.as_ref() else {
+        return false;
+    };
     if header.frame_number == 0 {
         return true;
     }
-    let Some(signature) = header.public_key_signature_bls48581.as_ref() else { return false };
+    let Some(signature) = header.public_key_signature_bls48581.as_ref() else {
+        return false;
+    };
     if quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).is_some() {
         // Without the committee no certificate can be checked; such a node
         // keeps its earlier behavior rather than holding every frame.
@@ -422,7 +469,10 @@ pub(crate) fn frame_self_certified(
             || frame_validator.verify_global_finalization_cert(header);
     }
     !signature.signature.is_empty()
-        && signature.public_key.as_ref().is_some_and(|key| !key.key_value.is_empty())
+        && signature
+            .public_key
+            .as_ref()
+            .is_some_and(|key| !key.key_value.is_empty())
 }
 
 /// Reconstruct a `GlobalProposal` for frame `n` from the LOCAL clock store,
@@ -519,7 +569,9 @@ pub(crate) fn reconstruct_local_proposal(
     let prior_rank_timeout_certificate = clock_store
         .get_timeout_certificate(&[], rank.saturating_sub(1))
         .ok();
-    let parent = clock_store.get_global_clock_frame(n - 1).map_err(|e| e.to_string())?;
+    let parent = clock_store
+        .get_global_clock_frame(n - 1)
+        .map_err(|e| e.to_string())?;
     let parent_rank = parent.header.as_ref().map(|h| h.rank).unwrap_or(0);
     let parent_quorum_certificate = clock_store.get_quorum_certificate(&[], parent_rank).ok();
     Ok(quil_types::proto::global::GlobalProposal {
@@ -658,15 +710,27 @@ async fn run_record_only_backfill(
         .collect();
     if remaining.is_empty() {
         info!(lo, hi, "record-only backfill: no holes, nothing to do");
-        return BackfillOutcome { filled: promoted_local, unresolved: 0 };
+        return BackfillOutcome {
+            filled: promoted_local,
+            unresolved: 0,
+        };
     }
     let initial = remaining.len();
-    info!(holes = initial, lo, hi, "record-only backfill: filling missing frame records");
+    info!(
+        holes = initial,
+        lo, hi, "record-only backfill: filling missing frame records"
+    );
 
     let endpoints = pool.get_all().await;
     if endpoints.is_empty() {
-        warn!(holes = initial, "record-only backfill: no archive endpoints known yet — skipping");
-        return BackfillOutcome { filled: promoted_local, unresolved: initial as u64 };
+        warn!(
+            holes = initial,
+            "record-only backfill: no archive endpoints known yet — skipping"
+        );
+        return BackfillOutcome {
+            filled: promoted_local,
+            unresolved: initial as u64,
+        };
     }
     // One pass per known endpoint, plus a little slack; we rotate through
     // `endpoints` so each round prefers a different archive.
@@ -705,7 +769,9 @@ async fn run_record_only_backfill(
                     // Gate BEFORE persist. Execution side effects are already
                     // skipped by design (record-only). Re-queue so another
                     // endpoint may still serve the canonical record for `n`.
-                    if let Err(reason) = canonical_hole_frame(&clock_store, n, &frame, &frame_validate) {
+                    if let Err(reason) =
+                        canonical_hole_frame(&clock_store, n, &frame, &frame_validate)
+                    {
                         debug!(%addr, frame = n, reason, "record-only backfill: frame rejected — skipping");
                         invalid += 1;
                         still.push(n);
@@ -737,18 +803,30 @@ async fn run_record_only_backfill(
         remaining = still;
     }
     if remaining.is_empty() {
-        info!(filled, attempted = initial, "record-only frame-record backfill complete");
+        info!(
+            filled,
+            attempted = initial,
+            "record-only frame-record backfill complete"
+        );
     } else {
         warn!(
             filled,
             attempted = initial,
             unresolved = remaining.len(),
-            invalid, unavailable, timed_out, store_failed, connect_failed,
-            lo, hi,
+            invalid,
+            unavailable,
+            timed_out,
+            store_failed,
+            connect_failed,
+            lo,
+            hi,
             "record-only backfill could not fill every height this pass"
         );
     }
-    BackfillOutcome { filled: promoted_local + filled, unresolved: remaining.len() as u64 }
+    BackfillOutcome {
+        filled: promoted_local + filled,
+        unresolved: remaining.len() as u64,
+    }
 }
 
 /// Whether `frame`, served by a peer for height `n` of a record hole, is the
@@ -908,9 +986,7 @@ async fn run_all_gap_backfill(
     // Key-only and windowed, but still a keyspace walk: run it on a blocking
     // thread so it never stalls the async runtime.
     let scan_cs = clock_store.clone();
-    let gaps = match tokio::task::spawn_blocking(move || recent_record_gaps(&scan_cs))
-    .await
-    {
+    let gaps = match tokio::task::spawn_blocking(move || recent_record_gaps(&scan_cs)).await {
         Ok(g) => g,
         Err(e) => {
             warn!(error = %e, "restart gap scan: scan task failed");
@@ -930,7 +1006,16 @@ async fn run_all_gap_backfill(
         "restart gap scan: found internal frame-record holes — backfilling \
          (local candidates first, peers as fallback)",
     );
-    backfill_record_gaps(pool, clock_store, frame_validate, seed, cancel, gaps, floor_frame).await;
+    backfill_record_gaps(
+        pool,
+        clock_store,
+        frame_validate,
+        seed,
+        cancel,
+        gaps,
+        floor_frame,
+    )
+    .await;
     info!("restart gap scan: backfill pass complete");
 }
 
@@ -945,7 +1030,11 @@ fn regular_gaps_to_fill(
     attempts.retain(|(_, hi), _| *hi >= from);
     let chosen: Vec<(u64, u64)> = found
         .into_iter()
-        .filter(|gap| attempts.get(gap).is_none_or(|tried| *tried < REGULAR_GAP_ATTEMPTS))
+        .filter(|gap| {
+            attempts
+                .get(gap)
+                .is_none_or(|tried| *tried < REGULAR_GAP_ATTEMPTS)
+        })
         .collect();
     for gap in &chosen {
         *attempts.entry(*gap).or_default() += 1;
@@ -966,17 +1055,30 @@ async fn backfill_record_gaps(
     floor_frame: u64,
 ) {
     for (gap_lo, hi) in gaps {
-        let Some((lo, hi)) = clamped_backfill_range(gap_lo, hi, floor_frame, None) else { continue };
+        let Some((lo, hi)) = clamped_backfill_range(gap_lo, hi, floor_frame, None) else {
+            continue;
+        };
         for (chunk_lo, chunk_hi) in backfill_chunks(lo, hi) {
-            if cancel.is_cancelled() { return; }
+            if cancel.is_cancelled() {
+                return;
+            }
             let anchor = clock_store.get_global_frame(chunk_hi + 1).ok();
             let outcome = run_record_only_backfill(
-                pool.clone(), clock_store.clone(), frame_validate.clone(), anchor,
-                seed.clone(), chunk_lo, chunk_hi, cancel.clone(),
-            ).await;
+                pool.clone(),
+                clock_store.clone(),
+                frame_validate.clone(),
+                anchor,
+                seed.clone(),
+                chunk_lo,
+                chunk_hi,
+                cancel.clone(),
+            )
+            .await;
             // A lower chunk cannot be authenticated across an unresolved link.
             // A range closed concurrently by the poller can still be descended.
-            if outcome.unresolved > 0 { break; }
+            if outcome.unresolved > 0 {
+                break;
+            }
         }
     }
 }
@@ -1098,244 +1200,266 @@ async fn run_state_jump(
         let mut reachable = false;
         let mut best_jumpable = 0u64;
         for addr in endpoints {
-        if cancel.is_cancelled() {
-            return None;
-        }
-        let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let head = match client.get_global_frame(0).await {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let hdr = match head.header.as_ref() {
-            Some(h) => h.clone(),
-            None => continue,
-        };
-        let target = hdr.frame_number;
-        // A peer with no head (0) tells us nothing — try the next.
-        if target == 0 {
-            continue;
-        }
-        // We successfully read a head from a peer this pass.
-        reachable = true;
-        // Archives won't snapshot a current-era peer (see STATE_JUMP_MAX_FRAME);
-        // non-archives have no such ceiling. A ceiling-skipped peer is NOT a jump
-        // target, so it doesn't count toward `best_jumpable` (else an archive would
-        // retry forever against current-era peers it will never snapshot).
-        if sync_all_shards && target >= STATE_JUMP_MAX_FRAME {
-            continue;
-        }
-        // Highest head among peers we WOULD jump to — the far-behind vs caught-up
-        // signal for the post-pass decision below.
-        best_jumpable = best_jumpable.max(target);
-        // Within MIN_GAP of head → the verified poller catches up fine; don't
-        // snapshot THIS peer. (Another peer may still be far enough ahead, so try
-        // the rest rather than aborting the whole jump.)
-        if target <= local_head.saturating_add(state_jump_min_gap()) {
-            continue;
-        }
-        if !frame_validate(&head) {
-            debug!(%addr, target, "state-jump: peer head failed validation — trying another peer");
-            continue;
-        }
-        // Single generation anchor for ALL pulls. `GlobalFrameHeader` commits
-        // the whole generation via `prover_tree_commitment`; the hypersync
-        // server's snapshot registry retains "(global + active app shards) per
-        // generation", so passing this one root as `expected_root` selects
-        // generation N and serves every tree (prover + each app-shard) from it
-        // → cross-tree consistent. (App-shard `state_roots` live on the
-        // app-shard `FrameHeader`, not here — the global header does not carry
-        // per-shard roots, so the generation anchor is the pin we use.)
-        let anchor = hdr.prover_tree_commitment.clone();
-        if anchor.is_empty() {
-            warn!(%addr, target, "state-jump: peer head has no prover_tree_commitment anchor — skipping");
-            continue;
-        }
-        info!(%addr, local_head, target, "state-jump: syncing FULL state pinned to frame N");
-
-        // Onboarding: a fresh node boots on the ephemeral in-memory forest, so
-        // `sync_shard_phase_from` below would write into memory (never persisted)
-        // and the node would produce with the wrong (un-QUIL-split) root. Swap in
-        // the persistent RocksDB forest + declare the QUIL partition BEFORE the
-        // pulls so synced + produced state lands on disk consistently. No-op once
-        // persistent (migrated node / prior jump).
-        if quil_forest_migrate::install_forest_for_sync(crdt.as_ref(), hg_store.as_ref(), mainnet_quil_grid) {
-            info!("state-jump: installed persistent forest for onboarding sync");
-        }
-
-        // Prover tree — the global prover shard is a single-shard forest app
-        // (L2 = [0xff; 32]). VERIFY the synced vertex-adds root against the
-        // AUTHENTICATED `anchor` (`hdr.prover_tree_commitment` from the head N
-        // that already passed `frame_validate`), not just trust the peer's tree.
-        // A forged prover tree would otherwise be written to local state and the
-        // cursor advanced past it (suppressing re-materialization), poisoning
-        // seniority / committee membership / reward balances until the periodic
-        // verified reconcile. `sync_single_shard_verified` returns `None` when the
-        // peer can't serve the anchored version → try another peer (a
-        // partial/forged jump must NOT be committed). On success it returns the
-        // frame `G` the anchored (pre-N) tree corresponds to — `anchor` binds
-        // `prover_root_at(N-1)`, so `G == target - 1` — and the cursor is pinned
-        // there so startup RE-MATERIALIZES frame `target` forward from the
-        // authenticated pre-state (rather than skipping it, which would fork).
-        let prover_pinned_frame = match crate::forest_sync::sync_single_shard_verified(
-            &addr, &seed, crdt.clone(), &[0xffu8; 32], &anchor,
-        )
-        .await
-        {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                warn!(%addr, target, "state-jump: peer cannot serve the authenticated prover-tree anchor version — trying another peer");
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let mut client = match quil_rpc::ArchiveClient::connect_mtls(&addr, &seed).await {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let head = match client.get_global_frame(0).await {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let hdr = match head.header.as_ref() {
+                Some(h) => h.clone(),
+                None => continue,
+            };
+            let target = hdr.frame_number;
+            // A peer with no head (0) tells us nothing — try the next.
+            if target == 0 {
                 continue;
             }
-            Err(e) => {
-                warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
+            // We successfully read a head from a peer this pass.
+            reachable = true;
+            // Archives won't snapshot a current-era peer (see STATE_JUMP_MAX_FRAME);
+            // non-archives have no such ceiling. A ceiling-skipped peer is NOT a jump
+            // target, so it doesn't count toward `best_jumpable` (else an archive would
+            // retry forever against current-era peers it will never snapshot).
+            if sync_all_shards && target >= STATE_JUMP_MAX_FRAME {
                 continue;
             }
-        };
+            // Highest head among peers we WOULD jump to — the far-behind vs caught-up
+            // signal for the post-pass decision below.
+            best_jumpable = best_jumpable.max(target);
+            // Within MIN_GAP of head → the verified poller catches up fine; don't
+            // snapshot THIS peer. (Another peer may still be far enough ahead, so try
+            // the rest rather than aborting the whole jump.)
+            if target <= local_head.saturating_add(state_jump_min_gap()) {
+                continue;
+            }
+            if !frame_validate(&head) {
+                debug!(%addr, target, "state-jump: peer head failed validation — trying another peer");
+                continue;
+            }
+            // Single generation anchor for ALL pulls. `GlobalFrameHeader` commits
+            // the whole generation via `prover_tree_commitment`; the hypersync
+            // server's snapshot registry retains "(global + active app shards) per
+            // generation", so passing this one root as `expected_root` selects
+            // generation N and serves every tree (prover + each app-shard) from it
+            // → cross-tree consistent. (App-shard `state_roots` live on the
+            // app-shard `FrameHeader`, not here — the global header does not carry
+            // per-shard roots, so the generation anchor is the pin we use.)
+            let anchor = hdr.prover_tree_commitment.clone();
+            if anchor.is_empty() {
+                warn!(%addr, target, "state-jump: peer head has no prover_tree_commitment anchor — skipping");
+                continue;
+            }
+            info!(%addr, local_head, target, "state-jump: syncing FULL state pinned to frame N");
 
-        // Every app's forest tree. Post-cutover (UNIFIED mode) an app is ONE tree
-        // keyed by the BARE app address (`l2`); its sub-shards are subtrees of that
-        // tree, NOT separate forest trees. So we sync PER-APP, keyed by `l2` — NOT
-        // per-sub-shard `addr_path_shard_id(l2, prefix)`, which addresses the LEGACY
-        // per-prefix trees. Those are orphaned residue that `--reclaim-legacy-forest`
-        // deletes and that will not carry live state once QUIL splits, so pulling
-        // them would sync nothing.
-        //
-        // AUTHENTICATION: app-shard consensus is per-APP; its frame's `state_roots[0]`
-        // is the app's aggregate vertex-adds root — and, like the global
-        // `prover_tree_commitment`, it binds the PRE-application root. So we pull
-        // ROOT-ADDRESSED (`sync_single_shard_verified` → `resolve_root` maps the
-        // anchor to the peer's version), not the peer's post-application head — the
-        // same off-by-one fix as the prover tree. A peer that can't serve the
-        // anchored version falls back to a trust sync of the SAME unified tree; the
-        // per-app CW fail-closed pre-state gate re-checks `state_roots` on the next
-        // produced frame, so a drifted app tree self-corrects. `state_roots[1..4]`
-        // are pinned only to the peer head (QUIL's other phases are empty; a
-        // multi-phase app would need per-phase anchoring here).
-        let _ = &anchor;
-        // Regulars skip the ALL-shards pull (see `sync_all_shards`): prover tree
-        // + cursor advance is enough to stop them replaying ancient history.
-        let mut shard_count = 0usize;
-        if sync_all_shards {
-            let shard_rows = shards_store.range_app_shards().unwrap_or_default();
-            // Distinct app L2s (the bare-address unified trees to sync).
-            let mut apps: std::collections::BTreeSet<[u8; 32]> = Default::default();
-            for row in &shard_rows {
-                if row.shard_key.len() < 35 {
+            // Onboarding: a fresh node boots on the ephemeral in-memory forest, so
+            // `sync_shard_phase_from` below would write into memory (never persisted)
+            // and the node would produce with the wrong (un-QUIL-split) root. Swap in
+            // the persistent RocksDB forest + declare the QUIL partition BEFORE the
+            // pulls so synced + produced state lands on disk consistently. No-op once
+            // persistent (migrated node / prior jump).
+            if quil_forest_migrate::install_forest_for_sync(
+                crdt.as_ref(),
+                hg_store.as_ref(),
+                mainnet_quil_grid,
+            ) {
+                info!("state-jump: installed persistent forest for onboarding sync");
+            }
+
+            // Prover tree — the global prover shard is a single-shard forest app
+            // (L2 = [0xff; 32]). VERIFY the synced vertex-adds root against the
+            // AUTHENTICATED `anchor` (`hdr.prover_tree_commitment` from the head N
+            // that already passed `frame_validate`), not just trust the peer's tree.
+            // A forged prover tree would otherwise be written to local state and the
+            // cursor advanced past it (suppressing re-materialization), poisoning
+            // seniority / committee membership / reward balances until the periodic
+            // verified reconcile. `sync_single_shard_verified` returns `None` when the
+            // peer can't serve the anchored version → try another peer (a
+            // partial/forged jump must NOT be committed). On success it returns the
+            // frame `G` the anchored (pre-N) tree corresponds to — `anchor` binds
+            // `prover_root_at(N-1)`, so `G == target - 1` — and the cursor is pinned
+            // there so startup RE-MATERIALIZES frame `target` forward from the
+            // authenticated pre-state (rather than skipping it, which would fork).
+            let prover_pinned_frame = match crate::forest_sync::sync_single_shard_verified(
+                &addr,
+                &seed,
+                crdt.clone(),
+                &[0xffu8; 32],
+                &anchor,
+            )
+            .await
+            {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    warn!(%addr, target, "state-jump: peer cannot serve the authenticated prover-tree anchor version — trying another peer");
                     continue;
                 }
-                let mut l2 = [0u8; 32];
-                l2.copy_from_slice(&row.shard_key[3..35]);
-                apps.insert(l2);
-            }
-            let mut aborted = false;
-            'apps: for l2 in &apps {
-                if cancel.is_cancelled() {
-                    return None;
+                Err(e) => {
+                    warn!(%addr, error = %e, "state-jump: prover tree sync failed — trying another peer");
+                    continue;
                 }
-                // The app's AUTHENTICATED per-phase pre-state roots (`state_roots`
-                // of its latest per-app CW frame) — the root-address anchors for all
-                // four phases. A zero/absent entry ⇒ that phase is synced to head.
-                let state_roots: Vec<Vec<u8>> = match client.get_app_shard_frame(l2.to_vec(), 0).await
-                {
-                    Ok(Some(f)) => f.header.map(|h| h.state_roots).unwrap_or_default(),
-                    Ok(None) => Vec::new(),
-                    Err(e) => {
-                        debug!(%addr, error = %e, "state-jump: app-shard frame fetch failed — app synced on trust");
-                        Vec::new()
+            };
+
+            // Every app's forest tree. Post-cutover (UNIFIED mode) an app is ONE tree
+            // keyed by the BARE app address (`l2`); its sub-shards are subtrees of that
+            // tree, NOT separate forest trees. So we sync PER-APP, keyed by `l2` — NOT
+            // per-sub-shard `addr_path_shard_id(l2, prefix)`, which addresses the LEGACY
+            // per-prefix trees. Those are orphaned residue that `--reclaim-legacy-forest`
+            // deletes and that will not carry live state once QUIL splits, so pulling
+            // them would sync nothing.
+            //
+            // AUTHENTICATION: app-shard consensus is per-APP; its frame's `state_roots[0]`
+            // is the app's aggregate vertex-adds root — and, like the global
+            // `prover_tree_commitment`, it binds the PRE-application root. So we pull
+            // ROOT-ADDRESSED (`sync_single_shard_verified` → `resolve_root` maps the
+            // anchor to the peer's version), not the peer's post-application head — the
+            // same off-by-one fix as the prover tree. A peer that can't serve the
+            // anchored version falls back to a trust sync of the SAME unified tree; the
+            // per-app CW fail-closed pre-state gate re-checks `state_roots` on the next
+            // produced frame, so a drifted app tree self-corrects. `state_roots[1..4]`
+            // are pinned only to the peer head (QUIL's other phases are empty; a
+            // multi-phase app would need per-phase anchoring here).
+            let _ = &anchor;
+            // Regulars skip the ALL-shards pull (see `sync_all_shards`): prover tree
+            // + cursor advance is enough to stop them replaying ancient history.
+            let mut shard_count = 0usize;
+            if sync_all_shards {
+                let shard_rows = shards_store.range_app_shards().unwrap_or_default();
+                // Distinct app L2s (the bare-address unified trees to sync).
+                let mut apps: std::collections::BTreeSet<[u8; 32]> = Default::default();
+                for row in &shard_rows {
+                    if row.shard_key.len() < 35 {
+                        continue;
                     }
-                };
-                let phase_anchor = |i: usize| -> &[u8] {
-                    match state_roots.get(i) {
-                        Some(r) if r.iter().any(|b| *b != 0) => r.as_slice(),
-                        _ => &[],
+                    let mut l2 = [0u8; 32];
+                    l2.copy_from_slice(&row.shard_key[3..35]);
+                    apps.insert(l2);
+                }
+                let mut aborted = false;
+                'apps: for l2 in &apps {
+                    if cancel.is_cancelled() {
+                        return None;
                     }
-                };
-                let anchors =
-                    [phase_anchor(0), phase_anchor(1), phase_anchor(2), phase_anchor(3)];
-                // Sync the UNIFIED app tree keyed by the bare L2, ROOT-ADDRESSING
-                // every phase we have an anchor for (empty ⇒ trust that phase to head
-                // — never the legacy sub-shards). All-empty anchors ⇒ `Some(0)`
-                // (trust sync), so `Ok(None)` only occurs with a real anchor.
-                match crate::forest_sync::sync_shard_phases_verified(
-                    &addr, &seed, crdt.clone(), &l2[..], anchors,
-                )
-                .await
-                {
-                    Ok(Some(_)) => {
-                        shard_count += 1;
-                    }
-                    Ok(None) => {
-                        // Anchored pull unavailable (peer pruned that version) or a
-                        // verified root disagreed. Fall back to a trust sync of the
-                        // unified tree so we still carry the app state; the CW gate
-                        // reconciles. Abort (retry peer) only if even that fails.
-                        match crate::forest_sync::sync_single_shard_verified(
-                            &addr, &seed, crdt.clone(), &l2[..], &[],
-                        )
+                    // The app's AUTHENTICATED per-phase pre-state roots (`state_roots`
+                    // of its latest per-app CW frame) — the root-address anchors for all
+                    // four phases. A zero/absent entry ⇒ that phase is synced to head.
+                    let state_roots: Vec<Vec<u8>> = match client
+                        .get_app_shard_frame(l2.to_vec(), 0)
                         .await
-                        {
-                            Ok(_) => {
-                                debug!(%addr, app = %hex::encode(l2), "state-jump: app anchored pull unavailable — synced unified tree on trust");
-                                shard_count += 1;
-                            }
-                            Err(e) => {
-                                warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree trust sync failed — aborting, retrying another peer");
-                                aborted = true;
-                                break 'apps;
+                    {
+                        Ok(Some(f)) => f.header.map(|h| h.state_roots).unwrap_or_default(),
+                        Ok(None) => Vec::new(),
+                        Err(e) => {
+                            debug!(%addr, error = %e, "state-jump: app-shard frame fetch failed — app synced on trust");
+                            Vec::new()
+                        }
+                    };
+                    let phase_anchor = |i: usize| -> &[u8] {
+                        match state_roots.get(i) {
+                            Some(r) if r.iter().any(|b| *b != 0) => r.as_slice(),
+                            _ => &[],
+                        }
+                    };
+                    let anchors = [
+                        phase_anchor(0),
+                        phase_anchor(1),
+                        phase_anchor(2),
+                        phase_anchor(3),
+                    ];
+                    // Sync the UNIFIED app tree keyed by the bare L2, ROOT-ADDRESSING
+                    // every phase we have an anchor for (empty ⇒ trust that phase to head
+                    // — never the legacy sub-shards). All-empty anchors ⇒ `Some(0)`
+                    // (trust sync), so `Ok(None)` only occurs with a real anchor.
+                    match crate::forest_sync::sync_shard_phases_verified(
+                        &addr,
+                        &seed,
+                        crdt.clone(),
+                        &l2[..],
+                        anchors,
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {
+                            shard_count += 1;
+                        }
+                        Ok(None) => {
+                            // Anchored pull unavailable (peer pruned that version) or a
+                            // verified root disagreed. Fall back to a trust sync of the
+                            // unified tree so we still carry the app state; the CW gate
+                            // reconciles. Abort (retry peer) only if even that fails.
+                            match crate::forest_sync::sync_single_shard_verified(
+                                &addr,
+                                &seed,
+                                crdt.clone(),
+                                &l2[..],
+                                &[],
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    debug!(%addr, app = %hex::encode(l2), "state-jump: app anchored pull unavailable — synced unified tree on trust");
+                                    shard_count += 1;
+                                }
+                                Err(e) => {
+                                    warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree trust sync failed — aborting, retrying another peer");
+                                    aborted = true;
+                                    break 'apps;
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree sync failed — aborting, retrying another peer");
-                        aborted = true;
-                        break 'apps;
+                        Err(e) => {
+                            warn!(%addr, error = %e, app = %hex::encode(l2), "state-jump: app unified-tree sync failed — aborting, retrying another peer");
+                            aborted = true;
+                            break 'apps;
+                        }
                     }
                 }
+                if aborted {
+                    continue;
+                }
             }
-            if aborted {
-                continue;
-            }
-        }
 
-        // Commit the jump: store the head frame record (clock head → target),
-        // then advance the durable materialized cursor. The prover tree was
-        // anchored to `prover_pinned_frame` (= target-1, the pre-`target` state
-        // frame `target`'s `prover_tree_commitment` binds), so the cursor pins
-        // THERE — startup then re-materializes (`prover_pinned_frame`..=target]
-        // (just frame `target`) forward from the authenticated pre-state. Pinning
-        // at `target` instead would mark `target` applied while the state is one
-        // frame behind, forking the next produced `prover_tree_commitment`.
-        if let Err(e) = clock_store.put_global_frame(&head, None) {
-            warn!(error = %e, target, "state-jump: store head frame failed — aborting");
-            return None;
-        }
-        let cursor_frame = prover_pinned_frame.min(target);
-        if let Err(e) = clock_store.put_global_materialized_cursor(cursor_frame) {
-            warn!(error = %e, "state-jump: cursor advance failed");
-        }
-        // Refresh the prover registry from the freshly-synced prover tree.
-        let pr = prover_registry.clone();
-        let hs = hg_store.clone();
-        match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs.as_ref())).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(%error, "state-jump: prover registry refresh failed");
+            // Commit the jump: store the head frame record (clock head → target),
+            // then advance the durable materialized cursor. The prover tree was
+            // anchored to `prover_pinned_frame` (= target-1, the pre-`target` state
+            // frame `target`'s `prover_tree_commitment` binds), so the cursor pins
+            // THERE — startup then re-materializes (`prover_pinned_frame`..=target]
+            // (just frame `target`) forward from the authenticated pre-state. Pinning
+            // at `target` instead would mark `target` applied while the state is one
+            // frame behind, forking the next produced `prover_tree_commitment`.
+            if let Err(e) = clock_store.put_global_frame(&head, None) {
+                warn!(error = %e, target, "state-jump: store head frame failed — aborting");
                 return None;
             }
-            Err(error) => {
-                warn!(%error, "state-jump: prover registry refresh task failed");
-                return None;
+            let cursor_frame = prover_pinned_frame.min(target);
+            if let Err(e) = clock_store.put_global_materialized_cursor(cursor_frame) {
+                warn!(error = %e, "state-jump: cursor advance failed");
             }
-        }
-        info!(
-            target,
-            shards = shard_count,
-            "state-jump complete — resuming near head (poller/consensus take over)"
-        );
-        return Some(target);
+            // Refresh the prover registry from the freshly-synced prover tree.
+            let pr = prover_registry.clone();
+            let hs = hg_store.clone();
+            match tokio::task::spawn_blocking(move || pr.refresh_from_store(hs.as_ref())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(%error, "state-jump: prover registry refresh failed");
+                    return None;
+                }
+                Err(error) => {
+                    warn!(%error, "state-jump: prover registry refresh task failed");
+                    return None;
+                }
+            }
+            info!(
+                target,
+                shards = shard_count,
+                "state-jump complete — resuming near head (poller/consensus take over)"
+            );
+            return Some(target);
         }
 
         // No jump completed this pass. Decide caught-up vs retry:
@@ -1368,7 +1492,8 @@ async fn run_state_jump(
 
 pub(crate) struct ArchiveSyncArgs {
     /// Set here once the frame verifier exists (see `historical_committees`).
-    pub historical_committees: Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
+    pub historical_committees:
+        Arc<std::sync::OnceLock<Arc<super::historical_committees::HistoricalCommittees>>>,
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
     /// Kept shard sizes shared with every other reader in the node.
     pub committed_shard_sizes: Arc<quil_engine::shard_info::CommittedShardSizes>,
@@ -1422,10 +1547,10 @@ pub(crate) struct ArchiveSyncArgs {
     pub consensus_leader_timeout_secs: u64,
     /// Shared cell the simplex inbound router is published into once activated;
     /// the receive loop routes CW-channel `:8340` messages through it.
-    pub cw_router:
-        Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
+    pub cw_router: Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
     /// Atomic GLOBAL finalization pipeline, published at CW activation.
-    pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
+    pub global_finalization:
+        Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
     /// Reports when readers of the two cells above start and stop falling back.
     pub activation_waits: Arc<super::activation_wait::ActivationWaits>,
     /// Archive-only application-frame ingest, published once constructed. GLOBAL
@@ -1442,14 +1567,14 @@ pub(crate) struct ArchiveSyncArgs {
     /// global anchor — otherwise they read their committee at epoch 0 forever.
     /// The master's recv loop only forwards GLOBAL_PEER_INFO, so this is the sole
     /// global-frame path to a cluster worker.
-    pub global_msg_tx: tokio::sync::broadcast::Sender<
-        quil_types::proto::global::StreamGlobalMessagesResponse,
-    >,
+    pub global_msg_tx:
+        tokio::sync::broadcast::Sender<quil_types::proto::global::StreamGlobalMessagesResponse>,
 }
 
 /// Where the archive's application-frame ingest is published once built.
-pub(crate) type AppIngestCell =
-    Arc<std::sync::OnceLock<Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>>>;
+pub(crate) type AppIngestCell = Arc<
+    std::sync::OnceLock<Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>>,
+>;
 
 /// Before a GLOBAL frame executes on an archive, materialize every shard's
 /// application frames through the highest one the frame rewards.
@@ -1482,10 +1607,16 @@ fn sequenced_ingest_hook(
     const LOOKAHEAD_FRAMES: u64 = 120;
     const LOOKAHEAD_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
     // (GLOBAL frame, waiting since, last logged)
-    let wait: std::sync::Mutex<Option<(u64, std::time::Instant, Option<std::time::Instant>)>> = Default::default();
-    // (GLOBAL frame, read at, per shard the highest frame the frames after it carry)
-    let lookahead: std::sync::Mutex<Option<(u64, std::time::Instant, std::collections::BTreeMap<Vec<u8>, u64>)>> =
+    let wait: std::sync::Mutex<Option<(u64, std::time::Instant, Option<std::time::Instant>)>> =
         Default::default();
+    // (GLOBAL frame, read at, per shard the highest frame the frames after it carry)
+    let lookahead: std::sync::Mutex<
+        Option<(
+            u64,
+            std::time::Instant,
+            std::collections::BTreeMap<Vec<u8>, u64>,
+        )>,
+    > = Default::default();
     Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
         use quil_execution::global_intrinsic::{conversions, prover_shard_update};
         use quil_types::proto::global::message_request::Request;
@@ -1495,47 +1626,87 @@ fn sequenced_ingest_hook(
         let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
         // The flag day's discard precedes the first GLOBAL frame from
         // activation, so no session frame it sequences is ever discarded.
-        ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).discard_legacy_history_at(frame_number)?;
+        ingest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .discard_legacy_history_at(frame_number)?;
         let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
         let bls = quil_crypto::FalconKeyConstructor;
         // Per shard: the certified headers this frame carries, by frame number.
         // The highest is the frame to materialize through; any of them whose
         // body no endpoint serves can be rebuilt if it carried no requests.
-        let mut vouched: std::collections::BTreeMap<Vec<u8>, std::collections::HashMap<u64, quil_types::proto::global::FrameHeader>> =
-            std::collections::BTreeMap::new();
-        for request in frame.requests.iter().flat_map(|bundle| bundle.requests.iter()) {
-            let Some(Request::Shard(header)) = request.request.as_ref() else { continue };
+        let mut vouched: std::collections::BTreeMap<
+            Vec<u8>,
+            std::collections::HashMap<u64, quil_types::proto::global::FrameHeader>,
+        > = std::collections::BTreeMap::new();
+        for request in frame
+            .requests
+            .iter()
+            .flat_map(|bundle| bundle.requests.iter())
+        {
+            let Some(Request::Shard(header)) = request.request.as_ref() else {
+                continue;
+            };
             let op = conversions::frame_header_from_proto(header);
-            let committee_frame = if op.global_frame_number > 0 { op.global_frame_number } else { frame_number };
+            let committee_frame = if op.global_frame_number > 0 {
+                op.global_frame_number
+            } else {
+                frame_number
+            };
             if prover_shard_update::verify_frame_header_session(
-                &state, &op, frame_prover.as_ref(), &bls, prover_registry.as_ref(), committee_frame, frame_number,
+                &state,
+                &op,
+                frame_prover.as_ref(),
+                &bls,
+                prover_registry.as_ref(),
+                committee_frame,
+                frame_number,
             )
             .is_err()
             {
                 continue;
             }
-            vouched.entry(op.address.clone()).or_default().insert(op.frame_number, header.clone());
+            vouched
+                .entry(op.address.clone())
+                .or_default()
+                .insert(op.frame_number, header.clone());
         }
-        let mut ingest = ingest.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut ingest = ingest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut missing = Vec::new();
         for (address, headers) in vouched {
-            let Some(&through) = headers.keys().max() else { continue };
+            let Some(&through) = headers.keys().max() else {
+                continue;
+            };
             if !ingest.materialize_through_vouched(&address, through, &headers)? {
                 let held = ingest.materialized_height(&address).unwrap_or(0);
-                missing.push(format!("{}: frame {} of {through}", hex::encode(&address), held + 1));
+                missing.push(format!(
+                    "{}: frame {} of {through}",
+                    hex::encode(&address),
+                    held + 1
+                ));
             }
         }
         if missing.is_empty() {
             return Ok(true);
         }
         drop(ingest);
-        let mut lookahead = lookahead.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lookahead.as_ref().is_none_or(|(frame, read, _)| *frame != frame_number || read.elapsed() >= LOOKAHEAD_REFRESH) {
+        let mut lookahead = lookahead
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lookahead.as_ref().is_none_or(|(frame, read, _)| {
+            *frame != frame_number || read.elapsed() >= LOOKAHEAD_REFRESH
+        }) {
             let targets = upcoming_shard_frames(clock.as_ref(), frame_number, LOOKAHEAD_FRAMES);
             *lookahead = Some((frame_number, std::time::Instant::now(), targets));
         }
         if let Some((_, _, targets)) = lookahead.as_ref() {
-            let mut ingest = cell.get().expect("checked above").lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut ingest = cell
+                .get()
+                .expect("checked above")
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (address, &through) in targets {
                 if let Err(error) = ingest.prefetch_through(address, through) {
                     tracing::debug!(%error, address = %hex::encode(address), "application frame prefetch skipped");
@@ -1549,10 +1720,16 @@ fn sequenced_ingest_hook(
             Some(state) if state.0 == frame_number => state,
             _ => wait.insert((frame_number, now, None)),
         };
-        if since.elapsed() >= QUIET_WAIT && logged.is_none_or(|at| at.elapsed() >= WAIT_LOG_INTERVAL) {
+        if since.elapsed() >= QUIET_WAIT
+            && logged.is_none_or(|at| at.elapsed() >= WAIT_LOG_INTERVAL)
+        {
             *logged = Some(now);
-            warn!(frame = frame_number, waited_secs = since.elapsed().as_secs(), ?missing,
-                "GLOBAL frame waits for application frames this archive has not ingested");
+            warn!(
+                frame = frame_number,
+                waited_secs = since.elapsed().as_secs(),
+                ?missing,
+                "GLOBAL frame waits for application frames this archive has not ingested"
+            );
         }
         Ok(false)
     })
@@ -1571,11 +1748,20 @@ fn upcoming_shard_frames(
     let mut targets = std::collections::BTreeMap::new();
     for number in frame.saturating_add(1)..=frame.saturating_add(count) {
         let stored = clock.get_global_clock_frame(number).ok().or_else(|| {
-            clock.range_global_clock_frame_candidates(number, number, 1).ok().and_then(|mut frames| frames.pop())
+            clock
+                .range_global_clock_frame_candidates(number, number, 1)
+                .ok()
+                .and_then(|mut frames| frames.pop())
         });
         let Some(stored) = stored else { break };
-        for request in stored.requests.iter().flat_map(|bundle| bundle.requests.iter()) {
-            let Some(Request::Shard(header)) = request.request.as_ref() else { continue };
+        for request in stored
+            .requests
+            .iter()
+            .flat_map(|bundle| bundle.requests.iter())
+        {
+            let Some(Request::Shard(header)) = request.request.as_ref() else {
+                continue;
+            };
             if header.address.is_empty() {
                 continue;
             }
@@ -1634,8 +1820,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
     // Archives bring application state to each GLOBAL frame's sequenced point
     // before executing it, on every execution path below.
     let sequenced_ingest = archive_mode.then(|| {
-        sequenced_ingest_hook(app_ingest, crdt.clone(), frame_prover.clone(), prover_registry.clone(),
-            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>)
+        sequenced_ingest_hook(
+            app_ingest,
+            crdt.clone(),
+            frame_prover.clone(),
+            prover_registry.clone(),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+        )
     });
 
     // The archive-sync transport identity is the FALCON network key (all
@@ -1673,9 +1864,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             // so CW-finalized global frames are verified against it via their
             // carried finalization cert (defense-in-depth over VDF). Empty on a
             // legacy/no-committee config → cert check is skipped.
-            let decode = |keys: &[String]| -> Vec<Vec<u8>> { keys.iter().filter_map(|s| hex::decode(s).ok()).collect() };
-            let (successor, _) =
-                global_committee_successor(network, &consensus_committee, &consensus_committee_peer_ids);
+            let decode = |keys: &[String]| -> Vec<Vec<u8>> {
+                keys.iter().filter_map(|s| hex::decode(s).ok()).collect()
+            };
+            let (successor, _) = global_committee_successor(
+                network,
+                &consensus_committee,
+                &consensus_committee_peer_ids,
+            );
             Arc::new(
                 quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
                     frame_prover.clone(),
@@ -1696,15 +1892,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 archive_frame_is_valid(frame, &addrs, &verifier)
             })
         };
-        let _ = historical_committees.set(Arc::new(super::historical_committees::HistoricalCommittees::new(
-            archive_pool.clone(),
-            seed.clone(),
-            clock_store.clone(),
-            frame_validate.clone(),
-            frame_verifier.clone(),
-            inclusion_prover.clone(),
-            cw_storage_dir.join("historical-prover-tree"),
-        )));
+        let _ = historical_committees.set(Arc::new(
+            super::historical_committees::HistoricalCommittees::new(
+                archive_pool.clone(),
+                seed.clone(),
+                clock_store.clone(),
+                frame_validate.clone(),
+                frame_verifier.clone(),
+                inclusion_prover.clone(),
+                cw_storage_dir.join("historical-prover-tree"),
+            ),
+        ));
 
         // Far-behind recovery: spawn a one-shot state jump pinned to a single
         // peer frame N. It fires for ANY node whose gap to the network head
@@ -1752,35 +1950,35 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             spawner.detach("state-jump", {
                 let seed = seed.clone();
                 async move {
-                let jumped = run_state_jump(
-                    sj_pool,
-                    seed.clone(),
-                    sj_cs,
-                    sj_hg,
-                    sj_ss,
-                    sj_fv,
-                    sj_pr,
-                    sj_crdt,
-                    sj_all_shards,
-                    sj_mainnet_quil_grid,
-                    // Boot: hold the barrier and retry until the jump completes (or
-                    // we confirm we're caught up) — never drop a far-behind node
-                    // into the forward-fill grind because the pool was momentarily
-                    // empty/failing during PeerInfo discovery.
-                    true,
-                    tokio_util::sync::CancellationToken::new(),
-                )
-                .await;
-                if let Some(n) = jumped {
-                    info!(target = n, "state-jump: fast-forwarded to peer head");
-                    quil_execution::global_intrinsic::intrinsic::request_pending_repair();
-                }
-                // Notify the registry task only after all jump verification,
-                // data installation, cursor storage and registry refresh finish.
-                let _ = bootstrap_tx.send(jumped);
-                // Lift the barrier regardless of outcome so the poller proceeds.
-                let _ = sj_tx.send(());
-                Ok(())
+                    let jumped = run_state_jump(
+                        sj_pool,
+                        seed.clone(),
+                        sj_cs,
+                        sj_hg,
+                        sj_ss,
+                        sj_fv,
+                        sj_pr,
+                        sj_crdt,
+                        sj_all_shards,
+                        sj_mainnet_quil_grid,
+                        // Boot: hold the barrier and retry until the jump completes (or
+                        // we confirm we're caught up) — never drop a far-behind node
+                        // into the forward-fill grind because the pool was momentarily
+                        // empty/failing during PeerInfo discovery.
+                        true,
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+                    if let Some(n) = jumped {
+                        info!(target = n, "state-jump: fast-forwarded to peer head");
+                        quil_execution::global_intrinsic::intrinsic::request_pending_repair();
+                    }
+                    // Notify the registry task only after all jump verification,
+                    // data installation, cursor storage and registry refresh finish.
+                    let _ = bootstrap_tx.send(jumped);
+                    // Lift the barrier regardless of outcome so the poller proceeds.
+                    let _ = sj_tx.send(());
+                    Ok(())
                 }
             });
             Some(sj_rx)
@@ -1813,8 +2011,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         // gossip-populated store and pauses its RPC head-poll while the mesh is
         // current (archives keep polling — they need contiguous history that
         // unordered gossip can't guarantee).
-        let poller_gossip_freshness =
-            if archive_mode { None } else { Some(gossip_freshness.clone()) };
+        let poller_gossip_freshness = if archive_mode {
+            None
+        } else {
+            Some(gossip_freshness.clone())
+        };
         // Runtime far-behind rescue (non-archive only): if the poller falls a long
         // way behind mid-run, it invokes this to snapshot-jump near head (one
         // best-effort pass — `retry = false`) instead of forward-filling the whole
@@ -1839,35 +2040,34 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             let fb_pr = prover_registry.clone();
             let fb_crdt = crdt.clone();
             let fb_mainnet = network == 0;
-            Some(Arc::new(move |_head: u64, cancel: tokio_util::sync::CancellationToken| {
-                let pool = fb_pool.clone();
-                let seed = fb_seed.clone();
-                let cs = fb_cs.clone();
-                let hg = fb_hg.clone();
-                let ss = fb_ss.clone();
-                let fv = fb_fv.clone();
-                let pr = fb_pr.clone();
-                let crdt = fb_crdt.clone();
-                Box::pin(async move {
-                    let jumped = run_state_jump(
-                        pool, seed, cs, hg, ss, fv, pr, crdt,
-                        /*sync_all_shards*/ false,
-                        fb_mainnet,
-                        /*retry*/ false,
-                        // The poller's cancel — so `run_state_jump`'s internal
-                        // `wait_nonempty` is interrupted on node shutdown rather
-                        // than hanging this supervised task.
-                        cancel,
-                    )
-                    .await;
-                    if jumped.is_some() {
-                        quil_execution::global_intrinsic::intrinsic::request_pending_repair();
-                    }
-                    jumped
-                }) as std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Option<u64>> + Send>,
-                >
-            }) as quil_rpc::frame_sync::FarBehindJump)
+            Some(Arc::new(
+                move |_head: u64, cancel: tokio_util::sync::CancellationToken| {
+                    let pool = fb_pool.clone();
+                    let seed = fb_seed.clone();
+                    let cs = fb_cs.clone();
+                    let hg = fb_hg.clone();
+                    let ss = fb_ss.clone();
+                    let fv = fb_fv.clone();
+                    let pr = fb_pr.clone();
+                    let crdt = fb_crdt.clone();
+                    Box::pin(async move {
+                        let jumped = run_state_jump(
+                            pool, seed, cs, hg, ss, fv, pr, crdt, /*sync_all_shards*/ false,
+                            fb_mainnet, /*retry*/ false,
+                            // The poller's cancel — so `run_state_jump`'s internal
+                            // `wait_nonempty` is interrupted on node shutdown rather
+                            // than hanging this supervised task.
+                            cancel,
+                        )
+                        .await;
+                        if jumped.is_some() {
+                            quil_execution::global_intrinsic::intrinsic::request_pending_repair();
+                        }
+                        jumped
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send>>
+                },
+            ) as quil_rpc::frame_sync::FarBehindJump)
         };
         let poller_config = quil_rpc::ArchivePollerConfig {
             gossip_freshness: poller_gossip_freshness,
@@ -1883,7 +2083,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     let pipeline = finalization.get();
                     waits.global_finalization.observe(
                         pipeline.is_some(),
-                        chain.last().and_then(|frame| frame.header.as_ref()).map(|header| header.frame_number),
+                        chain
+                            .last()
+                            .and_then(|frame| frame.header.as_ref())
+                            .map(|header| header.frame_number),
                     );
                     pipeline.is_some_and(|pipeline| pipeline.offer_synced_chain(chain))
                 }) as quil_rpc::frame_sync::FrameStoreHook
@@ -1897,299 +2100,313 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     frame_self_certified(frame, &verifier)
                 }) as quil_rpc::frame_sync::FrameCertified
             }),
-            on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
-                let _callback = probe::section(ProbeSection::PollerFrameCallback);
-                let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-                let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
-                // Skip bogus frames (no header or frame_number=0):
-                // `current_frame.observe(0)` is a no-op, and the
-                // lifecycle's evaluate guards against 0 anyway.
-                if frame_num == 0 {
-                    tracing::debug!(
-                        "archive poller: dropping frame with frame_number=0"
-                    );
-                    return;
-                }
-                // Frames the poller fetches never pass the gossip receive
-                // path, so match own operations here too.
-                quil_engine::own_prover_ops::tracker().observe_frame(frame_num, &frame.requests);
-                cf_for_poller.observe(frame_num);
-                lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
+            on_frame: Some(Arc::new(
+                move |frame: &quil_types::proto::global::GlobalFrame| {
+                    let _callback = probe::section(ProbeSection::PollerFrameCallback);
+                    let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+                    let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
+                    // Skip bogus frames (no header or frame_number=0):
+                    // `current_frame.observe(0)` is a no-op, and the
+                    // lifecycle's evaluate guards against 0 anyway.
+                    if frame_num == 0 {
+                        tracing::debug!("archive poller: dropping frame with frame_number=0");
+                        return;
+                    }
+                    // Frames the poller fetches never pass the gossip receive
+                    // path, so match own operations here too.
+                    quil_engine::own_prover_ops::tracker()
+                        .observe_frame(frame_num, &frame.requests);
+                    cf_for_poller.observe(frame_num);
+                    lhf_for_poller.fetch_max(frame_num, std::sync::atomic::Ordering::Relaxed);
 
-                // Tee this frame to cluster workers (separate processes). A
-                // cluster worker has no archive poller of its own and the
-                // master's recv loop only forwards GLOBAL_PEER_INFO, so this is
-                // the ONLY way its `handle_global_frame_message` learns the
-                // global head — without it the worker's committee is read at
-                // epoch 0 forever (every prover looks `Joining`) and app-shard CW
-                // can never form a real committee. Bounded (~one per frame);
-                // `send` is a no-op when there are no worker subscribers.
-                // MUST use the consensus-wire encoding (`encode_global_frame`),
-                // NOT raw prost — the worker's `handle_global_frame_message`
-                // decodes via `decode_global_frame`, which requires the 4-byte
-                // GLOBAL_FRAME_TYPE prefix + length-prefixed fields. Raw proto
-                // fails that decode silently and the anchor never advances.
-                if let Ok(buf) = quil_engine::consensus_wire::encode_global_frame(frame) {
-                    let _ = gmtx_for_poller.send(
-                        quil_types::proto::global::StreamGlobalMessagesResponse {
-                            data: buf,
-                            bitmask: quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
-                        },
-                    );
-                }
+                    // Tee this frame to cluster workers (separate processes). A
+                    // cluster worker has no archive poller of its own and the
+                    // master's recv loop only forwards GLOBAL_PEER_INFO, so this is
+                    // the ONLY way its `handle_global_frame_message` learns the
+                    // global head — without it the worker's committee is read at
+                    // epoch 0 forever (every prover looks `Joining`) and app-shard CW
+                    // can never form a real committee. Bounded (~one per frame);
+                    // `send` is a no-op when there are no worker subscribers.
+                    // MUST use the consensus-wire encoding (`encode_global_frame`),
+                    // NOT raw prost — the worker's `handle_global_frame_message`
+                    // decodes via `decode_global_frame`, which requires the 4-byte
+                    // GLOBAL_FRAME_TYPE prefix + length-prefixed fields. Raw proto
+                    // fails that decode silently and the anchor never advances.
+                    if let Ok(buf) = quil_engine::consensus_wire::encode_global_frame(frame) {
+                        let _ = gmtx_for_poller.send(
+                            quil_types::proto::global::StreamGlobalMessagesResponse {
+                                data: buf,
+                                bitmask: quil_engine::bitmasks::GLOBAL_FRAME.to_vec(),
+                            },
+                        );
+                    }
 
-                // SINGLE-WRITER. The frame record is already persisted (the
-                // poller's `put_global_frame` above). Rather than process + commit
-                // + refresh state HERE — a SECOND writer that races the serial
-                // materializer and refreshes the shared prover-registry committee
-                // cache to a different frame (the epoch-boundary prover-root
-                // divergence) — just SIGNAL the materializer's single serial
-                // worker, which applies `[last+1..=frame_num]` in order from the
-                // stored records. Only a node without a materializer (not an
-                // archive) processes frames inline. An archive whose worker is not
-                // up yet leaves them stored: the worker executes from its durable
-                // cursor once it is, so nothing runs out of order with it.
-                let signaled = fm_for_poller
-                    .as_ref()
-                    .map(|fm| fm.enqueue_catchup(frame.clone(), frame_num))
-                    .unwrap_or(false);
-                // Session-enabled regulars follow authenticated GLOBAL state through sync
-                // from activation on. Replaying against incomplete local shard metadata can
-                // turn an archive's rejected join into local-only prover records.
-                if !signaled && !archive_mode_poller && (network == 99
-                    || !quil_types::consensus::committee_handoff_active(frame_num)) {
-                let _execute = probe::section(ProbeSection::GlobalFrameExecution);
-                // Process frame messages through execution pipeline
-                match quil_engine::frame_processor::process_global_frame(
-                    &exec_mgr_for_poller,
-                    frame,
-                    &num_bigint::BigInt::from(1),
-                ) {
-                    Ok((applied, skipped)) => {
-                        if applied > 0 || skipped > 0 {
-                            info!(
-                                frame = frame_num,
-                                applied,
-                                skipped,
-                                "processed frame messages"
-                            );
-                        }
-                        // After per-bundle materialize calls flushed
-                        // their changesets to the in-memory CRDT (via
-                        // each engine's `state.commit`), persist the
-                        // resulting phase trees to the on-disk
-                        // hypergraph store. Without this commit, the
-                        // store still serves the previous frame's
-                        // trees and the registry refresh below sees
-                        // no new ProverJoin/Confirm/Leave writes.
-                        if applied > 0 {
-                            // Flip to the unified app-tree commitment at exactly
-                            // the cutover frame, BEFORE this frame commits.
-                            crate::unified_consolidation::gate_unified_at_frame(
-                                crdt_for_poller.as_ref(),
-                                &hg_for_poller,
-                                shards_store_for_poller.as_ref(),
-                                frame_num,
-                            );
-                            // (The at-cutover prover-tree reset for regulars runs in
-                            // the gossip apply path — `message_loop.rs` — where they
-                            // apply frames FIRST/in-order; here `applied` is already 0
-                            // so this poller path never carries the cutover frame.)
-                            // Apply any epoch-aligned shard split/merge due at this
-                            // frame BEFORE committing, so the reassignment writes ride
-                            // the same commit and the shards store reflects the new
-                            // topology. On the ARCHIVE this runs in the FrameMaterializer;
-                            // regular nodes have no materializer (it's archive-only) and
-                            // otherwise NEVER apply splits locally — their shards_store
-                            // stays single-shard, so `refresh_crdt_shard_prefixes` never
-                            // sees the leaves, `app_prefixes`/size-buckets/compute_shard_root
-                            // go stale, and provers churn (proposing to leave the
-                            // data-bearing leaf they read as size 0). The global intrinsic
-                            // here has shards_store+shards_db wired (init_engines), so this
-                            // records + applies deterministically, converging the reg to the
-                            // archive's committed topology. (No-op when nothing is due.)
-                            if let Err(e) =
-                                exec_mgr_for_poller.apply_global_due_shard_changes(frame_num)
-                            {
-                                warn!(error = %e, frame = frame_num,
+                    // SINGLE-WRITER. The frame record is already persisted (the
+                    // poller's `put_global_frame` above). Rather than process + commit
+                    // + refresh state HERE — a SECOND writer that races the serial
+                    // materializer and refreshes the shared prover-registry committee
+                    // cache to a different frame (the epoch-boundary prover-root
+                    // divergence) — just SIGNAL the materializer's single serial
+                    // worker, which applies `[last+1..=frame_num]` in order from the
+                    // stored records. Only a node without a materializer (not an
+                    // archive) processes frames inline. An archive whose worker is not
+                    // up yet leaves them stored: the worker executes from its durable
+                    // cursor once it is, so nothing runs out of order with it.
+                    let signaled = fm_for_poller
+                        .as_ref()
+                        .map(|fm| fm.enqueue_catchup(frame.clone(), frame_num))
+                        .unwrap_or(false);
+                    // Session-enabled regulars follow authenticated GLOBAL state through sync
+                    // from activation on. Replaying against incomplete local shard metadata can
+                    // turn an archive's rejected join into local-only prover records.
+                    if !signaled
+                        && !archive_mode_poller
+                        && (network == 99
+                            || !quil_types::consensus::committee_handoff_active(frame_num))
+                    {
+                        let _execute = probe::section(ProbeSection::GlobalFrameExecution);
+                        // Process frame messages through execution pipeline
+                        match quil_engine::frame_processor::process_global_frame(
+                            &exec_mgr_for_poller,
+                            frame,
+                            &num_bigint::BigInt::from(1),
+                        ) {
+                            Ok((applied, skipped)) => {
+                                if applied > 0 || skipped > 0 {
+                                    info!(
+                                        frame = frame_num,
+                                        applied, skipped, "processed frame messages"
+                                    );
+                                }
+                                // After per-bundle materialize calls flushed
+                                // their changesets to the in-memory CRDT (via
+                                // each engine's `state.commit`), persist the
+                                // resulting phase trees to the on-disk
+                                // hypergraph store. Without this commit, the
+                                // store still serves the previous frame's
+                                // trees and the registry refresh below sees
+                                // no new ProverJoin/Confirm/Leave writes.
+                                if applied > 0 {
+                                    // Flip to the unified app-tree commitment at exactly
+                                    // the cutover frame, BEFORE this frame commits.
+                                    crate::unified_consolidation::gate_unified_at_frame(
+                                        crdt_for_poller.as_ref(),
+                                        &hg_for_poller,
+                                        shards_store_for_poller.as_ref(),
+                                        frame_num,
+                                    );
+                                    // (The at-cutover prover-tree reset for regulars runs in
+                                    // the gossip apply path — `message_loop.rs` — where they
+                                    // apply frames FIRST/in-order; here `applied` is already 0
+                                    // so this poller path never carries the cutover frame.)
+                                    // Apply any epoch-aligned shard split/merge due at this
+                                    // frame BEFORE committing, so the reassignment writes ride
+                                    // the same commit and the shards store reflects the new
+                                    // topology. On the ARCHIVE this runs in the FrameMaterializer;
+                                    // regular nodes have no materializer (it's archive-only) and
+                                    // otherwise NEVER apply splits locally — their shards_store
+                                    // stays single-shard, so `refresh_crdt_shard_prefixes` never
+                                    // sees the leaves, `app_prefixes`/size-buckets/compute_shard_root
+                                    // go stale, and provers churn (proposing to leave the
+                                    // data-bearing leaf they read as size 0). The global intrinsic
+                                    // here has shards_store+shards_db wired (init_engines), so this
+                                    // records + applies deterministically, converging the reg to the
+                                    // archive's committed topology. (No-op when nothing is due.)
+                                    if let Err(e) = exec_mgr_for_poller
+                                        .apply_global_due_shard_changes(frame_num)
+                                    {
+                                        warn!(error = %e, frame = frame_num,
                                     "apply_due_shard_changes (inline) failed");
+                                    }
+                                    if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
+                                        warn!(error = %e, frame = frame_num, "hypergraph commit failed");
+                                    }
+                                    let refreshed = {
+                                        let _refresh =
+                                            probe::section(ProbeSection::ProverRegistryRefresh);
+                                        pr_for_poller.refresh_from_store(hg_for_poller.as_ref())
+                                    };
+                                    if let Err(error) = refreshed {
+                                        warn!(frame = frame_num, %error, "inline prover registry refresh failed");
+                                    }
+                                    // Keep the CRDT's per-app shard sets in sync with the
+                                    // shards store so a split applied this frame (at an
+                                    // epoch boundary) is reflected in the NEXT frame's app
+                                    // root — deterministically on every node. Cheap: reuses
+                                    // the store the poller already reads.
+                                    super::engines::refresh_crdt_shard_prefixes(
+                                        crdt_for_poller.as_ref(),
+                                        shards_store_for_poller.as_ref(),
+                                    );
+                                }
                             }
-                            if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
-                                warn!(error = %e, frame = frame_num, "hypergraph commit failed");
+                            Err(e) => {
+                                warn!(frame = frame_num, error = %e, "frame processing failed");
                             }
-                            let refreshed = {
-                                let _refresh = probe::section(ProbeSection::ProverRegistryRefresh);
-                                pr_for_poller.refresh_from_store(hg_for_poller.as_ref())
-                            };
-                            if let Err(error) = refreshed {
-                                warn!(frame = frame_num, %error, "inline prover registry refresh failed");
-                            }
-                            // Keep the CRDT's per-app shard sets in sync with the
-                            // shards store so a split applied this frame (at an
-                            // epoch boundary) is reflected in the NEXT frame's app
-                            // root — deterministically on every node. Cheap: reuses
-                            // the store the poller already reads.
-                            super::engines::refresh_crdt_shard_prefixes(
-                                crdt_for_poller.as_ref(),
-                                shards_store_for_poller.as_ref(),
-                            );
+                        }
+                    } // end inline-processing fallback (no serial materializer wired)
+
+                    // Trigger worker allocation reconciliation. Skip in
+                    // archive mode — archives don't run app-shard workers,
+                    // so the reconciler has nothing to do and calling it
+                    // would resurface the no-workers-spawned-yet pathways
+                    // that produced phantom worker allocations on prior
+                    // versions.
+                    cov_for_poller.check(frame_num);
+                    if !archive_mode_poller {
+                        let reconciled = {
+                            let _reconcile = probe::section(ProbeSection::AllocationReconcile);
+                            wa_for_poller.on_new_frame(frame_num)
+                        };
+                        if let Err(e) = reconciled {
+                            tracing::warn!(error = %e, "worker allocation failed");
                         }
                     }
-                    Err(e) => {
-                        warn!(frame = frame_num, error = %e, "frame processing failed");
-                    }
-                }
-                } // end inline-processing fallback (no serial materializer wired)
 
-                // Trigger worker allocation reconciliation. Skip in
-                // archive mode — archives don't run app-shard workers,
-                // so the reconciler has nothing to do and calling it
-                // would resurface the no-workers-spawned-yet pathways
-                // that produced phantom worker allocations on prior
-                // versions.
-                cov_for_poller.check(frame_num);
-                if !archive_mode_poller {
-                    let reconciled = {
-                        let _reconcile = probe::section(ProbeSection::AllocationReconcile);
-                        wa_for_poller.on_new_frame(frame_num)
-                    };
-                    if let Err(e) = reconciled {
-                        tracing::warn!(error = %e, "worker allocation failed");
-                    }
-                }
+                    // Advance the lifecycle's "verified frame" marker. The
+                    // initial prover-tree sync already proved our root
+                    // matches the network (`commitments_match==true` —
+                    // see the spawn at the bottom of `main.rs`). From
+                    // that point on, every successfully-processed frame
+                    // either applies new prover messages (and our tree
+                    // moves with it) or is a no-op for prover state.
+                    // Either way we stay in sync; drift is caught by the
+                    // 5-minute periodic incremental sync.
+                    //
+                    // The earlier strict per-frame commitment check
+                    // required `crdt.commit(frame_num)` to have run AND
+                    // matched the frame's `prover_tree_commitment`, which
+                    // only happened on the rare frames where we applied
+                    // prover messages — leaving the lifecycle gate held
+                    // perpetually for non-archive nodes.
+                    pl_for_poller.set_prover_root_verified_frame(frame_num);
 
-                // Advance the lifecycle's "verified frame" marker. The
-                // initial prover-tree sync already proved our root
-                // matches the network (`commitments_match==true` —
-                // see the spawn at the bottom of `main.rs`). From
-                // that point on, every successfully-processed frame
-                // either applies new prover messages (and our tree
-                // moves with it) or is a no-op for prover state.
-                // Either way we stay in sync; drift is caught by the
-                // 5-minute periodic incremental sync.
-                //
-                // The earlier strict per-frame commitment check
-                // required `crdt.commit(frame_num)` to have run AND
-                // matched the frame's `prover_tree_commitment`, which
-                // only happened on the rare frames where we applied
-                // prover messages — leaving the lifecycle gate held
-                // perpetually for non-archive nodes.
-                pl_for_poller.set_prover_root_verified_frame(frame_num);
-
-                // Refresh the lifecycle's per-filter byte-size map
-                // before evaluating. Without this the proposer falls
-                // back to `summary.total_size` which is a prover-
-                // count proxy (sum of status_counts), not bytes —
-                // joins fire on shards with no actual data, and
-                // halt-risk priority can't tell apart "0 bytes
-                // because empty" from "real bytes." We walk the
-                // local hypergraph the same way the
-                // GetShardInfo RPC does (`local_app_shard_get_sizes`).
-                // Only the lifecycle below reads it, and an archive does not
-                // evaluate it here; the sizes cost an archive 8-26 s a frame
-                // on this task, between fetches (2026-10-04).
-                if !archive_mode_poller {
-                    use std::collections::HashMap;
-                    let _sizes = probe::section(ProbeSection::ShardSizeRead);
-                    let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
-                        crdt_for_poller.clone(),
-                        shards_store_for_poller.clone(),
-                        sizes_for_poller.clone(),
-                    );
-                    let mut sizes_by_filter: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
-                    if let Ok(shards) = shards_store_for_poller.range_app_shards() {
-                        // Dedupe to one entry per parent shard_key
-                        // (range_app_shards returns one row per
-                        // sub-shard).
-                        let mut seen: std::collections::HashSet<Vec<u8>> =
-                            std::collections::HashSet::new();
-                        for s in shards {
-                            if !seen.insert(s.shard_key.clone()) {
-                                continue;
-                            }
-                            if let Ok(sub_sizes) = get_sizes(&s.shard_key, &s) {
-                                for entry in sub_sizes {
-                                    // `entry.size` is a big-endian
-                                    // byte representation of the
-                                    // shard's byte count. Saturate
-                                    // at u64::MAX for absurdly large
-                                    // shards rather than wrap.
-                                    let mut bytes: u64 = 0;
-                                    for &b in entry.size.iter() {
-                                        bytes = bytes
-                                            .saturating_mul(256)
-                                            .saturating_add(b as u64);
+                    // Refresh the lifecycle's per-filter byte-size map
+                    // before evaluating. Without this the proposer falls
+                    // back to `summary.total_size` which is a prover-
+                    // count proxy (sum of status_counts), not bytes —
+                    // joins fire on shards with no actual data, and
+                    // halt-risk priority can't tell apart "0 bytes
+                    // because empty" from "real bytes." We walk the
+                    // local hypergraph the same way the
+                    // GetShardInfo RPC does (`local_app_shard_get_sizes`).
+                    // Only the lifecycle below reads it, and an archive does not
+                    // evaluate it here; the sizes cost an archive 8-26 s a frame
+                    // on this task, between fetches (2026-10-04).
+                    if !archive_mode_poller {
+                        use std::collections::HashMap;
+                        let _sizes = probe::section(ProbeSection::ShardSizeRead);
+                        let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
+                            crdt_for_poller.clone(),
+                            shards_store_for_poller.clone(),
+                            sizes_for_poller.clone(),
+                        );
+                        let mut sizes_by_filter: HashMap<Vec<u8>, (u64, u64)> = HashMap::new();
+                        if let Ok(shards) = shards_store_for_poller.range_app_shards() {
+                            // Dedupe to one entry per parent shard_key
+                            // (range_app_shards returns one row per
+                            // sub-shard).
+                            let mut seen: std::collections::HashSet<Vec<u8>> =
+                                std::collections::HashSet::new();
+                            for s in shards {
+                                if !seen.insert(s.shard_key.clone()) {
+                                    continue;
+                                }
+                                if let Ok(sub_sizes) = get_sizes(&s.shard_key, &s) {
+                                    for entry in sub_sizes {
+                                        // `entry.size` is a big-endian
+                                        // byte representation of the
+                                        // shard's byte count. Saturate
+                                        // at u64::MAX for absurdly large
+                                        // shards rather than wrap.
+                                        let mut bytes: u64 = 0;
+                                        for &b in entry.size.iter() {
+                                            bytes =
+                                                bytes.saturating_mul(256).saturating_add(b as u64);
+                                        }
+                                        if bytes == 0 {
+                                            continue;
+                                        }
+                                        // Reconstruct the `bp` filter the proposer keys
+                                        // on (canonical, sentinel-aware).
+                                        let l2 = if s.shard_key.len() >= 35 {
+                                            &s.shard_key[3..35]
+                                        } else if s.shard_key.len() > 3 {
+                                            &s.shard_key[3..]
+                                        } else {
+                                            &s.shard_key[..]
+                                        };
+                                        let bp =
+                                            quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
+                                        sizes_by_filter.insert(bp, (bytes, entry.data_shards));
                                     }
-                                    if bytes == 0 {
-                                        continue;
-                                    }
-                                    // Reconstruct the `bp` filter the proposer keys
-                                    // on (canonical, sentinel-aware).
-                                    let l2 = if s.shard_key.len() >= 35 {
-                                        &s.shard_key[3..35]
-                                    } else if s.shard_key.len() > 3 {
-                                        &s.shard_key[3..]
-                                    } else {
-                                        &s.shard_key[..]
-                                    };
-                                    let bp = quil_forest::shard_prefix_to_filter(l2, &entry.prefix);
-                                    sizes_by_filter.insert(bp, (bytes, entry.data_shards));
                                 }
                             }
                         }
+                        pl_for_poller.set_local_shard_metrics(sizes_by_filter);
                     }
-                    pl_for_poller.set_local_shard_metrics(sizes_by_filter);
-                }
 
-                // Skip lifecycle evaluation on archives — they don't
-                // propose joins/leaves, don't dispatch through the
-                // prover pipeline, and the evaluate() output would
-                // be ignored anyway since there are no workers to
-                // bind allocations to.
-                //
-                // Nor while this node replays a backlog (after a restart, or
-                // when it fell behind): an operation planned at a replayed
-                // frame is signed for a frame GLOBAL may already be past (a
-                // confirm from an earlier epoch is refused), and the
-                // lifecycle's cooldowns, retry fences and inclusion windows,
-                // counted in frames, would run out at replay speed. The state
-                // above still follows every frame; the lifecycle evaluates
-                // again at the head, seconds later.
-                let head = head_for_poller.load(std::sync::atomic::Ordering::Relaxed);
-                let at_head = frame_num.saturating_add(1) >= head;
-                if !archive_mode_poller {
-                    if !at_head {
-                        if !lifecycle_deferred.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            tracing::info!(frame = frame_num, head,
+                    // Skip lifecycle evaluation on archives — they don't
+                    // propose joins/leaves, don't dispatch through the
+                    // prover pipeline, and the evaluate() output would
+                    // be ignored anyway since there are no workers to
+                    // bind allocations to.
+                    //
+                    // Nor while this node replays a backlog (after a restart, or
+                    // when it fell behind): an operation planned at a replayed
+                    // frame is signed for a frame GLOBAL may already be past (a
+                    // confirm from an earlier epoch is refused), and the
+                    // lifecycle's cooldowns, retry fences and inclusion windows,
+                    // counted in frames, would run out at replay speed. The state
+                    // above still follows every frame; the lifecycle evaluates
+                    // again at the head, seconds later.
+                    let head = head_for_poller.load(std::sync::atomic::Ordering::Relaxed);
+                    let at_head = frame_num.saturating_add(1) >= head;
+                    if !archive_mode_poller {
+                        if !at_head {
+                            if !lifecycle_deferred.swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                tracing::info!(frame = frame_num, head,
                                 "prover lifecycle waits until this node reaches the GLOBAL head");
+                            }
+                        } else if lifecycle_deferred
+                            .swap(false, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            tracing::info!(
+                                frame = frame_num,
+                                "prover lifecycle resumes at the GLOBAL head"
+                            );
                         }
-                    } else if lifecycle_deferred.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(frame = frame_num, "prover lifecycle resumes at the GLOBAL head");
                     }
-                }
-                if !archive_mode_poller && at_head {
-                    let evaluated = {
-                        let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
-                        pl_for_poller.evaluate(
-                            frame_num,
-                            frame_difficulty as u64,
-                            pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
-                            wm_for_poller.as_ref(),
-                        )
-                    };
-                    match evaluated {
-                        Ok(actions) => {
-                            for action in actions {
-                                tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
-                                pp_for_poller.dispatch(action);
+                    if !archive_mode_poller && at_head {
+                        let evaluated = {
+                            let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
+                            pl_for_poller.evaluate(
+                                frame_num,
+                                frame_difficulty as u64,
+                                pr_for_poller.as_ref()
+                                    as &dyn quil_types::consensus::ProverRegistry,
+                                wm_for_poller.as_ref(),
+                            )
+                        };
+                        match evaluated {
+                            Ok(actions) => {
+                                for action in actions {
+                                    tracing::info!(
+                                        frame = frame_num,
+                                        ?action,
+                                        "prover lifecycle action"
+                                    );
+                                    pp_for_poller.dispatch(action);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "prover lifecycle evaluation skipped");
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "prover lifecycle evaluation skipped");
-                        }
                     }
-                }
-            })),
+                },
+            )),
             frame_validator: Some(frame_validate.clone()),
             // Forward-fill EVERY global frame (not just the head), on regulars too
             // — NOT only archives. A regular runs app-shard workers whose storage
@@ -2216,10 +2433,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             );
             sup.run_until_cancelled("archive-poller", {
                 let seed = seed.clone();
-                move |cancel| probe::task_probed(poller_probe, async move {
-                    quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
-                    Ok(())
-                })
+                move |cancel| {
+                    probe::task_probed(poller_probe, async move {
+                        quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
+                        Ok(())
+                    })
+                }
             });
         }
         info!("archive frame poller spawned (with execution pipeline)");
@@ -2242,7 +2461,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 (0, 1_762_862_400_000, 80_000)
             };
             let sync_da = Arc::new(quil_engine::AsertDifficultyAdjuster::new(
-                anchor_frame, anchor_time, anchor_diff,
+                anchor_frame,
+                anchor_time,
+                anchor_diff,
             ));
             let sync_mc = message_collector.clone();
             let sync_em = exec_manager.clone();
@@ -2279,7 +2500,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             // minutes despite requesting a five-second refresh. Production
             // mainnet retains its existing cadence; reject zero/absurd timers.
             let sync_interval_secs = std::env::var("QUIL_PROVER_TREE_SYNC_SECS")
-                .ok().and_then(|value| value.parse::<u64>().ok())
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
                 .filter(|seconds| network != 0 && (1..=86_400).contains(seconds))
                 .unwrap_or(300);
             sup.spawn("archive-prover-tree-sync", move |sync_token| async move {
@@ -4265,7 +4487,10 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }
                 Ok(())
             });
-            info!(interval_secs = sync_interval_secs, "periodic prover tree sync task spawned");
+            info!(
+                interval_secs = sync_interval_secs,
+                "periodic prover tree sync task spawned"
+            );
         }
 
         // Periodic archive-direct shard info refresh. Drives the
@@ -4294,9 +4519,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // disagree; the node still takes each refresh's list.
                 let mut shard_lists = quil_rpc::ArchiveShardListTracker::new();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -4336,21 +4559,34 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             }
                             // Each refresh asks one archive and replaces the
                             // set: name the shards when it changes.
-                            let mut frozen_filters: Vec<Vec<u8>> = found.frozen.iter().cloned().collect();
+                            let mut frozen_filters: Vec<Vec<u8>> =
+                                found.frozen.iter().cloned().collect();
                             frozen_filters.sort();
                             if last_frozen != frozen_filters {
-                                let list = |filters: &[Vec<u8>]| filters.iter().map(hex::encode).collect::<Vec<_>>().join(",");
+                                let list = |filters: &[Vec<u8>]| {
+                                    filters
+                                        .iter()
+                                        .map(hex::encode)
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                };
                                 info!(frame = now_frame, frozen = %list(&frozen_filters),
                                     previous = %list(&last_frozen),
                                     "shard_info refresh: frozen shards changed");
                                 last_frozen = frozen_filters;
                             }
                             lifecycle.set_frozen_shards(found.frozen);
-                            lifecycle.set_remote_shard_metrics(found.sizes.into_iter()
-                                .map(|(filter, bytes)| {
-                                    let shards = found.data_shards.get(&filter).copied().unwrap_or(0);
-                                    (filter, (bytes, shards))
-                                }).collect());
+                            lifecycle.set_remote_shard_metrics(
+                                found
+                                    .sizes
+                                    .into_iter()
+                                    .map(|(filter, bytes)| {
+                                        let shards =
+                                            found.data_shards.get(&filter).copied().unwrap_or(0);
+                                        (filter, (bytes, shards))
+                                    })
+                                    .collect(),
+                            );
                             last_refresh_frame = now_frame.max(1);
                             // Archives publish admission topology from the
                             // serial materializer after each durable commit.
@@ -4379,7 +4615,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                         Err(quil_rpc::ShardInfoRefreshError::NoLocalShards) => {
                             // Local shards-store empty — genesis not
                             // yet seeded, or the wrong network ID.
-                            tracing::debug!("shard_info refresh: local shards-store empty, retrying");
+                            tracing::debug!(
+                                "shard_info refresh: local shards-store empty, retrying"
+                            );
                         }
                         Err(e) => {
                             warn!(error = %e, "shard_info refresh failed (will retry)");
@@ -4392,14 +4630,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             info!("shard_info refresh task spawned (frame-anchored, 60-frame cadence)");
         }
     } else {
-        warn!("no Ed448 seed available — archive poller disabled (production archives require mTLS)");
+        warn!(
+            "no Ed448 seed available — archive poller disabled (production archives require mTLS)"
+        );
     }
 }
 
 #[cfg(test)]
 mod bootstrap_sync_tests {
     use super::bootstrap_prover_sync;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
 
@@ -4408,10 +4651,14 @@ mod bootstrap_sync_tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Some(42)).unwrap();
         let calls = AtomicUsize::new(0);
-        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            false
-        }).await, Some(true));
+        assert_eq!(
+            bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+            .await,
+            Some(true)
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -4424,7 +4671,8 @@ mod bootstrap_sync_tests {
             bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
                 seen.fetch_add(1, Ordering::SeqCst);
                 true
-            }).await
+            })
+            .await
         });
         // A scheduler barrier lets the task reach its pending receive.
         tokio::task::yield_now().await;
@@ -4440,10 +4688,14 @@ mod bootstrap_sync_tests {
         let (tx, rx) = oneshot::channel();
         drop(tx);
         let calls = AtomicUsize::new(0);
-        assert_eq!(bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            false
-        }).await, Some(false));
+        assert_eq!(
+            bootstrap_prover_sync(rx, &CancellationToken::new(), || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                false
+            })
+            .await,
+            Some(false)
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4452,9 +4704,13 @@ mod bootstrap_sync_tests {
         let (_tx, rx) = oneshot::channel();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert_eq!(bootstrap_prover_sync(rx, &cancel, || async {
-            panic!("cancelled bootstrap must not download")
-        }).await, None);
+        assert_eq!(
+            bootstrap_prover_sync(rx, &cancel, || async {
+                panic!("cancelled bootstrap must not download")
+            })
+            .await,
+            None
+        );
     }
 }
 
@@ -4463,33 +4719,53 @@ mod validation_tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn reassigned_worker_fixture(public_key: Vec<u8>) -> (
+    fn reassigned_worker_fixture(
+        public_key: Vec<u8>,
+    ) -> (
         Arc<quil_engine::test_support::TestWorkerManager>,
         quil_engine::worker_allocator::WorkerAllocator,
     ) {
         use quil_engine::test_support::{TestProverRegistry, TestWorkerManager};
         use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
         let allocation = |filter, status| ProverAllocationInfo {
-            status, confirmation_filter: filter, rejection_filter: vec![],
-            join_frame_number: 1, join_confirm_frame_number: 2,
-            leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
-            kick_frame_number: 0, join_reject_frame_number: 0,
-            leave_confirm_frame_number: 0, leave_reject_frame_number: 0,
-            last_active_frame_number: 2, epoch: 2, ring: 0, vertex_address: vec![],
+            status,
+            confirmation_filter: filter,
+            rejection_filter: vec![],
+            join_frame_number: 1,
+            join_confirm_frame_number: 2,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 2,
+            epoch: 2,
+            ring: 0,
+            vertex_address: vec![],
             last_signed_frame_number: 0,
         };
         let workers = Arc::new(TestWorkerManager::new());
         workers.add_with_filter(6, vec![1; 32]);
         let registry = Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
-            public_key, address: vec![7; 32], status: ProverStatus::Active,
-            kick_frame_number: 0, available_storage: 0, seniority: 100,
-            delegate_address: vec![], allocations: vec![
+            public_key,
+            address: vec![7; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
+            allocations: vec![
                 allocation(vec![1; 32], ProverStatus::Historic),
                 allocation(vec![2; 32], ProverStatus::Active),
             ],
         }]));
         let allocator = quil_engine::worker_allocator::WorkerAllocator::new(
-            workers.clone(), registry, vec![7; 32]);
+            workers.clone(),
+            registry,
+            vec![7; 32],
+        );
         (workers, allocator)
     }
 
@@ -4503,11 +4779,16 @@ mod validation_tests {
         let ids: Vec<String> = peers.iter().map(|(id, _)| id.clone()).collect();
         let (successor_keys, successor_ids) = global_committee_successor(0, &keys, &ids);
         assert_eq!(successor_ids.len(), 4);
-        assert!(!successor_ids.iter().any(|id| quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&id.as_str())));
+        assert!(!successor_ids
+            .iter()
+            .any(|id| quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&id.as_str())));
         for (key, id) in successor_keys.iter().zip(&successor_ids) {
             assert!(keys.iter().zip(&ids).any(|pair| pair == (key, id)));
         }
-        assert_eq!(global_committee_successor(1, &keys, &ids), (Vec::new(), Vec::new()));
+        assert_eq!(
+            global_committee_successor(1, &keys, &ids),
+            (Vec::new(), Vec::new())
+        );
     }
 
     /// The prefetch hint reads the stored GLOBAL frames after the waiting one,
@@ -4515,30 +4796,62 @@ mod validation_tests {
     /// and keeps each shard's highest frame.
     #[test]
     fn upcoming_shard_frames_reads_ahead_to_the_first_missing_frame() {
+        use quil_types::proto::global::{
+            message_request::Request, FrameHeader, GlobalFrame, GlobalFrameHeader, MessageBundle,
+            MessageRequest,
+        };
         use quil_types::store::ClockStore;
-        use quil_types::proto::global::{message_request::Request, FrameHeader, GlobalFrame, GlobalFrameHeader, MessageBundle, MessageRequest};
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let frame = |number: u64, shards: &[(u8, u64)]| GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: number, output: vec![number as u8; 32], ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![number as u8; 32],
+                ..Default::default()
+            }),
             requests: vec![MessageBundle {
-                requests: shards.iter().map(|&(address, frame_number)| MessageRequest {
-                    request: Some(Request::Shard(FrameHeader { address: vec![address; 32], frame_number, ..Default::default() })),
-                    ..Default::default()
-                }).collect(),
+                requests: shards
+                    .iter()
+                    .map(|&(address, frame_number)| MessageRequest {
+                        request: Some(Request::Shard(FrameHeader {
+                            address: vec![address; 32],
+                            frame_number,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
             }],
             ..Default::default()
         };
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame(&frame(11, &[(1, 40), (2, 7)]), txn.as_ref()).unwrap();
-        clock.put_global_clock_frame(&frame(12, &[(1, 38)]), txn.as_ref()).unwrap();
-        clock.put_global_clock_frame_candidate(&frame(13, &[(1, 41), (3, 9)]), txn.as_ref()).unwrap();
-        clock.put_global_clock_frame(&frame(15, &[(4, 99)]), txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame(&frame(11, &[(1, 40), (2, 7)]), txn.as_ref())
+            .unwrap();
+        clock
+            .put_global_clock_frame(&frame(12, &[(1, 38)]), txn.as_ref())
+            .unwrap();
+        clock
+            .put_global_clock_frame_candidate(&frame(13, &[(1, 41), (3, 9)]), txn.as_ref())
+            .unwrap();
+        clock
+            .put_global_clock_frame(&frame(15, &[(4, 99)]), txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
         let targets = upcoming_shard_frames(&clock, 10, 120);
-        assert_eq!(targets, std::collections::BTreeMap::from([(vec![1; 32], 41), (vec![2; 32], 7), (vec![3; 32], 9)]));
-        assert_eq!(upcoming_shard_frames(&clock, 10, 1), std::collections::BTreeMap::from([(vec![1; 32], 40), (vec![2; 32], 7)]));
+        assert_eq!(
+            targets,
+            std::collections::BTreeMap::from([
+                (vec![1; 32], 41),
+                (vec![2; 32], 7),
+                (vec![3; 32], 9)
+            ])
+        );
+        assert_eq!(
+            upcoming_shard_frames(&clock, 10, 1),
+            std::collections::BTreeMap::from([(vec![1; 32], 40), (vec![2; 32], 7)])
+        );
     }
 
     /// A reconcile may skip executing GLOBAL frames only when none of them
@@ -4546,17 +4859,29 @@ mod validation_tests {
     /// first becomes due among them, and every one is stored to tell.
     #[test]
     fn a_skipped_range_with_a_grid_change_is_found() {
-        use quil_types::store::{ClockStore, PendingShardChange, ShardChangeKind, ShardsStore as _};
-        use quil_types::proto::global::{message_request::Request, GlobalFrame, GlobalFrameHeader, MessageBundle, MessageRequest, ShardSplit};
+        use quil_types::proto::global::{
+            message_request::Request, GlobalFrame, GlobalFrameHeader, MessageBundle,
+            MessageRequest, ShardSplit,
+        };
+        use quil_types::store::{
+            ClockStore, PendingShardChange, ShardChangeKind, ShardsStore as _,
+        };
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let shards = quil_store::RocksShardsStore::new(db.inner());
         let length = quil_types::consensus::epoch_length_frames();
         let frame = |number: u64, split: bool| GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: number, output: vec![number as u8; 32], ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![number as u8; 32],
+                ..Default::default()
+            }),
             requests: vec![MessageBundle {
                 requests: if split {
-                    vec![MessageRequest { request: Some(Request::ShardSplit(ShardSplit::default())), ..Default::default() }]
+                    vec![MessageRequest {
+                        request: Some(Request::ShardSplit(ShardSplit::default())),
+                        ..Default::default()
+                    }]
                 } else {
                     Vec::new()
                 },
@@ -4566,62 +4891,108 @@ mod validation_tests {
         };
         let txn = clock.new_transaction(false).unwrap();
         for number in 11..=13 {
-            clock.put_global_clock_frame(&frame(number, number == 12), txn.as_ref()).unwrap();
+            clock
+                .put_global_clock_frame(&frame(number, number == 12), txn.as_ref())
+                .unwrap();
         }
         for number in 2 * length - 1..=2 * length + 1 {
-            clock.put_global_clock_frame(&frame(number, false), txn.as_ref()).unwrap();
+            clock
+                .put_global_clock_frame(&frame(number, false), txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
 
         assert_eq!(grid_change_between(&clock, &shards, 10, 11), None);
-        assert_eq!(grid_change_between(&clock, &shards, 13, 13), None, "nothing skipped");
-        assert!(grid_change_between(&clock, &shards, 10, 13).is_some_and(|why| why.contains("frame 12 stages")));
-        assert!(grid_change_between(&clock, &shards, 12, 14).is_some_and(|why| why.contains("frame 14 is not stored")));
-        assert_eq!(grid_change_between(&clock, &shards, 2 * length - 2, 2 * length), None);
+        assert_eq!(
+            grid_change_between(&clock, &shards, 13, 13),
+            None,
+            "nothing skipped"
+        );
+        assert!(grid_change_between(&clock, &shards, 10, 13)
+            .is_some_and(|why| why.contains("frame 12 stages")));
+        assert!(grid_change_between(&clock, &shards, 12, 14)
+            .is_some_and(|why| why.contains("frame 14 is not stored")));
+        assert_eq!(
+            grid_change_between(&clock, &shards, 2 * length - 2, 2 * length),
+            None
+        );
 
         let txn = clock.new_transaction(false).unwrap();
-        shards.put_pending_shard_change(txn.as_ref(), &PendingShardChange {
-            kind: ShardChangeKind::Split,
-            parent: vec![7; 35],
-            children: Vec::new(),
-            effective_epoch: 2,
-            proposed_frame: 1,
-        }).unwrap();
+        shards
+            .put_pending_shard_change(
+                txn.as_ref(),
+                &PendingShardChange {
+                    kind: ShardChangeKind::Split,
+                    parent: vec![7; 35],
+                    children: Vec::new(),
+                    effective_epoch: 2,
+                    proposed_frame: 1,
+                },
+            )
+            .unwrap();
         txn.commit().unwrap();
-        assert!(grid_change_between(&clock, &shards, 2 * length - 2, 2 * length)
-            .is_some_and(|why| why.contains("becomes due at frame")));
-        assert_eq!(grid_change_between(&clock, &shards, 2 * length, 2 * length + 1), None,
-            "a change already due before the range is applied by later execution");
+        assert!(
+            grid_change_between(&clock, &shards, 2 * length - 2, 2 * length)
+                .is_some_and(|why| why.contains("becomes due at frame"))
+        );
+        assert_eq!(
+            grid_change_between(&clock, &shards, 2 * length, 2 * length + 1),
+            None,
+            "a change already due before the range is applied by later execution"
+        );
     }
 
     #[test]
     fn verified_registry_sync_rebinds_without_a_new_global_frame() {
         use quil_engine::worker::WorkerManager;
-        use quil_types::store::ClockStore;
         use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::store::ClockStore;
         let (workers, allocator) = reassigned_worker_fixture(vec![8; 32]);
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame(&GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: 2160,
-                prover_tree_commitment: vec![9; 32], ..Default::default() }),
-            ..Default::default()
-        }, txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame(
+                &GlobalFrame {
+                    header: Some(GlobalFrameHeader {
+                        frame_number: 2160,
+                        prover_tree_commitment: vec![9; 32],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
         txn.commit().unwrap();
         let anchor = RegistrySyncAnchor::capture(&clock, None);
         assert_eq!(anchor.cursor, Some(2159));
-        assert_eq!(reconcile_workers_after_registry_sync(&allocator, &anchor, true).unwrap(), None);
+        assert_eq!(
+            reconcile_workers_after_registry_sync(&allocator, &anchor, true).unwrap(),
+            None
+        );
         for unverified in [
-            RegistrySyncAnchor { root: vec![], cursor: Some(2159) },
-            RegistrySyncAnchor { root: vec![9; 32], cursor: None },
+            RegistrySyncAnchor {
+                root: vec![],
+                cursor: Some(2159),
+            },
+            RegistrySyncAnchor {
+                root: vec![9; 32],
+                cursor: None,
+            },
         ] {
-            assert_eq!(reconcile_workers_after_registry_sync(&allocator, &unverified, false).unwrap(), None);
+            assert_eq!(
+                reconcile_workers_after_registry_sync(&allocator, &unverified, false).unwrap(),
+                None
+            );
             assert_eq!(workers.range_workers().unwrap()[0].filter, vec![1; 32]);
         }
         // No additional frame is stored. Using the header's height here would
         // expire the epoch-2 child instead of binding at its authenticated height.
-        assert_eq!(reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap(), Some(2159));
+        assert_eq!(
+            reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap(),
+            Some(2159)
+        );
         let worker = workers.range_workers().unwrap().remove(0);
         assert_eq!(worker.filter, vec![2; 32]);
         assert!(worker.allocated);
@@ -4634,59 +5005,117 @@ mod validation_tests {
     #[test]
     fn verified_registry_sync_preserves_committee_retention_until_sealed() {
         use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
-        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
-        use quil_execution::hypergraph_state::HypergraphState;
         use quil_engine::worker::WorkerManager;
+        use quil_execution::global_intrinsic::handoff::{
+            self, CertificateSubmission, DesiredCommittee,
+        };
+        use quil_execution::hypergraph_state::HypergraphState;
         use quil_types::crypto::Signer as _;
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         let state = HypergraphState::new(global.clone());
         let commit = |frame| {
-            state.commit().unwrap(); state.abort();
-            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            state.commit().unwrap();
+            state.abort();
+            global
+                .commit_with_global_cursor(
+                    frame,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
         };
-        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
         let (workers, allocator) = reassigned_worker_fixture(signers[0].public_key().to_vec());
         allocator.set_session_authority(global.clone());
         let mut members: Vec<_> = signers.iter().map(|s| s.public_key().to_vec()).collect();
         members.sort();
-        let session = Session { chain_id: [7; 32], filter: vec![1; 32], generation: 1,
+        let session = Session {
+            chain_id: [7; 32],
+            filter: vec![1; 32],
+            generation: 1,
             genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
-            base_frame: 0, authorization: [0; 32], members };
+            base_frame: 0,
+            authorization: [0; 32],
+            members,
+        };
         commit(1);
-        handoff::initialize(&state, 2, &session).unwrap(); commit(2);
-        let request = handoff::schedule(&state, 3, vec![session.filter.clone()], vec![
-            DesiredCommittee { filter: session.filter.clone(), members: vec![signers[1].public_key().to_vec()] }
-        ]).unwrap(); commit(3);
-        let anchor = RegistrySyncAnchor { root: vec![9; 32], cursor: Some(3) };
+        handoff::initialize(&state, 2, &session).unwrap();
+        commit(2);
+        let request = handoff::schedule(
+            &state,
+            3,
+            vec![session.filter.clone()],
+            vec![DesiredCommittee {
+                filter: session.filter.clone(),
+                members: vec![signers[1].public_key().to_vec()],
+            }],
+        )
+        .unwrap();
+        commit(3);
+        let anchor = RegistrySyncAnchor {
+            root: vec![9; 32],
+            cursor: Some(3),
+        };
         reconcile_workers_after_registry_sync(&allocator, &anchor, false).unwrap();
         assert_eq!(workers.range_workers().unwrap()[0].filter, session.filter);
-        let seal = Seal { request: request.id().unwrap(), session: session.id().unwrap(), view: 3,
-            checkpoint: Checkpoint { frame: 0, view: 0, digest: session.genesis,
-                state_roots: [[0; 32]; 4], history_root: [9; 32] } };
+        let seal = Seal {
+            request: request.id().unwrap(),
+            session: session.id().unwrap(),
+            view: 3,
+            checkpoint: Checkpoint {
+                frame: 0,
+                view: 0,
+                digest: session.genesis,
+                state_roots: [[0; 32]; 4],
+                history_root: [9; 32],
+            },
+        };
         let certificate = quil_engine::test_support::certify_seal(&session, &signers, &seal);
         handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
-        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        assert!(
+            handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate })
+                .unwrap()
+        );
         commit(4);
-        reconcile_workers_after_registry_sync(&allocator,
-            &RegistrySyncAnchor { root: vec![9; 32], cursor: Some(4) }, false).unwrap();
+        reconcile_workers_after_registry_sync(
+            &allocator,
+            &RegistrySyncAnchor {
+                root: vec![9; 32],
+                cursor: Some(4),
+            },
+            false,
+        )
+        .unwrap();
         assert_eq!(workers.range_workers().unwrap()[0].filter, vec![2; 32]);
     }
 
     fn early_pull_clock(head: u64, view: u64) -> quil_store::RocksClockStore {
-        use quil_types::store::ClockStore;
         use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::store::ClockStore;
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame(&GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: head, ..Default::default() }),
-            ..Default::default()
-        }, txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame(
+                &GlobalFrame {
+                    header: Some(GlobalFrameHeader {
+                        frame_number: head,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
         txn.commit().unwrap();
         clock.put_global_materialized_cursor(view).unwrap();
         clock
@@ -4711,17 +5140,50 @@ mod validation_tests {
             let mut periodic = tokio::time::interval(std::time::Duration::from_secs(300));
             periodic.tick().await;
             let mut check = tokio::time::interval(std::time::Duration::from_millis(20));
-            tokio::time::timeout(std::time::Duration::from_millis(500),
-                next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock)).await
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock),
+            )
+            .await
         };
-        assert_eq!(pull(early_pull_clock(boundary + 1, boundary - 5), early_refresh(true)).await,
-            Ok(Some(EarlyPull { reason: Reason::EpochBoundary, through: boundary })));
-        assert!(pull(early_pull_clock(boundary + 1, boundary), early_refresh(true)).await.is_err(),
-            "nothing newer to pull");
-        assert!(pull(early_pull_clock(boundary, boundary - 5), early_refresh(true)).await.is_err(),
-            "the boundary is not bindable yet");
-        assert!(pull(early_pull_clock(boundary + 1, boundary - 5), early_refresh(false)).await.is_err(),
-            "an archive pulls only periodically");
+        assert_eq!(
+            pull(
+                early_pull_clock(boundary + 1, boundary - 5),
+                early_refresh(true)
+            )
+            .await,
+            Ok(Some(EarlyPull {
+                reason: Reason::EpochBoundary,
+                through: boundary
+            }))
+        );
+        assert!(
+            pull(
+                early_pull_clock(boundary + 1, boundary),
+                early_refresh(true)
+            )
+            .await
+            .is_err(),
+            "nothing newer to pull"
+        );
+        assert!(
+            pull(
+                early_pull_clock(boundary, boundary - 5),
+                early_refresh(true)
+            )
+            .await
+            .is_err(),
+            "the boundary is not bindable yet"
+        );
+        assert!(
+            pull(
+                early_pull_clock(boundary + 1, boundary - 5),
+                early_refresh(false)
+            )
+            .await
+            .is_err(),
+            "an archive pulls only periodically"
+        );
     }
 
     /// An early pull restarts the period, and the periodic pull still follows.
@@ -4735,31 +5197,54 @@ mod validation_tests {
         periodic.tick().await;
         tokio::time::sleep(period * 2 / 3).await;
         let mut check = tokio::time::interval(std::time::Duration::from_millis(20));
-        let early = tokio::time::timeout(period, next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock))
-            .await.unwrap();
-        assert!(early.is_some(), "the boundary is pulled before the period ends");
+        let early = tokio::time::timeout(
+            period,
+            next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock),
+        )
+        .await
+        .unwrap();
+        assert!(
+            early.is_some(),
+            "the boundary is pulled before the period ends"
+        );
         let restarted = tokio::time::Instant::now();
         // It did not converge: the gap holds the next early pull, the period's comes.
         refresh.end(std::time::Instant::now());
-        let periodic_pull = tokio::time::timeout(period * 3, next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock))
-            .await.unwrap();
+        let periodic_pull = tokio::time::timeout(
+            period * 3,
+            next_prover_tree_pull(&mut periodic, &mut check, &refresh, &clock),
+        )
+        .await
+        .unwrap();
         assert_eq!(periodic_pull, None);
-        assert!(restarted.elapsed() >= period, "the period restarted at the early pull: {:?}", restarted.elapsed());
+        assert!(
+            restarted.elapsed() >= period,
+            "the period restarted at the early pull: {:?}",
+            restarted.elapsed()
+        );
     }
 
     #[test]
     fn registry_sync_anchor_survives_a_received_head_change() {
-        use quil_types::store::ClockStore;
         use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::store::ClockStore;
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let put = |number, root: Vec<u8>| {
             let txn = clock.new_transaction(false).unwrap();
-            clock.put_global_clock_frame(&GlobalFrame {
-                header: Some(GlobalFrameHeader {
-                    frame_number: number, prover_tree_commitment: root, ..Default::default()
-                }), ..Default::default()
-            }, txn.as_ref()).unwrap();
+            clock
+                .put_global_clock_frame(
+                    &GlobalFrame {
+                        header: Some(GlobalFrameHeader {
+                            frame_number: number,
+                            prover_tree_commitment: root,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    txn.as_ref(),
+                )
+                .unwrap();
             txn.commit().unwrap();
         };
         put(424, vec![1; 32]);
@@ -4768,29 +5253,49 @@ mod validation_tests {
         assert_eq!(anchor.root, vec![1; 32]);
         assert_eq!(anchor.cursor, Some(423));
         // The old completion-time lookup lost the citation for this root.
-        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(anchor.root)).cursor, None);
+        assert_eq!(
+            RegistrySyncAnchor::capture(&clock, Some(anchor.root)).cursor,
+            None
+        );
         assert_eq!(RegistrySyncAnchor::capture(&clock, None).cursor, Some(424));
     }
 
     #[test]
     fn registry_sync_fork_and_bootstrap_targets_require_a_matching_header() {
-        use quil_types::store::ClockStore;
         use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::store::ClockStore;
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let clock = quil_store::RocksClockStore::new(db.inner());
         let empty = RegistrySyncAnchor::capture(&clock, None);
         assert!(empty.root.is_empty());
         assert_eq!(empty.cursor, None);
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame(&GlobalFrame {
-            header: Some(GlobalFrameHeader {
-                frame_number: 50, prover_tree_commitment: vec![1; 32], ..Default::default()
-            }), ..Default::default()
-        }, txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame(
+                &GlobalFrame {
+                    header: Some(GlobalFrameHeader {
+                        frame_number: 50,
+                        prover_tree_commitment: vec![1; 32],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
         txn.commit().unwrap();
-        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(vec![2; 32])).cursor, None);
-        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(vec![1; 32])).cursor, Some(49));
-        assert_eq!(RegistrySyncAnchor::capture(&clock, Some(Vec::new())).cursor, Some(49));
+        assert_eq!(
+            RegistrySyncAnchor::capture(&clock, Some(vec![2; 32])).cursor,
+            None
+        );
+        assert_eq!(
+            RegistrySyncAnchor::capture(&clock, Some(vec![1; 32])).cursor,
+            Some(49)
+        );
+        assert_eq!(
+            RegistrySyncAnchor::capture(&clock, Some(Vec::new())).cursor,
+            Some(49)
+        );
     }
 
     // A lagging archive's fill retried one ancient hole every 3 s, from frame
@@ -4803,17 +5308,30 @@ mod validation_tests {
         let window = archive_gap_window();
         for n in [1, 2, 5, head - window - 10, head - 100, head - 98, head] {
             let frame = quil_types::proto::global::GlobalFrame {
-                header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: n, ..Default::default() }),
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: n,
+                    ..Default::default()
+                }),
                 requests: Vec::new(),
             };
             clock.put_global_frame(&frame, None).unwrap();
         }
-        assert_eq!(recent_record_gaps(&clock), vec![(head - window, head - 101), (head - 99, head - 99), (head - 97, head - 1)]);
+        assert_eq!(
+            recent_record_gaps(&clock),
+            vec![
+                (head - window, head - 101),
+                (head - 99, head - 99),
+                (head - 97, head - 1)
+            ]
+        );
     }
 
     #[test]
     fn a_stalled_execution_behind_the_canonical_head_is_detected() {
-        assert!(execution_stalled_behind(0, 0, 390), "the live archive: frame 1 missing, head far ahead");
+        assert!(
+            execution_stalled_behind(0, 0, 390),
+            "the live archive: frame 1 missing, head far ahead"
+        );
         assert!(!execution_stalled_behind(10, 12, 13), "advancing");
         assert!(!execution_stalled_behind(12, 12, 12), "an idle chain");
     }
@@ -4828,8 +5346,14 @@ mod validation_tests {
         // A split flips at the boundary; the refresh follows two frames on.
         assert!(!shard_info_refresh_due(4 * length + 1, last, true, false));
         assert!(shard_info_refresh_due(4 * length + 2, last, true, false));
-        assert!(!shard_info_refresh_due(4 * length + 3, 4 * length + 2, true, false), "once per epoch");
-        assert!(shard_info_refresh_due(last + 60, last, true, false), "the cadence still applies");
+        assert!(
+            !shard_info_refresh_due(4 * length + 3, 4 * length + 2, true, false),
+            "once per epoch"
+        );
+        assert!(
+            shard_info_refresh_due(last + 60, last, true, false),
+            "the cadence still applies"
+        );
     }
 
     // A live width run: the refresh ran at 302, two frames past the
@@ -4841,7 +5365,10 @@ mod validation_tests {
         let last = 10 * length + 2;
         assert!(!shard_info_refresh_due(last + 3, last, true, false));
         assert!(shard_info_refresh_due(last + 3, last, true, true));
-        assert!(!shard_info_refresh_due(last + 1, last, true, true), "not on every tick");
+        assert!(
+            !shard_info_refresh_due(last + 1, last, true, true),
+            "not on every tick"
+        );
     }
 
     fn verifier() -> quil_engine::frame_validator::GlobalFrameVerifier {
@@ -4905,14 +5432,24 @@ mod validation_tests {
         let v = verifier();
         assert!(frame_self_certified(&frame(0, None), &v), "genesis");
         assert!(!frame_self_certified(&frame(5, None), &v), "unsigned");
-        assert!(!frame_self_certified(&frame(5, Some(aggregate(vec![], vec![]))), &v), "empty signature");
-        assert!(frame_self_certified(&frame(5, Some(aggregate(vec![1; 8], vec![2; 8]))), &v), "legacy aggregate");
+        assert!(
+            !frame_self_certified(&frame(5, Some(aggregate(vec![], vec![]))), &v),
+            "empty signature"
+        );
+        assert!(
+            frame_self_certified(&frame(5, Some(aggregate(vec![1; 8], vec![2; 8]))), &v),
+            "legacy aggregate"
+        );
         let forged = quil_cw_consensus::app_cert::wrap_cert_for_header(&[3; 64]);
-        assert!(frame_self_certified(&frame(5, Some(aggregate(vec![], forged.clone()))), &v),
-            "without a committee nothing can be checked: the earlier behavior");
+        assert!(
+            frame_self_certified(&frame(5, Some(aggregate(vec![], forged.clone()))), &v),
+            "without a committee nothing can be checked: the earlier behavior"
+        );
         let committee = verifier().with_global_committee(vec![vec![4; 897]]);
-        assert!(!frame_self_certified(&frame(5, Some(aggregate(vec![], forged))), &committee),
-            "with a committee, a commonware certificate must verify");
+        assert!(
+            !frame_self_certified(&frame(5, Some(aggregate(vec![], forged))), &committee),
+            "with a committee, a commonware certificate must verify"
+        );
     }
 
     /// A record hole is filled only with the chain the canonical record above
@@ -4925,13 +5462,22 @@ mod validation_tests {
     fn a_regular_retries_a_hole_a_few_passes_then_leaves_it() {
         let mut attempts = std::collections::BTreeMap::new();
         for _ in 0..REGULAR_GAP_ATTEMPTS {
-            assert_eq!(regular_gaps_to_fill(vec![(10, 10), (20, 21)], &mut attempts, 0), vec![(10, 10), (20, 21)]);
+            assert_eq!(
+                regular_gaps_to_fill(vec![(10, 10), (20, 21)], &mut attempts, 0),
+                vec![(10, 10), (20, 21)]
+            );
         }
         assert!(regular_gaps_to_fill(vec![(10, 10), (20, 21)], &mut attempts, 0).is_empty());
-        assert_eq!(regular_gaps_to_fill(vec![(10, 10), (30, 30)], &mut attempts, 0), vec![(30, 30)],
-            "a new hole is taken at once");
+        assert_eq!(
+            regular_gaps_to_fill(vec![(10, 10), (30, 30)], &mut attempts, 0),
+            vec![(30, 30)],
+            "a new hole is taken at once"
+        );
         regular_gaps_to_fill(vec![], &mut attempts, 15);
-        assert!(!attempts.contains_key(&(10, 10)), "a hole below the window is forgotten");
+        assert!(
+            !attempts.contains_key(&(10, 10)),
+            "a hole below the window is forgotten"
+        );
         assert!(attempts.contains_key(&(20, 21)));
     }
 
@@ -4954,7 +5500,11 @@ mod validation_tests {
             requests: Vec::new(),
         };
         let base = GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: 1, output: vec![1; 516], ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: 1,
+                output: vec![1; 516],
+                ..Default::default()
+            }),
             requests: Vec::new(),
         };
         let two = frame(2, 2, &base);
@@ -4965,15 +5515,23 @@ mod validation_tests {
         clock.put_global_frame(&four, None).unwrap();
         let valid: quil_rpc::frame_sync::FrameValidator = Arc::new(|_| true);
 
-        assert_eq!(canonical_hole_frame(&clock, 2, &two, &valid),
-            Err("no canonical record above it"));
-        assert_eq!(canonical_hole_frame(&clock, 3, &sibling, &valid),
-            Err("not the parent of the canonical record above it"));
-        assert_eq!(canonical_hole_frame(&clock, 2, &three, &valid),
-            Err("frame is for another height"));
+        assert_eq!(
+            canonical_hole_frame(&clock, 2, &two, &valid),
+            Err("no canonical record above it")
+        );
+        assert_eq!(
+            canonical_hole_frame(&clock, 3, &sibling, &valid),
+            Err("not the parent of the canonical record above it")
+        );
+        assert_eq!(
+            canonical_hole_frame(&clock, 2, &three, &valid),
+            Err("frame is for another height")
+        );
         let invalid: quil_rpc::frame_sync::FrameValidator = Arc::new(|_| false);
-        assert_eq!(canonical_hole_frame(&clock, 3, &three, &invalid),
-            Err("frame failed validation"));
+        assert_eq!(
+            canonical_hole_frame(&clock, 3, &three, &invalid),
+            Err("frame failed validation")
+        );
         assert_eq!(canonical_hole_frame(&clock, 3, &three, &valid), Ok(()));
         clock.put_global_frame(&three, None).unwrap();
         assert_eq!(canonical_hole_frame(&clock, 2, &two, &valid), Ok(()));
@@ -5022,15 +5580,27 @@ mod gap_backfill_tests {
     fn chunks_descend_and_cover_the_gap_exactly() {
         let chunks = backfill_chunks(1, 3 * MAX_BACKFILL_CHUNK);
         assert_eq!(chunks.len(), 3);
-        assert!(chunks.windows(2).all(|w| w[0].0 > w[1].1), "must descend: {chunks:?}");
         assert!(
-            chunks.iter().all(|(lo, hi)| hi - lo + 1 <= MAX_BACKFILL_CHUNK),
+            chunks.windows(2).all(|w| w[0].0 > w[1].1),
+            "must descend: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|(lo, hi)| hi - lo + 1 <= MAX_BACKFILL_CHUNK),
             "no chunk may exceed the bound: {chunks:?}",
         );
-        assert_eq!(chunks.first().unwrap().1, 3 * MAX_BACKFILL_CHUNK, "starts at the top");
+        assert_eq!(
+            chunks.first().unwrap().1,
+            3 * MAX_BACKFILL_CHUNK,
+            "starts at the top"
+        );
         assert_eq!(chunks.last().unwrap().0, 1, "bottoms out at the gap floor");
         // Contiguous with no overlap.
-        assert!(chunks.windows(2).all(|w| w[0].0 == w[1].1 + 1), "contiguous: {chunks:?}");
+        assert!(
+            chunks.windows(2).all(|w| w[0].0 == w[1].1 + 1),
+            "contiguous: {chunks:?}"
+        );
     }
 
     /// A gap smaller than the bound is one chunk; an empty gap is none.
@@ -5091,13 +5661,22 @@ mod gap_backfill_tests {
         assert_eq!(clamped_backfill_range(5, 10, 1, Some(0)), None);
         assert_eq!(clamped_backfill_range(10, 5, 1, None), None);
         // Cap of 1000 from a top of 1010 would reach 11; the floor holds at 1000.
-        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(1000)), Some((1000, 1010)));
+        assert_eq!(
+            clamped_backfill_range(5, 1010, 1000, Some(1000)),
+            Some((1000, 1010))
+        );
         // Cap bites inside the permitted range.
-        assert_eq!(clamped_backfill_range(5, 1010, 1000, Some(4)), Some((1007, 1010)));
+        assert_eq!(
+            clamped_backfill_range(5, 1010, 1000, Some(4)),
+            Some((1007, 1010))
+        );
         // Entirely below the floor.
         assert_eq!(clamped_backfill_range(5, 999, 1000, None), None);
         // Straddling: only the part at/above the floor survives.
-        assert_eq!(clamped_backfill_range(5, 1000, 1000, None), Some((1000, 1000)));
+        assert_eq!(
+            clamped_backfill_range(5, 1000, 1000, None),
+            Some((1000, 1000))
+        );
     }
 
     /// The headline number must report what the pass INTENDS, not the raw hole.
@@ -5123,8 +5702,14 @@ mod gap_backfill_tests {
         );
         // A hole ABOVE the flag day is still counted, and still depth-bounded.
         let live = vec![(669_976u64, 698_605u64)];
-        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), depth), 2160);
-        assert_eq!(intended_backfill_count(&live, gap_backfill_floor(0), None), 28_630);
+        assert_eq!(
+            intended_backfill_count(&live, gap_backfill_floor(0), depth),
+            2160
+        );
+        assert_eq!(
+            intended_backfill_count(&live, gap_backfill_floor(0), None),
+            28_630
+        );
     }
 
     fn test_store() -> Arc<quil_store::RocksClockStore> {
@@ -5150,7 +5735,9 @@ mod gap_backfill_tests {
                     parent_selector: if n == 1 {
                         vec![0u8; 32]
                     } else {
-                        quil_crypto::poseidon::hash_bytes_to_32(&output(n - 1)).unwrap().to_vec()
+                        quil_crypto::poseidon::hash_bytes_to_32(&output(n - 1))
+                            .unwrap()
+                            .to_vec()
                     },
                     prover: vec![0u8; 32],
                     ..Default::default()
@@ -5183,7 +5770,9 @@ mod gap_backfill_tests {
             store.put_global_frame(f, None).unwrap();
         }
         for f in &frames[..7] {
-            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+            store
+                .put_global_clock_frame_candidate(f, txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
 
@@ -5194,7 +5783,9 @@ mod gap_backfill_tests {
         );
 
         backfill_record_gaps(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             vec![0u8; 32],
@@ -5228,17 +5819,26 @@ mod gap_backfill_tests {
         let store = test_store();
         let frames = chain(top);
         let txn = store.new_transaction(false).unwrap();
-        store.put_global_frame(frames.last().unwrap(), None).unwrap();
+        store
+            .put_global_frame(frames.last().unwrap(), None)
+            .unwrap();
         for f in &frames[..frames.len() - 1] {
-            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+            store
+                .put_global_clock_frame_candidate(f, txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
 
         assert_eq!(store.find_global_frame_record_gaps(), vec![(1, top - 1)]);
-        assert!(backfill_chunks(1, top - 1).len() > 1, "fixture must span >1 chunk");
+        assert!(
+            backfill_chunks(1, top - 1).len() > 1,
+            "fixture must span >1 chunk"
+        );
 
         backfill_record_gaps(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             vec![0u8; 32],
@@ -5267,7 +5867,9 @@ mod gap_backfill_tests {
         }
 
         let outcome = run_record_only_backfill(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             None,
@@ -5278,7 +5880,13 @@ mod gap_backfill_tests {
         )
         .await;
 
-        assert_eq!(outcome, BackfillOutcome { filled: 0, unresolved: 0 });
+        assert_eq!(
+            outcome,
+            BackfillOutcome {
+                filled: 0,
+                unresolved: 0
+            }
+        );
     }
 
     /// Contrast: a range nobody can serve — no local candidates, no endpoints —
@@ -5291,7 +5899,9 @@ mod gap_backfill_tests {
         store.put_global_frame(&frames[9], None).unwrap();
 
         let outcome = run_record_only_backfill(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             None,
@@ -5302,7 +5912,13 @@ mod gap_backfill_tests {
         )
         .await;
 
-        assert_eq!(outcome, BackfillOutcome { filled: 0, unresolved: 3 });
+        assert_eq!(
+            outcome,
+            BackfillOutcome {
+                filled: 0,
+                unresolved: 3
+            }
+        );
     }
 
     /// A regular scans only its recent window before descending. The gap
@@ -5324,13 +5940,17 @@ mod gap_backfill_tests {
             store.put_global_frame(f, None).unwrap();
         }
         for f in &frames[1..9] {
-            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+            store
+                .put_global_clock_frame_candidate(f, txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
         assert_eq!(store.find_global_frame_record_gaps(), vec![(2, 9)]);
 
         backfill_record_gaps(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             vec![0u8; 32],
@@ -5341,7 +5961,10 @@ mod gap_backfill_tests {
         .await;
 
         for n in 7..=9u64 {
-            assert!(store.get_global_frame(n).is_ok(), "frame {n} is inside the window");
+            assert!(
+                store.get_global_frame(n).is_ok(),
+                "frame {n} is inside the window"
+            );
         }
         for n in 2..=6u64 {
             assert!(
@@ -5367,7 +5990,9 @@ mod gap_backfill_tests {
         }
         let txn = store.new_transaction(false).unwrap();
         for f in &frames[..(genesis - 1) as usize] {
-            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+            store
+                .put_global_clock_frame_candidate(f, txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
         assert_eq!(
@@ -5377,7 +6002,9 @@ mod gap_backfill_tests {
         );
 
         backfill_record_gaps(
-            Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60))),
+            Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                std::time::Duration::from_secs(60),
+            )),
             store.clone(),
             Arc::new(|_: &GlobalFrame| true),
             vec![0u8; 32],
@@ -5388,7 +6015,10 @@ mod gap_backfill_tests {
         .await;
 
         assert!(store.get_global_frame(genesis - 1).is_err());
-        assert_eq!(store.find_global_frame_record_gaps(), vec![(1, genesis - 1)]);
+        assert_eq!(
+            store.find_global_frame_record_gaps(),
+            vec![(1, genesis - 1)]
+        );
     }
 
     #[tokio::test]
@@ -5396,21 +6026,40 @@ mod gap_backfill_tests {
         let store = test_store();
         let frames = chain(6);
         store.put_global_frame(&frames[5], None).unwrap();
-        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60)));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
+            std::time::Duration::from_secs(60),
+        ));
         let validate: quil_rpc::frame_sync::FrameValidator = Arc::new(|_: &GlobalFrame| true);
-        backfill_record_gaps(pool.clone(), store.clone(), validate.clone(), vec![0; 32],
-            tokio_util::sync::CancellationToken::new(), store.find_global_frame_record_gaps(), 1).await;
+        backfill_record_gaps(
+            pool.clone(),
+            store.clone(),
+            validate.clone(),
+            vec![0; 32],
+            tokio_util::sync::CancellationToken::new(),
+            store.find_global_frame_record_gaps(),
+            1,
+        )
+        .await;
         assert!(store.get_global_frame(5).is_err());
         let txn = store.new_transaction(false).unwrap();
         for f in &frames[..5] {
-            store.put_global_clock_frame_candidate(f, txn.as_ref()).unwrap();
+            store
+                .put_global_clock_frame_candidate(f, txn.as_ref())
+                .unwrap();
         }
         txn.commit().unwrap();
-        backfill_record_gaps(pool, store.clone(), validate, vec![0; 32],
-            tokio_util::sync::CancellationToken::new(), store.find_global_frame_record_gaps(), 1).await;
+        backfill_record_gaps(
+            pool,
+            store.clone(),
+            validate,
+            vec![0; 32],
+            tokio_util::sync::CancellationToken::new(),
+            store.find_global_frame_record_gaps(),
+            1,
+        )
+        .await;
         assert!(store.find_global_frame_record_gaps().is_empty());
     }
-
 }
 
 #[cfg(test)]
@@ -5430,14 +6079,20 @@ mod global_activation_tests {
 
     /// A store holding one prover with one allocation on `filter`, and that
     /// prover's address.
-    fn store_with_allocation(filter: &[u8]) -> (tempfile::TempDir, Arc<RocksHypergraphStore>, [u8; 32]) {
+    fn store_with_allocation(
+        filter: &[u8],
+    ) -> (tempfile::TempDir, Arc<RocksHypergraphStore>, [u8; 32]) {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = quil_store::RocksDb::open(tmp.path()).unwrap();
         let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
         let public_key = vec![0xA5u8; 585];
         let prover = prover_address_from_pubkey(&public_key).unwrap();
-        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
-        let txn = <RocksHypergraphStore as HypergraphStore>::new_transaction(&store, false).unwrap();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        let txn =
+            <RocksHypergraphStore as HypergraphStore>::new_transaction(&store, false).unwrap();
         for (address, tree) in [
             (prover, create_prover_vertex_tree(&public_key, 0).unwrap()),
             (
@@ -5448,7 +6103,13 @@ mod global_activation_tests {
             let mut key = quil_execution::domains::GLOBAL.to_vec();
             key.extend_from_slice(&address);
             <RocksHypergraphStore as HypergraphStore>::save_vertex_underlying(
-                &store, txn.as_ref(), "vertex", "adds", &shard, &key, &vertex_tree_to_blob(&tree),
+                &store,
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &key,
+                &vertex_tree_to_blob(&tree),
             )
             .unwrap();
         }
@@ -5484,7 +6145,11 @@ mod global_activation_tests {
         .await
         .expect("decides once the registry has loaded");
         loader.await.unwrap().unwrap();
-        assert_eq!(decided, Some(true), "a GLOBAL prover activates GLOBAL consensus");
+        assert_eq!(
+            decided,
+            Some(true),
+            "a GLOBAL prover activates GLOBAL consensus"
+        );
     }
 
     #[tokio::test]
@@ -5503,7 +6168,10 @@ mod global_activation_tests {
         let registry = SharedProverRegistry::new();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert_eq!(global_prover_once_loaded(&registry, &[7; 32], &cancel).await, None);
+        assert_eq!(
+            global_prover_once_loaded(&registry, &[7; 32], &cancel).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -5522,6 +6190,8 @@ mod global_activation_tests {
         assert!(noticed);
         cancel.cancel();
         let other = SharedProverRegistry::new();
-        assert!(!await_global_allocation(&other, &prover, &cancel, Duration::from_millis(20)).await);
+        assert!(
+            !await_global_allocation(&other, &prover, &cancel, Duration::from_millis(20)).await
+        );
     }
 }

@@ -16,13 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use quil_engine::frame_materializer::{FrameMaterializer, GLOBAL_EVICTION_ACTIVATION_FRAME};
-use quil_execution::prover_registry::{
-    rebuild_vertex_tree_from_blob, vertex_tree_to_blob, SharedProverRegistry,
-};
 use quil_execution::global_intrinsic::materialize::{
     create_allocation_vertex_tree, create_prover_vertex_tree,
 };
 use quil_execution::global_schema::{read_field, write_field};
+use quil_execution::prover_registry::{
+    rebuild_vertex_tree_from_blob, vertex_tree_to_blob, SharedProverRegistry,
+};
 use quil_types::consensus::ProverRegistry;
 use quil_types::crypto::{InclusionProver, NoopInclusionProver};
 use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
@@ -57,9 +57,8 @@ impl MaterializeHarness {
         ));
 
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
-        let hg_resolver: Arc<
-            dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver,
-        > = Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        let hg_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
         let exec_manager = Arc::new(quil_execution::ExecutionEngineManager::new(
             inclusion_prover.clone(),
             stubs.key_manager.clone(),
@@ -131,7 +130,10 @@ impl MaterializeHarness {
     /// CRDT's in-memory tree: the exact production seam.
     pub fn seed_flat_vertex(&self, addr: &[u8; 32], blob: &[u8]) {
         use quil_types::store::HypergraphStore as _;
-        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
         let mut vk = vec![0xFFu8; 32];
         vk.extend_from_slice(addr);
         let txn = self.hg_store.new_transaction(false).unwrap();
@@ -142,7 +144,9 @@ impl MaterializeHarness {
     }
 
     pub fn refresh_registry(&self) {
-        self.registry.refresh_from_store(self.hg_store.as_ref()).unwrap();
+        self.registry
+            .refresh_from_store(self.hg_store.as_ref())
+            .unwrap();
     }
 }
 
@@ -153,7 +157,13 @@ fn active_inactive_prover(prover_addr: &[u8; 32], filter: &[u8]) -> (Vec<u8>, Ve
     write_field(&mut prover, "prover:Prover", "Status", &[STATUS_ACTIVE]).unwrap();
 
     let mut alloc = create_allocation_vertex_tree(prover_addr, filter, 0).unwrap();
-    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Status",
+        &[STATUS_ACTIVE],
+    )
+    .unwrap();
     write_field(
         &mut alloc,
         "allocation:ProverAllocation",
@@ -170,7 +180,8 @@ fn active_inactive_prover(prover_addr: &[u8; 32], filter: &[u8]) -> (Vec<u8>, Ve
         &mut alloc,
         "allocation:ProverAllocation",
         "Epoch",
-        &quil_types::consensus::epoch_for_frame(GLOBAL_EVICTION_ACTIVATION_FRAME + 100).to_be_bytes(),
+        &quil_types::consensus::epoch_for_frame(GLOBAL_EVICTION_ACTIVATION_FRAME + 100)
+            .to_be_bytes(),
     )
     .unwrap();
 
@@ -186,7 +197,13 @@ fn active_recent_prover(prover_addr: &[u8; 32], filter: &[u8], frame: u64) -> (V
     write_field(&mut prover, "prover:Prover", "Status", &[STATUS_ACTIVE]).unwrap();
 
     let mut alloc = create_allocation_vertex_tree(prover_addr, filter, 0).unwrap();
-    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Status",
+        &[STATUS_ACTIVE],
+    )
+    .unwrap();
     write_field(
         &mut alloc,
         "allocation:ProverAllocation",
@@ -277,7 +294,9 @@ fn materialize_evicts_inactive_prover_present_only_in_flat_store() {
     // Status=4 is no longer read as active on refresh).
     let post = h.registry.find_eviction_candidates(frame, 360, &halts);
     assert!(
-        !post.iter().any(|a| a.prover_address == prover_addr.to_vec()),
+        !post
+            .iter()
+            .any(|a| a.prover_address == prover_addr.to_vec()),
         "after materialize the allocation must be kicked and gone from the candidate set \
          (this is the store-vs-CRDT seam that had no end-to-end coverage)"
     );
@@ -306,7 +325,10 @@ fn seed_idle_prover(
 /// The global intrinsic (prover) shard root — the `prover_tree_commitment`
 /// two archives must agree on.
 fn prover_root(h: &MaterializeHarness) -> Vec<u8> {
-    let shard = ShardKey { l1: [0u8; 3], l2: [0xFFu8; 32] };
+    let shard = ShardKey {
+        l1: [0u8; 3],
+        l2: [0xFFu8; 32],
+    };
     h.crdt.compute_shard_root("vertex", "adds", &shard)
 }
 
@@ -362,13 +384,19 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
     let cand_b = node_b
         .registry
         .find_eviction_candidates(frame, 360, &HashMap::new());
-    assert_eq!(cand_a, cand_b, "independent nodes must agree on the candidate set");
+    assert_eq!(
+        cand_a, cand_b,
+        "independent nodes must agree on the candidate set"
+    );
     assert_eq!(
         cand_a.len(),
         1,
         "only shard X's idle prover is a candidate; shard-Y is exempt"
     );
-    assert_eq!(cand_a[0].prover_address, x_addrs[0], "the idle shard-X prover goes");
+    assert_eq!(
+        cand_a[0].prover_address, x_addrs[0],
+        "the idle shard-X prover goes"
+    );
     assert_eq!(cand_a[0].confirmation_filter, filter_x);
 
     // DIVERGENT per-node coverage state — the crux. Node A saw no halts; node B's
@@ -395,7 +423,10 @@ fn two_nodes_with_divergent_coverage_evict_identically() {
 
     let root_a = prover_root(&node_a);
     let root_b = prover_root(&node_b);
-    assert!(!root_a.is_empty(), "eviction must have mutated the prover tree");
+    assert!(
+        !root_a.is_empty(),
+        "eviction must have mutated the prover tree"
+    );
     assert_eq!(
         root_a, root_b,
         "two archives with divergent coverage state must converge to the same prover root"
@@ -445,7 +476,6 @@ fn split_fixture() -> (
     Arc<quil_execution::prover_registry::SharedProverRegistry>,
     Arc<quil_store::RocksHypergraphStore>,
 ) {
-
     let rocks = quil_store::RocksDb::open_in_memory().unwrap();
     let db = rocks.inner();
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db.clone()));
@@ -505,14 +535,25 @@ fn seed_global_prover(
     let prover_blob = vertex_tree_to_blob(&prover);
 
     let mut alloc = create_allocation_vertex_tree(&prover_addr, filter, 0).unwrap();
-    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Status",
+        &[STATUS_ACTIVE],
+    )
+    .unwrap();
     let alloc_blob = vertex_tree_to_blob(&alloc);
 
-    let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+    let shard = ShardKey {
+        l1: [0; 3],
+        l2: [0xFF; 32],
+    };
     let txn = hg_store.new_transaction(false).unwrap();
     let mut vkp = vec![0xFFu8; 32];
     vkp.extend_from_slice(&prover_addr);
-    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
+    hg_store
+        .save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob)
+        .unwrap();
     // The gate looks the allocation up at `allocation_address(pubkey, <empty>)`,
     // not at an arbitrary flat key: `verify_shard_op_signer_is_active_global`
     // reads the signer's PublicKey out of the prover tree and derives the
@@ -524,7 +565,9 @@ fn seed_global_prover(
     let _ = alloc_flat_byte;
     let mut vka = vec![0xFFu8; 32];
     vka.extend_from_slice(&alloc_addr);
-    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
+    hg_store
+        .save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob)
+        .unwrap();
     txn.commit().unwrap();
     registry.refresh_from_store(hg_store.as_ref()).unwrap();
 
@@ -532,14 +575,20 @@ fn seed_global_prover(
     // the pubkey at (GLOBAL, prover_addr).
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
     state
-        .set(&quil_execution::domains::GLOBAL, &prover_addr[..], &va, 1, prover_blob)
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &va,
+            1,
+            prover_blob,
+        )
         .unwrap();
     prover_addr
 }
 
 fn shard_split_bytes(shard_address: &[u8], proposer: &[u8; 32]) -> Vec<u8> {
-    use quil_execution::global_intrinsic::prover_ops::ShardSplit;
     use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+    use quil_execution::global_intrinsic::prover_ops::ShardSplit;
     let c0 = {
         let mut c = shard_address.to_vec();
         c.push(0x00);
@@ -564,8 +613,8 @@ fn shard_split_bytes(shard_address: &[u8], proposer: &[u8; 32]) -> Vec<u8> {
 }
 
 fn shard_merge_bytes(parent: &[u8], children: &[Vec<u8>], proposer: &[u8; 32]) -> Vec<u8> {
-    use quil_execution::global_intrinsic::prover_ops::ShardMerge;
     use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+    use quil_execution::global_intrinsic::prover_ops::ShardMerge;
     ShardMerge {
         shard_addresses: children.to_vec(),
         parent_address: parent.to_vec(),
@@ -585,7 +634,10 @@ fn shard_merge_bytes(parent: &[u8], children: &[Vec<u8>], proposer: &[u8; 32]) -
 fn commit_fixture_frame(state: &quil_execution::hypergraph_state::HypergraphState, frame: u64) {
     state.commit().unwrap();
     let cursor = quil_store::encoding::global_materialized_cursor_key();
-    state.crdt().commit_with_global_cursor(frame, &cursor).unwrap();
+    state
+        .crdt()
+        .commit_with_global_cursor(frame, &cursor)
+        .unwrap();
     state.abort();
     assert_eq!(state.crdt().read_frame_cursor(&cursor).unwrap(), frame);
 }
@@ -601,12 +653,16 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
     {
         let (gi, state, shards_store, registry, hg_store) = split_fixture();
         // Empty filter ⇒ global prover ⇒ authorized to propose splits.
-        let proposer = seed_global_prover(&state, &hg_store, &registry, &vec![0xCDu8; 57], 0x88, &[]);
+        let proposer =
+            seed_global_prover(&state, &hg_store, &registry, &vec![0xCDu8; 57], 0x88, &[]);
         let bytes = shard_split_bytes(&shard_address, &proposer);
         // Propose in epoch 0 (frame 1).
-        gi.invoke_step(1, &bytes, &state).expect("global proposer split must be accepted");
-        assert!(shards_store.all_pending_shard_changes().unwrap().is_empty(),
-            "an uncommitted proposal cannot publish pending metadata");
+        gi.invoke_step(1, &bytes, &state)
+            .expect("global proposer split must be accepted");
+        assert!(
+            shards_store.all_pending_shard_changes().unwrap().is_empty(),
+            "an uncommitted proposal cannot publish pending metadata"
+        );
         commit_fixture_frame(&state, 1);
 
         let count_children = |store: &dyn quil_types::store::ShardsStore| -> usize {
@@ -620,20 +676,40 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
 
         // Epoch-aligned: the topology flip is DEFERRED to E+2. The children are
         // not yet enumerable, but a pending change is staged for epoch 2.
-        assert_eq!(count_children(shards_store.as_ref()), 0, "split must be staged, not immediate");
+        assert_eq!(
+            count_children(shards_store.as_ref()),
+            0,
+            "split must be staged, not immediate"
+        );
         let pending = shards_store.all_pending_shard_changes().unwrap();
         assert_eq!(pending.len(), 1, "one pending split recorded");
-        assert_eq!(pending[0].effective_epoch, 2, "frame 1 (epoch 0) → effective epoch 2");
-        assert!(pending[0].affects_shard(&shard_address), "pending change targets the parent");
+        assert_eq!(
+            pending[0].effective_epoch, 2,
+            "frame 1 (epoch 0) → effective epoch 2"
+        );
+        assert!(
+            pending[0].affects_shard(&shard_address),
+            "pending change targets the parent"
+        );
 
         // Applying within epoch 1 does nothing (E+2 not reached).
-        gi.apply_due_shard_changes(720, &state).expect("apply at epoch 1"); // frame 720 = epoch 1
+        gi.apply_due_shard_changes(720, &state)
+            .expect("apply at epoch 1"); // frame 720 = epoch 1
         commit_fixture_frame(&state, 720);
-        assert_eq!(count_children(shards_store.as_ref()), 0, "not applied before E+2");
+        assert_eq!(
+            count_children(shards_store.as_ref()),
+            0,
+            "not applied before E+2"
+        );
 
         // Crossing into epoch 2 flips the topology: both children become enumerable.
-        gi.apply_due_shard_changes(1440, &state).expect("apply at epoch 2"); // frame 1440 = epoch 2
-        assert_eq!(count_children(shards_store.as_ref()), 0, "topology waits for the frame commit");
+        gi.apply_due_shard_changes(1440, &state)
+            .expect("apply at epoch 2"); // frame 1440 = epoch 2
+        assert_eq!(
+            count_children(shards_store.as_ref()),
+            0,
+            "topology waits for the frame commit"
+        );
         commit_fixture_frame(&state, 1440);
         let shards = shards_store.range_app_shards().unwrap();
         let children: Vec<_> = shards
@@ -649,7 +725,8 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
         assert!(children.iter().any(|s| s.prefix == vec![0x05, 0x80]));
         // The pending change is consumed once applied (idempotent).
         assert!(shards_store.all_pending_shard_changes().unwrap().is_empty());
-        gi.apply_due_shard_changes(1440, &state).expect("re-apply is a no-op");
+        gi.apply_due_shard_changes(1440, &state)
+            .expect("re-apply is a no-op");
     }
 
     // --- Non-global proposer: split is rejected (authorization). ---
@@ -657,10 +734,18 @@ fn shard_split_by_global_prover_registers_enumerable_child_and_rejects_non_globa
         let (gi, state, shards_store, registry, hg_store) = split_fixture();
         // Non-empty filter ⇒ NOT a global prover ⇒ unauthorized. Distinct
         // pubkey so it has a distinct address.
-        let proposer = seed_global_prover(&state, &hg_store, &registry, &vec![0xEEu8; 57], 0xAA, &vec![0x33u8; 64]);
+        let proposer = seed_global_prover(
+            &state,
+            &hg_store,
+            &registry,
+            &vec![0xEEu8; 57],
+            0xAA,
+            &vec![0x33u8; 64],
+        );
         let bytes = shard_split_bytes(&shard_address, &proposer);
         let res = gi.invoke_step(1, &bytes, &state);
-        let err = res.expect_err("a non-global proposer must be rejected (proposer_is_active_global)");
+        let err =
+            res.expect_err("a non-global proposer must be rejected (proposer_is_active_global)");
         // Pin the REASON, not just the rejection: without this the test passes
         // just as well when the op is refused for an unrelated reason (a bad
         // signature, a missing prover vertex), which is how the authorization
@@ -719,26 +804,35 @@ fn pending_split_freezes_joins_to_affected_shard_until_e2() {
     };
 
     // A join to the parent shard is frozen.
-    assert!(is_frozen(&gi.invoke_step(2, &join_to(shard_address.clone(), 2), &state)),
-        "join to the splitting shard must be frozen");
+    assert!(
+        is_frozen(&gi.invoke_step(2, &join_to(shard_address.clone(), 2), &state)),
+        "join to the splitting shard must be frozen"
+    );
     // A join to a pending CHILD is frozen too (the child doesn't exist yet).
     let mut child = shard_address.clone();
     child.push(0x00);
-    assert!(is_frozen(&gi.invoke_step(2, &join_to(child, 2), &state)),
-        "join to a pending child must be frozen");
+    assert!(
+        is_frozen(&gi.invoke_step(2, &join_to(child, 2), &state)),
+        "join to a pending child must be frozen"
+    );
 
     // A join to an unrelated shard is NOT frozen (fails later, but not on the freeze).
     let mut other = quil.to_vec();
     other.push(0x09);
-    assert!(!is_frozen(&gi.invoke_step(2, &join_to(other, 2), &state)),
-        "join to an unrelated shard must not be frozen");
+    assert!(
+        !is_frozen(&gi.invoke_step(2, &join_to(other, 2), &state)),
+        "join to an unrelated shard must not be frozen"
+    );
 
     // Once the split applies at E+2, the freeze lifts.
-    gi.apply_due_shard_changes(1440, &state).expect("apply at epoch 2"); // frame 1440 = epoch 2
+    gi.apply_due_shard_changes(1440, &state)
+        .expect("apply at epoch 2"); // frame 1440 = epoch 2
     commit_fixture_frame(&state, 1440);
     assert!(shards_store.all_pending_shard_changes().unwrap().is_empty());
-    assert!(!is_frozen(&gi.invoke_step(1441, &join_to(shard_address, 1441), &state)),
-        "freeze must lift after the E+2 apply");
+    assert!(
+        !is_frozen(&gi.invoke_step(1441, &join_to(shard_address, 1441), &state)),
+        "freeze must lift after the E+2 apply"
+    );
 }
 
 /// Seed an ACTIVE data-shard prover whose allocation lives at the CANONICAL
@@ -767,28 +861,65 @@ fn seed_data_prover(
     let prover_blob = vertex_tree_to_blob(&prover);
 
     let mut alloc = create_allocation_vertex_tree(&prover_addr, filter, 0).unwrap();
-    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Status",
+        &[STATUS_ACTIVE],
+    )
+    .unwrap();
     let alloc_blob = vertex_tree_to_blob(&alloc);
 
     // Into hg_store (registry source), keyed by canonical addresses.
-    let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+    let shard = ShardKey {
+        l1: [0; 3],
+        l2: [0xFF; 32],
+    };
     let txn = hg_store.new_transaction(false).unwrap();
     let mut vkp = vec![0xFFu8; 32];
     vkp.extend_from_slice(&prover_addr);
-    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob).unwrap();
+    hg_store
+        .save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vkp, &prover_blob)
+        .unwrap();
     let mut vka = vec![0xFFu8; 32];
     vka.extend_from_slice(&alloc_addr);
-    hg_store.save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob).unwrap();
+    hg_store
+        .save_vertex_underlying_txn(txn.as_ref(), "vertex", "adds", &shard, &vka, &alloc_blob)
+        .unwrap();
     txn.commit().unwrap();
     registry.refresh_from_store(hg_store.as_ref()).unwrap();
 
     // Into the state changeset so `rekey_allocation`'s `state.get` finds it.
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
     let ha = quil_execution::hypergraph_state::hyperedge_adds_discriminator().unwrap();
-    state.set(&quil_execution::domains::GLOBAL, &prover_addr[..], &va, 1, prover_blob).unwrap();
-    state.set(&quil_execution::domains::GLOBAL, &alloc_addr[..], &va, 1, alloc_blob).unwrap();
+    state
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &va,
+            1,
+            prover_blob,
+        )
+        .unwrap();
+    state
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &alloc_addr[..],
+            &va,
+            1,
+            alloc_blob,
+        )
+        .unwrap();
     let he = build_prover_allocation_hyperedge_blob(&prover_addr, &[(alloc_addr, &alloc)]).unwrap();
-    state.set(&quil_execution::domains::GLOBAL, &prover_addr[..], &ha, 1, he).unwrap();
+    state
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &ha,
+            1,
+            he,
+        )
+        .unwrap();
 
     (prover_addr, alloc_addr)
 }
@@ -825,12 +956,21 @@ fn split_at_e2_reassigns_active_prover_to_deterministic_child() {
         .expect("split staged");
 
     // Apply at E+2 → reassignment runs.
-    gi.apply_due_shard_changes(1440, &state).expect("apply at epoch 2");
+    gi.apply_due_shard_changes(1440, &state)
+        .expect("apply at epoch 2");
 
     // The prover must land on the child selected by the deterministic rule.
     let children = vec![
-        { let mut c = parent.clone(); c.push(0x00); c },
-        { let mut c = parent.clone(); c.push(0x80); c },
+        {
+            let mut c = parent.clone();
+            c.push(0x00);
+            c
+        },
+        {
+            let mut c = parent.clone();
+            c.push(0x80);
+            c
+        },
     ];
     let idx = assign_child_index(&data_addr, children.len());
     let child_filter = &children[idx];
@@ -846,7 +986,12 @@ fn split_at_e2_reassigns_active_prover_to_deterministic_child() {
         .expect("child allocation must exist after reassignment");
     let child_tree = rebuild_vertex_tree_from_blob(&child_blob);
     assert_eq!(
-        read_field(&child_tree, "allocation:ProverAllocation", "ConfirmationFilter").unwrap(),
+        read_field(
+            &child_tree,
+            "allocation:ProverAllocation",
+            "ConfirmationFilter"
+        )
+        .unwrap(),
         *child_filter,
         "reassigned allocation carries the child filter"
     );
@@ -871,10 +1016,16 @@ fn split_at_e2_reassigns_active_prover_to_deterministic_child() {
         k
     };
     let keys: Vec<Vec<u8>> = he.leaves().into_iter().map(|(k, _)| k).collect();
-    assert!(keys.contains(&atom_key(&child_alloc_addr)), "hyperedge points at child");
+    assert!(
+        keys.contains(&atom_key(&child_alloc_addr)),
+        "hyperedge points at child"
+    );
     // The 0x80 child (the non-colliding case) fully re-keys: parent atom gone.
     if child_alloc_addr != parent_alloc_addr {
-        assert!(!keys.contains(&atom_key(&parent_alloc_addr)), "old parent atom removed");
+        assert!(
+            !keys.contains(&atom_key(&parent_alloc_addr)),
+            "old parent atom removed"
+        );
     }
 }
 
@@ -889,8 +1040,16 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
     // Merge materialize requires a 32-byte parent (merge-to-root), so use the
     // bare QUIL address as the parent and its depth-1 children.
     let parent = quil_execution::domains::QUIL_TOKEN.to_vec();
-    let child0 = { let mut c = parent.clone(); c.push(0x00); c }; // collides w/ parent addr
-    let child1 = { let mut c = parent.clone(); c.push(0x80); c }; // re-keys
+    let child0 = {
+        let mut c = parent.clone();
+        c.push(0x00);
+        c
+    }; // collides w/ parent addr
+    let child1 = {
+        let mut c = parent.clone();
+        c.push(0x80);
+        c
+    }; // re-keys
 
     let (gi, state, _shards_store, registry, hg_store) = split_fixture();
     let proposer = seed_global_prover(&state, &hg_store, &registry, &vec![0xCDu8; 57], 0x88, &[]);
@@ -901,20 +1060,46 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
     let (a_addr, a_child_alloc) = seed_data_prover(&state, &hg_store, &registry, &a_pk, &child1);
     let (_b_addr, b_child_alloc) = seed_data_prover(&state, &hg_store, &registry, &b_pk, &child0);
 
-    assert_eq!(registry.get_active_provers(&child1, 0).unwrap().len(), 1, "A on child1");
-    assert_eq!(registry.get_active_provers(&child0, 0).unwrap().len(), 1, "B on child0");
+    assert_eq!(
+        registry.get_active_provers(&child1, 0).unwrap().len(),
+        1,
+        "A on child1"
+    );
+    assert_eq!(
+        registry.get_active_provers(&child0, 0).unwrap().len(),
+        1,
+        "B on child0"
+    );
 
     // Stage the merge (epoch 0 → effective epoch 2) and apply at E+2.
-    gi.invoke_step(1, &shard_merge_bytes(&parent, &[child0.clone(), child1.clone()], &proposer), &state)
-        .expect("merge staged");
-    assert!(_shards_store.all_pending_shard_changes().unwrap().is_empty());
+    gi.invoke_step(
+        1,
+        &shard_merge_bytes(&parent, &[child0.clone(), child1.clone()], &proposer),
+        &state,
+    )
+    .expect("merge staged");
+    assert!(_shards_store
+        .all_pending_shard_changes()
+        .unwrap()
+        .is_empty());
     commit_fixture_frame(&state, 1);
-    assert_eq!(_shards_store.all_pending_shard_changes().unwrap().len(), 1, "one pending merge");
-    gi.apply_due_shard_changes(1440, &state).expect("apply merge at epoch 2");
-    assert_eq!(_shards_store.all_pending_shard_changes().unwrap().len(), 1,
-        "staging the merge cannot consume durable metadata before commit");
+    assert_eq!(
+        _shards_store.all_pending_shard_changes().unwrap().len(),
+        1,
+        "one pending merge"
+    );
+    gi.apply_due_shard_changes(1440, &state)
+        .expect("apply merge at epoch 2");
+    assert_eq!(
+        _shards_store.all_pending_shard_changes().unwrap().len(),
+        1,
+        "staging the merge cannot consume durable metadata before commit"
+    );
     commit_fixture_frame(&state, 1440);
-    assert!(_shards_store.all_pending_shard_changes().unwrap().is_empty());
+    assert!(_shards_store
+        .all_pending_shard_changes()
+        .unwrap()
+        .is_empty());
 
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
     let assert_on_parent = |pk: &[u8]| {
@@ -945,11 +1130,20 @@ fn merge_at_e2_reassigns_active_provers_to_parent() {
         .expect("A hyperedge present");
     let mut he = quil_tries::VectorCommitmentTree::new();
     he.root = quil_tries::deserialize_go_tree(&he_blob).unwrap();
-    let atom_key = |addr: &[u8; 32]| { let mut k = vec![0xFFu8; 32]; k.extend_from_slice(addr); k };
+    let atom_key = |addr: &[u8; 32]| {
+        let mut k = vec![0xFFu8; 32];
+        k.extend_from_slice(addr);
+        k
+    };
     let keys: Vec<Vec<u8>> = he.leaves().into_iter().map(|(k, _)| k).collect();
-    assert!(keys.contains(&atom_key(&allocation_address(&a_pk, &parent).unwrap())),
-        "A hyperedge points at parent allocation");
-    assert!(!keys.contains(&atom_key(&a_child_alloc)), "A old child1 atom removed");
+    assert!(
+        keys.contains(&atom_key(&allocation_address(&a_pk, &parent).unwrap())),
+        "A hyperedge points at parent allocation"
+    );
+    assert!(
+        !keys.contains(&atom_key(&a_child_alloc)),
+        "A old child1 atom removed"
+    );
 }
 
 // ---- invoke_join admission guards ----
@@ -984,10 +1178,22 @@ fn invoke_join_rejects_previously_kicked_prover() {
 
     // Seed a KICKED prover vertex at its canonical address.
     let mut prover = create_prover_vertex_tree(&pubkey, 0).unwrap();
-    write_field(&mut prover, "prover:Prover", "KickFrameNumber", &500u64.to_be_bytes()).unwrap();
+    write_field(
+        &mut prover,
+        "prover:Prover",
+        "KickFrameNumber",
+        &500u64.to_be_bytes(),
+    )
+    .unwrap();
     let va = quil_execution::hypergraph_state::vertex_adds_discriminator().unwrap();
     state
-        .set(&quil_execution::domains::GLOBAL, &prover_addr[..], &va, 1, vertex_tree_to_blob(&prover))
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &va,
+            1,
+            vertex_tree_to_blob(&prover),
+        )
         .unwrap();
 
     let res = gi.invoke_step(2, &build_join_op(&pubkey, &quil.to_vec(), 2), &state);
@@ -1001,7 +1207,9 @@ fn invoke_join_rejects_previously_kicked_prover() {
 /// re-join the same filter; once the window elapses the guard lets it through.
 #[test]
 fn invoke_join_rejects_rejoin_while_allocation_still_active() {
-    use quil_execution::global_intrinsic::materialize::{allocation_address, prover_address_from_pubkey};
+    use quil_execution::global_intrinsic::materialize::{
+        allocation_address, prover_address_from_pubkey,
+    };
     let quil = quil_execution::domains::QUIL_TOKEN;
     let (gi, state, _ss, _reg, _hg) = split_fixture();
     let pubkey = vec![0xACu8; 897];
@@ -1012,13 +1220,31 @@ fn invoke_join_rejects_rejoin_while_allocation_still_active() {
     // Prover vertex (not kicked) + an Active allocation joined at frame 10.
     let prover = create_prover_vertex_tree(&pubkey, 0).unwrap();
     state
-        .set(&quil_execution::domains::GLOBAL, &prover_addr[..], &va, 1, vertex_tree_to_blob(&prover))
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &va,
+            1,
+            vertex_tree_to_blob(&prover),
+        )
         .unwrap();
     let mut alloc = create_allocation_vertex_tree(&prover_addr, &filter, 10).unwrap();
-    write_field(&mut alloc, "allocation:ProverAllocation", "Status", &[STATUS_ACTIVE]).unwrap();
+    write_field(
+        &mut alloc,
+        "allocation:ProverAllocation",
+        "Status",
+        &[STATUS_ACTIVE],
+    )
+    .unwrap();
     let alloc_addr = allocation_address(&pubkey, &filter).unwrap();
     state
-        .set(&quil_execution::domains::GLOBAL, &alloc_addr[..], &va, 1, vertex_tree_to_blob(&alloc))
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &alloc_addr[..],
+            &va,
+            1,
+            vertex_tree_to_blob(&alloc),
+        )
         .unwrap();
 
     // Within the 720-frame window (frame 100 < 10 + 720) → rejected.
@@ -1051,7 +1277,13 @@ fn invoke_join_preserves_existing_seniority_via_max() {
     // Existing prover with seniority 100 (not kicked, no active allocation).
     let prover = create_prover_vertex_tree(&pubkey, 100).unwrap();
     state
-        .set(&quil_execution::domains::GLOBAL, &prover_addr[..], &va, 1, vertex_tree_to_blob(&prover))
+        .set(
+            &quil_execution::domains::GLOBAL,
+            &prover_addr[..],
+            &va,
+            1,
+            vertex_tree_to_blob(&prover),
+        )
         .unwrap();
 
     let res = gi.invoke_step(2, &build_join_op(&pubkey, &quil.to_vec(), 2), &state);

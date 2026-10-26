@@ -133,11 +133,7 @@ impl BranchNode {
         data
     }
 
-    pub fn commit(
-        &mut self,
-        prover: &dyn InclusionProver,
-        recalculate: bool,
-    ) -> &[u8] {
+    pub fn commit(&mut self, prover: &dyn InclusionProver, recalculate: bool) -> &[u8] {
         if !recalculate && !self.commitment.is_empty() {
             return &self.commitment;
         }
@@ -504,10 +500,8 @@ mod tests {
     fn branch_clone_preserves_children_count() {
         let mut original = BranchNode::new(vec![1, 2]);
         let leaf = leaf_with(b"k", b"v");
-        original.children[10] =
-            Some(Box::new(VectorCommitmentNode::Leaf(leaf.clone())));
-        original.children[20] =
-            Some(Box::new(VectorCommitmentNode::Leaf(leaf)));
+        original.children[10] = Some(Box::new(VectorCommitmentNode::Leaf(leaf.clone())));
+        original.children[20] = Some(Box::new(VectorCommitmentNode::Leaf(leaf)));
 
         let cloned = original.clone();
         assert_eq!(cloned.prefix, original.prefix);

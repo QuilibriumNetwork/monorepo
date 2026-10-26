@@ -199,8 +199,7 @@ impl<'a> GoCursor<'a> {
 
     fn read_branch(&mut self, depth: usize) -> Result<BranchNode> {
         let prefix = self.read_int_slice()?;
-        let mut children: [Option<Box<VectorCommitmentNode>>; 64] =
-            std::array::from_fn(|_| None);
+        let mut children: [Option<Box<VectorCommitmentNode>>; 64] = std::array::from_fn(|_| None);
         for slot in children.iter_mut() {
             if let Some(child) = self.read_node(depth + 1)? {
                 *slot = Some(Box::new(child));
@@ -278,11 +277,7 @@ fn write_bigint(out: &mut Vec<u8>, n: &BigInt) -> Result<()> {
             "go_format: negative BigInt not representable".into(),
         ));
     }
-    let canonical: &[u8] = if sign == Sign::NoSign {
-        &[]
-    } else {
-        &bytes
-    };
+    let canonical: &[u8] = if sign == Sign::NoSign { &[] } else { &bytes };
     write_len_prefixed(out, canonical);
     Ok(())
 }

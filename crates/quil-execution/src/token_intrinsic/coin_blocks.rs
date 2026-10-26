@@ -78,7 +78,10 @@ pub fn shape(block_bits: u8) -> Result<Shape> {
     if block_bits < INITIAL_BLOCK_BITS || block_bits > MAX_BLOCK_BITS {
         return Err(invalid("block width outside the accumulator's range"));
     }
-    Ok(Shape { shard_bits: BLOCK_INDEX_BITS, subtree_bits: SUBTREE_BITS })
+    Ok(Shape {
+        shard_bits: BLOCK_INDEX_BITS,
+        subtree_bits: SUBTREE_BITS,
+    })
 }
 
 /// Blocks available at `block_bits`.
@@ -162,7 +165,9 @@ pub fn shard_owns_block(prefix: &[bool], block: u64) -> bool {
 /// there. Walking only these (rather than every id of a width) is what keeps a
 /// whole-application holder at the widest setting from visiting 32,768 ids.
 pub fn owned_blocks(shard: &[bool], max_width: u8) -> impl Iterator<Item = u64> + '_ {
-    let prefix = shard.iter().fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
+    let prefix = shard
+        .iter()
+        .fold(0u64, |acc, bit| (acc << 1) | u64::from(*bit));
     (INITIAL_BLOCK_BITS..=max_width.min(MAX_BLOCK_BITS))
         .filter(move |width| shard.len() <= usize::from(*width))
         .flat_map(move |width| {
@@ -221,7 +226,10 @@ mod tests {
         let p = position(width, block, 9).unwrap();
         assert_eq!(locate(p), (block, 9));
         assert!(position(width, 0, 0).is_err(), "id 0 carries no sentinel");
-        assert!(position(width, block, 1u64 << SUBTREE_BITS).is_err(), "a full block is refused");
+        assert!(
+            position(width, block, 1u64 << SUBTREE_BITS).is_err(),
+            "a full block is refused"
+        );
         // A block wider than the committed width does not exist yet.
         let wider = block_id(width + 1, 5).unwrap();
         assert!(position(width, wider, 0).is_err());
@@ -246,7 +254,10 @@ mod tests {
         let wide = block_id(INITIAL_BLOCK_BITS + 1, 0b101011).unwrap();
         assert_ne!(narrow, wide);
         assert_eq!(creation_width(wide), INITIAL_BLOCK_BITS + 1);
-        assert_eq!(block_path(wide), vec![false, true, false, true, false, true, true]);
+        assert_eq!(
+            block_path(wide),
+            vec![false, true, false, true, false, true, true]
+        );
         // Growing to the maximum never changes the narrow block's path, its
         // owner, or the position of a coin inside it.
         let before = position(INITIAL_BLOCK_BITS, narrow, 7).unwrap();
@@ -258,10 +269,19 @@ mod tests {
             assert_eq!(position(width, narrow, 7).unwrap(), before);
         }
         assert_eq!(width, MAX_BLOCK_BITS);
-        assert!(grown(width).is_err(), "growth stops explicitly at the index width");
+        assert!(
+            grown(width).is_err(),
+            "growth stops explicitly at the index width"
+        );
         // Every id in use fits the reserved index field.
-        assert!(block_id(MAX_BLOCK_BITS, (1u64 << MAX_BLOCK_BITS) - 1).unwrap() < (1u64 << BLOCK_INDEX_BITS));
-        assert!(position(MAX_BLOCK_BITS, block_id(MAX_BLOCK_BITS, 1).unwrap(), 1).unwrap() < max_position());
+        assert!(
+            block_id(MAX_BLOCK_BITS, (1u64 << MAX_BLOCK_BITS) - 1).unwrap()
+                < (1u64 << BLOCK_INDEX_BITS)
+        );
+        assert!(
+            position(MAX_BLOCK_BITS, block_id(MAX_BLOCK_BITS, 1).unwrap(), 1).unwrap()
+                < max_position()
+        );
     }
 
     /// A coin's block follows from its address, so the shard that stores the
@@ -272,16 +292,25 @@ mod tests {
         // Address beginning 1010 1011 -> path 101010 at width 6.
         let address = addr(0b1010_1011, 0);
         let block = block_for_address(width, &address).unwrap();
-        assert_eq!(block_path(block), vec![true, false, true, false, true, false]);
+        assert_eq!(
+            block_path(block),
+            vec![true, false, true, false, true, false]
+        );
         assert!(shard_owns_block(&[true, false, true], block));
         assert!(!shard_owns_block(&[false], block));
         // Only the leading bits matter.
-        assert_eq!(block_for_address(width, &addr(0b1010_1011, 0xFF)).unwrap(), block);
+        assert_eq!(
+            block_for_address(width, &addr(0b1010_1011, 0xFF)).unwrap(),
+            block
+        );
         // At a wider width the SAME address selects a new, deeper block,
         // leaving the old one exactly as it was.
         let deeper = block_for_address(width + 1, &address).unwrap();
         assert_ne!(deeper, block);
-        assert_eq!(block_path(block), vec![true, false, true, false, true, false]);
+        assert_eq!(
+            block_path(block),
+            vec![true, false, true, false, true, false]
+        );
         assert_eq!(block_path(deeper).len(), usize::from(width) + 1);
     }
 
@@ -312,7 +341,10 @@ mod tests {
         assert!(shape(INITIAL_BLOCK_BITS).is_ok());
         assert!(shape(MAX_BLOCK_BITS).is_ok());
         assert!(shape(MAX_BLOCK_BITS + 1).is_err());
-        assert_eq!(shape(INITIAL_BLOCK_BITS).unwrap().depth(), usize::from(BLOCK_INDEX_BITS + SUBTREE_BITS));
+        assert_eq!(
+            shape(INITIAL_BLOCK_BITS).unwrap().depth(),
+            usize::from(BLOCK_INDEX_BITS + SUBTREE_BITS)
+        );
         assert_eq!(shape(INITIAL_BLOCK_BITS).unwrap().depth(), MAX_DEPTH);
     }
 }

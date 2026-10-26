@@ -20,12 +20,19 @@ pub async fn http_get_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
     if !resp.status().is_success() {
         anyhow::bail!("GET {url}: HTTP {}", resp.status());
     }
-    Ok(resp.bytes().await.map_err(|e| anyhow::anyhow!("read {url}: {e}"))?.to_vec())
+    Ok(resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("read {url}: {e}"))?
+        .to_vec())
 }
 
 /// Whether a remote file exists (HEAD-ish via GET status).
 pub async fn remote_exists(url: &str) -> bool {
-    reqwest::get(url).await.map(|r| r.status().is_success()).unwrap_or(false)
+    reqwest::get(url)
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 /// Fetch the latest version string for a release type (`node` or `qclient`).
@@ -124,7 +131,9 @@ pub async fn download_and_install(
     symlink: &Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let base = release_filename(release_type, version)?;
-    let dest_dir = Path::new(system::BINARY_PATH).join(release_type).join(version);
+    let dest_dir = Path::new(system::BINARY_PATH)
+        .join(release_type)
+        .join(version);
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dest_dir.display()))?;
 
@@ -171,7 +180,8 @@ mod tests {
 
     #[test]
     fn digest_checksum_parses() {
-        let f = b"SHA3-256 aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 filename";
+        let f =
+            b"SHA3-256 aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 filename";
         let sum = digest_checksum(f).unwrap();
         assert_eq!(sum.len(), 32);
         assert_eq!(sum[0], 0xaa);

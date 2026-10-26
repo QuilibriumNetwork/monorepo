@@ -148,8 +148,14 @@ mod pq_quic_tests {
             }
         }
 
-        assert!(!client.is_handshaking(), "client handshake did not complete");
-        assert!(!server.is_handshaking(), "server handshake did not complete");
+        assert!(
+            !client.is_handshaking(),
+            "client handshake did not complete"
+        );
+        assert!(
+            !server.is_handshaking(),
+            "server handshake did not complete"
+        );
 
         let group = client
             .negotiated_key_exchange_group()

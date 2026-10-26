@@ -7,7 +7,11 @@ use std::time::Duration;
 use quil_p2p::{DirectOutcome, P2PNode};
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 #[tokio::test]
@@ -27,7 +31,9 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
         .unwrap();
 
     let mut sender_config = config.clone();
-    sender_config.bootstrap_peers = vec![format!("/ip4/127.0.0.1/tcp/{receiver_port}/p2p/{receiver_id}")];
+    sender_config.bootstrap_peers = vec![format!(
+        "/ip4/127.0.0.1/tcp/{receiver_port}/p2p/{receiver_id}"
+    )];
     let sender = P2PNode::new_with_options(&sender_config, true, None).unwrap();
     let sender_id = sender.peer_id;
     let (sender, _) = sender
@@ -40,27 +46,45 @@ async fn a_direct_message_reaches_its_connected_peer_on_an_allowed_bitmask() {
     // The sender dials its bootstrap peer on its first discovery tick.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let outcome = loop {
-        let outcome = sender.send_direct(receiver_id, allowed.clone(), b"resolver response".to_vec()).await;
+        let outcome = sender
+            .send_direct(receiver_id, allowed.clone(), b"resolver response".to_vec())
+            .await;
         if outcome != DirectOutcome::NotConnected || tokio::time::Instant::now() > deadline {
             break outcome;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     assert_eq!(outcome, DirectOutcome::Delivered);
-    let message = tokio::time::timeout(Duration::from_secs(5), inbound.recv()).await.unwrap().unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(message.bitmask, allowed);
     assert_eq!(message.data, b"resolver response");
-    assert_eq!(message.from, sender_id.to_bytes(), "attributed to the authenticated connection's peer");
+    assert_eq!(
+        message.from,
+        sender_id.to_bytes(),
+        "attributed to the authenticated connection's peer"
+    );
 
     assert_eq!(
-        sender.send_direct(receiver_id, vec![9, 9], b"elsewhere".to_vec()).await,
+        sender
+            .send_direct(receiver_id, vec![9, 9], b"elsewhere".to_vec())
+            .await,
         DirectOutcome::Refused,
         "a bitmask the receiver does not allow is refused"
     );
     receiver.revoke_direct(allowed.clone()).await;
-    assert_eq!(sender.send_direct(receiver_id, allowed.clone(), Vec::new()).await, DirectOutcome::Refused);
     assert_eq!(
-        sender.send_direct(quil_p2p::PeerId::random(), allowed, Vec::new()).await,
+        sender
+            .send_direct(receiver_id, allowed.clone(), Vec::new())
+            .await,
+        DirectOutcome::Refused
+    );
+    assert_eq!(
+        sender
+            .send_direct(quil_p2p::PeerId::random(), allowed, Vec::new())
+            .await,
         DirectOutcome::NotConnected,
         "no dial: an unconnected peer is reported at once"
     );

@@ -322,7 +322,10 @@ impl BlossomSubBehaviour {
     /// subscribed or on a publish error — matching the historical contract.
     pub fn publish(&mut self, bitmask: Vec<u8>, data: Vec<u8>) -> Result<(), String> {
         if !self.subscriptions.contains(&bitmask) {
-            return Err(format!("not subscribed to bitmask {}", hex::encode(&bitmask)));
+            return Err(format!(
+                "not subscribed to bitmask {}",
+                hex::encode(&bitmask)
+            ));
         }
         match self.inner.publish(topic_for(&bitmask).hash(), data) {
             Ok(_) => Ok(()),
@@ -352,9 +355,9 @@ impl BlossomSubBehaviour {
     /// Total score for a peer (falls back to the mirrored application score if
     /// the scorer has no entry).
     pub fn score(&self, peer: &PeerId) -> f64 {
-        self.inner.peer_score(peer).unwrap_or_else(|| {
-            self.application_scores.get(peer).copied().unwrap_or(0.0)
-        })
+        self.inner
+            .peer_score(peer)
+            .unwrap_or_else(|| self.application_scores.get(peer).copied().unwrap_or(0.0))
     }
 
     /// Set the application-level score for a peer (0.0 clears the override).
@@ -388,9 +391,12 @@ impl BlossomSubBehaviour {
     /// Connected peers which advertised this exact bitmask. This becomes
     /// useful before the mesh heartbeat has populated `mesh_peers`.
     pub fn subscribed_peer_count(&self, bitmask: &[u8]) -> usize {
-        self.peer_subscriptions.iter().filter(|(peer, subscriptions)| {
-            self.connected_peers.contains_key(*peer) && subscriptions.contains(bitmask)
-        }).count()
+        self.peer_subscriptions
+            .iter()
+            .filter(|(peer, subscriptions)| {
+                self.connected_peers.contains_key(*peer) && subscriptions.contains(bitmask)
+            })
+            .count()
     }
 
     /// Exempt authorized committee peers from IP-colocation only.
@@ -444,7 +450,8 @@ impl BlossomSubBehaviour {
         }
         self.last_need_peers_check = now;
         // The message cache's byte-budget signal shares this cadence.
-        self.cache_pressure.observe(self.inner.message_cache_stats(), now);
+        self.cache_pressure
+            .observe(self.inner.message_cache_stats(), now);
         if self.subscriptions.is_empty() {
             return;
         }
@@ -542,10 +549,15 @@ impl CachePressure {
             });
         }
         let episode = self.episode.as_ref()?;
-        let evicted_messages = stats.evicted_messages.saturating_sub(episode.base.evicted_messages);
-        let evicted_bytes = stats.evicted_bytes.saturating_sub(episode.base.evicted_bytes);
-        let evicted_unvalidated =
-            stats.evicted_unvalidated.saturating_sub(episode.base.evicted_unvalidated);
+        let evicted_messages = stats
+            .evicted_messages
+            .saturating_sub(episode.base.evicted_messages);
+        let evicted_bytes = stats
+            .evicted_bytes
+            .saturating_sub(episode.base.evicted_bytes);
+        let evicted_unvalidated = stats
+            .evicted_unvalidated
+            .saturating_sub(episode.base.evicted_unvalidated);
         let duration_secs = now.duration_since(episode.started).as_secs();
         match log {
             CachePressureLog::Started => tracing::warn!(
@@ -710,13 +722,11 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                             outcome.to_acceptance(),
                         );
                         if outcome == ValidationResult::Accept {
-                            return Poll::Ready(ToSwarm::GenerateEvent(
-                                BlossomSubEvent::Message {
-                                    propagation_source,
-                                    message_id: message_id.0,
-                                    message: to_pb_message(message, bitmask),
-                                },
-                            ));
+                            return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Message {
+                                propagation_source,
+                                message_id: message_id.0,
+                                message: to_pb_message(message, bitmask),
+                            }));
                         }
                         // Rejected / ignored: don't surface, keep polling.
                         continue;
@@ -727,9 +737,10 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                             .entry(peer_id)
                             .or_default()
                             .insert(bitmask.clone());
-                        return Poll::Ready(ToSwarm::GenerateEvent(
-                            BlossomSubEvent::Subscribed { peer_id, bitmask },
-                        ));
+                        return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Subscribed {
+                            peer_id,
+                            bitmask,
+                        }));
                     }
                     gossipsub::Event::Unsubscribed { peer_id, topic } => {
                         let bitmask = bitmask_from_topic(&topic);
@@ -786,9 +797,9 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
     pi_topic.mesh_failure_penalty_weight = 0.0;
     pi_topic.invalid_message_deliveries_weight = -50.0; // P₄ = weight × counter²
     pi_topic.invalid_message_deliveries_decay = 0.5; // ~halves each decay_interval → recovers
-    // Keep `PeerScoreParams::default()` for everything else — notably
-    // `app_specific_weight` (the existing `set_application_score` channel),
-    // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
+                                                     // Keep `PeerScoreParams::default()` for everything else — notably
+                                                     // `app_specific_weight` (the existing `set_application_score` channel),
+                                                     // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
     let mut score_params = gossipsub::PeerScoreParams::default();
     // GLOBAL_PEER_INFO bitmask `[0,0,0,0]` → topic `hex("00000000")`.
     score_params
@@ -894,14 +905,26 @@ mod propagation_tests {
         let at = |secs| t0 + Duration::from_secs(secs);
         let mut pressure = CachePressure::default();
         assert_eq!(pressure.observe(stats(0), at(0)), None);
-        assert_eq!(pressure.observe(stats(5), at(1)), Some(CachePressureLog::Started));
+        assert_eq!(
+            pressure.observe(stats(5), at(1)),
+            Some(CachePressureLog::Started)
+        );
         assert_eq!(pressure.observe(stats(9), at(2)), None);
         assert_eq!(pressure.observe(stats(9), at(30)), None);
-        assert_eq!(pressure.observe(stats(12), at(61)), Some(CachePressureLog::Continuing));
+        assert_eq!(
+            pressure.observe(stats(12), at(61)),
+            Some(CachePressureLog::Continuing)
+        );
         assert_eq!(pressure.observe(stats(12), at(100)), None);
-        assert_eq!(pressure.observe(stats(12), at(121)), Some(CachePressureLog::Ended));
+        assert_eq!(
+            pressure.observe(stats(12), at(121)),
+            Some(CachePressureLog::Ended)
+        );
         assert_eq!(pressure.observe(stats(12), at(200)), None);
-        assert_eq!(pressure.observe(stats(13), at(201)), Some(CachePressureLog::Started));
+        assert_eq!(
+            pressure.observe(stats(13), at(201)),
+            Some(CachePressureLog::Started)
+        );
     }
 
     // The peer-score config must pass gossipsub's own validation, or
@@ -952,8 +975,12 @@ mod propagation_tests {
         let topic = vec![0x0c, 0xa1];
         let peer = PeerId::random();
         let disconnected = PeerId::random();
-        behaviour.peer_subscriptions.insert(peer, [topic.clone()].into_iter().collect());
-        behaviour.peer_subscriptions.insert(disconnected, [topic.clone()].into_iter().collect());
+        behaviour
+            .peer_subscriptions
+            .insert(peer, [topic.clone()].into_iter().collect());
+        behaviour
+            .peer_subscriptions
+            .insert(disconnected, [topic.clone()].into_iter().collect());
         behaviour.connected_peers.insert(peer, 1);
 
         assert_eq!(behaviour.subscribed_peer_count(&topic), 1);

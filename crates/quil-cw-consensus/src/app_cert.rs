@@ -77,14 +77,20 @@ pub fn unverified_signers(bytes: &[u8]) -> Option<(usize, usize)> {
     }
     let mut cursor = bytes;
     let f = <AppFinalization as Read>::read_cfg(&mut cursor, &crate::handoff::MAX_MEMBERS).ok()?;
-    cursor.is_empty().then(|| (f.certificate.signers.len(), f.certificate.signers.count()))
+    cursor
+        .is_empty()
+        .then(|| (f.certificate.signers.len(), f.certificate.signers.count()))
 }
 
 /// Which of `candidates` produced the certificate's signatures: each
 /// `(signer index in the signing committee, public key)` found. UNAUTHENTICATED,
 /// for diagnostics: it names who signed a certificate whose committee cannot be
 /// rebuilt, by checking every candidate key against every signature.
-pub fn identify_signers(bytes: &[u8], namespace: &[u8], candidates: &[Vec<u8>]) -> Option<Vec<(u32, Vec<u8>)>> {
+pub fn identify_signers(
+    bytes: &[u8],
+    namespace: &[u8],
+    candidates: &[Vec<u8>],
+) -> Option<Vec<(u32, Vec<u8>)>> {
     use commonware_consensus::simplex::{scheme::Namespace as SimplexNamespace, types::Subject};
     use commonware_cryptography::certificate::{Namespace as _, Subject as _};
     use commonware_cryptography::Verifier as _;
@@ -97,16 +103,28 @@ pub fn identify_signers(bytes: &[u8], namespace: &[u8], candidates: &[Vec<u8>]) 
         return None;
     }
     let base = SimplexNamespace::derive(namespace);
-    let subject = Subject::Finalize { proposal: &f.proposal };
+    let subject = Subject::Finalize {
+        proposal: &f.proposal,
+    };
     let (namespace, message) = (subject.namespace(&base), subject.message());
     let keys: Vec<(FalconPublicKey, &Vec<u8>)> = candidates
         .iter()
         .filter_map(|bytes| FalconPublicKey::from_bytes(bytes).map(|key| (key, bytes)))
         .collect();
     let mut found = Vec::new();
-    for (signer, signature) in f.certificate.signers.iter().zip(f.certificate.signatures.iter()) {
-        let Some(signature) = signature.get() else { continue };
-        if let Some((_, bytes)) = keys.iter().find(|(key, _)| key.verify(namespace, &message, signature)) {
+    for (signer, signature) in f
+        .certificate
+        .signers
+        .iter()
+        .zip(f.certificate.signatures.iter())
+    {
+        let Some(signature) = signature.get() else {
+            continue;
+        };
+        if let Some((_, bytes)) = keys
+            .iter()
+            .find(|(key, _)| key.verify(namespace, &message, signature))
+        {
             found.push((signer.get(), (*bytes).clone()));
         }
     }
@@ -200,7 +218,8 @@ pub fn check_finalization(
 
     // Decode the finalization (cfg = committee size, bounds the Signers bitmap).
     let mut cursor: &[u8] = bytes;
-    let f = <AppFinalization as Read>::read_cfg(&mut cursor, &n).map_err(|_| CertError::Encoding)?;
+    let f =
+        <AppFinalization as Read>::read_cfg(&mut cursor, &n).map_err(|_| CertError::Encoding)?;
     if !cursor.is_empty() {
         return Err(CertError::Encoding);
     }
@@ -248,8 +267,16 @@ mod tests {
     #[test]
     fn certificate_parsers_survive_arbitrary_bytes() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
-        let mut next = || { x ^= x >> 12; x ^= x << 25; x ^= x >> 27; x.wrapping_mul(0x9e37_79b9_7f4a_7c15) };
-        let member = FalconPrivateKey::random(commonware_utils::test_rng()).public_key().as_ref().to_vec();
+        let mut next = || {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        };
+        let member = FalconPrivateKey::random(commonware_utils::test_rng())
+            .public_key()
+            .as_ref()
+            .to_vec();
         for i in 0..5_000u64 {
             let len = (next() % 700) as usize;
             let mut bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
@@ -259,11 +286,16 @@ mod tests {
             let outcome = std::panic::catch_unwind(|| {
                 let cert = unwrap_cert_from_header(&bytes).unwrap_or(&bytes);
                 let _ = unverified_finalization_epoch(cert);
-                let _ = check_finalization(cert, std::slice::from_ref(&member), b"appshard", [7; 32]);
+                let _ =
+                    check_finalization(cert, std::slice::from_ref(&member), b"appshard", [7; 32]);
                 let _ = unverified_signers(cert);
                 let _ = identify_signers(cert, b"appshard", std::slice::from_ref(&member));
             });
-            assert!(outcome.is_ok(), "certificate parser panicked on {}", hex::encode(&bytes));
+            assert!(
+                outcome.is_ok(),
+                "certificate parser panicked on {}",
+                hex::encode(&bytes)
+            );
         }
     }
 
@@ -306,8 +338,10 @@ mod tests {
         assert_eq!(unverified_finalization_epoch(&bytes[..2]), None);
         let prefix = finalization.proposal.encode().to_vec();
         assert_eq!(unverified_finalization_epoch(&prefix), Some(7));
-        assert!(verify_finalization_details(&prefix, &member_bytes, namespace, [9; 32]).is_none(),
-            "an epoch lookup hint is not a verified certificate");
+        assert!(
+            verify_finalization_details(&prefix, &member_bytes, namespace, [9; 32]).is_none(),
+            "an epoch lookup hint is not a verified certificate"
+        );
         let verified =
             verify_finalization_details(&bytes, &member_bytes, namespace, [9; 32]).unwrap();
         assert_eq!(
@@ -317,18 +351,47 @@ mod tests {
         assert_eq!(verified.finalization.proposal.parent, View::new(40));
         assert_eq!(verified.signers.len(), 3);
         assert_eq!(unverified_signers(&bytes), Some((4, 3)));
-        assert_eq!(check_finalization(&bytes, &member_bytes[..3], namespace, [9; 32]).err(),
-            Some(CertError::Encoding), "a smaller rebuilt committee cannot decode it");
+        assert_eq!(
+            check_finalization(&bytes, &member_bytes[..3], namespace, [9; 32]).err(),
+            Some(CertError::Encoding),
+            "a smaller rebuilt committee cannot decode it"
+        );
         assert_eq!(unverified_signers(&prefix), None);
         let mut pool = member_bytes.clone();
-        pool.push(FalconPrivateKey::random(commonware_utils::test_rng()).public_key().as_ref().to_vec());
+        pool.push(
+            FalconPrivateKey::random(commonware_utils::test_rng())
+                .public_key()
+                .as_ref()
+                .to_vec(),
+        );
         let named = identify_signers(&bytes, namespace, &pool).unwrap();
-        let signed: Vec<u32> = finalization.certificate.signers.iter().map(|signer| signer.get()).collect();
-        assert_eq!(named.iter().map(|(index, _)| *index).collect::<Vec<_>>(), signed, "every signer, by its index");
+        let signed: Vec<u32> = finalization
+            .certificate
+            .signers
+            .iter()
+            .map(|signer| signer.get())
+            .collect();
+        assert_eq!(
+            named.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            signed,
+            "every signer, by its index"
+        );
         for (index, key) in &named {
-            assert_eq!(key, &set.key(commonware_utils::Participant::new(*index)).unwrap().as_ref().to_vec(), "signer {index}");
+            assert_eq!(
+                key,
+                &set.key(commonware_utils::Participant::new(*index))
+                    .unwrap()
+                    .as_ref()
+                    .to_vec(),
+                "signer {index}"
+            );
         }
-        assert!(identify_signers(&bytes, b"other shard", &pool).unwrap().is_empty(), "the namespace binds each signature");
+        assert!(
+            identify_signers(&bytes, b"other shard", &pool)
+                .unwrap()
+                .is_empty(),
+            "the namespace binds each signature"
+        );
         assert!(
             crate::engine_host::GlobalEngineParams::new("test", 7, Sha256Digest([0; 32]))
                 .with_finalized_floor(verified.finalization)
@@ -356,12 +419,27 @@ mod tests {
         );
         let mut noncausal = finalization.clone();
         noncausal.proposal.parent = View::new(43);
-        let votes: Vec<_> = schemes[..3].iter().map(|scheme| {
-            scheme.sign(Subject::Finalize { proposal: &noncausal.proposal }).unwrap()
-        }).collect();
+        let votes: Vec<_> = schemes[..3]
+            .iter()
+            .map(|scheme| {
+                scheme
+                    .sign(Subject::Finalize {
+                        proposal: &noncausal.proposal,
+                    })
+                    .unwrap()
+            })
+            .collect();
         noncausal.certificate = schemes[0].assemble::<_, N3f1>(votes, &Sequential).unwrap();
-        assert!(verify_finalization_details(&encode_finalization(&noncausal), &member_bytes, namespace, [9; 32]).is_none(),
-            "even a signed quorum cannot name its own view as parent");
+        assert!(
+            verify_finalization_details(
+                &encode_finalization(&noncausal),
+                &member_bytes,
+                namespace,
+                [9; 32]
+            )
+            .is_none(),
+            "even a signed quorum cannot name its own view as parent"
+        );
         let mut changed = finalization;
         changed.proposal.round = Round::new(Epoch::new(8), View::new(43));
         assert!(verify_finalization_details(

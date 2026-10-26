@@ -46,7 +46,12 @@ const SLOW_FRAME_FETCH: Duration = Duration::from_secs(2);
 
 impl ConnectionTraffic {
     fn new() -> Self {
-        Self { opened: Instant::now(), frames: 0, bytes: 0, slowest_ms: 0 }
+        Self {
+            opened: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            slowest_ms: 0,
+        }
     }
 
     fn age_ms(&self) -> u64 {
@@ -63,11 +68,25 @@ impl ConnectionTraffic {
         self.slowest_ms = self.slowest_ms.max(ms);
         let frame_number = frame.header.as_ref().map_or(0, |h| h.frame_number);
         if elapsed >= SLOW_FRAME_FETCH {
-            info!(addr, requested, frame = frame_number, ms, bytes,
-                connection_age_ms = self.age_ms(), "slow archive frame fetch");
+            info!(
+                addr,
+                requested,
+                frame = frame_number,
+                ms,
+                bytes,
+                connection_age_ms = self.age_ms(),
+                "slow archive frame fetch"
+            );
         } else {
-            debug!(addr, requested, frame = frame_number, ms, bytes,
-                connection_age_ms = self.age_ms(), "archive frame fetched");
+            debug!(
+                addr,
+                requested,
+                frame = frame_number,
+                ms,
+                bytes,
+                connection_age_ms = self.age_ms(),
+                "archive frame fetched"
+            );
         }
     }
 }
@@ -412,7 +431,8 @@ where
     F: std::future::Future<Output = Result<S, ArchiveClientError>>,
 {
     let started = Instant::now();
-    let mut result = tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
+    let mut result =
+        tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
     if let Ok(Err(error)) = &result {
         if error.is_transport_failure() {
             info!(
@@ -431,7 +451,8 @@ where
             *connection = ConnectionTraffic::new();
             probe::step(ProbeSection::PollerRefetch);
             let started = Instant::now();
-            result = tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
+            result =
+                tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
             if let Ok(Ok(frame)) = &result {
                 connection.fetched(addr, number, frame, started);
             }
@@ -470,8 +491,12 @@ fn admit_frame(
     held: &mut std::collections::BTreeMap<u64, GlobalFrame>,
     frame: GlobalFrame,
 ) -> Vec<GlobalFrame> {
-    let Some(certified) = certified else { return vec![frame] };
-    let Some(number) = frame.header.as_ref().map(|h| h.frame_number) else { return Vec::new() };
+    let Some(certified) = certified else {
+        return vec![frame];
+    };
+    let Some(number) = frame.header.as_ref().map(|h| h.frame_number) else {
+        return Vec::new();
+    };
     if !certified(&frame) {
         held.insert(number, frame);
         while held.len() > MAX_HELD_UNCERTIFIED {
@@ -480,7 +505,11 @@ fn admit_frame(
         return Vec::new();
     }
     let mut chain = Vec::new();
-    let mut selector = frame.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+    let mut selector = frame
+        .header
+        .as_ref()
+        .map(|h| h.parent_selector.clone())
+        .unwrap_or_default();
     let mut below = number;
     while let Some(parent_number) = below.checked_sub(1) {
         let links = held
@@ -491,7 +520,11 @@ fn admit_frame(
             break;
         }
         let parent = held.remove(&parent_number).expect("checked above");
-        selector = parent.header.as_ref().map(|h| h.parent_selector.clone()).unwrap_or_default();
+        selector = parent
+            .header
+            .as_ref()
+            .map(|h| h.parent_selector.clone())
+            .unwrap_or_default();
         chain.push(parent);
         below = parent_number;
     }
@@ -509,7 +542,10 @@ fn admit_frame(
 /// instead of forward-filling (and re-materializing) the whole gap. Boot-time
 /// far-behind is handled separately by [`ArchivePollerConfig::startup_barrier`].
 pub type FarBehindJump = Arc<
-    dyn Fn(u64, CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send>>
+    dyn Fn(
+            u64,
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<u64>> + Send>>
         + Send
         + Sync,
 >;
@@ -703,10 +739,8 @@ pub(crate) trait PollerFrameSource: Send {
     /// The latest frame: whole when it is numbered above `newer_than`, else
     /// possibly its header alone (a server predating the request sends it
     /// whole).
-    async fn get_global_head(
-        &mut self,
-        newer_than: u64,
-    ) -> Result<GlobalFrame, ArchiveClientError>;
+    async fn get_global_head(&mut self, newer_than: u64)
+        -> Result<GlobalFrame, ArchiveClientError>;
 }
 
 #[tonic::async_trait]
@@ -821,8 +855,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
     // Validated frames with no certificate of their own, until a certified frame
     // links down to them (see `FrameCertified`).
     let mut held: std::collections::BTreeMap<u64, GlobalFrame> = std::collections::BTreeMap::new();
-    let mut stall_endpoints: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut stall_endpoints: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Distinct archives that served a frame at the stuck height which FAILED
     // validation (forged, or — the real case — a legacy pre-migration frame
     // whose VDF/allowlist can never pass under the new chain). Tracked apart
@@ -994,8 +1027,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             }
         }
 
-        let Some((addr, client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c))
-        else {
+        let Some((addr, client)) = current_client.as_mut().map(|(a, c)| (a.clone(), c)) else {
             continue;
         };
 
@@ -1126,7 +1158,10 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     if n > last_frame {
                         last_frame = n;
                     }
-                    info!(target = n, "archive poller: runtime state-jump landed — resuming near head");
+                    info!(
+                        target = n,
+                        "archive poller: runtime state-jump landed — resuming near head"
+                    );
                     continue;
                 }
                 warn!(
@@ -1143,7 +1178,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         if config.forward_fill && forward_fill_due(last_frame, has_genesis, new_number) {
             // Keep the cursor below an unfinished gap and resume next tick.
             let fill_end = new_number.min(
-                last_frame.saturating_add(1).saturating_add(MAX_FORWARD_FILL_PER_TICK),
+                last_frame
+                    .saturating_add(1)
+                    .saturating_add(MAX_FORWARD_FILL_PER_TICK),
             );
             // Track partial progress: every frame we successfully store
             // advances `last_frame`, so a failure midway does NOT throw
@@ -1221,11 +1258,19 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         let validated = processing.elapsed();
                         let chain = admit_frame(config.frame_certified.as_ref(), &mut held, frame);
                         let admitted = processing.elapsed();
-                        let stored = store_chain(&config, &clock_store, &chain).unwrap_or_else(|e| {
-                            warn!(error = %e, frame = fn_, "store catchup frame failed");
-                            StoreTiming::default()
-                        });
-                        log_slow_processing(&addr, fn_, validated, admitted - validated, &stored, processing.elapsed());
+                        let stored =
+                            store_chain(&config, &clock_store, &chain).unwrap_or_else(|e| {
+                                warn!(error = %e, frame = fn_, "store catchup frame failed");
+                                StoreTiming::default()
+                            });
+                        log_slow_processing(
+                            &addr,
+                            fn_,
+                            validated,
+                            admitted - validated,
+                            &stored,
+                            processing.elapsed(),
+                        );
                         // Advance over each fetched frame (stored, or held until a
                         // certified frame links to it) so progress is durable.
                         last_frame = fn_;
@@ -1293,8 +1338,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 // backfill/scan still tracks the hole for any later fill; this
                 // only unblocks forward progress.
                 let head_far_past = new_number >= bad.saturating_add(UNFILLABLE_HEAD_MARGIN);
-                let notfound_unfillable =
-                    stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
+                let notfound_unfillable = stall_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
                 let invalid_unfillable =
                     stall_invalid_endpoints.len() >= UNFILLABLE_DISTINCT_ENDPOINTS;
                 if (notfound_unfillable || invalid_unfillable) && head_far_past {
@@ -1379,7 +1423,14 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 continue;
             }
         };
-        log_slow_processing(&addr, new_number, validated, admit, &stored, processing.elapsed());
+        log_slow_processing(
+            &addr,
+            new_number,
+            validated,
+            admit,
+            &stored,
+            processing.elapsed(),
+        );
         info!(
             head = new_number,
             gap = new_number.saturating_sub(last_frame),
@@ -1457,8 +1508,15 @@ mod pool_tests {
         }
         pool.mark_own("c:1").await;
         assert_eq!(pool.next().await, None);
-        let picks = [pool.any_known().await, pool.any_known().await, pool.any_known().await];
-        assert_eq!(picks, [Some("a:1".into()), Some("b:1".into()), Some("a:1".into())]);
+        let picks = [
+            pool.any_known().await,
+            pool.any_known().await,
+            pool.any_known().await,
+        ];
+        assert_eq!(
+            picks,
+            [Some("a:1".into()), Some("b:1".into()), Some("a:1".into())]
+        );
         pool.mark_own("a:1").await;
         pool.mark_own("b:1").await;
         assert_eq!(pool.any_known().await, None);
@@ -1496,7 +1554,11 @@ mod pool_tests {
         assert_eq!(pool.next().await.as_deref(), Some("b:1"));
         let mut all = pool.get_all().await;
         all.sort();
-        assert_eq!(all, vec!["b:1", "self:1"], "the directory still names this node");
+        assert_eq!(
+            all,
+            vec!["b:1", "self:1"],
+            "the directory still names this node"
+        );
     }
 
     /// Regression: prior to the TTL fix a single timeout permanently
@@ -1561,7 +1623,11 @@ mod pool_tests {
         }
 
         // After the TTL, the poller retries it; it was in get_all all along.
-        assert_eq!(pool.next().await.as_deref(), Some("a:1"), "retried after TTL");
+        assert_eq!(
+            pool.next().await.as_deref(),
+            Some("a:1"),
+            "retried after TTL"
+        );
         assert_eq!(pool.get_all().await, vec!["a:1"]);
     }
 
@@ -1703,26 +1769,37 @@ mod pool_tests {
 #[cfg(test)]
 mod admit_tests {
     use super::*;
-    use quil_types::proto::global::{GlobalFrameHeader, GlobalFrame};
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
 
     #[test]
     fn an_archive_holding_only_genesis_fills_from_frame_one() {
         // A localnet archive that started as frame 1 was finalized: its first
         // poll saw head 2 and must fetch frame 1 rather than store 2 alone.
         assert!(forward_fill_due(0, true, 2));
-        assert!(!forward_fill_due(0, true, 1), "the head itself is stored directly");
+        assert!(
+            !forward_fill_due(0, true, 1),
+            "the head itself is stored directly"
+        );
         // No record at all: the state-jump fills a far-behind store.
         assert!(!forward_fill_due(0, false, 2));
         assert!(forward_fill_due(5, false, 7));
         assert!(!forward_fill_due(5, false, 6));
     }
 
-    fn frame(number: u64, output: u8, parent: Option<&GlobalFrame>, certified: bool) -> GlobalFrame {
+    fn frame(
+        number: u64,
+        output: u8,
+        parent: Option<&GlobalFrame>,
+        certified: bool,
+    ) -> GlobalFrame {
         GlobalFrame {
             header: Some(GlobalFrameHeader {
                 frame_number: number,
                 output: vec![output; 516],
-                parent_selector: parent.and_then(frame_identity).map(|id| id.to_vec()).unwrap_or_default(),
+                parent_selector: parent
+                    .and_then(frame_identity)
+                    .map(|id| id.to_vec())
+                    .unwrap_or_default(),
                 // The test predicate reads certification off the rank.
                 rank: if certified { 1 } else { 0 },
                 ..Default::default()
@@ -1736,7 +1813,10 @@ mod admit_tests {
     }
 
     fn numbers(chain: &[GlobalFrame]) -> Vec<u64> {
-        chain.iter().map(|f| f.header.as_ref().unwrap().frame_number).collect()
+        chain
+            .iter()
+            .map(|f| f.header.as_ref().unwrap().frame_number)
+            .collect()
     }
 
     /// Without a predicate every validated frame is stored, as before.
@@ -1758,10 +1838,16 @@ mod admit_tests {
         let five = frame(5, 5, Some(&four), false);
         let six = frame(6, 6, Some(&five), false);
         let seven = frame(7, 7, Some(&six), true);
-        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, four)), vec![4]);
+        assert_eq!(
+            numbers(&admit_frame(Some(&predicate), &mut held, four)),
+            vec![4]
+        );
         assert!(admit_frame(Some(&predicate), &mut held, five).is_empty());
         assert!(admit_frame(Some(&predicate), &mut held, six).is_empty());
-        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, seven)), vec![5, 6, 7]);
+        assert_eq!(
+            numbers(&admit_frame(Some(&predicate), &mut held, seven)),
+            vec![5, 6, 7]
+        );
         assert!(held.is_empty());
     }
 
@@ -1777,9 +1863,15 @@ mod admit_tests {
         let six = frame(6, 6, Some(&honest), true);
         admit_frame(Some(&predicate), &mut held, four);
         assert!(admit_frame(Some(&predicate), &mut held, nullified).is_empty());
-        assert_eq!(numbers(&admit_frame(Some(&predicate), &mut held, six)), vec![6],
-            "the certified frame does not link to the held one");
-        assert!(held.is_empty(), "held frames at or below a certified frame are dropped");
+        assert_eq!(
+            numbers(&admit_frame(Some(&predicate), &mut held, six)),
+            vec![6],
+            "the certified frame does not link to the held one"
+        );
+        assert!(
+            held.is_empty(),
+            "held frames at or below a certified frame are dropped"
+        );
     }
 
     /// A frame the canonical clock already holds unchanged is not rewritten
@@ -1802,7 +1894,11 @@ mod admit_tests {
         clock.put_global_frame(&stored, None).unwrap();
         let sequence = db.inner().latest_sequence_number();
         store_chain(&config, &clock, &[stored.clone()]).unwrap();
-        assert_eq!(db.inner().latest_sequence_number(), sequence, "not rewritten");
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "not rewritten"
+        );
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let other = frame(6, 7, None, true);
@@ -1818,7 +1914,12 @@ mod admit_tests {
         let predicate = certified();
         let mut held = std::collections::BTreeMap::new();
         for number in 1..=(MAX_HELD_UNCERTIFIED as u64 + 10) {
-            assert!(admit_frame(Some(&predicate), &mut held, frame(number, number as u8, None, false)).is_empty());
+            assert!(admit_frame(
+                Some(&predicate),
+                &mut held,
+                frame(number, number as u8, None, false)
+            )
+            .is_empty());
         }
         assert_eq!(held.len(), MAX_HELD_UNCERTIFIED);
         assert_eq!(*held.keys().next().unwrap(), 11);
@@ -1901,7 +2002,10 @@ mod forward_fill_tests {
             newer_than: u64,
         ) -> Result<GlobalFrame, ArchiveClientError> {
             let mut head = self.get_global_frame(0).await?;
-            let newer = head.header.as_ref().is_some_and(|h| h.frame_number > newer_than);
+            let newer = head
+                .header
+                .as_ref()
+                .is_some_and(|h| h.frame_number > newer_than);
             let whole = self.legacy || newer_than == 0 || newer;
             if !whole {
                 head.requests.clear();
@@ -1916,16 +2020,25 @@ mod forward_fill_tests {
         struct BrokenSource(bool);
         #[tonic::async_trait]
         impl PollerFrameSource for BrokenSource {
-            async fn get_global_frame(&mut self, number: u64) -> Result<GlobalFrame, ArchiveClientError> {
+            async fn get_global_frame(
+                &mut self,
+                number: u64,
+            ) -> Result<GlobalFrame, ArchiveClientError> {
                 if self.0 {
-                    Err(ArchiveClientError::Rpc(tonic::Status::from_error(Box::new(
-                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection closed"),
-                    ))))
+                    Err(ArchiveClientError::Rpc(tonic::Status::from_error(
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "connection closed",
+                        )),
+                    )))
                 } else {
                     Ok(mk_frame(number))
                 }
             }
-            async fn get_global_head(&mut self, _newer_than: u64) -> Result<GlobalFrame, ArchiveClientError> {
+            async fn get_global_head(
+                &mut self,
+                _newer_than: u64,
+            ) -> Result<GlobalFrame, ArchiveClientError> {
                 self.get_global_frame(0).await
             }
         }
@@ -1936,8 +2049,18 @@ mod forward_fill_tests {
         };
         let mut source = BrokenSource(true);
         let mut traffic = ConnectionTraffic::new();
-        let frame = fetch_frame(&mut source, "archive:1", 7, 0, &connect, Duration::from_secs(1), &mut traffic)
-            .await.unwrap().unwrap();
+        let frame = fetch_frame(
+            &mut source,
+            "archive:1",
+            7,
+            0,
+            &connect,
+            Duration::from_secs(1),
+            &mut traffic,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(frame.header.unwrap().frame_number, 7);
         assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(traffic.frames, 1);
@@ -1947,10 +2070,15 @@ mod forward_fill_tests {
             reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async { Ok(FakeArchive::serving(1..=7)) }
         };
-        assert!(matches!(fetch_frame(&mut missing, "archive:1", 7, 0, &connect, Duration::from_secs(1), &mut traffic)
-            .await.unwrap(), Err(ArchiveClientError::Rpc(status)) if status.code() == tonic::Code::NotFound));
-        assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1,
-            "an application status must not reconnect or bypass endpoint rotation");
+        assert!(
+            matches!(fetch_frame(&mut missing, "archive:1", 7, 0, &connect, Duration::from_secs(1), &mut traffic)
+            .await.unwrap(), Err(ArchiveClientError::Rpc(status)) if status.code() == tonic::Code::NotFound)
+        );
+        assert_eq!(
+            reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an application status must not reconnect or bypass endpoint rotation"
+        );
     }
 
     struct Rig {
@@ -2012,7 +2140,10 @@ mod forward_fill_tests {
             on_frame: Some(Arc::new(move |f: &GlobalFrame| {
                 if let Some(h) = f.header.as_ref() {
                     seen_cb.lock().unwrap().push(h.frame_number);
-                    targets_cb.lock().unwrap().push(head_cb.load(std::sync::atomic::Ordering::Relaxed));
+                    targets_cb
+                        .lock()
+                        .unwrap()
+                        .push(head_cb.load(std::sync::atomic::Ordering::Relaxed));
                 }
             })),
             ..Default::default()
@@ -2066,7 +2197,10 @@ mod forward_fill_tests {
             let mut fake = FakeArchive::serving(1..=5);
             fake.legacy = legacy;
             for (n, frame) in fake.frames.lock().unwrap().iter_mut() {
-                frame.requests.push(MessageBundle { timestamp: *n as i64, ..Default::default() });
+                frame.requests.push(MessageBundle {
+                    timestamp: *n as i64,
+                    ..Default::default()
+                });
             }
             let answers = fake.head_answers.clone();
             let rig = spawn_poller(fake, &[0, 1, 2, 3, 4], None).await;
@@ -2085,7 +2219,11 @@ mod forward_fill_tests {
                 "head 5 whole for a poller at 4, then whole again only from a legacy server ({legacy})",
             );
             assert_eq!(*rig.seen.lock().unwrap(), vec![5]);
-            assert_eq!(rig.store.get_global_frame(5).unwrap().requests.len(), 1, "the newer head is stored whole");
+            assert_eq!(
+                rig.store.get_global_frame(5).unwrap().requests.len(),
+                1,
+                "the newer head is stored whole"
+            );
         }
     }
 
@@ -2102,7 +2240,12 @@ mod forward_fill_tests {
     /// proposes nothing at a replayed frame).
     #[tokio::test]
     async fn a_replayed_frame_sees_the_head_its_tick_catches_up_to() {
-        let rig = spawn_poller(FakeArchive::serving(1..=5), &[0], Some(GossipFreshness::new())).await;
+        let rig = spawn_poller(
+            FakeArchive::serving(1..=5),
+            &[0],
+            Some(GossipFreshness::new()),
+        )
+        .await;
         assert!(await_head_then_stop(&rig, 5).await);
         rig.poller.await.unwrap();
         assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);

@@ -1,7 +1,7 @@
 //! Bounded point reads of a frozen secondary; no RocksDB snapshot iterators.
 //! Reports hashes and small public summary fields, never mutates the primary.
-use quil_store::{encoding, RocksDb};
 use prost::Message;
+use quil_store::{encoding, RocksDb};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -46,13 +46,17 @@ fn main() -> Result<(), Error> {
     db.inner().try_catch_up_with_primary()?;
     let mut frames = Vec::new();
     for frame in from..=through {
-        let certified = db.inner().get(encoding::clock_shard_frame_key(&filter, frame))?;
+        let certified = db
+            .inner()
+            .get(encoding::clock_shard_frame_key(&filter, frame))?;
         let header = match certified {
             Some(bytes) if bytes.len() <= 16 * 1024 * 1024 => {
                 let frame = quil_types::proto::global::AppShardFrame::decode(bytes.as_slice())?;
-                frame.header.map(|header| json!({"accumulator":describe(Some(header.accumulator)),
+                frame.header.map(|header| {
+                    json!({"accumulator":describe(Some(header.accumulator)),
                     "roots":header.state_roots.iter().map(hex::encode).collect::<Vec<_>>(),
-                    "requests":frame.requests.len(),"global_frame":header.global_frame_number}))
+                    "requests":frame.requests.len(),"global_frame":header.global_frame_number})
+                })
             }
             Some(_) => return Err("certified frame exceeds 16 MiB diagnostic cap".into()),
             None => None,

@@ -38,7 +38,11 @@ fn control(action: &str) -> anyhow::Result<()> {
             "enable" => vec!["load".into(), "-w".into(), launchd_plist_path()],
             "disable" => vec!["unload".into(), "-w".into(), launchd_plist_path()],
             "status" => vec!["list".into(), LAUNCHD_LABEL.into()],
-            "reload" => vec!["kickstart".into(), "-k".into(), format!("system/{LAUNCHD_LABEL}")],
+            "reload" => vec![
+                "kickstart".into(),
+                "-k".into(),
+                format!("system/{LAUNCHD_LABEL}"),
+            ],
             a => vec![a.into(), LAUNCHD_LABEL.into()],
         };
         Command::new("sudo").arg("launchctl").args(&mapped).status()
@@ -57,7 +61,10 @@ fn control(action: &str) -> anyhow::Result<()> {
 }
 
 fn install() -> anyhow::Result<()> {
-    println!("Installing Quilibrium node service for {}...", system::os_type());
+    println!(
+        "Installing Quilibrium node service for {}...",
+        system::os_type()
+    );
     if system::os_type() == "darwin" {
         install_launchd()
     } else if system::os_type() == "linux" {
@@ -73,7 +80,10 @@ fn install_systemd() -> anyhow::Result<()> {
     let node_bin = system::default_node_symlink_path();
 
     // Environment file.
-    write_root_file(env_path.to_str().unwrap(), "# Quilibrium Node Environment\n")?;
+    write_root_file(
+        env_path.to_str().unwrap(),
+        "# Quilibrium Node Environment\n",
+    )?;
 
     let unit = format!(
         "[Unit]\n\
@@ -100,7 +110,9 @@ fn install_systemd() -> anyhow::Result<()> {
     );
     write_root_file(SYSTEMD_UNIT_PATH, &unit)?;
 
-    let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
+    let _ = Command::new("sudo")
+        .args(["systemctl", "daemon-reload"])
+        .status();
     println!("Created systemd service file at {SYSTEMD_UNIT_PATH}");
     Ok(())
 }
@@ -143,15 +155,21 @@ fn install_launchd() -> anyhow::Result<()> {
 fn uninstall() -> anyhow::Result<()> {
     if system::os_type() == "darwin" {
         let plist = launchd_plist_path();
-        let _ = Command::new("sudo").args(["launchctl", "unload", &plist]).status();
+        let _ = Command::new("sudo")
+            .args(["launchctl", "unload", &plist])
+            .status();
         let _ = Command::new("sudo").args(["rm", "-f", &plist]).status();
         println!("Removed launchd service");
     } else {
         let _ = Command::new("sudo")
             .args(["systemctl", "disable", "--now", system::NODE_SERVICE_NAME])
             .status();
-        let _ = Command::new("sudo").args(["rm", "-f", SYSTEMD_UNIT_PATH]).status();
-        let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
+        let _ = Command::new("sudo")
+            .args(["rm", "-f", SYSTEMD_UNIT_PATH])
+            .status();
+        let _ = Command::new("sudo")
+            .args(["systemctl", "daemon-reload"])
+            .status();
         println!("Removed systemd service");
     }
     Ok(())

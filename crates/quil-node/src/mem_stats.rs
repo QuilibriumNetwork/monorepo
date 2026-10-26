@@ -202,8 +202,7 @@ pub fn host_memory() -> Option<HostMemory> {
 }
 
 /// Minimum interval between repeated low-memory warnings.
-pub const HOST_LOW_MEMORY_WARN_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(600);
+pub const HOST_LOW_MEMORY_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Available host memory below 10% of the total.
 pub fn host_memory_is_low(mem: &HostMemory) -> bool {
@@ -216,10 +215,14 @@ pub enum HostMemoryAction {
     None,
     /// Low and no warning in the last interval: warn; `low_secs` is how
     /// long it has been low (0 on the first warning).
-    Warn { low_secs: u64 },
+    Warn {
+        low_secs: u64,
+    },
     /// Was low, no longer is: log one recovery line; `low_secs` is the
     /// episode's total length.
-    Cleared { low_secs: u64 },
+    Cleared {
+        low_secs: u64,
+    },
 }
 
 /// Rate-limit state for the host low-memory warning.
@@ -233,9 +236,9 @@ impl HostMemoryWatch {
     pub fn observe(&mut self, mem: &HostMemory, now: std::time::Instant) -> HostMemoryAction {
         if host_memory_is_low(mem) {
             let since = *self.low_since.get_or_insert(now);
-            let due = self
-                .last_warn
-                .map_or(true, |t| now.duration_since(t) >= HOST_LOW_MEMORY_WARN_INTERVAL);
+            let due = self.last_warn.map_or(true, |t| {
+                now.duration_since(t) >= HOST_LOW_MEMORY_WARN_INTERVAL
+            });
             if due {
                 self.last_warn = Some(now);
                 return HostMemoryAction::Warn {
@@ -340,10 +343,8 @@ pub fn jemalloc_size_classes() -> JemallocBreakdown {
         return out;
     }
     unsafe {
-        out.small_bytes =
-            rd_usize(format!("stats.arenas.{MERGED}.small.allocated\0")) as u64;
-        out.large_bytes =
-            rd_usize(format!("stats.arenas.{MERGED}.large.allocated\0")) as u64;
+        out.small_bytes = rd_usize(format!("stats.arenas.{MERGED}.small.allocated\0")) as u64;
+        out.large_bytes = rd_usize(format!("stats.arenas.{MERGED}.large.allocated\0")) as u64;
 
         let mut classes: Vec<(u64, u64, u64)> = Vec::new();
         // Small bins.
@@ -423,7 +424,12 @@ pub fn fmt_breakdown(b: &JemallocBreakdown) -> String {
         fmt_mb(b.large_bytes)
     );
     for (size, live, count) in &b.top {
-        s.push_str(&format!(" {}={}MB×{}", fmt_size(*size), fmt_mb(*live), count));
+        s.push_str(&format!(
+            " {}={}MB×{}",
+            fmt_size(*size),
+            fmt_mb(*live),
+            count
+        ));
     }
     s
 }
@@ -463,7 +469,10 @@ mod jemalloc_breakdown_tests {
             assert!(*size > 0 && *count > 0 && *live >= *size);
         }
         // The 8 MiB allocation should register in the large pool.
-        assert!(br.large_bytes >= 8 * 1024 * 1024, "8MiB alloc not in large pool");
+        assert!(
+            br.large_bytes >= 8 * 1024 * 1024,
+            "8MiB alloc not in large pool"
+        );
         drop(big);
     }
 }
@@ -472,12 +481,13 @@ mod jemalloc_breakdown_tests {
 /// tracks. Cheap to clone (everything is `Arc`).
 #[derive(Clone)]
 pub struct StructuralSources {
-    pub peer_info_cache: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
-    >>,
-    pub shard_engines: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >>,
+    pub peer_info_cache:
+        Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
+    pub shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
     pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
     /// `None` on archive nodes (they don't run the time reel).
@@ -492,9 +502,9 @@ impl StructuralSources {
         archive_peers_seen_len: usize,
         peer_info_digest_cache_len: usize,
     ) -> StructuralSizes {
-        let (prover_addresses, prover_filters) = self.prover_registry.read(|r| {
-            (r.distinct_provers(), r.distinct_filters())
-        });
+        let (prover_addresses, prover_filters) = self
+            .prover_registry
+            .read(|r| (r.distinct_provers(), r.distinct_filters()));
         let (tr_nodes, tr_pending, tr_eq) = self
             .time_reel
             .as_ref()

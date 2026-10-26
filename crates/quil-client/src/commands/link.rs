@@ -32,6 +32,10 @@ pub fn run() -> anyhow::Result<()> {
         )
     })?;
 
-    println!("Symlink created at {} → {}", link.display(), exec_path.display());
+    println!(
+        "Symlink created at {} → {}",
+        link.display(),
+        exec_path.display()
+    );
     Ok(())
 }

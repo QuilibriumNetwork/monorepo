@@ -62,16 +62,28 @@ pub fn seal(plaintext: &[u8], recipient_public_key: &[u8], aad: &[u8]) -> Result
     seal_capped(plaintext, recipient_public_key, aad, MAX_PLAINTEXT)
 }
 
-fn seal_capped(plaintext: &[u8], recipient_public_key: &[u8], aad: &[u8], cap: usize) -> Result<Vec<u8>> {
+fn seal_capped(
+    plaintext: &[u8],
+    recipient_public_key: &[u8],
+    aad: &[u8],
+    cap: usize,
+) -> Result<Vec<u8>> {
     if plaintext.len() > cap {
-        return Err(QuilError::InvalidArgument(format!("seal: payload of {} bytes exceeds {cap}", plaintext.len())));
+        return Err(QuilError::InvalidArgument(format!(
+            "seal: payload of {} bytes exceeds {cap}",
+            plaintext.len()
+        )));
     }
     let (shared_secret, kem_ct) = encapsulate(recipient_public_key)?;
     let cipher = aead(&shared_secret, aad)?;
     let mut out = Vec::with_capacity(sealed_len(plaintext.len()));
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&kem_ct);
-    let chunks: Vec<&[u8]> = if plaintext.is_empty() { vec![&[]] } else { plaintext.chunks(CHUNK_LEN).collect() };
+    let chunks: Vec<&[u8]> = if plaintext.is_empty() {
+        vec![&[]]
+    } else {
+        plaintext.chunks(CHUNK_LEN).collect()
+    };
     let count = chunks.len();
     for (index, chunk) in chunks.into_iter().enumerate() {
         let nonce = nonce(index as u64, index + 1 == count);
@@ -89,7 +101,9 @@ fn seal_capped(plaintext: &[u8], recipient_public_key: &[u8], aad: &[u8], cap: u
 pub fn open(sealed: &[u8], recipient_secret_key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let refused = || QuilError::Crypto("sealed payload does not open with this key".into());
     if sealed.len() < HEADER_LEN || &sealed[..MAGIC.len()] != MAGIC {
-        return Err(QuilError::InvalidArgument("not a sealed payload of this version".into()));
+        return Err(QuilError::InvalidArgument(
+            "not a sealed payload of this version".into(),
+        ));
     }
     let shared_secret = decapsulate(&sealed[MAGIC.len()..HEADER_LEN], recipient_secret_key)?;
     let cipher = aead(&shared_secret, aad)?;
@@ -97,7 +111,11 @@ pub fn open(sealed: &[u8], recipient_secret_key: &[u8], aad: &[u8]) -> Result<Ve
     let mut at = HEADER_LEN;
     let mut index = 0u64;
     loop {
-        let len_bytes: [u8; 4] = sealed.get(at..at + 4).ok_or_else(refused)?.try_into().map_err(|_| refused())?;
+        let len_bytes: [u8; 4] = sealed
+            .get(at..at + 4)
+            .ok_or_else(refused)?
+            .try_into()
+            .map_err(|_| refused())?;
         let len = u32::from_le_bytes(len_bytes) as usize;
         if !(TAG_LEN..=CHUNK_LEN + TAG_LEN).contains(&len) {
             return Err(refused());
@@ -109,7 +127,10 @@ pub fn open(sealed: &[u8], recipient_secret_key: &[u8], aad: &[u8]) -> Result<Ve
             return Err(refused());
         }
         let chunk = cipher
-            .decrypt(Nonce::from_slice(&nonce(index, last)), Payload { msg: body, aad })
+            .decrypt(
+                Nonce::from_slice(&nonce(index, last)),
+                Payload { msg: body, aad },
+            )
             .map_err(|_| refused())?;
         plaintext.extend_from_slice(&chunk);
         if last {
@@ -131,12 +152,28 @@ mod tests {
     #[test]
     fn payloads_of_every_size_round_trip() {
         let key = Sntrup761KeyPair::generate();
-        for len in [0, 1, CHUNK_LEN - 1, CHUNK_LEN, CHUNK_LEN + 1, 3 * CHUNK_LEN + CHUNK_LEN / 2] {
+        for len in [
+            0,
+            1,
+            CHUNK_LEN - 1,
+            CHUNK_LEN,
+            CHUNK_LEN + 1,
+            3 * CHUNK_LEN + CHUNK_LEN / 2,
+        ] {
             let plaintext = payload(len);
             let sealed = seal(&plaintext, &key.public, b"request").unwrap();
             assert_eq!(sealed.len(), sealed_len(len), "{len}");
-            assert!(!sealed.windows(16.min(len.max(1))).any(|w| len >= 16 && w == &plaintext[..16]), "{len}: plaintext visible");
-            assert_eq!(open(&sealed, &key.secret, b"request").unwrap(), plaintext, "{len}");
+            assert!(
+                !sealed
+                    .windows(16.min(len.max(1)))
+                    .any(|w| len >= 16 && w == &plaintext[..16]),
+                "{len}: plaintext visible"
+            );
+            assert_eq!(
+                open(&sealed, &key.secret, b"request").unwrap(),
+                plaintext,
+                "{len}"
+            );
         }
         let a = seal(b"same", &key.public, b"x").unwrap();
         let b = seal(b"same", &key.public, b"x").unwrap();
@@ -150,7 +187,10 @@ mod tests {
         assert!(open(&sealed, &other.secret, b"request-1").is_err());
         assert!(open(&sealed, &key.secret, b"request-2").is_err());
         assert!(open(&sealed, &key.secret, b"").is_err());
-        assert!(seal(b"x", &[0u8; 10], b"").is_err(), "a malformed public key is an error");
+        assert!(
+            seal(b"x", &[0u8; 10], b"").is_err(),
+            "a malformed public key is an error"
+        );
     }
 
     #[test]
@@ -160,22 +200,50 @@ mod tests {
         let first = HEADER_LEN;
         let second = first + 4 + CHUNK_LEN + TAG_LEN;
         let third = second + 4 + CHUNK_LEN + TAG_LEN;
-        for at in [0, 9, HEADER_LEN - 1, first, first + 4, first + 4 + CHUNK_LEN + 3, second + 100, third + 4, sealed.len() - 1] {
+        for at in [
+            0,
+            9,
+            HEADER_LEN - 1,
+            first,
+            first + 4,
+            first + 4 + CHUNK_LEN + 3,
+            second + 100,
+            third + 4,
+            sealed.len() - 1,
+        ] {
             let mut flipped = sealed.clone();
             flipped[at] ^= 0x01;
-            assert!(open(&flipped, &key.secret, b"aad").is_err(), "flipped byte {at} opened");
+            assert!(
+                open(&flipped, &key.secret, b"aad").is_err(),
+                "flipped byte {at} opened"
+            );
         }
-        assert!(open(&sealed[..third], &key.secret, b"aad").is_err(), "last chunk dropped");
-        assert!(open(&sealed[..sealed.len() - 1], &key.secret, b"aad").is_err(), "truncated");
+        assert!(
+            open(&sealed[..third], &key.secret, b"aad").is_err(),
+            "last chunk dropped"
+        );
+        assert!(
+            open(&sealed[..sealed.len() - 1], &key.secret, b"aad").is_err(),
+            "truncated"
+        );
         let mut appended = sealed.clone();
         appended.extend_from_slice(&sealed[second..third]);
-        assert!(open(&appended, &key.secret, b"aad").is_err(), "chunk appended");
+        assert!(
+            open(&appended, &key.secret, b"aad").is_err(),
+            "chunk appended"
+        );
         let mut swapped = sealed[..first].to_vec();
         swapped.extend_from_slice(&sealed[second..third]);
         swapped.extend_from_slice(&sealed[first..second]);
         swapped.extend_from_slice(&sealed[third..]);
-        assert!(open(&swapped, &key.secret, b"aad").is_err(), "chunks reordered");
-        assert!(open(&sealed[..HEADER_LEN], &key.secret, b"aad").is_err(), "no chunks");
+        assert!(
+            open(&swapped, &key.secret, b"aad").is_err(),
+            "chunks reordered"
+        );
+        assert!(
+            open(&sealed[..HEADER_LEN], &key.secret, b"aad").is_err(),
+            "no chunks"
+        );
         assert!(open(b"short", &key.secret, b"aad").is_err());
     }
 

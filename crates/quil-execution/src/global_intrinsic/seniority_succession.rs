@@ -58,12 +58,16 @@ use super::materialize::{
 use super::prover_ops::ProverSeniorityMerge;
 use super::prover_shard_update::SENIORITY_PER_ACTIVE_FRAME;
 use super::verify::{
-    seniority_merge_signer, verify_seniority_merge_consents, verify_seniority_merge_prover_signature,
-    SeniorityMergeConsent,
+    seniority_merge_signer, verify_seniority_merge_consents,
+    verify_seniority_merge_prover_signature, SeniorityMergeConsent,
 };
 use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
-use crate::hypergraph_state::{hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState};
-use crate::prover_registry::{decode_allocation_tree, rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
+use crate::hypergraph_state::{
+    hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState,
+};
+use crate::prover_registry::{
+    decode_allocation_tree, rebuild_vertex_tree_from_blob, vertex_tree_to_blob,
+};
 
 /// Domain of a target's consent to a succession.
 pub const SUCCESSION_DOMAIN: &[u8] = b"PROVER_SENIORITY_SUCCESSION";
@@ -101,12 +105,16 @@ pub trait GlobalReader {
 impl GlobalReader for HypergraphState {
     fn vertex(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let disc = vertex_adds_discriminator()?;
-        Ok(self.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &disc)?.filter(|blob| !blob.is_empty()))
+        Ok(self
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &disc)?
+            .filter(|blob| !blob.is_empty()))
     }
 
     fn hyperedge(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let disc = hyperedge_adds_discriminator()?;
-        Ok(self.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &disc)?.filter(|blob| !blob.is_empty()))
+        Ok(self
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &disc)?
+            .filter(|blob| !blob.is_empty()))
     }
 }
 
@@ -120,11 +128,19 @@ pub struct GlobalSnapshot {
 
 impl GlobalReader for GlobalSnapshot {
     fn vertex(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        Ok(self.vertices.get(address).filter(|blob| !blob.is_empty()).cloned())
+        Ok(self
+            .vertices
+            .get(address)
+            .filter(|blob| !blob.is_empty())
+            .cloned())
     }
 
     fn hyperedge(&self, address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        Ok(self.hyperedges.get(address).filter(|blob| !blob.is_empty()).cloned())
+        Ok(self
+            .hyperedges
+            .get(address)
+            .filter(|blob| !blob.is_empty())
+            .cloned())
     }
 }
 
@@ -260,7 +276,11 @@ pub enum SeniorityMergeMode {
 
 /// The mode of a merge by `submitter` whose targets have `markers`, at GLOBAL
 /// frame `frame`. Refuses markers that fit no mode.
-pub fn select_mode(frame: u64, submitter: &[u8; 32], markers: &[TargetMarkers]) -> Result<SeniorityMergeMode> {
+pub fn select_mode(
+    frame: u64,
+    submitter: &[u8; 32],
+    markers: &[TargetMarkers],
+) -> Result<SeniorityMergeMode> {
     if !seniority_succession_active(frame) {
         return Ok(SeniorityMergeMode::Legacy);
     }
@@ -273,7 +293,10 @@ pub fn select_mode(frame: u64, submitter: &[u8; 32], markers: &[TargetMarkers]) 
 /// whose markers fit nothing are skipped. Refused: targets counting for two
 /// other provers, or an unconsumed target in a succession (it would be
 /// consumed without credit).
-pub fn mode_from_markers(submitter: &[u8; 32], markers: &[TargetMarkers]) -> Result<SeniorityMergeMode> {
+pub fn mode_from_markers(
+    submitter: &[u8; 32],
+    markers: &[TargetMarkers],
+) -> Result<SeniorityMergeMode> {
     let mut predecessor: Option<[u8; 32]> = None;
     let mut fresh = false;
     for target in markers {
@@ -339,7 +362,8 @@ impl PredecessorState {
         if public_key.is_empty() {
             return Ok(None);
         }
-        let mut linked = hyperedge_allocation_addresses(&reader.hyperedge(address)?.unwrap_or_default())?;
+        let mut linked =
+            hyperedge_allocation_addresses(&reader.hyperedge(address)?.unwrap_or_default())?;
         let global = allocation_address(&public_key, &[])?;
         if !linked.contains(&global) {
             linked.push(global);
@@ -380,7 +404,9 @@ impl PredecessorState {
     /// The last activity recorded for `allocation`: its frame fields and the
     /// prover's `LastSeniorityFrameNumber`.
     pub fn allocation_end_frame(&self, allocation: &ProverAllocationInfo) -> u64 {
-        allocation_frames(allocation).into_iter().fold(self.last_seniority_frame_number, u64::max)
+        allocation_frames(allocation)
+            .into_iter()
+            .fold(self.last_seniority_frame_number, u64::max)
     }
 
     /// The effective status of `allocation` when it keeps this prover from
@@ -389,20 +415,27 @@ impl PredecessorState {
     /// records no activity while its prover produces GLOBAL frames. A
     /// Paused or other live allocation without activity for the quiet period
     /// is left behind and counts as idle.
-    pub fn allocation_blocks(&self, allocation: &ProverAllocationInfo, frame: u64) -> Option<EffectiveStatus> {
+    pub fn allocation_blocks(
+        &self,
+        allocation: &ProverAllocationInfo,
+        frame: u64,
+    ) -> Option<EffectiveStatus> {
         let status = allocation.effective_status(frame);
-        let recent =
-            frame.saturating_sub(self.allocation_end_frame(allocation)) < seniority_succession_quiet_frames();
+        let recent = frame.saturating_sub(self.allocation_end_frame(allocation))
+            < seniority_succession_quiet_frames();
         let global = allocation.confirmation_filter.is_empty() && status == EffectiveStatus::Active;
         (status.is_live() && (recent || global)).then_some(status)
     }
 
     /// The frame its first recorded allocation joined, if any.
     pub fn start_frame(&self) -> Option<u64> {
-        self.allocations.iter().map(|allocation| allocation.join_frame_number).filter(|&frame| frame > 0).min()
+        self.allocations
+            .iter()
+            .map(|allocation| allocation.join_frame_number)
+            .filter(|&frame| frame > 0)
+            .min()
     }
 }
-
 
 /// What keeps a succession from applying.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,7 +455,10 @@ pub enum SuccessionBlocker {
     /// An allocation of the predecessor is live and recorded activity
     /// within the quiet period. A live allocation with no activity for the
     /// quiet period (a Paused or global allocation left behind) is idle.
-    Live { filter: Vec<u8>, status: EffectiveStatus },
+    Live {
+        filter: Vec<u8>,
+        status: EffectiveStatus,
+    },
     /// The predecessor's last activity is within the quiet period.
     Quiet { remaining: u64, until: u64 },
     /// The keys would not raise the submitting prover's seniority: they are
@@ -485,7 +521,11 @@ pub fn set_credited_retro(tree: &mut VectorCommitmentTree, parts: &RetroParts) -
 fn read_parts(tree: &VectorCommitmentTree, field: &str) -> Option<RetroParts> {
     let bytes = read_field(tree, PROVER, field).filter(|bytes| bytes.len() == 40)?;
     Some(std::array::from_fn(|index| {
-        u64::from_be_bytes(bytes[index * 8..index * 8 + 8].try_into().unwrap_or_default())
+        u64::from_be_bytes(
+            bytes[index * 8..index * 8 + 8]
+                .try_into()
+                .unwrap_or_default(),
+        )
     }))
 }
 
@@ -547,7 +587,10 @@ pub fn credit_retro(
 ) -> (u64, RetroParts) {
     let base = held_base(credited, moved, own, retro);
     let after = parts_max(&base, &retro(added));
-    (retro_value(&after).saturating_sub(retro_value(&base)), after)
+    (
+        retro_value(&after).saturating_sub(retro_value(&base)),
+        after,
+    )
 }
 
 /// What a prover holds before crediting new keys: its held ledger, and the
@@ -626,7 +669,8 @@ pub fn succession_amounts(
     let keys = retro(moved);
     let held = predecessor.held.unwrap_or_default();
     let out = predecessor.moved.unwrap_or_default();
-    let available: RetroParts = std::array::from_fn(|p| held[p].max(keys[p].saturating_sub(out[p])));
+    let available: RetroParts =
+        std::array::from_fn(|p| held[p].max(keys[p].saturating_sub(out[p])));
     let taken: RetroParts = std::array::from_fn(|p| keys[p].min(available[p]));
     let left: RetroParts = std::array::from_fn(|p| available[p] - taken[p]);
     let retro_debit = retro_value(&available).saturating_sub(retro_value(&left));
@@ -641,7 +685,9 @@ pub fn succession_amounts(
     } else {
         predecessor.seniority.saturating_sub(retro_debit)
     };
-    let debit = predecessor.seniority.min(retro_debit.saturating_add(accrual_share));
+    let debit = predecessor
+        .seniority
+        .min(retro_debit.saturating_add(accrual_share));
     let accrual = debit - retro_debit.min(debit);
 
     let successor_out = successor.moved.unwrap_or_default();
@@ -709,14 +755,19 @@ pub struct SuccessionPreview {
 
 impl SuccessionPreview {
     pub fn predecessor_seniority(&self) -> u64 {
-        self.predecessor.as_ref().map_or(0, |predecessor| predecessor.seniority)
+        self.predecessor
+            .as_ref()
+            .map_or(0, |predecessor| predecessor.seniority)
     }
 
     /// The predecessor exists and holds no live allocation with recent
     /// activity.
     pub fn predecessor_idle(&self) -> bool {
         self.predecessor.is_some()
-            && !self.blockers.iter().any(|blocker| matches!(blocker, SuccessionBlocker::Live { .. }))
+            && !self
+                .blockers
+                .iter()
+                .any(|blocker| matches!(blocker, SuccessionBlocker::Live { .. }))
     }
 }
 
@@ -738,14 +789,18 @@ pub fn succession_preview(
     let own_seniority = prover_u64(successor_tree, "Seniority");
     let mut blockers = Vec::new();
     if !seniority_succession_active(frame) {
-        blockers.push(SuccessionBlocker::Inactive { epoch: seniority_succession_epoch() });
+        blockers.push(SuccessionBlocker::Inactive {
+            epoch: seniority_succession_epoch(),
+        });
     }
     if predecessor == successor {
         blockers.push(SuccessionBlocker::SameProver);
     }
     let successor_kick = prover_u64(successor_tree, "KickFrameNumber");
     if kick_bars_rejoin(successor_kick, frame) {
-        blockers.push(SuccessionBlocker::SuccessorKicked { frame: successor_kick });
+        blockers.push(SuccessionBlocker::SuccessorKicked {
+            frame: successor_kick,
+        });
     }
     let quiet_frames = seniority_succession_quiet_frames();
     let state = PredecessorState::read(reader, predecessor)?;
@@ -756,7 +811,9 @@ pub fn succession_preview(
         }
         Some(state) => {
             if kick_bars_rejoin(state.kick_frame_number, frame) {
-                blockers.push(SuccessionBlocker::PredecessorKicked { frame: state.kick_frame_number });
+                blockers.push(SuccessionBlocker::PredecessorKicked {
+                    frame: state.kick_frame_number,
+                });
             }
             if state.seniority == 0 {
                 blockers.push(SuccessionBlocker::NoSeniority);
@@ -777,7 +834,8 @@ pub fn succession_preview(
                     until: end.saturating_add(quiet_frames),
                 });
             }
-            let successor_start = PredecessorState::read(reader, successor)?.and_then(|state| state.start_frame());
+            let successor_start =
+                PredecessorState::read(reader, successor)?.and_then(|state| state.start_frame());
             let amounts = succession_amounts(
                 &state.retro,
                 &ProverRetro::of(successor_tree),
@@ -862,7 +920,13 @@ impl SeniorityMergePlan {
     pub fn apply(&self, state: &HypergraphState, frame: u64) -> Result<()> {
         let disc = vertex_adds_discriminator()?;
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-        state.set(domain, &self.successor, &disc, frame, vertex_tree_to_blob(&self.successor_tree))?;
+        state.set(
+            domain,
+            &self.successor,
+            &disc,
+            frame,
+            vertex_tree_to_blob(&self.successor_tree),
+        )?;
         if let Some((address, tree)) = &self.predecessor {
             state.set(domain, address, &disc, frame, vertex_tree_to_blob(tree))?;
         }
@@ -898,10 +962,18 @@ pub fn plan_seniority_merge(
     if op.merge_targets.is_empty() {
         return Err(refused("no merge targets"));
     }
-    let signature = op.public_key_signature_bls48581.as_ref().ok_or_else(|| refused("missing signature"))?;
-    let successor: [u8; 32] =
-        signature.address.as_slice().try_into().map_err(|_| refused("invalid address length"))?;
-    let blob = reader.vertex(&successor)?.ok_or_else(|| refused("prover not found"))?;
+    let signature = op
+        .public_key_signature_bls48581
+        .as_ref()
+        .ok_or_else(|| refused("missing signature"))?;
+    let successor: [u8; 32] = signature
+        .address
+        .as_slice()
+        .try_into()
+        .map_err(|_| refused("invalid address length"))?;
+    let blob = reader
+        .vertex(&successor)?
+        .ok_or_else(|| refused("prover not found"))?;
     let mut successor_tree = rebuild_vertex_tree_from_blob(&blob);
     let kick = prover_u64(&successor_tree, "KickFrameNumber");
     if kick_bars_rejoin(kick, frame) {
@@ -919,11 +991,15 @@ pub fn plan_seniority_merge(
         .collect::<Result<Vec<_>>>()?;
     let mode = mode_from_markers(&successor, &markers)?;
     let consent = match &mode {
-        SeniorityMergeMode::Succession { predecessor } => SeniorityMergeConsent::Succession { predecessor },
+        SeniorityMergeMode::Succession { predecessor } => {
+            SeniorityMergeConsent::Succession { predecessor }
+        }
         _ => SeniorityMergeConsent::Merge,
     };
     if !verify_seniority_merge_consents(op, &pubkey, key_manager, consent)? {
-        return Err(refused(format!("signature verification failed ({mode:?} consent)")));
+        return Err(refused(format!(
+            "signature verification failed ({mode:?} consent)"
+        )));
     }
     let existing = prover_u64(&successor_tree, "Seniority");
     // Keys counting for the submitter, and the others: unconsumed ones in a
@@ -971,17 +1047,27 @@ pub fn plan_seniority_merge(
         }
         SeniorityMergeMode::Succession { predecessor } => {
             let preview = succession_preview(
-                reader, frame, &successor, &successor_tree, &predecessor, &others, &own, retro,
+                reader,
+                frame,
+                &successor,
+                &successor_tree,
+                &predecessor,
+                &others,
+                &own,
+                retro,
             )?;
             if !preview.blockers.is_empty() {
-                let reasons: Vec<String> = preview.blockers.iter().map(ToString::to_string).collect();
+                let reasons: Vec<String> =
+                    preview.blockers.iter().map(ToString::to_string).collect();
                 return Err(refused(format!(
                     "succession from prover {} refused: {}",
                     hex::encode(predecessor),
                     reasons.join("; ")
                 )));
             }
-            let blob = reader.vertex(&predecessor)?.ok_or_else(|| refused(SuccessionBlocker::PredecessorMissing))?;
+            let blob = reader
+                .vertex(&predecessor)?
+                .ok_or_else(|| refused(SuccessionBlocker::PredecessorMissing))?;
             let mut predecessor_tree = rebuild_vertex_tree_from_blob(&blob);
             // Both ledgers and seniorities: the predecessor drops what moved
             // and records it as moved out; the successor holds it.
@@ -1054,7 +1140,9 @@ pub fn plan_submissions(
         let markers = TargetMarkers::read(reader, key)?;
         standings.push((markers, markers.standing(prover)));
     }
-    let tree = reader.vertex(prover)?.map(|blob| rebuild_vertex_tree_from_blob(&blob));
+    let tree = reader
+        .vertex(prover)?
+        .map(|blob| rebuild_vertex_tree_from_blob(&blob));
     let kicked = tree
         .as_ref()
         .map(|tree| prover_u64(tree, "KickFrameNumber"))
@@ -1072,7 +1160,9 @@ pub fn plan_submissions(
     if plan.kicked.is_some() {
         return Ok(plan);
     }
-    let of = |indexes: &[usize]| -> Vec<Vec<u8>> { indexes.iter().map(|&index| keys[index].clone()).collect() };
+    let of = |indexes: &[usize]| -> Vec<Vec<u8>> {
+        indexes.iter().map(|&index| keys[index].clone()).collect()
+    };
     let mut fresh = Vec::new();
     let mut own = Vec::new();
     let mut groups: Vec<([u8; 32], Vec<usize>)> = Vec::new();
@@ -1080,7 +1170,10 @@ pub fn plan_submissions(
         match standing {
             TargetStanding::Fresh => fresh.push(index),
             TargetStanding::Own => own.push(index),
-            TargetStanding::Other(predecessor) => match groups.iter_mut().find(|(address, _)| address == predecessor) {
+            TargetStanding::Other(predecessor) => match groups
+                .iter_mut()
+                .find(|(address, _)| address == predecessor)
+            {
                 Some((_, group)) => group.push(index),
                 None => groups.push((*predecessor, vec![index])),
             },
@@ -1093,15 +1186,32 @@ pub fn plan_submissions(
         if increment > 0 {
             let mut named: Vec<usize> = fresh.iter().chain(&own).copied().collect();
             named.sort_unstable();
-            plan.merge = Some(MergeProposal { keys: named, increment });
+            plan.merge = Some(MergeProposal {
+                keys: named,
+                increment,
+            });
         }
     }
     for (predecessor, group) in groups {
-        let preview = succession_preview(reader, frame, prover, &tree, &predecessor, &of(&group), &of(&own), retro)?;
+        let preview = succession_preview(
+            reader,
+            frame,
+            prover,
+            &tree,
+            &predecessor,
+            &of(&group),
+            &of(&own),
+            retro,
+        )?;
         let moving = group.len();
         let mut named: Vec<usize> = group.into_iter().chain(own.iter().copied()).collect();
         named.sort_unstable();
-        plan.successions.push(SuccessionCandidate { predecessor, keys: named, moving, preview });
+        plan.successions.push(SuccessionCandidate {
+            predecessor,
+            keys: named,
+            moving,
+            preview,
+        });
     }
     Ok(plan)
 }
@@ -1112,7 +1222,9 @@ mod tests {
     use std::sync::Arc;
 
     use quil_hypergraph::HypergraphCrdt;
-    use quil_types::consensus::{epoch_for_frame, epoch_length_frames, set_seniority_succession_epoch_for_thread};
+    use quil_types::consensus::{
+        epoch_for_frame, epoch_length_frames, set_seniority_succession_epoch_for_thread,
+    };
     use quil_types::crypto::KeyType;
     use quil_types::execution::ShardExecutionEngine;
     use sha2::{Digest, Sha256};
@@ -1120,13 +1232,15 @@ mod tests {
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_intrinsic::intrinsic::GlobalIntrinsic;
     use crate::global_intrinsic::materialize::{
-        create_allocation_vertex_tree, create_prover_vertex_tree, extend_prover_allocation_hyperedge_blob,
-        prover_address_from_pubkey,
+        create_allocation_vertex_tree, create_prover_vertex_tree,
+        extend_prover_allocation_hyperedge_blob, prover_address_from_pubkey,
     };
     use crate::global_intrinsic::prover_join::ProverJoin;
     use crate::global_intrinsic::seniority_merge::SeniorityMerge;
     use crate::global_intrinsic::sig_with_pop::SignatureWithPop;
-    use crate::global_intrinsic::verify::{intrinsic_domain, verify_prover_seniority_merge_spent_markers};
+    use crate::global_intrinsic::verify::{
+        intrinsic_domain, verify_prover_seniority_merge_spent_markers,
+    };
     use crate::global_schema::write_type;
     use crate::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
@@ -1187,14 +1301,28 @@ mod tests {
 
     struct DomainKeys;
     impl KeyManager for DomainKeys {
-        fn validate_signature(&self, _: KeyType, key: &[u8], message: &[u8], signature: &[u8], domain: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            key: &[u8],
+            message: &[u8],
+            signature: &[u8],
+            domain: &[u8],
+        ) -> Result<bool> {
             Ok(signature == fake_signature(signature.len(), key, message, domain).as_slice())
         }
     }
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
@@ -1255,7 +1383,11 @@ mod tests {
             }),
             merge_targets: targets
                 .iter()
-                .map(|&byte| SeniorityMerge { signature: vec![byte; 114], key_type: 0, prover_public_key: target(byte) })
+                .map(|&byte| SeniorityMerge {
+                    signature: vec![byte; 114],
+                    key_type: 0,
+                    prover_public_key: target(byte),
+                })
                 .collect(),
             ..Default::default()
         }
@@ -1275,10 +1407,20 @@ mod tests {
             set_retro_parts_for_thread(Some(parts));
             let db = quil_store::RocksDb::open_in_memory().unwrap();
             let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
-            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(quil_hypergraph::testing::StubProver)));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+            let crdt = Arc::new(HypergraphCrdt::new(
+                store,
+                Arc::new(quil_hypergraph::testing::StubProver),
+            ));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let state = HypergraphState::new(crdt.clone());
-            Self { _db: db, crdt, state }
+            Self {
+                _db: db,
+                crdt,
+                state,
+            }
         }
 
         /// X holds 5,000,000 and was last active 10,000 frames before `F`,
@@ -1287,13 +1429,18 @@ mod tests {
         fn eligible() -> Self {
             let world = Self::new();
             world.prover(X, 5_000_000, Some(F - 10_000), 0);
-            world.allocation(X, &DATA_SHARD, 1, &[
-                ("JoinFrameNumber", F - 100_000),
-                ("JoinConfirmFrameNumber", F - 99_000),
-                ("Epoch", epoch_for_frame(F) - 10),
-                ("LastActiveFrameNumber", F - 10_000),
-                ("LastSignedFrameNumber", F - 10_000),
-            ]);
+            world.allocation(
+                X,
+                &DATA_SHARD,
+                1,
+                &[
+                    ("JoinFrameNumber", F - 100_000),
+                    ("JoinConfirmFrameNumber", F - 99_000),
+                    ("Epoch", epoch_for_frame(F) - 10),
+                    ("LastActiveFrameNumber", F - 10_000),
+                    ("LastSignedFrameNumber", F - 10_000),
+                ],
+            );
             world.prover(Y, 100_000, Some(F - 1), 0);
             world.marker(true, 1, Some(X));
             world
@@ -1301,13 +1448,27 @@ mod tests {
 
         fn put(&self, at: &[u8; 32], tree: &VectorCommitmentTree) {
             let disc = vertex_adds_discriminator().unwrap();
-            self.state.set(&GLOBAL_INTRINSIC_ADDRESS[..], at, &disc, 1, vertex_tree_to_blob(tree)).unwrap();
+            self.state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    at,
+                    &disc,
+                    1,
+                    vertex_tree_to_blob(tree),
+                )
+                .unwrap();
         }
 
         fn prover(&self, byte: u8, seniority: u64, last_seniority: Option<u64>, kick: u64) {
             let mut tree = create_prover_vertex_tree(&key(byte), seniority).unwrap();
             if let Some(last) = last_seniority {
-                write_field(&mut tree, PROVER, "LastSeniorityFrameNumber", &last.to_be_bytes()).unwrap();
+                write_field(
+                    &mut tree,
+                    PROVER,
+                    "LastSeniorityFrameNumber",
+                    &last.to_be_bytes(),
+                )
+                .unwrap();
             }
             if kick > 0 {
                 write_field(&mut tree, PROVER, "KickFrameNumber", &kick.to_be_bytes()).unwrap();
@@ -1339,14 +1500,24 @@ mod tests {
             }
             self.put(&at, &tree);
             let disc = hyperedge_adds_discriminator().unwrap();
-            let existing = self.state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &disc).unwrap().unwrap_or_default();
+            let existing = self
+                .state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &disc)
+                .unwrap()
+                .unwrap_or_default();
             let blob = extend_prover_allocation_hyperedge_blob(&existing, &[(at, &tree)]).unwrap();
-            self.state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &disc, 1, blob).unwrap();
+            self.state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &disc, 1, blob)
+                .unwrap();
         }
 
         /// A spent marker of target `byte` naming prover `owner`, or none.
         fn marker(&self, join: bool, byte: u8, owner: Option<u8>) {
-            let at = if join { spent_join_merge_address(&target(byte)) } else { spent_seniority_merge_address(&target(byte)) };
+            let at = if join {
+                spent_join_merge_address(&target(byte))
+            } else {
+                spent_seniority_merge_address(&target(byte))
+            };
             let tree = match owner {
                 Some(owner) => create_spent_merge_tree(&address(owner)).unwrap(),
                 None => {
@@ -1361,7 +1532,12 @@ mod tests {
         fn commit(&self) {
             self.state.commit().unwrap();
             self.state.abort();
-            self.crdt.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            self.crdt
+                .commit_with_global_cursor(
+                    1,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
         }
 
         fn tree(&self, byte: u8) -> VectorCommitmentTree {
@@ -1376,12 +1552,20 @@ mod tests {
             TargetMarkers::read(&self.state, &target(byte)).unwrap()
         }
 
-        fn plan(&self, op: &ProverSeniorityMerge, frame: u64) -> Result<Option<SeniorityMergePlan>> {
+        fn plan(
+            &self,
+            op: &ProverSeniorityMerge,
+            frame: u64,
+        ) -> Result<Option<SeniorityMergePlan>> {
             plan_seniority_merge(op, frame, &self.state, &DomainKeys, &parts)
         }
 
         fn apply(&self, op: &ProverSeniorityMerge, frame: u64) {
-            self.plan(op, frame).unwrap().expect("active").apply(&self.state, frame).unwrap();
+            self.plan(op, frame)
+                .unwrap()
+                .expect("active")
+                .apply(&self.state, frame)
+                .unwrap();
         }
 
         fn refusal(&self, op: &ProverSeniorityMerge, frame: u64) -> String {
@@ -1392,11 +1576,23 @@ mod tests {
         }
 
         fn rejoin(&self, prover: u8, frame: u64, targets: &[u8]) {
-            GlobalIntrinsic::new(Arc::new(AcceptAll)).invoke_step(frame, &join(prover, frame, targets), &self.state).unwrap();
+            GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .invoke_step(frame, &join(prover, frame, targets), &self.state)
+                .unwrap();
         }
 
         fn preview(&self, frame: u64) -> SuccessionPreview {
-            succession_preview(&self.state, frame, &address(Y), &self.tree(Y), &address(X), &[target(1)], &[], &parts).unwrap()
+            succession_preview(
+                &self.state,
+                frame,
+                &address(Y),
+                &self.tree(Y),
+                &address(X),
+                &[target(1)],
+                &[],
+                &parts,
+            )
+            .unwrap()
         }
     }
 
@@ -1407,33 +1603,89 @@ mod tests {
     #[test]
     fn the_mode_follows_the_activation_epoch_and_the_markers() {
         let (x, y, z) = ([1u8; 32], [2u8; 32], [3u8; 32]);
-        let by = |owner: [u8; 32]| TargetMarkers { join: Some(MarkerOwner::Prover(owner)), seniority: None };
-        let legacy = TargetMarkers { join: Some(MarkerOwner::Unattributed), seniority: None };
+        let by = |owner: [u8; 32]| TargetMarkers {
+            join: Some(MarkerOwner::Prover(owner)),
+            seniority: None,
+        };
+        let legacy = TargetMarkers {
+            join: Some(MarkerOwner::Unattributed),
+            seniority: None,
+        };
         let merge_prefix = crate::global_intrinsic::TYPE_PROVER_SENIORITY_MERGE;
 
         set_seniority_succession_epoch_for_thread(Some(u64::MAX));
         for frame in [0, F, u64::MAX - 1] {
-            assert_eq!(select_mode(frame, &y, &[by(x)]).unwrap(), SeniorityMergeMode::Legacy, "inert while unset");
-            assert!(!crate::global_engine::is_global_type_prefix_at(merge_prefix, frame));
+            assert_eq!(
+                select_mode(frame, &y, &[by(x)]).unwrap(),
+                SeniorityMergeMode::Legacy,
+                "inert while unset"
+            );
+            assert!(!crate::global_engine::is_global_type_prefix_at(
+                merge_prefix,
+                frame
+            ));
         }
 
         set_seniority_succession_epoch_for_thread(Some(ACTIVATION));
         let first = ACTIVATION * epoch_length_frames();
-        assert_eq!(select_mode(first - 1, &y, &[by(x)]).unwrap(), SeniorityMergeMode::Legacy);
-        assert!(!crate::global_engine::is_global_type_prefix_at(merge_prefix, first - 1));
-        assert!(crate::global_engine::is_global_type_prefix_at(merge_prefix, first));
+        assert_eq!(
+            select_mode(first - 1, &y, &[by(x)]).unwrap(),
+            SeniorityMergeMode::Legacy
+        );
+        assert!(!crate::global_engine::is_global_type_prefix_at(
+            merge_prefix,
+            first - 1
+        ));
+        assert!(crate::global_engine::is_global_type_prefix_at(
+            merge_prefix,
+            first
+        ));
         let succession = SeniorityMergeMode::Succession { predecessor: x };
         assert_eq!(select_mode(first, &y, &[by(x)]).unwrap(), succession);
-        assert_eq!(select_mode(first, &y, &[by(x), by(y)]).unwrap(), succession, "with the submitter's own keys");
-        assert_eq!(select_mode(first, &y, &[by(x), legacy]).unwrap(), succession, "a legacy key is skipped");
-        assert_eq!(select_mode(first, &y, &[TargetMarkers::default()]).unwrap(), SeniorityMergeMode::Merge);
-        assert_eq!(select_mode(first, &y, &[by(y)]).unwrap(), SeniorityMergeMode::Merge, "the submitter's own markers");
-        assert_eq!(select_mode(first, &y, &[legacy]).unwrap(), SeniorityMergeMode::Merge, "skipped, never an error");
-        assert!(select_mode(first, &y, &[by(x), by(z)]).is_err(), "two predecessors");
-        assert!(select_mode(first, &y, &[by(x), TargetMarkers::default()]).is_err(), "an unconsumed target in a succession");
-        let conflicting = TargetMarkers { join: Some(MarkerOwner::Prover(x)), seniority: Some(MarkerOwner::Prover(z)) };
-        assert_eq!(conflicting.standing(&y), TargetStanding::Unusable(Unusable::Conflicting));
-        assert_eq!(legacy.standing(&y), TargetStanding::Unusable(Unusable::Legacy));
+        assert_eq!(
+            select_mode(first, &y, &[by(x), by(y)]).unwrap(),
+            succession,
+            "with the submitter's own keys"
+        );
+        assert_eq!(
+            select_mode(first, &y, &[by(x), legacy]).unwrap(),
+            succession,
+            "a legacy key is skipped"
+        );
+        assert_eq!(
+            select_mode(first, &y, &[TargetMarkers::default()]).unwrap(),
+            SeniorityMergeMode::Merge
+        );
+        assert_eq!(
+            select_mode(first, &y, &[by(y)]).unwrap(),
+            SeniorityMergeMode::Merge,
+            "the submitter's own markers"
+        );
+        assert_eq!(
+            select_mode(first, &y, &[legacy]).unwrap(),
+            SeniorityMergeMode::Merge,
+            "skipped, never an error"
+        );
+        assert!(
+            select_mode(first, &y, &[by(x), by(z)]).is_err(),
+            "two predecessors"
+        );
+        assert!(
+            select_mode(first, &y, &[by(x), TargetMarkers::default()]).is_err(),
+            "an unconsumed target in a succession"
+        );
+        let conflicting = TargetMarkers {
+            join: Some(MarkerOwner::Prover(x)),
+            seniority: Some(MarkerOwner::Prover(z)),
+        };
+        assert_eq!(
+            conflicting.standing(&y),
+            TargetStanding::Unusable(Unusable::Conflicting)
+        );
+        assert_eq!(
+            legacy.standing(&y),
+            TargetStanding::Unusable(Unusable::Legacy)
+        );
     }
 
     /// A key's retro counts once per prover however keys are split across
@@ -1443,14 +1695,34 @@ mod tests {
         set_retro_parts_for_thread(Some(parts));
         let (credit, recorded) = credit_retro(None, None, &[target(5)], &[], &parts);
         assert_eq!((credit, recorded), (500, [500, 0, 0, 0, 0]));
-        assert_eq!(credit_retro(Some(recorded), None, &[target(7)], &[], &parts).0, 0, "an overlapping key in a later op");
-        assert_eq!(credit_retro(Some(recorded), None, &[target(6)], &[], &parts).0, 300, "a disjoint key");
-        assert_eq!(credit_retro(None, None, &[target(7)], &[target(5)], &parts).0, 0, "a first op starts from its own keys");
-        assert_eq!(credit_retro(Some([500, 300, 0, 0, 0]), None, &[target(8)], &[], &parts).0, 7_000_000 - 800, "the mainnet part");
+        assert_eq!(
+            credit_retro(Some(recorded), None, &[target(7)], &[], &parts).0,
+            0,
+            "an overlapping key in a later op"
+        );
+        assert_eq!(
+            credit_retro(Some(recorded), None, &[target(6)], &[], &parts).0,
+            300,
+            "a disjoint key"
+        );
+        assert_eq!(
+            credit_retro(None, None, &[target(7)], &[target(5)], &parts).0,
+            0,
+            "a first op starts from its own keys"
+        );
+        assert_eq!(
+            credit_retro(Some([500, 300, 0, 0, 0]), None, &[target(8)], &[], &parts).0,
+            7_000_000 - 800,
+            "the mainnet part"
+        );
     }
 
     fn bare(seniority: u64) -> ProverRetro {
-        ProverRetro { seniority, held: None, moved: None }
+        ProverRetro {
+            seniority,
+            held: None,
+            moved: None,
+        }
     }
 
     /// What moves: the keys' retro the predecessor holds, and its accrual
@@ -1462,41 +1734,119 @@ mod tests {
         let moved = [target(1)];
         let end = F - 100_000;
         // No ledger: the first mover takes the whole accrual.
-        let amounts = succession_amounts(&bare(6_300_000), &bare(0), None, &moved, &[], F, end, &parts);
-        assert_eq!((amounts.debit, amounts.accrual, amounts.credit), (6_300_000, 1_300_000, 6_300_000));
+        let amounts = succession_amounts(
+            &bare(6_300_000),
+            &bare(0),
+            None,
+            &moved,
+            &[],
+            F,
+            end,
+            &parts,
+        );
+        assert_eq!(
+            (amounts.debit, amounts.accrual, amounts.credit),
+            (6_300_000, 1_300_000, 6_300_000)
+        );
         assert_eq!(
             amounts.predecessor,
-            ProverRetro { seniority: 0, held: Some([0; 5]), moved: Some([5_000_000, 0, 0, 0, 0]) }
+            ProverRetro {
+                seniority: 0,
+                held: Some([0; 5]),
+                moved: Some([5_000_000, 0, 0, 0, 0])
+            }
         );
         // A ledger of 6,000,000 and 300,000 accrual: key 1 holds 5/6.
-        let x = ProverRetro { seniority: 6_300_000, held: Some([5_000_000, 1_000_000, 0, 0, 0]), moved: None };
+        let x = ProverRetro {
+            seniority: 6_300_000,
+            held: Some([5_000_000, 1_000_000, 0, 0, 0]),
+            moved: None,
+        };
         let first = succession_amounts(&x, &bare(0), None, &moved, &[], F, end, &parts);
-        assert_eq!((first.debit, first.accrual, first.credit), (5_250_000, 250_000, 5_250_000));
+        assert_eq!(
+            (first.debit, first.accrual, first.credit),
+            (5_250_000, 250_000, 5_250_000)
+        );
         // The second mover still finds its key and its accrual share.
-        let second = succession_amounts(&first.predecessor, &bare(0), None, &[target(2)], &[], F, end, &parts);
-        assert_eq!((second.debit, second.credit, second.predecessor.seniority), (1_050_000, 1_050_000, 0));
+        let second = succession_amounts(
+            &first.predecessor,
+            &bare(0),
+            None,
+            &[target(2)],
+            &[],
+            F,
+            end,
+            &parts,
+        );
+        assert_eq!(
+            (second.debit, second.credit, second.predecessor.seniority),
+            (1_050_000, 1_050_000, 0)
+        );
         // The successor's accrual earned while the predecessor was active
         // (100,000 beyond 10 × 1,000 frames) is taken off the accrual, unless
         // it started after the predecessor stopped.
-        let overlapping = succession_amounts(&x, &bare(100_000), None, &moved, &[], F, F - 1_000, &parts);
-        assert_eq!((overlapping.debit, overlapping.credit), (5_250_000, 5_160_000));
-        let later = succession_amounts(&x, &bare(100_000), Some(F - 500), &moved, &[], F, F - 1_000, &parts);
+        let overlapping =
+            succession_amounts(&x, &bare(100_000), None, &moved, &[], F, F - 1_000, &parts);
+        assert_eq!(
+            (overlapping.debit, overlapping.credit),
+            (5_250_000, 5_160_000)
+        );
+        let later = succession_amounts(
+            &x,
+            &bare(100_000),
+            Some(F - 500),
+            &moved,
+            &[],
+            F,
+            F - 1_000,
+            &parts,
+        );
         assert_eq!(later.credit, 5_250_000);
         // Retro the successor already holds: the predecessor loses it, the
         // successor gains nothing, and its ledger records nothing new.
-        let holder = ProverRetro { seniority: 5_000_000, held: Some([5_000_000, 0, 0, 0, 0]), moved: None };
-        let amounts = succession_amounts(&bare(5_000_000), &holder, None, &moved, &[], F, end, &parts);
-        assert_eq!((amounts.debit, amounts.credit, amounts.successor.held), (5_000_000, 0, holder.held));
+        let holder = ProverRetro {
+            seniority: 5_000_000,
+            held: Some([5_000_000, 0, 0, 0, 0]),
+            moved: None,
+        };
+        let amounts =
+            succession_amounts(&bare(5_000_000), &holder, None, &moved, &[], F, end, &parts);
+        assert_eq!(
+            (amounts.debit, amounts.credit, amounts.successor.held),
+            (5_000_000, 0, holder.held)
+        );
         // Never more than the predecessor holds; the successor then holds the
         // retro in proportion and records the rest as moved out, so a later
         // mover of the key finds only what it gained.
-        let capped = succession_amounts(&bare(3_000_000), &bare(0), None, &moved, &[], F, end, &parts);
+        let capped = succession_amounts(
+            &bare(3_000_000),
+            &bare(0),
+            None,
+            &moved,
+            &[],
+            F,
+            end,
+            &parts,
+        );
         assert_eq!((capped.debit, capped.credit), (3_000_000, 3_000_000));
         assert_eq!(
             capped.successor,
-            ProverRetro { seniority: 3_000_000, held: Some([3_000_000, 0, 0, 0, 0]), moved: Some([2_000_000, 0, 0, 0, 0]) }
+            ProverRetro {
+                seniority: 3_000_000,
+                held: Some([3_000_000, 0, 0, 0, 0]),
+                moved: Some([2_000_000, 0, 0, 0, 0])
+            }
         );
-        let onward = succession_amounts(&capped.successor, &bare(0), None, &moved, &[], F, end, &parts);
+        let onward = succession_amounts(
+            &capped.successor,
+            &bare(0),
+            None,
+            &moved,
+            &[],
+            F,
+            end,
+            &parts,
+        );
         assert_eq!(onward.debit, 3_000_000);
     }
 
@@ -1505,14 +1855,46 @@ mod tests {
     #[test]
     fn a_ledger_debits_a_period_once_and_trusts_a_marker_for_a_missing_part() {
         let end = F - 100_000;
-        let x = ProverRetro { seniority: 10_000, held: Some([500, 0, 0, 0, 0]), moved: None };
+        let x = ProverRetro {
+            seniority: 10_000,
+            held: Some([500, 0, 0, 0, 0]),
+            moved: None,
+        };
         let first = succession_amounts(&x, &bare(0), None, &[target(5)], &[], F, end, &parts);
         assert_eq!(first.predecessor.held, Some([0; 5]));
-        let second = succession_amounts(&first.predecessor, &bare(0), None, &[target(7)], &[], F, end, &parts);
-        assert_eq!(second.credit, 0, "key 7 shares key 5's period, already moved");
-        let bootstrapped = ProverRetro { seniority: 6_000_000, held: Some([0, 1_000_000, 0, 0, 0]), moved: None };
-        let amounts = succession_amounts(&bootstrapped, &bare(0), None, &[target(1)], &[], F, end, &parts);
-        assert_eq!(amounts.debit, 5_000_000, "key 1's part, proven by its marker");
+        let second = succession_amounts(
+            &first.predecessor,
+            &bare(0),
+            None,
+            &[target(7)],
+            &[],
+            F,
+            end,
+            &parts,
+        );
+        assert_eq!(
+            second.credit, 0,
+            "key 7 shares key 5's period, already moved"
+        );
+        let bootstrapped = ProverRetro {
+            seniority: 6_000_000,
+            held: Some([0, 1_000_000, 0, 0, 0]),
+            moved: None,
+        };
+        let amounts = succession_amounts(
+            &bootstrapped,
+            &bare(0),
+            None,
+            &[target(1)],
+            &[],
+            F,
+            end,
+            &parts,
+        );
+        assert_eq!(
+            amounts.debit, 5_000_000,
+            "key 1's part, proven by its marker"
+        );
     }
 
     #[test]
@@ -1520,49 +1902,132 @@ mod tests {
         let world = World::eligible();
         let op = claim(Y, F, &[1], Consent::Succession(X));
         let plan = world.plan(&op, F).unwrap().expect("active");
-        assert_eq!(plan.mode, SeniorityMergeMode::Succession { predecessor: address(X) });
+        assert_eq!(
+            plan.mode,
+            SeniorityMergeMode::Succession {
+                predecessor: address(X)
+            }
+        );
         assert_eq!(plan.seniority(), 5_100_000);
         plan.apply(&world.state, F).unwrap();
         assert_eq!((world.seniority(X), world.seniority(Y)), (0, 5_100_000));
-        assert_eq!(world.markers(1), TargetMarkers { join: named(Y), seniority: named(Y) });
-        assert_eq!(credited_retro(&world.tree(Y)), Some([5_000_000, 0, 0, 0, 0]), "recorded on the successor");
+        assert_eq!(
+            world.markers(1),
+            TargetMarkers {
+                join: named(Y),
+                seniority: named(Y)
+            }
+        );
+        assert_eq!(
+            credited_retro(&world.tree(Y)),
+            Some([5_000_000, 0, 0, 0, 0]),
+            "recorded on the successor"
+        );
         assert_eq!(
             ProverRetro::of(&world.tree(X)),
-            ProverRetro { seniority: 0, held: Some([0; 5]), moved: Some([5_000_000, 0, 0, 0, 0]) }
+            ProverRetro {
+                seniority: 0,
+                held: Some([0; 5]),
+                moved: Some([5_000_000, 0, 0, 0, 0])
+            }
         );
-        assert_eq!(prover_u64(&world.tree(X), "LastSeniorityFrameNumber"), F - 10_000, "the predecessor keeps its history");
+        assert_eq!(
+            prover_u64(&world.tree(X), "LastSeniorityFrameNumber"),
+            F - 10_000,
+            "the predecessor keeps its history"
+        );
     }
 
     #[test]
     fn a_consent_signed_for_the_old_domain_another_predecessor_or_frame_is_refused() {
         let world = World::eligible();
         world.prover(Z, 1, Some(F - 50_000), 0);
-        for consent in [Consent::Merge, Consent::Succession(Z), Consent::SuccessionAt(X, F - 5)] {
-            assert!(world.refusal(&claim(Y, F, &[1], consent), F).contains("signature verification failed"));
+        for consent in [
+            Consent::Merge,
+            Consent::Succession(Z),
+            Consent::SuccessionAt(X, F - 5),
+        ] {
+            assert!(world
+                .refusal(&claim(Y, F, &[1], consent), F)
+                .contains("signature verification failed"));
         }
-        assert_eq!((world.seniority(X), world.seniority(Y)), (5_000_000, 100_000));
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y)),
+            (5_000_000, 100_000)
+        );
     }
 
     #[test]
     fn a_kicked_live_or_recent_predecessor_is_refused() {
         type Setup = fn(&World);
         let cases: [(&str, Setup, &str); 9] = [
-            ("kicked", |w| w.prover(X, 5_000_000, Some(F - 10_000), 850_000), "kicked at frame 850000"),
-            ("no seniority", |w| w.prover(X, 0, Some(F - 10_000), 0), "holds no seniority"),
-            ("active", |w| w.allocation(X, &[0x6B; 32], 1, &[("JoinConfirmFrameNumber", F - 99_000), ("Epoch", epoch_for_frame(F)), ("LastActiveFrameNumber", F - 100)]), "is Active"),
-            ("joining", |w| w.allocation(X, &[0x6B; 32], 0, &[("JoinFrameNumber", F - 100)]), "is Joining"),
-            ("leaving", |w| w.allocation(X, &[0x6B; 32], 3, &[("LeaveFrameNumber", F - 100)]), "is Leaving"),
-            ("paused", |w| w.allocation(X, &[0x6B; 32], 2, &[("PauseFrameNumber", F - 500)]), "is Paused"),
-            ("global active", |w| w.allocation(X, &[], 1, &[("LastActiveFrameNumber", F - 100)]), "global allocation is Active"),
-            ("quiet", |w| w.prover(X, 5_000_000, Some(F - 1_000), 0), "440 more frames without activity (until frame 900440)"),
-            ("successor kicked", |w| w.prover(Y, 100_000, Some(F - 1), 850_000), "this prover was kicked at frame 850000"),
+            (
+                "kicked",
+                |w| w.prover(X, 5_000_000, Some(F - 10_000), 850_000),
+                "kicked at frame 850000",
+            ),
+            (
+                "no seniority",
+                |w| w.prover(X, 0, Some(F - 10_000), 0),
+                "holds no seniority",
+            ),
+            (
+                "active",
+                |w| {
+                    w.allocation(
+                        X,
+                        &[0x6B; 32],
+                        1,
+                        &[
+                            ("JoinConfirmFrameNumber", F - 99_000),
+                            ("Epoch", epoch_for_frame(F)),
+                            ("LastActiveFrameNumber", F - 100),
+                        ],
+                    )
+                },
+                "is Active",
+            ),
+            (
+                "joining",
+                |w| w.allocation(X, &[0x6B; 32], 0, &[("JoinFrameNumber", F - 100)]),
+                "is Joining",
+            ),
+            (
+                "leaving",
+                |w| w.allocation(X, &[0x6B; 32], 3, &[("LeaveFrameNumber", F - 100)]),
+                "is Leaving",
+            ),
+            (
+                "paused",
+                |w| w.allocation(X, &[0x6B; 32], 2, &[("PauseFrameNumber", F - 500)]),
+                "is Paused",
+            ),
+            (
+                "global active",
+                |w| w.allocation(X, &[], 1, &[("LastActiveFrameNumber", F - 100)]),
+                "global allocation is Active",
+            ),
+            (
+                "quiet",
+                |w| w.prover(X, 5_000_000, Some(F - 1_000), 0),
+                "440 more frames without activity (until frame 900440)",
+            ),
+            (
+                "successor kicked",
+                |w| w.prover(Y, 100_000, Some(F - 1), 850_000),
+                "this prover was kicked at frame 850000",
+            ),
         ];
         for (case, setup, reason) in cases {
             let world = World::eligible();
             setup(&world);
             let refusal = world.refusal(&claim(Y, F, &[1], Consent::Succession(X)), F);
             assert!(refusal.contains(reason), "{case}: {refusal}");
-            assert_eq!(world.seniority(Y), 100_000, "{case}: the successor keeps its seniority");
+            assert_eq!(
+                world.seniority(Y),
+                100_000,
+                "{case}: the successor keeps its seniority"
+            );
             assert_eq!(world.markers(1).join, named(X), "{case}: the markers stay");
         }
         // An allocation past its epoch is idle: the eligible world has one.
@@ -1576,7 +2041,15 @@ mod tests {
     #[test]
     fn allocations_left_behind_count_as_idle_after_the_quiet_period() {
         let world = World::eligible();
-        world.allocation(X, &[0x6B; 32], 2, &[("JoinFrameNumber", F - 90_000), ("PauseFrameNumber", F - 20_000)]);
+        world.allocation(
+            X,
+            &[0x6B; 32],
+            2,
+            &[
+                ("JoinFrameNumber", F - 90_000),
+                ("PauseFrameNumber", F - 20_000),
+            ],
+        );
         assert_eq!(world.preview(F).blockers, vec![]);
         world.apply(&claim(Y, F, &[1], Consent::Succession(X)), F);
         assert_eq!(world.seniority(Y), 5_100_000);
@@ -1585,18 +2058,34 @@ mod tests {
         world.allocation(X, &[], 1, &[("JoinFrameNumber", F - 50_000)]);
         assert_eq!(
             world.preview(F).blockers,
-            vec![SuccessionBlocker::Live { filter: vec![], status: EffectiveStatus::Active }]
+            vec![SuccessionBlocker::Live {
+                filter: vec![],
+                status: EffectiveStatus::Active
+            }]
         );
 
         let world = World::eligible();
-        world.allocation(X, &[0x6B; 32], 1, &[
-            ("JoinConfirmFrameNumber", F - 99_000),
-            ("Epoch", epoch_for_frame(F)),
-            ("LastActiveFrameNumber", F - 300),
-        ]);
+        world.allocation(
+            X,
+            &[0x6B; 32],
+            1,
+            &[
+                ("JoinConfirmFrameNumber", F - 99_000),
+                ("Epoch", epoch_for_frame(F)),
+                ("LastActiveFrameNumber", F - 300),
+            ],
+        );
         let blockers = world.preview(F).blockers;
-        assert!(blockers.contains(&SuccessionBlocker::Live { filter: vec![0x6B; 32], status: EffectiveStatus::Active }), "{blockers:?}");
-        assert!(blockers.iter().any(|blocker| matches!(blocker, SuccessionBlocker::Quiet { .. })));
+        assert!(
+            blockers.contains(&SuccessionBlocker::Live {
+                filter: vec![0x6B; 32],
+                status: EffectiveStatus::Active
+            }),
+            "{blockers:?}"
+        );
+        assert!(blockers
+            .iter()
+            .any(|blocker| matches!(blocker, SuccessionBlocker::Quiet { .. })));
     }
 
     #[test]
@@ -1605,22 +2094,40 @@ mod tests {
         let world = World::eligible();
         world.prover(Z, 1, Some(F - 50_000), 0);
         world.marker(true, 2, Some(Z));
-        assert!(world.refusal(&claim(Y, F, &[1, 2], Consent::Succession(X)), F).contains("count for different provers"));
+        assert!(world
+            .refusal(&claim(Y, F, &[1, 2], Consent::Succession(X)), F)
+            .contains("count for different provers"));
         // An unconsumed key in a succession.
         let world = World::eligible();
-        assert!(world.refusal(&claim(Y, F, &[1, 2], Consent::Succession(X)), F).contains("unconsumed target"));
+        assert!(world
+            .refusal(&claim(Y, F, &[1, 2], Consent::Succession(X)), F)
+            .contains("unconsumed target"));
         // A key whose markers fit nothing is skipped: left alone, so the op
         // names nothing to credit.
         let world = World::eligible();
         world.marker(false, 1, None);
-        assert!(world.refusal(&claim(Y, F, &[1], Consent::Merge), F).contains("no target is unconsumed"));
+        assert!(world
+            .refusal(&claim(Y, F, &[1], Consent::Merge), F)
+            .contains("no target is unconsumed"));
         assert_eq!(world.markers(1).seniority, Some(MarkerOwner::Unattributed));
         // X == Y: markers naming the submitter select a merge, which the
         // succession consent does not sign.
         let world = World::eligible();
         world.marker(true, 1, Some(Y));
-        assert!(world.refusal(&claim(Y, F, &[1], Consent::Succession(Y)), F).contains("signature verification failed"));
-        let preview = succession_preview(&world.state, F, &address(Y), &world.tree(Y), &address(Y), &[], &[], &parts).unwrap();
+        assert!(world
+            .refusal(&claim(Y, F, &[1], Consent::Succession(Y)), F)
+            .contains("signature verification failed"));
+        let preview = succession_preview(
+            &world.state,
+            F,
+            &address(Y),
+            &world.tree(Y),
+            &address(Y),
+            &[],
+            &[],
+            &parts,
+        )
+        .unwrap();
         assert!(preview.blockers.contains(&SuccessionBlocker::SameProver));
     }
 
@@ -1630,15 +2137,33 @@ mod tests {
         // A rejoin wrote the vertex without `LastSeniorityFrameNumber`; its
         // allocation still records the predecessor's last signed frame.
         world.prover(X, 5_000_000, None, 0);
-        world.allocation(X, &[0x6B; 32], 1, &[
-            ("JoinFrameNumber", F - 30_000),
-            ("Epoch", epoch_for_frame(F) - 2),
-            ("LastSignedFrameNumber", F - 1_000),
-        ]);
+        world.allocation(
+            X,
+            &[0x6B; 32],
+            1,
+            &[
+                ("JoinFrameNumber", F - 30_000),
+                ("Epoch", epoch_for_frame(F) - 2),
+                ("LastSignedFrameNumber", F - 1_000),
+            ],
+        );
         let preview = world.preview(F);
-        assert_eq!(preview.predecessor.as_ref().unwrap().last_seniority_frame_number, 0);
+        assert_eq!(
+            preview
+                .predecessor
+                .as_ref()
+                .unwrap()
+                .last_seniority_frame_number,
+            0
+        );
         assert_eq!(preview.end_frame, F - 1_000);
-        assert_eq!(preview.blockers, vec![SuccessionBlocker::Quiet { remaining: 440, until: F + 440 }]);
+        assert_eq!(
+            preview.blockers,
+            vec![SuccessionBlocker::Quiet {
+                remaining: 440,
+                until: F + 440
+            }]
+        );
         assert!(world.preview(F + 440).blockers.is_empty());
     }
 
@@ -1654,7 +2179,10 @@ mod tests {
         assert!(world.plan(&by_y, F).is_err());
         // A later frame within the op's freshness window.
         assert!(world.plan(&by_y, F + 1).is_err());
-        assert_eq!((world.seniority(X), world.seniority(Y), world.seniority(Z)), (0, 5_100_000, 0));
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y), world.seniority(Z)),
+            (0, 5_100_000, 0)
+        );
     }
 
     #[test]
@@ -1668,8 +2196,17 @@ mod tests {
         // Y records key 1's retro: its 100,000 beyond it is accrual, which
         // moves pro rata (all of it: key 1 is Y's whole record).
         world.apply(&claim(Z, F + 5, &[1], Consent::Succession(Y)), F + 5);
-        assert_eq!((world.seniority(X), world.seniority(Y), world.seniority(Z)), (0, 0, 5_100_000));
-        assert_eq!(world.markers(1), TargetMarkers { join: named(Z), seniority: named(Z) });
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y), world.seniority(Z)),
+            (0, 0, 5_100_000)
+        );
+        assert_eq!(
+            world.markers(1),
+            TargetMarkers {
+                join: named(Z),
+                seniority: named(Z)
+            }
+        );
     }
 
     /// Per-key succession. From a predecessor without a ledger the first
@@ -1684,8 +2221,14 @@ mod tests {
         world.prover(W, 0, Some(F - 50_000), 0);
         let before = total(&world);
         world.apply(&claim(Y, F, &[1], Consent::Succession(X)), F);
-        assert_eq!((world.seniority(X), world.seniority(Y)), (0, 6_400_000), "the first mover takes X's accrual too");
-        assert!(world.refusal(&claim(W, F, &[2], Consent::Succession(X)), F).contains("holds no seniority"));
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y)),
+            (0, 6_400_000),
+            "the first mover takes X's accrual too"
+        );
+        assert!(world
+            .refusal(&claim(W, F, &[2], Consent::Succession(X)), F)
+            .contains("holds no seniority"));
         assert_eq!(total(&world), before);
 
         let world = World::eligible();
@@ -1695,13 +2238,26 @@ mod tests {
         world.prover(W, 0, Some(F - 50_000), 0);
         let before = total(&world);
         world.apply(&claim(Y, F, &[1], Consent::Succession(X)), F);
-        assert_eq!((world.seniority(X), world.seniority(Y)), (1_050_000, 5_350_000));
-        assert_eq!(world.markers(2).join, named(X), "the other key still counts for X");
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y)),
+            (1_050_000, 5_350_000)
+        );
+        assert_eq!(
+            world.markers(2).join,
+            named(X),
+            "the other key still counts for X"
+        );
         // X merges its other key: it already counts for X.
-        assert!(world.refusal(&claim(X, F, &[2], Consent::Merge), F).contains("no target is unconsumed"));
+        assert!(world
+            .refusal(&claim(X, F, &[2], Consent::Merge), F)
+            .contains("no target is unconsumed"));
         // Y cannot move key 1 again: it counts for Y now.
-        assert!(world.refusal(&claim(Y, F, &[1], Consent::Succession(X)), F).contains("signature verification failed"));
-        assert!(world.refusal(&claim(Y, F, &[1], Consent::Merge), F).contains("no target is unconsumed"));
+        assert!(world
+            .refusal(&claim(Y, F, &[1], Consent::Succession(X)), F)
+            .contains("signature verification failed"));
+        assert!(world
+            .refusal(&claim(Y, F, &[1], Consent::Merge), F)
+            .contains("no target is unconsumed"));
         // Key 2's holder moves its share to W.
         world.apply(&claim(W, F, &[2], Consent::Succession(X)), F);
         assert_eq!((world.seniority(X), world.seniority(W)), (0, 1_050_000));
@@ -1711,7 +2267,11 @@ mod tests {
         assert_eq!(world.seniority(X), 0);
         assert_eq!(world.markers(2).join, named(W));
         assert_eq!(world.markers(3).join, named(X), "a fresh key is stamped");
-        assert_eq!(ProverRetro::of(&world.tree(X)).moved, Some([5_000_000, 1_000_000, 0, 0, 0]), "a rejoin keeps the ledger");
+        assert_eq!(
+            ProverRetro::of(&world.tree(X)).moved,
+            Some([5_000_000, 1_000_000, 0, 0, 0]),
+            "a rejoin keeps the ledger"
+        );
     }
 
     /// X's own key whose period already moved out holds nothing there: a key
@@ -1733,7 +2293,11 @@ mod tests {
         let world = setup();
         world.set_seniority(Y, 1_500);
         world.apply(&claim(X, F + 5, &[5, 7], Consent::Succession(Y)), F + 5);
-        assert_eq!((world.seniority(X), world.seniority(Y)), (1_500, 0), "nothing is destroyed");
+        assert_eq!(
+            (world.seniority(X), world.seniority(Y)),
+            (1_500, 0),
+            "nothing is destroyed"
+        );
         // Without accrual the move back is still a gain.
         let world = setup();
         world.apply(&claim(X, F + 5, &[5, 7], Consent::Succession(Y)), F + 5);
@@ -1749,7 +2313,9 @@ mod tests {
         world.apply(&claim(X, F, &[6, 7], Consent::Merge), F);
         assert_eq!(world.seniority(X), 300);
         assert_eq!(credited_retro(&world.tree(X)), Some([0, 300, 0, 0, 0]));
-        assert!(world.refusal(&claim(Z, F, &[7], Consent::Succession(X)), F).contains("would not raise"));
+        assert!(world
+            .refusal(&claim(Z, F, &[7], Consent::Succession(X)), F)
+            .contains("would not raise"));
     }
 
     /// A successor that moves keys back is credited them again.
@@ -1762,7 +2328,11 @@ mod tests {
         assert_eq!((world.seniority(X), world.seniority(Y)), (5_100_000, 0));
         assert_eq!(
             ProverRetro::of(&world.tree(X)),
-            ProverRetro { seniority: 5_100_000, held: Some([5_000_000, 0, 0, 0, 0]), moved: Some([0; 5]) }
+            ProverRetro {
+                seniority: 5_100_000,
+                held: Some([5_000_000, 0, 0, 0, 0]),
+                moved: Some([0; 5])
+            }
         );
     }
 
@@ -1777,7 +2347,13 @@ mod tests {
         assert_eq!(world.seniority(Y), 500);
         world.rejoin(Z, F + 1, &[5]);
         assert_eq!(world.seniority(Z), 0);
-        assert_eq!(world.markers(5), TargetMarkers { join: None, seniority: named(Y) });
+        assert_eq!(
+            world.markers(5),
+            TargetMarkers {
+                join: None,
+                seniority: named(Y)
+            }
+        );
         assert_eq!(world.markers(5).standing(&address(Y)), TargetStanding::Own);
     }
 
@@ -1789,7 +2365,9 @@ mod tests {
         world.apply(&claim(Y, F, &[1], Consent::Succession(X)), F);
         world.rejoin(Y, F + 1, &[1]);
         assert_eq!(world.seniority(Y), 5_100_000);
-        assert!(world.refusal(&claim(Y, F + 1, &[1], Consent::Merge), F + 1).contains("no target is unconsumed"));
+        assert!(world
+            .refusal(&claim(Y, F + 1, &[1], Consent::Merge), F + 1)
+            .contains("no target is unconsumed"));
     }
 
     #[test]
@@ -1800,14 +2378,22 @@ mod tests {
         let plan = world.plan(&op, F).unwrap().unwrap();
         assert_eq!(plan.mode, SeniorityMergeMode::Merge);
         assert_eq!(plan.seniority(), 600);
-        assert_eq!(plan.markers, vec![spent_seniority_merge_address(&target(5)).unwrap()]);
+        assert_eq!(
+            plan.markers,
+            vec![spent_seniority_merge_address(&target(5)).unwrap()]
+        );
         // An established prover still gains what a new key adds.
         world.prover(Y, 600_000, Some(F - 1), 0);
         assert_eq!(world.plan(&op, F).unwrap().unwrap().seniority(), 600_500);
         // A key worth nothing adds nothing.
-        assert!(world.refusal(&claim(Y, F, &[3], Consent::Merge), F).contains("add no seniority"));
+        assert!(world
+            .refusal(&claim(Y, F, &[3], Consent::Merge), F)
+            .contains("add no seniority"));
         set_seniority_succession_epoch_for_thread(Some(u64::MAX));
-        assert!(world.plan(&op, F).unwrap().is_none(), "the earlier rules apply");
+        assert!(
+            world.plan(&op, F).unwrap().is_none(),
+            "the earlier rules apply"
+        );
     }
 
     /// Same-prover idempotency: a merge may name keys that already count for
@@ -1818,22 +2404,40 @@ mod tests {
         world.prover(Y, 600, Some(F - 1), 0);
         world.marker(true, 5, Some(Y));
         let replay = claim(Y, F, &[5], Consent::Merge);
-        assert!(world.refusal(&replay, F).contains("no target is unconsumed"));
+        assert!(world
+            .refusal(&replay, F)
+            .contains("no target is unconsumed"));
         // {consumed, fresh}: only what the fresh key adds.
         let both = claim(Y, F, &[5, 6], Consent::Merge);
         let plan = world.plan(&both, F).unwrap().unwrap();
         assert_eq!(plan.seniority(), 900, "600 + 300");
-        assert_eq!(plan.markers, vec![spent_seniority_merge_address(&target(6)).unwrap()], "only the fresh key is stamped");
-        assert!(world.refusal(&claim(Y, F, &[5, 7], Consent::Merge), F).contains("add no seniority"), "key 7 overlaps key 5");
+        assert_eq!(
+            plan.markers,
+            vec![spent_seniority_merge_address(&target(6)).unwrap()],
+            "only the fresh key is stamped"
+        );
+        assert!(
+            world
+                .refusal(&claim(Y, F, &[5, 7], Consent::Merge), F)
+                .contains("add no seniority"),
+            "key 7 overlaps key 5"
+        );
         plan.apply(&world.state, F).unwrap();
-        assert!(world.plan(&both, F + 1).is_err(), "a replay names no unconsumed key");
+        assert!(
+            world.plan(&both, F + 1).is_err(),
+            "a replay names no unconsumed key"
+        );
         assert_eq!(world.seniority(Y), 900);
         // Before activation a consumed target refuses the merge outright.
-        let earlier = verify_prover_seniority_merge_spent_markers(&replay, |at: &[u8; 32]| world.state.vertex(at));
+        let earlier = verify_prover_seniority_merge_spent_markers(&replay, |at: &[u8; 32]| {
+            world.state.vertex(at)
+        });
         assert!(earlier.is_err());
         // A kicked prover restores nothing.
         world.prover(Y, 0, Some(F - 1), 850_000);
-        assert!(world.refusal(&claim(Y, F, &[3], Consent::Merge), F).contains("kicked"));
+        assert!(world
+            .refusal(&claim(Y, F, &[3], Consent::Merge), F)
+            .contains("kicked"));
     }
 
     /// Ops naming one concurrent key each credit the period once.
@@ -1842,7 +2446,9 @@ mod tests {
         let world = World::new();
         world.prover(Y, 0, Some(F - 1), 0);
         world.apply(&claim(Y, F, &[5], Consent::Merge), F);
-        assert!(world.refusal(&claim(Y, F, &[7], Consent::Merge), F).contains("add no seniority"));
+        assert!(world
+            .refusal(&claim(Y, F, &[7], Consent::Merge), F)
+            .contains("add no seniority"));
         world.apply(&claim(Y, F, &[6], Consent::Merge), F);
         assert_eq!(world.seniority(Y), 800);
         assert_eq!(credited_retro(&world.tree(Y)), Some([500, 300, 0, 0, 0]));
@@ -1851,7 +2457,9 @@ mod tests {
         let world = World::new();
         world.prover(Y, 500, Some(F - 1), 0);
         world.marker(true, 5, Some(Y));
-        assert!(world.refusal(&claim(Y, F, &[5, 7], Consent::Merge), F).contains("add no seniority"));
+        assert!(world
+            .refusal(&claim(Y, F, &[5, 7], Consent::Merge), F)
+            .contains("add no seniority"));
     }
 
     /// The node and the dry run plan from the same function: keys group by
@@ -1865,17 +2473,28 @@ mod tests {
         let keys: Vec<Vec<u8>> = [1u8, 2, 3, 4].iter().map(|&byte| target(byte)).collect();
         let plan = plan_submissions(&world.state, F, &address(Y), &keys, &parts).unwrap();
         assert_eq!(plan.seniority, Some(100_000));
-        let standings: Vec<TargetStanding> = plan.keys.iter().map(|(_, standing)| *standing).collect();
-        assert_eq!(standings, vec![
-            TargetStanding::Other(address(X)),
-            TargetStanding::Own,
-            TargetStanding::Fresh,
-            TargetStanding::Unusable(Unusable::Legacy),
-        ]);
+        let standings: Vec<TargetStanding> =
+            plan.keys.iter().map(|(_, standing)| *standing).collect();
+        assert_eq!(
+            standings,
+            vec![
+                TargetStanding::Other(address(X)),
+                TargetStanding::Own,
+                TargetStanding::Fresh,
+                TargetStanding::Unusable(Unusable::Legacy),
+            ]
+        );
         assert_eq!(plan.merge, None, "the fresh key is worth nothing");
         assert_eq!(plan.successions.len(), 1);
         let candidate = &plan.successions[0];
-        assert_eq!((candidate.predecessor, candidate.keys.clone(), candidate.moving), (address(X), vec![0, 1], 1));
+        assert_eq!(
+            (
+                candidate.predecessor,
+                candidate.keys.clone(),
+                candidate.moving
+            ),
+            (address(X), vec![0, 1], 1)
+        );
         assert!(candidate.submits());
         assert_eq!(candidate.preview.new_seniority, 5_100_000);
         // A successor whose seniority exceeds the keys' retro still submits.
@@ -1904,20 +2523,51 @@ mod tests {
         let cases: [(&str, Setup, Consent, bool); 7] = [
             ("eligible", |_| {}, Consent::Succession(X), true),
             ("old domain", |_| {}, Consent::Merge, false),
-            ("quiet", |w| w.prover(X, 5_000_000, Some(F - 1_000), 0), Consent::Succession(X), false),
-            ("live", |w| w.allocation(X, &[], 1, &[("LastActiveFrameNumber", F - 100)]), Consent::Succession(X), false),
-            ("legacy marker", |w| w.marker(false, 1, None), Consent::Succession(X), false),
-            ("kicked", |w| w.prover(X, 5_000_000, Some(F - 10_000), 850_000), Consent::Succession(X), false),
-            ("own key only", |w| w.marker(true, 1, Some(Y)), Consent::Merge, false),
+            (
+                "quiet",
+                |w| w.prover(X, 5_000_000, Some(F - 1_000), 0),
+                Consent::Succession(X),
+                false,
+            ),
+            (
+                "live",
+                |w| w.allocation(X, &[], 1, &[("LastActiveFrameNumber", F - 100)]),
+                Consent::Succession(X),
+                false,
+            ),
+            (
+                "legacy marker",
+                |w| w.marker(false, 1, None),
+                Consent::Succession(X),
+                false,
+            ),
+            (
+                "kicked",
+                |w| w.prover(X, 5_000_000, Some(F - 10_000), 850_000),
+                Consent::Succession(X),
+                false,
+            ),
+            (
+                "own key only",
+                |w| w.marker(true, 1, Some(Y)),
+                Consent::Merge,
+                false,
+            ),
         ];
         for (case, setup, consent, accepted) in cases {
             let world = World::eligible();
             setup(&world);
             world.commit();
             let bytes = claim(Y, F, &[1], consent).to_canonical_bytes().unwrap();
-            let intrinsic = GlobalIntrinsic::new(Arc::new(DomainKeys)).with_hypergraph(world.crdt.clone());
-            let validated = matches!(intrinsic.validate(F, &bytes, Some(&world.tree(Y)), None), Ok(true));
-            let executed = intrinsic.invoke_step(F, &bytes, &HypergraphState::new(world.crdt.clone())).is_ok();
+            let intrinsic =
+                GlobalIntrinsic::new(Arc::new(DomainKeys)).with_hypergraph(world.crdt.clone());
+            let validated = matches!(
+                intrinsic.validate(F, &bytes, Some(&world.tree(Y)), None),
+                Ok(true)
+            );
+            let executed = intrinsic
+                .invoke_step(F, &bytes, &HypergraphState::new(world.crdt.clone()))
+                .is_ok();
             assert_eq!(validated, executed, "{case}");
             assert_eq!(validated, accepted, "{case}");
         }
@@ -1931,7 +2581,14 @@ mod tests {
         let world = World::eligible();
         world.commit();
         let bundle = CanonicalMessageBundle {
-            requests: vec![Some(CanonicalMessageRequest::wrap(claim(Y, F, &[1], Consent::Succession(X)).to_canonical_bytes().unwrap()).unwrap())],
+            requests: vec![Some(
+                CanonicalMessageRequest::wrap(
+                    claim(Y, F, &[1], Consent::Succession(X))
+                        .to_canonical_bytes()
+                        .unwrap(),
+                )
+                .unwrap(),
+            )],
             timestamp: 0,
         }
         .to_canonical_bytes()
@@ -1948,24 +2605,42 @@ mod tests {
         let fee = num_bigint::BigInt::from(1);
         let read = |byte: u8| {
             let state = HypergraphState::new(world.crdt.clone());
-            prover_u64(&rebuild_vertex_tree_from_blob(&state.vertex(&address(byte)).unwrap().unwrap()), "Seniority")
+            prover_u64(
+                &rebuild_vertex_tree_from_blob(&state.vertex(&address(byte)).unwrap().unwrap()),
+                "Seniority",
+            )
         };
 
         set_seniority_succession_epoch_for_thread(Some(u64::MAX));
         engine.validate_message(F, &global, &bundle).unwrap();
         engine.process_message(F, &fee, &global, &bundle).unwrap();
-        assert_eq!((read(X), read(Y)), (5_000_000, 100_000), "inert while no epoch is set");
+        assert_eq!(
+            (read(X), read(Y)),
+            (5_000_000, 100_000),
+            "inert while no epoch is set"
+        );
         // The intrinsic itself refuses it under the earlier rules.
-        let op = claim(Y, F, &[1], Consent::Succession(X)).to_canonical_bytes().unwrap();
-        let intrinsic = GlobalIntrinsic::new(Arc::new(DomainKeys)).with_hypergraph(world.crdt.clone());
-        assert!(!matches!(intrinsic.validate(F, &op, Some(&world.tree(Y)), None), Ok(true)));
-        assert!(intrinsic.invoke_step(F, &op, &HypergraphState::new(world.crdt.clone())).is_err());
+        let op = claim(Y, F, &[1], Consent::Succession(X))
+            .to_canonical_bytes()
+            .unwrap();
+        let intrinsic =
+            GlobalIntrinsic::new(Arc::new(DomainKeys)).with_hypergraph(world.crdt.clone());
+        assert!(!matches!(
+            intrinsic.validate(F, &op, Some(&world.tree(Y)), None),
+            Ok(true)
+        ));
+        assert!(intrinsic
+            .invoke_step(F, &op, &HypergraphState::new(world.crdt.clone()))
+            .is_err());
 
         set_seniority_succession_epoch_for_thread(Some(ACTIVATION));
         engine.validate_message(F, &global, &bundle).unwrap();
         engine.process_message(F, &fee, &global, &bundle).unwrap();
         assert_eq!((read(X), read(Y)), (0, 5_100_000));
-        assert!(engine.validate_message(F + 1, &global, &bundle).is_err(), "a replay is refused");
+        assert!(
+            engine.validate_message(F + 1, &global, &bundle).is_err(),
+            "a replay is refused"
+        );
     }
 
     /// A rejoin rewrites the prover vertex; from activation it keeps the
@@ -1977,12 +2652,27 @@ mod tests {
             let world = World::new();
             set_seniority_succession_epoch_for_thread(Some(epoch));
             world.prover(Y, 1_000, Some(F), 0);
-            world.allocation(Y, &DATA_SHARD, 1, &[("JoinConfirmFrameNumber", F - 99_000), ("Epoch", epoch_for_frame(F))]);
+            world.allocation(
+                Y,
+                &DATA_SHARD,
+                1,
+                &[
+                    ("JoinConfirmFrameNumber", F - 99_000),
+                    ("Epoch", epoch_for_frame(F)),
+                ],
+            );
             world.rejoin(Y, F, &[]);
             let tree = world.tree(Y);
-            (prover_u64(&tree, "Seniority"), read_field(&tree, PROVER, "LastSeniorityFrameNumber"))
+            (
+                prover_u64(&tree, "Seniority"),
+                read_field(&tree, PROVER, "LastSeniorityFrameNumber"),
+            )
         };
         assert_eq!(rejoin(ACTIVATION), (1_000, Some(F.to_be_bytes().to_vec())));
-        assert_eq!(rejoin(u64::MAX), (1_000, None), "the earlier rewrite clears it");
+        assert_eq!(
+            rejoin(u64::MAX),
+            (1_000, None),
+            "the earlier rewrite clears it"
+        );
     }
 }

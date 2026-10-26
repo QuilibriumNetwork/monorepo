@@ -1,10 +1,10 @@
 //! GlobalFrameHeader (0x0309) and FrameHeader (0x030A) canonical bytes.
 
-use quil_types::error::Result;
 use crate::canonical_cursor::{
-    put_u32, put_u64, put_i64, put_lp, read_u32, read_u64, read_i64,
-    read_lp, read_array, write_array,
+    put_i64, put_lp, put_u32, put_u64, read_array, read_i64, read_lp, read_u32, read_u64,
+    write_array,
 };
+use quil_types::error::Result;
 
 pub const TYPE_GLOBAL_FRAME_HEADER: u32 = 0x0309;
 pub const TYPE_FRAME_HEADER: u32 = 0x030A;
@@ -83,9 +83,10 @@ impl GlobalFrameHeader {
         let mut c = 0;
         let tp = read_u32(data, &mut c)?;
         if tp != TYPE_GLOBAL_FRAME_HEADER {
-            return Err(quil_types::error::QuilError::InvalidArgument(
-                format!("GlobalFrameHeader: bad type 0x{:08x}", tp),
-            ));
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "GlobalFrameHeader: bad type 0x{:08x}",
+                tp
+            )));
         }
         Ok(Self {
             frame_number: read_u64(data, &mut c)?,
@@ -100,7 +101,11 @@ impl GlobalFrameHeader {
             prover_tree_aux_roots: read_array(data, &mut c)?,
             prover: read_lp(data, &mut c)?,
             public_key_signature_bls48581: read_opt_sig(data, &mut c)?,
-            world_state_size: if c < data.len() { read_u64(data, &mut c)? } else { 0 },
+            world_state_size: if c < data.len() {
+                read_u64(data, &mut c)?
+            } else {
+                0
+            },
         })
     }
 }
@@ -208,7 +213,11 @@ impl FrameHeader {
         // that build's bytes exactly, so the GLOBAL bodies embedding it still
         // recompute to their requests roots.
         let fee_total = self.fee_total_value();
-        if fee_total != 0 || !self.settlements.is_empty() || !self.accumulator.is_empty() || !self.spends.is_empty() {
+        if fee_total != 0
+            || !self.settlements.is_empty()
+            || !self.accumulator.is_empty()
+            || !self.spends.is_empty()
+        {
             out.push(RELAY_BLOCK_TAG);
             out.extend_from_slice(&fee_total_to_bytes(fee_total));
             put_lp(&mut out, &self.settlements);
@@ -230,9 +239,10 @@ impl FrameHeader {
         let mut c = 0;
         let tp = read_u32(data, &mut c)?;
         if tp != TYPE_FRAME_HEADER {
-            return Err(quil_types::error::QuilError::InvalidArgument(
-                format!("FrameHeader: bad type 0x{:08x}", tp),
-            ));
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "FrameHeader: bad type 0x{:08x}",
+                tp
+            )));
         }
         let mut h = Self {
             address: read_lp(data, &mut c)?,
@@ -264,8 +274,11 @@ impl FrameHeader {
                 c += 1;
                 // Canonical form: a zero total is the empty vector, so
                 // encode/decode round-trips headers built without fees.
-                let total = data.get(c..c + 16).ok_or_else(|| quil_types::error::QuilError::InvalidArgument(
-                    "FrameHeader: truncated relay block".into()))?;
+                let total = data.get(c..c + 16).ok_or_else(|| {
+                    quil_types::error::QuilError::InvalidArgument(
+                        "FrameHeader: truncated relay block".into(),
+                    )
+                })?;
                 if total.iter().any(|b| *b != 0) {
                     h.fee_total = total.to_vec();
                 }
@@ -274,9 +287,14 @@ impl FrameHeader {
                 h.accumulator = read_lp(data, &mut c)?;
                 h.spends = read_lp(data, &mut c)?;
                 // Written only when one of them is set: one encoding per header.
-                if h.fee_total.is_empty() && h.settlements.is_empty() && h.accumulator.is_empty() && h.spends.is_empty() {
+                if h.fee_total.is_empty()
+                    && h.settlements.is_empty()
+                    && h.accumulator.is_empty()
+                    && h.spends.is_empty()
+                {
                     return Err(quil_types::error::QuilError::InvalidArgument(
-                        "FrameHeader: empty relay block".into()));
+                        "FrameHeader: empty relay block".into(),
+                    ));
                 }
             }
             // The full openings blob is itself a tolerant trailing field —
@@ -296,8 +314,12 @@ mod tests {
     #[test]
     fn global_frame_header_round_trip() {
         let h = GlobalFrameHeader {
-            frame_number: 100, rank: 0, timestamp: 1234567890, difficulty: 200000,
-            output: vec![0xAAu8; 516], parent_selector: vec![0xBBu8; 32],
+            frame_number: 100,
+            rank: 0,
+            timestamp: 1234567890,
+            difficulty: 200000,
+            output: vec![0xAAu8; 516],
+            parent_selector: vec![0xBBu8; 32],
             global_commitments: vec![vec![0xCCu8; 64], vec![0xDDu8; 64]],
             prover_tree_commitment: vec![0xEEu8; 64],
             prover_tree_aux_roots: vec![vec![0x33u8; 64], vec![0x44u8; 64], vec![0x55u8; 64]],
@@ -313,9 +335,18 @@ mod tests {
 
     #[test]
     fn global_frame_header_world_state_size_is_a_trailing_field() {
-        let mut h = GlobalFrameHeader { frame_number: 5, output: vec![1; 516], ..Default::default() };
+        let mut h = GlobalFrameHeader {
+            frame_number: 5,
+            output: vec![1; 516],
+            ..Default::default()
+        };
         let legacy = h.to_canonical_bytes().unwrap();
-        assert_eq!(GlobalFrameHeader::from_canonical_bytes(&legacy).unwrap().world_state_size, 0);
+        assert_eq!(
+            GlobalFrameHeader::from_canonical_bytes(&legacy)
+                .unwrap()
+                .world_state_size,
+            0
+        );
         h.world_state_size = u64::MAX - 1;
         let sized = h.to_canonical_bytes().unwrap();
         assert_eq!(&sized[..legacy.len()], legacy.as_slice());
@@ -332,9 +363,13 @@ mod tests {
     #[test]
     fn frame_header_round_trip() {
         let f = FrameHeader {
-            address: vec![0x01u8; 32], frame_number: 50, rank: 1,
-            timestamp: -999, difficulty: 100000,
-            output: vec![0xAAu8; 516], parent_selector: vec![0xBBu8; 32],
+            address: vec![0x01u8; 32],
+            frame_number: 50,
+            rank: 1,
+            timestamp: -999,
+            difficulty: 100000,
+            output: vec![0xAAu8; 516],
+            parent_selector: vec![0xBBu8; 32],
             requests_root: vec![0xCCu8; 64],
             state_roots: vec![vec![0xDDu8; 64], vec![0xEEu8; 64]],
             prover: vec![0xFFu8; 585],
@@ -424,11 +459,21 @@ mod tests {
     #[test]
     fn a_header_without_relays_keeps_the_mainnet_layout() {
         let mut f = FrameHeader {
-            address: vec![0x01u8; 35], frame_number: 7, rank: 3, timestamp: 11, difficulty: 5,
-            output: vec![0xAAu8; 516], parent_selector: vec![0xBBu8; 32], requests_root: vec![0xCCu8; 64],
-            state_roots: vec![vec![0xDDu8; 32]; 4], prover: vec![0x11u8; 32], fee_multiplier_vote: 2,
-            public_key_signature_bls48581: vec![0x22u8; 74], storage_attestation_root: vec![0x33u8; 32],
-            global_frame_number: 900, storage_attestation: vec![0x44u8; 40],
+            address: vec![0x01u8; 35],
+            frame_number: 7,
+            rank: 3,
+            timestamp: 11,
+            difficulty: 5,
+            output: vec![0xAAu8; 516],
+            parent_selector: vec![0xBBu8; 32],
+            requests_root: vec![0xCCu8; 64],
+            state_roots: vec![vec![0xDDu8; 32]; 4],
+            prover: vec![0x11u8; 32],
+            fee_multiplier_vote: 2,
+            public_key_signature_bls48581: vec![0x22u8; 74],
+            storage_attestation_root: vec![0x33u8; 32],
+            global_frame_number: 900,
+            storage_attestation: vec![0x44u8; 40],
             ..Default::default()
         };
         // The mainnet build's encoder (monorepo global_intrinsic/frame_header.rs).
@@ -466,7 +511,10 @@ mod tests {
         assert_eq!(FrameHeader::from_canonical_bytes(&relayed).unwrap(), f);
 
         f.spends.clear();
-        let mut empty_block = mainnet(&FrameHeader { storage_attestation: Vec::new(), ..f.clone() });
+        let mut empty_block = mainnet(&FrameHeader {
+            storage_attestation: Vec::new(),
+            ..f.clone()
+        });
         empty_block.push(RELAY_BLOCK_TAG);
         empty_block.extend_from_slice(&[0u8; 16]);
         for _ in 0..3 {
@@ -477,7 +525,11 @@ mod tests {
 
     #[test]
     fn frame_header_negative_timestamp_and_vote() {
-        let f = FrameHeader { timestamp: -42, fee_multiplier_vote: -100, ..Default::default() };
+        let f = FrameHeader {
+            timestamp: -42,
+            fee_multiplier_vote: -100,
+            ..Default::default()
+        };
         let b = f.to_canonical_bytes().unwrap();
         let r = FrameHeader::from_canonical_bytes(&b).unwrap();
         assert_eq!(r.timestamp, -42);

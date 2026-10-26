@@ -310,7 +310,10 @@ mod tests {
     #[test]
     fn global_state_unique_trait() {
         let state = GlobalState::new(
-            42, 5, 1000, 100000,
+            42,
+            5,
+            1000,
+            100000,
             vec![0xAAu8; 64],
             vec![],
             vec![0xBBu8; 585],
@@ -327,9 +330,16 @@ mod tests {
     #[test]
     fn global_state_identity_is_deterministic() {
         let state = GlobalState::new(
-            1, 0, 0, 0,
+            1,
+            0,
+            0,
+            0,
             vec![1, 2, 3],
-            vec![], vec![], vec![], vec![], vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
         let id1 = state.compute_identity();
         let id2 = state.compute_identity();

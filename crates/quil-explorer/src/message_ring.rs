@@ -124,7 +124,11 @@ impl RecentMessageRing {
     fn snapshot_versioned(&self, limit: usize) -> (u64, Vec<RecentMessage>) {
         let q = self.inner.read();
         let version = self.version.load(Ordering::Acquire);
-        let n = if limit == 0 || limit > q.len() { q.len() } else { limit };
+        let n = if limit == 0 || limit > q.len() {
+            q.len()
+        } else {
+            limit
+        };
         (version, q.iter().take(n).cloned().collect())
     }
 
@@ -152,7 +156,12 @@ impl RecentMessageRing {
         }
         let (version, records) = self.snapshot_versioned(limit);
         let body = render(&records);
-        *cache = Some(CachedBody { version, limit, built: now, body: body.clone() });
+        *cache = Some(CachedBody {
+            version,
+            limit,
+            built: now,
+            body: body.clone(),
+        });
         body
     }
 }
@@ -180,7 +189,7 @@ mod tests {
         }
         let snap = ring.snapshot(0);
         assert_eq!(snap.len(), 3); // bounded to capacity
-        // Newest first: last pushed (4) is at front.
+                                   // Newest first: last pushed (4) is at front.
         assert_eq!(snap[0].from.as_ref(), [4]);
         assert_eq!(snap[1].from.as_ref(), [3]);
         assert_eq!(snap[2].from.as_ref(), [2]);

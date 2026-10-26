@@ -35,7 +35,8 @@ const RESPAWN_RETRY_MAX: Duration = Duration::from_secs(300);
 const STARTING_WARN_AFTER: u64 = 120;
 /// What the operator can check when a worker cannot be reached or does not
 /// take its Respawn.
-const WORKER_REMEDY: &str = "check the worker process on that host and its 'DataIPC gRPC server' line";
+const WORKER_REMEDY: &str =
+    "check the worker process on that host and its 'DataIPC gRPC server' line";
 
 /// A Respawn a worker is owed: its RPC failed, or the worker reported
 /// running another filter or none while its allocation is active. The
@@ -65,7 +66,10 @@ impl OwedRespawn {
     /// Log the end of a starting wait that warned, at `now`.
     fn started(&mut self, core_id: u32, now: Instant) {
         if let Some(OutageEvent::Ended { secs, .. }) = self.starting.observe(now, true) {
-            info!(core_id, secs, "remote worker finished starting after {}s", secs);
+            info!(
+                core_id,
+                secs, "remote worker finished starting after {}s", secs
+            );
         }
     }
 }
@@ -100,9 +104,16 @@ struct RespawnInFlight {
 
 impl RespawnInFlight {
     /// Count a Respawn in flight to `worker`; called with the table locked.
-    fn begin(workers: &std::sync::Arc<Mutex<HashMap<u32, RemoteWorkerState>>>, worker: &mut RemoteWorkerState) -> Self {
+    fn begin(
+        workers: &std::sync::Arc<Mutex<HashMap<u32, RemoteWorkerState>>>,
+        worker: &mut RemoteWorkerState,
+    ) -> Self {
         worker.respawns_in_flight += 1;
-        Self { workers: workers.clone(), core_id: worker.core_id, settled: false }
+        Self {
+            workers: workers.clone(),
+            core_id: worker.core_id,
+            settled: false,
+        }
     }
 }
 
@@ -134,7 +145,9 @@ enum RespawnError {
 impl RespawnError {
     fn of(status: &tonic::Status) -> Self {
         match status.code() {
-            tonic::Code::Unavailable if status.message() == crate::worker_node::WORKER_STARTING => Self::Starting,
+            tonic::Code::Unavailable if status.message() == crate::worker_node::WORKER_STARTING => {
+                Self::Starting
+            }
             tonic::Code::Unavailable => Self::Unreachable,
             tonic::Code::DeadlineExceeded => Self::TimedOut,
             tonic::Code::Internal | tonic::Code::FailedPrecondition => Self::Refused,
@@ -332,25 +345,28 @@ impl RemoteWorkerManager {
                 endpoint = %display_endpoint,
                 "registered remote worker"
             );
-            workers.insert(core_id, RemoteWorkerState {
+            workers.insert(
                 core_id,
-                endpoint,
-                filter: Vec::new(),
-                quote_binding: std::sync::Arc::new(()),
-                pending_filter_frame: 0,
-                manually_managed: false,
-                allocated: false,
-                channel: None,
-                connected: false,
-                wants_consensus: false,
-                owed: None,
-                respawns_in_flight: 0,
-                // A worker restarting with the master is refused for a few
-                // ticks; three failed dials in a row (15 s) are an outage.
-                connect_outage: Outage::begin_after(3),
-                respawned_at: None,
-                lost: None,
-            });
+                RemoteWorkerState {
+                    core_id,
+                    endpoint,
+                    filter: Vec::new(),
+                    quote_binding: std::sync::Arc::new(()),
+                    pending_filter_frame: 0,
+                    manually_managed: false,
+                    allocated: false,
+                    channel: None,
+                    connected: false,
+                    wants_consensus: false,
+                    owed: None,
+                    respawns_in_flight: 0,
+                    // A worker restarting with the master is refused for a few
+                    // ticks; three failed dials in a row (15 s) are an outage.
+                    connect_outage: Outage::begin_after(3),
+                    respawned_at: None,
+                    lost: None,
+                },
+            );
         }
 
         Self {
@@ -403,7 +419,8 @@ impl RemoteWorkerManager {
     pub async fn connect_all(&self) {
         let endpoints: Vec<(u32, String)> = {
             let workers = self.workers.lock().unwrap();
-            workers.values()
+            workers
+                .values()
                 .filter(|w| w.channel.is_none())
                 .map(|w| (w.core_id, w.endpoint.clone()))
                 .collect()
@@ -422,7 +439,9 @@ impl RemoteWorkerManager {
         }
         let mut owed_on_connect = false;
         while let Some(dial) = dials.join_next().await {
-            let Ok((core_id, endpoint, dialled)) = dial else { continue };
+            let Ok((core_id, endpoint, dialled)) = dial else {
+                continue;
+            };
             // Log the EFFECTIVE scheme: `connect_to_worker` dials https (mTLS)
             // when `client_tls` is set, swapping the endpoint's `http://` →
             // `https://`. Mirror that here so the log matches the real dial
@@ -459,31 +478,50 @@ impl RemoteWorkerManager {
                         }
                     };
                     match outage {
-                        Some(OutageEvent::Ended { secs, failures }) => info!(core_id, endpoint = %display_endpoint,
-                            secs, failures, "connected to remote worker after {} failed dials over {}s", failures, secs),
-                        _ => info!(core_id, endpoint = %display_endpoint, "connected to remote worker"),
+                        Some(OutageEvent::Ended { secs, failures }) => {
+                            info!(core_id, endpoint = %display_endpoint,
+                            secs, failures, "connected to remote worker after {} failed dials over {}s", failures, secs)
+                        }
+                        _ => {
+                            info!(core_id, endpoint = %display_endpoint, "connected to remote worker")
+                        }
                     }
-                    let _ = self.event_tx.send(RemoteWorkerEvent::Connected { core_id }).await;
+                    let _ = self
+                        .event_tx
+                        .send(RemoteWorkerEvent::Connected { core_id })
+                        .await;
                     // Re-issue the deferred Respawn now that the worker is up,
                     // unless it already runs the filter.
                     if let Some(filter) = owed_filter {
-                        info!(core_id, filter = hex::encode(&filter), "re-issuing deferred Respawn on connect");
+                        info!(
+                            core_id,
+                            filter = hex::encode(&filter),
+                            "re-issuing deferred Respawn on connect"
+                        );
                         owed_on_connect = true;
                     }
                 }
                 Err(e) => {
                     let outage = match self.workers.lock() {
-                        Ok(mut workers) => workers.get_mut(&core_id).and_then(|w| w.connect_outage.observe(now, false)),
+                        Ok(mut workers) => workers
+                            .get_mut(&core_id)
+                            .and_then(|w| w.connect_outage.observe(now, false)),
                         Err(_) => None,
                     };
                     match outage {
-                        Some(OutageEvent::Began) => warn!(core_id, endpoint = %display_endpoint, error = %e,
+                        Some(OutageEvent::Began) => {
+                            warn!(core_id, endpoint = %display_endpoint, error = %e,
                             scope = "local", action = "check",
-                            "failed to connect to remote worker; it gets no assignment until it is reached; {}", WORKER_REMEDY),
-                        Some(OutageEvent::Continues { secs, failures }) => warn!(core_id, endpoint = %display_endpoint,
+                            "failed to connect to remote worker; it gets no assignment until it is reached; {}", WORKER_REMEDY)
+                        }
+                        Some(OutageEvent::Continues { secs, failures }) => {
+                            warn!(core_id, endpoint = %display_endpoint,
                             error = %e, secs, failures, scope = "local", action = "check",
-                            "still cannot connect to remote worker"),
-                        _ => debug!(core_id, endpoint = %display_endpoint, error = %e, "remote worker dial failed"),
+                            "still cannot connect to remote worker")
+                        }
+                        _ => {
+                            debug!(core_id, endpoint = %display_endpoint, error = %e, "remote worker dial failed")
+                        }
                     }
                 }
             }
@@ -515,12 +553,19 @@ impl RemoteWorkerManager {
         let mut fetches = tokio::task::JoinSet::new();
         for (core_id, filter, channel) in targets {
             fetches.spawn(async move {
-                let Some(channel) = channel else { return (core_id, filter, Answer::Unanswered(NOT_CONNECTED)) };
-                let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+                let Some(channel) = channel else {
+                    return (core_id, filter, Answer::Unanswered(NOT_CONNECTED));
+                };
+                let mut client =
+                    quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(
+                        channel,
+                    )
                     .max_decoding_message_size(64 << 10);
                 let answer = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    client.get_worker_execution(quil_types::proto::node::GetWorkerExecutionRequest {}),
+                    client.get_worker_execution(
+                        quil_types::proto::node::GetWorkerExecutionRequest {},
+                    ),
                 )
                 .await;
                 let answer = match answer {
@@ -529,14 +574,29 @@ impl RemoteWorkerManager {
                         if response.filter != filter {
                             Answer::Other(response.filter)
                         } else {
-                            response.execution.map_or(Answer::Nothing, |execution| Answer::Report(
-                                on_local_clock(execution, response.now_unix_ms, crate::worker_execution::now_ms())))
+                            response.execution.map_or(Answer::Nothing, |execution| {
+                                Answer::Report(on_local_clock(
+                                    execution,
+                                    response.now_unix_ms,
+                                    crate::worker_execution::now_ms(),
+                                ))
+                            })
                         }
                     }
-                    Ok(Err(status)) if status.code() == tonic::Code::Unavailable
-                        && status.message() == crate::worker_node::WORKER_STARTING => Answer::Unanswered(STARTING),
-                    Ok(Err(status)) if matches!(status.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) =>
-                        Answer::Unanswered(NO_ANSWER),
+                    Ok(Err(status))
+                        if status.code() == tonic::Code::Unavailable
+                            && status.message() == crate::worker_node::WORKER_STARTING =>
+                    {
+                        Answer::Unanswered(STARTING)
+                    }
+                    Ok(Err(status))
+                        if matches!(
+                            status.code(),
+                            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                        ) =>
+                    {
+                        Answer::Unanswered(NO_ANSWER)
+                    }
                     Ok(Err(_)) => Answer::Nothing,
                     Err(_) => Answer::Unanswered(NO_ANSWER),
                 };
@@ -552,7 +612,11 @@ impl RemoteWorkerManager {
         let mut lost = Vec::new();
         let mut running = Vec::new();
         {
-            let (Ok(mut executions), Ok(mut unanswered)) = (self.executions.lock(), self.unanswered.lock()) else { return };
+            let (Ok(mut executions), Ok(mut unanswered)) =
+                (self.executions.lock(), self.unanswered.lock())
+            else {
+                return;
+            };
             executions.clear();
             unanswered.clear();
             for (core_id, filter, answer) in fetched {
@@ -581,9 +645,15 @@ impl RemoteWorkerManager {
     /// once reports show it running for `ENGINE_UP_FOR`, an engine that
     /// kept exiting counts as up again and its backoff is reset.
     fn note_engine_running(&self, core_id: u32, filter: &[u8], asked: Instant) {
-        let Ok(mut workers) = self.workers.lock() else { return };
-        let Some(w) = workers.get_mut(&core_id) else { return };
-        let Some(lost) = w.lost.as_mut().filter(|lost| lost.filter == filter) else { return };
+        let Ok(mut workers) = self.workers.lock() else {
+            return;
+        };
+        let Some(w) = workers.get_mut(&core_id) else {
+            return;
+        };
+        let Some(lost) = w.lost.as_mut().filter(|lost| lost.filter == filter) else {
+            return;
+        };
         let since = *lost.running_since.get_or_insert(asked);
         if asked.saturating_duration_since(since) < ENGINE_UP_FOR {
             return;
@@ -602,8 +672,12 @@ impl RemoteWorkerManager {
     /// predates a Respawn in flight or since delivered shows the engine it
     /// replaced.
     fn owe_reported_respawn(&self, core_id: u32, filter: &[u8], running: &[u8], asked: Instant) {
-        let Ok(mut workers) = self.workers.lock() else { return };
-        let Some(w) = workers.get_mut(&core_id) else { return };
+        let Ok(mut workers) = self.workers.lock() else {
+            return;
+        };
+        let Some(w) = workers.get_mut(&core_id) else {
+            return;
+        };
         if !Self::owes_consensus(w, filter)
             || w.respawns_in_flight > 0
             || w.owed.is_some()
@@ -626,24 +700,36 @@ impl RemoteWorkerManager {
         let Some(lost) = w.lost.as_mut() else { return };
         lost.running_since = None;
         let event = lost.exits.observe(asked, false);
-        let retry = if repeated { lost.backoff } else { Duration::ZERO };
+        let retry = if repeated {
+            lost.backoff
+        } else {
+            Duration::ZERO
+        };
         if repeated {
             lost.backoff = (lost.backoff * 2).min(RESPAWN_RETRY_MAX);
         }
         w.owed = Some(OwedRespawn::new(filter, asked + retry));
         let filter_hex = hex::encode(filter);
         match event {
-            Some(OutageEvent::Began) => warn!(core_id, endpoint = %w.endpoint, filter = %filter_hex,
+            Some(OutageEvent::Began) => {
+                warn!(core_id, endpoint = %w.endpoint, filter = %filter_hex,
                 exits = 2, retry_secs = retry.as_secs(), scope = "local", action = "check",
                 "remote worker's engine exited again after its Respawn; re-sending with backoff until it stays up; \
-                 check the worker's lines before its 'app consensus engine exited' warning"),
-            Some(OutageEvent::Continues { secs, failures }) => warn!(core_id, endpoint = %w.endpoint,
+                 check the worker's lines before its 'app consensus engine exited' warning")
+            }
+            Some(OutageEvent::Continues { secs, failures }) => {
+                warn!(core_id, endpoint = %w.endpoint,
                 filter = %filter_hex, exits = failures, secs, retry_secs = retry.as_secs(),
-                scope = "local", action = "check", "remote worker's engine still keeps exiting after its Respawn"),
+                scope = "local", action = "check", "remote worker's engine still keeps exiting after its Respawn")
+            }
             _ if repeated => debug!(core_id, filter = %filter_hex, retry_secs = retry.as_secs(),
                 "remote worker's engine exited again; Respawn re-sent after its backoff"),
             _ => {
-                let running = if running.is_empty() { "none".to_string() } else { hex::encode(running) };
+                let running = if running.is_empty() {
+                    "none".to_string()
+                } else {
+                    hex::encode(running)
+                };
                 warn!(core_id, endpoint = %w.endpoint, filter = %filter_hex, running = %running,
                     scope = "local", action = "check",
                     "remote worker runs another filter or none while its allocation is active (it restarted, or its \
@@ -678,17 +764,26 @@ impl RemoteWorkerManager {
 
     async fn reconcile_respawns_at(&self, now: Instant) {
         let due: Vec<(RespawnInFlight, Vec<u8>, Channel)> = {
-            let Ok(mut workers) = self.workers.lock() else { return };
+            let Ok(mut workers) = self.workers.lock() else {
+                return;
+            };
             let mut due = Vec::new();
             for w in workers.values_mut() {
                 // An assignment changed or released since the Respawn was
                 // owed owes nothing.
-                if w.owed.as_ref().is_some_and(|owed| !Self::owes_consensus(w, &owed.filter)) {
+                if w.owed
+                    .as_ref()
+                    .is_some_and(|owed| !Self::owes_consensus(w, &owed.filter))
+                {
                     w.owed = None;
                 }
-                let Some(owed) = w.owed.as_ref() else { continue };
+                let Some(owed) = w.owed.as_ref() else {
+                    continue;
+                };
                 // Not connected: `connect_all` re-issues it on connect.
-                let Some(channel) = w.channel.clone() else { continue };
+                let Some(channel) = w.channel.clone() else {
+                    continue;
+                };
                 if owed.next_at > now || w.respawns_in_flight > 0 {
                     continue;
                 }
@@ -701,7 +796,8 @@ impl RemoteWorkerManager {
         for (in_flight, filter, channel) in due {
             let started = Instant::now();
             attempts.spawn(async move {
-                let outcome = resend_respawn(&in_flight.workers, in_flight.core_id, channel, &filter).await;
+                let outcome =
+                    resend_respawn(&in_flight.workers, in_flight.core_id, channel, &filter).await;
                 // Back off from the attempt's end, so a Respawn that ran
                 // into its timeout does not use up the wait.
                 Self::settle_respawn(in_flight, &filter, outcome, now + started.elapsed());
@@ -713,12 +809,21 @@ impl RemoteWorkerManager {
     /// Record how a Respawn of `filter` ended: clear or record the Respawn
     /// its worker is owed, and log the start, bounded repeats and end of a
     /// failing one.
-    fn settle_respawn(mut in_flight: RespawnInFlight, filter: &[u8], outcome: RespawnOutcome, now: Instant) {
+    fn settle_respawn(
+        mut in_flight: RespawnInFlight,
+        filter: &[u8],
+        outcome: RespawnOutcome,
+        now: Instant,
+    ) {
         let table = in_flight.workers.clone();
-        let Ok(mut workers) = table.lock() else { return };
+        let Ok(mut workers) = table.lock() else {
+            return;
+        };
         in_flight.settled = true;
         let core_id = in_flight.core_id;
-        let Some(w) = workers.get_mut(&core_id) else { return };
+        let Some(w) = workers.get_mut(&core_id) else {
+            return;
+        };
         w.respawns_in_flight = w.respawns_in_flight.saturating_sub(1);
         let filter_hex = hex::encode(filter);
         if !Self::owes_consensus(w, filter) {
@@ -748,12 +853,18 @@ impl RemoteWorkerManager {
                     _ => None,
                 };
                 match (taken, recovered) {
-                    (RespawnOutcome::Delivered, Some((secs, failures))) => info!(core_id, filter = %filter_hex,
-                        secs, failures, "remote worker respawned after {} failures over {}s", failures, secs),
-                    (RespawnOutcome::Delivered, None) => info!(core_id, filter = %filter_hex, "remote worker respawned"),
-                    (RespawnOutcome::Deferred, Some((secs, failures))) => info!(core_id, filter = %filter_hex,
+                    (RespawnOutcome::Delivered, Some((secs, failures))) => {
+                        info!(core_id, filter = %filter_hex,
+                        secs, failures, "remote worker respawned after {} failures over {}s", failures, secs)
+                    }
+                    (RespawnOutcome::Delivered, None) => {
+                        info!(core_id, filter = %filter_hex, "remote worker respawned")
+                    }
+                    (RespawnOutcome::Deferred, Some((secs, failures))) => {
+                        info!(core_id, filter = %filter_hex,
                         secs, failures, "remote worker took its Respawn after {} failures over {}s; it is still starting \
-                         and applies it once its initial prover-tree sync completes", failures, secs),
+                         and applies it once its initial prover-tree sync completes", failures, secs)
+                    }
                     (RespawnOutcome::Deferred, None) => info!(core_id, filter = %filter_hex,
                         "remote worker took its Respawn while starting; it applies it once its initial prover-tree \
                          sync completes"),
@@ -772,14 +883,18 @@ impl RemoteWorkerManager {
             // only when it lasts beyond a normal start.
             owed.next_at = now + RESPAWN_RETRY_FIRST;
             match owed.starting.observe(now, false) {
-                Some(OutageEvent::Began) => warn!(core_id, endpoint = %endpoint, filter = %filter_hex,
+                Some(OutageEvent::Began) => {
+                    warn!(core_id, endpoint = %endpoint, filter = %filter_hex,
                     scope = "local", action = "check",
                     "remote worker still in its initial prover-tree sync; its Respawn waits until it is ready; \
-                     check the worker's 'initial prover-tree sync' lines"),
+                     check the worker's 'initial prover-tree sync' lines")
+                }
                 Some(OutageEvent::Continues { secs, .. }) => warn!(core_id, endpoint = %endpoint,
                     filter = %filter_hex, secs, scope = "local", action = "check",
                     "remote worker still in its initial prover-tree sync"),
-                _ => debug!(core_id, filter = %filter_hex, "remote worker starting; its Respawn waits"),
+                _ => {
+                    debug!(core_id, filter = %filter_hex, "remote worker starting; its Respawn waits")
+                }
             }
             return;
         }
@@ -797,34 +912,65 @@ impl RemoteWorkerManager {
                 filter = %filter_hex, error_class = error.as_str(), error = %message, secs, failures,
                 retry_secs = retry.as_secs(), scope = "local", action = "check",
                 "remote worker still has not taken its Respawn"),
-            _ => debug!(core_id, error_class = error.as_str(), error = %message, "remote worker Respawn retry failed"),
+            _ => {
+                debug!(core_id, error_class = error.as_str(), error = %message, "remote worker Respawn retry failed")
+            }
         }
     }
 
     /// Read one bound worker's actual materialized pricing inputs. No fanout,
     /// archive-derived fallback, or connection is created by this operation.
-    pub async fn app_fee_snapshot(&self, application: [u8; 32]) -> Result<quil_execution::pricing::AppFeeSnapshot> {
-        let unavailable = || quil_types::error::QuilError::ExecutionUnavailable("application fee worker unavailable".into());
+    pub async fn app_fee_snapshot(
+        &self,
+        application: [u8; 32],
+    ) -> Result<quil_execution::pricing::AppFeeSnapshot> {
+        let unavailable = || {
+            quil_types::error::QuilError::ExecutionUnavailable(
+                "application fee worker unavailable".into(),
+            )
+        };
         let (core, binding, channel) = {
             let workers = self.workers.lock().map_err(|_| unavailable())?;
-            workers.iter().filter(|(_, w)| w.filter.as_slice() == application.as_slice())
-                .filter_map(|(core, w)| w.channel.clone().map(|c| (*core, w.quote_binding.clone(), c)))
-                .min_by_key(|(core, _, _)| *core).ok_or_else(unavailable)?
+            workers
+                .iter()
+                .filter(|(_, w)| w.filter.as_slice() == application.as_slice())
+                .filter_map(|(core, w)| {
+                    w.channel
+                        .clone()
+                        .map(|c| (*core, w.quote_binding.clone(), c))
+                })
+                .min_by_key(|(core, _, _)| *core)
+                .ok_or_else(unavailable)?
         };
-        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
-            .max_decoding_message_size(1024).max_encoding_message_size(1024);
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), client.get_app_fee_snapshot(
-            quil_types::proto::node::GetAppFeeSnapshotRequest { application: application.to_vec() },
-        )).await.map_err(|_| unavailable())?.map_err(|_| unavailable())?.into_inner();
+        let mut client =
+            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+                .max_decoding_message_size(1024)
+                .max_encoding_message_size(1024);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get_app_fee_snapshot(quil_types::proto::node::GetAppFeeSnapshotRequest {
+                application: application.to_vec(),
+            }),
+        )
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?
+        .into_inner();
         let workers = self.workers.lock().map_err(|_| unavailable())?;
         if response.application.as_slice() != application.as_slice()
-            || !workers.get(&core).is_some_and(|w| w.filter.as_slice() == application.as_slice()
-                && std::sync::Arc::ptr_eq(&w.quote_binding, &binding)) {
+            || !workers.get(&core).is_some_and(|w| {
+                w.filter.as_slice() == application.as_slice()
+                    && std::sync::Arc::ptr_eq(&w.quote_binding, &binding)
+            })
+        {
             return Err(unavailable());
         }
         Ok(quil_execution::pricing::AppFeeSnapshot {
-            application, frame_number: response.frame_number, global_frame_number: response.global_frame_number,
-            difficulty: response.difficulty, world_state_bytes: response.world_state_bytes,
+            application,
+            frame_number: response.frame_number,
+            global_frame_number: response.global_frame_number,
+            difficulty: response.difficulty,
+            world_state_bytes: response.world_state_bytes,
             fee_multiplier_vote: response.fee_multiplier_vote,
         })
     }
@@ -848,17 +994,32 @@ impl RemoteWorkerManager {
     /// snapshot (hash storage proofs), the one assigned it before it runs it
     /// (a joining seat). That worker encodes from the snapshot, synced from an
     /// archive, so the replicas it later proves land in its own store.
-    pub fn prepares_storage_confirm(&self, filter: &[u8], snapshots: &[crate::prover_pipeline::SnapshotSources]) -> bool {
+    pub fn prepares_storage_confirm(
+        &self,
+        filter: &[u8],
+        snapshots: &[crate::prover_pipeline::SnapshotSources],
+    ) -> bool {
         self.workers
             .lock()
-            .map(|workers| workers.values().any(|w| Self::prepares(w, filter, snapshots)))
+            .map(|workers| {
+                workers
+                    .values()
+                    .any(|w| Self::prepares(w, filter, snapshots))
+            })
             .unwrap_or(false)
     }
 
-    fn prepares(worker: &RemoteWorkerState, filter: &[u8], snapshots: &[crate::prover_pipeline::SnapshotSources]) -> bool {
+    fn prepares(
+        worker: &RemoteWorkerState,
+        filter: &[u8],
+        snapshots: &[crate::prover_pipeline::SnapshotSources],
+    ) -> bool {
         Self::runs(worker, filter)
-            || (!filter.is_empty() && worker.filter.as_slice() == filter
-                && snapshots.iter().any(|(shard, _)| shard.as_slice() == filter))
+            || (!filter.is_empty()
+                && worker.filter.as_slice() == filter
+                && snapshots
+                    .iter()
+                    .any(|(shard, _)| shard.as_slice() == filter))
     }
 
     /// Filters a standalone worker is running consensus for.
@@ -866,7 +1027,11 @@ impl RemoteWorkerManager {
         self.workers
             .lock()
             .map(|workers| {
-                workers.values().filter(|w| Self::runs(w, &w.filter)).map(|w| w.filter.clone()).collect()
+                workers
+                    .values()
+                    .filter(|w| Self::runs(w, &w.filter))
+                    .map(|w| w.filter.clone())
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -882,22 +1047,35 @@ impl RemoteWorkerManager {
         from: Vec<u8>,
     ) -> RemoteDelivery {
         let connection = self.workers.lock().ok().and_then(|workers| {
-            workers.values().find(|w| Self::runs(w, filter)).and_then(|w| w.channel.clone())
+            workers
+                .values()
+                .find(|w| Self::runs(w, filter))
+                .and_then(|w| w.channel.clone())
         });
-        let Some(connection) = connection else { return RemoteDelivery::Failed };
-        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(connection)
-            .max_decoding_message_size(16 << 20)
-            .max_encoding_message_size(16 << 20);
+        let Some(connection) = connection else {
+            return RemoteDelivery::Failed;
+        };
+        let mut client =
+            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(connection)
+                .max_decoding_message_size(16 << 20)
+                .max_encoding_message_size(16 << 20);
         let request = quil_types::proto::node::DeliverShardConsensusRequest {
             filter: filter.to_vec(),
             channel,
             data,
             from,
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(5), client.deliver_shard_consensus(request)).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.deliver_shard_consensus(request),
+        )
+        .await
+        {
             Ok(Ok(response)) if response.get_ref().accepted => RemoteDelivery::Accepted,
             Ok(Ok(_)) => RemoteDelivery::Refused,
-            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => RemoteDelivery::Unsupported,
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                RemoteDelivery::Unsupported
+            }
             _ => RemoteDelivery::Failed,
         }
     }
@@ -915,27 +1093,43 @@ impl RemoteWorkerManager {
         frame_number: u64,
         timeout: std::time::Duration,
         snapshots: &[crate::prover_pipeline::SnapshotSources],
-    ) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>> {
+    ) -> Result<
+        Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>,
+    > {
         let channel = {
-            let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
-            let Some(worker) = workers.values().find(|w| Self::runs(w, filter))
-                .or_else(|| workers.values().find(|w| Self::prepares(w, filter, snapshots)))
+            let workers = self
+                .workers
+                .lock()
+                .map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+            let Some(worker) = workers
+                .values()
+                .find(|w| Self::runs(w, filter))
+                .or_else(|| {
+                    workers
+                        .values()
+                        .find(|w| Self::prepares(w, filter, snapshots))
+                })
             else {
                 return Ok(None);
             };
             worker.channel.clone().ok_or_else(|| {
-                QuilError::ExecutionUnavailable("worker serving this filter is not connected".into())
+                QuilError::ExecutionUnavailable(
+                    "worker serving this filter is not connected".into(),
+                )
             })?
         };
-        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
-            .max_decoding_message_size(16 << 20);
+        let mut client =
+            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
+                .max_decoding_message_size(16 << 20);
         let response = match tokio::time::timeout(
             timeout,
             client.prepare_storage_confirm(quil_types::proto::node::PrepareStorageConfirmRequest {
                 filter: filter.to_vec(),
                 frame_number,
                 targets: targets.to_vec(),
-                snapshot_sources: quil_execution::global_intrinsic::storage_snapshot::encode_plan(snapshots),
+                snapshot_sources: quil_execution::global_intrinsic::storage_snapshot::encode_plan(
+                    snapshots,
+                ),
             }),
         )
         .await
@@ -945,11 +1139,18 @@ impl RemoteWorkerManager {
             // The worker has not bound or synced this shard yet: the caller
             // encodes from its own store, as for a Joining allocation.
             Err(status) if status.code() == tonic::Code::FailedPrecondition => {
-                debug!(filter = hex::encode(filter), message = status.message(), "worker cannot prepare storage confirm yet");
+                debug!(
+                    filter = hex::encode(filter),
+                    message = status.message(),
+                    "worker cannot prepare storage confirm yet"
+                );
                 return Ok(None);
             }
             Err(status) => {
-                return Err(QuilError::ExecutionUnavailable(format!("worker storage confirm: {}", status.message())));
+                return Err(QuilError::ExecutionUnavailable(format!(
+                    "worker storage confirm: {}",
+                    status.message()
+                )));
             }
         };
         let roots: Vec<_> = response
@@ -959,8 +1160,13 @@ impl RemoteWorkerManager {
             .collect();
         // The worker encodes its shard and the shards a pending split or
         // merge creates from it (`targets`); any other group is not its own.
-        if roots.iter().any(|group| group.filter != filter && !targets.contains(&group.filter)) {
-            return Err(QuilError::ExecutionUnavailable("worker returned leaf roots for another filter".into()));
+        if roots
+            .iter()
+            .any(|group| group.filter != filter && !targets.contains(&group.filter))
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "worker returned leaf roots for another filter".into(),
+            ));
         }
         Ok(Some(roots))
     }
@@ -979,10 +1185,11 @@ impl RemoteWorkerManager {
                 .collect()
         };
         for (core_id, channel) in channels {
-            let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
-            let request = tonic::Request::new(
-                quil_types::proto::node::SetHaltedRequest { halted },
-            );
+            let mut client =
+                quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(
+                    channel,
+                );
+            let request = tonic::Request::new(quil_types::proto::node::SetHaltedRequest { halted });
             match client.set_halted(request).await {
                 Ok(_) => {
                     info!(core_id, halted, "remote worker SetHalted ack");
@@ -998,15 +1205,18 @@ impl RemoteWorkerManager {
     pub async fn send_respawn(&self, core_id: u32, filter: &[u8]) -> Result<()> {
         let channel = {
             let mut workers = self.workers.lock().unwrap();
-            workers.get_mut(&core_id)
-                .and_then(|w| { w.quote_binding = std::sync::Arc::new(()); w.channel.clone() })
-                .ok_or_else(|| QuilError::Internal(
-                    format!("worker {} not connected", core_id)
-                ))?
+            workers
+                .get_mut(&core_id)
+                .and_then(|w| {
+                    w.quote_binding = std::sync::Arc::new(());
+                    w.channel.clone()
+                })
+                .ok_or_else(|| QuilError::Internal(format!("worker {} not connected", core_id)))?
         };
 
         // Call the DataIPC Respawn RPC
-        let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
+        let mut client =
+            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
         let request = tonic::Request::new(quil_types::proto::node::RespawnRequest {
             filter: filter.to_vec(),
         });
@@ -1018,9 +1228,17 @@ impl RemoteWorkerManager {
                     info!(core_id, filter = hex::encode(filter),
                         "remote worker took its Respawn while starting; it applies it once its initial prover-tree sync completes");
                 } else if response.kept {
-                    info!(core_id, filter = hex::encode(filter), "remote worker already runs its filter; its engine is kept");
+                    info!(
+                        core_id,
+                        filter = hex::encode(filter),
+                        "remote worker already runs its filter; its engine is kept"
+                    );
                 } else {
-                    info!(core_id, filter = hex::encode(filter), "remote worker respawned");
+                    info!(
+                        core_id,
+                        filter = hex::encode(filter),
+                        "remote worker respawned"
+                    );
                 }
                 Ok(())
             }
@@ -1049,18 +1267,25 @@ impl WorkerManager for RemoteWorkerManager {
     /// is asked again then.
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
         let channel = {
-            let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+            let workers = self
+                .workers
+                .lock()
+                .map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
             let worker = workers
                 .get(&core_id)
                 .ok_or_else(|| QuilError::InvalidArgument("eviction worker missing".into()))?;
             worker.channel.clone()
         };
         let Some(channel) = channel else {
-            debug!(core_id, "remote worker not connected; payload eviction waits for the next interval");
+            debug!(
+                core_id,
+                "remote worker not connected; payload eviction waits for the next interval"
+            );
             return Ok(());
         };
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| QuilError::ExecutionUnavailable("payload eviction needs a runtime".into()))?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            QuilError::ExecutionUnavailable("payload eviction needs a runtime".into())
+        })?;
         let unsupported = self.evict_unsupported.clone();
         runtime.spawn(async move {
             let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel)
@@ -1091,12 +1316,7 @@ impl WorkerManager for RemoteWorkerManager {
         Ok(())
     }
 
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         let connected = {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
@@ -1111,7 +1331,10 @@ impl WorkerManager for RemoteWorkerManager {
                 // allocator's next pass re-issues the Respawn (see the thread
                 // manager).
                 w.allocated = w.wants_consensus;
-                if w.owed.as_ref().is_some_and(|owed| !(w.wants_consensus && owed.filter == filter)) {
+                if w.owed
+                    .as_ref()
+                    .is_some_and(|owed| !(w.wants_consensus && owed.filter == filter))
+                {
                     w.owed = None;
                 }
                 if w.lost.as_ref().is_some_and(|lost| lost.filter != filter) {
@@ -1129,14 +1352,17 @@ impl WorkerManager for RemoteWorkerManager {
                     }
                     // The Respawn below is in flight from here, so a report
                     // of the old engine does not count as a lost assignment.
-                    Some(channel) if w.wants_consensus => Some(Some((RespawnInFlight::begin(&self.workers, w), channel))),
+                    Some(channel) if w.wants_consensus => {
+                        Some(Some((RespawnInFlight::begin(&self.workers, w), channel)))
+                    }
                     Some(_) => Some(None),
                     None => None,
                 }
             } else {
-                return Err(QuilError::InvalidArgument(
-                    format!("no remote worker with core_id {}", core_id)
-                ));
+                return Err(QuilError::InvalidArgument(format!(
+                    "no remote worker with core_id {}",
+                    core_id
+                )));
             }
         };
 
@@ -1174,7 +1400,11 @@ impl WorkerManager for RemoteWorkerManager {
             return Ok(());
         };
         let Some((in_flight, channel)) = send else {
-            info!(core_id, filter = hex::encode(filter), "remote worker Respawn queued behind the one in flight");
+            info!(
+                core_id,
+                filter = hex::encode(filter),
+                "remote worker Respawn queued behind the one in flight"
+            );
             return Ok(());
         };
 
@@ -1205,7 +1435,8 @@ impl WorkerManager for RemoteWorkerManager {
 
     fn check_workers_connected(&self) -> Result<Vec<u32>> {
         let workers = self.workers.lock().unwrap();
-        Ok(workers.values()
+        Ok(workers
+            .values()
             .filter(|w| w.connected)
             .map(|w| w.core_id)
             .collect())
@@ -1219,7 +1450,9 @@ impl WorkerManager for RemoteWorkerManager {
         };
         executions
             .iter()
-            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| Self::runs(w, filter)))
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| Self::runs(w, filter))
+            })
             .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
             .collect()
     }
@@ -1232,14 +1465,17 @@ impl WorkerManager for RemoteWorkerManager {
         };
         unanswered
             .iter()
-            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| Self::runs(w, filter)))
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| Self::runs(w, filter))
+            })
             .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
             .collect()
     }
 
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
         let workers = self.workers.lock().unwrap();
-        Ok(workers.values()
+        Ok(workers
+            .values()
             .map(|w| WorkerInfo {
                 core_id: w.core_id,
                 filter: w.filter.clone(),
@@ -1313,7 +1549,13 @@ fn on_local_clock(
     if worker_now_ms == 0 {
         return execution;
     }
-    let rebase = |at: u64| if at == 0 { 0 } else { local_now_ms.saturating_sub(worker_now_ms.saturating_sub(at)) };
+    let rebase = |at: u64| {
+        if at == 0 {
+            0
+        } else {
+            local_now_ms.saturating_sub(worker_now_ms.saturating_sub(at))
+        }
+    };
     execution.observed_unix_ms = rebase(execution.observed_unix_ms);
     execution.last_advance_unix_ms = rebase(execution.last_advance_unix_ms);
     execution.last_peer_vote_unix_ms = rebase(execution.last_peer_vote_unix_ms);
@@ -1376,8 +1618,12 @@ async fn connect_to_worker(
             .tls_config(cfg.clone())
             .map_err(|e| QuilError::Internal(format!("worker channel TLS: {}", e)))?;
     }
-    ep.connect().await
-        .map_err(|e| QuilError::Internal(format!("failed to connect: {}", crate::worker_node::error_chain(&e))))
+    ep.connect().await.map_err(|e| {
+        QuilError::Internal(format!(
+            "failed to connect: {}",
+            crate::worker_node::error_chain(&e)
+        ))
+    })
 }
 
 /// A failed call's code and message, for the log.
@@ -1388,14 +1634,20 @@ fn status_text(status: &tonic::Status) -> String {
 /// Send a Respawn of `filter`, bounded by `RESPAWN_TIMEOUT`. A worker build
 /// without the answer's fields reads as respawned.
 async fn respawn_rpc(channel: Channel, filter: &[u8]) -> RespawnOutcome {
-    let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
-    let request = quil_types::proto::node::RespawnRequest { filter: filter.to_vec() };
+    let mut client =
+        quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel);
+    let request = quil_types::proto::node::RespawnRequest {
+        filter: filter.to_vec(),
+    };
     match tokio::time::timeout(RESPAWN_TIMEOUT, client.respawn(request)).await {
         Ok(Ok(response)) if response.get_ref().deferred => RespawnOutcome::Deferred,
         Ok(Ok(response)) if response.get_ref().kept => RespawnOutcome::AlreadyRuns,
         Ok(Ok(_)) => RespawnOutcome::Delivered,
         Ok(Err(status)) => RespawnOutcome::Failed(RespawnError::of(&status), status_text(&status)),
-        Err(_) => RespawnOutcome::Failed(RespawnError::TimedOut, format!("no answer in {}s", RESPAWN_TIMEOUT.as_secs())),
+        Err(_) => RespawnOutcome::Failed(
+            RespawnError::TimedOut,
+            format!("no answer in {}s", RESPAWN_TIMEOUT.as_secs()),
+        ),
     }
 }
 
@@ -1410,22 +1662,35 @@ async fn resend_respawn(
     channel: Channel,
     filter: &[u8],
 ) -> RespawnOutcome {
-    let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(channel.clone())
-        .max_decoding_message_size(64 << 10);
+    let mut client = quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(
+        channel.clone(),
+    )
+    .max_decoding_message_size(64 << 10);
     let answer = tokio::time::timeout(
         Duration::from_secs(3),
         client.get_worker_execution(quil_types::proto::node::GetWorkerExecutionRequest {}),
     )
     .await;
     match answer {
-        Ok(Ok(response)) if response.get_ref().filter == filter => return RespawnOutcome::AlreadyRuns,
+        Ok(Ok(response)) if response.get_ref().filter == filter => {
+            return RespawnOutcome::AlreadyRuns
+        }
         Ok(Ok(_)) => {}
         Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
-        Ok(Err(status)) => return RespawnOutcome::Failed(RespawnError::of(&status), status_text(&status)),
-        Err(_) => return RespawnOutcome::Failed(RespawnError::TimedOut, "no answer to the execution request in 3s".into()),
+        Ok(Err(status)) => {
+            return RespawnOutcome::Failed(RespawnError::of(&status), status_text(&status))
+        }
+        Err(_) => {
+            return RespawnOutcome::Failed(
+                RespawnError::TimedOut,
+                "no answer to the execution request in 3s".into(),
+            )
+        }
     }
     let current = workers.lock().ok().is_some_and(|workers| {
-        workers.get(&core_id).is_some_and(|w| RemoteWorkerManager::owes_consensus(w, filter))
+        workers
+            .get(&core_id)
+            .is_some_and(|w| RemoteWorkerManager::owes_consensus(w, filter))
     });
     if !current {
         return RespawnOutcome::Superseded;
@@ -1481,7 +1746,10 @@ mod tests {
             None,
         );
         mgr.allocate_worker(1, &[0xAA; 32]).unwrap();
-        assert!(mgr.range_workers().unwrap()[0].allocated, "a worker owed consensus is allocated");
+        assert!(
+            mgr.range_workers().unwrap()[0].allocated,
+            "a worker owed consensus is allocated"
+        );
         mgr.deallocate_worker(1).unwrap();
         let workers = mgr.range_workers().unwrap();
         assert!(workers[0].filter.is_empty());
@@ -1495,17 +1763,35 @@ mod tests {
     /// worker running the shard prepares it.
     #[test]
     fn a_joining_seat_is_prepared_by_its_worker_from_the_recorded_snapshot() {
-        let mgr = RemoteWorkerManager::new(vec![(1, "http://10.0.0.1:32501".into())], String::new(), None);
+        let mgr = RemoteWorkerManager::new(
+            vec![(1, "http://10.0.0.1:32501".into())],
+            String::new(),
+            None,
+        );
         let (joining, other) = (vec![0xBB; 32], vec![0xCC; 32]);
         mgr.set_worker_filter(1, &joining, false).unwrap();
-        let snapshot = |shard: &[u8]| -> Vec<crate::prover_pipeline::SnapshotSources> { vec![(shard.to_vec(), Vec::new())] };
+        let snapshot = |shard: &[u8]| -> Vec<crate::prover_pipeline::SnapshotSources> {
+            vec![(shard.to_vec(), Vec::new())]
+        };
         assert!(!mgr.serves_filter(&joining));
-        assert!(!mgr.prepares_storage_confirm(&joining, &[]), "no snapshot: not before it runs the shard");
+        assert!(
+            !mgr.prepares_storage_confirm(&joining, &[]),
+            "no snapshot: not before it runs the shard"
+        );
         assert!(mgr.prepares_storage_confirm(&joining, &snapshot(&joining)));
-        assert!(!mgr.prepares_storage_confirm(&other, &snapshot(&other)), "a shard it was not assigned");
-        assert!(!mgr.prepares_storage_confirm(&joining, &snapshot(&other)), "another shard's snapshot");
+        assert!(
+            !mgr.prepares_storage_confirm(&other, &snapshot(&other)),
+            "a shard it was not assigned"
+        );
+        assert!(
+            !mgr.prepares_storage_confirm(&joining, &snapshot(&other)),
+            "another shard's snapshot"
+        );
         mgr.set_worker_filter(1, &joining, true).unwrap();
-        assert!(mgr.prepares_storage_confirm(&joining, &[]), "the worker running it");
+        assert!(
+            mgr.prepares_storage_confirm(&joining, &[]),
+            "the worker running it"
+        );
     }
 
     /// A mode toggle on a remote worker is logged on change, as the local
@@ -1515,13 +1801,24 @@ mod tests {
         #[derive(Clone, Default)]
         struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Lines {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        let mgr = RemoteWorkerManager::new(vec![(1, "http://10.0.0.1:32501".into())], String::new(), None);
+        let mgr = RemoteWorkerManager::new(
+            vec![(1, "http://10.0.0.1:32501".into())],
+            String::new(),
+            None,
+        );
         let lines = Lines::default();
         let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, || {
             mgr.set_manually_managed(1, true).unwrap();
             mgr.set_manually_managed(1, true).unwrap();
@@ -1529,77 +1826,130 @@ mod tests {
             mgr.set_manually_managed(99, true).unwrap();
         });
         let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(logged.matches("worker management mode changed").count(), 2, "{logged}");
-        assert!(logged.contains("mode=\"manual\"") || logged.contains("mode=manual"), "{logged}");
+        assert_eq!(
+            logged.matches("worker management mode changed").count(),
+            2,
+            "{logged}"
+        );
+        assert!(
+            logged.contains("mode=\"manual\"") || logged.contains("mode=manual"),
+            "{logged}"
+        );
         assert!(logged.contains("persisted=false"), "{logged}");
         assert!(!mgr.range_workers().unwrap()[0].manually_managed);
     }
 }
-
 
 #[cfg(test)]
 impl RemoteWorkerManager {
     /// Whether `core_id` is owed a Respawn, and how many are in flight.
     fn respawn_state(&self, core_id: u32) -> (bool, u32) {
         let workers = self.workers.lock().unwrap();
-        workers.get(&core_id).map_or((false, 0), |w| (w.owed.is_some(), w.respawns_in_flight))
+        workers
+            .get(&core_id)
+            .map_or((false, 0), |w| (w.owed.is_some(), w.respawns_in_flight))
     }
 }
 
 #[cfg(test)]
 mod fee_relay_tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
     use quil_types::proto::node;
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
 
     struct Incoming(tokio::net::TcpListener);
     impl tonic::codegen::tokio_stream::Stream for Incoming {
         type Item = std::io::Result<tokio::net::TcpStream>;
-        fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
-            -> std::task::Poll<Option<Self::Item>> {
-            self.0.poll_accept(cx).map(|result| Some(result.map(|(stream, _)| stream)))
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0
+                .poll_accept(cx)
+                .map(|result| Some(result.map(|(stream, _)| stream)))
         }
     }
 
     struct SnapshotServer {
-        mode: Arc<AtomicU8>, entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>,
+        mode: Arc<AtomicU8>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
         /// The keep sets of eviction requests received.
         keeps: Arc<std::sync::Mutex<Vec<Vec<Vec<u8>>>>>,
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for SnapshotServer {
-        async fn deliver_shard_consensus(&self, _: tonic::Request<node::DeliverShardConsensusRequest>)
-            -> std::result::Result<tonic::Response<node::DeliverShardConsensusResponse>, tonic::Status> {
+        async fn deliver_shard_consensus(
+            &self,
+            _: tonic::Request<node::DeliverShardConsensusRequest>,
+        ) -> std::result::Result<tonic::Response<node::DeliverShardConsensusResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn get_app_fee_snapshot(&self, request: tonic::Request<node::GetAppFeeSnapshotRequest>)
-            -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status> {
+        async fn get_app_fee_snapshot(
+            &self,
+            request: tonic::Request<node::GetAppFeeSnapshotRequest>,
+        ) -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status>
+        {
             let mode = self.mode.load(Ordering::SeqCst);
-            if mode == 1 { self.entered.notify_one(); self.release.notified().await; }
-            if mode == 4 { std::future::pending::<()>().await; }
-            let application = match mode { 2 => vec![9; 32], 3 => vec![7; 2048], _ => request.into_inner().application };
-            Ok(tonic::Response::new(node::GetAppFeeSnapshotResponse { application,
-                frame_number: 42, global_frame_number: 100, difficulty: 50_000,
-                world_state_bytes: 1234, fee_multiplier_vote: 7 }))
+            if mode == 1 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if mode == 4 {
+                std::future::pending::<()>().await;
+            }
+            let application = match mode {
+                2 => vec![9; 32],
+                3 => vec![7; 2048],
+                _ => request.into_inner().application,
+            };
+            Ok(tonic::Response::new(node::GetAppFeeSnapshotResponse {
+                application,
+                frame_number: 42,
+                global_frame_number: 100,
+                difficulty: 50_000,
+                world_state_bytes: 1234,
+                fee_multiplier_vote: 7,
+            }))
         }
-        async fn respawn(&self, _: tonic::Request<node::RespawnRequest>) -> std::result::Result<tonic::Response<node::RespawnResponse>, tonic::Status> {
+        async fn respawn(
+            &self,
+            _: tonic::Request<node::RespawnRequest>,
+        ) -> std::result::Result<tonic::Response<node::RespawnResponse>, tonic::Status> {
             Ok(tonic::Response::new(node::RespawnResponse::default()))
         }
-        async fn create_join_proof(&self, _: tonic::Request<node::CreateJoinProofRequest>) -> std::result::Result<tonic::Response<node::CreateJoinProofResponse>, tonic::Status> {
+        async fn create_join_proof(
+            &self,
+            _: tonic::Request<node::CreateJoinProofRequest>,
+        ) -> std::result::Result<tonic::Response<node::CreateJoinProofResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("not used by fee relay"))
         }
-        async fn set_halted(&self, _: tonic::Request<node::SetHaltedRequest>) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
+        async fn set_halted(
+            &self,
+            _: tonic::Request<node::SetHaltedRequest>,
+        ) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
             Ok(tonic::Response::new(node::SetHaltedResponse {}))
         }
         /// Mode 8 answers for the requested shard and its targets, as a
         /// worker does; mode 9 adds a group for a shard it was not asked for.
-        async fn prepare_storage_confirm(&self, request: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
+        async fn prepare_storage_confirm(
+            &self,
+            request: tonic::Request<node::PrepareStorageConfirmRequest>,
+        ) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status>
+        {
             let mode = self.mode.load(Ordering::SeqCst);
             if !matches!(mode, 8 | 9) {
                 return Err(tonic::Status::unimplemented("not used by fee relay"));
             }
             let request = request.into_inner();
-            let mut groups: Vec<Vec<u8>> = std::iter::once(request.filter).chain(request.targets).collect();
+            let mut groups: Vec<Vec<u8>> = std::iter::once(request.filter)
+                .chain(request.targets)
+                .collect();
             if mode == 9 {
                 groups.push(vec![0xEE; 32]);
             }
@@ -1613,20 +1963,29 @@ mod fee_relay_tests {
             }))
         }
         /// Mode 5 is an older build without the call.
-        async fn evict_payload(&self, request: tonic::Request<node::EvictPayloadRequest>)
-            -> std::result::Result<tonic::Response<node::EvictPayloadResponse>, tonic::Status> {
+        async fn evict_payload(
+            &self,
+            request: tonic::Request<node::EvictPayloadRequest>,
+        ) -> std::result::Result<tonic::Response<node::EvictPayloadResponse>, tonic::Status>
+        {
             if self.mode.load(Ordering::SeqCst) == 5 {
                 return Err(tonic::Status::unimplemented("older worker"));
             }
             self.keeps.lock().unwrap().push(request.into_inner().keep);
-            Ok(tonic::Response::new(node::EvictPayloadResponse { started: true, deferred: String::new() }))
+            Ok(tonic::Response::new(node::EvictPayloadResponse {
+                started: true,
+                deferred: String::new(),
+            }))
         }
         /// Mode 5 is an older build without the call, mode 6 never answers
         /// and mode 7 answers unavailable; otherwise the engine runs
         /// `[7; 32]`, blocked, observed a minute before the answer, on a
         /// clock an hour ahead of the master's.
-        async fn get_worker_execution(&self, _: tonic::Request<node::GetWorkerExecutionRequest>)
-            -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status> {
+        async fn get_worker_execution(
+            &self,
+            _: tonic::Request<node::GetWorkerExecutionRequest>,
+        ) -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status>
+        {
             match self.mode.load(Ordering::SeqCst) {
                 5 => return Err(tonic::Status::unimplemented("older worker")),
                 6 => std::future::pending::<()>().await,
@@ -1636,7 +1995,11 @@ mod fee_relay_tests {
             let now = crate::worker_execution::now_ms() + 3_600_000;
             Ok(tonic::Response::new(node::GetWorkerExecutionResponse {
                 filter: vec![7; 32],
-                execution: Some(node::WorkerExecution { state: "blocked".into(), observed_unix_ms: now - 60_000, ..Default::default() }),
+                execution: Some(node::WorkerExecution {
+                    state: "blocked".into(),
+                    observed_unix_ms: now - 60_000,
+                    ..Default::default()
+                }),
                 now_unix_ms: now,
             }))
         }
@@ -1648,15 +2011,38 @@ mod fee_relay_tests {
     /// worker reported them.
     #[test]
     fn a_report_is_moved_onto_the_local_clock() {
-        let report = node::WorkerExecution { observed_unix_ms: 9_000, last_advance_unix_ms: 8_000,
-            last_peer_vote_unix_ms: 7_000, own_votes: Some(0), host_started_unix_ms: 6_000,
-            engine_started_unix_ms: 5_000, silent_ms: 4_000, ..Default::default() };
+        let report = node::WorkerExecution {
+            observed_unix_ms: 9_000,
+            last_advance_unix_ms: 8_000,
+            last_peer_vote_unix_ms: 7_000,
+            own_votes: Some(0),
+            host_started_unix_ms: 6_000,
+            engine_started_unix_ms: 5_000,
+            silent_ms: 4_000,
+            ..Default::default()
+        };
         let moved = on_local_clock(report, 10_000, 50_000);
-        assert_eq!((moved.observed_unix_ms, moved.last_advance_unix_ms, moved.last_peer_vote_unix_ms),
-            (49_000, 48_000, 47_000));
-        assert_eq!((moved.own_votes, moved.host_started_unix_ms, moved.engine_started_unix_ms, moved.silent_ms),
-            (Some(0), 6_000, 5_000, 4_000));
-        assert_eq!(on_local_clock(node::WorkerExecution::default(), 10_000, 50_000).last_peer_vote_unix_ms, 0);
+        assert_eq!(
+            (
+                moved.observed_unix_ms,
+                moved.last_advance_unix_ms,
+                moved.last_peer_vote_unix_ms
+            ),
+            (49_000, 48_000, 47_000)
+        );
+        assert_eq!(
+            (
+                moved.own_votes,
+                moved.host_started_unix_ms,
+                moved.engine_started_unix_ms,
+                moved.silent_ms
+            ),
+            (Some(0), 6_000, 5_000, 4_000)
+        );
+        assert_eq!(
+            on_local_clock(node::WorkerExecution::default(), 10_000, 50_000).last_peer_vote_unix_ms,
+            0
+        );
     }
 
     /// A standalone worker's execution report reaches the master on the
@@ -1676,31 +2062,52 @@ mod fee_relay_tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
         let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
         manager.connect_all().await;
         manager.set_worker_filter(1, &[8; 32], true).unwrap();
         manager.refresh_executions().await;
-        assert!(manager.worker_execution().is_empty(), "a report for another filter is no report");
+        assert!(
+            manager.worker_execution().is_empty(),
+            "a report for another filter is no report"
+        );
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         manager.refresh_executions().await;
         let reports = manager.worker_execution();
         assert_eq!(reports.len(), 1);
         let (core_id, filter, execution) = &reports[0];
-        assert_eq!((*core_id, filter.as_slice(), execution.state.as_str()), (1, &[7u8; 32][..], "blocked"));
+        assert_eq!(
+            (*core_id, filter.as_slice(), execution.state.as_str()),
+            (1, &[7u8; 32][..], "blocked")
+        );
         let age = crate::worker_execution::now_ms().saturating_sub(execution.observed_unix_ms);
-        assert!((59_000..=65_000).contains(&age), "a minute old on the master's clock: {age}");
+        assert!(
+            (59_000..=65_000).contains(&age),
+            "a minute old on the master's clock: {age}"
+        );
 
         manager.set_worker_filter(1, &[7; 32], false).unwrap();
-        assert!(manager.worker_execution().is_empty(), "a worker no longer running consensus reports nothing");
+        assert!(
+            manager.worker_execution().is_empty(),
+            "a worker no longer running consensus reports nothing"
+        );
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         mode.store(5, Ordering::SeqCst);
         manager.refresh_executions().await;
-        assert!(manager.worker_execution().is_empty(), "an older build leaves no report");
+        assert!(
+            manager.worker_execution().is_empty(),
+            "an older build leaves no report"
+        );
         stop.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
     }
@@ -1723,12 +2130,20 @@ mod fee_relay_tests {
         };
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming(Incoming(listener)).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming(Incoming(listener))
+                .await
+                .unwrap();
         });
         // Core 2's endpoint cannot be dialled (a reachable one that refuses
         // would be retried for seconds), so the master never connects to it.
-        let manager = RemoteWorkerManager::new(vec![(1, endpoint), (2, "http://no such host".into())], String::new(), None);
+        let manager = RemoteWorkerManager::new(
+            vec![(1, endpoint), (2, "http://no such host".into())],
+            String::new(),
+            None,
+        );
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         manager.set_worker_filter(2, &[9; 32], true).unwrap();
@@ -1739,7 +2154,11 @@ mod fee_relay_tests {
         };
         manager.refresh_executions().await;
         assert!(manager.worker_execution().is_empty());
-        assert_eq!(listed(), vec![(2, vec![9; 32], NOT_CONNECTED)], "an older build answers");
+        assert_eq!(
+            listed(),
+            vec![(2, vec![9; 32], NOT_CONNECTED)],
+            "an older build answers"
+        );
 
         mode.store(0, Ordering::SeqCst);
         manager.refresh_executions().await;
@@ -1750,11 +2169,19 @@ mod fee_relay_tests {
             mode.store(silent, Ordering::SeqCst);
             manager.refresh_executions().await;
             assert!(manager.worker_execution().is_empty(), "mode {silent}");
-            assert_eq!(listed(), vec![(1, vec![7; 32], NO_ANSWER), (2, vec![9; 32], NOT_CONNECTED)], "mode {silent}");
+            assert_eq!(
+                listed(),
+                vec![(1, vec![7; 32], NO_ANSWER), (2, vec![9; 32], NOT_CONNECTED)],
+                "mode {silent}"
+            );
         }
 
         manager.set_worker_filter(1, &[7; 32], false).unwrap();
-        assert_eq!(listed(), vec![(2, vec![9; 32], NOT_CONNECTED)], "a worker no longer running consensus is not listed");
+        assert_eq!(
+            listed(),
+            vec![(2, vec![9; 32], NOT_CONNECTED)],
+            "a worker no longer running consensus is not listed"
+        );
         serving.abort();
     }
 
@@ -1776,10 +2203,20 @@ mod fee_relay_tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
-        let manager = RemoteWorkerManager::new(vec![(1, endpoint), (2, "http://no such host".into())], String::new(), None);
+        let manager = RemoteWorkerManager::new(
+            vec![(1, endpoint), (2, "http://no such host".into())],
+            String::new(),
+            None,
+        );
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         async fn until(done: impl Fn() -> bool) {
@@ -1791,16 +2228,26 @@ mod fee_relay_tests {
         let keep = vec![vec![7; 32], vec![7; 33]];
         manager.evict_payload(1, keep.clone()).unwrap();
         until(|| !keeps.lock().unwrap().is_empty()).await;
-        assert_eq!(*keeps.lock().unwrap(), vec![keep.clone()], "the worker receives the keep set");
+        assert_eq!(
+            *keeps.lock().unwrap(),
+            vec![keep.clone()],
+            "the worker receives the keep set"
+        );
 
         mode.store(5, Ordering::SeqCst);
         manager.evict_payload(1, keep.clone()).unwrap();
         until(|| manager.evict_unsupported.lock().unwrap().contains(&1)).await;
-        assert!(manager.evict_unsupported.lock().unwrap().contains(&1), "an older build is noted");
+        assert!(
+            manager.evict_unsupported.lock().unwrap().contains(&1),
+            "an older build is noted"
+        );
         mode.store(0, Ordering::SeqCst);
         manager.evict_payload(1, keep.clone()).unwrap();
         until(|| !manager.evict_unsupported.lock().unwrap().contains(&1)).await;
-        assert!(!manager.evict_unsupported.lock().unwrap().contains(&1), "an upgraded worker is asked again");
+        assert!(
+            !manager.evict_unsupported.lock().unwrap().contains(&1),
+            "an upgraded worker is asked again"
+        );
         assert_eq!(keeps.lock().unwrap().len(), 2);
 
         manager.evict_payload(2, keep.clone()).unwrap();
@@ -1825,22 +2272,35 @@ mod fee_relay_tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
         let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], false).unwrap();
-        assert!(manager.served_filters().is_empty(), "a Joining allocation runs no consensus yet");
+        assert!(
+            manager.served_filters().is_empty(),
+            "a Joining allocation runs no consensus yet"
+        );
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         assert_eq!(manager.served_filters(), vec![vec![7; 32]]);
         assert_eq!(
-            manager.deliver_shard_consensus(&[7; 32], 2, b"x".to_vec(), vec![5; 897]).await,
+            manager
+                .deliver_shard_consensus(&[7; 32], 2, b"x".to_vec(), vec![5; 897])
+                .await,
             RemoteDelivery::Unsupported,
             "this test worker lacks the RPC, like an older build"
         );
         assert_eq!(
-            manager.deliver_shard_consensus(&[8; 32], 2, b"x".to_vec(), vec![5; 897]).await,
+            manager
+                .deliver_shard_consensus(&[8; 32], 2, b"x".to_vec(), vec![5; 897])
+                .await,
             RemoteDelivery::Failed,
             "no worker runs that shard"
         );
@@ -1864,29 +2324,53 @@ mod fee_relay_tests {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
         let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         let targets = vec![vec![10; 32], vec![11; 32]];
         let roots = manager
-            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10), &[])
+            .prepare_storage_confirm(
+                &[7; 32],
+                &targets,
+                720,
+                std::time::Duration::from_secs(10),
+                &[],
+            )
             .await
             .unwrap()
             .expect("the worker runs the shard");
         assert_eq!(
-            roots.iter().map(|group| group.filter.clone()).collect::<Vec<_>>(),
+            roots
+                .iter()
+                .map(|group| group.filter.clone())
+                .collect::<Vec<_>>(),
             vec![vec![7; 32], vec![10; 32], vec![11; 32]],
             "its shard and the shards a split creates from it"
         );
         mode.store(9, Ordering::SeqCst);
-        assert!(manager
-            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10), &[])
-            .await
-            .unwrap_err()
-            .is_execution_unavailable(), "a group for a shard it was not asked for");
+        assert!(
+            manager
+                .prepare_storage_confirm(
+                    &[7; 32],
+                    &targets,
+                    720,
+                    std::time::Duration::from_secs(10),
+                    &[]
+                )
+                .await
+                .unwrap_err()
+                .is_execution_unavailable(),
+            "a group for a shard it was not asked for"
+        );
         stop.send(()).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serving).await;
     }
@@ -1898,39 +2382,83 @@ mod fee_relay_tests {
         let mode = Arc::new(AtomicU8::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let server = SnapshotServer { mode: mode.clone(), entered: entered.clone(), release: release.clone(), keeps: Default::default() };
+        let server = SnapshotServer {
+            mode: mode.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            keeps: Default::default(),
+        };
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let mut serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(server))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    server,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
-        let manager = Arc::new(RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None));
+        let manager = Arc::new(RemoteWorkerManager::new(
+            vec![(1, endpoint)],
+            String::new(),
+            None,
+        ));
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], false).unwrap();
         let snapshot = manager.app_fee_snapshot([7; 32]).await.unwrap();
-        assert_eq!((snapshot.application, snapshot.frame_number, snapshot.global_frame_number,
-            snapshot.difficulty, snapshot.world_state_bytes, snapshot.fee_multiplier_vote),
-            ([7; 32], 42, 100, 50_000, 1234, 7));
+        assert_eq!(
+            (
+                snapshot.application,
+                snapshot.frame_number,
+                snapshot.global_frame_number,
+                snapshot.difficulty,
+                snapshot.world_state_bytes,
+                snapshot.fee_multiplier_vote
+            ),
+            ([7; 32], 42, 100, 50_000, 1234, 7)
+        );
         for bad_mode in [2, 3] {
             mode.store(bad_mode, Ordering::SeqCst);
-            assert!(manager.app_fee_snapshot([7; 32]).await.unwrap_err().is_execution_unavailable());
+            assert!(manager
+                .app_fee_snapshot([7; 32])
+                .await
+                .unwrap_err()
+                .is_execution_unavailable());
         }
         mode.store(1, Ordering::SeqCst);
-        let in_flight = { let manager = manager.clone(); tokio::spawn(async move { manager.app_fee_snapshot([7; 32]).await }) };
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified()).await.unwrap();
+        let in_flight = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.app_fee_snapshot([7; 32]).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
         manager.set_worker_filter(1, &[8; 32], false).unwrap();
         manager.set_worker_filter(1, &[7; 32], false).unwrap();
         release.notify_one();
-        assert!(in_flight.await.unwrap().is_err(), "rebinding away and back must invalidate the old response");
+        assert!(
+            in_flight.await.unwrap().is_err(),
+            "rebinding away and back must invalidate the old response"
+        );
         mode.store(4, Ordering::SeqCst);
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(7), manager.app_fee_snapshot([7; 32]))
-            .await.unwrap().unwrap_err().is_execution_unavailable());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            manager.app_fee_snapshot([7; 32])
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .is_execution_unavailable());
         mode.store(0, Ordering::SeqCst);
         manager.deallocate_worker(1).unwrap();
         assert!(manager.app_fee_snapshot([7; 32]).await.is_err());
         stop.send(()).unwrap();
-        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut serving).await.is_err() {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut serving)
+            .await
+            .is_err()
+        {
             serving.abort();
             let _ = serving.await;
         }
@@ -1953,64 +2481,117 @@ mod fee_relay_tests {
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for AssignedWorker {
-        async fn deliver_shard_consensus(&self, _: tonic::Request<node::DeliverShardConsensusRequest>)
-            -> std::result::Result<tonic::Response<node::DeliverShardConsensusResponse>, tonic::Status> {
+        async fn deliver_shard_consensus(
+            &self,
+            _: tonic::Request<node::DeliverShardConsensusRequest>,
+        ) -> std::result::Result<tonic::Response<node::DeliverShardConsensusResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn get_app_fee_snapshot(&self, _: tonic::Request<node::GetAppFeeSnapshotRequest>)
-            -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status> {
+        async fn get_app_fee_snapshot(
+            &self,
+            _: tonic::Request<node::GetAppFeeSnapshotRequest>,
+        ) -> std::result::Result<tonic::Response<node::GetAppFeeSnapshotResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn evict_payload(&self, _: tonic::Request<node::EvictPayloadRequest>)
-            -> std::result::Result<tonic::Response<node::EvictPayloadResponse>, tonic::Status> {
+        async fn evict_payload(
+            &self,
+            _: tonic::Request<node::EvictPayloadRequest>,
+        ) -> std::result::Result<tonic::Response<node::EvictPayloadResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn respawn(&self, request: tonic::Request<node::RespawnRequest>) -> std::result::Result<tonic::Response<node::RespawnResponse>, tonic::Status> {
+        async fn respawn(
+            &self,
+            request: tonic::Request<node::RespawnRequest>,
+        ) -> std::result::Result<tonic::Response<node::RespawnResponse>, tonic::Status> {
             let filter = request.into_inner().filter;
             self.respawns.lock().unwrap().push(filter.clone());
             let deferred = self.starting.load(Ordering::SeqCst);
             if !deferred && !self.exits.load(Ordering::SeqCst) {
                 *self.runs.lock().unwrap() = filter;
             }
-            Ok(tonic::Response::new(node::RespawnResponse { deferred, kept: false }))
+            Ok(tonic::Response::new(node::RespawnResponse {
+                deferred,
+                kept: false,
+            }))
         }
-        async fn create_join_proof(&self, _: tonic::Request<node::CreateJoinProofRequest>) -> std::result::Result<tonic::Response<node::CreateJoinProofResponse>, tonic::Status> {
+        async fn create_join_proof(
+            &self,
+            _: tonic::Request<node::CreateJoinProofRequest>,
+        ) -> std::result::Result<tonic::Response<node::CreateJoinProofResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn set_halted(&self, _: tonic::Request<node::SetHaltedRequest>) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
+        async fn set_halted(
+            &self,
+            _: tonic::Request<node::SetHaltedRequest>,
+        ) -> std::result::Result<tonic::Response<node::SetHaltedResponse>, tonic::Status> {
             Ok(tonic::Response::new(node::SetHaltedResponse {}))
         }
-        async fn prepare_storage_confirm(&self, _: tonic::Request<node::PrepareStorageConfirmRequest>) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status> {
+        async fn prepare_storage_confirm(
+            &self,
+            _: tonic::Request<node::PrepareStorageConfirmRequest>,
+        ) -> std::result::Result<tonic::Response<node::PrepareStorageConfirmResponse>, tonic::Status>
+        {
             Err(tonic::Status::unimplemented("test server"))
         }
-        async fn get_worker_execution(&self, _: tonic::Request<node::GetWorkerExecutionRequest>)
-            -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status> {
+        async fn get_worker_execution(
+            &self,
+            _: tonic::Request<node::GetWorkerExecutionRequest>,
+        ) -> std::result::Result<tonic::Response<node::GetWorkerExecutionResponse>, tonic::Status>
+        {
             if self.hold.load(Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
             let filter = self.runs.lock().unwrap().clone();
             let now = crate::worker_execution::now_ms();
-            let execution = (!filter.is_empty())
-                .then(|| node::WorkerExecution { state: "running".into(), observed_unix_ms: now, ..Default::default() });
-            Ok(tonic::Response::new(node::GetWorkerExecutionResponse { filter, execution, now_unix_ms: now }))
+            let execution = (!filter.is_empty()).then(|| node::WorkerExecution {
+                state: "running".into(),
+                observed_unix_ms: now,
+                ..Default::default()
+            });
+            Ok(tonic::Response::new(node::GetWorkerExecutionResponse {
+                filter,
+                execution,
+                now_unix_ms: now,
+            }))
         }
     }
 
-    fn serve_assigned(listener: tokio::net::TcpListener, worker: AssignedWorker)
-        -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    fn serve_assigned(
+        listener: tokio::net::TcpListener,
+        worker: AssignedWorker,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(worker))
-                .serve_with_incoming_shutdown(Incoming(listener), async { let _ = stopped.await; }).await.unwrap();
+                .add_service(node::data_ipc_service_server::DataIpcServiceServer::new(
+                    worker,
+                ))
+                .serve_with_incoming_shutdown(Incoming(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
         });
         (stop, serving)
     }
 
-    async fn stop_serving(stop: tokio::sync::oneshot::Sender<()>, mut serving: tokio::task::JoinHandle<()>) {
+    async fn stop_serving(
+        stop: tokio::sync::oneshot::Sender<()>,
+        mut serving: tokio::task::JoinHandle<()>,
+    ) {
         let _ = stop.send(());
-        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut serving).await.is_err() {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut serving)
+            .await
+            .is_err()
+        {
             serving.abort();
             let _ = serving.await;
         }
@@ -2028,14 +2609,25 @@ mod fee_relay_tests {
     }
 
     /// A connected worker assigned and started, its Respawn delivered.
-    async fn assigned(worker: &AssignedWorker) -> (RemoteWorkerManager, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    async fn assigned(
+        worker: &AssignedWorker,
+    ) -> (
+        RemoteWorkerManager,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, serving) = serve_assigned(listener, worker.clone());
         let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
         manager.connect_all().await;
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
-        assert!(eventually(|| worker.respawns.lock().unwrap().len() == 1 && manager.respawn_state(1).1 == 0).await);
+        assert!(
+            eventually(
+                || worker.respawns.lock().unwrap().len() == 1 && manager.respawn_state(1).1 == 0
+            )
+            .await
+        );
         (manager, stop, serving)
     }
 
@@ -2050,19 +2642,28 @@ mod fee_relay_tests {
         let address = listener.local_addr().unwrap();
         let worker = AssignedWorker::default();
         let (stop, serving) = serve_assigned(listener, worker.clone());
-        let manager = RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
+        let manager =
+            RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
         manager.connect_all().await;
         assert_eq!(manager.check_workers_connected().unwrap(), vec![1]);
         stop_serving(stop, serving).await;
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
-        assert!(eventually(|| manager.respawn_state(1) == (true, 0)).await, "the failed Respawn is owed");
+        assert!(
+            eventually(|| manager.respawn_state(1) == (true, 0)).await,
+            "the failed Respawn is owed"
+        );
         assert!(worker.respawns.lock().unwrap().is_empty());
 
         let listener = tokio::net::TcpListener::bind(address).await.unwrap();
         let (stop, serving) = serve_assigned(listener, worker.clone());
-        manager.reconcile_respawns_at(std::time::Instant::now()).await;
-        assert!(worker.respawns.lock().unwrap().is_empty(), "not before its backoff");
+        manager
+            .reconcile_respawns_at(std::time::Instant::now())
+            .await;
+        assert!(
+            worker.respawns.lock().unwrap().is_empty(),
+            "not before its backoff"
+        );
         let mut later = std::time::Instant::now();
         for _ in 0..5 {
             later += std::time::Duration::from_secs(600);
@@ -2075,11 +2676,21 @@ mod fee_relay_tests {
         assert_eq!(manager.respawn_state(1), (false, 0));
 
         manager.refresh_executions().await;
-        manager.reconcile_respawns_at(later + std::time::Duration::from_secs(600)).await;
-        assert_eq!(worker.respawns.lock().unwrap().len(), 1, "a worker running its filter is not respawned again");
+        manager
+            .reconcile_respawns_at(later + std::time::Duration::from_secs(600))
+            .await;
+        assert_eq!(
+            worker.respawns.lock().unwrap().len(),
+            1,
+            "a worker running its filter is not respawned again"
+        );
         let failed = logs.lines_with("remote worker Respawn RPC failed");
         assert_eq!(failed.len(), 1, "{failed:?}");
-        assert!(failed[0].contains("core_id=1") && failed[0].contains(&address.to_string()), "{}", failed[0]);
+        assert!(
+            failed[0].contains("core_id=1") && failed[0].contains(&address.to_string()),
+            "{}",
+            failed[0]
+        );
         assert_eq!(logs.lines_with("remote worker respawned after").len(), 1);
         stop_serving(stop, serving).await;
     }
@@ -2092,8 +2703,14 @@ mod fee_relay_tests {
         let (manager, stop, serving) = assigned(&worker).await;
         worker.runs.lock().unwrap().clear();
         manager.refresh_executions().await;
-        assert_eq!(manager.respawn_state(1), (true, 0), "a lost assignment is owed");
-        manager.reconcile_respawns_at(std::time::Instant::now()).await;
+        assert_eq!(
+            manager.respawn_state(1),
+            (true, 0),
+            "a lost assignment is owed"
+        );
+        manager
+            .reconcile_respawns_at(std::time::Instant::now())
+            .await;
         assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![7u8; 32]; 2]);
         assert_eq!(manager.respawn_state(1), (false, 0));
         stop_serving(stop, serving).await;
@@ -2106,7 +2723,9 @@ mod fee_relay_tests {
         let (manager, stop, serving) = assigned(&worker).await;
         manager.refresh_executions().await;
         assert_eq!(manager.respawn_state(1), (false, 0));
-        manager.reconcile_respawns_at(std::time::Instant::now() + std::time::Duration::from_secs(600)).await;
+        manager
+            .reconcile_respawns_at(std::time::Instant::now() + std::time::Duration::from_secs(600))
+            .await;
         assert_eq!(worker.respawns.lock().unwrap().len(), 1);
         stop_serving(stop, serving).await;
     }
@@ -2123,7 +2742,10 @@ mod fee_relay_tests {
         let manager = RemoteWorkerManager::new(vec![(1, endpoint)], String::new(), None);
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         manager.connect_all().await;
-        assert!(worker.respawns.lock().unwrap().is_empty(), "a running engine is not restarted");
+        assert!(
+            worker.respawns.lock().unwrap().is_empty(),
+            "a running engine is not restarted"
+        );
         assert_eq!(manager.respawn_state(1), (false, 0));
 
         // One that runs nothing is sent its Respawn.
@@ -2150,7 +2772,10 @@ mod fee_relay_tests {
         let (manager, stop, serving) = assigned(&worker).await;
         let taken = logs.lines_with("remote worker took its Respawn while starting");
         assert_eq!(taken.len(), 1, "{taken:?}");
-        assert!(logs.lines_with("remote worker respawned").is_empty(), "nothing was applied yet");
+        assert!(
+            logs.lines_with("remote worker respawned").is_empty(),
+            "nothing was applied yet"
+        );
         assert_eq!(manager.respawn_state(1), (false, 0));
         stop_serving(stop, serving).await;
     }
@@ -2177,11 +2802,25 @@ mod fee_relay_tests {
                 sent_at.push(5 * tick);
             }
         }
-        assert!((4..=10).contains(&sent_at.len()), "re-sent with backoff, not at the refresh cadence: {sent_at:?}");
+        assert!(
+            (4..=10).contains(&sent_at.len()),
+            "re-sent with backoff, not at the refresh cadence: {sent_at:?}"
+        );
         let gaps: Vec<u64> = sent_at.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(gaps.windows(2).all(|pair| pair[1] >= pair[0]), "intervals grow: {sent_at:?}");
-        assert_eq!(logs.lines_with("engine exited again after its Respawn").len(), 1);
-        assert_eq!(logs.lines_with("runs another filter or none").len(), 1, "the first loss only");
+        assert!(
+            gaps.windows(2).all(|pair| pair[1] >= pair[0]),
+            "intervals grow: {sent_at:?}"
+        );
+        assert_eq!(
+            logs.lines_with("engine exited again after its Respawn")
+                .len(),
+            1
+        );
+        assert_eq!(
+            logs.lines_with("runs another filter or none").len(),
+            1,
+            "the first loss only"
+        );
 
         worker.exits.store(false, Ordering::SeqCst);
         let mut tick = 120u64;
@@ -2191,7 +2830,11 @@ mod fee_relay_tests {
             manager.refresh_executions_at(now).await;
             manager.reconcile_respawns_at(now).await;
         }
-        assert_eq!(logs.lines_with("engine stays up again").len(), 1, "the loop ends once the engine stays up");
+        assert_eq!(
+            logs.lines_with("engine stays up again").len(),
+            1,
+            "the loop ends once the engine stays up"
+        );
         stop_serving(stop, serving).await;
     }
 
@@ -2204,20 +2847,32 @@ mod fee_relay_tests {
         let address = listener.local_addr().unwrap();
         let worker = AssignedWorker::default();
         let (stop, serving) = serve_assigned(listener, worker.clone());
-        let manager = RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
+        let manager =
+            RemoteWorkerManager::new(vec![(1, format!("http://{address}"))], String::new(), None);
         manager.connect_all().await;
         stop_serving(stop, serving).await;
 
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
-        assert!(eventually(|| manager.respawn_state(1) == (true, 0)).await, "the failed Respawn is owed");
+        assert!(
+            eventually(|| manager.respawn_state(1) == (true, 0)).await,
+            "the failed Respawn is owed"
+        );
         manager.set_worker_filter(1, &[8; 32], true).unwrap();
-        assert!(eventually(|| manager.respawn_state(1) == (true, 0)).await, "the reassignment's failed Respawn is owed");
+        assert!(
+            eventually(|| manager.respawn_state(1) == (true, 0)).await,
+            "the reassignment's failed Respawn is owed"
+        );
         let mut later = std::time::Instant::now();
         let restart = {
             let worker = worker.clone();
             move || {
                 let worker = worker.clone();
-                async move { serve_assigned(tokio::net::TcpListener::bind(address).await.unwrap(), worker) }
+                async move {
+                    serve_assigned(
+                        tokio::net::TcpListener::bind(address).await.unwrap(),
+                        worker,
+                    )
+                }
             }
         };
         let (stop, serving) = restart().await;
@@ -2228,7 +2883,11 @@ mod fee_relay_tests {
                 break;
             }
         }
-        assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![8u8; 32]], "only the current filter");
+        assert_eq!(
+            *worker.respawns.lock().unwrap(),
+            vec![vec![8u8; 32]],
+            "only the current filter"
+        );
         stop_serving(stop, serving).await;
 
         manager.set_worker_filter(1, &[9; 32], true).unwrap();
@@ -2239,7 +2898,11 @@ mod fee_relay_tests {
             later += std::time::Duration::from_secs(600);
             manager.reconcile_respawns_at(later).await;
         }
-        assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![8u8; 32]], "nothing after a deallocation");
+        assert_eq!(
+            *worker.respawns.lock().unwrap(),
+            vec![vec![8u8; 32]],
+            "nothing after a deallocation"
+        );
         stop_serving(stop, serving).await;
 
         manager.set_worker_filter(1, &[10; 32], true).unwrap();
@@ -2250,7 +2913,11 @@ mod fee_relay_tests {
             later += std::time::Duration::from_secs(600);
             manager.reconcile_respawns_at(later).await;
         }
-        assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![8u8; 32]], "nothing for a released allocation");
+        assert_eq!(
+            *worker.respawns.lock().unwrap(),
+            vec![vec![8u8; 32]],
+            "nothing for a released allocation"
+        );
         assert_eq!(manager.respawn_state(1), (false, 0));
         stop_serving(stop, serving).await;
     }
@@ -2268,17 +2935,32 @@ mod fee_relay_tests {
         worker.hold.store(true, Ordering::SeqCst);
         let reconciling = {
             let manager = manager.clone();
-            tokio::spawn(async move { manager.reconcile_respawns_at(std::time::Instant::now()).await })
+            tokio::spawn(async move {
+                manager
+                    .reconcile_respawns_at(std::time::Instant::now())
+                    .await
+            })
         };
-        tokio::time::timeout(std::time::Duration::from_secs(2), worker.entered.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker.entered.notified())
+            .await
+            .unwrap();
         manager.set_worker_filter(1, &[8; 32], true).unwrap();
         worker.hold.store(false, Ordering::SeqCst);
         worker.release.notify_one();
         reconciling.await.unwrap();
         tokio::task::yield_now().await;
-        assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![7u8; 32]], "the old filter is not sent");
-        manager.reconcile_respawns_at(std::time::Instant::now() + std::time::Duration::from_secs(600)).await;
-        assert_eq!(*worker.respawns.lock().unwrap(), vec![vec![7u8; 32], vec![8u8; 32]]);
+        assert_eq!(
+            *worker.respawns.lock().unwrap(),
+            vec![vec![7u8; 32]],
+            "the old filter is not sent"
+        );
+        manager
+            .reconcile_respawns_at(std::time::Instant::now() + std::time::Duration::from_secs(600))
+            .await;
+        assert_eq!(
+            *worker.respawns.lock().unwrap(),
+            vec![vec![7u8; 32], vec![8u8; 32]]
+        );
         assert_eq!(manager.respawn_state(1), (false, 0));
         stop_serving(stop, serving).await;
     }

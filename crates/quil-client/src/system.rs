@@ -188,8 +188,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -217,7 +216,10 @@ fn resolve_node_binary(
         return Ok(path);
     }
     let beside = exe.and_then(|exe| {
-        let rest = exe.file_name()?.to_str()?.strip_prefix(RELEASE_TYPE_QCLIENT)?;
+        let rest = exe
+            .file_name()?
+            .to_str()?
+            .strip_prefix(RELEASE_TYPE_QCLIENT)?;
         // Only a versioned name: a bare `qclient` would map to `node`,
         // which on many hosts is Node.js.
         rest.starts_with('-')
@@ -264,8 +266,7 @@ fn resolve_node_binary(
 
 /// A release version such as `2.1.0.25`: digits and dots.
 fn is_release_version(v: &str) -> bool {
-    v.starts_with(|c: char| c.is_ascii_digit())
-        && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+    v.starts_with(|c: char| c.is_ascii_digit()) && v.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 #[cfg(test)]
@@ -276,16 +277,22 @@ mod tests {
     fn arch_and_os_are_normalized() {
         // Whatever host we run on, the value is one of the Go-style names
         // or the raw fallback; the important invariant is the mapping.
-        assert_eq!(arch(), match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            o => o,
-        });
+        assert_eq!(
+            arch(),
+            match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                o => o,
+            }
+        );
     }
 
     #[test]
     fn path_constants_match_go() {
-        assert_eq!(client_data_path(), PathBuf::from("/var/quilibrium/bin/qclient"));
+        assert_eq!(
+            client_data_path(),
+            PathBuf::from("/var/quilibrium/bin/qclient")
+        );
         assert_eq!(node_data_path(), PathBuf::from("/var/quilibrium/bin/node"));
         assert_eq!(
             default_qclient_symlink_path(),
@@ -295,7 +302,10 @@ mod tests {
             default_node_symlink_path(),
             PathBuf::from("/usr/local/bin/quilibrium-node")
         );
-        assert_eq!(node_env_path(), PathBuf::from("/var/quilibrium/quilibrium.env"));
+        assert_eq!(
+            node_env_path(),
+            PathBuf::from("/var/quilibrium/quilibrium.env")
+        );
     }
 
     /// `resolve_node_binary` over a fake file system: `files` are the
@@ -381,14 +391,21 @@ mod tests {
     #[test]
     fn node_binary_of_several_versions_is_none() {
         let cwd = ["./node-2.1.0.24-linux-amd64", "./node-2.1.0.25-linux-amd64"];
-        let err = resolve(None, "/opt/q/qclient", &cwd, &cwd).unwrap_err().to_string();
+        let err = resolve(None, "/opt/q/qclient", &cwd, &cwd)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("several node binaries"), "{err}");
-        assert!(err.contains("node-2.1.0.24-linux-amd64, node-2.1.0.25-linux-amd64"), "{err}");
+        assert!(
+            err.contains("node-2.1.0.24-linux-amd64, node-2.1.0.25-linux-amd64"),
+            "{err}"
+        );
     }
 
     #[test]
     fn node_binary_not_found_names_the_fixes() {
-        let err = resolve(None, "/opt/q/qclient", &[], &["./.config"]).unwrap_err().to_string();
+        let err = resolve(None, "/opt/q/qclient", &[], &["./.config"])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("quilibrium-node is not on PATH"), "{err}");
         assert!(err.contains("node-<version>-linux-amd64"), "{err}");
         assert!(err.contains("qclient node link"), "{err}");

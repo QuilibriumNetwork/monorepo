@@ -19,7 +19,8 @@ pub const FILE_INDEX_ADDR_SIZE: usize = 32;
 
 /// Build a binary file index. Mirror of Go `BuildFileIndex`.
 pub fn build_file_index(total_size: u64, chunk_size: u32, blob_addresses: &[[u8; 32]]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(FILE_INDEX_HEADER_SIZE + blob_addresses.len() * FILE_INDEX_ADDR_SIZE);
+    let mut buf =
+        Vec::with_capacity(FILE_INDEX_HEADER_SIZE + blob_addresses.len() * FILE_INDEX_ADDR_SIZE);
     buf.extend_from_slice(FILE_INDEX_MAGIC);
     buf.extend_from_slice(&FILE_INDEX_VERSION.to_be_bytes());
     buf.extend_from_slice(&chunk_size.to_be_bytes());

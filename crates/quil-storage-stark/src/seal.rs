@@ -179,7 +179,11 @@ impl LeafPublic {
         Ok(Self {
             n,
             depth: storage_proof::tree_depth(n),
-            key: hash::key_digest(&quil_crypto::sdr::replica_key(statement.member, statement.leaf_id, statement.epoch)),
+            key: hash::key_digest(&quil_crypto::sdr::replica_key(
+                statement.member,
+                statement.leaf_id,
+                statement.epoch,
+            )),
             commitments: [
                 Some(commitment(&registered.comm_d)?),
                 Some(commitment(&registered.comm_c)?),
@@ -206,7 +210,11 @@ impl LeafPublic {
 
     /// Opened columns of tree C: every slot that opens.
     fn column_paths(&self) -> u64 {
-        self.slots.iter().flatten().filter(|(_, open)| *open).count() as u64
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|(_, open)| *open)
+            .count() as u64
     }
 
     /// Paths reaching each tree's root: data, column, replica.
@@ -264,7 +272,9 @@ pub struct Public {
 impl Public {
     pub fn new(statement: &EpochStatement, params: &SdrParams) -> Result<Self, String> {
         if (params.drg_degree, params.expander_degree, params.layers) != (DRG, EXPANDER, LAYERS) {
-            return Err("the seal circuit is fixed to DRG degree 6, expander degree 8 and 11 layers".into());
+            return Err(
+                "the seal circuit is fixed to DRG degree 6, expander degree 8 and 11 layers".into(),
+            );
         }
         if statement.seals.is_empty() && statement.frames.is_empty() {
             return Err("an epoch proof covers at least one seal or frame".into());
@@ -272,8 +282,11 @@ impl Public {
         if !statement.seals.is_empty() && statement.count == 0 {
             return Err("seals need challenges".into());
         }
-        let mut leaves =
-            statement.seals.iter().map(|s| LeafPublic::sealed(s, params, statement.count)).collect::<Result<Vec<_>, _>>()?;
+        let mut leaves = statement
+            .seals
+            .iter()
+            .map(|s| LeafPublic::sealed(s, params, statement.count))
+            .collect::<Result<Vec<_>, _>>()?;
         let sealed = leaves.len();
         let mut opened = vec![0u64; statement.held.len()];
         for frame in &statement.frames {
@@ -281,15 +294,19 @@ impl Public {
                 return Err(format!("frame {} opens nothing", frame.frame_number));
             }
             for &h in &frame.held {
-                *opened.get_mut(h).ok_or_else(|| format!("frame {} opens held registration {h}", frame.frame_number))? +=
-                    statement.queries as u64;
+                *opened.get_mut(h).ok_or_else(|| {
+                    format!("frame {} opens held registration {h}", frame.frame_number)
+                })? += statement.queries as u64;
             }
         }
         for (held, &count) in statement.held.iter().zip(&opened) {
             leaves.push(LeafPublic::held(held, count)?);
         }
-        let challenge_of =
-            leaves.iter().enumerate().flat_map(|(l, leaf)| (0..leaf.challenges.len()).map(move |k| (l, k))).collect();
+        let challenge_of = leaves
+            .iter()
+            .enumerate()
+            .flat_map(|(l, leaf)| (0..leaf.challenges.len()).map(move |k| (l, k)))
+            .collect();
 
         let mut openings = Vec::new();
         let mut blocks = Vec::new();
@@ -298,8 +315,18 @@ impl Public {
             for &h in &frame.held {
                 let held = &statement.held[h];
                 for q in 0..statement.queries {
-                    let index = storage_proof::opening_index(frame.rho_n, held.leaf_id, held.epoch, held.member, q, held.n);
-                    openings.push(OpeningPublic { leaf: sealed + h, index });
+                    let index = storage_proof::opening_index(
+                        frame.rho_n,
+                        held.leaf_id,
+                        held.epoch,
+                        held.member,
+                        q,
+                        held.n,
+                    );
+                    openings.push(OpeningPublic {
+                        leaf: sealed + h,
+                        index,
+                    });
                 }
             }
             let count = openings.len() - first_opening;
@@ -308,7 +335,8 @@ impl Public {
             let digests = 1 + count;
             let rows = digests.div_ceil(2);
             for b in 0..rows {
-                let value = |slot: usize| (slot >= 1 && slot <= count).then(|| first_opening + slot - 1);
+                let value =
+                    |slot: usize| (slot >= 1 && slot <= count).then(|| first_opening + slot - 1);
                 blocks.push(FrameBlock {
                     first: b == 0,
                     last: b + 1 == rows,
@@ -320,7 +348,13 @@ impl Public {
                 });
             }
         }
-        Ok(Self { leaves, challenge_of, openings, blocks, digest: statement_digest(statement) })
+        Ok(Self {
+            leaves,
+            challenge_of,
+            openings,
+            blocks,
+            digest: statement_digest(statement),
+        })
     }
 
     fn challenges(&self) -> usize {
@@ -329,7 +363,12 @@ impl Public {
 
     /// Rows per Merkle path: the deepest tree's levels, rounded up.
     fn path_rows(&self) -> usize {
-        self.leaves.iter().map(|l| l.depth).max().unwrap_or(1).next_power_of_two()
+        self.leaves
+            .iter()
+            .map(|l| l.depth)
+            .max()
+            .unwrap_or(1)
+            .next_power_of_two()
     }
 
     /// The leaf of global challenge `g`, its index there, and the leaf.
@@ -339,8 +378,11 @@ impl Public {
     }
 
     fn transcript_values(&self) -> Vec<Val> {
-        let mut values =
-            vec![felt(self.leaves.len() as u64), felt(self.challenges() as u64), felt(self.openings.len() as u64)];
+        let mut values = vec![
+            felt(self.leaves.len() as u64),
+            felt(self.challenges() as u64),
+            felt(self.openings.len() as u64),
+        ];
         values.extend_from_slice(&self.digest);
         values
     }
@@ -373,7 +415,9 @@ impl Public {
                 let count = leaf.challenges.len();
                 let columns = leaf.column_paths() as usize;
                 let paths = 2 * count + columns + leaf.openings as usize;
-                count * LAYERS * LABEL_BLOCKS + columns * LAYERS + paths * leaf.depth
+                count * LAYERS * LABEL_BLOCKS
+                    + columns * LAYERS
+                    + paths * leaf.depth
                     + leaf.commitments.iter().flatten().count()
             })
             .sum();
@@ -436,16 +480,34 @@ fn statement_digest(statement: &EpochStatement) -> Digest {
 pub enum SealAir {
     /// The permutation table also carries the statement's digest as public
     /// values, so the transcript binds it.
-    Perm { public_values: usize },
-    Pub { periodic: Vec<Vec<Val>> },
-    Leaves { periodic: Vec<Vec<Val>> },
-    Column { periodic: Vec<Vec<Val>> },
-    Label { periodic: Vec<Vec<Val>> },
-    Merkle { periodic: Vec<Vec<Val>> },
+    Perm {
+        public_values: usize,
+    },
+    Pub {
+        periodic: Vec<Vec<Val>>,
+    },
+    Leaves {
+        periodic: Vec<Vec<Val>>,
+    },
+    Column {
+        periodic: Vec<Vec<Val>>,
+    },
+    Label {
+        periodic: Vec<Vec<Val>>,
+    },
+    Merkle {
+        periodic: Vec<Vec<Val>>,
+    },
     Check,
-    Bind { periodic: Vec<Vec<Val>> },
-    OPub { periodic: Vec<Vec<Val>> },
-    Frames { periodic: Vec<Vec<Val>> },
+    Bind {
+        periodic: Vec<Vec<Val>>,
+    },
+    OPub {
+        periodic: Vec<Vec<Val>>,
+    },
+    Frames {
+        periodic: Vec<Vec<Val>>,
+    },
 }
 
 pub(crate) const PERM_WIDTH: usize = poseidon::NUM_COLS + 1;
@@ -725,7 +787,9 @@ impl SealAir {
         }
 
         vec![
-            SealAir::Perm { public_values: public.transcript_values().len() },
+            SealAir::Perm {
+                public_values: public.transcript_values().len(),
+            },
             SealAir::Pub { periodic: pub_p },
             SealAir::Leaves { periodic: leaves_p },
             SealAir::Column { periodic: column_p },
@@ -769,7 +833,9 @@ impl SealAir {
 
     /// `trace` widened with the copies of this table's periodic columns.
     fn with_periodic_copies(&self, trace: &RowMajorMatrix<Val>) -> RowMajorMatrix<Val> {
-        let Some(periodic) = self.periodic() else { return trace.clone() };
+        let Some(periodic) = self.periodic() else {
+            return trace.clone();
+        };
         let base = self.base_width();
         let width = base + periodic.len();
         let mut values = Vec::with_capacity(trace.values.len() / base * width);
@@ -828,7 +894,12 @@ impl<AB: InteractionBuilder<F = Val>> Air<AB> for SealAir {
 /// The copies of the periodic columns, starting at column `base`, each
 /// constrained equal to its periodic column. Only LogUp's trace builder
 /// evaluates without periodic values; it checks no constraints.
-fn periodic_copies<AB: AirBuilder<F = Val>>(builder: &mut AB, local: &[AB::Var], base: usize, count: usize) -> Vec<AB::Expr> {
+fn periodic_copies<AB: AirBuilder<F = Val>>(
+    builder: &mut AB,
+    local: &[AB::Var],
+    base: usize,
+    count: usize,
+) -> Vec<AB::Expr> {
     let periodic = builder.periodic_values().to_vec();
     if periodic.len() == count {
         for (i, value) in periodic.into_iter().enumerate() {
@@ -844,7 +915,11 @@ fn constant<AB: AirBuilder<F = Val>>(value: Val) -> AB::Expr {
 
 /// A permutation input of two digests and a domain in the first capacity
 /// element (a Merkle node or a column step).
-fn compress_input<AB: AirBuilder<F = Val>>(left: Vec<AB::Expr>, right: Vec<AB::Expr>, domain: Domain) -> Vec<AB::Expr> {
+fn compress_input<AB: AirBuilder<F = Val>>(
+    left: Vec<AB::Expr>,
+    right: Vec<AB::Expr>,
+    domain: Domain,
+) -> Vec<AB::Expr> {
     let mut input: Vec<AB::Expr> = left.into_iter().chain(right).collect();
     input.push(constant::<AB>(hash::felt(domain as u32)));
     input.extend((0..W - 2 * D - 1).map(|_| AB::Expr::ZERO));
@@ -853,7 +928,9 @@ fn compress_input<AB: AirBuilder<F = Val>>(left: Vec<AB::Expr>, right: Vec<AB::E
 
 /// A tuple: the leading expressions, then `D` columns from `at`.
 fn with_digest<AB: AirBuilder>(head: Vec<AB::Expr>, local: &[AB::Var], at: usize) -> Vec<AB::Expr> {
-    head.into_iter().chain((0..D).map(|i| local[at + i].into())).collect()
+    head.into_iter()
+        .chain((0..D).map(|i| local[at + i].into()))
+        .collect()
 }
 
 fn eval_perm<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
@@ -861,8 +938,16 @@ fn eval_perm<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let local = main.current_slice().to_vec();
     let cols: &poseidon::Cols<AB::Var> = core::borrow::Borrow::borrow(&local[..poseidon::NUM_COLS]);
     let (input, output) = poseidon::eval(builder, cols);
-    let fields: Vec<AB::Expr> = input.iter().chain(output.iter()).map(|&v| v.into()).collect();
-    builder.push_interaction(PERM, fields, Count::provided(local[poseidon::NUM_COLS].into()));
+    let fields: Vec<AB::Expr> = input
+        .iter()
+        .chain(output.iter())
+        .map(|&v| v.into())
+        .collect();
+    builder.push_interaction(
+        PERM,
+        fields,
+        Count::provided(local[poseidon::NUM_COLS].into()),
+    );
 }
 
 fn eval_pub<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
@@ -872,7 +957,13 @@ fn eval_pub<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let p = periodic_copies(builder, &local, pubc::WIDTH, pubc::PERIODIC);
     builder.push_interaction(
         PUB,
-        [p[pubc::P_G].clone(), p[pubc::P_S].clone(), p[pubc::P_NODE].clone(), p[pubc::P_ACTIVE].clone(), p[pubc::P_LEAF].clone()],
+        [
+            p[pubc::P_G].clone(),
+            p[pubc::P_S].clone(),
+            p[pubc::P_NODE].clone(),
+            p[pubc::P_ACTIVE].clone(),
+            p[pubc::P_LEAF].clone(),
+        ],
         Count::provided(p[pubc::P_READS].clone()),
     );
 }
@@ -882,9 +973,16 @@ fn eval_leaves<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let local = main.current_slice().to_vec();
     builder.assert_zero(local[0]);
     let p = periodic_copies(builder, &local, lvs::WIDTH, lvs::PERIODIC);
-    let key: Vec<AB::Expr> = [p[lvs::P_LEAF].clone()].into_iter().chain((0..D).map(|i| p[lvs::P_KEY + i].clone())).collect();
+    let key: Vec<AB::Expr> = [p[lvs::P_LEAF].clone()]
+        .into_iter()
+        .chain((0..D).map(|i| p[lvs::P_KEY + i].clone()))
+        .collect();
     builder.push_interaction(KEY, key, Count::provided(p[lvs::P_KEY_READS].clone()));
-    builder.push_interaction(DEPTH, [p[lvs::P_LEAF].clone(), p[lvs::P_DEPTH].clone()], Count::provided(p[lvs::P_DEPTH_READS].clone()));
+    builder.push_interaction(
+        DEPTH,
+        [p[lvs::P_LEAF].clone(), p[lvs::P_DEPTH].clone()],
+        Count::provided(p[lvs::P_DEPTH_READS].clone()),
+    );
 }
 
 fn eval_opub<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
@@ -894,7 +992,11 @@ fn eval_opub<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let p = periodic_copies(builder, &local, opb::WIDTH, opb::PERIODIC);
     builder.push_interaction(
         OPEN,
-        [p[opb::P_O].clone(), p[opb::P_LEAF].clone(), p[opb::P_IDX].clone()],
+        [
+            p[opb::P_O].clone(),
+            p[opb::P_LEAF].clone(),
+            p[opb::P_IDX].clone(),
+        ],
         Count::provided(p[opb::P_READS].clone()),
     );
 }
@@ -913,7 +1015,14 @@ fn eval_column<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     }
     // The slot, node, activity, instance and leaf hold for all 16 rows.
     let within = builder.is_transition() * (AB::Expr::ONE - p(col::P_END));
-    for i in [col::G, col::S, col::NODE, col::ACTIVE, col::INSTANCE, col::LEAF] {
+    for i in [
+        col::G,
+        col::S,
+        col::NODE,
+        col::ACTIVE,
+        col::INSTANCE,
+        col::LEAF,
+    ] {
         builder.when(within.clone()).assert_eq(nv(i), v(i));
     }
     let live = v(col::INSTANCE) * v(col::ACTIVE) * p(col::P_LIVE);
@@ -921,29 +1030,47 @@ fn eval_column<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let continues = within * p(col::P_LIVE) * (AB::Expr::ONE - p(col::P_LAST));
     for i in 0..D {
         builder.when(p(col::P_FIRST)).assert_zero(v(col::ACC + i));
-        builder.when(continues.clone()).assert_eq(nv(col::ACC + i), v(col::OUT + i));
+        builder
+            .when(continues.clone())
+            .assert_eq(nv(col::ACC + i), v(col::OUT + i));
     }
     // Only a live instance row provides its label.
     builder.assert_zero(v(col::MULT) * (AB::Expr::ONE - live.clone()));
 
     let acc: Vec<AB::Expr> = (0..D).map(|i| v(col::ACC + i)).collect();
     let label: Vec<AB::Expr> = (0..D).map(|i| v(col::LABEL + i)).collect();
-    let fields: Vec<AB::Expr> =
-        compress_input::<AB>(acc, label, Domain::Column).into_iter().chain((0..W).map(|i| v(col::OUT + i))).collect();
+    let fields: Vec<AB::Expr> = compress_input::<AB>(acc, label, Domain::Column)
+        .into_iter()
+        .chain((0..W).map(|i| v(col::OUT + i)))
+        .collect();
     builder.push_interaction(PERM, fields, Count::bounded(-live, 1));
     builder.push_interaction(
         LABEL,
-        with_digest::<AB>(vec![v(col::LEAF), v(col::NODE), p(col::P_LAYER)], &local, col::LABEL),
+        with_digest::<AB>(
+            vec![v(col::LEAF), v(col::NODE), p(col::P_LAYER)],
+            &local,
+            col::LABEL,
+        ),
         Count::provided(v(col::MULT)),
     );
     builder.push_interaction(
         PUB,
-        [v(col::G), v(col::S), v(col::NODE), v(col::ACTIVE), v(col::LEAF)],
+        [
+            v(col::G),
+            v(col::S),
+            v(col::NODE),
+            v(col::ACTIVE),
+            v(col::LEAF),
+        ],
         Count::bounded(-(v(col::INSTANCE) * p(col::P_FIRST)), 1),
     );
     builder.push_interaction(
         LEAF,
-        with_digest::<AB>(vec![AB::Expr::ZERO, v(col::G), v(col::S) + AB::Expr::TWO], &local, col::OUT),
+        with_digest::<AB>(
+            vec![AB::Expr::ZERO, v(col::G), v(col::S) + AB::Expr::TWO],
+            &local,
+            col::OUT,
+        ),
         Count::bounded(v(col::INSTANCE) * v(col::ACTIVE) * p(col::P_LAST), 1),
     );
 }
@@ -963,7 +1090,9 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     // The challenge counter starts at 0 and steps after each challenge's 128
     // rows; its node, leaf and reality hold within the challenge.
     builder.when_first_row().assert_zero(v(lab::G));
-    builder.when_transition().assert_eq(nv(lab::G), v(lab::G) + p(lab::P_LAST_OF_CHALLENGE));
+    builder
+        .when_transition()
+        .assert_eq(nv(lab::G), v(lab::G) + p(lab::P_LAST_OF_CHALLENGE));
     let same_challenge = builder.is_transition() * (AB::Expr::ONE - p(lab::P_LAST_OF_CHALLENGE));
     for i in [lab::J, lab::LEAF, lab::REAL] {
         builder.when(same_challenge.clone()).assert_eq(nv(i), v(i));
@@ -974,8 +1103,12 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let first = live.clone() * p(lab::P_FIRST_BLOCK);
     // Block 0: the leaf's key (read below), then [layer, j, 0, …]; the
     // sponge starts from its IV.
-    builder.when(first.clone()).assert_eq(v(lab::B), p(lab::P_LAYER));
-    builder.when(first.clone()).assert_eq(v(lab::B + 1), v(lab::J));
+    builder
+        .when(first.clone())
+        .assert_eq(v(lab::B), p(lab::P_LAYER));
+    builder
+        .when(first.clone())
+        .assert_eq(v(lab::B + 1), v(lab::J));
     for i in 2..D {
         builder.when(first.clone()).assert_zero(v(lab::B + i));
     }
@@ -985,12 +1118,17 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
             17 => hash::felt(LABEL_LENGTH),
             _ => Val::ZERO,
         };
-        builder.when(first.clone()).assert_eq(v(lab::STATE + i), constant::<AB>(iv));
+        builder
+            .when(first.clone())
+            .assert_eq(v(lab::STATE + i), constant::<AB>(iv));
     }
     // Later blocks continue the sponge.
     let continues = live.clone() * (AB::Expr::ONE - p(lab::P_LAST_BLOCK));
     for i in 0..W {
-        builder.when_transition().when(continues.clone()).assert_eq(nv(lab::STATE + i), v(lab::OUT + i));
+        builder
+            .when_transition()
+            .when(continues.clone())
+            .assert_eq(nv(lab::STATE + i), v(lab::OUT + i));
     }
     // Slots that read nothing are zero: DRG slots of node 0, expander slots on
     // layer 0.
@@ -999,7 +1137,9 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let expander_zero = live.clone() * p(lab::P_EXPANDER) * (AB::Expr::ONE - p(lab::P_BELOW));
     for (active, slot) in [(lab::A_ACTIVE, lab::A), (lab::B_ACTIVE, lab::B)] {
         for i in 0..D {
-            builder.when(drg.clone() * (AB::Expr::ONE - v(active))).assert_zero(v(slot + i));
+            builder
+                .when(drg.clone() * (AB::Expr::ONE - v(active)))
+                .assert_zero(v(slot + i));
             builder.when(expander_zero.clone()).assert_zero(v(slot + i));
         }
     }
@@ -1007,7 +1147,13 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     // The permutation: state plus the two slots.
     let mut fields: Vec<AB::Expr> = (0..W)
         .map(|i| {
-            let absorbed = if i < D { v(lab::A + i) } else if i < 2 * D { v(lab::B + i - D) } else { AB::Expr::ZERO };
+            let absorbed = if i < D {
+                v(lab::A + i)
+            } else if i < 2 * D {
+                v(lab::B + i - D)
+            } else {
+                AB::Expr::ZERO
+            };
             v(lab::STATE + i) + absorbed
         })
         .collect();
@@ -1017,35 +1163,68 @@ fn eval_label<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     // Once per layer: the challenged node and the leaf's key.
     builder.push_interaction(
         PUB,
-        [v(lab::G), AB::Expr::ZERO, v(lab::J), AB::Expr::ONE, v(lab::LEAF)],
+        [
+            v(lab::G),
+            AB::Expr::ZERO,
+            v(lab::J),
+            AB::Expr::ONE,
+            v(lab::LEAF),
+        ],
         Count::bounded(-first.clone(), 1),
     );
-    builder.push_interaction(KEY, with_digest::<AB>(vec![v(lab::LEAF)], &local, lab::A), Count::bounded(-first, 1));
+    builder.push_interaction(
+        KEY,
+        with_digest::<AB>(vec![v(lab::LEAF)], &local, lab::A),
+        Count::bounded(-first, 1),
+    );
     // Each parent slot: its node from `Pub`, its label from its column.
     let reads = drg + below;
     let a_slot = p(lab::P_A_SLOT);
     builder.push_interaction(
         PUB,
-        [v(lab::G), a_slot.clone(), v(lab::A_NODE), v(lab::A_ACTIVE), v(lab::LEAF)],
+        [
+            v(lab::G),
+            a_slot.clone(),
+            v(lab::A_NODE),
+            v(lab::A_ACTIVE),
+            v(lab::LEAF),
+        ],
         Count::bounded(-reads.clone(), 1),
     );
     builder.push_interaction(
         PUB,
-        [v(lab::G), a_slot + AB::Expr::ONE, v(lab::B_NODE), v(lab::B_ACTIVE), v(lab::LEAF)],
+        [
+            v(lab::G),
+            a_slot + AB::Expr::ONE,
+            v(lab::B_NODE),
+            v(lab::B_ACTIVE),
+            v(lab::LEAF),
+        ],
         Count::bounded(-reads.clone(), 1),
     );
     let parent_layer = p(lab::P_LAYER) - p(lab::P_EXPANDER);
-    for (node, active, slot) in [(lab::A_NODE, lab::A_ACTIVE, lab::A), (lab::B_NODE, lab::B_ACTIVE, lab::B)] {
+    for (node, active, slot) in [
+        (lab::A_NODE, lab::A_ACTIVE, lab::A),
+        (lab::B_NODE, lab::B_ACTIVE, lab::B),
+    ] {
         builder.push_interaction(
             LABEL,
-            with_digest::<AB>(vec![v(lab::LEAF), v(node), parent_layer.clone()], &local, slot),
+            with_digest::<AB>(
+                vec![v(lab::LEAF), v(node), parent_layer.clone()],
+                &local,
+                slot,
+            ),
             Count::bounded(-(reads.clone() * v(active)), 1),
         );
     }
     // The last block's output is the node's label on this layer: its column's.
     builder.push_interaction(
         LABEL,
-        with_digest::<AB>(vec![v(lab::LEAF), v(lab::J), p(lab::P_LAYER)], &local, lab::OUT),
+        with_digest::<AB>(
+            vec![v(lab::LEAF), v(lab::J), p(lab::P_LAYER)],
+            &local,
+            lab::OUT,
+        ),
         Count::bounded(-(live * p(lab::P_LAST_BLOCK)), 1),
     );
 }
@@ -1059,14 +1238,22 @@ fn eval_merkle<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let v = |i: usize| -> AB::Expr { local[i].into() };
     let nv = |i: usize| -> AB::Expr { next[i].into() };
 
-    for i in [mrk::IS_COLUMN, mrk::IS_PATH, mrk::ACTIVE, mrk::BIT, mrk::LIVE, mrk::OPEN] {
+    for i in [
+        mrk::IS_COLUMN,
+        mrk::IS_PATH,
+        mrk::ACTIVE,
+        mrk::BIT,
+        mrk::LIVE,
+        mrk::OPEN,
+    ] {
         builder.assert_bool(local[i]);
     }
     // A data or replica path reads slot 0; a column path's tree position is
     // its slot plus 2; an opening's path is a replica path, always active.
     builder.assert_zero((AB::Expr::ONE - v(mrk::IS_COLUMN)) * v(mrk::S));
     builder.assert_zero(v(mrk::IS_COLUMN) * (v(mrk::T) - v(mrk::S) - AB::Expr::TWO));
-    builder.assert_zero((AB::Expr::ONE - v(mrk::IS_COLUMN)) * v(mrk::T) * (v(mrk::T) - AB::Expr::ONE));
+    builder
+        .assert_zero((AB::Expr::ONE - v(mrk::IS_COLUMN)) * v(mrk::T) * (v(mrk::T) - AB::Expr::ONE));
     builder.assert_zero(v(mrk::OPEN) * v(mrk::IS_COLUMN));
     builder.assert_zero(v(mrk::OPEN) * (v(mrk::T) - AB::Expr::ONE));
     builder.assert_zero(v(mrk::OPEN) * (AB::Expr::ONE - v(mrk::ACTIVE)));
@@ -1074,33 +1261,66 @@ fn eval_merkle<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
 
     // The path's identity holds over its block of rows.
     let within = builder.is_transition() * (AB::Expr::ONE - p(mrk::P_END));
-    for i in [mrk::G, mrk::T, mrk::S, mrk::IS_COLUMN, mrk::IS_PATH, mrk::ACTIVE, mrk::LEAF, mrk::DEPTH, mrk::OPEN] {
+    for i in [
+        mrk::G,
+        mrk::T,
+        mrk::S,
+        mrk::IS_COLUMN,
+        mrk::IS_PATH,
+        mrk::ACTIVE,
+        mrk::LEAF,
+        mrk::DEPTH,
+        mrk::OPEN,
+    ] {
         builder.when(within.clone()).assert_eq(nv(i), v(i));
     }
     // A path is live from level 0 for exactly its leaf's depth: live starts
     // at 1, never comes back, and its last live level is depth - 1.
-    builder.when(v(mrk::IS_PATH) * p(mrk::P_FIRST)).assert_one(v(mrk::LIVE));
-    builder.when(within.clone()).assert_zero(nv(mrk::LIVE) * (AB::Expr::ONE - v(mrk::LIVE)));
+    builder
+        .when(v(mrk::IS_PATH) * p(mrk::P_FIRST))
+        .assert_one(v(mrk::LIVE));
+    builder
+        .when(within.clone())
+        .assert_zero(nv(mrk::LIVE) * (AB::Expr::ONE - v(mrk::LIVE)));
     // At a block's end the next row is another path's; `P_END` cuts it off.
-    let ends = v(mrk::LIVE) * (p(mrk::P_END) + (AB::Expr::ONE - p(mrk::P_END)) * (AB::Expr::ONE - nv(mrk::LIVE)));
+    let ends = v(mrk::LIVE)
+        * (p(mrk::P_END) + (AB::Expr::ONE - p(mrk::P_END)) * (AB::Expr::ONE - nv(mrk::LIVE)));
     builder.assert_eq(v(mrk::END), ends);
-    builder.when(v(mrk::END)).assert_eq(p(mrk::P_LEVEL) + AB::Expr::ONE, v(mrk::DEPTH));
+    builder
+        .when(v(mrk::END))
+        .assert_eq(p(mrk::P_LEVEL) + AB::Expr::ONE, v(mrk::DEPTH));
 
     // Each live level halves the index and hands its output up; the last has
     // index 0 above it.
     let chain = within * v(mrk::LIVE) * nv(mrk::LIVE);
-    builder.when(chain.clone()).assert_eq(v(mrk::IDX), nv(mrk::IDX) * AB::Expr::TWO + v(mrk::BIT));
-    builder.when(v(mrk::END)).assert_eq(v(mrk::IDX), v(mrk::BIT));
+    builder
+        .when(chain.clone())
+        .assert_eq(v(mrk::IDX), nv(mrk::IDX) * AB::Expr::TWO + v(mrk::BIT));
+    builder
+        .when(v(mrk::END))
+        .assert_eq(v(mrk::IDX), v(mrk::BIT));
     for i in 0..D {
-        builder.when(chain.clone()).assert_eq(nv(mrk::CUR + i), v(mrk::OUT + i));
+        builder
+            .when(chain.clone())
+            .assert_eq(nv(mrk::CUR + i), v(mrk::OUT + i));
     }
 
     let bit = v(mrk::BIT);
-    let left: Vec<AB::Expr> = (0..D).map(|i| v(mrk::CUR + i) + bit.clone() * (v(mrk::SIB + i) - v(mrk::CUR + i))).collect();
-    let right: Vec<AB::Expr> = (0..D).map(|i| v(mrk::SIB + i) + bit.clone() * (v(mrk::CUR + i) - v(mrk::SIB + i))).collect();
-    let fields: Vec<AB::Expr> =
-        compress_input::<AB>(left, right, Domain::Node).into_iter().chain((0..W).map(|i| v(mrk::OUT + i))).collect();
-    builder.push_interaction(PERM, fields, Count::bounded(-(v(mrk::GATE) * v(mrk::LIVE)), 1));
+    let left: Vec<AB::Expr> = (0..D)
+        .map(|i| v(mrk::CUR + i) + bit.clone() * (v(mrk::SIB + i) - v(mrk::CUR + i)))
+        .collect();
+    let right: Vec<AB::Expr> = (0..D)
+        .map(|i| v(mrk::SIB + i) + bit.clone() * (v(mrk::CUR + i) - v(mrk::SIB + i)))
+        .collect();
+    let fields: Vec<AB::Expr> = compress_input::<AB>(left, right, Domain::Node)
+        .into_iter()
+        .chain((0..W).map(|i| v(mrk::OUT + i)))
+        .collect();
+    builder.push_interaction(
+        PERM,
+        fields,
+        Count::bounded(-(v(mrk::GATE) * v(mrk::LIVE)), 1),
+    );
 
     // The first level reads the leaf index (from `Pub` for a seal path, from
     // `OPub` for an opening), the leaf's depth, and the value from its
@@ -1108,7 +1328,13 @@ fn eval_merkle<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let starts = v(mrk::IS_PATH) * p(mrk::P_FIRST);
     builder.push_interaction(
         PUB,
-        [v(mrk::G), v(mrk::S), v(mrk::IDX), v(mrk::ACTIVE), v(mrk::LEAF)],
+        [
+            v(mrk::G),
+            v(mrk::S),
+            v(mrk::IDX),
+            v(mrk::ACTIVE),
+            v(mrk::LEAF),
+        ],
         Count::bounded(-(starts.clone() * (AB::Expr::ONE - v(mrk::OPEN))), 1),
     );
     builder.push_interaction(
@@ -1116,7 +1342,11 @@ fn eval_merkle<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
         [v(mrk::G), v(mrk::LEAF), v(mrk::IDX)],
         Count::bounded(-(starts.clone() * v(mrk::OPEN)), 1),
     );
-    builder.push_interaction(DEPTH, [v(mrk::LEAF), v(mrk::DEPTH)], Count::bounded(-starts, 1));
+    builder.push_interaction(
+        DEPTH,
+        [v(mrk::LEAF), v(mrk::DEPTH)],
+        Count::bounded(-starts, 1),
+    );
     builder.push_interaction(
         LEAF,
         with_digest::<AB>(vec![v(mrk::OPEN), v(mrk::G), v(mrk::T)], &local, mrk::CUR),
@@ -1138,22 +1368,42 @@ fn eval_check<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     builder.assert_bool(local[chk::ROW]);
     let row = v(chk::ROW);
     for i in 0..D {
-        builder.when(row.clone()).assert_eq(v(chk::REPLICA + i), v(chk::DATA + i) + v(chk::LABEL + i));
+        builder
+            .when(row.clone())
+            .assert_eq(v(chk::REPLICA + i), v(chk::DATA + i) + v(chk::LABEL + i));
     }
     builder.push_interaction(
         PUB,
-        [v(chk::G), AB::Expr::ZERO, v(chk::J), AB::Expr::ONE, v(chk::LEAF)],
+        [
+            v(chk::G),
+            AB::Expr::ZERO,
+            v(chk::J),
+            AB::Expr::ONE,
+            v(chk::LEAF),
+        ],
         Count::bounded(-row.clone(), 1),
     );
     builder.push_interaction(
         LABEL,
-        with_digest::<AB>(vec![v(chk::LEAF), v(chk::J), constant::<AB>(felt(LAYERS as u64 - 1))], &local, chk::LABEL),
+        with_digest::<AB>(
+            vec![
+                v(chk::LEAF),
+                v(chk::J),
+                constant::<AB>(felt(LAYERS as u64 - 1)),
+            ],
+            &local,
+            chk::LABEL,
+        ),
         Count::bounded(-row.clone(), 1),
     );
     for (t, at) in [(0u64, chk::DATA), (1, chk::REPLICA)] {
         builder.push_interaction(
             LEAF,
-            with_digest::<AB>(vec![AB::Expr::ZERO, v(chk::G), constant::<AB>(felt(t))], &local, at),
+            with_digest::<AB>(
+                vec![AB::Expr::ZERO, v(chk::G), constant::<AB>(felt(t))],
+                &local,
+                at,
+            ),
             Count::bounded(row.clone(), 1),
         );
     }
@@ -1178,7 +1428,9 @@ fn eval_bind<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     fields.extend((0..W).map(|i| v(bnd::OUT + i)));
     builder.push_interaction(PERM, fields, Count::bounded(-live.clone(), 1));
     for i in 0..D {
-        builder.when(live.clone()).assert_eq(v(bnd::OUT + i), p(bnd::P_COMMITMENT + i));
+        builder
+            .when(live.clone())
+            .assert_eq(v(bnd::OUT + i), p(bnd::P_COMMITMENT + i));
     }
     builder.push_interaction(
         ROOT,
@@ -1200,8 +1452,12 @@ fn eval_frames<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     let first = live.clone() * p(frm::P_FIRST);
     // Block 0 absorbs the header [frame, count, 0, …] in slot A; the sponge
     // starts from its IV, whose length is 8 × (1 + count).
-    builder.when(first.clone()).assert_eq(v(frm::A), p(frm::P_FRAME));
-    builder.when(first.clone()).assert_eq(v(frm::A + 1), p(frm::P_COUNT));
+    builder
+        .when(first.clone())
+        .assert_eq(v(frm::A), p(frm::P_FRAME));
+    builder
+        .when(first.clone())
+        .assert_eq(v(frm::A + 1), p(frm::P_COUNT));
     for i in 2..D {
         builder.when(first.clone()).assert_zero(v(frm::A + i));
     }
@@ -1216,13 +1472,19 @@ fn eval_frames<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     // Later blocks continue the frame's sponge; the last yields its root.
     let continues = live.clone() * (AB::Expr::ONE - p(frm::P_LAST));
     for i in 0..W {
-        builder.when_transition().when(continues.clone()).assert_eq(nv(frm::STATE + i), v(frm::OUT + i));
+        builder
+            .when_transition()
+            .when(continues.clone())
+            .assert_eq(nv(frm::STATE + i), v(frm::OUT + i));
     }
     for i in 0..D {
-        builder.when(live.clone() * p(frm::P_LAST)).assert_eq(v(frm::OUT + i), p(frm::P_ROOT + i));
+        builder
+            .when(live.clone() * p(frm::P_LAST))
+            .assert_eq(v(frm::OUT + i), p(frm::P_ROOT + i));
     }
     // A slot that is neither the header nor an opened value is zero padding.
-    let a_pad = live.clone() * (AB::Expr::ONE - p(frm::P_FIRST)) * (AB::Expr::ONE - p(frm::P_A_VALUE));
+    let a_pad =
+        live.clone() * (AB::Expr::ONE - p(frm::P_FIRST)) * (AB::Expr::ONE - p(frm::P_A_VALUE));
     let b_pad = live.clone() * (AB::Expr::ONE - p(frm::P_B_VALUE));
     for i in 0..D {
         builder.when(a_pad.clone()).assert_zero(v(frm::A + i));
@@ -1231,7 +1493,13 @@ fn eval_frames<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
 
     let mut fields: Vec<AB::Expr> = (0..W)
         .map(|i| {
-            let absorbed = if i < D { v(frm::A + i) } else if i < 2 * D { v(frm::B + i - D) } else { AB::Expr::ZERO };
+            let absorbed = if i < D {
+                v(frm::A + i)
+            } else if i < 2 * D {
+                v(frm::B + i - D)
+            } else {
+                AB::Expr::ZERO
+            };
             v(frm::STATE + i) + absorbed
         })
         .collect();
@@ -1240,12 +1508,20 @@ fn eval_frames<AB: InteractionBuilder<F = Val>>(builder: &mut AB) {
     // Each opened value is the leaf its opening's path starts from.
     builder.push_interaction(
         LEAF,
-        with_digest::<AB>(vec![AB::Expr::ONE, p(frm::P_A_ID), AB::Expr::ONE], &local, frm::A),
+        with_digest::<AB>(
+            vec![AB::Expr::ONE, p(frm::P_A_ID), AB::Expr::ONE],
+            &local,
+            frm::A,
+        ),
         Count::bounded(live.clone() * p(frm::P_A_VALUE), 1),
     );
     builder.push_interaction(
         LEAF,
-        with_digest::<AB>(vec![AB::Expr::ONE, p(frm::P_B_ID), AB::Expr::ONE], &local, frm::B),
+        with_digest::<AB>(
+            vec![AB::Expr::ONE, p(frm::P_B_ID), AB::Expr::ONE],
+            &local,
+            frm::B,
+        ),
         Count::bounded(live * p(frm::P_B_VALUE), 1),
     );
 }
@@ -1309,12 +1585,20 @@ struct PathWitness {
 
 fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<Traces, String> {
     // Sealed leaves come first; they alone register a data commitment.
-    let sealed = public.leaves.iter().filter(|l| l.commitments[0].is_some()).count();
+    let sealed = public
+        .leaves
+        .iter()
+        .filter(|l| l.commitments[0].is_some())
+        .count();
     if seals.len() != sealed {
         return Err(format!("{} seal proofs for {sealed} seals", seals.len()));
     }
     if openings.len() != public.openings.len() {
-        return Err(format!("{} openings for {} expected", openings.len(), public.openings.len()));
+        return Err(format!(
+            "{} openings for {} expected",
+            openings.len(),
+            public.openings.len()
+        ));
     }
     let heights = public.heights();
     let total = public.challenges();
@@ -1325,7 +1609,11 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
     let mut columns: Vec<[Option<SlotColumn>; SLOTS]> = Vec::with_capacity(total);
     for (l, (leaf, seal)) in public.leaves[..sealed].iter().zip(seals).enumerate() {
         if seal.openings.len() != leaf.challenges.len() {
-            return Err(format!("leaf {l}: {} openings for {} challenges", seal.openings.len(), leaf.challenges.len()));
+            return Err(format!(
+                "leaf {l}: {} openings for {} challenges",
+                seal.openings.len(),
+                leaf.challenges.len()
+            ));
         }
         for (k, opening) in seal.openings.iter().enumerate() {
             let read = |c: &storage_proof::ColumnOpening| -> Result<SlotColumn, String> {
@@ -1336,15 +1624,29 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             };
             let mut slot_columns: [Option<SlotColumn>; SLOTS] = Default::default();
             slot_columns[0] = Some(read(&opening.column)?);
-            let parents: Vec<usize> = if leaf.slots[k][1].1 { (1..SLOTS).collect() } else { (1 + DRG..SLOTS).collect() };
+            let parents: Vec<usize> = if leaf.slots[k][1].1 {
+                (1..SLOTS).collect()
+            } else {
+                (1 + DRG..SLOTS).collect()
+            };
             if opening.parents.len() != parents.len() {
-                return Err(format!("leaf {l} challenge {k}: {} parent columns, {} expected", opening.parents.len(), parents.len()));
+                return Err(format!(
+                    "leaf {l} challenge {k}: {} parent columns, {} expected",
+                    opening.parents.len(),
+                    parents.len()
+                ));
             }
             for (slot, parent) in parents.into_iter().zip(&opening.parents) {
                 slot_columns[slot] = Some(read(parent)?);
             }
-            if slot_columns.iter().flatten().any(|c| c.labels.len() != LAYERS || c.path.len() != leaf.depth) {
-                return Err(format!("leaf {l} challenge {k}: a column of the wrong shape"));
+            if slot_columns
+                .iter()
+                .flatten()
+                .any(|c| c.labels.len() != LAYERS || c.path.len() != leaf.depth)
+            {
+                return Err(format!(
+                    "leaf {l} challenge {k}: a column of the wrong shape"
+                ));
             }
             seal_openings.push(opening);
             columns.push(slot_columns);
@@ -1352,7 +1654,8 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
     }
 
     // LABEL demand per (leaf, node, layer): what label rows and check rows read.
-    let mut demand: std::collections::HashMap<(usize, u64, usize), u32> = std::collections::HashMap::new();
+    let mut demand: std::collections::HashMap<(usize, u64, usize), u32> =
+        std::collections::HashMap::new();
     for g in 0..total {
         let (l, k, leaf) = public.challenge(g);
         let j = leaf.challenges[k];
@@ -1379,7 +1682,8 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             let (node, active) = leaf.slots[k][s];
             let mut acc = hash::ZERO;
             for layer in 0..COLUMN_ROWS {
-                let row = &mut column.values[(instance * COLUMN_ROWS + layer) * col::WIDTH..][..col::WIDTH];
+                let row = &mut column.values[(instance * COLUMN_ROWS + layer) * col::WIDTH..]
+                    [..col::WIDTH];
                 row[col::G] = felt(g as u64);
                 row[col::S] = felt(s as u64);
                 row[col::NODE] = felt(node);
@@ -1389,7 +1693,10 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
                 if !active || layer >= LAYERS {
                     continue;
                 }
-                let label = columns[g][s].as_ref().expect("an open slot has a column").labels[layer];
+                let label = columns[g][s]
+                    .as_ref()
+                    .expect("an open slot has a column")
+                    .labels[layer];
                 let out = perms.run(compress_state(&acc, &label, Domain::Column));
                 row[col::ACC..col::ACC + D].copy_from_slice(&acc);
                 row[col::LABEL..col::LABEL + D].copy_from_slice(&label);
@@ -1425,7 +1732,8 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             state[16] = hash::felt(Domain::Label as u32);
             state[17] = hash::felt(LABEL_LENGTH);
             for block in 0..LABEL_BLOCKS {
-                let row = &mut label.values[((g * 16 + layer) * LABEL_BLOCKS + block) * lab::WIDTH..][..lab::WIDTH];
+                let row = &mut label.values
+                    [((g * 16 + layer) * LABEL_BLOCKS + block) * lab::WIDTH..][..lab::WIDTH];
                 row[lab::J] = felt(j);
                 row[lab::LEAF] = felt(l as u64);
                 row[lab::REAL] = Val::ONE;
@@ -1445,7 +1753,10 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
                             return hash::ZERO;
                         }
                         let at = if s <= DRG { layer } else { layer - 1 };
-                        columns[g][s].as_ref().expect("an open slot has a column").labels[at]
+                        columns[g][s]
+                            .as_ref()
+                            .expect("an open slot has a column")
+                            .labels[at]
                     };
                     let (sa, sb) = (2 * block - 1, 2 * block);
                     row[lab::A_NODE] = felt(leaf.slots[k][sa].0);
@@ -1487,13 +1798,18 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
         row[chk::ROW] = Val::ONE;
         seal_leaves[g][0] = Some(data);
         seal_leaves[g][1] = Some(replica);
-        let path = |nodes: &[[u8; 32]]| -> Result<Vec<Digest>, String> { nodes.iter().map(digest).collect() };
+        let path = |nodes: &[[u8; 32]]| -> Result<Vec<Digest>, String> {
+            nodes.iter().map(digest).collect()
+        };
         data_paths.push((path(&opening.data_path)?, path(&opening.replica_path)?));
     }
 
     // Frames table: each frame's sponge over its header and opened values.
     let mut frames = RowMajorMatrix::new(vec![Val::ZERO; heights[9] * frm::WIDTH], frm::WIDTH);
-    let opened_values: Vec<Digest> = openings.iter().map(|o| digest(&o.value)).collect::<Result<_, _>>()?;
+    let opened_values: Vec<Digest> = openings
+        .iter()
+        .map(|o| digest(&o.value))
+        .collect::<Result<_, _>>()?;
     let mut state = [Val::ZERO; W];
     for (row_index, block) in public.blocks.iter().enumerate() {
         if block.first {
@@ -1522,7 +1838,10 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
         state = perms.run(input);
         row[frm::OUT..frm::OUT + W].copy_from_slice(&state);
         if block.last && state[..D] != block.root[..] {
-            return Err(format!("frame {}: the opened values do not hash to the committed root", block.frame_number));
+            return Err(format!(
+                "frame {}: the opened values do not hash to the committed root",
+                block.frame_number
+            ));
         }
     }
 
@@ -1536,7 +1855,9 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             let path = match t {
                 0 => data_paths[g].0.clone(),
                 1 => data_paths[g].1.clone(),
-                _ => columns[g][s].as_ref().map_or(Vec::new(), |c| c.path.clone()),
+                _ => columns[g][s]
+                    .as_ref()
+                    .map_or(Vec::new(), |c| c.path.clone()),
             };
             paths.push(PathWitness {
                 id: g,
@@ -1552,7 +1873,11 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
         }
     }
     for (o, (opening, witness)) in public.openings.iter().zip(openings).enumerate() {
-        let path = witness.path.iter().map(digest).collect::<Result<Vec<_>, _>>()?;
+        let path = witness
+            .path
+            .iter()
+            .map(digest)
+            .collect::<Result<Vec<_>, _>>()?;
         if path.len() != public.leaves[opening.leaf].depth {
             return Err(format!("opening {o}: a path of the wrong depth"));
         }
@@ -1617,7 +1942,10 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
             match roots[witness.leaf][tree] {
                 None => roots[witness.leaf][tree] = Some(cur),
                 Some(root) if root != cur => {
-                    return Err(format!("leaf {}: a path reaches another root of tree {tree}", witness.leaf))
+                    return Err(format!(
+                        "leaf {}: a path reaches another root of tree {tree}",
+                        witness.leaf
+                    ))
                 }
                 Some(_) => {}
             }
@@ -1645,16 +1973,28 @@ fn build(public: &Public, seals: &[&SealProof], openings: &[Opened]) -> Result<T
         }
     }
 
-    Ok(Traces { perm: perms.0, column, label, merkle, check, bind, frames })
+    Ok(Traces {
+        perm: perms.0,
+        column,
+        label,
+        merkle,
+        check,
+        bind,
+        frames,
+    })
 }
 
 fn perm_trace(inputs: &[[Val; W]], height: usize) -> RowMajorMatrix<Val> {
     use p3_maybe_rayon::prelude::*;
     let mut trace = RowMajorMatrix::new(vec![Val::ZERO; height * PERM_WIDTH], PERM_WIDTH);
-    trace.values.par_chunks_exact_mut(PERM_WIDTH).enumerate().for_each(|(i, row)| {
-        let _ = poseidon::fill(row, inputs.get(i).copied().unwrap_or([Val::ZERO; W]));
-        row[poseidon::NUM_COLS] = Val::from_bool(i < inputs.len());
-    });
+    trace
+        .values
+        .par_chunks_exact_mut(PERM_WIDTH)
+        .enumerate()
+        .for_each(|(i, row)| {
+            let _ = poseidon::fill(row, inputs.get(i).copied().unwrap_or([Val::ZERO; W]));
+            row[poseidon::NUM_COLS] = Val::from_bool(i < inputs.len());
+        });
     trace
 }
 
@@ -1686,7 +2026,8 @@ pub(crate) fn prove_with(
     let traces = build(&public, seals, openings)?;
     let heights = public.heights();
     let perm = perm_trace(&traces.perm, heights[0]);
-    let zero = |rows: usize, width: usize| RowMajorMatrix::new(vec![Val::ZERO; rows * width], width);
+    let zero =
+        |rows: usize, width: usize| RowMajorMatrix::new(vec![Val::ZERO; rows * width], width);
     let pub_trace = zero(heights[1], pubc::WIDTH);
     let leaves_trace = zero(heights[2], lvs::WIDTH);
     let opub_trace = zero(heights[8], opb::WIDTH);
@@ -1718,46 +2059,91 @@ pub(crate) fn prove_with(
         .iter()
         .zip(&traces)
         .enumerate()
-        .map(|(i, (air, trace))| StarkInstance { air, trace, public_values: if i == 0 { transcript.clone() } else { Vec::new() } })
+        .map(|(i, (air, trace))| StarkInstance {
+            air,
+            trace,
+            public_values: if i == 0 {
+                transcript.clone()
+            } else {
+                Vec::new()
+            },
+        })
         .collect();
-    let prover_data = ProverData::from_instances(&config, &instances).map_err(|e| format!("{e:?}"))?;
+    let prover_data =
+        ProverData::from_instances(&config, &instances).map_err(|e| format!("{e:?}"))?;
     let proof = prove_batch(&config, &instances, &prover_data).map_err(|e| format!("{e:?}"))?;
     postcard::to_allocvec(&proof).map_err(|e| e.to_string())
 }
 
 /// Check a member's epoch proof against its statement.
-pub fn verify_epoch(statement: &EpochStatement, params: &SdrParams, bytes: &[u8]) -> Result<(), String> {
+pub fn verify_epoch(
+    statement: &EpochStatement,
+    params: &SdrParams,
+    bytes: &[u8],
+) -> Result<(), String> {
     let public = Public::new(statement, params)?;
     let proof: BatchProof<Config> = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
     let airs = SealAir::tables(&public);
-    let degree_bits: Vec<usize> = public.heights().iter().map(|h| h.trailing_zeros() as usize).collect();
+    let degree_bits: Vec<usize> = public
+        .heights()
+        .iter()
+        .map(|h| h.trailing_zeros() as usize)
+        .collect();
     let config = config();
-    let common = ProverData::from_airs_and_degrees(&config, &airs, &degree_bits).map_err(|e| format!("{e:?}"))?.common;
+    let common = ProverData::from_airs_and_degrees(&config, &airs, &degree_bits)
+        .map_err(|e| format!("{e:?}"))?
+        .common;
     let mut public_values = vec![Vec::new(); airs.len()];
     public_values[0] = public.transcript_values();
     verify_batch(&config, &airs, &proof, &public_values, &common).map_err(|e| format!("{e:?}"))
 }
 
 fn seals_only<'a>(statements: &[SealStatement<'a>], count: usize) -> EpochStatement<'a> {
-    EpochStatement { seals: statements.to_vec(), count, held: Vec::new(), frames: Vec::new(), queries: 0 }
+    EpochStatement {
+        seals: statements.to_vec(),
+        count,
+        held: Vec::new(),
+        frames: Vec::new(),
+        queries: 0,
+    }
 }
 
 /// One proof of several seals, no openings.
-pub fn prove_many(statements: &[SealStatement], params: &SdrParams, count: usize, seals: &[&SealProof]) -> Result<Vec<u8>, String> {
+pub fn prove_many(
+    statements: &[SealStatement],
+    params: &SdrParams,
+    count: usize,
+    seals: &[&SealProof],
+) -> Result<Vec<u8>, String> {
     prove_epoch(&seals_only(statements, count), params, seals, &[])
 }
 
 /// Check [`prove_many`]'s proof.
-pub fn verify_many(statements: &[SealStatement], params: &SdrParams, count: usize, bytes: &[u8]) -> Result<(), String> {
+pub fn verify_many(
+    statements: &[SealStatement],
+    params: &SdrParams,
+    count: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
     verify_epoch(&seals_only(statements, count), params, bytes)
 }
 
 /// A proof of one seal.
-pub fn prove(statement: &SealStatement, params: &SdrParams, count: usize, seal: &SealProof) -> Result<Vec<u8>, String> {
+pub fn prove(
+    statement: &SealStatement,
+    params: &SdrParams,
+    count: usize,
+    seal: &SealProof,
+) -> Result<Vec<u8>, String> {
     prove_many(std::slice::from_ref(statement), params, count, &[seal])
 }
 
 /// Check [`prove`]'s proof.
-pub fn verify(statement: &SealStatement, params: &SdrParams, count: usize, bytes: &[u8]) -> Result<(), String> {
+pub fn verify(
+    statement: &SealStatement,
+    params: &SdrParams,
+    count: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
     verify_many(std::slice::from_ref(statement), params, count, bytes)
 }

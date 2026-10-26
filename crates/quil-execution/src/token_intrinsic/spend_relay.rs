@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn relays_are_canonical_and_windowed() {
-        let frames = vec![(12u64, vec![vec![1u8; 10], vec![2; 3]]), (15, vec![vec![3; 7]])];
+        let frames = vec![
+            (12u64, vec![vec![1u8; 10], vec![2; 3]]),
+            (15, vec![vec![3; 7]]),
+        ];
         let bytes = encode_relay(&frames).unwrap();
         assert_eq!(decode_relay(16, &bytes).unwrap(), frames);
         // Frame 12 is outside header 21's window (13..=20).
@@ -131,7 +134,10 @@ mod tests {
         assert!(encode_relay(&[(15, vec![vec![1]]), (12, vec![vec![1]])]).is_err());
         assert!(encode_frame_entries(&vec![vec![1u8]; MAX_ENTRIES_PER_FRAME + 1]).is_err());
         assert!(encode_frame_entries(&[vec![0u8; MAX_ENTRY_BYTES + 1]]).is_err());
-        assert_eq!(decode_frame_entries(&encode_frame_entries(&[vec![9; 4]]).unwrap()).unwrap(), vec![vec![9; 4]]);
+        assert_eq!(
+            decode_frame_entries(&encode_frame_entries(&[vec![9; 4]]).unwrap()).unwrap(),
+            vec![vec![9; 4]]
+        );
         assert!(decode_relay(1, &[]).unwrap().is_empty());
         assert_eq!(relay_window(1), 1..=0);
         assert_eq!(relay_window(20), 12..=19);

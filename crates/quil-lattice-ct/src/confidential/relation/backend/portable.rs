@@ -161,17 +161,25 @@ impl RelationSink for PortableWitnessChecker {
         if values.len() != DEGREE || values.iter().any(|&v| v > 1) {
             return Err(CheckError::Domain);
         }
-        self.binary.push(values.iter().map(|&v| i64::from(v)).collect());
+        self.binary
+            .push(values.iter().map(|&v| i64::from(v)).collect());
         Ok(())
     }
     fn short(&mut self, index: usize, values: &[i64]) -> Result<(), CheckError> {
         let expected = self.active()?;
         let binary = expected.original_binary_polynomials + expected.auxiliary_binary_polynomials;
-        if index != self.binary.len() || index < binary || index >= binary + expected.short_polynomials {
+        if index != self.binary.len()
+            || index < binary
+            || index >= binary + expected.short_polynomials
+        {
             return Err(CheckError::Counts);
         }
-        let normsq = values.iter().try_fold(0u128, |s, &v| s.checked_add((i128::from(v) * i128::from(v)) as u128));
-        if values.len() != DEGREE || normsq.is_none_or(|n| n > u128::from(self.short_normsq[index - binary])) {
+        let normsq = values.iter().try_fold(0u128, |s, &v| {
+            s.checked_add((i128::from(v) * i128::from(v)) as u128)
+        });
+        if values.len() != DEGREE
+            || normsq.is_none_or(|n| n > u128::from(self.short_normsq[index - binary]))
+        {
             return Err(CheckError::Domain);
         }
         self.binary.push(values.to_vec());
@@ -243,7 +251,8 @@ impl RelationSink for PortableWitnessChecker {
             let (zero, one, selected) = (self.bit_poly(z)?, self.bit_poly(o)?, self.bit_poly(sel)?);
             for i in 0..DEGREE {
                 residual[i] += i128::from(w)
-                    * (s * (i128::from(one[i]) - i128::from(zero[i])) + i128::from(zero[i]) - i128::from(selected[i]));
+                    * (s * (i128::from(one[i]) - i128::from(zero[i])) + i128::from(zero[i])
+                        - i128::from(selected[i]));
             }
         }
         if residual.iter().any(|v| v.rem_euclid(PROOF_MODULUS) != 0) {
@@ -255,7 +264,9 @@ impl RelationSink for PortableWitnessChecker {
     fn finish(&mut self, counts: SubmissionCounts) -> Result<(), CheckError> {
         if counts != self.active()?
             || self.binary.len()
-                != counts.original_binary_polynomials + counts.auxiliary_binary_polynomials + counts.short_polynomials
+                != counts.original_binary_polynomials
+                    + counts.auxiliary_binary_polynomials
+                    + counts.short_polynomials
             || self.rows
                 != [
                     counts.scalar_equations,
@@ -275,48 +286,106 @@ mod tests {
     #[cfg(feature = "native-proof")]
     #[test]
     fn private_aes256_native_streams_match_portable_references() {
-        use super::{expansion::CounterExpander, gaussian, uniform, rejection::{self, RejectionKind, RejectionParameters}};
+        use super::{
+            expansion::CounterExpander,
+            gaussian,
+            rejection::{self, RejectionKind, RejectionParameters},
+            uniform,
+        };
         use quil_lattice_proof_sys::{ffi, NATIVE_STATE};
         let _guard = NATIVE_STATE.lock().unwrap();
         let key: [u8; 32] = std::array::from_fn(|i| i as u8);
-        let mut other = key; other[31] ^= 128;
+        let mut other = key;
+        other[31] ^= 128;
         let nonce = 0x0102030405060708;
         let mut previous_bytes = None;
         for seed in [key, other] {
             let mut actual = [0; 1024];
-            assert_eq!(unsafe { ffi::quil_fixture_private_stream(seed.as_ptr(), nonce, 2, actual.as_mut_ptr()) }, 0);
+            assert_eq!(
+                unsafe {
+                    ffi::quil_fixture_private_stream(seed.as_ptr(), nonce, 2, actual.as_mut_ptr())
+                },
+                0
+            );
             let mut expected = [0; 1024];
-            CounterExpander::aes256(&seed, nonce).squeeze(&mut expected).unwrap();
+            CounterExpander::aes256(&seed, nonce)
+                .squeeze(&mut expected)
+                .unwrap();
             assert_eq!(actual, expected);
-            if let Some(previous) = previous_bytes { assert_ne!(actual, previous); }
+            if let Some(previous) = previous_bytes {
+                assert_ne!(actual, previous);
+            }
             previous_bytes = Some(actual);
             for count in 1..=8 {
                 for mode in [0, 1] {
                     let mut actual = vec![0i64; 256 * count];
-                    assert_eq!(unsafe { ffi::quil_fixture_sample_prg(seed.as_ptr(), nonce, count, 0, mode, actual.as_mut_ptr()) }, 0);
+                    assert_eq!(
+                        unsafe {
+                            ffi::quil_fixture_sample_prg(
+                                seed.as_ptr(),
+                                nonce,
+                                count,
+                                0,
+                                mode,
+                                actual.as_mut_ptr(),
+                            )
+                        },
+                        0
+                    );
                     let expected = if mode == 0 {
                         uniform::uniform_polynomials(&seed, nonce, count).unwrap()
                     } else {
                         uniform::uniform_polynomials_private(&seed, nonce, count).unwrap()
                     };
-                    let coefficients: Vec<_> = expected.iter().flat_map(|p| p.0.iter().map(|&x| x as i64)).collect();
-                    let mismatch = actual.iter().zip(&coefficients).enumerate()
+                    let coefficients: Vec<_> = expected
+                        .iter()
+                        .flat_map(|p| p.0.iter().map(|&x| x as i64))
+                        .collect();
+                    let mismatch = actual
+                        .iter()
+                        .zip(&coefficients)
+                        .enumerate()
                         .find(|(_, (actual, expected))| actual != expected);
-                    assert!(mismatch.is_none(), "uniform mode={mode} count={count}: first mismatch {mismatch:?}");
+                    assert!(
+                        mismatch.is_none(),
+                        "uniform mode={mode} count={count}: first mismatch {mismatch:?}"
+                    );
                 }
             }
             for scale in [0, 4, 12, 20, 26] {
                 for mode in [2, 3] {
                     let mut actual = vec![0i64; 256];
-                    assert_eq!(unsafe { ffi::quil_fixture_sample_prg(seed.as_ptr(), nonce, 1, scale, mode, actual.as_mut_ptr()) }, 0);
+                    assert_eq!(
+                        unsafe {
+                            ffi::quil_fixture_sample_prg(
+                                seed.as_ptr(),
+                                nonce,
+                                1,
+                                scale,
+                                mode,
+                                actual.as_mut_ptr(),
+                            )
+                        },
+                        0
+                    );
                     let mut stream = CounterExpander::aes256(&seed, nonce);
                     let expected = gaussian::gaussian_i32(&mut stream, 256, scale).unwrap();
-                    assert_eq!(actual, expected.iter().map(|&x| i64::from(x)).collect::<Vec<_>>(), "Gaussian mode={mode} scale={scale}");
+                    assert_eq!(
+                        actual,
+                        expected.iter().map(|&x| i64::from(x)).collect::<Vec<_>>(),
+                        "Gaussian mode={mode} scale={scale}"
+                    );
                 }
             }
-            for (kind, mode) in [(RejectionKind::Standard, 0), (RejectionKind::SignFiltered, 1), (RejectionKind::Bimodal, 2)] {
+            for (kind, mode) in [
+                (RejectionKind::Standard, 0),
+                (RejectionKind::SignFiltered, 1),
+                (RejectionKind::Bimodal, 2),
+            ] {
                 for (zv, vv, variance) in [
-                    (-3, 4, 8.0), (0, 4, 8.0), (3, 4, 8.0),
+                    (-3, 4, 8.0),
+                    (0, 4, 8.0),
+                    (3, 4, 8.0),
                     (i64::MIN, i64::MAX, 2.0f64.powi(63)),
                     (i64::MAX, i64::MAX, 2.0f64.powi(63)),
                     (i64::MIN, 0, 2.0f64.powi(63)),
@@ -324,8 +393,22 @@ mod tests {
                 ] {
                     let mut stream = CounterExpander::aes256(&seed, nonce);
                     let params = RejectionParameters::from_binary64(variance, 2.0).unwrap();
-                    let expected = rejection::sample_decision(&mut stream, kind, zv, vv, &params).unwrap();
-                    assert_eq!(unsafe { ffi::quil_fixture_private_rejection(seed.as_ptr(), nonce, mode, zv, vv, variance, 2.0) }, i32::from(expected));
+                    let expected =
+                        rejection::sample_decision(&mut stream, kind, zv, vv, &params).unwrap();
+                    assert_eq!(
+                        unsafe {
+                            ffi::quil_fixture_private_rejection(
+                                seed.as_ptr(),
+                                nonce,
+                                mode,
+                                zv,
+                                vv,
+                                variance,
+                                2.0,
+                            )
+                        },
+                        i32::from(expected)
+                    );
                 }
             }
         }

@@ -1,22 +1,23 @@
 //! Shield admission: the checks a legacy transparent coin's move into the
 //! confidential accumulator needs, which verification runs and the global
 //! commit then decides.
+use super::{legacy_migration, materialize};
 #[cfg(test)]
-use super::{roots, spent_check, state::{self, SnapshotLimits}};
 use super::{
-    legacy_migration, materialize,
+    roots, spent_check,
+    state::{self, SnapshotLimits},
 };
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 #[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_lattice_ct::confidential::shield::AnyShield;
 #[cfg(test)]
+use quil_lattice_ct::confidential::shield::{Shield, ShieldStatement};
+#[cfg(test)]
 use quil_lattice_ct::confidential::{
     relation::backend::native::{self, NativeBudget},
     transfer::parameter_context,
 };
-#[cfg(test)]
-use quil_lattice_ct::confidential::shield::{Shield, ShieldStatement};
 use quil_types::error::{QuilError, Result};
 
 fn invalid(message: &str) -> QuilError {
@@ -29,7 +30,13 @@ fn invalid(message: &str) -> QuilError {
 /// the source was already shielded is a consume-once decision made elsewhere.
 #[cfg(test)]
 fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
-    check_coin(state, &s.application, &s.transparent_address, s.amount, &s.owner_public_key)
+    check_coin(
+        state,
+        &s.application,
+        &s.transparent_address,
+        s.amount,
+        &s.owner_public_key,
+    )
 }
 
 /// Every source of `shield` passes `check_source`'s checks. From the batch
@@ -52,7 +59,13 @@ pub(crate) fn check_sources(
         if active && !shard.covers(&source.address) {
             return Err(invalid("source outside this shard"));
         }
-        check_coin(state, application, &source.address, source.amount, shield.owner_public_key())?;
+        check_coin(
+            state,
+            application,
+            &source.address,
+            source.amount,
+            shield.owner_public_key(),
+        )?;
     }
     Ok(())
 }
@@ -104,7 +117,9 @@ fn check_coin(
 /// The legacy owner signed the shield's statement bytes, which bind every
 /// source, amount, fee and output.
 pub(crate) fn check_authorization(shield: &AnyShield) -> Result<()> {
-    let context = shield.context_bytes().map_err(|_| invalid("invalid statement"))?;
+    let context = shield
+        .context_bytes()
+        .map_err(|_| invalid("invalid statement"))?;
     if !quil_crypto::ed448_verify(shield.owner_public_key(), &context, shield.signature()) {
         return Err(invalid("invalid source authorization"));
     }
@@ -150,7 +165,12 @@ mod tests {
         run_complete_shield(true, Some(worker));
     }
 
-    fn run_complete_shield(engine_route: bool, worker: Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>) {
+    fn run_complete_shield(
+        engine_route: bool,
+        worker: Option<
+            quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+        >,
+    ) {
         use pqcrypto_ntruprime::sntrup761;
         use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
         use quil_lattice_ct::confidential::{
@@ -243,8 +263,14 @@ mod tests {
             max_depth: 3,
             max_nodes: 24,
         };
-        let consumed = |state: &HypergraphState| crate::token_intrinsic::global_commit::is_consumed(
-            state, &application, &spent_check::key_image_spent_address(&source).unwrap()).unwrap();
+        let consumed = |state: &HypergraphState| {
+            crate::token_intrinsic::global_commit::is_consumed(
+                state,
+                &application,
+                &spent_check::key_image_spent_address(&source).unwrap(),
+            )
+            .unwrap()
+        };
         let tp = crate::token_engine::TYPE_LATTICE_SHIELD;
         let output_addresses: Vec<[u8; 32]> = if engine_route {
             use crate::{
@@ -297,11 +323,9 @@ mod tests {
                 ),
                 Err(QuilError::ExecutionUnavailable(_))
             ));
-            assert!(
-                roots::read_current(&state, &network, &application)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(roots::read_current(&state, &network, &application)
+                .unwrap()
+                .is_none());
             assert!(!consumed(&state));
             let engine = make_engine(budget);
             assert!(engine.validate_message(2, &[99; 32], &message).is_err());
@@ -329,14 +353,30 @@ mod tests {
         } else {
             let clock = crate::testing::NoopClockStore;
             let at = |frame: u64| quil_types::execution::FrameExecutionContext {
-                frame_number: frame, finalized_global_frame: Some(frame - 1),
-                shard: quil_types::execution::ShardPath::WHOLE, venue: None,
+                frame_number: frame,
+                finalized_global_frame: Some(frame - 1),
+                shard: quil_types::execution::ShardPath::WHOLE,
+                venue: None,
             };
             let compile = quil_lattice_ct::confidential::transfer::CompileLimits {
-                max_inputs: 1, max_outputs: 2, max_depth: 1,
+                max_inputs: 1,
+                max_outputs: 2,
+                max_depth: 1,
             };
-            let verify = |budget| crate::token_intrinsic::commit_verify::verify_for_commit(
-                &state, &clock, at(2), &network, &application, tp, &encoded, compile, budget, worker.as_ref());
+            let verify = |budget| {
+                crate::token_intrinsic::commit_verify::verify_for_commit(
+                    &state,
+                    &clock,
+                    at(2),
+                    &network,
+                    &application,
+                    tp,
+                    &encoded,
+                    compile,
+                    budget,
+                    worker.as_ref(),
+                )
+            };
             // Verification writes nothing and decides nothing.
             let checkpoint = state.changeset_len();
             verify(budget).unwrap();
@@ -344,18 +384,50 @@ mod tests {
             assert!(!consumed(&state));
             // A snapshot budget too small to place the outputs fails the
             // commit; the caller rolls its changeset back, as the engine does.
-            let too_small = SnapshotLimits { max_coins: 1, ..limits };
-            assert!(crate::token_intrinsic::commit_apply::commit_and_place(&state, 2, &network, &application, tp, &encoded, too_small).is_err());
+            let too_small = SnapshotLimits {
+                max_coins: 1,
+                ..limits
+            };
+            assert!(crate::token_intrinsic::commit_apply::commit_and_place(
+                &state,
+                2,
+                &network,
+                &application,
+                tp,
+                &encoded,
+                too_small
+            )
+            .is_err());
             state.rollback_to(checkpoint);
             assert!(!consumed(&state));
-            crate::token_intrinsic::commit_apply::commit_and_place(&state, 2, &network, &application, tp, &encoded, limits).unwrap()
+            crate::token_intrinsic::commit_apply::commit_and_place(
+                &state,
+                2,
+                &network,
+                &application,
+                tp,
+                &encoded,
+                limits,
+            )
+            .unwrap()
         };
         assert_eq!(output_addresses.len(), 2);
-        let root = roots::read_current(&state, &network, &application).unwrap().unwrap();
+        let root = roots::read_current(&state, &network, &application)
+            .unwrap()
+            .unwrap();
         // The legacy source is consumed once, in GLOBAL, so the same coin
         // cannot be shielded again — by this operation or another.
         assert!(consumed(&state));
-        assert!(crate::token_intrinsic::commit_apply::commit_and_place(&state, 3, &network, &application, tp, &encoded, limits).is_err());
+        assert!(crate::token_intrinsic::commit_apply::commit_and_place(
+            &state,
+            3,
+            &network,
+            &application,
+            tp,
+            &encoded,
+            limits
+        )
+        .is_err());
         state.commit().unwrap();
         state.abort();
         state.crdt().commit(2).unwrap();
@@ -365,16 +437,23 @@ mod tests {
             roots::read_current(&state, &network, &application).unwrap(),
             Some(root)
         );
-        assert!(crate::token_intrinsic::commit_apply::commit_and_place(&state, 4, &network, &application, tp, &encoded, limits).is_err());
+        assert!(crate::token_intrinsic::commit_apply::commit_and_place(
+            &state,
+            4,
+            &network,
+            &application,
+            tp,
+            &encoded,
+            limits
+        )
+        .is_err());
         assert!(consumed(&state));
         for (i, address) in output_addresses.iter().enumerate() {
             let blob = state.get(&application, address, &disc).unwrap().unwrap();
             let tree = quil_tries::VectorCommitmentTree {
                 root: quil_tries::deserialize_go_tree(&blob).unwrap(),
             };
-            let coin = state::read_coin(&tree, &context)
-                .unwrap()
-                .unwrap();
+            let coin = state::read_coin(&tree, &context).unwrap().unwrap();
             let (recipient, secret) = &recipients[i];
             assert_eq!(
                 open_output(&context, secret.as_bytes(), recipient, &coin.output)
@@ -458,19 +537,43 @@ mod tests {
         let encoded = submitted.encode().unwrap();
         let clock = crate::testing::NoopClockStore;
         let at = quil_types::execution::FrameExecutionContext {
-            frame_number: 2, finalized_global_frame: Some(1),
-            shard: quil_types::execution::ShardPath::WHOLE, venue: None,
+            frame_number: 2,
+            finalized_global_frame: Some(1),
+            shard: quil_types::execution::ShardPath::WHOLE,
+            venue: None,
         };
         let tp = crate::token_engine::TYPE_LATTICE_SHIELD;
         let compile = quil_lattice_ct::confidential::transfer::CompileLimits {
-            max_inputs: 1, max_outputs: 1, max_depth: 1,
+            max_inputs: 1,
+            max_outputs: 1,
+            max_depth: 1,
         };
-        let exhausted = NativeBudget { max_native_bytes: 0 };
-        let verify = |bytes: &[u8]| crate::token_intrinsic::commit_verify::verify_for_commit(
-            &state, &clock, at, &network, &application, tp, bytes, compile, exhausted, None);
-        assert!(matches!(verify(&encoded), Err(QuilError::ExecutionUnavailable(_))));
+        let exhausted = NativeBudget {
+            max_native_bytes: 0,
+        };
+        let verify = |bytes: &[u8]| {
+            crate::token_intrinsic::commit_verify::verify_for_commit(
+                &state,
+                &clock,
+                at,
+                &network,
+                &application,
+                tp,
+                bytes,
+                compile,
+                exhausted,
+                None,
+            )
+        };
+        assert!(matches!(
+            verify(&encoded),
+            Err(QuilError::ExecutionUnavailable(_))
+        ));
         submitted.signature[0] ^= 1;
-        assert!(matches!(verify(&submitted.encode().unwrap()), Err(QuilError::InvalidArgument(_))));
+        assert!(matches!(
+            verify(&submitted.encode().unwrap()),
+            Err(QuilError::InvalidArgument(_))
+        ));
         let before = state.changeset_len();
         let mut changed = shield.clone();
         changed.statement.amount += 1;
@@ -490,10 +593,27 @@ mod tests {
         // the source stays valid to check, and the second shield of it is
         // refused there rather than by a marker this shard wrote.
         assert_eq!(state.changeset_len(), before);
-        let entry = crate::token_intrinsic::spend_entries::spend_entry(&network, &application, tp, &encoded, 2).unwrap();
-        assert_eq!(entry.consumptions, vec![spent_check::key_image_spent_address(&address).unwrap()]);
+        let entry = crate::token_intrinsic::spend_entries::spend_entry(
+            &network,
+            &application,
+            tp,
+            &encoded,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.consumptions,
+            vec![spent_check::key_image_spent_address(&address).unwrap()]
+        );
         assert!(matches!(
-            crate::token_intrinsic::global_commit::commit_entry(&state, 2, &application, &entry, quil_types::execution::ShardPath::WHOLE).unwrap(),
+            crate::token_intrinsic::global_commit::commit_entry(
+                &state,
+                2,
+                &application,
+                &entry,
+                quil_types::execution::ShardPath::WHOLE
+            )
+            .unwrap(),
             crate::token_intrinsic::global_commit::Outcome::Committed { .. }
         ));
         assert!(check_source(&state, &shield.statement).is_ok());
@@ -501,9 +621,23 @@ mod tests {
         other.proof = vec![0; 40];
         other.proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
         other.statement.outputs[0].memo[0] ^= 1;
-        let entry = crate::token_intrinsic::spend_entries::spend_entry(&network, &application, tp, &other.encode().unwrap(), 3).unwrap();
+        let entry = crate::token_intrinsic::spend_entries::spend_entry(
+            &network,
+            &application,
+            tp,
+            &other.encode().unwrap(),
+            3,
+        )
+        .unwrap();
         assert_eq!(
-            crate::token_intrinsic::global_commit::commit_entry(&state, 3, &application, &entry, quil_types::execution::ShardPath::WHOLE).unwrap(),
+            crate::token_intrinsic::global_commit::commit_entry(
+                &state,
+                3,
+                &application,
+                &entry,
+                quil_types::execution::ShardPath::WHOLE
+            )
+            .unwrap(),
             crate::token_intrinsic::global_commit::Outcome::Rejected("already consumed")
         );
     }
@@ -514,7 +648,9 @@ mod tests {
     /// is checked as it always was.
     #[test]
     fn batch_sources_are_checked_coin_by_coin_against_the_shard_and_activation() {
-        use quil_lattice_ct::confidential::shield::{BatchShield, BatchShieldStatement, ShieldSource};
+        use quil_lattice_ct::confidential::shield::{
+            BatchShield, BatchShieldStatement, ShieldSource,
+        };
         use quil_types::execution::ShardPath;
         let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_hypergraph::testing::MemStore::new()),
@@ -524,75 +660,164 @@ mod tests {
         let public = quil_crypto::Ed448Signer::derive_public(&[3; 57]).unwrap();
         let signer = quil_crypto::Ed448Signer::from_bytes(&[3; 57], &public).unwrap();
         let by_key = quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap();
-        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(&quil_crypto::peer_id_multihash_from_ed448_pubkey(&public)).unwrap();
+        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(
+            &quil_crypto::peer_id_multihash_from_ed448_pubkey(&public),
+        )
+        .unwrap();
         let disc = vertex_adds_discriminator().unwrap();
         let place = |owner: [u8; 32], amount: u128, origin: u8| {
             let tree = legacy_migration::create_transparent_coin_tree(
-                &legacy_migration::TransparentCoin { owner_address: owner, amount },
+                &legacy_migration::TransparentCoin {
+                    owner_address: owner,
+                    amount,
+                },
                 &legacy_migration::transparent_type_hash(&application).unwrap(),
                 &[origin; 32],
-            ).unwrap();
+            )
+            .unwrap();
             let address = materialize::coin_content_address(&tree).unwrap();
-            state.set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
             ShieldSource { address, amount }
         };
-        let mut sources = vec![place(by_key, 10, 1), place(by_peer, 20, 2), place(by_key, 30, 3)];
+        let mut sources = vec![
+            place(by_key, 10, 1),
+            place(by_peer, 20, 2),
+            place(by_key, 30, 3),
+        ];
         sources.sort_by_key(|source| source.address);
         let stranger = place([9; 32], 40, 4);
         let context = parameter_context(&network, &application);
         let opening = AmountOpening::from_seed(&context, &[5; 32]);
         let statement = |sources: Vec<ShieldSource>| BatchShieldStatement {
-            network, application, owner_public_key: public.clone().try_into().unwrap(), sources, fee: 1,
-            outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(59, &opening), owner: [6; IDENTITY_BYTES], memo: [7; MEMO_BYTES] }],
+            network,
+            application,
+            owner_public_key: public.clone().try_into().unwrap(),
+            sources,
+            fee: 1,
+            outputs: vec![Output {
+                commitment: CommitmentKey::derive(&context).commit(59, &opening),
+                owner: [6; IDENTITY_BYTES],
+                memo: [7; MEMO_BYTES],
+            }],
         };
         let shield = |statement: BatchShieldStatement| {
-            let signature = signer.sign(&statement.context_bytes().unwrap()).unwrap().try_into().unwrap();
-            AnyShield::Batch(BatchShield { statement, signature, proof: Vec::new() })
+            let signature = signer
+                .sign(&statement.context_bytes().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            AnyShield::Batch(BatchShield {
+                statement,
+                signature,
+                proof: Vec::new(),
+            })
         };
         let batch = shield(statement(sources.clone()));
-        assert!(check_sources(&state, ShardPath::WHOLE, true, &application, &batch).is_ok(), "both owner forms of one key");
+        assert!(
+            check_sources(&state, ShardPath::WHOLE, true, &application, &batch).is_ok(),
+            "both owner forms of one key"
+        );
         assert!(check_authorization(&batch).is_ok());
-        let error = check_sources(&state, ShardPath::WHOLE, false, &application, &batch).unwrap_err();
+        let error =
+            check_sources(&state, ShardPath::WHOLE, false, &application, &batch).unwrap_err();
         assert!(error.to_string().contains("not active"), "{error}");
 
         // From activation every source must be in the executing shard.
         let first_bit = sources[0].address[0] & 0x80 != 0;
         let one = shield(statement(vec![sources[0]]));
-        assert!(check_sources(&state, ShardPath::from_bits(&[first_bit]), true, &application, &one).is_ok());
-        let error = check_sources(&state, ShardPath::from_bits(&[!first_bit]), true, &application, &one).unwrap_err();
+        assert!(check_sources(
+            &state,
+            ShardPath::from_bits(&[first_bit]),
+            true,
+            &application,
+            &one
+        )
+        .is_ok());
+        let error = check_sources(
+            &state,
+            ShardPath::from_bits(&[!first_bit]),
+            true,
+            &application,
+            &one,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("outside this shard"), "{error}");
 
         // Each source is the signer's, at its listed amount.
         let mut wrong_amount = sources.clone();
         wrong_amount[1].amount += 1;
-        assert!(check_sources(&state, ShardPath::WHOLE, true, &application, &shield(statement(wrong_amount))).is_err());
+        assert!(check_sources(
+            &state,
+            ShardPath::WHOLE,
+            true,
+            &application,
+            &shield(statement(wrong_amount))
+        )
+        .is_err());
         let mut foreign = sources.clone();
         foreign.push(stranger);
         foreign.sort_by_key(|source| source.address);
-        let error = check_sources(&state, ShardPath::WHOLE, true, &application, &shield(statement(foreign))).unwrap_err();
+        let error = check_sources(
+            &state,
+            ShardPath::WHOLE,
+            true,
+            &application,
+            &shield(statement(foreign)),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("owner mismatch"), "{error}");
         let mut missing = sources.clone();
         missing[2].address[31] ^= 1;
         missing.sort_by_key(|source| source.address);
-        assert!(check_sources(&state, ShardPath::WHOLE, true, &application, &shield(statement(missing))).is_err());
+        assert!(check_sources(
+            &state,
+            ShardPath::WHOLE,
+            true,
+            &application,
+            &shield(statement(missing))
+        )
+        .is_err());
 
         // A signature over another statement does not authorize this one.
-        let AnyShield::Batch(mut forged) = batch.clone() else { unreachable!() };
+        let AnyShield::Batch(mut forged) = batch.clone() else {
+            unreachable!()
+        };
         forged.statement.fee = 2;
         assert!(check_authorization(&AnyShield::Batch(forged)).is_err());
 
         // A single shield before activation is checked as it always was.
         let single = AnyShield::Single(Shield {
             statement: ShieldStatement {
-                network, application, transparent_address: sources[0].address,
-                owner_public_key: public.clone().try_into().unwrap(), amount: sources[0].amount, fee: 1,
+                network,
+                application,
+                transparent_address: sources[0].address,
+                owner_public_key: public.clone().try_into().unwrap(),
+                amount: sources[0].amount,
+                fee: 1,
                 outputs: statement(Vec::new()).outputs,
             },
             signature: [0; 114],
             proof: Vec::new(),
         });
-        assert!(check_sources(&state, ShardPath::from_bits(&[!first_bit]), false, &application, &single).is_ok(),
-            "before activation the shard range is not checked");
+        assert!(
+            check_sources(
+                &state,
+                ShardPath::from_bits(&[!first_bit]),
+                false,
+                &application,
+                &single
+            )
+            .is_ok(),
+            "before activation the shard range is not checked"
+        );
     }
 
     /// A real batch: three legacy coins of one key (both owner forms) proven
@@ -601,6 +826,7 @@ mod tests {
     #[test]
     #[ignore = "native batch shield proof"]
     fn complete_batch_shield_verifies_relays_and_commits() {
+        use crate::token_intrinsic::global_commit;
         use pqcrypto_ntruprime::sntrup761;
         use pqcrypto_traits::kem::{PublicKey as _, SecretKey as _};
         use quil_lattice_ct::confidential::{
@@ -609,7 +835,6 @@ mod tests {
             relation::membership::RecipientSecret,
             shield::{BatchShield, BatchShieldStatement, ShieldSource},
         };
-        use crate::token_intrinsic::global_commit;
         let directory = tempfile::tempdir().unwrap();
         let state = disk_state(directory.path());
         let (network, application) = ([31; 32], [32; 32]);
@@ -617,17 +842,35 @@ mod tests {
         let public = quil_crypto::Ed448Signer::derive_public(&[33; 57]).unwrap();
         let signer = quil_crypto::Ed448Signer::from_bytes(&[33; 57], &public).unwrap();
         let by_key = quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap();
-        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(&quil_crypto::peer_id_multihash_from_ed448_pubkey(&public)).unwrap();
+        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(
+            &quil_crypto::peer_id_multihash_from_ed448_pubkey(&public),
+        )
+        .unwrap();
         let disc = vertex_adds_discriminator().unwrap();
         let mut sources = Vec::new();
-        for (i, (owner, amount)) in [(by_key, 1_000u128), (by_peer, 2_000), (by_key, 3_000)].into_iter().enumerate() {
+        for (i, (owner, amount)) in [(by_key, 1_000u128), (by_peer, 2_000), (by_key, 3_000)]
+            .into_iter()
+            .enumerate()
+        {
             let tree = legacy_migration::create_transparent_coin_tree(
-                &legacy_migration::TransparentCoin { owner_address: owner, amount },
+                &legacy_migration::TransparentCoin {
+                    owner_address: owner,
+                    amount,
+                },
                 &legacy_migration::transparent_type_hash(&application).unwrap(),
                 &[34 + i as u8; 32],
-            ).unwrap();
+            )
+            .unwrap();
             let address = materialize::coin_content_address(&tree).unwrap();
-            state.set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
             sources.push(ShieldSource { address, amount });
         }
         sources.sort_by_key(|source| source.address);
@@ -641,48 +884,104 @@ mod tests {
         let fee = 6;
         let created = create_output(&context, &address, 6_000 - fee).unwrap();
         let statement = BatchShieldStatement {
-            network, application, owner_public_key: public.clone().try_into().unwrap(),
-            sources: sources.clone(), fee, outputs: vec![created.output.clone()],
+            network,
+            application,
+            owner_public_key: public.clone().try_into().unwrap(),
+            sources: sources.clone(),
+            fee,
+            outputs: vec![created.output.clone()],
         };
-        let relation = statement.private_relation(&[(6_000 - fee, &created.opening)], 1).unwrap();
-        let signature = signer.sign(&statement.context_bytes().unwrap()).unwrap().try_into().unwrap();
-        let budget = NativeBudget { max_native_bytes: 1024 * 1024 * 1024 };
+        let relation = statement
+            .private_relation(&[(6_000 - fee, &created.opening)], 1)
+            .unwrap();
+        let signature = signer
+            .sign(&statement.context_bytes().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let budget = NativeBudget {
+            max_native_bytes: 1024 * 1024 * 1024,
+        };
         let started = std::time::Instant::now();
         let proof = native::prove(&relation, budget).unwrap();
         let proving = started.elapsed();
         drop(relation);
-        let encoded = BatchShield { statement, signature, proof }.encode().unwrap();
+        let encoded = BatchShield {
+            statement,
+            signature,
+            proof,
+        }
+        .encode()
+        .unwrap();
 
         global_commit::set_batch_shield_frame_for_thread(Some(10));
         let clock = crate::testing::NoopClockStore;
         let tp = crate::token_engine::TYPE_LATTICE_SHIELD;
-        let compile = quil_lattice_ct::confidential::transfer::CompileLimits { max_inputs: 1, max_outputs: 1, max_depth: 1 };
-        let at = |anchor: u64| quil_types::execution::FrameExecutionContext {
-            frame_number: 2, finalized_global_frame: Some(anchor),
-            shard: quil_types::execution::ShardPath::WHOLE, venue: None,
+        let compile = quil_lattice_ct::confidential::transfer::CompileLimits {
+            max_inputs: 1,
+            max_outputs: 1,
+            max_depth: 1,
         };
-        let verify = |anchor| crate::token_intrinsic::commit_verify::verify_for_commit(
-            &state, &clock, at(anchor), &network, &application, tp, &encoded, compile, budget, None);
+        let at = |anchor: u64| quil_types::execution::FrameExecutionContext {
+            frame_number: 2,
+            finalized_global_frame: Some(anchor),
+            shard: quil_types::execution::ShardPath::WHOLE,
+            venue: None,
+        };
+        let verify = |anchor| {
+            crate::token_intrinsic::commit_verify::verify_for_commit(
+                &state,
+                &clock,
+                at(anchor),
+                &network,
+                &application,
+                tp,
+                &encoded,
+                compile,
+                budget,
+                None,
+            )
+        };
         let error = verify(9).unwrap_err();
         assert!(error.to_string().contains("not active"), "{error}");
         let started = std::time::Instant::now();
         verify(10).unwrap();
         let verifying = started.elapsed();
 
-        let entry = crate::token_intrinsic::spend_entries::spend_entry(&network, &application, tp, &encoded, 2).unwrap();
+        let entry = crate::token_intrinsic::spend_entries::spend_entry(
+            &network,
+            &application,
+            tp,
+            &encoded,
+            2,
+        )
+        .unwrap();
         assert_eq!(entry.consumptions.len(), 3);
         let relayed = global_commit::SpendEntry::decode_at(&entry.encode().unwrap(), 11).unwrap();
         assert!(matches!(
-            global_commit::commit_entry(&state, 11, &application, &relayed, quil_types::execution::ShardPath::WHOLE).unwrap(),
+            global_commit::commit_entry(
+                &state,
+                11,
+                &application,
+                &relayed,
+                quil_types::execution::ShardPath::WHOLE
+            )
+            .unwrap(),
             global_commit::Outcome::Committed { .. }
         ));
         for source in &sources {
             let marker = spent_check::key_image_spent_address(&source.address).unwrap();
             assert!(global_commit::is_consumed(&state, &application, &marker).unwrap());
         }
-        let opened = open_output(&context, kem_secret.as_bytes(), &recipient, &created.output).unwrap();
+        let opened =
+            open_output(&context, kem_secret.as_bytes(), &recipient, &created.output).unwrap();
         assert_eq!(opened.amount, 6_000 - fee);
         global_commit::set_batch_shield_frame_for_thread(None);
-        eprintln!("batch shield of 3: {} bytes, proving {:.1}s, verifying {:.1}s", encoded.len(), proving.as_secs_f64(), verifying.as_secs_f64());
+        eprintln!(
+            "batch shield of 3: {} bytes, proving {:.1}s, verifying {:.1}s",
+            encoded.len(),
+            proving.as_secs_f64(),
+            verifying.as_secs_f64()
+        );
     }
 }

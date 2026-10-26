@@ -119,19 +119,39 @@ pub async fn send_paid_request(
     execution_domain: [u8; 32],
     request: MessageRequest,
 ) -> anyhow::Result<()> {
-    use quil_execution::message_envelope::{proto_message_request_to_canonical_inner_bytes, CanonicalMessageBundle, CanonicalMessageRequest};
+    use quil_execution::message_envelope::{
+        proto_message_request_to_canonical_inner_bytes, CanonicalMessageBundle,
+        CanonicalMessageRequest,
+    };
     use quil_types::proto::global::message_request::Request;
     let timestamp = now_millis();
-    let inner = proto_message_request_to_canonical_inner_bytes(&request).map_err(|e| anyhow::anyhow!("canonical request: {e}"))?;
+    let inner = proto_message_request_to_canonical_inner_bytes(&request)
+        .map_err(|e| anyhow::anyhow!("canonical request: {e}"))?;
     let rest = CanonicalMessageBundle {
-        requests: vec![None, Some(CanonicalMessageRequest::wrap(inner).map_err(|e| anyhow::anyhow!("wrap request: {e}"))?)],
+        requests: vec![
+            None,
+            Some(
+                CanonicalMessageRequest::wrap(inner)
+                    .map_err(|e| anyhow::anyhow!("wrap request: {e}"))?,
+            ),
+        ],
         timestamp,
     };
-    let (claim, global_execution) = crate::commands::token::pay_for_bundle(global, execution_domain, &rest, PAID_SUBMISSION_WAIT).await?;
+    let (claim, global_execution) = crate::commands::token::pay_for_bundle(
+        global,
+        execution_domain,
+        &rest,
+        PAID_SUBMISSION_WAIT,
+    )
+    .await?;
     let bundle = MessageBundle {
         requests: vec![
             MessageRequest {
-                request: Some(Request::TokenOperation(quil_types::proto::token::TokenOperation { canonical_bytes: claim })),
+                request: Some(Request::TokenOperation(
+                    quil_types::proto::token::TokenOperation {
+                        canonical_bytes: claim,
+                    },
+                )),
                 timestamp: 0,
             },
             request,
@@ -139,9 +159,11 @@ pub async fn send_paid_request(
         timestamp,
     };
     // The node sees exactly the bundle the settlement is bound to.
-    let canonical = CanonicalMessageBundle::from_canonical_bytes(&proto_message_bundle_to_canonical_bytes(&bundle)
-        .map_err(|e| anyhow::anyhow!("canonicalize paid bundle: {e}"))?)
-        .map_err(|e| anyhow::anyhow!("decode paid bundle: {e}"))?;
+    let canonical = CanonicalMessageBundle::from_canonical_bytes(
+        &proto_message_bundle_to_canonical_bytes(&bundle)
+            .map_err(|e| anyhow::anyhow!("canonicalize paid bundle: {e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("decode paid bundle: {e}"))?;
     anyhow::ensure!(
         quil_execution::token_intrinsic::settlement_claim::bundle_context(&canonical)?
             == quil_execution::token_intrinsic::settlement_claim::bundle_context(&rest)?,
@@ -167,20 +189,27 @@ pub async fn send_to_venue(
     if submit_domain == global || global_execution {
         return send_message_bundle(client, key_manager, global, bundle).await;
     }
-    let shard = match send_message_bundle(client, key_manager, submit_domain.clone(), bundle.clone()).await {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
+    let shard =
+        match send_message_bundle(client, key_manager, submit_domain.clone(), bundle.clone()).await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
     // Coverage can change between the quote and submission.
     eprintln!("warning: the application's shard topic did not accept the bundle ({shard}); trying the global venue");
-    send_message_bundle(client, key_manager, global, bundle).await
+    send_message_bundle(client, key_manager, global, bundle)
+        .await
         .map_err(|global| anyhow::anyhow!("shard topic: {shard}; global topic: {global}"))
 }
 
 #[cfg(not(feature = "native-proof"))]
 pub async fn send_paid_request(
-    _: crate::context::GlobalArgs, _: &mut NodeServiceClient<Channel>, _: &FileKeyManager,
-    _: Vec<u8>, _: [u8; 32], _: MessageRequest,
+    _: crate::context::GlobalArgs,
+    _: &mut NodeServiceClient<Channel>,
+    _: &FileKeyManager,
+    _: Vec<u8>,
+    _: [u8; 32],
+    _: MessageRequest,
 ) -> anyhow::Result<()> {
     anyhow::bail!("writes are paid in QUIL; this build lacks native proofs")
 }

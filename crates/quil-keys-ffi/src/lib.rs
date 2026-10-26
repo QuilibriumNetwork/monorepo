@@ -169,8 +169,7 @@ pub fn create_temp_key_manager_and_get_pubkey(encryption_key: String) -> Vec<u8>
 mod tests {
     use super::*;
 
-    const TEST_KEY_HEX: &str =
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const TEST_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     #[test]
     fn create_and_destroy_manager() {

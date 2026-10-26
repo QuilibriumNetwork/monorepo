@@ -24,18 +24,14 @@ static MAINNET_SENIORITY_BIN: &[u8] =
 // because `include_bytes!` requires a literal path string. The
 // `node/execution/intrinsics/global/compat/` prefix is Go's authoritative
 // location — we don't copy the files to the Rust crate.
-static FIRST_RETRO_JSON: &[u8] = include_bytes!(
-    "../../../node/execution/intrinsics/global/compat/first_retro.json"
-);
-static SECOND_RETRO_JSON: &[u8] = include_bytes!(
-    "../../../node/execution/intrinsics/global/compat/second_retro.json"
-);
-static THIRD_RETRO_JSON: &[u8] = include_bytes!(
-    "../../../node/execution/intrinsics/global/compat/third_retro.json"
-);
-static FOURTH_RETRO_JSON: &[u8] = include_bytes!(
-    "../../../node/execution/intrinsics/global/compat/fourth_retro.json"
-);
+static FIRST_RETRO_JSON: &[u8] =
+    include_bytes!("../../../node/execution/intrinsics/global/compat/first_retro.json");
+static SECOND_RETRO_JSON: &[u8] =
+    include_bytes!("../../../node/execution/intrinsics/global/compat/second_retro.json");
+static THIRD_RETRO_JSON: &[u8] =
+    include_bytes!("../../../node/execution/intrinsics/global/compat/third_retro.json");
+static FOURTH_RETRO_JSON: &[u8] =
+    include_bytes!("../../../node/execution/intrinsics/global/compat/fourth_retro.json");
 
 /// A parsed first-retro entry. `reward` is an integer string (no decimals).
 #[derive(Debug, serde::Deserialize)]
@@ -136,8 +132,7 @@ pub fn get_aggregated_seniority(peer_ids: &[String]) -> u64 {
 /// mainnet snapshot value. Parts of several key sets combine by their
 /// per-part maximum, as one call over the union would.
 pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
-    let peer_set: std::collections::HashSet<&str> =
-        peer_ids.iter().map(|s| s.as_str()).collect();
+    let peer_set: std::collections::HashSet<&str> = peer_ids.iter().map(|s| s.as_str()).collect();
 
     let mut highest_first: u64 = 0;
     for f in first_retro() {
@@ -171,11 +166,21 @@ pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
             continue;
         }
         let mut amt: u64 = 0;
-        if f.jan_presence { amt += 10 * 6 * 60 * 24 * 31; }
-        if f.feb_presence { amt += 10 * 6 * 60 * 24 * 29; }
-        if f.mar_presence { amt += 10 * 6 * 60 * 24 * 31; }
-        if f.apr_presence { amt += 10 * 6 * 60 * 24 * 30; }
-        if f.may_presence { amt += 10 * 6 * 60 * 24 * 31; }
+        if f.jan_presence {
+            amt += 10 * 6 * 60 * 24 * 31;
+        }
+        if f.feb_presence {
+            amt += 10 * 6 * 60 * 24 * 29;
+        }
+        if f.mar_presence {
+            amt += 10 * 6 * 60 * 24 * 31;
+        }
+        if f.apr_presence {
+            amt += 10 * 6 * 60 * 24 * 30;
+        }
+        if f.may_presence {
+            amt += 10 * 6 * 60 * 24 * 31;
+        }
         if amt > highest_second {
             highest_second = amt;
         }
@@ -203,7 +208,6 @@ pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
         }
     }
 
-
     // Mainnet snapshot lookup: decode peer_id base58 → poseidon-hash → 32-byte address.
     let mut highest_mainnet: u64 = 0;
     for peer_id in peer_ids {
@@ -221,7 +225,13 @@ pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
         }
     }
 
-    [highest_first, highest_second, highest_third, highest_fourth, highest_mainnet]
+    [
+        highest_first,
+        highest_second,
+        highest_third,
+        highest_fourth,
+        highest_mainnet,
+    ]
 }
 
 /// `max(sum of the four retro epochs, mainnet)`: the seniority of
@@ -240,7 +250,10 @@ mod tests {
 
     #[test]
     fn unknown_peers_return_zero() {
-        let ids = vec!["QmUnknownPeerId1".to_string(), "QmUnknownPeerId2".to_string()];
+        let ids = vec![
+            "QmUnknownPeerId1".to_string(),
+            "QmUnknownPeerId2".to_string(),
+        ];
         // Unknown peers not in any retro list and not resolving to a mainnet
         // address return 0. Base58 decode may still succeed on any valid
         // base58 string, but the poseidon hash won't land on a stored

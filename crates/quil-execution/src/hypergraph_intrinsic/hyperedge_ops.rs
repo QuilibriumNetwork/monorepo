@@ -99,9 +99,7 @@ pub fn extract_hyperedge_id(value: &[u8]) -> Result<[u8; HYPEREDGE_ID_LEN]> {
         )));
     }
     let mut id = [0u8; HYPEREDGE_ID_LEN];
-    id.copy_from_slice(
-        &value[HYPEREDGE_ID_OFFSET..HYPEREDGE_ID_OFFSET + HYPEREDGE_ID_LEN],
-    );
+    id.copy_from_slice(&value[HYPEREDGE_ID_OFFSET..HYPEREDGE_ID_OFFSET + HYPEREDGE_ID_LEN]);
     Ok(id)
 }
 
@@ -248,9 +246,7 @@ pub fn build_hyperedge_add_value(
 
 /// Build the hyperedge-remove signing message. Go layout:
 /// `hyperedgeID[:64]` (no commitment).
-pub fn hyperedge_remove_signing_message(
-    hyperedge_id: &[u8; HYPEREDGE_ID_LEN],
-) -> Vec<u8> {
+pub fn hyperedge_remove_signing_message(hyperedge_id: &[u8; HYPEREDGE_ID_LEN]) -> Vec<u8> {
     hyperedge_id.to_vec()
 }
 
@@ -410,14 +406,8 @@ mod tests {
 
     #[test]
     fn hyperedge_add_cost_equals_atom_count() {
-        assert_eq!(
-            hyperedge_add_cost_from_atom_count(0),
-            BigInt::from(0)
-        );
-        assert_eq!(
-            hyperedge_add_cost_from_atom_count(42),
-            BigInt::from(42)
-        );
+        assert_eq!(hyperedge_add_cost_from_atom_count(0), BigInt::from(0));
+        assert_eq!(hyperedge_add_cost_from_atom_count(42), BigInt::from(42));
         assert_eq!(
             hyperedge_add_cost_from_atom_count(u64::MAX),
             BigInt::from(u64::MAX)

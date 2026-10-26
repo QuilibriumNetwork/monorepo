@@ -44,7 +44,13 @@ pub fn run_reclaim_legacy_forest(
     let inner = db.inner();
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(inner.clone()));
 
-    if hg_store.raw_db().get(RECLAIM_MARKER_KEY).ok().flatten().is_some() {
+    if hg_store
+        .raw_db()
+        .get(RECLAIM_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         println!("\nalready reclaimed (marker present) — nothing to do.");
         println!("\n=== RECLAIM COMPLETE ===");
         return Ok(());
@@ -109,7 +115,9 @@ pub fn run_reclaim_legacy_forest(
     let mut upper = quil_store::FOREST_NAMESPACE.to_vec();
     // FOREST_NAMESPACE is a single non-0xFF byte; exclusive upper = +1.
     *upper.last_mut().unwrap() += 1;
-    hg_store.raw_db().compact_range(Some(lower.as_slice()), Some(upper.as_slice()));
+    hg_store
+        .raw_db()
+        .compact_range(Some(lower.as_slice()), Some(upper.as_slice()));
     println!("compacted the forest namespace to release the tombstoned space.");
 
     // Safety proof: the unified app-phase root — the consensus-visible commitment —
