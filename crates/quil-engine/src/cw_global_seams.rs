@@ -917,6 +917,9 @@ pub struct GlobalConsensusCwHandle {
     /// `BlockStore` (so `verify` finds the block behind a proposed digest) and
     /// leave its parent-height metadata untouched. Drops malformed bytes.
     pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// Record each inbound consensus message's sender here, for the GLOBAL
+    /// stall watch ([`crate::global_stall`]).
+    pub contact: Arc<crate::global_stall::GlobalContact>,
 }
 
 /// Assemble + start the simplex-backed global consensus from real dependencies.
@@ -959,7 +962,30 @@ pub fn activate_global_consensus_cw(
     // Atomic finalization: the finalizer queues certified bodies for the
     // materializer worker instead of writing the canonical clock first.
     pipeline: Option<Arc<crate::global_finalization::GlobalFinalizationPipeline>>,
+    // How logs name each member of `peers` (same order), such as its peer
+    // ID tail; a member without one is named by its key's tail.
+    member_labels: Vec<String>,
 ) -> quil_types::error::Result<GlobalConsensusCwHandle> {
+    // Operator signals: the GLOBAL stall watch reads the votes consensus
+    // reports and when each member was last heard. Logging state only.
+    let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+    let (contact, watch) = {
+        use quil_cw_consensus::_crypto::certificate::Scheme as _;
+        use quil_cw_consensus::_utils::ordered::Quorum as _;
+        let participants = scheme.participants();
+        let labels = participants.iter().map(|member| {
+            peers.iter().position(|peer| peer == member).and_then(|index| member_labels.get(index).cloned())
+                .unwrap_or_else(|| crate::global_stall::tail(&hex::encode(member)))
+        }).collect();
+        // The quorum consensus counts votes against (`batcher/round.rs`).
+        let quorum = participants.quorum::<quil_cw_consensus::_utils::N3f1>() as usize;
+        let timeouts = GlobalEngineParams::new("global", epoch, genesis_digest)
+            .with_leader_timeout_secs(leader_timeout_secs);
+        let watch = crate::global_stall::GlobalWatch::new(
+            labels, scheme.me().map(usize::from), quorum, epoch, timeouts.leader_timeout, timeouts.timeout_retry,
+        );
+        (Arc::new(crate::global_stall::GlobalContact::new(participants.iter().cloned())), watch)
+    };
     // Shared block store: `propose` inserts our own frame; the node inserts
     // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
     // read it.
@@ -999,6 +1025,7 @@ pub fn activate_global_consensus_cw(
         let proposer = proposer.clone();
         let sink = sink.clone();
         let store = store.clone();
+        let liveness = liveness.clone();
         move |shutdown| spawn_global_host(
             scheme.clone(),
             peers.clone(),
@@ -1006,12 +1033,17 @@ pub fn activate_global_consensus_cw(
             sink.clone(),
             finalizer.clone(),
             store.clone(),
-            GlobalEngineParams::new("global", epoch, genesis_digest)
-                .with_leader_timeout_secs(leader_timeout_secs),
+            {
+                let mut params = GlobalEngineParams::new("global", epoch, genesis_digest)
+                    .with_leader_timeout_secs(leader_timeout_secs);
+                params.liveness = Some(liveness.clone());
+                params
+            },
             Some(storage_directory.clone()),
             Some(shutdown),
         )
     }, transport);
+    crate::global_stall::spawn(watch, Arc::downgrade(&contact), liveness, clock_store.clone());
 
     // Another member may have stopped after voting but before keeping the old
     // candidate. Re-advertise this bounded recovered tail until finalized. The
@@ -1038,7 +1070,7 @@ pub fn activate_global_consensus_cw(
     // Peer ingress can store candidates, but cannot change trusted heights.
     let ingest_block = proposer.peer_ingress(store.clone());
 
-    Ok(GlobalConsensusCwHandle { inbound, ingest_block })
+    Ok(GlobalConsensusCwHandle { inbound, ingest_block, contact })
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ pub mod frame_processor;
 pub mod genesis;
 pub mod global_catch_up;
 pub mod global_finalization;
+pub mod global_stall;
 pub mod global_view_refresh;
 pub mod frame_replay;
 pub mod frame_validator;
