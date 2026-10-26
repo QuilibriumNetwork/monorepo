@@ -26,6 +26,7 @@ use quil_types::thread_probe as probe;
 
 use crate::app_types::AppShardState;
 use crate::bounded_warn::{self, Report};
+use crate::gossip_frames::{NotHeld, RefusalReport};
 use crate::outage::OutageEvent;
 
 #[path = "app_parent.rs"]
@@ -38,6 +39,9 @@ pub use app_parent::{AppParentExecutor, PrivateAppParent};
 use app_parent::{PRIVATE_PARENT_MESSAGE_BYTES, PRIVATE_PARENT_MESSAGE_ITEMS};
 
 const CONSENSUS_QUEUE_SIZE: usize = 1000;
+/// Full frames peers publish on the shard's frame topic, queued apart from
+/// consensus and control messages so a flood of them cannot fill that queue.
+const GOSSIP_FRAME_QUEUE_SIZE: usize = 64;
 const MAX_APP_MESSAGES_PER_RANK: usize = 100;
 /// Consecutive `commit_frame` failures on a received frame before it's
 /// dropped and repaired via a shard sync instead of retried-from-zero.
@@ -325,6 +329,9 @@ pub struct AppEngineHandle {
     materialized: Arc<std::sync::atomic::AtomicU64>,
     pub filter: Vec<u8>,
     msg_tx: mpsc::Sender<AppEngineMessage>,
+    /// The engine's queue of [`AppEngineMessage::Frame`]s (frame-topic
+    /// gossip); `None` sends them with every other message.
+    frame_tx: Option<mpsc::Sender<Vec<u8>>>,
     sizes: SharedAppEngineSizes,
     execution: crate::worker_execution::SharedWorkerExecution,
     fee_snapshot: Arc<std::sync::Mutex<Option<quil_execution::pricing::AppFeeSnapshot>>>,
@@ -361,6 +368,7 @@ impl AppEngineHandle {
             materialized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             filter,
             msg_tx,
+            frame_tx: None,
             sizes: SharedAppEngineSizes::new(),
             execution: Default::default(),
             fee_snapshot: Arc::new(std::sync::Mutex::new(None)),
@@ -374,8 +382,17 @@ impl AppEngineHandle {
     }
 
     /// Send a message to the app engine (non-blocking, drops on full).
+    /// Frame-topic gossip goes to its own queue, which the engine reads
+    /// after every other message.
     pub fn send(&self, msg: AppEngineMessage) {
-        let _ = self.msg_tx.try_send(msg);
+        match (msg, self.frame_tx.as_ref()) {
+            (AppEngineMessage::Frame(data), Some(frames)) => {
+                let _ = frames.try_send(data);
+            }
+            (msg, _) => {
+                let _ = self.msg_tx.try_send(msg);
+            }
+        }
     }
 
     /// The GLOBAL frame this worker's materialized frame `frame` is anchored
@@ -2728,8 +2745,18 @@ pub struct AppConsensusEngine {
     /// frame's recomputed `requests_root` must equal the one we finalized.
     finalized_requests_roots: HashMap<u64, Vec<u8>>,
     /// Full `AppShardFrame`s received on `shard_frame_bitmask`, buffered
-    /// by frame number until they can be materialized in order.
+    /// by frame number until they can be materialized in order. Holds only
+    /// bodies this worker authenticated (a certificate, a committed child
+    /// naming it, or the root it finalized), and a held body is never
+    /// replaced by one from a peer.
     received_full_frames: HashMap<u64, quil_types::proto::global::AppShardFrame>,
+    /// Bodies without a certificate of their own received from peers, held
+    /// (bounded) until a committed certified child names them.
+    uncertified_frames: crate::gossip_frames::UncertifiedFrames,
+    /// Pacing of the off-loop preparation of certified frames from peers.
+    gossip_prep: crate::gossip_frames::PrepBudget,
+    /// Frames from peers refused on the frame topic, for bounded logging.
+    gossip_refusals: crate::gossip_frames::Refusals,
     /// Frames received above one missing, for bounded logging.
     frame_gap: FrameGap,
     pending_follower_clock: Option<(u64, quil_types::proto::global::AppShardFrame)>,
@@ -2741,6 +2768,8 @@ pub struct AppConsensusEngine {
     // Channels
     cancel: CancellationToken,
     msg_rx: Option<mpsc::Receiver<AppEngineMessage>>,
+    /// Frame-topic gossip ([`AppEngineHandle::send`]).
+    frame_rx: Option<mpsc::Receiver<Vec<u8>>>,
     event_tx: mpsc::UnboundedSender<AppEngineEvent>,
 
     // App digest, storage and committee validator for this shard. Used by the inbound
@@ -2865,6 +2894,9 @@ pub struct AppConsensusEngine {
     /// Self-clone of the inbound message sender, so `on_finalized` (running
     /// on the simplex thread) can inject `CwFinalizedFrame` into this run loop.
     self_msg_tx: mpsc::Sender<AppEngineMessage>,
+    /// Self-clone of the frame-topic sender, so a frame prepared off the
+    /// loop comes back to it.
+    self_frame_tx: mpsc::Sender<Vec<u8>>,
 
     /// Atomic publish slot for engine sizes. Updated each event-loop
     /// iteration so external memory snapshots can read internal
@@ -2887,6 +2919,7 @@ impl AppConsensusEngine {
         event_tx: mpsc::UnboundedSender<AppEngineEvent>,
     ) -> (Self, AppEngineHandle) {
         let (msg_tx, msg_rx) = mpsc::channel(CONSENSUS_QUEUE_SIZE);
+        let (frame_tx, frame_rx) = mpsc::channel(GOSSIP_FRAME_QUEUE_SIZE);
 
         // The shard's app address IS the domain — the same 32-byte value
         // the master assigns as `filter` (Go's `appAddress`). It must NOT
@@ -2927,6 +2960,7 @@ impl AppConsensusEngine {
             fee_snapshot: fee_snapshot.clone(),
             filter: filter.clone(),
             msg_tx: msg_tx.clone(),
+            frame_tx: Some(frame_tx.clone()),
             sizes: sizes.clone(),
         };
 
@@ -2989,11 +3023,15 @@ impl AppConsensusEngine {
             replicas_retired_below: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             finalized_requests_roots: HashMap::new(),
             received_full_frames: HashMap::new(),
+            uncertified_frames: Default::default(),
+            gossip_prep: Default::default(),
+            gossip_refusals: Default::default(),
             frame_gap: FrameGap::default(),
             pending_follower_clock: None,
             materialize_failures: HashMap::new(),
             cancel,
             msg_rx: Some(msg_rx),
+            frame_rx: Some(frame_rx),
             event_tx,
             app_frame_validator: None,
             storage_history_source: None,
@@ -3037,6 +3075,7 @@ impl AppConsensusEngine {
             session_status_outage: crate::outage::Outage::begin_after(3),
             session_view_lag: Default::default(),
             self_msg_tx: msg_tx,
+            self_frame_tx: frame_tx,
             sizes,
             fee_snapshot,
             frame_outflows: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
@@ -4207,6 +4246,7 @@ impl AppConsensusEngine {
         self.set_materialized_frame(synced_to);
         self.shard_frame_number = synced_to;
         self.received_full_frames.clear();
+        self.uncertified_frames.clear();
         self.finalized_requests_roots.clear();
         self.pending_follower_clock = None;
         self.materialize_failures.clear();
@@ -4380,6 +4420,7 @@ impl AppConsensusEngine {
             .retain(|&f, _| f > synced_to_frame);
         self.finalized_requests_roots
             .retain(|&f, _| f > synced_to_frame);
+        self.uncertified_frames.retain_above(synced_to_frame);
         // Continue materializing any contiguous frames we still hold.
         self.try_materialize_follower_frames().await;
         Ok(())
@@ -5912,6 +5953,7 @@ impl AppConsensusEngine {
         >,
     ) {
         let mut msg_rx = self.msg_rx.take().expect("msg_rx already taken");
+        let mut frame_rx = self.frame_rx.take().expect("frame_rx already taken");
 
         info!(
             core_id = self.core_id,
@@ -6351,6 +6393,15 @@ impl AppConsensusEngine {
                     }
                 }
 
+                // Frames peers publish on the frame topic, after every queued
+                // consensus and control message: a flood of them waits in its
+                // own bounded queue instead of crowding those out.
+                Some(data) = frame_rx.recv() => {
+                    probe::step(probe::Section::EngineFrameMessage);
+                    self.maybe_flip_unified_at_cutover();
+                    self.handle_frame_message(&data).await;
+                }
+
                 // Periodic cleanup
                 _ = cleanup_timer.tick() => {
                     probe::step(probe::Section::EngineCleanupTimer);
@@ -6362,6 +6413,7 @@ impl AppConsensusEngine {
                         self.try_materialize_follower_frames().await;
                     }
                     self.cleanup_frame_store();
+                    self.note_gossip_refusals_quiet();
                 }
 
                 // Passive-mode CW retry: keep trying to start simplex until the
@@ -7427,6 +7479,7 @@ impl AppConsensusEngine {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.received_full_frames.clear();
+        self.uncertified_frames.clear();
         self.pending_follower_clock = None;
         self.finalized_requests_roots.clear();
         self.materialize_failures.clear();
@@ -9082,121 +9135,394 @@ impl AppConsensusEngine {
         }
     }
 
+    /// Handle a full frame a peer published on this shard's frame topic.
+    /// Any peer may publish there, so this never waits on the network and
+    /// never replaces a body this worker holds: a frame at or below the
+    /// cursor, or at a number whose body is held, is dropped before any
+    /// validation, and the rest are validated with local data only. A
+    /// certified frame that needs a GLOBAL anchor or storage history this
+    /// worker lacks is prepared off the loop, paced, and comes back once
+    /// prepared ([`Self::prepare_gossip_frame`]). A frame without a
+    /// certificate of its own is never prepared
+    /// ([`Self::admit_uncertified_gossip_frame`]).
     async fn handle_frame_message(&mut self, data: &[u8]) {
         if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        if let Ok(frame) = prost::Message::decode(data) {
-            let frame: quil_types::proto::global::AppShardFrame = frame;
-            if let Some(h) = frame.header.as_ref() {
-                // Validate: address must match this shard
-                if h.address != self.app_address {
+        let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data)
+        else {
+            return;
+        };
+        let Some(h) = frame.header.as_ref() else {
+            return;
+        };
+        if h.address != self.app_address {
+            return;
+        }
+        let frame_number = h.frame_number;
+        // Nothing to buffer, or a body held already: the follower path
+        // materializes only frames above the cursor, and a held body came
+        // from this worker's consensus, an archive, or authentication here.
+        if frame_number <= self.last_materialized_frame
+            || self.received_full_frames.contains_key(&frame_number)
+        {
+            return;
+        }
+        // A frame with no certificate of its own is one a certified
+        // descendant finalized: every check but the quorum here, and it is
+        // applied only once that descendant is committed and links to it
+        // (`adopt_linked_parents`).
+        let certified = h
+            .public_key_signature_bls48581
+            .as_ref()
+            .is_some_and(|s| !s.signature.is_empty());
+        let Some(validator) = self.app_frame_validator.clone() else {
+            debug!(
+                core_id = self.core_id,
+                frame = frame_number,
+                "app frame received but validator not ready — dropping",
+            );
+            return;
+        };
+
+        // DEV-ONLY fault injection: drop a specific app-frame on receipt
+        // to force a PERSISTENT materialization gap (a locally-dropped
+        // frame can't be refilled by gossip — it's re-dropped on every
+        // receipt), exercising the step-4 catch-up sync. Unset in prod;
+        // set QUIL_APP_SYNC_DROP_FRAME=<app_frame_number> to reproduce a
+        // deeply-behind node. Re-read per receipt (rare, dev-only path).
+        // Drops a small RANGE [df, df+8) so a single node falls behind
+        // even across the frames it happens to lead (a leader
+        // self-materializes and doesn't hit this receive path).
+        let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|df| frame_number >= df && frame_number < df + 8)
+            .unwrap_or(false);
+        if fault_drop {
+            tracing::warn!(
+                core_id = self.core_id,
+                frame = frame_number,
+                "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping received \
+                 app-frame to force a step-4 catch-up sync"
+            );
+            return;
+        }
+
+        if !certified {
+            self.admit_uncertified_gossip_frame(&validator, frame, data)
+                .await;
+            return;
+        }
+        if let Some(missing) = validator.missing_global_anchor(&frame) {
+            self.prepare_gossip_frame(validator, frame, data, Some(missing));
+            return;
+        }
+        // Run the full app-shard digest, storage and committee frame
+        // validator before buffering for follower materialization.
+        // Untrusted header fields (e.g. `fee_multiplier_vote`) are read
+        // downstream.
+        match validate_app_frame_panic_safe(&validator, &frame, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.refuse_gossip_frame("failed validation", frame_number, None);
+                return;
+            }
+            // A storage registration (or authorization) this worker does
+            // not hold: fetched off the loop, once.
+            Err(QuilError::ExecutionUnavailable(error)) => {
+                debug!(core_id = self.core_id, frame = frame_number, %error,
+                    "app frame from a peer needs history this worker lacks");
+                self.prepare_gossip_frame(validator, frame, data, None);
+                return;
+            }
+            Err(error) => {
+                self.refuse_gossip_frame("failed validation", frame_number, Some(&error));
+                return;
+            }
+        }
+        if let Some(reason) = self.gossip_body_conflict(&frame) {
+            self.refuse_gossip_frame(reason, frame_number, None);
+            return;
+        }
+        self.hold_gossip_frame(frame_number, frame, data);
+        self.try_materialize_follower_frames().await;
+    }
+
+    /// A frame without a certificate of its own from a peer
+    /// ([`Self::handle_frame_message`]). Its body is held for the follower
+    /// path once a committed certified child names it, or when it carries
+    /// the root this worker finalized at its number; otherwise it waits in
+    /// the bounded [`crate::gossip_frames::UncertifiedFrames`] for that
+    /// child. No GLOBAL anchor or storage history is fetched for it: one it
+    /// cannot validate with local data is dropped, and the frame reaches
+    /// this worker through its committee's finalization or an archive
+    /// ancestor sync instead.
+    async fn admit_uncertified_gossip_frame(
+        &mut self,
+        validator: &BlsAppFrameValidator,
+        frame: quil_types::proto::global::AppShardFrame,
+        data: &[u8],
+    ) {
+        let Some(header) = frame.header.clone() else {
+            return;
+        };
+        let number = header.frame_number;
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return;
+        };
+        let finalized = self.finalized_requests_roots.contains_key(&number);
+        let child = self
+            .clock_store
+            .get_shard_clock_frame(&self.filter, number.saturating_add(1), false)
+            .ok()
+            .and_then(|child| child.header);
+        match child.as_ref() {
+            Some(child) => {
+                if !crate::frame_validator::app_frame_links_to_child(&header, child) {
+                    self.refuse_gossip_frame(
+                        "not the parent of the committed frame after it",
+                        number,
+                        None,
+                    );
                     return;
                 }
-                let frame_number = h.frame_number;
-
-                if let Some(validator) = self.app_frame_validator.as_ref() {
-                    if let Err(error) = validator.prepare_storage_history(&frame).await {
-                        debug!(core_id = self.core_id, frame = frame_number, %error,
-                            "follower frame historical registration unavailable");
-                        return;
-                    }
-                }
-
-                // Run the full app-shard digest, storage and committee
-                // frame validator before buffering for follower
-                // materialization. The archive ingest path already does
-                // this; the follower path did not. Untrusted header
-                // fields (e.g. `fee_multiplier_vote`) are read downstream.
-                // A frame with no certificate of its own is one a certified
-                // descendant finalized: every check but the quorum here, and
-                // it is applied only once that descendant is committed and
-                // links to it (`adopt_linked_parents`).
-                let certified = h
-                    .public_key_signature_bls48581
-                    .as_ref()
-                    .is_some_and(|s| !s.signature.is_empty());
-                match self.app_frame_validator.as_ref() {
-                    Some(v) => match validate_app_frame_panic_safe(
-                        v, &frame, /* proposal */ !certified,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            warn!(
-                                core_id = self.core_id,
-                                frame = frame_number,
-                                "rejecting app-shard follower frame: failed validation",
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(
-                                core_id = self.core_id,
-                                frame = frame_number,
-                                error = %e,
-                                "rejecting app-shard follower frame: validation error",
-                            );
-                            return;
-                        }
-                    },
-                    None => {
-                        debug!(
-                            core_id = self.core_id,
-                            frame = frame_number,
-                            "app frame received but validator not ready — dropping",
-                        );
-                        return;
-                    }
-                }
-
-                // Cache in frame store (keyed by output hash) — kept for
-                // the existing output-hash lookup path.
-                use sha2::{Digest, Sha256};
-                let frame_id = hex::encode(Sha256::digest(&h.output));
-                self.frame_store.insert(frame_id, data.to_vec());
-
-                // DEV-ONLY fault injection: drop a specific app-frame on receipt
-                // to force a PERSISTENT materialization gap (a locally-dropped
-                // frame can't be refilled by gossip — it's re-dropped on every
-                // receipt), exercising the step-4 catch-up sync. Unset in prod;
-                // set QUIL_APP_SYNC_DROP_FRAME=<app_frame_number> to reproduce a
-                // deeply-behind node. Re-read per receipt (rare, dev-only path).
-                // Drops a small RANGE [df, df+8) so a single node falls behind
-                // even across the frames it happens to lead (a leader
-                // self-materializes and doesn't hit this receive path).
-                let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|df| frame_number >= df && frame_number < df + 8)
-                    .unwrap_or(false);
-                if fault_drop {
-                    tracing::warn!(
-                        core_id = self.core_id,
-                        frame = frame_number,
-                        "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping received \
-                         app-frame to force a step-4 catch-up sync"
-                    );
-                } else if frame_number > self.last_materialized_frame {
-                    // Buffer the full frame (header+requests) for follower
-                    // materialization, but only if it's still ahead of what
-                    // we've materialized (avoid unbounded re-buffering of old
-                    // frames). The buffer is materialized in strict order
-                    // against the finalized (trusted) requests_root.
-                    self.received_full_frames.insert(frame_number, frame);
-                    if !certified {
-                        if let Ok(child) = self.clock_store.get_shard_clock_frame(
-                            &self.filter,
-                            frame_number + 1,
-                            false,
-                        ) {
-                            if let Some(child) = child.header {
-                                self.adopt_linked_parents(&child);
-                            }
-                        }
-                    }
-                    self.try_materialize_follower_frames().await;
-                }
             }
+            None if finalized => {}
+            None => match self.uncertified_frames.admits(
+                self.last_materialized_frame,
+                number,
+                &digest,
+                data.len(),
+            ) {
+                Ok(()) => {}
+                Err(NotHeld::Full) => {
+                    self.refuse_gossip_frame("uncertified frame buffer full", number, None);
+                    return;
+                }
+                Err(NotHeld::OutsideWindow | NotHeld::Duplicate) => return,
+            },
+        }
+        if validator.missing_global_anchor(&frame).is_some() {
+            debug!(
+                core_id = self.core_id,
+                frame = number,
+                "app frame from a peer without a certificate names a GLOBAL frame this worker \
+                 lacks — dropping; it is not fetched for an uncertified frame",
+            );
+            return;
+        }
+        match validate_app_frame_panic_safe(validator, &frame, true) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.refuse_gossip_frame("failed validation", number, None);
+                return;
+            }
+            Err(QuilError::ExecutionUnavailable(error)) => {
+                debug!(
+                    core_id = self.core_id,
+                    frame = number,
+                    %error,
+                    "app frame from a peer without a certificate needs history this worker \
+                     lacks — dropping",
+                );
+                return;
+            }
+            Err(error) => {
+                self.refuse_gossip_frame("failed validation", number, Some(&error));
+                return;
+            }
+        }
+        if let Some(reason) = self.gossip_body_conflict(&frame) {
+            self.refuse_gossip_frame(reason, number, None);
+            return;
+        }
+        if child.is_none() && !finalized {
+            if let Err(NotHeld::Full) = self.uncertified_frames.insert(
+                self.last_materialized_frame,
+                number,
+                digest,
+                data.len(),
+                frame,
+            ) {
+                self.refuse_gossip_frame("uncertified frame buffer full", number, None);
+            }
+            return;
+        }
+        self.hold_gossip_frame(number, frame, data);
+        if let Some(child) = child {
+            self.adopt_linked_parents(&child);
+        }
+        self.try_materialize_follower_frames().await;
+    }
+
+    /// Why a validated frame from a peer cannot be the body of its number:
+    /// another root than the one this worker finalized there, or a body
+    /// that does not hash to its own root.
+    fn gossip_body_conflict(
+        &self,
+        frame: &quil_types::proto::global::AppShardFrame,
+    ) -> Option<&'static str> {
+        let header = frame.header.as_ref()?;
+        if self
+            .finalized_requests_roots
+            .get(&header.frame_number)
+            .is_some_and(|root| *root != header.requests_root)
+        {
+            return Some("not the frame this worker finalized at its number");
+        }
+        (!self.body_matches_requests_root(frame)).then_some("body does not match its requests root")
+    }
+
+    /// Buffer an authenticated frame from a peer for the follower path.
+    fn hold_gossip_frame(
+        &mut self,
+        number: u64,
+        frame: quil_types::proto::global::AppShardFrame,
+        data: &[u8],
+    ) {
+        // Cache in frame store (keyed by output hash) — kept for
+        // the existing output-hash lookup path.
+        if let Some(header) = frame.header.as_ref() {
+            use sha2::{Digest, Sha256};
+            let frame_id = hex::encode(Sha256::digest(&header.output));
+            self.frame_store.insert(frame_id, data.to_vec());
+        }
+        self.received_full_frames.insert(number, frame);
+    }
+
+    /// Fetch what a certified frame from a peer lacks for validation (its
+    /// GLOBAL anchor from this node's master, storage history) off the
+    /// loop, and queue it again once prepared. One preparation per shard
+    /// at a time, paced, each frame once
+    /// ([`crate::gossip_frames::PrepBudget`]). A `missing` anchor at or
+    /// above this worker's GLOBAL head is not fetched (it arrives with the
+    /// GLOBAL chain), nor one more than an epoch older than the anchor of
+    /// the materialized frame, which no frame above it names.
+    fn prepare_gossip_frame(
+        &mut self,
+        validator: Arc<BlsAppFrameValidator>,
+        frame: quil_types::proto::global::AppShardFrame,
+        data: &[u8],
+        missing: Option<(u64, Option<u64>)>,
+    ) {
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        let number = header.frame_number;
+        if let Some((anchor, latest)) = missing {
+            if latest.is_none_or(|head| anchor >= head) {
+                debug!(
+                    core_id = self.core_id,
+                    frame = number,
+                    anchor,
+                    "app frame from a peer names a GLOBAL frame this worker has not received \
+                     yet — dropping",
+                );
+                return;
+            }
+            let floor = self
+                .clock_store
+                .get_shard_clock_frame(&self.filter, self.last_materialized_frame, false)
+                .ok()
+                .and_then(|frame| frame.header)
+                .map_or(0, |header| {
+                    header
+                        .global_frame_number
+                        .saturating_sub(quil_types::consensus::epoch_length_frames())
+                });
+            if anchor < floor {
+                self.refuse_gossip_frame(
+                    "GLOBAL anchor older than the materialized frame's",
+                    number,
+                    None,
+                );
+                return;
+            }
+        }
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
+            return;
+        };
+        let running = match self.gossip_prep.start(digest, std::time::Instant::now()) {
+            Ok(running) => running,
+            Err(refused) => {
+                debug!(
+                    core_id = self.core_id,
+                    frame = number,
+                    ?refused,
+                    "preparation of an app frame from a peer not started — dropping"
+                );
+                return;
+            }
+        };
+        let frames = self.self_frame_tx.clone();
+        let data = data.to_vec();
+        let core_id = self.core_id;
+        tokio::spawn(async move {
+            let prepared = validator.prepare_storage_history(&frame).await;
+            running.store(false, std::sync::atomic::Ordering::Release);
+            match prepared {
+                Ok(()) => {
+                    let _ = frames.try_send(data);
+                }
+                Err(error) => debug!(core_id, frame = number, %error,
+                    "app frame from a peer could not be prepared — dropped"),
+            }
+        });
+    }
+
+    /// Count a frame from a peer refused on the frame topic: a warning when
+    /// refusals start, a repeat with their count at most every 10 min while
+    /// they continue ([`Self::note_gossip_refusals_quiet`] logs the end).
+    fn refuse_gossip_frame(&mut self, reason: &'static str, frame: u64, error: Option<&QuilError>) {
+        let error = error.map(ToString::to_string).unwrap_or_default();
+        debug!(core_id = self.core_id, frame, reason, %error, "app frame from a peer refused");
+        match self
+            .gossip_refusals
+            .refused(reason, std::time::Instant::now())
+        {
+            Some(RefusalReport::Started) => warn!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                frame,
+                reason,
+                %error,
+                "refusing app-shard frames from peers on this shard's frame topic: a peer sent a \
+                 frame that fails authentication or exceeds this worker's buffer; this worker \
+                 still materializes through its committee and archive sync; repeats every 10 min \
+                 while refusals continue",
+            ),
+            Some(RefusalReport::Continuing {
+                refused,
+                reasons,
+                ongoing,
+            }) => warn!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                frame,
+                refused,
+                %reasons,
+                ongoing_secs = ongoing.as_secs(),
+                "still refusing app-shard frames from peers on this shard's frame topic",
+            ),
+            _ => {}
+        }
+    }
+
+    /// The end of a frame-topic refusal condition, once no frame was
+    /// refused for 10 min.
+    fn note_gossip_refusals_quiet(&mut self) {
+        if let Some(RefusalReport::Ended { refused, lasted }) =
+            self.gossip_refusals.quiet(std::time::Instant::now())
+        {
+            info!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                refused,
+                lasted_secs = lasted.as_secs(),
+                "app-shard frames from peers on this shard's frame topic: none refused for 10 min, \
+                 the condition ended",
+            );
         }
     }
 
@@ -9209,8 +9535,21 @@ impl AppConsensusEngine {
         let mut child = child.clone();
         while child.frame_number > self.last_materialized_frame + 1 {
             let number = child.frame_number - 1;
-            let Some(parent) = self.received_full_frames.get(&number).cloned() else {
-                return;
+            // A body from a peer is held only once the child names it.
+            let held = self.received_full_frames.get(&number).cloned();
+            let parent = match held {
+                Some(parent) => parent,
+                None => match self.uncertified_frames.take(number, &child.parent_selector) {
+                    Some(parent)
+                        if parent.header.as_ref().is_some_and(|header| {
+                            crate::frame_validator::app_frame_links_to_child(header, &child)
+                        }) =>
+                    {
+                        self.received_full_frames.insert(number, parent.clone());
+                        parent
+                    }
+                    _ => return,
+                },
             };
             let Some(header) = parent.header.clone() else {
                 return;
@@ -9649,6 +9988,8 @@ impl AppConsensusEngine {
         // Bound the received-frame buffer to recent + future frames.
         let cutoff = self.last_materialized_frame.saturating_sub(8);
         self.received_full_frames.retain(|&f, _| f > cutoff);
+        self.uncertified_frames
+            .retain_above(self.last_materialized_frame);
     }
 
     // ---------------------------------------------------------------
@@ -17414,6 +17755,7 @@ mod tests {
             cancel: CancellationToken::new(),
             filter: vec![7; 32],
             msg_tx,
+            frame_tx: None,
             sizes: SharedAppEngineSizes::new(),
             materialized: materialized.clone(),
             fee_snapshot: stored.clone(),
@@ -20393,6 +20735,282 @@ mod tests {
     }
 }
 
+/// Frames peers publish on the shard's frame topic: queued apart, prepared
+/// off the loop, and held only once authenticated
+/// ([`AppConsensusEngine::handle_frame_message`]).
+#[cfg(test)]
+mod gossip_frame_tests {
+    use super::*;
+    use quil_types::proto::global::{AppShardFrame, FrameHeader, GlobalFrame, GlobalFrameHeader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn build(
+        anchors: Option<Arc<quil_store::testing::InMemoryClockStore>>,
+        executor: bool,
+    ) -> (AppConsensusEngine, AppEngineHandle) {
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let (execution_engine, hypergraph) = if executor {
+            use quil_types::crypto::NoopInclusionProver;
+            let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(NoopInclusionProver),
+            ));
+            let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+                Arc::new(NoopInclusionProver),
+                crypto.key_manager.clone(),
+                crdt.clone(),
+                crypto.circuit_compiler.clone(),
+                crypto.clock_store.clone(),
+                Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+                false,
+            ));
+            (Some(manager), Some(crdt))
+        } else {
+            (None, None)
+        };
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            global_anchor_store: anchors.map(|anchors| anchors as Arc<dyn ClockStore>),
+            global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32],
+            local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false,
+            min_active_provers_for_propose: 1,
+            coverage_publish: None,
+            hypergraph,
+            storage_source_hypergraph: None,
+            topology: None,
+            execution_engine,
+            inclusion_prover: None,
+            kv_db: None,
+            app_consensus_cw: false,
+            db_config: Default::default(),
+            unified_cutover_hook: None,
+        };
+        AppConsensusEngine::new(
+            1,
+            quil_execution::domains::QUIL_TOKEN.to_vec(),
+            deps,
+            events,
+        )
+    }
+
+    /// A frame without a certificate that passes proposal validation.
+    fn unanchored(number: u64, rank: u64, requests_root: Vec<u8>) -> AppShardFrame {
+        let mut frame = AppShardFrame {
+            header: Some(FrameHeader {
+                address: quil_execution::domains::QUIL_TOKEN.to_vec(),
+                frame_number: number,
+                rank,
+                state_roots: vec![vec![0; 32]; 4],
+                requests_root,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let h = frame.header.as_mut().unwrap();
+        h.output = quil_crypto::porep::deterministic_app_frame_output(
+            &h.parent_selector,
+            &h.requests_root,
+            &h.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]),
+            h.frame_number,
+            h.rank,
+            &h.prover,
+            h.difficulty,
+            h.fee_multiplier_vote,
+            h.timestamp,
+            &h.storage_attestation_root,
+            quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&h.fee_total),
+            &h.settlements,
+            &h.accumulator,
+            &h.spends,
+        );
+        frame
+    }
+
+    fn encode(frame: &AppShardFrame) -> Vec<u8> {
+        prost::Message::encode_to_vec(frame)
+    }
+
+    /// Frame-topic gossip fills its own queue: a flood of it leaves the
+    /// consensus and control queue its capacity.
+    #[tokio::test]
+    async fn frame_topic_gossip_is_queued_apart_from_consensus() {
+        let (mut engine, handle) = build(None, false);
+        for n in 0..(GOSSIP_FRAME_QUEUE_SIZE + 100) {
+            handle.send(AppEngineMessage::Frame(vec![n as u8]));
+        }
+        handle.send(AppEngineMessage::CwIn {
+            channel: 0,
+            from: vec![5; 897],
+            data: b"vote".to_vec(),
+        });
+        let frames = engine.frame_rx.as_mut().unwrap();
+        let mut queued = 0;
+        while frames.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, GOSSIP_FRAME_QUEUE_SIZE);
+        assert!(matches!(
+            engine.msg_rx.as_mut().unwrap().try_recv(),
+            Ok(AppEngineMessage::CwIn { channel: 0, .. })
+        ));
+    }
+
+    /// A body without a certificate waits aside, beside a decoy at its
+    /// number, until the committed certified child names it; only the named
+    /// one is adopted and both frames materialize.
+    #[tokio::test]
+    async fn an_uncertified_body_waits_for_the_certified_child_that_names_it() {
+        let (mut engine, _handle) = build(None, true);
+        engine.frame_validator();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let mut roots = Vec::new();
+        for number in 1..=3 {
+            roots.push(
+                engine
+                    .recompute_requests_root_offloaded(vec![], number)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let plain = |number: u64, parent_selector: Vec<u8>, requests_root: Vec<u8>| AppShardFrame {
+            header: Some(FrameHeader {
+                address: filter.clone(),
+                frame_number: number,
+                rank: number,
+                output: vec![number as u8; 32],
+                parent_selector,
+                state_roots: vec![vec![1], vec![2], vec![3], vec![4]],
+                requests_root,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        engine
+            .handle_cw_finalized_frame(
+                &encode(&plain(1, vec![], roots[0].clone())),
+                &[],
+                true,
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(engine.last_materialized_frame, 1);
+        // A decoy with the same body and another output digest.
+        let decoy = unanchored(2, 1, roots[1].clone());
+        let named = unanchored(2, 2, roots[1].clone());
+        engine.handle_frame_message(&encode(&decoy)).await;
+        engine.handle_frame_message(&encode(&named)).await;
+        assert!(
+            !engine.received_full_frames.contains_key(&2),
+            "held aside until a certified child names it"
+        );
+        assert_eq!(engine.uncertified_frames.len(), 2);
+        let selector =
+            quil_crypto::poseidon::hash_bytes_to_32(&named.header.as_ref().unwrap().output)
+                .unwrap()
+                .to_vec();
+        engine
+            .handle_cw_finalized_frame(
+                &encode(&plain(3, selector, roots[2].clone())),
+                &[],
+                true,
+                Vec::new(),
+            )
+            .await;
+        engine.try_materialize_follower_frames().await;
+        assert_eq!(engine.last_materialized_frame, 3);
+        assert_eq!(
+            engine
+                .clock_store
+                .get_shard_clock_frame(&filter, 2, false)
+                .unwrap()
+                .header
+                .unwrap()
+                .output,
+            named.header.as_ref().unwrap().output,
+            "the named body was adopted"
+        );
+        assert_eq!(engine.uncertified_frames.len(), 0, "the decoy is dropped");
+    }
+
+    /// A certified frame from a peer whose GLOBAL anchor this worker lacks
+    /// is prepared off the loop and queued again; the next one within the
+    /// pacing interval, and any frame without a certificate, fetches
+    /// nothing.
+    #[tokio::test]
+    async fn a_certified_frame_from_a_peer_is_prepared_off_the_loop_and_paced() {
+        let global = |number| GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![1; 516],
+                ..Default::default()
+            }),
+            requests: vec![],
+        };
+        let anchors = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        anchors.seed_frame(global(100));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: crate::global_anchor::GlobalAnchorSource = {
+            let calls = calls.clone();
+            Arc::new(move |number| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(global(number)) })
+            })
+        };
+        let (engine, _handle) = build(Some(anchors.clone()), false);
+        let mut engine = engine.with_global_anchor_source(Some(source));
+        engine.frame_validator();
+        let certified = |number: u64, anchor: u64| {
+            let mut frame = unanchored(number, number, vec![0; 32]);
+            let header = frame.header.as_mut().unwrap();
+            header.global_frame_number = anchor;
+            header.public_key_signature_bls48581 =
+                Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                    signature: vec![1; 64],
+                    ..Default::default()
+                });
+            frame
+        };
+
+        let first = encode(&certified(5, 50));
+        engine.handle_frame_message(&first).await;
+        let requeued = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.frame_rx.as_mut().unwrap().recv(),
+        )
+        .await
+        .expect("the prepared frame is queued again");
+        assert_eq!(requeued, Some(first));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(anchors.get_global_clock_frame(50).is_ok());
+
+        engine
+            .handle_frame_message(&encode(&certified(6, 60)))
+            .await;
+        let mut uncertified = unanchored(7, 7, vec![0; 32]);
+        uncertified.header.as_mut().unwrap().global_frame_number = 70;
+        engine.handle_frame_message(&encode(&uncertified)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "paced, and never for a frame without a certificate"
+        );
+        assert!(engine.received_full_frames.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod shard_path_tests {
     use super::shard_path_of_filter;
@@ -20428,5 +21046,258 @@ mod shard_path_tests {
         let mut malformed = quil_forest::encode_shard_bit_path(&app, &[true, false, true]);
         *malformed.last_mut().unwrap() |= 1; // a padding bit set
         assert_eq!(shard_path_of_filter(&malformed), ShardPath::UNKNOWN);
+    }
+}
+
+/// A/B reproducers for the app-shard frame topic: frames any peer can
+/// publish there must not stall the engine loop on a GLOBAL anchor they
+/// choose, be buffered without a certified child, request archive syncs,
+/// or displace a finalized body this worker holds.
+#[cfg(test)]
+mod gossip_frame_repro_tests {
+    use super::*;
+    use quil_types::proto::global::{AppShardFrame, FrameHeader, GlobalFrame, GlobalFrameHeader};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn build(
+        clock: Arc<quil_store::testing::InMemoryClockStore>,
+        anchors: Option<Arc<quil_store::testing::InMemoryClockStore>>,
+        executor: bool,
+    ) -> (AppConsensusEngine, mpsc::UnboundedReceiver<AppEngineEvent>) {
+        let (events, received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let (execution_engine, hypergraph) = if executor {
+            use quil_types::crypto::NoopInclusionProver;
+            let crypto = quil_execution::testing::NoopExecutionCrypto::new();
+            let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(NoopInclusionProver),
+            ));
+            let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
+                Arc::new(NoopInclusionProver),
+                crypto.key_manager.clone(),
+                crdt.clone(),
+                crypto.circuit_compiler.clone(),
+                crypto.clock_store.clone(),
+                Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+                false,
+            ));
+            (Some(manager), Some(crdt))
+        } else {
+            (None, None)
+        };
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock,
+            global_anchor_store: anchors.map(|anchors| anchors as Arc<dyn ClockStore>),
+            global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32],
+            local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false,
+            min_active_provers_for_propose: 1,
+            coverage_publish: None,
+            hypergraph,
+            storage_source_hypergraph: None,
+            topology: None,
+            execution_engine,
+            inclusion_prover: None,
+            kv_db: None,
+            app_consensus_cw: false,
+            db_config: Default::default(),
+            unified_cutover_hook: None,
+        };
+        let (engine, _handle) = AppConsensusEngine::new(
+            1,
+            quil_execution::domains::QUIL_TOKEN.to_vec(),
+            deps,
+            events,
+        );
+        (engine, received)
+    }
+
+    /// A frame without a certificate that passes proposal validation: its
+    /// output is computed from public inputs, unanchored.
+    fn planted(number: u64, requests_root: Vec<u8>) -> AppShardFrame {
+        let mut frame = AppShardFrame {
+            header: Some(FrameHeader {
+                address: quil_execution::domains::QUIL_TOKEN.to_vec(),
+                frame_number: number,
+                rank: number,
+                state_roots: vec![vec![0; 32]; 4],
+                requests_root,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let h = frame.header.as_mut().unwrap();
+        h.output = quil_crypto::porep::deterministic_app_frame_output(
+            &h.parent_selector,
+            &h.requests_root,
+            &h.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]),
+            h.frame_number,
+            h.rank,
+            &h.prover,
+            h.difficulty,
+            h.fee_multiplier_vote,
+            h.timestamp,
+            &h.storage_attestation_root,
+            quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&h.fee_total),
+            &h.settlements,
+            &h.accumulator,
+            &h.spends,
+        );
+        frame
+    }
+
+    fn encode(frame: &AppShardFrame) -> Vec<u8> {
+        prost::Message::encode_to_vec(frame)
+    }
+
+    /// H7: a frame from a peer, certified or not, names a GLOBAL anchor
+    /// this worker lacks. The engine loop must not wait on its fetch.
+    #[tokio::test]
+    async fn reproduces_h7_peer_frame_stalls_the_engine_loop_on_its_anchor() {
+        let anchors = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        anchors.seed_frame(GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 100,
+                output: vec![1; 516],
+                ..Default::default()
+            }),
+            requests: vec![],
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: crate::global_anchor::GlobalAnchorSource = {
+            let calls = calls.clone();
+            Arc::new(move |_number| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending::<Result<GlobalFrame>>())
+            })
+        };
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (engine, _events) = build(clock, Some(anchors), false);
+        let mut engine = engine.with_global_anchor_source(Some(source));
+        engine.frame_validator();
+        let mut frame = planted(5, vec![0; 32]);
+        frame.header.as_mut().unwrap().global_frame_number = 50;
+
+        let handled = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.handle_frame_message(&encode(&frame)),
+        )
+        .await;
+        assert!(
+            handled.is_ok(),
+            "the engine loop waited on GLOBAL anchor 50, named by a peer's frame without a certificate"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a peer's frame without a certificate made the engine fetch its GLOBAL anchor"
+        );
+
+        frame.header.as_mut().unwrap().public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature {
+                signature: vec![1; 64],
+                ..Default::default()
+            });
+        let handled = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.handle_frame_message(&encode(&frame)),
+        )
+        .await;
+        assert!(
+            handled.is_ok(),
+            "the engine loop waited on GLOBAL anchor 50, named by a peer's frame with a forged certificate"
+        );
+    }
+
+    /// H8: frames without a certificate, valid by the proposal rules
+    /// anyone can satisfy, are not buffered for the follower path before a
+    /// certified child names them, and do not make this worker request
+    /// archive syncs.
+    #[tokio::test]
+    async fn reproduces_h8_peer_frames_buffer_without_bound_and_request_syncs() {
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (mut engine, mut events) = build(clock, None, false);
+        engine.frame_validator();
+        for number in (1..=40).chain(1_000..1_040) {
+            for variant in 0..3u8 {
+                let frame = planted(number, vec![variant; 32]);
+                engine.handle_frame_message(&encode(&frame)).await;
+            }
+        }
+        let syncs = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event, AppEngineEvent::AncestorSyncRequested { .. }))
+            .count();
+        assert!(
+            engine.received_full_frames.is_empty(),
+            "{} frames from a peer without a certificate were buffered for materialization",
+            engine.received_full_frames.len()
+        );
+        assert_eq!(
+            syncs, 0,
+            "frames from a peer without a certificate made this worker request archive syncs"
+        );
+    }
+
+    /// H8: a finalized frame's body this worker holds is not replaced by
+    /// a peer's frame at the same number, so it still materializes.
+    #[tokio::test]
+    async fn reproduces_h8_peer_frame_replaces_a_held_finalized_body() {
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (mut engine, _events) = build(clock, None, true);
+        engine.frame_validator();
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let mut frames = Vec::new();
+        for number in 1..=2u64 {
+            let mut frame = AppShardFrame {
+                header: Some(FrameHeader {
+                    address: filter.clone(),
+                    frame_number: number,
+                    rank: number,
+                    output: vec![number as u8; 32],
+                    state_roots: vec![vec![1], vec![2], vec![3], vec![4]],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            frame.header.as_mut().unwrap().requests_root = engine
+                .recompute_requests_root_offloaded(vec![], number)
+                .await
+                .unwrap();
+            frames.push(frame);
+        }
+        engine
+            .handle_cw_finalized_frame(&encode(&frames[1]), &[], true, Vec::new())
+            .await;
+        assert!(engine.received_full_frames.contains_key(&2));
+        engine
+            .handle_frame_message(&encode(&planted(2, vec![0xab; 32])))
+            .await;
+        assert_eq!(
+            engine
+                .received_full_frames
+                .get(&2)
+                .and_then(|frame| frame.header.as_ref())
+                .map(|header| header.output.clone()),
+            Some(vec![2; 32]),
+            "a peer's frame replaced the finalized body this worker held for frame 2"
+        );
+        engine
+            .handle_cw_finalized_frame(&encode(&frames[0]), &[], true, Vec::new())
+            .await;
+        engine.try_materialize_follower_frames().await;
+        assert_eq!(
+            engine.last_materialized_frame, 2,
+            "the finalized frame 2 no longer materializes"
+        );
     }
 }

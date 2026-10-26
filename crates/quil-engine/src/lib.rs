@@ -38,6 +38,7 @@ pub mod global_catch_up;
 pub mod global_finalization;
 pub mod global_stall;
 pub mod global_view_refresh;
+mod gossip_frames;
 pub mod halt_state;
 pub mod historical_committee;
 pub mod leader_provider;
