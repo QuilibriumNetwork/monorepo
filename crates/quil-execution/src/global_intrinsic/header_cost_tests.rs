@@ -7,7 +7,7 @@ use super::*;
 use crate::global_intrinsic::frame_header::FrameHeader;
 use crate::global_intrinsic::materialize;
 use crate::global_intrinsic::prover_shard_update::{
-    materialize_prover_shard_update_with_fees, ShardMetadata,
+    materialize_prover_shard_update_with_fees, HeaderIssuance, ShardMetadata,
 };
 use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
 use num_bigint::BigInt;
@@ -241,8 +241,9 @@ fn measure_global_frame_header_cost() {
             .iter()
             .map(|s| prover_info(s, &shard_filter(h), 0))
             .collect();
+        let prior = header(h, Vec::new());
         materialize_prover_shard_update_with_fees(
-            &header(h, Vec::new()),
+            &prior,
             prior_frame,
             &state,
             &registry,
@@ -255,6 +256,7 @@ fn measure_global_frame_header_cost() {
             0,
             None,
             None,
+            HeaderIssuance::claimed(&prior),
         )
         .unwrap();
         state.commit().unwrap();
@@ -327,6 +329,7 @@ fn measure_global_frame_header_cost() {
                 0,
                 None,
                 None,
+                HeaderIssuance::claimed(op),
             )
             .unwrap();
             let credited = Instant::now();

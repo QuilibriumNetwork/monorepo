@@ -86,6 +86,48 @@ pub struct ShardMetadata {
     pub shard_count: u64,
 }
 
+/// The lowest difficulty GLOBAL prices issuance at under the anchored
+/// issuance rules: the first of the square-root generation
+/// ([`crate::pricing::pomw_generation`] one). GLOBAL's own difficulty never
+/// falls below 50,000, so it binds only a header without an anchor.
+pub const ISSUANCE_MIN_DIFFICULTY: u64 = 10_000;
+
+/// How GLOBAL prices and credits one shard header
+/// ([`materialize_prover_shard_update_with_fees`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderIssuance {
+    /// The difficulty issuance is priced at.
+    pub difficulty: u64,
+    /// Whether the header earns issuance, fees and activity. From the
+    /// anchored issuance epoch a header at or below its session's executed
+    /// tip does not: GLOBAL already credited that frame.
+    pub credit: bool,
+}
+
+impl HeaderIssuance {
+    /// The rule before [`quil_types::consensus::anchored_issuance_active`]:
+    /// the difficulty the shard's leader wrote into the header, credited.
+    pub fn claimed(frame_header: &FrameHeader) -> Self {
+        Self {
+            difficulty: u64::from(frame_header.difficulty),
+            credit: true,
+        }
+    }
+}
+
+/// The difficulty GLOBAL prices a header's issuance at under the anchored
+/// issuance rules: that of the GLOBAL frame it anchors to
+/// (`anchor_difficulty`, from GLOBAL's own clock), or for a header without
+/// an anchor its own, and never below [`ISSUANCE_MIN_DIFFICULTY`]. App voters
+/// only bind the header's difficulty into its output and never compare it
+/// with GLOBAL's, so the leader's value cannot price issuance.
+pub fn anchored_issuance_difficulty(
+    frame_header: &FrameHeader,
+    anchor_difficulty: Option<u32>,
+) -> u64 {
+    u64::from(anchor_difficulty.unwrap_or(frame_header.difficulty)).max(ISSUANCE_MIN_DIFFICULTY)
+}
+
 /// Participants from a frame header, grouped by ring.
 #[derive(Debug, Clone)]
 pub struct ShardUpdateContext {
@@ -900,6 +942,7 @@ pub fn materialize_prover_shard_update(
         0,
         None,
         None,
+        HeaderIssuance::claimed(frame_header),
     )
 }
 
@@ -917,6 +960,9 @@ pub fn materialize_prover_shard_update(
 /// `storage` marks a frame anchored in a hash-proof epoch: each participant's
 /// issuance share is held in its storage seat instead of paid
 /// ([`hold_storage_shares`]); fees are still paid at once.
+///
+/// `issuance` prices the frame's issuance and says whether it is credited at
+/// all ([`HeaderIssuance`]); a frame not credited only resolves its rings.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_prover_shard_update_with_fees(
     frame_header: &FrameHeader,
@@ -932,6 +978,7 @@ pub fn materialize_prover_shard_update_with_fees(
     committed_fees: u128,
     session: Option<[u8; 32]>,
     storage: Option<&mut StorageFrame>,
+    issuance: HeaderIssuance,
 ) -> Result<()> {
     let session_rings = match &session {
         Some(session) => Some(session_member_rings(
@@ -971,6 +1018,16 @@ pub fn materialize_prover_shard_update_with_fees(
         shard_metadata,
         session_rings.as_deref(),
     )?;
+    if !issuance.credit {
+        tracing::info!(
+            shard = %hex::encode(&frame_header.address),
+            shard_frame = frame_header.frame_number,
+            frame = current_frame_number,
+            "shard header at or below its session's executed tip: GLOBAL already \
+             credited this frame, so it earns no issuance, fees or activity again",
+        );
+        return Ok(());
+    }
 
     // Per-ring reward shares: build a single-prover allocation map
     // per ring and divide `outputs[0]` by `ringGroupSize`.
@@ -990,7 +1047,7 @@ pub fn materialize_prover_shard_update_with_fees(
         );
 
         let outputs = reward_issuance.calculate(
-            frame_header.difficulty as u64,
+            issuance.difficulty,
             world_state_size,
             REWARD_UNITS,
             &[alloc_map],
@@ -2752,6 +2809,160 @@ mod tests {
         );
     }
 
+    /// Records the difficulty each issuance calculation was priced at.
+    struct DifficultyProbe(std::sync::Mutex<Vec<u64>>);
+    impl RewardIssuance for DifficultyProbe {
+        fn calculate(
+            &self,
+            difficulty: u64,
+            _world_state_bytes: u64,
+            _units: u64,
+            provers: &[HashMap<String, ProverAllocation>],
+        ) -> Result<Vec<BigInt>> {
+            self.0.lock().unwrap().push(difficulty);
+            Ok(provers.iter().map(|_| BigInt::from(8_000)).collect())
+        }
+    }
+
+    /// Under the anchored issuance rules a leader's difficulty below the
+    /// square-root generation (about 32 times the issuance at a 1 TiB world)
+    /// prices nothing: GLOBAL prices the anchor's difficulty. An honest
+    /// header, whose leader wrote GLOBAL's latest difficulty, keeps exactly
+    /// the issuance it had, since issuance depends on difficulty only through
+    /// its generation.
+    #[test]
+    fn anchored_issuance_ignores_the_leaders_difficulty() {
+        let world = 1u64 << 40;
+        let basis = |difficulty| crate::pricing::pomw_basis(difficulty, world, REWARD_UNITS);
+        let mut inflated = fake_header(vec![0xABu8; 32], 10);
+        inflated.difficulty = 1;
+        inflated.global_frame_number = 900;
+        let mut honest = inflated.clone();
+        honest.difficulty = 150_000;
+
+        assert_eq!(
+            anchored_issuance_difficulty(&inflated, Some(160_000)),
+            160_000
+        );
+        assert_eq!(
+            basis(anchored_issuance_difficulty(&inflated, Some(160_000))),
+            basis(u64::from(honest.difficulty)),
+            "an inflated claim earns what an honest one does"
+        );
+        assert!(
+            basis(HeaderIssuance::claimed(&inflated).difficulty)
+                > basis(150_000) * BigInt::from(30),
+            "the leader's claim alone prices over 30 times the issuance"
+        );
+        assert_eq!(
+            basis(anchored_issuance_difficulty(&honest, Some(160_000))),
+            basis(HeaderIssuance::claimed(&honest).difficulty),
+            "an honest header's issuance is unchanged"
+        );
+
+        // A header without an anchor keeps its own difficulty, floored at
+        // the square-root generation.
+        inflated.global_frame_number = 0;
+        honest.global_frame_number = 0;
+        assert_eq!(
+            anchored_issuance_difficulty(&inflated, None),
+            ISSUANCE_MIN_DIFFICULTY
+        );
+        assert_eq!(anchored_issuance_difficulty(&honest, None), 150_000);
+        assert_eq!(crate::pricing::pomw_generation(ISSUANCE_MIN_DIFFICULTY), 1);
+        assert_eq!(
+            crate::pricing::pomw_generation(ISSUANCE_MIN_DIFFICULTY - 1),
+            0
+        );
+    }
+
+    /// The materializer prices issuance at the difficulty it is given, and a
+    /// header it is told not to credit earns no issuance, fees or activity.
+    #[test]
+    fn a_header_not_credited_earns_nothing() {
+        let state = make_state();
+        let filter = vec![0xACu8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=3)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let mut header = fake_header(filter.clone(), 10);
+        header.difficulty = 1;
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(900);
+        let probe = Arc::new(DifficultyProbe(std::sync::Mutex::new(Vec::new())));
+        let reward_issuance: Arc<dyn RewardIssuance> = probe.clone();
+        let md = ShardMetadata {
+            state_size: 1024,
+            shard_count: 1,
+        };
+        let last_active = |p: &ProverInfo| {
+            let address = allocation_address(&p.public_key, &filter).unwrap();
+            let blob = state
+                .get(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &address,
+                    &vertex_adds_discriminator().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            read_prover_u64(
+                &rebuild_vertex_tree_from_blob(&blob),
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber",
+            )
+        };
+        let materialize = |frame: u64, issuance: HeaderIssuance| {
+            materialize_prover_shard_update_with_fees(
+                &header,
+                frame,
+                &state,
+                &noop_registry(),
+                &noop_frame_prover(),
+                &reward_issuance,
+                4096,
+                provers.clone(),
+                &[0, 1, 2],
+                md,
+                0,
+                None,
+                None,
+                issuance,
+            )
+            .unwrap()
+        };
+
+        materialize(
+            11,
+            HeaderIssuance {
+                difficulty: 160_000,
+                credit: true,
+            },
+        );
+        assert_eq!(*probe.0.lock().unwrap(), vec![160_000]);
+        let credited = reward_balance(&state, &provers[0]);
+        assert_eq!(credited, BigInt::from(1_000 + 300));
+        assert_eq!(last_active(&provers[0]), 11);
+
+        // The same header again in a later GLOBAL frame.
+        materialize(
+            12,
+            HeaderIssuance {
+                difficulty: 160_000,
+                credit: false,
+            },
+        );
+        assert_eq!(probe.0.lock().unwrap().len(), 1, "not priced");
+        assert_eq!(reward_balance(&state, &provers[0]), credited);
+        assert_eq!(last_active(&provers[0]), 11, "activity not refreshed");
+
+        // Before the epoch the leader's difficulty prices it, every time.
+        materialize(13, HeaderIssuance::claimed(&header));
+        assert_eq!(*probe.0.lock().unwrap(), vec![160_000, 1]);
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(2 * 1_300));
+    }
+
     /// Hash-proof epochs (decided 2026-10-21): a participant's issuance share
     /// is held in its storage seat, and only with a sealed registration; each
     /// frame counts toward the proposals expected of it, and a proposer's
@@ -2808,6 +3019,7 @@ mod tests {
                 0,
                 None,
                 Some(&mut storage),
+                HeaderIssuance::claimed(header),
             )
             .unwrap();
             storage.kicks
@@ -3741,8 +3953,9 @@ mod tests {
         };
         let everyone: Vec<usize> = (0..9).collect();
         let reward = |header_frame: u64, members: Vec<ProverInfo>, session: Option<[u8; 32]>| {
+            let header = fake_header(filter.clone(), header_frame);
             materialize_prover_shard_update_with_fees(
-                &fake_header(filter.clone(), header_frame),
+                &header,
                 header_frame + 1,
                 &state,
                 &noop_registry(),
@@ -3755,6 +3968,7 @@ mod tests {
                 0,
                 session,
                 None,
+                HeaderIssuance::claimed(&header),
             )
         };
 

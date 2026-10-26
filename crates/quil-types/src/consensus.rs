@@ -532,6 +532,68 @@ pub fn set_kick_signed_slot_epoch_for_thread(epoch: Option<u64>) {
     KICK_SIGNED_SLOT_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which GLOBAL prices a shard header's issuance at the
+/// difficulty of the GLOBAL frame it anchors to, read from GLOBAL's own clock
+/// (a header without an anchor at its own difficulty, at least the first of
+/// the square-root generation), instead of the difficulty the shard's leader
+/// wrote into it, and credits a header of an authorized session only once:
+/// one at or below the session's executed tip earns no issuance, fees or
+/// activity. Consensus-affecting: every node that executes GLOBAL frames
+/// must run a build carrying the epoch before it. `None` on mainnet until it
+/// is decided; `QUIL_ANCHORED_ISSUANCE_EPOCH` elsewhere, never by default.
+pub const MAINNET_ANCHORED_ISSUANCE_EPOCH: Option<u64> = None;
+
+static ANCHORED_ISSUANCE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static ANCHORED_ISSUANCE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn anchored_issuance_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_ANCHORED_ISSUANCE_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's anchored issuance epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_anchored_issuance_epoch(network: u8) -> u64 {
+    *ANCHORED_ISSUANCE_EPOCH.get_or_init(|| {
+        anchored_issuance_epoch_for(
+            network,
+            std::env::var("QUIL_ANCHORED_ISSUANCE_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_anchored_issuance_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn anchored_issuance_epoch() -> u64 {
+    if let Some(epoch) = ANCHORED_ISSUANCE_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *ANCHORED_ISSUANCE_EPOCH.get_or_init(|| anchored_issuance_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` prices and credits shard headers by the
+/// anchored issuance rules ([`MAINNET_ANCHORED_ISSUANCE_EPOCH`]).
+pub fn anchored_issuance_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= anchored_issuance_epoch()
+}
+
+/// Set the anchored issuance epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_anchored_issuance_epoch_for_thread(epoch: Option<u64>) {
+    ANCHORED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -2216,6 +2278,35 @@ mod seniority_succession_epoch_tests {
         assert_eq!(
             super::seniority_succession_epoch(),
             super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn only_a_test_network_reads_the_anchored_issuance_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::anchored_issuance_epoch_for(0, setting),
+                super::MAINNET_ANCHORED_ISSUANCE_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::anchored_issuance_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::anchored_issuance_epoch_for(1, Some("x")), u64::MAX);
+        assert_eq!(super::anchored_issuance_epoch_for(1, None), u64::MAX);
+        assert_eq!(super::MAINNET_ANCHORED_ISSUANCE_EPOCH, None);
+    }
+
+    #[test]
+    fn anchored_issuance_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_anchored_issuance_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::anchored_issuance_active(u64::MAX - 1));
+        super::set_anchored_issuance_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::anchored_issuance_active(first - 1));
+        assert!(super::anchored_issuance_active(first));
+        super::set_anchored_issuance_epoch_for_thread(None);
+        assert_eq!(
+            super::anchored_issuance_epoch(),
+            super::MAINNET_ANCHORED_ISSUANCE_EPOCH.unwrap_or(u64::MAX)
         );
     }
 
