@@ -33,11 +33,24 @@ pub struct CoinPage {
 /// is what a spend proves against and the
 /// global accumulator publishes it for split and whole applications alike.
 pub fn snapshot_root(snapshot: &dyn SnapshotReadable, network: &[u8; 32], application: &[u8; 32]) -> Result<RootRecord> {
+    snapshot_root_if_any(snapshot, network, application)?.ok_or_else(no_root)
+}
+
+/// [`snapshot_root`], or `None` when the application has neither root.
+fn snapshot_root_if_any(
+    snapshot: &dyn SnapshotReadable,
+    network: &[u8; 32],
+    application: &[u8; 32],
+) -> Result<Option<RootRecord>> {
     let context = parameter_context(network, application);
     if let Some(canonical) = canonical_snapshot_root(snapshot, &context, application)? {
-        return Ok(canonical);
+        return Ok(Some(canonical));
     }
-    local_snapshot_root(snapshot, network, application)
+    local_snapshot_root_if_any(snapshot, network, application)
+}
+
+fn no_root() -> QuilError {
+    QuilError::NotFound("coin scan: no root in snapshot".into())
 }
 
 /// Root of the coins actually present in this local snapshot. A witness
@@ -49,6 +62,14 @@ pub(super) fn local_snapshot_root(
     network: &[u8; 32],
     application: &[u8; 32],
 ) -> Result<RootRecord> {
+    local_snapshot_root_if_any(snapshot, network, application)?.ok_or_else(no_root)
+}
+
+fn local_snapshot_root_if_any(
+    snapshot: &dyn SnapshotReadable,
+    network: &[u8; 32],
+    application: &[u8; 32],
+) -> Result<Option<RootRecord>> {
     let context = parameter_context(network, application);
     let shard = shard_key_for_location(&Location {
         app_address: *application,
@@ -61,9 +82,8 @@ pub(super) fn local_snapshot_root(
     let root_bytes = match snapshot.read_record(&super::state::local_record_key(application, &ROOT_ADDRESS)) {
         Ok(Some(bytes)) => Some(bytes),
         _ => snapshot.load_vertex_underlying_raw("vertex", "adds", &shard, &key)?,
-    }
-    .ok_or_else(|| QuilError::NotFound("coin scan: no root in snapshot".into()))?;
-    roots::decode_current(&root_bytes, &context)
+    };
+    root_bytes.map(|bytes| roots::decode_current(&bytes, &context)).transpose()
 }
 
 /// The application's canonical root as the global accumulator published it:
@@ -117,6 +137,51 @@ pub fn scan_page(
         snapshot_root(snapshot, network, application)?)
 }
 
+/// What a wallet scan finds in one store.
+pub enum WalletPage {
+    /// A page listed against the application's root.
+    Page(CoinPage),
+    /// No root and no coin: no confidential coin exists in the application.
+    NoRoot,
+    /// No root, yet the store holds a coin: its root has not arrived.
+    UnrootedCoins,
+}
+
+/// The error a scan answers for [`WalletPage::UnrootedCoins`].
+pub fn unrooted_coins_error() -> QuilError {
+    QuilError::ExecutionUnavailable(
+        "coin scan: coins but no root in snapshot yet; retry once the root is published".into(),
+    )
+}
+
+/// A wallet scan's page. An application with no coin root at all, neither
+/// the canonical root GLOBAL folds from shard reports (a shard holding no
+/// confidential coin reports nothing) nor a local record (written with the
+/// first coin a node commits), is one in which no confidential coin exists
+/// yet, such as QUIL before its first shield or mint. Its scan is complete
+/// and empty, [`WalletPage::NoRoot`], rather than failed.
+///
+/// Only a fresh scan gets that answer. A continuation without a root is an
+/// error, and a first page that already holds a coin is
+/// [`WalletPage::UnrootedCoins`]: a store whose root has not arrived, not an
+/// empty application.
+pub fn scan_wallet_page(
+    snapshot: &dyn SnapshotReadable,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    after: Option<&[u8; 32]>,
+    limits: VertexPageLimits,
+) -> Result<WalletPage> {
+    if let Some(root) = snapshot_root_if_any(snapshot, network, application)? {
+        return scan_page_with_root(snapshot, network, application, after, limits, root).map(WalletPage::Page);
+    }
+    if after.is_some() {
+        return Err(no_root());
+    }
+    let (coins, _, _) = scan_coins(snapshot, network, application, None, limits)?;
+    Ok(if coins.is_empty() { WalletPage::NoRoot } else { WalletPage::UnrootedCoins })
+}
+
 /// Internal index scan. Wallet pages continue to advertise the canonical root.
 pub(super) fn scan_local_page(
     snapshot: &dyn SnapshotReadable,
@@ -137,6 +202,19 @@ fn scan_page_with_root(
     limits: VertexPageLimits,
     root: RootRecord,
 ) -> Result<CoinPage> {
+    let (coins, cursor, has_more) = scan_coins(snapshot, network, application, after, limits)?;
+    Ok(CoinPage { root, coins, cursor, has_more })
+}
+
+/// One bounded page of coin records: the coins, the last examined address
+/// and whether the scan continues.
+fn scan_coins(
+    snapshot: &dyn SnapshotReadable,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    after: Option<&[u8; 32]>,
+    limits: VertexPageLimits,
+) -> Result<(Vec<([u8; 32], StoredCoin)>, Option<[u8; 32]>, bool)> {
     if limits.max_entries == 0 || limits.max_bytes < 64 {
         return Err(QuilError::InvalidArgument(
             "coin scan: invalid page limits".into(),
@@ -182,12 +260,7 @@ fn scan_page_with_root(
         }
         cursor = Some(address);
     }
-    Ok(CoinPage {
-        root,
-        coins,
-        cursor,
-        has_more: page.has_more,
-    })
+    Ok((coins, cursor, page.has_more))
 }
 
 /// Public encrypted escrows from one retained snapshot; no ownership or
@@ -440,6 +513,71 @@ mod tests {
         assert!(super::super::witnesses::canonical_witnesses(
             &state, &state, &network, &application, &[addresses[unreported]], &[local_root], &index,
         ).is_err(), "local indexing cannot authorize an unreported coin");
+    }
+
+    /// An application in which no confidential coin exists has no root at
+    /// all, canonical or local: QUIL on every archive until its first shield
+    /// or mint (#698). A wallet's scan of it is complete and empty instead of
+    /// failing. A store holding a coin whose root has not arrived, and a
+    /// continuation without a root, are not that answer; spends still need
+    /// a root.
+    #[test]
+    fn a_wallet_scan_of_an_application_without_coins_is_empty_not_failed() {
+        let (network, application) = ([1u8; 32], [2u8; 32]);
+        let context = parameter_context(&network, &application);
+        let limits = VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 };
+        let snapshot_limits = SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 1 << 12 };
+        let output = Output {
+            owner: [3; IDENTITY_BYTES],
+            commitment: CommitmentKey::derive(&context).commit(5, &AmountOpening::from_seed(&context, &[4; 32])),
+            memo: [0; 1115],
+        };
+        // A store with the coin, its root published or not.
+        let store_with_coin = |publish: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let db = quil_store::RocksDb::open(dir.path()).unwrap();
+            let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+            let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                store.clone(), Arc::new(NoopInclusionProver),
+            )));
+            let mut staged = std::collections::BTreeMap::new();
+            let (address, tree) = roots::stage_coin(
+                &state, &network, &application, &context, 7, &output, &mut staged, snapshot_limits,
+            ).unwrap();
+            state.set(&application, &address, &vertex_adds_discriminator().unwrap(), 0,
+                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+            let root = publish.then(|| roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap());
+            state.commit().unwrap();
+            state.abort();
+            state.crdt().commit(1).unwrap();
+            (dir, db, store, address, root)
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let empty_store = quil_store::RocksHypergraphStore::new(db.inner());
+        let empty = empty_store.capture_snapshot().unwrap();
+        assert!(matches!(scan_wallet_page(empty.as_ref(), &network, &application, None, limits), Ok(WalletPage::NoRoot)));
+        assert!(matches!(snapshot_root(empty.as_ref(), &network, &application), Err(QuilError::NotFound(_))));
+        assert!(matches!(
+            scan_wallet_page(empty.as_ref(), &network, &application, Some(&[1; 32]), limits),
+            Err(QuilError::NotFound(_))
+        ));
+
+        let (_dir, _db, store, _, _) = store_with_coin(false);
+        let unrooted = store.capture_snapshot().unwrap();
+        assert!(matches!(
+            scan_wallet_page(unrooted.as_ref(), &network, &application, None, limits),
+            Ok(WalletPage::UnrootedCoins)
+        ), "a coin without a root is not an empty application");
+
+        let (_dir, _db, store, address, root) = store_with_coin(true);
+        let rooted = store.capture_snapshot().unwrap();
+        let Ok(WalletPage::Page(page)) = scan_wallet_page(rooted.as_ref(), &network, &application, None, limits) else {
+            panic!("the coin's root is published");
+        };
+        assert_eq!(page.root, root.unwrap());
+        assert_eq!(page.coins.iter().map(|(address, _)| *address).collect::<Vec<_>>(), vec![address]);
     }
 
     #[test]

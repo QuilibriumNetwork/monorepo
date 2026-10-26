@@ -559,7 +559,7 @@ pub fn reward_address(prover_address: &[u8]) -> Result<[u8; 32]> {
     let mut preimage = Vec::with_capacity(32 + prover_address.len());
     preimage.extend_from_slice(&crate::domains::QUIL_TOKEN);
     preimage.extend_from_slice(prover_address);
-    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+    remembered_poseidon(preimage)
 }
 
 /// Read the current balance from a reward vertex tree.
@@ -679,8 +679,10 @@ pub fn materialize_prover_kick_allocation(
 /// hash its ~900-byte Falcon key, about 1.4 ms each, and GLOBAL execution
 /// derives the same ones over and over: every member of every shard header's
 /// committee, and every participant several times. On mainnet that was most
-/// of each header's ~300 ms (2026-10-08). The value is the hash itself, so
-/// remembering it changes nothing but the time.
+/// of each header's ~300 ms (2026-10-08). A participant's reward address and
+/// a member's leaf-root registration address recur the same way, in every
+/// header it serves and every execution of the frame. The value is the hash
+/// itself, so remembering it changes nothing but the time.
 fn remembered_poseidon(preimage: Vec<u8>) -> Result<[u8; 32]> {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
@@ -808,7 +810,7 @@ pub fn leaf_root_address(member: &[u8], leaf_id: &[u8]) -> Result<[u8; 32]> {
     preimage.extend_from_slice(b"LEAF_ROOT_REGISTRATION");
     preimage.extend_from_slice(member);
     preimage.extend_from_slice(leaf_id);
-    quil_crypto::poseidon::hash_bytes_to_32(&preimage)
+    remembered_poseidon(preimage)
 }
 
 /// Pack a sub-shard prefix (`Vec<u32>` nibbles) into bytes (u32 BE each) for

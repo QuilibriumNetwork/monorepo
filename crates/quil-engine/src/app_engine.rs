@@ -5910,7 +5910,11 @@ impl AppConsensusEngine {
         let now = std::time::Instant::now();
         let filter = hex::encode(&self.filter);
         let error = status.as_ref().err().map(ToString::to_string).unwrap_or_default();
-        match self.session_status_outage.observe(now, status.is_ok()) {
+        // A GLOBAL state sync between chunks withholds the view: an expected
+        // wait the master logs, during which the session keeps running.
+        let syncing = status.as_ref()
+            .is_err_and(|error| quil_execution::global_intrinsic::handoff::global_sync_in_progress(error));
+        match (!syncing).then(|| self.session_status_outage.observe(now, status.is_ok())).flatten() {
             Some(OutageEvent::Began) => warn!(core_id = self.core_id, filter = %filter,
                 generation = session.generation, error = %error, scope = "local", action = "report",
                 "committee session status unavailable; the session keeps running until it can be read"),
@@ -6438,7 +6442,11 @@ impl AppConsensusEngine {
                 // the missing frames from an archive when it has a lineage, the
                 // archive's certified tip otherwise. Nothing else requests it,
                 // and the retry loop would otherwise ask this question forever.
-                if matches!(error, QuilError::ExecutionUnavailable(_)) {
+                // A GLOBAL view withheld while its sync installs is no missing
+                // shard state: the retry finds it once the sync is in.
+                if matches!(error, QuilError::ExecutionUnavailable(_))
+                    && !quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error)
+                {
                     let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested {
                         filter: self.filter.clone(),
                     });
@@ -6856,8 +6864,8 @@ impl AppConsensusEngine {
                 };
                 let source = crate::app_handoff::ParentSource::new(
                     session.clone(), global, shard, self.clock_store.clone(), self.session_closing.clone(),
+                    self.data_ready.clone(),
                 )?;
-                source.require_staged_data(self.data_ready.clone());
                 let msg_tx = self.self_msg_tx.clone();
                 let read_private_parent = self.private_parents.clone().map(|parents| {
                     let source = source.clone();
@@ -10057,10 +10065,6 @@ pub(crate) fn refusal_of(number: u64, error: QuilError) -> QuilError {
     }
 }
 
-/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
-/// validating untrusted frame or storage-proof bytes is a validation failure
-/// rather than unwinding the receive task. Mirrors the global frame
-/// path's `catch_unwind` (`message_loop.rs`).
 /// Fetch the historical storage registrations a certified frame's attestation
 /// names. False when they cannot be had: the frame is then validated on its
 /// certificate alone ([`validate_certified_frame`]).
@@ -10071,11 +10075,24 @@ async fn storage_history_retained(
     storage_history_unavailable(validator, frame).await.is_none()
 }
 
-/// [`storage_history_retained`], with why the history is not.
-async fn storage_history_unavailable(
+/// [`storage_history_retained`], with why the history is not. A frame
+/// without a certificate of its own (final through its certified child, or
+/// the frame GLOBAL committed) is validated without possession, so only its
+/// GLOBAL anchor is prepared: asked for as a certified frame's, its history
+/// was refused for the certificate it never had ("missing BLS signature"),
+/// warned as a certified frame's, and named as the anchor's history error
+/// of a sync whose predecessor its child authenticated (…091200 at frame
+/// 28439, 2026-10-24).
+pub(crate) async fn storage_history_unavailable(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> Option<QuilError> {
+    let certified = frame.header.as_ref()
+        .and_then(|header| header.public_key_signature_bls48581.as_ref())
+        .is_some_and(|signature| !signature.signature.is_empty());
+    if !certified {
+        return validator.prepare_global_anchor(frame).await.err();
+    }
     prepare_certified_frame(validator, frame).await.history
 }
 
@@ -10699,6 +10716,10 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             its head lay past its session fence or its archive replays kept failing; attempted every 5 minutes, \
             backing off to hourly after a replay mismatch; it starts once the re-anchor installs; the re-anchor \
             warnings name an attempt that fails or has no outcome", true)
+    } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
+        (ExpectedWait, "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
+            withheld until its last chunk is in (the 'sync phase: installing' lines show its progress); it retries \
+            every 10 s", true)
     } else if text.contains("authenticated GLOBAL state") {
         (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
             check the master if it persists", true)
@@ -11076,6 +11097,10 @@ pub(crate) fn validate_certified_frame(
     }
 }
 
+/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
+/// validating untrusted frame or storage-proof bytes is a validation failure
+/// rather than unwinding the receive task. Mirrors the global frame
+/// path's `catch_unwind` (`message_loop.rs`).
 pub(crate) fn validate_app_frame_panic_safe(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,

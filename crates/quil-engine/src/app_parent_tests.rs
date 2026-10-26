@@ -676,6 +676,7 @@ fn a_private_session_parent_reads_as_the_committed_checkpoint_it_will_become() {
     commit(2);
     let source = crate::app_handoff::ParentSource::new(
         session.clone(), global, rig.manager.crdt(), rig.clock.clone(), Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(true)),
     )
     .unwrap();
     let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));

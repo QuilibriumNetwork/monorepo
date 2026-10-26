@@ -25,6 +25,9 @@ use quil_types::store::ClockStore;
 use crate::app_engine::{AppConsensusEngine, AppEngineDeps, AppEngineHandle, AppEngineMessage};
 use crate::message_collector::MessageCollector;
 
+/// Resolver replies being relayed to a shard's members at once.
+static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate = crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
+
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
 /// each time it needs a fresh channel. main.rs supplies an
@@ -849,7 +852,11 @@ impl WorkerOnlyNode {
                                         // members drop it unread.
                                         let worker = worker_for_pump.clone();
                                         let publish = publish.clone();
+                                        // A peer's resolver requests drive these; each can wait
+                                        // out the master's timeout. A dropped reply is re-asked.
+                                        let Some(permit) = RESOLVER_RELAY_TASKS.try_enter() else { continue };
                                         tokio::spawn(async move {
+                                            let _permit = permit;
                                             let payload = crate::bitmasks::shard_cw_frame_for(channel, &bytes, &recipients);
                                             if !worker.relay_direct(filter.clone(), channel, bytes, recipients).await {
                                                 publish(crate::bitmasks::shard_cw_bitmask(&filter), payload).await;
@@ -1962,6 +1969,12 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             (None, Some(handle)) => (handle.filter.clone(), Some(handle.execution())),
             (None, None) => (Vec::new(), None),
         };
+        // A standalone worker runs its own swarm: its gossip traffic is not
+        // in the master's.
+        let execution = execution.map(|mut execution| {
+            execution.gossip_traffic = self.worker.worker_p2p.as_ref().map(|p2p| p2p.gossip_traffic().to_proto());
+            execution
+        });
         Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
             filter,
             // A store that refuses writes reads as blocked by it, to the

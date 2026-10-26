@@ -1426,6 +1426,8 @@ pub(crate) struct ArchiveSyncArgs {
         Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
     /// Atomic GLOBAL finalization pipeline, published at CW activation.
     pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
+    /// Reports when readers of the two cells above start and stop falling back.
+    pub activation_waits: Arc<super::activation_wait::ActivationWaits>,
     /// Archive-only application-frame ingest, published once constructed. GLOBAL
     /// execution materializes it at the points the chain sequences.
     pub app_ingest: AppIngestCell,
@@ -1624,6 +1626,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         consensus_leader_timeout_secs,
         cw_router,
         global_finalization,
+        activation_waits,
         app_ingest,
         cw_storage_dir,
         global_msg_tx,
@@ -1875,10 +1878,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             // execution state, instead of entering the canonical clock first.
             store_hook: Some({
                 let finalization = global_finalization.clone();
+                let waits = activation_waits.clone();
                 Arc::new(move |chain: &[quil_types::proto::global::GlobalFrame]| {
-                    finalization
-                        .get()
-                        .is_some_and(|pipeline| pipeline.offer_synced_chain(chain))
+                    let pipeline = finalization.get();
+                    waits.global_finalization.observe(
+                        pipeline.is_some(),
+                        chain.last().and_then(|frame| frame.header.as_ref()).map(|header| header.frame_number),
+                    );
+                    pipeline.is_some_and(|pipeline| pipeline.offer_synced_chain(chain))
                 }) as quil_rpc::frame_sync::FrameStoreHook
             }),
             // A frame without a certificate of its own waits for a certified

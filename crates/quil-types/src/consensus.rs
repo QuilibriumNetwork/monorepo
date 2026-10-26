@@ -1710,14 +1710,14 @@ mod hash_storage_proof_epoch_tests {
         assert_eq!(super::hash_storage_proof_epoch_for(1, None), u64::MAX);
     }
 
-    /// Mainnet's first hash-proof epoch begins at GLOBAL frame 928,800, and
+    /// Mainnet's first hash-proof epoch begins at GLOBAL frame 943,920, and
     /// its snapshot and registrations come in the epoch before.
     #[test]
-    fn mainnet_hash_storage_proofs_begin_at_frame_928800() {
+    fn mainnet_hash_storage_proofs_begin_at_frame_943920() {
         let epoch = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
-        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 928_800);
-        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 928_080);
-        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET, 928_096);
+        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 943_920);
+        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 943_200);
+        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET, 943_216);
     }
 }
 

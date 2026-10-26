@@ -596,9 +596,18 @@ impl P2PNode {
 
         let direct_stats: std::sync::Arc<crate::direct::DirectStats> = Default::default();
         let loop_direct_stats = direct_stats.clone();
+        let gossip_traffic = swarm.behaviour().blossomsub.traffic();
+        let loop_gossip_traffic = gossip_traffic.clone();
         sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
             let direct_stats = loop_direct_stats;
+            // One `gossip traffic by class` line per interval.
+            let mut traffic_timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + crate::gossip_traffic::LOG_INTERVAL,
+                crate::gossip_traffic::LOG_INTERVAL,
+            );
+            traffic_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut traffic_logged = loop_gossip_traffic.snapshot();
             // Direct delivery state: sends awaiting their outcome, peers that
             // lack the protocol (until `UNSUPPORTED_RETRY_AFTER`), and the
             // bitmasks this node takes direct messages on.
@@ -634,6 +643,11 @@ impl P2PNode {
                     _ = cancel_token.cancelled() => {
                         debug!("P2P swarm shutting down — supervisor cancelled");
                         break;
+                    }
+                    _ = traffic_timer.tick() => {
+                        let now = loop_gossip_traffic.snapshot();
+                        crate::gossip_traffic::log_interval(&now.since(&traffic_logged));
+                        traffic_logged = now;
                     }
                     _ = discovery_timer.tick() => {
                         // Other nodes' AutoNAT dial-back requests: one line
@@ -1294,7 +1308,7 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, external_addrs, peer_count, metrics_registry, direct_stats },
+            P2PHandle { peer_id, cmd_tx, external_addrs, peer_count, metrics_registry, direct_stats, gossip_traffic },
             msg_rx,
         ))
     }
@@ -1313,6 +1327,8 @@ pub struct P2PHandle {
     /// rendered on demand via [`render_metrics`](Self::render_metrics).
     metrics_registry: crate::metrics::SharedRegistry,
     direct_stats: std::sync::Arc<crate::direct::DirectStats>,
+    /// This process's gossip traffic by class, counted by the swarm.
+    gossip_traffic: std::sync::Arc<crate::gossip_traffic::GossipTraffic>,
 }
 
 impl P2PHandle {
@@ -1668,6 +1684,17 @@ impl P2PHandle {
         self.direct_stats.snapshot()
     }
 
+    /// This process's gossip traffic by class since it started.
+    pub fn gossip_traffic(&self) -> crate::gossip_traffic::GossipTrafficSnapshot {
+        self.gossip_traffic.snapshot()
+    }
+
+    /// The counters behind [`gossip_traffic`](Self::gossip_traffic), for a
+    /// reader that outlives this handle's borrow.
+    pub fn gossip_traffic_counters(&self) -> std::sync::Arc<crate::gossip_traffic::GossipTraffic> {
+        self.gossip_traffic.clone()
+    }
+
     /// The node's current AutoNAT-confirmed external addresses: at most one
     /// per listener transport, most recently accepted first, globally
     /// routable and on a listen port (see [`crate::external_addr`]).
@@ -1715,6 +1742,7 @@ impl P2PHandle {
                 prometheus_client::registry::Registry::default(),
             )),
             direct_stats: Default::default(),
+            gossip_traffic: Default::default(),
         }
     }
 }

@@ -144,6 +144,8 @@ pub struct WorkerEntry {
     pub manually_managed: bool,
     pub allocated: bool,
     pub execution: Option<node::WorkerExecution>,
+    /// Above the configured worker count (`WorkerManager::is_draining`).
+    pub draining: bool,
 }
 
 /// gRPC NodeService implementation with live node state.
@@ -164,10 +166,11 @@ pub type RemoteVertex = Arc<
         + Sync,
 >;
 
-/// Forwards one coin-scan page to a node holding the application.
+/// Forwards one coin-scan page to a node holding the application. `Err`
+/// carries the asked peers' reasons for declining, for the wallet's status.
 pub type RemoteCoinPage = Arc<
     dyn Fn([u8; 32], Option<[u8; 32]>, Option<[u8; 32]>)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<quil_types::store::CoinPageData>> + Send>>
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<quil_types::store::CoinPageData, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -252,7 +255,11 @@ pub struct NodeRpcServer {
     pub send_handler_fn: Option<SendHandler>,
     /// When unset, `peer_score` in `GetNodeInfo` returns 0.
     pub peer_score_provider: Option<PeerScoreProvider>,
+    /// The configured worker count, refreshed with `workers`; 0 unknown.
+    pub worker_capacity: Arc<std::sync::atomic::AtomicU32>,
     pub workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
+    /// This process's gossip traffic counters, reported by `GetNodeInfo`.
+    pub gossip_traffic: Option<Arc<quil_p2p::GossipTraffic>>,
 }
 
 /// Async closure returning the local node's peer-score as `f64`. The
@@ -348,7 +355,9 @@ impl NodeRpcServer {
             traversal_proof_generator: None,
             send_handler_fn: None,
             peer_score_provider: None,
+            worker_capacity: Arc::default(),
             workers: Arc::new(std::sync::RwLock::new(Vec::new())),
+            gossip_traffic: None,
         }
     }
 
@@ -526,6 +535,10 @@ impl NodeRpcServer {
         self.metrics_renderer = Some(renderer);
         self
     }
+    pub fn with_gossip_traffic(mut self, traffic: Arc<quil_p2p::GossipTraffic>) -> Self {
+        self.gossip_traffic = Some(traffic);
+        self
+    }
     pub fn with_worker_control(mut self, ctl: Arc<dyn WorkerControl>) -> Self {
         self.worker_control = Some(ctl);
         self
@@ -553,6 +566,11 @@ impl NodeRpcServer {
         workers: Arc<std::sync::RwLock<Vec<WorkerEntry>>>,
     ) -> Self {
         self.workers = workers;
+        self
+    }
+    /// The configured worker count `GetNodeInfo` reports.
+    pub fn with_worker_capacity(mut self, capacity: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        self.worker_capacity = capacity;
         self
     }
 }
@@ -691,7 +709,9 @@ impl NodeService for NodeRpcServer {
             // checks above used (`current_frame.effective()`), so the client's
             // epoch matches the one the allocations were evaluated against.
             current_epoch: epoch_for_frame(self.current_frame.effective()),
+            worker_capacity: self.worker_capacity.load(Ordering::Relaxed),
             epoch_length_frames: epoch_length_frames(),
+            gossip_traffic: self.gossip_traffic.as_ref().map(|traffic| traffic.snapshot().to_proto()),
         }))
     }
 
@@ -709,6 +729,7 @@ impl NodeService for NodeRpcServer {
                 total_storage: w.total_storage,
                 manually_managed: w.manually_managed,
                 execution: w.execution.clone(),
+                draining: w.draining,
             })
             .collect();
 
@@ -905,14 +926,24 @@ impl NodeService for NodeRpcServer {
                 .ok_or_else(|| Status::unimplemented("coin scan is not enabled"))?
         } else {
             let remote = self.remote_coin_page.as_ref().ok_or_else(|| self.coverage_error(&domain))?;
-            remote(domain, snapshot_id, after).await.ok_or_else(|| Status::unavailable(format!(
-                "no node serving application {} answered this node", hex::encode(domain)
+            // The peers' own reasons travel with the refusal, so the wallet
+            // learns why its node could not read the application.
+            remote(domain, snapshot_id, after).await.map_err(|reasons| Status::unavailable(format!(
+                "no node serving application {} answered this node: {reasons}", hex::encode(domain)
             )))?
         };
+        // An empty root record answers a scan of an application without any
+        // coin root: no confidential coin exists in it yet. It is valid only
+        // as a fresh scan's single page, empty and final.
+        let root_valid = if page.root_record.is_empty() {
+            snapshot_id.is_none() && page.coins.is_empty() && !page.has_more && page.cursor.is_none()
+        } else {
+            page.root_record.len() == ROOT_RECORD_BYTES
+                && page.root_record.get(..8) == Some(b"QCT3RT\0\x02".as_slice())
+                && page.root_record.get(40).is_some_and(|depth| (1..=32).contains(depth))
+        };
         if snapshot_id.is_some_and(|id| id != page.snapshot_id)
-            || page.root_record.len() != ROOT_RECORD_BYTES
-            || page.root_record.get(..8) != Some(b"QCT3RT\0\x02".as_slice())
-            || !page.root_record.get(40).is_some_and(|depth| (1..=32).contains(depth))
+            || !root_valid
             || page.coins.len() > 8
             || (page.has_more && (page.cursor.is_none() || page.cursor <= after))
             || page.cursor < after {
@@ -1710,6 +1741,59 @@ mod witness_tests {
         assert_eq!(disabled.list_coins(request(vec![], vec![])).await.unwrap_err().code(), tonic::Code::Unimplemented);
     }
 
+    /// QUIL before its first confidential coin has no root anywhere (#698):
+    /// the scan's one page is empty, final and rootless, and that is an
+    /// answer rather than a malformed page. Only there is a page rootless.
+    #[tokio::test]
+    async fn a_rootless_page_ends_a_fresh_scan_empty() {
+        struct Rootless {
+            coins: u8,
+            has_more: bool,
+        }
+        impl CoinWitnessProvider for Rootless {
+            fn coin_page(&self, _: &[u8; 32], _: Option<&[u8; 32]>, _: Option<&[u8; 32]>) -> quil_types::error::Result<Option<CoinPageData>> {
+                Ok(Some(CoinPageData {
+                    network: [0; 32], snapshot_id: [7; 32], root_record: Vec::new(),
+                    coins: (1..=self.coins).map(|i| CoinData {
+                        address: [i; 32], frame_number: 1, position: 0, owner: vec![0; IDENTITY_BYTES],
+                        commitment: vec![0; 10368], memo: vec![0; 1115],
+                    }).collect(),
+                    cursor: (self.coins > 0 || self.has_more).then_some([8; 32]),
+                    has_more: self.has_more,
+                }))
+            }
+        }
+        let request = |snapshot_id: Vec<u8>, after: Vec<u8>| Request::new(node::ListCoinsRequest {
+            domain: vec![1; 32], snapshot_id, after,
+        });
+        let server = |coins, has_more| NodeRpcServer::new().with_coin_witness_provider(Arc::new(Rootless { coins, has_more }));
+        let page = server(0, false).list_coins(request(vec![], vec![])).await.unwrap().into_inner();
+        assert!(page.root_record.is_empty() && page.coins.is_empty() && page.cursor.is_empty() && !page.has_more);
+        assert_eq!(page.snapshot_id, vec![7; 32]);
+        for (coins, has_more) in [(1, false), (0, true)] {
+            assert_eq!(server(coins, has_more).list_coins(request(vec![], vec![])).await.unwrap_err().code(),
+                tonic::Code::Internal, "coins={coins} has_more={has_more}");
+        }
+        assert_eq!(server(0, false).list_coins(request(vec![7; 32], vec![9; 32])).await.unwrap_err().code(),
+            tonic::Code::Internal, "a continuation cannot lose its root");
+    }
+
+    /// A node that does not hold the application forwards the scan; when
+    /// every asked peer declines, their reasons reach the wallet (#698).
+    #[tokio::test]
+    async fn a_forwarded_scan_refusal_names_the_peers_reasons() {
+        let reasons = "4 peers declined: 4x Unavailable: coin scan: no root in snapshot";
+        let remote: RemoteCoinPage = Arc::new(move |_, _, _| Box::pin(async move { Err(reasons.to_string()) }));
+        let server = NodeRpcServer::new()
+            .with_application_coverage(Arc::new(|_: &[u8]| false))
+            .with_remote_coin_page(remote);
+        let status = server.list_coins(Request::new(node::ListCoinsRequest {
+            domain: vec![1; 32], snapshot_id: Vec::new(), after: Vec::new(),
+        })).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().ends_with(reasons), "{}", status.message());
+    }
+
     fn request(addresses: Vec<Vec<u8>>) -> Request<node::GetCoinWitnessesRequest> {
         Request::new(node::GetCoinWitnessesRequest {
             domain: vec![1; 32],
@@ -1901,13 +1985,14 @@ mod worker_execution_tests {
         };
         let server = NodeRpcServer::new().with_workers_view(Arc::new(std::sync::RwLock::new(vec![
             WorkerEntry { core_id: 1, filter: vec![1], available_storage: 0, total_storage: 0,
-                manually_managed: false, allocated: true, execution: Some(observed.clone()) },
+                manually_managed: false, allocated: true, execution: Some(observed.clone()), draining: false },
             WorkerEntry { core_id: 2, filter: vec![2], available_storage: 0, total_storage: 0,
-                manually_managed: false, allocated: true, execution: None },
+                manually_managed: false, allocated: true, execution: None, draining: true },
         ])));
         let response = server.get_worker_info(Request::new(node::GetWorkerInfoRequest {})).await.unwrap().into_inner();
         assert_eq!(response.worker_info[0].execution, Some(observed));
         assert!(response.worker_info[1].execution.is_none());
+        assert_eq!(response.worker_info.iter().map(|w| w.draining).collect::<Vec<_>>(), vec![false, true]);
     }
 }
 

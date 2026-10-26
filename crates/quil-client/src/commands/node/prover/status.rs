@@ -24,6 +24,20 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
     }
 }
 
+/// The running workers against the configured count, with the workers above
+/// it that drain: `9 of 6 configured | draining 3`. A node that predates the
+/// configured count (0) gets the running count alone.
+fn running_workers(running: u32, capacity: u32, draining: usize) -> String {
+    let mut text = running.to_string();
+    if capacity > 0 {
+        text += &format!(" of {capacity} configured");
+    }
+    if draining > 0 {
+        text += &format!(" | draining {draining}");
+    }
+    text
+}
+
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
 
@@ -52,7 +66,11 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     println!("Peer Score:         {}", info.peer_score);
-    println!("Running Workers:    {}", info.running_workers);
+    let draining = match client.get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default())).await {
+        Ok(workers) => workers.into_inner().worker_info.iter().filter(|w| w.draining).count(),
+        Err(_) => 0,
+    };
+    println!("Running Workers:    {}", running_workers(info.running_workers, info.worker_capacity, draining));
     println!("Allocated Workers:  {}", info.allocated_workers);
     println!("Last Received:      {}", info.last_received_frame);
     println!("Last Global Head:   {}", info.last_global_head_frame);
@@ -67,6 +85,13 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         cur_epoch, el, next_boundary
     );
     println!("Reachable:          {}", info.reachable);
+
+    let worker_info = client
+        .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
+        .await
+        .map(|response| response.into_inner().worker_info);
+    let workers_listed = worker_info.as_deref().unwrap_or_default();
+    println!("\n{}", super::gossip_traffic::render(info.gossip_traffic.as_ref(), workers_listed));
 
     if info.shard_allocations.is_empty() {
         println!("\nNo shard allocations");
@@ -131,20 +156,17 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     // Also display worker info.
-    if let Ok(worker_info) = client
-        .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
-        .await
-    {
-        let worker_info = worker_info.into_inner();
-        if !worker_info.worker_info.is_empty() {
-            println!("\nWorkers ({}):", worker_info.worker_info.len());
-            for w in &worker_info.worker_info {
+    if let Ok(worker_info) = worker_info {
+        if !worker_info.is_empty() {
+            println!("\nWorkers ({}):", worker_info.len());
+            for w in &worker_info {
                 println!(
-                    "  Core {}: Filter: {}  Storage: {} / {}",
+                    "  Core {}: Filter: {}  Storage: {} / {}{}",
                     w.core_id,
                     hex::encode(&w.filter),
                     format_storage(w.available_storage),
-                    format_storage(w.total_storage)
+                    format_storage(w.total_storage),
+                    if w.draining { "  Draining: above the configured count; stops once its seat departs" } else { "" }
                 );
                 println!("    {}", super::local_execution::detail(w.execution.as_ref()));
             }
@@ -152,4 +174,16 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::running_workers;
+
+    #[test]
+    fn running_workers_name_the_configured_count_and_the_draining_ones() {
+        assert_eq!(running_workers(9, 6, 3), "9 of 6 configured | draining 3");
+        assert_eq!(running_workers(6, 6, 0), "6 of 6 configured");
+        assert_eq!(running_workers(9, 0, 0), "9", "a node that predates the configured count");
+    }
 }

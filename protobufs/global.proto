@@ -1038,6 +1038,8 @@ message ShardCoin {
   uint64 position = 6;
 }
 
+// Same contract as node.pb ListCoinsResponse, including its empty
+// root_record answer for an application without a coin root.
 message ListShardCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;

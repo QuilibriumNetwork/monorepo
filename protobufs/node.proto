@@ -91,7 +91,43 @@ message NodeInfoResponse {
   // parameter). Clients mirror the node's epoch-aligned lifecycle timing with
   // this rather than hardcoding a value.
   uint64 epoch_length_frames = 13;
+  // The configured worker count: how many allocations this node may hold.
+  // Workers above it drain (`WorkerInfo.draining`). 0 on older nodes.
+  uint32 worker_capacity = 16;
   FrameCadence frame_cadence = 14;
+  // The master process's gossip traffic since it started. Standalone
+  // workers report theirs in `WorkerExecution.gossip_traffic`. Absent on
+  // older nodes.
+  GossipTraffic gossip_traffic = 15;
+}
+
+// One process's gossip messages by bitmask class, since the process started.
+// Sizes are encoded message bytes (payload, signature, key and header),
+// without control messages and transport overhead.
+message GossipTraffic {
+  // Time the counts cover: the process's uptime.
+  uint64 uptime_ms = 1;
+  repeated GossipClassTraffic classes = 2;
+}
+
+message GossipClassTraffic {
+  // "shard_consensus" (shard CW certificates, resolver and blocks),
+  // "shard_frames", "votes" (shard CW votes and the shard vote and timeout
+  // topic), "global" (every GLOBAL topic but peer info), "peer_info" or
+  // "other" (shard prover and dispatch topics, and any other).
+  string class = 1;
+  // Every copy received from a peer, before duplicates are dropped.
+  uint64 received_messages = 2;
+  uint64 received_bytes = 3;
+  // The first copy of each message.
+  uint64 unique_messages = 4;
+  uint64 unique_bytes = 5;
+  // Every copy sent to a peer: this process's publishes and forwards.
+  uint64 sent_messages = 6;
+  uint64 sent_bytes = 7;
+  // Messages this process published, once each.
+  uint64 published_messages = 8;
+  uint64 published_bytes = 9;
 }
 
 message WorkerInfo {
@@ -102,6 +138,10 @@ message WorkerInfo {
   bool manually_managed = 5;
   // Absent on older nodes and worker implementations without local telemetry.
   WorkerExecution execution = 6;
+  // Above the configured worker count: the worker takes no new seat or
+  // join, its seat leaves through the surplus leave, and it stops once it
+  // holds none. False on older nodes.
+  bool draining = 7;
 }
 
 // Local engine observations; independent of allocation and remote shard data.
@@ -154,6 +194,10 @@ message WorkerExecution {
   // counted.
   uint64 silent_ms = 13;
   uint64 engine_started_unix_ms = 14;
+  // The worker process's gossip traffic since it started; set by standalone
+  // workers, which run their own swarm. Absent for workers that share the
+  // master's and on older builds.
+  GossipTraffic gossip_traffic = 15;
 }
 
 // A finalized terminal seal and its submission to GLOBAL. GLOBAL accepts a
@@ -743,6 +787,9 @@ message ConfidentialCoin {
   // committed content address.
   uint64 position = 6;
 }
+// An empty root_record answers a fresh scan of an application that has no
+// coin root: no confidential coin exists in it yet. Such a page has no
+// coins, no cursor and has_more false; every other page carries the root.
 message ListCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;

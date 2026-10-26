@@ -549,6 +549,8 @@ pub struct Liveness {
     /// ([`Liveness::notarized`]); bound by the host's reporter, and not kept
     /// alive by it.
     blocks: std::sync::OnceLock<WeakBlockStore>,
+    /// Set once [`Liveness::notarized`] has warned that no store is bound.
+    unbound_warned: std::sync::atomic::AtomicBool,
     /// Whether notarize votes keep their signatures ([`Liveness::keep_votes`]).
     keep_votes: std::sync::atomic::AtomicBool,
 }
@@ -812,7 +814,18 @@ impl Liveness {
     /// ascending view order, each with its votes and the body this node
     /// built or verified; a proposal without such a body is left out.
     pub fn notarized(&self) -> Vec<NotarizedProposal> {
-        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else { return Vec::new() };
+        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else {
+            // A host that failed part-way through activation never bound its
+            // store; a bound store that is gone is an ordinary shutdown.
+            if self.blocks.get().is_none() && !self.unbound_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "consensus liveness has no block store bound, so notarized proposals are reported without \
+                     bodies; this node's consensus activation did not finish (defect to report with the \
+                     preceding activation errors)",
+                );
+            }
+            return Vec::new();
+        };
         let recent: Vec<NotarizedProposal> = {
             let Ok(state) = self.inner.lock() else { return Vec::new() };
             state.views.iter().flat_map(|(view, votes)| {
@@ -1174,6 +1187,7 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.evidence(7, 3, 6, [1; 32], 2, vec![0xa2]);
         assert!(liveness.notarized().is_empty(), "no block store bound");
+        assert!(liveness.unbound_warned.load(std::sync::atomic::Ordering::Relaxed), "an unbound store warns once");
         let store = BlockStore::new();
         liveness.bind_blocks(&store);
         liveness.evidence(7, 3, 6, [1; 32], 0, vec![0xa0]);

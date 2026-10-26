@@ -51,6 +51,9 @@ pub(super) enum Cause {
     /// No GLOBAL frame materialized locally yet: the normal state of a fresh
     /// start until the first one commits.
     Bootstrap,
+    /// A GLOBAL state sync from an archive has installed some of its chunks
+    /// but not the last: an expected wait that ends when it does.
+    GlobalSync,
     /// Anything else: committed GLOBAL state this node cannot read or trust.
     Other,
 }
@@ -60,6 +63,7 @@ impl Cause {
         match error {
             // `CommittedView::capture` before the first materialized GLOBAL frame.
             QuilError::ExecutionUnavailable(message) if message.contains("no materialized cursor") => Self::Bootstrap,
+            error if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) => Self::GlobalSync,
             _ => Self::Other,
         }
     }
@@ -67,6 +71,7 @@ impl Cause {
     fn as_str(self) -> &'static str {
         match self {
             Self::Bootstrap => "global history not materialized yet",
+            Self::GlobalSync => quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS,
             Self::Other => "committed global state unreadable",
         }
     }
@@ -154,6 +159,14 @@ impl Transition {
                         repeat_every_s,
                         action = "expected wait after a fresh start: it ends when this node commits its first materialized GLOBAL frame",
                         "committed committee peer policy unavailable; served committees' members get no IP-colocation exemption until then"
+                    ),
+                    Cause::GlobalSync => info!(
+                        scope = "this node",
+                        cause = cause.as_str(),
+                        replaced = %replaced,
+                        repeat_every_s,
+                        action = "expected wait: committed GLOBAL state is withheld while a GLOBAL state sync from an archive installs its chunks; it ends when the sync installs its last chunk, or when a later prover tree sync completes if this one fails",
+                        "committed committee peer policy waits for a GLOBAL state sync; served committees' members get no IP-colocation exemption until then"
                     ),
                     Cause::Other => warn!(
                         scope = "this node",
@@ -255,6 +268,23 @@ mod tests {
         assert_eq!(state.recovered(t0 + Duration::from_secs(10)), None);
         assert_eq!(state.failed(&bootstrap(), t0 + Duration::from_secs(15)),
             Transition::Started { cause: Cause::Bootstrap, replaced: None });
+    }
+
+    /// A view withheld while a GLOBAL state sync installs its chunks is its
+    /// own expected wait, not unreadable state to report.
+    #[test]
+    fn a_global_sync_in_progress_is_an_expected_wait_of_its_own() {
+        use quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS;
+        let t0 = Instant::now();
+        let sync = QuilError::ExecutionUnavailable(GLOBAL_SYNC_IN_PROGRESS.into());
+        assert_eq!(Cause::of(&sync), Cause::GlobalSync);
+        let mut state = Unavailability::default();
+        assert_eq!(state.failed(&bootstrap(), t0), Transition::Started { cause: Cause::Bootstrap, replaced: None });
+        assert_eq!(state.failed(&sync, t0 + Duration::from_secs(5)), Transition::Started {
+            cause: Cause::GlobalSync, replaced: Some((Cause::Bootstrap, Duration::from_secs(5), 1)) });
+        assert_eq!(state.failed(&sync, t0 + Duration::from_secs(10)), Transition::Suppressed);
+        assert_eq!(state.recovered(t0 + Duration::from_secs(40)),
+            Some(Transition::Ended { cause: Cause::GlobalSync, duration: Duration::from_secs(35), failures: 2 }));
     }
 
     #[test]

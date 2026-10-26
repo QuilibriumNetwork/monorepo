@@ -43,19 +43,92 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
+    retry_until_ok(budget, delay, || {
+        let pending = attempt();
+        async move { pending.await.ok_or(()) }
+    })
+    .await
+    .ok()
+}
+
+/// [`retry_within`], keeping the last attempt's error.
+async fn retry_until_ok<T, E, F, Fut>(budget: Duration, delay: Duration, mut attempt: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let deadline = Instant::now() + budget;
     loop {
-        if let Some(value) = attempt().await {
-            return Some(value);
-        }
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
         if Instant::now() + delay > deadline {
-            return None;
+            return Err(error);
         }
         tokio::time::sleep(delay).await;
     }
 }
 const MAX_PINNED_SCANS: usize = 256;
 const SCAN_PIN_TTL: Duration = Duration::from_secs(300);
+/// A peer's decline is logged at info at most this often per endpoint.
+const DECLINE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Distinct decline reasons named in a refusal, and each reason's length.
+const MAX_REASONS: usize = 4;
+const MAX_REASON_CHARS: usize = 200;
+
+fn bounded_reason(reason: &str) -> String {
+    reason.chars().take(MAX_REASON_CHARS).collect()
+}
+
+/// An error with its causes: tonic's transport error alone says only
+/// "transport error", not that the connection was refused or timed out.
+fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let part = next.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        cause = next.source();
+    }
+    text
+}
+
+/// Why the peers asked for one forwarded read declined, for the wallet's
+/// status: each distinct reason with its count, bounded.
+#[derive(Default)]
+struct Declines(Vec<(String, usize)>);
+
+impl Declines {
+    fn push(&mut self, reason: &str) {
+        let reason = bounded_reason(reason);
+        match self.0.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, count)) => *count += 1,
+            None => self.0.push((reason, 1)),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let total: usize = self.0.iter().map(|(_, count)| count).sum();
+        if total == 0 {
+            return "no covering node or archive is known".into();
+        }
+        let mut parts: Vec<_> = self.0.iter().take(MAX_REASONS)
+            .map(|(reason, count)| format!("{count}x {reason}"))
+            .collect();
+        if self.0.len() > MAX_REASONS {
+            parts.push(format!("and {} other reasons", self.0.len() - MAX_REASONS));
+        }
+        format!("{total} {} declined: {}", if total == 1 { "peer" } else { "peers" }, parts.join("; "))
+    }
+}
+
+fn lost_pin() -> String {
+    "the peer serving this scan is no longer pinned; restart the scan".into()
+}
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 enum ScanKind {
@@ -81,6 +154,8 @@ pub struct PeerCoinReader {
     served_by: parking_lot::Mutex<HashMap<ScanKey, (String, Instant)>>,
     /// `(budget, delay)` of each forwarded read's retries.
     read_retry: (Duration, Duration),
+    /// Endpoint → when its last decline was logged at info.
+    declines_logged: parking_lot::Mutex<HashMap<String, Instant>>,
 }
 
 impl PeerCoinReader {
@@ -97,6 +172,7 @@ impl PeerCoinReader {
             network,
             served_by: parking_lot::Mutex::new(HashMap::new()),
             read_retry: (READ_RETRY_BUDGET, READ_RETRY_DELAY),
+            declines_logged: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -173,39 +249,60 @@ impl PeerCoinReader {
         pins.insert((kind, domain, id), (endpoint, Instant::now()));
     }
 
-    /// Ask one endpoint for a page. `Ok(None)` means that peer does not serve
-    /// the application (or could not be reached) — try the next one; it is
-    /// never read as "the application is empty".
+    /// Log a peer's decline of a coin scan: at info once per endpoint per
+    /// [`DECLINE_LOG_INTERVAL`], at debug otherwise.
+    fn log_decline(&self, endpoint: &str, domain: &[u8; 32], reason: &str) {
+        let now = Instant::now();
+        let first = {
+            let mut logged = self.declines_logged.lock();
+            logged.retain(|_, at| now.duration_since(*at) < DECLINE_LOG_INTERVAL);
+            match logged.entry(endpoint.to_string()) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(now);
+                    true
+                }
+            }
+        };
+        let reason = bounded_reason(reason);
+        if first {
+            tracing::info!(
+                %endpoint, application = %hex::encode(domain), %reason,
+                "remote coin scan: peer declined; asking the next covering node or archive"
+            );
+        } else {
+            tracing::debug!(%endpoint, application = %hex::encode(domain), %reason, "remote coin scan: peer declined");
+        }
+    }
+
+    /// Ask one endpoint for a page. `Err` is that peer's reason for not
+    /// answering (it does not serve the application, could not be reached,
+    /// or sent a malformed page): try the next one. It is never read as
+    /// "the application is empty".
     async fn page_from(
         &self,
         endpoint: &str,
         domain: &[u8; 32],
         snapshot_id: Option<&[u8; 32]>,
         after: Option<&[u8; 32]>,
-    ) -> Option<CoinPageData> {
-        let mut client = match quil_rpc::ArchiveClient::connect_mtls(endpoint, &self.falcon_key).await {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::debug!(%endpoint, %error, "remote coin scan: dial failed");
-                return None;
-            }
-        };
-        let page = match client
+    ) -> Result<CoinPageData, String> {
+        let mut client = quil_rpc::ArchiveClient::connect_mtls(endpoint, &self.falcon_key)
+            .await
+            .map_err(|error| format!("dial failed: {}", with_causes(&error)))?;
+        let page = client
             .list_shard_coins(
                 domain.to_vec(),
                 snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                 after.map(|a| a.to_vec()).unwrap_or_default(),
             )
             .await
-        {
-            Ok(page) => page,
-            Err(error) => {
-                tracing::debug!(%endpoint, %error, "remote coin scan: peer declined");
-                return None;
-            }
-        };
-        let network: [u8; 32] = page.network.try_into().ok()?;
-        let snapshot: [u8; 32] = page.snapshot_id.try_into().ok()?;
+            .map_err(|error| match error {
+                quil_rpc::ArchiveClientError::Rpc(status) => format!("{:?}: {}", status.code(), status.message()),
+                other => with_causes(&other),
+            })?;
+        let malformed = || "malformed coin page".to_string();
+        let network: [u8; 32] = page.network.try_into().map_err(|_| malformed())?;
+        let snapshot: [u8; 32] = page.snapshot_id.try_into().map_err(|_| malformed())?;
         let coins = page
             .coins
             .into_iter()
@@ -219,13 +316,14 @@ impl PeerCoinReader {
                     memo: c.memo,
                 })
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(malformed)?;
         let cursor = if page.cursor.is_empty() {
             None
         } else {
-            Some(page.cursor.try_into().ok()?)
+            Some(page.cursor.try_into().map_err(|_| malformed())?)
         };
-        Some(CoinPageData {
+        Ok(CoinPageData {
             network,
             snapshot_id: snapshot,
             root_record: page.root_record,
@@ -315,22 +413,22 @@ impl PeerCoinReader {
     }
 
     /// One page of `domain`'s coins from a node that holds it: covering nodes
-    /// first, an archive last. `None` when nobody answered — the caller then
-    /// reports that this node cannot serve the application, never an empty
-    /// page.
+    /// first, an archive last. `Err` when nobody answered, with the peers'
+    /// reasons; the caller then reports that this node cannot serve the
+    /// application, never an empty page.
     pub async fn coin_page(
         &self,
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
-    ) -> Option<CoinPageData> {
+    ) -> Result<CoinPageData, String> {
         // Continuing a scan goes back to the peer whose snapshot it names; no
         // retry brings back a pin that is gone.
         if let Some(id) = snapshot_id {
-            self.pinned_endpoint(ScanKind::Coins, domain, id)?;
+            self.pinned_endpoint(ScanKind::Coins, domain, id).ok_or_else(lost_pin)?;
         }
         let (budget, delay) = self.read_retry;
-        retry_within(budget, delay, || self.coin_page_once(domain, snapshot_id, after)).await
+        retry_until_ok(budget, delay, || self.coin_page_once(domain, snapshot_id, after)).await
     }
 
     async fn coin_page_once(
@@ -338,25 +436,38 @@ impl PeerCoinReader {
         domain: [u8; 32],
         snapshot_id: Option<[u8; 32]>,
         after: Option<[u8; 32]>,
-    ) -> Option<CoinPageData> {
+    ) -> Result<CoinPageData, String> {
         let endpoints = match snapshot_id {
-            Some(id) => vec![self.pinned_endpoint(ScanKind::Coins, domain, id)?],
+            Some(id) => vec![self.pinned_endpoint(ScanKind::Coins, domain, id).ok_or_else(lost_pin)?],
             None => self.read_endpoints(&domain).await,
         };
+        let mut declines = Declines::default();
+        // A peer's answer that the application has no coin root yet is held
+        // back while another peer may still list coins: a lagging or
+        // withholding peer must not hide what another can show.
+        let mut rootless = None;
         for endpoint in endpoints {
-            if let Some(page) = self
-                .page_from(&endpoint, &domain, snapshot_id.as_ref(), after.as_ref())
-                .await
-            {
-                tracing::debug!(
-                    %endpoint, application = %hex::encode(domain),
-                    "served a coin page from a covering node or archive"
-                );
-                self.remember_scan(ScanKind::Coins, domain, page.snapshot_id, endpoint, page.has_more);
-                return Some(page);
+            match self.page_from(&endpoint, &domain, snapshot_id.as_ref(), after.as_ref()).await {
+                Ok(page) if page.root_record.is_empty() => {
+                    if rootless.is_none() {
+                        rootless = Some(page);
+                    }
+                }
+                Ok(page) => {
+                    tracing::debug!(
+                        %endpoint, application = %hex::encode(domain),
+                        "served a coin page from a covering node or archive"
+                    );
+                    self.remember_scan(ScanKind::Coins, domain, page.snapshot_id, endpoint, page.has_more);
+                    return Ok(page);
+                }
+                Err(reason) => {
+                    self.log_decline(&endpoint, &domain, &reason);
+                    declines.push(&reason);
+                }
             }
         }
-        None
+        rootless.ok_or_else(|| declines.summary())
     }
 
     /// One page of `owner`'s legacy coins from an archive: only an archive
@@ -614,14 +725,55 @@ mod tests {
         ).with_read_retry(Duration::from_millis(60), Duration::from_millis(10));
         let domain = [3; 32];
         let started = Instant::now();
-        assert!(reader.coin_page(domain, None, None).await.is_none());
+        assert!(reader.coin_page(domain, None, None).await.is_err());
         assert!(reader.escrow_page(domain, None, None).await.is_none());
         assert!(reader.vertex(domain, vec![4; 32]).await.is_none());
         assert!(started.elapsed() >= Duration::from_millis(150), "each read kept asking");
         let started = Instant::now();
-        assert!(reader.coin_page(domain, Some([5; 32]), Some([6; 32])).await.is_none());
+        assert!(reader.coin_page(domain, Some([5; 32]), Some([6; 32])).await.is_err());
         assert!(reader.escrow_page(domain, Some([5; 32]), None).await.is_none());
         assert!(started.elapsed() < Duration::from_millis(50), "a lost pin fails at once");
+    }
+
+    /// When no peer answers a forwarded scan, the wallet's status says why
+    /// (#698: the archives' "no root in snapshot" was lost behind a generic
+    /// refusal): each distinct reason with its count, bounded.
+    #[test]
+    fn declines_are_counted_by_reason_and_bounded() {
+        let mut declines = Declines::default();
+        assert_eq!(declines.summary(), "no covering node or archive is known");
+        declines.push("Unavailable: coin scan: no root in snapshot");
+        assert_eq!(declines.summary(), "1 peer declined: 1x Unavailable: coin scan: no root in snapshot");
+        for _ in 0..2 {
+            declines.push("Unavailable: coin scan: no root in snapshot");
+        }
+        declines.push("dial failed: transport error");
+        assert_eq!(declines.summary(),
+            "4 peers declined: 3x Unavailable: coin scan: no root in snapshot; 1x dial failed: transport error");
+        declines.push(&"x".repeat(10_000));
+        for i in 0..8 {
+            declines.push(&format!("reason {i}"));
+        }
+        let summary = declines.summary();
+        assert!(summary.starts_with("13 peers declined: 3x Unavailable"), "{summary}");
+        assert!(summary.ends_with("; and 7 other reasons"), "{summary}");
+        assert!(summary.len() < 4 * (MAX_REASON_CHARS + 16) + 64, "{summary}");
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_scan_nobody_answers_reports_each_peers_reason() {
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(Duration::ZERO));
+        // Nothing listens on these ports.
+        for endpoint in ["127.0.0.1:1", "127.0.0.1:2"] {
+            pool.add(endpoint.into()).await;
+        }
+        let reader = PeerCoinReader::new(Arc::new(parking_lot::RwLock::new(HashMap::new())), pool, vec![0; 32], 1)
+            .with_read_retry(Duration::ZERO, Duration::from_millis(1));
+        let Err(reasons) = reader.coin_page([3; 32], None, None).await else {
+            panic!("nobody serves the application");
+        };
+        assert!(reasons.starts_with("2 peers declined: "), "{reasons}");
+        assert!(reasons.contains("dial failed"), "{reasons}");
     }
 
     #[test]

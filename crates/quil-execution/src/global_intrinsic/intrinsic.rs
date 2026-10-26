@@ -41,6 +41,10 @@ use crate::hypergraph_state::{
 #[path = "fork_tests.rs"]
 mod fork_tests;
 
+#[cfg(test)]
+#[path = "header_cost_tests.rs"]
+mod header_cost_tests;
+
 /// The global intrinsic: holds dependencies for signature
 /// verification and state lookups. Dispatches `validate` and
 /// `invoke_step` calls to per-op handlers.
@@ -2159,6 +2163,7 @@ impl GlobalIntrinsic {
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
     }
 
+    #[cfg(test)]
     fn audit_storage_attestation(
         &self,
         frame_number: u64,
@@ -2166,6 +2171,21 @@ impl GlobalIntrinsic {
         bitmask: &[u8],
         state: &HypergraphState,
         va_disc: &[u8; 32],
+    ) -> Result<()> {
+        let mut timing = HeaderTiming::start();
+        self.audit_storage_attestation_timed(frame_number, op, bitmask, state, va_disc, &mut timing)
+    }
+
+    /// The PoRep storage audit of `op`, marking in `timing` where its registry
+    /// lookups end; the caller marks the end of the possession checks.
+    fn audit_storage_attestation_timed(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        bitmask: &[u8],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+        timing: &mut HeaderTiming,
     ) -> Result<()> {
         // Genesis / legacy-VDF frames anchor to 0 — no storage beacon, no
         // lockstep requirement.
@@ -2263,13 +2283,19 @@ impl GlobalIntrinsic {
             Some((leaf_root, num_blocks, active_epoch))
         };
 
-        let failed = quil_crypto::porep::audit_frame_storage_attestations(
+        let audited = quil_crypto::porep::audit_storage_registry(
             &openings,
             &rho_n,
-            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
             active_epoch,
             quil_types::consensus::STORAGE_AUDIT_SAMPLE,
             lookup,
+        );
+        timing.mark("storage audit lookup");
+        let failed = quil_crypto::porep::audit_storage_possession(
+            &audited,
+            &rho_n,
+            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            active_epoch,
         );
         for member in failed {
             tracing::warn!(frame = frame_number, epoch = active_epoch, member = %hex::encode(&member),
@@ -2914,7 +2940,8 @@ impl GlobalIntrinsic {
         // anchored global frame's committed VDF output + the on-chain leaf-root
         // registry), so every archive evicts identically and non-archive nodes
         // inherit it via sync.
-        self.audit_storage_attestation(frame_number, op, &bitmask_bytes, state, va_disc)?;
+        self.audit_storage_attestation_timed(frame_number, op, &bitmask_bytes, state, va_disc, &mut timing)?;
+        timing.mark("storage audit verify");
         // Members whose seat closed an epoch without proving the roots they
         // committed in it, after the activity update for the same reason.
         for member in storage.map(|storage| storage.kicks).unwrap_or_default() {
@@ -2922,7 +2949,7 @@ impl GlobalIntrinsic {
                 "storage epoch proof missing for committed openings: kicking the member");
             self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
         }
-        timing.mark("storage audit");
+        timing.mark("storage epoch kicks");
         timing.finish(frame_number, op, participants);
         Ok(())
     }

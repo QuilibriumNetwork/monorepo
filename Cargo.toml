@@ -98,8 +98,10 @@ libp2p-tls = { path = "crates/libp2p-tls" }
 # the history window rolled over); signature verification encodes the signed
 # bytes from borrowed fields instead of cloning the message twice. IDONTWANT
 # works on our custom protocol id (`Version::V1_2`), is sent for a message's
-# first copy only, and is sent with priority. Wire format and validation are
-# unchanged. Local changes are marked `QUILIBRIUM:`.
+# first copy only, and is sent with priority. The message cache has a byte
+# budget (`mcache_max_bytes`): past it, the oldest messages are evicted,
+# validated ones first. Wire format and validation are unchanged. Local
+# changes are marked `QUILIBRIUM:`.
 libp2p-gossipsub = { path = "crates/libp2p-gossipsub" }
 
 [profile.release]

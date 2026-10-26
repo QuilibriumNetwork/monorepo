@@ -57,6 +57,45 @@ fn restore_and_fill_worker_pool(
     Ok((restored, created))
 }
 
+/// Restore the local worker pool from `persisted` and fill it to
+/// `expected_worker_count`, then say how many run against the count and
+/// which workers drain. An archive restores none: it runs no app-shard
+/// workers, and the records stay in the store for a return to a regular
+/// node. Returns `(restored, created)`, or `None` on an archive.
+fn restore_local_workers(
+    worker_manager: &dyn quil_engine::worker::WorkerManager,
+    persisted: &[quil_types::store::PersistedWorkerInfo],
+    expected_worker_count: u32,
+    archive_mode: bool,
+) -> quil_types::error::Result<Option<(usize, usize)>> {
+    if archive_mode {
+        if !persisted.is_empty() {
+            info!("archive mode: skipping persisted worker restore");
+        }
+        return Ok(None);
+    }
+    let (restored, created) = restore_and_fill_worker_pool(worker_manager, persisted, expected_worker_count)?;
+    let workers = worker_manager.range_workers()?;
+    info!(configured = expected_worker_count, running = workers.len(), restored, created,
+        "restored and filled local worker pool");
+    let draining: Vec<String> = workers.iter()
+        .filter(|w| worker_manager.is_draining(w.core_id))
+        .map(|w| match (w.filter.is_empty(), w.pending_filter_frame) {
+            (false, _) => format!("core {} {}", w.core_id, hex::encode(&w.filter)),
+            (true, 0) => format!("core {} idle", w.core_id),
+            (true, frame) => format!("core {} join proposed at frame {frame}", w.core_id),
+        })
+        .collect();
+    if !draining.is_empty() {
+        info!(configured = expected_worker_count, running = workers.len(), draining = draining.len(),
+            cores = ?draining, scope = "this node",
+            "running more workers than configured: the workers above the configured count drain; they take no \
+             new seat, their seats leave through the surplus leave, and each stops once it holds no seat or join \
+             (summary once per epoch)");
+    }
+    Ok(Some((restored, created)))
+}
+
 /// `NoPeersSubscribedToTopic` is transient during gossip mesh startup; other
 /// publish errors require a different recovery path and must not be retried by
 /// the CW outbox.
@@ -1343,26 +1382,12 @@ pub(crate) fn init(
             // run app-shard workers. A subsequent return to non-archive
             // will pick
             // them up again because we don't delete them here.
-            let persisted = if archive_mode {
-                if !thread_mgr.load_all_persisted().is_empty() {
-                    info!("archive mode: skipping persisted worker restore");
-                }
-                Vec::new()
-            } else {
-                thread_mgr.load_all_persisted()
-            };
-            if !archive_mode {
-                // The manager's count is also its allocation capacity.
-                let worker_count = thread_mgr.num_worker_cores();
-                match restore_and_fill_worker_pool(thread_mgr.as_ref(), &persisted, worker_count) {
-                    Ok((restored, created)) => info!(
-                        workers = worker_count,
-                        restored,
-                        created,
-                        "restored and filled local worker pool"
-                    ),
-                    Err(e) => warn!(error = %e, "failed to restore and fill local worker pool"),
-                }
+            // The manager's count is also its allocation capacity.
+            let persisted = thread_mgr.load_all_persisted();
+            if let Err(e) = restore_local_workers(
+                thread_mgr.as_ref(), &persisted, thread_mgr.num_worker_cores(), archive_mode)
+            {
+                warn!(error = %e, "failed to restore and fill local worker pool");
             }
             thread_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         };
@@ -1672,6 +1697,35 @@ mod tests {
         let workers = manager.range_workers().unwrap();
         assert_eq!(workers.iter().map(|w| w.core_id).collect::<Vec<_>>(), vec![1, 2, 4, 5]);
         assert_eq!(workers[3].pending_filter_frame, 100);
+    }
+
+    /// A count lowered below seated records keeps those running, draining;
+    /// raised again, the cores fill and none drains. An archive restores
+    /// nothing, the records staying in the store.
+    #[test]
+    fn restore_drains_records_above_the_count_and_archives_restore_none() {
+        let record = |core_id, filter: Vec<u8>| quil_types::store::PersistedWorkerInfo {
+            core_id, filter, manually_managed: false, allocated: true, pending_filter_frame: 0,
+        };
+        let persisted = vec![record(1, vec![0xaa]), record(4, vec![0xbb]), record(5, Vec::new())];
+
+        let archive = TestWorkerManager::new();
+        archive.set_configured_count(2);
+        assert_eq!(restore_local_workers(&archive, &persisted, 2, true).unwrap(), None);
+        assert!(archive.range_workers().unwrap().is_empty());
+
+        let lowered = TestWorkerManager::new();
+        lowered.set_configured_count(2);
+        assert_eq!(restore_local_workers(&lowered, &persisted, 2, false).unwrap(), Some((2, 1)));
+        let cores: Vec<u32> = lowered.range_workers().unwrap().iter().map(|w| w.core_id).collect();
+        assert_eq!(cores, vec![1, 2, 4]);
+        assert_eq!(lowered.draining_workers(), HashSet::from([4]));
+
+        let raised = TestWorkerManager::new();
+        raised.set_configured_count(5);
+        assert_eq!(restore_local_workers(&raised, &persisted, 5, false).unwrap(), Some((3, 2)));
+        assert_eq!(raised.range_workers().unwrap().len(), 5);
+        assert!(raised.draining_workers().is_empty());
     }
 
     /// #595 regression: a fresh thread worker must install a PERSISTENT (Rocks)

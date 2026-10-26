@@ -205,7 +205,8 @@ mod tests {
             // An intermediate "node" that launches a worker and dies abruptly,
             // without killing or reaping it.
             let mut command = worker("orphan_child");
-            command.env("QUIL_PROCESS_TEST_PID_FILE", std::env::var("QUIL_PROCESS_TEST_PID_FILE").unwrap());
+            command.env("QUIL_PROCESS_TEST_PID_FILE", std::env::var("QUIL_PROCESS_TEST_PID_FILE").unwrap())
+                .env(super::super::worker_limits::PARENT_PID_ENV, std::process::id().to_string());
             let child = command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             std::mem::forget(child);
             std::thread::sleep(Duration::from_millis(300));
@@ -219,6 +220,10 @@ mod tests {
             std::thread::sleep(Duration::from_secs(60));
             std::process::exit(7);
         }
+        #[cfg(unix)]
+        if mode == "named_parent" {
+            super::super::worker_limits::exit_when_orphaned().unwrap();
+        }
         if mode == "hungry" {
             // Touch every page so the memory is resident, then linger.
             let mut block = vec![0u8; 192 << 20];
@@ -231,7 +236,7 @@ mod tests {
         std::io::stdin().read_to_end(&mut request).unwrap();
         assert_eq!(request, b"public test request");
         std::process::exit(match mode.as_str() {
-            "valid" | "limits" | "address_limit" => VALID_EXIT, "invalid" => INVALID_EXIT,
+            "valid" | "limits" | "address_limit" | "named_parent" => VALID_EXIT, "invalid" => INVALID_EXIT,
             "allocation_exit" => 1, "ordinary_exit" => 0, _ => 7,
         });
     }
@@ -250,6 +255,23 @@ mod tests {
         assert!(matches!(run_worker(worker("valid"), &[], limit), Err(WorkerError::InvalidLimits)));
         assert!(matches!(run_worker(worker("valid"), &vec![0; MAX_REQUEST_BYTES], limit), Err(WorkerError::InvalidLimits)));
         assert!(matches!(run_worker(worker("valid"), request, Duration::ZERO), Err(WorkerError::InvalidLimits)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_worker_keeps_only_the_parent_its_launcher_named() {
+        use super::super::worker_limits::{ORPHANED_EXIT, PARENT_PID_ENV};
+        let request = b"public test request";
+        let limit = Duration::from_secs(5);
+        // The launcher names itself, as a node running as PID 1 must.
+        let mut named = worker("named_parent");
+        named.env(PARENT_PID_ENV, std::process::id().to_string());
+        assert!(run_worker(named, request, limit).unwrap());
+        // A worker whose actual parent is not the named one stops at once.
+        let mut other = worker("named_parent");
+        other.env(PARENT_PID_ENV, "1");
+        assert!(matches!(run_worker(other, request, limit),
+            Err(WorkerError::UnexpectedExit(Some(ORPHANED_EXIT)))));
     }
 
     #[test]

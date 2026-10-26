@@ -66,19 +66,42 @@ pub(crate) async fn list(
     Ok(coins)
 }
 
-pub async fn run(tc: &TokenCtx, application: &[u8; 32]) -> anyhow::Result<()> {
-    let client = tc.connect().await?;
+/// `(unshielded total, unshielded count, shielded count)` of `coins`.
+fn tally(coins: &[([u8; 32], u128, bool)]) -> anyhow::Result<(u128, usize, usize)> {
     let (mut unshielded_total, mut unshielded, mut shielded) = (0u128, 0usize, 0usize);
-    for (address, amount, is_shielded) in list(tc, &client, application).await? {
-        println!("0x{} {}{}", hex::encode(address), amount, if is_shielded { " (shielded)" } else { "" });
-        if is_shielded {
+    for (_, amount, is_shielded) in coins {
+        if *is_shielded {
             shielded += 1;
         } else {
             unshielded += 1;
-            unshielded_total = unshielded_total.checked_add(amount)
+            unshielded_total = unshielded_total.checked_add(*amount)
                 .ok_or_else(|| anyhow::anyhow!("legacy total overflows u128"))?;
         }
     }
+    Ok((unshielded_total, unshielded, shielded))
+}
+
+/// This identity's legacy coins tallied for `token balance`, or `None` when
+/// the node has no Ed448 identity and so holds none.
+#[cfg(feature = "confidential-tokens")]
+pub(crate) async fn unshielded(
+    tc: &TokenCtx,
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    application: &[u8; 32],
+) -> anyhow::Result<Option<(u128, usize, usize)>> {
+    if owner_addresses(tc).is_err() {
+        return Ok(None);
+    }
+    tally(&list(tc, client, application).await?).map(Some)
+}
+
+pub async fn run(tc: &TokenCtx, application: &[u8; 32]) -> anyhow::Result<()> {
+    let client = tc.connect().await?;
+    let coins = list(tc, &client, application).await?;
+    for (address, amount, is_shielded) in &coins {
+        println!("0x{} {}{}", hex::encode(address), amount, if *is_shielded { " (shielded)" } else { "" });
+    }
+    let (unshielded_total, unshielded, shielded) = tally(&coins)?;
     println!("{unshielded_total} base units across {unshielded} unshielded legacy coins ({shielded} already shielded)");
     Ok(())
 }
