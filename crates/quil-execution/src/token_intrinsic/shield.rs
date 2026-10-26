@@ -36,6 +36,7 @@ fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
         &s.transparent_address,
         s.amount,
         &s.owner_public_key,
+        false,
     )
 }
 
@@ -44,11 +45,14 @@ fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
 /// shard's range: a shard reads only its own store, so a source elsewhere is
 /// refused for that reason, identically on every member and on an archive
 /// replaying the frame (which holds every shard). Before it, a batch is
-/// refused outright.
+/// refused outright. From the migrated owner frame (`migrated_owners`), each
+/// source's owner is matched in the form the migration wrote it
+/// ([`legacy_migration::migrated_owner`]).
 pub(crate) fn check_sources(
     state: &HypergraphState,
     shard: quil_types::execution::ShardPath,
     active: bool,
+    migrated_owners: bool,
     application: &[u8; 32],
     shield: &AnyShield,
 ) -> Result<()> {
@@ -65,6 +69,7 @@ pub(crate) fn check_sources(
             &source.address,
             source.amount,
             shield.owner_public_key(),
+            migrated_owners,
         )?;
     }
     Ok(())
@@ -76,6 +81,7 @@ fn check_coin(
     address: &[u8; 32],
     expected_amount: u128,
     owner_public_key: &[u8; 57],
+    migrated_owners: bool,
 ) -> Result<()> {
     let disc = vertex_adds_discriminator()?;
     let blob = state
@@ -106,9 +112,15 @@ fn check_coin(
     if amount != expected_amount {
         return Err(invalid("source amount mismatch"));
     }
-    let public_address = quil_crypto::poseidon::hash_bytes_to_32(owner_public_key)?;
     let peer = quil_crypto::peer_id_multihash_from_ed448_pubkey(owner_public_key);
-    if owner != public_address && owner != quil_crypto::poseidon::hash_bytes_to_32(&peer)? {
+    let mut addresses = [
+        quil_crypto::poseidon::hash_bytes_to_32(owner_public_key)?,
+        quil_crypto::poseidon::hash_bytes_to_32(&peer)?,
+    ];
+    if migrated_owners {
+        addresses = addresses.map(|address| legacy_migration::migrated_owner(&address));
+    }
+    if !addresses.contains(&owner) {
         return Err(invalid("source owner mismatch"));
     }
     Ok(())
@@ -722,12 +734,12 @@ mod tests {
         };
         let batch = shield(statement(sources.clone()));
         assert!(
-            check_sources(&state, ShardPath::WHOLE, true, &application, &batch).is_ok(),
+            check_sources(&state, ShardPath::WHOLE, true, false, &application, &batch).is_ok(),
             "both owner forms of one key"
         );
         assert!(check_authorization(&batch).is_ok());
-        let error =
-            check_sources(&state, ShardPath::WHOLE, false, &application, &batch).unwrap_err();
+        let error = check_sources(&state, ShardPath::WHOLE, false, false, &application, &batch)
+            .unwrap_err();
         assert!(error.to_string().contains("not active"), "{error}");
 
         // From activation every source must be in the executing shard.
@@ -737,6 +749,7 @@ mod tests {
             &state,
             ShardPath::from_bits(&[first_bit]),
             true,
+            false,
             &application,
             &one
         )
@@ -745,6 +758,7 @@ mod tests {
             &state,
             ShardPath::from_bits(&[!first_bit]),
             true,
+            false,
             &application,
             &one,
         )
@@ -758,6 +772,7 @@ mod tests {
             &state,
             ShardPath::WHOLE,
             true,
+            false,
             &application,
             &shield(statement(wrong_amount))
         )
@@ -769,6 +784,7 @@ mod tests {
             &state,
             ShardPath::WHOLE,
             true,
+            false,
             &application,
             &shield(statement(foreign)),
         )
@@ -781,6 +797,7 @@ mod tests {
             &state,
             ShardPath::WHOLE,
             true,
+            false,
             &application,
             &shield(statement(missing))
         )
@@ -812,12 +829,99 @@ mod tests {
                 &state,
                 ShardPath::from_bits(&[!first_bit]),
                 false,
+                false,
                 &application,
                 &single
             )
             .is_ok(),
             "before activation the shard range is not checked"
         );
+    }
+
+    /// A migrated coin's owner leaf is its holder's address shifted one byte
+    /// (`legacy_migration::migrated_owner`). Before the migrated owner frame
+    /// a source is matched against the signing key's addresses themselves, so
+    /// such a coin is refused; from it, against their migrated form, for both
+    /// owner forms, while another key's coin is still refused.
+    #[test]
+    fn migrated_owners_are_matched_in_their_stored_form_from_activation() {
+        use quil_types::execution::ShardPath;
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        )));
+        let (network, application) = ([1; 32], [2; 32]);
+        let public = quil_crypto::Ed448Signer::derive_public(&[3; 57]).unwrap();
+        let by_key = quil_crypto::poseidon::hash_bytes_to_32(&public).unwrap();
+        let by_peer = quil_crypto::poseidon::hash_bytes_to_32(
+            &quil_crypto::peer_id_multihash_from_ed448_pubkey(&public),
+        )
+        .unwrap();
+        let disc = vertex_adds_discriminator().unwrap();
+        let place = |owner: [u8; 32], amount: u128, origin: u8| {
+            let tree = legacy_migration::create_transparent_coin_tree(
+                &legacy_migration::TransparentCoin {
+                    owner_address: owner,
+                    amount,
+                },
+                &legacy_migration::transparent_type_hash(&application).unwrap(),
+                &[origin; 32],
+            )
+            .unwrap();
+            let address = materialize::coin_content_address(&tree).unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            address
+        };
+        let check = |address: [u8; 32], amount: u128, migrated_owners: bool| {
+            let shield = AnyShield::Single(Shield {
+                statement: ShieldStatement {
+                    network,
+                    application,
+                    transparent_address: address,
+                    owner_public_key: public.clone().try_into().unwrap(),
+                    amount,
+                    fee: 1,
+                    outputs: Vec::new(),
+                },
+                signature: [0; 114],
+                proof: Vec::new(),
+            });
+            check_sources(
+                &state,
+                ShardPath::WHOLE,
+                false,
+                migrated_owners,
+                &application,
+                &shield,
+            )
+        };
+        let mismatch = |result: Result<()>| {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("owner mismatch"), "{error}");
+        };
+
+        let by_key_coin = place(legacy_migration::migrated_owner(&by_key), 10, 1);
+        let by_peer_coin = place(legacy_migration::migrated_owner(&by_peer), 20, 2);
+        for (address, amount) in [(by_key_coin, 10), (by_peer_coin, 20)] {
+            mismatch(check(address, amount, false));
+            assert!(check(address, amount, true).is_ok());
+        }
+        let unshifted = place(by_key, 30, 3);
+        assert!(
+            check(unshifted, 30, false).is_ok(),
+            "before the frame, as it always was"
+        );
+        mismatch(check(unshifted, 30, true));
+        let stranger = place(legacy_migration::migrated_owner(&[9; 32]), 40, 4);
+        mismatch(check(stranger, 40, true));
     }
 
     /// A real batch: three legacy coins of one key (both owner forms) proven

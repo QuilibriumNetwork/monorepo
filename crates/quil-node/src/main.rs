@@ -847,6 +847,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
         "batch shields and shield source coverage"
     );
+    let migrated_owners_from =
+        quil_execution::token_intrinsic::legacy_migration::init_migrated_owner_frame(args.network);
+    info!(
+        migrated_owner_frame = %if migrated_owners_from == u64::MAX { "never".to_string() } else { migrated_owners_from.to_string() },
+        "shields matching legacy coin owners in their migrated form"
+    );
     let committed_credit_from =
         quil_execution::token_intrinsic::settlement_record::init_committed_credit_frame(
             args.network,

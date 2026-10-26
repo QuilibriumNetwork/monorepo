@@ -188,6 +188,88 @@ pub fn read_transparent_coin(
     Some((owner, amount, origin))
 }
 
+/// The owner leaf the migration wrote for a holder whose address is `owner`:
+/// `0x00 ‖ owner[..31]`. [`decode_legacy_verenc_coin`] reads the owner slot
+/// one byte late (the amount slot leads with a pad byte; the owner slot does
+/// not), so every migrated coin carries its holder's address shifted right by
+/// one byte with the last byte dropped. The originals were deleted, so that
+/// byte is gone: a holder is matched on the 31 bytes that remain. The
+/// migration never runs again and is left as it is (decided 2026-10-26).
+pub fn migrated_owner(owner: &[u8; 32]) -> [u8; 32] {
+    let mut stored = [0u8; 32];
+    stored[1..].copy_from_slice(&owner[..31]);
+    stored
+}
+
+/// The owner leaf `owner`'s legacy coins carry on this network: the migrated
+/// form ([`migrated_owner`]) where the network's legacy coins came from the
+/// migration (it has a migrated owner frame), the address itself elsewhere.
+pub fn stored_owner(owner: &[u8; 32]) -> [u8; 32] {
+    if migrated_owner_frame() == u64::MAX {
+        *owner
+    } else {
+        migrated_owner(owner)
+    }
+}
+
+/// From this GLOBAL frame a shield matches each source's owner leaf against
+/// the signing key's addresses in their migrated form ([`migrated_owner`]);
+/// before it, against the addresses themselves, which no migrated coin
+/// carries. The first frame of epoch 1311 (decided 2026-10-26).
+/// Consensus-affecting for application shards and every node replaying their
+/// frames. Fixed on mainnet; `QUIL_MIGRATED_OWNER_FRAME` elsewhere, never by
+/// default.
+pub const MAINNET_MIGRATED_OWNER_FRAME: u64 = 1311 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+
+static MIGRATED_OWNER_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static MIGRATED_OWNER_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn migrated_owner_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_MIGRATED_OWNER_FRAME;
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's migrated owner frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_migrated_owner_frame(network: u8) -> u64 {
+    *MIGRATED_OWNER_FRAME.get_or_init(|| {
+        migrated_owner_frame_for(
+            network,
+            std::env::var("QUIL_MIGRATED_OWNER_FRAME").ok().as_deref(),
+        )
+    })
+}
+
+pub fn migrated_owner_frame() -> u64 {
+    if let Some(frame) = MIGRATED_OWNER_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *MIGRATED_OWNER_FRAME.get_or_init(|| {
+        std::env::var("QUIL_MIGRATED_OWNER_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the migrated owner frame for the calling thread only (tests).
+pub fn set_migrated_owner_frame_for_thread(frame: Option<u64>) {
+    MIGRATED_OWNER_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Whether a shield anchored at GLOBAL frame `anchor` matches owners in their
+/// migrated form (none known: not yet).
+pub fn migrated_owners_active(anchor: Option<u64>) -> bool {
+    anchor.is_some_and(|frame| frame >= migrated_owner_frame())
+}
+
 /// Migrate one legacy coin: decrypt it and (if it is one) build its transparent
 /// vertex, bound to its `origin` (original 32-byte address) for uniqueness.
 /// Returns `(transparent_address, amount, transparent_tree)`, or `Ok(None)` for
@@ -582,6 +664,47 @@ mod read_transparent_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mainnet genesis gave `QmNLiXRb…` one coin of its retro rewards, owned
+    /// by `poseidon(peer id)`; the archive's migrated store holds that coin
+    /// (found by its exact amount) under the owner below.
+    #[test]
+    fn a_migrated_owner_is_the_mainnet_address_shifted_one_byte() {
+        let peer = bs58::decode("QmNLiXRbKx2Lc7BJgzRb1MYVaEU8GtreLLBGaDedK6UPnq")
+            .into_vec()
+            .unwrap();
+        let address = quil_crypto::poseidon::hash_bytes_to_32(&peer).unwrap();
+        assert_eq!(
+            hex::encode(address),
+            "0172436030f2a678910c85adee63ec77da6080c00e9d8782addbf768f772e690"
+        );
+        assert_eq!(
+            hex::encode(migrated_owner(&address)),
+            "000172436030f2a678910c85adee63ec77da6080c00e9d8782addbf768f772e6"
+        );
+    }
+
+    #[test]
+    fn migrated_owners_activate_at_epoch_1311_on_mainnet_only() {
+        assert_eq!(MAINNET_MIGRATED_OWNER_FRAME, 943_920);
+        assert_eq!(
+            migrated_owner_frame_for(0, Some("5")),
+            MAINNET_MIGRATED_OWNER_FRAME
+        );
+        assert_eq!(migrated_owner_frame_for(1, Some("5")), 5);
+        assert_eq!(migrated_owner_frame_for(1, None), u64::MAX);
+
+        let owner = [7u8; 32];
+        set_migrated_owner_frame_for_thread(Some(u64::MAX));
+        assert_eq!(stored_owner(&owner), owner, "no migrated coins here");
+        assert!(!migrated_owners_active(Some(u64::MAX - 1)));
+        set_migrated_owner_frame_for_thread(Some(100));
+        assert_eq!(stored_owner(&owner), migrated_owner(&owner));
+        assert!(!migrated_owners_active(Some(99)));
+        assert!(migrated_owners_active(Some(100)));
+        assert!(!migrated_owners_active(None));
+        set_migrated_owner_frame_for_thread(None);
+    }
 
     #[test]
     fn transparent_coin_tree_stores_owner_amount_and_origin() {

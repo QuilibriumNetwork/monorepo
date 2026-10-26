@@ -176,7 +176,16 @@ pub fn verify_for_commit(
                 return Err(invalid("too many outputs"));
             }
             let active = super::global_commit::batch_shields_active(context.finalized_global_frame);
-            shield::check_sources(state, context.shard, active, application, &tx)?;
+            let migrated_owners =
+                super::legacy_migration::migrated_owners_active(context.finalized_global_frame);
+            shield::check_sources(
+                state,
+                context.shard,
+                active,
+                migrated_owners,
+                application,
+                &tx,
+            )?;
             shield::check_authorization(&tx)?;
             let shield_limits = CompileLimits {
                 max_inputs: 1,

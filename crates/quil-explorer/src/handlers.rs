@@ -2457,6 +2457,9 @@ pub async fn handle_token_coins(
     let domain = quil_execution::domains::QUIL_TOKEN;
     let transparent =
         quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
+    // Migrated coins carry the address shifted one byte; coins written
+    // otherwise carry it as it is.
+    let migrated = quil_execution::token_intrinsic::legacy_migration::migrated_owner(&owner);
     let (mut count, mut total, mut truncated) = (0u64, 0u128, false);
     let mut coins: Vec<CoinJson> = Vec::new();
     let mut cb = |vk: Vec<u8>, blob: Vec<u8>| {
@@ -2472,7 +2475,8 @@ pub async fn handle_token_coins(
         if Some(ty) != transparent.as_ref().map(|h| h.as_slice()) {
             return; // private coins have no readable owner — not enumerable here
         }
-        if tree.get(&[0x00]) != Some(owner.as_slice()) {
+        let stored = tree.get(&[0x00]);
+        if stored != Some(owner.as_slice()) && stored != Some(migrated.as_slice()) {
             return;
         }
         let amount = tree

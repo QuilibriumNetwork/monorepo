@@ -212,9 +212,11 @@ impl LegacyOwnerIndex {
         }
     }
 
-    /// Up to `limit` of `owner`'s coins after `after`, ascending by address,
-    /// and whether more follow. `None` until the index is complete: a partial
-    /// index would silently omit coins.
+    /// Up to `limit` of the coins of the holder whose address is `owner` after
+    /// `after`, ascending by address, and whether more follow. The coins are
+    /// keyed by their owner leaf, so the address is looked up in the form this
+    /// network's coins carry it (`legacy_migration::stored_owner`). `None`
+    /// until the index is complete: a partial index would silently omit coins.
     pub(crate) fn page(
         &self,
         owner: &[u8; 32],
@@ -224,6 +226,7 @@ impl LegacyOwnerIndex {
         if !self.ready() {
             return Ok(None);
         }
+        let owner = &quil_execution::token_intrinsic::legacy_migration::stored_owner(owner);
         let lower = match after {
             Some(after) => {
                 let mut key = self.coin_key(owner, after);
@@ -451,6 +454,33 @@ mod tests {
             expected[o].sort();
             assert_eq!(got, expected[o], "owner {o}");
         }
+    }
+
+    /// Mainnet's coins carry their holder's address in its migrated form; the
+    /// holder asks by the address itself.
+    #[test]
+    fn a_holder_finds_coins_stored_under_the_migrated_owner() {
+        use quil_execution::token_intrinsic::legacy_migration::{
+            migrated_owner, set_migrated_owner_frame_for_thread,
+        };
+        let holder = [5u8; 32];
+        let (db, store, expected, _dir) = seeded(&[migrated_owner(&holder)], 12);
+        let index = LegacyOwnerIndex::new(db, store, APP).unwrap();
+        index.build(std::time::Duration::ZERO).unwrap();
+        set_migrated_owner_frame_for_thread(Some(943_920));
+        let (coins, more) = index.page(&holder, None, 64).unwrap().unwrap();
+        set_migrated_owner_frame_for_thread(Some(u64::MAX));
+        let unmigrated = index.page(&holder, None, 64).unwrap().unwrap();
+        set_migrated_owner_frame_for_thread(None);
+        let mut want: Vec<[u8; 32]> = expected.iter().map(|(_, a, _)| *a).collect();
+        want.sort();
+        assert!(!more);
+        assert_eq!(coins.iter().map(|(a, _, _)| *a).collect::<Vec<_>>(), want);
+        assert_eq!(
+            unmigrated,
+            (Vec::new(), false),
+            "a network without migrated coins looks the address up as it is"
+        );
     }
 
     #[test]
