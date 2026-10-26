@@ -6,10 +6,12 @@
 # curl -sSL https://raw.githubusercontent.com/QuilibriumNetwork/ceremonyclient/refs/heads/develop/install-qclient.sh | sudo bash
 #
 # The release is verified before anything is installed: the binary must
-# match its SHA3-256 digest file, and a quorum of the release signatories
-# (the keys qclient and the node check) must have signed that file with
-# Ed448. File names are built here from a validated version; no name from
-# the release server becomes a path. Needs curl and OpenSSL 1.1.1 or later.
+# match its SHA3-256 digest file, a quorum of the release signatories (the
+# keys qclient and the node check) must have signed that file with Ed448,
+# and its signed label must name the file this script asked for, so a
+# release signed for another version or platform is refused. File names
+# are built here from a validated version; no name from the release server
+# becomes a path. Needs curl and OpenSSL 1.1.1 or later.
 #
 # Options:
 #   --dry-run          download and verify the release in a temporary
@@ -167,6 +169,14 @@ dgst_checksum() {
     printf '%s\n' "$hex" | tr 'A-F' 'a-f'
 }
 
+# Whether .dgst file $1 is the digest of release file $2: its signed label,
+# as `openssl sha3-256` writes it, is "SHA3-256($2)=".
+dgst_names() {
+    local label=""
+    read -r label _ <"$1" || true
+    [ "$label" = "SHA3-256($2)=" ]
+}
+
 check_tools() {
     command -v curl >/dev/null || die "curl is required"
     command -v openssl >/dev/null || die "OpenSSL 1.1.1 or later is required"
@@ -194,7 +204,8 @@ download_release() {
 }
 
 # Verify the downloaded release $1 in $STAGE: the binary matches the
-# digest file, every present signature is valid, and they reach the quorum.
+# digest file, every present signature is valid, they reach the quorum, and
+# the signed label names $1.
 verify_release() {
     local base=$1 claimed actual i valid=0
     claimed=$(dgst_checksum "$STAGE/$base.dgst") || {
@@ -217,6 +228,10 @@ verify_release() {
     done
     if [ "$valid" -lt "$QUORUM" ]; then
         echo "Error: signature quorum not met ($valid/$QUORUM)" >&2
+        return 1
+    fi
+    if ! dgst_names "$STAGE/$base.dgst" "$base"; then
+        echo "Error: $base.dgst is signed for another release file" >&2
         return 1
     fi
     echo "Signature quorum met ($valid valid)"

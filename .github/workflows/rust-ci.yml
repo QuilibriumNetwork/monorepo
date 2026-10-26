@@ -11,6 +11,10 @@ on:
   # it, so changes that pass alone but conflict together never land.
   merge_group:
 
+# Jobs read the repository only; a job that needs more says so itself.
+permissions:
+  contents: read
+
 concurrency:
   group: rust-ci-${{ github.ref }}
   cancel-in-progress: true

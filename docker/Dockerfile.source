@@ -65,7 +65,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
 FROM base AS gmp-builder
 
 ARG GMP_VERSION=6.3.0
+# sha256 of gmp-6.3.0.tar.xz; set it together with GMP_VERSION.
+ARG GMP_SHA256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
 RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
+    echo "${GMP_SHA256}  gmp-${GMP_VERSION}.tar.xz" | sha256sum -c - && \
     tar -xf gmp-${GMP_VERSION}.tar.xz && \
     cd gmp-${GMP_VERSION} && \
     ./configure \

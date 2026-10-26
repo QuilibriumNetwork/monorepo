@@ -145,7 +145,8 @@ fi
 # ---------------------------------------------------------------
 pushd "$ROOT_DIR" > /dev/null
 
-cargo_args=(build --bin "$BIN_NAME" -p "$CRATE_NAME")
+# --locked: build exactly the dependency versions Cargo.lock records.
+cargo_args=(build --locked --bin "$BIN_NAME" -p "$CRATE_NAME")
 if [[ "${CARGO_TIMINGS:-0}" == 1 ]]; then
     cargo_args+=(--timings)
 fi
