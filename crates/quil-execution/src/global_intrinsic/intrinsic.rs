@@ -934,6 +934,7 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
+                Self::require_global_anchor(frame_number, &op)?;
                 // Header fields a certificate does not sign directly (fee
                 // total, settlement relay, ...) must reproduce the certified
                 // output, and a relay must be canonical for its window.
@@ -2641,6 +2642,28 @@ impl GlobalIntrinsic {
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
     }
 
+    /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
+    /// shard frame header that names no GLOBAL anchor
+    /// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]): the
+    /// lockstep window, the storage seat and the proof-of-storage gate are
+    /// all keyed on the anchor, and such a header escapes each of them.
+    fn require_global_anchor(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        if op.global_frame_number == 0
+            && quil_types::consensus::required_anchor_active(frame_number)
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "FrameHeader: shard {} frame {} names no GLOBAL anchor (required at frame {})",
+                hex::encode(&op.address),
+                op.frame_number,
+                frame_number
+            )));
+        }
+        Ok(())
+    }
+
     /// The difficulty of the GLOBAL frame a shard frame header anchors to,
     /// from this node's clock store; `None` for a header without an anchor.
     /// [`Self::verify_shard_frame_output`] already required that frame.
@@ -3355,6 +3378,7 @@ impl GlobalIntrinsic {
         // archive-mode extras: when absent, we skip the state
         // mutations but only AFTER the attestation has verified.
         let mut timing = HeaderTiming::start();
+        Self::require_global_anchor(frame_number, op)?;
         let fp = self.frame_prover.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: frame_prover not installed — cannot verify attestation"
@@ -6384,6 +6408,29 @@ mod tests {
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_schema::{write_field, write_type};
     use quil_types::crypto::KeyType;
+
+    /// From the required-anchor epoch GLOBAL refuses a shard frame header
+    /// without a GLOBAL anchor, before any verification; an anchored header
+    /// and frames before the epoch are unaffected.
+    #[test]
+    fn an_unanchored_header_is_refused_from_the_required_anchor_epoch() {
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        let mut header = crate::global_intrinsic::frame_header::FrameHeader {
+            address: vec![1; 32],
+            frame_number: 7,
+            ..Default::default()
+        };
+        assert!(GlobalIntrinsic::require_global_anchor(first - 1, &header).is_ok());
+        let refused = GlobalIntrinsic::require_global_anchor(first, &header).unwrap_err();
+        assert!(
+            refused.to_string().contains("names no GLOBAL anchor"),
+            "{refused}"
+        );
+        header.global_frame_number = first - 1;
+        assert!(GlobalIntrinsic::require_global_anchor(first, &header).is_ok());
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+    }
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {

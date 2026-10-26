@@ -1138,6 +1138,24 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.unanchored_after_activation(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                latest_global = latest,
+                "cw app verify: the frame names no GLOBAL anchor, which GLOBAL requires now"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "frame names no GLOBAL anchor",
+                format!(
+                    "frame {}, latest GLOBAL frame {latest}",
+                    header.frame_number
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 frame = header.frame_number,
@@ -4253,6 +4271,96 @@ mod tests {
             liveness.decisions().refused.get("block not delivered"),
             Some(&1)
         );
+    }
+
+    /// A voter whose latest GLOBAL frame is in the required-anchor epoch
+    /// refuses a proposal that names no GLOBAL anchor: GLOBAL would refuse
+    /// the frame. Before the epoch it votes as before.
+    #[test]
+    fn a_proposal_without_a_global_anchor_is_refused_from_the_required_anchor_epoch() {
+        use quil_types::store::ClockStore as _;
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put_global(first - 1);
+        let filter = vec![1; 32];
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            Arc::new(
+                BlsAppFrameValidator::new(
+                    Arc::new(crate::test_support::TestProverRegistry::default()),
+                    Arc::new(quil_crypto::FalconKeyConstructor),
+                    Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+                )
+                .with_clock_store(clock.clone()),
+            ),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| Ok(()))),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
+        let mut header = quil_types::proto::global::FrameHeader {
+            address: filter,
+            frame_number: 7,
+            rank: 43,
+            parent_selector: vec![7; 32],
+            state_roots: vec![vec![0; 32]; 4],
+            ..Default::default()
+        };
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector,
+            &header.requests_root,
+            &header.state_roots,
+            &quil_crypto::porep::derive_storage_beacon(0, &[]),
+            header.frame_number,
+            header.rank,
+            &header.prover,
+            header.difficulty,
+            header.fee_multiplier_vote,
+            header.timestamp,
+            &header.storage_attestation_root,
+            0,
+            &header.settlements,
+            &header.accumulator,
+            &header.spends,
+        );
+        let frame = AppShardFrame {
+            header: Some(header),
+            ..Default::default()
+        };
+        let digest = app_frame_digest(&frame).unwrap();
+        let parent = digest_from_identity([7; 32]);
+        assert!(
+            proposer.verify(43, parent, digest, Some(encode_app_frame(&frame))),
+            "before the epoch"
+        );
+        put_global(first);
+        assert!(!proposer.verify(43, parent, digest, Some(encode_app_frame(&frame))));
+        liveness.settle(Step::Verify, 43, false);
+        assert_eq!(
+            liveness
+                .decisions()
+                .refused
+                .get("frame names no GLOBAL anchor"),
+            Some(&1)
+        );
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
     }
 
     /// A proposal anchored one or two GLOBAL frames past this node's latest
