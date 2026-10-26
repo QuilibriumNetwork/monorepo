@@ -405,9 +405,9 @@ pub fn epoch_for_frame(frame_number: u64) -> u64 {
 /// allocation's last resume or pause, and a `ProverSeniorityMerge` is refused
 /// when a merge or join earlier in the same frame consumed one of its
 /// targets. Consensus-affecting: every archive and prover must run a build
-/// with it before then. Not yet scheduled on mainnet;
+/// with it before then. Mainnet epoch 1311 (frame 943,920);
 /// `QUIL_PROVER_OP_REPLAY_GUARD_EPOCH` elsewhere, never by default.
-pub const MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH: Option<u64> = None;
+pub const MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH: Option<u64> = Some(1311);
 
 static PROVER_OP_REPLAY_GUARD_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
