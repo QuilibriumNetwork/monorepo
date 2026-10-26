@@ -3340,7 +3340,9 @@ impl GlobalIntrinsic {
         };
 
         // Cross-domain settlements the QUIL shard relays become GLOBAL
-        // records here, independent of the reward gates below.
+        // records here, independent of the reward gates below; from the
+        // committed-credit frame only with their committed spends, in the
+        // relay commit below.
         super::prover_shard_update::materialize_settlement_records(op, frame_number, state)?;
         timing.mark("settlements");
         // The shard's accumulator report joins the application's canonical

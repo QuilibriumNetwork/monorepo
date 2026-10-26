@@ -171,7 +171,10 @@ pub fn verify_settlement_relay(
 
 /// Write the GLOBAL settlement record of every relayed entry not yet recorded.
 /// Idempotent: a header re-carries its window, so most entries are repeats.
-/// Returns the number of records written.
+/// From the committed-credit frame (`settlement_record::committed_credit_frame`)
+/// the relay is only checked: the global commit writes a record together with
+/// the spend that carries it, so a settlement whose spend is rejected, or never
+/// committed, records nothing. Returns the number of records written.
 pub fn materialize_settlement_records(
     frame_header: &FrameHeader,
     current_frame_number: u64,
@@ -179,7 +182,7 @@ pub fn materialize_settlement_records(
 ) -> Result<usize> {
     use crate::token_intrinsic::settlement_record;
     let frames = verify_settlement_relay(frame_header)?;
-    if frames.is_empty() {
+    if frames.is_empty() || current_frame_number >= settlement_record::committed_credit_frame() {
         return Ok(0);
     }
     let va_disc = vertex_adds_discriminator()?;
@@ -1790,6 +1793,143 @@ mod tests {
             materialize_settlement_records(&other, 1_003, &state).unwrap(),
             0
         );
+    }
+
+    /// A settlement spending `image`, executed at QUIL shard frame 39 and
+    /// carrying the settlement of `receipt`.
+    #[cfg(feature = "confidential-tokens")]
+    fn settling_spend(
+        tx: u8,
+        image: u8,
+        receipt: u8,
+    ) -> crate::token_intrinsic::global_commit::SpendEntry {
+        crate::token_intrinsic::global_commit::SpendEntry {
+            kind: crate::token_engine::TYPE_LATTICE_SETTLEMENT,
+            tx_id: [tx; 32],
+            source_frame: 39,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[image; 32]],
+            outputs: Vec::new(),
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: Some(relay_entry(receipt)),
+        }
+    }
+
+    /// QUIL shard header 40 relaying `spends` from frame 39, with the
+    /// settlements they carry plus `unspent`, settlements of no relayed spend.
+    #[cfg(feature = "confidential-tokens")]
+    fn settling_header(
+        spends: &[crate::token_intrinsic::global_commit::SpendEntry],
+        unspent: &[u8],
+    ) -> FrameHeader {
+        let mut settlements: Vec<_> = spends.iter().filter_map(|s| s.settlement).collect();
+        settlements.extend(unspent.iter().map(|receipt| relay_entry(*receipt)));
+        settlements.sort();
+        settlements.dedup();
+        let mut header = fake_header(crate::domains::QUIL_TOKEN.to_vec(), 40);
+        header.settlements =
+            crate::token_intrinsic::settlement_record::encode_relay(&[(39, settlements)]).unwrap();
+        let relayed: Vec<Vec<u8>> = spends.iter().map(|s| s.encode().unwrap()).collect();
+        header.spends =
+            crate::token_intrinsic::spend_relay::encode_relay(&[(39, relayed)]).unwrap();
+        header
+    }
+
+    /// What GLOBAL does with a certified QUIL shard header, in its order:
+    /// the settlement relay, then the spend relay. Returns the credited fees.
+    #[cfg(feature = "confidential-tokens")]
+    fn settle(header: &FrameHeader, frame: u64, state: &HypergraphState) -> u128 {
+        materialize_settlement_records(header, frame, state).unwrap();
+        crate::token_intrinsic::global_commit::materialize_relay(
+            state,
+            frame,
+            &header.address,
+            header.frame_number,
+            &header.spends,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn settlement_record_of(state: &HypergraphState, receipt: u8) -> Option<Vec<u8>> {
+        let va_disc = vertex_adds_discriminator().unwrap();
+        state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &[receipt; 32], &va_disc)
+            .unwrap()
+            .filter(|blob| !blob.is_empty())
+    }
+
+    /// From the committed-credit frame a relayed settlement is recorded only
+    /// with its committed spend: not for a double spend, a spend citing a
+    /// root the application never had, or a settlement no spend carries.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn settlement_records_follow_only_committed_spends_from_the_activation_frame() {
+        use crate::token_intrinsic::settlement_record::{
+            create_record, set_committed_credit_frame_for_thread,
+        };
+        let honest = settling_spend(1, 20, 1);
+        let double = settling_spend(2, 20, 2);
+        let mut unrooted = settling_spend(3, 21, 3);
+        unrooted.root_digest = Some([9; 32]);
+        let header = settling_header(&[honest, double, unrooted], &[4]);
+
+        set_committed_credit_frame_for_thread(Some(1_001));
+        let before = make_state();
+        assert_eq!(settle(&header, 1_000, &before), 5);
+        for receipt in 1..=4 {
+            assert!(settlement_record_of(&before, receipt).is_some());
+        }
+
+        set_committed_credit_frame_for_thread(Some(1_000));
+        let after = make_state();
+        assert_eq!(settle(&header, 1_000, &after), 5, "only the honest spend");
+        assert_eq!(
+            settlement_record_of(&after, 1),
+            Some(create_record(&relay_entry(1)).unwrap()),
+            "an honest settlement is recorded exactly as before"
+        );
+        assert_eq!(
+            settlement_record_of(&after, 1),
+            settlement_record_of(&before, 1)
+        );
+        for receipt in 2..=4 {
+            assert!(
+                settlement_record_of(&after, receipt).is_none(),
+                "receipt {receipt} has no committed spend"
+            );
+        }
+        // The next header re-carries the window: nothing changes.
+        let mut next = header.clone();
+        next.frame_number = 41;
+        assert_eq!(settle(&next, 1_001, &after), 0);
+        for receipt in 2..=4 {
+            assert!(settlement_record_of(&after, receipt).is_none());
+        }
+        set_committed_credit_frame_for_thread(None);
+    }
+
+    /// A settlement relayed twice, or spent again under another operation
+    /// id, is recorded and credited once.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn a_duplicated_settlement_is_recorded_and_credited_once() {
+        use crate::token_intrinsic::settlement_record::set_committed_credit_frame_for_thread;
+        set_committed_credit_frame_for_thread(Some(1_000));
+        let state = make_state();
+        let spend = settling_spend(1, 20, 1);
+        let header = settling_header(&[spend.clone(), spend.clone()], &[]);
+        assert_eq!(settle(&header, 1_000, &state), 5);
+        let recorded = settlement_record_of(&state, 1).unwrap();
+        // Re-carried, and re-encoded under another operation id.
+        let mut next = settling_header(&[spend, settling_spend(2, 20, 1)], &[]);
+        next.frame_number = 41;
+        assert_eq!(settle(&next, 1_001, &state), 0);
+        assert_eq!(settlement_record_of(&state, 1), Some(recorded));
+        set_committed_credit_frame_for_thread(None);
     }
 
     #[test]
@@ -3647,5 +3787,79 @@ mod tests {
             super::super::handoff::record_session_rings(&state, 13, &id, &[0; 9]).is_err(),
             "a recorded snapshot is never replaced"
         );
+    }
+
+    /// A relayed settlement becomes a GLOBAL record only with the committed
+    /// spend that carries it: a spend the global commit rejects (a repeated
+    /// consumption, a root outside the application's history) and a
+    /// settlement no relayed spend carries leave no record. Runs at the
+    /// committed-credit frame, set the way a test network sets it; a build
+    /// without that rule ignores the setting.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn reproduces_unbacked_settlement_records() {
+        use crate::token_intrinsic::global_commit::{materialize_relay, SpendEntry};
+        use crate::token_intrinsic::{settlement_record, spend_relay};
+        const FRAME: u64 = 1 << 40;
+        std::env::set_var("QUIL_COMMITTED_CREDIT_FRAME", FRAME.to_string());
+        let spend = |tx: u8, image: u8, receipt: u8| SpendEntry {
+            kind: crate::token_engine::TYPE_LATTICE_SETTLEMENT,
+            tx_id: [tx; 32],
+            source_frame: 39,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[image; 32]],
+            outputs: Vec::new(),
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: Some(relay_entry(receipt)),
+        };
+        let honest = spend(1, 20, 1);
+        let repeated = spend(2, 20, 2);
+        let mut unrooted = spend(3, 21, 3);
+        unrooted.root_digest = Some([9; 32]);
+        let relayed: Vec<Vec<u8>> = [honest, repeated, unrooted]
+            .iter()
+            .map(|s| s.encode().unwrap())
+            .collect();
+        // Receipt 4 is relayed with no spend carrying it.
+        let settlements: Vec<_> = (1..=4).map(relay_entry).collect();
+        let mut header = fake_header(crate::domains::QUIL_TOKEN.to_vec(), 40);
+        header.settlements = settlement_record::encode_relay(&[(39, settlements)]).unwrap();
+        header.spends = spend_relay::encode_relay(&[(39, relayed)]).unwrap();
+
+        // GLOBAL's order for a certified QUIL shard header.
+        let state = make_state();
+        materialize_settlement_records(&header, FRAME, &state).unwrap();
+        let fees = materialize_relay(
+            &state,
+            FRAME,
+            &header.address,
+            header.frame_number,
+            &header.spends,
+        )
+        .unwrap();
+        assert_eq!(fees, 5, "only the first spend of the coin commits");
+
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let record = |receipt: u8| {
+            state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &[receipt; 32], &va_disc)
+                .unwrap()
+                .filter(|blob| !blob.is_empty())
+        };
+        assert_eq!(
+            record(1),
+            Some(settlement_record::create_record(&relay_entry(1)).unwrap()),
+            "the committed spend's settlement is recorded"
+        );
+        for receipt in 2..=4 {
+            assert!(
+                record(receipt).is_none(),
+                "settlement record written for a rejected or absent spend \
+                 (receipt {receipt}): claimable credit without a committed spend"
+            );
+        }
     }
 }

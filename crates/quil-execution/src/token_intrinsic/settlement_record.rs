@@ -3,9 +3,10 @@
 //!
 //! A settlement executes on the QUIL shard. Its entry rides the next certified
 //! QUIL shard frame header to the global materializer, which writes the record
-//! below into GLOBAL state. The destination application consumes it once, by a
-//! membership proof against a cited canonical global root. Record construction
-//! confers no authority on its own.
+//! below into GLOBAL state: from [`committed_credit_frame`] only when the
+//! global commit commits the settlement's spend. The destination application
+//! consumes it once, by a membership proof against a cited canonical global
+//! root. Record construction confers no authority on its own.
 #[cfg(feature = "confidential-tokens")]
 use quil_lattice_ct::confidential::{settlement::SettlementStatement, transfer::parameter_context};
 use quil_types::error::{QuilError, Result};
@@ -31,6 +32,65 @@ pub const MAX_RELAY_ENTRIES: usize = MAX_ENTRIES_PER_FRAME * RELAY_WINDOW_FRAMES
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("settlement record: {message}"))
+}
+
+/// From this GLOBAL frame the global commit credits only what it commits. A
+/// settlement record is written only by the commit of the spend that carries
+/// it (`global_commit::commit_entry`, in the same frame and changeset), so a
+/// relayed settlement whose spend is rejected, or never reaches the commit,
+/// records nothing; a header's settlement list is still checked but writes
+/// nothing. A mint claim's fee, paid and credited with the reward mint it
+/// claims, is not credited again when the claim commits. Before it, GLOBAL
+/// records every relayed settlement and credits both fees.
+///
+/// Changes GLOBAL state and reward credit: consensus-affecting for GLOBAL,
+/// and every archive and prover must run a build with it before the frame.
+/// Not scheduled on mainnet; `QUIL_COMMITTED_CREDIT_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_COMMITTED_CREDIT_FRAME: Option<u64> = Some(0);
+
+static COMMITTED_CREDIT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static COMMITTED_CREDIT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn committed_credit_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_COMMITTED_CREDIT_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's committed-credit frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_committed_credit_frame(network: u8) -> u64 {
+    *COMMITTED_CREDIT_FRAME.get_or_init(|| {
+        committed_credit_frame_for(
+            network,
+            std::env::var("QUIL_COMMITTED_CREDIT_FRAME").ok().as_deref(),
+        )
+    })
+}
+
+pub fn committed_credit_frame() -> u64 {
+    if let Some(frame) = COMMITTED_CREDIT_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *COMMITTED_CREDIT_FRAME.get_or_init(|| {
+        std::env::var("QUIL_COMMITTED_CREDIT_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the committed-credit frame for the calling thread only (tests).
+pub fn set_committed_credit_frame_for_thread(frame: Option<u64>) {
+    COMMITTED_CREDIT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 /// What the global materializer needs to write one settlement record.
@@ -320,6 +380,20 @@ pub fn verify_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_credit_is_unscheduled_on_mainnet_and_never_by_default() {
+        for setting in [None, Some("5"), Some("bad")] {
+            assert_eq!(
+                committed_credit_frame_for(0, setting),
+                MAINNET_COMMITTED_CREDIT_FRAME.unwrap_or(u64::MAX),
+                "no setting moves the mainnet frame"
+            );
+        }
+        assert_eq!(committed_credit_frame_for(1, None), u64::MAX);
+        assert_eq!(committed_credit_frame_for(1, Some("bad")), u64::MAX);
+        assert_eq!(committed_credit_frame_for(1, Some("230")), 230);
+    }
 
     fn entry_with(receipt: u8, settlement: u128) -> SettlementEntry {
         SettlementEntry {
