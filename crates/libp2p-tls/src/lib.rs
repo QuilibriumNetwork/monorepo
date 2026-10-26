@@ -32,7 +32,7 @@ mod verifier;
 
 use std::sync::Arc;
 
-use certificate::AlwaysResolvesCert;
+use certificate::FreshCertResolver;
 pub use futures_rustls::TlsStream;
 use libp2p_identity::{Keypair, PeerId};
 pub use upgrade::{Config, UpgradeError};
@@ -44,18 +44,13 @@ pub fn make_client_config(
     keypair: &Keypair,
     remote_peer_id: Option<PeerId>,
 ) -> Result<rustls::ClientConfig, certificate::GenError> {
-    let (certificate, private_key) = certificate::generate(keypair)?;
-
     let mut provider = rustls::crypto::ring::default_provider();
     provider.cipher_suites = verifier::CIPHERSUITES.to_vec();
     // Quilibrium: post-quantum, pure-NTRU QUIC key exchange. Offer ONLY
     // sntrup761 (non-hybrid) — the Rust-only network agrees on this group.
     provider.kx_groups = vec![sntrup761_kx::SNTRUP761];
 
-    let cert_resolver = Arc::new(
-        AlwaysResolvesCert::new(certificate, &private_key)
-            .expect("Client cert key DER is valid; qed"),
-    );
+    let cert_resolver = Arc::new(FreshCertResolver::new(keypair)?);
 
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
@@ -74,17 +69,12 @@ pub fn make_client_config(
 pub fn make_server_config(
     keypair: &Keypair,
 ) -> Result<rustls::ServerConfig, certificate::GenError> {
-    let (certificate, private_key) = certificate::generate(keypair)?;
-
     let mut provider = rustls::crypto::ring::default_provider();
     provider.cipher_suites = verifier::CIPHERSUITES.to_vec();
     // Quilibrium: post-quantum, pure-NTRU QUIC key exchange (see client config).
     provider.kx_groups = vec![sntrup761_kx::SNTRUP761];
 
-    let cert_resolver = Arc::new(
-        AlwaysResolvesCert::new(certificate, &private_key)
-            .expect("Server cert key DER is valid; qed"),
-    );
+    let cert_resolver = Arc::new(FreshCertResolver::new(keypair)?);
 
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(verifier::PROTOCOL_VERSIONS)
