@@ -427,6 +427,26 @@ impl PreparedMutations {
             ));
         }
     }
+
+    /// The size the removal tombstone of `id` in phase `phase` records,
+    /// staged in this batch, staged before it or committed (0 if none).
+    fn tombstone_size(
+        &self,
+        crdt: &HypergraphCrdt,
+        shard: &ShardKey,
+        phase: usize,
+        id: &[u8],
+    ) -> Result<u64> {
+        let key = &id[32..64];
+        if let Some(value) = self
+            .deltas
+            .get(&(shard.clone(), phase))
+            .and_then(|leaves| leaves.get(key))
+        {
+            return Ok(quil_forest::vertex_leaf_size(value) as u64);
+        }
+        crdt.staged_tombstone_size(shard, phase, key)
+    }
 }
 
 /// Own drained work until durable commit succeeds. On failure, restore older
@@ -597,10 +617,16 @@ pub struct HypergraphCrdt {
     /// `shard_count`. `total_size()` is Σ of all sizes (the prover shard 0xff is
     /// excluded — its registry/reward vertices aren't reward-bearing state).
     /// Maintained live in the mutation methods; the migrated baseline is seeded
-    /// once by [`warm_sizes`](Self::warm_sizes) at startup.
+    /// once by [`warm_sizes`](Self::warm_sizes) at startup. With exact sizes
+    /// ([`Self::activate_exact_sizes`]) `size` is the raw sum of committed
+    /// leaf sizes, adds minus removal tombstones, which may be negative;
+    /// readers count each bucket as at least zero.
     sub_meta: RwLock<HashMap<Vec<u8>, (u64, i128)>>,
     /// Set once `warm_sizes` has seeded the committed baseline.
     sizes_warmed: AtomicBool,
+    /// Sizes count every committed leaf exactly, from the exact state-size
+    /// epoch on ([`Self::activate_exact_sizes`]).
+    exact_sizes: AtomicBool,
     size_warm_lock: std::sync::Mutex<()>,
     /// Snapshot-generation registry for sync `expected_root` gating.
     snapshot_mgr: SnapshotManager,
@@ -638,6 +664,19 @@ pub struct AppForestStats {
     pub legacy_nonempty: Vec<(u32, u64)>,
     /// Sum of VertexAdds leaves across ALL 64 legacy per-prefix trees.
     pub legacy_total_vertex_adds: u64,
+}
+
+/// What [`HypergraphCrdt::activate_exact_sizes`] rebuilt.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactSizeRebuild {
+    /// Applications whose size buckets were rebuilt from committed state.
+    pub apps: usize,
+    /// Size buckets (shards holding data) of the committed state.
+    pub shards: usize,
+    /// Staged, uncommitted leaves recounted on top of committed state.
+    pub staged_leaves: usize,
+    /// Time the rebuild took.
+    pub elapsed: std::time::Duration,
 }
 
 impl HypergraphCrdt {
@@ -745,6 +784,7 @@ impl HypergraphCrdt {
             shard_metadata: RwLock::new(HashMap::new()),
             sub_meta: RwLock::new(HashMap::new()),
             sizes_warmed: AtomicBool::new(false),
+            exact_sizes: AtomicBool::new(false),
             size_warm_lock: std::sync::Mutex::new(()),
             snapshot_mgr: SnapshotManager::new(),
             local_vertex_observer: RwLock::new(None),
@@ -1406,6 +1446,9 @@ impl HypergraphCrdt {
             QuilError::ExecutionUnavailable("CRDT mutation/commit lock poisoned".into())
         })?;
         let mut prepared = PreparedMutations::default();
+        // From the exact state-size epoch a mutation counts the change in its
+        // leaf's committed size (see `activate_exact_sizes`).
+        let exact = self.exact_sizes();
         for mutation in mutations {
             let (location, data, adds_phase) = match mutation {
                 Mutation::AddVertex(location, data) => (location, Some(*data), 0),
@@ -1430,13 +1473,21 @@ impl HypergraphCrdt {
                     }
                     false
                 };
+                // An overwrite replaces its leaf: only the size change counts.
+                let replaced = if exact {
+                    prepared
+                        .read(self, &shard, adds_phase, &id)?
+                        .map_or(0, |blob| blob.len())
+                } else {
+                    0
+                };
                 prepared.stage(&shard, adds_phase, &id, data, None)?;
                 prepared.bump(
                     self,
                     &shard,
                     location,
                     i64::from(new_vertex),
-                    data.len() as i128,
+                    data.len() as i128 - replaced as i128,
                 );
             } else {
                 let existing = prepared.read(self, &shard, adds_phase, &id)?;
@@ -1444,13 +1495,26 @@ impl HypergraphCrdt {
                 let size = existing.as_ref().map_or(0, |blob| blob.len());
                 let present = size != 0 && !removed;
                 let placeholder = existing.is_none();
+                // A repeated removal restamps its tombstone with the current
+                // add size, so exact sizes count the tombstone's change.
+                let replaced = if exact && removed {
+                    prepared.tombstone_size(self, &shard, adds_phase + 1, &id)?
+                } else {
+                    0
+                };
                 if placeholder {
                     prepared.stage(&shard, adds_phase, &id, &[], None)?;
                 }
                 prepared.stage(&shard, adds_phase + 1, &id, &[], Some(size as u64))?;
                 // Vertex placeholders enter the raw adds count. Hyperedges
                 // contribute only live size. Repeated removes keep original size.
-                if present || (adds_phase == 0 && placeholder) {
+                if exact {
+                    let change = replaced as i128 - size as i128;
+                    let placeholders = i64::from(adds_phase == 0 && placeholder);
+                    if change != 0 || placeholders != 0 {
+                        prepared.bump(self, &shard, location, placeholders, change);
+                    }
+                } else if present || (adds_phase == 0 && placeholder) {
                     prepared.bump(
                         self,
                         &shard,
@@ -2119,12 +2183,15 @@ impl HypergraphCrdt {
     }
 
     pub fn total_size(&self) -> BigInt {
+        // Exact buckets are raw sums; each counts as at least zero, as the
+        // clamped rebuilds before the exact state-size epoch did.
+        let exact = self.exact_sizes();
         let sum: i128 = self
             .sub_meta
             .read()
             .unwrap()
             .values()
-            .map(|(_, s)| *s)
+            .map(|(_, s)| if exact { (*s).max(0) } else { *s })
             .sum();
         BigInt::from(sum.max(0))
     }
@@ -2159,6 +2226,7 @@ impl HypergraphCrdt {
                         .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
                 }
             });
+        let exact = self.exact_sizes();
         let m = self.sub_meta.read().unwrap();
         prefixes
             .iter()
@@ -2170,6 +2238,7 @@ impl HypergraphCrdt {
                     .unwrap_or(false)
             })
             .filter_map(|(_, p)| m.get(&Forest::addr_path_shard_id(app, p)).copied())
+            .map(|(count, size)| (count, if exact { size.max(0) } else { size }))
             .fold((0u64, 0i128), |(c, s), (pc, ps)| (c + pc, s + ps))
     }
 
@@ -2312,10 +2381,17 @@ impl HypergraphCrdt {
         // in-memory buckets if a `rebucket_app` this boot already re-keyed them to
         // the current prefixes (the `refresh_crdt_shard_prefixes` path), re-persist,
         // and skip the rescan; otherwise fall through to a fresh scan that re-keys.
-        let blob = {
+        let (blob, exact) = {
             let read_txn = self.store.new_transaction(false)?;
-            read_txn.get(SIZE_BUCKETS_KEY)?
+            (
+                read_txn.get(SIZE_BUCKETS_KEY)?,
+                read_txn.get(SIZE_EXACT_KEY)?.as_deref() == Some(SIZE_EXACT_VERSION),
+            )
         };
+        // Buckets persisted since the exact-size rebuild count exactly.
+        if exact {
+            self.exact_sizes.store(true, Ordering::Release);
+        }
         if let Some(blob) = blob {
             let restored = deserialize_buckets(&blob);
             if self.buckets_match_current_prefixes(apps, &restored) {
@@ -2476,6 +2552,19 @@ impl HypergraphCrdt {
         app: &[u8; 32],
         buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
     ) -> Result<()> {
+        self.scan_app_buckets_with(app, buckets, self.exact_sizes())
+    }
+
+    /// [`Self::scan_app_buckets`] by the legacy or the `exact` rule. Exact
+    /// sizes count every add leaf and subtract what each removal tombstone
+    /// records, leaf by leaf what the forest's size index sums, so a removed
+    /// vertex added again counts the same in both.
+    fn scan_app_buckets_with(
+        &self,
+        app: &[u8; 32],
+        buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
+        exact: bool,
+    ) -> Result<()> {
         if *app == [0xFFu8; 32] {
             return Ok(()); // prover shard excluded from world size
         }
@@ -2519,7 +2608,7 @@ impl HypergraphCrdt {
             .for_each_vertex_underlying("vertex", "adds", &shard_key, &mut |vk, blob| {
                 let e = buckets.entry(route(&vk)).or_insert((0, 0));
                 e.0 += 1;
-                if !blob.is_empty() && !v_removed.contains(&vk) {
+                if !blob.is_empty() && (exact || !v_removed.contains(&vk)) {
                     e.1 += blob.len() as i128;
                 }
             })?;
@@ -2529,11 +2618,32 @@ impl HypergraphCrdt {
             "adds",
             &shard_key,
             &mut |vk, blob| {
-                if !blob.is_empty() && !he_removed.contains(&vk) {
+                if !blob.is_empty() && (exact || !he_removed.contains(&vk)) {
                     buckets.entry(route(&vk)).or_insert((0, 0)).1 += blob.len() as i128;
                 }
             },
         )?;
+        if exact {
+            let forest = self.forest.read().map_err(|_| {
+                QuilError::ExecutionUnavailable("size accounting forest lock poisoned".into())
+            })?;
+            for (phase_idx, removed) in [(1, &v_removed), (3, &he_removed)] {
+                for vk in removed {
+                    let data: &[u8] = if vk.len() >= 64 {
+                        &vk[32..64]
+                    } else {
+                        vk.as_slice()
+                    };
+                    let size = self
+                        .committed_leaf_size(&forest, app, phase_idx, data)?
+                        .unwrap_or(0);
+                    if size != 0 {
+                        let e = buckets.entry(route(vk.as_slice())).or_insert((0, 0));
+                        e.1 -= i128::from(size);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2580,11 +2690,23 @@ impl HypergraphCrdt {
         app: &[u8; 32],
         buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
     ) -> Result<()> {
+        self.forest_app_buckets_with(app, buckets, self.exact_sizes())
+    }
+
+    /// [`Self::forest_app_buckets`] by the legacy or the `exact` rule: exact
+    /// buckets keep each shard's raw sum, which readers clamp at zero, so a
+    /// later mutation's change adds to it as it adds to the forest.
+    fn forest_app_buckets_with(
+        &self,
+        app: &[u8; 32],
+        buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
+        exact: bool,
+    ) -> Result<()> {
         if *app == [0xFFu8; 32] {
             return Ok(()); // prover shard excluded from world size
         }
         if !self.unified_tree() {
-            return self.scan_app_buckets(app, buckets);
+            return self.scan_app_buckets_with(app, buckets, exact);
         }
         let prefixes = self.app_prefixes(app);
         let single = prefixes.len() == 1 && prefixes[0].is_empty();
@@ -2611,6 +2733,8 @@ impl HypergraphCrdt {
         }
         let read_error =
             |e| QuilError::ExecutionUnavailable(format!("size accounting forest read: {e}"));
+        // Exact buckets keep the raw sum; legacy ones clamp each shard at zero.
+        let floor = if exact { i128::MIN } else { 0 };
         let empty_bits: Vec<bool> = Vec::new();
         for (i, prefix) in prefixes.iter().enumerate() {
             let bits: &[bool] = if single { &empty_bits } else { &bit_paths[i] };
@@ -2646,7 +2770,7 @@ impl HypergraphCrdt {
                 .and_then(|v| v.checked_add(ha))
                 .and_then(|v| v.checked_sub(hr))
                 .ok_or_else(|| QuilError::ExecutionUnavailable("size accounting overflow".into()))?
-                .max(0);
+                .max(floor);
             // Match `scan_app_buckets`, which only creates a bucket for a shard a
             // leaf actually routes to — never an empty `(0, 0)` placeholder.
             if count == 0 && size == 0 {
@@ -2748,6 +2872,148 @@ impl HypergraphCrdt {
         }
         self.layout_rebuilds.write().unwrap().remove(app);
         Ok(())
+    }
+
+    /// Whether sizes count every committed leaf exactly (see
+    /// [`Self::activate_exact_sizes`]).
+    pub fn exact_sizes(&self) -> bool {
+        self.exact_sizes.load(Ordering::Acquire)
+    }
+
+    /// Switch to exact size accounting, before the first GLOBAL frame of the
+    /// exact state-size epoch executes. Rebuilds every application's size
+    /// buckets from the committed leaf sizes the forest's size index sums:
+    /// per shard `(vertex adds − vertex removes) + (hyperedge adds −
+    /// hyperedge removes)`, unclamped, and the vertex adds leaf count. Staged
+    /// mutations count as each staged leaf's size against its committed
+    /// leaf. The committed buckets persist with a marker, so a restart keeps
+    /// the rule ([`Self::warm_sizes`]). From then on a mutation counts the
+    /// change in its leaf's size, so the incremental buckets, a rebuild and
+    /// the leaf scan agree on every node whatever its restart or sync
+    /// history. `apps` adds to the applications this CRDT knows of; the
+    /// global prover tree stays excluded. Cost per unified application:
+    /// O(shards × depth) reads of the size index (a full leaf scan off the
+    /// unified tree), plus one leaf read per staged leaf. `None` once active.
+    pub fn activate_exact_sizes(&self, apps: &[[u8; 32]]) -> Result<Option<ExactSizeRebuild>> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("exact size commit lock poisoned".into())
+        })?;
+        if self.exact_sizes() {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let mut all: std::collections::BTreeSet<[u8; 32]> = apps.iter().copied().collect();
+        all.extend(self.app_shard_prefixes.read().unwrap().keys().copied());
+        all.extend(
+            self.sub_meta
+                .read()
+                .unwrap()
+                .keys()
+                .filter_map(|key| <[u8; 32]>::try_from(key.get(..32)?).ok()),
+        );
+        all.remove(&[0xFFu8; 32]);
+        let mut buckets: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+        for app in &all {
+            self.forest_app_buckets_with(app, &mut buckets, true)?;
+        }
+        let shards = buckets.len();
+        let txn = self.store.new_transaction(false)?;
+        txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
+        txn.set(SIZE_EXACT_KEY, SIZE_EXACT_VERSION)?;
+        txn.commit()?;
+        // Staged leaves persist with the next commit's buckets.
+        let staged: Vec<(ShardKey, usize, Vec<u8>, Vec<u8>)> = self
+            .pending
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|((shard, _), _)| shard.l2 != [0xFFu8; 32])
+            .flat_map(|((shard, phase_idx), leaves)| {
+                leaves.iter().map(move |(key, value)| {
+                    (shard.clone(), *phase_idx, key.clone(), value.clone())
+                })
+            })
+            .collect();
+        if !staged.is_empty() {
+            let forest = self.forest.read().map_err(|_| {
+                QuilError::ExecutionUnavailable("size accounting forest lock poisoned".into())
+            })?;
+            for (shard, phase_idx, key, value) in &staged {
+                let committed = self.committed_leaf_size(&forest, &shard.l2, *phase_idx, key)?;
+                let change = quil_forest::vertex_leaf_size(value) as i128
+                    - i128::from(committed.unwrap_or(0));
+                let entry = buckets
+                    .entry(self.sub_shard_id_for(&shard.l2, key))
+                    .or_insert((0, 0));
+                if *phase_idx == 0 && committed.is_none() {
+                    entry.0 += 1;
+                }
+                entry.1 += if *phase_idx % 2 == 0 { change } else { -change };
+            }
+        }
+        *self.sub_meta.write().unwrap() = buckets;
+        self.layout_rebuilds
+            .write()
+            .unwrap()
+            .retain(|app| !all.contains(app));
+        self.exact_sizes.store(true, Ordering::Release);
+        Ok(Some(ExactSizeRebuild {
+            apps: all.len(),
+            shards,
+            staged_leaves: staged.len(),
+            elapsed: started.elapsed(),
+        }))
+    }
+
+    /// The size `app`'s committed leaf for `data` records in phase
+    /// `phase_idx`, or `None` without such a leaf: one term of the size index
+    /// [`Self::forest_app_buckets`] sums.
+    fn committed_leaf_size(
+        &self,
+        forest: &Forest,
+        app: &[u8; 32],
+        phase_idx: usize,
+        data: &[u8],
+    ) -> Result<Option<u64>> {
+        let tree = if self.unified_tree() {
+            app.to_vec()
+        } else {
+            self.sub_shard_id_for(app, data)
+        };
+        let version = self
+            .resolve_phase_version_checked(forest, &tree, phase_idx)?
+            .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
+        let value = forest
+            .serve_value(
+                &tree,
+                PHASES[phase_idx],
+                version,
+                quil_forest::shard_path_key_hash(data).0,
+            )
+            .map_err(|e| {
+                QuilError::ExecutionUnavailable(format!("size accounting leaf read: {e}"))
+            })?;
+        Ok(value.map(|value| quil_forest::vertex_leaf_size(&value) as u64))
+    }
+
+    /// The size the staged or committed removal tombstone at data address
+    /// `key` records in phase `phase` (0 if there is none).
+    fn staged_tombstone_size(&self, shard: &ShardKey, phase: usize, key: &[u8]) -> Result<u64> {
+        if let Some(value) = self
+            .pending
+            .read()
+            .unwrap()
+            .get(&(shard.clone(), phase))
+            .and_then(|leaves| leaves.get(key))
+        {
+            return Ok(quil_forest::vertex_leaf_size(value) as u64);
+        }
+        let forest = self.forest.read().map_err(|_| {
+            QuilError::ExecutionUnavailable("size accounting forest lock poisoned".into())
+        })?;
+        Ok(self
+            .committed_leaf_size(&forest, &shard.l2, phase, key)?
+            .unwrap_or(0))
     }
 
     pub fn shard_metadata_for_address(&self, filter: &[u8]) -> Option<ShardMetadata> {
@@ -5646,6 +5912,11 @@ const SIZE_BUCKETS_KEY: &[u8] = b"hgsz:buckets";
 /// pre-existing tree ([`HypergraphCrdt::warm_size_index`]). Present ⇒ the index
 /// is warm and kept so by write-time maintenance; absent ⇒ backfill on boot.
 const SIZE_INDEX_SEEDED_KEY: &[u8] = b"hgsz:seeded";
+/// Marker: sizes count every committed leaf exactly
+/// ([`HypergraphCrdt::activate_exact_sizes`]), and the persisted buckets do.
+/// Its value is the rule's version; another value or none rebuilds.
+const SIZE_EXACT_KEY: &[u8] = b"hgsz:exact";
+const SIZE_EXACT_VERSION: &[u8] = b"1";
 
 /// `[count u32][ (klen u32)(shard_id)(count u64)(size i128) ]*` — the persisted
 /// per-sub-shard `(raw_count, live_size)` map. Small (one entry per sub-shard).
@@ -5967,6 +6238,133 @@ mod size_index_tests {
             "forest vs scan must agree under removes (spent, double-remove, \
              never-added, removed hyperedge)\nforest={forest:?}\nscan={scan:?}"
         );
+    }
+
+    /// Buckets holding nothing: incremental counting may keep one where a
+    /// rebuild creates none.
+    fn nonzero(buckets: &HashMap<Vec<u8>, (u64, i128)>) -> HashMap<Vec<u8>, (u64, i128)> {
+        buckets
+            .iter()
+            .filter(|(_, value)| **value != (0, 0))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+
+    /// Exact sizes count every mutation as the change in its leaf's size, so
+    /// the incremental buckets equal the size index's rebuild and the leaf
+    /// scan through overwrites, a removed vertex added again (larger, and
+    /// smaller so that its shard's raw sum turns negative), a removal repeated
+    /// after such an add, an add after a removal of a never-added vertex, and
+    /// hyperedge overwrites and removals.
+    #[test]
+    fn exact_sizes_match_forest_and_scan_through_overwrites_and_readds() {
+        let app = [9u8; 32];
+        let c = crdt();
+        c.set_unified_tree(true);
+        c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
+        assert!(c.activate_exact_sizes(&[app]).unwrap().is_some());
+        assert!(c.activate_exact_sizes(&[app]).unwrap().is_none(), "once");
+        // Shard `[0]`: a coin overwritten larger, then smaller.
+        let coin = at(app, 0x00, 0x01, 0x01);
+        c.add_vertex(&coin, b"coin-aaaa").unwrap();
+        c.commit(1).unwrap();
+        c.add_vertex(&coin, b"coin-aaaa-grown").unwrap();
+        c.add_vertex(&coin, b"coin").unwrap();
+        // Removed, added again larger, removed again after a commit.
+        let spent = at(app, 0x00, 0x02, 0x02);
+        c.add_vertex(&spent, b"spent").unwrap();
+        c.remove_vertex(&spent).unwrap();
+        c.add_vertex(&spent, b"spent-again-larger").unwrap();
+        c.commit(2).unwrap();
+        c.remove_vertex(&spent).unwrap();
+        // Removed before any add, then added.
+        let early = at(app, 0x00, 0x03, 0x03);
+        c.remove_vertex(&early).unwrap();
+        c.add_vertex(&early, b"added-after-removal").unwrap();
+        // Hyperedges: an overwrite, and an add after a removal (ignored).
+        let edge = at(app, 0x00, 0x05, 0x05);
+        c.add_hyperedge(&edge, b"edge").unwrap();
+        c.add_hyperedge(&edge, b"edge-rewritten").unwrap();
+        let dead = at(app, 0x00, 0x04, 0x04);
+        c.add_hyperedge(&dead, b"dead-edge").unwrap();
+        c.remove_hyperedge(&dead).unwrap();
+        c.add_hyperedge(&dead, b"dead-edge-again").unwrap();
+        // Shard `[1]` (the binary grid's top address bit set): a removed
+        // vertex added again smaller.
+        let shrunk = at(app, 0x80, 0x01, 0x01);
+        c.add_vertex(&shrunk, b"a-long-original-value").unwrap();
+        c.commit(3).unwrap();
+        c.remove_vertex(&shrunk).unwrap();
+        c.add_vertex(&shrunk, b"x").unwrap();
+        c.add_vertex(&at(app, 0x80, 0x02, 0x02), b"coin-b").unwrap();
+        c.commit(4).unwrap();
+
+        let incremental = nonzero(&c.sub_meta.read().unwrap());
+        let mut forest = HashMap::new();
+        c.forest_app_buckets(&app, &mut forest).unwrap();
+        let mut scan = HashMap::new();
+        c.scan_app_buckets(&app, &mut scan).unwrap();
+        let expected: HashMap<Vec<u8>, (u64, i128)> = [
+            (Forest::addr_path_shard_id(&app, &[0]), (3, 4 + 19 + 14)),
+            (Forest::addr_path_shard_id(&app, &[1]), (2, 1 - 21 + 6)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(incremental, expected, "incremental buckets");
+        assert_eq!(nonzero(&forest), expected, "size index rebuild");
+        assert_eq!(nonzero(&scan), expected, "leaf scan");
+        assert_eq!(
+            c.total_size(),
+            BigInt::from(37),
+            "a negative shard counts 0"
+        );
+    }
+
+    /// Switching with mutations staged under the legacy rule recounts them,
+    /// persists only the committed buckets, and a CRDT opened later over the
+    /// same store keeps the rule.
+    #[test]
+    fn exact_sizes_recount_staged_mutations_and_persist_the_rule() {
+        let store = Arc::new(MemStore::new());
+        let c = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        let app = [10u8; 32];
+        let coin = at(app, 0x00, 0x01, 0x01);
+        c.add_vertex(&coin, b"original").unwrap();
+        c.commit(1).unwrap();
+        c.add_vertex(&coin, b"rewritten-value").unwrap();
+        assert_eq!(c.total_size(), BigInt::from(23), "legacy rule");
+        let rebuild = c.activate_exact_sizes(&[app]).unwrap().unwrap();
+        assert_eq!(
+            (rebuild.apps, rebuild.shards, rebuild.staged_leaves),
+            (1, 1, 1)
+        );
+        assert_eq!(c.total_size(), BigInt::from(15));
+        let key = Forest::addr_path_shard_id(&app, &[]);
+        assert_eq!(c.persisted_size_bucket(&key), Some((1, 8)), "committed");
+        c.commit(2).unwrap();
+        assert_eq!(c.persisted_size_bucket(&key), Some((1, 15)));
+        let reopened = HypergraphCrdt::new(store, Arc::new(StubProver));
+        assert!(!reopened.exact_sizes());
+        reopened.warm_sizes(&[app]).unwrap();
+        assert!(reopened.exact_sizes(), "the marker keeps the rule");
+        assert_eq!(reopened.total_size(), BigInt::from(15));
+        reopened.add_vertex(&coin, b"short").unwrap();
+        assert_eq!(reopened.total_size(), BigInt::from(5));
+    }
+
+    /// Before the switch the legacy rule stands: an overwrite and an add
+    /// after a removal each count their full size.
+    #[test]
+    fn legacy_sizes_are_unchanged_before_the_switch() {
+        let c = crdt();
+        let coin = at([11u8; 32], 0x00, 0x01, 0x01);
+        c.add_vertex(&coin, b"original").unwrap();
+        c.add_vertex(&coin, b"replaced").unwrap();
+        assert_eq!(c.total_size(), BigInt::from(16));
+        c.remove_vertex(&coin).unwrap();
+        assert_eq!(c.total_size(), BigInt::from(8));
+        c.add_vertex(&coin, b"again").unwrap();
+        assert_eq!(c.total_size(), BigInt::from(13));
     }
 }
 

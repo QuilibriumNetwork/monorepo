@@ -1004,6 +1004,90 @@ pub fn set_vertex_value_binding_epoch_for_thread(epoch: Option<u64>) {
     VERTEX_VALUE_BINDING_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a state size counts every committed leaf exactly
+/// as the forest's size index sums it: an overwrite counts the change in
+/// its leaf's size, and a removal subtracts the size its tombstone
+/// records. Before it a node added an overwrite's full size, so nodes with
+/// different restart and sync histories disagreed on the world size and
+/// the reward basis. Every node rebuilds its sizes from its committed
+/// state trees before it executes the epoch's first GLOBAL frame.
+/// Consensus-affecting: every archive and prover must run a build with it
+/// before then. `QUIL_EXACT_STATE_SIZE_EPOCH` elsewhere, never by default.
+pub const MAINNET_EXACT_STATE_SIZE_EPOCH: Option<u64> = Some(1311);
+
+static EXACT_STATE_SIZE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static EXACT_STATE_SIZE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn exact_state_size_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_EXACT_STATE_SIZE_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's exact state-size epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_exact_state_size_epoch(network: u8) -> u64 {
+    *EXACT_STATE_SIZE_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_EXACT_STATE_SIZE_EPOCH").ok();
+        exact_state_size_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_exact_state_size_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX`: never.
+pub fn exact_state_size_epoch() -> u64 {
+    if let Some(epoch) = EXACT_STATE_SIZE_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *EXACT_STATE_SIZE_EPOCH.get_or_init(|| exact_state_size_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` executes with exact state sizes.
+pub fn exact_state_size_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= exact_state_size_epoch()
+}
+
+/// Set the exact state-size epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_exact_state_size_epoch_for_thread(epoch: Option<u64>) {
+    EXACT_STATE_SIZE_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod exact_state_size_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_exact_state_size_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::exact_state_size_epoch_for(0, setting), 1311);
+        }
+        assert_eq!(super::exact_state_size_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::exact_state_size_epoch_for(1, Some("x")), u64::MAX);
+        assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet's rule starts at GLOBAL frame 943,920, with the other gates
+    /// of the release; a thread override moves or disables it.
+    #[test]
+    fn exact_state_sizes_begin_at_the_first_frame_of_the_epoch() {
+        let epoch = super::MAINNET_EXACT_STATE_SIZE_EPOCH.unwrap();
+        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 943_920);
+        super::set_exact_state_size_epoch_for_thread(Some(3));
+        assert!(!super::exact_state_size_active(0));
+        assert!(super::exact_state_size_active(1_000_000));
+        super::set_exact_state_size_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::exact_state_size_active(u64::MAX));
+        super::set_exact_state_size_epoch_for_thread(None);
+    }
+}
+
 /// The effective state of an allocation at a given frame, with the
 /// 720-frame grace window applied. Prefer this over reading
 /// `alloc.status` directly anywhere the protocol's implicit

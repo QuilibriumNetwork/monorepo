@@ -690,6 +690,40 @@ impl ExecutionEngineManager {
         Ok(())
     }
 
+    /// Call before GLOBAL frame `frame_number` executes. From the exact
+    /// state-size epoch sizes count every committed leaf exactly: the first
+    /// such frame rebuilds them once from the committed state trees
+    /// ([`quil_hypergraph::HypergraphCrdt::activate_exact_sizes`]), so every
+    /// node counts the world size and the reward basis alike whatever its
+    /// restart or sync history. A no-op before the epoch and once active.
+    pub fn prepare_exact_state_sizes(&self, frame_number: u64) -> Result<()> {
+        if self.crdt.exact_sizes() || !quil_types::consensus::exact_state_size_active(frame_number)
+        {
+            return Ok(());
+        }
+        let mut apps: Vec<[u8; 32]> = Vec::new();
+        if let Some(shards) = &self.shards_store {
+            apps.extend(
+                shards
+                    .range_app_shards()?
+                    .iter()
+                    .filter(|shard| shard.shard_key.len() == 35)
+                    .filter_map(|shard| <[u8; 32]>::try_from(&shard.shard_key[3..]).ok()),
+            );
+        }
+        if let Some(rebuild) = self.crdt.activate_exact_sizes(&apps)? {
+            tracing::info!(
+                frame = frame_number,
+                apps = rebuild.apps,
+                shards = rebuild.shards,
+                staged_leaves = rebuild.staged_leaves,
+                ms = rebuild.elapsed.as_millis() as u64,
+                "exact state sizes: rebuilt every application's sizes from the committed leaf sizes; world size and reward basis follow them from this frame"
+            );
+        }
+        Ok(())
+    }
+
     /// Atomically publish application state and its full-filter cursor.
     pub fn commit_frame_with_app_cursor(&self, frame_number: u64, filter: &[u8]) -> Result<()> {
         let key = quil_store::encoding::consensus_materialized_cursor_key(filter);
@@ -1903,6 +1937,36 @@ mod tests {
             hg_resolver,
             include_global,
         )
+    }
+
+    /// GLOBAL execution switches to exact state sizes before the first frame
+    /// of their epoch, rebuilding the sizes once: an overwrite counted in
+    /// full before it is corrected, a frame below it keeps the legacy rule,
+    /// and later overwrites count only their size change.
+    #[test]
+    fn exact_state_sizes_rebuild_before_the_first_frame_of_their_epoch() {
+        quil_types::consensus::set_exact_state_size_epoch_for_thread(Some(2));
+        let first = 2 * quil_types::consensus::epoch_length_frames();
+        let manager = build_manager(true);
+        let crdt = manager.crdt();
+        let vertex = quil_hypergraph::Location {
+            app_address: [0x42; 32],
+            data_address: [0x07; 32],
+        };
+        crdt.add_vertex(&vertex, b"original").unwrap();
+        crdt.add_vertex(&vertex, b"replaced").unwrap();
+        manager.commit_frame(first - 2).unwrap();
+        manager.prepare_exact_state_sizes(first - 1).unwrap();
+        assert!(!crdt.exact_sizes(), "below the epoch");
+        assert_eq!(crdt.total_size(), BigInt::from(16), "legacy rule");
+        manager.prepare_exact_state_sizes(first).unwrap();
+        assert!(crdt.exact_sizes());
+        assert_eq!(crdt.total_size(), BigInt::from(8), "rebuilt from the leaf");
+        crdt.add_vertex(&vertex, b"twelve bytes").unwrap();
+        assert_eq!(crdt.total_size(), BigInt::from(12));
+        manager.prepare_exact_state_sizes(first + 1).unwrap();
+        assert_eq!(crdt.total_size(), BigInt::from(12), "rebuilds once");
+        quil_types::consensus::set_exact_state_size_epoch_for_thread(None);
     }
 
     #[cfg(feature = "confidential-tokens")]

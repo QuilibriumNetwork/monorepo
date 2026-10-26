@@ -503,6 +503,12 @@ impl FrameMaterializer {
             });
         }
 
+        // From the exact state-size epoch every node counts sizes from its
+        // committed leaves; the epoch's first frame rebuilds them before it
+        // executes (a no-op otherwise).
+        self.execution_manager
+            .prepare_exact_state_sizes(frame_number)?;
+
         // Time the full materialization (verify + apply + commit) — records on
         // every real exit path (success or `?`-error) below the idempotency
         // skip. RAII so we don't have to thread the record call through each

@@ -59,6 +59,13 @@ pub(crate) fn initialize(network: u8) {
              QUIL_SENIORITY_SUCCESSION_EPOCH too to start them earlier (localnet only)"
         );
     }
+    let exact_size_epoch = quil_types::consensus::init_exact_state_size_epoch(network);
+    if network != 0 && exact_size_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = exact_size_epoch,
+            "QUIL_EXACT_STATE_SIZE_EPOCH override active (localnet only)"
+        );
+    }
 
     let kick_epoch = quil_types::consensus::init_kick_signed_slot_epoch(network);
     if network != 0 && kick_epoch != u64::MAX {

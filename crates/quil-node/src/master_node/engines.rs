@@ -241,6 +241,41 @@ pub(crate) fn init_engines(
             "seeded per-sub-shard live-size baseline"
         );
     }
+    // From the exact state-size epoch sizes count every committed leaf
+    // exactly. `warm_sizes` keeps the rule on a store already switched; a
+    // node resuming at or past the epoch without it rebuilds here, before it
+    // executes a frame (GLOBAL execution checks again before each frame).
+    let next_frame = crdt
+        .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+        .map(|cursor| cursor.saturating_add(1));
+    match next_frame {
+        Ok(frame) if quil_types::consensus::exact_state_size_active(frame) => {
+            match crdt.activate_exact_sizes(&committed_apps) {
+                Ok(Some(rebuild)) => info!(
+                    frame,
+                    apps = rebuild.apps,
+                    shards = rebuild.shards,
+                    ms = rebuild.elapsed.as_millis() as u64,
+                    "exact state sizes: rebuilt every application's sizes from the committed leaf sizes at boot"
+                ),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        frame,
+                        "exact state sizes: boot rebuild failed; GLOBAL execution retries it before the frame runs"
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "exact state sizes: could not read the GLOBAL cursor at boot; GLOBAL execution checks before each frame"
+            );
+        }
+    }
     // Eagerly run one commit at startup so the per-shard tree blob
     // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
     // before any sync probe arrives. Without an eager commit the
