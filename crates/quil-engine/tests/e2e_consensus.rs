@@ -2166,8 +2166,9 @@ async fn tier2_storage_audit_evicts_cheating_member() {
     let prover = TestProver::generate();
     let filter: Vec<u8> = vec![0x46; 32];
 
-    // One opening for `prover`, at the current epoch, but with NO matching
-    // leaf-root registration on chain → the audit's registry cross-check fails.
+    // The openings for `prover`'s leaf (one per query, as a producer attaches
+    // them), at the current epoch, but with NO matching leaf-root
+    // registration on chain → the audit's registry cross-check fails.
     let opening = quil_types::proto::global::StorageOpening {
         shard_id: vec![0x07u8; 32],
         epoch: quil_types::consensus::epoch_for_frame(1000),
@@ -2179,11 +2180,42 @@ async fn tier2_storage_audit_evicts_cheating_member() {
         path_proofs: vec![],
         commitment: vec![0u8; 666],
         value: vec![0u8; 32],
-        proof: vec![0u8; 666],
+        // A valid G1 point, so the opening aggregates to a root the header can
+        // certify: GLOBAL audits only a body its header certifies.
+        proof:
+            <quil_crypto::KzgInclusionProver as quil_types::crypto::InclusionProver>::commit_raw(
+                &quil_crypto::KzgInclusionProver,
+                &[0x47u8; 64],
+                16,
+            )
+            .expect("G1 point"),
     };
     let att = quil_types::proto::global::StorageAttestation {
-        openings: vec![opening],
+        openings: (0..quil_types::consensus::STORAGE_QUERIES_PER_LEAF)
+            .map(|query| quil_types::proto::global::StorageOpening {
+                query,
+                ..opening.clone()
+            })
+            .collect(),
     };
+    // The archive recomputes the output against anchored global frame 1000,
+    // seeded into its clock store below with this output.
+    let anchor_output = vec![0x42u8; 516];
+    // Certify the body as its producer does (empty bitmask, ρ_N of the anchor).
+    let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+        &att.openings
+            .iter()
+            .map(quil_crypto::porep::StorageOpening::from_proto)
+            .collect::<Vec<_>>(),
+        5,
+        &quil_crypto::porep::derive_storage_beacon(1000, &anchor_output),
+        &[],
+        quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+    );
+    assert!(
+        !storage_attestation_root.is_empty(),
+        "the openings must aggregate to a root"
+    );
 
     // Reward proof anchored to a real global frame (gfn=1000 → storage active),
     // signed by the single-member committee (this prover). `output=[0;516]` is
@@ -2203,7 +2235,7 @@ async fn tier2_storage_audit_evicts_cheating_member() {
         public_key_signature_bls48581: single_signer_agg_sig(&prover.bls_pubkey)
             .to_canonical_bytes()
             .expect("agg sig"),
-        storage_attestation_root: vec![0u8; 666],
+        storage_attestation_root,
         global_frame_number: 1000,
         storage_attestation: prost::Message::encode_to_vec(&att),
         fee_total: Vec::new(),
@@ -2211,9 +2243,6 @@ async fn tier2_storage_audit_evicts_cheating_member() {
         accumulator: Vec::new(),
         spends: Vec::new(),
     };
-    // The archive recomputes the output against anchored global frame 1000,
-    // seeded into its clock store below with this output.
-    let anchor_output = vec![0x42u8; 516];
     stamp_anchored_app_frame_output(&mut reward, &anchor_output);
     let header_bytes = reward.to_canonical_bytes().expect("encode reward proof");
     let bundle = {

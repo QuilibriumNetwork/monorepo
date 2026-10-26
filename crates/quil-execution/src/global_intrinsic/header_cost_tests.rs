@@ -288,18 +288,33 @@ fn measure_global_frame_header_cost() {
         .into_par_iter()
         .map(|h| {
             let leaf_id = crate::global_intrinsic::leaf_id_bytes(&shard_filter(h), &[]);
-            let openings: Vec<quil_types::proto::global::StorageOpening> = seats[h]
+            let openings: Vec<quil_crypto::porep::StorageOpening> = seats[h]
                 .iter()
                 .flat_map(|s| (0..queries).map(move |q| (s, q)))
                 .map(|(s, q)| {
                     quil_crypto::porep::build_storage_opening(
                         &replica, &leaf, &leaf_id, epoch, &s.address, q, &rho_n, poly_size,
                     )
-                    .to_proto()
                 })
                 .collect();
-            let attestation = quil_types::proto::global::StorageAttestation { openings };
-            header(h, prost::Message::encode_to_vec(&attestation))
+            // Certified as its producer certifies it, so GLOBAL audits it.
+            let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+                &openings,
+                5,
+                &rho_n,
+                &[],
+                poly_size,
+            );
+            let attestation = quil_types::proto::global::StorageAttestation {
+                openings: openings
+                    .iter()
+                    .map(quil_crypto::porep::StorageOpening::to_proto)
+                    .collect(),
+            };
+            FrameHeader {
+                storage_attestation_root,
+                ..header(h, prost::Message::encode_to_vec(&attestation))
+            }
         })
         .collect();
     eprintln!(
