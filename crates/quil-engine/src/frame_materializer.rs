@@ -56,6 +56,20 @@ fn describe_eviction(candidate: &quil_execution::prover_registry::EvictionCandid
     )
 }
 
+/// A halt-risk leave penalty in the pass log: the first 8 bytes of the
+/// prover address, the full shard filter, the seniority charged, the leave's
+/// proposal frame and the provers its shard kept.
+fn describe_penalty(penalty: &quil_execution::prover_registry::SeniorityPenalty) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        hex::encode(&penalty.prover_address[..penalty.prover_address.len().min(8)]),
+        hex::encode(&penalty.confirmation_filter),
+        penalty.amount,
+        penalty.leave_frame,
+        penalty.remaining,
+    )
+}
+
 /// Preserve local failures before deduplicating prevalidated frame headers.
 /// In particular, a later successful duplicate cannot erase a failed read.
 fn finish_frame_header_validation(
@@ -1345,6 +1359,18 @@ impl FrameMaterializer {
             warn!(frame = frame_number, error = %e, "prune orphan joins failed");
         }
 
+        // Seniority penalties (#976), before inactivity eviction so a
+        // departure is counted against the census it left. Unlike eviction,
+        // every node that executes GLOBAL frames applies them, from the
+        // registry it just refreshed from committed state, so regular nodes
+        // reach the archives' prover root instead of resyncing to it. A no-op
+        // until the penalty epoch.
+        if run_eviction_pass {
+            if let Some(eviction_reg) = self.eviction_registry.as_ref() {
+                self.apply_seniority_penalties(frame_number, eviction_reg)?;
+            }
+        }
+
         // 7. Evict inactive provers (archive mode only, no active halt).
         //
         // Route through the *mutating* helper so prover and
@@ -1500,93 +1526,47 @@ impl FrameMaterializer {
                         ) {
                             Ok(evicted) => {
                                 if !evicted.is_empty() {
-                                    if let Err(e) = state.commit() {
-                                        if self.tentative_execution {
-                                            return Err(e);
-                                        }
-                                        warn!(frame = frame_number, error = %e, "eviction commit failed");
-                                    } else {
-                                        // Persist the eviction durably. `commit_frame`
-                                        // already ran earlier this frame (before
-                                        // eviction), so the kick currently lives only in
-                                        // the CRDT's in-memory global-shard tree. A plain
-                                        // re-commit would hit the same-frame idempotency
-                                        // cache and SKIP the now-dirty shard, so the kick
-                                        // would never reach RocksDB — the background
-                                        // refresh_from_store would then revert the cache
-                                        // and the same provers would be re-evicted every
-                                        // frame (no visible effect). Invalidate the global
-                                        // intrinsic shard's cached frame commit, re-commit
-                                        // (only that dirty shard recomputes; others stay
-                                        // cached), then refresh so the registry cache +
-                                        // shard summaries reflect the kicks.
-                                        let global_addr =
-                                            quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
-                                        if let Err(e) =
-                                            self.hypergraph.invalidate_domain_shard_commit(
-                                                frame_number,
-                                                &global_addr,
-                                            )
-                                        {
-                                            if self.tentative_execution {
-                                                return Err(e);
-                                            }
-                                            warn!(frame = frame_number, error = %e, "eviction: invalidate shard commit failed");
-                                        }
-                                        if let Err(e) =
-                                            self.execution_manager.commit_frame(frame_number)
-                                        {
-                                            if self.tentative_execution {
-                                                return Err(e);
-                                            }
-                                            warn!(frame = frame_number, error = %e, "eviction re-commit (flush) failed");
-                                        }
-                                        if let Err(error) = eviction_reg
-                                            .refresh_from_store(self.hypergraph_store.as_ref())
-                                        {
-                                            if self.tentative_execution {
-                                                return Err(error);
-                                            }
-                                            self.last_eviction_pass_epoch
-                                                .store(u64::MAX, Ordering::SeqCst);
-                                            warn!(frame = frame_number, %error, "post-eviction registry refresh failed; will retry");
-                                        } else {
-                                            // Persistence probe: after the flush+refresh the
-                                            // just-kicked allocations must no longer be eviction
-                                            // candidates — their vertex is now Status=4, which
-                                            // the registry no longer reads as active. If any
-                                            // still appear, the kick did not reach the backing
-                                            // store (or was reverted by a later sync) — surface it.
-                                            let recheck = eviction_reg.find_eviction_candidates(
-                                                frame_number,
-                                                self.eviction_grace_frames,
-                                                &decision_halt,
-                                            );
-                                            let still_present = recheck
-                                                .iter()
-                                                .filter(|a| {
-                                                    evicted.iter().any(|e| e.same_allocation(a))
-                                                })
-                                                .count();
-                                            let provers = evicted
-                                                .iter()
-                                                .map(|e| e.prover_address.as_slice())
-                                                .collect::<std::collections::BTreeSet<_>>()
-                                                .len();
-                                            let allocations = evicted
-                                                .iter()
-                                                .map(describe_eviction)
-                                                .collect::<Vec<_>>()
-                                                .join(",");
-                                            info!(
-                                                frame = frame_number,
-                                                count = evicted.len(),
-                                                provers,
-                                                still_candidates = still_present,
-                                                %allocations,
-                                                "evicted inactive allocations (still_candidates>0 ⇒ kick did not persist)"
-                                            );
-                                        }
+                                    if self.persist_registry_pass(
+                                        frame_number,
+                                        &state,
+                                        eviction_reg,
+                                        "eviction",
+                                    )? {
+                                        // Persistence probe: after the flush+refresh the
+                                        // just-kicked allocations must no longer be eviction
+                                        // candidates — their vertex is now Status=4, which
+                                        // the registry no longer reads as active. If any
+                                        // still appear, the kick did not reach the backing
+                                        // store (or was reverted by a later sync) — surface it.
+                                        let recheck = eviction_reg.find_eviction_candidates(
+                                            frame_number,
+                                            self.eviction_grace_frames,
+                                            &decision_halt,
+                                        );
+                                        let still_present = recheck
+                                            .iter()
+                                            .filter(|a| {
+                                                evicted.iter().any(|e| e.same_allocation(a))
+                                            })
+                                            .count();
+                                        let provers = evicted
+                                            .iter()
+                                            .map(|e| e.prover_address.as_slice())
+                                            .collect::<std::collections::BTreeSet<_>>()
+                                            .len();
+                                        let allocations = evicted
+                                            .iter()
+                                            .map(describe_eviction)
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        info!(
+                                            frame = frame_number,
+                                            count = evicted.len(),
+                                            provers,
+                                            still_candidates = still_present,
+                                            %allocations,
+                                            "evicted inactive allocations (still_candidates>0 ⇒ kick did not persist)"
+                                        );
                                     }
                                 }
                             }
@@ -1665,6 +1645,11 @@ impl FrameMaterializer {
         // 9. Update state
         self.last_materialized_frame
             .store(frame_number, Ordering::SeqCst);
+        if !self.tentative_execution {
+            // One aggregated line per epoch for the seniority penalties
+            // (#976) of the epoch before, not one per prover or frame.
+            quil_execution::seniority_penalty_log::end_frame(frame_number);
+        }
 
         // Capture this frame's prover-shard root the moment materialization of
         // it completes (forest reflects exactly `frame_number`). The verify for
@@ -1992,6 +1977,125 @@ impl FrameMaterializer {
     ///
     /// Called before materialization so the commits are visible to
     /// subsequent state reads within the same frame.
+    /// Persist the registry pass's writes to `state` (kicks, penalties)
+    /// durably and refresh the registry from them. Returns whether the
+    /// refresh succeeded; failures retry the pass on the next frame.
+    ///
+    /// `commit_frame` already ran earlier this frame (before the pass), so
+    /// the writes live only in the CRDT's in-memory global-shard tree. A plain
+    /// re-commit would hit the same-frame idempotency cache and SKIP the
+    /// now-dirty shard, so they would never reach RocksDB — the background
+    /// refresh_from_store would then revert the cache and the same pass would
+    /// repeat every frame (no visible effect). Invalidate the global intrinsic
+    /// shard's cached frame commit, re-commit (only that dirty shard
+    /// recomputes; others stay cached), then refresh so the registry cache +
+    /// shard summaries reflect the writes.
+    fn persist_registry_pass(
+        &self,
+        frame_number: u64,
+        state: &quil_execution::hypergraph_state::HypergraphState,
+        eviction_reg: &ConcreteProverRegistry,
+        pass: &str,
+    ) -> Result<bool> {
+        if let Err(e) = state.commit() {
+            if self.tentative_execution {
+                return Err(e);
+            }
+            warn!(frame = frame_number, error = %e, pass, "registry pass commit failed");
+            return Ok(false);
+        }
+        let global_addr = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        if let Err(e) = self
+            .hypergraph
+            .invalidate_domain_shard_commit(frame_number, &global_addr)
+        {
+            if self.tentative_execution {
+                return Err(e);
+            }
+            warn!(frame = frame_number, error = %e, pass, "registry pass: invalidate shard commit failed");
+        }
+        if let Err(e) = self.execution_manager.commit_frame(frame_number) {
+            if self.tentative_execution {
+                return Err(e);
+            }
+            warn!(frame = frame_number, error = %e, pass, "registry pass re-commit (flush) failed");
+        }
+        if let Err(error) = eviction_reg.refresh_from_store(self.hypergraph_store.as_ref()) {
+            if self.tentative_execution {
+                return Err(error);
+            }
+            self.last_eviction_pass_epoch
+                .store(u64::MAX, Ordering::SeqCst);
+            warn!(frame = frame_number, %error, pass, "registry refresh after the pass failed; will retry");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Apply the seniority penalties (#976) due at this epoch-boundary pass
+    /// (halt-risk departures, absence evictions) and persist them like
+    /// evictions; absence charges happen in GLOBAL execution itself. Before
+    /// `MAINNET_SENIORITY_PENALTY_EPOCH` it neither reads nor writes state
+    /// and logs nothing. One line per pass after that, naming every charge.
+    fn apply_seniority_penalties(
+        &self,
+        frame_number: u64,
+        eviction_reg: &ConcreteProverRegistry,
+    ) -> Result<()> {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        if !quil_types::consensus::seniority_penalties_at(epoch) {
+            return Ok(());
+        }
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.hypergraph.clone());
+        let pass = match eviction_reg.apply_seniority_penalties(
+            frame_number,
+            &state,
+            Some(self.hypergraph_store.as_ref()),
+        ) {
+            Ok(pass) => pass,
+            Err(error) => {
+                if self.tentative_execution {
+                    return Err(error);
+                }
+                self.last_eviction_pass_epoch
+                    .store(u64::MAX, Ordering::SeqCst);
+                warn!(frame = frame_number, epoch, %error, scope = "local",
+                    action = "report: this node may diverge from the network's prover root until the retry succeeds",
+                    "seniority penalty pass failed; retried at the next frame");
+                return Ok(());
+            }
+        };
+        let persisted = !pass.is_empty()
+            && self.persist_registry_pass(
+                frame_number,
+                &state,
+                eviction_reg,
+                "seniority penalty",
+            )?;
+        // Per-prover detail at debug only: the charges reach the operator in
+        // the aggregated per-epoch lines (`seniority_penalty_log`).
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let penalties = pass
+                .penalties
+                .iter()
+                .map(describe_penalty)
+                .collect::<Vec<_>>()
+                .join(",");
+            let evicted = pass
+                .evicted
+                .iter()
+                .map(describe_eviction)
+                .collect::<Vec<_>>()
+                .join(",");
+            debug!(frame = frame_number, epoch, departures = pass.departures.len(),
+                halt_risk_leaves = pass.penalties.len(), absence_evictions = pass.evicted.len(),
+                persisted, %penalties, %evicted,
+                "seniority penalty pass (penalties as prover:filter:charged:leave_frame:remaining, \
+                 evictions as prover:filter:missed committee frames)");
+        }
+        Ok(())
+    }
+
     fn persist_alt_shard_updates(
         &self,
         frame_number: u64,

@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod pricing;
 pub mod prover_registry;
 pub mod seniority_compat;
+pub mod seniority_penalty_log;
 pub mod step_timing;
 pub mod test_hooks;
 #[cfg(any(test, feature = "testing-stubs"))]

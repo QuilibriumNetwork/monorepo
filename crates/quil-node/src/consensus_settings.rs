@@ -14,6 +14,13 @@ pub(crate) fn initialize(network: u8) {
     let local_override = std::env::var("QUIL_EPOCH_LENGTH_FRAMES").ok();
     let frames = epoch_length(network, local_override.as_deref());
     quil_types::consensus::set_epoch_length_frames(frames);
+    let penalty_epoch = quil_types::consensus::init_seniority_penalty_epoch(network);
+    if network != 0 && penalty_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = penalty_epoch,
+            "QUIL_SENIORITY_PENALTY_EPOCH override active (localnet only)"
+        );
+    }
     quil_types::consensus::init_committee_handoff_for_network(network);
     quil_types::consensus::init_global_committee_succession_for_network(network);
     let hash_epoch = quil_types::consensus::init_hash_storage_proof_epoch(network);
@@ -37,6 +44,15 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_SENIORITY_SUCCESSION_EPOCH override active (localnet only)"
         );
     }
+    if network != 0 && penalty_epoch < succession_epoch {
+        tracing::warn!(
+            penalty_epoch,
+            succession_epoch,
+            "seniority penalties apply only from the seniority succession epoch; set \
+             QUIL_SENIORITY_SUCCESSION_EPOCH too to start them earlier (localnet only)"
+        );
+    }
+
     let kick_epoch = quil_types::consensus::init_kick_signed_slot_epoch(network);
     if network != 0 && kick_epoch != u64::MAX {
         tracing::warn!(
