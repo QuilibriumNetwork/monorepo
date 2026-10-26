@@ -105,10 +105,14 @@ pub enum AppEngineMessage {
     },
     /// Authenticate an archive anchor before a background sync mutates the
     /// worker's trees. An accepted request gates propose/vote until completion.
+    /// A check that needed committed GLOBAL state while a GLOBAL state sync
+    /// installed its chunks answers its wait
+    /// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]),
+    /// which the shard sync waits out, rather than a refusal.
     ValidateShardSyncAnchor {
         anchor: quil_types::proto::global::AppShardFrame,
         predecessor: Option<quil_types::proto::global::AppShardFrame>,
-        reply: tokio::sync::oneshot::Sender<bool>,
+        reply: tokio::sync::oneshot::Sender<Result<bool>>,
     },
     /// The base-state roots a refused archive tip attests
     /// ([`AppConsensusEngine::discarded_base_roots`]).
@@ -325,6 +329,8 @@ impl SharedAppEngineSizes {
 /// master holds one, and it can be shared across message routing tasks.
 #[derive(Clone, Debug)]
 pub struct AppEngineHandle {
+    /// The worker's core, named in its recovery's log lines.
+    pub(crate) core_id: u32,
     cancel: CancellationToken,
     materialized: Arc<std::sync::atomic::AtomicU64>,
     pub filter: Vec<u8>,
@@ -366,6 +372,7 @@ impl AppEngineHandle {
         let handle = Self {
             cancel: CancellationToken::new(),
             materialized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            core_id: 0,
             filter,
             msg_tx,
             frame_tx: None,
@@ -461,7 +468,7 @@ impl AppEngineHandle {
                 })?;
             receive.await.map_err(|_| {
                 QuilError::ExecutionUnavailable("shard sync validation was cancelled".into())
-            })
+            })?
         })
         .await
         .map_err(|_| QuilError::ExecutionUnavailable("shard sync validation timed out".into()))?
@@ -2954,6 +2961,7 @@ impl AppConsensusEngine {
         execution.engine_started();
         execution.state("starting", "waiting for transport");
         let handle = AppEngineHandle {
+            core_id,
             execution: execution.clone(),
             cancel: cancel.clone(),
             materialized: shard_mat_frame.clone(),
@@ -5016,6 +5024,13 @@ impl AppConsensusEngine {
         // closed there without a frame, the head's direct origins named no
         // frame, and each joiner refused the sealed frame on every attempt
         // (…091f80 at frame 4693, generations 13 to 23, 2026-10-23).
+        // A GLOBAL state sync installing its chunks withholds the committed
+        // view, which says nothing about the frame: a refusal the lookup may
+        // have caused is the sync's wait, which the shard sync waits out and
+        // asks again, not a frame no checkpoint authenticates. Read as a
+        // refusal, it failed the attempt, and its worker queued for another
+        // recovery turn behind every other.
+        let global_sync = std::sync::atomic::AtomicBool::new(false);
         let committed = |frame: &quil_types::proto::global::AppShardFrame| -> bool {
             let (Some(global), Some(header)) =
                 (self.global_hypergraph.as_ref(), frame.header.as_ref())
@@ -5025,14 +5040,19 @@ impl AppConsensusEngine {
             let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else {
                 return false;
             };
-            crate::app_handoff::committed_frame_digest_looked_through(
+            match crate::app_handoff::committed_frame_digest_looked_through(
                 global,
                 &self.filter,
                 header.frame_number,
-            )
-            .ok()
-            .flatten()
-                == Some(digest)
+            ) {
+                Ok(committed) => committed == Some(digest),
+                Err(error) => {
+                    if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) {
+                        global_sync.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    false
+                }
+            }
         };
         let certified = |frame: &quil_types::proto::global::AppShardFrame| {
             frame
@@ -5060,7 +5080,7 @@ impl AppConsensusEngine {
                 )),
             };
         let mut first = true;
-        validate_archive_sync_anchor_in(
+        let validated = validate_archive_sync_anchor_in(
             &self.filter,
             floor,
             anchor,
@@ -5096,7 +5116,15 @@ impl AppConsensusEngine {
                     ))
                 })
             },
-        )
+        );
+        match validated {
+            Err(_) if global_sync.load(std::sync::atomic::Ordering::Relaxed) => {
+                Err(QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ))
+            }
+            validated => validated,
+        }
     }
 
     /// The base-state roots a refused archive tip attests while GLOBAL has
@@ -6227,6 +6255,7 @@ impl AppConsensusEngine {
                             let _ = reply.send(anchor);
                         }
                         Some(AppEngineMessage::ValidateShardSyncAnchor { anchor, predecessor, reply }) => {
+                            use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
                             let reanchor = self.owed_reanchor_now();
                             let reanchoring = matches!(reanchor, Ok(Some(_)));
                             let checked = match reanchor {
@@ -6236,8 +6265,11 @@ impl AppConsensusEngine {
                             let valid = match checked {
                                 Ok(_) => {
                                     self.predecessor_block.refusal = None;
-                                    true
+                                    Ok(true)
                                 }
+                                // An expected wait, no refusal: the shard
+                                // sync asks again once the install is in.
+                                Err(error) if global_sync_in_progress(&error) => Err(error),
                                 Err(error) => {
                                     warn!(core_id = self.core_id, filter = hex::encode(&self.filter), error = %error,
                                         "archive sync anchor rejected before tree writes");
@@ -6245,10 +6277,10 @@ impl AppConsensusEngine {
                                         self.fence_reanchor.refused(std::time::Instant::now(), error.to_string());
                                     }
                                     self.record_anchor_refusal(&anchor, predecessor.as_ref(), &error);
-                                    false
+                                    Ok(false)
                                 }
                             };
-                            if valid && !reply.is_closed() {
+                            if matches!(valid, Ok(true)) && !reply.is_closed() {
                                 self.data_ready.store(false, std::sync::atomic::Ordering::Release);
                             }
                             let _ = reply.send(valid);
@@ -17751,6 +17783,7 @@ mod tests {
         let materialized = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stored = Arc::new(std::sync::Mutex::new(None));
         let handle = AppEngineHandle {
+            core_id: 0,
             execution: Default::default(),
             cancel: CancellationToken::new(),
             filter: vec![7; 32],
@@ -18522,6 +18555,96 @@ mod tests {
             .to_string();
         assert!(error.starts_with("invalid argument: archive sync predecessor frame 7: invalid argument: has no certificate"),
             "{error}");
+    }
+
+    /// Starts an archive state sync of `global`'s GLOBAL tree and installs
+    /// only its first chunk: until the last one is in, the committed view is
+    /// withheld
+    /// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]).
+    fn begin_global_sync(global: &Arc<quil_hypergraph::HypergraphCrdt>) {
+        use quil_execution::global_intrinsic::handoff::{global_sync_in_progress, CommittedView};
+        // GLOBAL's address.
+        let address = [0xff; 32];
+        let archive = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location {
+                app_address: address,
+                data_address: [byte; 32],
+            };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: archive,
+            shard_id: address.to_vec(),
+            phase: 0,
+        };
+        let mut plan = global
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &address,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let (key, leaf) = &plan.remaining()[0];
+        let first = vec![if leaf.is_some() {
+            vec![key[0]; 48]
+        } else {
+            Vec::new()
+        }];
+        global.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = CommittedView::capture(global)
+            .err()
+            .expect("no committed view between a sync's chunks");
+        assert!(global_sync_in_progress(&error), "{error}");
+    }
+
+    /// While this node's master installs a GLOBAL state sync, the shard
+    /// sync's anchor check cannot read the digest GLOBAL committed: it
+    /// answers the sync's wait, which recovery waits out and asks again
+    /// (`prover_tree_syncer::waiting_out_global_sync`), not a refusal of an
+    /// anchor no checkpoint authenticates. Read as "not committed", it failed
+    /// the attempt as an anchor refusal, and its worker queued for another
+    /// recovery turn (2026-10-26). Replay of the frame GLOBAL committed
+    /// answers the same wait.
+    #[tokio::test]
+    async fn the_sync_anchor_check_answers_a_global_sync_install_as_a_wait() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let sealed = sealed_frame_eight(1);
+        let (mut engine, predecessor, _, global) =
+            engine_with_sessions_from_seven(0x43, Some((8, output_digest(&sealed))));
+        // The committed route takes the anchor; the refusal is the fixture
+        // predecessor's, which has no certificate and which no checkpoint
+        // names.
+        let error = engine
+            .validate_archive_sync_anchor(&sealed, Some(&predecessor), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("invalid argument: archive sync predecessor frame 7: "),
+            "{error}"
+        );
+
+        begin_global_sync(&global);
+        let error = engine
+            .validate_archive_sync_anchor(&sealed, Some(&predecessor), None)
+            .await
+            .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
+        let error = engine
+            .replay_archive_frame(sealed, Vec::new())
+            .await
+            .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
     }
 
     /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without
