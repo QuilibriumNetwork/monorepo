@@ -794,6 +794,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         presence_credit_frame = %if presence_credit_from == u64::MAX { "never".to_string() } else { presence_credit_from.to_string() },
         "committee presence reports recorded and credited as activity"
     );
+    let presence_exclusion_from = quil_execution::global_intrinsic::handoff::init_presence_exclusion_frame(args.network);
+    info!(
+        presence_exclusion_frame = %if presence_exclusion_from == u64::MAX { "never".to_string() } else { presence_exclusion_from.to_string() },
+        "committee successors leaving out members recorded absent from a stalled session"
+    );
     let early_fence_from = quil_execution::global_intrinsic::handoff::init_early_fence_frame(args.network);
     info!(
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },

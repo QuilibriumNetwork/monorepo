@@ -65,6 +65,16 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // multi-shard prover (one call per allocation) or a re-materialized
             // frame accrues `SENIORITY_PER_ACTIVE_FRAME` at most once per frame.
             FieldTag { name: "LastSeniorityFrameNumber", order: 5, size: 8, rdf_type: RdfType::Uint },
+            // order 32 — not in the Go schema: the retro seniority this prover
+            // holds from the seniority succession epoch, per part of
+            // `seniority_compat::retro_components` (4 retro epochs, then the
+            // mainnet snapshot), 5 × u64 BE. A key's retro counts once: a merge,
+            // join or succession credits only what raises a part. Order 32, key
+            // 0x80: no other class has an order-32 field.
+            FieldTag { name: "RetroCredited", order: 32, size: 40, rdf_type: RdfType::ByteArray },
+            // order 33 — not in the Go schema: the retro successions moved out
+            // of this prover, per part, 5 × u64 BE. Key 0x84, unique.
+            FieldTag { name: "RetroMoved", order: 33, size: 40, rdf_type: RdfType::ByteArray },
         ],
     },
     ClassDef {
@@ -288,12 +298,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 31 (a storage
-/// snapshot's `Snapshot`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 33 (a prover's
+/// `RetroMoved`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 31;
+pub const GLOBAL_MAX_ORDER: u16 = 33;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -608,12 +618,30 @@ mod tests {
     }
 
     #[test]
+    fn retro_ledger_keys_are_unique_across_classes() {
+        // Orders 32 and 33 → 0x80 and 0x84, single byte: no existing key
+        // changes width, and no other field of any class shares them (readers
+        // probe keys across classes).
+        for (name, key) in [("RetroCredited", 0x80u8), ("RetroMoved", 0x84)] {
+            assert_eq!(field_key("prover:Prover", name), Some(vec![key]));
+            for class in GLOBAL_CLASSES {
+                for field in class.fields {
+                    if class.name == "prover:Prover" && field.name == name {
+                        continue;
+                    }
+                    assert_ne!(order_to_key(field.order, GLOBAL_MAX_ORDER), vec![key], "{}.{}", class.name, field.name);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn release_key_is_unique_across_classes_and_keeps_every_key() {
         // Order 19 → 0x4C, still in the single-byte band: no existing key
         // changes width, and no other field of any class shares it.
         let cls = "allocation:ProverAllocation";
         assert_eq!(field_key(cls, "Release"), Some(vec![0x4C]));
-        assert_eq!(GLOBAL_MAX_ORDER, 31);
+        assert_eq!(GLOBAL_MAX_ORDER, 33, "RetroMoved (order 33) is the highest");
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(
             GLOBAL_CLASSES.iter().flat_map(|c| c.fields.iter()).map(|f| f.order).max(),

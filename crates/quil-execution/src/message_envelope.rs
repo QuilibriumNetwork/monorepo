@@ -213,7 +213,8 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             Ok(bytes.clone())
         }
         Inner::PresenceReport(bytes) => {
-            crate::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
+            // Admission of a node's own or a client's submission: no frame.
+            crate::global_intrinsic::handoff::presence::check_encoding(bytes, None)?;
             Ok(bytes.clone())
         }
         Inner::StorageEpochProof(bytes) => {
