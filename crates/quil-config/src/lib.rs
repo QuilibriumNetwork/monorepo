@@ -7,6 +7,7 @@ mod explorer;
 mod keys;
 mod logger;
 mod p2p;
+mod private_files;
 mod proof_worker;
 mod signatories;
 mod unused_keys;
@@ -21,6 +22,7 @@ pub use explorer::*;
 pub use keys::*;
 pub use logger::*;
 pub use p2p::*;
+pub use private_files::*;
 pub use proof_worker::*;
 pub use signatories::*;
 pub use unused_keys::*;
@@ -188,8 +190,8 @@ pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNoti
 
     if !config_path.exists() {
         // First run — create config directory and generate defaults,
-        // matching Go's LoadConfig behavior.
-        std::fs::create_dir_all(config_dir)?;
+        // matching Go's LoadConfig behavior (a directory of mode 0700).
+        create_private_dir_all(config_dir)?;
 
         let mut config = Config::default();
         config.apply_defaults();
@@ -258,12 +260,14 @@ pub fn load_config_with_notices(config_dir: &Path) -> Result<(Config, ConfigNoti
     Ok((config, notices))
 }
 
-/// Save a config to the given directory.
+/// Save a config to the given directory. The config holds private keys:
+/// the file is written readable by its owner only, and a directory this
+/// creates is accessible by its owner only.
 pub fn save_config(config_dir: &Path, config: &Config) -> Result<(), ConfigError> {
-    std::fs::create_dir_all(config_dir)?;
+    create_private_dir_all(config_dir)?;
     let config_path = config_dir.join("config.yml");
     let contents = serde_yaml::to_string(config)?;
-    std::fs::write(config_path, contents)?;
+    write_private_file(&config_path, contents.as_bytes())?;
     Ok(())
 }
 
@@ -856,6 +860,26 @@ p2p:
         cleanup(&generated);
     }
 
+    /// A config directory created on first run is accessible by its owner
+    /// only.
+    #[cfg(unix)]
+    #[test]
+    fn first_run_creates_a_private_config_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir("private_config_dir");
+        let generated = dir.join("node").join(".config");
+        load_config(&generated).unwrap();
+        for created in [&generated, &dir.join("node")] {
+            assert_eq!(
+                std::fs::metadata(created).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                created.display()
+            );
+        }
+        cleanup(&dir);
+    }
+
     /// The devnet configs load and use every key they set.
     #[test]
     fn devnet_configs_use_every_key() {
@@ -876,5 +900,44 @@ p2p:
             loaded += 1;
         }
         assert_eq!(loaded, 6);
+    }
+
+    /// The config holds the keystore's encryption key and the Ed448 peer
+    /// key: whether generated on first run or saved over an operator's
+    /// file, it is readable by its owner only.
+    #[cfg(unix)]
+    #[test]
+    fn reproduces_world_readable_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let check = |path: &Path| {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                let whom = if mode & 0o004 != 0 {
+                    "world-readable"
+                } else {
+                    "group-readable"
+                };
+                panic!("config.yml written with mode {mode:04o} ({whom})");
+            }
+        };
+        let dir = tempdir("private_config");
+        let generated = dir.join("generated");
+        let config = load_config(&generated).unwrap();
+        assert!(!config.key.key_store_file.encryption_key.is_empty());
+        check(&generated.join("config.yml"));
+
+        let existing = dir.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        let path = existing.join("config.yml");
+        std::fs::write(&path, "p2p:\n  network: 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_config(&existing, &config).unwrap();
+        check(&path);
+        let reloaded = load_config(&existing).unwrap();
+        assert_eq!(
+            reloaded.key.key_store_file.encryption_key,
+            config.key.key_store_file.encryption_key
+        );
+        cleanup(&dir);
     }
 }
