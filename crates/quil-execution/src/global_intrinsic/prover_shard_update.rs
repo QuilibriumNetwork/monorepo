@@ -4363,7 +4363,7 @@ mod tests {
         }
         quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
     }
-  
+
     /// A relayed settlement becomes a GLOBAL record only with the committed
     /// spend that carries it: a spend the global commit rejects (a repeated
     /// consumption, a root outside the application's history) and a
