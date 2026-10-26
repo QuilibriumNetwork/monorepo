@@ -2035,6 +2035,17 @@ where
                 // advertising this message via an IHAVE and it's invalid it will be double
                 // penalized, one for sending us an invalid and again for breaking a promise.
                 peer_score.reject_invalid_message(propagation_source, topic_hash);
+                // QUILIBRIUM: an invalid signature costs us a verification the
+                // sender chose, and an honest peer forwards only messages it
+                // verified. Penalise it on every topic, not only on topics with
+                // score parameters, so a peer that keeps sending them is
+                // graylisted.
+                if matches!(
+                    reject_reason,
+                    RejectReason::ValidationError(ValidationError::InvalidSignature)
+                ) {
+                    peer_score.add_penalty(propagation_source, 1);
+                }
             }
         }
     }

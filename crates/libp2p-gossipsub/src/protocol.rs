@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{collections::HashMap, convert::Infallible, fmt, io, pin::Pin};
+use std::{collections::HashMap, convert::Infallible, fmt, io, pin::Pin, time::Duration};
 
 use asynchronous_codec::{Decoder, Encoder, Framed};
 use byteorder::{BigEndian, ByteOrder};
@@ -28,6 +28,7 @@ use libp2p_core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use libp2p_identity::{PeerId, PublicKey};
 use libp2p_swarm::StreamProtocol;
 use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
+use web_time::Instant;
 
 use crate::{
     config::ValidationMode,
@@ -42,6 +43,50 @@ use crate::{
 };
 
 pub(crate) const SIGNING_PREFIX: &[u8] = b"libp2p-pubsub:";
+
+/// QUILIBRIUM: failed signature checks one inbound stream may cause within
+/// [`INVALID_SIGNATURE_WINDOW`]. Every published entry costs a verification
+/// with the key the entry carries (Ed448 among them, which is slow), and an
+/// honest peer forwards only entries it verified itself, so a stream past
+/// this budget is closed instead of verifying further entries. The handler
+/// disables gossip on a connection after a few such closures, which bounds
+/// the verifications a connection can force.
+const MAX_INVALID_SIGNATURES_PER_WINDOW: u32 = 16;
+
+/// QUILIBRIUM: window of [`MAX_INVALID_SIGNATURES_PER_WINDOW`].
+const INVALID_SIGNATURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// QUILIBRIUM: failed signature checks of one inbound stream in the current
+/// window.
+#[derive(Debug, Default)]
+struct InvalidSignatureBudget {
+    window_start: Option<Instant>,
+    failures: u32,
+    exhausted: bool,
+}
+
+impl InvalidSignatureBudget {
+    /// Count a failed check at `now`, spending the budget past its limit.
+    fn record_failure(&mut self, now: Instant) {
+        match self.window_start {
+            Some(start) if now.duration_since(start) < INVALID_SIGNATURE_WINDOW => {
+                self.failures = self.failures.saturating_add(1);
+            }
+            _ => {
+                self.window_start = Some(now);
+                self.failures = 1;
+            }
+        }
+        if self.failures > MAX_INVALID_SIGNATURES_PER_WINDOW && !self.exhausted {
+            self.exhausted = true;
+            tracing::warn!(
+                failures = self.failures,
+                window_secs = INVALID_SIGNATURE_WINDOW.as_secs(),
+                "Closing gossipsub inbound stream: too many messages with invalid signatures"
+            );
+        }
+    }
+}
 
 /// QUILIBRIUM: the bytes a message's signature covers, `SIGNING_PREFIX` then
 /// the protobuf encoding of the message without its signature and key, written
@@ -212,6 +257,8 @@ pub struct GossipsubCodec {
     max_length: usize,
     /// Maximum transmit sizes per topic, with a default if not specified.
     max_transmit_sizes: HashMap<TopicHash, usize>,
+    /// QUILIBRIUM: failed signature checks this stream has caused.
+    invalid_signatures: InvalidSignatureBudget,
 }
 
 impl GossipsubCodec {
@@ -226,6 +273,7 @@ impl GossipsubCodec {
             codec,
             max_length,
             max_transmit_sizes,
+            invalid_signatures: InvalidSignatureBudget::default(),
         }
     }
 
@@ -260,7 +308,7 @@ impl GossipsubCodec {
             _ => match PublicKey::try_decode_protobuf(&source.to_bytes()[2..]) {
                 Ok(v) => v,
                 Err(_) => {
-                    tracing::warn!("Signature verification failed: No valid public key supplied");
+                    tracing::debug!("Signature verification failed: No valid public key supplied");
                     return false;
                 }
             },
@@ -268,7 +316,7 @@ impl GossipsubCodec {
 
         // The key must match the peer_id
         if source != public_key.to_peer_id() {
-            tracing::warn!(
+            tracing::debug!(
                 "Signature verification failed: Public key doesn't match source peer id"
             );
             return false;
@@ -299,6 +347,15 @@ impl Decoder for GossipsubCodec {
     type Error = quick_protobuf_codec::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // QUILIBRIUM: a stream that spent its invalid-signature budget is
+        // closed; the error makes the handler drop it.
+        if self.invalid_signatures.exhausted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "too many messages with invalid signatures",
+            )
+            .into());
+        }
         // QUILIBRIUM: the frame is read here rather than by `quick_protobuf_codec`, so that
         // its entries are counted before any of them is decoded (`scan_rpc`). A frame over
         // the limits is consumed undecoded and reported, and the handler closes the stream.
@@ -335,6 +392,11 @@ impl Decoder for GossipsubCodec {
         let mut invalid_messages = Vec::new();
 
         for message in rpc.publish.into_iter() {
+            // QUILIBRIUM: once the budget is spent, the rest of the RPC is
+            // dropped unverified.
+            if self.invalid_signatures.exhausted {
+                break;
+            }
             let topic = TopicHash::from_raw(&message.topic);
 
             // Check the message size to ensure it doesn't bypass the configured max.
@@ -419,7 +481,10 @@ impl Decoder for GossipsubCodec {
 
             // verify message signatures if required
             if verify_signature && !GossipsubCodec::verify_signature(&message) {
-                tracing::warn!("Invalid signature for received message");
+                // QUILIBRIUM: debug, as every entry of an RPC can fail; the
+                // budget logs once when it closes the stream.
+                tracing::debug!("Invalid signature for received message");
+                self.invalid_signatures.record_failure(Instant::now());
                 // Build the invalid message (ignoring further validation of sequence number
                 // and source)
                 let message = RawMessage {
@@ -1018,6 +1083,73 @@ mod tests {
         QuickCheck::new().quickcheck(prop as fn(_) -> _)
     }
 
+    /// Signed messages on one topic, with `tampered` of them altered after
+    /// signing so that their signatures fail.
+    fn signed_messages(valid: u8, tampered: u8) -> Vec<RawMessage> {
+        let keypair = Keypair::generate_ed25519();
+        let mut gs: Behaviour =
+            Behaviour::new(MessageAuthenticity::Signed(keypair), Config::default()).unwrap();
+        let topic = TopicHash::from_raw("test");
+        (0..valid.saturating_add(tampered))
+            .map(|i| {
+                let mut message = gs.build_raw_message(topic.clone(), vec![i]).unwrap();
+                if i >= valid {
+                    message.data.push(0xff);
+                }
+                message
+            })
+            .collect()
+    }
+
+    fn decode_rpc(
+        codec: &mut GossipsubCodec,
+        messages: Vec<RawMessage>,
+    ) -> Result<Option<HandlerEvent>, quick_protobuf_codec::Error> {
+        let rpc = Rpc {
+            messages,
+            subscriptions: vec![],
+            control_msgs: vec![],
+        };
+        let mut buf = BytesMut::new();
+        codec.encode(rpc.into_protobuf(), &mut buf).unwrap();
+        codec.decode(&mut buf)
+    }
+
+    fn counts(event: Option<HandlerEvent>) -> (usize, usize) {
+        match event {
+            Some(HandlerEvent::Message {
+                rpc,
+                invalid_messages,
+            }) => (rpc.messages.len(), invalid_messages.len()),
+            _ => panic!("must decode an RPC"),
+        }
+    }
+
+    /// QUILIBRIUM: a stream that sends more invalid signatures than the budget
+    /// has the rest of its RPC dropped unverified and is then closed.
+    #[test]
+    fn invalid_signatures_past_the_budget_close_the_stream() {
+        let budget = MAX_INVALID_SIGNATURES_PER_WINDOW as u8;
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let event = decode_rpc(&mut codec, signed_messages(0, budget + 5)).unwrap();
+        assert_eq!(counts(event), (0, budget as usize + 1));
+        assert!(decode_rpc(&mut codec, signed_messages(1, 0)).is_err());
+    }
+
+    /// QUILIBRIUM: invalid signatures within the budget are reported and the
+    /// stream keeps delivering valid messages.
+    #[test]
+    fn invalid_signatures_within_the_budget_keep_the_stream() {
+        let budget = MAX_INVALID_SIGNATURES_PER_WINDOW as u8;
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let event = decode_rpc(&mut codec, signed_messages(1, budget)).unwrap();
+        assert_eq!(counts(event), (1, budget as usize));
+        let event = decode_rpc(&mut codec, signed_messages(2, 0)).unwrap();
+        assert_eq!(counts(event), (2, 0));
+    }
+
     /// QUILIBRIUM: the signed bytes written from borrowed fields are those of
     /// the encoded message without signature and key, after the prefix.
     #[test]
@@ -1255,5 +1387,44 @@ mod tests {
 
         assert_eq!(protocol_config.protocol_ids[0].protocol, "/foosub");
         assert_eq!(protocol_config.protocol_ids[1].protocol, "/floodsub/1.0.0");
+    }
+
+    /// One RPC whose entries all carry invalid signatures must not cost one
+    /// signature verification per entry: the key and signature of each entry
+    /// are the sender's choice, and verification runs before any dedup.
+    #[test]
+    fn reproduces_unbounded_signature_verification_per_rpc() {
+        let keypair = Keypair::generate_ed25519();
+        let mut gs: Behaviour =
+            Behaviour::new(MessageAuthenticity::Signed(keypair), Config::default()).unwrap();
+        let topic = TopicHash::from_raw("test");
+        let messages = (0..64u8)
+            .map(|i| {
+                let mut message = gs.build_raw_message(topic.clone(), vec![i]).unwrap();
+                // Altered after signing, so the signature no longer verifies.
+                message.data.push(0xff);
+                message
+            })
+            .collect::<Vec<_>>();
+        let rpc = Rpc {
+            messages,
+            subscriptions: vec![],
+            control_msgs: vec![],
+        };
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let mut buf = BytesMut::new();
+        codec.encode(rpc.into_protobuf(), &mut buf).unwrap();
+        let verified = match codec.decode(&mut buf) {
+            Ok(Some(HandlerEvent::Message {
+                invalid_messages, ..
+            })) => invalid_messages.len(),
+            Ok(_) => panic!("must decode an RPC"),
+            Err(_) => 0,
+        };
+        assert!(
+            verified <= 32,
+            "one RPC made the codec verify {verified} invalid signatures out of 64 entries"
+        );
     }
 }

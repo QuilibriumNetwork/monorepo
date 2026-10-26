@@ -231,6 +231,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         activation_waits: activation_waits_for_recv,
     } = args;
     let archive_ingest_for_recv = archive_app_shard_ingest;
+    // GLOBAL_FRAME admission state shared with the gossip gate: a frame this
+    // loop accepted is neither forwarded nor checked again, and a header whose
+    // certificate and VDF verified skips both checks on later copies.
+    let global_frame_gate_for_recv = p2p_for_recv.global_frame_gate();
 
     // Global bitmasks for BlossomSub topic subscriptions.
     const GLOBAL_CONSENSUS: &[u8] = &[0x00];
@@ -849,6 +853,21 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             // (peer discovery for their own mesh): a PeerInfo
                             // is forwarded below once verified.
 
+                            // A copy of a GLOBAL frame this loop already accepted,
+                            // or a stale one, is dropped before any decode. The
+                            // gossip gate drops most; this catches copies queued
+                            // before the first one was accepted.
+                            if received.bitmask.as_slice() == GLOBAL_FRAME
+                                && quil_p2p::global_frame_gate::peek_frame_number(&received.data)
+                                    .is_some_and(|frame| {
+                                        global_frame_gate_for_recv.status(frame)
+                                            != quil_p2p::FrameStatus::New
+                                    })
+                            {
+                                debug!("gossip global frame already accepted or stale — dropping");
+                                continue;
+                            }
+
                             // Per-topic validator gate. Malformed bytes are
                             // dropped before they reach a queue.
                             // Unregistered topics fall through.
@@ -1292,6 +1311,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             }
                                         }
 
+                                        // A header whose certificate and VDF already verified
+                                        // (an earlier copy, possibly with another body) skips
+                                        // both checks; its body is still bound to the requests
+                                        // root below. Keyed by the decoded header, so encoding
+                                        // variants of one header share an entry.
+                                        let header_digest: Option<[u8; 32]> =
+                                            frame.header.as_ref().map(|h| {
+                                                <sha2::Sha256 as sha2::Digest>::digest(
+                                                    prost::Message::encode_to_vec(h),
+                                                )
+                                                .into()
+                                            });
+                                        let header_verified = header_digest.is_some_and(|digest| {
+                                            global_frame_gate_for_recv.header_verified(&digest)
+                                        });
+
                                         // UNTRUSTED SOURCE GATE. This frame came off the open
                                         // GLOBAL_FRAME gossip mesh (any peer can publish), not the
                                         // mTLS-authenticated archive poller. The VDF proof below is
@@ -1304,8 +1339,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // the expensive VDF verify so forged frames are cheap to shed.
                                         // Legit gossip + archive frames both carry this cert.
                                         match frame.header.as_ref() {
-                                            Some(h) if frame_validator_for_recv
-                                                .verify_global_finalization_cert(h) => {}
+                                            Some(h) if header_verified
+                                                || frame_validator_for_recv
+                                                    .verify_global_finalization_cert(h) => {}
                                             _ => {
                                                 debug!(
                                                     frame = frame_num,
@@ -1319,12 +1355,16 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // Verify VDF proof before storing.
                                         // Wrap in catch_unwind — the classgroup can panic
                                         // on malformed VDF output from canonical decode bugs.
-                                        let validate_result = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
-                                                frame_validator_for_recv.validate(&frame)
-                                            })
-                                        );
+                                        let validate_result = if header_verified {
+                                            Ok(Ok(true))
+                                        } else {
+                                            std::panic::catch_unwind(
+                                                std::panic::AssertUnwindSafe(|| {
+                                                    let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                                                    frame_validator_for_recv.validate(&frame)
+                                                })
+                                            )
+                                        };
                                         match validate_result {
                                             Ok(Ok(true)) => {}
                                             Ok(Ok(false)) => {
@@ -1346,6 +1386,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 );
                                                 continue;
                                             }
+                                        }
+                                        if let Some(digest) = header_digest.filter(|_| !header_verified) {
+                                            global_frame_gate_for_recv.mark_header_verified(digest, frame_num);
                                         }
 
                                         // BIND THE BODY TO THE AUTHENTICATED HEADER. The cert + VDF
@@ -1433,6 +1476,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         match stored {
                                             Ok(()) => {
                                                 frames_received += 1;
+                                                global_frame_gate_for_recv.mark_accepted(frame_num);
                                                 // `observe` / `fetch_max` never
                                                 // regress these counters below
                                                 // an already-seen value (e.g.

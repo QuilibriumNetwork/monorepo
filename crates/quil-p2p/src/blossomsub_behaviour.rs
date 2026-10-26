@@ -80,8 +80,9 @@ impl ValidationResult {
     }
 }
 
-/// A per-bitmask validator closure.
-type Validator = Arc<dyn Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync>;
+/// A per-bitmask validator closure: forwarding peer, signed author (if the
+/// message is signed) and data.
+type Validator = Arc<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync>;
 
 /// Events emitted by the behaviour to the swarm. Identical in shape to the
 /// historical `BlossomSubEvent` so `node.rs`'s match arms are unchanged.
@@ -270,6 +271,21 @@ impl BlossomSubBehaviour {
         &mut self,
         bitmask: Vec<u8>,
         validator: impl Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync + 'static,
+    ) {
+        self.validators.insert(
+            bitmask,
+            Arc::new(
+                move |peer: &PeerId, _author: Option<&PeerId>, data: &[u8]| validator(peer, data),
+            ),
+        );
+    }
+
+    /// Register a per-bitmask validator that also sees the message's signed
+    /// author (`None` for an unsigned message).
+    pub fn register_authored_validator(
+        &mut self,
+        bitmask: Vec<u8>,
+        validator: impl Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync + 'static,
     ) {
         self.validators.insert(bitmask, Arc::new(validator));
     }
@@ -830,7 +846,9 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         // `validate_messages()` is on, so we must report an
                         // outcome for every message before it is forwarded.
                         let outcome = match self.validators.get(&bitmask) {
-                            Some(v) => v(&propagation_source, &message.data),
+                            Some(v) => {
+                                v(&propagation_source, message.source.as_ref(), &message.data)
+                            }
                             None => ValidationResult::Accept,
                         };
                         let _ = self.inner.report_message_validation_result(
@@ -918,6 +936,13 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
                                                      // `app_specific_weight` (the existing `set_application_score` channel),
                                                      // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
     let mut score_params = gossipsub::PeerScoreParams::default();
+    // GLOBAL_FRAME `[0,0]`: the gate `Reject`s only a wrong type prefix, which
+    // every build rejects, so an honest relay never forwards one; copies of
+    // known frames and rate-limited frames are `Ignore`d, without penalty.
+    // Invalid signatures on the topic count too.
+    score_params
+        .topics
+        .insert(topic_for(&[0u8, 0]).hash(), pi_topic.clone());
     // GLOBAL_PEER_INFO bitmask `[0,0,0,0]` → topic `hex("00000000")`.
     score_params
         .topics
@@ -1101,6 +1126,37 @@ mod propagation_tests {
         assert_eq!(tp.mesh_message_deliveries_weight, 0.0);
         assert_eq!(tp.first_message_deliveries_weight, 0.0);
         assert_eq!(tp.time_in_mesh_weight, 0.0);
+        // GLOBAL_FRAME is scored the same way, so its rejects penalise.
+        let frame = params
+            .topics
+            .get(&topic_for(&[0u8, 0]).hash())
+            .expect("GLOBAL_FRAME must be scored");
+        assert!(frame.invalid_message_deliveries_weight < 0.0);
+        assert_eq!(frame.mesh_message_deliveries_weight, 0.0);
+    }
+
+    /// The registered validator sees the signed author of a message.
+    #[test]
+    fn authored_validators_see_the_author() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        let author = PeerId::random();
+        behaviour.register_authored_validator(vec![1], move |_, from, _| {
+            if from == Some(&author) {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Ignore
+            }
+        });
+        behaviour.register_validator(vec![2], |_, _| ValidationResult::Reject);
+        let forwarder = PeerId::random();
+        let one = &behaviour.validators[&vec![1]];
+        assert_eq!(
+            one(&forwarder, Some(&author), b""),
+            ValidationResult::Accept
+        );
+        assert_eq!(one(&forwarder, None, b""), ValidationResult::Ignore);
+        let two = &behaviour.validators[&vec![2]];
+        assert_eq!(two(&forwarder, None, b""), ValidationResult::Reject);
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
