@@ -87,6 +87,11 @@ jobs:
           rustflags: ""
           # The explicit cache below owns restore/save for this job.
           cache: false
+          components: rustfmt
+
+      # Formatting needs no build: fail on it before compiling.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
 
       - uses: Swatinem/rust-cache@v2
         with:
