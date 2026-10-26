@@ -1210,15 +1210,13 @@ pub fn global_committee_epoch(frame: u64) -> u64 {
 /// must hash to its `requests_root` before it is stored or executed.
 ///
 /// It changes what a node accepts from archives, not what consensus
-/// produces or votes for; frames below it keep the earlier checks. Unset on
-/// mainnet until a store scan confirms that no finalized frame from the
-/// proposed activation on carries a signature other than a committee
-/// certificate, since a syncing node refusing an honest frame would stop
-/// there. Suggested: [`MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`] (907,920),
-/// from which commonware simplex finalizes every frame with a certificate or
-/// no signature and voters bind its body before voting.
+/// produces or votes for; frames below it keep the earlier checks. Mainnet
+/// frame 943,920, the first of epoch 1311: commonware simplex finalizes
+/// every frame since [`MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`] (907,920)
+/// with a certificate or no signature and voters bind its body before
+/// voting, so a syncing node refuses no honest frame from it on.
 /// `QUIL_GLOBAL_SYNC_AUTHENTICATION_FRAME` elsewhere, never by default.
-pub const MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME: Option<u64> = None;
+pub const MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME: Option<u64> = Some(943_920);
 
 static GLOBAL_SYNC_AUTHENTICATION_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -2511,10 +2509,13 @@ mod global_sync_authentication_tests {
         );
     }
 
-    /// Inert on mainnet until scheduled; from its frame once set.
+    /// Scheduled on mainnet at frame 943,920; from its frame once set.
     #[test]
     fn archive_frames_are_authenticated_by_the_committee_from_the_set_frame() {
-        assert_eq!(super::MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME, None);
+        assert_eq!(
+            super::MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME,
+            Some(943_920)
+        );
         super::set_global_sync_authentication_frame_for_thread(Some(10));
         assert!(!super::global_sync_authenticated_at(9));
         assert!(super::global_sync_authenticated_at(10));
