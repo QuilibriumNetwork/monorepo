@@ -40,7 +40,10 @@ pub(crate) async fn start(
             std::path::PathBuf::from(p)
         } else if !config.db.worker_path_prefix.is_empty() {
             std::path::PathBuf::from(
-                config.db.worker_path_prefix.replace("%d", &core_id.to_string()),
+                config
+                    .db
+                    .worker_path_prefix
+                    .replace("%d", &core_id.to_string()),
             )
         } else {
             let base = if config.db.path.is_empty() {
@@ -54,7 +57,8 @@ pub(crate) async fn start(
     info!(core_id, db_path = %db_path.display(), "worker store path resolved");
     std::fs::create_dir_all(&db_path)?;
     let db = quil_store::RocksDb::open(&db_path)?;
-    db.inner().register_store(quil_forest::StoreRole::Worker(core_id));
+    db.inner()
+        .register_store(quil_forest::StoreRole::Worker(core_id));
     crate::storage_watch::start(&config.db);
     // This process's store, once it stops writing, is reopened by a restart
     // of the process once its disk has room again.
@@ -97,8 +101,14 @@ pub(crate) async fn start(
         tracing::info!("Phase-3 JMT forest installed — committing state to the forest");
     }
     crate::master_node::worker_manager::initialize_worker_size_accounting(&crdt, "worker");
-    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env(false)) {
-        tracing::info!(?policy, "retained-version pruning enabled on the worker CRDT");
+    if let (true, Some(policy)) = (
+        crdt.forest_is_persistent(),
+        quil_hypergraph::RetentionPolicy::from_env(false),
+    ) {
+        tracing::info!(
+            ?policy,
+            "retained-version pruning enabled on the worker CRDT"
+        );
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "worker".into());
     }
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, "worker");
@@ -108,10 +118,12 @@ pub(crate) async fn start(
     // impls. See the master block earlier in this file for rationale.
     let circuit_compiler_worker: Arc<dyn quil_types::execution::CircuitCompiler> =
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
-    let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> =
-        clock_store.clone();
-    let hypergraph_resolver_worker: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()));
+    let clock_store_for_exec_worker: Arc<dyn quil_types::store::ClockStore> = clock_store.clone();
+    let hypergraph_resolver_worker: Arc<
+        dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver,
+    > = Arc::new(
+        quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()),
+    );
     let exec_manager = quil_execution::ExecutionEngineManager::new(
         inclusion_prover.clone(),
         key_manager.clone(),
@@ -127,7 +139,11 @@ pub(crate) async fn start(
     // remote worker builds its own verifier client from the same configuration.
     #[cfg(feature = "native-proof")]
     let exec_manager = {
-        crate::proof_worker::install_token_worker(exec_manager, config.p2p.network, proof_worker.as_ref())?
+        crate::proof_worker::install_token_worker(
+            exec_manager,
+            config.p2p.network,
+            proof_worker.as_ref(),
+        )?
     };
     let exec_manager = Arc::new(exec_manager);
 
@@ -217,8 +233,10 @@ pub(crate) async fn start(
         Box::pin(async move {
             use tonic::transport::Endpoint;
             let endpoint = Endpoint::from_shared(endpoint_str)
-                .map_err(|e| Box::new(std::io::Error::other(format!("endpoint: {}", e)))
-                    as Box<dyn std::error::Error + Send + Sync>)?
+                .map_err(|e| {
+                    Box::new(std::io::Error::other(format!("endpoint: {}", e)))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .keep_alive_while_idle(true);
             match seed {
@@ -231,12 +249,16 @@ pub(crate) async fn start(
                     // (Was Ed448/X.509 mTLS via QuilTlsConnector — a transport
                     // mismatch against the pqnoise server + not post-quantum.)
                     let connector = quil_rpc::QuilPqNoiseConnector::new(seed);
-                    let channel = endpoint.connect_with_connector(connector).await
+                    let channel = endpoint
+                        .connect_with_connector(connector)
+                        .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     Ok(channel)
                 }
                 None => {
-                    let channel = endpoint.connect().await
+                    let channel = endpoint
+                        .connect()
+                        .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
                     Ok(channel)
                 }
@@ -253,7 +275,11 @@ pub(crate) async fn start(
         .ok()
         .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
     {
-        Some(t) => (Some(t.ca_cert_pem), Some(t.leaf_cert_pem), Some(t.leaf_key_pem)),
+        Some(t) => (
+            Some(t.ca_cert_pem),
+            Some(t.leaf_cert_pem),
+            Some(t.leaf_key_pem),
+        ),
         None => {
             warn!("could not build worker-channel mTLS cert — DataIpc server will be UNAUTHENTICATED plaintext");
             (None, None, None)
@@ -267,7 +293,11 @@ pub(crate) async fn start(
         channel_tls_ca_pem,
         channel_tls_leaf_pem,
         channel_tls_key_pem,
-        parent_pid: if parent_process > 0 { Some(parent_process) } else { None },
+        parent_pid: if parent_process > 0 {
+            Some(parent_process)
+        } else {
+            None
+        },
         channel_factory: Some(channel_factory),
         app_consensus_cw: config.engine.app_consensus_cw,
         // Persist the app-shard CW journal under the worker's resolved data dir
@@ -280,8 +310,7 @@ pub(crate) async fn start(
     // Mainnet (`p2p.network == 0`) uses 3 — matches the protocol's
     // halt-risk floor so a single prover can't drive consensus alone.
     // Testnets use 1 so a single-prover test cluster still progresses.
-    let min_active_provers_for_propose: u64 =
-        if config.p2p.network == 0 { 3 } else { 1 };
+    let min_active_provers_for_propose: u64 = if config.p2p.network == 0 { 3 } else { 1 };
 
     // Concrete registry + store for the post-sync refresh hook (the trait
     // `refresh()` is a no-op; a cluster worker must `refresh_from_store` to
@@ -329,27 +358,32 @@ pub(crate) async fn start(
         if let Ok(falcon_sk) =
             file_key_manager.get_private_key(quil_types::crypto::KeyType::Falcon512)
         {
-            worker_node = worker_node.with_storage_history_source(
-                crate::storage_history::from_master(stream_addr.clone(), falcon_sk.clone()),
-            ).with_global_anchor_source(
-                crate::storage_history::global_frames_from_master(stream_addr.clone(), falcon_sk.clone()),
-            );
-            let prod_syncer =
-                Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
-                    master_stream_addr: stream_addr,
-                    hg_store: hg_store.clone(),
-                    falcon_signing_key: falcon_sk,
-                    crdt: crdt.clone(),
-                    // Discover through the authenticated master, then fetch
-                    // app trees directly: a regular master has no app forest.
-                    archive_pool: Some(Arc::new(quil_rpc::ArchiveEndpointPool::new(
-                        std::time::Duration::from_secs(30),
-                    ))),
-                    discover_archives_from_master: true,
-                });
-            worker_node = worker_node.with_outgoing_history_source(prod_syncer.outgoing_history_source());
+            worker_node = worker_node
+                .with_storage_history_source(crate::storage_history::from_master(
+                    stream_addr.clone(),
+                    falcon_sk.clone(),
+                ))
+                .with_global_anchor_source(crate::storage_history::global_frames_from_master(
+                    stream_addr.clone(),
+                    falcon_sk.clone(),
+                ));
+            let prod_syncer = Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                master_stream_addr: stream_addr,
+                hg_store: hg_store.clone(),
+                falcon_signing_key: falcon_sk,
+                crdt: crdt.clone(),
+                // Discover through the authenticated master, then fetch
+                // app trees directly: a regular master has no app forest.
+                archive_pool: Some(Arc::new(quil_rpc::ArchiveEndpointPool::new(
+                    std::time::Duration::from_secs(30),
+                ))),
+                discover_archives_from_master: true,
+            });
+            worker_node =
+                worker_node.with_outgoing_history_source(prod_syncer.outgoing_history_source());
             quil_engine::storage_snapshot::install_remote(prod_syncer.storage_snapshot_remote(
-                crate::prover_tree_syncer_prod::snapshot_scratch_dir(&db_path), tokio::runtime::Handle::current(),
+                crate::prover_tree_syncer_prod::snapshot_scratch_dir(&db_path),
+                tokio::runtime::Handle::current(),
             ));
             let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> = prod_syncer;
             let delivery_syncer = syncer.clone();
@@ -357,8 +391,14 @@ pub(crate) async fn start(
                 .with_delivery_frame_source(Arc::new(move |filter, number| {
                     let syncer = delivery_syncer.clone();
                     Box::pin(async move {
-                        tokio::time::timeout(std::time::Duration::from_secs(10),
-                            syncer.get_app_shard_frame(&filter, number)).await.ok()?.ok().flatten()
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            syncer.get_app_shard_frame(&filter, number),
+                        )
+                        .await
+                        .ok()?
+                        .ok()
+                        .flatten()
                     })
                 }))
                 .with_prover_tree_syncer(syncer);
@@ -385,7 +425,8 @@ pub(crate) async fn start(
         // before its master keeps connecting in the background instead of
         // running receive-only until restarted; its publishes are dropped
         // until the proxy connects.
-        let proxy: Arc<std::sync::OnceLock<Arc<quil_rpc::proxy_pubsub::ProxyPubSub>>> = Arc::default();
+        let proxy: Arc<std::sync::OnceLock<Arc<quil_rpc::proxy_pubsub::ProxyPubSub>>> =
+            Arc::default();
         let master_addr_for_publish = master_addr.clone();
         let mut outage = quil_engine::outage::Outage::default();
         match quil_rpc::proxy_pubsub::ProxyPubSub::connect(master_addr.clone(), None).await {
@@ -434,32 +475,34 @@ pub(crate) async fn start(
         // A committee handoff seal dropped before the proxy connects warns,
         // at most once a minute with the count dropped since; other
         // publishes are routine and dropped quietly.
-        let dropped_seals: Arc<std::sync::Mutex<(Option<std::time::Instant>, u64)>> = Arc::default();
-        let publish_fn: quil_engine::worker_node::PublishFn =
-            Arc::new(move |bitmask, data| {
-                let p = proxy_for_publish.get().cloned();
-                if p.is_none() && bitmask.as_slice() == quil_engine::bitmasks::GLOBAL_PROVER {
-                    if let Ok(mut dropped) = dropped_seals.lock() {
-                        dropped.1 += 1;
-                        let now = std::time::Instant::now();
-                        if dropped.0.is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(60)) {
-                            warn!(master = %master_addr_for_publish, dropped = dropped.1, scope = "local", action = "check",
+        let dropped_seals: Arc<std::sync::Mutex<(Option<std::time::Instant>, u64)>> =
+            Arc::default();
+        let publish_fn: quil_engine::worker_node::PublishFn = Arc::new(move |bitmask, data| {
+            let p = proxy_for_publish.get().cloned();
+            if p.is_none() && bitmask.as_slice() == quil_engine::bitmasks::GLOBAL_PROVER {
+                if let Ok(mut dropped) = dropped_seals.lock() {
+                    dropped.1 += 1;
+                    let now = std::time::Instant::now();
+                    if dropped.0.is_none_or(|at| {
+                        now.duration_since(at) >= std::time::Duration::from_secs(60)
+                    }) {
+                        warn!(master = %master_addr_for_publish, dropped = dropped.1, scope = "local", action = "check",
                                 "committee handoff seal not published: the master PubSubProxy is not connected yet; \
                                  check that the master runs and listens on that address");
-                            *dropped = (Some(now), 0);
-                        }
+                        *dropped = (Some(now), 0);
                     }
                 }
-                Box::pin(async move {
-                    let Some(p) = p else {
-                        tracing::debug!("proxy publish dropped: master PubSubProxy not connected yet");
-                        return;
-                    };
-                    if let Err(e) = p.publish(bitmask, data).await {
-                        warn!(error = %e, "proxy publish failed");
-                    }
-                })
-            });
+            }
+            Box::pin(async move {
+                let Some(p) = p else {
+                    tracing::debug!("proxy publish dropped: master PubSubProxy not connected yet");
+                    return;
+                };
+                if let Err(e) = p.publish(bitmask, data).await {
+                    warn!(error = %e, "proxy publish failed");
+                }
+            })
+        });
         worker_node = worker_node.with_publish_fn(publish_fn);
     }
 
@@ -479,11 +522,8 @@ pub(crate) async fn start(
         let p2p_node =
             quil_p2p::P2PNode::new_for_worker(&config.p2p, core_id, Some(&worker_falcon_sk))
                 .map_err(|e| anyhow::anyhow!("worker p2p node init: {}", e))?;
-        let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(
-            &config.engine,
-            core_id,
-        )
-        .map_err(|e| anyhow::anyhow!("worker p2p listen addr: {}", e))?;
+        let worker_listen = quil_p2p::P2PNode::worker_listen_multiaddr(&config.engine, core_id)
+            .map_err(|e| anyhow::anyhow!("worker p2p listen addr: {}", e))?;
         info!(core_id, listen = %worker_listen, "starting worker-owned p2p");
         let (handle, rx) = p2p_node
             .start(&mut sup, &worker_listen)
@@ -500,19 +540,22 @@ pub(crate) async fn start(
         //     `subscribe_to_shard_bitmasks`). Subscribing to GLOBAL
         //     causes every worker to relay every shard's votes/
         //     proposals — massive amplification with zero benefit.
-        handle.subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec()).await;
-        handle.subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec()).await;
+        handle
+            .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
+            .await;
+        handle
+            .subscribe(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
+            .await;
         // Wire publish_fn → worker's own p2p.
         let p2p_for_publish = handle.clone();
-        let publish_fn: quil_engine::worker_node::PublishFn =
-            Arc::new(move |bitmask, data| {
-                let h = p2p_for_publish.clone();
-                Box::pin(async move {
-                    if let Err(e) = h.publish(bitmask, data).await {
-                        warn!(error = %e, "worker p2p publish failed");
-                    }
-                })
-            });
+        let publish_fn: quil_engine::worker_node::PublishFn = Arc::new(move |bitmask, data| {
+            let h = p2p_for_publish.clone();
+            Box::pin(async move {
+                if let Err(e) = h.publish(bitmask, data).await {
+                    warn!(error = %e, "worker p2p publish failed");
+                }
+            })
+        });
         worker_node = worker_node
             .with_publish_fn(publish_fn)
             .with_p2p_handle(handle.clone());
@@ -529,21 +572,18 @@ pub(crate) async fn start(
     // silently dropped.
     if let Some((_handle, mut rx)) = worker_owned_p2p {
         let route_worker = worker.clone();
-        sup.run_until_cancelled(
-            "worker-p2p-router",
-            move |_token| async move {
-                loop {
-                    match rx.recv().await {
-                        // `msg.from` is the gossip sender's PeerId — needed to
-                        // resolve the committee key for inbound app-shard CW.
-                        Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask, &msg.from),
-                        None => break,
-                    }
+        sup.run_until_cancelled("worker-p2p-router", move |_token| async move {
+            loop {
+                match rx.recv().await {
+                    // `msg.from` is the gossip sender's PeerId — needed to
+                    // resolve the committee key for inbound app-shard CW.
+                    Some(msg) => route_worker.route_message(&msg.data, &msg.bitmask, &msg.from),
+                    None => break,
                 }
-                info!("worker p2p routing task stopped");
-                Ok(())
-            },
-        );
+            }
+            info!("worker p2p routing task stopped");
+            Ok(())
+        });
     }
 
     info!(core_id, "worker node initialized, starting event loop");

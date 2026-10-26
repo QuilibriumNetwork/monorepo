@@ -110,8 +110,8 @@ impl OnionOriginator {
     pub fn new(transport: Arc<dyn Transport>, on_data: Option<OnData>) -> Arc<Self> {
         let orig = Self::detached(Arc::clone(&transport), on_data);
         let handler = Arc::clone(&orig);
-        transport.set_on_receive(Arc::new(move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
-            match cell::parse_cell(cell) {
+        transport.set_on_receive(Arc::new(
+            move |src_peer: &[u8], circ_id: u32, cell: &[u8]| match cell::parse_cell(cell) {
                 Some((cell::CMD_CREATED, payload)) => {
                     handler.handle_created(src_peer, circ_id, payload);
                 }
@@ -119,8 +119,8 @@ impl OnionOriginator {
                     handler.handle_relay_backward(circ_id, ciphertext);
                 }
                 _ => {}
-            }
-        }));
+            },
+        ));
         orig
     }
 
@@ -227,7 +227,13 @@ impl OnionOriginator {
         }
 
         let created_payload = rx.await.ok()?;
-        let hop_secret = derive_and_verify_hop(&ss_static, &eph_secret_key, &eph_public_key, &ct_static, &created_payload)?;
+        let hop_secret = derive_and_verify_hop(
+            &ss_static,
+            &eph_secret_key,
+            &eph_public_key,
+            &ct_static,
+            &created_payload,
+        )?;
         self.circuits.lock().unwrap().insert(
             entry_circ,
             CircuitState {
@@ -276,7 +282,13 @@ impl OnionOriginator {
         }
 
         let extended_payload = rx.await.ok()?;
-        let new_secret = derive_and_verify_hop(&ss_static, &eph_secret_key, &eph_public_key, &ct_static, &extended_payload)?;
+        let new_secret = derive_and_verify_hop(
+            &ss_static,
+            &eph_secret_key,
+            &eph_public_key,
+            &ct_static,
+            &extended_payload,
+        )?;
         if let Some(c) = self.circuits.lock().unwrap().get_mut(&entry_circ) {
             c.secrets.push(Zeroizing::new(new_secret));
         }
@@ -304,15 +316,20 @@ impl OnionOriginator {
         }
         let (entry_peer, secrets, seq) = {
             let mut circuits = self.circuits.lock().unwrap();
-            let c = circuits.get_mut(&entry_circ).ok_or(TransportError::NoActiveStream)?;
+            let c = circuits
+                .get_mut(&entry_circ)
+                .ok_or(TransportError::NoActiveStream)?;
             c.fwd_send_seq += 1;
             (c.entry_peer.clone(), c.secrets.clone(), c.fwd_send_seq)
         };
         // Stamp the forward sequence inside the DATA cell (exit's replay guard).
         let inner = cell::build_relay_inner(cell::RCMD_DATA, &cell::seq_data(seq, payload));
         let onion = wrap_for_last_hop(&secrets, &inner).ok_or(TransportError::StreamClosed)?;
-        self.transport
-            .send(&entry_peer, entry_circ, cell::build_cell(cell::CMD_RELAY, &onion))
+        self.transport.send(
+            &entry_peer,
+            entry_circ,
+            cell::build_cell(cell::CMD_RELAY, &onion),
+        )
     }
 }
 
@@ -436,10 +453,17 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let (circ, payload) = got.lock().unwrap().clone().expect("message delivered at exit");
+        let (circ, payload) = got
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("message delivered at exit");
         assert_eq!(payload, b"three-hop private hello");
         // Delivered on relayC's own upstream circuit id, not the originator's.
-        assert!(circ >= 0x8000_0000, "exit circ is a downstream-allocated id");
+        assert!(
+            circ >= 0x8000_0000,
+            "exit circ is a downstream-allocated id"
+        );
     }
 
     /// Bidirectional TWO-hop circuit: the originator sends a request, the exit
@@ -503,7 +527,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(reply.lock().unwrap().clone().expect("reply delivered"), b"pong");
+        assert_eq!(
+            reply.lock().unwrap().clone().expect("reply delivered"),
+            b"pong"
+        );
     }
 
     /// Single-hop: create + deliver at the (exit) relay.

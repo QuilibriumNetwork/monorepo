@@ -107,10 +107,7 @@ pub struct BlossomSubHandler {
 
 enum InboundState {
     /// We have a stream and a read buffer.
-    Active {
-        stream: Stream,
-        buf: Vec<u8>,
-    },
+    Active { stream: Stream, buf: Vec<u8> },
 }
 
 enum OutboundState {
@@ -289,7 +286,10 @@ impl BlossomSubHandler {
                     let ctrl_prunes = rpc.control.as_ref().map(|c| c.prune.len()).unwrap_or(0);
                     let ctrl_ihaves = rpc.control.as_ref().map(|c| c.ihave.len()).unwrap_or(0);
                     if subs > 0 || msgs > 0 || has_control {
-                        debug!(consumed, subs, msgs, ctrl_grafts, ctrl_prunes, ctrl_ihaves, "decoded RPC");
+                        debug!(
+                            consumed,
+                            subs, msgs, ctrl_grafts, ctrl_prunes, ctrl_ihaves, "decoded RPC"
+                        );
                     }
                     self.events.push_back(HandlerOut::Rpc(rpc));
                     *buf = buf[consumed..].to_vec();
@@ -384,7 +384,11 @@ impl ConnectionHandler for BlossomSubHandler {
             // Queuing more would only be shed — drop it now.
             return;
         }
-        debug!(data_len = event.rpc_data.len(), queue_len = self.send_queue.len(), "handler received data from behaviour");
+        debug!(
+            data_len = event.rpc_data.len(),
+            queue_len = self.send_queue.len(),
+            "handler received data from behaviour"
+        );
         self.send_queue_bytes += event.rpc_data.len();
         if event.bulk {
             self.send_queue_bulk_bytes += event.rpc_data.len();
@@ -427,7 +431,10 @@ impl ConnectionHandler for BlossomSubHandler {
             ConnectionEvent::DialUpgradeError(_) => {
                 self.outbound_retries += 1;
                 if self.outbound_retries < 3 {
-                    debug!(retry = self.outbound_retries, "outbound BlossomSub upgrade failed, will retry");
+                    debug!(
+                        retry = self.outbound_retries,
+                        "outbound BlossomSub upgrade failed, will retry"
+                    );
                     self.outbound_requested = false;
                 } else {
                     // Outbound never negotiated after 3 tries: we can never
@@ -461,7 +468,10 @@ impl ConnectionHandler for BlossomSubHandler {
         // Request outbound substream if we have data to send and no outbound yet
         if !self.send_queue.is_empty() && self.outbound.is_none() && !self.outbound_requested {
             self.outbound_requested = true;
-            debug!(queue_len = self.send_queue.len(), "requesting outbound BlossomSub stream");
+            debug!(
+                queue_len = self.send_queue.len(),
+                "requesting outbound BlossomSub stream"
+            );
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                 protocol: SubstreamProtocol::new(ReadyUpgrade::new(self.protocol.clone()), ()),
             });
@@ -516,7 +526,10 @@ mod tests {
         assert_eq!(control, 4, "control RPCs must survive backlog shedding");
         // Accounting matches the actual buffered bytes.
         let actual: usize = h.send_queue.iter().map(|q| q.data.len()).sum();
-        assert_eq!(actual, h.send_queue_bytes, "byte accounting must stay exact");
+        assert_eq!(
+            actual, h.send_queue_bytes,
+            "byte accounting must stay exact"
+        );
     }
 
     /// Hard stop: a queue of pure control that still exceeds the cap drops

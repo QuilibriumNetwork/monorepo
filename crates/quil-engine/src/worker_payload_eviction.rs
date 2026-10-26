@@ -86,7 +86,9 @@ fn coverage(filters: &[Vec<u8>]) -> Result<BTreeMap<Address, Vec<Interval>>> {
         let (app, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)
             .ok_or_else(|| QuilError::InvalidArgument("invalid protected filter".into()))?;
         if bits.len() > 256 || (filter.len() == 33 && filter[32] >= 64) {
-            return Err(QuilError::InvalidArgument("invalid protected address depth".into()));
+            return Err(QuilError::InvalidArgument(
+                "invalid protected address depth".into(),
+            ));
         }
         let app: Address = app
             .try_into()
@@ -161,21 +163,33 @@ struct Plan {
 /// Read-only: the payload ranges outside `keep`, refusing anything whose
 /// layout or completeness it cannot vouch for.
 fn plan(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>) -> Result<Plan> {
-    let mut plan = Plan { ranges: Vec::new(), gaps: Vec::new(), records: 0, bytes: 0 };
+    let mut plan = Plan {
+        ranges: Vec::new(),
+        gaps: Vec::new(),
+        records: 0,
+        bytes: 0,
+    };
     for (app, keep) in apps {
         let shard = quil_types::store::ShardKey {
             l1: quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3),
             l2: *app,
         };
-        for (set, phase) in [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")] {
-            let mut prefix = quil_store::encoding::hypergraph_vertex_data_v2_shard_prefix(set, phase, &shard);
+        for (set, phase) in [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ] {
+            let mut prefix =
+                quil_store::encoding::hypergraph_vertex_data_v2_shard_prefix(set, phase, &shard);
             prefix.extend(app);
             for (lo, hi) in gaps(keep) {
                 let mut lower = prefix.clone();
                 lower.extend(lo);
                 let upper = match hi {
                     Some(hi) => [prefix.as_slice(), hi.as_slice()].concat(),
-                    None => successor(prefix.clone()).ok_or_else(|| unavailable("unbounded payload domain"))?,
+                    None => successor(prefix.clone())
+                        .ok_or_else(|| unavailable("unbounded payload domain"))?,
                 };
                 let mut found = false;
                 // Every key a tombstone would cover must be a canonical blob of
@@ -202,14 +216,23 @@ fn plan(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>) -> Result<P
 /// Checks that need the write barrier: nothing may claim historical roots or
 /// an interrupted sync for an evicted application, and readiness markers the
 /// removal falsifies are collected for the same batch.
-fn markers(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>, affected: &[Address]) -> Result<Vec<Vec<u8>>> {
+fn markers(
+    db: &CoordinatedDb,
+    apps: &BTreeMap<Address, Vec<Interval>>,
+    affected: &[Address],
+) -> Result<Vec<Vec<u8>>> {
     let mut invalid = Vec::new();
     for app in affected {
         let keep = &apps[app];
-        for tag in [quil_store::encoding::HG_ROOT_VERSION, quil_store::encoding::HG_APP_MANIFEST] {
+        for tag in [
+            quil_store::encoding::HG_ROOT_VERSION,
+            quil_store::encoding::HG_APP_MANIFEST,
+        ] {
             scan(db, &[tag], None, |key, _| {
                 if key.len() >= 35 && key[3..35] == app[..] {
-                    return Err(unavailable("application has indexed historical roots or manifests"));
+                    return Err(unavailable(
+                        "application has indexed historical roots or manifests",
+                    ));
                 }
                 Ok(())
             })?;
@@ -234,12 +257,20 @@ fn markers(db: &CoordinatedDb, apps: &BTreeMap<Address, Vec<Interval>>, affected
                 return Err(unavailable("malformed readiness marker"));
             }
             let bits = u16::from_be_bytes([tail[n + 3], tail[n + 4]]) as usize;
-            if bits > 256 || tail.len() != n + 5 + bits.div_ceil(8) || tail[n + 2] >= 4 || value != [1] {
+            if bits > 256
+                || tail.len() != n + 5 + bits.div_ceil(8)
+                || tail[n + 2] >= 4
+                || value != [1]
+            {
                 return Err(unavailable("malformed readiness scope"));
             }
             if tail[2..34] == app[..] {
                 let packed = &tail[n + 5..];
-                let (lo, hi) = bounds(&(0..bits).map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0).collect::<Vec<_>>());
+                let (lo, hi) = bounds(
+                    &(0..bits)
+                        .map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0)
+                        .collect::<Vec<_>>(),
+                );
                 // An exact unified scope wholly inside a kept interval still
                 // holds all its data. Broad, overlapping or legacy scopes do not.
                 if n != 32 || !keep.iter().any(|(a, b)| lo >= *a && hi <= *b) {
@@ -265,14 +296,21 @@ pub fn evict_outside(crdt: &HypergraphCrdt, keep: &[Vec<u8>]) -> Result<Outcome>
 /// write barrier just before the deletion, which is skipped once it says no
 /// ([`Outcome::stopped`]), as when the worker was rebound during the scan to
 /// a shard `keep` does not protect.
-pub fn evict_outside_while(crdt: &HypergraphCrdt, keep: &[Vec<u8>], proceed: &dyn Fn() -> bool) -> Result<Outcome> {
+pub fn evict_outside_while(
+    crdt: &HypergraphCrdt,
+    keep: &[Vec<u8>],
+    proceed: &dyn Fn() -> bool,
+) -> Result<Outcome> {
     if !crdt.unified_tree() {
         return Err(unavailable("payload eviction requires a unified store"));
     }
     let apps = coverage(keep)?;
     let guard = crdt.lock_forest_writes();
     let db = crdt.maintain_forest(&guard, |forest| {
-        forest.db().cloned().ok_or_else(|| unavailable("payload eviction requires a persistent forest"))
+        forest
+            .db()
+            .cloned()
+            .ok_or_else(|| unavailable("payload eviction requires a persistent forest"))
     })?;
     drop(guard);
     let planned = plan(&db, &apps)?;
@@ -291,7 +329,10 @@ pub fn evict_outside_while(crdt: &HypergraphCrdt, keep: &[Vec<u8>], proceed: &dy
 /// cursor above zero, and that cursor. A worker keeps the frames and cursor
 /// of every shard it served.
 pub(crate) fn lineages(db: &CoordinatedDb) -> Result<Vec<(Vec<u8>, u64)>> {
-    let prefix = [quil_store::encoding::CONSENSUS, quil_store::encoding::CONSENSUS_MATERIALIZED_CURSOR];
+    let prefix = [
+        quil_store::encoding::CONSENSUS,
+        quil_store::encoding::CONSENSUS_MATERIALIZED_CURSOR,
+    ];
     let mut found = Vec::new();
     scan(db, &prefix, None, |key, value| {
         let filter = &key[prefix.len()..];
@@ -312,16 +353,34 @@ pub(crate) fn lineages(db: &CoordinatedDb) -> Result<Vec<(Vec<u8>, u64)>> {
 /// stopped at ([`crate::app_handoff::dropped_lineage`]). A lineage whose
 /// subtree already holds no leaf in any phase (an empty shard, or one an
 /// earlier confinement dropped) gets none: there is nothing to drop.
-pub(crate) fn lineage_drop_records(crdt: &HypergraphCrdt) -> Result<Vec<quil_hypergraph::LineageRecord>> {
-    let Some(db) = crdt.forest_store() else { return Ok(Vec::new()) };
-    let empty = |filter: &[u8]| crdt.canonical_bits_for_filter(filter).is_some_and(|bits| {
-        [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")].iter()
-            .all(|(set, phase)| crdt.unified_subtree_leaf_count_checked(set, phase, &filter[..32], &bits) == Some(0))
-    });
-    Ok(lineages(&db)?.into_iter()
+pub(crate) fn lineage_drop_records(
+    crdt: &HypergraphCrdt,
+) -> Result<Vec<quil_hypergraph::LineageRecord>> {
+    let Some(db) = crdt.forest_store() else {
+        return Ok(Vec::new());
+    };
+    let empty = |filter: &[u8]| {
+        crdt.canonical_bits_for_filter(filter).is_some_and(|bits| {
+            [
+                ("vertex", "adds"),
+                ("vertex", "removes"),
+                ("hyperedge", "adds"),
+                ("hyperedge", "removes"),
+            ]
+            .iter()
+            .all(|(set, phase)| {
+                crdt.unified_subtree_leaf_count_checked(set, phase, &filter[..32], &bits) == Some(0)
+            })
+        })
+    };
+    Ok(lineages(&db)?
+        .into_iter()
         .filter(|(filter, _)| !empty(filter))
         .map(|(filter, cursor)| {
-            let record = (quil_store::encoding::app_lineage_dropped_key(&filter), cursor.to_be_bytes().to_vec());
+            let record = (
+                quil_store::encoding::app_lineage_dropped_key(&filter),
+                cursor.to_be_bytes().to_vec(),
+            );
             (filter, vec![record])
         })
         .collect())
@@ -333,12 +392,19 @@ pub(crate) fn lineage_drop_records(crdt: &HypergraphCrdt) -> Result<Vec<quil_hyp
 /// leaves ([`crate::app_shard_metadata::has_committed_shard_data`]). Binding
 /// a shard to the worker that holds it saves an archive install of it.
 pub(crate) fn held_shards(crdt: &HypergraphCrdt) -> Result<Vec<(Vec<u8>, u64)>> {
-    let Some(db) = crdt.forest_store() else { return Ok(Vec::new()) };
+    let Some(db) = crdt.forest_store() else {
+        return Ok(Vec::new());
+    };
     let mut held = Vec::new();
     for (filter, cursor) in lineages(&db)? {
-        let dropped = db.get(quil_store::encoding::app_lineage_dropped_key(&filter)).map_err(store_error)?
+        let dropped = db
+            .get(quil_store::encoding::app_lineage_dropped_key(&filter))
+            .map_err(store_error)?
             .is_some_and(|bytes| bytes == cursor.to_be_bytes());
-        if dropped || (crdt.unified_tree() && !crate::app_shard_metadata::has_committed_shard_data(crdt, &filter)) {
+        if dropped
+            || (crdt.unified_tree()
+                && !crate::app_shard_metadata::has_committed_shard_data(crdt, &filter))
+        {
             continue;
         }
         held.push((filter, cursor));
@@ -353,7 +419,12 @@ const FOREST_SCAN_BUDGET: usize = 250_000;
 /// Why a worker defers a request to evict outside `keep`, or `None` to run
 /// it: the scope it is bound to must be protected, served by a running
 /// engine, and settled.
-pub(crate) fn deferral(bound: &[u8], keep: &[Vec<u8>], serving: bool, bound_for: std::time::Duration) -> Option<&'static str> {
+pub(crate) fn deferral(
+    bound: &[u8],
+    keep: &[Vec<u8>],
+    serving: bool,
+    bound_for: std::time::Duration,
+) -> Option<&'static str> {
     if bound.is_empty() || !keep.iter().any(|filter| filter.as_slice() == bound) {
         Some("binding is not protected")
     } else if !serving {
@@ -392,15 +463,25 @@ pub(crate) async fn run_passes<R>(
     };
     let started = std::time::Instant::now();
     let payload_bound = bound.clone();
-    let outcome = tokio::task::spawn_blocking(move || evict_outside_while(&crdt, &keep, &*payload_bound)).await;
+    let outcome =
+        tokio::task::spawn_blocking(move || evict_outside_while(&crdt, &keep, &*payload_bound))
+            .await;
     if matches!(&outcome, Ok(Ok(o)) if o.stopped) {
         return rebound("payload eviction");
     }
     match outcome {
-        Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
-            removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
-            compacted_ranges = o.compacted_ranges, reclaimable_bytes = o.reclaimable_bytes,
-            secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
+        Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(
+            core_id,
+            filter,
+            removed_records = o.removed_records,
+            removed_bytes = o.removed_bytes,
+            ranges = o.ranges,
+            invalidated_markers = o.invalidated_markers,
+            compacted_ranges = o.compacted_ranges,
+            reclaimable_bytes = o.reclaimable_bytes,
+            secs = started.elapsed().as_secs(),
+            "worker payload outside served scopes evicted"
+        ),
         Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
         Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
         Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
@@ -415,7 +496,8 @@ pub(crate) async fn run_passes<R>(
     let outcome = tokio::task::spawn_blocking(move || {
         let lineages = lineage_drop_records(&forest_crdt)?;
         forest_crdt.confine_forest_recording(&forest_keep, FOREST_SCAN_BUDGET, &lineages, &*proceed)
-    }).await;
+    })
+    .await;
     let stopped = matches!(&outcome, Ok(Ok(o)) if o.stopped);
     if let Ok(Ok(o)) = &outcome {
         if !o.dropped_lineages.is_empty() {
@@ -425,9 +507,16 @@ pub(crate) async fn run_passes<R>(
         }
     }
     match outcome {
-        Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(core_id, filter, commits = o.commits,
-            nodes = o.nodes, stale_records = o.stale_records, key_ranges = o.key_ranges,
-            secs = started.elapsed().as_secs(), "worker forest outside served scopes removed"),
+        Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(
+            core_id,
+            filter,
+            commits = o.commits,
+            nodes = o.nodes,
+            stale_records = o.stale_records,
+            key_ranges = o.key_ranges,
+            secs = started.elapsed().as_secs(),
+            "worker forest outside served scopes removed"
+        ),
         Ok(Ok(_)) => debug!(core_id, "no worker forest outside served scopes"),
         Ok(Err(error)) => warn!(core_id, filter, %error, "worker forest confinement refused"),
         Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
@@ -441,14 +530,25 @@ pub(crate) async fn run_passes<R>(
         return rebound("consensus storage");
     }
     if let Some((base, retained)) = storage {
-        let outcome = tokio::task::spawn_blocking(move ||
-            crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)).await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)
+        })
+        .await;
         match outcome {
-            Ok(Ok(o)) if o.entries > 0 => info!(core_id, filter, entries = o.entries, bytes = o.bytes,
-                "worker consensus storage outside served scopes removed"),
+            Ok(Ok(o)) if o.entries > 0 => info!(
+                core_id,
+                filter,
+                entries = o.entries,
+                bytes = o.bytes,
+                "worker consensus storage outside served scopes removed"
+            ),
             Ok(Ok(_)) => debug!(core_id, "no worker consensus storage outside served scopes"),
-            Ok(Err(error)) => warn!(core_id, filter, %error, "worker consensus storage removal failed"),
-            Err(error) => warn!(core_id, filter, %error, "worker consensus storage removal task failed"),
+            Ok(Err(error)) => {
+                warn!(core_id, filter, %error, "worker consensus storage removal failed")
+            }
+            Err(error) => {
+                warn!(core_id, filter, %error, "worker consensus storage removal task failed")
+            }
         }
     }
 }
@@ -490,7 +590,12 @@ fn delete(
 ) -> Result<Outcome> {
     let affected: Vec<Address> = apps
         .keys()
-        .filter(|app| planned.ranges.iter().any(|(lower, _)| lower[38..70] == app[..]))
+        .filter(|app| {
+            planned
+                .ranges
+                .iter()
+                .any(|(lower, _)| lower[38..70] == app[..])
+        })
         .copied()
         .collect();
     let guard = crdt.lock_forest_writes();
@@ -513,7 +618,10 @@ fn delete(
     })?;
     drop(guard);
     let Some(invalidated) = invalidated else {
-        return Ok(Outcome { stopped: true, ..Outcome::default() });
+        return Ok(Outcome {
+            stopped: true,
+            ..Outcome::default()
+        });
     };
     for (lower, upper) in &planned.ranges {
         let mut residue = false;
@@ -522,7 +630,9 @@ fn delete(
             Ok(())
         })?;
         if residue {
-            return Err(QuilError::Store("payload eviction left records in a deleted range".into()));
+            return Err(QuilError::Store(
+                "payload eviction left records in a deleted range".into(),
+            ));
         }
     }
     // Reclaim now where no older snapshot holds the records; boundary files
@@ -549,17 +659,30 @@ mod tests {
 
     const APP: Address = [0x21; 32];
 
-    fn open() -> (Arc<quil_store::RocksDb>, Arc<quil_store::RocksHypergraphStore>, HypergraphCrdt) {
+    fn open() -> (
+        Arc<quil_store::RocksDb>,
+        Arc<quil_store::RocksHypergraphStore>,
+        HypergraphCrdt,
+    ) {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
-        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let crdt = HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        );
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         crdt.set_unified_tree(true);
         (db, store, crdt)
     }
 
     fn shard() -> ShardKey {
-        ShardKey { l1: quil_hypergraph::addressing::get_bloom_filter_indices(&APP, 256, 3), l2: APP }
+        ShardKey {
+            l1: quil_hypergraph::addressing::get_bloom_filter_indices(&APP, 256, 3),
+            l2: APP,
+        }
     }
 
     fn lower_half() -> Vec<Vec<u8>> {
@@ -567,7 +690,10 @@ mod tests {
     }
 
     fn location(key: u8) -> Location {
-        Location { app_address: APP, data_address: [key; 32] }
+        Location {
+            app_address: APP,
+            data_address: [key; 32],
+        }
     }
 
     #[test]
@@ -579,12 +705,26 @@ mod tests {
         }
         source.commit(1).unwrap();
         let (version, root) = source.serve_forest_head(&APP, 0).unwrap();
-        let forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
+        let forest =
+            quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
         let reader = forest.shard_phase_reader(&APP, PHASES[0]);
 
         let (db, store, target) = open();
-        let mut sync = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-        let blobs: Vec<_> = sync.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        let mut sync = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &APP,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let blobs: Vec<_> = sync
+            .remaining()
+            .iter()
+            .map(|(key, _)| vec![key[0]; 48])
+            .collect();
         target.apply_sync_chunk(&mut sync, &blobs).unwrap();
         target.finish_phase_sync(&sync).unwrap();
         // A readiness promise for the kept half survives; the whole-app one cannot.
@@ -596,23 +736,67 @@ mod tests {
         kept_marker.push(0);
         db.inner().put(&kept_marker, [1]).unwrap();
         assert!(target.sync_data_ready(&APP, 0, &[]).unwrap());
-        let kept = store.load_vertex_underlying_at("vertex", "adds", &shard(), &location(1).to_id(), 0).unwrap();
+        let kept = store
+            .load_vertex_underlying_at("vertex", "adds", &shard(), &location(1).to_id(), 0)
+            .unwrap();
 
         let outcome = evict_outside(&target, &lower_half()).unwrap();
-        assert_eq!((outcome.removed_records, outcome.invalidated_markers), (1, 1));
-        assert!(target.get_vertex_data_checked(&location(129)).unwrap().is_none());
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard(), &location(1).to_id(), 0).unwrap(), kept);
-        assert_eq!(target.serve_forest_head(&APP, 0).unwrap().1, root, "the forest is untouched");
+        assert_eq!(
+            (outcome.removed_records, outcome.invalidated_markers),
+            (1, 1)
+        );
+        assert!(target
+            .get_vertex_data_checked(&location(129))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard(), &location(1).to_id(), 0)
+                .unwrap(),
+            kept
+        );
+        assert_eq!(
+            target.serve_forest_head(&APP, 0).unwrap().1,
+            root,
+            "the forest is untouched"
+        );
         assert!(!target.sync_data_ready(&APP, 0, &[]).unwrap());
-        assert!(target.sync_data_ready(&APP, 0, &[false]).unwrap(), "the kept scope needs no repair");
-        assert_eq!(evict_outside(&target, &lower_half()).unwrap(), Outcome::default(), "a repeat finds nothing");
+        assert!(
+            target.sync_data_ready(&APP, 0, &[false]).unwrap(),
+            "the kept scope needs no repair"
+        );
+        assert_eq!(
+            evict_outside(&target, &lower_half()).unwrap(),
+            Outcome::default(),
+            "a repeat finds nothing"
+        );
 
-        let mut repair = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-        assert_eq!(repair.remaining().len(), 2, "an equal root must not skip the data audit");
-        let blobs: Vec<_> = repair.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        let mut repair = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &APP,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        assert_eq!(
+            repair.remaining().len(),
+            2,
+            "an equal root must not skip the data audit"
+        );
+        let blobs: Vec<_> = repair
+            .remaining()
+            .iter()
+            .map(|(key, _)| vec![key[0]; 48])
+            .collect();
         target.apply_sync_chunk(&mut repair, &blobs).unwrap();
         target.finish_phase_sync(&repair).unwrap();
-        assert_eq!(target.get_vertex_data_checked(&location(129)).unwrap(), Some(vec![129; 48]));
+        assert_eq!(
+            target.get_vertex_data_checked(&location(129)).unwrap(),
+            Some(vec![129; 48])
+        );
         assert!(target.sync_data_ready(&APP, 0, &[]).unwrap());
     }
 
@@ -625,12 +809,26 @@ mod tests {
         }
         source.commit(1).unwrap();
         let (version, root) = source.serve_forest_head(&APP, 0).unwrap();
-        let forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
+        let forest =
+            quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
         let reader = forest.shard_phase_reader(&APP, PHASES[0]);
 
         let (_db, _, target) = open();
-        let mut sync = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-        let blobs: Vec<_> = sync.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        let mut sync = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &APP,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let blobs: Vec<_> = sync
+            .remaining()
+            .iter()
+            .map(|(key, _)| vec![key[0]; 48])
+            .collect();
         target.apply_sync_chunk(&mut sync, &blobs).unwrap();
         target.finish_phase_sync(&sync).unwrap();
         let served = lower_half();
@@ -641,15 +839,31 @@ mod tests {
         let confined = target.confine_forest(&served, 1).unwrap();
         assert_eq!(confined.commits, 1, "only the populated phase has a head");
         assert!(confined.nodes > 0 && confined.key_ranges > 0);
-        assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]), served_root);
-        assert_ne!(target.serve_forest_head(&APP, 0).unwrap().1, root, "the dropped half left the head");
-        assert_eq!(target.get_vertex_data_checked(&location(1)).unwrap(), Some(vec![1; 48]));
-        assert_eq!(target.confine_forest(&served, 1).unwrap(), quil_hypergraph::ForestConfinement::default(),
-            "a repeat finds nothing and sweeps nothing");
+        assert_eq!(
+            target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]),
+            served_root
+        );
+        assert_ne!(
+            target.serve_forest_head(&APP, 0).unwrap().1,
+            root,
+            "the dropped half left the head"
+        );
+        assert_eq!(
+            target.get_vertex_data_checked(&location(1)).unwrap(),
+            Some(vec![1; 48])
+        );
+        assert_eq!(
+            target.confine_forest(&served, 1).unwrap(),
+            quil_hypergraph::ForestConfinement::default(),
+            "a repeat finds nothing and sweeps nothing"
+        );
         // A frame commit on the confined tree keeps working.
         target.add_vertex(&location(3), &vec![3; 48]).unwrap();
         target.commit(2).unwrap();
-        assert_ne!(target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]), served_root);
+        assert_ne!(
+            target.sub_shard_commitment_for_filter("vertex", "adds", &served[0]),
+            served_root
+        );
 
         // Reassignment to the whole application syncs the dropped half back.
         let (version, root) = {
@@ -658,12 +872,28 @@ mod tests {
             source.serve_forest_head(&APP, 0).unwrap()
         };
         let reader = forest.shard_phase_reader(&APP, PHASES[0]);
-        let mut repair = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-        let blobs: Vec<_> = repair.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        let mut repair = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &APP,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let blobs: Vec<_> = repair
+            .remaining()
+            .iter()
+            .map(|(key, _)| vec![key[0]; 48])
+            .collect();
         target.apply_sync_chunk(&mut repair, &blobs).unwrap();
         target.finish_phase_sync(&repair).unwrap();
         assert_eq!(target.serve_forest_head(&APP, 0).unwrap().1, root);
-        assert_eq!(target.get_vertex_data_checked(&location(130)).unwrap(), Some(vec![130; 48]));
+        assert_eq!(
+            target.get_vertex_data_checked(&location(130)).unwrap(),
+            Some(vec![130; 48])
+        );
     }
 
     /// A confinement that drops the subtree of a shard whose frames the
@@ -682,11 +912,25 @@ mod tests {
         }
         source.commit(1).unwrap();
         let (version, root) = source.serve_forest_head(&APP, 0).unwrap();
-        let forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
+        let forest =
+            quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE);
         let reader = forest.shard_phase_reader(&APP, PHASES[0]);
         let (db, _, target) = open();
-        let mut sync = target.prepare_phase_sync(&reader, version, &APP, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-        let blobs: Vec<_> = sync.remaining().iter().map(|(key, _)| vec![key[0]; 48]).collect();
+        let mut sync = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &APP,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        let blobs: Vec<_> = sync
+            .remaining()
+            .iter()
+            .map(|(key, _)| vec![key[0]; 48])
+            .collect();
         target.apply_sync_chunk(&mut sync, &blobs).unwrap();
         target.finish_phase_sync(&sync).unwrap();
 
@@ -696,57 +940,124 @@ mod tests {
         // A lineage of the left half whose own subtree holds nothing.
         let quiet = quil_forest::encode_shard_bit_path(&APP, &[true, true]);
         for (filter, cursor) in [(&served[0], 40u64), (&left, 31), (&other, 12), (&quiet, 7)] {
-            db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(filter), cursor.to_be_bytes()).unwrap();
+            db.inner()
+                .put(
+                    quil_store::encoding::consensus_materialized_cursor_key(filter),
+                    cursor.to_be_bytes(),
+                )
+                .unwrap();
         }
-        let sorted = |mut held: Vec<(Vec<u8>, u64)>| { held.sort(); held };
-        assert_eq!(sorted(held_shards(&target).unwrap()), sorted(vec![(served[0].clone(), 40), (left.clone(), 31)]),
-            "another application's lineage holds no data here");
+        let sorted = |mut held: Vec<(Vec<u8>, u64)>| {
+            held.sort();
+            held
+        };
+        assert_eq!(
+            sorted(held_shards(&target).unwrap()),
+            sorted(vec![(served[0].clone(), 40), (left.clone(), 31)]),
+            "another application's lineage holds no data here"
+        );
         let left_root = target.sub_shard_commitment_for_filter("vertex", "adds", &left);
         assert!(!left_root.is_empty() && left_root != vec![0; 32]);
 
         evict_outside(&target, &served).unwrap();
         let records = lineage_drop_records(&target).unwrap();
-        let record = |filter: &[u8]| db.inner().get(quil_store::encoding::app_lineage_dropped_key(filter)).unwrap();
+        let record = |filter: &[u8]| {
+            db.inner()
+                .get(quil_store::encoding::app_lineage_dropped_key(filter))
+                .unwrap()
+        };
         // Rebound before it commits, the confinement stops untouched.
-        let stopped = target.confine_forest_recording(&served, 1, &records, &|| false).unwrap();
-        assert!(stopped.stopped && stopped.commits == 0 && stopped.dropped_lineages.is_empty(), "{stopped:?}");
-        assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &left), left_root, "nothing dropped");
+        let stopped = target
+            .confine_forest_recording(&served, 1, &records, &|| false)
+            .unwrap();
+        assert!(
+            stopped.stopped && stopped.commits == 0 && stopped.dropped_lineages.is_empty(),
+            "{stopped:?}"
+        );
+        assert_eq!(
+            target.sub_shard_commitment_for_filter("vertex", "adds", &left),
+            left_root,
+            "nothing dropped"
+        );
         assert_eq!(record(&left), None);
-        let confined = target.confine_forest_recording(&served, 1, &records, &|| true).unwrap();
+        let confined = target
+            .confine_forest_recording(&served, 1, &records, &|| true)
+            .unwrap();
         assert!(!confined.stopped);
-        assert_eq!(confined.dropped_lineages, vec![left.clone()], "the empty lineage has nothing to drop");
+        assert_eq!(
+            confined.dropped_lineages,
+            vec![left.clone()],
+            "the empty lineage has nothing to drop"
+        );
         assert_eq!(record(&left), Some(31u64.to_be_bytes().to_vec()));
-        assert_eq!((record(&served[0]), record(&other), record(&quiet)), (None, None, None));
+        assert_eq!(
+            (record(&served[0]), record(&other), record(&quiet)),
+            (None, None, None)
+        );
         // What an archive replay compares the dropped shard's certified
         // pre-state with: an empty subtree, read as the tree's empty-range
         // placeholder for a path ending inside a node that keeps other
         // children, and as all zeros where the path's node is gone.
-        assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &left),
-            b"SPARSE_MERKLE_PLACEHOLDER_HASH__".to_vec());
+        assert_eq!(
+            target.sub_shard_commitment_for_filter("vertex", "adds", &left),
+            b"SPARSE_MERKLE_PLACEHOLDER_HASH__".to_vec()
+        );
         let gone = quil_forest::encode_shard_bit_path(&APP, &[true, false, false, false]);
-        assert_eq!(target.sub_shard_commitment_for_filter("vertex", "adds", &gone), vec![0; 32]);
-        assert_eq!(target.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]), 0);
+        assert_eq!(
+            target.sub_shard_commitment_for_filter("vertex", "adds", &gone),
+            vec![0; 32]
+        );
+        assert_eq!(
+            target.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]),
+            0
+        );
         assert_eq!(held_shards(&target).unwrap(), vec![(served[0].clone(), 40)]);
-        assert!(target.confine_forest_recording(&served, 1, &lineage_drop_records(&target).unwrap(), &|| true).unwrap()
-            .dropped_lineages.is_empty(), "a repeat drops nothing");
+        assert!(
+            target
+                .confine_forest_recording(
+                    &served,
+                    1,
+                    &lineage_drop_records(&target).unwrap(),
+                    &|| true
+                )
+                .unwrap()
+                .dropped_lineages
+                .is_empty(),
+            "a repeat drops nothing"
+        );
     }
 
     /// A store holding a vertex in its lower half, with lineages of both
     /// halves (filters `held` and `quiet`).
-    fn lineage_store() -> (Arc<quil_store::RocksDb>, Arc<quil_store::RocksHypergraphStore>, HypergraphCrdt, Vec<u8>, Vec<u8>) {
+    fn lineage_store() -> (
+        Arc<quil_store::RocksDb>,
+        Arc<quil_store::RocksHypergraphStore>,
+        HypergraphCrdt,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
         let (db, store, crdt) = open();
         crdt.add_vertex(&location(1), &vec![1; 48]).unwrap();
         crdt.commit(1).unwrap();
         let held = lower_half()[0].clone();
         let quiet = quil_forest::encode_shard_bit_path(&APP, &[true]);
         for (filter, cursor) in [(&held, 4u64), (&quiet, 3)] {
-            db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(filter), cursor.to_be_bytes()).unwrap();
+            db.inner()
+                .put(
+                    quil_store::encoding::consensus_materialized_cursor_key(filter),
+                    cursor.to_be_bytes(),
+                )
+                .unwrap();
         }
         (db, store, crdt, held, quiet)
     }
 
     fn drop_record_filters(crdt: &HypergraphCrdt) -> Vec<Vec<u8>> {
-        let mut filters: Vec<Vec<u8>> = lineage_drop_records(crdt).unwrap().into_iter().map(|(f, _)| f).collect();
+        let mut filters: Vec<Vec<u8>> = lineage_drop_records(crdt)
+            .unwrap()
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
         filters.sort();
         filters
     }
@@ -755,8 +1066,15 @@ mod tests {
     #[test]
     fn a_lineage_whose_subtree_is_empty_gets_no_drop_record() {
         let (_db, _store, crdt, held, _quiet) = lineage_store();
-        assert_eq!(crdt.unified_subtree_leaf_count_checked("vertex", "adds", &APP, &[true]), Some(0));
-        assert_eq!(drop_record_filters(&crdt), vec![held], "the empty half has nothing to drop");
+        assert_eq!(
+            crdt.unified_subtree_leaf_count_checked("vertex", "adds", &APP, &[true]),
+            Some(0)
+        );
+        assert_eq!(
+            drop_record_filters(&crdt),
+            vec![held],
+            "the empty half has nothing to drop"
+        );
     }
 
     /// A leaf count that cannot be read (here a malformed head version on a
@@ -766,16 +1084,33 @@ mod tests {
     fn an_unreadable_leaf_count_is_unknown_not_empty() {
         let (db, store, _crdt, held, quiet) = lineage_store();
         let forest = quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE);
-        let (head, _) = forest.head_version_put(&APP, quil_forest::PHASES[0], 1).unwrap();
+        let (head, _) = forest
+            .head_version_put(&APP, quil_forest::PHASES[0], 1)
+            .unwrap();
         db.inner().put(&head, b"bad").unwrap();
-        let reopened = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        reopened.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let reopened =
+            HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
+        reopened.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         reopened.set_unified_tree(true);
-        assert_eq!(reopened.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]), 0, "the unchecked count");
-        assert_eq!(reopened.unified_subtree_leaf_count_checked("vertex", "adds", &APP, &[true]), None);
+        assert_eq!(
+            reopened.unified_subtree_leaf_count("vertex", "adds", &APP, &[true]),
+            0,
+            "the unchecked count"
+        );
+        assert_eq!(
+            reopened.unified_subtree_leaf_count_checked("vertex", "adds", &APP, &[true]),
+            None
+        );
         let mut both = vec![held, quiet];
         both.sort();
-        assert_eq!(drop_record_filters(&reopened), both, "an unreadable count is not empty");
+        assert_eq!(
+            drop_record_filters(&reopened),
+            both,
+            "an unreadable count is not empty"
+        );
     }
 
     /// A payload pass whose worker was rebound during its scan removes
@@ -804,22 +1139,52 @@ mod tests {
         let (db, _, crdt) = open();
         let inner = db.inner();
         let (mut kept, mut evicted) = (Vec::new(), Vec::new());
-        for (set, phase) in [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")] {
+        for (set, phase) in [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ] {
             for version in [0, 1, 9] {
                 for address in [1u8, 129] {
                     let mut id = APP.to_vec();
                     id.extend([address; 32]);
-                    let key = quil_store::encoding::hypergraph_vertex_data_v2_key(set, phase, &shard(), &id, version);
+                    let key = quil_store::encoding::hypergraph_vertex_data_v2_key(
+                        set,
+                        phase,
+                        &shard(),
+                        &id,
+                        version,
+                    );
                     inner.put(&key, [address, version as u8]).unwrap();
-                    if address == 1 { kept.push(key) } else { evicted.push(key) }
+                    if address == 1 {
+                        kept.push(key)
+                    } else {
+                        evicted.push(key)
+                    }
                 }
             }
         }
         // Another application without a protected scope is never classified.
-        let other = ShardKey { l1: quil_hypergraph::addressing::get_bloom_filter_indices(&[0x22; 32], 256, 3), l2: [0x22; 32] };
-        let foreign_app = quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &other, &[[0x22; 32], [129; 32]].concat(), 0);
+        let other = ShardKey {
+            l1: quil_hypergraph::addressing::get_bloom_filter_indices(&[0x22; 32], 256, 3),
+            l2: [0x22; 32],
+        };
+        let foreign_app = quil_store::encoding::hypergraph_vertex_data_v2_key(
+            "vertex",
+            "adds",
+            &other,
+            &[[0x22; 32], [129; 32]].concat(),
+            0,
+        );
         inner.put(&foreign_app, b"other").unwrap();
-        let global = quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &quil_store::encoding::prover_registry_shard(), &[255; 64], 5);
+        let global = quil_store::encoding::hypergraph_vertex_data_v2_key(
+            "vertex",
+            "adds",
+            &quil_store::encoding::prover_registry_shard(),
+            &[255; 64],
+            5,
+        );
         inner.put(&global, b"GLOBAL").unwrap();
         inner.put(b"consensus-metadata", b"preserve").unwrap();
 
@@ -833,9 +1198,15 @@ mod tests {
         for key in evicted {
             assert!(inner.get(key).unwrap().is_none());
         }
-        assert_eq!(inner.get(foreign_app).unwrap().as_deref(), Some(&b"other"[..]));
+        assert_eq!(
+            inner.get(foreign_app).unwrap().as_deref(),
+            Some(&b"other"[..])
+        );
         assert_eq!(inner.get(global).unwrap().as_deref(), Some(&b"GLOBAL"[..]));
-        assert_eq!(inner.get(b"consensus-metadata").unwrap().as_deref(), Some(&b"preserve"[..]));
+        assert_eq!(
+            inner.get(b"consensus-metadata").unwrap().as_deref(),
+            Some(&b"preserve"[..])
+        );
     }
 
     #[test]
@@ -844,7 +1215,8 @@ mod tests {
         let inner = db.inner();
         let mut id = APP.to_vec();
         id.extend([129; 32]);
-        let key = quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0);
+        let key =
+            quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0);
         inner.put(&key, b"unprotected").unwrap();
         let refuses = |setup: &dyn Fn(), cleanup: &dyn Fn()| {
             setup();
@@ -855,15 +1227,28 @@ mod tests {
             cleanup();
         };
         let mixed = key[..key.len() - 1].to_vec();
-        refuses(&|| inner.put(&mixed, b"bad shape").unwrap(), &|| inner.delete(&mixed).unwrap());
+        refuses(&|| inner.put(&mixed, b"bad shape").unwrap(), &|| {
+            inner.delete(&mixed).unwrap()
+        });
         let mut incomplete = INCOMPLETE.to_vec();
         incomplete.extend(32u16.to_be_bytes());
         incomplete.extend(APP);
-        refuses(&|| inner.put(&incomplete, [0, 0, 1, 0]).unwrap(), &|| inner.delete(&incomplete).unwrap());
-        let root_index = quil_store::encoding::hypergraph_root_version_key("vertex", "adds", &APP, &[1; 32]);
-        refuses(&|| inner.put(&root_index, [0; 16]).unwrap(), &|| inner.delete(&root_index).unwrap());
-        refuses(&|| crdt.set_unified_tree(false), &|| crdt.set_unified_tree(true));
-        assert_eq!(evict_outside(&crdt, &lower_half()).unwrap().removed_records, 1, "each refusal was the only obstacle");
+        refuses(&|| inner.put(&incomplete, [0, 0, 1, 0]).unwrap(), &|| {
+            inner.delete(&incomplete).unwrap()
+        });
+        let root_index =
+            quil_store::encoding::hypergraph_root_version_key("vertex", "adds", &APP, &[1; 32]);
+        refuses(&|| inner.put(&root_index, [0; 16]).unwrap(), &|| {
+            inner.delete(&root_index).unwrap()
+        });
+        refuses(&|| crdt.set_unified_tree(false), &|| {
+            crdt.set_unified_tree(true)
+        });
+        assert_eq!(
+            evict_outside(&crdt, &lower_half()).unwrap().removed_records,
+            1,
+            "each refusal was the only obstacle"
+        );
     }
 
     /// A request runs only for a protected, served and settled binding.
@@ -871,10 +1256,22 @@ mod tests {
     fn eviction_waits_for_a_protected_served_and_settled_binding() {
         let settled = crate::worker_allocator::PAYLOAD_EVICTION_SETTLE;
         let keep = lower_half();
-        assert_eq!(deferral(&[], &keep, true, settled), Some("binding is not protected"));
-        assert_eq!(deferral(&[1; 32], &keep, true, settled), Some("binding is not protected"));
-        assert_eq!(deferral(&keep[0], &keep, false, settled), Some("engine is not serving the binding"));
-        assert_eq!(deferral(&keep[0], &keep, true, settled / 2), Some("binding has not settled"));
+        assert_eq!(
+            deferral(&[], &keep, true, settled),
+            Some("binding is not protected")
+        );
+        assert_eq!(
+            deferral(&[1; 32], &keep, true, settled),
+            Some("binding is not protected")
+        );
+        assert_eq!(
+            deferral(&keep[0], &keep, false, settled),
+            Some("engine is not serving the binding")
+        );
+        assert_eq!(
+            deferral(&keep[0], &keep, true, settled / 2),
+            Some("binding has not settled")
+        );
         assert_eq!(deferral(&keep[0], &keep, true, settled), None);
     }
 
@@ -892,20 +1289,46 @@ mod tests {
         };
         inner.put(key(1), b"kept").unwrap();
         inner.put(key(129), b"left").unwrap();
-        let base = std::env::temp_dir().join(format!("quil-worker-passes-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let base = std::env::temp_dir().join(format!(
+            "quil-worker-passes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let keep = lower_half();
         let (owed, left) = (vec![0x22; 32], vec![0x23; 32]);
-        let entry = |filter: &[u8]| base.join("cw-app-consensus").join(format!("app-{}", hex::encode(filter)));
+        let entry = |filter: &[u8]| {
+            base.join("cw-app-consensus")
+                .join(format!("app-{}", hex::encode(filter)))
+        };
         for filter in [&keep[0], &owed, &left] {
             std::fs::create_dir_all(entry(filter)).unwrap();
         }
-        let retained = { let owed = owed.clone(); move |filter: &[u8]| filter == owed.as_slice() };
-        run_passes(1, "test".into(), Arc::new(crdt), keep.clone(), Some((base.clone(), retained)), Arc::new(|| true)).await;
+        let retained = {
+            let owed = owed.clone();
+            move |filter: &[u8]| filter == owed.as_slice()
+        };
+        run_passes(
+            1,
+            "test".into(),
+            Arc::new(crdt),
+            keep.clone(),
+            Some((base.clone(), retained)),
+            Arc::new(|| true),
+        )
+        .await;
         assert_eq!(inner.get(key(1)).unwrap().as_deref(), Some(&b"kept"[..]));
-        assert!(inner.get(key(129)).unwrap().is_none(), "payload outside the kept scope is evicted");
+        assert!(
+            inner.get(key(129)).unwrap().is_none(),
+            "payload outside the kept scope is evicted"
+        );
         assert!(entry(&keep[0]).exists() && entry(&owed).exists());
-        assert!(!entry(&left).exists(), "a left shard's consensus storage is removed");
+        assert!(
+            !entry(&left).exists(),
+            "a left shard's consensus storage is removed"
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -920,26 +1343,54 @@ mod tests {
             for address in half {
                 let mut id = APP.to_vec();
                 id.extend([address; 32]);
-                let key = quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard(), &id, 0);
+                let key = quil_store::encoding::hypergraph_vertex_data_v2_key(
+                    "vertex",
+                    "adds",
+                    &shard(),
+                    &id,
+                    0,
+                );
                 inner.put(&key, vec![address; 4096]).unwrap();
             }
             inner.flush().unwrap();
         }
         let inside = |db: &CoordinatedDb| {
-            let mut lower = quil_store::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard());
+            let mut lower = quil_store::encoding::hypergraph_vertex_data_v2_shard_prefix(
+                "vertex",
+                "adds",
+                &shard(),
+            );
             lower.extend(APP);
             lower.push(0x80);
-            db.live_files().unwrap().iter().filter(|f| f.start_key.as_deref().is_some_and(|a| a >= lower.as_slice())).map(|f| f.size).sum::<usize>()
+            db.live_files()
+                .unwrap()
+                .iter()
+                .filter(|f| {
+                    f.start_key
+                        .as_deref()
+                        .is_some_and(|a| a >= lower.as_slice())
+                })
+                .map(|f| f.size)
+                .sum::<usize>()
         };
         let snapshot = inner.snapshot();
         let first = evict_outside(&crdt, &lower_half()).unwrap();
         assert_eq!(first.removed_records, 128);
-        assert!(inside(&inner) > 0, "the held snapshot keeps the deleted records");
+        assert!(
+            inside(&inner) > 0,
+            "the held snapshot keeps the deleted records"
+        );
         drop(snapshot);
         let second = evict_outside(&crdt, &lower_half()).unwrap();
-        assert_eq!(second.removed_records, 0, "nothing visible is left to delete");
+        assert_eq!(
+            second.removed_records, 0,
+            "nothing visible is left to delete"
+        );
         assert!(second.compacted_ranges >= 1 && second.reclaimable_bytes > 0);
         assert_eq!(inside(&inner), 0, "the released records are compacted away");
-        assert_eq!(evict_outside(&crdt, &lower_half()).unwrap(), Outcome::default());
+        assert_eq!(
+            evict_outside(&crdt, &lower_half()).unwrap(),
+            Outcome::default()
+        );
     }
 }

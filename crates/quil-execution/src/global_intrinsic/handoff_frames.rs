@@ -93,7 +93,10 @@ pub fn verify_discarded_base_frame(
     let session = session_at_generation(state, claim.filter, generation)?
         .ok_or_else(|| invalid(UNAUTHORIZED_GENERATION))?;
     let certificate = quil_cw_consensus::app_cert::check_finalization(
-        bytes, &session.members, &session.namespace()?, claim.digest,
+        bytes,
+        &session.members,
+        &session.namespace()?,
+        claim.digest,
     )
     .map_err(|reason| invalid(&format!("generation {generation}: {reason}")))?;
     let proposal = &certificate.finalization.proposal;
@@ -103,7 +106,9 @@ pub fn verify_discarded_base_frame(
         || !proposal.parent.is_zero()
         || claim.parent != session.genesis
     {
-        return Err(invalid("frame is not the certified first frame of its session"));
+        return Err(invalid(
+            "frame is not the certified first frame of its session",
+        ));
     }
     let ended_at_base = submitted_checkpoint(state, &session.id()?)?
         .is_some_and(|end| end.frame == session.base_frame && end.digest == session.genesis);
@@ -136,7 +141,10 @@ fn verify_with(
         return Ok(None);
     };
     let certificate = quil_cw_consensus::app_cert::check_finalization(
-        bytes, &session.members, &session.namespace()?, claim.digest,
+        bytes,
+        &session.members,
+        &session.namespace()?,
+        claim.digest,
     )
     .map_err(|reason| invalid(&format!("generation {generation}: {reason}")))?;
     let proposal = &certificate.finalization.proposal;
@@ -192,8 +200,11 @@ fn resealed_tip(
     if claim.frame != end.frame || claim.digest != end.digest || claim.view >= end.view {
         return Ok(false);
     }
-    Ok(super::session_tip(state, &session.id()?)?
-        .is_some_and(|tip| (tip.frame, tip.view, tip.digest) == (claim.frame, claim.view, claim.digest)))
+    Ok(
+        super::session_tip(state, &session.id()?)?.is_some_and(|tip| {
+            (tip.frame, tip.view, tip.digest) == (claim.frame, claim.view, claim.digest)
+        }),
+    )
 }
 
 /// Under a committee-handoff flag day (`LegacyHistory::Discard`) the legacy
@@ -207,7 +218,8 @@ pub fn refuse_legacy_after_flag_day(global_frame: u64) -> Result<()> {
                 && global_frame >= policy.activation_frame =>
         {
             Err(QuilError::InvalidSignature(
-                "legacy app certificates are not accepted after the committee-handoff flag day".into(),
+                "legacy app certificates are not accepted after the committee-handoff flag day"
+                    .into(),
             ))
         }
         _ => Ok(()),

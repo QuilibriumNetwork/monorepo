@@ -19,16 +19,12 @@ fn main() {
     let primary = Path::new(&args[1]);
     let rank: u64 = args[2].parse().expect("rank must be a u64");
 
-    let scratch = std::env::temp_dir().join(format!(
-        "inspect-qc-{}",
-        std::process::id()
-    ));
+    let scratch = std::env::temp_dir().join(format!("inspect-qc-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("scratch dir");
 
     let mut opts = rocksdb::Options::default();
     opts.set_max_open_files(64);
-    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch)
-        .expect("open as secondary");
+    let db = rocksdb::DB::open_as_secondary(&opts, primary, &scratch).expect("open as secondary");
     let _ = db.try_catch_up_with_primary();
 
     // QC key: [0x00 CLOCK_FRAME, 0x0B CLOCK_QUORUM_CERTIFICATE, rank(8 BE)]
@@ -49,11 +45,15 @@ fn main() {
 
     println!("raw bytes len: {}", value.len());
 
-    let qc = quil_types::proto::global::QuorumCertificate::decode(value.as_slice())
-        .expect("decode QC");
+    let qc =
+        quil_types::proto::global::QuorumCertificate::decode(value.as_slice()).expect("decode QC");
 
     println!("QC at rank {}:", rank);
-    println!("  filter:        {} bytes hex={}", qc.filter.len(), hex::encode(&qc.filter));
+    println!(
+        "  filter:        {} bytes hex={}",
+        qc.filter.len(),
+        hex::encode(&qc.filter)
+    );
     println!("  rank:          {}", qc.rank);
     println!("  frame_number:  {}", qc.frame_number);
     println!("  selector:      {}", hex::encode(&qc.selector));
@@ -62,7 +62,10 @@ fn main() {
         println!(
             "  signature_len: {} pubkey_len: {} bitmask: {}",
             sig.signature.len(),
-            sig.public_key.as_ref().map(|p| p.key_value.len()).unwrap_or(0),
+            sig.public_key
+                .as_ref()
+                .map(|p| p.key_value.len())
+                .unwrap_or(0),
             hex::encode(&sig.bitmask),
         );
     } else {
@@ -76,7 +79,10 @@ fn main() {
     let mut cand_prefix = vec![0x00u8, 0x0F];
     cand_prefix.extend_from_slice(&qc.frame_number.to_be_bytes());
     println!();
-    println!("looking for global frame candidates at frame_number {}:", qc.frame_number);
+    println!(
+        "looking for global frame candidates at frame_number {}:",
+        qc.frame_number
+    );
     let iter = db.iterator(rocksdb::IteratorMode::From(
         &cand_prefix,
         rocksdb::Direction::Forward,
@@ -104,7 +110,10 @@ fn main() {
         );
         if let Ok(frame) = quil_types::proto::global::GlobalFrame::decode(v.as_ref()) {
             if let Some(hdr) = frame.header.as_ref() {
-                println!("    decoded rank={} frame_number={}", hdr.rank, hdr.frame_number);
+                println!(
+                    "    decoded rank={} frame_number={}",
+                    hdr.rank, hdr.frame_number
+                );
             }
         }
     }
@@ -115,7 +124,11 @@ fn main() {
     match db.get(&fkey) {
         Ok(Some(v)) => {
             println!();
-            println!("frame at frame_number {} exists ({} bytes)", qc.frame_number, v.len());
+            println!(
+                "frame at frame_number {} exists ({} bytes)",
+                qc.frame_number,
+                v.len()
+            );
             // Decode the proto frame header
             if let Ok(header) = quil_types::proto::global::GlobalFrameHeader::decode(v.as_slice()) {
                 let output_identity = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
@@ -125,7 +138,10 @@ fn main() {
                 println!("  frame.frame_number: {}", header.frame_number);
                 println!("  frame.output:       {} bytes", header.output.len());
                 println!("  poseidon(output):   {}", output_identity);
-                println!("  matches QC.selector? {}", qc.selector == hex::decode(&output_identity).unwrap_or_default());
+                println!(
+                    "  matches QC.selector? {}",
+                    qc.selector == hex::decode(&output_identity).unwrap_or_default()
+                );
             }
         }
         _ => println!("\nno frame at frame_number {}", qc.frame_number),

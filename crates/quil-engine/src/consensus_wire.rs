@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use quil_types::error::{QuilError, Result};
 use quil_execution::global_intrinsic::handoff::presence::EncodingGate;
+use quil_types::error::{QuilError, Result};
 
 // Type prefixes matching Go's canonical_types.go
 pub const PROPOSAL_VOTE_TYPE: u32 = 0x030C;
@@ -22,22 +22,30 @@ pub const GLOBAL_PROPOSAL_TYPE: u32 = 0x0317;
 pub const TIMEOUT_STATE_TYPE: u32 = 0x031C;
 pub const TIMEOUT_CERTIFICATE_TYPE: u32 = 0x031D;
 
-fn put_u32(out: &mut Vec<u8>, v: u32) { out.extend_from_slice(&v.to_be_bytes()); }
-fn put_u64(out: &mut Vec<u8>, v: u64) { out.extend_from_slice(&v.to_be_bytes()); }
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
 fn put_bytes(out: &mut Vec<u8>, data: &[u8]) {
     put_u32(out, data.len() as u32);
     out.extend_from_slice(data);
 }
 
 fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
-    if *cursor + 4 > data.len() { return Err(QuilError::InvalidArgument("short read u32".into())); }
-    let v = u32::from_be_bytes(data[*cursor..*cursor+4].try_into().unwrap());
+    if *cursor + 4 > data.len() {
+        return Err(QuilError::InvalidArgument("short read u32".into()));
+    }
+    let v = u32::from_be_bytes(data[*cursor..*cursor + 4].try_into().unwrap());
     *cursor += 4;
     Ok(v)
 }
 fn read_u64(data: &[u8], cursor: &mut usize) -> Result<u64> {
-    if *cursor + 8 > data.len() { return Err(QuilError::InvalidArgument("short read u64".into())); }
-    let v = u64::from_be_bytes(data[*cursor..*cursor+8].try_into().unwrap());
+    if *cursor + 8 > data.len() {
+        return Err(QuilError::InvalidArgument("short read u64".into()));
+    }
+    let v = u64::from_be_bytes(data[*cursor..*cursor + 8].try_into().unwrap());
     *cursor += 8;
     Ok(v)
 }
@@ -49,10 +57,12 @@ fn read_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
     if *cursor + len > data.len() {
         return Err(QuilError::InvalidArgument(format!(
             "short read bytes: need {} at offset {}, have {}",
-            len, *cursor, data.len()
+            len,
+            *cursor,
+            data.len()
         )));
     }
-    let v = data[*cursor..*cursor+len].to_vec();
+    let v = data[*cursor..*cursor + len].to_vec();
     *cursor += len;
     Ok(v)
 }
@@ -64,9 +74,9 @@ fn read_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
 /// BLS48-581 aggregate signature with public key and bitmask.
 #[derive(Debug, Clone, Default)]
 pub struct AggregateSignature {
-    pub public_key: Vec<u8>,  // 585 bytes
-    pub signature: Vec<u8>,   // 74 bytes
-    pub bitmask: Vec<u8>,     // 32 bytes
+    pub public_key: Vec<u8>, // 585 bytes
+    pub signature: Vec<u8>,  // 74 bytes
+    pub bitmask: Vec<u8>,    // 32 bytes
 }
 
 impl AggregateSignature {
@@ -74,7 +84,7 @@ impl AggregateSignature {
         let mut out = Vec::new();
         // Go writes: type_prefix, signature(LP), public_key(LP), bitmask(LP)
         put_u32(&mut out, 0x011C); // BLS48581AggregateSignatureType
-        // Signature
+                                   // Signature
         put_bytes(&mut out, &self.signature);
         // BLS48581G2PublicKey: [type=0x0117][key]
         let mut pk = Vec::new();
@@ -99,7 +109,11 @@ impl AggregateSignature {
             pk_bytes
         };
         let bitmask = read_bytes(data, cursor)?;
-        Ok(Self { public_key, signature, bitmask })
+        Ok(Self {
+            public_key,
+            signature,
+            bitmask,
+        })
     }
 
     /// Empty aggregate signature for genesis QC.
@@ -122,10 +136,10 @@ pub struct ProposalVote {
     pub filter: Vec<u8>,
     pub rank: u64,
     pub frame_number: u64,
-    pub selector: Vec<u8>,    // 32 bytes — frame identity
+    pub selector: Vec<u8>, // 32 bytes — frame identity
     pub timestamp: u64,
-    pub signature: Vec<u8>,   // BLS48581AddressedSignature bytes
-    pub address: Vec<u8>,     // 32 bytes — prover address
+    pub signature: Vec<u8>, // BLS48581AddressedSignature bytes
+    pub address: Vec<u8>,   // 32 bytes — prover address
     /// PoRep storage openings this voter attaches to its app-shard vote
     /// (a serialized `global::StorageAttestation`). The vote-aggregator
     /// collects these and assembles the frame's `StorageAttestation` +
@@ -172,7 +186,10 @@ impl ProposalVote {
         let mut c = 0usize;
         let tp = read_u32(data, &mut c)?;
         if tp != PROPOSAL_VOTE_TYPE {
-            return Err(QuilError::InvalidArgument(format!("bad vote type 0x{:08x}", tp)));
+            return Err(QuilError::InvalidArgument(format!(
+                "bad vote type 0x{:08x}",
+                tp
+            )));
         }
         let filter = read_bytes(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
@@ -199,7 +216,16 @@ impl ProposalVote {
         } else {
             Vec::new()
         };
-        Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address, openings })
+        Ok(Self {
+            filter,
+            rank,
+            frame_number,
+            selector,
+            timestamp,
+            signature,
+            address,
+            openings,
+        })
     }
 
     /// Build a wire `ProposalVote` from the proto representation (as returned by
@@ -228,15 +254,15 @@ impl ProposalVote {
     /// (`ClockStore::put_proposal_vote`), so it can later be served by
     /// `GetGlobalProposal`. Inverse of [`Self::from_proto`].
     pub fn to_proto(&self) -> quil_types::proto::global::ProposalVote {
-        let public_key_signature_bls48581 =
-            if self.signature.is_empty() && self.address.is_empty() {
-                None
-            } else {
-                Some(quil_types::proto::keys::Bls48581AddressedSignature {
-                    signature: self.signature.clone(),
-                    address: self.address.clone(),
-                })
-            };
+        let public_key_signature_bls48581 = if self.signature.is_empty() && self.address.is_empty()
+        {
+            None
+        } else {
+            Some(quil_types::proto::keys::Bls48581AddressedSignature {
+                signature: self.signature.clone(),
+                address: self.address.clone(),
+            })
+        };
         quil_types::proto::global::ProposalVote {
             filter: self.filter.clone(),
             rank: self.rank,
@@ -258,7 +284,7 @@ pub struct QuorumCertificate {
     pub filter: Vec<u8>,
     pub rank: u64,
     pub frame_number: u64,
-    pub selector: Vec<u8>,    // 32 bytes
+    pub selector: Vec<u8>, // 32 bytes
     pub timestamp: u64,
     pub aggregate_signature: AggregateSignature,
 }
@@ -281,7 +307,10 @@ impl QuorumCertificate {
         let mut c = 0usize;
         let tp = read_u32(data, &mut c)?;
         if tp != QUORUM_CERTIFICATE_TYPE {
-            return Err(QuilError::InvalidArgument(format!("bad QC type 0x{:08x}", tp)));
+            return Err(QuilError::InvalidArgument(format!(
+                "bad QC type 0x{:08x}",
+                tp
+            )));
         }
         let filter = read_bytes(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
@@ -291,7 +320,14 @@ impl QuorumCertificate {
         let agg_bytes = read_bytes(data, &mut c)?;
         let mut ac = 0usize;
         let aggregate_signature = AggregateSignature::from_canonical_bytes(&agg_bytes, &mut ac)?;
-        Ok(Self { filter, rank, frame_number, selector, timestamp, aggregate_signature })
+        Ok(Self {
+            filter,
+            rank,
+            frame_number,
+            selector,
+            timestamp,
+            aggregate_signature,
+        })
     }
 
     /// Genesis QC for bootstrapping the consensus loop.
@@ -315,7 +351,10 @@ impl QuorumCertificate {
     pub fn from_proto(qc: &quil_types::proto::global::QuorumCertificate) -> Self {
         let (public_key, signature, bitmask) = match qc.aggregate_signature.as_ref() {
             Some(agg) => (
-                agg.public_key.as_ref().map(|pk| pk.key_value.clone()).unwrap_or_default(),
+                agg.public_key
+                    .as_ref()
+                    .map(|pk| pk.key_value.clone())
+                    .unwrap_or_default(),
                 agg.signature.clone(),
                 agg.bitmask.clone(),
             ),
@@ -379,7 +418,10 @@ impl TimeoutCertificate {
     pub fn from_proto(tc: &quil_types::proto::global::TimeoutCertificate) -> Self {
         let (public_key, signature, bitmask) = match tc.aggregate_signature.as_ref() {
             Some(agg) => (
-                agg.public_key.as_ref().map(|pk| pk.key_value.clone()).unwrap_or_default(),
+                agg.public_key
+                    .as_ref()
+                    .map(|pk| pk.key_value.clone())
+                    .unwrap_or_default(),
                 agg.signature.clone(),
                 agg.bitmask.clone(),
             ),
@@ -408,7 +450,9 @@ impl TimeoutCertificate {
         put_bytes(&mut out, &self.filter);
         put_u64(&mut out, self.rank);
         put_u32(&mut out, self.latest_ranks.len() as u32);
-        for &r in &self.latest_ranks { put_u64(&mut out, r); }
+        for &r in &self.latest_ranks {
+            put_u64(&mut out, r);
+        }
         match &self.latest_quorum_certificate {
             Some(qc) => {
                 let qc_bytes = qc.to_canonical_bytes()?;
@@ -426,7 +470,10 @@ impl TimeoutCertificate {
         let mut c = 0usize;
         let tp = read_u32(data, &mut c)?;
         if tp != TIMEOUT_CERTIFICATE_TYPE {
-            return Err(QuilError::InvalidArgument(format!("bad TC type 0x{:08x}", tp)));
+            return Err(QuilError::InvalidArgument(format!(
+                "bad TC type 0x{:08x}",
+                tp
+            )));
         }
         let filter = read_bytes(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
@@ -435,11 +482,14 @@ impl TimeoutCertificate {
         // `remaining / 8` is impossible — reject before `Vec::with_capacity`.
         if count > data.len().saturating_sub(c) / 8 {
             return Err(QuilError::InvalidArgument(format!(
-                "TimeoutCertificate: latest_ranks count {} exceeds remaining bytes", count
+                "TimeoutCertificate: latest_ranks count {} exceeds remaining bytes",
+                count
             )));
         }
         let mut latest_ranks = Vec::with_capacity(count);
-        for _ in 0..count { latest_ranks.push(read_u64(data, &mut c)?); }
+        for _ in 0..count {
+            latest_ranks.push(read_u64(data, &mut c)?);
+        }
         let qc_bytes = read_bytes(data, &mut c)?;
         let latest_quorum_certificate = if qc_bytes.is_empty() {
             None
@@ -450,7 +500,14 @@ impl TimeoutCertificate {
         let agg_bytes = read_bytes(data, &mut c)?;
         let mut ac = 0usize;
         let aggregate_signature = AggregateSignature::from_canonical_bytes(&agg_bytes, &mut ac)?;
-        Ok(Self { filter, rank, latest_ranks, latest_quorum_certificate, timestamp, aggregate_signature })
+        Ok(Self {
+            filter,
+            rank,
+            latest_ranks,
+            latest_quorum_certificate,
+            timestamp,
+            aggregate_signature,
+        })
     }
 
     /// Build a wire `TimeoutCertificate` from a `dyn quil_consensus::models::
@@ -458,8 +515,9 @@ impl TimeoutCertificate {
     /// [`QuorumCertificate::from_trait_object`].
     pub fn from_trait_object(tc: &dyn quil_consensus::models::TimeoutCertificate) -> Self {
         let agg = tc.aggregated_signature();
-        let latest_quorum_certificate =
-            Some(QuorumCertificate::from_trait_object(tc.latest_quorum_cert()));
+        let latest_quorum_certificate = Some(QuorumCertificate::from_trait_object(
+            tc.latest_quorum_cert(),
+        ));
         Self {
             filter: tc.filter().to_vec(),
             rank: tc.rank(),
@@ -491,9 +549,15 @@ struct WireAggregateSignature {
 }
 
 impl quil_consensus::models::AggregatedSignature for WireAggregateSignature {
-    fn signature(&self) -> &[u8] { &self.signature }
-    fn public_key(&self) -> &[u8] { &self.public_key }
-    fn bitmask(&self) -> &[u8] { &self.bitmask }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+    fn bitmask(&self) -> &[u8] {
+        &self.bitmask
+    }
 }
 
 impl QuorumCertificate {
@@ -549,11 +613,21 @@ struct WireQcAdapter {
 }
 
 impl quil_consensus::models::QuorumCertificate for WireQcAdapter {
-    fn filter(&self) -> &[u8] { &self.filter }
-    fn rank(&self) -> u64 { self.rank }
-    fn frame_number(&self) -> u64 { self.frame_number }
-    fn identity(&self) -> &quil_consensus::models::Identity { &self.identity }
-    fn timestamp(&self) -> u64 { self.timestamp }
+    fn filter(&self) -> &[u8] {
+        &self.filter
+    }
+    fn rank(&self) -> u64 {
+        self.rank
+    }
+    fn frame_number(&self) -> u64 {
+        self.frame_number
+    }
+    fn identity(&self) -> &quil_consensus::models::Identity {
+        &self.identity
+    }
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
     fn aggregated_signature(&self) -> &dyn quil_consensus::models::AggregatedSignature {
         self.agg_sig.as_ref()
     }
@@ -572,9 +646,15 @@ struct WireTcAdapter {
 }
 
 impl quil_consensus::models::TimeoutCertificate for WireTcAdapter {
-    fn filter(&self) -> &[u8] { &self.filter }
-    fn rank(&self) -> u64 { self.rank }
-    fn latest_ranks(&self) -> &[u64] { &self.latest_ranks }
+    fn filter(&self) -> &[u8] {
+        &self.filter
+    }
+    fn rank(&self) -> u64 {
+        self.rank
+    }
+    fn latest_ranks(&self) -> &[u64] {
+        &self.latest_ranks
+    }
     fn latest_quorum_cert(&self) -> &dyn quil_consensus::models::QuorumCertificate {
         self.latest_qc.as_ref()
     }
@@ -623,7 +703,10 @@ impl GlobalProposal {
         let mut c = 0usize;
         let tp = read_u32(data, &mut c)?;
         if tp != GLOBAL_PROPOSAL_TYPE {
-            return Err(QuilError::InvalidArgument(format!("bad proposal type 0x{:08x}", tp)));
+            return Err(QuilError::InvalidArgument(format!(
+                "bad proposal type 0x{:08x}",
+                tp
+            )));
         }
         let state = read_bytes(data, &mut c)?;
         let qc_bytes = read_bytes(data, &mut c)?;
@@ -636,7 +719,12 @@ impl GlobalProposal {
         };
         let vote_bytes = read_bytes(data, &mut c)?;
         let vote = ProposalVote::from_canonical_bytes(&vote_bytes)?;
-        Ok(Self { state, parent_quorum_certificate, prior_rank_timeout_certificate, vote })
+        Ok(Self {
+            state,
+            parent_quorum_certificate,
+            prior_rank_timeout_certificate,
+            vote,
+        })
     }
 }
 
@@ -678,7 +766,10 @@ impl TimeoutState {
         let mut c = 0usize;
         let tp = read_u32(data, &mut c)?;
         if tp != TIMEOUT_STATE_TYPE {
-            return Err(QuilError::InvalidArgument(format!("bad timeout type 0x{:08x}", tp)));
+            return Err(QuilError::InvalidArgument(format!(
+                "bad timeout type 0x{:08x}",
+                tp
+            )));
         }
         let qc_bytes = read_bytes(data, &mut c)?;
         let latest_quorum_certificate = QuorumCertificate::from_canonical_bytes(&qc_bytes)?;
@@ -692,7 +783,13 @@ impl TimeoutState {
         let vote = ProposalVote::from_canonical_bytes(&vote_bytes)?;
         let timeout_tick = read_u64(data, &mut c)?;
         let timestamp = read_u64(data, &mut c)?;
-        Ok(Self { latest_quorum_certificate, prior_rank_timeout_certificate, vote, timeout_tick, timestamp })
+        Ok(Self {
+            latest_quorum_certificate,
+            prior_rank_timeout_certificate,
+            vote,
+            timeout_tick,
+            timestamp,
+        })
     }
 }
 
@@ -719,9 +816,7 @@ impl TimeoutState {
 /// in the doc-comment of `decode_global_frame`. Used by
 /// `GlobalConsumer::on_own_proposal` to produce the proposal's
 /// embedded frame bytes that go into `GlobalProposal.state`.
-pub fn encode_global_frame(
-    frame: &quil_types::proto::global::GlobalFrame,
-) -> Result<Vec<u8>> {
+pub fn encode_global_frame(frame: &quil_types::proto::global::GlobalFrame) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     put_u32(&mut out, GLOBAL_FRAME_TYPE);
     let header = frame
@@ -736,7 +831,8 @@ pub fn encode_global_frame(
     // tolerate `req_count = 0`.
     put_u32(&mut out, frame.requests.len() as u32);
     for bundle in &frame.requests {
-        let bundle_bytes = proto_message_bundle_to_canonical_bytes_at(bundle, Some(header.frame_number))?;
+        let bundle_bytes =
+            proto_message_bundle_to_canonical_bytes_at(bundle, Some(header.frame_number))?;
         put_bytes(&mut out, &bundle_bytes);
     }
     Ok(out)
@@ -744,9 +840,7 @@ pub fn encode_global_frame(
 
 /// Encode a `GlobalFrameHeader` proto into Quilibrium canonical bytes
 /// (type prefix `0x0309`). Mirror of `decode_frame_header`.
-fn encode_frame_header(
-    header: &quil_types::proto::global::GlobalFrameHeader,
-) -> Result<Vec<u8>> {
+fn encode_frame_header(header: &quil_types::proto::global::GlobalFrameHeader) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     put_u32(&mut out, GLOBAL_FRAME_HEADER_TYPE);
     put_u64(&mut out, header.frame_number);
@@ -792,14 +886,13 @@ fn encode_frame_header(
     Ok(out)
 }
 
-pub fn decode_global_frame(
-    data: &[u8],
-) -> Result<quil_types::proto::global::GlobalFrame> {
+pub fn decode_global_frame(data: &[u8]) -> Result<quil_types::proto::global::GlobalFrame> {
     let mut c = 0usize;
     let tp = read_u32(data, &mut c)?;
     if tp != GLOBAL_FRAME_TYPE {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrame: bad type prefix 0x{:08x}", tp
+            "GlobalFrame: bad type prefix 0x{:08x}",
+            tp
         )));
     }
 
@@ -850,17 +943,13 @@ pub fn decode_global_frame(
 /// consumers see the right bundle structure even when the inner oneof
 /// cannot yet be reconstructed. The bundle `timestamp` is always
 /// populated.
-pub fn decode_message_bundle(
-    data: &[u8],
-) -> Result<quil_types::proto::global::MessageBundle> {
+pub fn decode_message_bundle(data: &[u8]) -> Result<quil_types::proto::global::MessageBundle> {
     decode_message_bundle_gated(data, EncodingGate::Admission)
 }
 
 /// [`decode_message_bundle`] for an application shard's messages, which
 /// never carry a claim or a nullify report (`EncodingGate::App`).
-pub fn decode_app_message_bundle(
-    data: &[u8],
-) -> Result<quil_types::proto::global::MessageBundle> {
+pub fn decode_app_message_bundle(data: &[u8]) -> Result<quil_types::proto::global::MessageBundle> {
     decode_message_bundle_gated(data, EncodingGate::App)
 }
 
@@ -871,7 +960,10 @@ pub fn decode_message_bundle_at(
     data: &[u8],
     frame: Option<u64>,
 ) -> Result<quil_types::proto::global::MessageBundle> {
-    decode_message_bundle_gated(data, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+    decode_message_bundle_gated(
+        data,
+        frame.map_or(EncodingGate::Admission, EncodingGate::Global),
+    )
 }
 
 fn decode_message_bundle_gated(
@@ -888,15 +980,24 @@ fn decode_message_bundle_gated(
             None => requests.push(pb::MessageRequest::default()),
             Some(req) => {
                 if matches!(req.inner_type_prefix, 0x0509 | 0x050c | 0x050f) {
-                    return Err(quil_types::error::QuilError::InvalidArgument("retired token carrier".into()));
+                    return Err(quil_types::error::QuilError::InvalidArgument(
+                        "retired token carrier".into(),
+                    ));
                 }
-                if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
+                if req.inner_type_prefix
+                    == quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
+                {
                     // Known authorization messages must survive byte-for-byte.
                     // A malformed one must not become a default/empty request.
                     quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(&req.inner_bytes)?;
                 }
-                if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
-                    quil_execution::global_intrinsic::handoff::presence::check_encoding_in(&req.inner_bytes, gate)?;
+                if req.inner_type_prefix
+                    == quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT
+                {
+                    quil_execution::global_intrinsic::handoff::presence::check_encoding_in(
+                        &req.inner_bytes,
+                        gate,
+                    )?;
                 }
                 if req.inner_type_prefix == quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF {
                     quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(&req.inner_bytes)?;
@@ -919,8 +1020,20 @@ fn canonical_request_to_proto(
     req: &quil_execution::message_envelope::CanonicalMessageRequest,
     gate: EncodingGate,
 ) -> quil_types::proto::global::MessageRequest {
-    use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_join, prover_ops};
-    use quil_execution::global_intrinsic::consensus_types::{AltShardUpdate, TYPE_ALT_SHARD_UPDATE};
+    use quil_execution::compute_intrinsic::config::{
+        ComputeDeploy, ComputeUpdate, TYPE_COMPUTE_DEPLOY, TYPE_COMPUTE_UPDATE,
+    };
+    use quil_execution::compute_intrinsic::conversions as compute_conv;
+    use quil_execution::compute_intrinsic::ops::{
+        CodeDeployment, CodeExecute, CodeFinalize, TYPE_CODE_DEPLOYMENT, TYPE_CODE_EXECUTE,
+        TYPE_CODE_FINALIZE,
+    };
+    use quil_execution::global_intrinsic::consensus_types::{
+        AltShardUpdate, TYPE_ALT_SHARD_UPDATE,
+    };
+    use quil_execution::global_intrinsic::{
+        conversions, prover_filter_ops, prover_join, prover_ops,
+    };
     use quil_execution::hypergraph_intrinsic::canonical::{
         TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT,
         TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
@@ -928,14 +1041,6 @@ fn canonical_request_to_proto(
     use quil_execution::hypergraph_intrinsic::types as hg_types;
     use quil_execution::token_intrinsic::{
         conversions as token_conv, TokenDeploy, TokenUpdate, TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE,
-    };
-    use quil_execution::compute_intrinsic::conversions as compute_conv;
-    use quil_execution::compute_intrinsic::config::{
-        ComputeDeploy, ComputeUpdate, TYPE_COMPUTE_DEPLOY, TYPE_COMPUTE_UPDATE,
-    };
-    use quil_execution::compute_intrinsic::ops::{
-        CodeDeployment, CodeExecute, CodeFinalize, TYPE_CODE_DEPLOYMENT, TYPE_CODE_EXECUTE,
-        TYPE_CODE_FINALIZE,
     };
     use quil_types::proto::global::{message_request::Request, MessageRequest};
 
@@ -1118,26 +1223,34 @@ pub fn proto_message_bundle_to_canonical_bytes_at(
     bundle: &quil_types::proto::global::MessageBundle,
     frame: Option<u64>,
 ) -> Result<Vec<u8>> {
-    proto_message_bundle_to_canonical_gated(bundle, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+    proto_message_bundle_to_canonical_gated(
+        bundle,
+        frame.map_or(EncodingGate::Admission, EncodingGate::Global),
+    )
 }
 
 fn proto_message_bundle_to_canonical_gated(
     bundle: &quil_types::proto::global::MessageBundle,
     gate: EncodingGate,
 ) -> Result<Vec<u8>> {
-    use quil_execution::message_envelope::{
-        CanonicalMessageBundle, CanonicalMessageRequest,
-    };
+    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
-    let mut requests: Vec<Option<CanonicalMessageRequest>> = Vec::with_capacity(bundle.requests.len());
+    let mut requests: Vec<Option<CanonicalMessageRequest>> =
+        Vec::with_capacity(bundle.requests.len());
     for req in &bundle.requests {
-        if let Some(quil_types::proto::global::message_request::Request::CommitteeHandoff(bytes)) = &req.request {
+        if let Some(quil_types::proto::global::message_request::Request::CommitteeHandoff(bytes)) =
+            &req.request
+        {
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
         }
-        if let Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) = &req.request {
+        if let Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) =
+            &req.request
+        {
             quil_execution::global_intrinsic::handoff::presence::check_encoding_in(bytes, gate)?;
         }
-        if let Some(quil_types::proto::global::message_request::Request::StorageEpochProof(bytes)) = &req.request {
+        if let Some(quil_types::proto::global::message_request::Request::StorageEpochProof(bytes)) =
+            &req.request
+        {
             quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(bytes)?;
         }
         match proto_message_request_to_canonical(req, gate) {
@@ -1160,10 +1273,10 @@ fn proto_message_request_to_canonical(
     req: &quil_types::proto::global::MessageRequest,
     gate: EncodingGate,
 ) -> Option<quil_execution::message_envelope::CanonicalMessageRequest> {
-    use quil_execution::global_intrinsic::conversions;
-    use quil_execution::token_intrinsic::conversions as token_conv;
     use quil_execution::compute_intrinsic::conversions as compute_conv;
+    use quil_execution::global_intrinsic::conversions;
     use quil_execution::message_envelope::CanonicalMessageRequest;
+    use quil_execution::token_intrinsic::conversions as token_conv;
     use quil_types::proto::global::message_request::Request;
 
     let inner = req.request.as_ref()?;
@@ -1199,11 +1312,13 @@ fn proto_message_request_to_canonical(
             .to_canonical_bytes()
             .ok()?,
         Request::CommitteeHandoff(bytes) => {
-            quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes).ok()?;
+            quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)
+                .ok()?;
             bytes.clone()
         }
         Request::PresenceReport(bytes) => {
-            quil_execution::global_intrinsic::handoff::presence::check_encoding_in(bytes, gate).ok()?;
+            quil_execution::global_intrinsic::handoff::presence::check_encoding_in(bytes, gate)
+                .ok()?;
             bytes.clone()
         }
         Request::StorageEpochProof(bytes) => {
@@ -1282,21 +1397,22 @@ fn proto_message_request_to_canonical(
 
 const GLOBAL_FRAME_HEADER_TYPE: u32 = 0x0309;
 
-fn decode_frame_header(
-    data: &[u8],
-) -> Result<quil_types::proto::global::GlobalFrameHeader> {
+fn decode_frame_header(data: &[u8]) -> Result<quil_types::proto::global::GlobalFrameHeader> {
     let mut c = 0usize;
     let total = data.len();
-    let tp = read_u32(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("header type_prefix at 0/{}: {}", total, e)))?;
+    let tp = read_u32(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("header type_prefix at 0/{}: {}", total, e))
+    })?;
     if tp != GLOBAL_FRAME_HEADER_TYPE {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrameHeader: bad type prefix 0x{:08x}", tp
+            "GlobalFrameHeader: bad type prefix 0x{:08x}",
+            tp
         )));
     }
 
-    let frame_number = read_u64(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("frame_number at {}/{}: {}", c, total, e)))?;
+    let frame_number = read_u64(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("frame_number at {}/{}: {}", c, total, e))
+    })?;
     let rank = read_u64(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("rank at {}/{}: {}", c, total, e)))?;
     let timestamp = read_i64(data, &mut c)
@@ -1305,11 +1421,13 @@ fn decode_frame_header(
         .map_err(|e| QuilError::InvalidArgument(format!("difficulty at {}/{}: {}", c, total, e)))?;
     let output = read_bytes(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("output at {}/{}: {}", c, total, e)))?;
-    let parent_selector = read_bytes(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("parent_selector at {}/{}: {}", c, total, e)))?;
+    let parent_selector = read_bytes(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("parent_selector at {}/{}: {}", c, total, e))
+    })?;
 
-    let commit_count = read_u32(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("commit_count at {}/{}: {}", c, total, e)))? as usize;
+    let commit_count = read_u32(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("commit_count at {}/{}: {}", c, total, e))
+    })? as usize;
     // Bound the count against remaining bytes BEFORE pre-allocating: each entry
     // is a length-prefixed blob (>= 4 bytes), so a claimed count larger than
     // `remaining / 4` is impossible — reject it instead of letting an
@@ -1317,31 +1435,38 @@ fn decode_frame_header(
     // OOM/abort from a tiny frame, reachable pre-auth on the gossip path).
     if commit_count > data.len().saturating_sub(c) / 4 {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrame: commit_count {} exceeds what remaining bytes can hold", commit_count
+            "GlobalFrame: commit_count {} exceeds what remaining bytes can hold",
+            commit_count
         )));
     }
     let mut global_commitments = Vec::with_capacity(commit_count);
     for i in 0..commit_count {
-        global_commitments.push(read_bytes(data, &mut c)
-            .map_err(|e| QuilError::InvalidArgument(format!("commitment[{}] at {}/{}: {}", i, c, total, e)))?);
+        global_commitments.push(read_bytes(data, &mut c).map_err(|e| {
+            QuilError::InvalidArgument(format!("commitment[{}] at {}/{}: {}", i, c, total, e))
+        })?);
     }
 
-    let prover_tree_commitment = read_bytes(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("prover_tree_commit at {}/{}: {}", c, total, e)))?;
-    let requests_root = read_bytes(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("requests_root at {}/{}: {}", c, total, e)))?;
-    let aux_count = read_u32(data, &mut c)
-        .map_err(|e| QuilError::InvalidArgument(format!("aux_root_count at {}/{}: {}", c, total, e)))? as usize;
+    let prover_tree_commitment = read_bytes(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("prover_tree_commit at {}/{}: {}", c, total, e))
+    })?;
+    let requests_root = read_bytes(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("requests_root at {}/{}: {}", c, total, e))
+    })?;
+    let aux_count = read_u32(data, &mut c).map_err(|e| {
+        QuilError::InvalidArgument(format!("aux_root_count at {}/{}: {}", c, total, e))
+    })? as usize;
     // Same allocation-bomb guard as commit_count (entries are length-prefixed).
     if aux_count > data.len().saturating_sub(c) / 4 {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrame: aux_count {} exceeds what remaining bytes can hold", aux_count
+            "GlobalFrame: aux_count {} exceeds what remaining bytes can hold",
+            aux_count
         )));
     }
     let mut prover_tree_aux_roots = Vec::with_capacity(aux_count);
     for i in 0..aux_count {
-        prover_tree_aux_roots.push(read_bytes(data, &mut c)
-            .map_err(|e| QuilError::InvalidArgument(format!("aux_root[{}] at {}/{}: {}", i, c, total, e)))?);
+        prover_tree_aux_roots.push(read_bytes(data, &mut c).map_err(|e| {
+            QuilError::InvalidArgument(format!("aux_root[{}] at {}/{}: {}", i, c, total, e))
+        })?);
     }
     let prover = read_bytes(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("prover at {}/{}: {}", c, total, e)))?;
@@ -1364,8 +1489,9 @@ fn decode_frame_header(
     };
 
     let world_state_size = if c < data.len() {
-        read_u64(data, &mut c)
-            .map_err(|e| QuilError::InvalidArgument(format!("world_state_size at {}/{}: {}", c, total, e)))?
+        read_u64(data, &mut c).map_err(|e| {
+            QuilError::InvalidArgument(format!("world_state_size at {}/{}: {}", c, total, e))
+        })?
     } else {
         0
     };
@@ -1393,7 +1519,9 @@ fn decode_frame_header(
 
 /// Peek at the type prefix of a GLOBAL_CONSENSUS message.
 pub fn peek_consensus_type(data: &[u8]) -> Option<u32> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     Some(u32::from_be_bytes(data[..4].try_into().unwrap()))
 }
 
@@ -1403,10 +1531,18 @@ mod tests {
     fn replacement_carrier_preserves_canonical_bytes_through_protobuf() {
         use prost::Message;
         use quil_execution::message_envelope::CanonicalMessageRequest;
-        for (prefix, version) in [(0x0512u32, b"QCT3TX\0\x02"), (0x0513, b"QCT3MT\0\x02"), (0x0513, b"QCT3CM\0\x02"),
-            (0x0514, b"QCT3PE\0\x02"), (0x0515, b"QCT3PC\0\x02"),
-            (0x0516, b"QCT3SH\0\x02"), (0x0516, b"QCT3SH\0\x03"), (0x0517, b"QCT3MC\0\x02"), (0x0518, b"QCT3ST\0\x02"),
-            (0x0519, b"QCT3SC\0\x02")] {
+        for (prefix, version) in [
+            (0x0512u32, b"QCT3TX\0\x02"),
+            (0x0513, b"QCT3MT\0\x02"),
+            (0x0513, b"QCT3CM\0\x02"),
+            (0x0514, b"QCT3PE\0\x02"),
+            (0x0515, b"QCT3PC\0\x02"),
+            (0x0516, b"QCT3SH\0\x02"),
+            (0x0516, b"QCT3SH\0\x03"),
+            (0x0517, b"QCT3MC\0\x02"),
+            (0x0518, b"QCT3ST\0\x02"),
+            (0x0519, b"QCT3SC\0\x02"),
+        ] {
             // Transport-only fixture: payload validity belongs to execution.
             let mut bytes = vec![19; 200_000];
             bytes[..4].copy_from_slice(&prefix.to_be_bytes());
@@ -1414,21 +1550,54 @@ mod tests {
             bytes[44..76].copy_from_slice(&quil_execution::domains::QUIL_TOKEN);
             let canonical = CanonicalMessageRequest::wrap(bytes.clone()).unwrap();
             let pb = super::canonical_request_to_proto(&canonical, EncodingGate::Admission);
-            assert!(matches!(pb.request, Some(quil_types::proto::global::message_request::Request::TokenOperation(_))));
+            assert!(matches!(
+                pb.request,
+                Some(quil_types::proto::global::message_request::Request::TokenOperation(_))
+            ));
             let wire = pb.encode_to_vec();
             assert!(wire.len() < 256 * 1024);
-            let decoded = quil_types::proto::global::MessageRequest::decode(wire.as_slice()).unwrap();
-            assert_eq!(super::proto_message_request_to_canonical(&decoded, EncodingGate::Admission).unwrap().inner_bytes, bytes);
-            assert_eq!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&decoded).unwrap(), bytes);
+            let decoded =
+                quil_types::proto::global::MessageRequest::decode(wire.as_slice()).unwrap();
+            assert_eq!(
+                super::proto_message_request_to_canonical(&decoded, EncodingGate::Admission)
+                    .unwrap()
+                    .inner_bytes,
+                bytes
+            );
+            assert_eq!(
+                quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(
+                    &decoded
+                )
+                .unwrap(),
+                bytes
+            );
             bytes[4] ^= 1;
-            assert!(super::canonical_request_to_proto(&CanonicalMessageRequest::wrap(bytes.clone()).unwrap(), EncodingGate::Admission).request.is_none());
+            assert!(super::canonical_request_to_proto(
+                &CanonicalMessageRequest::wrap(bytes.clone()).unwrap(),
+                EncodingGate::Admission
+            )
+            .request
+            .is_none());
             let invalid = quil_types::proto::global::MessageRequest {
-                request: Some(quil_types::proto::global::message_request::Request::TokenOperation(
-                    quil_types::proto::token::TokenOperation { canonical_bytes: bytes })),
+                request: Some(
+                    quil_types::proto::global::message_request::Request::TokenOperation(
+                        quil_types::proto::token::TokenOperation {
+                            canonical_bytes: bytes,
+                        },
+                    ),
+                ),
                 ..Default::default()
             };
-            assert!(super::proto_message_request_to_canonical(&invalid, EncodingGate::Admission).is_none());
-            assert!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&invalid).is_err());
+            assert!(
+                super::proto_message_request_to_canonical(&invalid, EncodingGate::Admission)
+                    .is_none()
+            );
+            assert!(
+                quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(
+                    &invalid
+                )
+                .is_err()
+            );
         }
     }
     use super::*;
@@ -1439,19 +1608,39 @@ mod tests {
     #[test]
     fn global_header_world_state_size_round_trips_and_keeps_legacy_bytes() {
         let header = |size: u64| quil_types::proto::global::GlobalFrameHeader {
-            frame_number: 9, rank: 2, timestamp: 3, difficulty: 4,
-            output: vec![5; 516], parent_selector: vec![6; 32],
-            global_commitments: vec![vec![7; 32]], prover_tree_commitment: vec![8; 32],
-            prover_tree_aux_roots: vec![vec![9; 32]; 3], requests_root: vec![10; 32],
-            prover: vec![11; 32], public_key_signature_bls48581: None,
+            frame_number: 9,
+            rank: 2,
+            timestamp: 3,
+            difficulty: 4,
+            output: vec![5; 516],
+            parent_selector: vec![6; 32],
+            global_commitments: vec![vec![7; 32]],
+            prover_tree_commitment: vec![8; 32],
+            prover_tree_aux_roots: vec![vec![9; 32]; 3],
+            requests_root: vec![10; 32],
+            prover: vec![11; 32],
+            public_key_signature_bls48581: None,
             world_state_size: size,
         };
-        let frame = |size: u64| quil_types::proto::global::GlobalFrame { header: Some(header(size)), requests: vec![] };
+        let frame = |size: u64| quil_types::proto::global::GlobalFrame {
+            header: Some(header(size)),
+            requests: vec![],
+        };
         let zero = encode_global_frame(&frame(0)).unwrap();
         let sized = encode_global_frame(&frame(0x0102_0304_0506_0708)).unwrap();
         assert_eq!(sized.len(), zero.len() + 8);
-        assert_eq!(decode_global_frame(&zero).unwrap().header.unwrap().world_state_size, 0);
-        assert_eq!(decode_global_frame(&sized).unwrap().header.unwrap(), header(0x0102_0304_0506_0708));
+        assert_eq!(
+            decode_global_frame(&zero)
+                .unwrap()
+                .header
+                .unwrap()
+                .world_state_size,
+            0
+        );
+        assert_eq!(
+            decode_global_frame(&sized).unwrap().header.unwrap(),
+            header(0x0102_0304_0506_0708)
+        );
     }
 
     #[test]
@@ -1521,11 +1710,17 @@ mod tests {
         };
         // Empty openings → nothing appended → decodes back to empty.
         let empty_bytes = base.to_canonical_bytes().unwrap();
-        assert!(ProposalVote::from_canonical_bytes(&empty_bytes).unwrap().openings.is_empty());
+        assert!(ProposalVote::from_canonical_bytes(&empty_bytes)
+            .unwrap()
+            .openings
+            .is_empty());
 
         // Non-empty openings → appended (longer) and round-trips, with the
         // legacy fields intact.
-        let with = ProposalVote { openings: vec![0x11, 0x22, 0x33, 0x44], ..base.clone() };
+        let with = ProposalVote {
+            openings: vec![0x11, 0x22, 0x33, 0x44],
+            ..base.clone()
+        };
         let with_bytes = with.to_canonical_bytes().unwrap();
         assert!(
             with_bytes.len() > empty_bytes.len(),
@@ -1571,9 +1766,13 @@ mod tests {
             latest_quorum_certificate: QuorumCertificate::genesis(0, vec![0; 32]),
             prior_rank_timeout_certificate: None,
             vote: ProposalVote {
-                filter: vec![], rank: 1, frame_number: 1,
-                selector: vec![0; 32], timestamp: 0,
-                signature: vec![0; 74], address: vec![0; 32],
+                filter: vec![],
+                rank: 1,
+                frame_number: 1,
+                selector: vec![0; 32],
+                timestamp: 0,
+                signature: vec![0; 74],
+                address: vec![0; 32],
                 openings: Vec::new(),
             },
             timeout_tick: 10,
@@ -1595,78 +1794,171 @@ mod tests {
 
     #[test]
     fn handoff_certificate_roundtrips_global_bundle_and_rejects_malformed_payloads() {
-        use quil_cw_consensus::handoff::{Checkpoint, Seal};
-        use quil_execution::{global_intrinsic::handoff::CertificateSubmission,
-            message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest}};
-        use quil_types::proto::global::message_request::Request;
         use prost::Message as _;
-        let submission = CertificateSubmission { seal: Seal { request: [1; 32], session: [2; 32], view: 5,
-            checkpoint: Checkpoint { frame: 3, view: 4, digest: [3; 32], state_roots: [[4; 32]; 4], history_root: [5; 32] } },
-            certificate: vec![7; 1200] };
+        use quil_cw_consensus::handoff::{Checkpoint, Seal};
+        use quil_execution::{
+            global_intrinsic::handoff::CertificateSubmission,
+            message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest},
+        };
+        use quil_types::proto::global::message_request::Request;
+        let submission = CertificateSubmission {
+            seal: Seal {
+                request: [1; 32],
+                session: [2; 32],
+                view: 5,
+                checkpoint: Checkpoint {
+                    frame: 3,
+                    view: 4,
+                    digest: [3; 32],
+                    state_roots: [[4; 32]; 4],
+                    history_root: [5; 32],
+                },
+            },
+            certificate: vec![7; 1200],
+        };
         // Wire conversion preserves the bytes; authenticated global execution
         // separately verifies the certificate and its authorized source session.
         let inner = submission.to_canonical_bytes().unwrap();
-        let bundle = CanonicalMessageBundle { timestamp: 17,
-            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())] };
+        let bundle = CanonicalMessageBundle {
+            timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())],
+        };
         let canonical = bundle.to_canonical_bytes().unwrap();
         let decoded = decode_message_bundle(&canonical).unwrap();
-        assert!(matches!(decoded.requests[0].request.as_ref(), Some(Request::CommitteeHandoff(bytes)) if *bytes == inner));
-        assert!(quil_execution::global_engine::request_is_global_op(&decoded.requests[0]));
-        assert_eq!(quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
-            Some(quil_execution::global_engine::MessageKindGlobal::CommitteeHandoff));
-        let protobuf = quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
-        assert_eq!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
-        let mut malformed = inner; malformed.push(0);
-        let bad = CanonicalMessageBundle { timestamp: 17,
-            requests: vec![Some(CanonicalMessageRequest::wrap(malformed.clone()).unwrap())] }.to_canonical_bytes().unwrap();
+        assert!(
+            matches!(decoded.requests[0].request.as_ref(), Some(Request::CommitteeHandoff(bytes)) if *bytes == inner)
+        );
+        assert!(quil_execution::global_engine::request_is_global_op(
+            &decoded.requests[0]
+        ));
+        assert_eq!(
+            quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
+            Some(quil_execution::global_engine::MessageKindGlobal::CommitteeHandoff)
+        );
+        let protobuf =
+            quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(
+            proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(),
+            canonical
+        );
+        assert_eq!(
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf)
+                .unwrap(),
+            canonical
+        );
+        let mut malformed = inner;
+        malformed.push(0);
+        let bad = CanonicalMessageBundle {
+            timestamp: 17,
+            requests: vec![Some(
+                CanonicalMessageRequest::wrap(malformed.clone()).unwrap(),
+            )],
+        }
+        .to_canonical_bytes()
+        .unwrap();
         assert!(decode_message_bundle(&bad).is_err());
         let mut bad_proto = protobuf;
         bad_proto.requests[0].request = Some(Request::CommitteeHandoff(malformed));
         assert!(proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
-        assert!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+        assert!(
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto)
+                .is_err()
+        );
     }
 
     #[test]
     fn presence_report_roundtrips_global_bundle_and_rejects_malformed_payloads() {
+        use prost::Message as _;
         use quil_execution::{
-            global_intrinsic::{handoff::presence::{NotarizeVote, PresenceProposal, PresenceReport}, FrameHeader},
+            global_intrinsic::{
+                handoff::presence::{NotarizeVote, PresenceProposal, PresenceReport},
+                FrameHeader,
+            },
             message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest},
         };
         use quil_types::proto::global::message_request::Request;
-        use prost::Message as _;
         let filter = vec![0x21; 32];
         let header = FrameHeader {
-            address: filter.clone(), frame_number: 9, rank: 6, difficulty: 100, output: vec![3; 516],
-            parent_selector: vec![4; 32], global_frame_number: 1_441, ..Default::default()
+            address: filter.clone(),
+            frame_number: 9,
+            rank: 6,
+            difficulty: 100,
+            output: vec![3; 516],
+            parent_selector: vec![4; 32],
+            global_frame_number: 1_441,
+            ..Default::default()
         };
-        let vote = |signer| NotarizeVote { signer, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] };
-        let report = PresenceReport { session: [2; 32], filter, proposals: vec![PresenceProposal {
-            header, epoch: 3, view: 6, parent: 5, payload: [5; 32], votes: vec![vote(0), vote(2)] }],
-            nullifies: Vec::new() };
+        let vote = |signer| NotarizeVote {
+            signer,
+            signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+        };
+        let report = PresenceReport {
+            session: [2; 32],
+            filter,
+            proposals: vec![PresenceProposal {
+                header,
+                epoch: 3,
+                view: 6,
+                parent: 5,
+                payload: [5; 32],
+                votes: vec![vote(0), vote(2)],
+            }],
+            nullifies: Vec::new(),
+        };
         // Wire conversion preserves the bytes; authenticated global execution
         // separately verifies the votes against the session and its anchors.
         let inner = report.to_canonical_bytes().unwrap();
-        assert_eq!(PresenceReport::from_canonical_bytes(&inner).unwrap(), report);
-        let bundle = CanonicalMessageBundle { timestamp: 17,
-            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())] };
+        assert_eq!(
+            PresenceReport::from_canonical_bytes(&inner).unwrap(),
+            report
+        );
+        let bundle = CanonicalMessageBundle {
+            timestamp: 17,
+            requests: vec![Some(CanonicalMessageRequest::wrap(inner.clone()).unwrap())],
+        };
         let canonical = bundle.to_canonical_bytes().unwrap();
         let decoded = decode_message_bundle(&canonical).unwrap();
-        assert!(matches!(decoded.requests[0].request.as_ref(), Some(Request::PresenceReport(bytes)) if *bytes == inner));
-        assert!(quil_execution::global_engine::request_is_global_op(&decoded.requests[0]));
-        assert_eq!(quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
-            Some(quil_execution::global_engine::MessageKindGlobal::PresenceReport));
-        let protobuf = quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
-        assert_eq!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(), canonical);
-        let mut malformed = inner; malformed.push(0);
-        let bad = CanonicalMessageBundle { timestamp: 17,
-            requests: vec![Some(CanonicalMessageRequest::wrap(malformed.clone()).unwrap())] }.to_canonical_bytes().unwrap();
+        assert!(
+            matches!(decoded.requests[0].request.as_ref(), Some(Request::PresenceReport(bytes)) if *bytes == inner)
+        );
+        assert!(quil_execution::global_engine::request_is_global_op(
+            &decoded.requests[0]
+        ));
+        assert_eq!(
+            quil_execution::global_engine::global_kind_for_request(&decoded.requests[0]),
+            Some(quil_execution::global_engine::MessageKindGlobal::PresenceReport)
+        );
+        let protobuf =
+            quil_types::proto::global::MessageBundle::decode(decoded.encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(
+            proto_message_bundle_to_canonical_bytes(&protobuf).unwrap(),
+            canonical
+        );
+        assert_eq!(
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&protobuf)
+                .unwrap(),
+            canonical
+        );
+        let mut malformed = inner;
+        malformed.push(0);
+        let bad = CanonicalMessageBundle {
+            timestamp: 17,
+            requests: vec![Some(
+                CanonicalMessageRequest::wrap(malformed.clone()).unwrap(),
+            )],
+        }
+        .to_canonical_bytes()
+        .unwrap();
         assert!(decode_message_bundle(&bad).is_err());
         let mut bad_proto = protobuf;
         bad_proto.requests[0].request = Some(Request::PresenceReport(malformed));
         assert!(proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
-        assert!(quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto).is_err());
+        assert!(
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bad_proto)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1786,7 +2078,11 @@ mod tests {
             session: [2; 32],
             filter: vec![0x21; 32],
             proposals: Vec::new(),
-            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
+            nullifies: vec![NullifyVote {
+                view: 1,
+                signer: 0,
+                signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+            }],
         };
         let claim = PresenceClaim {
             filter: vec![0x21; 32],
@@ -1795,7 +2091,12 @@ mod tests {
             signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
         };
         let frame_of = |number: u64, inner: Vec<u8>| {
-            let header = CanonicalGlobalHeader { frame_number: number, ..Default::default() }.to_canonical_bytes().unwrap();
+            let header = CanonicalGlobalHeader {
+                frame_number: number,
+                ..Default::default()
+            }
+            .to_canonical_bytes()
+            .unwrap();
             let bundle = CanonicalMessageBundle {
                 timestamp: 1,
                 requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())],
@@ -1810,25 +2111,45 @@ mod tests {
             frame
         };
         handoff::set_presence_exclusion_frame_for_thread(Some(100));
-        for inner in [report.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
-            assert!(decode_global_frame(&frame_of(99, inner.clone())).is_err(), "below the frame");
+        for inner in [
+            report.to_canonical_bytes().unwrap(),
+            claim.to_canonical_bytes().unwrap(),
+        ] {
+            assert!(
+                decode_global_frame(&frame_of(99, inner.clone())).is_err(),
+                "below the frame"
+            );
             let decoded = decode_global_frame(&frame_of(100, inner.clone())).unwrap();
             assert!(matches!(
                 &decoded.requests[0].requests[0].request,
                 Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) if *bytes == inner
             ));
             // Still rejected below the frame after this node decoded one past it.
-            assert!(decode_global_frame(&frame_of(99, inner.clone())).is_err(), "the frame's number decides");
+            assert!(
+                decode_global_frame(&frame_of(99, inner.clone())).is_err(),
+                "the frame's number decides"
+            );
             assert!(presence::check_encoding(&inner, Some(99)).is_err());
             assert!(presence::check_encoding(&inner, Some(100)).is_ok());
-            assert!(presence::check_encoding(&inner, None).is_ok(), "gossip: the frame is scheduled");
+            assert!(
+                presence::check_encoding(&inner, None).is_ok(),
+                "gossip: the frame is scheduled"
+            );
             // The body binding judges proto requests at the header's frame.
-            let header = |frame_number| quil_types::proto::global::GlobalFrameHeader { frame_number, ..Default::default() };
+            let header = |frame_number| quil_types::proto::global::GlobalFrameHeader {
+                frame_number,
+                ..Default::default()
+            };
             let converted = |frame_number| {
                 proto_message_bundle_to_canonical_bytes_at(&decoded.requests[0], Some(frame_number))
             };
             assert!(converted(99).is_err() && converted(100).is_ok());
-            assert!(!crate::frame_validator::global_frame_body_matches_requests_root(&header(99), &decoded.requests));
+            assert!(
+                !crate::frame_validator::global_frame_body_matches_requests_root(
+                    &header(99),
+                    &decoded.requests
+                )
+            );
         }
         handoff::set_presence_exclusion_frame_for_thread(None);
     }
@@ -1854,7 +2175,11 @@ mod tests {
             session: [2; 32],
             filter: vec![0x21; 32],
             proposals: Vec::new(),
-            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: signature.clone() }],
+            nullifies: vec![NullifyVote {
+                view: 1,
+                signer: 0,
+                signature: signature.clone(),
+            }],
         };
         let claim = PresenceClaim {
             filter: vec![0x21; 32],
@@ -1863,36 +2188,70 @@ mod tests {
             signature: signature.clone(),
         };
         let header = FrameHeader {
-            address: vec![0x21; 32], frame_number: 9, rank: 6, difficulty: 100, output: vec![3; 516],
-            parent_selector: vec![4; 32], global_frame_number: 1_441, ..Default::default()
+            address: vec![0x21; 32],
+            frame_number: 9,
+            rank: 6,
+            difficulty: 100,
+            output: vec![3; 516],
+            parent_selector: vec![4; 32],
+            global_frame_number: 1_441,
+            ..Default::default()
         };
         let notarize = PresenceReport {
             session: [2; 32],
             filter: vec![0x21; 32],
             proposals: vec![PresenceProposal {
-                header, epoch: 3, view: 6, parent: 5, payload: [5; 32],
-                votes: vec![NotarizeVote { signer: 0, signature }],
+                header,
+                epoch: 3,
+                view: 6,
+                parent: 5,
+                payload: [5; 32],
+                votes: vec![NotarizeVote {
+                    signer: 0,
+                    signature,
+                }],
             }],
             nullifies: Vec::new(),
         };
         let proto = |inner: Vec<u8>| MessageBundle {
-            requests: vec![MessageRequest { request: Some(Request::PresenceReport(inner)), ..Default::default() }],
+            requests: vec![MessageRequest {
+                request: Some(Request::PresenceReport(inner)),
+                ..Default::default()
+            }],
             timestamp: 1,
         };
         let canonical = |inner: Vec<u8>| {
-            CanonicalMessageBundle { timestamp: 1, requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())] }
-                .to_canonical_bytes()
-                .unwrap()
+            CanonicalMessageBundle {
+                timestamp: 1,
+                requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())],
+            }
+            .to_canonical_bytes()
+            .unwrap()
         };
         handoff::set_presence_exclusion_frame_for_thread(Some(0));
-        for inner in [nullify.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
-            assert!(app_bundle_to_canonical_bytes(&proto(inner.clone())).is_err(), "an application frame refuses it");
-            assert!(decode_app_message_bundle(&canonical(inner.clone())).is_err(), "an application message too");
-            assert!(proto_message_bundle_to_canonical_bytes_at(&proto(inner.clone()), Some(5)).is_ok(), "GLOBAL takes it");
+        for inner in [
+            nullify.to_canonical_bytes().unwrap(),
+            claim.to_canonical_bytes().unwrap(),
+        ] {
+            assert!(
+                app_bundle_to_canonical_bytes(&proto(inner.clone())).is_err(),
+                "an application frame refuses it"
+            );
+            assert!(
+                decode_app_message_bundle(&canonical(inner.clone())).is_err(),
+                "an application message too"
+            );
+            assert!(
+                proto_message_bundle_to_canonical_bytes_at(&proto(inner.clone()), Some(5)).is_ok(),
+                "GLOBAL takes it"
+            );
             assert!(decode_message_bundle_at(&canonical(inner), Some(5)).is_ok());
         }
         let inner = notarize.to_canonical_bytes().unwrap();
-        assert_eq!(app_bundle_to_canonical_bytes(&proto(inner.clone())).unwrap(), canonical(inner.clone()));
+        assert_eq!(
+            app_bundle_to_canonical_bytes(&proto(inner.clone())).unwrap(),
+            canonical(inner.clone())
+        );
         assert!(decode_app_message_bundle(&canonical(inner)).is_ok());
         handoff::set_presence_exclusion_frame_for_thread(None);
     }
@@ -1942,7 +2301,10 @@ mod tests {
         let proto_bundle = decode_message_bundle(&canon_bundle).unwrap();
         assert_eq!(proto_bundle.requests.len(), 1);
         assert!(
-            matches!(proto_bundle.requests[0].request, Some(Request::VertexAdd(_))),
+            matches!(
+                proto_bundle.requests[0].request,
+                Some(Request::VertexAdd(_))
+            ),
             "canonical→proto must preserve the VertexAdd, got {:?}",
             proto_bundle.requests[0].request
         );
@@ -2037,7 +2399,10 @@ mod tests {
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         for prefix in [0x0509u32, 0x050c, 0x050f] {
             let request = CanonicalMessageRequest::wrap(prefix.to_be_bytes().to_vec()).unwrap();
-            let bundle = CanonicalMessageBundle { requests: vec![Some(request)], timestamp: 0 };
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(request)],
+                timestamp: 0,
+            };
             let bytes = bundle.to_canonical_bytes().unwrap();
             assert!(decode_message_bundle(&bytes).is_err());
         }
@@ -2045,25 +2410,31 @@ mod tests {
 
     #[test]
     fn token_compute_altshard_ops_survive_bundle_round_trip() {
+        use quil_execution::compute_intrinsic::config::{ComputeDeploy, ComputeUpdate};
         use quil_execution::compute_intrinsic::ops::{
             CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation, ExecutionResult,
             StateTransition,
         };
-        use quil_execution::compute_intrinsic::config::{ComputeDeploy, ComputeUpdate};
         use quil_execution::global_intrinsic::consensus_types::AltShardUpdate;
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         use quil_execution::token_intrinsic::deploy::{TokenDeploy, TokenUpdate};
         use quil_types::proto::global::message_request::Request;
 
         // --- token ---
-        let token_deploy = TokenDeploy { config: Vec::new(), rdf_schema: b"schema".to_vec() };
+        let token_deploy = TokenDeploy {
+            config: Vec::new(),
+            rdf_schema: b"schema".to_vec(),
+        };
         let token_update = TokenUpdate {
             config: Vec::new(),
             rdf_schema: b"schema".to_vec(),
             public_key_signature_bls48581: vec![0x66u8; 74],
         };
         // --- compute ---
-        let compute_deploy = ComputeDeploy { config: Vec::new(), rdf_schema: b"schema".to_vec() };
+        let compute_deploy = ComputeDeploy {
+            config: Vec::new(),
+            rdf_schema: b"schema".to_vec(),
+        };
         let compute_update = ComputeUpdate {
             config: Vec::new(),
             rdf_schema: b"schema".to_vec(),
@@ -2125,8 +2496,14 @@ mod tests {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             (token_deploy.to_canonical_bytes().unwrap(), "token_deploy"),
             (token_update.to_canonical_bytes().unwrap(), "token_update"),
-            (compute_deploy.to_canonical_bytes().unwrap(), "compute_deploy"),
-            (compute_update.to_canonical_bytes().unwrap(), "compute_update"),
+            (
+                compute_deploy.to_canonical_bytes().unwrap(),
+                "compute_deploy",
+            ),
+            (
+                compute_update.to_canonical_bytes().unwrap(),
+                "compute_update",
+            ),
             (code_deploy.to_canonical_bytes().unwrap(), "code_deploy"),
             (code_execute.to_canonical_bytes().unwrap(), "code_execute"),
             (code_finalize.to_canonical_bytes().unwrap(), "code_finalize"),

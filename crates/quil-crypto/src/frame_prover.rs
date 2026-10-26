@@ -51,7 +51,11 @@ fn frame_header_bls_inputs(
     header: &global::FrameHeader,
 ) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let sig = header.public_key_signature_bls48581.as_ref()?;
-    let pubkey = sig.public_key.as_ref().map(|k| k.key_value.clone()).unwrap_or_default();
+    let pubkey = sig
+        .public_key
+        .as_ref()
+        .map(|k| k.key_value.clone())
+        .unwrap_or_default();
     if pubkey.is_empty() || sig.signature.len() < 666 {
         return None;
     }
@@ -248,7 +252,8 @@ impl FrameProver for WesolowskiFrameProver {
             }
             other => {
                 return Err(QuilError::Crypto(format!(
-                    "unsupported proving key type: {:?}", other
+                    "unsupported proving key type: {:?}",
+                    other
                 )));
             }
         };
@@ -272,10 +277,7 @@ impl FrameProver for WesolowskiFrameProver {
         })
     }
 
-    fn verify_global_frame_header(
-        &self,
-        header: &global::GlobalFrameHeader,
-    ) -> Result<Vec<u8>> {
+    fn verify_global_frame_header(&self, header: &global::GlobalFrameHeader) -> Result<Vec<u8>> {
         // Build challenge matching Go's GetGlobalFrameSignaturePayload:
         // SHA3-256(frame_number || timestamp || difficulty || parent_selector
         //          || global_commitments... || prover_tree_commitment || requests_root)
@@ -286,7 +288,8 @@ impl FrameProver for WesolowskiFrameProver {
         }
         if header.output.len() != 516 {
             return Err(QuilError::Crypto(format!(
-                "invalid output length: {} (expected 516)", header.output.len()
+                "invalid output length: {} (expected 516)",
+                header.output.len()
             )));
         }
 
@@ -378,7 +381,9 @@ impl FrameProver for WesolowskiFrameProver {
                 return Ok(false);
             }
         };
-        let pubkey_bytes = sig.public_key.as_ref()
+        let pubkey_bytes = sig
+            .public_key
+            .as_ref()
             .map(|k| k.key_value.as_slice())
             .unwrap_or(&[]);
         if pubkey_bytes.is_empty() || sig.signature.len() < 666 {
@@ -411,8 +416,7 @@ impl FrameProver for WesolowskiFrameProver {
         // concatenated in the same order (the caller validates it against the
         // committee via `aggregate_public_keys`). We verify each (key, sig)
         // component individually.
-        let present_count =
-            sig.bitmask.iter().map(|b| b.count_ones()).sum::<u32>() as usize;
+        let present_count = sig.bitmask.iter().map(|b| b.count_ones()).sum::<u32>() as usize;
         if present_count == 0 {
             tracing::warn!(
                 bitmask_hex = %hex::encode(&sig.bitmask),
@@ -484,8 +488,7 @@ impl FrameProver for WesolowskiFrameProver {
             return Ok(false);
         }
         let mut cursor = 0usize;
-        let mp_count =
-            u32::from_be_bytes(mp[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let mp_count = u32::from_be_bytes(mp[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         // `mp_count` lives in the UNAUTHENTICATED signature tail (beyond the
         // Falcon-verified prefix), so any relayer can inflate it. Each multiproof
@@ -541,8 +544,10 @@ impl FrameProver for WesolowskiFrameProver {
             return Ok(false);
         }
         let committee_vec: Vec<Vec<u8>> = committee.iter().map(|s| s.to_vec()).collect();
-        let present_vec: Vec<Vec<u8>> =
-            present_indices.iter().map(|&i| committee[i].to_vec()).collect();
+        let present_vec: Vec<Vec<u8>> = present_indices
+            .iter()
+            .map(|&i| committee[i].to_vec())
+            .collect();
         let solutions_vec: Vec<Vec<u8>> = multiproofs.iter().map(|s| s.to_vec()).collect();
         let ok = vdf::wesolowski_verify_multi_sparse(
             self.int_size_bits,
@@ -616,7 +621,9 @@ impl FrameProver for WesolowskiFrameProver {
             Some(s) => s,
             None => return Ok(false),
         };
-        let pubkey_bytes = sig.public_key.as_ref()
+        let pubkey_bytes = sig
+            .public_key
+            .as_ref()
             .map(|k| k.key_value.as_slice())
             .unwrap_or(&[]);
         if pubkey_bytes.is_empty() || sig.signature.is_empty() {
@@ -631,12 +638,7 @@ impl FrameProver for WesolowskiFrameProver {
         payload.extend_from_slice(&identity);
         payload.extend_from_slice(&header.rank.to_be_bytes());
 
-        Ok(bls.verify_signature_raw(
-            pubkey_bytes,
-            &sig.signature,
-            &payload,
-            b"global",
-        ))
+        Ok(bls.verify_signature_raw(pubkey_bytes, &sig.signature, &payload, b"global"))
     }
 }
 
@@ -648,15 +650,31 @@ mod batch_tests {
     #[test]
     fn app_header_links_genesis_and_padded_digests_without_a_vdf() {
         let prover = WesolowskiFrameProver::new(2048);
-        let build = |output: &[u8]| prover.prove_frame_header(
-            output, &[1; 32], &[0; 32], &vec![vec![0; 32]; 4], &[2; 32],
-            1, 1, 0, 2, &[], 0,
-        ).unwrap();
+        let build = |output: &[u8]| {
+            prover
+                .prove_frame_header(
+                    output,
+                    &[1; 32],
+                    &[0; 32],
+                    &vec![vec![0; 32]; 4],
+                    &[2; 32],
+                    1,
+                    1,
+                    0,
+                    2,
+                    &[],
+                    0,
+                )
+                .unwrap()
+        };
         let mut padded_digest = vec![0; 516];
         padded_digest[..32].fill(3);
         for output in [vec![0; 32], padded_digest] {
             let header = build(&output);
-            assert_eq!(header.parent_selector, crate::poseidon::hash_bytes_to_32(&output).unwrap());
+            assert_eq!(
+                header.parent_selector,
+                crate::poseidon::hash_bytes_to_32(&output).unwrap()
+            );
             // The caller fills the deterministic app output; this constructor
             // must not perform a VDF or produce a VDF output.
             assert!(header.output.is_empty());
@@ -691,13 +709,15 @@ mod batch_tests {
             address,
             output,
             rank,
-            public_key_signature_bls48581: Some(quil_types::proto::keys::Bls48581AggregateSignature {
-                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                    key_value: pk.to_vec(),
-                }),
-                signature: sig,
-                bitmask: vec![0x01],
-            }),
+            public_key_signature_bls48581: Some(
+                quil_types::proto::keys::Bls48581AggregateSignature {
+                    public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                        key_value: pk.to_vec(),
+                    }),
+                    signature: sig,
+                    bitmask: vec![0x01],
+                },
+            ),
             ..Default::default()
         }
     }
@@ -716,24 +736,36 @@ mod batch_tests {
             let output = vec![(i + 1) as u8; 516];
             let h = make_signed_header(signer.as_ref(), &pk, addr, output, 100 + i);
             // Ground truth: individual verify passes (666-byte sig, ids None).
-            assert!(fp.verify_frame_header_signature(&h, &bls, None).unwrap(), "individual {i}");
+            assert!(
+                fp.verify_frame_header_signature(&h, &bls, None).unwrap(),
+                "individual {i}"
+            );
             headers.push(h);
             _signers.push(signer);
         }
 
         // Batch verify all → true, populates the preverified set.
         let refs: Vec<&global::FrameHeader> = headers.iter().collect();
-        assert!(fp.verify_frame_header_signatures_batch(&refs, &bls), "batch all-valid");
+        assert!(
+            fp.verify_frame_header_signatures_batch(&refs, &bls),
+            "batch all-valid"
+        );
 
         // Per-header verify now succeeds via the skip path.
         for h in &headers {
-            assert!(fp.verify_frame_header_signature(h, &bls, None).unwrap(), "post-batch skip");
+            assert!(
+                fp.verify_frame_header_signature(h, &bls, None).unwrap(),
+                "post-batch skip"
+            );
         }
 
         // Clear → still verifies (real pairing again, no stale skip).
         fp.clear_bls_preverified();
         for h in &headers {
-            assert!(fp.verify_frame_header_signature(h, &bls, None).unwrap(), "post-clear re-verify");
+            assert!(
+                fp.verify_frame_header_signature(h, &bls, None).unwrap(),
+                "post-clear re-verify"
+            );
         }
 
         // Tamper one header's address (payload changes) → batch rejects all,
@@ -741,9 +773,13 @@ mod batch_tests {
         let mut tampered = headers.clone();
         tampered[2].address = vec![0xABu8; 32];
         let trefs: Vec<&global::FrameHeader> = tampered.iter().collect();
-        assert!(!fp.verify_frame_header_signatures_batch(&trefs, &bls), "batch rejects tampered set");
         assert!(
-            !fp.verify_frame_header_signature(&tampered[2], &bls, None).unwrap(),
+            !fp.verify_frame_header_signatures_batch(&trefs, &bls),
+            "batch rejects tampered set"
+        );
+        assert!(
+            !fp.verify_frame_header_signature(&tampered[2], &bls, None)
+                .unwrap(),
             "individual rejects tampered"
         );
     }
@@ -783,8 +819,14 @@ mod batch_tests {
                 0,
             )
             .expect("prove");
-        assert_eq!(header.prover_tree_aux_roots, aux, "aux roots carried on header");
-        assert_eq!(header.world_state_size, 987_654_321, "world size carried on header");
+        assert_eq!(
+            header.prover_tree_aux_roots, aux,
+            "aux roots carried on header"
+        );
+        assert_eq!(
+            header.world_state_size, 987_654_321,
+            "world size carried on header"
+        );
 
         // Honest header: verify recomputes the identical challenge → OK.
         assert!(
@@ -803,10 +845,16 @@ mod batch_tests {
         // The certified world size is bound too: changing or zeroing it fails.
         let mut resized = header.clone();
         resized.world_state_size += 1;
-        assert!(fp.verify_global_frame_header(&resized).is_err(), "altered world size must fail verify");
+        assert!(
+            fp.verify_global_frame_header(&resized).is_err(),
+            "altered world size must fail verify"
+        );
         let mut unsized_header = header.clone();
         unsized_header.world_state_size = 0;
-        assert!(fp.verify_global_frame_header(&unsized_header).is_err(), "stripped world size must fail verify");
+        assert!(
+            fp.verify_global_frame_header(&unsized_header).is_err(),
+            "stripped world size must fail verify"
+        );
 
         // Strip the aux roots entirely → also FAILS (proves they are bound, not
         // silently ignored on the verify side).

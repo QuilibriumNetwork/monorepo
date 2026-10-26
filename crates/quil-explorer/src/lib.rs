@@ -15,13 +15,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{
-    extract::Request,
-    middleware::Next,
-    response::Response,
-    routing::any,
-    Router,
-};
+use axum::{extract::Request, middleware::Next, response::Response, routing::any, Router};
 use parking_lot::{Mutex, RwLock};
 
 pub mod handlers;
@@ -177,7 +171,9 @@ impl ExplorerState {
     /// at start, if they were computed on `network` with this build's
     /// parameters (see [`production::history::persist`]).
     pub fn with_history_file(mut self, path: std::path::PathBuf, network: u8) -> Self {
-        self.history_file = Some(production::history::persist::HistoryFile::new(path, network));
+        self.history_file = Some(production::history::persist::HistoryFile::new(
+            path, network,
+        ));
         self
     }
 }
@@ -206,13 +202,22 @@ pub fn router(state: ExplorerState) -> Router {
         .route("/peers/releases", any(handlers::handle_peer_releases))
         .route("/provers", any(handlers::handle_provers))
         .route("/provers/shards", any(handlers::handle_prover_shards))
-        .route("/provers/shards/:filter", any(handlers::handle_prover_shard_detail))
-        .route("/provers/eviction-risk", any(handlers::handle_eviction_risk))
+        .route(
+            "/provers/shards/:filter",
+            any(handlers::handle_prover_shard_detail),
+        )
+        .route(
+            "/provers/eviction-risk",
+            any(handlers::handle_eviction_risk),
+        )
         .route("/provers/seniority", any(handlers::handle_seniority))
         .route("/provers/kicked", any(handlers::handle_kicked))
         .route("/stats", any(handlers::handle_stats))
         .route("/shards/production", any(handlers::handle_shard_production))
-        .route("/shards/production/history", any(handlers::handle_shard_production_history))
+        .route(
+            "/shards/production/history",
+            any(handlers::handle_shard_production_history),
+        )
         .route("/token/supply", any(handlers::handle_token_supply))
         .route("/token/coin/:address", any(handlers::handle_token_coin))
         .route("/token/coins/:owner", any(handlers::handle_token_coins))
@@ -235,7 +240,10 @@ async fn limit_in_flight(
 ) -> Response {
     match permits.try_acquire() {
         Ok(_serving) => next.run(req).await,
-        Err(_) => handlers::busy("the explorer is serving its maximum of requests; retry shortly", 1),
+        Err(_) => handlers::busy(
+            "the explorer is serving its maximum of requests; retry shortly",
+            1,
+        ),
     }
 }
 
@@ -251,23 +259,29 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let listener = listener.into_std()?;
     let (done, served) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new().name("explorer-http".into()).spawn(move || {
-        let result = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(HTTP_WORKERS)
-            .thread_name("explorer-http")
-            .enable_all()
-            .build()
-            .and_then(|runtime| {
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener)?;
-                    axum::serve(listener, router).with_graceful_shutdown(shutdown).await
-                })
-            });
-        let _ = done.send(result);
-    })?;
-    served
-        .await
-        .unwrap_or_else(|_| Err(std::io::Error::other("the explorer HTTP thread ended without a result")))
+    std::thread::Builder::new()
+        .name("explorer-http".into())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(HTTP_WORKERS)
+                .thread_name("explorer-http")
+                .enable_all()
+                .build()
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let listener = tokio::net::TcpListener::from_std(listener)?;
+                        axum::serve(listener, router)
+                            .with_graceful_shutdown(shutdown)
+                            .await
+                    })
+                });
+            let _ = done.send(result);
+        })?;
+    served.await.unwrap_or_else(|_| {
+        Err(std::io::Error::other(
+            "the explorer HTTP thread ended without a result",
+        ))
+    })
 }
 
 /// CORS + OPTIONS middleware, mirroring Go's `withCORS`: every response
@@ -288,10 +302,7 @@ async fn cors_layer(req: Request, next: Next) -> Response {
     };
 
     let headers = resp.headers_mut();
-    headers.insert(
-        "Access-Control-Allow-Origin",
-        HeaderValue::from_static("*"),
-    );
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     headers.insert(
         "Access-Control-Allow-Methods",
         HeaderValue::from_static("GET, OPTIONS"),
@@ -334,27 +345,43 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(resp.headers()["Access-Control-Allow-Origin"], "*");
-        assert_eq!(resp.headers()["Access-Control-Allow-Methods"], "GET, OPTIONS");
-        assert_eq!(resp.headers()["Access-Control-Allow-Headers"], "Content-Type");
-        assert_eq!(resp.headers()["Access-Control-Expose-Headers"], "X-Total-Count");
+        assert_eq!(
+            resp.headers()["Access-Control-Allow-Methods"],
+            "GET, OPTIONS"
+        );
+        assert_eq!(
+            resp.headers()["Access-Control-Allow-Headers"],
+            "Content-Type"
+        );
+        assert_eq!(
+            resp.headers()["Access-Control-Expose-Headers"],
+            "X-Total-Count"
+        );
     }
 
     #[tokio::test]
     async fn requests_beyond_the_limit_are_answered_busy() {
         let limited = |permits: Arc<tokio::sync::Semaphore>| {
-            Router::new()
-                .route("/x", any(|| async { "ok" }))
-                .layer(axum::middleware::from_fn_with_state(permits, limit_in_flight))
+            Router::new().route("/x", any(|| async { "ok" })).layer(
+                axum::middleware::from_fn_with_state(permits, limit_in_flight),
+            )
         };
         let get = || Request::builder().uri("/x").body(Body::empty()).unwrap();
         // Every permit taken: the request is answered at once, not queued.
-        let full = limited(Arc::new(tokio::sync::Semaphore::new(0))).oneshot(get()).await.unwrap();
+        let full = limited(Arc::new(tokio::sync::Semaphore::new(0)))
+            .oneshot(get())
+            .await
+            .unwrap();
         assert_eq!(full.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(full.headers()["Retry-After"], "1");
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         let served = limited(permits.clone()).oneshot(get()).await.unwrap();
         assert_eq!(served.status(), StatusCode::OK);
-        assert_eq!(permits.available_permits(), 1, "a served request returns its permit");
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "a served request returns its permit"
+        );
     }
 
     #[tokio::test]
@@ -378,7 +405,10 @@ mod tests {
         let mut answer = String::new();
         stream.read_to_string(&mut answer).await.unwrap();
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-        assert!(answer.ends_with("explorer-http"), "served off the caller's runtime: {answer}");
+        assert!(
+            answer.ends_with("explorer-http"),
+            "served off the caller's runtime: {answer}"
+        );
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();
     }
@@ -397,6 +427,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["Access-Control-Allow-Origin"], "*");
-        assert_eq!(resp.headers()["Access-Control-Expose-Headers"], "X-Total-Count");
+        assert_eq!(
+            resp.headers()["Access-Control-Expose-Headers"],
+            "X-Total-Count"
+        );
     }
 }

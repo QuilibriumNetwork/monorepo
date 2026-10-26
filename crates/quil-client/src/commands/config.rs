@@ -48,7 +48,11 @@ fn public_rpc(value: Option<&str>) -> anyhow::Result<()> {
         None => cfg.public_rpc = !cfg.public_rpc,
     }
     config::save(&cfg)?;
-    let status = if cfg.public_rpc { "enabled" } else { "disabled" };
+    let status = if cfg.public_rpc {
+        "enabled"
+    } else {
+        "disabled"
+    };
     println!(
         "Public RPC has been set to {status} and will be persisted across future commands unless reset."
     );

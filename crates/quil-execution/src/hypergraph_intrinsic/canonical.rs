@@ -26,8 +26,8 @@
 //! size; otherwise the decoder is permissive.
 
 use super::types::{
-    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy,
-    HypergraphUpdate, VertexAdd, VertexRemove,
+    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy, HypergraphUpdate,
+    VertexAdd, VertexRemove,
 };
 use quil_types::error::{QuilError, Result};
 
@@ -61,8 +61,7 @@ pub const TYPE_BLS48581_AGGREGATE_SIGNATURE: u32 = 0x011C;
 
 // Re-use the crate-wide canonical cursor helpers.
 use crate::canonical_cursor::{
-    put_u32, put_lp as put_len_prefixed,
-    read_u32, read_bytes, read_lp as read_len_prefixed,
+    put_lp as put_len_prefixed, put_u32, read_bytes, read_lp as read_len_prefixed, read_u32,
 };
 
 /// Verify that `actual` matches `expected`, returning an error
@@ -130,7 +129,11 @@ impl Bls48581G2PublicKey {
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
         let mut cursor = 0usize;
         let type_prefix = read_u32(data, &mut cursor)?;
-        expect_type_prefix(type_prefix, TYPE_BLS48581_G2_PUBLIC_KEY, "BLS48581G2PublicKey")?;
+        expect_type_prefix(
+            type_prefix,
+            TYPE_BLS48581_G2_PUBLIC_KEY,
+            "BLS48581G2PublicKey",
+        )?;
         let key_value = data[cursor..].to_vec();
         if key_value.is_empty() || key_value.len() % Self::KEY_VALUE_LEN != 0 {
             return Err(QuilError::InvalidArgument(
@@ -223,9 +226,8 @@ impl AggregateSignature {
         // The consumer (bls_verifier / frame_prover) splits by the bitmask's
         // present-signer count; this gate is a sanity bound only.
         let valid_qc = sig_len >= 666 && sig_len % 666 == 0 && sig_len <= Self::MAX_SIG_LEN;
-        let valid_frame = sig_len >= 1186
-            && sig_len <= Self::MAX_SIG_LEN
-            && (sig_len - 4) % 1182 == 0;
+        let valid_frame =
+            sig_len >= 1186 && sig_len <= Self::MAX_SIG_LEN && (sig_len - 4) % 1182 == 0;
         if !valid_qc && !valid_frame {
             return Err(QuilError::InvalidArgument(format!(
                 "BLS48581AggregateSignature: invalid signature length {}",
@@ -316,13 +318,15 @@ impl HypergraphConfiguration {
         // read key is the sntrup761 KEM public key (PQ, replacing X448).
         if self.read_public_key.len() != quil_crypto::SNTRUP761_PUBLIC_KEY_LEN {
             return Err(QuilError::InvalidArgument(
-                "HypergraphConfiguration: invalid read public key length (expected sntrup761 1158)".into(),
+                "HypergraphConfiguration: invalid read public key length (expected sntrup761 1158)"
+                    .into(),
             ));
         }
         // write/owner are FALCON (FN-DSA-512, 897 B) signature keys now.
         if self.write_public_key.len() != quil_crypto::FALCON_PUBLIC_KEY_LEN {
             return Err(QuilError::InvalidArgument(
-                "HypergraphConfiguration: invalid write public key length (expected Falcon 897)".into(),
+                "HypergraphConfiguration: invalid write public key length (expected Falcon 897)"
+                    .into(),
             ));
         }
         if !self.owner_public_key.is_empty()
@@ -347,9 +351,10 @@ impl HypergraphDeploy {
         put_u32(&mut out, TYPE_HYPERGRAPH_DEPLOYMENT);
 
         // Go rejects nil config on encode.
-        let config = self.config.as_ref().ok_or_else(|| {
-            QuilError::InvalidArgument("HypergraphDeploy: nil config".into())
-        })?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| QuilError::InvalidArgument("HypergraphDeploy: nil config".into()))?;
         let config_bytes = config.to_canonical_bytes()?;
         put_len_prefixed(&mut out, &config_bytes);
 

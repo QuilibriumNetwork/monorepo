@@ -3,11 +3,8 @@
 //! tree, which rolls up into one of the 256 Level-1 global trees. Proves the
 //! wiring, determinism, per-tree-id isolation, and on-disk round-trip.
 
-
 use jmt::{KeyHash, RootHash, Sha256Jmt};
-use quil_forest::{
-    commit, global_tree_index, AppEntry, RocksTreeStore, ShardEntry, TreeId,
-};
+use quil_forest::{commit, global_tree_index, AppEntry, RocksTreeStore, ShardEntry, TreeId};
 use sha2::Sha256;
 
 fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
@@ -17,11 +14,7 @@ fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
 }
 
 /// Build a Level-3 shard tree of `n` state leaves; return (root, count, size).
-fn build_shard(
-    db: &quil_forest::CoordinatedDb,
-    shard_id: &[u8],
-    n: u32,
-) -> (RootHash, u64, u128) {
+fn build_shard(db: &quil_forest::CoordinatedDb, shard_id: &[u8], n: u32) -> (RootHash, u64, u128) {
     let store = RocksTreeStore::new(db.clone(), &TreeId::shard(shard_id));
     let mut total_size: u128 = 0;
     let leaves: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
@@ -53,13 +46,21 @@ fn three_tier_rollup_over_shared_rocksdb() {
     let l2_leaves = vec![
         (
             shard_a.clone(),
-            ShardEntry { shard_commitment: root_a.0, num_leaves: n_a, total_size: sz_a }
-                .to_bytes(),
+            ShardEntry {
+                shard_commitment: root_a.0,
+                num_leaves: n_a,
+                total_size: sz_a,
+            }
+            .to_bytes(),
         ),
         (
             shard_b.clone(),
-            ShardEntry { shard_commitment: root_b.0, num_leaves: n_b, total_size: sz_b }
-                .to_bytes(),
+            ShardEntry {
+                shard_commitment: root_b.0,
+                num_leaves: n_b,
+                total_size: sz_b,
+            }
+            .to_bytes(),
         ),
     ];
     let app_root = commit(&app_store, 0, l2_leaves).unwrap();

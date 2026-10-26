@@ -16,16 +16,57 @@ pub static NATIVE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub mod ffi {
     use std::ffi::{c_int, c_void};
     pub type GaussianSampler = unsafe extern "C" fn(*const u8, u64, u32, u32, *mut i32) -> c_int;
-    pub type RejectionDecider = unsafe extern "C" fn(u32, i64, i64, *const u8, *const u8, i32, *const u8, i32) -> c_int;
+    pub type RejectionDecider =
+        unsafe extern "C" fn(u32, i64, i64, *const u8, *const u8, i32, *const u8, i32) -> c_int;
     extern "C" {
         pub fn quil_set_private_gaussian_sampler(sampler: Option<GaussianSampler>);
         pub fn quil_set_rejection_decider(decider: Option<RejectionDecider>);
-        pub fn quil_fixture_exact_rejection(seed: *const u8, nonce: u64, kind: u32, zv: i64, vv: i64, standard_deviation: f64, repetition: f64) -> c_int;
-        pub fn quil_fixture_private_stream(seed: *const u8, nonce: u64, blocks: usize, out: *mut u8) -> c_int;
-        pub fn quil_fixture_sample_prg(seed: *const u8, nonce: u64, count: usize, scale: u32, mode: u32, out: *mut i64) -> c_int;
-        pub fn quil_fixture_private_rejection(seed: *const u8, nonce: u64, kind: u32, zv: i64, vv: i64, variance: f64, repetition: f64) -> c_int;
-        pub fn quil_fixture_rejection_parts(value: f64, mode: u32, out: *mut u8, exponent: *mut i32, precision: *mut u32) -> c_int;
-        pub fn quil_fixture_test_sampling_error(ctx: *mut c_void, stage: u32, bytes: *mut u8, capacity: usize, written: *mut usize) -> c_int;
+        pub fn quil_fixture_exact_rejection(
+            seed: *const u8,
+            nonce: u64,
+            kind: u32,
+            zv: i64,
+            vv: i64,
+            standard_deviation: f64,
+            repetition: f64,
+        ) -> c_int;
+        pub fn quil_fixture_private_stream(
+            seed: *const u8,
+            nonce: u64,
+            blocks: usize,
+            out: *mut u8,
+        ) -> c_int;
+        pub fn quil_fixture_sample_prg(
+            seed: *const u8,
+            nonce: u64,
+            count: usize,
+            scale: u32,
+            mode: u32,
+            out: *mut i64,
+        ) -> c_int;
+        pub fn quil_fixture_private_rejection(
+            seed: *const u8,
+            nonce: u64,
+            kind: u32,
+            zv: i64,
+            vv: i64,
+            variance: f64,
+            repetition: f64,
+        ) -> c_int;
+        pub fn quil_fixture_rejection_parts(
+            value: f64,
+            mode: u32,
+            out: *mut u8,
+            exponent: *mut i32,
+            precision: *mut u32,
+        ) -> c_int;
+        pub fn quil_fixture_test_sampling_error(
+            ctx: *mut c_void,
+            stage: u32,
+            bytes: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> c_int;
         pub fn quil_fixture_test_gaussian_limits() -> c_int;
         pub fn quil_fixture_test_partial_proof_cleanup() -> c_int;
         pub fn quil_fixture_test_coefficient_pool() -> c_int;
@@ -37,7 +78,11 @@ pub mod ffi {
         pub fn quil_fixture_test_wide_crt() -> c_int;
         pub fn quil_fixture_test_parallel_rotation() -> c_int;
         pub fn quil_fixture_test_parallel_jl() -> c_int;
-        pub fn quil_fixture_ntt_benchmark(rounds: usize, seconds: *mut f64, digest: *mut u8) -> c_int;
+        pub fn quil_fixture_ntt_benchmark(
+            rounds: usize,
+            seconds: *mut f64,
+            digest: *mut u8,
+        ) -> c_int;
         pub fn quil_fixture_test_signed_mulhi() -> c_int;
         pub fn quil_fixture_test_unsigned_mulhi() -> c_int;
         pub fn quil_fixture_test_poly_reduction() -> c_int;
@@ -53,7 +98,14 @@ pub mod ffi {
         pub fn quil_fixture_test_parallel_ldr_zq() -> c_int;
         pub fn quil_fixture_new(count: usize, rings: usize, scalars: usize) -> *mut c_void;
         pub fn quil_fixture_new_public(count: usize, rings: usize, scalars: usize) -> *mut c_void;
-        pub fn quil_fixture_new_typed(count: usize, rings: usize, scalars: usize, short_from: usize, short_normsq: *const u64, with_witness: c_int) -> *mut c_void;
+        pub fn quil_fixture_new_typed(
+            count: usize,
+            rings: usize,
+            scalars: usize,
+            short_from: usize,
+            short_normsq: *const u64,
+            with_witness: c_int,
+        ) -> *mut c_void;
         pub fn quil_fixture_short(ctx: *mut c_void, values: *const i64) -> c_int;
         pub fn quil_fixture_short_domain(ctx: *mut c_void) -> c_int;
         pub fn quil_fixture_binary(ctx: *mut c_void, values: *const i64) -> c_int;
@@ -105,7 +157,10 @@ mod tests {
 
     #[test]
     fn incremental_shake_matches_independent_absorption_across_boundaries() {
-        assert_eq!(unsafe { crate::ffi::quil_fixture_test_shake_absorption() }, 1);
+        assert_eq!(
+            unsafe { crate::ffi::quil_fixture_test_shake_absorption() },
+            1
+        );
     }
 
     use super::ffi::*;
@@ -171,7 +226,10 @@ mod tests {
     #[test]
     fn absent_optional_constraints_do_not_inherit_parameter_memory() {
         let _guard = super::NATIVE_STATE.lock().unwrap();
-        assert_eq!(unsafe { quil_fixture_test_empty_optional_dachshund_parameters() }, 1);
+        assert_eq!(
+            unsafe { quil_fixture_test_empty_optional_dachshund_parameters() },
+            1
+        );
     }
     #[test]
     fn private_mask_decomposition_preserves_signed_values_and_checks_ranges() {
@@ -185,7 +243,20 @@ mod tests {
         assert_eq!(unsafe { quil_fixture_test_gaussian_limits() }, 1);
         for kind in 0..=2 {
             for (variance, repetition) in [(f64::INFINITY, 2.0), (8.0, f64::INFINITY), (8.0, 0.5)] {
-                assert_eq!(unsafe { quil_fixture_private_rejection([3;32].as_ptr(), 0, kind, 0, 4, variance, repetition) }, -1);
+                assert_eq!(
+                    unsafe {
+                        quil_fixture_private_rejection(
+                            [3; 32].as_ptr(),
+                            0,
+                            kind,
+                            0,
+                            4,
+                            variance,
+                            repetition,
+                        )
+                    },
+                    -1
+                );
             }
         }
     }
@@ -201,10 +272,15 @@ mod tests {
         let _guard = super::NATIVE_STATE.lock().unwrap();
         let mut digest = [0u8; 32];
         let mut seconds = [0f64; 2];
-        assert_eq!(unsafe { quil_fixture_ntt_benchmark(2048, seconds.as_mut_ptr(), digest.as_mut_ptr()) }, 1);
+        assert_eq!(
+            unsafe { quil_fixture_ntt_benchmark(2048, seconds.as_mut_ptr(), digest.as_mut_ptr()) },
+            1
+        );
         let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(digest, "7b3ea0657641c73f2c1dd16131a4a38b0a8bda5c4fe9527a21385fbc523248a8",
-            "transform outputs differ from the pinned portable implementation");
+        assert_eq!(
+            digest, "7b3ea0657641c73f2c1dd16131a4a38b0a8bda5c4fe9527a21385fbc523248a8",
+            "transform outputs differ from the pinned portable implementation"
+        );
         eprintln!("native_ntt_benchmark rounds_per_prime=2048 primes=6 forward_seconds={:.6} inverse_seconds={:.6} output_digest={digest}",seconds[0],seconds[1]);
     }
 

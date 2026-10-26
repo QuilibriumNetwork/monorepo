@@ -45,7 +45,10 @@ pub fn claimed_generation(signature: &[u8]) -> Option<u64> {
 /// one above its head session's, or 1 without one. Generations are
 /// sequential per filter, so a lower one without a session never gets one and
 /// a higher one needs this one first. `None` when it cannot be read.
-pub fn next_generation(global: &Arc<quil_hypergraph::HypergraphCrdt>, filter: &[u8]) -> Option<u64> {
+pub fn next_generation(
+    global: &Arc<quil_hypergraph::HypergraphCrdt>,
+    filter: &[u8],
+) -> Option<u64> {
     let view = crate::app_handoff::committed_view(global).ok()??;
     let head = quil_execution::global_intrinsic::handoff::head(&view, filter).ok()?;
     head.map_or(Some(1), |session| session.generation.checked_add(1))
@@ -107,7 +110,10 @@ pub struct CollectorDeferrals {
 
 impl Default for CollectorDeferrals {
     fn default() -> Self {
-        Self { log: DeferralLog::new("message collector"), held: Mutex::new(HashMap::new()) }
+        Self {
+            log: DeferralLog::new("message collector"),
+            held: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -129,7 +135,9 @@ impl CollectorDeferrals {
         next_generation: impl Fn(&[u8]) -> Option<u64>,
     ) -> ShardFrameVerdict {
         let invalid = || ShardFrameVerdict::Invalid(error.to_string());
-        let Some(executed) = executed else { return invalid() };
+        let Some(executed) = executed else {
+            return invalid();
+        };
         let claims = bundle_shard_claims(bundle);
         let waits = !claims.is_empty()
             && claims.iter().all(|claim| {
@@ -169,15 +177,26 @@ impl CollectorDeferrals {
                 }
                 frames.insert(claim.frame, claim.anchor);
             }
-            let new_shards = touched.keys().filter(|address| !held.contains_key(*address)).count();
+            let new_shards = touched
+                .keys()
+                .filter(|address| !held.contains_key(*address))
+                .count();
             if held.len() + new_shards > MAX_HELD_SHARDS {
-                return ShardFrameVerdict::Full(format!("{error}; {MAX_HELD_SHARDS} shards have frames waiting for GLOBAL execution"));
+                return ShardFrameVerdict::Full(format!(
+                    "{error}; {MAX_HELD_SHARDS} shards have frames waiting for GLOBAL execution"
+                ));
             }
             held.extend(touched);
             held.len()
         };
         for claim in &claims {
-            self.log.deferred(&claim.address, claim.frame, claim.anchor, executed, Some(shards));
+            self.log.deferred(
+                &claim.address,
+                claim.frame,
+                claim.anchor,
+                executed,
+                Some(shards),
+            );
         }
         ShardFrameVerdict::Unavailable(format!(
             "{error}; anchored past executed GLOBAL frame {executed}, verified again once execution reaches it"
@@ -192,7 +211,10 @@ impl CollectorDeferrals {
     /// GLOBAL execution reached `executed`: forget the frames it passed, and
     /// log the end of the wait once it passed every anchor. Call periodically.
     pub fn executed(&self, executed: u64) {
-        forget_reached(&mut self.held.lock().unwrap_or_else(|p| p.into_inner()), executed);
+        forget_reached(
+            &mut self.held.lock().unwrap_or_else(|p| p.into_inner()),
+            executed,
+        );
         self.log.executed(executed);
     }
 }
@@ -214,11 +236,25 @@ pub const DEFERRAL_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeferralEvent {
     /// The first frame of a wait.
-    Started { frame: u64, anchor: u64, executed: u64 },
+    Started {
+        frame: u64,
+        anchor: u64,
+        executed: u64,
+    },
     /// Frames still wait, at most once per [`DEFERRAL_REPORT_INTERVAL`].
-    Waiting { frames: u64, shards: Option<usize>, highest_anchor: u64, executed: u64, waited_secs: u64 },
+    Waiting {
+        frames: u64,
+        shards: Option<usize>,
+        highest_anchor: u64,
+        executed: u64,
+        waited_secs: u64,
+    },
     /// Execution reached every anchor waited for.
-    Ended { frames: u64, executed: u64, waited_secs: u64 },
+    Ended {
+        frames: u64,
+        executed: u64,
+        waited_secs: u64,
+    },
 }
 
 struct Wait {
@@ -240,19 +276,32 @@ pub struct DeferralLog {
 
 impl DeferralLog {
     pub const fn new(path: &'static str) -> Self {
-        Self { path, wait: Mutex::new(None) }
+        Self {
+            path,
+            wait: Mutex::new(None),
+        }
     }
 
     /// Frame `frame` of shard `address` waits for execution, at `executed`,
     /// to reach `anchor`; `shards` have waiting frames.
-    pub fn deferred(&self, address: &[u8], frame: u64, anchor: u64, executed: u64, shards: Option<usize>) {
+    pub fn deferred(
+        &self,
+        address: &[u8],
+        frame: u64,
+        anchor: u64,
+        executed: u64,
+        shards: Option<usize>,
+    ) {
         let event = self.deferred_at(Instant::now(), frame, anchor, executed, shards);
         self.log(address, event);
     }
 
     /// Whether frames wait.
     pub fn waiting(&self) -> bool {
-        self.wait.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        self.wait
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     /// GLOBAL execution reached `executed`.
@@ -272,8 +321,17 @@ impl DeferralLog {
         let mut guard = self.wait.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_mut() {
             None => {
-                *guard = Some(Wait { since: now, reported: now, frames: 1, highest_anchor: anchor });
-                Some(DeferralEvent::Started { frame, anchor, executed })
+                *guard = Some(Wait {
+                    since: now,
+                    reported: now,
+                    frames: 1,
+                    highest_anchor: anchor,
+                });
+                Some(DeferralEvent::Started {
+                    frame,
+                    anchor,
+                    executed,
+                })
             }
             Some(wait) => {
                 wait.frames += 1;
@@ -295,7 +353,10 @@ impl DeferralLog {
 
     fn executed_at(&self, now: Instant, executed: u64) -> Option<DeferralEvent> {
         let mut guard = self.wait.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.as_ref().is_none_or(|wait| executed < wait.highest_anchor) {
+        if guard
+            .as_ref()
+            .is_none_or(|wait| executed < wait.highest_anchor)
+        {
             return None;
         }
         let ended = guard.take()?;
@@ -351,16 +412,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     fn unauthorized() -> QuilError {
-        QuilError::InvalidSignature("app session certificate: generation has no authorization".into())
+        QuilError::InvalidSignature(
+            "app session certificate: generation has no authorization".into(),
+        )
     }
 
     /// A certificate-shaped signature field naming `generation` (only its
     /// unauthenticated proposal prefix).
     pub(crate) fn certificate(generation: u64) -> Vec<u8> {
         use quil_cw_consensus::_codec::Encode as _;
-        use quil_cw_consensus::_consensus::{simplex::types::Proposal, types::{Epoch, Round, View}};
-        let proposal = Proposal::new(Round::new(Epoch::new(generation), View::new(5)), View::new(0),
-            quil_cw_consensus::_crypto::sha256::Digest([0; 32]));
+        use quil_cw_consensus::_consensus::{
+            simplex::types::Proposal,
+            types::{Epoch, Round, View},
+        };
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(generation), View::new(5)),
+            View::new(0),
+            quil_cw_consensus::_crypto::sha256::Digest([0; 32]),
+        );
         quil_cw_consensus::app_cert::wrap_cert_for_header(&proposal.encode().to_vec())
     }
 
@@ -382,18 +451,33 @@ mod tests {
             inner_type_prefix: TYPE_FRAME_HEADER,
             inner_bytes: header.to_canonical_bytes().unwrap(),
         };
-        CanonicalMessageBundle { requests: vec![Some(request)], timestamp: copy as i64 }
-            .to_canonical_bytes()
-            .unwrap()
+        CanonicalMessageBundle {
+            requests: vec![Some(request)],
+            timestamp: copy as i64,
+        }
+        .to_canonical_bytes()
+        .unwrap()
     }
 
     #[test]
     fn only_an_unauthorized_generation_anchored_past_execution_waits() {
         assert!(awaits_execution(&unauthorized(), 100, 99));
-        assert!(!awaits_execution(&unauthorized(), 99, 99), "execution reached the anchor");
-        let forged = QuilError::InvalidSignature("app session certificate: generation 3: below quorum".into());
-        assert!(!awaits_execution(&forged, 100, 99), "the session refused it");
-        assert!(!awaits_execution(&QuilError::InvalidSignature("generation has no authorization".into()), 100, 99));
+        assert!(
+            !awaits_execution(&unauthorized(), 99, 99),
+            "execution reached the anchor"
+        );
+        let forged = QuilError::InvalidSignature(
+            "app session certificate: generation 3: below quorum".into(),
+        );
+        assert!(
+            !awaits_execution(&forged, 100, 99),
+            "the session refused it"
+        );
+        assert!(!awaits_execution(
+            &QuilError::InvalidSignature("generation has no authorization".into()),
+            100,
+            99
+        ));
         assert_eq!(claimed_generation(&certificate(7)), Some(7));
         assert_eq!(claimed_generation(b"not a certificate"), None);
     }
@@ -411,40 +495,73 @@ mod tests {
         let deferrals = Arc::new(CollectorDeferrals::default());
         let collector = MessageCollector::new();
         collector.set_shard_frame_verifier({
-            let (executed, authorized, deferrals) = (executed.clone(), authorized.clone(), deferrals.clone());
+            let (executed, authorized, deferrals) =
+                (executed.clone(), authorized.clone(), deferrals.clone());
             Arc::new(move |data: &[u8]| {
-                let address = crate::message_collector::extract_shard_frame_keys(data)[0].0.clone();
+                let address = crate::message_collector::extract_shard_frame_keys(data)[0]
+                    .0
+                    .clone();
                 if authorized.load(Ordering::SeqCst) && address == vec![0x11; 32] {
                     return ShardFrameVerdict::Valid;
                 }
                 // Every shard's head session is generation 1.
-                deferrals.verdict(&unauthorized(), data, Some(executed.load(Ordering::SeqCst)), 100, |_| Some(2))
+                deferrals.verdict(
+                    &unauthorized(),
+                    data,
+                    Some(executed.load(Ordering::SeqCst)),
+                    100,
+                    |_| Some(2),
+                )
             })
         });
         let refused = SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
 
         let first = bundle(0x11, 5, 99, 2, 0);
-        assert_eq!(collector.add_message_outcome(1, first.clone()), SubmitOutcome::Accepted);
+        assert_eq!(
+            collector.add_message_outcome(1, first.clone()),
+            SubmitOutcome::Accepted
+        );
         assert!(!collector.is_verified(&first), "held unverified");
         assert!(deferrals.waiting());
-        assert_eq!(collector.add_message_outcome(1, bundle(0x22, 3, 101, 2, 0)), refused,
-            "anchored past the frame it is verified for");
-        assert_eq!(collector.add_message_outcome(1, bundle(0x22, 3, 99, 9, 0)), refused,
-            "a generation GLOBAL frames not yet executed cannot authorize");
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(0x22, 3, 101, 2, 0)),
+            refused,
+            "anchored past the frame it is verified for"
+        );
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(0x22, 3, 99, 9, 0)),
+            refused,
+            "a generation GLOBAL frames not yet executed cannot authorize"
+        );
         // Members' copies of one frame take one place: the next frame of the
         // shard is still admitted.
         for copy in 0..MAX_HELD_PER_SHARD as u64 {
-            assert_eq!(collector.add_message_outcome(1, bundle(0x44, 7, 99, 2, copy)), SubmitOutcome::Accepted);
+            assert_eq!(
+                collector.add_message_outcome(1, bundle(0x44, 7, 99, 2, copy)),
+                SubmitOutcome::Accepted
+            );
         }
-        assert_eq!(collector.add_message_outcome(1, bundle(0x44, 8, 99, 2, 0)), SubmitOutcome::Accepted);
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(0x44, 8, 99, 2, 0)),
+            SubmitOutcome::Accepted
+        );
         // Past the cap a higher frame takes the lowest one's place, and a
         // lower one is refused retryably.
         for frame in 9..15 {
-            assert_eq!(collector.add_message_outcome(1, bundle(0x44, frame, 99, 2, 0)), SubmitOutcome::Accepted);
+            assert_eq!(
+                collector.add_message_outcome(1, bundle(0x44, frame, 99, 2, 0)),
+                SubmitOutcome::Accepted
+            );
         }
-        assert_eq!(collector.add_message_outcome(1, bundle(0x44, 15, 99, 2, 0)), SubmitOutcome::Accepted);
         assert_eq!(
-            deferrals.held.lock().unwrap()[&vec![0x44; 32]].keys().copied().collect::<Vec<_>>(),
+            collector.add_message_outcome(1, bundle(0x44, 15, 99, 2, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            deferrals.held.lock().unwrap()[&vec![0x44; 32]]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
             (8..=15).collect::<Vec<_>>(),
             "the highest frames are admitted"
         );
@@ -456,13 +573,22 @@ mod tests {
         executed.store(99, Ordering::SeqCst);
         authorized.store(true, Ordering::SeqCst);
         let copy = bundle(0x11, 5, 99, 2, 1);
-        assert_eq!(collector.add_message_outcome(1, copy.clone()), SubmitOutcome::Accepted);
+        assert_eq!(
+            collector.add_message_outcome(1, copy.clone()),
+            SubmitOutcome::Accepted
+        );
         assert!(collector.is_verified(&copy));
-        assert_eq!(collector.add_message_outcome(1, bundle(0x33, 4, 99, 2, 0)), refused,
-            "no session authorized once execution reached the anchor");
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(0x33, 4, 99, 2, 0)),
+            refused,
+            "no session authorized once execution reached the anchor"
+        );
         deferrals.executed(99);
         assert!(!deferrals.waiting());
-        assert!(deferrals.held.lock().unwrap().is_empty(), "frames execution passed are forgotten");
+        assert!(
+            deferrals.held.lock().unwrap().is_empty(),
+            "frames execution passed are forgotten"
+        );
     }
 
     #[test]
@@ -471,18 +597,39 @@ mod tests {
         let start = Instant::now();
         assert_eq!(
             log.deferred_at(start, 5, 100, 90, None),
-            Some(DeferralEvent::Started { frame: 5, anchor: 100, executed: 90 })
+            Some(DeferralEvent::Started {
+                frame: 5,
+                anchor: 100,
+                executed: 90
+            })
         );
-        assert_eq!(log.deferred_at(start + Duration::from_secs(1), 6, 104, 91, Some(2)), None);
+        assert_eq!(
+            log.deferred_at(start + Duration::from_secs(1), 6, 104, 91, Some(2)),
+            None
+        );
         assert_eq!(
             log.deferred_at(start + DEFERRAL_REPORT_INTERVAL, 7, 102, 95, Some(2)),
-            Some(DeferralEvent::Waiting { frames: 3, shards: Some(2), highest_anchor: 104, executed: 95, waited_secs: 600 })
+            Some(DeferralEvent::Waiting {
+                frames: 3,
+                shards: Some(2),
+                highest_anchor: 104,
+                executed: 95,
+                waited_secs: 600
+            })
         );
         let end = start + DEFERRAL_REPORT_INTERVAL + Duration::from_secs(60);
-        assert_eq!(log.executed_at(end, 103), None, "frames anchored at 104 still wait");
+        assert_eq!(
+            log.executed_at(end, 103),
+            None,
+            "frames anchored at 104 still wait"
+        );
         assert_eq!(
             log.executed_at(end, 104),
-            Some(DeferralEvent::Ended { frames: 3, executed: 104, waited_secs: 660 })
+            Some(DeferralEvent::Ended {
+                frames: 3,
+                executed: 104,
+                waited_secs: 660
+            })
         );
         assert_eq!(log.executed_at(end, 105), None);
         assert!(!log.waiting());

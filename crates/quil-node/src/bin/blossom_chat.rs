@@ -23,9 +23,7 @@ async fn main() -> anyhow::Result<()> {
     use clap::Parser;
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Build a minimal P2P config
     let mut p2p_config = quil_config::P2PConfig::default();

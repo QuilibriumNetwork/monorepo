@@ -16,12 +16,13 @@ use std::sync::RwLock;
 
 use anyhow::Result;
 use jmt::storage::{
-    LeafNode, NibblePath, Node, NodeBatch, NodeKey, StaleNodeIndex, TreeReader, TreeUpdateBatch, TreeWriter,
+    LeafNode, NibblePath, Node, NodeBatch, NodeKey, StaleNodeIndex, TreeReader, TreeUpdateBatch,
+    TreeWriter,
 };
 use jmt::{KeyHash, OwnedValue, Version};
 
-use crate::TreeId;
 use crate::overlay::{KvIterator, KvStore};
+use crate::TreeId;
 
 /// A store that can persist a full JMT [`TreeUpdateBatch`] (nodes, values,
 /// and the stale-node index) and later prune superseded nodes. This is the
@@ -94,9 +95,16 @@ impl MemTreeStore {
         let values = self.values.read().unwrap();
         let mut live: Vec<(KeyHash, OwnedValue)> = values
             .iter()
-            .filter(|(key, _)| key.0 >= *first && key.0 <= *last && after.is_none_or(|after| key.0 > *after))
+            .filter(|(key, _)| {
+                key.0 >= *first && key.0 <= *last && after.is_none_or(|after| key.0 > *after)
+            })
             .filter_map(|(key, history)| {
-                let value = history.iter().rev().find(|(v, _)| *v <= version)?.1.clone()?;
+                let value = history
+                    .iter()
+                    .rev()
+                    .find(|(v, _)| *v <= version)?
+                    .1
+                    .clone()?;
                 Some((*key, value))
             })
             .collect();
@@ -105,7 +113,8 @@ impl MemTreeStore {
         let mut leaves = Vec::new();
         let total = live.len();
         for (key, value) in live {
-            if !leaves.is_empty() && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes) {
+            if !leaves.is_empty() && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes)
+            {
                 return Ok((leaves, true));
             }
             bytes += value.len();
@@ -445,10 +454,16 @@ impl RocksTreeStore {
                 Some(k) if it.valid() && k < hi.as_slice() => Some(k),
                 _ => None,
             };
-            let next_key = entry.and_then(|k| (k.len() == khs + 40).then(|| <[u8; 32]>::try_from(&k[khs..khs + 32]).unwrap()));
-            if current.as_ref().is_some_and(|(key, _)| entry.is_none() || next_key.is_some_and(|next| next != *key)) {
+            let next_key = entry.and_then(|k| {
+                (k.len() == khs + 40).then(|| <[u8; 32]>::try_from(&k[khs..khs + 32]).unwrap())
+            });
+            if current.as_ref().is_some_and(|(key, _)| {
+                entry.is_none() || next_key.is_some_and(|next| next != *key)
+            }) {
                 if let Some((key, Some(value))) = current.take() {
-                    if !leaves.is_empty() && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes) {
+                    if !leaves.is_empty()
+                        && (leaves.len() >= max_leaves || bytes + value.len() > max_bytes)
+                    {
                         return Ok((leaves, true));
                     }
                     bytes += value.len();
@@ -516,7 +531,10 @@ impl RocksTreeStore {
         // The bulk bootstrap intentionally collects a whole tree in memory.
         // It belongs on the canonical startup path, never inside a bounded
         // tentative frame. Ordinary lazy size lookups remain overlay-backed.
-        anyhow::ensure!(self.db.db().is_some(), "bulk size-index seeding unavailable in execution overlay");
+        anyhow::ensure!(
+            self.db.db().is_some(),
+            "bulk size-index seeding unavailable in execution overlay"
+        );
 
         // ---- Pass 1: value column → live leaf size by key_hash. -------------
         // Keys: prefix ++ 'v' ++ key_hash(32) ++ version_be(8); values sort ascending
@@ -615,7 +633,10 @@ impl RocksTreeStore {
             }
         }
         // A single-leaf tree has no internal root: take the root memo directly.
-        if internals.iter().all(|(nk, _)| nk.nibble_path().num_nibbles() != 0) {
+        if internals
+            .iter()
+            .all(|(nk, _)| nk.nibble_path().num_nibbles() != 0)
+        {
             root_size = node_size.get(&root_key).copied().unwrap_or(0);
         }
 
@@ -661,8 +682,12 @@ impl RocksTreeStore {
     /// Whether this tree holds any key at all (node, value, stale index or
     /// preimage).
     pub fn has_any_key(&self) -> Result<bool> {
-        let Some(upper) = self.prefix_upper_bound() else { return Ok(false) };
-        let mut it = self.db.iterator(&self.prefix, &upper, rocksdb::ReadOptions::default())?;
+        let Some(upper) = self.prefix_upper_bound() else {
+            return Ok(false);
+        };
+        let mut it = self
+            .db
+            .iterator(&self.prefix, &upper, rocksdb::ReadOptions::default())?;
         it.seek(&self.prefix)?;
         Ok(it.valid())
     }
@@ -688,7 +713,9 @@ impl RocksTreeStore {
     pub fn clear(&self) -> Result<()> {
         let lower = self.prefix.clone();
         // Empty prefix: nothing scoped to clear.
-        let Some(upper) = self.prefix_upper_bound() else { return Ok(()) };
+        let Some(upper) = self.prefix_upper_bound() else {
+            return Ok(());
+        };
         let mut wb = self.db.batch();
         wb.delete_range(&lower, &upper);
         self.db.write(wb)?;
@@ -751,7 +778,9 @@ impl RocksTreeStore {
             let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(batch_records);
             let mut more = false;
             {
-                let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+                let mut it = self
+                    .db
+                    .iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
                 it.seek(&from)?;
                 while it.valid() {
                     let k = match it.key() {
@@ -822,7 +851,8 @@ impl SizeIndex for RocksTreeStore {
     }
 
     fn put_size_sum(&self, node_key: &NodeKey, size: u128) -> Result<()> {
-        self.db.put(self.size_key_bytes(node_key), size.to_be_bytes())?;
+        self.db
+            .put(self.size_key_bytes(node_key), size.to_be_bytes())?;
         Ok(())
     }
 }
@@ -849,7 +879,9 @@ impl TreeReader for RocksTreeStore {
         // Include every u64 version, even u64::MAX, in this hash bucket.
         upper.extend_from_slice(&[0xff; 8]);
         upper.push(0);
-        let mut it = self.db.iterator(&vp, &upper, rocksdb::ReadOptions::default())?;
+        let mut it = self
+            .db
+            .iterator(&vp, &upper, rocksdb::ReadOptions::default())?;
         it.seek_for_prev(&seek)?;
         if !it.valid() {
             return Ok(None);
@@ -953,7 +985,10 @@ impl RocksTreeStore {
         wb: &mut rocksdb::WriteBatch,
         batch: &TreeUpdateBatch,
     ) -> Result<()> {
-        anyhow::ensure!(self.db.db().is_some(), "execution overlay cannot stage a writable RocksDB batch; use update_puts");
+        anyhow::ensure!(
+            self.db.db().is_some(),
+            "execution overlay cannot stage a writable RocksDB batch; use update_puts"
+        );
         for (k, v) in self.update_puts(batch)? {
             wb.put(k, v);
         }
@@ -976,8 +1011,15 @@ impl RocksTreeStore {
         let khs = self.prefix.len() + 1;
         let mut doomed: Vec<Vec<u8>> = Vec::new();
         {
-            let floor_out = |versions: &mut Vec<(Version, Vec<u8>)>, doomed: &mut Vec<Vec<u8>>, budget: &mut usize| {
-                if let Some(floor) = versions.iter().map(|(v, _)| *v).filter(|v| *v <= min_readable_version).max() {
+            let floor_out = |versions: &mut Vec<(Version, Vec<u8>)>,
+                             doomed: &mut Vec<Vec<u8>>,
+                             budget: &mut usize| {
+                if let Some(floor) = versions
+                    .iter()
+                    .map(|(v, _)| *v)
+                    .filter(|v| *v <= min_readable_version)
+                    .max()
+                {
                     for (_, key) in versions.iter().filter(|(v, _)| *v < floor) {
                         if *budget == 0 {
                             break;
@@ -1045,12 +1087,17 @@ impl RocksTreeStore {
     ) -> Result<(usize, Option<Vec<u8>>)> {
         let (lo, hi) = self.tag_bounds(TAG_NODE);
         let start = after.unwrap_or_else(|| lo.clone());
-        anyhow::ensure!(start >= lo && start <= hi, "node sweep cursor outside this tree");
+        anyhow::ensure!(
+            start >= lo && start <= hi,
+            "node sweep cursor outside this tree"
+        );
         let mut wb = self.db.batch();
         let (mut deleted, mut scanned) = (0usize, 0usize);
         let mut next = None;
         {
-            let mut it = self.db.iterator(&start, &hi, rocksdb::ReadOptions::default())?;
+            let mut it = self
+                .db
+                .iterator(&start, &hi, rocksdb::ReadOptions::default())?;
             it.seek(&start)?;
             while it.valid() {
                 let Some(k) = it.key() else { break };
@@ -1083,7 +1130,9 @@ impl RocksTreeStore {
         let mut wb = self.db.batch();
         let mut deleted = 0;
         {
-            let mut it = self.db.iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
+            let mut it = self
+                .db
+                .iterator(&lo, &hi, rocksdb::ReadOptions::default())?;
             it.seek(&lo)?;
             while it.valid() {
                 let Some(k) = it.key() else { break };
@@ -1105,7 +1154,9 @@ impl RocksTreeStore {
     /// Compact this tree's key range through the bottommost level, so deleted
     /// records free their space even where no newer write overlaps them.
     pub(crate) fn compact(&self) {
-        let (Some(db), Some(upper)) = (self.db.db(), self.prefix_upper_bound()) else { return };
+        let (Some(db), Some(upper)) = (self.db.db(), self.prefix_upper_bound()) else {
+            return;
+        };
         let mut options = rocksdb::CompactOptions::default();
         options.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::ForceOptimized);
         db.compact_range_opt(Some(&self.prefix), Some(&upper), &options);
@@ -1113,16 +1164,24 @@ impl RocksTreeStore {
 
     /// Range-delete leaf values and preimages whose key hash lies in one of
     /// `ranges` (`[low, high)`, `None` for an open end).
-    pub(crate) fn delete_keyed_ranges(&self, ranges: &[(Option<[u8; 32]>, Option<[u8; 32]>)]) -> Result<()> {
+    pub(crate) fn delete_keyed_ranges(
+        &self,
+        ranges: &[(Option<[u8; 32]>, Option<[u8; 32]>)],
+    ) -> Result<()> {
         let mut wb = self.db.batch();
         for tag in [TAG_VALUE, TAG_PREIMAGE] {
             let (lo, hi) = self.tag_bounds(tag);
             for (low, high) in ranges {
-                let bound = |key: &Option<[u8; 32]>, open: &Vec<u8>| key.map_or_else(|| open.clone(), |key| {
-                    let mut k = lo.clone();
-                    k.extend_from_slice(&key);
-                    k
-                });
+                let bound = |key: &Option<[u8; 32]>, open: &Vec<u8>| {
+                    key.map_or_else(
+                        || open.clone(),
+                        |key| {
+                            let mut k = lo.clone();
+                            k.extend_from_slice(&key);
+                            k
+                        },
+                    )
+                };
                 wb.delete_range(bound(low, &lo), bound(high, &hi));
             }
         }
@@ -1135,7 +1194,9 @@ impl ForestStore for RocksTreeStore {
     fn apply_update(&self, batch: &TreeUpdateBatch) -> Result<()> {
         // Nodes, values, and stale records all land in one atomic write.
         let mut wb = self.db.batch();
-        for (key, value) in self.update_puts(batch)? { wb.put(key, value); }
+        for (key, value) in self.update_puts(batch)? {
+            wb.put(key, value);
+        }
         self.db.write(wb)?;
         Ok(())
     }

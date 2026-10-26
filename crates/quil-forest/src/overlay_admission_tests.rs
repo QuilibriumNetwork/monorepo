@@ -29,12 +29,20 @@ fn held_views_are_bounded_across_databases_and_freed_by_their_last_branch() {
     let b = ExecutionOverlay::capture_admitted(b_db.clone(), limits(), &admission).unwrap();
     assert_eq!(admission.active(), 2);
     let refused = ExecutionOverlay::capture_admitted(a_db.clone(), limits(), &admission);
-    assert!(refused.err().unwrap().to_string().contains("admission limit"));
+    assert!(refused
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("admission limit"));
 
     let child = a.fork(limits()).unwrap();
     assert_eq!(admission.active(), 2, "a fork shares its family's view");
     a.close();
-    assert_eq!(admission.active(), 2, "the child still reads the family's view");
+    assert_eq!(
+        admission.active(),
+        2,
+        "the child still reads the family's view"
+    );
     assert!(ExecutionOverlay::capture_admitted(b_db.clone(), limits(), &admission).is_err());
     assert_eq!(child.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     child.close();
@@ -53,11 +61,17 @@ fn an_expired_view_fails_its_reads_and_cannot_publish() {
     let db = open(dir.path());
     let admission = ExecutionViewAdmission::new(4, Duration::from_millis(50));
     let overlay = ExecutionOverlay::capture_admitted(db.clone(), limits(), &admission).unwrap();
-    overlay.apply(&[OverlayMutation::Put(b"x".to_vec(), b"y".to_vec())]).unwrap();
+    overlay
+        .apply(&[OverlayMutation::Put(b"x".to_vec(), b"y".to_vec())])
+        .unwrap();
     assert_eq!(overlay.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     std::thread::sleep(Duration::from_millis(80));
 
-    assert!(overlay.get(b"k").unwrap_err().to_string().contains("expired"));
+    assert!(overlay
+        .get(b"k")
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
     assert_eq!(admission.active(), 0);
     assert!(overlay.stats().closed);
     let mut cursor_failed = overlay.cursor(b"a", b"z").unwrap();
@@ -82,7 +96,11 @@ fn a_new_capture_releases_an_idle_holders_expired_view() {
     assert_eq!(admission.active(), 1);
     assert_eq!(fresh.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     assert!(idle.get(b"k").unwrap_err().to_string().contains("expired"));
-    assert_eq!(admission.release_expired(), 0, "nothing else is held past its age");
+    assert_eq!(
+        admission.release_expired(),
+        0,
+        "nothing else is held past its age"
+    );
 }
 
 /// Cache validation must detect expiry before a record read has discovered it,
@@ -96,9 +114,16 @@ fn cached_view_validation_detects_expiry_without_spending_read_budget() {
     let before = overlay.stats();
     overlay.ensure_readable().unwrap();
     let after = overlay.stats();
-    assert_eq!((before.read_bytes, before.read_operations), (after.read_bytes, after.read_operations));
+    assert_eq!(
+        (before.read_bytes, before.read_operations),
+        (after.read_bytes, after.read_operations)
+    );
     admission.set_policy(2, Duration::ZERO);
-    assert!(overlay.ensure_readable().unwrap_err().to_string().contains("expired"));
+    assert!(overlay
+        .ensure_readable()
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
     assert!(!overlay.execution_healthy());
     assert!(overlay.stats().closed);
     assert_eq!(admission.active(), 0);
@@ -107,6 +132,10 @@ fn cached_view_validation_detects_expiry_without_spending_read_budget() {
     let swept = ExecutionOverlay::capture_admitted(db, limits(), &admission).unwrap();
     admission.set_policy(2, Duration::ZERO);
     assert_eq!(admission.release_expired(), 1);
-    assert!(swept.ensure_readable().unwrap_err().to_string().contains("expired"));
+    assert!(swept
+        .ensure_readable()
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
     assert!(!swept.execution_healthy());
 }

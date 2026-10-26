@@ -41,12 +41,7 @@ pub trait WorkerManager: Send + Sync {
     /// prover isn't Active yet (the engine's `leader_for_rank`
     /// would die immediately). Mirrors Go's
     /// `worker.Filter`-set / `worker.Allocated=false` state.
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()>;
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()>;
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
 
@@ -62,7 +57,13 @@ pub trait WorkerManager: Send + Sync {
     /// The listed workers that are draining ([`Self::is_draining`]).
     fn draining_workers(&self) -> HashSet<u32> {
         self.range_workers()
-            .map(|workers| workers.into_iter().map(|w| w.core_id).filter(|core_id| self.is_draining(*core_id)).collect())
+            .map(|workers| {
+                workers
+                    .into_iter()
+                    .map(|w| w.core_id)
+                    .filter(|core_id| self.is_draining(*core_id))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -166,7 +167,8 @@ pub struct WorkerInfo {
 /// Filters pinned to manual workers, including pending joins. Idle manual
 /// workers have no filter to protect.
 pub(crate) fn manually_managed_filters(workers: &[WorkerInfo]) -> HashSet<Vec<u8>> {
-    workers.iter()
+    workers
+        .iter()
         .filter(|w| w.manually_managed && !w.filter.is_empty())
         .map(|w| w.filter.clone())
         .collect()

@@ -15,17 +15,30 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use quil_execution::global_intrinsic::{handoff, intrinsic, intrinsic::GlobalIntrinsic, materialize};
+use quil_execution::global_intrinsic::{
+    handoff, intrinsic, intrinsic::GlobalIntrinsic, materialize,
+};
 use quil_execution::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
-use quil_execution::hypergraph_state::{hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState};
+use quil_execution::hypergraph_state::{
+    hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState,
+};
 use quil_execution::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
 use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
 use quil_types::error::Result;
-use quil_types::store::{ClockStore, KvDb as _, PendingShardChange, ShardChangeKind, ShardInfo, ShardKey, ShardsStore};
+use quil_types::store::{
+    ClockStore, KvDb as _, PendingShardChange, ShardChangeKind, ShardInfo, ShardKey, ShardsStore,
+};
 
 struct AcceptAll;
 impl quil_types::crypto::KeyManager for AcceptAll {
-    fn validate_signature(&self, _: quil_types::crypto::KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+    fn validate_signature(
+        &self,
+        _: quil_types::crypto::KeyType,
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+        _: &[u8],
+    ) -> Result<bool> {
         Ok(true)
     }
 }
@@ -40,7 +53,9 @@ fn install_policy() {
     quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
         activation_frame: ACTIVATION,
         chain_id: [0x51; 32],
-        legacy_history: LegacyHistory::Discard, membership_boundary_frame: ACTIVATION, first_session_boundary_frame: u64::MAX,
+        legacy_history: LegacyHistory::Discard,
+        membership_boundary_frame: ACTIVATION,
+        first_session_boundary_frame: u64::MAX,
     }));
 }
 
@@ -64,7 +79,13 @@ fn grid_key() -> Vec<u8> {
 }
 
 fn row(bits: &[bool]) -> ShardInfo {
-    ShardInfo { shard_key: grid_key(), prefix: quil_forest::bit_path_to_prefix(bits), size: vec![], data_shards: 0, commitment: vec![] }
+    ShardInfo {
+        shard_key: grid_key(),
+        prefix: quil_forest::bit_path_to_prefix(bits),
+        size: vec![],
+        data_shards: 0,
+        commitment: vec![],
+    }
 }
 
 struct Prover {
@@ -104,7 +125,10 @@ impl World {
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         crdt.set_unified_tree(true);
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let intrinsic = GlobalIntrinsic::new(Arc::new(AcceptAll))
@@ -112,10 +136,19 @@ impl World {
             .with_shards_db(db.clone())
             .with_hypergraph(crdt.clone())
             .with_clock_store(clock.clone());
-        let world = Self { db, shards, crdt, clock, intrinsic, repair_off: false };
+        let world = Self {
+            db,
+            shards,
+            crdt,
+            clock,
+            intrinsic,
+            repair_off: false,
+        };
         world.edit_grid(&rows.iter().map(|bits| row(bits)).collect::<Vec<_>>(), &[]);
         let state = HypergraphState::new(world.crdt.clone());
-        let seeded = (0..provers).map(|i| seed(&state, 0x10 + i, 10 + u64::from(i) * 7, &shard(on))).collect();
+        let seeded = (0..provers)
+            .map(|i| seed(&state, 0x10 + i, 10 + u64::from(i) * 7, &shard(on)))
+            .collect();
         state.commit().unwrap();
         state.abort();
         world.crdt.commit(1).unwrap();
@@ -127,7 +160,9 @@ impl World {
     fn edit_grid(&self, put: &[ShardInfo], delete: &[ShardInfo]) {
         let txn = self.db.new_batch(false).unwrap();
         for shard in delete {
-            self.shards.delete_app_shard(txn.as_ref(), &shard.shard_key, &shard.prefix).unwrap();
+            self.shards
+                .delete_app_shard(txn.as_ref(), &shard.shard_key, &shard.prefix)
+                .unwrap();
         }
         for shard in put {
             self.shards.put_app_shard(txn.as_ref(), shard).unwrap();
@@ -138,15 +173,22 @@ impl World {
     /// A proposal's pending record, staged as its frame would.
     fn propose(&self, change: &PendingShardChange) {
         let txn = self.db.new_batch(false).unwrap();
-        self.shards.put_pending_shard_change(txn.as_ref(), change).unwrap();
+        self.shards
+            .put_pending_shard_change(txn.as_ref(), change)
+            .unwrap();
         txn.commit().unwrap();
     }
 
     /// The GLOBAL frame record of a frame that executed `merge`.
     fn record_merge_frame(&self, merge: &PendingShardChange) {
-        use quil_types::proto::global::{message_request::Request, GlobalFrame, GlobalFrameHeader, MessageBundle, MessageRequest};
+        use quil_types::proto::global::{
+            message_request::Request, GlobalFrame, GlobalFrameHeader, MessageBundle, MessageRequest,
+        };
         let frame = GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: merge.proposed_frame, ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: merge.proposed_frame,
+                ..Default::default()
+            }),
             requests: vec![MessageBundle {
                 requests: vec![MessageRequest {
                     request: Some(Request::ShardMerge(quil_types::proto::global::ShardMerge {
@@ -162,7 +204,9 @@ impl World {
             ..Default::default()
         };
         let txn = self.clock.new_transaction(false).unwrap();
-        self.clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+        self.clock
+            .put_global_clock_frame(&frame, txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
     }
 
@@ -170,7 +214,9 @@ impl World {
     fn lose_pending(&self) {
         let txn = self.db.new_batch(false).unwrap();
         for change in self.shards.all_pending_shard_changes().unwrap() {
-            self.shards.delete_pending_shard_change(txn.as_ref(), &change.parent, change.effective_epoch).unwrap();
+            self.shards
+                .delete_pending_shard_change(txn.as_ref(), &change.parent, change.effective_epoch)
+                .unwrap();
         }
         txn.commit().unwrap();
     }
@@ -185,42 +231,68 @@ impl World {
         intrinsic::set_pending_repair_off_for_thread(self.repair_off);
         let state = HypergraphState::new(self.crdt.clone());
         messages(&state);
-        self.intrinsic.apply_due_shard_changes(frame, &state).unwrap();
+        self.intrinsic
+            .apply_due_shard_changes(frame, &state)
+            .unwrap();
         state.commit().unwrap();
         state.abort();
         let roots = self.crdt.commit(frame).unwrap();
         intrinsic::set_pending_repair_off_for_thread(false);
-        Observed { roots, ..self.observe() }
+        Observed {
+            roots,
+            ..self.observe()
+        }
     }
 
     fn observe(&self) -> Observed {
-        let mut rows: Vec<_> = self.shards.range_app_shards().unwrap().into_iter().map(|r| (r.shard_key, r.prefix)).collect();
+        let mut rows: Vec<_> = self
+            .shards
+            .range_app_shards()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.shard_key, r.prefix))
+            .collect();
         rows.sort();
         let mut pending = self.shards.all_pending_shard_changes().unwrap();
         pending.sort_by(|a, b| (a.effective_epoch, &a.parent).cmp(&(b.effective_epoch, &b.parent)));
-        Observed { rows, pending, roots: HashMap::new(), commitments: self.prover_root() }
+        Observed {
+            rows,
+            pending,
+            roots: HashMap::new(),
+            commitments: self.prover_root(),
+        }
     }
 
     /// The four phase roots of GLOBAL's prover shard, as committed.
     fn prover_root(&self) -> Vec<Vec<u8>> {
         let key = ShardKey {
-            l1: quil_hypergraph::addressing::get_bloom_filter_indices(&GLOBAL_INTRINSIC_ADDRESS, 256, 3),
+            l1: quil_hypergraph::addressing::get_bloom_filter_indices(
+                &GLOBAL_INTRINSIC_ADDRESS,
+                256,
+                3,
+            ),
             l2: GLOBAL_INTRINSIC_ADDRESS,
         };
-        [("vertex", "adds"), ("vertex", "removes"), ("hyperedge", "adds"), ("hyperedge", "removes")]
-            .into_iter()
-            .map(|(set, phase)| self.crdt.compute_shard_root(set, phase, &key))
-            .collect()
+        [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ]
+        .into_iter()
+        .map(|(set, phase)| self.crdt.compute_shard_root(set, phase, &key))
+        .collect()
     }
 
     fn in_grid(&self, bits: &[bool]) -> bool {
-        self.observe().rows.contains(&(grid_key(), quil_forest::bit_path_to_prefix(bits)))
+        self.observe()
+            .rows
+            .contains(&(grid_key(), quil_forest::bit_path_to_prefix(bits)))
     }
 
     fn state(&self) -> HypergraphState {
         HypergraphState::new(self.crdt.clone())
     }
-
 }
 
 /// A prover with an Active allocation on `filter`, eligible for many epochs.
@@ -230,16 +302,56 @@ fn seed(state: &HypergraphState, n: u8, seniority: u64, filter: &[u8]) -> Prover
     let address = materialize::prover_address_from_pubkey(&key).unwrap();
     let mut prover = materialize::create_prover_vertex_tree(&key, seniority).unwrap();
     write_field(&mut prover, "prover:Prover", "Status", &[1]).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va, 1, vertex_tree_to_blob(&prover)).unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &va,
+            1,
+            vertex_tree_to_blob(&prover),
+        )
+        .unwrap();
     let allocation_address = materialize::allocation_address(&key, filter).unwrap();
     let mut allocation = materialize::create_allocation_vertex_tree(&address, filter, 1).unwrap();
     let class = "allocation:ProverAllocation";
     write_field(&mut allocation, class, "Status", &[1]).unwrap();
-    write_field(&mut allocation, class, "JoinConfirmFrameNumber", &0u64.to_be_bytes()).unwrap();
-    write_field(&mut allocation, class, "Epoch", &(ACTIVATION / EPOCH + 1000).to_be_bytes()).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation_address, &va, 1, vertex_tree_to_blob(&allocation)).unwrap();
-    let blob = materialize::build_prover_allocation_hyperedge_blob(&address, &[(allocation_address, &allocation)]).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &hyperedge_adds_discriminator().unwrap(), 1, blob).unwrap();
+    write_field(
+        &mut allocation,
+        class,
+        "JoinConfirmFrameNumber",
+        &0u64.to_be_bytes(),
+    )
+    .unwrap();
+    write_field(
+        &mut allocation,
+        class,
+        "Epoch",
+        &(ACTIVATION / EPOCH + 1000).to_be_bytes(),
+    )
+    .unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &allocation_address,
+            &va,
+            1,
+            vertex_tree_to_blob(&allocation),
+        )
+        .unwrap();
+    let blob = materialize::build_prover_allocation_hyperedge_blob(
+        &address,
+        &[(allocation_address, &allocation)],
+    )
+    .unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &hyperedge_adds_discriminator().unwrap(),
+            1,
+            blob,
+        )
+        .unwrap();
     Prover { key }
 }
 
@@ -252,26 +364,68 @@ fn seed_on_each(state: &HypergraphState, n: u8, filters: &[Vec<u8>]) -> Prover {
     let address = materialize::prover_address_from_pubkey(&key).unwrap();
     let mut prover = materialize::create_prover_vertex_tree(&key, 1).unwrap();
     write_field(&mut prover, "prover:Prover", "Status", &[1]).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va, 1, vertex_tree_to_blob(&prover)).unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &va,
+            1,
+            vertex_tree_to_blob(&prover),
+        )
+        .unwrap();
     let mut atoms = Vec::new();
     for (i, filter) in filters.iter().enumerate() {
         let allocation_address = materialize::allocation_address(&key, filter).unwrap();
-        let mut allocation = materialize::create_allocation_vertex_tree(&address, filter, 1).unwrap();
+        let mut allocation =
+            materialize::create_allocation_vertex_tree(&address, filter, 1).unwrap();
         let class = "allocation:ProverAllocation";
         write_field(&mut allocation, class, "Status", &[0]).unwrap();
-        write_field(&mut allocation, class, "JoinFrameNumber", &(ACTIVATION + 11 + i as u64).to_be_bytes()).unwrap();
-        state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation_address, &va, 1, vertex_tree_to_blob(&allocation)).unwrap();
+        write_field(
+            &mut allocation,
+            class,
+            "JoinFrameNumber",
+            &(ACTIVATION + 11 + i as u64).to_be_bytes(),
+        )
+        .unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &allocation_address,
+                &va,
+                1,
+                vertex_tree_to_blob(&allocation),
+            )
+            .unwrap();
         atoms.push((allocation_address, allocation));
     }
     let refs: Vec<_> = atoms.iter().map(|(a, t)| (*a, t)).collect();
     let blob = materialize::build_prover_allocation_hyperedge_blob(&address, &refs).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &hyperedge_adds_discriminator().unwrap(), 1, blob).unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &hyperedge_adds_discriminator().unwrap(),
+            1,
+            blob,
+        )
+        .unwrap();
     Prover { key }
 }
 
-fn allocation_field(state: &HypergraphState, prover: &Prover, filter: &[u8], field: &str) -> Option<Vec<u8>> {
+fn allocation_field(
+    state: &HypergraphState,
+    prover: &Prover,
+    filter: &[u8],
+    field: &str,
+) -> Option<Vec<u8>> {
     let address = materialize::allocation_address(&prover.key, filter).unwrap();
-    state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &vertex_adds_discriminator().unwrap()).unwrap()
+    state
+        .get(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &vertex_adds_discriminator().unwrap(),
+        )
+        .unwrap()
         .filter(|blob| !blob.is_empty())
         .map(|blob| rebuild_vertex_tree_from_blob(&blob))
         .and_then(|tree| read_field(&tree, "allocation:ProverAllocation", field))
@@ -279,7 +433,13 @@ fn allocation_field(state: &HypergraphState, prover: &Prover, filter: &[u8], fie
 
 fn allocation_status(state: &HypergraphState, prover: &Prover, filter: &[u8]) -> Option<u8> {
     let address = materialize::allocation_address(&prover.key, filter).unwrap();
-    state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &vertex_adds_discriminator().unwrap()).unwrap()
+    state
+        .get(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &vertex_adds_discriminator().unwrap(),
+        )
+        .unwrap()
         .filter(|blob| !blob.is_empty())
         .map(|blob| rebuild_vertex_tree_from_blob(&blob))
         .and_then(|tree| read_field(&tree, "allocation:ProverAllocation", "Status"))
@@ -290,10 +450,21 @@ fn allocation_status(state: &HypergraphState, prover: &Prover, filter: &[u8]) ->
 fn pause(state: &HypergraphState, prover: &Prover, filter: &[u8]) {
     let va = vertex_adds_discriminator().unwrap();
     let address = materialize::allocation_address(&prover.key, filter).unwrap();
-    let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va).unwrap().unwrap();
+    let blob = state
+        .get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va)
+        .unwrap()
+        .unwrap();
     let mut tree = rebuild_vertex_tree_from_blob(&blob);
     write_field(&mut tree, "allocation:ProverAllocation", "Status", &[2]).unwrap();
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va, 1, vertex_tree_to_blob(&tree)).unwrap();
+    state
+        .set(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &address,
+            &va,
+            1,
+            vertex_tree_to_blob(&tree),
+        )
+        .unwrap();
 }
 
 /// The frames both stores execute in `epoch`: its first two (the epoch's
@@ -318,7 +489,10 @@ fn p_split() -> PendingShardChange {
 /// Two stores through the root split; `lose` runs on the second after each
 /// frame and may rewrite its store. Returns both, after the epoch the split
 /// flipped in plus one more.
-fn split_lifecycle(lose: impl Fn(&World, u64), second_repair_off: bool) -> (World, World, Vec<(u64, Observed, Observed)>) {
+fn split_lifecycle(
+    lose: impl Fn(&World, u64),
+    second_repair_off: bool,
+) -> (World, World, Vec<(u64, Observed, Observed)>) {
     install_policy();
     let (a, _) = World::new(5);
     let (mut b, _) = World::new(5);
@@ -335,7 +509,14 @@ fn split_lifecycle(lose: impl Fn(&World, u64), second_repair_off: bool) -> (Worl
             let observed_b = b.step(frame);
             lose(&b, frame);
             // As left for the next frame.
-            trace.push((frame, observed_a, Observed { roots: observed_b.roots, ..b.observe() }));
+            trace.push((
+                frame,
+                observed_a,
+                Observed {
+                    roots: observed_b.roots,
+                    ..b.observe()
+                },
+            ));
         }
         if flipped_epoch.is_none() && !a.in_grid(P) {
             flipped_epoch = Some(epoch);
@@ -344,7 +525,10 @@ fn split_lifecycle(lose: impl Fn(&World, u64), second_repair_off: bool) -> (Worl
             break;
         }
     }
-    assert!(flipped_epoch.is_some(), "the healthy store applies the split");
+    assert!(
+        flipped_epoch.is_some(),
+        "the healthy store applies the split"
+    );
     (a, b, trace)
 }
 
@@ -360,27 +544,62 @@ fn a_record_lost_mid_epoch_is_restored_at_the_next_epoch_and_flips_in_step() {
     // still holds the request.
     let lose = |world: &World, frame: u64| {
         if frame == p_split().effective_epoch * EPOCH {
-            assert!(p_request(world).is_some(), "scheduled at the first due frame");
+            assert!(
+                p_request(world).is_some(),
+                "scheduled at the first due frame"
+            );
             world.lose_pending();
         }
     };
     let (_a, b, trace) = split_lifecycle(lose, false);
-    let lost_at = trace.iter().position(|(_, a, b)| a.pending != b.pending).expect("the second store lost the record");
+    let lost_at = trace
+        .iter()
+        .position(|(_, a, b)| a.pending != b.pending)
+        .expect("the second store lost the record");
     let next_epoch = (trace[lost_at].0 / EPOCH + 1) * EPOCH;
     for (frame, observed_a, observed_b) in &trace[lost_at..] {
         if *frame < next_epoch {
-            assert_ne!(observed_a.pending, observed_b.pending, "no trigger until the next epoch (frame {frame})");
+            assert_ne!(
+                observed_a.pending, observed_b.pending,
+                "no trigger until the next epoch (frame {frame})"
+            );
         } else {
-            assert_eq!(observed_a, observed_b, "both stores agree after frame {frame}");
+            assert_eq!(
+                observed_a, observed_b,
+                "both stores agree after frame {frame}"
+            );
         }
     }
     assert!(!b.in_grid(P) && b.in_grid(SPINE) && b.in_grid(C0) && b.in_grid(C1));
-    let flip = trace.iter().position(|(_, a, _)| !a.rows.contains(&(grid_key(), quil_forest::bit_path_to_prefix(P)))).unwrap();
-    assert!(trace[flip].0 > next_epoch, "the record was back before the flip");
-    assert!(trace[flip].1.commitments.iter().any(|root| !root.is_empty()), "the prover shard has a root");
-    assert_ne!(trace[flip - 1].1.commitments, trace[flip].1.commitments, "the flip moves allocations: roots change");
+    let flip = trace
+        .iter()
+        .position(|(_, a, _)| {
+            !a.rows
+                .contains(&(grid_key(), quil_forest::bit_path_to_prefix(P)))
+        })
+        .unwrap();
+    assert!(
+        trace[flip].0 > next_epoch,
+        "the record was back before the flip"
+    );
+    assert!(
+        trace[flip]
+            .1
+            .commitments
+            .iter()
+            .any(|root| !root.is_empty()),
+        "the prover shard has a root"
+    );
+    assert_ne!(
+        trace[flip - 1].1.commitments,
+        trace[flip].1.commitments,
+        "the flip moves allocations: roots change"
+    );
     let parent = handoff::head(&b.state(), &shard(P)).unwrap().unwrap();
-    assert!(handoff::is_fenced(&b.state(), &parent.id().unwrap()).unwrap(), "the parent was fenced, as on mainnet");
+    assert!(
+        handoff::is_fenced(&b.state(), &parent.id().unwrap()).unwrap(),
+        "the parent was fenced, as on mainnet"
+    );
 }
 
 /// The frame the healthy store flips at: the fence authorizes the successors
@@ -395,7 +614,10 @@ fn fence_frame() -> u64 {
 fn lose_at_the_fence(world: &World, frame: u64, trigger: bool) {
     if frame == fence_frame() {
         let request = p_request(world).unwrap();
-        assert!(handoff::schedule::activated(&world.state(), &request).unwrap(), "authorized by the fence");
+        assert!(
+            handoff::schedule::activated(&world.state(), &request).unwrap(),
+            "authorized by the fence"
+        );
         world.lose_pending();
         if trigger {
             // A restart with this store, or a reconcile, before the next frame.
@@ -406,13 +628,28 @@ fn lose_at_the_fence(world: &World, frame: u64, trigger: bool) {
 
 #[test]
 fn a_trigger_restores_a_lost_record_on_the_next_frame_and_flips_with_the_network() {
-    let (_a, b, trace) = split_lifecycle(|world, frame| lose_at_the_fence(world, frame, true), false);
-    let fence = trace.iter().position(|(frame, _, _)| *frame == fence_frame()).unwrap();
-    assert_ne!(trace[fence].1.pending, trace[fence].2.pending, "lost after the fence");
+    let (_a, b, trace) =
+        split_lifecycle(|world, frame| lose_at_the_fence(world, frame, true), false);
+    let fence = trace
+        .iter()
+        .position(|(frame, _, _)| *frame == fence_frame())
+        .unwrap();
+    assert_ne!(
+        trace[fence].1.pending, trace[fence].2.pending,
+        "lost after the fence"
+    );
     let (frame, observed_a, observed_b) = &trace[fence + 1];
-    assert!(!observed_a.rows.contains(&(grid_key(), quil_forest::bit_path_to_prefix(P))), "the healthy store flips at {frame}");
+    assert!(
+        !observed_a
+            .rows
+            .contains(&(grid_key(), quil_forest::bit_path_to_prefix(P))),
+        "the healthy store flips at {frame}"
+    );
     for (frame, observed_a, observed_b) in &trace[fence + 1..] {
-        assert_eq!(observed_a, observed_b, "both stores agree after frame {frame}");
+        assert_eq!(
+            observed_a, observed_b,
+            "both stores agree after frame {frame}"
+        );
     }
     assert_eq!(observed_a, observed_b);
     assert!(!b.in_grid(P) && b.in_grid(C0) && b.in_grid(C1));
@@ -420,15 +657,24 @@ fn a_trigger_restores_a_lost_record_on_the_next_frame_and_flips_with_the_network
 
 #[test]
 fn without_a_trigger_a_record_lost_before_its_flip_is_restored_late() {
-    let (_a, _b, trace) = split_lifecycle(|world, frame| lose_at_the_fence(world, frame, false), false);
-    let fence = trace.iter().position(|(frame, _, _)| *frame == fence_frame()).unwrap();
+    let (_a, _b, trace) =
+        split_lifecycle(|world, frame| lose_at_the_fence(world, frame, false), false);
+    let fence = trace
+        .iter()
+        .position(|(frame, _, _)| *frame == fence_frame())
+        .unwrap();
     let parent = (grid_key(), quil_forest::bit_path_to_prefix(P));
     for (frame, observed_a, observed_b) in &trace[fence + 1..] {
         if *frame < fence_frame() + EPOCH {
-            assert!(!observed_a.rows.contains(&parent) && observed_b.rows.contains(&parent),
-                "the second store keeps the parent until the next epoch (frame {frame})");
+            assert!(
+                !observed_a.rows.contains(&parent) && observed_b.rows.contains(&parent),
+                "the second store keeps the parent until the next epoch (frame {frame})"
+            );
         } else {
-            assert_eq!(observed_a.rows, observed_b.rows, "restored and flipped at the next epoch (frame {frame})");
+            assert_eq!(
+                observed_a.rows, observed_b.rows,
+                "restored and flipped at the next epoch (frame {frame})"
+            );
             assert_eq!(observed_a.pending, observed_b.pending);
         }
     }
@@ -448,7 +694,10 @@ fn without_the_repair_a_store_that_lost_a_scheduled_split_keeps_the_parent_and_d
     assert!(b.observe().pending.is_empty());
     let (_, last_a, last_b) = trace.last().unwrap();
     assert_ne!(last_a.rows, last_b.rows);
-    assert_ne!(last_a.commitments, last_b.commitments, "the allocations did not move: roots diverge");
+    assert_ne!(
+        last_a.commitments, last_b.commitments,
+        "the allocations did not move: roots diverge"
+    );
     drop(a);
 }
 
@@ -464,9 +713,15 @@ fn a_store_whose_grid_was_rewound_after_the_flip_reapplies_it_and_matches() {
     let next = (ACTIVATION / EPOCH + 40) * EPOCH;
     let observed_a = a.step(next);
     let observed_b = b.step(next);
-    assert_eq!(observed_a.rows, observed_b.rows, "the rewound grid flips again");
+    assert_eq!(
+        observed_a.rows, observed_b.rows,
+        "the rewound grid flips again"
+    );
     assert_eq!(observed_a.pending, observed_b.pending);
-    assert_eq!(observed_a.commitments, observed_b.commitments, "a late flip moves nothing more");
+    assert_eq!(
+        observed_a.commitments, observed_b.commitments,
+        "a late flip moves nothing more"
+    );
     for frame in frames(ACTIVATION / EPOCH + 41) {
         assert_eq!(a.step(frame), b.step(frame));
     }
@@ -480,7 +735,10 @@ fn the_repair_leaves_a_rewound_grid_alone_when_off() {
     let next = (ACTIVATION / EPOCH + 40) * EPOCH;
     let observed_a = a.step(next);
     let observed_b = b.step(next);
-    assert_ne!(observed_a.rows, observed_b.rows, "without the repair the rewound grid stays");
+    assert_ne!(
+        observed_a.rows, observed_b.rows,
+        "without the repair the rewound grid stays"
+    );
 }
 
 #[test]
@@ -494,7 +752,9 @@ fn the_repair_writes_nothing_through_a_full_lifecycle() {
     let mut merge_proposed = false;
     let mut joined = false;
     let mut drop_proposed = false;
-    let late = Prover { key: vec![0x40; 897] };
+    let late = Prover {
+        key: vec![0x40; 897],
+    };
     let mut steps = 0;
     for epoch in ACTIVATION / EPOCH..ACTIVATION / EPOCH + 40 {
         for frame in frames(epoch) {
@@ -526,13 +786,18 @@ fn the_repair_writes_nothing_through_a_full_lifecycle() {
             }
             // After the merge: a prover joins the merged shard, so its
             // committee is replaced at the next epoch boundary.
-            let join = merge_proposed && !joined && on.in_grid(BRANCH) && on.observe().pending.is_empty();
+            let join =
+                merge_proposed && !joined && on.in_grid(BRANCH) && on.observe().pending.is_empty();
             joined |= join;
             // While that membership successor closes: every prover on the
             // merged shard pauses and a split of it is proposed, which the gate
             // drops once the successor is live.
-            let pause_all = joined && !join && !drop_proposed
-                && handoff::schedule::retiring_request(&on.state(), &one).unwrap().is_some();
+            let pause_all = joined
+                && !join
+                && !drop_proposed
+                && handoff::schedule::retiring_request(&on.state(), &one)
+                    .unwrap()
+                    .is_some();
             if pause_all {
                 drop_proposed = true;
                 let split = PendingShardChange {
@@ -560,17 +825,29 @@ fn the_repair_writes_nothing_through_a_full_lifecycle() {
             intrinsic::request_pending_repair();
             let observed_on = on.step_with(frame, messages);
             let observed_off = off.step_with(frame, messages);
-            assert_eq!(observed_on, observed_off, "the repair changes nothing at frame {frame}");
+            assert_eq!(
+                observed_on, observed_off,
+                "the repair changes nothing at frame {frame}"
+            );
             steps += 1;
         }
     }
     let state = on.state();
     assert!(steps > 100);
-    assert!(!on.in_grid(P) && on.in_grid(SPINE) && on.in_grid(BRANCH), "split, then merged");
-    assert!(!on.in_grid(C0) && !on.in_grid(C1), "the split of the merged shard was dropped");
+    assert!(
+        !on.in_grid(P) && on.in_grid(SPINE) && on.in_grid(BRANCH),
+        "split, then merged"
+    );
+    assert!(
+        !on.in_grid(C0) && !on.in_grid(C1),
+        "the split of the merged shard was dropped"
+    );
     assert!(drop_proposed && on.observe().pending.is_empty());
     let head = handoff::head(&state, &one).unwrap().unwrap();
-    assert!(head.generation >= 2, "1's committee was replaced by a membership successor");
+    assert!(
+        head.generation >= 2,
+        "1's committee was replaced by a membership successor"
+    );
     let root = handoff::head(&state, &shard(P)).unwrap().unwrap();
     assert!(handoff::is_fenced(&state, &root.id().unwrap()).unwrap());
 }
@@ -588,13 +865,21 @@ fn a_shard_without_a_session_and_a_shard_with_an_active_one_are_left_alone() {
                 let before = w.observe().rows;
                 intrinsic::request_pending_repair();
                 let observed = w.step(frame);
-                assert!(observed.pending.is_empty(), "nothing is restored at frame {frame}");
+                assert!(
+                    observed.pending.is_empty(),
+                    "nothing is restored at frame {frame}"
+                );
                 assert_eq!(observed.rows, before);
             }
         }
     }
-    assert!(handoff::head(&world.state(), &shard(&[false])).unwrap().is_none());
-    assert!(handoff::head(&world.state(), &shard(P)).unwrap().is_some(), "P runs an active session");
+    assert!(handoff::head(&world.state(), &shard(&[false]))
+        .unwrap()
+        .is_none());
+    assert!(
+        handoff::head(&world.state(), &shard(P)).unwrap().is_some(),
+        "P runs an active session"
+    );
     assert!(handoff::head(&bare.state(), &shard(P)).unwrap().is_none());
 }
 
@@ -608,15 +893,24 @@ fn a_trigger_survives_an_execution_below_the_highest_frame() {
             world.lose_pending();
             intrinsic::request_pending_repair();
             let state = world.state();
-            world.intrinsic.apply_due_shard_changes(frame - 5, &state).unwrap();
+            world
+                .intrinsic
+                .apply_due_shard_changes(frame - 5, &state)
+                .unwrap();
             state.abort();
         }
     };
     let (_a, _b, trace) = split_lifecycle(lose, false);
-    let at = trace.iter().position(|(frame, _, _)| *frame == lost).unwrap();
+    let at = trace
+        .iter()
+        .position(|(frame, _, _)| *frame == lost)
+        .unwrap();
     assert_ne!(trace[at].1.pending, trace[at].2.pending, "lost");
     for (frame, observed_a, observed_b) in &trace[at + 1..] {
-        assert_eq!(observed_a, observed_b, "restored at the next frame; both stores agree after frame {frame}");
+        assert_eq!(
+            observed_a, observed_b,
+            "restored at the next frame; both stores agree after frame {frame}"
+        );
     }
 }
 
@@ -646,13 +940,22 @@ fn a_merge_that_re_registers_a_split_parent_does_not_split_it_again() {
             intrinsic::request_pending_repair();
             let observed_a = a.step(frame);
             let observed_b = b.step(frame);
-            assert_eq!(observed_a, observed_b, "the repair leaves the re-registered parent alone at frame {frame}");
+            assert_eq!(
+                observed_a, observed_b,
+                "the repair leaves the re-registered parent alone at frame {frame}"
+            );
             reentered |= a.in_grid(P);
         }
     }
-    assert!(reentered && a.in_grid(P) && a.in_grid(C0) && a.in_grid(C1), "P is back beside the split's children");
+    assert!(
+        reentered && a.in_grid(P) && a.in_grid(C0) && a.in_grid(C1),
+        "P is back beside the split's children"
+    );
     let head = handoff::head(&a.state(), &shard(P)).unwrap().unwrap();
-    assert!(matches!(handoff::status(&a.state(), &head.id().unwrap()).unwrap(), handoff::Status::Closed(_)));
+    assert!(matches!(
+        handoff::status(&a.state(), &head.id().unwrap()).unwrap(),
+        handoff::Status::Closed(_)
+    ));
 }
 
 /// Both stores split P; then the children merge back into 1‖1, proposed in
@@ -684,21 +987,38 @@ fn merge_run(record: bool, shared: bool) -> (World, World, Vec<(u64, Observed, O
             };
             let observed_a = a.step_with(frame, messages);
             let observed_b = b.step_with(frame, messages);
-            if lost_at.is_none() && handoff::schedule::topology_request(&b.state(), &merge).unwrap().is_some() {
+            if lost_at.is_none()
+                && handoff::schedule::topology_request(&b.state(), &merge)
+                    .unwrap()
+                    .is_some()
+            {
                 lost_at = Some(frame);
                 b.lose_pending();
                 intrinsic::request_pending_repair();
             }
-            trace.push((frame, observed_a, Observed { roots: observed_b.roots, ..b.observe() }));
+            trace.push((
+                frame,
+                observed_a,
+                Observed {
+                    roots: observed_b.roots,
+                    ..b.observe()
+                },
+            ));
             if a.in_grid(BRANCH) && frame % EPOCH == 9 {
                 break 'run;
             }
         }
     }
     let lost_at = lost_at.expect("the merge was scheduled");
-    let at = trace.iter().position(|(frame, _, _)| *frame == lost_at).unwrap();
+    let at = trace
+        .iter()
+        .position(|(frame, _, _)| *frame == lost_at)
+        .unwrap();
     assert_ne!(trace[at].1.pending, trace[at].2.pending, "lost");
-    assert!(a.in_grid(BRANCH) && !a.in_grid(C0) && !a.in_grid(C1), "merged");
+    assert!(
+        a.in_grid(BRANCH) && !a.in_grid(C0) && !a.in_grid(C1),
+        "merged"
+    );
     (a, b, trace, at)
 }
 
@@ -720,14 +1040,25 @@ fn a_restored_merge_moves_allocations_in_the_proposal_order() {
     // The proposal's order comes from the frame record.
     let (a, b, trace, at) = merge_run(true, true);
     for (frame, observed_a, observed_b) in &trace[at + 1..] {
-        assert_eq!(observed_a, observed_b, "both stores agree after frame {frame}");
+        assert_eq!(
+            observed_a, observed_b,
+            "both stores agree after frame {frame}"
+        );
     }
     // The prover's parent slot came from the last child moved: C0, the
     // proposal's second.
-    let joined = Prover { key: vec![0x50; 897] };
+    let joined = Prover {
+        key: vec![0x50; 897],
+    };
     let from_c0 = (ACTIVATION + 11).to_be_bytes().to_vec();
-    assert_eq!(allocation_field(&a.state(), &joined, &shard(BRANCH), "JoinFrameNumber"), Some(from_c0.clone()));
-    assert_eq!(allocation_field(&b.state(), &joined, &shard(BRANCH), "JoinFrameNumber"), Some(from_c0));
+    assert_eq!(
+        allocation_field(&a.state(), &joined, &shard(BRANCH), "JoinFrameNumber"),
+        Some(from_c0.clone())
+    );
+    assert_eq!(
+        allocation_field(&b.state(), &joined, &shard(BRANCH), "JoinFrameNumber"),
+        Some(from_c0)
+    );
 }
 
 #[test]
@@ -739,9 +1070,14 @@ fn a_lost_merge_without_its_frame_record_is_not_restored() {
     for shared in [false, true] {
         let (_a, b, trace, at) = merge_run(false, shared);
         for (frame, observed_a, observed_b) in &trace[at + 1..] {
-            assert!(observed_b.pending.is_empty(), "not restored (frame {frame}, shared {shared})");
-            assert!(observed_a.rows != observed_b.rows || observed_a.pending != observed_b.pending,
-                "the second store stays diverged (frame {frame}, shared {shared})");
+            assert!(
+                observed_b.pending.is_empty(),
+                "not restored (frame {frame}, shared {shared})"
+            );
+            assert!(
+                observed_a.rows != observed_b.rows || observed_a.pending != observed_b.pending,
+                "the second store stays diverged (frame {frame}, shared {shared})"
+            );
         }
         assert!(b.in_grid(C0) && b.in_grid(C1) && !b.in_grid(BRANCH));
     }
@@ -759,8 +1095,12 @@ fn handoff_record(kind: &[u8], key: &[u8], value: &[u8]) -> ([u8; 32], Vec<u8>) 
     h.update(key);
     let address: [u8; 32] = h.finalize().into();
     let mut tree = quil_tries::VectorCommitmentTree::new();
-    tree.insert(&[0], value, &[], &num_bigint::BigInt::from(value.len())).unwrap();
-    (address, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap())
+    tree.insert(&[0], value, &[], &num_bigint::BigInt::from(value.len()))
+        .unwrap();
+    (
+        address,
+        quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+    )
 }
 
 #[test]
@@ -789,15 +1129,31 @@ fn a_lasting_store_error_neither_repeats_the_examination_nor_the_warning() {
     // Frames off the eight-frame session pass, which would read the corrupt
     // head too and fail the frame.
     world.step_with(base + 1, |state| {
-        state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &vertex_adds_discriminator().unwrap(), base + 1, blob.clone()).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &address,
+                &vertex_adds_discriminator().unwrap(),
+                base + 1,
+                blob.clone(),
+            )
+            .unwrap();
     });
     let first = handoff::schedule::recovery_examinations();
     assert_eq!(first, before + 1, "the lost split is examined once");
     for frame in base + 2..base + 8 {
         world.step(frame);
     }
-    assert_eq!(handoff::schedule::recovery_examinations(), first, "no repeated examination (key search, warning) while the error lasts");
-    assert_eq!(intrinsic::pending_repair_failures(), failures + 7, "every one of the seven scans hit the corrupt head");
+    assert_eq!(
+        handoff::schedule::recovery_examinations(),
+        first,
+        "no repeated examination (key search, warning) while the error lasts"
+    );
+    assert_eq!(
+        intrinsic::pending_repair_failures(),
+        failures + 7,
+        "every one of the seven scans hit the corrupt head"
+    );
     assert!(world.observe().pending.is_empty(), "not restored");
 }
 
@@ -833,7 +1189,10 @@ fn a_split_parent_brought_back_through_an_ancestor_is_not_split_again() {
                 1 if on.in_grid(f0) && !on.in_grid(f) => Some(PendingShardChange {
                     kind: ShardChangeKind::Merge,
                     parent: shard(&[]),
-                    children: [&[false][..], &[true, false], f0, f1].iter().map(|bits| shard(bits)).collect(),
+                    children: [&[false][..], &[true, false], f0, f1]
+                        .iter()
+                        .map(|bits| shard(bits))
+                        .collect(),
                     effective_epoch: frame / EPOCH + 2,
                     proposed_frame: frame,
                 }),
@@ -849,7 +1208,10 @@ fn a_split_parent_brought_back_through_an_ancestor_is_not_split_again() {
             intrinsic::request_pending_repair();
             let observed_on = on.step(frame);
             let observed_off = off.step(frame);
-            assert_eq!(observed_on, observed_off, "the repair leaves F alone at frame {frame}");
+            assert_eq!(
+                observed_on, observed_off,
+                "the repair leaves F alone at frame {frame}"
+            );
             if step == 4 && reentered.is_none() && on.in_grid(f) {
                 reentered = Some(epoch);
             }
@@ -861,7 +1223,10 @@ fn a_split_parent_brought_back_through_an_ancestor_is_not_split_again() {
     assert!(reentered.is_some(), "F is back in the grid (step {step})");
     let state = on.state();
     let head = handoff::head(&state, &shard(f)).unwrap().unwrap();
-    assert!(matches!(handoff::status(&state, &head.id().unwrap()).unwrap(), handoff::Status::Closed(_)));
+    assert!(matches!(
+        handoff::status(&state, &head.id().unwrap()).unwrap(),
+        handoff::Status::Closed(_)
+    ));
     assert!(on.in_grid(f) && !on.in_grid(f0) && !on.in_grid(f1));
 }
 
@@ -889,8 +1254,12 @@ fn a_record_lost_while_a_split_parent_splits_again_is_restored() {
         for frame in frames(epoch) {
             let proposal = match step {
                 0 if frame == ACTIVATION + 1 => Some(change(ShardChangeKind::Split, frame)),
-                1 if a.in_grid(halves[0]) && !a.in_grid(P) => Some(change(ShardChangeKind::Merge, frame)),
-                2 if a.in_grid(P) && a.observe().pending.is_empty() => Some(change(ShardChangeKind::Split, frame)),
+                1 if a.in_grid(halves[0]) && !a.in_grid(P) => {
+                    Some(change(ShardChangeKind::Merge, frame))
+                }
+                2 if a.in_grid(P) && a.observe().pending.is_empty() => {
+                    Some(change(ShardChangeKind::Split, frame))
+                }
                 _ => None,
             };
             if let Some(proposed) = proposal {
@@ -901,27 +1270,46 @@ fn a_record_lost_while_a_split_parent_splits_again_is_restored() {
             let observed_a = a.step(frame);
             let observed_b = b.step(frame);
             if step == 3 && lost_at.is_none() {
-                let scheduled = b.observe().pending.iter()
-                    .any(|pending| handoff::schedule::topology_request(&b.state(), pending).unwrap().is_some());
+                let scheduled = b.observe().pending.iter().any(|pending| {
+                    handoff::schedule::topology_request(&b.state(), pending)
+                        .unwrap()
+                        .is_some()
+                });
                 if scheduled {
                     lost_at = Some(frame);
                     b.lose_pending();
                     intrinsic::request_pending_repair();
                 }
             }
-            trace.push((frame, observed_a, Observed { roots: observed_b.roots, ..b.observe() }));
+            trace.push((
+                frame,
+                observed_a,
+                Observed {
+                    roots: observed_b.roots,
+                    ..b.observe()
+                },
+            ));
             if lost_at.is_some() && !a.in_grid(P) && frame % EPOCH == 9 {
                 break 'run;
             }
         }
     }
     let lost_at = lost_at.expect("R2 was scheduled");
-    let at = trace.iter().position(|(frame, _, _)| *frame == lost_at).unwrap();
+    let at = trace
+        .iter()
+        .position(|(frame, _, _)| *frame == lost_at)
+        .unwrap();
     assert_ne!(trace[at].1.pending, trace[at].2.pending, "lost");
     for (frame, observed_a, observed_b) in &trace[at + 1..] {
-        assert_eq!(observed_a, observed_b, "restored at the next frame; both stores agree after frame {frame}");
+        assert_eq!(
+            observed_a, observed_b,
+            "restored at the next frame; both stores agree after frame {frame}"
+        );
     }
-    assert!(!b.in_grid(P) && b.in_grid(halves[0]) && b.in_grid(halves[1]), "R2 flipped in both");
+    assert!(
+        !b.in_grid(P) && b.in_grid(halves[0]) && b.in_grid(halves[1]),
+        "R2 flipped in both"
+    );
 }
 
 #[test]
@@ -948,7 +1336,11 @@ fn a_stale_split_whose_children_changed_committees_is_restored() {
             b.step_with(frame, messages);
         }
         let state = a.state();
-        let replaced = handoff::head(&state, &shard(C0)).unwrap().unwrap().generation >= 2;
+        let replaced = handoff::head(&state, &shard(C0))
+            .unwrap()
+            .unwrap()
+            .generation
+            >= 2;
         let closing = handoff::schedule::retiring_request(&state, &shard(C1)).unwrap();
         if replaced && closing.is_some() {
             done = Some((epoch, closing.unwrap()));
@@ -957,13 +1349,22 @@ fn a_stale_split_whose_children_changed_committees_is_restored() {
     }
     let (epoch, closing) = done.expect("C0's successor is live and C1's is closing");
     let request = handoff::request(&a.state(), &closing).unwrap().unwrap();
-    assert!(request.targets.iter().any(|target| target.committee.filter == shard(C1)), "C1 closes for its own successor");
+    assert!(
+        request
+            .targets
+            .iter()
+            .any(|target| target.committee.filter == shard(C1)),
+        "C1 closes for its own successor"
+    );
     b.edit_grid(&[row(P)], &[row(SPINE), row(C0), row(C1)]);
     intrinsic::request_pending_repair();
     let next = epoch * EPOCH + 10;
     let observed_a = a.step(next);
     let observed_b = b.step(next);
-    assert_eq!(observed_a.rows, observed_b.rows, "restored and flipped again");
+    assert_eq!(
+        observed_a.rows, observed_b.rows,
+        "restored and flipped again"
+    );
     assert_eq!(observed_a.pending, observed_b.pending);
     assert!(!b.in_grid(P) && b.in_grid(C0) && b.in_grid(C1));
 }

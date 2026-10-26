@@ -3,11 +3,11 @@ mod autonat_servers;
 pub mod blossomsub_behaviour;
 pub mod direct;
 pub mod ed448_identity;
-pub mod falcon_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod external_addr;
+pub mod falcon_identity;
 pub mod gossip_traffic;
 pub mod handler;
 pub mod metrics;
@@ -24,26 +24,28 @@ pub mod tls_debug;
 // The BlossomSub behaviour + event + validation-result surface come from the
 // `blossomsub_behaviour` bridge over stock `libp2p::gossipsub`.
 pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
-pub use libp2p::identity::Keypair;
-pub use libp2p::PeerId;
+pub use direct::{DirectOutcome, DirectStatsSnapshot};
 pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
 pub use falcon_identity::{
     falcon_identity_self_check, generate_falcon_signing_key, peer_id_base58_from_falcon_pubkey,
     peer_id_from_falcon_pubkey,
 };
+pub use gossip_traffic::{
+    ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind,
+};
+pub use libp2p::identity::Keypair;
+pub use libp2p::PeerId;
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
-pub use direct::{DirectOutcome, DirectStatsSnapshot};
-pub use gossip_traffic::{ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind};
-pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
     decode_canonical_peer_info, encode_canonical_peer_info, encode_key_registry,
-    peek_key_registry_timestamp, peek_peer_info_timestamp,
-    CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
-    InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
-    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID, RELEASE_SUBPATCH_CAPABILITY_ID,
+    peek_key_registry_timestamp, peek_peer_info_timestamp, CanonicalCapability,
+    CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability, InMemoryPeerInfoManager,
+    PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, BUILD_FINGERPRINT_CAPABILITY_ID,
+    KEY_REGISTRY_TYPE, PEER_INFO_TYPE, RELEASE_SUBPATCH_CAPABILITY_ID,
 };
+pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use signer_registry::{SignerEntry, SignerRegistry};
 
 /// BlossomSub protocol identifiers.

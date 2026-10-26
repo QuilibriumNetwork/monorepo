@@ -94,14 +94,23 @@ pub(super) fn shard_member_endpoints(
 /// Saves the newest [`MAX_RECORDS`] records no older than [`MAX_AGE_MS`],
 /// atomically (written beside the file, then renamed). Returns how many
 /// were saved.
-pub(super) fn save(cache: &PeerInfoCache, path: &Path, network: u8, now_ms: i64) -> std::io::Result<usize> {
+pub(super) fn save(
+    cache: &PeerInfoCache,
+    path: &Path,
+    network: u8,
+    now_ms: i64,
+) -> std::io::Result<usize> {
     let mut records: Vec<quil_p2p::CanonicalPeerInfo> = cache
         .read()
         .values()
         .filter(|info| within_age(info, now_ms))
         .cloned()
         .collect();
-    records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.peer_id.cmp(&b.peer_id)));
+    records.sort_by(|a, b| {
+        b.timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.peer_id.cmp(&b.peer_id))
+    });
     records.truncate(MAX_RECORDS);
     let mut encoded = Vec::with_capacity(records.len());
     let mut total = (MAGIC.len() + 1 + 8) as u64;
@@ -150,7 +159,12 @@ pub(super) struct Restored {
 /// Loads the saved records into `cache`, verifying each. A record replaces
 /// the cache's record of its peer only when its timestamp is newer. An
 /// unreadable or malformed file loads nothing (`Err`).
-pub(super) fn restore(cache: &PeerInfoCache, path: &Path, network: u8, now_ms: i64) -> std::io::Result<Restored> {
+pub(super) fn restore(
+    cache: &PeerInfoCache,
+    path: &Path,
+    network: u8,
+    now_ms: i64,
+) -> std::io::Result<Restored> {
     let records = read(path, network)?;
     let mut restored = Restored::default();
     let mut accepted = Vec::new();
@@ -173,7 +187,10 @@ pub(super) fn restore(cache: &PeerInfoCache, path: &Path, network: u8, now_ms: i
     }
     let mut cache = cache.write();
     for info in accepted {
-        if cache.get(&info.peer_id).is_none_or(|held| held.timestamp < info.timestamp) {
+        if cache
+            .get(&info.peer_id)
+            .is_none_or(|held| held.timestamp < info.timestamp)
+        {
             cache.insert(info.peer_id.clone(), info);
             restored.loaded += 1;
         } else {
@@ -218,7 +235,10 @@ fn read(path: &Path, network: u8) -> std::io::Result<Vec<Vec<u8>>> {
 }
 
 fn invalid(reason: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid peer info cache file: {reason}"))
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("invalid peer info cache file: {reason}"),
+    )
 }
 
 fn read_u64(r: &mut impl Read) -> std::io::Result<u64> {
@@ -270,9 +290,13 @@ pub(super) async fn save_until_cancelled(
             _ = interval.tick() => false,
         };
         let (records, file) = (cache.clone(), path.clone());
-        let saved = tokio::task::spawn_blocking(move || save(&records, &file, network, unix_millis())).await;
+        let saved =
+            tokio::task::spawn_blocking(move || save(&records, &file, network, unix_millis()))
+                .await;
         match saved {
-            Ok(Ok(count)) if shutdown => tracing::info!(records = count, "peer info cache saved at shutdown"),
+            Ok(Ok(count)) if shutdown => {
+                tracing::info!(records = count, "peer info cache saved at shutdown")
+            }
             Ok(Ok(count)) => tracing::debug!(records = count, "peer info cache saved"),
             Ok(Err(error)) => tracing::warn!(%error, shutdown,
                 "peer info cache save failed; a restart before the next save restores older records or none"),
@@ -294,7 +318,10 @@ impl HourlyNotice {
         const HOUR: Duration = Duration::from_secs(3600);
         let now = Instant::now();
         let mut last = self.0.lock();
-        if last.get(filter).is_some_and(|at| now.duration_since(*at) < HOUR) {
+        if last
+            .get(filter)
+            .is_some_and(|at| now.duration_since(*at) < HOUR)
+        {
             return false;
         }
         if last.len() >= 4096 {
@@ -343,7 +370,10 @@ mod tests {
 
     fn cache_of(records: impl IntoIterator<Item = quil_p2p::CanonicalPeerInfo>) -> PeerInfoCache {
         Arc::new(parking_lot::RwLock::new(
-            records.into_iter().map(|info| (info.peer_id.clone(), info)).collect(),
+            records
+                .into_iter()
+                .map(|info| (info.peer_id.clone(), info))
+                .collect(),
         ))
     }
 
@@ -354,17 +384,32 @@ mod tests {
         let now = 1_800_000_000_000;
         let member = signed(now - 25 * 60 * 1000, &FILTER);
         let running = cache_of([member.clone()]);
-        assert_eq!(shard_member_endpoints(&running.read(), &FILTER, 0), vec!["203.0.113.7:8340".to_string()]);
+        assert_eq!(
+            shard_member_endpoints(&running.read(), &FILTER, 0),
+            vec!["203.0.113.7:8340".to_string()]
+        );
         assert_eq!(save(&running, &path, 0, now).unwrap(), 1);
 
         // The restarted node: an empty cache, then the saved file.
         let restarted = cache_of([]);
         assert!(shard_member_endpoints(&restarted.read(), &FILTER, 0).is_empty());
         let restored = restore(&restarted, &path, 0, now + 5 * 60 * 1000).unwrap();
-        assert_eq!(restored, Restored { loaded: 1, ..Default::default() });
-        assert_eq!(shard_member_endpoints(&restarted.read(), &FILTER, 0), vec!["203.0.113.7:8340".to_string()]);
+        assert_eq!(
+            restored,
+            Restored {
+                loaded: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            shard_member_endpoints(&restarted.read(), &FILTER, 0),
+            vec!["203.0.113.7:8340".to_string()]
+        );
         let held = restarted.read().get(&member.peer_id).cloned().unwrap();
-        assert_eq!((held.signature, held.last_global_head_frame), (member.signature, 932_137));
+        assert_eq!(
+            (held.signature, held.last_global_head_frame),
+            (member.signature, 932_137)
+        );
     }
 
     #[test]
@@ -392,14 +437,23 @@ mod tests {
         let records = [&good, &tampered, &forged, &unsigned, &stale, &ahead];
         file.extend_from_slice(&(records.len() as u64).to_be_bytes());
         for info in records {
-            let bytes = quil_p2p::encode_canonical_peer_info(info, &info.public_key, &info.signature);
+            let bytes =
+                quil_p2p::encode_canonical_peer_info(info, &info.public_key, &info.signature);
             file.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             file.extend_from_slice(&bytes);
         }
         std::fs::write(&path, &file).unwrap();
         let cache = cache_of([]);
         let restored = restore(&cache, &path, 0, now).unwrap();
-        assert_eq!(restored, Restored { loaded: 1, stale: 2, invalid: 3, ..Default::default() });
+        assert_eq!(
+            restored,
+            Restored {
+                loaded: 1,
+                stale: 2,
+                invalid: 3,
+                ..Default::default()
+            }
+        );
         let cache = cache.read();
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&good.peer_id).unwrap().signature, good.signature);
@@ -419,15 +473,29 @@ mod tests {
         let now = 1_800_000_000_000;
         let fresh = signed(now - 10 * 60 * 1000, &FILTER);
         let stale = signed(now - MAX_AGE_MS - 1, &FILTER);
-        assert_eq!(save(&cache_of([fresh.clone(), stale]), &path, 0, now).unwrap(), 1);
+        assert_eq!(
+            save(&cache_of([fresh.clone(), stale]), &path, 0, now).unwrap(),
+            1
+        );
         // The cache already holds a newer record of the peer (from gossip).
         let mut newer = fresh.clone();
         newer.timestamp = now;
         newer.reachability.clear();
         let cache = cache_of([newer]);
         let restored = restore(&cache, &path, 0, now).unwrap();
-        assert_eq!(restored, Restored { superseded: 1, ..Default::default() });
-        assert!(cache.read().get(&fresh.peer_id).unwrap().reachability.is_empty());
+        assert_eq!(
+            restored,
+            Restored {
+                superseded: 1,
+                ..Default::default()
+            }
+        );
+        assert!(cache
+            .read()
+            .get(&fresh.peer_id)
+            .unwrap()
+            .reachability
+            .is_empty());
         // Restored records are older than the head report bound only once
         // they are an hour old.
         assert!(head_is_current(&fresh, now));

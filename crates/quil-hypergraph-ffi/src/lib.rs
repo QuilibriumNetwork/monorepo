@@ -10,9 +10,11 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use quil_hypergraph::addressing::{shard_key_for_location as rust_shard_key_for_location, Location};
-use quil_hypergraph::HypergraphCrdt;
+use quil_hypergraph::addressing::{
+    shard_key_for_location as rust_shard_key_for_location, Location,
+};
 use quil_hypergraph::testing::MemStore;
+use quil_hypergraph::HypergraphCrdt;
 use quil_types::crypto::NoopInclusionProver;
 use quil_types::store::ShardKey;
 
@@ -371,14 +373,7 @@ mod tests {
             b"hello-world".to_vec(),
         );
 
-        let val = get_vertex(
-            h,
-            "vertex".into(),
-            "adds".into(),
-            l1,
-            l2,
-            key,
-        );
+        let val = get_vertex(h, "vertex".into(), "adds".into(), l1, l2, key);
         assert!(val.is_some());
         assert_eq!(val.unwrap(), b"hello-world");
 
@@ -411,14 +406,7 @@ mod tests {
             key.clone(),
         );
 
-        let val = get_vertex(
-            h,
-            "vertex".into(),
-            "adds".into(),
-            l1,
-            l2,
-            key,
-        );
+        let val = get_vertex(h, "vertex".into(), "adds".into(), l1, l2, key);
         assert!(val.is_none());
 
         destroy_crdt(h);

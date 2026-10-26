@@ -30,11 +30,11 @@
 //! Every member executes that refresh at the same frame. Until then, every
 //! read uses the flat record, and a rebuild (member-local: restart, sync,
 //! merge) keeps it flat.
-#[cfg(test)]
-use crate::hypergraph_state::vertex_adds_discriminator;
 use super::coin_blocks::{BLOCK_INDEX_BITS, SUBTREE_BITS};
 use super::roots::{BlockSummary, MAX_NONEMPTY_BLOCKS};
 use super::state::BLOCK_SUMMARY_ADDRESS;
+#[cfg(test)]
+use crate::hypergraph_state::vertex_adds_discriminator;
 use crate::hypergraph_state::HypergraphState;
 use quil_lattice_ct::confidential::relation::membership::{MembershipKey, Node, NODE_BYTES};
 use quil_types::error::{QuilError, Result};
@@ -124,11 +124,20 @@ impl TreeNode {
             return Err(invalid());
         }
         let node = Node::from_bytes(&bytes[HEADER..]).map_err(|_| invalid())?;
-        Ok(Some(Self { coins, blocks, node }))
+        Ok(Some(Self {
+            coins,
+            blocks,
+            node,
+        }))
     }
 }
 
-fn read_node(state: &HypergraphState, application: &[u8; 32], level: u8, index: u64) -> Result<Option<TreeNode>> {
+fn read_node(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    level: u8,
+    index: u64,
+) -> Result<Option<TreeNode>> {
     if level > LEVELS || index >= 1u64 << (LEVELS - level) {
         return Err(invalid());
     }
@@ -139,7 +148,10 @@ fn read_node(state: &HypergraphState, application: &[u8; 32], level: u8, index: 
 }
 
 /// The flat summary, while one is still stored in its place.
-pub fn legacy_summary(state: &HypergraphState, application: &[u8; 32]) -> Result<Option<BlockSummary>> {
+pub fn legacy_summary(
+    state: &HypergraphState,
+    application: &[u8; 32],
+) -> Result<Option<BlockSummary>> {
     match super::state::read_local(state, application, &BLOCK_SUMMARY_ADDRESS)? {
         Some(bytes) if bytes.as_slice() == MOVED => Ok(None),
         Some(bytes) => BlockSummary::decode(&bytes).map(Some),
@@ -154,18 +166,35 @@ pub fn top(state: &HypergraphState, application: &[u8; 32]) -> Result<Option<Tre
 
 /// The node over one shard's owned range in one width layer, at the report's
 /// `(level, index)` counted from the coins (`shard_accumulator::subtree_position`).
-pub fn subtree(state: &HypergraphState, application: &[u8; 32], level: usize, index: u64) -> Result<Option<TreeNode>> {
-    let level = level.checked_sub(usize::from(SUBTREE_BITS)).ok_or_else(invalid)?;
-    read_node(state, application, u8::try_from(level).map_err(|_| invalid())?, index)
+pub fn subtree(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    level: usize,
+    index: u64,
+) -> Result<Option<TreeNode>> {
+    let level = level
+        .checked_sub(usize::from(SUBTREE_BITS))
+        .ok_or_else(invalid)?;
+    read_node(
+        state,
+        application,
+        u8::try_from(level).map_err(|_| invalid())?,
+        index,
+    )
 }
 
 /// Every stored node's position, walked down from the top: a node exists only
 /// under a stored parent.
-fn stored_positions(state: &HypergraphState, application: &[u8; 32]) -> Result<Vec<(u8, u64, TreeNode)>> {
+fn stored_positions(
+    state: &HypergraphState,
+    application: &[u8; 32],
+) -> Result<Vec<(u8, u64, TreeNode)>> {
     let mut found = Vec::new();
     let mut pending = vec![(LEVELS, 0u64)];
     while let Some((level, index)) = pending.pop() {
-        let Some(node) = read_node(state, application, level, index)? else { continue };
+        let Some(node) = read_node(state, application, level, index)? else {
+            continue;
+        };
         if level > 0 {
             pending.push((level - 1, (index << 1) | 1));
             pending.push((level - 1, index << 1));
@@ -202,7 +231,12 @@ impl<'a> SummaryTree<'a> {
             let next = key.parent(&zeros[level], &zeros[level]);
             zeros.push(next);
         }
-        Self { state, application, key, zeros }
+        Self {
+            state,
+            application,
+            key,
+            zeros,
+        }
     }
 
     /// The application root: the top node, or the zero tree with no blocks.
@@ -219,19 +253,33 @@ impl<'a> SummaryTree<'a> {
 
     /// Stores `node`, which differs from what is stored there.
     fn write(&self, level: u8, index: u64, node: Option<&TreeNode>) -> Result<()> {
-        let bytes = node.map(TreeNode::encode).unwrap_or_else(|| CLEARED.to_vec());
-        super::state::write_local(self.state, self.application, &node_address(level, index), bytes);
+        let bytes = node
+            .map(TreeNode::encode)
+            .unwrap_or_else(|| CLEARED.to_vec());
+        super::state::write_local(
+            self.state,
+            self.application,
+            &node_address(level, index),
+            bytes,
+        );
         Ok(())
     }
 
     /// The parent of two children at `level`; absent when both are.
-    fn parent(&self, level: u8, left: Option<&TreeNode>, right: Option<&TreeNode>) -> Result<Option<TreeNode>> {
+    fn parent(
+        &self,
+        level: u8,
+        left: Option<&TreeNode>,
+        right: Option<&TreeNode>,
+    ) -> Result<Option<TreeNode>> {
         if left.is_none() && right.is_none() {
             return Ok(None);
         }
         let zero = &self.zeros[usize::from(SUBTREE_BITS + level)];
         let sum = |field: fn(&TreeNode) -> u64| {
-            left.map_or(0, field).checked_add(right.map_or(0, field)).ok_or_else(invalid)
+            left.map_or(0, field)
+                .checked_add(right.map_or(0, field))
+                .ok_or_else(invalid)
         };
         Ok(Some(TreeNode {
             coins: sum(|node| node.coins)?,
@@ -249,7 +297,11 @@ impl<'a> SummaryTree<'a> {
             if *block >= 1u64 << LEVELS {
                 return Err(invalid());
             }
-            let leaf = (*coins > 0).then(|| TreeNode { coins: *coins, blocks: 1, node: root.clone() });
+            let leaf = (*coins > 0).then(|| TreeNode {
+                coins: *coins,
+                blocks: 1,
+                node: root.clone(),
+            });
             if level.insert(*block, leaf).is_some() {
                 return Err(invalid());
             }
@@ -259,7 +311,12 @@ impl<'a> SummaryTree<'a> {
 
     fn check_cap(&self) -> Result<()> {
         match top(self.state, self.application)? {
-            Some(top) if usize::try_from(top.blocks).map_or(true, |blocks| blocks > MAX_NONEMPTY_BLOCKS) => Err(invalid()),
+            Some(top)
+                if usize::try_from(top.blocks)
+                    .map_or(true, |blocks| blocks > MAX_NONEMPTY_BLOCKS) =>
+            {
+                Err(invalid())
+            }
             _ => Ok(()),
         }
     }
@@ -281,7 +338,11 @@ impl<'a> SummaryTree<'a> {
                 break;
             }
             let mut parents = BTreeMap::new();
-            for parent in changed.keys().map(|index| index >> 1).collect::<BTreeSet<_>>() {
+            for parent in changed
+                .keys()
+                .map(|index| index >> 1)
+                .collect::<BTreeSet<_>>()
+            {
                 let child = |index: u64| match changed.get(&index) {
                     Some(node) => Ok(node.clone()),
                     None => self.read(level, index),
@@ -319,7 +380,11 @@ impl<'a> SummaryTree<'a> {
                 break;
             }
             let mut parents = BTreeMap::new();
-            for parent in nodes.keys().map(|index| index >> 1).collect::<BTreeSet<_>>() {
+            for parent in nodes
+                .keys()
+                .map(|index| index >> 1)
+                .collect::<BTreeSet<_>>()
+            {
                 let (left, right) = (nodes.get(&(parent << 1)), nodes.get(&((parent << 1) | 1)));
                 if let Some(node) = self.parent(level, left, right)? {
                     parents.insert(parent, node);
@@ -335,17 +400,24 @@ impl<'a> SummaryTree<'a> {
 
     /// Replace a flat summary with its tree, once. Returns whether it did.
     pub fn upgrade(&self) -> Result<bool> {
-        let Some(flat) = legacy_summary(self.state, self.application)? else { return Ok(false) };
+        let Some(flat) = legacy_summary(self.state, self.application)? else {
+            return Ok(false);
+        };
         self.replace(&flat.blocks)?;
-        super::state::write_local(self.state, self.application, &BLOCK_SUMMARY_ADDRESS, MOVED.to_vec());
+        super::state::write_local(
+            self.state,
+            self.application,
+            &BLOCK_SUMMARY_ADDRESS,
+            MOVED.to_vec(),
+        );
         Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::coin_blocks::{self, INITIAL_BLOCK_BITS};
+    use super::*;
     use quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots;
 
     fn mem_state() -> HypergraphState {
@@ -358,7 +430,10 @@ mod tests {
     struct Rng(u64);
     impl Rng {
         fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (self.0 >> 33) % n
         }
     }
@@ -367,24 +442,55 @@ mod tests {
     fn block_roots(context: &[u8; 32], count: usize) -> Vec<Node> {
         let key = MembershipKey::derive(context);
         let mut node = Node::zero();
-        (0..count).map(|_| { node = key.parent(&node, &Node::zero()); node.clone() }).collect()
+        (0..count)
+            .map(|_| {
+                node = key.parent(&node, &Node::zero());
+                node.clone()
+            })
+            .collect()
     }
 
     fn fold(context: &[u8; 32], blocks: &BTreeMap<u64, (u64, Node)>) -> Node {
-        let roots: Vec<(u64, Node)> = blocks.iter().map(|(block, (_, root))| (*block, root.clone())).collect();
-        fold_subtree_roots(context, coin_blocks::shape(INITIAL_BLOCK_BITS).unwrap(), &roots).unwrap()
+        let roots: Vec<(u64, Node)> = blocks
+            .iter()
+            .map(|(block, (_, root))| (*block, root.clone()))
+            .collect();
+        fold_subtree_roots(
+            context,
+            coin_blocks::shape(INITIAL_BLOCK_BITS).unwrap(),
+            &roots,
+        )
+        .unwrap()
     }
 
     fn leaves(blocks: &BTreeMap<u64, (u64, Node)>) -> Vec<(u64, u64, Node)> {
-        blocks.iter().map(|(block, (coins, root))| (*block, *coins, root.clone())).collect()
+        blocks
+            .iter()
+            .map(|(block, (coins, root))| (*block, *coins, root.clone()))
+            .collect()
     }
 
-    fn assert_matches(state: &HypergraphState, context: &[u8; 32], application: &[u8; 32], blocks: &BTreeMap<u64, (u64, Node)>) {
+    fn assert_matches(
+        state: &HypergraphState,
+        context: &[u8; 32],
+        application: &[u8; 32],
+        blocks: &BTreeMap<u64, (u64, Node)>,
+    ) {
         let tree = SummaryTree::new(state, context, application);
-        assert_eq!(tree.root().unwrap(), fold(context, blocks), "the tree root is the fold of its blocks");
+        assert_eq!(
+            tree.root().unwrap(),
+            fold(context, blocks),
+            "the tree root is the fold of its blocks"
+        );
         let top = top(state, application).unwrap();
-        assert_eq!(top.as_ref().map_or(0, |top| top.coins), blocks.values().map(|(coins, _)| coins).sum::<u64>());
-        assert_eq!(top.as_ref().map_or(0, |top| top.blocks), blocks.len() as u64);
+        assert_eq!(
+            top.as_ref().map_or(0, |top| top.coins),
+            blocks.values().map(|(coins, _)| coins).sum::<u64>()
+        );
+        assert_eq!(
+            top.as_ref().map_or(0, |top| top.blocks),
+            blocks.len() as u64
+        );
         assert_eq!(entries(state, application).unwrap(), leaves(blocks));
     }
 
@@ -408,7 +514,10 @@ mod tests {
                 changed.insert(block, (coins, roots[rng.below(64) as usize].clone()));
             }
             // An existing block gains coins too.
-            if let Some((&block, (coins, _))) = blocks.iter().nth(rng.below(blocks.len().max(1) as u64) as usize) {
+            if let Some((&block, (coins, _))) = blocks
+                .iter()
+                .nth(rng.below(blocks.len().max(1) as u64) as usize)
+            {
                 changed.insert(block, (coins + 3, roots[rng.below(64) as usize].clone()));
             }
             tree.update(&leaves(&changed)).unwrap();
@@ -422,9 +531,14 @@ mod tests {
         }
         // Rebuilt from scratch, the same blocks store the same records.
         let rebuilt = mem_state();
-        SummaryTree::new(&rebuilt, &context, &application).replace(&leaves(&blocks)).unwrap();
-        assert_eq!(stored_positions(&rebuilt, &application).unwrap(), stored_positions(&state, &application).unwrap(),
-            "an incremental history stores exactly what a rebuild of its blocks stores");
+        SummaryTree::new(&rebuilt, &context, &application)
+            .replace(&leaves(&blocks))
+            .unwrap();
+        assert_eq!(
+            stored_positions(&rebuilt, &application).unwrap(),
+            stored_positions(&state, &application).unwrap(),
+            "an incremental history stores exactly what a rebuild of its blocks stores"
+        );
     }
 
     /// A refresh that names only unchanged blocks writes nothing.
@@ -434,8 +548,12 @@ mod tests {
         let (context, application) = ([5u8; 32], [6u8; 32]);
         let tree = SummaryTree::new(&state, &context, &application);
         let roots = block_roots(&context, 3);
-        let blocks: BTreeMap<u64, (u64, Node)> =
-            [(64, (2, roots[0].clone())), (65, (1, roots[1].clone())), (300, (4, roots[2].clone()))].into();
+        let blocks: BTreeMap<u64, (u64, Node)> = [
+            (64, (2, roots[0].clone())),
+            (65, (1, roots[1].clone())),
+            (300, (4, roots[2].clone())),
+        ]
+        .into();
         tree.update(&leaves(&blocks)).unwrap();
         state.commit().unwrap();
         state.abort();
@@ -451,9 +569,13 @@ mod tests {
         let (context, application) = ([5u8; 32], [6u8; 32]);
         let tree = SummaryTree::new(&state, &context, &application);
         let roots = block_roots(&context, 4);
-        let kept: BTreeMap<u64, (u64, Node)> = [(64, (2, roots[0].clone())), (200, (3, roots[1].clone()))].into();
+        let kept: BTreeMap<u64, (u64, Node)> =
+            [(64, (2, roots[0].clone())), (200, (3, roots[1].clone()))].into();
         let mut all = kept.clone();
-        all.extend([(127u64, (1u64, roots[2].clone())), (40_000, (9, roots[3].clone()))]);
+        all.extend([
+            (127u64, (1u64, roots[2].clone())),
+            (40_000, (9, roots[3].clone())),
+        ]);
         tree.replace(&leaves(&all)).unwrap();
         assert_matches(&state, &context, &application, &all);
         state.commit().unwrap();
@@ -462,14 +584,24 @@ mod tests {
         tree.replace(&leaves(&kept)).unwrap();
         assert_matches(&state, &context, &application, &kept);
         let fresh = mem_state();
-        SummaryTree::new(&fresh, &context, &application).replace(&leaves(&kept)).unwrap();
-        assert_eq!(stored_positions(&state, &application).unwrap(), stored_positions(&fresh, &application).unwrap());
+        SummaryTree::new(&fresh, &context, &application)
+            .replace(&leaves(&kept))
+            .unwrap();
+        assert_eq!(
+            stored_positions(&state, &application).unwrap(),
+            stored_positions(&fresh, &application).unwrap()
+        );
         state.commit().unwrap();
         state.abort();
-        assert_eq!(super::super::state::read_local(&state, &application, &node_address(0, 40_000)).unwrap(),
-            Some(CLEARED.to_vec()), "a cleared leaf is rewritten, not removed");
+        assert_eq!(
+            super::super::state::read_local(&state, &application, &node_address(0, 40_000))
+                .unwrap(),
+            Some(CLEARED.to_vec()),
+            "a cleared leaf is rewritten, not removed"
+        );
 
-        tree.update(&leaves(&[(40_000u64, (11u64, roots[3].clone()))].into())).unwrap();
+        tree.update(&leaves(&[(40_000u64, (11u64, roots[3].clone()))].into()))
+            .unwrap();
         let mut again = kept.clone();
         again.insert(40_000, (11, roots[3].clone()));
         assert_matches(&state, &context, &application, &again);
@@ -487,7 +619,14 @@ mod tests {
         tree.update(&leaves(&blocks)).unwrap();
         state.commit().unwrap();
         state.abort();
-        tree.update(&leaves(&[(70u64, (6u64, roots[1].clone())), (9_000, (1, roots[1].clone()))].into())).unwrap();
+        tree.update(&leaves(
+            &[
+                (70u64, (6u64, roots[1].clone())),
+                (9_000, (1, roots[1].clone())),
+            ]
+            .into(),
+        ))
+        .unwrap();
         state.abort();
         assert_matches(&state, &context, &application, &blocks);
     }
@@ -498,32 +637,68 @@ mod tests {
     fn a_flat_summary_is_read_until_converted_once() {
         let state = mem_state();
         let (network, application) = ([8u8; 32], [9u8; 32]);
-        let context = quil_lattice_ct::confidential::transfer::parameter_context(&network, &application);
+        let context =
+            quil_lattice_ct::confidential::transfer::parameter_context(&network, &application);
         let disc = vertex_adds_discriminator().unwrap();
         let roots = block_roots(&context, 3);
-        let blocks: BTreeMap<u64, (u64, Node)> =
-            [(64, (2, roots[0].clone())), (130, (7, roots[1].clone())), (1_000, (1, roots[2].clone()))].into();
+        let blocks: BTreeMap<u64, (u64, Node)> = [
+            (64, (2, roots[0].clone())),
+            (130, (7, roots[1].clone())),
+            (1_000, (1, roots[2].clone())),
+        ]
+        .into();
         let mut flat = BlockSummary::default();
         for (block, (coins, root)) in &blocks {
             flat.put(*block, *coins, root.clone()).unwrap();
         }
-        state.set(&application, &BLOCK_SUMMARY_ADDRESS, &disc, 0, flat.encode()).unwrap();
+        state
+            .set(
+                &application,
+                &BLOCK_SUMMARY_ADDRESS,
+                &disc,
+                0,
+                flat.encode(),
+            )
+            .unwrap();
         state.commit().unwrap();
         state.abort();
 
-        let before = super::super::roots::fold_application_root(&state, &network, &application).unwrap();
+        let before =
+            super::super::roots::fold_application_root(&state, &network, &application).unwrap();
         assert_eq!(before, fold(&context, &blocks));
-        assert_eq!(super::super::roots::summary_coins(&state, &application).unwrap(), 10);
+        assert_eq!(
+            super::super::roots::summary_coins(&state, &application).unwrap(),
+            10
+        );
         assert!(top(&state, &application).unwrap().is_none());
 
         let tree = SummaryTree::new(&state, &context, &application);
         assert!(tree.upgrade().unwrap());
-        assert_eq!(super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS).unwrap().as_deref(), Some(MOVED.as_slice()));
-        assert!(!tree.upgrade().unwrap(), "a converted summary is not converted again");
+        assert_eq!(
+            super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS)
+                .unwrap()
+                .as_deref(),
+            Some(MOVED.as_slice())
+        );
+        assert!(
+            !tree.upgrade().unwrap(),
+            "a converted summary is not converted again"
+        );
         assert_matches(&state, &context, &application, &blocks);
-        assert_eq!(super::super::roots::fold_application_root(&state, &network, &application).unwrap(), before);
-        assert_eq!(super::super::roots::summary_coins(&state, &application).unwrap(), 10);
-        assert_eq!(super::super::roots::block_summary(&state, &application).unwrap().blocks, leaves(&blocks));
+        assert_eq!(
+            super::super::roots::fold_application_root(&state, &network, &application).unwrap(),
+            before
+        );
+        assert_eq!(
+            super::super::roots::summary_coins(&state, &application).unwrap(),
+            10
+        );
+        assert_eq!(
+            super::super::roots::block_summary(&state, &application)
+                .unwrap()
+                .blocks,
+            leaves(&blocks)
+        );
     }
 
     /// The tree keeps the flat summary's block cap.
@@ -532,10 +707,15 @@ mod tests {
         let state = mem_state();
         let (context, application) = ([5u8; 32], [6u8; 32]);
         let root = block_roots(&context, 1).remove(0);
-        let mut blocks: Vec<(u64, u64, Node)> = (1024..2048).map(|block| (block, 1, root.clone())).collect();
-        SummaryTree::new(&state, &context, &application).replace(&blocks).unwrap();
+        let mut blocks: Vec<(u64, u64, Node)> =
+            (1024..2048).map(|block| (block, 1, root.clone())).collect();
+        SummaryTree::new(&state, &context, &application)
+            .replace(&blocks)
+            .unwrap();
         blocks.push((2048, 1, root));
-        assert!(SummaryTree::new(&state, &context, &application).replace(&blocks).is_err());
+        assert!(SummaryTree::new(&state, &context, &application)
+            .replace(&blocks)
+            .is_err());
     }
 
     /// The records sit exactly where [`node_address`] puts them, apart from
@@ -557,9 +737,16 @@ mod tests {
         let mut unfilled = node_address(3, 9);
         unfilled[27] = 0;
         assert!(!is_node_address(&unfilled));
-        for address in [state::ROOT_ADDRESS, state::FRONTIER_ADDRESS, state::SHAPE_ADDRESS, BLOCK_SUMMARY_ADDRESS,
-            block_record_address(state::BLOCK_ROOT_TAG, coin_blocks::block_id(15, (1 << 15) - 1).unwrap())]
-        {
+        for address in [
+            state::ROOT_ADDRESS,
+            state::FRONTIER_ADDRESS,
+            state::SHAPE_ADDRESS,
+            BLOCK_SUMMARY_ADDRESS,
+            block_record_address(
+                state::BLOCK_ROOT_TAG,
+                coin_blocks::block_id(15, (1 << 15) - 1).unwrap(),
+            ),
+        ] {
             assert!(!is_node_address(&address));
         }
     }

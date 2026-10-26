@@ -107,7 +107,11 @@ impl<N: Namespace> Generic<N> {
         let Some(signature) = attestation.signature.get() else {
             return false;
         };
-        public_key.verify(subject.namespace(&self.namespace), &subject.message(), signature)
+        public_key.verify(
+            subject.namespace(&self.namespace),
+            &subject.message(),
+            signature,
+        )
     }
 
     pub fn verify_attestations<'a, S, D, I>(
@@ -163,8 +167,15 @@ impl<N: Namespace> Generic<N> {
         entries.sort_by_key(|(signer, _)| *signer);
         let (signer, signatures): (Vec<Participant>, Vec<_>) = entries.into_iter().unzip();
         let signers = Signers::from(self.participants.len(), signer);
-        let signatures = signatures.into_iter().map(Lazy::from).collect::<Vec<_>>().into();
-        Some(Certificate { signers, signatures })
+        let signatures = signatures
+            .into_iter()
+            .map(Lazy::from)
+            .collect::<Vec<_>>()
+            .into();
+        Some(Certificate {
+            signers,
+            signatures,
+        })
     }
 
     pub fn verify_certificate<'a, S, D, M>(
@@ -189,7 +200,11 @@ impl<N: Namespace> Generic<N> {
         }
         let namespace = subject.namespace(&self.namespace);
         let message = subject.message();
-        for (signer, signature) in certificate.signers.iter().zip(certificate.signatures.iter()) {
+        for (signer, signature) in certificate
+            .signers
+            .iter()
+            .zip(certificate.signatures.iter())
+        {
             let Some(public_key) = self.participants.key(signer) else {
                 return false;
             };
@@ -259,7 +274,10 @@ impl Read for Certificate {
                 "Signers and signatures counts differ",
             ));
         }
-        Ok(Self { signers, signatures: signatures.into() })
+        Ok(Self {
+            signers,
+            signatures: signatures.into(),
+        })
     }
 }
 
@@ -309,7 +327,8 @@ impl commonware_cryptography::certificate::Verifier for FalconCertScheme {
         D: Digest,
         M: Faults,
     {
-        self.generic.verify_certificate::<Self, D, M>(subject, certificate)
+        self.generic
+            .verify_certificate::<Self, D, M>(subject, certificate)
     }
 
     fn verify_certificates<'a, R, D, I, M>(
@@ -325,7 +344,10 @@ impl commonware_cryptography::certificate::Verifier for FalconCertScheme {
         M: Faults,
     {
         for (subject, certificate) in certificates {
-            if !self.generic.verify_certificate::<Self, D, M>(subject, certificate) {
+            if !self
+                .generic
+                .verify_certificate::<Self, D, M>(subject, certificate)
+            {
                 return false;
             }
         }
@@ -371,7 +393,8 @@ impl Scheme for FalconCertScheme {
         R: CryptoRng,
         D: Digest,
     {
-        self.generic.verify_attestation::<Self, D>(subject, attestation)
+        self.generic
+            .verify_attestation::<Self, D>(subject, attestation)
     }
 
     fn verify_attestations<R, D, I>(
@@ -387,10 +410,15 @@ impl Scheme for FalconCertScheme {
         I: IntoIterator<Item = Attestation<Self>>,
         I::IntoIter: Send,
     {
-        self.generic.verify_attestations::<Self, D, _>(subject, attestations)
+        self.generic
+            .verify_attestations::<Self, D, _>(subject, attestations)
     }
 
-    fn assemble<I, M>(&self, attestations: I, _strategy: &impl Strategy) -> Option<Self::Certificate>
+    fn assemble<I, M>(
+        &self,
+        attestations: I,
+        _strategy: &impl Strategy,
+    ) -> Option<Self::Certificate>
     where
         I: IntoIterator<Item = Attestation<Self>>,
         I::IntoIter: Send,
@@ -432,7 +460,9 @@ mod tests {
     const NAMESPACE: &[u8] = b"global";
 
     fn setup(n: u32) -> Vec<FalconCertScheme> {
-        let sks: Vec<_> = (0..n).map(|_| FalconPrivateKey::random(test_rng())).collect();
+        let sks: Vec<_> = (0..n)
+            .map(|_| FalconPrivateKey::random(test_rng()))
+            .collect();
         let participants: Set<FalconPublicKey> =
             sks.iter().map(|sk| sk.public_key()).try_collect().unwrap();
         sks.into_iter()
@@ -441,7 +471,9 @@ mod tests {
     }
 
     fn subject() -> TestSubject {
-        TestSubject { message: bytes::Bytes::from_static(b"state_id|rank") }
+        TestSubject {
+            message: bytes::Bytes::from_static(b"state_id|rank"),
+        }
     }
 
     /// A certificate encodes exactly as it did with a `Vec` of signatures:
@@ -496,10 +528,7 @@ mod tests {
             schemes[0].participants(),
             cloned.participants()
         ));
-        let verifier = FalconCertScheme::verifier(
-            NAMESPACE,
-            schemes[0].participants().clone(),
-        );
+        let verifier = FalconCertScheme::verifier(NAMESPACE, schemes[0].participants().clone());
         let verifier_clone = verifier.clone();
         assert!(std::ptr::eq(
             verifier.participants(),
@@ -509,21 +538,36 @@ mod tests {
             .iter()
             .map(|scheme| scheme.sign::<Sha256Digest>(subject()).unwrap())
             .collect();
-        let certificate = cloned.assemble::<_, N3f1>(attestations, &Sequential).unwrap();
+        let certificate = cloned
+            .assemble::<_, N3f1>(attestations, &Sequential)
+            .unwrap();
         drop(cloned);
         drop(verifier);
         drop(schemes);
         assert!(verifier_clone.verify_certificate::<_, Sha256Digest, N3f1>(
-            &mut test_rng(), subject(), &certificate, &Sequential
+            &mut test_rng(),
+            subject(),
+            &certificate,
+            &Sequential
         ));
-        let other = TestSubject { message: bytes::Bytes::from_static(b"different") };
+        let other = TestSubject {
+            message: bytes::Bytes::from_static(b"different"),
+        };
         assert!(!verifier_clone.verify_certificate::<_, Sha256Digest, N3f1>(
-            &mut test_rng(), other, &certificate, &Sequential
+            &mut test_rng(),
+            other,
+            &certificate,
+            &Sequential
         ));
         let different_committee = setup(4);
-        assert!(!different_committee[0].verify_certificate::<_, Sha256Digest, N3f1>(
-            &mut test_rng(), subject(), &certificate, &Sequential
-        ));
+        assert!(
+            !different_committee[0].verify_certificate::<_, Sha256Digest, N3f1>(
+                &mut test_rng(),
+                subject(),
+                &certificate,
+                &Sequential
+            )
+        );
     }
 
     #[test]
@@ -545,7 +589,9 @@ mod tests {
         ));
 
         // A tampered message must fail verification.
-        let other = TestSubject { message: bytes::Bytes::from_static(b"different") };
+        let other = TestSubject {
+            message: bytes::Bytes::from_static(b"different"),
+        };
         assert!(!schemes[0].verify_certificate::<_, Sha256Digest, N3f1>(
             &mut rng,
             other,

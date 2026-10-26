@@ -21,15 +21,11 @@ use quil_types::error::{QuilError, Result};
 /// `token_intrinsic_transaction.go:33`:
 /// `2cf07ca8d9ab1a4bb0902e25a9b90759dd54d881f54d52a76a17e79bf0361c325650f12746e4337ffb5940e7665ad7bf83f44af98d964bbe`.
 pub(crate) const PUBLIC_READ_KEY: [u8; 56] = [
-    0x2c, 0xf0, 0x7c, 0xa8, 0xd9, 0xab, 0x1a, 0x4b,
-    0xb0, 0x90, 0x2e, 0x25, 0xa9, 0xb9, 0x07, 0x59,
-    0xdd, 0x54, 0xd8, 0x81, 0xf5, 0x4d, 0x52, 0xa7,
-    0x6a, 0x17, 0xe7, 0x9b, 0xf0, 0x36, 0x1c, 0x32,
-    0x56, 0x50, 0xf1, 0x27, 0x46, 0xe4, 0x33, 0x7f,
-    0xfb, 0x59, 0x40, 0xe7, 0x66, 0x5a, 0xd7, 0xbf,
+    0x2c, 0xf0, 0x7c, 0xa8, 0xd9, 0xab, 0x1a, 0x4b, 0xb0, 0x90, 0x2e, 0x25, 0xa9, 0xb9, 0x07, 0x59,
+    0xdd, 0x54, 0xd8, 0x81, 0xf5, 0x4d, 0x52, 0xa7, 0x6a, 0x17, 0xe7, 0x9b, 0xf0, 0x36, 0x1c, 0x32,
+    0x56, 0x50, 0xf1, 0x27, 0x46, 0xe4, 0x33, 0x7f, 0xfb, 0x59, 0x40, 0xe7, 0x66, 0x5a, 0xd7, 0xbf,
     0x83, 0xf4, 0x4a, 0xf9, 0x8d, 0x96, 0x4b, 0xbe,
 ];
-
 
 // =====================================================================
 // Legacy verenc decryption (migration only — decodes pre-2.1 coins into
@@ -77,8 +73,6 @@ pub(crate) fn decrypt_single_verenc(bytes: &[u8], decryption_key: &[u8]) -> Opti
     Some(verenc::combine_chunked_data(vec![chunk]))
 }
 
-
-
 /// The decrypted legacy coin: its Ed448-derived owner address and public amount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransparentCoin {
@@ -104,10 +98,14 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
     let amt = decrypt_single_verenc(&amount_blob, &PUBLIC_READ_KEY)
         .ok_or_else(|| QuilError::InvalidArgument("migrate: decrypt amount failed".into()))?;
     if amt.len() < 17 {
-        return Err(QuilError::InvalidArgument("migrate: legacy amount slot too short".into()));
+        return Err(QuilError::InvalidArgument(
+            "migrate: legacy amount slot too short".into(),
+        ));
     }
     if amt.iter().skip(17).any(|&b| b != 0) {
-        return Err(QuilError::InvalidArgument("migrate: legacy amount exceeds u128".into()));
+        return Err(QuilError::InvalidArgument(
+            "migrate: legacy amount exceeds u128".into(),
+        ));
     }
     let mut a16 = [0u8; 16];
     a16.copy_from_slice(&amt[1..17]);
@@ -117,13 +115,18 @@ pub fn decode_legacy_verenc_coin(tree: &VectorCommitmentTree) -> Result<Option<T
     let addr = decrypt_single_verenc(&address_blob, &PUBLIC_READ_KEY)
         .ok_or_else(|| QuilError::InvalidArgument("migrate: decrypt address failed".into()))?;
     if addr.len() < 33 {
-        return Err(QuilError::InvalidArgument("migrate: legacy address < 33 bytes".into()));
+        return Err(QuilError::InvalidArgument(
+            "migrate: legacy address < 33 bytes".into(),
+        ));
     }
     let mut owner_address = [0u8; 32];
     owner_address.copy_from_slice(&addr[1..33]);
     owner_address.reverse();
 
-    Ok(Some(TransparentCoin { owner_address, amount }))
+    Ok(Some(TransparentCoin {
+        owner_address,
+        amount,
+    }))
 }
 
 /// Type hash for a transparent legacy coin vertex: `poseidon(domain ‖
@@ -168,9 +171,14 @@ pub fn create_transparent_coin_tree(
 /// blob, or `None` for any other vertex. The checks are `shield::check_source`'s
 /// except the content address, which the caller read the blob under. The type
 /// hash is stored verbatim, so other vertices are passed over without parsing.
-pub fn read_transparent_coin(blob: &[u8], type_hash: &[u8; 32]) -> Option<([u8; 32], u128, [u8; 32])> {
+pub fn read_transparent_coin(
+    blob: &[u8],
+    type_hash: &[u8; 32],
+) -> Option<([u8; 32], u128, [u8; 32])> {
     memchr::memmem::find(blob, type_hash)?;
-    let tree = VectorCommitmentTree { root: quil_tries::deserialize_go_tree(blob).ok()? };
+    let tree = VectorCommitmentTree {
+        root: quil_tries::deserialize_go_tree(blob).ok()?,
+    };
     if tree.leaves().len() != 4 || tree.get(&[0xff; 32]) != Some(type_hash.as_slice()) {
         return None;
     }
@@ -256,50 +264,52 @@ pub fn migrate_all_legacy_coins(
     let total = Mutex::new(0u128);
     let progress = Mutex::new(progress);
 
-    (0u8..=255u8).into_par_iter().try_for_each(|top| -> Result<()> {
-        // Sub-range key (after the shard prefix): domain(32) ‖ [top address byte].
-        let mut sub = Vec::with_capacity(dom.len() + 1);
-        sub.extend_from_slice(&dom);
-        sub.push(top);
+    (0u8..=255u8)
+        .into_par_iter()
+        .try_for_each(|top| -> Result<()> {
+            // Sub-range key (after the shard prefix): domain(32) ‖ [top address byte].
+            let mut sub = Vec::with_capacity(dom.len() + 1);
+            sub.extend_from_slice(&dom);
+            sub.push(top);
 
-        store.migrate_vertex_adds_subrange(
-            &shard,
-            &sub,
-            chunk_size,
-            |chunk: &[(Vec<u8>, Vec<u8>)]| -> Result<(usize, Vec<quil_store::VertexWrite>)> {
-                let mut writes = Vec::with_capacity(chunk.len() * 2);
-                let mut m = 0usize;
-                let mut chunk_amount: u128 = 0;
-                for (vk, blob) in chunk {
-                    if let Some((amount, ws)) = migrate_one(domain, vk, blob)? {
-                        chunk_amount = chunk_amount.checked_add(amount).ok_or_else(|| {
+            store.migrate_vertex_adds_subrange(
+                &shard,
+                &sub,
+                chunk_size,
+                |chunk: &[(Vec<u8>, Vec<u8>)]| -> Result<(usize, Vec<quil_store::VertexWrite>)> {
+                    let mut writes = Vec::with_capacity(chunk.len() * 2);
+                    let mut m = 0usize;
+                    let mut chunk_amount: u128 = 0;
+                    for (vk, blob) in chunk {
+                        if let Some((amount, ws)) = migrate_one(domain, vk, blob)? {
+                            chunk_amount = chunk_amount.checked_add(amount).ok_or_else(|| {
+                                QuilError::InvalidArgument(
+                                    "migrate: total legacy amount overflows u128".into(),
+                                )
+                            })?;
+                            m += 1;
+                            writes.extend(ws);
+                        }
+                    }
+                    // Fold this chunk's counts into the shared totals and report PER
+                    // CHUNK (across all ranges), so progress is live rather than only
+                    // when a whole ~760k-coin range finishes.
+                    let sc = scanned.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
+                    let mi = migrated.fetch_add(m, Ordering::Relaxed) + m;
+                    {
+                        let mut t = total.lock().unwrap();
+                        *t = t.checked_add(chunk_amount).ok_or_else(|| {
                             QuilError::InvalidArgument(
                                 "migrate: total legacy amount overflows u128".into(),
                             )
                         })?;
-                        m += 1;
-                        writes.extend(ws);
                     }
-                }
-                // Fold this chunk's counts into the shared totals and report PER
-                // CHUNK (across all ranges), so progress is live rather than only
-                // when a whole ~760k-coin range finishes.
-                let sc = scanned.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
-                let mi = migrated.fetch_add(m, Ordering::Relaxed) + m;
-                {
-                    let mut t = total.lock().unwrap();
-                    *t = t.checked_add(chunk_amount).ok_or_else(|| {
-                        QuilError::InvalidArgument(
-                            "migrate: total legacy amount overflows u128".into(),
-                        )
-                    })?;
-                }
-                (*progress.lock().unwrap())(sc, mi);
-                Ok((m, writes))
-            },
-        )?;
-        Ok(())
-    })?;
+                    (*progress.lock().unwrap())(sc, mi);
+                    Ok((m, writes))
+                },
+            )?;
+            Ok(())
+        })?;
 
     let total_amount = *total.lock().unwrap();
     Ok(LegacyMigrationSummary {
@@ -387,7 +397,9 @@ pub fn read_migration_receipt(
             let total = u128::from_be_bytes(rec[8..24].try_into().unwrap());
             Ok(Some((count, total)))
         }
-        Some(_) => Err(QuilError::InvalidArgument("malformed migration receipt".into())),
+        Some(_) => Err(QuilError::InvalidArgument(
+            "malformed migration receipt".into(),
+        )),
         None => Ok(None),
     }
 }
@@ -428,7 +440,9 @@ pub fn read_migration_receipt_raw(
             let total = u128::from_be_bytes(rec[8..24].try_into().unwrap());
             Ok(Some((count, total)))
         }
-        Some(_) => Err(QuilError::InvalidArgument("malformed migration receipt".into())),
+        Some(_) => Err(QuilError::InvalidArgument(
+            "malformed migration receipt".into(),
+        )),
         None => Ok(None),
     }
 }
@@ -495,18 +509,28 @@ pub fn sum_transparent_coins(
         };
         let tree = VectorCommitmentTree { root };
         // Count only transparent coins (type leaf == transparent type hash).
-        if tree.get(&[0xFFu8; 32]).map(|t| t == th.as_slice()).unwrap_or(false) {
+        if tree
+            .get(&[0xFFu8; 32])
+            .map(|t| t == th.as_slice())
+            .unwrap_or(false)
+        {
             let Some(a) = tree.get(&[1u8 << 2]).filter(|a| a.len() == 16) else {
-                scan_err = Some(QuilError::InvalidArgument("transparent coin amount must be 16 bytes".into()));
+                scan_err = Some(QuilError::InvalidArgument(
+                    "transparent coin amount must be 16 bytes".into(),
+                ));
                 return;
             };
             let amount = u128::from_le_bytes(a.try_into().unwrap());
             let Some(next_total) = total.checked_add(amount) else {
-                scan_err = Some(QuilError::InvalidArgument("transparent coin total overflows u128".into()));
+                scan_err = Some(QuilError::InvalidArgument(
+                    "transparent coin total overflows u128".into(),
+                ));
                 return;
             };
             let Some(next_count) = count.checked_add(1) else {
-                scan_err = Some(QuilError::InvalidArgument("transparent coin count overflows u64".into()));
+                scan_err = Some(QuilError::InvalidArgument(
+                    "transparent coin count overflows u64".into(),
+                ));
                 return;
             };
             total = next_total;
@@ -527,17 +551,31 @@ mod read_transparent_tests {
     fn a_transparent_coin_reads_back_and_other_vertices_do_not() {
         let domain = [0x11u8; 32];
         let th = transparent_type_hash(&domain).unwrap();
-        let coin = TransparentCoin { owner_address: [7; 32], amount: 123_456_789_012_345, };
+        let coin = TransparentCoin {
+            owner_address: [7; 32],
+            amount: 123_456_789_012_345,
+        };
         let tree = create_transparent_coin_tree(&coin, &th, &[9; 32]).unwrap();
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
-        assert_eq!(read_transparent_coin(&blob, &th), Some(([7; 32], 123_456_789_012_345, [9; 32])));
+        assert_eq!(
+            read_transparent_coin(&blob, &th),
+            Some(([7; 32], 123_456_789_012_345, [9; 32]))
+        );
         let other = transparent_type_hash(&[0x22; 32]).unwrap();
-        assert_eq!(read_transparent_coin(&blob, &other), None, "another domain's type");
+        assert_eq!(
+            read_transparent_coin(&blob, &other),
+            None,
+            "another domain's type"
+        );
         assert_eq!(read_transparent_coin(&[0; 64], &th), None);
         let mut extra = create_transparent_coin_tree(&coin, &th, &[9; 32]).unwrap();
         extra.insert(&[12], &[1], &[], &BigInt::from(1)).unwrap();
         let extra = quil_tries::serialize_go_tree(extra.root.as_ref()).unwrap();
-        assert_eq!(read_transparent_coin(&extra, &th), None, "a fifth field is not a transparent coin");
+        assert_eq!(
+            read_transparent_coin(&extra, &th),
+            None,
+            "a fifth field is not a transparent coin"
+        );
     }
 }
 
@@ -547,12 +585,18 @@ mod tests {
 
     #[test]
     fn transparent_coin_tree_stores_owner_amount_and_origin() {
-        let coin = TransparentCoin { owner_address: [0x7Au8; 32], amount: 123456789 };
+        let coin = TransparentCoin {
+            owner_address: [0x7Au8; 32],
+            amount: 123456789,
+        };
         let th = transparent_type_hash(&[0x51u8; 32]).unwrap();
         let origin = [0x33u8; 32];
         let tree = create_transparent_coin_tree(&coin, &th, &origin).unwrap();
         assert_eq!(tree.get(&[0x00]).unwrap(), &coin.owner_address[..]);
-        assert_eq!(tree.get(&[1u8 << 2]).unwrap(), &coin.amount.to_le_bytes()[..]);
+        assert_eq!(
+            tree.get(&[1u8 << 2]).unwrap(),
+            &coin.amount.to_le_bytes()[..]
+        );
         assert_eq!(tree.get(&[2u8 << 2]).unwrap(), &origin[..]);
         assert_eq!(tree.get(&[0xFFu8; 32]).unwrap(), &th[..]);
     }
@@ -561,7 +605,10 @@ mod tests {
     fn identical_owner_amount_coins_get_distinct_addresses_via_origin() {
         // Two legacy coins with the SAME (owner, amount) must not collide: the
         // origin leaf makes their content addresses distinct so neither is lost.
-        let coin = TransparentCoin { owner_address: [0x7Au8; 32], amount: 100 };
+        let coin = TransparentCoin {
+            owner_address: [0x7Au8; 32],
+            amount: 100,
+        };
         let th = transparent_type_hash(&[0x51u8; 32]).unwrap();
         let a = super::super::materialize::coin_content_address(
             &create_transparent_coin_tree(&coin, &th, &[0xA1u8; 32]).unwrap(),
@@ -578,7 +625,8 @@ mod tests {
     fn non_legacy_tree_decodes_to_none() {
         // A tree without the encrypted slots is not a legacy coin.
         let mut tree = VectorCommitmentTree::new();
-        tree.insert(&[0x00], b"not-a-coin", &[], &BigInt::from(10)).unwrap();
+        tree.insert(&[0x00], b"not-a-coin", &[], &BigInt::from(10))
+            .unwrap();
         assert!(decode_legacy_verenc_coin(&tree).unwrap().is_none());
     }
 }
@@ -588,7 +636,10 @@ mod _size_probe {
     use super::*;
     #[test]
     fn print_transparent_coin_size() {
-        let coin = TransparentCoin { owner_address: [0xabu8; 32], amount: 123456789u128 };
+        let coin = TransparentCoin {
+            owner_address: [0xabu8; 32],
+            amount: 123456789u128,
+        };
         let th = [0xffu8; 32];
         let origin = [0xcdu8; 32];
         let tree = create_transparent_coin_tree(&coin, &th, &origin).unwrap();

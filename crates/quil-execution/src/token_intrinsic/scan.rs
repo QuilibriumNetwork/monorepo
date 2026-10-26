@@ -32,7 +32,11 @@ pub struct CoinPage {
 /// and a wallet could not read a split application at all. The canonical root
 /// is what a spend proves against and the
 /// global accumulator publishes it for split and whole applications alike.
-pub fn snapshot_root(snapshot: &dyn SnapshotReadable, network: &[u8; 32], application: &[u8; 32]) -> Result<RootRecord> {
+pub fn snapshot_root(
+    snapshot: &dyn SnapshotReadable,
+    network: &[u8; 32],
+    application: &[u8; 32],
+) -> Result<RootRecord> {
     snapshot_root_if_any(snapshot, network, application)?.ok_or_else(no_root)
 }
 
@@ -79,11 +83,14 @@ fn local_snapshot_root_if_any(
     key[..32].copy_from_slice(application);
     key[32..].copy_from_slice(&ROOT_ADDRESS);
     // The node-local record, else a legacy copy in the tree.
-    let root_bytes = match snapshot.read_record(&super::state::local_record_key(application, &ROOT_ADDRESS)) {
-        Ok(Some(bytes)) => Some(bytes),
-        _ => snapshot.load_vertex_underlying_raw("vertex", "adds", &shard, &key)?,
-    };
-    root_bytes.map(|bytes| roots::decode_current(&bytes, &context)).transpose()
+    let root_bytes =
+        match snapshot.read_record(&super::state::local_record_key(application, &ROOT_ADDRESS)) {
+            Ok(Some(bytes)) => Some(bytes),
+            _ => snapshot.load_vertex_underlying_raw("vertex", "adds", &shard, &key)?,
+        };
+    root_bytes
+        .map(|bytes| roots::decode_current(&bytes, &context))
+        .transpose()
 }
 
 /// The application's canonical root as the global accumulator published it:
@@ -96,7 +103,10 @@ fn canonical_snapshot_root(
 ) -> Result<Option<RootRecord>> {
     let address = super::global_accumulator::root_history_address(application)?;
     let domain = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
-    let shard = shard_key_for_location(&Location { app_address: domain, data_address: address });
+    let shard = shard_key_for_location(&Location {
+        app_address: domain,
+        data_address: address,
+    });
     let mut key = [0; 64];
     key[..32].copy_from_slice(&domain);
     key[32..].copy_from_slice(&address);
@@ -113,8 +123,9 @@ fn canonical_snapshot_root(
         return Ok(None);
     };
     let tree = quil_tries::VectorCommitmentTree {
-        root: quil_tries::deserialize_go_tree(&blob)
-            .map_err(|_| QuilError::ExecutionUnavailable("cannot decode the canonical root record".into()))?,
+        root: quil_tries::deserialize_go_tree(&blob).map_err(|_| {
+            QuilError::ExecutionUnavailable("cannot decode the canonical root record".into())
+        })?,
     };
     match tree.get(&[0]) {
         Some(history) => roots::decode_current(history, context).map(Some),
@@ -133,8 +144,14 @@ pub fn scan_page(
     after: Option<&[u8; 32]>,
     limits: VertexPageLimits,
 ) -> Result<CoinPage> {
-    scan_page_with_root(snapshot, network, application, after, limits,
-        snapshot_root(snapshot, network, application)?)
+    scan_page_with_root(
+        snapshot,
+        network,
+        application,
+        after,
+        limits,
+        snapshot_root(snapshot, network, application)?,
+    )
 }
 
 /// What a wallet scan finds in one store.
@@ -173,13 +190,18 @@ pub fn scan_wallet_page(
     limits: VertexPageLimits,
 ) -> Result<WalletPage> {
     if let Some(root) = snapshot_root_if_any(snapshot, network, application)? {
-        return scan_page_with_root(snapshot, network, application, after, limits, root).map(WalletPage::Page);
+        return scan_page_with_root(snapshot, network, application, after, limits, root)
+            .map(WalletPage::Page);
     }
     if after.is_some() {
         return Err(no_root());
     }
     let (coins, _, _) = scan_coins(snapshot, network, application, None, limits)?;
-    Ok(if coins.is_empty() { WalletPage::NoRoot } else { WalletPage::UnrootedCoins })
+    Ok(if coins.is_empty() {
+        WalletPage::NoRoot
+    } else {
+        WalletPage::UnrootedCoins
+    })
 }
 
 /// Internal index scan. Wallet pages continue to advertise the canonical root.
@@ -190,8 +212,14 @@ pub(super) fn scan_local_page(
     after: Option<&[u8; 32]>,
     limits: VertexPageLimits,
 ) -> Result<CoinPage> {
-    scan_page_with_root(snapshot, network, application, after, limits,
-        local_snapshot_root(snapshot, network, application)?)
+    scan_page_with_root(
+        snapshot,
+        network,
+        application,
+        after,
+        limits,
+        local_snapshot_root(snapshot, network, application)?,
+    )
 }
 
 fn scan_page_with_root(
@@ -203,7 +231,12 @@ fn scan_page_with_root(
     root: RootRecord,
 ) -> Result<CoinPage> {
     let (coins, cursor, has_more) = scan_coins(snapshot, network, application, after, limits)?;
-    Ok(CoinPage { root, coins, cursor, has_more })
+    Ok(CoinPage {
+        root,
+        coins,
+        cursor,
+        has_more,
+    })
 }
 
 /// One bounded page of coin records: the coins, the last examined address
@@ -221,8 +254,12 @@ fn scan_coins(
         ));
     }
     let context = parameter_context(network, application);
-    let shard = shard_key_for_location(&Location { app_address: *application, data_address: [0; 32] });
-    let mut key = [0; 64]; key[..32].copy_from_slice(application);
+    let shard = shard_key_for_location(&Location {
+        app_address: *application,
+        data_address: [0; 32],
+    });
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(application);
     // The accumulator's own records share this keyspace and are never coins.
     // They are passed over unread: the root history (up to 128 root ids) and
     // the block summary (one root per non-empty block) outgrow a page, and
@@ -240,9 +277,7 @@ fn scan_coins(
     let mut bytes = 0usize;
     let mut coins = Vec::new();
     if page.entries.len() > limits.max_entries || (page.has_more && page.entries.is_empty()) {
-        return Err(QuilError::Store(
-            "coin scan: invalid backend page".into(),
-        ));
+        return Err(QuilError::Store("coin scan: invalid backend page".into()));
     }
     for (address, blob) in page.entries {
         bytes = bytes
@@ -302,9 +337,7 @@ pub fn scan_escrow_page(
     let mut bytes = 0usize;
     let mut escrows = Vec::new();
     if page.entries.len() > limits.max_entries || (page.has_more && page.entries.is_empty()) {
-        return Err(QuilError::Store(
-            "coin scan: invalid backend page".into(),
-        ));
+        return Err(QuilError::Store("coin scan: invalid backend page".into()));
     }
     for (address, blob) in page.entries {
         bytes = bytes
@@ -364,59 +397,159 @@ mod tests {
     #[test]
     fn escrow_scan_retains_snapshot_and_advances_over_metadata_without_coin_root() {
         use super::super::escrow::StoredEscrow;
-        use quil_lattice_ct::confidential::{memo::EscrowRecoveryMemo, pending_claim::EscrowPolicy};
+        use quil_lattice_ct::confidential::{
+            memo::EscrowRecoveryMemo, pending_claim::EscrowPolicy,
+        };
         let dir = tempfile::tempdir().unwrap();
         let db = quil_store::RocksDb::open(dir.path()).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
-        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), Arc::new(NoopInclusionProver))));
-        let network = [1; 32]; let application = [2; 32];
+        let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(NoopInclusionProver),
+        )));
+        let network = [1; 32];
+        let application = [2; 32];
         let context = parameter_context(&network, &application);
-        let limits = VertexPageLimits { max_entries: 1, max_bytes: 240 * 1024 };
+        let limits = VertexPageLimits {
+            max_entries: 1,
+            max_bytes: 240 * 1024,
+        };
         let empty = store.capture_snapshot().unwrap();
         let page = scan_escrow_page(empty.as_ref(), &network, &application, None, limits).unwrap();
         assert!(page.escrows.is_empty() && !page.has_more);
-        let escrow = StoredEscrow { frame_number: 73,
-            output: Output { owner: [3; IDENTITY_BYTES], memo: [4; 1115], commitment: CommitmentKey::derive(&context).commit(7, &AmountOpening::from_seed(&context, &[5; 32])) },
-            policy: EscrowPolicy { recipient: [6; 897], refund: [7; 897], refund_after_global_frame: 100 },
-            refund_recovery: EscrowRecoveryMemo { owner: [8; IDENTITY_BYTES], ciphertext: [9; 1115] } };
+        let escrow = StoredEscrow {
+            frame_number: 73,
+            output: Output {
+                owner: [3; IDENTITY_BYTES],
+                memo: [4; 1115],
+                commitment: CommitmentKey::derive(&context)
+                    .commit(7, &AmountOpening::from_seed(&context, &[5; 32])),
+            },
+            policy: EscrowPolicy {
+                recipient: [6; 897],
+                refund: [7; 897],
+                refund_after_global_frame: 100,
+            },
+            refund_recovery: EscrowRecoveryMemo {
+                owner: [8; IDENTITY_BYTES],
+                ciphertext: [9; 1115],
+            },
+        };
         let (address, blob) = escrow.encode(&context).unwrap();
         let disc = vertex_adds_discriminator().unwrap();
-        state.set(&application, &address, &disc, 0, blob.clone()).unwrap();
-        state.set(&application, &super::super::state::FRONTIER_ADDRESS, &disc, 0, vec![1, 2, 3]).unwrap();
+        state
+            .set(&application, &address, &disc, 0, blob.clone())
+            .unwrap();
+        state
+            .set(
+                &application,
+                &super::super::state::FRONTIER_ADDRESS,
+                &disc,
+                0,
+                vec![1, 2, 3],
+            )
+            .unwrap();
         // The accumulator's PER-BLOCK records are not Go trees either. A scan
         // that skips only the application-wide reserved addresses dies on the
         // first one it meets ("go_format: unknown node tag"), which surfaces
         // as a corrupt store and makes every escrow unlistable.
-        let block = super::super::coin_blocks::block_id(super::super::coin_blocks::INITIAL_BLOCK_BITS, 5).unwrap();
-        for tag in [super::super::state::BLOCK_FRONTIER_TAG, super::super::state::BLOCK_ROOT_TAG] {
+        let block =
+            super::super::coin_blocks::block_id(super::super::coin_blocks::INITIAL_BLOCK_BITS, 5)
+                .unwrap();
+        for tag in [
+            super::super::state::BLOCK_FRONTIER_TAG,
+            super::super::state::BLOCK_ROOT_TAG,
+        ] {
             let address = super::super::state::block_record_address(tag, block);
-            state.set(&application, &address, &disc, 0, b"QCT3FR\0\x02 not a tree".to_vec()).unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    0,
+                    b"QCT3FR\0\x02 not a tree".to_vec(),
+                )
+                .unwrap();
         }
         // The root history and block summary outgrow a page (a 249,339-byte
         // root history fails every wallet's scan). They, and the summary
         // tree's records, are passed over unread.
-        for address in [super::super::state::ROOT_ADDRESS, super::super::state::BLOCK_SUMMARY_ADDRESS,
-            super::super::summary_tree::node_address(0, 64), super::super::summary_tree::node_address(16, 0)] {
-            state.set(&application, &address, &disc, 0, vec![7; 300 * 1024]).unwrap();
+        for address in [
+            super::super::state::ROOT_ADDRESS,
+            super::super::state::BLOCK_SUMMARY_ADDRESS,
+            super::super::summary_tree::node_address(0, 64),
+            super::super::summary_tree::node_address(16, 0),
+        ] {
+            state
+                .set(&application, &address, &disc, 0, vec![7; 300 * 1024])
+                .unwrap();
         }
-        state.commit().unwrap(); state.abort(); state.crdt().commit(1).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        state.crdt().commit(1).unwrap();
         let snapshot = store.capture_snapshot().unwrap();
-        let mut after = None; let mut records = Vec::new(); let mut pages = 0;
+        let mut after = None;
+        let mut records = Vec::new();
+        let mut pages = 0;
         loop {
-            let page = scan_escrow_page(snapshot.as_ref(), &network, &application, after.as_ref(), limits).unwrap();
-            records.extend(page.escrows); pages += 1;
-            if !page.has_more { break; }
-            assert!(page.cursor > after); after = page.cursor;
+            let page = scan_escrow_page(
+                snapshot.as_ref(),
+                &network,
+                &application,
+                after.as_ref(),
+                limits,
+            )
+            .unwrap();
+            records.extend(page.escrows);
+            pages += 1;
+            if !page.has_more {
+                break;
+            }
+            assert!(page.cursor > after);
+            after = page.cursor;
         }
         assert_eq!(records, vec![(address, blob.clone())]);
-        assert_eq!(pages, 2, "the escrow's page, then one that passes over the accumulator's records");
+        assert_eq!(
+            pages, 2,
+            "the escrow's page, then one that passes over the accumulator's records"
+        );
         // A later malformed committed record cannot alter an existing scan.
-        let shard = shard_key_for_location(&Location { app_address: application, data_address: [0; 32] });
-        let mut key = application.to_vec(); key.extend_from_slice(&address);
-        db.inner().put(quil_store::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &key, u64::MAX), b"invalid").unwrap();
-        let all = VertexPageLimits { max_entries: 8, ..limits };
-        assert_eq!(scan_escrow_page(snapshot.as_ref(), &network, &application, None, all).unwrap().escrows, records);
-        assert!(scan_escrow_page(store.capture_snapshot().unwrap().as_ref(), &network, &application, None, all).is_err());
+        let shard = shard_key_for_location(&Location {
+            app_address: application,
+            data_address: [0; 32],
+        });
+        let mut key = application.to_vec();
+        key.extend_from_slice(&address);
+        db.inner()
+            .put(
+                quil_store::encoding::hypergraph_vertex_data_v2_key(
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &key,
+                    u64::MAX,
+                ),
+                b"invalid",
+            )
+            .unwrap();
+        let all = VertexPageLimits {
+            max_entries: 8,
+            ..limits
+        };
+        assert_eq!(
+            scan_escrow_page(snapshot.as_ref(), &network, &application, None, all)
+                .unwrap()
+                .escrows,
+            records
+        );
+        assert!(scan_escrow_page(
+            store.capture_snapshot().unwrap().as_ref(),
+            &network,
+            &application,
+            None,
+            all
+        )
+        .is_err());
     }
 
     /// A split application's whole-application root record is a LOCAL root —
@@ -429,17 +562,22 @@ mod tests {
     #[test]
     fn a_split_application_scans_against_its_canonical_root() {
         use super::super::{coin_blocks, global_accumulator, roots, shard_accumulator};
-        use quil_types::store::HypergraphStore;
         use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+        use quil_types::store::HypergraphStore;
         let dir = tempfile::tempdir().unwrap();
         let db = quil_store::RocksDb::open(dir.path()).unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            store.clone(), Arc::new(NoopInclusionProver),
+            store.clone(),
+            Arc::new(NoopInclusionProver),
         )));
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 1 << 12 };
+        let limits = SnapshotLimits {
+            max_coins: 8,
+            max_depth: 32,
+            max_nodes: 1 << 12,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         let mut staged = std::collections::BTreeMap::new();
         let mut blocks = Vec::new();
@@ -451,11 +589,29 @@ mod tests {
                     .commit(7, &AmountOpening::from_seed(&context, &[seed; 32])),
                 memo: [0; 1115],
             };
-            let (address, tree) =
-                roots::stage_coin(&state, &network, &application, &context, 0, &output, &mut staged, limits).unwrap();
-            state.set(&application, &address, &disc, 0,
-                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
-            blocks.push(coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap());
+            let (address, tree) = roots::stage_coin(
+                &state,
+                &network,
+                &application,
+                &context,
+                0,
+                &output,
+                &mut staged,
+                limits,
+            )
+            .unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    0,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            blocks.push(
+                coin_blocks::block_for_address(coin_blocks::INITIAL_BLOCK_BITS, &address).unwrap(),
+            );
             addresses.push(address);
         }
         // The LOCAL record covers every staged coin.
@@ -468,10 +624,18 @@ mod tests {
             .find(|candidate| coin_blocks::shard_owns_block(candidate, blocks[0]))
             .expect("some depth-3 shard owns the first coin's block");
         let report = shard_accumulator::shard_report(&state, &network, &application, &shard, false)
-            .unwrap().expect("the shard holds a coin");
+            .unwrap()
+            .expect("the shard holds a coin");
         let filter = quil_forest::encode_shard_bit_path(&application, &shard);
-        assert!(global_accumulator::materialize_report(&state, 10, &filter, &report.encode().unwrap()).unwrap());
-        let canonical = global_accumulator::read_root_history(&state, &application).unwrap()
+        assert!(global_accumulator::materialize_report(
+            &state,
+            10,
+            &filter,
+            &report.encode().unwrap()
+        )
+        .unwrap());
+        let canonical = global_accumulator::read_root_history(&state, &application)
+            .unwrap()
             .map(|history| roots::decode_current(&history, &context).unwrap())
             .expect("the accumulator published a canonical root");
         state.commit().unwrap();
@@ -481,38 +645,83 @@ mod tests {
         // The coin-scan RPC serves from `capture_tree_snapshot`, so the
         // canonical record must be visible through THAT, not merely through a
         // plain store snapshot.
-        let snapshot = store.capture_tree_snapshot().unwrap().expect("tree snapshot");
+        let snapshot = store
+            .capture_tree_snapshot()
+            .unwrap()
+            .expect("tree snapshot");
         let root = snapshot_root(snapshot.as_ref(), &network, &application).unwrap();
         // Compare compactly: a RootRecord's Debug is a full lattice polynomial.
-        let digest = |r: &RootRecord| (r.coins, r.depth, r.context,
-            quil_crypto::poseidon::hash_bytes_to_32(&r.root.to_bytes()).unwrap());
-        assert_eq!(digest(&root), digest(&canonical), "the scan answers from the canonical root");
-        assert_ne!(root.coins, local_root.coins, "not the whole-application local record");
+        let digest = |r: &RootRecord| {
+            (
+                r.coins,
+                r.depth,
+                r.context,
+                quil_crypto::poseidon::hash_bytes_to_32(&r.root.to_bytes()).unwrap(),
+            )
+        };
+        assert_eq!(
+            digest(&root),
+            digest(&canonical),
+            "the scan answers from the canonical root"
+        );
+        assert_ne!(
+            root.coins, local_root.coins,
+            "not the whole-application local record"
+        );
 
         // The index must build the three LOCAL coins even while only one
         // shard has reported. Using the wallet's canonical root here used to
         // fail forever with "incomplete coin coverage" whenever reports lagged.
         use super::super::witness_index::{LocalWitnessIndex, WitnessBootstrap};
         let db = Arc::new(db);
-        let mut builder = WitnessBootstrap::new(db.clone(), snapshot, &network, &application).unwrap();
+        let mut builder =
+            WitnessBootstrap::new(db.clone(), snapshot, &network, &application).unwrap();
         assert_eq!(digest(builder.root()), digest(&local_root));
         let mut finished = false;
         for _ in 0..128 {
-            if builder.step().unwrap() { finished = true; break; }
+            if builder.step().unwrap() {
+                finished = true;
+                break;
+            }
         }
-        assert!(finished, "bounded local bootstrap finishes with lagging reports");
-        let ready = LocalWitnessIndex::ready_root(db.as_ref(), &context).unwrap().unwrap();
+        assert!(
+            finished,
+            "bounded local bootstrap finishes with lagging reports"
+        );
+        let ready = LocalWitnessIndex::ready_root(db.as_ref(), &context)
+            .unwrap()
+            .unwrap();
         assert_eq!(digest(&ready), digest(&local_root));
         let index = LocalWitnessIndex::for_root(db, &local_root, 32).unwrap();
         let witnesses = super::super::witnesses::canonical_witnesses(
-            &state, &state, &network, &application, &addresses[..1], &[local_root.clone()], &index,
-        ).unwrap();
+            &state,
+            &state,
+            &network,
+            &application,
+            &addresses[..1],
+            &[local_root.clone()],
+            &index,
+        )
+        .unwrap();
         assert_eq!(digest(&witnesses.root), digest(&canonical));
         assert!(witnesses.coins[0].path.is_some());
-        let unreported = blocks.iter().position(|block| !coin_blocks::shard_owns_block(&shard, *block)).unwrap();
-        assert!(super::super::witnesses::canonical_witnesses(
-            &state, &state, &network, &application, &[addresses[unreported]], &[local_root], &index,
-        ).is_err(), "local indexing cannot authorize an unreported coin");
+        let unreported = blocks
+            .iter()
+            .position(|block| !coin_blocks::shard_owns_block(&shard, *block))
+            .unwrap();
+        assert!(
+            super::super::witnesses::canonical_witnesses(
+                &state,
+                &state,
+                &network,
+                &application,
+                &[addresses[unreported]],
+                &[local_root],
+                &index,
+            )
+            .is_err(),
+            "local indexing cannot authorize an unreported coin"
+        );
     }
 
     /// An application in which no confidential coin exists has no root at
@@ -525,11 +734,19 @@ mod tests {
     fn a_wallet_scan_of_an_application_without_coins_is_empty_not_failed() {
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = VertexPageLimits { max_entries: 8, max_bytes: 240 * 1024 };
-        let snapshot_limits = SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 1 << 12 };
+        let limits = VertexPageLimits {
+            max_entries: 8,
+            max_bytes: 240 * 1024,
+        };
+        let snapshot_limits = SnapshotLimits {
+            max_coins: 8,
+            max_depth: 32,
+            max_nodes: 1 << 12,
+        };
         let output = Output {
             owner: [3; IDENTITY_BYTES],
-            commitment: CommitmentKey::derive(&context).commit(5, &AmountOpening::from_seed(&context, &[4; 32])),
+            commitment: CommitmentKey::derive(&context)
+                .commit(5, &AmountOpening::from_seed(&context, &[4; 32])),
             memo: [0; 1115],
         };
         // A store with the coin, its root published or not.
@@ -538,15 +755,33 @@ mod tests {
             let db = quil_store::RocksDb::open(dir.path()).unwrap();
             let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
             let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
-                store.clone(), Arc::new(NoopInclusionProver),
+                store.clone(),
+                Arc::new(NoopInclusionProver),
             )));
             let mut staged = std::collections::BTreeMap::new();
             let (address, tree) = roots::stage_coin(
-                &state, &network, &application, &context, 7, &output, &mut staged, snapshot_limits,
-            ).unwrap();
-            state.set(&application, &address, &vertex_adds_discriminator().unwrap(), 0,
-                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
-            let root = publish.then(|| roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap());
+                &state,
+                &network,
+                &application,
+                &context,
+                7,
+                &output,
+                &mut staged,
+                snapshot_limits,
+            )
+            .unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &vertex_adds_discriminator().unwrap(),
+                    0,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            let root = publish.then(|| {
+                roots::refresh_root(&state, &network, &application, snapshot_limits).unwrap()
+            });
             state.commit().unwrap();
             state.abort();
             state.crdt().commit(1).unwrap();
@@ -557,27 +792,50 @@ mod tests {
         let db = quil_store::RocksDb::open(dir.path()).unwrap();
         let empty_store = quil_store::RocksHypergraphStore::new(db.inner());
         let empty = empty_store.capture_snapshot().unwrap();
-        assert!(matches!(scan_wallet_page(empty.as_ref(), &network, &application, None, limits), Ok(WalletPage::NoRoot)));
-        assert!(matches!(snapshot_root(empty.as_ref(), &network, &application), Err(QuilError::NotFound(_))));
         assert!(matches!(
-            scan_wallet_page(empty.as_ref(), &network, &application, Some(&[1; 32]), limits),
+            scan_wallet_page(empty.as_ref(), &network, &application, None, limits),
+            Ok(WalletPage::NoRoot)
+        ));
+        assert!(matches!(
+            snapshot_root(empty.as_ref(), &network, &application),
+            Err(QuilError::NotFound(_))
+        ));
+        assert!(matches!(
+            scan_wallet_page(
+                empty.as_ref(),
+                &network,
+                &application,
+                Some(&[1; 32]),
+                limits
+            ),
             Err(QuilError::NotFound(_))
         ));
 
         let (_dir, _db, store, _, _) = store_with_coin(false);
         let unrooted = store.capture_snapshot().unwrap();
-        assert!(matches!(
-            scan_wallet_page(unrooted.as_ref(), &network, &application, None, limits),
-            Ok(WalletPage::UnrootedCoins)
-        ), "a coin without a root is not an empty application");
+        assert!(
+            matches!(
+                scan_wallet_page(unrooted.as_ref(), &network, &application, None, limits),
+                Ok(WalletPage::UnrootedCoins)
+            ),
+            "a coin without a root is not an empty application"
+        );
 
         let (_dir, _db, store, address, root) = store_with_coin(true);
         let rooted = store.capture_snapshot().unwrap();
-        let Ok(WalletPage::Page(page)) = scan_wallet_page(rooted.as_ref(), &network, &application, None, limits) else {
+        let Ok(WalletPage::Page(page)) =
+            scan_wallet_page(rooted.as_ref(), &network, &application, None, limits)
+        else {
             panic!("the coin's root is published");
         };
         assert_eq!(page.root, root.unwrap());
-        assert_eq!(page.coins.iter().map(|(address, _)| *address).collect::<Vec<_>>(), vec![address]);
+        assert_eq!(
+            page.coins
+                .iter()
+                .map(|(address, _)| *address)
+                .collect::<Vec<_>>(),
+            vec![address]
+        );
     }
 
     #[test]
@@ -641,12 +899,9 @@ mod tests {
             .unwrap();
             let block =
                 crate::token_intrinsic::coin_blocks::block_for_address(width, &address).unwrap();
-            let position = crate::token_intrinsic::coin_blocks::position(
-                width,
-                block,
-                staged[&block] - 1,
-            )
-            .unwrap();
+            let position =
+                crate::token_intrinsic::coin_blocks::position(width, block, staged[&block] - 1)
+                    .unwrap();
             state
                 .set(
                     &application,

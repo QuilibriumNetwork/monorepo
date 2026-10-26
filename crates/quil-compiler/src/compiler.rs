@@ -49,11 +49,7 @@ impl Compiler {
     }
 
     /// Compile QCL source code into a boolean circuit.
-    pub fn compile(
-        &mut self,
-        source: &str,
-        input_sizes: &[Vec<i32>],
-    ) -> Result<Circuit, String> {
+    pub fn compile(&mut self, source: &str, input_sizes: &[Vec<i32>]) -> Result<Circuit, String> {
         let mut pkg = Package::new("main", "{data}");
         let mut parser = Parser::new("{data}", source);
         parser.parse(&mut pkg)?;
@@ -90,11 +86,7 @@ impl Compiler {
     }
 
     /// Build SSA program from AST.
-    fn build_ssa(
-        &self,
-        pkg: &Package,
-        input_sizes: &[Vec<i32>],
-    ) -> Result<ssa::Program, String> {
+    fn build_ssa(&self, pkg: &Package, input_sizes: &[Vec<i32>]) -> Result<ssa::Program, String> {
         let main_fn = pkg
             .main()
             .ok_or_else(|| "no main function found".to_string())?;
@@ -168,7 +160,12 @@ impl Compiler {
                 program.return_values = ret_vals.clone();
                 gen.emit_ret(&ret_vals);
             }
-            ast::Stmt::Var { names, init, type_info, .. } => {
+            ast::Stmt::Var {
+                names,
+                init,
+                type_info,
+                ..
+            } => {
                 for (i, name) in names.iter().enumerate() {
                     let ti = type_info.clone().unwrap_or_default();
                     if i < init.len() {
@@ -188,7 +185,9 @@ impl Compiler {
                     }
                 }
             }
-            ast::Stmt::Assign { targets, values, .. } => {
+            ast::Stmt::Assign {
+                targets, values, ..
+            } => {
                 for (i, target) in targets.iter().enumerate() {
                     if i < values.len() {
                         let val = self.gen_expr(gen, &values[i])?;
@@ -201,7 +200,12 @@ impl Compiler {
             ast::Stmt::ExprStmt { expr, .. } => {
                 self.gen_expr(gen, expr)?;
             }
-            ast::Stmt::If { cond, body, else_body, .. } => {
+            ast::Stmt::If {
+                cond,
+                body,
+                else_body,
+                ..
+            } => {
                 let cond_val = self.gen_expr(gen, cond)?;
                 let then_block = gen.new_block("then");
                 let else_block = gen.new_block("else");
@@ -219,7 +223,13 @@ impl Compiler {
 
                 gen.set_current_block(merge_block);
             }
-            ast::Stmt::For { init, cond, post, body, .. } => {
+            ast::Stmt::For {
+                init,
+                cond,
+                post,
+                body,
+                ..
+            } => {
                 if let Some(init) = init {
                     self.gen_stmt(gen, program, init)?;
                 }
@@ -285,7 +295,9 @@ impl Compiler {
                     }
                 }
             }
-            ast::Stmt::CompoundAssign { op, target, value, .. } => {
+            ast::Stmt::CompoundAssign {
+                op, target, value, ..
+            } => {
                 if let ast::Expr::VariableRef { name, .. } = target {
                     if let Some(lhs) = gen.bindings.lookup(name) {
                         let rhs = self.gen_expr(gen, value)?;
@@ -306,29 +318,27 @@ impl Compiler {
         expr: &ast::Expr,
     ) -> Result<ssa::value::ValueId, String> {
         match expr {
-            ast::Expr::Constant { value, type_info, .. } => {
-                match value {
-                    ast::ConstValue::Int(v) => {
-                        Ok(gen.new_const(v.clone(), type_info.clone()))
-                    }
-                    ast::ConstValue::Bool(b) => {
-                        let val = if *b { 1 } else { 0 };
-                        Ok(gen.new_const(
-                            crate::mpa::Int::from_i64(val, 1),
-                            type_info.clone(),
-                        ))
-                    }
-                    _ => {
-                        Ok(gen.new_value("const", type_info.clone()))
-                    }
+            ast::Expr::Constant {
+                value, type_info, ..
+            } => match value {
+                ast::ConstValue::Int(v) => Ok(gen.new_const(v.clone(), type_info.clone())),
+                ast::ConstValue::Bool(b) => {
+                    let val = if *b { 1 } else { 0 };
+                    Ok(gen.new_const(crate::mpa::Int::from_i64(val, 1), type_info.clone()))
                 }
-            }
-            ast::Expr::VariableRef { name, .. } => {
-                gen.bindings
-                    .lookup(name)
-                    .ok_or_else(|| format!("undefined variable: {}", name))
-            }
-            ast::Expr::Binary { op, left, right, type_info, .. } => {
+                _ => Ok(gen.new_value("const", type_info.clone())),
+            },
+            ast::Expr::VariableRef { name, .. } => gen
+                .bindings
+                .lookup(name)
+                .ok_or_else(|| format!("undefined variable: {}", name)),
+            ast::Expr::Binary {
+                op,
+                left,
+                right,
+                type_info,
+                ..
+            } => {
                 let lhs = self.gen_expr(gen, left)?;
                 let rhs = self.gen_expr(gen, right)?;
                 let opcode = binary_type_to_opcode(op);
@@ -339,7 +349,12 @@ impl Compiler {
                 };
                 Ok(gen.emit_binary(opcode, lhs, rhs, result_type))
             }
-            ast::Expr::Unary { op, expr, type_info: _, .. } => {
+            ast::Expr::Unary {
+                op,
+                expr,
+                type_info: _,
+                ..
+            } => {
                 let val = self.gen_expr(gen, expr)?;
                 let opcode = match op {
                     ast::UnaryType::Minus => ssa::instructions::Opcode::Isub,
@@ -376,9 +391,7 @@ impl Compiler {
                 // Simplified: return base value.
                 Ok(base)
             }
-            _ => {
-                Ok(gen.new_value("expr", crate::types::Info::default()))
-            }
+            _ => Ok(gen.new_value("expr", crate::types::Info::default())),
         }
     }
 }

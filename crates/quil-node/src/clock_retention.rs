@@ -49,7 +49,10 @@ fn default_on(setting: Option<&str>) -> bool {
 /// Apply the `QUIL_SNAPSHOT_PINNED_MAX` pin cap to `crdt`, unless it is off.
 pub(crate) fn apply_snapshot_pin_limit(crdt: &quil_hypergraph::HypergraphCrdt, label: &str) {
     if let Some(limit) = quil_hypergraph::snapshot_pin_limit_from_env() {
-        info!(store = label, limit, "keeping store snapshots only on the newest published generations");
+        info!(
+            store = label,
+            limit, "keeping store snapshots only on the newest published generations"
+        );
         crdt.set_snapshot_pinned_limit(limit);
     }
 }
@@ -87,14 +90,16 @@ pub(crate) fn spawn_candidate_pruner(clock: &Arc<quil_store::RocksClockStore>, l
         .unwrap_or(2 * quil_types::consensus::EPOCH_LENGTH_FRAMES)
         .max(MIN_CANDIDATE_MARGIN);
     let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
-    let spawned = std::thread::Builder::new().name(format!("candidate-prune-{label}")).spawn(move || {
-        info!(store = %label, margin, "GLOBAL candidate pruning enabled");
-        loop {
-            std::thread::sleep(interval);
-            let Some(store) = clock.upgrade() else { return };
-            prune_candidates(&store, margin, &label);
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name(format!("candidate-prune-{label}"))
+        .spawn(move || {
+            info!(store = %label, margin, "GLOBAL candidate pruning enabled");
+            loop {
+                std::thread::sleep(interval);
+                let Some(store) = clock.upgrade() else { return };
+                prune_candidates(&store, margin, &label);
+            }
+        });
     if let Err(error) = spawned {
         warn!(%error, "GLOBAL candidate pruning not started");
     }
@@ -108,7 +113,9 @@ pub(crate) fn spawn_request_pruner(clock: &Arc<quil_store::RocksClockStore>, lab
         return;
     }
     let clock: Weak<quil_store::RocksClockStore> = Arc::downgrade(clock);
-    let keep = setting("QUIL_PRUNE_GLOBAL_REQUESTS_KEEP").unwrap_or(MIN_REQUEST_KEEP).max(MIN_REQUEST_KEEP);
+    let keep = setting("QUIL_PRUNE_GLOBAL_REQUESTS_KEEP")
+        .unwrap_or(MIN_REQUEST_KEEP)
+        .max(MIN_REQUEST_KEEP);
     let interval = Duration::from_secs(setting("QUIL_PRUNE_INTERVAL_SECS").unwrap_or(600).max(10));
     let spawned = std::thread::Builder::new().name(format!("request-prune-{label}")).spawn(move || {
         info!(store = %label, keep, "GLOBAL request body pruning enabled");

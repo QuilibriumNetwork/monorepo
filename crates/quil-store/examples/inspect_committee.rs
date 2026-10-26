@@ -29,12 +29,13 @@ fn main() {
     }
 
     let primary = Path::new(&args[1]);
-    let db = quil_store::RocksDb::open_for_read_only(primary)
-        .expect("open stopped RocksDB read-only");
+    let db =
+        quil_store::RocksDb::open_for_read_only(primary).expect("open stopped RocksDB read-only");
     let hg_store = Arc::new(RocksHypergraphStore::new(db.inner()));
 
     let mut reg = InMemoryProverRegistry::new();
-    reg.refresh(hg_store.as_ref()).expect("read prover registry snapshot");
+    reg.refresh(hg_store.as_ref())
+        .expect("read prover registry snapshot");
 
     println!("provers_visited={}", reg.provers_visited());
     println!("unknown_vertex_count (registry-level): n/a (private)");
@@ -60,7 +61,10 @@ fn main() {
     }
     println!();
     println!("total active weight: {}", total_weight);
-    println!("quorum_threshold = (total*2)/3 = {}", (total_weight * 2) / 3);
+    println!(
+        "quorum_threshold = (total*2)/3 = {}",
+        (total_weight * 2) / 3
+    );
     println!("timeout_threshold = same = {}", (total_weight * 2) / 3);
 
     // 1-byte bitmask weight readout: for a QC carrying bitmask 0x0B

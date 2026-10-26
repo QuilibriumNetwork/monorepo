@@ -194,14 +194,26 @@ impl DeployCtx {
     ) -> anyhow::Result<()> {
         use quil_types::proto::global::message_request::Request;
         let base: [u8; 32] = match &request.request {
-            Some(Request::TokenDeploy(_)) => quil_execution::token_intrinsic::constants::token_base_domain(),
-            Some(Request::HypergraphDeploy(_)) => quil_execution::hypergraph_intrinsic::hypergraph_base_domain(),
+            Some(Request::TokenDeploy(_)) => {
+                quil_execution::token_intrinsic::constants::token_base_domain()
+            }
+            Some(Request::HypergraphDeploy(_)) => {
+                quil_execution::hypergraph_intrinsic::hypergraph_base_domain()
+            }
             Some(Request::ComputeDeploy(_)) => quil_execution::domains::COMPUTE,
             _ => anyhow::bail!("not a deploy request"),
         };
         // Deploys execute in the global venue, which collects the global
         // prover topic.
-        crate::send::send_paid_request(self.global.clone(), client, &self.key_manager, vec![0xffu8; 32], base, request).await
+        crate::send::send_paid_request(
+            self.global.clone(),
+            client,
+            &self.key_manager,
+            vec![0xffu8; 32],
+            base,
+            request,
+        )
+        .await
     }
 
     /// Submit a write to an existing application, paid in QUIL.
@@ -211,8 +223,18 @@ impl DeployCtx {
         domain: &[u8],
         request: MessageRequest,
     ) -> anyhow::Result<()> {
-        let execution: [u8; 32] = domain.try_into().map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?;
-        crate::send::send_paid_request(self.global.clone(), client, &self.key_manager, domain.to_vec(), execution, request).await
+        let execution: [u8; 32] = domain
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?;
+        crate::send::send_paid_request(
+            self.global.clone(),
+            client,
+            &self.key_manager,
+            domain.to_vec(),
+            execution,
+            request,
+        )
+        .await
     }
 }
 

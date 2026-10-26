@@ -166,9 +166,11 @@ pub fn materialize_prover_update(
     let prover_address = &sig.address;
 
     // Load prover vertex to cross-check the address binding.
-    let prover_data = state.get(domain, prover_address, &va_disc)?.ok_or_else(|| {
-        QuilError::InvalidArgument("prover update materialize: prover not found".into())
-    })?;
+    let prover_data = state
+        .get(domain, prover_address, &va_disc)?
+        .ok_or_else(|| {
+            QuilError::InvalidArgument("prover update materialize: prover not found".into())
+        })?;
     if prover_data.is_empty() {
         return Err(QuilError::InvalidArgument(
             "prover update materialize: prover has no data".into(),
@@ -223,27 +225,63 @@ mod tests {
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
 
     struct RejectAll;
     impl KeyManager for RejectAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(false)
         }
     }
 
     struct StubProver;
     impl InclusionProver for StubProver {
-        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![0u8; 64])
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> Result<Box<dyn Multiproof>> {
             Err(QuilError::Internal("batch not supported".into()))
         }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     fn make_state() -> HypergraphState {
@@ -265,13 +303,15 @@ mod tests {
         let tree = make_prover_tree(pubkey);
         let blob = vertex_tree_to_blob(&tree);
         let va_disc = vertex_adds_discriminator().unwrap();
-        state.set(
-            &GLOBAL_INTRINSIC_ADDRESS[..],
-            &prover_addr,
-            &va_disc,
-            1,
-            blob,
-        ).unwrap();
+        state
+            .set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                &prover_addr,
+                &va_disc,
+                1,
+                blob,
+            )
+            .unwrap();
         prover_addr
     }
 
@@ -288,7 +328,10 @@ mod tests {
     #[test]
     fn domain_is_deterministic_and_32_bytes() {
         assert_eq!(prover_update_domain().unwrap().len(), 32);
-        assert_eq!(prover_update_domain().unwrap(), prover_update_domain().unwrap());
+        assert_eq!(
+            prover_update_domain().unwrap(),
+            prover_update_domain().unwrap()
+        );
     }
 
     #[test]

@@ -48,9 +48,7 @@ pub type PeerRoutingLookup = Arc<dyn Fn(&[u8]) -> Option<Vec<String>> + Send + S
 /// from a VERIFIED `CanonicalPeerInfo` is authenticated as that peer's onion key
 /// — the value a circuit initiator encapsulates to (closing the MITM gap). `None`
 /// if the peer doesn't advertise routing or published no key.
-pub fn onion_public_key_from_peer_info(
-    info: &quil_p2p::CanonicalPeerInfo,
-) -> Option<&[u8]> {
+pub fn onion_public_key_from_peer_info(info: &quil_p2p::CanonicalPeerInfo) -> Option<&[u8]> {
     info.capabilities
         .iter()
         .find(|c| c.protocol_identifier == PROTOCOL_ROUTING)
@@ -229,17 +227,15 @@ impl Transport for OnionTransport {
 
         // `http://` scheme: tonic refuses `https://` unless its own TLS is set;
         // we install our own PQNoise connector on :8340 instead.
-        let endpoint = match tonic::transport::Endpoint::from_shared(format!(
-            "http://{}",
-            socket_addr
-        )) {
-            Ok(e) => e
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .tcp_nodelay(true)
-                .http2_keep_alive_interval(std::time::Duration::from_secs(10))
-                .keep_alive_while_idle(true),
-            Err(_) => return false,
-        };
+        let endpoint =
+            match tonic::transport::Endpoint::from_shared(format!("http://{}", socket_addr)) {
+                Ok(e) => e
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .tcp_nodelay(true)
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+                    .keep_alive_while_idle(true),
+                Err(_) => return false,
+            };
         let channel = match endpoint
             .connect_with_connector(QuilPqNoiseConnector::new(seed))
             .await
@@ -255,10 +251,7 @@ impl Transport for OnionTransport {
         let mut client = OnionServiceClient::new(channel)
             .max_decoding_message_size(64 * 1024 * 1024)
             .max_encoding_message_size(64 * 1024 * 1024);
-        let response = match client
-            .connect(Request::new(ReceiverStream::new(rx)))
-            .await
-        {
+        let response = match client.connect(Request::new(ReceiverStream::new(rx))).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(error = %e, "onion connect stream failed");
@@ -361,7 +354,8 @@ impl OnionService for OnionTransport {
                         if let Some(pid) = registered {
                             let mut streams = transport.inner.server_streams.write();
                             // Only remove if still ours (peer may have reconnected).
-                            let still_ours = matches!(streams.get(&pid), Some(s) if s.same_channel(&tx));
+                            let still_ours =
+                                matches!(streams.get(&pid), Some(s) if s.same_channel(&tx));
                             if still_ours {
                                 streams.remove(&pid);
                             }
@@ -401,9 +395,8 @@ mod tests {
     #[test]
     fn send_rejects_empty_and_unknown_peers() {
         // Lookup that only knows "good".
-        let lookup: PeerRoutingLookup = Arc::new(|peer_id: &[u8]| {
-            (peer_id == b"good").then(|| vec!["addr".to_string()])
-        });
+        let lookup: PeerRoutingLookup =
+            Arc::new(|peer_id: &[u8]| (peer_id == b"good").then(|| vec!["addr".to_string()]));
         let t = OnionTransport::new(b"self".to_vec(), lookup);
         assert!(matches!(
             t.send(b"", 1, vec![9]).unwrap_err(),
@@ -450,7 +443,8 @@ mod tests {
         let pump = tokio::spawn(async move {
             let mut registered: Option<Vec<u8>> = None;
             while let Some(msg) = in_rx.recv().await {
-                if msg.peer_id.is_empty() || msg.cell.is_empty() || !t2.validate_peer(&msg.peer_id) {
+                if msg.peer_id.is_empty() || msg.cell.is_empty() || !t2.validate_peer(&msg.peer_id)
+                {
                     continue;
                 }
                 if registered.as_deref() != Some(msg.peer_id.as_slice()) {

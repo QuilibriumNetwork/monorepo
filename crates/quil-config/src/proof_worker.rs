@@ -142,22 +142,37 @@ impl ProofWorkerConfig {
             return Err("proofWorker.addressSpaceBytes is out of range".into());
         }
         if !(1..=64).contains(&self.max_concurrent) {
-            return Err(format!("proofWorker.maxConcurrent must be within 1..=64, got {}", self.max_concurrent));
+            return Err(format!(
+                "proofWorker.maxConcurrent must be within 1..=64, got {}",
+                self.max_concurrent
+            ));
         }
         if !(1..=8).contains(&self.native_threads) {
-            return Err(format!("proofWorker.nativeThreads must be within 1..=8, got {}", self.native_threads));
+            return Err(format!(
+                "proofWorker.nativeThreads must be within 1..=8, got {}",
+                self.native_threads
+            ));
         }
         if !(1..=10).contains(&self.verify_budget_secs) {
-            return Err(format!("proofWorker.verifyBudgetSecs must be within 1..=10, got {}", self.verify_budget_secs));
+            return Err(format!(
+                "proofWorker.verifyBudgetSecs must be within 1..=10, got {}",
+                self.verify_budget_secs
+            ));
         }
         if self.admission_wait_ms > 60_000 {
-            return Err(format!("proofWorker.admissionWaitMs must be within 0..=60000, got {}", self.admission_wait_ms));
+            return Err(format!(
+                "proofWorker.admissionWaitMs must be within 0..=60000, got {}",
+                self.admission_wait_ms
+            ));
         }
         if self.max_resident_bytes != 0 && self.max_resident_bytes < (256 << 20) {
             return Err("proofWorker.maxResidentBytes must be 0 (off) or at least 256 MiB".into());
         }
         if !self.path.is_empty() && !std::path::Path::new(&self.path).is_absolute() {
-            return Err(format!("proofWorker.path must be absolute, got {:?}", self.path));
+            return Err(format!(
+                "proofWorker.path must be absolute, got {:?}",
+                self.path
+            ));
         }
         Ok(())
     }
@@ -180,21 +195,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, "/opt/quil/quil-amount-proof-worker");
-        assert_eq!((parsed.cpu_seconds, parsed.wall_timeout_secs, parsed.address_space_bytes), (600, 900, 8 << 30));
+        assert_eq!(
+            (
+                parsed.cpu_seconds,
+                parsed.wall_timeout_secs,
+                parsed.address_space_bytes
+            ),
+            (600, 900, 8 << 30)
+        );
         parsed.validate().unwrap();
         let empty: ProofWorkerConfig = serde_yaml::from_str("{}").unwrap();
         assert_eq!(empty, ProofWorkerConfig::default());
         let encoded = serde_yaml::to_string(&parsed).unwrap();
-        assert_eq!(serde_yaml::from_str::<ProofWorkerConfig>(&encoded).unwrap(), parsed);
+        assert_eq!(
+            serde_yaml::from_str::<ProofWorkerConfig>(&encoded).unwrap(),
+            parsed
+        );
     }
 
     #[test]
     fn validation_rejects_out_of_range_and_relative_paths() {
         let base = ProofWorkerConfig::default();
-        assert!(ProofWorkerConfig { cpu_seconds: 3601, wall_timeout_secs: 3601, ..base.clone() }.validate().is_err());
-        assert!(ProofWorkerConfig { cpu_seconds: 1800, wall_timeout_secs: 600, ..base.clone() }.validate().is_err());
-        assert!(ProofWorkerConfig { address_space_bytes: u64::MAX, ..base.clone() }.validate().is_err());
-        assert!(ProofWorkerConfig { path: "relative/worker".into(), ..base.clone() }.validate().is_err());
-        assert!(ProofWorkerConfig { path: "/abs/worker".into(), ..base }.validate().is_ok());
+        assert!(ProofWorkerConfig {
+            cpu_seconds: 3601,
+            wall_timeout_secs: 3601,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ProofWorkerConfig {
+            cpu_seconds: 1800,
+            wall_timeout_secs: 600,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ProofWorkerConfig {
+            address_space_bytes: u64::MAX,
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ProofWorkerConfig {
+            path: "relative/worker".into(),
+            ..base.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ProofWorkerConfig {
+            path: "/abs/worker".into(),
+            ..base
+        }
+        .validate()
+        .is_ok());
     }
 }

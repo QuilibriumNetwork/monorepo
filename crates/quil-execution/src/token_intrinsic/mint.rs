@@ -1,7 +1,10 @@
 //! QUIL reward-mint admission. Clock-backed admission resolves the
 //! cited global root; callers must serialize global reward/token mutation.
 #[cfg(test)]
-use super::{roots, materialize, state::{self, SnapshotLimits}};
+use super::{
+    materialize, roots,
+    state::{self, SnapshotLimits},
+};
 use crate::{
     domains, global_schema,
     hypergraph_state::{vertex_adds_discriminator, HypergraphState},
@@ -152,7 +155,18 @@ pub fn verify_mint_from_clock(
     max_outputs: usize,
     budget: NativeBudget,
 ) -> Result<VerifiedMint> {
-    verify_mint_from_clock_with_worker(state, clock, network, application, finalized_global_frame, bytes, max_claims, max_outputs, budget, None)
+    verify_mint_from_clock_with_worker(
+        state,
+        clock,
+        network,
+        application,
+        finalized_global_frame,
+        bytes,
+        max_claims,
+        max_outputs,
+        budget,
+        None,
+    )
 }
 
 pub(crate) fn verify_mint_from_clock_with_worker(
@@ -165,7 +179,9 @@ pub(crate) fn verify_mint_from_clock_with_worker(
     max_claims: usize,
     max_outputs: usize,
     budget: NativeBudget,
-    worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+    worker: Option<
+        &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+    >,
 ) -> Result<VerifiedMint> {
     let mint = Mint::decode(bytes, network, application)
         .map_err(|_| invalid("invalid encoding or context"))?;
@@ -226,14 +242,27 @@ fn verify_decoded_mint(
     max_claims: usize,
     max_outputs: usize,
     budget: NativeBudget,
-    worker: Option<(&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier, &[u8])>,
+    worker: Option<(
+        &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+        &[u8],
+    )>,
 ) -> Result<VerifiedMint> {
     state.require_full_domain_coverage(&domains::GLOBAL)?;
     prepare_rewards(state, &mint.statement)?;
     check_authorization(&mint, finalized_global_frame, trusted_reward_root)?;
     if let Some((worker, bytes)) = worker {
-        super::dispatch::verify_in_worker(worker, &mint.statement.network, &mint.statement.application, bytes,
-            quil_lattice_ct::confidential::transfer::CompileLimits { max_inputs: max_claims, max_outputs, max_depth: 1 }, budget)?;
+        super::dispatch::verify_in_worker(
+            worker,
+            &mint.statement.network,
+            &mint.statement.application,
+            bytes,
+            quil_lattice_ct::confidential::transfer::CompileLimits {
+                max_inputs: max_claims,
+                max_outputs,
+                max_depth: 1,
+            },
+            budget,
+        )?;
     } else {
         let relation = mint
             .statement
@@ -283,7 +312,6 @@ impl VerifiedMint {
     pub fn fee(&self) -> u128 {
         self.mint.statement.fee
     }
-
 }
 
 #[cfg(test)]
@@ -456,9 +484,7 @@ mod tests {
 
     #[test]
     fn mint_dispatch_policy_rejects_wrong_venue_limits_fee_and_future_citation() {
-        use crate::{
-            engines::ExecutionMode, token_intrinsic::dispatch::TokenPolicy,
-        };
+        use crate::{engines::ExecutionMode, token_intrinsic::dispatch::TokenPolicy};
         use quil_lattice_ct::confidential::transfer::CompileLimits;
         let f = fixture(HypergraphState::new(Arc::new(
             quil_hypergraph::HypergraphCrdt::new(
@@ -485,10 +511,16 @@ mod tests {
             },
         };
         let tp = crate::token_engine::TYPE_LATTICE_MINT;
-        assert!(policy.check_venue(ExecutionMode::Global, &s.application, tp).is_ok());
-        assert!(policy.check_venue(ExecutionMode::Application, &s.application, tp).is_err());
+        assert!(policy
+            .check_venue(ExecutionMode::Global, &s.application, tp)
+            .is_ok());
+        assert!(policy
+            .check_venue(ExecutionMode::Application, &s.application, tp)
+            .is_err());
         // Custom-token issuance shares the type prefix but is application state.
-        assert!(policy.check_venue(ExecutionMode::Application, &[7; 32], tp).is_ok());
+        assert!(policy
+            .check_venue(ExecutionMode::Application, &[7; 32], tp)
+            .is_ok());
         assert!(policy.preflight(&s.application, &bytes, tp).is_ok());
         let mut bad = policy;
         bad.limits.max_inputs = 1;
@@ -573,7 +605,10 @@ mod tests {
         // staging: a matching boundary group still selects only some data.
         let global_path = quil_tries::get_full_path(&domains::GLOBAL);
         let boundary = domains::GLOBAL.len() * 8 / quil_tries::BRANCH_BITS + 1;
-        f.state.crdt().set_covered_prefix(&global_path[..boundary]).unwrap();
+        f.state
+            .crdt()
+            .set_covered_prefix(&global_path[..boundary])
+            .unwrap();
         assert!(
             matches!(verify(2, 2), Err(QuilError::ExecutionUnavailable(e))
             if e.contains("complete domain coverage"))
@@ -676,18 +711,40 @@ mod tests {
                 Self::Manager(manager) => manager.validate_message(frame, app, bytes),
             }
         }
-        fn process_message(&self, frame: u64, fee: &num_bigint::BigInt, app: &[u8], bytes: &[u8])
-            -> Result<quil_types::execution::ProcessMessageResult> {
-            self.process_message_with_context(quil_types::execution::FrameExecutionContext {
-                frame_number: frame, finalized_global_frame: None, venue: None, shard: quil_types::execution::ShardPath::WHOLE
-            }, fee, app, bytes)
+        fn process_message(
+            &self,
+            frame: u64,
+            fee: &num_bigint::BigInt,
+            app: &[u8],
+            bytes: &[u8],
+        ) -> Result<quil_types::execution::ProcessMessageResult> {
+            self.process_message_with_context(
+                quil_types::execution::FrameExecutionContext {
+                    frame_number: frame,
+                    finalized_global_frame: None,
+                    venue: None,
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                },
+                fee,
+                app,
+                bytes,
+            )
         }
-        fn process_message_with_context(&self, context: quil_types::execution::FrameExecutionContext,
-            fee: &num_bigint::BigInt, app: &[u8], bytes: &[u8]) -> Result<quil_types::execution::ProcessMessageResult> {
+        fn process_message_with_context(
+            &self,
+            context: quil_types::execution::FrameExecutionContext,
+            fee: &num_bigint::BigInt,
+            app: &[u8],
+            bytes: &[u8],
+        ) -> Result<quil_types::execution::ProcessMessageResult> {
             use quil_types::execution::ShardExecutionEngine;
             match self {
-                Self::Token(engine) => engine.process_message_with_context(context, fee, app, bytes),
-                Self::Manager(manager) => manager.process_message_with_context(context, fee, app, bytes),
+                Self::Token(engine) => {
+                    engine.process_message_with_context(context, fee, app, bytes)
+                }
+                Self::Manager(manager) => {
+                    manager.process_message_with_context(context, fee, app, bytes)
+                }
             }
         }
     }
@@ -698,19 +755,36 @@ mod tests {
         clock: Arc<dyn quil_types::store::ClockStore>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         policy: super::super::dispatch::TokenPolicy,
-        worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+        worker: Option<
+            &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+        >,
     ) -> MintExecutor {
         if let Some(worker) = worker {
-            MintExecutor::Manager(crate::manager::ExecutionEngineManager::new(
-                Arc::new(NoopInclusionProver), key_manager, crdt,
-                Arc::new(crate::testing::NoopCircuitCompiler), clock,
-                Arc::new(crate::testing::NoopHypergraphConfigResolver),
-                mode == crate::engines::ExecutionMode::Global,
-            ).with_token_worker(policy, worker.clone()).unwrap())
+            MintExecutor::Manager(
+                crate::manager::ExecutionEngineManager::new(
+                    Arc::new(NoopInclusionProver),
+                    key_manager,
+                    crdt,
+                    Arc::new(crate::testing::NoopCircuitCompiler),
+                    clock,
+                    Arc::new(crate::testing::NoopHypergraphConfigResolver),
+                    mode == crate::engines::ExecutionMode::Global,
+                )
+                .with_token_worker(policy, worker.clone())
+                .unwrap(),
+            )
         } else {
-            MintExecutor::Token(crate::engines::TokenExecutionEngine::new_with_state(
-                mode, Arc::new(NoopInclusionProver), crdt, key_manager, clock,
-            ).with_token_proofs(policy).unwrap())
+            MintExecutor::Token(
+                crate::engines::TokenExecutionEngine::new_with_state(
+                    mode,
+                    Arc::new(NoopInclusionProver),
+                    crdt,
+                    key_manager,
+                    clock,
+                )
+                .with_token_proofs(policy)
+                .unwrap(),
+            )
         }
     }
 
@@ -730,7 +804,9 @@ mod tests {
     }
 
     fn reward_mint_authorization_roundtrip(
-        worker: Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+        worker: Option<
+            quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+        >,
     ) {
         let started = std::time::Instant::now();
         let directory = tempfile::tempdir().unwrap();
@@ -768,30 +844,58 @@ mod tests {
             let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
             clock.seed_frame(quil_types::proto::global::GlobalFrame {
                 header: Some(quil_types::proto::global::GlobalFrameHeader {
-                    frame_number: s.cited_frame, prover_tree_commitment: s.reward_root.to_vec(),
+                    frame_number: s.cited_frame,
+                    prover_tree_commitment: s.reward_root.to_vec(),
                     ..Default::default()
-                }), ..Default::default()
+                }),
+                ..Default::default()
             });
             let stubs = crate::testing::NoopExecutionCrypto::new();
-            let make_engine = |mode, native_budget, override_worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>| {
-                mint_executor(mode, crdt.clone(), clock.clone(), stubs.key_manager.clone(),
+            let make_engine = |mode,
+                               native_budget,
+                               override_worker: Option<
+                &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+            >| {
+                mint_executor(
+                    mode,
+                    crdt.clone(),
+                    clock.clone(),
+                    stubs.key_manager.clone(),
                     super::super::dispatch::TokenPolicy {
                         network: s.network,
                         limits: quil_lattice_ct::confidential::transfer::CompileLimits {
-                            max_inputs: 2, max_outputs: 2, max_depth: 32,
-                        }, snapshots: SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 128 },
+                            max_inputs: 2,
+                            max_outputs: 2,
+                            max_depth: 32,
+                        },
+                        snapshots: SnapshotLimits {
+                            max_coins: 8,
+                            max_depth: 32,
+                            max_nodes: 128,
+                        },
                         native_budget,
-                    }, override_worker.or(worker.as_ref()))
+                    },
+                    override_worker.or(worker.as_ref()),
+                )
             };
             let carrier = quil_types::proto::global::MessageRequest {
-                request: Some(quil_types::proto::global::message_request::Request::TokenOperation(
-                    quil_types::proto::token::TokenOperation { canonical_bytes: bytes.clone() })),
+                request: Some(
+                    quil_types::proto::global::message_request::Request::TokenOperation(
+                        quil_types::proto::token::TokenOperation {
+                            canonical_bytes: bytes.clone(),
+                        },
+                    ),
+                ),
                 ..Default::default()
             };
-            let inner = crate::message_envelope::proto_message_request_to_canonical_inner_bytes(&carrier).unwrap();
+            let inner =
+                crate::message_envelope::proto_message_request_to_canonical_inner_bytes(&carrier)
+                    .unwrap();
             assert_eq!(inner, bytes);
-            let message = crate::message_envelope::CanonicalMessageRequest::wrap(inner).unwrap()
-                .to_canonical_bytes().unwrap();
+            let message = crate::message_envelope::CanonicalMessageRequest::wrap(inner)
+                .unwrap()
+                .to_canonical_bytes()
+                .unwrap();
             let app = make_engine(crate::engines::ExecutionMode::Application, budget, None);
             assert!(app.validate_message(2, &s.application, &message).is_err());
             if worker.is_some() {
@@ -800,30 +904,65 @@ mod tests {
                 let missing_path = directory.path().join("absent-proof-worker");
                 let missing = quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::new(
                     missing_path, 1, std::time::Duration::from_secs(2)).unwrap();
-                let failed = make_engine(crate::engines::ExecutionMode::Global, budget, Some(&missing));
+                let failed = make_engine(
+                    crate::engines::ExecutionMode::Global,
+                    budget,
+                    Some(&missing),
+                );
                 let before = f.state.changeset_len();
-                assert!(matches!(failed.process_message(2, &num_bigint::BigInt::from(0),
-                    &s.application, &message), Err(QuilError::ExecutionUnavailable(_))));
+                assert!(matches!(
+                    failed.process_message(
+                        2,
+                        &num_bigint::BigInt::from(0),
+                        &s.application,
+                        &message
+                    ),
+                    Err(QuilError::ExecutionUnavailable(_))
+                ));
                 assert_eq!(f.state.changeset_len(), before);
             }
-            let unavailable = make_engine(crate::engines::ExecutionMode::Global, NativeBudget { max_native_bytes: 0 }, None);
-            assert!(matches!(unavailable.process_message(2, &num_bigint::BigInt::from(0),
-                &s.application, &message), Err(QuilError::ExecutionUnavailable(_))));
+            let unavailable = make_engine(
+                crate::engines::ExecutionMode::Global,
+                NativeBudget {
+                    max_native_bytes: 0,
+                },
+                None,
+            );
+            assert!(matches!(
+                unavailable.process_message(
+                    2,
+                    &num_bigint::BigInt::from(0),
+                    &s.application,
+                    &message
+                ),
+                Err(QuilError::ExecutionUnavailable(_))
+            ));
             let engine = make_engine(crate::engines::ExecutionMode::Global, budget, None);
-            engine.validate_message(2, &s.application, &message).unwrap();
-            engine.process_message(2, &num_bigint::BigInt::from(0), &s.application, &message).unwrap();
+            engine
+                .validate_message(2, &s.application, &message)
+                .unwrap();
+            engine
+                .process_message(2, &num_bigint::BigInt::from(0), &s.application, &message)
+                .unwrap();
             receipt = receipt_address(s).unwrap();
             let disc = vertex_adds_discriminator().unwrap();
-            let authorization = f.state.get(&domains::GLOBAL, &receipt, &disc).unwrap().unwrap();
-            engine.process_message(2, &num_bigint::BigInt::from(0), &s.application, &message).unwrap_err();
-            assert_eq!(f.state.get(&domains::GLOBAL, &receipt, &disc).unwrap(), Some(authorization));
+            let authorization = f
+                .state
+                .get(&domains::GLOBAL, &receipt, &disc)
+                .unwrap()
+                .unwrap();
+            engine
+                .process_message(2, &num_bigint::BigInt::from(0), &s.application, &message)
+                .unwrap_err();
+            assert_eq!(
+                f.state.get(&domains::GLOBAL, &receipt, &disc).unwrap(),
+                Some(authorization)
+            );
             // The reward mint authorizes and debits; it creates no coins in
             // any venue. Its claim does, through the commit.
-            assert!(
-                roots::read_current(&f.state, &s.network, &s.application)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(roots::read_current(&f.state, &s.network, &s.application)
+                .unwrap()
+                .is_none());
             let disc = vertex_adds_discriminator().unwrap();
             for (address, _) in &f.rewards {
                 let blob = f
@@ -897,18 +1036,43 @@ mod tests {
         // The shard's latest anchor (3) bounds the citation; a claim cannot cite
         // a global frame after it, and with no stored frame at or before a lower
         // anchor there is nothing to cite yet.
-        let witness = super::super::mint_authorization_witness::witness(&state, clock.as_ref(), &receipt, Some(3)).unwrap();
+        let witness = super::super::mint_authorization_witness::witness(
+            &state,
+            clock.as_ref(),
+            &receipt,
+            Some(3),
+        )
+        .unwrap();
         assert_eq!(witness.cited_frame, 3);
         assert_eq!(witness.forest_proof, reopened);
-        assert!(!super::super::mint_authorization_witness::witness(&state, clock.as_ref(), &[9; 32], Some(3)).unwrap().found);
-        assert!(super::super::mint_authorization_witness::witness(&state, clock.as_ref(), &receipt, Some(2)).is_err());
+        assert!(
+            !super::super::mint_authorization_witness::witness(
+                &state,
+                clock.as_ref(),
+                &[9; 32],
+                Some(3)
+            )
+            .unwrap()
+            .found
+        );
+        assert!(super::super::mint_authorization_witness::witness(
+            &state,
+            clock.as_ref(),
+            &receipt,
+            Some(2)
+        )
+        .is_err());
         let claim = super::super::mint_authorization::claim_from_witness(s, witness).unwrap();
         let claim_bytes = claim.encode().unwrap();
-        assert!(bytes.len() + claim_bytes.len()
-            < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES);
+        assert!(
+            bytes.len() + claim_bytes.len()
+                < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES
+        );
         let execution = quil_types::execution::FrameExecutionContext {
             frame_number: 7,
-            finalized_global_frame: Some(3), venue: None, shard: quil_types::execution::ShardPath::WHOLE
+            finalized_global_frame: Some(3),
+            venue: None,
+            shard: quil_types::execution::ShardPath::WHOLE,
         };
         let verify_claim = || {
             super::super::mint_claim::verify_from_clock(
@@ -921,7 +1085,10 @@ mod tests {
             )
             .unwrap()
         };
-        for mode in [crate::engines::ExecutionMode::Application, crate::engines::ExecutionMode::Global] {
+        for mode in [
+            crate::engines::ExecutionMode::Application,
+            crate::engines::ExecutionMode::Global,
+        ] {
             let app_directory = tempfile::tempdir().unwrap();
             let app_state = disk_state(app_directory.path());
             let limits = SnapshotLimits {
@@ -933,57 +1100,131 @@ mod tests {
             let policy = super::super::dispatch::TokenPolicy {
                 network: s.network,
                 limits: quil_lattice_ct::confidential::transfer::CompileLimits {
-                    max_inputs: 2, max_outputs: 2, max_depth: 32,
+                    max_inputs: 2,
+                    max_outputs: 2,
+                    max_depth: 32,
                 },
                 snapshots: limits,
                 native_budget: budget,
             };
-            let engine = mint_executor(mode, app_state.crdt().clone(), clock.clone(),
-                stubs.key_manager.clone(), policy, worker.as_ref());
-            let message = crate::message_envelope::CanonicalMessageRequest::wrap(claim_bytes.clone())
-                .unwrap().to_canonical_bytes().unwrap();
-            engine.validate_message(7, &s.application, &message).unwrap();
+            let engine = mint_executor(
+                mode,
+                app_state.crdt().clone(),
+                clock.clone(),
+                stubs.key_manager.clone(),
+                policy,
+                worker.as_ref(),
+            );
+            let message =
+                crate::message_envelope::CanonicalMessageRequest::wrap(claim_bytes.clone())
+                    .unwrap()
+                    .to_canonical_bytes()
+                    .unwrap();
+            engine
+                .validate_message(7, &s.application, &message)
+                .unwrap();
             if mode == crate::engines::ExecutionMode::Application {
-                assert!(matches!(engine.process_message(7, &num_bigint::BigInt::from(0),
-                    &s.application, &message), Err(QuilError::ExecutionUnavailable(_))));
+                assert!(matches!(
+                    engine.process_message(
+                        7,
+                        &num_bigint::BigInt::from(0),
+                        &s.application,
+                        &message
+                    ),
+                    Err(QuilError::ExecutionUnavailable(_))
+                ));
             } else {
                 // An explicit anchor is authoritative in either venue and bounds
                 // the citation: anchor 2 cannot admit the root of frame 3.
-                engine.process_message_with_context(quil_types::execution::FrameExecutionContext {
-                    frame_number: 100, finalized_global_frame: Some(2), venue: None, shard: quil_types::execution::ShardPath::WHOLE
-                }, &num_bigint::BigInt::from(0), &s.application, &message).unwrap_err();
+                engine
+                    .process_message_with_context(
+                        quil_types::execution::FrameExecutionContext {
+                            frame_number: 100,
+                            finalized_global_frame: Some(2),
+                            venue: None,
+                            shard: quil_types::execution::ShardPath::WHOLE,
+                        },
+                        &num_bigint::BigInt::from(0),
+                        &s.application,
+                        &message,
+                    )
+                    .unwrap_err();
             }
-            assert!(roots::read_current(&app_state, &s.network, &s.application).unwrap().is_none());
+            assert!(roots::read_current(&app_state, &s.network, &s.application)
+                .unwrap()
+                .is_none());
             let claim_execution = quil_types::execution::FrameExecutionContext {
-                finalized_global_frame: if mode == crate::engines::ExecutionMode::Global { None } else { Some(3) },
+                finalized_global_frame: if mode == crate::engines::ExecutionMode::Global {
+                    None
+                } else {
+                    Some(3)
+                },
                 ..execution
             };
-            engine.process_message_with_context(claim_execution, &num_bigint::BigInt::from(0),
-                &s.application, &message).unwrap();
-            let accepted_root = roots::read_current(&app_state, &s.network, &s.application).unwrap();
+            engine
+                .process_message_with_context(
+                    claim_execution,
+                    &num_bigint::BigInt::from(0),
+                    &s.application,
+                    &message,
+                )
+                .unwrap();
+            let accepted_root =
+                roots::read_current(&app_state, &s.network, &s.application).unwrap();
             if mode == crate::engines::ExecutionMode::Application {
                 // An app shard verifies and relays: the coins are placed by the
                 // owning shard once the global frame commits the claim, so
                 // nothing is written here and a re-run verifies just as well.
                 assert!(accepted_root.is_none());
-                engine.process_message_with_context(claim_execution, &num_bigint::BigInt::from(0),
-                    &s.application, &message).unwrap();
-                assert!(roots::read_current(&app_state, &s.network, &s.application).unwrap().is_none());
+                engine
+                    .process_message_with_context(
+                        claim_execution,
+                        &num_bigint::BigInt::from(0),
+                        &s.application,
+                        &message,
+                    )
+                    .unwrap();
+                assert!(roots::read_current(&app_state, &s.network, &s.application)
+                    .unwrap()
+                    .is_none());
                 verify_claim();
                 continue;
             }
             // The global venue commits and places inline, once.
             assert!(accepted_root.is_some());
-            engine.process_message_with_context(claim_execution, &num_bigint::BigInt::from(0),
-                &s.application, &message).unwrap_err();
-            assert_eq!(roots::read_current(&app_state, &s.network, &s.application).unwrap(), accepted_root);
+            engine
+                .process_message_with_context(
+                    claim_execution,
+                    &num_bigint::BigInt::from(0),
+                    &s.application,
+                    &message,
+                )
+                .unwrap_err();
+            assert_eq!(
+                roots::read_current(&app_state, &s.network, &s.application).unwrap(),
+                accepted_root
+            );
             let context = parameter_context(&s.network, &s.application);
-            let output_addresses: Vec<_> = s.outputs.iter()
-                .map(|output| state::coin_identity(&context, execution.frame_number, output).unwrap().0)
+            let output_addresses: Vec<_> = s
+                .outputs
+                .iter()
+                .map(|output| {
+                    state::coin_identity(&context, execution.frame_number, output)
+                        .unwrap()
+                        .0
+                })
                 .collect();
             let claim_tp = crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
             let replay = crate::token_intrinsic::commit_apply::commit_and_place(
-                &app_state, 8, &s.network, &s.application, claim_tp, &claim_bytes, limits).unwrap_err();
+                &app_state,
+                8,
+                &s.network,
+                &s.application,
+                claim_tp,
+                &claim_bytes,
+                limits,
+            )
+            .unwrap_err();
             assert!(replay.to_string().contains("already decided"), "{replay}");
             app_state.rollback_to(0);
             app_state.commit().unwrap();
@@ -993,7 +1234,15 @@ mod tests {
             drop(app_state);
             let app_state = disk_state(app_directory.path());
             let replay = crate::token_intrinsic::commit_apply::commit_and_place(
-                &app_state, 8, &s.network, &s.application, claim_tp, &claim_bytes, limits).unwrap_err();
+                &app_state,
+                8,
+                &s.network,
+                &s.application,
+                claim_tp,
+                &claim_bytes,
+                limits,
+            )
+            .unwrap_err();
             assert!(replay.to_string().contains("already decided"), "{replay}");
             app_state.rollback_to(0);
             let disc = vertex_adds_discriminator().unwrap();
@@ -1006,9 +1255,7 @@ mod tests {
                     root: quil_tries::deserialize_go_tree(&blob).unwrap(),
                 };
                 let context = parameter_context(&s.network, &s.application);
-                let coin = state::read_coin(&tree, &context)
-                    .unwrap()
-                    .unwrap();
+                let coin = state::read_coin(&tree, &context).unwrap().unwrap();
                 assert_eq!(
                     open_output(
                         &context,
@@ -1041,14 +1288,10 @@ mod tests {
             Err(QuilError::InvalidArgument(e)) if e.contains("authorization already consumed"))
         );
         state.abort();
-        assert!(
-            roots::read_current(&state, &s.network, &s.application)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            bytes.len() < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES
-        );
+        assert!(roots::read_current(&state, &s.network, &s.application)
+            .unwrap()
+            .is_none());
+        assert!(bytes.len() < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES);
         assert!(proof.len() < super::super::reward_witness::MAX_REWARD_PROOF_BYTES);
         if let Ok(path) = std::env::var("QUIL_TEST_TRANSACTION_PATH") {
             std::fs::write(&path, &bytes).unwrap();
@@ -1086,9 +1329,7 @@ mod tests {
         f.mint.proof = native::prove(&relation, budget).unwrap();
         drop(relation);
         let bytes = f.mint.encode().unwrap();
-        assert!(
-            bytes.len() < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES
-        );
+        assert!(bytes.len() < quil_lattice_ct::confidential::transfer::TARGET_TRANSACTION_BYTES);
         let s = &f.mint.statement;
         // Persist and reopen the canonical global frame independently of the
         // token store, as a node loading reward history would do.
@@ -1151,8 +1392,15 @@ mod tests {
         // The mint authorizes its claims and debits the rewards; the coins
         // come later, from claims the global frame commits.
         let receipt = verified.authorize_global(&f.state, 2).unwrap();
-        assert!(f.state.get(&domains::GLOBAL, &receipt,
-            &vertex_adds_discriminator().unwrap()).unwrap().is_some());
+        assert!(f
+            .state
+            .get(
+                &domains::GLOBAL,
+                &receipt,
+                &vertex_adds_discriminator().unwrap()
+            )
+            .unwrap()
+            .is_some());
         assert!(f.state.changeset_len() > checkpoint);
         for (address, _) in &f.rewards {
             let blob = f
@@ -1174,8 +1422,13 @@ mod tests {
         drop(f.state);
         let state = disk_state(directory.path());
         // Authorization creates no coins, so the accumulator is untouched.
-        assert!(roots::read_current(&state, &s.network, &s.application).unwrap().is_none());
-        assert!(state.get(&domains::GLOBAL, &receipt, &disc).unwrap().is_some());
+        assert!(roots::read_current(&state, &s.network, &s.application)
+            .unwrap()
+            .is_none());
+        assert!(state
+            .get(&domains::GLOBAL, &receipt, &disc)
+            .unwrap()
+            .is_some());
         // Replenishing rewards does not revive this already consumed signed mint.
         for (address, original) in &f.rewards {
             state

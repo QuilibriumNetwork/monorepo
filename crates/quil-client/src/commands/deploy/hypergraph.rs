@@ -15,8 +15,8 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         .iter()
         .find(|a| a.ends_with(".rdf"))
         .ok_or_else(|| anyhow::anyhow!("a <schema>.rdf file argument is required"))?;
-    let rdf_schema = std::fs::read(rdf_file)
-        .map_err(|e| anyhow::anyhow!("read RDF file {rdf_file:?}: {e}"))?;
+    let rdf_schema =
+        std::fs::read(rdf_file).map_err(|e| anyhow::anyhow!("read RDF file {rdf_file:?}: {e}"))?;
     if rdf_schema.is_empty() {
         anyhow::bail!("RDF schema file {rdf_file:?} is empty");
     }
@@ -36,9 +36,14 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         rdf_schema,
     };
 
-    let domain = quil_execution::hypergraph_intrinsic::HypergraphConfiguration::from_proto(deploy.config.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("hypergraph configuration missing"))
-        .and_then(|config| quil_execution::hypergraph_intrinsic::hypergraph_deploy_domain(&config).map_err(|e| anyhow::anyhow!("deploy domain: {e}")))?;
+    let domain = quil_execution::hypergraph_intrinsic::HypergraphConfiguration::from_proto(
+        deploy.config.as_ref(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("hypergraph configuration missing"))
+    .and_then(|config| {
+        quil_execution::hypergraph_intrinsic::hypergraph_deploy_domain(&config)
+            .map_err(|e| anyhow::anyhow!("deploy domain: {e}"))
+    })?;
     let mut client = dc.connect().await?;
     let request = MessageRequest {
         request: Some(Request::HypergraphDeploy(deploy)),

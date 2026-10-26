@@ -21,12 +21,15 @@ use tracing::{debug, info, warn};
 
 use quil_config::HealthReportConfig;
 use quil_p2p::PeerId;
-use quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient;
-use quil_types::proto::diagnostics::diagnostics_service_server::{DiagnosticsService, DiagnosticsServiceServer};
-use quil_types::proto::diagnostics::{
-    Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase, WorkerHealth,
-};
 use quil_types::consensus::JoinWait;
+use quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient;
+use quil_types::proto::diagnostics::diagnostics_service_server::{
+    DiagnosticsService, DiagnosticsServiceServer,
+};
+use quil_types::proto::diagnostics::{
+    Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure,
+    RecoveryPhase, WorkerHealth,
+};
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
 use crate::node_service::WorkerEntry;
@@ -66,18 +69,39 @@ const PHASES: [(&str, Phase); 11] = [
 
 const BLOCKERS: [(&str, Blocker); 14] = [
     ("waiting for transport", Blocker::WaitingForTransport),
-    ("restarting consensus host", Blocker::RestartingConsensusHost),
+    (
+        "restarting consensus host",
+        Blocker::RestartingConsensusHost,
+    ),
     ("engine exited", Blocker::EngineExited),
     ("awaiting successor", Blocker::AwaitingSuccessor),
     ("staging shard data", Blocker::StagingShardData),
-    ("awaiting closing certificate", Blocker::AwaitingClosingCertificate),
-    ("awaiting allocation activation", Blocker::AwaitingAllocationActivation),
+    (
+        "awaiting closing certificate",
+        Blocker::AwaitingClosingCertificate,
+    ),
+    (
+        "awaiting allocation activation",
+        Blocker::AwaitingAllocationActivation,
+    ),
     ("checkpoint mismatch", Blocker::CheckpointMismatch),
     ("state unavailable", Blocker::StateUnavailable),
-    ("committee admission unavailable", Blocker::CommitteeAdmissionUnavailable),
-    ("consensus startup unavailable", Blocker::ConsensusStartupUnavailable),
-    ("session identity unavailable", Blocker::SessionIdentityUnavailable),
-    ("session state unavailable", Blocker::SessionStateUnavailable),
+    (
+        "committee admission unavailable",
+        Blocker::CommitteeAdmissionUnavailable,
+    ),
+    (
+        "consensus startup unavailable",
+        Blocker::ConsensusStartupUnavailable,
+    ),
+    (
+        "session identity unavailable",
+        Blocker::SessionIdentityUnavailable,
+    ),
+    (
+        "session state unavailable",
+        Blocker::SessionStateUnavailable,
+    ),
     ("storage writes stopped", Blocker::StorageWriteFailed),
 ];
 
@@ -100,11 +124,17 @@ const FAILURES: [(&str, RecoveryFailure); 6] = [
 ];
 
 fn lookup<T: Copy + PartialEq>(table: &[(&'static str, T)], text: &str) -> Option<T> {
-    table.iter().find(|(name, _)| *name == text).map(|(_, value)| *value)
+    table
+        .iter()
+        .find(|(name, _)| *name == text)
+        .map(|(_, value)| *value)
 }
 
 fn name<T: Copy + PartialEq>(table: &[(&'static str, T)], value: T) -> Option<&'static str> {
-    table.iter().find(|(_, v)| *v == value).map(|(name, _)| *name)
+    table
+        .iter()
+        .find(|(_, v)| *v == value)
+        .map(|(name, _)| *name)
 }
 
 /// The phase of a worker record's `state` and `blocker`.
@@ -209,9 +239,15 @@ pub fn worker_health(
             worker.join_confirm_epoch = Some(epoch);
         }
         worker.activation_frame = Some(wait.activation_frame());
-        if matches!(worker.phase(), Phase::Unspecified | Phase::Starting | Phase::Waiting | Phase::Blocked
-            | Phase::Unknown | Phase::Running)
-        {
+        if matches!(
+            worker.phase(),
+            Phase::Unspecified
+                | Phase::Starting
+                | Phase::Waiting
+                | Phase::Blocked
+                | Phase::Unknown
+                | Phase::Running
+        ) {
             worker.set_phase(Phase::Joining);
         }
     }
@@ -235,15 +271,18 @@ fn observe(worker: &mut WorkerHealth, execution: &WorkerExecution) {
             let total = failures.entry(recovery_failure(class) as i32).or_default();
             *total = total.saturating_add(*count);
         }
-        worker.recovery_failures =
-            failures.into_iter().map(|(class, count)| FailureCount { class, count }).collect();
+        worker.recovery_failures = failures
+            .into_iter()
+            .map(|(class, count)| FailureCount { class, count })
+            .collect();
         if recovery.last_error_unix_ms > 0 {
             let class = quil_engine::worker_execution::failure_class(&recovery.last_error);
             worker.set_last_failure(recovery_failure(class));
             worker.last_failure_unix_ms = recovery.last_error_unix_ms;
         }
         worker.last_success_unix_ms = recovery.last_outcome_unix_ms;
-        worker.longest_permit_wait_ms = recovery.longest_permit_wait_ms.max(recovery.permit_wait_ms);
+        worker.longest_permit_wait_ms =
+            recovery.longest_permit_wait_ms.max(recovery.permit_wait_ms);
     }
     if let Some(seal) = &execution.seal {
         worker.seal_generation = Some(seal.generation);
@@ -292,8 +331,12 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
             omitted += 1;
             continue;
         }
-        let head = (!entry.filter.is_empty()).then(|| inputs.committee_heads.get(&entry.filter)).flatten();
-        let join_wait = (!entry.filter.is_empty()).then(|| inputs.join_waits.get(&entry.filter).copied()).flatten();
+        let head = (!entry.filter.is_empty())
+            .then(|| inputs.committee_heads.get(&entry.filter))
+            .flatten();
+        let join_wait = (!entry.filter.is_empty())
+            .then(|| inputs.join_waits.get(&entry.filter).copied())
+            .flatten();
         let worker = worker_health(entry, head, join_wait);
         let len = worker.encoded_len();
         let framed = 1 + prost::length_delimiter_len(len) + len;
@@ -369,20 +412,32 @@ impl RefusalLog {
     /// allowlisted one is a report this node was set up to serve and did
     /// not.
     pub fn level(&self) -> tracing::Level {
-        if self.rate_limited > 0 { tracing::Level::WARN } else { tracing::Level::INFO }
+        if self.rate_limited > 0 {
+            tracing::Level::WARN
+        } else {
+            tracing::Level::INFO
+        }
     }
 }
 
 impl RefusalSummary {
     /// Count a refusal at `now`; the summary to log, at once for the first
     /// and then at most every [`REFUSAL_SUMMARY_INTERVAL`].
-    fn note(&mut self, refusal: Refusal, caller: Option<&PeerId>, now: Instant) -> Option<RefusalLog> {
+    fn note(
+        &mut self,
+        refusal: Refusal,
+        caller: Option<&PeerId>,
+        now: Instant,
+    ) -> Option<RefusalLog> {
         let since = *self.since.get_or_insert(now);
         *self.counts.entry(refusal).or_default() += 1;
         if let Some(caller) = caller.filter(|_| self.requesters.len() < MAX_COUNTED_REQUESTERS) {
             self.requesters.insert(*caller);
         }
-        if self.logged.is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_SUMMARY_INTERVAL) {
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < REFUSAL_SUMMARY_INTERVAL)
+        {
             return None;
         }
         self.logged = Some(now);
@@ -392,7 +447,11 @@ impl RefusalSummary {
             refused: counts.values().sum(),
             requesters: std::mem::take(&mut self.requesters).len(),
             rate_limited: counts.get(&Refusal::RateLimited).copied().unwrap_or(0),
-            reasons: counts.iter().map(|(r, n)| format!("{}:{n}", r.label())).collect::<Vec<_>>().join(","),
+            reasons: counts
+                .iter()
+                .map(|(r, n)| format!("{}:{n}", r.label()))
+                .collect::<Vec<_>>()
+                .join(","),
             window_secs: now.saturating_duration_since(since).as_secs(),
         })
     }
@@ -443,16 +502,27 @@ impl Admission {
             *quil_config::HEALTH_REPORT_INTERVAL_SECS.end(),
         );
         if config.enabled {
-            info!(health_peers = allowed.len(), min_interval_secs,
-                serves = if allowed.is_empty() { "this node only" } else { "this node and the allowlisted peers" },
-                "diagnostics enabled");
+            info!(
+                health_peers = allowed.len(),
+                min_interval_secs,
+                serves = if allowed.is_empty() {
+                    "this node only"
+                } else {
+                    "this node and the allowlisted peers"
+                },
+                "diagnostics enabled"
+            );
         } else if !config.allowed_peers.is_empty() {
             info!(allowed_peers = config.allowed_peers.len(),
                 "diagnostics.healthReport.allowedPeers is ignored until diagnostics.healthReport.enabled is set");
         }
         Self {
             enabled: config.enabled,
-            allowed: if config.enabled { allowed } else { HashSet::new() },
+            allowed: if config.enabled {
+                allowed
+            } else {
+                HashSet::new()
+            },
             own,
             min_interval: Duration::from_secs(min_interval_secs),
             served: Mutex::default(),
@@ -462,13 +532,18 @@ impl Admission {
 
     /// Count a refusal for the summary of an enabled node.
     fn note(&self, refusal: Refusal, caller: Option<&PeerId>, now: Instant) -> Option<RefusalLog> {
-        self.refusals.lock().unwrap_or_else(PoisonError::into_inner).note(refusal, caller, now)
+        self.refusals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note(refusal, caller, now)
     }
 
     /// Give back the interval `requester` was charged at `at`, for a report
     /// that could not be built.
     pub fn refund(&self, requester: Requester, at: Instant) {
-        let Requester::Peer(peer) = requester else { return };
+        let Requester::Peer(peer) = requester else {
+            return;
+        };
         let mut served = self.served.lock().unwrap_or_else(PoisonError::into_inner);
         if served.get(&peer) == Some(&at) {
             served.remove(&peer);
@@ -481,10 +556,17 @@ impl Admission {
             return Ok(Requester::Own);
         }
         if !self.allowed.contains(caller) {
-            return Err(if self.enabled { Refusal::NotAllowed } else { Refusal::Disabled });
+            return Err(if self.enabled {
+                Refusal::NotAllowed
+            } else {
+                Refusal::Disabled
+            });
         }
         let mut served = self.served.lock().unwrap_or_else(PoisonError::into_inner);
-        if served.get(caller).is_some_and(|at| now.saturating_duration_since(*at) < self.min_interval) {
+        if served
+            .get(caller)
+            .is_some_and(|at| now.saturating_duration_since(*at) < self.min_interval)
+        {
             return Err(Refusal::RateLimited);
         }
         served.insert(*caller, now);
@@ -501,7 +583,10 @@ impl Admission {
         // Every node serves itself, so a node that never enabled the report
         // still answers probes: nothing there for its operator to act on.
         if !self.enabled {
-            debug!(reason = refusal.label(), "diagnostics request refused: the health report is disabled");
+            debug!(
+                reason = refusal.label(),
+                "diagnostics request refused: the health report is disabled"
+            );
         } else if let Some(log) = self.note(refusal, caller, now) {
             if log.level() == tracing::Level::WARN {
                 warn!(refused = log.refused, requesters = log.requesters, reasons = %log.reasons,
@@ -537,8 +622,16 @@ pub struct DiagnosticsServer {
 }
 
 impl DiagnosticsServer {
-    pub fn new(admission: Arc<Admission>, source: HealthSource, build_fingerprint: Vec<u8>) -> Self {
-        Self { admission, source, build_fingerprint }
+    pub fn new(
+        admission: Arc<Admission>,
+        source: HealthSource,
+        build_fingerprint: Vec<u8>,
+    ) -> Self {
+        Self {
+            admission,
+            source,
+            build_fingerprint,
+        }
     }
 
     /// The tonic service, bounded to empty requests.
@@ -556,7 +649,10 @@ impl DiagnosticsService for DiagnosticsServer {
         request: Request<GetHealthReportRequest>,
     ) -> Result<Response<HealthReport>, Status> {
         // Fail closed: only the handshake identity admits a caller.
-        let caller = request.extensions().get::<AuthenticatedPeer>().map(|auth| auth.peer_id);
+        let caller = request
+            .extensions()
+            .get::<AuthenticatedPeer>()
+            .map(|auth| auth.peer_id);
         let admitted = Instant::now();
         let requester = self.admission.admit(caller.as_ref(), admitted)?;
         let source = self.source.clone();
@@ -570,7 +666,11 @@ impl DiagnosticsService for DiagnosticsServer {
                 return Err(Status::unavailable("health report unavailable"));
             }
         };
-        let report = build_report(&inputs, &self.build_fingerprint, quil_engine::worker_execution::now_ms());
+        let report = build_report(
+            &inputs,
+            &self.build_fingerprint,
+            quil_engine::worker_execution::now_ms(),
+        );
         let requester = match requester {
             Requester::Own => "self".to_string(),
             Requester::Peer(peer) => peer_tail(&peer),
@@ -592,7 +692,8 @@ pub async fn connect_peer(
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30))
         .tcp_nodelay(true);
-    let connector = crate::QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(expected);
+    let connector =
+        crate::QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(expected);
     let channel = endpoint.connect_with_connector(connector).await?;
     Ok(DiagnosticsServiceClient::new(channel).max_decoding_message_size(2 * MAX_REPORT_BYTES))
 }
@@ -600,11 +701,17 @@ pub async fn connect_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_engine::worker_execution::{BLOCKERS as ENGINE_BLOCKERS, FAILURE_CLASSES, RECOVERY_PHASES as ENGINE_RECOVERY_PHASES, STATES};
+    use quil_engine::worker_execution::{
+        BLOCKERS as ENGINE_BLOCKERS, FAILURE_CLASSES, RECOVERY_PHASES as ENGINE_RECOVERY_PHASES,
+        STATES,
+    };
     use quil_types::proto::node::{SessionSeal, ShardRecovery};
 
     fn peer() -> PeerId {
-        quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key()).unwrap().public().to_peer_id()
+        quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id()
     }
 
     fn config(enabled: bool, allowed: &[PeerId]) -> HealthReportConfig {
@@ -642,7 +749,10 @@ mod tests {
     fn request(caller: Option<PeerId>) -> Request<GetHealthReportRequest> {
         let mut request = Request::new(GetHealthReportRequest {});
         if let Some(peer_id) = caller {
-            request.extensions_mut().insert(AuthenticatedPeer { peer_id, falcon_public_key: Vec::new() });
+            request.extensions_mut().insert(AuthenticatedPeer {
+                peer_id,
+                falcon_public_key: Vec::new(),
+            });
         }
         request
     }
@@ -655,19 +765,46 @@ mod tests {
         let enabled = server(Admission::new(&config(true, &[listed]), own));
         let disabled = server(Admission::new(&config(false, &[listed]), own));
         let mut refusals = Vec::new();
-        for (service, caller) in [(&enabled, None), (&enabled, Some(other)), (&disabled, Some(listed)), (&disabled, None)] {
-            refusals.push(service.get_health_report(request(caller)).await.unwrap_err());
+        for (service, caller) in [
+            (&enabled, None),
+            (&enabled, Some(other)),
+            (&disabled, Some(listed)),
+            (&disabled, None),
+        ] {
+            refusals.push(
+                service
+                    .get_health_report(request(caller))
+                    .await
+                    .unwrap_err(),
+            );
         }
         for status in &refusals {
-            assert_eq!((status.code(), status.message()), (tonic::Code::PermissionDenied, DENIED));
+            assert_eq!(
+                (status.code(), status.message()),
+                (tonic::Code::PermissionDenied, DENIED)
+            );
         }
-        let served = enabled.get_health_report(request(Some(listed))).await.unwrap().into_inner();
-        assert_eq!((served.schema, served.global_head_frame, served.workers.len()), (SCHEMA, 9, 1));
+        let served = enabled
+            .get_health_report(request(Some(listed)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            (
+                served.schema,
+                served.global_head_frame,
+                served.workers.len()
+            ),
+            (SCHEMA, 9, 1)
+        );
         assert_eq!(served.build_fingerprint, vec![0xab; 32]);
         assert_eq!(served.version, quil_config::VERSION.to_vec());
         for service in [&enabled, &disabled] {
             for _ in 0..3 {
-                assert!(service.get_health_report(request(Some(own))).await.is_ok(), "this node is always served");
+                assert!(
+                    service.get_health_report(request(Some(own))).await.is_ok(),
+                    "this node is always served"
+                );
             }
         }
     }
@@ -677,14 +814,29 @@ mod tests {
         let (own, listed, other) = (peer(), peer(), peer());
         let admission = Admission::new(&config(true, &[listed, other]), own);
         let start = Instant::now();
-        assert_eq!(admission.admit(Some(&listed), start).unwrap(), Requester::Peer(listed));
-        let again = admission.admit(Some(&listed), start + Duration::from_secs(59)).unwrap_err();
+        assert_eq!(
+            admission.admit(Some(&listed), start).unwrap(),
+            Requester::Peer(listed)
+        );
+        let again = admission
+            .admit(Some(&listed), start + Duration::from_secs(59))
+            .unwrap_err();
         assert_eq!(again.code(), tonic::Code::ResourceExhausted);
-        assert!(admission.admit(Some(&other), start + Duration::from_secs(59)).is_ok(), "each peer has its own interval");
-        assert!(admission.admit(Some(&listed), start + Duration::from_secs(60)).is_ok());
+        assert!(
+            admission
+                .admit(Some(&other), start + Duration::from_secs(59))
+                .is_ok(),
+            "each peer has its own interval"
+        );
+        assert!(admission
+            .admit(Some(&listed), start + Duration::from_secs(60))
+            .is_ok());
         assert_eq!(admission.check(Some(&own), start), Ok(Requester::Own));
         assert_eq!(admission.check(None, start), Err(Refusal::NoIdentity));
-        assert_eq!(admission.check(Some(&peer()), start), Err(Refusal::NotAllowed));
+        assert_eq!(
+            admission.check(Some(&peer()), start),
+            Err(Refusal::NotAllowed)
+        );
         let disabled = Admission::new(&config(false, &[listed]), own);
         assert_eq!(disabled.check(Some(&listed), start), Err(Refusal::Disabled));
     }
@@ -697,14 +849,33 @@ mod tests {
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let failing = fail.clone();
         let source: HealthSource = Arc::new(move || {
-            assert!(!failing.swap(false, std::sync::atomic::Ordering::SeqCst), "the master's state is unreadable");
+            assert!(
+                !failing.swap(false, std::sync::atomic::Ordering::SeqCst),
+                "the master's state is unreadable"
+            );
             HealthInputs::default()
         });
-        let service = DiagnosticsServer::new(Arc::new(Admission::new(&config(true, &[listed]), own)), source, Vec::new());
-        let failed = service.get_health_report(request(Some(listed))).await.unwrap_err();
+        let service = DiagnosticsServer::new(
+            Arc::new(Admission::new(&config(true, &[listed]), own)),
+            source,
+            Vec::new(),
+        );
+        let failed = service
+            .get_health_report(request(Some(listed)))
+            .await
+            .unwrap_err();
         assert_eq!(failed.code(), tonic::Code::Unavailable);
-        assert!(service.get_health_report(request(Some(listed))).await.is_ok(), "the failure was refunded");
-        let again = service.get_health_report(request(Some(listed))).await.unwrap_err();
+        assert!(
+            service
+                .get_health_report(request(Some(listed)))
+                .await
+                .is_ok(),
+            "the failure was refunded"
+        );
+        let again = service
+            .get_health_report(request(Some(listed)))
+            .await
+            .unwrap_err();
         assert_eq!(again.code(), tonic::Code::ResourceExhausted);
     }
 
@@ -719,20 +890,43 @@ mod tests {
         for caller in [None, Some(&listed), Some(&other)] {
             assert!(disabled.admit(caller, start).is_err());
         }
-        assert!(disabled.refusals.lock().unwrap().logged.is_none(), "nothing summarized while disabled");
+        assert!(
+            disabled.refusals.lock().unwrap().logged.is_none(),
+            "nothing summarized while disabled"
+        );
         let enabled = Admission::new(&config(true, &[listed]), own);
-        let unlisted = enabled.note(Refusal::NotAllowed, Some(&other), start).unwrap();
+        let unlisted = enabled
+            .note(Refusal::NotAllowed, Some(&other), start)
+            .unwrap();
         assert_eq!(unlisted.level(), tracing::Level::INFO);
         enabled.note(Refusal::NoIdentity, None, start + Duration::from_secs(1));
-        enabled.note(Refusal::RateLimited, Some(&listed), start + Duration::from_secs(2));
-        let mixed = enabled.note(Refusal::NotAllowed, Some(&other), start + REFUSAL_SUMMARY_INTERVAL).unwrap();
-        assert_eq!((mixed.rate_limited, mixed.level()), (1, tracing::Level::WARN));
+        enabled.note(
+            Refusal::RateLimited,
+            Some(&listed),
+            start + Duration::from_secs(2),
+        );
+        let mixed = enabled
+            .note(
+                Refusal::NotAllowed,
+                Some(&other),
+                start + REFUSAL_SUMMARY_INTERVAL,
+            )
+            .unwrap();
+        assert_eq!(
+            (mixed.rate_limited, mixed.level()),
+            (1, tracing::Level::WARN)
+        );
     }
 
     #[test]
     fn entries_that_are_not_peer_ids_are_dropped_by_index() {
         let (a, b) = (peer(), peer());
-        let entries = vec![a.to_base58(), "not-a-peer".into(), format!(" {} ", b.to_base58()), String::new()];
+        let entries = vec![
+            a.to_base58(),
+            "not-a-peer".into(),
+            format!(" {} ", b.to_base58()),
+            String::new(),
+        ];
         let (peers, invalid) = parse_allowed(&entries);
         assert_eq!(peers, HashSet::from([a, b]));
         assert_eq!(invalid, [1, 3]);
@@ -745,20 +939,56 @@ mod tests {
         let (a, b, c) = (peer(), peer(), peer());
         let start = Instant::now();
         let mut summary = RefusalSummary::default();
-        assert_eq!(summary.note(Refusal::NotAllowed, Some(&a), start),
-            Some(RefusalLog { refused: 1, requesters: 1, reasons: "not_allowed:1".into(), rate_limited: 0, window_secs: 0 }));
+        assert_eq!(
+            summary.note(Refusal::NotAllowed, Some(&a), start),
+            Some(RefusalLog {
+                refused: 1,
+                requesters: 1,
+                reasons: "not_allowed:1".into(),
+                rate_limited: 0,
+                window_secs: 0
+            })
+        );
         let mut logged = 0;
         for (n, peer) in [&a, &b, &a, &c, &b].into_iter().enumerate() {
             let at = start + Duration::from_secs(60 * (n as u64 + 1));
             logged += usize::from(summary.note(Refusal::NotAllowed, Some(peer), at).is_some());
         }
         assert_eq!(logged, 0);
-        assert_eq!(summary.note(Refusal::RateLimited, Some(&a), start + Duration::from_secs(400)), None);
-        assert_eq!(summary.note(Refusal::NoIdentity, None, start + Duration::from_secs(500)), None);
-        assert_eq!(summary.note(Refusal::RateLimited, Some(&a), start + Duration::from_secs(600)),
-            Some(RefusalLog { refused: 8, requesters: 3,
-                reasons: "no_identity:1,not_allowed:5,rate_limited:2".into(), rate_limited: 2, window_secs: 540 }));
-        assert_eq!(summary.note(Refusal::Disabled, Some(&b), start + Duration::from_secs(601)), None);
+        assert_eq!(
+            summary.note(
+                Refusal::RateLimited,
+                Some(&a),
+                start + Duration::from_secs(400)
+            ),
+            None
+        );
+        assert_eq!(
+            summary.note(Refusal::NoIdentity, None, start + Duration::from_secs(500)),
+            None
+        );
+        assert_eq!(
+            summary.note(
+                Refusal::RateLimited,
+                Some(&a),
+                start + Duration::from_secs(600)
+            ),
+            Some(RefusalLog {
+                refused: 8,
+                requesters: 3,
+                reasons: "no_identity:1,not_allowed:5,rate_limited:2".into(),
+                rate_limited: 2,
+                window_secs: 540
+            })
+        );
+        assert_eq!(
+            summary.note(
+                Refusal::Disabled,
+                Some(&b),
+                start + Duration::from_secs(601)
+            ),
+            None
+        );
     }
 
     /// Every phase, reason, recovery phase and failure class the engine
@@ -768,30 +998,58 @@ mod tests {
         let phases: HashSet<Phase> = STATES.iter().map(|state| phase(state, "")).collect();
         assert_eq!(phases.len(), STATES.len());
         for state in STATES {
-            assert!(!matches!(phase(state, ""), Phase::Unrecognized | Phase::Unspecified), "{state}");
+            assert!(
+                !matches!(phase(state, ""), Phase::Unrecognized | Phase::Unspecified),
+                "{state}"
+            );
             assert_eq!(phase_name(phase(state, "")), state);
         }
         assert_eq!(phase("running", ""), Phase::Running, "older workers");
-        assert_eq!(phase("blocked", "awaiting successor"), Phase::Handoff, "older workers");
-        assert_eq!((phase("", ""), phase("dancing", "")), (Phase::Unspecified, Phase::Unrecognized));
+        assert_eq!(
+            phase("blocked", "awaiting successor"),
+            Phase::Handoff,
+            "older workers"
+        );
+        assert_eq!(
+            (phase("", ""), phase("dancing", "")),
+            (Phase::Unspecified, Phase::Unrecognized)
+        );
 
         let blockers: HashSet<Blocker> = ENGINE_BLOCKERS.iter().map(|text| blocker(text)).collect();
         assert_eq!(blockers.len(), ENGINE_BLOCKERS.len());
         for text in ENGINE_BLOCKERS {
-            assert!(!matches!(blocker(text), Blocker::Unrecognized | Blocker::None), "{text}");
+            assert!(
+                !matches!(blocker(text), Blocker::Unrecognized | Blocker::None),
+                "{text}"
+            );
             assert_eq!(blocker_text(blocker(text)), text);
         }
-        assert_eq!((blocker(""), blocker("disk full at 192.0.2.1")), (Blocker::None, Blocker::Unrecognized));
+        assert_eq!(
+            (blocker(""), blocker("disk full at 192.0.2.1")),
+            (Blocker::None, Blocker::Unrecognized)
+        );
 
-        let recovery: HashSet<RecoveryPhase> = ENGINE_RECOVERY_PHASES.iter().map(|text| recovery_phase(text)).collect();
+        let recovery: HashSet<RecoveryPhase> = ENGINE_RECOVERY_PHASES
+            .iter()
+            .map(|text| recovery_phase(text))
+            .collect();
         assert_eq!(recovery.len(), ENGINE_RECOVERY_PHASES.len());
         for text in ENGINE_RECOVERY_PHASES {
-            assert!(!matches!(recovery_phase(text), RecoveryPhase::Unrecognized | RecoveryPhase::Starting), "{text}");
+            assert!(
+                !matches!(
+                    recovery_phase(text),
+                    RecoveryPhase::Unrecognized | RecoveryPhase::Starting
+                ),
+                "{text}"
+            );
             assert_eq!(recovery_phase_name(recovery_phase(text)), text);
         }
         assert_eq!(recovery_phase("teleporting"), RecoveryPhase::Unrecognized);
 
-        let failures: HashSet<RecoveryFailure> = FAILURE_CLASSES.iter().map(|class| recovery_failure(class)).collect();
+        let failures: HashSet<RecoveryFailure> = FAILURE_CLASSES
+            .iter()
+            .map(|class| recovery_failure(class))
+            .collect();
         assert_eq!(failures.len(), FAILURE_CLASSES.len());
         for class in FAILURE_CLASSES {
             assert_ne!(recovery_failure(class), RecoveryFailure::None, "{class}");
@@ -809,11 +1067,20 @@ mod tests {
             observed_unix_ms: 2_000,
             ..Default::default()
         };
-        let inputs = HealthInputs { workers: vec![entry(2, &[2; 32], Some(latched))], ..Default::default() };
+        let inputs = HealthInputs {
+            workers: vec![entry(2, &[2; 32], Some(latched))],
+            ..Default::default()
+        };
         let report = build_report(&inputs, &[], 3_000);
-        assert_eq!((report.workers[0].phase(), report.workers[0].blocker()), (Phase::Blocked, Blocker::StorageWriteFailed));
+        assert_eq!(
+            (report.workers[0].phase(), report.workers[0].blocker()),
+            (Phase::Blocked, Blocker::StorageWriteFailed)
+        );
         assert!(!report.master_store_write_failed);
-        let inputs = HealthInputs { master_store_write_failed: true, ..inputs };
+        let inputs = HealthInputs {
+            master_store_write_failed: true,
+            ..inputs
+        };
         assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
     }
 
@@ -821,15 +1088,29 @@ mod tests {
     /// reported; the worker's phase stays the engine's.
     #[test]
     fn the_configured_count_and_draining_workers_are_reported() {
-        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 2_000, ..Default::default() };
+        let serving = WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: 2_000,
+            ..Default::default()
+        };
         let mut above = entry(7, &[7; 32], Some(serving));
         above.draining = true;
-        let inputs = HealthInputs { workers: vec![entry(1, &[1; 32], None), above], worker_capacity: 6,
-            ..Default::default() };
+        let inputs = HealthInputs {
+            workers: vec![entry(1, &[1; 32], None), above],
+            worker_capacity: 6,
+            ..Default::default()
+        };
         let report = build_report(&inputs, &[], 3_000);
         assert_eq!(report.worker_capacity, 6);
-        let draining: Vec<(u32, bool, Phase)> = report.workers.iter().map(|w| (w.core_id, w.draining, w.phase())).collect();
-        assert_eq!(draining, vec![(1, false, Phase::Unspecified), (7, true, Phase::Serving)]);
+        let draining: Vec<(u32, bool, Phase)> = report
+            .workers
+            .iter()
+            .map(|w| (w.core_id, w.draining, w.phase()))
+            .collect();
+        assert_eq!(
+            draining,
+            vec![(1, false, Phase::Unspecified), (7, true, Phase::Serving)]
+        );
     }
 
     fn noisy_execution() -> WorkerExecution {
@@ -851,10 +1132,19 @@ mod tests {
                 consecutive_failures: 2,
                 permit_wait_ms: 4_000,
                 longest_permit_wait_ms: 95_000,
-                failures_by_class: HashMap::from([("connect".into(), 2), ("archive_state".into(), 1), ("someday".into(), 1)]),
+                failures_by_class: HashMap::from([
+                    ("connect".into(), 2),
+                    ("archive_state".into(), 1),
+                    ("someday".into(), 1),
+                ]),
                 ..Default::default()
             }),
-            seal: Some(SessionSeal { generation: 6, drain: "partial via 192.0.2.10".into(), recorded_unix_ms: 1_700, ..Default::default() }),
+            seal: Some(SessionSeal {
+                generation: 6,
+                drain: "partial via 192.0.2.10".into(),
+                recorded_unix_ms: 1_700,
+                ..Default::default()
+            }),
             awaited_frame: None,
             ..Default::default()
         }
@@ -862,22 +1152,66 @@ mod tests {
 
     #[test]
     fn a_worker_reports_its_observations_without_their_texts() {
-        let head = GlobalAppFrameHead { frame: 1_204, global_frame: 90_000, generation: 7 };
-        let worker = worker_health(&entry(3, &[5; 32], Some(noisy_execution())), Some(&head), None);
-        assert_eq!((worker.phase(), worker.blocker()), (Phase::Blocked, Blocker::StateUnavailable));
-        assert_eq!((worker.materialized_frame, worker.committee_head_frame, worker.committed_generation),
-            (Some(1_180), Some(1_204), Some(7)));
-        assert_eq!((worker.recovery_phase(), worker.recovery_attempts, worker.recovery_consecutive_failures),
-            (RecoveryPhase::InstallingLeaves, 5, 2));
-        assert_eq!(worker.recovery_failures, [
-            FailureCount { class: RecoveryFailure::Connect as i32, count: 2 },
-            FailureCount { class: RecoveryFailure::ArchiveState as i32, count: 1 },
-            FailureCount { class: RecoveryFailure::Other as i32, count: 1 },
-        ]);
-        assert_eq!((worker.last_failure(), worker.last_failure_unix_ms, worker.last_success_unix_ms),
-            (RecoveryFailure::Connect, 1_900, 1_200));
+        let head = GlobalAppFrameHead {
+            frame: 1_204,
+            global_frame: 90_000,
+            generation: 7,
+        };
+        let worker = worker_health(
+            &entry(3, &[5; 32], Some(noisy_execution())),
+            Some(&head),
+            None,
+        );
+        assert_eq!(
+            (worker.phase(), worker.blocker()),
+            (Phase::Blocked, Blocker::StateUnavailable)
+        );
+        assert_eq!(
+            (
+                worker.materialized_frame,
+                worker.committee_head_frame,
+                worker.committed_generation
+            ),
+            (Some(1_180), Some(1_204), Some(7))
+        );
+        assert_eq!(
+            (
+                worker.recovery_phase(),
+                worker.recovery_attempts,
+                worker.recovery_consecutive_failures
+            ),
+            (RecoveryPhase::InstallingLeaves, 5, 2)
+        );
+        assert_eq!(
+            worker.recovery_failures,
+            [
+                FailureCount {
+                    class: RecoveryFailure::Connect as i32,
+                    count: 2
+                },
+                FailureCount {
+                    class: RecoveryFailure::ArchiveState as i32,
+                    count: 1
+                },
+                FailureCount {
+                    class: RecoveryFailure::Other as i32,
+                    count: 1
+                },
+            ]
+        );
+        assert_eq!(
+            (
+                worker.last_failure(),
+                worker.last_failure_unix_ms,
+                worker.last_success_unix_ms
+            ),
+            (RecoveryFailure::Connect, 1_900, 1_200)
+        );
         assert_eq!(worker.longest_permit_wait_ms, 95_000);
-        assert_eq!((worker.seal_generation, worker.seal_recorded_unix_ms), (Some(6), 1_700));
+        assert_eq!(
+            (worker.seal_generation, worker.seal_recorded_unix_ms),
+            (Some(6), 1_700)
+        );
 
         let inputs = HealthInputs {
             workers: vec![entry(3, &[5; 32], Some(noisy_execution()))],
@@ -887,8 +1221,21 @@ mod tests {
             ..Default::default()
         };
         let encoded = build_report(&inputs, &[1; 32], 3_000).encode_to_vec();
-        for secret in ["192.0.2", "/home", "operator", "refused", "replayed", "partial", "state unavailable"] {
-            assert!(!encoded.windows(secret.len()).any(|w| w == secret.as_bytes()), "{secret} leaked");
+        for secret in [
+            "192.0.2",
+            "/home",
+            "operator",
+            "refused",
+            "replayed",
+            "partial",
+            "state unavailable",
+        ] {
+            assert!(
+                !encoded
+                    .windows(secret.len())
+                    .any(|w| w == secret.as_bytes()),
+                "{secret} leaked"
+            );
         }
     }
 
@@ -902,78 +1249,201 @@ mod tests {
             state: "blocked".into(),
             blocker: "consensus startup unavailable".into(),
             observed_unix_ms: 2_000,
-            recovery: Some(ShardRecovery { phase: "idle".into(), attempts: 3, consecutive_failures: 3, ..Default::default() }),
+            recovery: Some(ShardRecovery {
+                phase: "idle".into(),
+                attempts: 3,
+                consecutive_failures: 3,
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        let unconfirmed = worker_health(&entry(1, &[1; 32], None), None, Some(JoinWait::Confirmation { epoch: 1276 }));
-        assert_eq!((unconfirmed.phase(), unconfirmed.join_confirm_epoch, unconfirmed.activation_frame),
-            (Phase::Joining, Some(1276), Some(1277 * 720)));
-        let activating = worker_health(&entry(2, &[2; 32], Some(blocked)), None, Some(JoinWait::Activation { frame: 918_720 }));
-        assert_eq!((activating.phase(), activating.blocker(), activating.join_confirm_epoch, activating.activation_frame),
-            (Phase::Joining, Blocker::ConsensusStartupUnavailable, None, Some(918_720)));
-        assert_eq!((activating.recovery_attempts, activating.recovery_consecutive_failures), (3, 3));
-        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 2_000, ..Default::default() };
-        let serving = worker_health(&entry(3, &[3; 32], Some(serving)), None, Some(JoinWait::Activation { frame: 918_720 }));
+        let unconfirmed = worker_health(
+            &entry(1, &[1; 32], None),
+            None,
+            Some(JoinWait::Confirmation { epoch: 1276 }),
+        );
+        assert_eq!(
+            (
+                unconfirmed.phase(),
+                unconfirmed.join_confirm_epoch,
+                unconfirmed.activation_frame
+            ),
+            (Phase::Joining, Some(1276), Some(1277 * 720))
+        );
+        let activating = worker_health(
+            &entry(2, &[2; 32], Some(blocked)),
+            None,
+            Some(JoinWait::Activation { frame: 918_720 }),
+        );
+        assert_eq!(
+            (
+                activating.phase(),
+                activating.blocker(),
+                activating.join_confirm_epoch,
+                activating.activation_frame
+            ),
+            (
+                Phase::Joining,
+                Blocker::ConsensusStartupUnavailable,
+                None,
+                Some(918_720)
+            )
+        );
+        assert_eq!(
+            (
+                activating.recovery_attempts,
+                activating.recovery_consecutive_failures
+            ),
+            (3, 3)
+        );
+        let serving = WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: 2_000,
+            ..Default::default()
+        };
+        let serving = worker_health(
+            &entry(3, &[3; 32], Some(serving)),
+            None,
+            Some(JoinWait::Activation { frame: 918_720 }),
+        );
         assert_eq!(serving.phase(), Phase::Serving);
-        let seat = WorkerExecution { state: "waiting".into(), blocker: "committee admission unavailable".into(),
-            observed_unix_ms: 2_000, awaited_frame: Some(919_440), ..Default::default() };
+        let seat = WorkerExecution {
+            state: "waiting".into(),
+            blocker: "committee admission unavailable".into(),
+            observed_unix_ms: 2_000,
+            awaited_frame: Some(919_440),
+            ..Default::default()
+        };
         let seat = worker_health(&entry(6, &[6; 32], Some(seat)), None, None);
-        assert_eq!((seat.phase(), seat.blocker(), seat.awaited_frame),
-            (Phase::Waiting, Blocker::CommitteeAdmissionUnavailable, Some(919_440)));
+        assert_eq!(
+            (seat.phase(), seat.blocker(), seat.awaited_frame),
+            (
+                Phase::Waiting,
+                Blocker::CommitteeAdmissionUnavailable,
+                Some(919_440)
+            )
+        );
         let unknown = worker_health(&entry(4, &[4; 32], None), None, None);
-        assert_eq!((unknown.phase(), unknown.activation_frame), (Phase::Unspecified, None));
+        assert_eq!(
+            (unknown.phase(), unknown.activation_frame),
+            (Phase::Unspecified, None)
+        );
 
         let inputs = HealthInputs {
             workers: vec![entry(1, &[1; 32], None), entry(5, &[], None)],
-            join_waits: HashMap::from([(vec![1; 32], JoinWait::Confirmation { epoch: 1276 }), (Vec::new(), JoinWait::Activation { frame: 1 })]),
+            join_waits: HashMap::from([
+                (vec![1; 32], JoinWait::Confirmation { epoch: 1276 }),
+                (Vec::new(), JoinWait::Activation { frame: 1 }),
+            ]),
             ..Default::default()
         };
-        let phases: Vec<(u32, Phase)> = build_report(&inputs, &[], 0).workers.iter().map(|w| (w.core_id, w.phase())).collect();
-        assert_eq!(phases, [(1, Phase::Joining), (5, Phase::Unspecified)], "an idle worker has no join");
+        let phases: Vec<(u32, Phase)> = build_report(&inputs, &[], 0)
+            .workers
+            .iter()
+            .map(|w| (w.core_id, w.phase()))
+            .collect();
+        assert_eq!(
+            phases,
+            [(1, Phase::Joining), (5, Phase::Unspecified)],
+            "an idle worker has no join"
+        );
         assert_eq!(phase_name(Phase::Joining), "joining");
     }
 
     #[test]
     fn allocated_workers_come_first_with_their_shards_committee_head() {
-        let head = |frame| GlobalAppFrameHead { frame, global_frame: 1, generation: frame / 100 };
+        let head = |frame| GlobalAppFrameHead {
+            frame,
+            global_frame: 1,
+            generation: frame / 100,
+        };
         let inputs = HealthInputs {
-            workers: vec![entry(4, &[], None), entry(2, &[2; 32], None), entry(1, &[], None), entry(3, &[3; 32], None)],
-            committee_heads: HashMap::from([(vec![2; 32], head(200)), (vec![3; 32], head(300)), (Vec::new(), head(9))]),
+            workers: vec![
+                entry(4, &[], None),
+                entry(2, &[2; 32], None),
+                entry(1, &[], None),
+                entry(3, &[3; 32], None),
+            ],
+            committee_heads: HashMap::from([
+                (vec![2; 32], head(200)),
+                (vec![3; 32], head(300)),
+                (Vec::new(), head(9)),
+            ]),
             global_head_frame: 5,
             join_waits: HashMap::new(),
             ..Default::default()
         };
         let report = build_report(&inputs, &[], 0);
-        let order: Vec<(u32, Option<u64>, Option<u64>)> =
-            report.workers.iter().map(|w| (w.core_id, w.committee_head_frame, w.committed_generation)).collect();
-        assert_eq!(order, [(2, Some(200), Some(2)), (3, Some(300), Some(3)), (1, None, None), (4, None, None)]);
+        let order: Vec<(u32, Option<u64>, Option<u64>)> = report
+            .workers
+            .iter()
+            .map(|w| (w.core_id, w.committee_head_frame, w.committed_generation))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (2, Some(200), Some(2)),
+                (3, Some(300), Some(3)),
+                (1, None, None),
+                (4, None, None)
+            ]
+        );
         assert_eq!(report.omitted_workers, 0);
     }
 
     #[test]
     fn a_report_is_bounded_in_workers_and_bytes() {
         let many = |execution: Option<WorkerExecution>| HealthInputs {
-            workers: (0..300).map(|core| entry(core, &[core as u8; 32], execution.clone())).collect(),
-            committee_heads: (0..300u32).map(|core| (vec![core as u8; 32],
-                GlobalAppFrameHead { frame: u64::MAX, global_frame: u64::MAX, generation: u64::MAX })).collect(),
+            workers: (0..300)
+                .map(|core| entry(core, &[core as u8; 32], execution.clone()))
+                .collect(),
+            committee_heads: (0..300u32)
+                .map(|core| {
+                    (
+                        vec![core as u8; 32],
+                        GlobalAppFrameHead {
+                            frame: u64::MAX,
+                            global_frame: u64::MAX,
+                            generation: u64::MAX,
+                        },
+                    )
+                })
+                .collect(),
             global_head_frame: u64::MAX,
             join_waits: HashMap::new(),
             ..Default::default()
         };
         let light = build_report(&many(None), &[0xff; 32], u64::MAX);
-        assert_eq!((light.workers.len(), light.omitted_workers), (MAX_WORKERS, 44));
+        assert_eq!(
+            (light.workers.len(), light.omitted_workers),
+            (MAX_WORKERS, 44)
+        );
         let mut heavy = noisy_execution();
         let recovery = heavy.recovery.as_mut().unwrap();
-        recovery.failures_by_class = FAILURE_CLASSES.iter().map(|class| (class.to_string(), u32::MAX)).collect();
+        recovery.failures_by_class = FAILURE_CLASSES
+            .iter()
+            .map(|class| (class.to_string(), u32::MAX))
+            .collect();
         (recovery.attempts, recovery.consecutive_failures) = (u32::MAX, u32::MAX);
-        for at in [&mut recovery.last_error_unix_ms, &mut recovery.last_outcome_unix_ms, &mut recovery.phase_since_unix_ms] {
+        for at in [
+            &mut recovery.last_error_unix_ms,
+            &mut recovery.last_outcome_unix_ms,
+            &mut recovery.phase_since_unix_ms,
+        ] {
             *at = u64::MAX;
         }
         let heavy = build_report(&many(Some(heavy)), &[0xff; 32], u64::MAX);
-        assert!(heavy.encoded_len() <= MAX_REPORT_BYTES, "{}", heavy.encoded_len());
+        assert!(
+            heavy.encoded_len() <= MAX_REPORT_BYTES,
+            "{}",
+            heavy.encoded_len()
+        );
         assert!(heavy.workers.len() < MAX_WORKERS);
         assert_eq!(heavy.workers.len() + heavy.omitted_workers as usize, 300);
-        let long = HealthInputs { workers: vec![entry(1, &[1; MAX_FILTER_BYTES + 1], None)], ..Default::default() };
+        let long = HealthInputs {
+            workers: vec![entry(1, &[1; MAX_FILTER_BYTES + 1], None)],
+            ..Default::default()
+        };
         assert_eq!(build_report(&long, &[], 0).omitted_workers, 1);
     }
 
@@ -988,7 +1458,12 @@ mod tests {
             quil_p2p::generate_falcon_signing_key(),
             quil_p2p::generate_falcon_signing_key(),
         );
-        let id = |key: &[u8]| quil_p2p::Keypair::falcon_from_bytes(key).unwrap().public().to_peer_id();
+        let id = |key: &[u8]| {
+            quil_p2p::Keypair::falcon_from_bytes(key)
+                .unwrap()
+                .public()
+                .to_peer_id()
+        };
         let (server_id, listed) = (id(&server_key), id(&listed_key));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -998,7 +1473,8 @@ mod tests {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let (tx, key) = (tx.clone(), server_key.clone());
                 tokio::spawn(async move {
-                    if let Ok(stream) = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await {
+                    if let Ok(stream) = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await
+                    {
                         let _ = tx.send(Ok::<_, std::io::Error>(stream));
                     }
                 });
@@ -1009,17 +1485,32 @@ mod tests {
             crate::peer_auth_middleware::peer_auth_interceptor,
         );
         let serve = tokio::spawn(
-            tonic::transport::Server::builder().add_service(service).serve_with_incoming(UnboundedReceiverStream::new(rx)),
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(UnboundedReceiverStream::new(rx)),
         );
 
         let mut client = connect_peer(&addr, &listed_key, server_id).await.unwrap();
-        let report = client.get_health_report(GetHealthReportRequest {}).await.unwrap().into_inner();
+        let report = client
+            .get_health_report(GetHealthReportRequest {})
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(report.workers.len(), 1);
         let mut client = connect_peer(&addr, &other_key, server_id).await.unwrap();
-        let refused = client.get_health_report(GetHealthReportRequest {}).await.unwrap_err();
-        assert_eq!((refused.code(), refused.message()), (tonic::Code::PermissionDenied, DENIED));
+        let refused = client
+            .get_health_report(GetHealthReportRequest {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (tonic::Code::PermissionDenied, DENIED)
+        );
         let pinned = connect_peer(&addr, &listed_key, listed).await;
-        assert!(pinned.is_err(), "an endpoint answering with another identity is refused");
+        assert!(
+            pinned.is_err(),
+            "an endpoint answering with another identity is refused"
+        );
         accept.abort();
         serve.abort();
     }

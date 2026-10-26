@@ -60,8 +60,11 @@ const ANCHOR_WARNED_KEPT: usize = 64;
 
 /// Connects to an archive (`:8340` mTLS under the node's identity).
 pub(crate) type ArchiveConnector = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<quil_rpc::ArchiveClient>> + Send>>
-        + Send
+    dyn Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<quil_rpc::ArchiveClient>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -91,12 +94,23 @@ impl AnchorWarnings {
     /// Whether a failed fetch of `frame` at `now` is warned about: the first
     /// time and then once per [`ANCHOR_WARN_REPEAT`].
     fn due(&mut self, frame: u64, now: std::time::Instant) -> bool {
-        if self.warned.get(&frame).is_some_and(|at| now.saturating_duration_since(*at) < ANCHOR_WARN_REPEAT) {
+        if self
+            .warned
+            .get(&frame)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ANCHOR_WARN_REPEAT)
+        {
             return false;
         }
         self.warned.insert(frame, now);
         while self.warned.len() > ANCHOR_WARNED_KEPT {
-            let Some(oldest) = self.warned.iter().min_by_key(|(_, at)| **at).map(|(frame, _)| *frame) else { break };
+            let Some(oldest) = self
+                .warned
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(frame, _)| *frame)
+            else {
+                break;
+            };
             self.warned.remove(&oldest);
         }
         true
@@ -171,7 +185,9 @@ impl HistoricalCommittees {
         let mut seen = HashSet::new();
         let mut committees: Vec<Vec<Vec<u8>>> = Vec::new();
         for header in headers {
-            let Ok(root) = <[u8; 32]>::try_from(header.prover_tree_commitment.as_slice()) else { continue };
+            let Ok(root) = <[u8; 32]>::try_from(header.prover_tree_commitment.as_slice()) else {
+                continue;
+            };
             if !seen.insert(root) {
                 continue;
             }
@@ -200,7 +216,12 @@ impl HistoricalCommittees {
     /// Headers `lo..=hi`, each held locally or authenticated from an archive.
     async fn authenticated_headers(&self, lo: u64, hi: u64) -> Result<Vec<GlobalFrameHeader>> {
         let local: Vec<Option<GlobalFrameHeader>> = (lo..=hi)
-            .map(|n| self.clock_store.get_global_frame(n).ok().and_then(|frame| frame.header))
+            .map(|n| {
+                self.clock_store
+                    .get_global_frame(n)
+                    .ok()
+                    .and_then(|frame| frame.header)
+            })
             .collect();
         if local.iter().all(Option::is_some) {
             return Ok(local.into_iter().flatten().collect());
@@ -215,24 +236,40 @@ impl HistoricalCommittees {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| QuilError::ExecutionUnavailable("no archive to fetch GLOBAL headers from".into())))
+        Err(last_error.unwrap_or_else(|| {
+            QuilError::ExecutionUnavailable("no archive to fetch GLOBAL headers from".into())
+        }))
     }
 
     /// Fetch frames from `lo` upward until one at or above `hi` carries its own
     /// certificate, then accept `lo..=hi` as its linked ancestors.
-    async fn fetch_certified_run(&self, addr: &str, lo: u64, hi: u64) -> Result<Vec<GlobalFrameHeader>> {
+    async fn fetch_certified_run(
+        &self,
+        addr: &str,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Vec<GlobalFrameHeader>> {
         let mut client = (self.connect)(addr.to_string()).await?;
         let mut run: Vec<GlobalFrame> = Vec::new();
         for n in lo..=hi + MAX_RUN {
             let frame = match self.clock_store.get_global_frame(n) {
                 Ok(frame) => frame,
-                Err(_) => tokio::time::timeout(std::time::Duration::from_secs(30), client.get_global_frame(n))
-                    .await
-                    .map_err(|_| QuilError::ExecutionUnavailable(format!("GLOBAL frame {n} fetch timed out")))?
-                    .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL frame {n}: {e}")))?,
+                Err(_) => tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    client.get_global_frame(n),
+                )
+                .await
+                .map_err(|_| {
+                    QuilError::ExecutionUnavailable(format!("GLOBAL frame {n} fetch timed out"))
+                })?
+                .map_err(|e| QuilError::ExecutionUnavailable(format!("GLOBAL frame {n}: {e}")))?,
             };
-            if frame.header.as_ref().map(|h| h.frame_number) != Some(n) || !(self.frame_validate)(&frame) {
-                return Err(QuilError::InvalidArgument(format!("GLOBAL frame {n} failed validation")));
+            if frame.header.as_ref().map(|h| h.frame_number) != Some(n)
+                || !(self.frame_validate)(&frame)
+            {
+                return Err(QuilError::InvalidArgument(format!(
+                    "GLOBAL frame {n} failed validation"
+                )));
             }
             let certified = n >= hi && self.self_certified(&frame);
             run.push(frame);
@@ -240,7 +277,9 @@ impl HistoricalCommittees {
                 return linked_headers(run, hi - lo + 1);
             }
         }
-        Err(QuilError::ExecutionUnavailable("no certified GLOBAL frame above the needed headers".into()))
+        Err(QuilError::ExecutionUnavailable(
+            "no certified GLOBAL frame above the needed headers".into(),
+        ))
     }
 
     /// GLOBAL frame `number` for this node's worker, which validates an app
@@ -270,7 +309,10 @@ impl HistoricalCommittees {
         // store keeps headers only and refuses them to peers, so a header is
         // all the anchor needs, and it spares the archive reading and sending
         // request bundles that can run to megabytes within `ANCHOR_FETCH`.
-        let header_only = self.clock_store.global_requests_retained_from().is_some_and(|from| number < from);
+        let header_only = self
+            .clock_store
+            .global_requests_retained_from()
+            .is_some_and(|from| number < from);
         let mut refusals = Vec::new();
         for addr in self.pool.get_all().await.into_iter().take(ANCHOR_ARCHIVES) {
             let fetched = tokio::time::timeout(ANCHOR_FETCH, async {
@@ -280,7 +322,8 @@ impl HistoricalCommittees {
                 } else {
                     client.get_global_frame(number).await
                 };
-                let frame = read.map_err(|e| QuilError::ExecutionUnavailable(format!("archive read: {e}")))?;
+                let frame = read
+                    .map_err(|e| QuilError::ExecutionUnavailable(format!("archive read: {e}")))?;
                 let accepted = self.anchor_accepted(number, &frame, &mut client).await;
                 Ok::<_, QuilError>((frame, accepted))
             })
@@ -303,15 +346,26 @@ impl HistoricalCommittees {
             info!(frame = number, archive = %addr, "recovered a worker's historical GLOBAL anchor from an archive");
             return Ok(frame);
         }
-        let reason = if refusals.is_empty() { "no archive is known to ask".to_string() } else { refusals.join("; ") };
-        if self.anchor_warnings.lock().unwrap().due(number, std::time::Instant::now()) {
+        let reason = if refusals.is_empty() {
+            "no archive is known to ask".to_string()
+        } else {
+            refusals.join("; ")
+        };
+        if self
+            .anchor_warnings
+            .lock()
+            .unwrap()
+            .due(number, std::time::Instant::now())
+        {
             warn!(frame = number, head, %reason, archives = refusals.len(),
                 repeat_secs = ANCHOR_WARN_REPEAT.as_secs(), scope = "this node",
                 action = "this node's workers cannot validate app frames anchored to it; retried on their next attempt; \
                     report it with this line if it persists",
                 "historical GLOBAL anchor unavailable from archives");
         }
-        Err(QuilError::ExecutionUnavailable(format!("no archive served GLOBAL frame {number} ({reason})")))
+        Err(QuilError::ExecutionUnavailable(format!(
+            "no archive served GLOBAL frame {number} ({reason})"
+        )))
     }
 
     /// Why an archive's `frame` is not GLOBAL anchor `number`, if it is not.
@@ -342,9 +396,13 @@ impl HistoricalCommittees {
             let above = client.get_global_frame_header_only(above_number).await.map_err(|e| {
                 format!("carries no certificate of its own, and frame {above_number} above it is unavailable: {e}")
             })?;
-            let identity = below.header.as_ref().and_then(|h| quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok());
+            let identity = below
+                .header
+                .as_ref()
+                .and_then(|h| quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok());
             let links = above.header.as_ref().is_some_and(|h| {
-                h.frame_number == above_number && identity.is_some_and(|id| h.parent_selector.as_slice() == id.as_slice())
+                h.frame_number == above_number
+                    && identity.is_some_and(|id| h.parent_selector.as_slice() == id.as_slice())
             });
             if !links {
                 return Err(format!("carries no certificate of its own, and frame {above_number} does not link down to it"));
@@ -359,19 +417,26 @@ impl HistoricalCommittees {
         if super::archive_sync::frame_self_certified(&below, &self.verifier) {
             return Ok(());
         }
-        Err(format!("carries no certificate of its own, nor does a frame up to {} linking down to it", number + ANCHOR_DESCENT))
+        Err(format!(
+            "carries no certificate of its own, nor does a frame up to {} linking down to it",
+            number + ANCHOR_DESCENT
+        ))
     }
 
     /// A frame carrying a GLOBAL finalization certificate that verifies
     /// against the GLOBAL committee.
     fn self_certified(&self, frame: &GlobalFrame) -> bool {
-        let Some(header) = frame.header.as_ref() else { return false };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
         let has_cert = header
             .public_key_signature_bls48581
             .as_ref()
             .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
             .is_some();
-        has_cert && self.verifier.knows_global_committee() && self.verifier.verify_global_finalization_cert(header)
+        has_cert
+            && self.verifier.knows_global_committee()
+            && self.verifier.verify_global_finalization_cert(header)
     }
 
     /// The registry built from the prover tree committed by `header`.
@@ -390,7 +455,12 @@ impl HistoricalCommittees {
             .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok());
         // Without a committed removes root the phase must stay empty; a tree
         // left from an earlier pinned sync would mix states.
-        if removes.is_none() && scratch.tree.as_ref().is_some_and(|tree| tree.removes_synced) {
+        if removes.is_none()
+            && scratch
+                .tree
+                .as_ref()
+                .is_some_and(|tree| tree.removes_synced)
+        {
             scratch.tree = None;
         }
         if scratch.tree.is_none() {
@@ -403,7 +473,14 @@ impl HistoricalCommittees {
         for addr in self.pool.get_all().await {
             let attempt = async {
                 let mut client = (self.connect)(addr.clone()).await?;
-                crate::forest_sync::sync_shard_phases_on(&mut client, tree.crdt.clone(), &[0xff; 32], expected, true).await
+                crate::forest_sync::sync_shard_phases_on(
+                    &mut client,
+                    tree.crdt.clone(),
+                    &[0xff; 32],
+                    expected,
+                    true,
+                )
+                .await
             };
             match attempt.await {
                 Ok(Some(_)) => {
@@ -411,11 +488,15 @@ impl HistoricalCommittees {
                     break;
                 }
                 Ok(None) => {}
-                Err(error) => warn!(peer = %addr, %error, "historical committee: prover tree sync failed; trying the next archive"),
+                Err(error) => {
+                    warn!(peer = %addr, %error, "historical committee: prover tree sync failed; trying the next archive")
+                }
             }
         }
         if !synced {
-            return Err(QuilError::ExecutionUnavailable("no archive serves the prover tree at this root".into()));
+            return Err(QuilError::ExecutionUnavailable(
+                "no archive serves the prover tree at this root".into(),
+            ));
         }
         tree.removes_synced |= removes.is_some();
         let store = quil_store::RocksHypergraphStore::new(tree.db.inner());
@@ -436,13 +517,24 @@ impl HistoricalCommittees {
 
     fn fresh_tree(&self) -> Result<ScratchTree> {
         if self.scratch_dir.exists() {
-            std::fs::remove_dir_all(&self.scratch_dir)
-                .map_err(|e| QuilError::Internal(format!("clear historical prover tree store: {e}")))?;
+            std::fs::remove_dir_all(&self.scratch_dir).map_err(|e| {
+                QuilError::Internal(format!("clear historical prover tree store: {e}"))
+            })?;
         }
-        let db = Arc::new(quil_store::RocksDb::open(&self.scratch_dir)
-            .map_err(|e| QuilError::Internal(format!("open historical prover tree store: {e}")))?);
-        let crdt = super::worker_manager::build_thread_worker_hypergraph(&db, self.inclusion_prover.clone(), false);
-        Ok(ScratchTree { db, crdt, removes_synced: false })
+        let db =
+            Arc::new(quil_store::RocksDb::open(&self.scratch_dir).map_err(|e| {
+                QuilError::Internal(format!("open historical prover tree store: {e}"))
+            })?);
+        let crdt = super::worker_manager::build_thread_worker_hypergraph(
+            &db,
+            self.inclusion_prover.clone(),
+            false,
+        );
+        Ok(ScratchTree {
+            db,
+            crdt,
+            removes_synced: false,
+        })
     }
 }
 
@@ -456,9 +548,12 @@ pub(crate) fn global_anchor_source(
         Box::pin(async move {
             match service {
                 Some(service) => service.global_anchor(number).await,
-                None => Err(QuilError::ExecutionUnavailable("GLOBAL anchor archive fallback not ready".into())),
+                None => Err(QuilError::ExecutionUnavailable(
+                    "GLOBAL anchor archive fallback not ready".into(),
+                )),
             }
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<GlobalFrame>> + Send>>
+        })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Result<GlobalFrame>> + Send>>
     })
 }
 
@@ -466,12 +561,16 @@ pub(crate) fn global_anchor_source(
 /// ending in a certified one), each linked to the next by its parent
 /// selector, so all are ancestors of the certified frame.
 fn linked_headers(run: Vec<GlobalFrame>, needed: u64) -> Result<Vec<GlobalFrameHeader>> {
-    let headers: Vec<GlobalFrameHeader> = run.into_iter().filter_map(|frame| frame.header).collect();
+    let headers: Vec<GlobalFrameHeader> =
+        run.into_iter().filter_map(|frame| frame.header).collect();
     for pair in headers.windows(2) {
         let identity = quil_crypto::poseidon::hash_bytes_to_32(&pair[0].output)?;
-        if pair[1].frame_number != pair[0].frame_number + 1 || pair[1].parent_selector.as_slice() != identity.as_slice() {
+        if pair[1].frame_number != pair[0].frame_number + 1
+            || pair[1].parent_selector.as_slice() != identity.as_slice()
+        {
             return Err(QuilError::InvalidArgument(format!(
-                "GLOBAL frame {} does not link to frame {}", pair[1].frame_number, pair[0].frame_number,
+                "GLOBAL frame {} does not link to frame {}",
+                pair[1].frame_number, pair[0].frame_number,
             )));
         }
     }
@@ -487,14 +586,21 @@ mod tests {
             frame_number: number,
             output: vec![output; 32],
             parent_selector: parent
-                .map(|p| quil_crypto::poseidon::hash_bytes_to_32(&[p; 32]).unwrap().to_vec())
+                .map(|p| {
+                    quil_crypto::poseidon::hash_bytes_to_32(&[p; 32])
+                        .unwrap()
+                        .to_vec()
+                })
                 .unwrap_or_default(),
             ..Default::default()
         }
     }
 
     fn frame(header: GlobalFrameHeader) -> GlobalFrame {
-        GlobalFrame { header: Some(header), requests: vec![] }
+        GlobalFrame {
+            header: Some(header),
+            requests: vec![],
+        }
     }
 
     struct NoFrames;
@@ -517,24 +623,46 @@ mod tests {
         let archive_dir = tempfile::tempdir().unwrap();
         let archive_db = Arc::new(quil_store::RocksDb::open(archive_dir.path()).unwrap());
         let archive = super::super::worker_manager::build_thread_worker_hypergraph(
-            &archive_db, Arc::new(quil_tries::ShaInclusionProver), false,
+            &archive_db,
+            Arc::new(quil_tries::ShaInclusionProver),
+            false,
         );
         let first = quil_crypto::FalconSigner::generate();
         let second = quil_crypto::FalconSigner::generate();
-        quil_engine::genesis::seed_active_prover_on_filter(&archive, first.public_key(), 100, 10, &filter).unwrap();
+        quil_engine::genesis::seed_active_prover_on_filter(
+            &archive,
+            first.public_key(),
+            100,
+            10,
+            &filter,
+        )
+        .unwrap();
         let (_, before) = archive.serve_forest_head(&[0xff; 32], 0).unwrap();
-        quil_engine::genesis::seed_active_prover_on_filter(&archive, second.public_key(), 100, 14, &filter).unwrap();
+        quil_engine::genesis::seed_active_prover_on_filter(
+            &archive,
+            second.public_key(),
+            100,
+            14,
+            &filter,
+        )
+        .unwrap();
         let (_, after) = archive.serve_forest_head(&[0xff; 32], 0).unwrap();
         assert_ne!(before, after);
 
-        let server = quil_rpc::GlobalRpcServer::new(Arc::new(NoFrames))
-            .with_forest_server(Arc::new(super::super::grpc::CrdtForestServer(archive.clone())));
+        let server = quil_rpc::GlobalRpcServer::new(Arc::new(NoFrames)).with_forest_server(
+            Arc::new(super::super::grpc::CrdtForestServer(archive.clone())),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(quil_types::proto::global::global_service_server::GlobalServiceServer::new(server))
+                .add_service(
+                    quil_types::proto::global::global_service_server::GlobalServiceServer::new(
+                        server,
+                    ),
+                )
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -548,12 +676,18 @@ mod tests {
         for n in 14..=25u64 {
             let root = if n <= 14 { before } else { after };
             let frame = GlobalFrame {
-                header: Some(GlobalFrameHeader { frame_number: n, prover_tree_commitment: root.to_vec(), ..Default::default() }),
+                header: Some(GlobalFrameHeader {
+                    frame_number: n,
+                    prover_tree_commitment: root.to_vec(),
+                    ..Default::default()
+                }),
                 requests: vec![],
             };
             clock.put_global_frame(&frame, None).unwrap();
         }
-        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60)));
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
+            std::time::Duration::from_secs(60),
+        ));
         pool.add(addr).await;
         let scratch = tempfile::tempdir().unwrap();
         let verifier = Arc::new(quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
@@ -578,9 +712,14 @@ mod tests {
         }));
         let committees = service.committees(&filter, 15).await.unwrap();
         let only_first = vec![first.public_key().to_vec()];
-        assert!(committees.contains(&only_first), "the tree before the second join");
         assert!(
-            committees.iter().any(|c| c.len() == 2 && c.contains(&second.public_key().to_vec())),
+            committees.contains(&only_first),
+            "the tree before the second join"
+        );
+        assert!(
+            committees
+                .iter()
+                .any(|c| c.len() == 2 && c.contains(&second.public_key().to_vec())),
             "the tree after it: {} committees",
             committees.len(),
         );
@@ -596,12 +735,26 @@ mod tests {
     /// parent, is accepted up to the certified frame at its top.
     #[test]
     fn a_run_is_accepted_only_as_a_linked_chain() {
-        let run = vec![frame(header(10, 1, None)), frame(header(11, 2, Some(1))), frame(header(12, 3, Some(2)))];
+        let run = vec![
+            frame(header(10, 1, None)),
+            frame(header(11, 2, Some(1))),
+            frame(header(12, 3, Some(2))),
+        ];
         let headers = linked_headers(run, 2).unwrap();
-        assert_eq!(headers.iter().map(|h| h.frame_number).collect::<Vec<_>>(), vec![10, 11]);
+        assert_eq!(
+            headers.iter().map(|h| h.frame_number).collect::<Vec<_>>(),
+            vec![10, 11]
+        );
 
-        let forged = vec![frame(header(10, 1, None)), frame(header(11, 2, Some(9))), frame(header(12, 3, Some(2)))];
-        assert!(linked_headers(forged, 2).is_err(), "a frame not linked to its parent");
+        let forged = vec![
+            frame(header(10, 1, None)),
+            frame(header(11, 2, Some(9))),
+            frame(header(12, 3, Some(2))),
+        ];
+        assert!(
+            linked_headers(forged, 2).is_err(),
+            "a frame not linked to its parent"
+        );
         let gap = vec![frame(header(10, 1, None)), frame(header(12, 3, Some(1)))];
         assert!(linked_headers(gap, 1).is_err(), "a skipped height");
     }
@@ -626,7 +779,10 @@ mod tests {
             warnings.due(frame, start + MINUTE * 33);
         }
         assert_eq!(warnings.warned.len(), ANCHOR_WARNED_KEPT);
-        assert!(!warnings.due(199, start + MINUTE * 34), "the newest are kept");
+        assert!(
+            !warnings.due(199, start + MINUTE * 34),
+            "the newest are kept"
+        );
     }
 
     /// A GLOBAL frame from prover `[1; 32]` (the test's allowlist) or not,
@@ -638,7 +794,9 @@ mod tests {
                 frame_number: number,
                 prover: vec![if allowed { 1 } else { 2 }; 32],
                 public_key_signature_bls48581: signed.then(|| Bls48581AggregateSignature {
-                    public_key: Some(Bls48581g2PublicKey { key_value: vec![1; 8] }),
+                    public_key: Some(Bls48581g2PublicKey {
+                        key_value: vec![1; 8],
+                    }),
                     signature: vec![2; 8],
                     bitmask: Vec::new(),
                 }),
@@ -670,14 +828,23 @@ mod tests {
     /// with GLOBAL frame 100 as this node's head; the guards keep the stores.
     async fn anchor_service<L: quil_rpc::global_service::FrameLookup + Send + Sync + 'static>(
         archive: L,
-    ) -> (HistoricalCommittees, Arc<quil_store::RocksClockStore>, impl Sized) {
+    ) -> (
+        HistoricalCommittees,
+        Arc<quil_store::RocksClockStore>,
+        impl Sized,
+    ) {
         let server = quil_rpc::GlobalRpcServer::new(Arc::new(archive));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(quil_types::proto::global::global_service_server::GlobalServiceServer::new(server))
+                .add_service(
+                    quil_types::proto::global::global_service_server::GlobalServiceServer::new(
+                        server,
+                    ),
+                )
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -685,8 +852,12 @@ mod tests {
         let clock_dir = tempfile::tempdir().unwrap();
         let clock_db = quil_store::RocksDb::open(clock_dir.path()).unwrap();
         let clock = Arc::new(quil_store::RocksClockStore::new(clock_db.inner()));
-        clock.put_global_frame(&anchor(100, true, true), None).unwrap();
-        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(std::time::Duration::from_secs(60)));
+        clock
+            .put_global_frame(&anchor(100, true, true), None)
+            .unwrap();
+        let pool = Arc::new(quil_rpc::ArchiveEndpointPool::new(
+            std::time::Duration::from_secs(60),
+        ));
         pool.add(addr).await;
         let scratch = tempfile::tempdir().unwrap();
         let verifier = Arc::new(quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
@@ -697,7 +868,9 @@ mod tests {
             pool,
             Vec::new(),
             clock.clone(),
-            Arc::new(|frame: &GlobalFrame| frame.header.as_ref().is_some_and(|h| h.prover == [1u8; 32])),
+            Arc::new(|frame: &GlobalFrame| {
+                frame.header.as_ref().is_some_and(|h| h.prover == [1u8; 32])
+            }),
             verifier,
             Arc::new(quil_tries::ShaInclusionProver),
             scratch.path().join("tree"),
@@ -719,13 +892,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_anchors_are_stored_only_validated_and_self_certified() {
         let (service, clock, _stores) = anchor_service(AnchorArchive).await;
-        assert_eq!(service.global_anchor(50).await.unwrap(), anchor(50, true, true));
+        assert_eq!(
+            service.global_anchor(50).await.unwrap(),
+            anchor(50, true, true)
+        );
         assert_eq!(clock.get_global_frame(50).unwrap(), anchor(50, true, true));
         for n in [60, 70, 80, 150, 0] {
             assert!(service.global_anchor(n).await.is_err(), "frame {n}");
-            assert!(clock.get_global_frame(n).is_err(), "frame {n} is not stored");
+            assert!(
+                clock.get_global_frame(n).is_err(),
+                "frame {n} is not stored"
+            );
         }
-        assert_eq!(service.global_anchor(100).await.unwrap(), anchor(100, true, true), "held frames are served");
+        assert_eq!(
+            service.global_anchor(100).await.unwrap(),
+            anchor(100, true, true),
+            "held frames are served"
+        );
         assert_eq!(clock.get_latest_frame_number(), Some(100));
     }
 
@@ -736,7 +919,9 @@ mod tests {
         let mut frame = anchor(n, true, signed);
         let header = frame.header.as_mut().unwrap();
         header.output = output(n);
-        header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&output(n - 1)).unwrap().to_vec();
+        header.parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&output(n - 1))
+            .unwrap()
+            .to_vec();
         frame
     }
 
@@ -762,11 +947,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uncertified_anchors_are_stored_only_below_a_linked_certified_frame() {
         let (service, clock, _stores) = anchor_service(UncertifiedArchive).await;
-        assert_eq!(service.global_anchor(40).await.unwrap(), linked(40, false), "certified child");
-        assert_eq!(service.global_anchor(21).await.unwrap(), linked(21, false), "certified 8 frames above");
+        assert_eq!(
+            service.global_anchor(40).await.unwrap(),
+            linked(40, false),
+            "certified child"
+        );
+        assert_eq!(
+            service.global_anchor(21).await.unwrap(),
+            linked(21, false),
+            "certified 8 frames above"
+        );
         for n in [20, 30] {
             assert!(service.global_anchor(n).await.is_err(), "frame {n}");
-            assert!(clock.get_global_frame(n).is_err(), "frame {n} is not stored");
+            assert!(
+                clock.get_global_frame(n).is_err(),
+                "frame {n} is not stored"
+            );
         }
         assert_eq!(clock.get_global_frame(40).unwrap(), linked(40, false));
         assert_eq!(clock.get_latest_frame_number(), Some(100));
@@ -782,11 +978,19 @@ mod tests {
         fn get_frame(&self, n: u64) -> std::result::Result<GlobalFrame, String> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut frame = UncertifiedArchive.get_frame(n)?;
-            frame.requests.push(quil_types::proto::global::MessageBundle { timestamp: n as i64, ..Default::default() });
+            frame
+                .requests
+                .push(quil_types::proto::global::MessageBundle {
+                    timestamp: n as i64,
+                    ..Default::default()
+                });
             Ok(frame)
         }
         fn get_frame_header(&self, n: u64) -> std::result::Result<GlobalFrameHeader, String> {
-            UncertifiedArchive.get_frame(n)?.header.ok_or_else(|| "no header".to_string())
+            UncertifiedArchive
+                .get_frame(n)?
+                .header
+                .ok_or_else(|| "no header".to_string())
         }
     }
 
@@ -799,14 +1003,29 @@ mod tests {
         let whole = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let read_whole = || whole.load(std::sync::atomic::Ordering::SeqCst);
         let (service, clock, _stores) = anchor_service(BundledArchive(whole.clone())).await;
-        assert_eq!(clock.prune_global_frame_requests(70).unwrap().retained_from, Some(30));
+        assert_eq!(
+            clock.prune_global_frame_requests(70).unwrap().retained_from,
+            Some(30)
+        );
 
-        assert_eq!(service.global_anchor(21).await.unwrap(), linked(21, false), "certified 8 frames above");
-        assert_eq!(read_whole(), 0, "the anchor and the 8 frames above it, as headers");
+        assert_eq!(
+            service.global_anchor(21).await.unwrap(),
+            linked(21, false),
+            "certified 8 frames above"
+        );
+        assert_eq!(
+            read_whole(),
+            0,
+            "the anchor and the 8 frames above it, as headers"
+        );
         assert_eq!(clock.get_global_frame(21).unwrap(), linked(21, false));
 
         let anchor = service.global_anchor(40).await.unwrap();
-        assert_eq!(anchor.requests.len(), 1, "a whole frame at the boundary or above");
+        assert_eq!(
+            anchor.requests.len(),
+            1,
+            "a whole frame at the boundary or above"
+        );
         assert_eq!(anchor.header, linked(40, false).header);
         assert_eq!(read_whole(), 1, "its certified child, as a header");
         assert_eq!(clock.get_global_frame(40).unwrap(), anchor);

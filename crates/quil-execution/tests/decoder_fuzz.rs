@@ -18,11 +18,11 @@ use quil_execution::global_intrinsic::{
     prover_ops::{ProverConfirm, ProverReject, ProverSeniorityMerge, ShardMerge, ShardSplit},
     AddressedSignature, ProverLeave, ProverPause, ProverResume, SignatureWithPop,
 };
+use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
 use quil_execution::hypergraph_intrinsic::{
     HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy, HypergraphUpdate,
     VertexAdd, VertexRemove,
 };
-use quil_execution::hypergraph_intrinsic::canonical::AggregateSignature;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
 // ---------------------------------------------------------------------
@@ -43,10 +43,8 @@ fn bytes_fixed(len: usize) -> impl Strategy<Value = Vec<u8>> {
 
 fn addressed_sig() -> impl Strategy<Value = AddressedSignature> {
     // Falcon-512 single-signer signature is 666 bytes.
-    (bytes_fixed(666), bytes_fixed(32)).prop_map(|(signature, address)| AddressedSignature {
-        signature,
-        address,
-    })
+    (bytes_fixed(666), bytes_fixed(32))
+        .prop_map(|(signature, address)| AddressedSignature { signature, address })
 }
 
 fn sig_with_pop() -> impl Strategy<Value = SignatureWithPop> {
@@ -77,9 +75,7 @@ fn aggregate_sig() -> impl Strategy<Value = AggregateSignature> {
     (
         sig_strategy,
         prop::option::of(bytes_fixed(897).prop_map(|kv| {
-            quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey {
-                key_value: kv,
-            }
+            quil_execution::hypergraph_intrinsic::canonical::Bls48581G2PublicKey { key_value: kv }
         })),
         bytes(32),
     )
@@ -96,13 +92,13 @@ fn hypergraph_config() -> impl Strategy<Value = HypergraphConfiguration> {
         bytes_fixed(57),
         prop_oneof![Just(Vec::<u8>::new()), bytes_fixed(585)],
     )
-        .prop_map(
-            |(read_public_key, write_public_key, owner_public_key)| HypergraphConfiguration {
+        .prop_map(|(read_public_key, write_public_key, owner_public_key)| {
+            HypergraphConfiguration {
                 read_public_key,
                 write_public_key,
                 owner_public_key,
-            },
-        )
+            }
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -155,7 +151,12 @@ macro_rules! decode_fuzz_test {
 roundtrip_test!(
     vertex_add_roundtrip,
     VertexAdd,
-    (bytes_fixed(32), bytes_fixed(32), bytes(2048), bytes_fixed(114))
+    (
+        bytes_fixed(32),
+        bytes_fixed(32),
+        bytes(2048),
+        bytes_fixed(114)
+    )
         .prop_map(|(domain, data_address, data, signature)| VertexAdd {
             domain,
             data_address,
@@ -168,12 +169,13 @@ decode_fuzz_test!(vertex_add_decode_fuzz, VertexAdd);
 roundtrip_test!(
     vertex_remove_roundtrip,
     VertexRemove,
-    (bytes_fixed(32), bytes_fixed(32), bytes_fixed(114))
-        .prop_map(|(domain, data_address, signature)| VertexRemove {
+    (bytes_fixed(32), bytes_fixed(32), bytes_fixed(114)).prop_map(
+        |(domain, data_address, signature)| VertexRemove {
             domain,
             data_address,
             signature,
-        })
+        }
+    )
 );
 decode_fuzz_test!(vertex_remove_decode_fuzz, VertexRemove);
 
@@ -243,13 +245,11 @@ roundtrip_test!(
         bytes(1024),
         prop::option::of(aggregate_sig()),
     )
-        .prop_map(
-            |(config, rdf_schema, sig)| HypergraphUpdate {
-                config,
-                rdf_schema,
-                public_key_signature_bls48581: sig,
-            }
-        )
+        .prop_map(|(config, rdf_schema, sig)| HypergraphUpdate {
+            config,
+            rdf_schema,
+            public_key_signature_bls48581: sig,
+        })
 );
 decode_fuzz_test!(hypergraph_update_decode_fuzz, HypergraphUpdate);
 
@@ -292,26 +292,32 @@ decode_fuzz_test!(prover_join_decode_fuzz, ProverJoin);
 roundtrip_test!(
     prover_pause_roundtrip,
     ProverPause,
-    (bytes_fixed(32), any::<u64>(), prop::option::of(addressed_sig())).prop_map(
-        |(filter, frame_number, sig)| ProverPause {
+    (
+        bytes_fixed(32),
+        any::<u64>(),
+        prop::option::of(addressed_sig())
+    )
+        .prop_map(|(filter, frame_number, sig)| ProverPause {
             filter,
             frame_number,
             public_key_signature_bls48581: sig,
-        }
-    )
+        })
 );
 decode_fuzz_test!(prover_pause_decode_fuzz, ProverPause);
 
 roundtrip_test!(
     prover_resume_roundtrip,
     ProverResume,
-    (bytes_fixed(32), any::<u64>(), prop::option::of(addressed_sig())).prop_map(
-        |(filter, frame_number, sig)| ProverResume {
+    (
+        bytes_fixed(32),
+        any::<u64>(),
+        prop::option::of(addressed_sig())
+    )
+        .prop_map(|(filter, frame_number, sig)| ProverResume {
             filter,
             frame_number,
             public_key_signature_bls48581: sig,
-        }
-    )
+        })
 );
 decode_fuzz_test!(prover_resume_decode_fuzz, ProverResume);
 

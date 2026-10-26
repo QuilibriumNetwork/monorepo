@@ -117,7 +117,13 @@ pub fn unused_keys(contents: &str) -> Vec<UnusedKey> {
         return Vec::new();
     };
     let found = RefCell::new(Vec::new());
-    if Config::deserialize(Probe { value, path: String::new(), found: &found }).is_err() {
+    if Config::deserialize(Probe {
+        value,
+        path: String::new(),
+        found: &found,
+    })
+    .is_err()
+    {
         return Vec::new();
     }
     let mut keys: Vec<UnusedKey> = Vec::new();
@@ -125,7 +131,10 @@ pub fn unused_keys(contents: &str) -> Vec<UnusedKey> {
         if OTHER_TOOLS_KEYS.contains(&path.as_str()) {
             continue;
         }
-        let key = if RETIRED_KEYS.iter().any(|retired| retired.eq_ignore_ascii_case(&path)) {
+        let key = if RETIRED_KEYS
+            .iter()
+            .any(|retired| retired.eq_ignore_ascii_case(&path))
+        {
             UnusedKey::Retired(path)
         } else {
             UnusedKey::Unknown(path)
@@ -140,21 +149,40 @@ pub fn unused_keys(contents: &str) -> Vec<UnusedKey> {
 /// The startup warning naming the unknown keys among `keys`, at most
 /// [`MAX_LISTED_UNKNOWN_KEYS`] of them; `None` when there are none.
 pub fn unknown_keys_warning(keys: &[UnusedKey]) -> Option<String> {
-    let unknown: Vec<&str> =
-        keys.iter().filter_map(|key| if let UnusedKey::Unknown(path) = key { Some(path.as_str()) } else { None }).collect();
+    let unknown: Vec<&str> = keys
+        .iter()
+        .filter_map(|key| {
+            if let UnusedKey::Unknown(path) = key {
+                Some(path.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
     let listed = listing(&unknown, MAX_LISTED_UNKNOWN_KEYS)?;
     Some(if unknown.len() == 1 {
         format!("1 config key is not a known setting (typo?): {listed}")
     } else {
-        format!("{} config keys are not known settings (typo?): {listed}", unknown.len())
+        format!(
+            "{} config keys are not known settings (typo?): {listed}",
+            unknown.len()
+        )
     })
 }
 
 /// The startup notice naming every retired key among `keys`; `None` when
 /// there are none.
 pub fn retired_keys_notice(keys: &[UnusedKey]) -> Option<String> {
-    let retired: Vec<&str> =
-        keys.iter().filter_map(|key| if let UnusedKey::Retired(path) = key { Some(path.as_str()) } else { None }).collect();
+    let retired: Vec<&str> = keys
+        .iter()
+        .filter_map(|key| {
+            if let UnusedKey::Retired(path) = key {
+                Some(path.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
     let listed = listing(&retired, retired.len())?;
     Some(if retired.len() == 1 {
         format!("1 setting of an earlier release has no effect in this node; remove it from config.yml when convenient: {listed}; run `qclient node config clean` to comment it out")
@@ -173,7 +201,11 @@ fn listing(paths: &[&str], max: usize) -> Option<String> {
         return None;
     }
     let shown = paths.len().min(max);
-    let mut text = paths[..shown].iter().map(|path| shortened(path)).collect::<Vec<_>>().join(", ");
+    let mut text = paths[..shown]
+        .iter()
+        .map(|path| shortened(path))
+        .collect::<Vec<_>>()
+        .join(", ");
     if shown < paths.len() {
         text.push_str(&format!(" (+{} more)", paths.len() - shown));
     }
@@ -225,7 +257,10 @@ impl<'de> Deserializer<'de> for Probe<'_> {
         self.deserialize_string(visitor)
     }
 
-    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, serde_yaml::Error> {
+    fn deserialize_string<V: Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, serde_yaml::Error> {
         match self.value {
             Value::Number(number) => visitor.visit_string(number.to_string()),
             Value::Bool(flag) => visitor.visit_string(flag.to_string()),
@@ -233,11 +268,17 @@ impl<'de> Deserializer<'de> for Probe<'_> {
         }
     }
 
-    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, serde_yaml::Error> {
+    fn deserialize_identifier<V: Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, serde_yaml::Error> {
         self.deserialize_string(visitor)
     }
 
-    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, serde_yaml::Error> {
+    fn deserialize_option<V: Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, serde_yaml::Error> {
         match self.value {
             Value::Null => visitor.visit_none(),
             _ => visitor.visit_some(self),
@@ -260,7 +301,11 @@ impl<'de> Deserializer<'de> for Probe<'_> {
         visitor.visit_newtype_struct(self)
     }
 
-    fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, serde_yaml::Error> {
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        len: usize,
+        visitor: V,
+    ) -> Result<V::Value, serde_yaml::Error> {
         self.value.deserialize_tuple(len, visitor)
     }
 
@@ -298,13 +343,24 @@ impl<'de> Deserializer<'de> for Probe<'_> {
             // the typed parse.
             let name = match key {
                 Value::String(name) => name,
-                other => serde_yaml::to_string(&other).unwrap_or_default().trim().to_string(),
+                other => serde_yaml::to_string(&other)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
             };
-            let path = if self.path.is_empty() { name.clone() } else { format!("{}.{name}", self.path) };
+            let path = if self.path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{name}", self.path)
+            };
             let declared = fields.contains(&name.as_str());
             entries.push((name, value, path, declared));
         }
-        visitor.visit_map(ProbeMap { entries: entries.into_iter(), next_value: None, found: self.found })
+        visitor.visit_map(ProbeMap {
+            entries: entries.into_iter(),
+            next_value: None,
+            found: self.found,
+        })
     }
 }
 
@@ -319,7 +375,10 @@ struct ProbeMap<'a> {
 impl<'de> MapAccess<'de> for ProbeMap<'_> {
     type Error = serde_yaml::Error;
 
-    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, serde_yaml::Error> {
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, serde_yaml::Error> {
         let Some((key, value, path, declared)) = self.entries.next() else {
             return Ok(None);
         };
@@ -330,12 +389,18 @@ impl<'de> MapAccess<'de> for ProbeMap<'_> {
         seed.deserialize(Value::String(key)).map(Some)
     }
 
-    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, serde_yaml::Error> {
-        let (value, path) = self
-            .next_value
-            .take()
-            .ok_or_else(|| <serde_yaml::Error as serde::de::Error>::custom("value requested before its key"))?;
-        seed.deserialize(Probe { value, path, found: self.found })
+    fn next_value_seed<V: DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, serde_yaml::Error> {
+        let (value, path) = self.next_value.take().ok_or_else(|| {
+            <serde_yaml::Error as serde::de::Error>::custom("value requested before its key")
+        })?;
+        seed.deserialize(Probe {
+            value,
+            path,
+            found: self.found,
+        })
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -455,7 +520,10 @@ diagnostics:
     enabled: false
 "#;
         assert_eq!(unused_keys(yaml), Vec::new());
-        assert_eq!(unused_keys("listenGRPCMultiaddr: /ip4/127.0.0.1/tcp/8337\n"), Vec::new());
+        assert_eq!(
+            unused_keys("listenGRPCMultiaddr: /ip4/127.0.0.1/tcp/8337\n"),
+            Vec::new()
+        );
         let written = serde_yaml::to_string(&Config::default()).unwrap();
         assert_eq!(unused_keys(&written), Vec::new());
         assert_eq!(unknown_keys_warning(&unused_keys(&written)), None);
@@ -587,7 +655,13 @@ listenGrpcMultiaddr: ""
 listenRESTMultiaddr: ""
 "#;
         let keys = unused_keys(yaml);
-        assert_eq!(keys.iter().filter(|key| matches!(key, UnusedKey::Unknown(_))).count(), 0, "{keys:?}");
+        assert_eq!(
+            keys.iter()
+                .filter(|key| matches!(key, UnusedKey::Unknown(_)))
+                .count(),
+            0,
+            "{keys:?}"
+        );
         assert_eq!(keys.len(), 60, "{keys:?}");
     }
 
@@ -597,7 +671,11 @@ listenRESTMultiaddr: ""
     fn unknown_and_retired_keys_get_separate_lines() {
         assert_eq!(unknown_keys_warning(&[]), None);
         assert_eq!(retired_keys_notice(&[]), None);
-        let keys = [retired("p2p.d"), unknown("p2p.bootstrapPeer"), retired("engine.framePublish")];
+        let keys = [
+            retired("p2p.d"),
+            unknown("p2p.bootstrapPeer"),
+            retired("engine.framePublish"),
+        ];
         assert_eq!(
             unknown_keys_warning(&keys).unwrap(),
             "1 config key is not a known setting (typo?): p2p.bootstrapPeer"
@@ -613,20 +691,34 @@ listenRESTMultiaddr: ""
         );
         assert_eq!(unknown_keys_warning(&[retired("p2p.d")]), None);
 
-        let mut many: Vec<UnusedKey> = (0..25).map(|n| unknown(&format!("engine.typo{n}"))).collect();
+        let mut many: Vec<UnusedKey> = (0..25)
+            .map(|n| unknown(&format!("engine.typo{n}")))
+            .collect();
         many.extend((0..40).map(|n| retired(&format!("p2p.old{n}"))));
         let warning = unknown_keys_warning(&many).unwrap();
-        assert!(warning.starts_with("25 config keys are not known settings (typo?): engine.typo0, "), "{warning}");
+        assert!(
+            warning.starts_with("25 config keys are not known settings (typo?): engine.typo0, "),
+            "{warning}"
+        );
         assert!(warning.ends_with("engine.typo19 (+5 more)"), "{warning}");
         let notice = retired_keys_notice(&many).unwrap();
-        assert!(notice.starts_with("40 settings of earlier releases"), "{notice}");
-        assert!(notice.contains("p2p.old38, p2p.old39; run `qclient node config clean`"), "{notice}");
+        assert!(
+            notice.starts_with("40 settings of earlier releases"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("p2p.old38, p2p.old39; run `qclient node config clean`"),
+            "{notice}"
+        );
 
         let long = format!("engine.{}", "x".repeat(80));
         let warning = unknown_keys_warning(&[unknown(&long)]).unwrap();
         let shown = warning.rsplit(": ").next().unwrap();
         assert_eq!(shown.chars().count(), 64, "{warning}");
-        assert!(shown.ends_with('…') && shown.starts_with("engine.xxx"), "{warning}");
+        assert!(
+            shown.ends_with('…') && shown.starts_with("engine.xxx"),
+            "{warning}"
+        );
     }
 
     /// The probe reads scalars as leniently as the typed parse: a string
@@ -636,7 +728,16 @@ listenRESTMultiaddr: ""
     fn bare_scalars_and_non_string_keys_are_read_like_the_typed_parse() {
         let yaml = "p2p:\n  network: 1\n  peerPrivKey: 1234\n  listenMultiaddr: true\n  d: 8\n  7: x\nengine:\n  delegateAddress: 99\n  true: y\n";
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!((config.p2p.peer_priv_key.as_str(), config.engine.delegate_address.as_str()), ("1234", "99"));
-        assert_eq!(unused_keys(yaml), vec![retired("p2p.d"), unknown("p2p.7"), unknown("engine.true")]);
+        assert_eq!(
+            (
+                config.p2p.peer_priv_key.as_str(),
+                config.engine.delegate_address.as_str()
+            ),
+            ("1234", "99")
+        );
+        assert_eq!(
+            unused_keys(yaml),
+            vec![retired("p2p.d"), unknown("p2p.7"), unknown("engine.true")]
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! Memos are fixed-size opaque ciphertexts; delivery, memo suite,
 //! root admission and spent-image checks are not performed here.
 
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::{
         membership::{InputPath, MembershipKey, MembershipStatement, Node, MAX_DEPTH, NODE_BYTES},
@@ -10,7 +11,6 @@ use super::{
     },
     *,
 };
-use super::relation::membership::IDENTITY_BYTES;
 use std::collections::BTreeSet;
 
 pub const MAX_TRANSACTION_BYTES: usize = 1 << 20;
@@ -298,7 +298,10 @@ impl Transfer {
         let root =
             Node::from_bytes(reader.take(NODE_BYTES)?).map_err(|_| TransferError::Noncanonical)?;
         // Count-derived lower bound is checked before allocating the vectors.
-        let required = inputs * IDENTITY_BYTES + outputs * (COMMITMENT_BYTES + IDENTITY_BYTES + MEMO_BYTES) + 4 + 40;
+        let required = inputs * IDENTITY_BYTES
+            + outputs * (COMMITMENT_BYTES + IDENTITY_BYTES + MEMO_BYTES)
+            + 4
+            + 40;
         if reader.0.len() < required {
             return Err(TransferError::Length);
         }
@@ -434,7 +437,7 @@ mod tests {
     #[test]
     fn retired_native_proof_version_is_rejected() {
         for magic in [b"QPF1\0\0\0\0", b"QPF2\0\0\0\0", b"QPF3\0\0\0\0"] {
-            let mut tx=fixture(1);
+            let mut tx = fixture(1);
             tx.proof[..8].copy_from_slice(magic);
             assert!(tx.encode().is_err());
         }
@@ -570,7 +573,8 @@ mod tests {
         duplicate.statement.images[1] = duplicate.statement.images[0];
         assert_eq!(duplicate.encode(), Err(TransferError::DuplicateImage));
         let mut bytes = encoded.clone();
-        bytes[97 + NODE_BYTES + IDENTITY_BYTES..97 + NODE_BYTES + 2 * IDENTITY_BYTES].copy_from_slice(&[1; IDENTITY_BYTES]);
+        bytes[97 + NODE_BYTES + IDENTITY_BYTES..97 + NODE_BYTES + 2 * IDENTITY_BYTES]
+            .copy_from_slice(&[1; IDENTITY_BYTES]);
         reject(&bytes);
         let mut bytes = encoded.clone();
         bytes.push(0);

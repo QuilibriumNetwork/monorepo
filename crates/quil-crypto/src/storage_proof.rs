@@ -112,7 +112,10 @@ fn parent_level(level: &[Digest], height: usize) -> Vec<Digest> {
     level
         .par_chunks(2)
         .map(|pair| {
-            let right = pair.get(1).copied().unwrap_or_else(|| empty_subtree(height));
+            let right = pair
+                .get(1)
+                .copied()
+                .unwrap_or_else(|| empty_subtree(height));
             hash::compress(&pair[0], &right, Domain::Node)
         })
         .collect()
@@ -129,13 +132,18 @@ impl MerkleTree {
     /// of canonical 32-byte nodes.
     pub fn from_nodes(nodes: &[u8]) -> Option<Self> {
         let leaves = hash::digests_from_bytes(nodes)?;
-        (!leaves.is_empty() && (leaves.len() as u64) < MAX_NODES).then(|| Self::from_digests(leaves))
+        (!leaves.is_empty() && (leaves.len() as u64) < MAX_NODES)
+            .then(|| Self::from_digests(leaves))
     }
 
     /// The tree over `leaves`, at least one.
     pub fn from_digests(leaves: Vec<Digest>) -> Self {
         assert!(!leaves.is_empty(), "a storage tree needs a leaf");
-        assert!((leaves.len() as u64) < MAX_NODES, "a storage tree of {} leaves is too large", leaves.len());
+        assert!(
+            (leaves.len() as u64) < MAX_NODES,
+            "a storage tree of {} leaves is too large",
+            leaves.len()
+        );
         let n = leaves.len() as u64;
         let mut levels = vec![leaves];
         for height in 0..tree_depth(n) {
@@ -158,7 +166,12 @@ impl MerkleTree {
         let mut path = Vec::with_capacity(self.levels.len() - 1);
         let mut i = index as usize;
         for (height, level) in self.levels[..self.levels.len() - 1].iter().enumerate() {
-            path.push(hash::to_bytes(&level.get(i ^ 1).copied().unwrap_or_else(|| empty_subtree(height))));
+            path.push(hash::to_bytes(
+                &level
+                    .get(i ^ 1)
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(height)),
+            ));
             i >>= 1;
         }
         path
@@ -167,20 +180,35 @@ impl MerkleTree {
     /// The levels from `height` up (all of them above a shallower tree's leaves).
     pub fn cap(&self, height: usize) -> MerkleCap {
         let height = height.min(self.levels.len() - 1);
-        MerkleCap { n: self.n, height, levels: self.levels[height..].to_vec() }
+        MerkleCap {
+            n: self.n,
+            height,
+            levels: self.levels[height..].to_vec(),
+        }
     }
 }
 
 /// Whether `path` opens leaf `index` of the `tree` committed as `commitment`,
 /// with `n` leaves, to `value`.
-pub fn verify_path(tree: Tree, n: u64, commitment: &Node, index: u64, value: &Node, path: &[Node]) -> bool {
+pub fn verify_path(
+    tree: Tree,
+    n: u64,
+    commitment: &Node,
+    index: u64,
+    value: &Node,
+    path: &[Node],
+) -> bool {
     if index >= n || n >= MAX_NODES || path.len() != tree_depth(n) {
         return false;
     }
-    let Some(mut acc) = hash::from_bytes(value) else { return false };
+    let Some(mut acc) = hash::from_bytes(value) else {
+        return false;
+    };
     let mut i = index;
     for sibling in path {
-        let Some(sibling) = hash::from_bytes(sibling) else { return false };
+        let Some(sibling) = hash::from_bytes(sibling) else {
+            return false;
+        };
         acc = if i & 1 == 0 {
             hash::compress(&acc, &sibling, Domain::Node)
         } else {
@@ -218,7 +246,12 @@ impl MerkleCap {
         let mut path = Vec::with_capacity(tree_depth(self.n));
         let mut i = index as usize - start;
         for height in 0..self.height {
-            path.push(hash::to_bytes(&level.get(i ^ 1).copied().unwrap_or_else(|| empty_subtree(height))));
+            path.push(hash::to_bytes(
+                &level
+                    .get(i ^ 1)
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(height)),
+            ));
             level = parent_level(&level, height);
             i >>= 1;
         }
@@ -228,7 +261,10 @@ impl MerkleCap {
         }
         for (above, cap_level) in self.levels[..self.levels.len() - 1].iter().enumerate() {
             path.push(hash::to_bytes(
-                &cap_level.get(i ^ 1).copied().unwrap_or_else(|| empty_subtree(self.height + above)),
+                &cap_level
+                    .get(i ^ 1)
+                    .copied()
+                    .unwrap_or_else(|| empty_subtree(self.height + above)),
             ));
             i >>= 1;
         }
@@ -299,11 +335,19 @@ fn label(
     header[1] = hash::felt(v as u32);
     absorber.absorb_digest(&header);
     for _ in 0..params.drg_degree {
-        let parent = if v > 0 { same_layer.next().unwrap_or(hash::ZERO) } else { hash::ZERO };
+        let parent = if v > 0 {
+            same_layer.next().unwrap_or(hash::ZERO)
+        } else {
+            hash::ZERO
+        };
         absorber.absorb_digest(&parent);
     }
     for _ in 0..params.expander_degree {
-        let parent = if layer > 0 { layer_below.next().unwrap_or(hash::ZERO) } else { hash::ZERO };
+        let parent = if layer > 0 {
+            layer_below.next().unwrap_or(hash::ZERO)
+        } else {
+            hash::ZERO
+        };
         absorber.absorb_digest(&parent);
     }
     absorber.finish()
@@ -319,7 +363,8 @@ fn label_layers(
     params: &SdrParams,
     on_layer: &mut dyn FnMut(usize, &[Digest]),
 ) -> Vec<Digest> {
-    let (parents, drg, width) = sdr::graph_parents(n, params).expect("a leaf's node indices fit in u32");
+    let (parents, drg, width) =
+        sdr::graph_parents(n, params).expect("a leaf's node indices fit in u32");
     let mut prev = vec![hash::ZERO; n];
     let mut cur = vec![hash::ZERO; n];
     for layer in 0..params.layers {
@@ -356,7 +401,10 @@ pub fn column_digest(labels: &[Node]) -> Option<Node> {
 }
 
 fn fold_layer(columns: &mut [Digest], layer: &[Digest]) {
-    columns.par_iter_mut().zip(layer.par_iter()).for_each(|(column, label)| *column = column_step(column, label));
+    columns
+        .par_iter_mut()
+        .zip(layer.par_iter())
+        .for_each(|(column, label)| *column = column_step(column, label));
 }
 
 /// The leaf's data as serialized nodes: 30 bytes per node, zero-padded to at
@@ -366,7 +414,10 @@ pub fn data_nodes(data: &[u8]) -> Vec<u8> {
 }
 
 fn packed_data(data: &[u8]) -> Vec<Digest> {
-    let mut nodes: Vec<Digest> = data.par_chunks(hash::DATA_BYTES_PER_NODE).map(hash::pack_node).collect();
+    let mut nodes: Vec<Digest> = data
+        .par_chunks(hash::DATA_BYTES_PER_NODE)
+        .map(hash::pack_node)
+        .collect();
     nodes.resize(nodes.len().max(MIN_NODES), hash::ZERO);
     nodes
 }
@@ -390,7 +441,10 @@ impl EncodedLeaf {
 }
 
 fn check_params(params: &SdrParams) {
-    assert_eq!(params.node_bytes, NODE_BYTES, "hash storage proofs use 32-byte nodes");
+    assert_eq!(
+        params.node_bytes, NODE_BYTES,
+        "hash storage proofs use 32-byte nodes"
+    );
 }
 
 /// Encode `data` into the replica keyed by `key`
@@ -402,8 +456,14 @@ pub fn encode_leaf(data: &[u8], key: &[u8], params: &SdrParams) -> EncodedLeaf {
     assert!((n as u64) < MAX_NODES, "a leaf of {n} nodes is too large");
     let comm_d = MerkleTree::from_digests(data.clone()).commitment(Tree::Data);
     let mut columns = vec![hash::ZERO; n];
-    let last = label_layers(n, &hash::key_digest(key), params, &mut |_, layer| fold_layer(&mut columns, layer));
-    let replica: Vec<Digest> = data.par_iter().zip(last.par_iter()).map(|(d, l)| hash::add(d, l)).collect();
+    let last = label_layers(n, &hash::key_digest(key), params, &mut |_, layer| {
+        fold_layer(&mut columns, layer)
+    });
+    let replica: Vec<Digest> = data
+        .par_iter()
+        .zip(last.par_iter())
+        .map(|(d, l)| hash::add(d, l))
+        .collect();
     drop((data, last));
     let comm_c = MerkleTree::from_digests(columns).commitment(Tree::Column);
     let replica_bytes = hash::digests_to_bytes(&replica);
@@ -439,7 +499,11 @@ pub fn parse_registration_root(root: &[u8]) -> Option<Registered> {
         let bytes: Node = root[at..at + NODE_BYTES].try_into().expect("32 bytes");
         hash::from_bytes(&bytes).map(|_| bytes)
     };
-    Some(Registered { comm_d: node(0)?, comm_c: node(NODE_BYTES)?, comm_r: node(2 * NODE_BYTES)? })
+    Some(Registered {
+        comm_d: node(0)?,
+        comm_c: node(NODE_BYTES)?,
+        comm_r: node(2 * NODE_BYTES)?,
+    })
 }
 
 // ── Seal proofs ──────────────────────────────────────────────────────────────
@@ -533,13 +597,23 @@ pub fn prove_seal(
     check_params(params);
     let n = statement.n as usize;
     if n < MIN_NODES || statement.n >= MAX_NODES || replica.len() != n * NODE_BYTES {
-        return Err(format!("replica is {} bytes, the registration has {n} nodes", replica.len()));
+        return Err(format!(
+            "replica is {} bytes, the registration has {n} nodes",
+            replica.len()
+        ));
     }
-    let replica = hash::digests_from_bytes(replica).ok_or("the replica holds a non-canonical node")?;
-    let key = hash::key_digest(&sdr::replica_key(statement.member, statement.leaf_id, statement.epoch));
+    let replica =
+        hash::digests_from_bytes(replica).ok_or("the replica holds a non-canonical node")?;
+    let key = hash::key_digest(&sdr::replica_key(
+        statement.member,
+        statement.leaf_id,
+        statement.epoch,
+    ));
     let challenges = seal_challenges(statement, count);
-    let parents: Vec<(Vec<u64>, Vec<u64>)> =
-        challenges.iter().map(|&j| parents_of(j, statement.n, params)).collect();
+    let parents: Vec<(Vec<u64>, Vec<u64>)> = challenges
+        .iter()
+        .map(|&j| parents_of(j, statement.n, params))
+        .collect();
     let mut kept: std::collections::BTreeMap<u64, Vec<Node>> = std::collections::BTreeMap::new();
     for (j, (same_layer, layer_below)) in challenges.iter().zip(&parents) {
         for v in std::iter::once(j).chain(same_layer).chain(layer_below) {
@@ -557,17 +631,31 @@ pub fn prove_seal(
     if column_tree.commitment(Tree::Column) != statement.registered.comm_c {
         return Err("the registered column commitment is not this replica's labelling".into());
     }
-    let column = |v: u64| ColumnOpening { labels: kept[&v].clone(), path: column_tree.path(v) };
+    let column = |v: u64| ColumnOpening {
+        labels: kept[&v].clone(),
+        path: column_tree.path(v),
+    };
     let column_openings: Vec<(ColumnOpening, Vec<ColumnOpening>)> = challenges
         .iter()
         .zip(&parents)
         .map(|(&j, (same_layer, layer_below))| {
-            (column(j), same_layer.iter().chain(layer_below).map(|&p| column(p)).collect())
+            (
+                column(j),
+                same_layer
+                    .iter()
+                    .chain(layer_below)
+                    .map(|&p| column(p))
+                    .collect(),
+            )
         })
         .collect();
     drop(column_tree);
 
-    let data: Vec<Digest> = replica.par_iter().zip(last.par_iter()).map(|(r, l)| hash::sub(r, l)).collect();
+    let data: Vec<Digest> = replica
+        .par_iter()
+        .zip(last.par_iter())
+        .map(|(r, l)| hash::sub(r, l))
+        .collect();
     drop(last);
     let data_tree = MerkleTree::from_digests(data);
     if data_tree.commitment(Tree::Data) != statement.registered.comm_d {
@@ -575,7 +663,12 @@ pub fn prove_seal(
     }
     let data_openings: Vec<(Node, Vec<Node>)> = challenges
         .iter()
-        .map(|&j| (hash::to_bytes(&data_tree.levels[0][j as usize]), data_tree.path(j)))
+        .map(|&j| {
+            (
+                hash::to_bytes(&data_tree.levels[0][j as usize]),
+                data_tree.path(j),
+            )
+        })
         .collect();
     drop(data_tree);
 
@@ -614,34 +707,78 @@ pub fn verify_seal(
         return Err(format!("a registration of {n} nodes"));
     }
     if proof.openings.len() != count {
-        return Err(format!("{} seal openings, {count} required", proof.openings.len()));
+        return Err(format!(
+            "{} seal openings, {count} required",
+            proof.openings.len()
+        ));
     }
-    let key = hash::key_digest(&sdr::replica_key(statement.member, statement.leaf_id, statement.epoch));
+    let key = hash::key_digest(&sdr::replica_key(
+        statement.member,
+        statement.leaf_id,
+        statement.epoch,
+    ));
     let registered = &statement.registered;
     let layers = params.layers;
     let column_ok = |v: u64, opening: &ColumnOpening| {
         opening.labels.len() == layers
-            && column_digest(&opening.labels)
-                .is_some_and(|digest| verify_path(Tree::Column, n, &registered.comm_c, v, &digest, &opening.path))
+            && column_digest(&opening.labels).is_some_and(|digest| {
+                verify_path(
+                    Tree::Column,
+                    n,
+                    &registered.comm_c,
+                    v,
+                    &digest,
+                    &opening.path,
+                )
+            })
     };
-    for (c, (j, opening)) in seal_challenges(statement, count).into_iter().zip(&proof.openings).enumerate() {
-        if !verify_path(Tree::Data, n, &registered.comm_d, j, &opening.data, &opening.data_path) {
-            return Err(format!("challenge {c}: data node {j} does not open the registered data"));
+    for (c, (j, opening)) in seal_challenges(statement, count)
+        .into_iter()
+        .zip(&proof.openings)
+        .enumerate()
+    {
+        if !verify_path(
+            Tree::Data,
+            n,
+            &registered.comm_d,
+            j,
+            &opening.data,
+            &opening.data_path,
+        ) {
+            return Err(format!(
+                "challenge {c}: data node {j} does not open the registered data"
+            ));
         }
-        if !verify_path(Tree::Replica, n, &registered.comm_r, j, &opening.replica, &opening.replica_path) {
-            return Err(format!("challenge {c}: replica node {j} does not open the registered replica"));
+        if !verify_path(
+            Tree::Replica,
+            n,
+            &registered.comm_r,
+            j,
+            &opening.replica,
+            &opening.replica_path,
+        ) {
+            return Err(format!(
+                "challenge {c}: replica node {j} does not open the registered replica"
+            ));
         }
         if !column_ok(j, &opening.column) {
-            return Err(format!("challenge {c}: column {j} does not open the registered columns"));
+            return Err(format!(
+                "challenge {c}: column {j} does not open the registered columns"
+            ));
         }
         let (same_layer, layer_below) = parents_of(j, n, params);
         if opening.parents.len() != same_layer.len() + layer_below.len() {
-            return Err(format!("challenge {c}: {} parent columns, {} required",
-                opening.parents.len(), same_layer.len() + layer_below.len()));
+            return Err(format!(
+                "challenge {c}: {} parent columns, {} required",
+                opening.parents.len(),
+                same_layer.len() + layer_below.len()
+            ));
         }
         for (p, parent) in same_layer.iter().chain(&layer_below).zip(&opening.parents) {
             if !column_ok(*p, parent) {
-                return Err(format!("challenge {c}: parent column {p} does not open the registered columns"));
+                return Err(format!(
+                    "challenge {c}: parent column {p} does not open the registered columns"
+                ));
             }
         }
         // Every label below is canonical: its column digest parsed above.
@@ -653,19 +790,28 @@ pub fn verify_seal(
                 layer,
                 j,
                 &mut same_columns.iter().map(|p| digest(&p.labels[layer])),
-                &mut below_columns.iter().map(|p| digest(&p.labels[layer.saturating_sub(1)])),
+                &mut below_columns
+                    .iter()
+                    .map(|p| digest(&p.labels[layer.saturating_sub(1)])),
                 params,
             );
             if hash::to_bytes(&expected) != opening.column.labels[layer] {
-                return Err(format!("challenge {c}: node {j}'s layer-{layer} label is not this member's"));
+                return Err(format!(
+                    "challenge {c}: node {j}'s layer-{layer} label is not this member's"
+                ));
             }
         }
         let last = digest(&opening.column.labels[layers - 1]);
-        let (Some(data), Some(replica)) = (hash::from_bytes(&opening.data), hash::from_bytes(&opening.replica)) else {
+        let (Some(data), Some(replica)) = (
+            hash::from_bytes(&opening.data),
+            hash::from_bytes(&opening.replica),
+        ) else {
             return Err(format!("challenge {c}: a non-canonical node"));
         };
         if hash::add(&data, &last) != replica {
-            return Err(format!("challenge {c}: replica node {j} is not its data under this member's labels"));
+            return Err(format!(
+                "challenge {c}: replica node {j} is not its data under this member's labels"
+            ));
         }
     }
     Ok(())
@@ -682,7 +828,11 @@ fn take_nodes(bytes: &mut &[u8], count: usize) -> Option<Vec<Node>> {
     let raw = bytes.get(..count * NODE_BYTES)?;
     hash::digests_from_bytes(raw)?;
     *bytes = &bytes[count * NODE_BYTES..];
-    Some(raw.chunks(NODE_BYTES).map(|c| c.try_into().expect("32 bytes")).collect())
+    Some(
+        raw.chunks(NODE_BYTES)
+            .map(|c| c.try_into().expect("32 bytes"))
+            .collect(),
+    )
 }
 
 fn take_node(bytes: &mut &[u8]) -> Option<Node> {
@@ -716,7 +866,12 @@ impl SealProof {
     /// Strict inverse of [`Self::to_bytes`] for a registration of `n` nodes:
     /// at most `max_openings` openings and 64 parents each, every node
     /// canonical, every byte used.
-    pub fn from_bytes(mut bytes: &[u8], n: u64, layers: usize, max_openings: usize) -> Option<Self> {
+    pub fn from_bytes(
+        mut bytes: &[u8],
+        n: u64,
+        layers: usize,
+        max_openings: usize,
+    ) -> Option<Self> {
         let depth = tree_depth(n);
         let count = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
         bytes = &bytes[4..];
@@ -729,7 +884,10 @@ impl SealProof {
             let data_path = take_nodes(&mut bytes, depth)?;
             let replica = take_node(&mut bytes)?;
             let replica_path = take_nodes(&mut bytes, depth)?;
-            let column = ColumnOpening { labels: take_nodes(&mut bytes, layers)?, path: take_nodes(&mut bytes, depth)? };
+            let column = ColumnOpening {
+                labels: take_nodes(&mut bytes, layers)?,
+                path: take_nodes(&mut bytes, depth)?,
+            };
             let parent_count = u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?) as usize;
             bytes = &bytes[2..];
             if parent_count > 64 {
@@ -742,7 +900,14 @@ impl SealProof {
                     path: take_nodes(&mut bytes, depth)?,
                 });
             }
-            openings.push(SealOpening { data, data_path, replica, replica_path, column, parents });
+            openings.push(SealOpening {
+                data,
+                data_path,
+                replica,
+                replica_path,
+                column,
+                parents,
+            });
         }
         bytes.is_empty().then_some(Self { openings })
     }
@@ -753,7 +918,14 @@ impl SealProof {
 /// The replica node a member opens for `query` in the frame whose beacon is
 /// `rho_n`: unpredictable until that GLOBAL frame exists, and distinct per
 /// leaf, epoch and member.
-pub fn opening_index(rho_n: &[u8], leaf_id: &[u8], epoch: u64, member: &[u8], query: u32, n: u64) -> u64 {
+pub fn opening_index(
+    rho_n: &[u8],
+    leaf_id: &[u8],
+    epoch: u64,
+    member: &[u8],
+    query: u32,
+    n: u64,
+) -> u64 {
     let mut h = Sha3_256::new();
     h.update(DST_OPEN);
     put_bytes(&mut h, rho_n);
@@ -805,7 +977,11 @@ pub fn verify_opening(opening: &crate::porep::StorageOpening, rho_n: &[u8]) -> b
         return false;
     };
     let n = opening.num_blocks;
-    if n == 0 || !opening.commitment.is_empty() || !opening.proof.is_empty() || !opening.path_proofs.is_empty() {
+    if n == 0
+        || !opening.commitment.is_empty()
+        || !opening.proof.is_empty()
+        || !opening.path_proofs.is_empty()
+    {
         return false;
     }
     let Ok(value) = <Node>::try_from(opening.value.as_slice()) else {
@@ -819,7 +995,14 @@ pub fn verify_opening(opening: &crate::porep::StorageOpening, rho_n: &[u8]) -> b
     else {
         return false;
     };
-    let index = opening_index(rho_n, &opening.shard_id, opening.epoch, &opening.member_id, opening.query, n);
+    let index = opening_index(
+        rho_n,
+        &opening.shard_id,
+        opening.epoch,
+        &opening.member_id,
+        opening.query,
+        n,
+    );
     verify_path(Tree::Replica, n, &registered.comm_r, index, &value, &path)
 }
 
@@ -831,7 +1014,8 @@ pub fn openings_root(frame_number: u64, values: &[Node]) -> Option<Node> {
     let mut header = hash::ZERO;
     header[0] = hash::felt(frame_number as u32);
     header[1] = hash::felt(values.len() as u32);
-    let mut absorber = hash::Absorber::new(Domain::Openings, hash::DIGEST_ELEMS * (1 + values.len()));
+    let mut absorber =
+        hash::Absorber::new(Domain::Openings, hash::DIGEST_ELEMS * (1 + values.len()));
     absorber.absorb_digest(&header);
     for value in values {
         absorber.absorb_digest(&hash::from_bytes(value)?);

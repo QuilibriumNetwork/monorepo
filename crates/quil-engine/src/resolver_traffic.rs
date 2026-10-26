@@ -83,7 +83,9 @@ pub struct ResolverTraffic {
 
 impl ResolverTraffic {
     fn new() -> Self {
-        Self { shards: Mutex::new((Instant::now(), HashMap::new())) }
+        Self {
+            shards: Mutex::new((Instant::now(), HashMap::new())),
+        }
     }
 
     /// This process's counts.
@@ -93,7 +95,10 @@ impl ResolverTraffic {
     }
 
     fn with_shard(&self, filter: &[u8], update: impl FnOnce(&mut ShardResolverTraffic)) {
-        let mut shards = self.shards.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match shards.1.get_mut(filter) {
             Some(shard) => update(shard),
             None => update(shards.1.entry(filter.to_vec()).or_default()),
@@ -119,8 +124,13 @@ impl ResolverTraffic {
 
     /// The counts since the last call, and the seconds they cover.
     pub fn take(&self) -> (f64, Vec<(Vec<u8>, ShardResolverTraffic)>) {
-        let mut shards = self.shards.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let seconds = std::mem::replace(&mut shards.0, Instant::now()).elapsed().as_secs_f64();
+        let mut shards = self
+            .shards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seconds = std::mem::replace(&mut shards.0, Instant::now())
+            .elapsed()
+            .as_secs_f64();
         (seconds, shards.1.drain().collect())
     }
 
@@ -155,7 +165,13 @@ impl ResolverTraffic {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let per_second = |count: u64| if seconds > 0.0 { count as f64 / seconds } else { 0.0 };
+        let per_second = |count: u64| {
+            if seconds > 0.0 {
+                count as f64 / seconds
+            } else {
+                0.0
+            }
+        };
         tracing::info!(
             seconds = seconds.round() as u64,
             shards = shards.len(),
@@ -202,11 +218,38 @@ mod tests {
         shards.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(shards.len(), 2);
         let first = shards[0].1;
-        assert_eq!(first.sent, KindCounts { requests: 1, responses: 0, errors: 0, bytes: 20 });
-        assert_eq!(first.received, KindCounts { requests: 0, responses: 2, errors: 0, bytes: 200 });
+        assert_eq!(
+            first.sent,
+            KindCounts {
+                requests: 1,
+                responses: 0,
+                errors: 0,
+                bytes: 20
+            }
+        );
+        assert_eq!(
+            first.received,
+            KindCounts {
+                requests: 0,
+                responses: 2,
+                errors: 0,
+                bytes: 200
+            }
+        );
         assert_eq!(first.untagged, 1);
-        assert_eq!(first.elsewhere, KindCounts { requests: 0, responses: 0, errors: 1, bytes: 9 });
+        assert_eq!(
+            first.elsewhere,
+            KindCounts {
+                requests: 0,
+                responses: 0,
+                errors: 1,
+                bytes: 9
+            }
+        );
         assert_eq!(shards[1].1.elsewhere.requests, 1);
-        assert!(traffic.take().1.is_empty(), "each report covers only what came after the last");
+        assert!(
+            traffic.take().1.is_empty(),
+            "each report covers only what came after the last"
+        );
     }
 }

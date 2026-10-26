@@ -124,8 +124,18 @@ async fn vertex(hc: &HypergraphCtx, domain_arg: &str, address: &str) -> anyhow::
         request: Some(Request::VertexRemove(op)),
         timestamp: 0,
     };
-    crate::send::send_paid_request(hc.global.clone(), &mut client, &hc.key_manager, domain.clone(),
-        domain.as_slice().try_into().map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?, request).await?;
+    crate::send::send_paid_request(
+        hc.global.clone(),
+        &mut client,
+        &hc.key_manager,
+        domain.clone(),
+        domain
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?,
+        request,
+    )
+    .await?;
 
     println!("Vertex removed successfully");
     Ok(())
@@ -154,8 +164,18 @@ async fn hyperedge(hc: &HypergraphCtx, domain_arg: &str, address: &str) -> anyho
         request: Some(Request::HyperedgeRemove(op)),
         timestamp: 0,
     };
-    crate::send::send_paid_request(hc.global.clone(), &mut client, &hc.key_manager, domain.clone(),
-        domain.as_slice().try_into().map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?, request).await?;
+    crate::send::send_paid_request(
+        hc.global.clone(),
+        &mut client,
+        &hc.key_manager,
+        domain.clone(),
+        domain
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("domain must be 32 bytes"))?,
+        request,
+    )
+    .await?;
 
     println!("Hyperedge removed successfully");
     println!("Address: {}", hex::encode(id));

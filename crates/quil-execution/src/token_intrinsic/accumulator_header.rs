@@ -29,7 +29,9 @@ pub const CARRY_WINDOW_FRAMES: u64 = 8;
 /// the [`CARRY_WINDOW_FRAMES`] frames before it (newest first; frames before
 /// genesis are empty).
 pub fn header_carries(frame_number: u64, earlier: &[Vec<u8>], last: &[u8]) -> bool {
-    !last.is_empty() && (earlier.iter().any(|digest| digest.as_slice() != last) || frame_number % HEARTBEAT_FRAMES == 0)
+    !last.is_empty()
+        && (earlier.iter().any(|digest| digest.as_slice() != last)
+            || frame_number % HEARTBEAT_FRAMES == 0)
 }
 
 #[cfg(test)]
@@ -52,6 +54,4 @@ mod tests {
         assert!(!header_carries(HEARTBEAT_FRAMES, &window(&[&a]), &[]));
         assert!(!header_carries(7, &window(&[&vec![]]), &[]));
     }
-
-
 }

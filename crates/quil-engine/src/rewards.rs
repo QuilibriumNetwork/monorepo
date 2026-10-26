@@ -42,10 +42,10 @@ use quil_types::error::Result;
 
 // Keep the existing engine API while execution, RPC and wallet code share one
 // implementation of the consensus pricing arithmetic.
+use quil_execution::pricing::allocation_ring_reward;
 pub use quil_execution::pricing::{
     fee_multiplier_for_cost, get_baseline_fee, pomw_basis, POMW_NUMERATOR, QUIL_TOKEN_UNITS,
 };
-use quil_execution::pricing::allocation_ring_reward;
 
 /// PoMW reward issuance.
 pub struct OptRewardIssuance;
@@ -69,8 +69,11 @@ impl RewardIssuance for OptRewardIssuance {
             let mut total = BigInt::zero();
             for alloc in allocs.values() {
                 let step3 = allocation_ring_reward(
-                    &basis, &BigInt::from(alloc.state_size), &world_bi,
-                    alloc.ring, alloc.shards,
+                    &basis,
+                    &BigInt::from(alloc.state_size),
+                    &world_bi,
+                    alloc.ring,
+                    alloc.shards,
                 );
 
                 total += step3;
@@ -96,17 +99,85 @@ mod tests {
     /// `pomw_basis` reduces to `(POMW_NUMERATOR / world) * units`.
     #[test]
     fn frame_fee_cost_bounds_and_vote_are_consistent() {
-        assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, u64::MAX, &BigInt::zero(), 7).unwrap(), BigInt::zero());
+        assert_eq!(
+            fee_multiplier_for_cost(
+                quil_execution::pricing::MAINNET_NETWORK,
+                50_000,
+                u64::MAX,
+                &BigInt::zero(),
+                7
+            )
+            .unwrap(),
+            BigInt::zero()
+        );
         for cost in [1, 1024, 195_907, u64::MAX] {
-            assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(cost), 1).unwrap(), BigInt::one());
-            assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(cost), 7).unwrap(), BigInt::from(7));
+            assert_eq!(
+                fee_multiplier_for_cost(
+                    quil_execution::pricing::MAINNET_NETWORK,
+                    50_000,
+                    0,
+                    &BigInt::from(cost),
+                    1
+                )
+                .unwrap(),
+                BigInt::one()
+            );
+            assert_eq!(
+                fee_multiplier_for_cost(
+                    quil_execution::pricing::MAINNET_NETWORK,
+                    50_000,
+                    0,
+                    &BigInt::from(cost),
+                    7
+                )
+                .unwrap(),
+                BigInt::from(7)
+            );
         }
-        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &BigInt::from(-1), 1).is_err());
-        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &(BigInt::from(u64::MAX) + 1u8), 1).is_err());
-        assert!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, u64::MAX, &BigInt::one(), 1).is_err());
-        let base = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 1 << 30, &BigInt::from(1024), 1).unwrap();
+        assert!(fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            50_000,
+            0,
+            &BigInt::from(-1),
+            1
+        )
+        .is_err());
+        assert!(fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            50_000,
+            0,
+            &(BigInt::from(u64::MAX) + 1u8),
+            1
+        )
+        .is_err());
+        assert!(fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            50_000,
+            u64::MAX,
+            &BigInt::one(),
+            1
+        )
+        .is_err());
+        let base = fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            50_000,
+            1 << 30,
+            &BigInt::from(1024),
+            1,
+        )
+        .unwrap();
         assert!(base >= BigInt::one());
-        assert_eq!(fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 1 << 30, &BigInt::from(1024), 7).unwrap(), base * 7);
+        assert_eq!(
+            fee_multiplier_for_cost(
+                quil_execution::pricing::MAINNET_NETWORK,
+                50_000,
+                1 << 30,
+                &BigInt::from(1024),
+                7
+            )
+            .unwrap(),
+            base * 7
+        );
     }
 
     #[test]
@@ -117,12 +188,28 @@ mod tests {
                 for added in [1u64, 3, 1_024, 195_907, 200_771] {
                     let cost = BigInt::from(added);
                     let baseline = get_baseline_fee(difficulty, world, added, QUIL_TOKEN_UNITS);
-                    let multiplier = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, difficulty, world, &cost, 1).unwrap();
+                    let multiplier = fee_multiplier_for_cost(
+                        quil_execution::pricing::MAINNET_NETWORK,
+                        difficulty,
+                        world,
+                        &cost,
+                        1,
+                    )
+                    .unwrap();
                     assert!(&multiplier * &cost >= baseline);
                     assert!((&multiplier - BigInt::one()) * &cost < baseline);
-                    if &baseline % &cost != BigInt::zero() { non_divisible += 1; }
+                    if &baseline % &cost != BigInt::zero() {
+                        non_divisible += 1;
+                    }
                     for vote in [0u64, 1, 7] {
-                        let voted = fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, difficulty, world, &cost, vote).unwrap();
+                        let voted = fee_multiplier_for_cost(
+                            quil_execution::pricing::MAINNET_NETWORK,
+                            difficulty,
+                            world,
+                            &cost,
+                            vote,
+                        )
+                        .unwrap();
                         assert!(voted * &cost >= &baseline * BigInt::from(vote));
                     }
                 }
@@ -189,8 +276,7 @@ mod tests {
     #[test]
     fn opt_reward_zero_provers_returns_zeros() {
         let r = OptRewardIssuance;
-        let provers: Vec<HashMap<String, ProverAllocation>> =
-            vec![HashMap::new(), HashMap::new()];
+        let provers: Vec<HashMap<String, ProverAllocation>> = vec![HashMap::new(), HashMap::new()];
         let out = r.calculate(5_000, 1 << 30, 1_000, &provers).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|v| v.is_zero()));
@@ -207,14 +293,12 @@ mod tests {
         allocs.insert(
             "shard-1".to_string(),
             ProverAllocation {
-                ring: 0,                   // divisor = 2
-                shards: 1,                 // sqrt = 1
-                state_size: 1 << 20,       // 1 MB
+                ring: 0,             // divisor = 2
+                shards: 1,           // sqrt = 1
+                state_size: 1 << 20, // 1 MB
             },
         );
-        let out = r
-            .calculate(5_000, 1 << 30, 1_000_000, &[allocs])
-            .unwrap();
+        let out = r.calculate(5_000, 1 << 30, 1_000_000, &[allocs]).unwrap();
         assert_eq!(out.len(), 1);
         assert!(
             !out[0].is_zero(),
@@ -279,7 +363,14 @@ mod tests {
     ) -> Vec<HashMap<String, quil_types::consensus::ProverAllocation>> {
         use quil_types::consensus::ProverAllocation;
         let mut m = HashMap::new();
-        m.insert("s".to_string(), ProverAllocation { ring, shards, state_size });
+        m.insert(
+            "s".to_string(),
+            ProverAllocation {
+                ring,
+                shards,
+                state_size,
+            },
+        );
         vec![m]
     }
 
@@ -287,8 +378,11 @@ mod tests {
     fn opt_reward_halves_each_ring() {
         let r = OptRewardIssuance;
         // Large state so rewards stay non-zero through ring 2.
-        let calc =
-            |ring| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(ring, 1, 1 << 28)).unwrap()[0].clone();
+        let calc = |ring| {
+            r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(ring, 1, 1 << 28))
+                .unwrap()[0]
+                .clone()
+        };
         let r0 = calc(0);
         let r1 = calc(1);
         let r2 = calc(2);
@@ -307,16 +401,25 @@ mod tests {
         let g0 = pomw_basis(5_000, world, units); // gen 0 (no root)
         let g1 = pomw_basis(50_000, world, units); // gen 1 (sqrt)
         let g2 = pomw_basis(100_000_000, world, units); // gen 2 (4th root)
-        assert!(g2 > BigInt::zero(), "gen-2 basis must be positive, got {g2}");
-        assert!(g0 > g1 && g1 > g2, "more roots → smaller basis: g0={g0} g1={g1} g2={g2}");
+        assert!(
+            g2 > BigInt::zero(),
+            "gen-2 basis must be positive, got {g2}"
+        );
+        assert!(
+            g0 > g1 && g1 > g2,
+            "more roots → smaller basis: g0={g0} g1={g1} g2={g2}"
+        );
     }
 
     #[test]
     fn opt_reward_scales_inversely_with_sqrt_shards() {
         let r = OptRewardIssuance;
         // Perfect-square shard counts → exact integer sqrt, so reward ∝ 1/sqrt(shards).
-        let calc =
-            |shards| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(0, shards, 1 << 28)).unwrap()[0].clone();
+        let calc = |shards| {
+            r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(0, shards, 1 << 28))
+                .unwrap()[0]
+                .clone()
+        };
         let s1 = calc(1);
         let s4 = calc(4); // sqrt = 2
         let s16 = calc(16); // sqrt = 4
@@ -339,8 +442,10 @@ mod tests {
         let difficulty = 5_000u64;
 
         // Data present (state_size > 0, world > 0) → positive reward.
-        let with_data =
-            r.calculate(difficulty, world, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
+        let with_data = r
+            .calculate(difficulty, world, units, &one_alloc(0, 1, 1 << 28))
+            .unwrap()[0]
+            .clone();
         assert!(
             with_data > BigInt::zero(),
             "a shard with materialized state must earn a reward, got {with_data}"
@@ -348,17 +453,24 @@ mod tests {
 
         // Empty shard (state_size == 0) → zero. This is exactly the localnet:
         // no token/compute/hg data → state_size 0 → no PoMW reward.
-        let empty_shard =
-            r.calculate(difficulty, world, units, &one_alloc(0, 1, 0)).unwrap()[0].clone();
+        let empty_shard = r
+            .calculate(difficulty, world, units, &one_alloc(0, 1, 0))
+            .unwrap()[0]
+            .clone();
         assert!(
             empty_shard.is_zero(),
             "empty shard (state_size=0) must earn 0, got {empty_shard}"
         );
 
         // Empty world (world_state_bytes == 0) → zero for everyone (early return).
-        let empty_world =
-            r.calculate(difficulty, 0, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
-        assert!(empty_world.is_zero(), "empty world → 0 reward, got {empty_world}");
+        let empty_world = r
+            .calculate(difficulty, 0, units, &one_alloc(0, 1, 1 << 28))
+            .unwrap()[0]
+            .clone();
+        assert!(
+            empty_world.is_zero(),
+            "empty world → 0 reward, got {empty_world}"
+        );
     }
 }
 
@@ -376,9 +488,18 @@ mod allocation_arithmetic_characterization {
                     let mut allocations = HashMap::new();
                     let basis = pomw_basis(difficulty, world, QUIL_TOKEN_UNITS);
                     let mut expected = BigInt::zero();
-                    for (index, shards) in [0, 1, 2, 3, 4, 5, 7, 16, u64::MAX].into_iter().enumerate() {
+                    for (index, shards) in
+                        [0, 1, 2, 3, 4, 5, 7, 16, u64::MAX].into_iter().enumerate()
+                    {
                         let state_size = [0, 1, 17, u64::MAX][index % 4];
-                        allocations.insert(index.to_string(), ProverAllocation { ring, shards, state_size });
+                        allocations.insert(
+                            index.to_string(),
+                            ProverAllocation {
+                                ring,
+                                shards,
+                                state_size,
+                            },
+                        );
                         if world != 0 && shards != 0 {
                             let sqrt = (BigInt::from(shards) << 106u32).sqrt();
                             let divisor = BigInt::from(1u64 << (u32::from(ring.min(62)) + 1));
@@ -386,8 +507,19 @@ mod allocation_arithmetic_characterization {
                                 / (BigInt::from(world) * divisor * sqrt);
                         }
                     }
-                    let actual = OptRewardIssuance.calculate(difficulty, world, QUIL_TOKEN_UNITS, &[allocations, HashMap::new()]).unwrap();
-                    assert_eq!(actual, vec![expected, BigInt::zero()], "difficulty={difficulty}, world={world}, ring={ring}");
+                    let actual = OptRewardIssuance
+                        .calculate(
+                            difficulty,
+                            world,
+                            QUIL_TOKEN_UNITS,
+                            &[allocations, HashMap::new()],
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        actual,
+                        vec![expected, BigInt::zero()],
+                        "difficulty={difficulty}, world={world}, ring={ring}"
+                    );
                 }
             }
         }

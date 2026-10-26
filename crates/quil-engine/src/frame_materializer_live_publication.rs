@@ -44,20 +44,29 @@ impl FrameMaterializer {
         // frame: 16 s a frame, a day for 5,300 frames (2026-10-12).
         let cursor = self.last_materialized_frame.load(Ordering::SeqCst);
         if cursor.checked_add(1) == Some(number)
-            && self.hypergraph.prover_root_at(cursor).is_some_and(|recorded| recorded != header.prover_tree_commitment)
+            && self
+                .hypergraph
+                .prover_root_at(cursor)
+                .is_some_and(|recorded| recorded != header.prover_tree_commitment)
         {
-            return CanonicalAttempt::Unavailable(unavailable("tentative parent prover root mismatch"));
+            return CanonicalAttempt::Unavailable(unavailable(
+                "tentative parent prover root mismatch",
+            ));
         }
         let attempt = self.publish_atomically(frame, limits, false, |branch| {
             let cursor = branch.cursor()?;
             let clock = branch.execution.clock_store();
             if clock.get_global_clock_frame(number)? != *frame {
-                return Err(unavailable("frame is not the canonical record at its height"));
+                return Err(unavailable(
+                    "frame is not the canonical record at its height",
+                ));
             }
             if number == cursor {
                 return match branch.completed_checkpoint()? {
                     Some(receipt) if receipt.matches_frame(frame)? => Ok(false),
-                    _ => Err(unavailable("canonical frame at the cursor has no matching receipt")),
+                    _ => Err(unavailable(
+                        "canonical frame at the cursor has no matching receipt",
+                    )),
                 };
             }
             if cursor.checked_add(1) != Some(number) {
@@ -67,7 +76,9 @@ impl FrameMaterializer {
             // one keeps the in-place path's semantics for its base.
             if let Some(receipt) = branch.completed_checkpoint()? {
                 if !receipt.matches_frame(&clock.get_global_clock_frame(cursor)?)? {
-                    return Err(unavailable("canonical base differs from its execution receipt"));
+                    return Err(unavailable(
+                        "canonical base differs from its execution receipt",
+                    ));
                 }
             }
             Ok(true)
@@ -108,11 +119,21 @@ impl FrameMaterializer {
         // Holds the frame lock (and, for a finalization, the execution lease):
         // votes and proposals on this node wait for it.
         let mut timing = crate::stage_clock::StageClock::start_after(
-            if write_clock { "GLOBAL finalization publication" } else { "GLOBAL canonical publication" },
+            if write_clock {
+                "GLOBAL finalization publication"
+            } else {
+                "GLOBAL canonical publication"
+            },
             number,
             crate::stage_clock::SLOW_EXECUTION,
         );
-        let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate, &mut timing);
+        let result = self.materialize_atomically_inner(
+            frame,
+            limits,
+            write_clock,
+            authenticate,
+            &mut timing,
+        );
         self.execution_counters.attempted(&result);
         let result = result?;
         if let Some(published) = &result {
@@ -185,7 +206,11 @@ impl FrameMaterializer {
         let result = branch.materialize(frame)?;
         timing.mark("execute frame");
         branch.log_reads(
-            if write_clock { "GLOBAL finalization publication" } else { "GLOBAL canonical publication" },
+            if write_clock {
+                "GLOBAL finalization publication"
+            } else {
+                "GLOBAL canonical publication"
+            },
             result.frame_number,
         );
         let number = result.frame_number;

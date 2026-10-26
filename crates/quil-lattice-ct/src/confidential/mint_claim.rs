@@ -1,11 +1,11 @@
 //! App-side transport of globally authorized mint outputs.
 //! Decoding does not authenticate the global root or consume the authorization.
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     mint::MAX_REWARD_PROOF_BYTES,
     transfer::{Output, Reader, TransferError, MAX_TRANSACTION_BYTES, MEMO_BYTES},
     AmountCommitment, COMMITMENT_BYTES, MAX_PRIVATE_COINS,
 };
-use super::relation::membership::IDENTITY_BYTES;
 
 const PREFIX: [u8; 4] = 0x0517u32.to_be_bytes();
 const VERSION: &[u8; 8] = b"QCT3MC\0\x02";

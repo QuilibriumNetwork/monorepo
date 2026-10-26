@@ -114,10 +114,12 @@ impl CwInboundRouter {
 /// Dependencies needed to start the simplex-backed global consensus. Mirrors the
 /// subset of `ConsensusActivationParams` the simplex path needs.
 pub struct CwGlobalDeps {
-    pub selected_parent_execution: Option<Arc<quil_engine::frame_materializer::GlobalParentExecutor>>,
+    pub selected_parent_execution:
+        Option<Arc<quil_engine::frame_materializer::GlobalParentExecutor>>,
     /// Atomic finalization shared with the materializer worker. `None` keeps
     /// the legacy order (canonical clock write, then materialization).
-    pub finalization_pipeline: Option<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>,
+    pub finalization_pipeline:
+        Option<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>,
     pub committee_hex: Vec<String>,
     /// The members' peer IDs, parallel to `committee_hex`; logs name a
     /// member by its tail.
@@ -125,12 +127,17 @@ pub struct CwGlobalDeps {
     /// This node's `q-consensus-key` bytes.
     pub my_signing_key: Vec<u8>,
     pub my_public_key: Vec<u8>,
-    pub leader_provider: Arc<dyn quil_consensus::leader_provider::LeaderProvider<quil_engine::consensus_types::GlobalState>>,
+    pub leader_provider: Arc<
+        dyn quil_consensus::leader_provider::LeaderProvider<
+            quil_engine::consensus_types::GlobalState,
+        >,
+    >,
     pub verifier: Arc<quil_engine::frame_validator::GlobalFrameVerifier>,
     pub clock_store: Arc<dyn quil_types::store::ClockStore>,
     /// The node's existing global-materializer channel (`(frame, frame_number)`)
     /// — reused so finalized frames run the same commit/evict/rebalance worker.
-    pub mat_job_tx: tokio::sync::mpsc::UnboundedSender<(quil_types::proto::global::GlobalFrame, u64)>,
+    pub mat_job_tx:
+        tokio::sync::mpsc::UnboundedSender<(quil_types::proto::global::GlobalFrame, u64)>,
     /// Bump head atomics / CurrentFrame on finalize.
     pub head_hook: quil_engine::cw_global_seams::HeadHook,
     pub filter: Vec<u8>,
@@ -185,11 +192,18 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
     )?;
 
     let member_labels = if deps.committee_peer_ids.len() == deps.committee_hex.len() {
-        deps.committee_peer_ids.iter().map(|id| quil_engine::global_stall::tail(id)).collect()
+        deps.committee_peer_ids
+            .iter()
+            .map(|id| quil_engine::global_stall::tail(id))
+            .collect()
     } else {
         Vec::new()
     };
-    let GlobalConsensusCwHandle { inbound, ingest_block, contact } = activate_global_consensus_cw(
+    let GlobalConsensusCwHandle {
+        inbound,
+        ingest_block,
+        contact,
+    } = activate_global_consensus_cw(
         committee.scheme,
         committee.peers,
         deps.leader_provider,
@@ -210,7 +224,9 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         selected_execution,
         deps.finalization_pipeline,
         member_labels,
-    ).inspect_err(|error| tracing::error!(%error, "GLOBAL consensus recovery refused activation")).ok()?;
+    )
+    .inspect_err(|error| tracing::error!(%error, "GLOBAL consensus recovery refused activation"))
+    .ok()?;
 
     tracing::info!("commonware-simplex global consensus started");
     // Our own committee key — the committee build above already validated

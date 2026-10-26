@@ -38,7 +38,9 @@ impl RegistryLimits {
             max_vertices: self.max_vertices.saturating_add(committed.vertices),
             max_record_bytes: self.max_record_bytes.max(largest_row),
             max_input_bytes: self.max_input_bytes.saturating_add(committed.input_bytes),
-            max_cache_entries: self.max_cache_entries.saturating_add(committed.cache_entries),
+            max_cache_entries: self
+                .max_cache_entries
+                .saturating_add(committed.cache_entries),
             max_cache_bytes: self.max_cache_bytes.saturating_add(committed.cache_bytes),
         }
     }
@@ -94,25 +96,54 @@ impl RegistryBudget {
 
     /// The input charge of one vertex row, or `None` past the record limit.
     pub fn row_charge(limits: RegistryLimits, key: usize, value: usize) -> Option<RegistryUsage> {
-        let bytes = key.checked_add(value).filter(|bytes| *bytes <= limits.max_record_bytes)?;
-        Some(RegistryUsage { vertices: 1, input_bytes: bytes.checked_add(128)?, ..RegistryUsage::default() })
+        let bytes = key
+            .checked_add(value)
+            .filter(|bytes| *bytes <= limits.max_record_bytes)?;
+        Some(RegistryUsage {
+            vertices: 1,
+            input_bytes: bytes.checked_add(128)?,
+            ..RegistryUsage::default()
+        })
     }
 
     pub fn prover_charge(info: &ProverInfo) -> RegistryUsage {
-        cache_charge(4, &[512, info.address.len(), info.address.len(), info.public_key.len(), info.delegate_address.len()])
+        cache_charge(
+            4,
+            &[
+                512,
+                info.address.len(),
+                info.address.len(),
+                info.public_key.len(),
+                info.delegate_address.len(),
+            ],
+        )
     }
 
-    pub fn leaf_root_charge(key: &(Vec<u8>, Vec<u8>, u64), record: &LeafRootRecord) -> RegistryUsage {
+    pub fn leaf_root_charge(
+        key: &(Vec<u8>, Vec<u8>, u64),
+        record: &LeafRootRecord,
+    ) -> RegistryUsage {
         cache_charge(4, &[512, key.0.len(), key.1.len(), record.leaf_root.len()])
     }
 
     pub fn allocation_charge(owner: &[u8], info: &ProverAllocationInfo) -> RegistryUsage {
         let (owner, confirmation) = (owner.len(), info.confirmation_filter.len());
-        cache_charge(16, &[
-            2048, owner, owner, owner, owner,
-            confirmation, confirmation, confirmation, confirmation,
-            info.rejection_filter.len(), info.vertex_address.len(),
-        ])
+        cache_charge(
+            16,
+            &[
+                2048,
+                owner,
+                owner,
+                owner,
+                owner,
+                confirmation,
+                confirmation,
+                confirmation,
+                confirmation,
+                info.rejection_filter.len(),
+                info.vertex_address.len(),
+            ],
+        )
     }
 
     /// Whether `usage` fits: charges only grow during a refresh, so the
@@ -167,8 +198,16 @@ impl RegistryBudget {
     }
 
     fn charge(&mut self, charge: RegistryUsage) -> QuilResult<()> {
-        let bytes = self.usage.cache_bytes.checked_add(charge.cache_bytes).ok_or_else(limit)?;
-        let count = self.usage.cache_entries.checked_add(charge.cache_entries).ok_or_else(limit)?;
+        let bytes = self
+            .usage
+            .cache_bytes
+            .checked_add(charge.cache_bytes)
+            .ok_or_else(limit)?;
+        let count = self
+            .usage
+            .cache_entries
+            .checked_add(charge.cache_entries)
+            .ok_or_else(limit)?;
         if bytes > self.limits.max_cache_bytes || count > self.limits.max_cache_entries {
             return Err(limit());
         }
@@ -199,7 +238,9 @@ impl RegistryBudget {
 fn cache_charge(entries: usize, lengths: &[usize]) -> RegistryUsage {
     RegistryUsage {
         cache_entries: entries,
-        cache_bytes: lengths.iter().fold(0usize, |total, len| total.saturating_add(*len)),
+        cache_bytes: lengths
+            .iter()
+            .fold(0usize, |total, len| total.saturating_add(*len)),
         ..RegistryUsage::default()
     }
 }

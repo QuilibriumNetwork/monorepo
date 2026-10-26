@@ -396,13 +396,16 @@ fn clock_capture_ignores_later_primary_changes_and_shares_hypergraph_transaction
 fn clock_transactions_reject_foreign_stores_and_poison_all_partial_writes() {
     let (_dir, db) = database();
     let primary = RocksClockStore::new(db.clone());
-    let overlay = Arc::new(ExecutionOverlay::capture(
-        db.clone(),
-        quil_forest::OverlayLimits {
-            max_record_bytes: 256,
-            ..limits()
-        },
-    ).unwrap());
+    let overlay = Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            quil_forest::OverlayLimits {
+                max_record_bytes: 256,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let store = OverlayClockStore::new(overlay.clone());
     let (other, sibling) = branch(db.clone());
     for foreign in [
@@ -495,13 +498,16 @@ fn clock_transactions_read_staged_frames_and_keep_indices_monotonic() {
 #[test]
 fn clock_range_deletion_preserves_neighbor_filters_and_bounds_empty_work() {
     let (_dir, db) = database();
-    let overlay = Arc::new(ExecutionOverlay::capture(
-        db.clone(),
-        quil_forest::OverlayLimits {
-            max_delta_entries: 64,
-            ..limits()
-        },
-    ).unwrap());
+    let overlay = Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            quil_forest::OverlayLimits {
+                max_delta_entries: 64,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let store = OverlayClockStore::new(overlay.clone());
     let txn = store.new_transaction(false).unwrap();
     for filter in [&[1][..], &[1, 0][..]] {
@@ -589,13 +595,16 @@ fn clock_reads_propagate_budget_and_corruption_errors_without_empty_fallbacks() 
     assert!(t.commit().is_err());
     overlay.close();
     assert!(store.new_transaction(false).is_err());
-    let limited = Arc::new(ExecutionOverlay::capture(
-        db,
-        quil_forest::OverlayLimits {
-            max_cursors: 0,
-            ..limits()
-        },
-    ).unwrap());
+    let limited = Arc::new(
+        ExecutionOverlay::capture(
+            db,
+            quil_forest::OverlayLimits {
+                max_cursors: 0,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     assert!(OverlayClockStore::new(limited.clone())
         .get_global_clock_frame(5)
         .is_err());
@@ -651,13 +660,16 @@ fn clock_accumulator_and_candidate_replacements_are_atomic() {
     assert_eq!(db.latest_sequence_number(), 0);
     overlay.close();
 
-    let tiny = Arc::new(ExecutionOverlay::capture(
-        db.clone(),
-        quil_forest::OverlayLimits {
-            max_delta_bytes: 90,
-            ..limits()
-        },
-    ).unwrap());
+    let tiny = Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            quil_forest::OverlayLimits {
+                max_delta_bytes: 90,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let tiny_store = OverlayClockStore::new(tiny.clone());
     // The report fits by itself, but the report plus frame digest does not.
     assert!(tiny_store

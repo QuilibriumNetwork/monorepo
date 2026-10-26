@@ -11,8 +11,8 @@
 
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{
-    message_request::Request, AltShardUpdate, MessageRequest, ProverLeave,
-    ProverPause, ProverReject, ProverResume, ProverUpdate,
+    message_request::Request, AltShardUpdate, MessageRequest, ProverLeave, ProverPause,
+    ProverReject, ProverResume, ProverUpdate,
 };
 
 use quil_types::proto::node::node_service_client::NodeServiceClient;
@@ -56,7 +56,10 @@ async fn send_split(
     build: impl Fn(&[Vec<u8>]) -> anyhow::Result<Request>,
 ) -> anyhow::Result<()> {
     let chunks: Vec<&[Vec<u8>]> = sign::op_chunks(filters).collect();
-    let requests = chunks.iter().map(|chunk| build(*chunk)).collect::<anyhow::Result<Vec<_>>>()?;
+    let requests = chunks
+        .iter()
+        .map(|chunk| build(*chunk))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let count = requests.len();
     let mut sent = 0;
     for (index, (request, chunk)) in requests.into_iter().zip(&chunks).enumerate() {
@@ -66,7 +69,10 @@ async fn send_split(
         sent += chunk.len();
     }
     if count > 1 {
-        println!("Prover {op} sent successfully as {count} messages for {} filters", filters.len());
+        println!(
+            "Prover {op} sent successfully as {count} messages for {} filters",
+            filters.len()
+        );
     } else {
         println!("Prover {op} sent successfully");
     }
@@ -121,7 +127,11 @@ pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<(
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
     send_split(pc, &mut client, "confirm", &filters, |chunk| {
-        Ok(Request::Confirm(sign::confirm_op(&pc.key_manager, chunk, frame)?))
+        Ok(Request::Confirm(sign::confirm_op(
+            &pc.key_manager,
+            chunk,
+            frame,
+        )?))
     })
     .await
 }
@@ -157,7 +167,8 @@ pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<(
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Pause(op))).await?;
+    pc.send_global(&mut client, wrap(Request::Pause(op)))
+        .await?;
     println!("Prover pause sent successfully");
     Ok(())
 }
@@ -172,15 +183,16 @@ pub async fn resume(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Resume(op))).await?;
+    pc.send_global(&mut client, wrap(Request::Resume(op)))
+        .await?;
     println!("Prover resume sent successfully");
     Ok(())
 }
 
 pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
     let addr_hex = address.strip_prefix("0x").unwrap_or(address);
-    let delegate_address =
-        hex::decode(addr_hex).map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
+    let delegate_address = hex::decode(addr_hex)
+        .map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
     if delegate_address.len() != 32 {
         anyhow::bail!("Invalid delegate address: must be 32 bytes hex-encoded");
     }
@@ -193,8 +205,12 @@ pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
         delegate_address: delegate_address.clone(),
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Update(op))).await?;
-    println!("Delegate address updated to 0x{}", hex::encode(&delegate_address));
+    pc.send_global(&mut client, wrap(Request::Update(op)))
+        .await?;
+    println!(
+        "Delegate address updated to 0x{}",
+        hex::encode(&delegate_address)
+    );
     Ok(())
 }
 
@@ -216,7 +232,9 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
     ];
     let mut roots: Vec<Vec<u8>> = Vec::with_capacity(4);
     for (i, arg) in roots_hex.iter().enumerate() {
-        roots.push(hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?);
+        roots.push(
+            hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?,
+        );
     }
 
     let mut client = pc.connect().await?;
@@ -250,7 +268,8 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
         hyperedge_removes_root: roots[3].clone(),
         signature,
     };
-    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op))).await?;
+    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op)))
+        .await?;
     println!("Alt shard update sent successfully");
     Ok(())
 }
@@ -274,7 +293,10 @@ mod tests {
         let filters: Vec<Vec<u8>> = (0..250u16).map(|n| n.to_be_bytes().to_vec()).collect();
         let error = split_send_error("leave", 1, 3, &filters, 100, "boom").to_string();
         let (head, follow_up) = error.split_once('\n').expect("a follow-up line");
-        assert_eq!(head, "prover leave message 2/3 not sent (100/250 filters sent): boom");
+        assert_eq!(
+            head,
+            "prover leave message 2/3 not sent (100/250 filters sent): boom"
+        );
         let args: Vec<&str> = follow_up
             .strip_prefix("send the 150 unsent filters with: qclient node prover leave ")
             .expect("the follow-up command")
@@ -283,6 +305,9 @@ mod tests {
         assert_eq!(args.len(), 150);
         assert_eq!((args[0], args[149]), ("0064", "00f9"));
         let first = split_send_error("leave", 0, 3, &filters, 0, "boom").to_string();
-        assert_eq!(first, "prover leave message 1/3 not sent (0/250 filters sent): boom");
+        assert_eq!(
+            first,
+            "prover leave message 1/3 not sent (0/250 filters sent): boom"
+        );
     }
 }

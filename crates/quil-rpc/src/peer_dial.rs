@@ -22,10 +22,9 @@ pub async fn dial_latest_frame_prover<F>(
 where
     F: Fn(&[u8]) -> Vec<String> + Send + Sync,
 {
-    let header = frame
-        .header
-        .as_ref()
-        .ok_or_else(|| QuilError::Internal("dial_latest_frame_prover: frame missing header".into()))?;
+    let header = frame.header.as_ref().ok_or_else(|| {
+        QuilError::Internal("dial_latest_frame_prover: frame missing header".into())
+    })?;
     let prover_addr = &header.prover;
     if prover_addr.is_empty() {
         return Err(QuilError::Internal(

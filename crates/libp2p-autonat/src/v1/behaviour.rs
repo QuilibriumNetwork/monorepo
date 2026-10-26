@@ -35,9 +35,7 @@ pub use as_server::{InboundProbeError, InboundProbeEvent, ServerStats};
 use futures_timer::Delay;
 use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
-use libp2p_request_response::{
-    self as request_response, OutboundRequestId, ProtocolSupport,
-};
+use libp2p_request_response::{self as request_response, OutboundRequestId, ProtocolSupport};
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm},
     ConnectionDenied, ConnectionId, ListenAddresses, NetworkBehaviour, THandler, THandlerInEvent,
@@ -322,9 +320,9 @@ impl Behaviour {
     pub fn eligible_servers(&self) -> usize {
         let now = Instant::now();
         let throttled = |peer: &PeerId| {
-            self.throttled_servers.iter().any(|(id, time)| {
-                id == peer && *time + self.config.throttle_server_period >= now
-            })
+            self.throttled_servers
+                .iter()
+                .any(|(id, time)| id == peer && *time + self.config.throttle_server_period >= now)
         };
         let mut eligible = self.servers.iter().filter(|p| !throttled(*p)).count();
         if self.config.use_connected {
@@ -767,7 +765,9 @@ mod tests {
     use super::*;
 
     fn junk(n: u16) -> Multiaddr {
-        format!("/ip4/203.0.113.7/tcp/{}", 40_000 + n).parse().unwrap()
+        format!("/ip4/203.0.113.7/tcp/{}", 40_000 + n)
+            .parse()
+            .unwrap()
     }
 
     #[test]

@@ -10,9 +10,9 @@
 use super::*;
 
 pub mod backend;
+mod exact_ring;
 pub mod membership;
 mod public_spend;
-mod exact_ring;
 use exact_ring::ExactRingEquation;
 
 #[derive(PartialEq, Eq)]
@@ -67,12 +67,23 @@ impl PublicAmountRelation {
         inflow: u128,
         outflow: u128,
     ) -> Result<Self, TokenError> {
-        if outputs.is_empty() { return Err(TokenError::Length); }
-        if outputs.len() > MAX_PRIVATE_COINS { return Err(TokenError::TooManyCoins); }
-        let opening = AmountOpening { r: std::array::from_fn(|_| Poly::zero()) };
+        if outputs.is_empty() {
+            return Err(TokenError::Length);
+        }
+        if outputs.len() > MAX_PRIVATE_COINS {
+            return Err(TokenError::TooManyCoins);
+        }
+        let opening = AmountOpening {
+            r: std::array::from_fn(|_| Poly::zero()),
+        };
         let output_coins: Vec<_> = outputs.iter().map(|c| (0, &opening, c)).collect();
         let mut relation = CompiledAmountRelation::compile_graph(
-            key, &[], &output_coins, inflow, outflow, &BalanceTrace { carries: [0; 17] },
+            key,
+            &[],
+            &output_coins,
+            inflow,
+            outflow,
+            &BalanceTrace { carries: [0; 17] },
         );
         relation.erase_private();
         Ok(Self { relation })
@@ -137,22 +148,37 @@ impl CompiledAmountRelation {
 
     /// Squared l2 bound declared to the backend for each short polynomial.
     pub(crate) fn short_normsq(&self) -> Vec<u64> {
-        self.short_bound.iter().map(|&b| (Poly::D as u64) * b * b).collect()
+        self.short_bound
+            .iter()
+            .map(|&b| (Poly::D as u64) * b * b)
+            .collect()
     }
 
     /// Witness value for a binary or short handle; `None` for unknown handles.
     pub(crate) fn witness(&self, handle: usize) -> Option<&Poly> {
-        if handle & SHORT_TAG != 0 { self.short.get(handle ^ SHORT_TAG) } else { self.binary.get(handle) }
+        if handle & SHORT_TAG != 0 {
+            self.short.get(handle ^ SHORT_TAG)
+        } else {
+            self.binary.get(handle)
+        }
     }
 
     /// Coefficient magnitude bound for a handle (1 for binary variables).
     pub(crate) fn variable_bound(&self, handle: usize) -> Option<u64> {
-        if handle & SHORT_TAG != 0 { self.short_bound.get(handle ^ SHORT_TAG).copied() } else { (handle < self.binary.len()).then_some(1) }
+        if handle & SHORT_TAG != 0 {
+            self.short_bound.get(handle ^ SHORT_TAG).copied()
+        } else {
+            (handle < self.binary.len()).then_some(1)
+        }
     }
 
     /// Global backend index of a handle given the auxiliary count.
     pub(crate) fn resolve(&self, handle: usize, auxiliary: usize) -> usize {
-        if handle & SHORT_TAG != 0 { self.binary.len() + auxiliary + (handle ^ SHORT_TAG) } else { handle }
+        if handle & SHORT_TAG != 0 {
+            self.binary.len() + auxiliary + (handle ^ SHORT_TAG)
+        } else {
+            handle
+        }
     }
 }
 
@@ -173,7 +199,9 @@ impl CompiledAmountRelation {
         inflow: u128,
         outflow: u128,
     ) -> Result<Self, TokenError> {
-        if outputs.is_empty() { return Err(TokenError::Length); }
+        if outputs.is_empty() {
+            return Err(TokenError::Length);
+        }
         Self::compile(key, &[], outputs, inflow, outflow)
     }
 
@@ -229,9 +257,9 @@ impl CompiledAmountRelation {
             c: p.c.iter().map(|&v| Poly::Q - 1 - v).collect(),
         });
         self.exact_ring.push(ExactRingEquation {
-            terms: (0..36).flat_map(|bit| {
-                [(1i64 << bit, value[bit]), (1i64 << bit, complement[bit])]
-            }).collect(),
+            terms: (0..36)
+                .flat_map(|bit| [(1i64 << bit, value[bit]), (1i64 << bit, complement[bit])])
+                .collect(),
             rhs: (Poly::Q - 1) as i64,
         });
         value
@@ -363,8 +391,10 @@ impl CompiledAmountRelation {
     ) -> Self {
         let mut result = Self {
             binary: Vec::new(),
-            short: Vec::new(), short_bound: Vec::new(),
-            ring: Vec::new(), exact_ring: Vec::new(),
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: Vec::new(),
             input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),
@@ -440,13 +470,20 @@ impl CompiledAmountRelation {
         if !self.exact_ring.iter().all(|row| row.validate(&self.binary)) {
             return false;
         }
-        if self.short.iter().zip(&self.short_bound).any(|(p, &b)| p.c.len() != Poly::D || p.c.iter().any(|&c| c > b)) {
+        if self
+            .short
+            .iter()
+            .zip(&self.short_bound)
+            .any(|(p, &b)| p.c.len() != Poly::D || p.c.iter().any(|&c| c > b))
+        {
             return false;
         }
         for equation in &self.ring {
             let mut sum = Poly::zero();
             for (coefficient, index) in &equation.terms {
-                let Some(input) = self.witness(*index) else { return false };
+                let Some(input) = self.witness(*index) else {
+                    return false;
+                };
                 sum = sum.add(&coefficient.mul_ntt(input));
             }
             if sum != equation.rhs {
@@ -474,28 +511,34 @@ mod tests {
     fn native_issuance_amount_relation_roundtrip() {
         use backend::native::{self, NativeBudget};
         let key = CommitmentKey::derive(&[41; 32]);
-        let openings: [_; 2] = std::array::from_fn(|i|
-            AmountOpening::from_seed(&[41; 32], &[i as u8; 32]));
+        let openings: [_; 2] =
+            std::array::from_fn(|i| AmountOpening::from_seed(&[41; 32], &[i as u8; 32]));
         let amounts = [u128::MAX - 258, 256];
         let commitments: [_; 2] = std::array::from_fn(|i| key.commit(amounts[i], &openings[i]));
         let coins: [_; 2] = std::array::from_fn(|i| (amounts[i], &openings[i], &commitments[i]));
         let context = b"issuance amount fixture: authorization remains external";
         let private = CompiledAmountRelation::compile_issuance(&key, &coins, u128::MAX, 2)
-            .unwrap().with_transaction_context(context);
-        let budget = NativeBudget { max_native_bytes: 1024 * 1024 * 1024 };
+            .unwrap()
+            .with_transaction_context(context);
+        let budget = NativeBudget {
+            max_native_bytes: 1024 * 1024 * 1024,
+        };
         let started = std::time::Instant::now();
         let proof = native::prove(&private, budget).unwrap();
         drop(private);
         let public = PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX, 2)
-            .unwrap().with_transaction_context(context);
+            .unwrap()
+            .with_transaction_context(context);
         assert!(native::verify_owned(public, &proof, budget).unwrap());
-        let changed_value = PublicAmountRelation::compile_issuance(
-            &key, &commitments, u128::MAX - 1, 2,
-        ).unwrap().with_transaction_context(context);
+        let changed_value =
+            PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX - 1, 2)
+                .unwrap()
+                .with_transaction_context(context);
         assert!(!native::verify_owned(changed_value, &proof, budget).unwrap());
-        let changed_context = PublicAmountRelation::compile_issuance(
-            &key, &commitments, u128::MAX, 2,
-        ).unwrap().with_transaction_context(b"different issuance authorization");
+        let changed_context =
+            PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX, 2)
+                .unwrap()
+                .with_transaction_context(b"different issuance authorization");
         assert!(!native::verify_owned(changed_context, &proof, budget).unwrap());
         // Amount-relation proof only: this is not a complete issuance encoding.
         assert!(proof.len() < 256 * 1024);
@@ -506,15 +549,17 @@ mod tests {
     #[test]
     fn issuance_binds_authorized_public_value_without_private_input_coins() {
         let key = CommitmentKey::derive(&[31; 32]);
-        let openings: [_; 2] = std::array::from_fn(|i|
-            AmountOpening::from_seed(&[31; 32], &[i as u8; 32]));
+        let openings: [_; 2] =
+            std::array::from_fn(|i| AmountOpening::from_seed(&[31; 32], &[i as u8; 32]));
         let amounts = [u128::MAX - 258, 256];
         let commitments: [_; 2] = std::array::from_fn(|i| key.commit(amounts[i], &openings[i]));
         let coins: [_; 2] = std::array::from_fn(|i| (amounts[i], &openings[i], &commitments[i]));
         let private = CompiledAmountRelation::compile_issuance(&key, &coins, u128::MAX, 2)
-            .unwrap().with_transaction_context(b"publicly authorized issuance fixture");
+            .unwrap()
+            .with_transaction_context(b"publicly authorized issuance fixture");
         let public = PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX, 2)
-            .unwrap().with_transaction_context(b"publicly authorized issuance fixture");
+            .unwrap()
+            .with_transaction_context(b"publicly authorized issuance fixture");
         assert!(private.validate_local_witness());
         assert!(private.input_commitment_planes.is_empty());
         assert!(private.ring == public.relation.ring);
@@ -523,20 +568,34 @@ mod tests {
         assert!(private.membership == public.relation.membership);
         assert_eq!(private.binary.len(), public.relation.binary.len());
         assert!(public.relation.binary.iter().all(|p| p.c.is_empty()));
-        assert!(matches!(CompiledAmountRelation::compile_issuance(&key, &coins, u128::MAX, 1),
-            Err(TokenError::Unbalanced)));
-        assert!(matches!(CompiledAmountRelation::compile_issuance(&key, &[], 0, 0),
-            Err(TokenError::Length)));
-        assert!(matches!(PublicAmountRelation::compile_issuance(&key, &[], 0, 0),
-            Err(TokenError::Length)));
-        assert!(matches!(PublicAmountRelation::compile_issuance(
-            &key, &vec![commitments[0].clone(); MAX_PRIVATE_COINS + 1], 0, 0),
-            Err(TokenError::TooManyCoins)));
+        assert!(matches!(
+            CompiledAmountRelation::compile_issuance(&key, &coins, u128::MAX, 1),
+            Err(TokenError::Unbalanced)
+        ));
+        assert!(matches!(
+            CompiledAmountRelation::compile_issuance(&key, &[], 0, 0),
+            Err(TokenError::Length)
+        ));
+        assert!(matches!(
+            PublicAmountRelation::compile_issuance(&key, &[], 0, 0),
+            Err(TokenError::Length)
+        ));
+        assert!(matches!(
+            PublicAmountRelation::compile_issuance(
+                &key,
+                &vec![commitments[0].clone(); MAX_PRIVATE_COINS + 1],
+                0,
+                0
+            ),
+            Err(TokenError::TooManyCoins)
+        ));
         let changed = PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX, 1)
-            .unwrap().with_transaction_context(b"publicly authorized issuance fixture");
+            .unwrap()
+            .with_transaction_context(b"publicly authorized issuance fixture");
         assert!(private.scalar != changed.relation.scalar);
         let changed = PublicAmountRelation::compile_issuance(&key, &commitments, u128::MAX, 2)
-            .unwrap().with_transaction_context(b"different issuance authorization");
+            .unwrap()
+            .with_transaction_context(b"different issuance authorization");
         assert!(private.ring != changed.relation.ring);
     }
 
@@ -585,8 +644,10 @@ mod tests {
     fn canonical_decomposition_rejects_modulus_alias_and_nonbinary_masks() {
         let mut relation = CompiledAmountRelation {
             binary: Vec::new(),
-            short: Vec::new(), short_bound: Vec::new(),
-            ring: Vec::new(), exact_ring: Vec::new(),
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: Vec::new(),
             input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),

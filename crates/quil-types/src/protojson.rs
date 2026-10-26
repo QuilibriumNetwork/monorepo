@@ -31,8 +31,7 @@ pub const KEY_REGISTRY: &str = "quilibrium.node.keys.pb.KeyRegistry";
 static DESCRIPTOR_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
 
 static POOL: Lazy<DescriptorPool> = Lazy::new(|| {
-    DescriptorPool::decode(DESCRIPTOR_BYTES)
-        .expect("embedded protobuf descriptor set is valid")
+    DescriptorPool::decode(DESCRIPTOR_BYTES).expect("embedded protobuf descriptor set is valid")
 });
 
 /// Serialize a prost message to protojson bytes, matching Go's
@@ -93,15 +92,17 @@ pub fn from_protojson<M: Message + Default>(full_name: &str, json: &[u8]) -> Res
     })?;
     let options = DeserializeOptions::new().deny_unknown_fields(false);
     let mut de = serde_json::Deserializer::from_slice(json);
-    let dynamic = DynamicMessage::deserialize_with_options(descriptor, &mut de, &options)
-        .map_err(|e| {
+    let dynamic =
+        DynamicMessage::deserialize_with_options(descriptor, &mut de, &options).map_err(|e| {
             QuilError::Serialization(format!("protojson: deserialize {full_name}: {e}"))
         })?;
-    de.end()
-        .map_err(|e| QuilError::Serialization(format!("protojson: trailing data {full_name}: {e}")))?;
+    de.end().map_err(|e| {
+        QuilError::Serialization(format!("protojson: trailing data {full_name}: {e}"))
+    })?;
     let wire = dynamic.encode_to_vec();
-    M::decode(wire.as_slice())
-        .map_err(|e| QuilError::Serialization(format!("protojson: decode {full_name} into prost: {e}")))
+    M::decode(wire.as_slice()).map_err(|e| {
+        QuilError::Serialization(format!("protojson: decode {full_name} into prost: {e}"))
+    })
 }
 
 /// Borrow the shared descriptor pool (useful for tests / introspection).
@@ -158,7 +159,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let value = to_protojson_value(GLOBAL_FRAME, &frame).unwrap();
         assert_eq!(value, parsed);
-        assert_eq!(serde_json::to_vec(&value).unwrap(), serde_json::to_vec(&parsed).unwrap());
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap(),
+            serde_json::to_vec(&parsed).unwrap()
+        );
     }
 
     #[test]
@@ -197,8 +201,7 @@ mod tests {
             request: Some(message_request::Request::Join(ProverJoin::default())),
             timestamp: 12345,
         };
-        let bytes =
-            to_protojson("quilibrium.node.global.pb.MessageRequest", &req).unwrap();
+        let bytes = to_protojson("quilibrium.node.global.pb.MessageRequest", &req).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let obj = v.as_object().expect("request is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -211,7 +214,9 @@ mod tests {
         );
         // The UI's detector resolves to the variant name.
         assert_eq!(
-            obj.keys().find(|k| k.as_str() != "timestamp").map(String::as_str),
+            obj.keys()
+                .find(|k| k.as_str() != "timestamp")
+                .map(String::as_str),
             Some("join"),
         );
     }

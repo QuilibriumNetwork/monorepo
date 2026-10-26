@@ -140,7 +140,12 @@ pub enum CatchUpEvent {
     /// At most once per interval during a catch-up.
     Progress(CatchUpReport),
     /// The catch-up ended after `frames` in `secs`.
-    CaughtUp { executed: u64, head: u64, frames: u64, secs: u64 },
+    CaughtUp {
+        executed: u64,
+        head: u64,
+        frames: u64,
+        secs: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -172,7 +177,13 @@ impl Default for CatchUp {
 
 impl CatchUp {
     pub fn with_interval(interval: Duration) -> Self {
-        Self { interval, in_place: 0, ingest_wait: Duration::ZERO, ingest_waiting: None, lagging: None }
+        Self {
+            interval,
+            in_place: 0,
+            ingest_wait: Duration::ZERO,
+            ingest_waiting: None,
+            lagging: None,
+        }
     }
 
     /// Whether a catch-up is under way, as of the last [`Self::observe`].
@@ -182,7 +193,11 @@ impl CatchUp {
 
     /// Atomic attempts for the next frame: none during a catch-up.
     pub fn atomic_attempts(&self) -> u32 {
-        if self.catching_up() { 0 } else { AT_HEAD_ATOMIC_ATTEMPTS }
+        if self.catching_up() {
+            0
+        } else {
+            AT_HEAD_ATOMIC_ATTEMPTS
+        }
     }
 
     /// A frame executed in place.
@@ -204,9 +219,22 @@ impl CatchUp {
 
     /// Update the state for execution at `executed` with the head at `head`
     /// and the materializer's `counts` at `now`; the event to log, if any.
-    pub fn observe(&mut self, now: Instant, executed: u64, head: u64, counts: ExecutionCounts) -> Option<CatchUpEvent> {
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        executed: u64,
+        head: u64,
+        counts: ExecutionCounts,
+    ) -> Option<CatchUpEvent> {
         let lag = head.saturating_sub(executed);
-        let mark = Mark { at: now, executed, head, in_place: self.in_place, ingest_wait: self.ingest_wait, counts };
+        let mark = Mark {
+            at: now,
+            executed,
+            head,
+            in_place: self.in_place,
+            ingest_wait: self.ingest_wait,
+            counts,
+        };
         if self.lagging.is_none() {
             if lag > CATCH_UP_WINDOW {
                 self.lagging = Some((mark, mark));
@@ -245,7 +273,13 @@ impl CatchUp {
     }
 
     /// [`Self::observe`], logging the event.
-    pub fn observe_and_log(&mut self, now: Instant, executed: u64, head: u64, counts: ExecutionCounts) {
+    pub fn observe_and_log(
+        &mut self,
+        now: Instant,
+        executed: u64,
+        head: u64,
+        counts: ExecutionCounts,
+    ) {
         if let Some(event) = self.observe(now, executed, head, counts) {
             log(&event);
         }
@@ -302,7 +336,10 @@ mod tests {
                 "canonical execution commit: execution base changed".into(),
             ))
         });
-        let in_place = !matches!(outcome, Some(CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed));
+        let in_place = !matches!(
+            outcome,
+            Some(CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed)
+        );
         (captures, captures + u32::from(in_place))
     }
 
@@ -347,10 +384,18 @@ mod tests {
         }
         assert!(matches!(
             at(&mut catch_up, 1_100, 1_100 + CATCH_UP_END_LAG),
-            Some(CatchUpEvent::CaughtUp { executed: 1_100, frames: 100, .. })
+            Some(CatchUpEvent::CaughtUp {
+                executed: 1_100,
+                frames: 100,
+                ..
+            })
         ));
         assert_eq!(catch_up.atomic_attempts(), AT_HEAD_ATOMIC_ATTEMPTS);
-        assert_eq!(at(&mut catch_up, 1_100, 1_100 + CATCH_UP_WINDOW), None, "one line per catch-up");
+        assert_eq!(
+            at(&mut catch_up, 1_100, 1_100 + CATCH_UP_WINDOW),
+            None,
+            "one line per catch-up"
+        );
         assert_eq!(catch_up.atomic_attempts(), AT_HEAD_ATOMIC_ATTEMPTS);
         at(&mut catch_up, 1_100, 1_101 + CATCH_UP_WINDOW);
         assert!(catch_up.catching_up(), "a new catch-up");
@@ -384,9 +429,17 @@ mod tests {
         progress.note_ingest(at(10), false);
         progress.note_ingest(at(12), false);
         progress.note_ingest(at(13), true);
-        assert_eq!(progress.observe(at(30), 1_010, 1_105, counts(1, 1, 0)), None);
-        assert_eq!(progress.observe(at(60), 1_020, 1_106, counts(1, 2, 1)), None);
-        let Some(CatchUpEvent::Progress(report)) = progress.observe(at(61), 1_021, 1_107, counts(2, 2, 1)) else {
+        assert_eq!(
+            progress.observe(at(30), 1_010, 1_105, counts(1, 1, 0)),
+            None
+        );
+        assert_eq!(
+            progress.observe(at(60), 1_020, 1_106, counts(1, 2, 1)),
+            None
+        );
+        let Some(CatchUpEvent::Progress(report)) =
+            progress.observe(at(61), 1_021, 1_107, counts(2, 2, 1))
+        else {
             panic!("a progress line after the interval");
         };
         assert_eq!(
@@ -405,17 +458,38 @@ mod tests {
         );
         // The next interval starts at that line.
         progress.record_in_place();
-        assert_eq!(progress.observe(at(120), 1_040, 1_110, counts(2, 3, 1)), None);
-        let Some(CatchUpEvent::Progress(report)) = progress.observe(at(121), 1_041, 1_111, counts(2, 3, 1)) else {
+        assert_eq!(
+            progress.observe(at(120), 1_040, 1_110, counts(2, 3, 1)),
+            None
+        );
+        let Some(CatchUpEvent::Progress(report)) =
+            progress.observe(at(121), 1_041, 1_111, counts(2, 3, 1))
+        else {
             panic!("the next progress line");
         };
-        assert_eq!((report.frames, report.in_place, report.ingest_wait_ms, report.counts), (20, 1, 0, counts(0, 1, 0)));
+        assert_eq!(
+            (
+                report.frames,
+                report.in_place,
+                report.ingest_wait_ms,
+                report.counts
+            ),
+            (20, 1, 0, counts(0, 1, 0))
+        );
         // Back within half the window: one line, then nothing.
         assert_eq!(
             progress.observe(at(130), 1_100, 1_112, counts(2, 3, 1)),
-            Some(CatchUpEvent::CaughtUp { executed: 1_100, head: 1_112, frames: 100, secs: 129 })
+            Some(CatchUpEvent::CaughtUp {
+                executed: 1_100,
+                head: 1_112,
+                frames: 100,
+                secs: 129
+            })
         );
-        assert_eq!(progress.observe(at(200), 1_110, 1_112, counts(2, 3, 1)), None);
+        assert_eq!(
+            progress.observe(at(200), 1_110, 1_112, counts(2, 3, 1)),
+            None
+        );
     }
 
     #[test]
@@ -424,9 +498,14 @@ mod tests {
         let mut progress = CatchUp::with_interval(Duration::from_secs(10));
         let none = ExecutionCounts::default();
         assert_eq!(progress.observe(start, 1_000, 1_100, none), None);
-        let Some(CatchUpEvent::Progress(report)) = progress.observe(start + Duration::from_secs(10), 1_000, 1_110, none) else {
+        let Some(CatchUpEvent::Progress(report)) =
+            progress.observe(start + Duration::from_secs(10), 1_000, 1_110, none)
+        else {
             panic!("a progress line");
         };
-        assert_eq!((report.frames, report.head_frames, report.ms_per_frame), (0, 10, 0));
+        assert_eq!(
+            (report.frames, report.head_frames, report.ms_per_frame),
+            (0, 10, 0)
+        );
     }
 }

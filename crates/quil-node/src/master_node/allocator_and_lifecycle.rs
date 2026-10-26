@@ -70,7 +70,8 @@ pub(crate) fn init(
     }
     {
         let shards = shards_store.clone();
-        worker_allocator.set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
+        worker_allocator
+            .set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
     }
     // Workers recover no shard state of a seat this node gives up, judged at
     // the frame the allocator last reconciled at.
@@ -104,7 +105,8 @@ pub(crate) fn init(
                             let mut seed = [0u8; 57];
                             seed.copy_from_slice(&bytes[..57]);
                             let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
-                            let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
+                            let peer_id =
+                                quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
                             peer_ids.push(bs58::encode(&peer_id).into_string());
                         }
                     }
@@ -232,9 +234,8 @@ pub(crate) fn init(
     // Wire the shards store so `evaluate` can discover shards that
     // have no allocations yet — calls `RangeAppShards` on the local
     // store.
-    prover_lifecycle.set_shards_store(
-        shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
-    );
+    prover_lifecycle
+        .set_shards_store(shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>);
 
     // Per the architecture: archives materialize global frames;
     // workers materialize app-shard frames (a separate path);
@@ -259,13 +260,15 @@ pub(crate) fn init(
     if archive_mode {
         let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
             Arc::new(quil_crypto::FalconKeyConstructor);
-        exec_manager.install_global_frame_header_deps(
-            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
-            reward_issuer.clone(),
-            bls_for_intrinsic,
-            inclusion_prover.clone(),
-            frame_prover.clone(),
-        ).expect("failed to install global frame header dependencies");
+        exec_manager
+            .install_global_frame_header_deps(
+                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                reward_issuer.clone(),
+                bls_for_intrinsic,
+                inclusion_prover.clone(),
+                frame_prover.clone(),
+            )
+            .expect("failed to install global frame header dependencies");
         // This collector feeds GLOBAL proposals: verify a shard frame's
         // certificate in committed state, as the GLOBAL frame after the head
         // would execute it, before holding it. A verified frame then supersedes
@@ -278,16 +281,24 @@ pub(crate) fn init(
         let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
         message_collector.set_shard_frame_verifier({
             use quil_engine::message_collector::ShardFrameVerdict;
-            let (manager, current, global, deferrals) =
-                (exec_manager.clone(), current_frame.clone(), crdt.clone(), deferrals.clone());
+            let (manager, current, global, deferrals) = (
+                exec_manager.clone(),
+                current_frame.clone(),
+                crdt.clone(),
+                deferrals.clone(),
+            );
             Arc::new(move |bundle: &[u8]| {
                 let verified_for = current.effective().saturating_add(1);
                 match manager.validate_message(verified_for, &[0xff; 32], bundle) {
                     Ok(()) => ShardFrameVerdict::Valid,
-                    Err(error) if error.is_execution_unavailable() => ShardFrameVerdict::Unavailable(error.to_string()),
+                    Err(error) if error.is_execution_unavailable() => {
+                        ShardFrameVerdict::Unavailable(error.to_string())
+                    }
                     Err(error) => {
                         let executed = global
-                            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                            .read_frame_cursor(
+                                &quil_store::encoding::global_materialized_cursor_key(),
+                            )
                             .ok();
                         deferrals.verdict(&error, bundle, executed, verified_for, |filter| {
                             quil_engine::execution_deferral::next_generation(&global, filter)
@@ -304,8 +315,8 @@ pub(crate) fn init(
             while !token.is_cancelled() {
                 tick.tick().await;
                 if deferrals.waiting() {
-                    if let Ok(executed) =
-                        global.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    if let Ok(executed) = global
+                        .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
                     {
                         deferrals.executed(executed);
                     }
@@ -314,7 +325,9 @@ pub(crate) fn init(
             Ok(())
         });
     } else {
-        exec_manager.install_global_frame_prover(frame_prover.clone()).expect("failed to install global frame prover");
+        exec_manager
+            .install_global_frame_prover(frame_prover.clone())
+            .expect("failed to install global frame prover");
     }
     let frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>> =
         if archive_mode {
@@ -330,7 +343,9 @@ pub(crate) fn init(
             )
             .with_eviction_registry(prover_registry.clone())
             .with_global_maintenance(quil_engine::frame_maintenance::GlobalMaintenance::new(
-                network, config.engine.genesis_seed.clone(), Vec::new(),
+                network,
+                config.engine.genesis_seed.clone(),
+                Vec::new(),
             ))
             // Deterministic per-shard data-size source for the eviction
             // halt gate: enumerate committed shards from the shards store

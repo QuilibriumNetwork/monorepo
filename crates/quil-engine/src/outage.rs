@@ -55,7 +55,10 @@ impl Default for Outage {
 impl Outage {
     /// An outage that begins after `failures` consecutive failed attempts.
     pub fn begin_after(failures: u64) -> Self {
-        Self { begin_after: failures.max(1), failing: None }
+        Self {
+            begin_after: failures.max(1),
+            failing: None,
+        }
     }
 
     /// Record one attempt's outcome at `now`; returns the transition to log.
@@ -67,7 +70,12 @@ impl Outage {
                 failures: f.failures,
             });
         }
-        let f = self.failing.get_or_insert(Failing { since: now, logged: now, failures: 0, began: false });
+        let f = self.failing.get_or_insert(Failing {
+            since: now,
+            logged: now,
+            failures: 0,
+            began: false,
+        });
         f.failures += 1;
         match f.began {
             false if f.failures >= self.begin_after => {
@@ -147,9 +155,21 @@ mod tests {
         assert_eq!(outage.observe(at(10), false), Some(OutageEvent::Began));
         assert_eq!(outage.observe(at(20), false), None);
         assert_eq!(outage.observe(at(609), false), None);
-        assert_eq!(outage.observe(at(610), false), Some(OutageEvent::Continues { secs: 600, failures: 4 }));
+        assert_eq!(
+            outage.observe(at(610), false),
+            Some(OutageEvent::Continues {
+                secs: 600,
+                failures: 4
+            })
+        );
         assert_eq!(outage.observe(at(900), false), None);
-        assert_eq!(outage.observe(at(905), true), Some(OutageEvent::Ended { secs: 895, failures: 5 }));
+        assert_eq!(
+            outage.observe(at(905), true),
+            Some(OutageEvent::Ended {
+                secs: 895,
+                failures: 5
+            })
+        );
         assert_eq!(outage.observe(at(915), true), None);
         assert_eq!(outage.observe(at(920), false), Some(OutageEvent::Began));
     }
@@ -169,7 +189,19 @@ mod tests {
         assert_eq!(outage.observe(at(40), false), None);
         assert_eq!(outage.observe(at(50), false), Some(OutageEvent::Began));
         assert_eq!(outage.observe(at(649), false), None);
-        assert_eq!(outage.observe(at(650), false), Some(OutageEvent::Continues { secs: 620, failures: 5 }));
-        assert_eq!(outage.observe(at(660), true), Some(OutageEvent::Ended { secs: 630, failures: 5 }));
+        assert_eq!(
+            outage.observe(at(650), false),
+            Some(OutageEvent::Continues {
+                secs: 620,
+                failures: 5
+            })
+        );
+        assert_eq!(
+            outage.observe(at(660), true),
+            Some(OutageEvent::Ended {
+                secs: 630,
+                failures: 5
+            })
+        );
     }
 }

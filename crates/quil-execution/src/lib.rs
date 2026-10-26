@@ -1,9 +1,10 @@
 pub mod canonical_cursor;
 pub mod compute_engine;
 pub mod compute_intrinsic;
+#[cfg(all(test, feature = "confidential-tokens"))]
+mod decoder_fuzz_tests;
 pub mod engines;
 pub mod fees;
-pub mod pricing;
 pub mod global_anchor_view;
 pub mod global_engine;
 pub mod global_intrinsic;
@@ -13,16 +14,15 @@ pub mod hypergraph_intrinsic;
 pub mod hypergraph_state;
 pub mod intrinsics;
 pub mod manager;
-pub mod metrics;
 pub mod message_envelope;
+pub mod metrics;
+pub mod pricing;
 pub mod prover_registry;
 pub mod seniority_compat;
 pub mod step_timing;
 pub mod test_hooks;
 #[cfg(any(test, feature = "testing-stubs"))]
 pub mod testing;
-#[cfg(all(test, feature = "confidential-tokens"))]
-mod decoder_fuzz_tests;
 pub mod token_engine;
 pub mod token_intrinsic;
 pub mod traversal_proof;
@@ -32,14 +32,19 @@ pub mod turtle;
 mod shard_frame_conflict_tests;
 
 pub use engines::{EngineType, ExecutionMode};
+pub use global_anchor_view::GlobalAnchorView;
 pub use global_schema::{
     class_def, class_for_type_hash, compute_type_hash, field_key, field_tag, order_to_key,
     ClassDef, FieldTag, RdfType, GLOBAL_CLASSES, GLOBAL_INTRINSIC_ADDRESS, GLOBAL_MAX_ORDER,
     TYPE_HASH_ALLOCATION, TYPE_HASH_PROVER, TYPE_HASH_REWARD, TYPE_HASH_TABLE,
 };
-pub use manager::{ExecutionBranch, ExecutionBranchLimits, ExecutionEngineManager, ExecutionForkContext, ExecutionPublicationGuard};
-pub use global_anchor_view::GlobalAnchorView;
-pub use prover_registry::{EvictionCandidate, InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry};
+pub use manager::{
+    ExecutionBranch, ExecutionBranchLimits, ExecutionEngineManager, ExecutionForkContext,
+    ExecutionPublicationGuard,
+};
+pub use prover_registry::{
+    EvictionCandidate, InMemoryProverRegistry, RegistryLimits, RegistryUsage, SharedProverRegistry,
+};
 
 /// Well-known domain addresses for execution engines.
 pub mod domains {
@@ -52,10 +57,9 @@ pub mod domains {
 
     /// QUIL token address (poseidon("q_mainnet_token")).
     pub const QUIL_TOKEN: [u8; 32] = [
-        0x11, 0x55, 0x85, 0x84, 0xaf, 0x70, 0x17, 0xa9,
-        0xbf, 0xd1, 0xff, 0x18, 0x64, 0x30, 0x2d, 0x64,
-        0x3f, 0xbe, 0x58, 0xc6, 0x2d, 0xcf, 0x90, 0xcb,
-        0xcd, 0x8f, 0xde, 0x74, 0xa2, 0x67, 0x94, 0xd9,
+        0x11, 0x55, 0x85, 0x84, 0xaf, 0x70, 0x17, 0xa9, 0xbf, 0xd1, 0xff, 0x18, 0x64, 0x30, 0x2d,
+        0x64, 0x3f, 0xbe, 0x58, 0xc6, 0x2d, 0xcf, 0x90, 0xcb, 0xcd, 0x8f, 0xde, 0x74, 0xa2, 0x67,
+        0x94, 0xd9,
     ];
 }
 

@@ -9,7 +9,9 @@ fn member(seed: u8) -> Vec<u8> {
 }
 
 fn data(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 fn params() -> SdrParams {
@@ -34,7 +36,11 @@ fn statement<'a>(member: &'a [u8], encoded: &EncodedLeaf, beacon: &'a [u8]) -> S
         leaf_id: LEAF,
         epoch: EPOCH,
         n: encoded.n,
-        registered: Registered { comm_d: encoded.comm_d, comm_c: encoded.comm_c, comm_r: encoded.comm_r },
+        registered: Registered {
+            comm_d: encoded.comm_d,
+            comm_c: encoded.comm_c,
+            comm_r: encoded.comm_r,
+        },
         beacon,
     }
 }
@@ -52,18 +58,47 @@ fn every_leaf_opens_against_the_commitment_and_nothing_else_does() {
         for index in 0..n {
             let value = node_at(&nodes, index);
             let path = tree.path(index);
-            assert!(verify_path(Tree::Replica, n, &commitment, index, &value, &path), "n={n} index={index}");
+            assert!(
+                verify_path(Tree::Replica, n, &commitment, index, &value, &path),
+                "n={n} index={index}"
+            );
             let mut wrong = value;
             wrong[0] ^= 1;
-            assert!(!verify_path(Tree::Replica, n, &commitment, index, &wrong, &path));
-            assert!(!verify_path(Tree::Data, n, &commitment, index, &value, &path), "another tree's commitment");
-            assert!(!verify_path(Tree::Replica, n + 1, &commitment, index, &value, &path), "another leaf count");
+            assert!(!verify_path(
+                Tree::Replica,
+                n,
+                &commitment,
+                index,
+                &wrong,
+                &path
+            ));
+            assert!(
+                !verify_path(Tree::Data, n, &commitment, index, &value, &path),
+                "another tree's commitment"
+            );
+            assert!(
+                !verify_path(Tree::Replica, n + 1, &commitment, index, &value, &path),
+                "another leaf count"
+            );
         }
-        assert!(!verify_path(Tree::Replica, n, &commitment, n, &[0; 32], &tree.path(n - 1)), "a padding position");
+        assert!(
+            !verify_path(
+                Tree::Replica,
+                n,
+                &commitment,
+                n,
+                &[0; 32],
+                &tree.path(n - 1)
+            ),
+            "a padding position"
+        );
     }
     let mut non_canonical = nodes(4, 1);
     non_canonical[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(MerkleTree::from_nodes(&non_canonical).is_none(), "nodes must be canonical field elements");
+    assert!(
+        MerkleTree::from_nodes(&non_canonical).is_none(),
+        "nodes must be canonical field elements"
+    );
     assert!(MerkleTree::from_nodes(&[]).is_none());
 }
 
@@ -74,9 +109,16 @@ fn a_cap_gives_the_same_paths_as_the_whole_tree() {
         let tree = MerkleTree::from_nodes(&nodes).unwrap();
         for height in [0usize, 3, CAP_HEIGHT, 20] {
             let cap = tree.cap(height);
-            assert_eq!(cap.commitment(Tree::Replica), tree.commitment(Tree::Replica));
+            assert_eq!(
+                cap.commitment(Tree::Replica),
+                tree.commitment(Tree::Replica)
+            );
             for index in [0, n / 3, n / 2, n - 1] {
-                assert_eq!(cap.path(&nodes, index), Some(tree.path(index)), "n={n} height={height} index={index}");
+                assert_eq!(
+                    cap.path(&nodes, index),
+                    Some(tree.path(index)),
+                    "n={n} height={height} index={index}"
+                );
             }
             assert_eq!(MerkleCap::from_bytes(&cap.to_bytes()), Some(cap.clone()));
             let mut other = nodes.clone();
@@ -84,11 +126,21 @@ fn a_cap_gives_the_same_paths_as_the_whole_tree() {
             assert_eq!(cap.path(&other, 0), None, "leaves that are not the tree's");
         }
     }
-    let cap = MerkleTree::from_nodes(&nodes(3000, 3)).unwrap().cap(CAP_HEIGHT);
+    let cap = MerkleTree::from_nodes(&nodes(3000, 3))
+        .unwrap()
+        .cap(CAP_HEIGHT);
     let mut bytes = cap.to_bytes();
     bytes[20] ^= 1;
-    assert_eq!(MerkleCap::from_bytes(&bytes), None, "levels that do not hash up");
-    assert_eq!(MerkleCap::from_bytes(&cap.to_bytes()[..100]), None, "truncated");
+    assert_eq!(
+        MerkleCap::from_bytes(&bytes),
+        None,
+        "levels that do not hash up"
+    );
+    assert_eq!(
+        MerkleCap::from_bytes(&cap.to_bytes()[..100]),
+        None,
+        "truncated"
+    );
 }
 
 #[test]
@@ -106,14 +158,23 @@ fn the_replica_is_the_data_plus_the_members_last_labels() {
             .collect();
         assert_eq!(&recovered[..len], raw.as_slice());
         assert!(recovered[len..].iter().all(|&b| b == 0), "zero padding");
-        assert_eq!(MerkleTree::from_nodes(&data_nodes(&raw)).unwrap().commitment(Tree::Data), encoded.comm_d);
+        assert_eq!(
+            MerkleTree::from_nodes(&data_nodes(&raw))
+                .unwrap()
+                .commitment(Tree::Data),
+            encoded.comm_d
+        );
     }
     // Data that is not whole nodes, or too little, is zero-padded to at least
     // two nodes.
     assert_eq!(encode(&m, &data(70, 1)).n, 3);
     assert_eq!(encode(&m, &data(20, 1)).n, 2);
     assert_eq!(encode(&m, &[]).n, 2);
-    assert_ne!(encode(&m, &data(640, 7)).replica, encode(&member(2), &data(640, 7)).replica, "member-unique");
+    assert_ne!(
+        encode(&m, &data(640, 7)).replica,
+        encode(&member(2), &data(640, 7)).replica,
+        "member-unique"
+    );
 }
 
 #[test]
@@ -124,18 +185,45 @@ fn an_honest_seal_verifies() {
     let proof = prove_seal(&encoded.replica, &stmt, &params(), 16).unwrap();
     assert_eq!(verify_seal(&stmt, &proof, &params(), 16), Ok(()));
     let bytes = proof.to_bytes();
-    assert_eq!(SealProof::from_bytes(&bytes, encoded.n, params().layers, 16), Some(proof.clone()));
-    assert_eq!(SealProof::from_bytes(&bytes[..bytes.len() - 1], encoded.n, params().layers, 16), None);
-    assert_eq!(SealProof::from_bytes(&[bytes.as_slice(), &[0]].concat(), encoded.n, params().layers, 16), None);
-    assert_eq!(SealProof::from_bytes(&bytes, encoded.n, params().layers, 15), None, "more openings than allowed");
-    assert!(verify_seal(&stmt, &proof, &params(), 17).is_err(), "too few openings");
+    assert_eq!(
+        SealProof::from_bytes(&bytes, encoded.n, params().layers, 16),
+        Some(proof.clone())
+    );
+    assert_eq!(
+        SealProof::from_bytes(&bytes[..bytes.len() - 1], encoded.n, params().layers, 16),
+        None
+    );
+    assert_eq!(
+        SealProof::from_bytes(
+            &[bytes.as_slice(), &[0]].concat(),
+            encoded.n,
+            params().layers,
+            16
+        ),
+        None
+    );
+    assert_eq!(
+        SealProof::from_bytes(&bytes, encoded.n, params().layers, 15),
+        None,
+        "more openings than allowed"
+    );
+    assert!(
+        verify_seal(&stmt, &proof, &params(), 17).is_err(),
+        "too few openings"
+    );
 }
 
 #[test]
 fn a_seal_answers_only_its_own_beacon() {
     let m = member(1);
     let encoded = encode(&m, &data(200 * NODE_BYTES, 2));
-    let proof = prove_seal(&encoded.replica, &statement(&m, &encoded, b"beacon-1"), &params(), 16).unwrap();
+    let proof = prove_seal(
+        &encoded.replica,
+        &statement(&m, &encoded, b"beacon-1"),
+        &params(),
+        16,
+    )
+    .unwrap();
     assert!(verify_seal(&statement(&m, &encoded, b"beacon-2"), &proof, &params(), 16).is_err());
 }
 
@@ -150,18 +238,36 @@ fn another_members_replica_cannot_be_sealed() {
     let encoded = encode(&a, &raw);
     let as_b = statement(&b, &encoded, b"beacon");
     assert!(prove_seal(&encoded.replica, &as_b, &params(), 16).is_err());
-    let a_proof = prove_seal(&encoded.replica, &statement(&a, &encoded, b"beacon"), &params(), 16).unwrap();
+    let a_proof = prove_seal(
+        &encoded.replica,
+        &statement(&a, &encoded, b"beacon"),
+        &params(),
+        16,
+    )
+    .unwrap();
     assert!(verify_seal(&as_b, &a_proof, &params(), 16).is_err());
 
     let n = encoded.n;
     let layers = all_layers(n as usize, &sdr::replica_key(&a, LEAF, EPOCH));
-    let column_labels = |v: u64| -> Vec<Node> { layers.iter().map(|layer| hash::to_bytes(&layer[v as usize])).collect() };
-    let columns: Vec<u8> = (0..n).flat_map(|v| column_digest(&column_labels(v)).unwrap()).collect();
+    let column_labels = |v: u64| -> Vec<Node> {
+        layers
+            .iter()
+            .map(|layer| hash::to_bytes(&layer[v as usize]))
+            .collect()
+    };
+    let columns: Vec<u8> = (0..n)
+        .flat_map(|v| column_digest(&column_labels(v)).unwrap())
+        .collect();
     let column_tree = MerkleTree::from_nodes(&columns).unwrap();
     let padded = data_nodes(&raw);
-    let (data_tree, replica_tree) =
-        (MerkleTree::from_nodes(&padded).unwrap(), MerkleTree::from_nodes(&encoded.replica).unwrap());
-    let column = |v: u64| ColumnOpening { labels: column_labels(v), path: column_tree.path(v) };
+    let (data_tree, replica_tree) = (
+        MerkleTree::from_nodes(&padded).unwrap(),
+        MerkleTree::from_nodes(&encoded.replica).unwrap(),
+    );
+    let column = |v: u64| ColumnOpening {
+        labels: column_labels(v),
+        path: column_tree.path(v),
+    };
     let copied = SealProof {
         openings: seal_challenges(&as_b, 16)
             .into_iter()
@@ -173,7 +279,11 @@ fn another_members_replica_cannot_be_sealed() {
                     replica: node_at(&encoded.replica, j),
                     replica_path: replica_tree.path(j),
                     column: column(j),
-                    parents: same_layer.iter().chain(&layer_below).map(|&p| column(p)).collect(),
+                    parents: same_layer
+                        .iter()
+                        .chain(&layer_below)
+                        .map(|&p| column(p))
+                        .collect(),
                 }
             })
             .collect(),
@@ -193,15 +303,26 @@ fn one_replica_cannot_serve_two_identities() {
     let eb = encode(&b, &raw);
     assert_eq!(ea.comm_d, eb.comm_d, "the same data");
     assert_ne!(ea.comm_r, eb.comm_r, "but different replicas");
-    let shared = SealStatement { registered: Registered { comm_r: ea.comm_r, ..Registered {
-        comm_d: eb.comm_d, comm_c: eb.comm_c, comm_r: eb.comm_r } }, ..statement(&b, &eb, b"beacon") };
+    let shared = SealStatement {
+        registered: Registered {
+            comm_r: ea.comm_r,
+            ..Registered {
+                comm_d: eb.comm_d,
+                comm_c: eb.comm_c,
+                comm_r: eb.comm_r,
+            }
+        },
+        ..statement(&b, &eb, b"beacon")
+    };
     assert!(prove_seal(&ea.replica, &shared, &params(), 16).is_err());
 }
 
 /// Every layer's labels of a leaf of `n` nodes, for building forgeries.
 fn all_layers(n: usize, key: &[u8]) -> Vec<Vec<hash::Digest>> {
     let mut layers = Vec::new();
-    label_layers(n, &hash::key_digest(key), &params(), &mut |_, layer| layers.push(layer.to_vec()));
+    label_layers(n, &hash::key_digest(key), &params(), &mut |_, layer| {
+        layers.push(layer.to_vec())
+    });
     layers
 }
 
@@ -218,17 +339,30 @@ fn a_junk_replica_fails_its_seal() {
     let junk = vec![0u8; honest.replica.len()];
     let junk_tree = MerkleTree::from_nodes(&junk).unwrap();
     let stmt = SealStatement {
-        registered: Registered { comm_r: junk_tree.commitment(Tree::Replica), ..statement(&m, &honest, b"beacon").registered },
+        registered: Registered {
+            comm_r: junk_tree.commitment(Tree::Replica),
+            ..statement(&m, &honest, b"beacon").registered
+        },
         ..statement(&m, &honest, b"beacon")
     };
     let layers = all_layers(n as usize, &sdr::replica_key(&m, LEAF, EPOCH));
-    let column_labels = |v: u64| -> Vec<Node> { layers.iter().map(|layer| hash::to_bytes(&layer[v as usize])).collect() };
-    let columns: Vec<u8> = (0..n).flat_map(|v| column_digest(&column_labels(v)).unwrap()).collect();
+    let column_labels = |v: u64| -> Vec<Node> {
+        layers
+            .iter()
+            .map(|layer| hash::to_bytes(&layer[v as usize]))
+            .collect()
+    };
+    let columns: Vec<u8> = (0..n)
+        .flat_map(|v| column_digest(&column_labels(v)).unwrap())
+        .collect();
     let column_tree = MerkleTree::from_nodes(&columns).unwrap();
     assert_eq!(column_tree.commitment(Tree::Column), honest.comm_c);
     let padded = data_nodes(&raw);
     let data_tree = MerkleTree::from_nodes(&padded).unwrap();
-    let column = |v: u64| ColumnOpening { labels: column_labels(v), path: column_tree.path(v) };
+    let column = |v: u64| ColumnOpening {
+        labels: column_labels(v),
+        path: column_tree.path(v),
+    };
     let forged = SealProof {
         openings: seal_challenges(&stmt, 16)
             .into_iter()
@@ -240,14 +374,21 @@ fn a_junk_replica_fails_its_seal() {
                     replica: node_at(&junk, j),
                     replica_path: junk_tree.path(j),
                     column: column(j),
-                    parents: same_layer.iter().chain(&layer_below).map(|&p| column(p)).collect(),
+                    parents: same_layer
+                        .iter()
+                        .chain(&layer_below)
+                        .map(|&p| column(p))
+                        .collect(),
                 }
             })
             .collect(),
     };
     let err = verify_seal(&stmt, &forged, &params(), 16).unwrap_err();
     assert!(err.contains("not its data"), "{err}");
-    assert!(prove_seal(&junk, &stmt, &params(), 16).is_err(), "nor can the prover seal it");
+    assert!(
+        prove_seal(&junk, &stmt, &params(), 16).is_err(),
+        "nor can the prover seal it"
+    );
 }
 
 /// Wrong data: the replica encodes data other than the registered data.
@@ -257,7 +398,10 @@ fn a_replica_of_other_data_fails_its_seal() {
     let real = encode(&m, &data(200 * NODE_BYTES, 6));
     let other = encode(&m, &data(200 * NODE_BYTES, 7));
     let stmt = SealStatement {
-        registered: Registered { comm_d: real.comm_d, ..statement(&m, &other, b"beacon").registered },
+        registered: Registered {
+            comm_d: real.comm_d,
+            ..statement(&m, &other, b"beacon").registered
+        },
         ..statement(&m, &other, b"beacon")
     };
     assert!(prove_seal(&other.replica, &stmt, &params(), 16).is_err());
@@ -279,24 +423,60 @@ fn an_opening_verifies_only_for_its_member_frame_and_epoch() {
     let encoded = encode(&a, &data(3000 * NODE_BYTES, 9));
     let root = encoded.registration_root();
     let open = |member: &[u8], query, rho: &[u8]| {
-        build_opening(&encoded.replica, &encoded.replica_cap, &root, LEAF, EPOCH, member, query, rho).unwrap()
+        build_opening(
+            &encoded.replica,
+            &encoded.replica_cap,
+            &root,
+            LEAF,
+            EPOCH,
+            member,
+            query,
+            rho,
+        )
+        .unwrap()
     };
     let opening = open(&a, 0, b"rho-1");
     assert!(verify_opening(&opening, b"rho-1"));
-    assert!(!verify_opening(&opening, b"rho-2"), "replayed in a later frame");
-    let as_b = crate::porep::StorageOpening { member_id: b.clone(), ..opening.clone() };
+    assert!(
+        !verify_opening(&opening, b"rho-2"),
+        "replayed in a later frame"
+    );
+    let as_b = crate::porep::StorageOpening {
+        member_id: b.clone(),
+        ..opening.clone()
+    };
     assert!(!verify_opening(&as_b, b"rho-1"), "another member's opening");
-    let other_epoch = crate::porep::StorageOpening { epoch: EPOCH + 1, ..opening.clone() };
-    assert!(!verify_opening(&other_epoch, b"rho-1"), "replayed in another epoch");
-    if opening_index(b"rho-1", LEAF, EPOCH, &a, 1, encoded.n) != opening_index(b"rho-1", LEAF, EPOCH, &a, 0, encoded.n) {
-        let other_query = crate::porep::StorageOpening { query: 1, ..opening.clone() };
-        assert!(!verify_opening(&other_query, b"rho-1"), "reused for another query");
+    let other_epoch = crate::porep::StorageOpening {
+        epoch: EPOCH + 1,
+        ..opening.clone()
+    };
+    assert!(
+        !verify_opening(&other_epoch, b"rho-1"),
+        "replayed in another epoch"
+    );
+    if opening_index(b"rho-1", LEAF, EPOCH, &a, 1, encoded.n)
+        != opening_index(b"rho-1", LEAF, EPOCH, &a, 0, encoded.n)
+    {
+        let other_query = crate::porep::StorageOpening {
+            query: 1,
+            ..opening.clone()
+        };
+        assert!(
+            !verify_opening(&other_query, b"rho-1"),
+            "reused for another query"
+        );
     }
     let mut wrong = opening.clone();
     wrong.value[0] ^= 1;
     assert!(!verify_opening(&wrong, b"rho-1"));
-    let kzg_fields = crate::porep::StorageOpening { proof: vec![1], ..opening.clone() };
-    assert!(!verify_opening(&kzg_fields, b"rho-1"), "only the hash fields may be set");
+    let kzg_fields = crate::porep::StorageOpening {
+        proof: vec![1],
+        ..opening.clone()
+    };
+    assert!(
+        !verify_opening(&kzg_fields, b"rho-1"),
+        "only the hash fields may be set"
+    );
 }
 
 #[test]
@@ -304,7 +484,11 @@ fn an_openings_root_binds_the_frame_and_every_value_in_order() {
     let values: Vec<Node> = (0..3).map(|i| node_at(&nodes(3, 9), i)).collect();
     let root = openings_root(7, &values).unwrap();
     assert_ne!(openings_root(8, &values).unwrap(), root, "another frame");
-    assert_ne!(openings_root(7, &values[..2]).unwrap(), root, "a value left out");
+    assert_ne!(
+        openings_root(7, &values[..2]).unwrap(),
+        root,
+        "a value left out"
+    );
     let reversed: Vec<Node> = values.iter().rev().copied().collect();
     assert_ne!(openings_root(7, &reversed).unwrap(), root, "another order");
     let mut other = values.clone();
@@ -319,7 +503,19 @@ fn the_attestation_root_binds_the_opening_set_in_any_order() {
     let encoded = encode(&a, &data(500 * NODE_BYTES, 1));
     let root = encoded.registration_root();
     let openings: Vec<_> = (0..3)
-        .map(|q| build_opening(&encoded.replica, &encoded.replica_cap, &root, LEAF, EPOCH, &a, q, b"rho").unwrap())
+        .map(|q| {
+            build_opening(
+                &encoded.replica,
+                &encoded.replica_cap,
+                &root,
+                LEAF,
+                EPOCH,
+                &a,
+                q,
+                b"rho",
+            )
+            .unwrap()
+        })
         .collect();
     let reversed: Vec<_> = openings.iter().rev().cloned().collect();
     let r = attestation_root(&openings, 5, b"rho", b"\x01");
@@ -339,16 +535,34 @@ fn porep_verifies_hash_openings_from_the_activation_epoch() {
     let encoded = encode(&a, &data(500 * NODE_BYTES, 1));
     let root = encoded.registration_root();
     let openings: Vec<_> = (0..2)
-        .map(|q| build_opening(&encoded.replica, &encoded.replica_cap, &root, LEAF, EPOCH, &a, q, b"rho").unwrap())
+        .map(|q| {
+            build_opening(
+                &encoded.replica,
+                &encoded.replica_cap,
+                &root,
+                LEAF,
+                EPOCH,
+                &a,
+                q,
+                b"rho",
+            )
+            .unwrap()
+        })
         .collect();
-    let verify = |att_root: &[u8]| crate::porep::verify_frame_storage_attestation(att_root, &openings, 5, b"rho", b"\x01", 64);
+    let verify = |att_root: &[u8]| {
+        crate::porep::verify_frame_storage_attestation(att_root, &openings, 5, b"rho", b"\x01", 64)
+    };
     quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(EPOCH));
-    let att_root = crate::porep::compute_storage_attestation_root(&openings, 5, b"rho", b"\x01", 64);
+    let att_root =
+        crate::porep::compute_storage_attestation_root(&openings, 5, b"rho", b"\x01", 64);
     assert_eq!(att_root, attestation_root(&openings, 5, b"rho", b"\x01"));
     assert!(verify(&att_root));
     assert!(!verify(&[0u8; 32]), "another opening set's root");
     quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(EPOCH + 1));
-    assert!(!verify(&att_root), "before activation the openings are read as KZG");
+    assert!(
+        !verify(&att_root),
+        "before activation the openings are read as KZG"
+    );
     quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
 }
 
@@ -359,7 +573,9 @@ fn porep_verifies_hash_openings_from_the_activation_epoch() {
 /// interfaces and missed these direct ones (2026-10-20).
 #[test]
 fn bls48581_stays_confined_to_the_kzg_storage_proofs() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("the crates directory");
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crates directory");
     let allowed = [
         "bls48581/",
         "bls48581-wasm/",
@@ -372,7 +588,10 @@ fn bls48581_stays_confined_to_the_kzg_storage_proofs() {
     let mut offenders = Vec::new();
     let mut pending = vec![crates.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).expect("readable source tree").flatten() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("readable source tree")
+            .flatten()
+        {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if path.is_dir() {
@@ -384,11 +603,17 @@ fn bls48581_stays_confined_to_the_kzg_storage_proofs() {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            let relative = path.strip_prefix(crates).expect("under crates").to_string_lossy().replace('\\', "/");
+            let relative = path
+                .strip_prefix(crates)
+                .expect("under crates")
+                .to_string_lossy()
+                .replace('\\', "/");
             if allowed.iter().any(|prefix| relative.starts_with(prefix)) {
                 continue;
             }
-            let Ok(source) = std::fs::read_to_string(&path) else { continue };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             for (number, line) in source.lines().enumerate() {
                 if !line.trim_start().starts_with("//") && line.contains(&needle) {
                     offenders.push(format!("{relative}:{}", number + 1));
@@ -396,5 +621,8 @@ fn bls48581_stays_confined_to_the_kzg_storage_proofs() {
             }
         }
     }
-    assert!(offenders.is_empty(), "direct bls48581 calls outside the KZG storage proofs: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "direct bls48581 calls outside the KZG storage proofs: {offenders:?}"
+    );
 }

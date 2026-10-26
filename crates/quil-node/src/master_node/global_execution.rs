@@ -26,7 +26,9 @@ pub(crate) struct GlobalExecution {
 
 impl Default for GlobalExecution {
     fn default() -> Self {
-        Self { outage: Outage::begin_after(LAG_TICKS) }
+        Self {
+            outage: Outage::begin_after(LAG_TICKS),
+        }
     }
 }
 
@@ -37,7 +39,8 @@ impl GlobalExecution {
         if executed == 0 {
             return None;
         }
-        self.outage.observe(now, head.saturating_sub(executed) <= LAG_FRAMES)
+        self.outage
+            .observe(now, head.saturating_sub(executed) <= LAG_FRAMES)
     }
 
     /// [`Self::assess`], logging the outage's start, repeats and end.
@@ -85,9 +88,20 @@ mod tests {
         }
         assert_eq!(g.assess(tick(4), 1_000, 1_100), Some(OutageEvent::Began));
         assert_eq!(g.assess(tick(5), 1_000, 1_101), None);
-        assert_eq!(g.assess(tick(5) + Duration::from_secs(600), 1_000, 1_130),
-            Some(OutageEvent::Continues { secs: 720, failures: 6 }));
-        assert_eq!(g.assess(tick(30), 1_129, 1_130), Some(OutageEvent::Ended { secs: 870, failures: 6 }));
+        assert_eq!(
+            g.assess(tick(5) + Duration::from_secs(600), 1_000, 1_130),
+            Some(OutageEvent::Continues {
+                secs: 720,
+                failures: 6
+            })
+        );
+        assert_eq!(
+            g.assess(tick(30), 1_129, 1_130),
+            Some(OutageEvent::Ended {
+                secs: 870,
+                failures: 6
+            })
+        );
     }
 
     #[test]

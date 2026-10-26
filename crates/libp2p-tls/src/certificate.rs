@@ -61,7 +61,10 @@ pub(crate) struct FreshCertResolver {
 
 impl FreshCertResolver {
     pub(crate) fn new(identity: &identity::Keypair) -> Result<Self, GenError> {
-        Ok(Self { identity: identity.clone(), fallback: certified_key(identity)? })
+        Ok(Self {
+            identity: identity.clone(),
+            fallback: certified_key(identity)?,
+        })
     }
 
     fn fresh(&self) -> Arc<rustls::sign::CertifiedKey> {
@@ -70,11 +73,16 @@ impl FreshCertResolver {
 }
 
 /// A new certificate for `identity`, with its signing key.
-fn certified_key(identity: &identity::Keypair) -> Result<Arc<rustls::sign::CertifiedKey>, GenError> {
+fn certified_key(
+    identity: &identity::Keypair,
+) -> Result<Arc<rustls::sign::CertifiedKey>, GenError> {
     let (cert, key) = generate(identity)?;
     let signing_key = rustls::crypto::ring::sign::any_ecdsa_type(&key)
         .expect("a generated certificate key is valid ECDSA DER; qed");
-    Ok(Arc::new(rustls::sign::CertifiedKey::new(vec![cert], signing_key)))
+    Ok(Arc::new(rustls::sign::CertifiedKey::new(
+        vec![cert],
+        signing_key,
+    )))
 }
 
 impl rustls::client::ResolvesClientCert for FreshCertResolver {
@@ -516,7 +524,10 @@ mod fresh_cert_tests {
         let (first, second) = (resolver.fresh(), resolver.fresh());
         assert_ne!(first.cert[0], second.cert[0]);
         for key in [first, second, Arc::clone(&resolver.fallback)] {
-            assert_eq!(parse(&key.cert[0]).unwrap().peer_id(), host.public().to_peer_id());
+            assert_eq!(
+                parse(&key.cert[0]).unwrap().peer_id(),
+                host.public().to_peer_id()
+            );
         }
     }
 }

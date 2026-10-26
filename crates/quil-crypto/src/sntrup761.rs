@@ -37,7 +37,10 @@ impl Sntrup761KeyPair {
     /// Generate a fresh sntrup761 keypair.
     pub fn generate() -> Self {
         let (pk, sk) = sntrup761::keypair();
-        Sntrup761KeyPair { public: pk.as_bytes().to_vec(), secret: sk.as_bytes().to_vec() }
+        Sntrup761KeyPair {
+            public: pk.as_bytes().to_vec(),
+            secret: sk.as_bytes().to_vec(),
+        }
     }
 }
 
@@ -70,7 +73,10 @@ mod tests {
         assert_eq!(sntrup761::public_key_bytes(), SNTRUP761_PUBLIC_KEY_LEN);
         assert_eq!(sntrup761::secret_key_bytes(), SNTRUP761_SECRET_KEY_LEN);
         assert_eq!(sntrup761::ciphertext_bytes(), SNTRUP761_CIPHERTEXT_LEN);
-        assert_eq!(sntrup761::shared_secret_bytes(), SNTRUP761_SHARED_SECRET_LEN);
+        assert_eq!(
+            sntrup761::shared_secret_bytes(),
+            SNTRUP761_SHARED_SECRET_LEN
+        );
     }
 
     #[test]
@@ -87,7 +93,13 @@ mod tests {
 
     #[test]
     fn wrong_key_rejected_cleanly() {
-        assert!(encapsulate(&[0u8; 10]).is_err(), "malformed public key errors, not panics");
-        assert!(decapsulate(&[0u8; 10], &[0u8; 10]).is_err(), "malformed inputs error");
+        assert!(
+            encapsulate(&[0u8; 10]).is_err(),
+            "malformed public key errors, not panics"
+        );
+        assert!(
+            decapsulate(&[0u8; 10], &[0u8; 10]).is_err(),
+            "malformed inputs error"
+        );
     }
 }

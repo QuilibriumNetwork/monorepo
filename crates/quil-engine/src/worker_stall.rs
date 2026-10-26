@@ -37,24 +37,37 @@ pub struct Place {
 
 impl Place {
     fn of(snapshot: &Snapshot) -> Self {
-        let engine = snapshot.task.is_some_and(|task| task.section == Section::AppEngine);
+        let engine = snapshot
+            .task
+            .is_some_and(|task| task.section == Section::AppEngine);
         Place {
             task: snapshot.task,
             step: snapshot.step.filter(|_| engine),
             section: snapshot.section,
-            outer: snapshot.outer.filter(|outer| Some(outer.section) != snapshot.section.map(|s| s.section)),
+            outer: snapshot
+                .outer
+                .filter(|outer| Some(outer.section) != snapshot.section.map(|s| s.section)),
         }
     }
 
     fn labels(&self) -> (Section, Section, Section, Section) {
         let label = |mark: Option<Mark>| mark.map_or(Section::None, |mark| mark.section);
-        (label(self.task), label(self.step), label(self.section), label(self.outer))
+        (
+            label(self.task),
+            label(self.step),
+            label(self.section),
+            label(self.outer),
+        )
     }
 
     /// `task / step / section (within outer)`, naming only what is marked.
     pub fn describe(&self) -> String {
         let (task, step, section, outer) = self.labels();
-        let mut text = if task == Section::None { "an unmarked task".to_string() } else { task.label().to_string() };
+        let mut text = if task == Section::None {
+            "an unmarked task".to_string()
+        } else {
+            task.label().to_string()
+        };
         if step != Section::None {
             text.push_str(" / ");
             text.push_str(step.label());
@@ -75,9 +88,22 @@ impl Place {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StallReport {
     /// A heartbeat became overdue (`continues: false`) or is still overdue.
-    Blocked { core_id: u32, filter: Vec<u8>, blocked: Duration, place: Place, at_ms: u64, continues: bool },
+    Blocked {
+        core_id: u32,
+        filter: Vec<u8>,
+        blocked: Duration,
+        place: Place,
+        at_ms: u64,
+        continues: bool,
+    },
     /// The heartbeat resumed, or the thread ended.
-    Ended { core_id: u32, filter: Vec<u8>, blocked: Duration, seen: Vec<String>, exited: bool },
+    Ended {
+        core_id: u32,
+        filter: Vec<u8>,
+        blocked: Duration,
+        seen: Vec<String>,
+        exited: bool,
+    },
 }
 
 struct Stall {
@@ -114,13 +140,22 @@ pub struct StallWatch {
 
 impl StallWatch {
     pub fn new(stall_after: Duration, repeat: Duration) -> Self {
-        Self { stall_after, repeat, watched: Vec::new() }
+        Self {
+            stall_after,
+            repeat,
+            watched: Vec::new(),
+        }
     }
 
     /// Watch a worker thread's probe until it is dropped.
     pub fn add(&mut self, core_id: u32, probe: &Arc<ThreadProbe>) {
-        self.watched.retain(|w| w.core_id != core_id || w.probe.strong_count() > 0);
-        self.watched.push(Watched { core_id, probe: Arc::downgrade(probe), stall: None });
+        self.watched
+            .retain(|w| w.core_id != core_id || w.probe.strong_count() > 0);
+        self.watched.push(Watched {
+            core_id,
+            probe: Arc::downgrade(probe),
+            stall: None,
+        });
     }
 
     /// Look at every watched thread at `now_ms`.
@@ -132,22 +167,31 @@ impl StallWatch {
             let Some(probe) = watched.probe.upgrade() else {
                 if let Some(stall) = watched.stall.take() {
                     reports.push(StallReport::Ended {
-                        core_id: watched.core_id, filter: stall.filter,
+                        core_id: watched.core_id,
+                        filter: stall.filter,
                         blocked: Duration::from_millis(now_ms.saturating_sub(stall.last_beat_ms)),
-                        seen: stall.described, exited: true,
+                        seen: stall.described,
+                        exited: true,
                     });
                 }
                 return false;
             };
             let snapshot = probe.snapshot();
             let age = now_ms.saturating_sub(snapshot.last_beat_ms);
-            let resumed = watched.stall.as_ref().is_some_and(|stall| stall.last_beat_ms != snapshot.last_beat_ms);
+            let resumed = watched
+                .stall
+                .as_ref()
+                .is_some_and(|stall| stall.last_beat_ms != snapshot.last_beat_ms);
             if resumed {
                 let stall = watched.stall.take().expect("a resumed thread was stalled");
                 reports.push(StallReport::Ended {
-                    core_id: watched.core_id, filter: stall.filter,
-                    blocked: Duration::from_millis(snapshot.last_beat_ms.saturating_sub(stall.last_beat_ms)),
-                    seen: stall.described, exited: false,
+                    core_id: watched.core_id,
+                    filter: stall.filter,
+                    blocked: Duration::from_millis(
+                        snapshot.last_beat_ms.saturating_sub(stall.last_beat_ms),
+                    ),
+                    seen: stall.described,
+                    exited: false,
                 });
             } else if let Some(stall) = watched.stall.as_mut() {
                 let place = Place::of(&snapshot);
@@ -155,22 +199,33 @@ impl StallWatch {
                 if now_ms.saturating_sub(stall.reported_ms) >= repeat {
                     stall.reported_ms = now_ms;
                     reports.push(StallReport::Blocked {
-                        core_id: watched.core_id, filter: stall.filter.clone(),
-                        blocked: Duration::from_millis(age), place, at_ms: now_ms, continues: true,
+                        core_id: watched.core_id,
+                        filter: stall.filter.clone(),
+                        blocked: Duration::from_millis(age),
+                        place,
+                        at_ms: now_ms,
+                        continues: true,
                     });
                 }
             } else if age > stall_after {
                 let place = Place::of(&snapshot);
                 let mut stall = Stall {
-                    last_beat_ms: snapshot.last_beat_ms, filter: probe.filter(), reported_ms: now_ms,
-                    seen: Vec::new(), described: Vec::new(),
+                    last_beat_ms: snapshot.last_beat_ms,
+                    filter: probe.filter(),
+                    reported_ms: now_ms,
+                    seen: Vec::new(),
+                    described: Vec::new(),
                 };
                 stall.see(&place);
                 let filter = stall.filter.clone();
                 watched.stall = Some(stall);
                 reports.push(StallReport::Blocked {
-                    core_id: watched.core_id, filter,
-                    blocked: Duration::from_millis(age), place, at_ms: now_ms, continues: false,
+                    core_id: watched.core_id,
+                    filter,
+                    blocked: Duration::from_millis(age),
+                    place,
+                    at_ms: now_ms,
+                    continues: false,
                 });
             }
             true
@@ -221,10 +276,14 @@ fn watchdog() -> &'static Mutex<StallWatch> {
 
 /// Watch a worker thread's probe from the shared watchdog thread.
 pub fn watch(core_id: u32, probe: &Arc<ThreadProbe>) {
-    watchdog().lock().unwrap_or_else(|e| e.into_inner()).add(core_id, probe);
+    watchdog()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(core_id, probe);
 }
 
-const BLOCKED_ACTION: &str = "a defect in this node's worker thread: votes and other work on it wait while it lasts; \
+const BLOCKED_ACTION: &str =
+    "a defect in this node's worker thread: votes and other work on it wait while it lasts; \
     report this line with its 'worker thread unblocked' line";
 
 fn log(report: &StallReport) {
@@ -235,12 +294,31 @@ fn log(report: &StallReport) {
     if let Some(route) = route {
         route(Some(core));
     }
-    let filter_text = |filter: &[u8]| if filter.is_empty() { "none".to_string() } else { hex::encode(filter) };
-    let secs = |mark: Option<Mark>, now: u64| mark.map_or(0, |mark| now.saturating_sub(mark.since_ms) / 1000);
+    let filter_text = |filter: &[u8]| {
+        if filter.is_empty() {
+            "none".to_string()
+        } else {
+            hex::encode(filter)
+        }
+    };
+    let secs = |mark: Option<Mark>, now: u64| {
+        mark.map_or(0, |mark| now.saturating_sub(mark.since_ms) / 1000)
+    };
     let label = |mark: Option<Mark>| mark.map_or("none", |mark| mark.section.label());
     match report {
-        StallReport::Blocked { core_id, filter, blocked, place, at_ms, continues } => {
-            let message = if *continues { "worker thread still blocked" } else { "worker thread blocked" };
+        StallReport::Blocked {
+            core_id,
+            filter,
+            blocked,
+            place,
+            at_ms,
+            continues,
+        } => {
+            let message = if *continues {
+                "worker thread still blocked"
+            } else {
+                "worker thread blocked"
+            };
             warn!(core_id, filter = %filter_text(filter), blocked_secs = blocked.as_secs(),
                 task = label(place.task), poll_secs = secs(place.task, *at_ms),
                 engine_step = label(place.step), step_secs = secs(place.step, *at_ms),
@@ -249,7 +327,13 @@ fn log(report: &StallReport) {
                 scope = "this node's worker thread", action = BLOCKED_ACTION,
                 "{message}: {} has not returned for {}s", place.describe(), blocked.as_secs());
         }
-        StallReport::Ended { core_id, filter, blocked, seen, exited } => {
+        StallReport::Ended {
+            core_id,
+            filter,
+            blocked,
+            seen,
+            exited,
+        } => {
             info!(core_id, filter = %filter_text(filter), blocked_secs = blocked.as_secs(),
                 seen = %seen.join("; "), exited, scope = "this node's worker thread",
                 "worker thread unblocked after {}s", blocked.as_secs());
@@ -266,7 +350,10 @@ mod tests {
     use quil_types::thread_probe::{install, probed, section, step};
 
     /// Poll `watch` every 20 ms until `found` picks a report, for at most 5 s.
-    fn await_report(watch: &mut StallWatch, found: impl Fn(&StallReport) -> bool) -> Option<StallReport> {
+    fn await_report(
+        watch: &mut StallWatch,
+        found: impl Fn(&StallReport) -> bool,
+    ) -> Option<StallReport> {
         for _ in 0..250 {
             if let Some(report) = watch.poll(now_ms()).into_iter().find(|r| found(r)) {
                 return Some(report);
@@ -287,9 +374,15 @@ mod tests {
         // The worker thread holds the only reference, as in a node.
         let worker_probe = probe;
         let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let installed = install(worker_probe.clone());
-            rt.spawn(heartbeat(Arc::downgrade(&worker_probe), Duration::from_millis(50)));
+            rt.spawn(heartbeat(
+                Arc::downgrade(&worker_probe),
+                Duration::from_millis(50),
+            ));
             drop(worker_probe);
             rt.block_on(async move {
                 // Longer than the threshold: a missing heartbeat would be reported.
@@ -311,29 +404,74 @@ mod tests {
         // Healthy beats before the block raise nothing.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while entered_rx.recv_timeout(Duration::from_millis(20)).is_err() {
-            assert!(std::time::Instant::now() < deadline, "the worker never blocked");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never blocked"
+            );
             assert_eq!(watch.poll(now_ms()), Vec::new());
         }
 
-        let started = await_report(&mut watch, |r| matches!(r, StallReport::Blocked { continues: false, .. }))
-            .expect("the watchdog reports the blocked worker thread");
-        let StallReport::Blocked { core_id, filter, blocked, place, .. } = started else { unreachable!() };
+        let started = await_report(&mut watch, |r| {
+            matches!(
+                r,
+                StallReport::Blocked {
+                    continues: false,
+                    ..
+                }
+            )
+        })
+        .expect("the watchdog reports the blocked worker thread");
+        let StallReport::Blocked {
+            core_id,
+            filter,
+            blocked,
+            place,
+            ..
+        } = started
+        else {
+            unreachable!()
+        };
         assert_eq!((core_id, filter), (7, vec![0xab; 35]));
         assert!(blocked > Duration::from_millis(1000));
         assert_eq!(place.task.map(|m| m.section), Some(Section::AppEngine));
-        assert_eq!(place.step.map(|m| m.section), Some(Section::EngineRetryTimer));
-        assert_eq!(place.section.map(|m| m.section), Some(Section::CommitLockWait));
-        assert_eq!(place.outer.map(|m| m.section), Some(Section::SuccessorStateCheck));
+        assert_eq!(
+            place.step.map(|m| m.section),
+            Some(Section::EngineRetryTimer)
+        );
+        assert_eq!(
+            place.section.map(|m| m.section),
+            Some(Section::CommitLockWait)
+        );
+        assert_eq!(
+            place.outer.map(|m| m.section),
+            Some(Section::SuccessorStateCheck)
+        );
         assert_eq!(place.describe(),
             "app engine / consensus retry timer / CRDT commit lock wait within successor state check");
 
         // It repeats while the thread stays blocked.
-        assert!(await_report(&mut watch, |r| matches!(r, StallReport::Blocked { continues: true, .. })).is_some());
+        assert!(await_report(&mut watch, |r| matches!(
+            r,
+            StallReport::Blocked {
+                continues: true,
+                ..
+            }
+        ))
+        .is_some());
 
         release_tx.send(()).unwrap();
         let ended = await_report(&mut watch, |r| matches!(r, StallReport::Ended { .. }))
             .expect("the watchdog reports the end of the stall");
-        let StallReport::Ended { core_id, blocked, seen, exited, .. } = ended else { unreachable!() };
+        let StallReport::Ended {
+            core_id,
+            blocked,
+            seen,
+            exited,
+            ..
+        } = ended
+        else {
+            unreachable!()
+        };
         assert_eq!((core_id, exited), (7, false));
         assert!(blocked > Duration::from_millis(1000));
         // The first sighting is the blocked place. The closure then drops its
@@ -341,7 +479,11 @@ mod tests {
         // the unwound place: the same task and step, shorter.
         let blocked_place = "app engine / consensus retry timer / CRDT commit lock wait within successor state check";
         let unwound_prefix = "app engine / consensus retry timer";
-        assert_eq!(seen.first().map(String::as_str), Some(blocked_place), "{seen:?}");
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some(blocked_place),
+            "{seen:?}"
+        );
         assert!(seen[1..].iter().all(|later| later.starts_with(unwound_prefix) && later.len() < blocked_place.len()),
             "{seen:?}");
         worker.join().unwrap();
@@ -359,9 +501,15 @@ mod tests {
         watch.add(3, &probe);
         let worker_probe = probe;
         let worker = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let _installed = install(worker_probe.clone());
-            rt.spawn(heartbeat(Arc::downgrade(&worker_probe), Duration::from_millis(50)));
+            rt.spawn(heartbeat(
+                Arc::downgrade(&worker_probe),
+                Duration::from_millis(50),
+            ));
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(3500)).await });
         });
         let mut reports = Vec::new();
@@ -381,13 +529,33 @@ mod tests {
         watch.add(4, &probe);
         let beat = probe.snapshot().last_beat_ms;
         let reports = watch.poll(beat + 500);
-        assert!(matches!(reports.as_slice(), [StallReport::Blocked { core_id: 4, continues: false, .. }]), "{reports:?}");
+        assert!(
+            matches!(
+                reports.as_slice(),
+                [StallReport::Blocked {
+                    core_id: 4,
+                    continues: false,
+                    ..
+                }]
+            ),
+            "{reports:?}"
+        );
         drop(probe);
         let reports = watch.poll(beat + 700);
-        let [StallReport::Ended { core_id, filter, blocked, exited, .. }] = reports.as_slice() else {
+        let [StallReport::Ended {
+            core_id,
+            filter,
+            blocked,
+            exited,
+            ..
+        }] = reports.as_slice()
+        else {
             panic!("{reports:?}");
         };
-        assert_eq!((*core_id, filter.as_slice(), *blocked, *exited), (4, &[0xcd; 35][..], Duration::from_millis(700), true));
+        assert_eq!(
+            (*core_id, filter.as_slice(), *blocked, *exited),
+            (4, &[0xcd; 35][..], Duration::from_millis(700), true)
+        );
         assert!(watch.watched.is_empty());
     }
 }

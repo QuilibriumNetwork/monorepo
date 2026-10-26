@@ -253,51 +253,58 @@ pub trait VDF: Send + Debug {
 /// Outputs the concatenated solution and proof (in this order).
 pub fn wesolowski_solve(int_size_bits: u16, challenge: &[u8], difficulty: u32) -> Vec<u8> {
     let vdf = WesolowskiVDFParams(int_size_bits).new();
-    vdf.solve(challenge, difficulty.into()).expect("invalid difficulty")
+    vdf.solve(challenge, difficulty.into())
+        .expect("invalid difficulty")
 }
 
 /// Verify with the Wesolowski VDF using the given parameters.
 /// `alleged_solution` is the output of `wesolowski_solve`.
-pub fn wesolowski_verify(int_size_bits: u16, challenge: &[u8], difficulty: u32, alleged_solution: &[u8]) -> bool {
+pub fn wesolowski_verify(
+    int_size_bits: u16,
+    challenge: &[u8],
+    difficulty: u32,
+    alleged_solution: &[u8],
+) -> bool {
     let vdf = WesolowskiVDFParams(int_size_bits).new();
-    vdf.verify(challenge, difficulty.into(), alleged_solution).is_ok()
+    vdf.verify(challenge, difficulty.into(), alleged_solution)
+        .is_ok()
 }
 
 /// Solve (single worker `i`) with Wesolowski using ID-bound base and a shared prime `b`.
 /// Produces this worker’s blob in the same layout as `wesolowski_solve`: `[y_i | π_i]`.
 pub fn wesolowski_solve_multi(
-  int_size_bits: u16,
-  challenge: &[u8],
-  difficulty: u32,
-  ids: &Vec<Vec<u8>>,
-  i: u32,
+    int_size_bits: u16,
+    challenge: &[u8],
+    difficulty: u32,
+    ids: &Vec<Vec<u8>>,
+    i: u32,
 ) -> Vec<u8> {
-  use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
-  use crate::proof_of_time::serialize;
-  use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, worker_prove_id_bound};
+    use crate::proof_of_time::serialize;
+    use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, worker_prove_id_bound};
+    use classgroup::{gmp_classgroup::GmpClassGroup, ClassGroup};
 
-  assert!(!ids.is_empty(), "ids must be non-empty");
-  assert!((i as usize) < ids.len(), "worker index out of range");
+    assert!(!ids.is_empty(), "ids must be non-empty");
+    assert!((i as usize) < ids.len(), "worker index out of range");
 
-  // Bind the entire ID set and derive shared prime b
-  let ids_commitment = commit_ids(&ids);
-  let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
-      challenge,
-      int_size_bits,
-      difficulty as u64,
-      &ids_commitment,
-  );
+    // Bind the entire ID set and derive shared prime b
+    let ids_commitment = commit_ids(&ids);
+    let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
+        challenge,
+        int_size_bits,
+        difficulty as u64,
+        &ids_commitment,
+    );
 
-  // This worker runs its own chain on its ID-bound base
-  let (y_i, pi_i) = worker_prove_id_bound::<<GmpClassGroup as ClassGroup>::BigNum, GmpClassGroup>(
-      challenge,
-      int_size_bits,
-      difficulty as u64,
-      &ids[i as usize],
-      &b,
-  );
+    // This worker runs its own chain on its ID-bound base
+    let (y_i, pi_i) = worker_prove_id_bound::<<GmpClassGroup as ClassGroup>::BigNum, GmpClassGroup>(
+        challenge,
+        int_size_bits,
+        difficulty as u64,
+        &ids[i as usize],
+        &b,
+    );
 
-  serialize(&[pi_i], &y_i, int_size_bits as usize)
+    serialize(&[pi_i], &y_i, int_size_bits as usize)
 }
 
 /// Verify all workers in one shot from their individual blobs.
@@ -308,20 +315,20 @@ pub fn wesolowski_solve_multi(
 /// `b` IS the set of present provers. This delegates to the sparse verifier
 /// with `commitment_ids == present_ids == ids`.
 pub fn wesolowski_verify_multi(
-  int_size_bits: u16,
-  challenge: &[u8],
-  difficulty: u32,
-  ids: &Vec<Vec<u8>>,
-  alleged_solutions: &Vec<Vec<u8>>,
+    int_size_bits: u16,
+    challenge: &[u8],
+    difficulty: u32,
+    ids: &Vec<Vec<u8>>,
+    alleged_solutions: &Vec<Vec<u8>>,
 ) -> bool {
-  wesolowski_verify_multi_sparse(
-      int_size_bits,
-      challenge,
-      difficulty,
-      ids,                // commitment set (fixes b)
-      ids,                // present set (aggregation)
-      alleged_solutions,
-  )
+    wesolowski_verify_multi_sparse(
+        int_size_bits,
+        challenge,
+        difficulty,
+        ids, // commitment set (fixes b)
+        ids, // present set (aggregation)
+        alleged_solutions,
+    )
 }
 
 /// Verify a SUBSET of workers against a multiproof whose challenge prime `b`
@@ -347,96 +354,108 @@ pub fn wesolowski_verify_multi(
 /// `present_ids` and `alleged_solutions` must be parallel and in the same
 /// order the prover/aggregator emitted them (ascending committee index).
 pub fn wesolowski_verify_multi_sparse(
-  int_size_bits: u16,
-  challenge: &[u8],
-  difficulty: u32,
-  commitment_ids: &Vec<Vec<u8>>,
-  present_ids: &Vec<Vec<u8>>,
-  alleged_solutions: &Vec<Vec<u8>>,
+    int_size_bits: u16,
+    challenge: &[u8],
+    difficulty: u32,
+    commitment_ids: &Vec<Vec<u8>>,
+    present_ids: &Vec<Vec<u8>>,
+    alleged_solutions: &Vec<Vec<u8>>,
 ) -> bool {
-  use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, ClassGroup};
-  use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, hash_to_exponent};
+    use crate::proof_wesolowski::{commit_ids, hash_prime_fixed, hash_to_exponent};
+    use classgroup::{gmp_classgroup::GmpClassGroup, BigNum, ClassGroup};
 
-  // Basic shape checks. `present_ids` is parallel to the solutions; the
-  // committee that fixes `b` is independent and must be non-empty.
-  if present_ids.is_empty() || present_ids.len() != alleged_solutions.len() { return false; }
-  if commitment_ids.is_empty() { return false; }
-  if (usize::MAX - 16) < int_size_bits as usize { return false; }
-  let elem_units = ((int_size_bits as usize) + 16) >> 4; // element is 2 * elem_units bytes
-  if elem_units == 0 { return false; }
-  let element_len = elem_units * 2;
-  let blob_len = element_len * 2; // [y | π]
+    // Basic shape checks. `present_ids` is parallel to the solutions; the
+    // committee that fixes `b` is independent and must be non-empty.
+    if present_ids.is_empty() || present_ids.len() != alleged_solutions.len() {
+        return false;
+    }
+    if commitment_ids.is_empty() {
+        return false;
+    }
+    if (usize::MAX - 16) < int_size_bits as usize {
+        return false;
+    }
+    let elem_units = ((int_size_bits as usize) + 16) >> 4; // element is 2 * elem_units bytes
+    if elem_units == 0 {
+        return false;
+    }
+    let element_len = elem_units * 2;
+    let blob_len = element_len * 2; // [y | π]
 
-  // Discriminant and canonical base x
-  let disc: <GmpClassGroup as ClassGroup>::BigNum = create_discriminant(challenge, int_size_bits);
-  let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), disc.clone());
+    // Discriminant and canonical base x
+    let disc: <GmpClassGroup as ClassGroup>::BigNum = create_discriminant(challenge, int_size_bits);
+    let x = GmpClassGroup::from_ab_discriminant(2.into(), 1.into(), disc.clone());
 
-  // Fixed prime b from (challenge, bits, t, commit_ids(COMMITTEE)). This is
-  // the same `b` every worker used when precomputing — derived from the full
-  // committee, NOT the present subset.
-  let commitment_slices: Vec<&[u8]> = commitment_ids.iter().map(|v| v.as_slice()).collect();
-  let ids_commitment = commit_ids(&commitment_slices);
-  let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
-      challenge,
-      int_size_bits,
-      difficulty as u64,
-      &ids_commitment,
-  );
+    // Fixed prime b from (challenge, bits, t, commit_ids(COMMITTEE)). This is
+    // the same `b` every worker used when precomputing — derived from the full
+    // committee, NOT the present subset.
+    let commitment_slices: Vec<&[u8]> = commitment_ids.iter().map(|v| v.as_slice()).collect();
+    let ids_commitment = commit_ids(&commitment_slices);
+    let b = hash_prime_fixed::<<GmpClassGroup as ClassGroup>::BigNum>(
+        challenge,
+        int_size_bits,
+        difficulty as u64,
+        &ids_commitment,
+    );
 
-  let two = <<GmpClassGroup as ClassGroup>::BigNum>::from(2u64);
-  if !(b > two) { return false; }
+    let two = <<GmpClassGroup as ClassGroup>::BigNum>::from(2u64);
+    if !(b > two) {
+        return false;
+    }
 
-  // r = 2^t mod b
-  let mut r = <<GmpClassGroup as ClassGroup>::BigNum>::from(0u64);
-  r.mod_powm(
-      &<<GmpClassGroup as ClassGroup>::BigNum>::from(2u64),
-      &<<GmpClassGroup as ClassGroup>::BigNum>::from(difficulty as u64),
-      &b,
-  );
+    // r = 2^t mod b
+    let mut r = <<GmpClassGroup as ClassGroup>::BigNum>::from(0u64);
+    r.mod_powm(
+        &<<GmpClassGroup as ClassGroup>::BigNum>::from(2u64),
+        &<<GmpClassGroup as ClassGroup>::BigNum>::from(difficulty as u64),
+        &b,
+    );
 
-  // Per-member verification (collusion-sound). Each present prover's proof
-  // must INDIVIDUALLY satisfy  π_iᵇ · x^{h_i·r} == y_i  (with x_i = x^{h_i},
-  // y_i = x_i^{2^t}, π_i = x_i^{⌊2^t/b⌋}).
-  //
-  // We deliberately do NOT use the cheaper batched product check
-  //   (∏π_i)ᵇ · x^{r·Σh_i} == ∏y_i
-  // because it is FORGEABLE BY ≥2 COLLUDING MEMBERS: with two members under
-  // their control they can pick compensating (y_i, π_i) whose residuals
-  // cancel in the product (derive one member's y from the others — NO b-th
-  // root required), passing the aggregate without doing the VDF work. Since
-  // rewards are distributed per participating prover, that is a real
-  // fake-attestation / reward-farming vector for a Byzantine minority. The
-  // per-member check forces a b-th root in a class group of unknown order to
-  // forge EACH proof, so collusion gains nothing. Cost is N exponentiations
-  // (N ≤ committee size, bounded per shard) instead of ~constant — an
-  // acceptable price for soundness.
-  for (id_bytes, blob) in present_ids.iter().zip(alleged_solutions.iter()) {
-      if blob.len() != blob_len { return false; }
-      let (y_bytes, pi_bytes) = blob.split_at(element_len);
-      let y_i  = GmpClassGroup::from_bytes(y_bytes, disc.clone());
-      let pi_i = GmpClassGroup::from_bytes(pi_bytes, disc.clone());
-      // Reject malformed forms decoded from the attacker's proof blob BEFORE
-      // any arithmetic: raw GMP/C code can divide by zero on them (a SIGFPE
-      // abort that `catch_unwind` cannot trap) or never finish reducing. A
-      // valid proof always decodes to well-formed forms.
-      if !y_i.is_well_formed() || !pi_i.is_well_formed() {
-          return false;
-      }
-      let h_i = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(
-          challenge,
-          id_bytes.as_slice(),
-      );
-      // lhs = π_iᵇ · x^{h_i·r}
-      let mut lhs = pi_i.clone();
-      lhs.pow(b.clone());
-      let mut x_exp = x.clone();
-      x_exp.pow(&h_i * &r);
-      lhs *= &x_exp;
-      if lhs != y_i {
-          return false;
-      }
-  }
-  true
+    // Per-member verification (collusion-sound). Each present prover's proof
+    // must INDIVIDUALLY satisfy  π_iᵇ · x^{h_i·r} == y_i  (with x_i = x^{h_i},
+    // y_i = x_i^{2^t}, π_i = x_i^{⌊2^t/b⌋}).
+    //
+    // We deliberately do NOT use the cheaper batched product check
+    //   (∏π_i)ᵇ · x^{r·Σh_i} == ∏y_i
+    // because it is FORGEABLE BY ≥2 COLLUDING MEMBERS: with two members under
+    // their control they can pick compensating (y_i, π_i) whose residuals
+    // cancel in the product (derive one member's y from the others — NO b-th
+    // root required), passing the aggregate without doing the VDF work. Since
+    // rewards are distributed per participating prover, that is a real
+    // fake-attestation / reward-farming vector for a Byzantine minority. The
+    // per-member check forces a b-th root in a class group of unknown order to
+    // forge EACH proof, so collusion gains nothing. Cost is N exponentiations
+    // (N ≤ committee size, bounded per shard) instead of ~constant — an
+    // acceptable price for soundness.
+    for (id_bytes, blob) in present_ids.iter().zip(alleged_solutions.iter()) {
+        if blob.len() != blob_len {
+            return false;
+        }
+        let (y_bytes, pi_bytes) = blob.split_at(element_len);
+        let y_i = GmpClassGroup::from_bytes(y_bytes, disc.clone());
+        let pi_i = GmpClassGroup::from_bytes(pi_bytes, disc.clone());
+        // Reject malformed forms decoded from the attacker's proof blob BEFORE
+        // any arithmetic: raw GMP/C code can divide by zero on them (a SIGFPE
+        // abort that `catch_unwind` cannot trap) or never finish reducing. A
+        // valid proof always decodes to well-formed forms.
+        if !y_i.is_well_formed() || !pi_i.is_well_formed() {
+            return false;
+        }
+        let h_i = hash_to_exponent::<<GmpClassGroup as ClassGroup>::BigNum>(
+            challenge,
+            id_bytes.as_slice(),
+        );
+        // lhs = π_iᵇ · x^{h_i·r}
+        let mut lhs = pi_i.clone();
+        lhs.pow(b.clone());
+        let mut x_exp = x.clone();
+        x_exp.pow(&h_i * &r);
+        lhs *= &x_exp;
+        if lhs != y_i {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -449,7 +468,9 @@ mod multiproof_tests {
         let blobs: Vec<Vec<u8>> = (0..2)
             .map(|i| super::wesolowski_solve_multi(2048, &challenge, 64, &ids, i))
             .collect();
-        let verify = |blobs: &Vec<Vec<u8>>| super::wesolowski_verify_multi(2048, &challenge, 64, &ids, blobs);
+        let verify = |blobs: &Vec<Vec<u8>>| {
+            super::wesolowski_verify_multi(2048, &challenge, 64, &ids, blobs)
+        };
         assert!(verify(&blobs));
         for start in [0, 258] {
             let mut zero_a = blobs.clone();
@@ -515,9 +536,7 @@ mod multiproof_bench {
             }
             let total = start.elapsed() / iters;
             let per_member = total / n as u32;
-            println!(
-                "N={n:>2}  verify_total={total:?}  per_member={per_member:?}"
-            );
+            println!("N={n:>2}  verify_total={total:?}  per_member={per_member:?}");
         }
     }
 }

@@ -612,9 +612,11 @@ mod mpz {
     /// `clone` must deep-copy, not alias the source's limb pointer.
     #[test]
     fn test_clone_is_independent() {
-        let original =
-            Mpz::from_str_radix("123456789012345678901234567890123456789012345678901234567890", 10)
-                .unwrap();
+        let original = Mpz::from_str_radix(
+            "123456789012345678901234567890123456789012345678901234567890",
+            10,
+        )
+        .unwrap();
         let mut copy = original.clone();
         copy.setbit(1024);
 

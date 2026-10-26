@@ -73,7 +73,9 @@ pub fn check_input_not_double_spent(
 /// coins/markers and cannot collide with the reserved accumulator-root address.
 pub fn key_image_spent_address(key_image: &[u8]) -> Result<[u8; 32]> {
     if key_image.is_empty() {
-        return Err(QuilError::InvalidArgument("spent check: empty key image".into()));
+        return Err(QuilError::InvalidArgument(
+            "spent check: empty key image".into(),
+        ));
     }
     quil_crypto::poseidon::hash_bytes_to_32(key_image)
 }
@@ -100,9 +102,7 @@ pub fn check_key_image_not_spent(
 /// actual verification calls `hypergraph.VerifyTraversalProof()`.
 ///
 /// For now, this validates the structural presence of the proof data.
-pub fn validate_traversal_proof_structural(
-    traversal_proof: &[u8],
-) -> Result<()> {
+pub fn validate_traversal_proof_structural(traversal_proof: &[u8]) -> Result<()> {
     if traversal_proof.is_empty() {
         return Err(QuilError::InvalidArgument(
             "traversal proof: empty proof data".into(),
@@ -120,13 +120,14 @@ pub fn validate_traversal_proof_structural(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use quil_types::crypto::NoopInclusionProver;
     use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::NoopInclusionProver;
+    use std::sync::Arc;
 
     fn stub_state() -> HypergraphState {
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            Arc::new(MemStore::new()), Arc::new(NoopInclusionProver),
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
         ));
         HypergraphState::new(crdt)
     }
@@ -145,7 +146,9 @@ mod tests {
         let domain = vec![0u8; 32];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&vk).unwrap();
         let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
-        state.set(&domain, &addr, &disc, 1, b"spent".to_vec()).unwrap();
+        state
+            .set(&domain, &addr, &disc, 1, b"spent".to_vec())
+            .unwrap();
         assert!(!check_output_not_spent(&state, &domain, &vk).unwrap());
     }
 
@@ -160,12 +163,14 @@ mod tests {
         let state = stub_state();
         let domain = vec![0u8; 32];
         let key_image = vec![0x5Au8; 200]; // wire-encoded T (any bytes here)
-        // First spend: not yet recorded ⇒ valid.
+                                           // First spend: not yet recorded ⇒ valid.
         assert!(check_key_image_not_spent(&state, &domain, &key_image).unwrap());
         // Record the marker (what materialize does on a spend).
         let addr = key_image_spent_address(&key_image).unwrap();
         let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
-        state.set(&domain, &addr, &disc, 1, b"spent".to_vec()).unwrap();
+        state
+            .set(&domain, &addr, &disc, 1, b"spent".to_vec())
+            .unwrap();
         // Second spend of the same key image ⇒ rejected.
         assert!(!check_key_image_not_spent(&state, &domain, &key_image).unwrap());
         // A different key image is unaffected.

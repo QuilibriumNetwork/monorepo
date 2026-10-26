@@ -42,11 +42,7 @@ pub fn replay_frames(
     };
 
     for frame in frames {
-        let frame_num = frame
-            .header
-            .as_ref()
-            .map(|h| h.frame_number)
-            .unwrap_or(0);
+        let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
 
         match crate::frame_processor::process_global_frame(exec_manager, frame, fee_multiplier) {
             Ok((applied, _skipped)) => {
@@ -84,10 +80,8 @@ mod tests {
     use std::sync::Arc;
 
     fn build_exec_manager() -> quil_execution::ExecutionEngineManager {
-        let inclusion_prover: Arc<dyn InclusionProver> =
-            Arc::new(quil_tries::ShaInclusionProver);
-        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
-            Arc::new(MemStore::new());
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(quil_tries::ShaInclusionProver);
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             hg_store,
             inclusion_prover.clone(),

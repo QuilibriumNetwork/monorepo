@@ -77,11 +77,17 @@ impl Node {
 
     /// Canonical compact encoding for owner IDs/key images only, not roots.
     pub fn identity_bytes(&self) -> Result<[u8; IDENTITY_BYTES], TokenError> {
-        if self.0[IDENTITY_RANK..].iter().any(|p| p.c.iter().any(|&c| c != 0)) {
+        if self.0[IDENTITY_RANK..]
+            .iter()
+            .any(|p| p.c.iter().any(|&c| c != 0))
+        {
             return Err(TokenError::NoncanonicalCoefficient);
         }
         let mut bytes = [0; IDENTITY_BYTES];
-        for (p, dst) in self.0[..IDENTITY_RANK].iter().zip(bytes.chunks_exact_mut(PACKED_P_BYTES)) {
+        for (p, dst) in self.0[..IDENTITY_RANK]
+            .iter()
+            .zip(bytes.chunks_exact_mut(PACKED_P_BYTES))
+        {
             p.encode(dst);
         }
         Ok(bytes)
@@ -200,7 +206,10 @@ fn matrix(context: &[u8; 32], label: &[u8], rows: usize, columns: usize) -> Arc<
     let rows: Matrix = (0..rows)
         .map(|_| (0..columns).map(|_| uniform_poly_p(&mut reader)).collect())
         .collect();
-    let prepared = rows.iter().map(|row| row.iter().map(PolyP::prepare).collect()).collect();
+    let prepared = rows
+        .iter()
+        .map(|row| row.iter().map(PolyP::prepare).collect())
+        .collect();
     Arc::new(PublicMatrix { rows, prepared })
 }
 
@@ -230,7 +239,11 @@ fn hash(matrix: &PublicMatrix, inputs: &[PolyP]) -> Node {
 /// Commitment polynomials (canonical residues below q < 2^36) as integers in
 /// the proof ring; their base-128 limbs are the coin hash input.
 fn commitment_polys(commitment: &AmountCommitment) -> Vec<PolyP> {
-    commitment.t.iter().map(|p| PolyP { c: p.c.clone() }).collect()
+    commitment
+        .t
+        .iter()
+        .map(|p| PolyP { c: p.c.clone() })
+        .collect()
 }
 
 /// Uniform canonical proof-ring polynomials from a private 32-byte seed. The
@@ -254,12 +267,42 @@ impl MembershipKey {
     pub fn derive(context: &[u8; 32]) -> Self {
         Self {
             context: *context,
-            coin: matrix(context, b"membership/v5/coin", NODE_RANK, (BINDING_RANK + 1) * LIMBS),
-            leaf: matrix(context, b"membership/v5/leaf", NODE_RANK, 2 * NODE_RANK * LIMBS),
-            branch: matrix(context, b"membership/v5/branch", NODE_RANK, 2 * NODE_RANK * LIMBS),
-            address: matrix(context, b"identity/v6/address", IDENTITY_RANK, RECIPIENT_POLYS * LIMBS),
-            owner: matrix(context, b"identity/v6/owner", IDENTITY_RANK, (IDENTITY_RANK + NOTE_POLYS) * LIMBS),
-            image: matrix(context, b"identity/v6/image", IDENTITY_RANK, (RECIPIENT_POLYS + NOTE_POLYS) * LIMBS),
+            coin: matrix(
+                context,
+                b"membership/v5/coin",
+                NODE_RANK,
+                (BINDING_RANK + 1) * LIMBS,
+            ),
+            leaf: matrix(
+                context,
+                b"membership/v5/leaf",
+                NODE_RANK,
+                2 * NODE_RANK * LIMBS,
+            ),
+            branch: matrix(
+                context,
+                b"membership/v5/branch",
+                NODE_RANK,
+                2 * NODE_RANK * LIMBS,
+            ),
+            address: matrix(
+                context,
+                b"identity/v6/address",
+                IDENTITY_RANK,
+                RECIPIENT_POLYS * LIMBS,
+            ),
+            owner: matrix(
+                context,
+                b"identity/v6/owner",
+                IDENTITY_RANK,
+                (IDENTITY_RANK + NOTE_POLYS) * LIMBS,
+            ),
+            image: matrix(
+                context,
+                b"identity/v6/image",
+                IDENTITY_RANK,
+                (RECIPIENT_POLYS + NOTE_POLYS) * LIMBS,
+            ),
         }
     }
 
@@ -268,13 +311,27 @@ impl MembershipKey {
         std::array::from_fn(|i| rows[i].clone())
     }
 
-    fn owner_value(&self, recipient: &[PolyP; IDENTITY_RANK], note: &[PolyP; NOTE_POLYS]) -> [PolyP; IDENTITY_RANK] {
-        let rows = hash_vec(&self.owner, &[recipient.as_slice(), note.as_slice()].concat());
+    fn owner_value(
+        &self,
+        recipient: &[PolyP; IDENTITY_RANK],
+        note: &[PolyP; NOTE_POLYS],
+    ) -> [PolyP; IDENTITY_RANK] {
+        let rows = hash_vec(
+            &self.owner,
+            &[recipient.as_slice(), note.as_slice()].concat(),
+        );
         std::array::from_fn(|i| rows[i].clone())
     }
 
-    fn image_value(&self, expanded: &[PolyP; RECIPIENT_POLYS], note: &[PolyP; NOTE_POLYS]) -> [PolyP; IDENTITY_RANK] {
-        let rows = hash_vec(&self.image, &[expanded.as_slice(), note.as_slice()].concat());
+    fn image_value(
+        &self,
+        expanded: &[PolyP; RECIPIENT_POLYS],
+        note: &[PolyP; NOTE_POLYS],
+    ) -> [PolyP; IDENTITY_RANK] {
+        let rows = hash_vec(
+            &self.image,
+            &[expanded.as_slice(), note.as_slice()].concat(),
+        );
         std::array::from_fn(|i| rows[i].clone())
     }
 
@@ -288,7 +345,11 @@ impl MembershipKey {
     /// Sender-side output construction from a public recipient address and
     /// fresh note nonce. No recipient spend secret is available to the sender.
     /// Returns `None` for a non-canonical recipient key.
-    pub fn output_owner(&self, recipient_key: &[u8; IDENTITY_BYTES], nonce: &[u8; 32]) -> Option<Node> {
+    pub fn output_owner(
+        &self,
+        recipient_key: &[u8; IDENTITY_BYTES],
+        nonce: &[u8; 32],
+    ) -> Option<Node> {
         let recipient = Node::from_identity_bytes(recipient_key).ok()?;
         let recipient: [PolyP; IDENTITY_RANK] = std::array::from_fn(|i| recipient.0[i].clone());
         let note = expand_note(&self.context, nonce);
@@ -395,7 +456,11 @@ pub(super) struct MembershipConstraints {
 }
 
 fn centered_p(v: u64) -> i64 {
-    if v > P / 2 { v as i64 - P as i64 } else { v as i64 }
+    if v > P / 2 {
+        v as i64 - P as i64
+    } else {
+        v as i64
+    }
 }
 
 fn scaled_column(column: &PolyP, scale: i64) -> Vec<i64> {
@@ -406,7 +471,11 @@ fn scaled_column(column: &PolyP, scale: i64) -> Vec<i64> {
         .collect()
 }
 
-fn add_term(terms: &mut std::collections::BTreeMap<usize, Vec<i64>>, handle: usize, coefficients: Vec<i64>) {
+fn add_term(
+    terms: &mut std::collections::BTreeMap<usize, Vec<i64>>,
+    handle: usize,
+    coefficients: Vec<i64>,
+) {
     let entry = terms.entry(handle).or_insert_with(|| vec![0; Poly::D]);
     for (e, c) in entry.iter_mut().zip(coefficients) {
         *e = centered_p(((*e as i128 + c as i128).rem_euclid(P as i128)) as u64);
@@ -440,8 +509,13 @@ impl MembershipConstraints {
                         }
                         Input::Planes(planes) => {
                             for (position, &handle) in planes.iter().enumerate() {
-                                let column = &equation.matrix.rows[row][input * LIMBS + position / 7];
-                                add_term(&mut terms, handle, scaled_column(column, 1 << (position % 7)));
+                                let column =
+                                    &equation.matrix.rows[row][input * LIMBS + position / 7];
+                                add_term(
+                                    &mut terms,
+                                    handle,
+                                    scaled_column(column, 1 << (position % 7)),
+                                );
                             }
                         }
                     }
@@ -458,7 +532,11 @@ impl MembershipConstraints {
                     }
                 };
                 NativeRow {
-                    terms: terms.into_iter().filter(|(_, c)| c.iter().any(|&v| v != 0)).map(|(i, c)| (c, i)).collect(),
+                    terms: terms
+                        .into_iter()
+                        .filter(|(_, c)| c.iter().any(|&v| v != 0))
+                        .map(|(i, c)| (c, i))
+                        .collect(),
                     rhs,
                 }
             })
@@ -479,7 +557,11 @@ impl MembershipConstraints {
     }
 
     pub(super) fn native_row_count(&self) -> usize {
-        self.hashes.iter().map(|h| h.matrix.rows.len()).sum::<usize>() + self.equalities.len()
+        self.hashes
+            .iter()
+            .map(|h| h.matrix.rows.len())
+            .sum::<usize>()
+            + self.equalities.len()
     }
 
     fn limb_value(relation: &CompiledAmountRelation, limbs: &Limbs) -> Option<PolyP> {
@@ -487,7 +569,12 @@ impl MembershipConstraints {
         for (limb, &handle) in limbs.iter().enumerate() {
             let p = witness_p(relation, handle)?;
             let weight = limb_weight(limb) as u128;
-            value = value.add(&PolyP { c: p.c.iter().map(|&v| ((v as u128 * weight) % P as u128) as u64).collect() });
+            value = value.add(&PolyP {
+                c: p.c
+                    .iter()
+                    .map(|&v| ((v as u128 * weight) % P as u128) as u64)
+                    .collect(),
+            });
         }
         Some(value)
     }
@@ -503,7 +590,12 @@ impl MembershipConstraints {
                             *d += sign as i128 * v as i128;
                         }
                     }
-                    Some(PolyP { c: digit.iter().map(|&v| v.rem_euclid(P as i128) as u64).collect() })
+                    Some(PolyP {
+                        c: digit
+                            .iter()
+                            .map(|&v| v.rem_euclid(P as i128) as u64)
+                            .collect(),
+                    })
                 })
                 .collect(),
             Input::Planes(planes) => (0..LIMBS)
@@ -528,13 +620,19 @@ impl MembershipConstraints {
         for gate in &self.selections {
             // selector is constrained to a constant binary polynomial by the
             // main relation, so it selects one whole node, not per coefficient.
-            let Some(selector) = relation.witness(gate.selector) else { return false };
+            let Some(selector) = relation.witness(gate.selector) else {
+                return false;
+            };
             if selector.c[1..].iter().any(|&v| v != 0) || selector.c[0] > 1 {
                 return false;
             }
             let (Some(zero), Some(one), Some(selected)) = (
-                relation.witness(gate.zero), relation.witness(gate.one), relation.witness(gate.selected),
-            ) else { return false };
+                relation.witness(gate.zero),
+                relation.witness(gate.one),
+                relation.witness(gate.selected),
+            ) else {
+                return false;
+            };
             if *(if selector.c[0] == 1 { one } else { zero }) != *selected {
                 return false;
             }
@@ -544,29 +642,44 @@ impl MembershipConstraints {
             // reduce the represented node and then decompose it again.
             let mut digits = Vec::new();
             for input in &equation.inputs {
-                let Some(mut d) = Self::input_digits(relation, input) else { return false };
-                if d.iter().any(|p| p.c.iter().any(|&v| v >= 256)) { return false; }
+                let Some(mut d) = Self::input_digits(relation, input) else {
+                    return false;
+                };
+                if d.iter().any(|p| p.c.iter().any(|&v| v >= 256)) {
+                    return false;
+                }
                 digits.append(&mut d);
             }
-            if digits.len() != equation.matrix.rows[0].len() { return false; }
+            if digits.len() != equation.matrix.rows[0].len() {
+                return false;
+            }
             let value: Vec<PolyP> = equation
                 .matrix
                 .prepared
                 .iter()
                 .map(|row| {
                     let mut acc = RowAccumulator::new();
-                    for (a, x) in row.iter().zip(&digits) { acc.add(a, x); }
+                    for (a, x) in row.iter().zip(&digits) {
+                        acc.add(a, x);
+                    }
                     acc.finish()
                 })
                 .collect();
             let target = match &equation.target {
                 Target::Public(rows) => Some(rows.clone()),
-                Target::Hidden(limbs) => limbs.iter().map(|l| Self::limb_value(relation, l)).collect(),
+                Target::Hidden(limbs) => limbs
+                    .iter()
+                    .map(|l| Self::limb_value(relation, l))
+                    .collect(),
             };
-            if Some(value) != target { return false; }
+            if Some(value) != target {
+                return false;
+            }
         }
         for (limbs, value) in &self.equalities {
-            if Self::limb_value(relation, limbs).as_ref() != Some(value) { return false; }
+            if Self::limb_value(relation, limbs).as_ref() != Some(value) {
+                return false;
+            }
         }
         true
     }
@@ -601,7 +714,14 @@ impl CompiledAmountRelation {
     /// Six short limb witnesses for one proof-ring polynomial.
     fn poly_limbs(&mut self, p: &PolyP) -> Limbs {
         let limbs = p.limbs(LIMBS);
-        std::array::from_fn(|i| self.short(Poly { c: limbs[i].c.clone() }, LIMB_BOUND[i]))
+        std::array::from_fn(|i| {
+            self.short(
+                Poly {
+                    c: limbs[i].c.clone(),
+                },
+                LIMB_BOUND[i],
+            )
+        })
     }
 
     fn node_limbs(&mut self, node: &Node) -> NodeLimbs {
@@ -693,17 +813,23 @@ impl CompiledAmountRelation {
                 //   I = A_img · digits(X_s ‖ X_n)   (I is public, R and O hidden).
                 let expanded = expand_recipient(&key.context, &path.owner.recipient);
                 let note = expand_note(&key.context, &path.owner.nonce);
-                let expanded_limbs: Vec<Limbs> = expanded.iter().map(|p| result.poly_limbs(p)).collect();
+                let expanded_limbs: Vec<Limbs> =
+                    expanded.iter().map(|p| result.poly_limbs(p)).collect();
                 let note_limbs: Vec<Limbs> = note.iter().map(|p| result.poly_limbs(p)).collect();
                 let recipient = key.recipient_value(&expanded);
-                let recipient_limbs: Vec<Limbs> = recipient.iter().map(|p| result.poly_limbs(p)).collect();
+                let recipient_limbs: Vec<Limbs> =
+                    recipient.iter().map(|p| result.poly_limbs(p)).collect();
                 result.membership.hashes.push(HashEquation {
                     matrix: key.address.clone(),
-                    inputs: expanded_limbs.iter().map(|&l| Input::Limbs(vec![(1, l)])).collect(),
+                    inputs: expanded_limbs
+                        .iter()
+                        .map(|&l| Input::Limbs(vec![(1, l)]))
+                        .collect(),
                     target: Target::Hidden(recipient_limbs.clone()),
                 });
                 let owner_value = key.owner_value(&recipient, &note);
-                let owner_identity_limbs: Vec<Limbs> = owner_value.iter().map(|p| result.poly_limbs(p)).collect();
+                let owner_identity_limbs: Vec<Limbs> =
+                    owner_value.iter().map(|p| result.poly_limbs(p)).collect();
                 result.membership.hashes.push(HashEquation {
                     matrix: key.owner.clone(),
                     inputs: recipient_limbs
@@ -726,7 +852,11 @@ impl CompiledAmountRelation {
                 });
                 // Owner node: identity rows, then shared zero limbs.
                 std::array::from_fn(|row| {
-                    if row < IDENTITY_RANK { owner_identity_limbs[row] } else { [zero; LIMBS] }
+                    if row < IDENTITY_RANK {
+                        owner_identity_limbs[row]
+                    } else {
+                        [zero; LIMBS]
+                    }
                 })
             };
             let compressed = hash(&key.coin, &commitment_polys(inputs[input].2));
@@ -770,13 +900,23 @@ impl CompiledAmountRelation {
                         let chosen = if path.right[level] { one } else { zero };
                         let value = result.witness(chosen).expect("limb handle").clone();
                         let selected = result.short(value, LIMB_BOUND[limb]);
-                        result.membership.selections.push(SelectEquation { selector, zero, one, selected });
+                        result.membership.selections.push(SelectEquation {
+                            selector,
+                            zero,
+                            one,
+                            selected,
+                        });
                         selected
                     })
                 });
-                let mut hash_inputs: Vec<Input> = left.iter().map(|&l| Input::Limbs(vec![(1, l)])).collect();
+                let mut hash_inputs: Vec<Input> =
+                    left.iter().map(|&l| Input::Limbs(vec![(1, l)])).collect();
                 hash_inputs.extend((0..NODE_RANK).map(|row| {
-                    Input::Limbs(vec![(1, current_limbs[row]), (1, sibling_limbs[row]), (-1, left[row])])
+                    Input::Limbs(vec![
+                        (1, current_limbs[row]),
+                        (1, sibling_limbs[row]),
+                        (-1, left[row]),
+                    ])
                 }));
                 current = if path.right[level] {
                     key.parent(sibling, &current)
@@ -801,7 +941,10 @@ impl CompiledAmountRelation {
             if statement.depth == 0 {
                 // The leaf itself is the public root; bind every component.
                 for row in 0..NODE_RANK {
-                    result.membership.equalities.push((current_limbs[row], statement.root.0[row].clone()));
+                    result
+                        .membership
+                        .equalities
+                        .push((current_limbs[row], statement.root.0[row].clone()));
                 }
             }
         }
@@ -894,12 +1037,17 @@ mod tests {
     fn native_row_holds(relation: &CompiledAmountRelation, row: &NativeRow) -> bool {
         let mut residual: Vec<i128> = row.rhs.iter().map(|&v| -i128::from(v)).collect();
         for (coefficients, handle) in &row.terms {
-            let Some(w) = relation.witness(*handle) else { return false };
+            let Some(w) = relation.witness(*handle) else {
+                return false;
+            };
             for (i, &a) in coefficients.iter().enumerate() {
-                if a == 0 { continue; }
+                if a == 0 {
+                    continue;
+                }
                 for (j, &b) in w.c.iter().enumerate() {
                     let k = i + j;
-                    residual[k % Poly::D] += if k < Poly::D { 1 } else { -1 } * i128::from(a) * i128::from(b);
+                    residual[k % Poly::D] +=
+                        if k < Poly::D { 1 } else { -1 } * i128::from(a) * i128::from(b);
                 }
             }
         }
@@ -909,8 +1057,10 @@ mod tests {
     // SHA3-256 of the 2,432-byte canonical identity encodings for context [6;32],
     // recipient seed [9;32], note seed [7;32]. Pinned from an independent Python
     // reimplementation.
-    const OWNER_VECTOR_SHA3: &str = "3897684e7a9c5271eb9c99ad54f8b6c6837268a4c211170a82f1b8b9e2fe7d63";
-    const IMAGE_VECTOR_SHA3: &str = "3131172893d43644500dc0e969be57bfa7cb6bcb2e67d921783fd8279c2146d0";
+    const OWNER_VECTOR_SHA3: &str =
+        "3897684e7a9c5271eb9c99ad54f8b6c6837268a4c211170a82f1b8b9e2fe7d63";
+    const IMAGE_VECTOR_SHA3: &str =
+        "3131172893d43644500dc0e969be57bfa7cb6bcb2e67d921783fd8279c2146d0";
 
     #[test]
     fn recipient_secret_and_note_nonce_bind_compact_identities() {
@@ -947,7 +1097,10 @@ mod tests {
         let digest = |node: &Node| {
             let mut h = <sha3::Sha3_256 as sha3::Digest>::new();
             sha3::Digest::update(&mut h, node.identity_bytes().unwrap());
-            sha3::Digest::finalize(h).iter().map(|b| format!("{b:02x}")).collect::<String>()
+            sha3::Digest::finalize(h)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         };
         assert_eq!(digest(&owner), OWNER_VECTOR_SHA3);
         assert_eq!(digest(&image), IMAGE_VECTOR_SHA3);
@@ -1024,7 +1177,9 @@ mod tests {
                 .all(|row| row.validate_local_witness(relation)));
             // Every emitted native proof-ring row must hold over the witness
             // modulo p, independently of the structural validator.
-            assert!(relation.native_membership_rows().all(|row| native_row_holds(relation, &row)));
+            assert!(relation
+                .native_membership_rows()
+                .all(|row| native_row_holds(relation, &row)));
             assert!(relation.native_membership_row_count() > 0);
         }
         let leaf_statement = MembershipStatement {
@@ -1166,10 +1321,22 @@ mod tests {
         // fail the identity equation, not merely the honest-witness builder.
         let mut wrong_image = images.clone();
         wrong_image[0].0[0].c[0] ^= 1;
-        let wrong = MembershipStatement { root: &root, key_images: &wrong_image, depth: 2 };
+        let wrong = MembershipStatement {
+            root: &root,
+            key_images: &wrong_image,
+            depth: 2,
+        };
         assert!(CompiledAmountRelation::compile_with_membership(
-            &value_key, &key, &coins[..2], &coins[2..], 0, 2, &wrong, &paths,
-        ).is_err());
+            &value_key,
+            &key,
+            &coins[..2],
+            &coins[2..],
+            0,
+            2,
+            &wrong,
+            &paths,
+        )
+        .is_err());
         let bad = MembershipStatement {
             root: &Node::zero(),
             key_images: &images,

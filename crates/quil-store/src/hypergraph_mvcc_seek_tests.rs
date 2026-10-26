@@ -34,15 +34,24 @@ fn limits() -> OverlayLimits {
 /// removes phase and just above the low shard's adds phase: no other key
 /// lies between them.
 fn evicted_shard() -> ShardKey {
-    ShardKey { l1: [0, 0, 1], l2: [0x11; 32] }
+    ShardKey {
+        l1: [0, 0, 1],
+        l2: [0x11; 32],
+    }
 }
 
 fn read_shard() -> ShardKey {
-    ShardKey { l1: [0, 0, 1], l2: [0x22; 32] }
+    ShardKey {
+        l1: [0, 0, 1],
+        l2: [0x22; 32],
+    }
 }
 
 fn low_shard() -> ShardKey {
-    ShardKey { l1: [0, 0, 1], l2: [0x05; 32] }
+    ShardKey {
+        l1: [0, 0, 1],
+        l2: [0x05; 32],
+    }
 }
 
 /// Lowest key of the read shard's removes phase: only an overlay writes it.
@@ -81,13 +90,19 @@ fn records() -> Vec<(Vec<u8>, Vec<u8>)> {
     let shard = read_shard();
     let mut records = vec![(v2(&shard, "removes", &SINGLE, 5), b"single-5".to_vec())];
     for version in MULTI_VERSIONS {
-        records.push((v2(&shard, "removes", &MULTI, version), format!("multi-{version}").into_bytes()));
+        records.push((
+            v2(&shard, "removes", &MULTI, version),
+            format!("multi-{version}").into_bytes(),
+        ));
     }
     records.push((
         crate::encoding::hypergraph_vertex_data_key("vertex", "removes", &shard, &LEGACY),
         b"legacy".to_vec(),
     ));
-    records.push((v2(&low_shard(), "adds", &LOW_SINGLE, 5), b"low-single-5".to_vec()));
+    records.push((
+        v2(&low_shard(), "adds", &LOW_SINGLE, 5),
+        b"low-single-5".to_vec(),
+    ));
     records
 }
 
@@ -128,7 +143,9 @@ fn evict_under_pin<'a>(
 }
 
 fn overlay_on(db: &quil_forest::CoordinatedDb) -> OverlayHypergraphStore {
-    OverlayHypergraphStore::new(Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap()))
+    OverlayHypergraphStore::new(Arc::new(
+        ExecutionOverlay::capture(db.clone(), limits()).unwrap(),
+    ))
 }
 
 enum Write {
@@ -152,9 +169,17 @@ fn write_delta(overlay: &OverlayHypergraphStore, writes: &[Write]) {
 }
 
 /// A named read and the blob it must return.
-type Read<'a> = (String, Box<dyn FnOnce() -> Option<Vec<u8>> + 'a>, Option<Vec<u8>>);
+type Read<'a> = (
+    String,
+    Box<dyn FnOnce() -> Option<Vec<u8>> + 'a>,
+    Option<Vec<u8>>,
+);
 
-fn read<'a>(name: String, run: impl FnOnce() -> Option<Vec<u8>> + 'a, expected: Option<&[u8]>) -> Read<'a> {
+fn read<'a>(
+    name: String,
+    run: impl FnOnce() -> Option<Vec<u8>> + 'a,
+    expected: Option<&[u8]>,
+) -> Read<'a> {
     (name, Box::new(run), expected.map(<[u8]>::to_vec))
 }
 
@@ -173,7 +198,12 @@ impl Readers {
         let store = RocksHypergraphStore::new(db.clone());
         let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
         let overlay_snapshot = overlay.capture_tree_snapshot().unwrap().unwrap();
-        Self { store, snapshot, overlay, overlay_snapshot }
+        Self {
+            store,
+            snapshot,
+            overlay,
+            overlay_snapshot,
+        }
     }
 
     /// Reads of `vertex` at version `at` on every path: the snapshots read
@@ -191,21 +221,45 @@ impl Readers {
         let name = |path: &str| format!("{path} read of {phase} {:02x}.. at {at}", vertex[0]);
         let (live, overlay) = (shard.clone(), shard.clone());
         let mut reads = vec![
-            read(name("live"), move || {
-                self.store.load_vertex_underlying_at("vertex", phase, &live, &vertex, at).unwrap()
-            }, stored),
-            read(name("overlay"), move || {
-                self.overlay.load_vertex_underlying_at("vertex", phase, &overlay, &vertex, at).unwrap()
-            }, merged),
+            read(
+                name("live"),
+                move || {
+                    self.store
+                        .load_vertex_underlying_at("vertex", phase, &live, &vertex, at)
+                        .unwrap()
+                },
+                stored,
+            ),
+            read(
+                name("overlay"),
+                move || {
+                    self.overlay
+                        .load_vertex_underlying_at("vertex", phase, &overlay, &vertex, at)
+                        .unwrap()
+                },
+                merged,
+            ),
         ];
         if at == u64::MAX {
             let (snapshot, overlay_snapshot) = (shard.clone(), shard.clone());
-            reads.push(read(name("snapshot"), move || {
-                self.snapshot.load_vertex_underlying_raw("vertex", phase, &snapshot, &vertex).unwrap()
-            }, stored));
-            reads.push(read(name("overlay snapshot"), move || {
-                self.overlay_snapshot.load_vertex_underlying_raw("vertex", phase, &overlay_snapshot, &vertex).unwrap()
-            }, merged));
+            reads.push(read(
+                name("snapshot"),
+                move || {
+                    self.snapshot
+                        .load_vertex_underlying_raw("vertex", phase, &snapshot, &vertex)
+                        .unwrap()
+                },
+                stored,
+            ));
+            reads.push(read(
+                name("overlay snapshot"),
+                move || {
+                    self.overlay_snapshot
+                        .load_vertex_underlying_raw("vertex", phase, &overlay_snapshot, &vertex)
+                        .unwrap()
+                },
+                merged,
+            ));
         }
         reads
     }
@@ -219,7 +273,8 @@ fn visited_blocks<T>(read: impl FnOnce() -> T) -> (T, u64, String) {
     let mut context = PerfContext::default();
     context.reset();
     let out = read();
-    let blocks = context.metric(PerfMetric::BlockCacheHitCount) + context.metric(PerfMetric::BlockReadCount);
+    let blocks =
+        context.metric(PerfMetric::BlockCacheHitCount) + context.metric(PerfMetric::BlockReadCount);
     let report = context.report(true);
     set_perf_stats(PerfStatsLevel::Disable);
     (out, blocks, report)
@@ -237,7 +292,10 @@ fn assert_bounded(reads: Vec<Read<'_>>) {
             over.push((name, blocks));
         }
     }
-    assert!(over.is_empty(), "reads visiting >= {MAX_BLOCKS} blocks: {over:#?}");
+    assert!(
+        over.is_empty(),
+        "reads visiting >= {MAX_BLOCKS} blocks: {over:#?}"
+    );
 }
 
 /// A read of a vertex just above the evicted range, absent, with one
@@ -251,12 +309,25 @@ fn a_vertex_read_next_to_an_evicted_range_stays_within_its_versions() {
     let _pin = evict_under_pin(&db, &records());
     let shard = read_shard();
     let overlay = overlay_on(&db);
-    write_delta(&overlay, &[
-        Write::Put(v2(&shard, "removes", &DELTA_ONLY, 2), b"delta-only-2".to_vec()),
-        Write::Put(v2(&shard, "removes", &DELTA_ONLY, 9), b"delta-only-9".to_vec()),
-    ]);
+    write_delta(
+        &overlay,
+        &[
+            Write::Put(
+                v2(&shard, "removes", &DELTA_ONLY, 2),
+                b"delta-only-2".to_vec(),
+            ),
+            Write::Put(
+                v2(&shard, "removes", &DELTA_ONLY, 9),
+                b"delta-only-9".to_vec(),
+            ),
+        ],
+    );
     let readers = Readers::new(&db, overlay);
-    let (low, single, delta) = (low_shard(), Some(&b"single-5"[..]), Some(&b"delta-only-9"[..]));
+    let (low, single, delta) = (
+        low_shard(),
+        Some(&b"single-5"[..]),
+        Some(&b"delta-only-9"[..]),
+    );
     let mut reads = Vec::new();
     for (shard, phase, vertex, at, stored, merged) in [
         (&shard, "removes", DELTA_ONLY, u64::MAX, None, delta),
@@ -264,7 +335,14 @@ fn a_vertex_read_next_to_an_evicted_range_stays_within_its_versions() {
         (&shard, "removes", ABSENT, u64::MAX, None, None),
         (&shard, "removes", SINGLE, u64::MAX, single, single),
         (&shard, "removes", SINGLE, 4, None, None),
-        (&low, "adds", LOW_SINGLE, u64::MAX, Some(&b"low-single-5"[..]), Some(&b"low-single-5"[..])),
+        (
+            &low,
+            "adds",
+            LOW_SINGLE,
+            u64::MAX,
+            Some(&b"low-single-5"[..]),
+            Some(&b"low-single-5"[..]),
+        ),
         (&low, "adds", LOW_SINGLE, 4, None, None),
         (&low, "adds", LOW_ABSENT, u64::MAX, None, None),
     ] {
@@ -283,13 +361,26 @@ fn an_overlay_read_over_deleted_stored_versions_stays_within_its_versions() {
     let db = open(directory.path());
     let shard = read_shard();
     let key = |version| v2(&shard, "removes", &TARGET, version);
-    let _pin = evict_under_pin(&db, &[(key(1), b"target-1".to_vec()), (key(2), b"target-2".to_vec())]);
-    let lower = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "removes", &shard);
+    let _pin = evict_under_pin(
+        &db,
+        &[
+            (key(1), b"target-1".to_vec()),
+            (key(2), b"target-2".to_vec()),
+        ],
+    );
+    let lower =
+        crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "removes", &shard);
     let mut upper = lower.clone();
     *upper.last_mut().unwrap() += 1;
     let deletes = [
-        ("point deletes", vec![Write::Delete(key(1)), Write::Delete(key(2))]),
-        ("a range within the vertex", vec![Write::Range(key(1), key(3))]),
+        (
+            "point deletes",
+            vec![Write::Delete(key(1)), Write::Delete(key(2))],
+        ),
+        (
+            "a range within the vertex",
+            vec![Write::Range(key(1), key(3))],
+        ),
         ("the shard's range", vec![Write::Range(lower, upper)]),
     ];
     let readers: Vec<_> = deletes
@@ -308,7 +399,11 @@ fn an_overlay_read_over_deleted_stored_versions_stays_within_its_versions() {
             (1, Some(&b"target-1"[..]), None),
             (2, Some(&b"target-2"[..]), None),
             (4, Some(&b"target-2"[..]), Some(&b"target-3-delta"[..])),
-            (u64::MAX, Some(&b"target-2"[..]), Some(&b"target-5-delta"[..])),
+            (
+                u64::MAX,
+                Some(&b"target-2"[..]),
+                Some(&b"target-5-delta"[..]),
+            ),
         ] {
             reads.extend(
                 readers
@@ -332,63 +427,112 @@ fn a_bounded_vertex_read_returns_the_newest_version_at_or_below() {
     let shard = read_shard();
     let key = |vertex: &[u8; 32], version| v2(&shard, "removes", vertex, version);
     let stored = |name: &str, version: u64| (version, format!("{name}-{version}").into_bytes());
-    let written = |name: &str, version: u64| (version, format!("{name}-{version}-delta").into_bytes());
+    let written =
+        |name: &str, version: u64| (version, format!("{name}-{version}-delta").into_bytes());
     let mut records = records();
-    for (vertex, name, versions) in [(MIXED, "mixed", &[3, 7, 11][..]), (CLEARED, "cleared", &[1, 2, 3, 4]), (FLOORED, "floored", &[2, 6])] {
+    for (vertex, name, versions) in [
+        (MIXED, "mixed", &[3, 7, 11][..]),
+        (CLEARED, "cleared", &[1, 2, 3, 4]),
+        (FLOORED, "floored", &[2, 6]),
+    ] {
         records.extend(versions.iter().map(|v| {
             let (version, blob) = stored(name, *v);
             (key(&vertex, version), blob)
         }));
     }
     let _pin = evict_under_pin(&db, &records);
-    let put = |vertex: &[u8; 32], name: &str, version: u64| Write::Put(key(vertex, version), written(name, version).1);
+    let put = |vertex: &[u8; 32], name: &str, version: u64| {
+        Write::Put(key(vertex, version), written(name, version).1)
+    };
     let overlay = overlay_on(&db);
-    write_delta(&overlay, &[
-        put(&BRANCH, "branch", 2),
-        put(&BRANCH, "branch", 9),
-        // Between, equal to and above stored versions, and a deleted one.
-        put(&MIXED, "mixed", 5),
-        put(&MIXED, "mixed", 7),
-        put(&MIXED, "mixed", 13),
-        Write::Delete(key(&MIXED, 11)),
-        // A range deleting two stored versions, one rewritten after it.
-        Write::Range(key(&CLEARED, 2), key(&CLEARED, 4)),
-        put(&CLEARED, "cleared", 3),
-        // A range from the vertex's lowest key over every stored version.
-        Write::Range(
-            crate::encoding::hypergraph_vertex_data_v2_vk_prefix("vertex", "removes", &shard, &FLOORED),
-            key(&FLOORED, 7),
-        ),
-        put(&FLOORED, "floored", 4),
-    ]);
+    write_delta(
+        &overlay,
+        &[
+            put(&BRANCH, "branch", 2),
+            put(&BRANCH, "branch", 9),
+            // Between, equal to and above stored versions, and a deleted one.
+            put(&MIXED, "mixed", 5),
+            put(&MIXED, "mixed", 7),
+            put(&MIXED, "mixed", 13),
+            Write::Delete(key(&MIXED, 11)),
+            // A range deleting two stored versions, one rewritten after it.
+            Write::Range(key(&CLEARED, 2), key(&CLEARED, 4)),
+            put(&CLEARED, "cleared", 3),
+            // A range from the vertex's lowest key over every stored version.
+            Write::Range(
+                crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+                    "vertex", "removes", &shard, &FLOORED,
+                ),
+                key(&FLOORED, 7),
+            ),
+            put(&FLOORED, "floored", 4),
+        ],
+    );
     let readers = Readers::new(&db, overlay);
 
     // (vertex, versions the store holds, versions the overlay reads)
     let vertices = [
         (ABSENT, vec![], vec![]),
         (SINGLE, vec![stored("single", 5)], vec![stored("single", 5)]),
-        (MULTI, MULTI_VERSIONS.map(|v| stored("multi", v)).to_vec(), MULTI_VERSIONS.map(|v| stored("multi", v)).to_vec()),
-        (BRANCH, vec![], vec![written("branch", 2), written("branch", 9)]),
+        (
+            MULTI,
+            MULTI_VERSIONS.map(|v| stored("multi", v)).to_vec(),
+            MULTI_VERSIONS.map(|v| stored("multi", v)).to_vec(),
+        ),
+        (
+            BRANCH,
+            vec![],
+            vec![written("branch", 2), written("branch", 9)],
+        ),
         (
             MIXED,
             [3, 7, 11].map(|v| stored("mixed", v)).to_vec(),
-            vec![stored("mixed", 3), written("mixed", 5), written("mixed", 7), written("mixed", 13)],
+            vec![
+                stored("mixed", 3),
+                written("mixed", 5),
+                written("mixed", 7),
+                written("mixed", 13),
+            ],
         ),
         (
             CLEARED,
             [1, 2, 3, 4].map(|v| stored("cleared", v)).to_vec(),
-            vec![stored("cleared", 1), written("cleared", 3), stored("cleared", 4)],
+            vec![
+                stored("cleared", 1),
+                written("cleared", 3),
+                stored("cleared", 4),
+            ],
         ),
-        (FLOORED, [2, 6].map(|v| stored("floored", v)).to_vec(), vec![written("floored", 4)]),
+        (
+            FLOORED,
+            [2, 6].map(|v| stored("floored", v)).to_vec(),
+            vec![written("floored", 4)],
+        ),
     ];
     let newest = |versions: &[(u64, Vec<u8>)], at: u64| {
-        versions.iter().rev().find(|(v, _)| *v <= at).map(|(_, blob)| blob.clone())
+        versions
+            .iter()
+            .rev()
+            .find(|(v, _)| *v <= at)
+            .map(|(_, blob)| blob.clone())
     };
     for at in (0..15).chain([u64::MAX]) {
-        let mut reads = readers.reads(&shard, "removes", LEGACY, at, Some(&b"legacy"[..]), Some(&b"legacy"[..]));
+        let mut reads = readers.reads(
+            &shard,
+            "removes",
+            LEGACY,
+            at,
+            Some(&b"legacy"[..]),
+            Some(&b"legacy"[..]),
+        );
         for (vertex, held, merged) in &vertices {
             reads.extend(readers.reads(
-                &shard, "removes", *vertex, at, newest(&held[..], at).as_deref(), newest(&merged[..], at).as_deref(),
+                &shard,
+                "removes",
+                *vertex,
+                at,
+                newest(&held[..], at).as_deref(),
+                newest(&merged[..], at).as_deref(),
             ));
         }
         for (name, run, expected) in reads {

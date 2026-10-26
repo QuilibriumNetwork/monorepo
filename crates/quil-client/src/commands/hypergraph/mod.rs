@@ -104,7 +104,8 @@ impl HypergraphCtx {
             }
         }
         let h = input.strip_prefix("0x").unwrap_or(input);
-        let b = hex::decode(h).map_err(|e| anyhow::anyhow!("must be an alias or hex address: {e}"))?;
+        let b =
+            hex::decode(h).map_err(|e| anyhow::anyhow!("must be an alias or hex address: {e}"))?;
         if b.len() != expected_len {
             anyhow::bail!(
                 "expected {expected_len} bytes ({} hex chars), got {} bytes",

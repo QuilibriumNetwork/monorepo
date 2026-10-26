@@ -84,7 +84,10 @@ fn list(kc: &KeyCtx) -> anyhow::Result<()> {
         println!("No keys found.");
         return Ok(());
     }
-    println!("{:<18}  {:<18}  {:<66}  {}", "ID", "TYPE", "PUBLIC KEY", "ALIAS");
+    println!(
+        "{:<18}  {:<18}  {:<66}  {}",
+        "ID", "TYPE", "PUBLIC KEY", "ALIAS"
+    );
     for k in keys {
         let mut pub_hex = hex::encode(&k.public_key);
         if pub_hex.len() > 64 {
@@ -107,7 +110,12 @@ fn list(kc: &KeyCtx) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create(kc: &mut KeyCtx, name: &str, key_type: &str, purpose: Option<&str>) -> anyhow::Result<()> {
+fn create(
+    kc: &mut KeyCtx,
+    name: &str,
+    key_type: &str,
+    purpose: Option<&str>,
+) -> anyhow::Result<()> {
     let kt = parse_key_type(key_type)?;
     let pubkey = kc
         .key_manager
@@ -168,7 +176,12 @@ fn import(kc: &KeyCtx, name: &str, key_type: &str, key_hex: &str) -> anyhow::Res
     Ok(())
 }
 
-fn sign(kc: &KeyCtx, name: &str, payload_hex: &str, domain_hex: Option<&str>) -> anyhow::Result<()> {
+fn sign(
+    kc: &KeyCtx,
+    name: &str,
+    payload_hex: &str,
+    domain_hex: Option<&str>,
+) -> anyhow::Result<()> {
     let signer: Box<dyn Signer> = kc
         .key_manager
         .get_signer_by_id(name)
@@ -176,9 +189,8 @@ fn sign(kc: &KeyCtx, name: &str, payload_hex: &str, domain_hex: Option<&str>) ->
     let payload = hex::decode(payload_hex.strip_prefix("0x").unwrap_or(payload_hex))
         .map_err(|e| anyhow::anyhow!("decode payload hex: {e}"))?;
     let domain = match domain_hex {
-        Some(d) if !d.is_empty() => {
-            hex::decode(d.strip_prefix("0x").unwrap_or(d)).map_err(|e| anyhow::anyhow!("decode domain hex: {e}"))?
-        }
+        Some(d) if !d.is_empty() => hex::decode(d.strip_prefix("0x").unwrap_or(d))
+            .map_err(|e| anyhow::anyhow!("decode domain hex: {e}"))?,
         _ => Vec::new(),
     };
     let sig = signer

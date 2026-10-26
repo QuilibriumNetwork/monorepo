@@ -542,7 +542,14 @@ fn failed_context_construction_releases_child_admission_and_preserves_parent() {
     let txn = parent.hypergraph_store().new_transaction(false).unwrap();
     parent
         .hypergraph_store()
-        .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(2), &prover_blob(1))
+        .save_vertex_underlying(
+            txn.as_ref(),
+            "vertex",
+            "adds",
+            &registry_shard(),
+            &vertex(2),
+            &prover_blob(1),
+        )
         .unwrap();
     txn.commit().unwrap();
     let mut small = limits();
@@ -640,14 +647,27 @@ fn a_committed_registry_past_the_branch_limits_still_executes() {
         let store = branch.hypergraph_store();
         let txn = store.new_transaction(false).unwrap();
         store
-            .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(n), &prover_blob(1))
+            .save_vertex_underlying(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &registry_shard(),
+                &vertex(n),
+                &prover_blob(1),
+            )
             .unwrap();
         txn.commit().unwrap();
     };
-    let refresh = |branch: &ExecutionBranch| branch.registry().refresh_from_store(branch.hypergraph_store().as_ref());
+    let refresh = |branch: &ExecutionBranch| {
+        branch
+            .registry()
+            .refresh_from_store(branch.hypergraph_store().as_ref())
+    };
     for seeded in [false, true] {
         let branch = if seeded {
-            f.source.capture_execution_branch_seeded(bounded, &canonical).unwrap()
+            f.source
+                .capture_execution_branch_seeded(bounded, &canonical)
+                .unwrap()
         } else {
             f.source.capture_execution_branch(bounded).unwrap()
         };
@@ -656,7 +676,11 @@ fn a_committed_registry_past_the_branch_limits_still_executes() {
         refresh(&branch).unwrap();
         write(&branch, 4);
         refresh(&branch).unwrap();
-        assert!(branch.registry().get_prover_info(&[4; 32]).unwrap().is_some());
+        assert!(branch
+            .registry()
+            .get_prover_info(&[4; 32])
+            .unwrap()
+            .is_some());
 
         // A child of a branch that wrote rows keeps that branch's headroom.
         let child = branch
@@ -668,7 +692,11 @@ fn a_committed_registry_past_the_branch_limits_still_executes() {
         let usage = child.registry_usage();
         assert!(refresh(&child).is_err(), "seeded {seeded}");
         assert_eq!(child.registry_usage(), usage);
-        assert!(child.registry().get_prover_info(&[5; 32]).unwrap().is_none());
+        assert!(child
+            .registry()
+            .get_prover_info(&[5; 32])
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -762,7 +790,10 @@ fn anchored_capture_reads_bounded_global_frames_from_a_separate_store() {
             == branch.manager().crdt().backing_store_identity()
     );
     put_frame(branch.clock_store().as_ref(), 7);
-    assert_eq!(branch.clock_store().get_global_clock_frame(7).unwrap(), frame(7));
+    assert_eq!(
+        branch.clock_store().get_global_clock_frame(7).unwrap(),
+        frame(7)
+    );
     assert!(clock.get_global_clock_frame(7).is_err());
     assert_eq!(master.db.inner().latest_sequence_number(), master_sequence);
     assert_eq!(worker.db.inner().latest_sequence_number(), worker_sequence);
@@ -784,12 +815,26 @@ fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
     let reads = |branch: &ExecutionBranch| branch.overlay().stats().read_operations;
     let check = |seeded: bool, provers: &[u8]| {
         let read = f.source.capture_execution_branch(limits()).unwrap();
-        let copied = f.source.capture_execution_branch_seeded(limits(), &canonical).unwrap();
+        let copied = f
+            .source
+            .capture_execution_branch_seeded(limits(), &canonical)
+            .unwrap();
         assert_eq!(reads(&copied) < reads(&read), seeded);
         assert_eq!(copied.registry_usage(), read.registry_usage());
         for n in 1..=4u8 {
-            let expected = read.registry().get_prover_info(&[n; 32]).unwrap().map(|p| p.status);
-            assert_eq!(copied.registry().get_prover_info(&[n; 32]).unwrap().map(|p| p.status), expected);
+            let expected = read
+                .registry()
+                .get_prover_info(&[n; 32])
+                .unwrap()
+                .map(|p| p.status);
+            assert_eq!(
+                copied
+                    .registry()
+                    .get_prover_info(&[n; 32])
+                    .unwrap()
+                    .map(|p| p.status),
+                expected
+            );
             assert_eq!(expected.is_some(), provers.contains(&n), "prover {n}");
         }
     };
@@ -810,11 +855,23 @@ fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
     let txn = branch.hypergraph_store().new_transaction(false).unwrap();
     branch
         .hypergraph_store()
-        .save_vertex_underlying(txn.as_ref(), "vertex", "adds", &registry_shard(), &vertex(3), &prover_blob(1))
+        .save_vertex_underlying(
+            txn.as_ref(),
+            "vertex",
+            "adds",
+            &registry_shard(),
+            &vertex(3),
+            &prover_blob(1),
+        )
         .unwrap();
     txn.commit().unwrap();
     guard
-        .publish(&mut branch, publication_context(&f, &canonical), &canonical, |_| {})
+        .publish(
+            &mut branch,
+            publication_context(&f, &canonical),
+            &canonical,
+            |_| {},
+        )
         .unwrap();
     drop(guard);
     check(true, &[1, 2, 3]);
@@ -824,7 +881,10 @@ fn seeded_capture_copies_only_a_registry_scan_of_the_captured_rows() {
     let mut tight = limits();
     tight.registry.max_vertices = 1;
     let read = f.source.capture_execution_branch(tight).unwrap();
-    let copied = f.source.capture_execution_branch_seeded(tight, &canonical).unwrap();
+    let copied = f
+        .source
+        .capture_execution_branch_seeded(tight, &canonical)
+        .unwrap();
     assert!(reads(&copied) < reads(&read));
     assert_eq!(copied.registry_usage(), read.registry_usage());
     assert_eq!(read.registry_usage().vertices, 3);

@@ -2,17 +2,17 @@
 //! The type marker binds the suite and network/application parameter context.
 //! Full commitments and mandatory memos use the existing vertex field layout.
 
+use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree;
 pub use quil_lattice_ct::confidential::transfer::network_identifier;
 use quil_lattice_ct::confidential::{
     coin_tree::CoinRecord,
     transfer::{parameter_context, Output, MEMO_BYTES},
     AmountCommitment,
 };
-use quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree;
 use quil_tries::VectorCommitmentTree;
-use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_types::error::{QuilError, Result};
-use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 
 use super::materialize::create_lattice_coin_vertex_tree;
 
@@ -212,14 +212,23 @@ pub fn local_record_application(key: &[u8], address: &[u8; 32]) -> Option<[u8; 3
 }
 
 /// A local accumulator record, or its legacy copy in the tree.
-pub(crate) fn read_local(state: &HypergraphState, application: &[u8; 32], address: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_local(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    address: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
     match state.get_record(&local_record_key(application, address))? {
         Some(value) => Ok(Some(value)),
         None => state.get(application, address, &vertex_adds_discriminator()?),
     }
 }
 
-pub(crate) fn write_local(state: &HypergraphState, application: &[u8; 32], address: &[u8; 32], value: Vec<u8>) {
+pub(crate) fn write_local(
+    state: &HypergraphState,
+    application: &[u8; 32],
+    address: &[u8; 32],
+    value: Vec<u8>,
+) {
     state.stage_records([quil_types::store::RecordMutation {
         key: local_record_key(application, address),
         value: Some(value),
@@ -230,7 +239,11 @@ pub(crate) fn write_local(state: &HypergraphState, application: &[u8; 32], addre
 /// address inside the block's prefix.
 fn block_path_prefix(block: u64) -> [u8; 2] {
     let mut prefix = 0u16;
-    for (i, bit) in super::coin_blocks::block_path(block).iter().enumerate().take(16) {
+    for (i, bit) in super::coin_blocks::block_path(block)
+        .iter()
+        .enumerate()
+        .take(16)
+    {
         if *bit {
             prefix |= 1 << (15 - i);
         }
@@ -261,7 +274,10 @@ pub fn is_accumulator_record(address: &[u8; 32]) -> bool {
         return true;
     }
     if !address[BLOCK_RECORD_FILL].iter().all(|byte| *byte == 0xff)
-        || !matches!(address[BLOCK_RECORD_TAG_AT], BLOCK_FRONTIER_TAG | BLOCK_ROOT_TAG | BLOCK_OWNER_TAG | BLOCK_ESCROW_COUNT_TAG)
+        || !matches!(
+            address[BLOCK_RECORD_TAG_AT],
+            BLOCK_FRONTIER_TAG | BLOCK_ROOT_TAG | BLOCK_OWNER_TAG | BLOCK_ESCROW_COUNT_TAG
+        )
     {
         return false;
     }
@@ -379,8 +395,8 @@ pub fn load_committed_snapshot(
 
 #[cfg(test)]
 mod block_record_address_tests {
-    use super::*;
     use super::super::coin_blocks;
+    use super::*;
 
     /// A block's records sit inside the block's own prefix, so the shard that
     /// owns the block is the one that holds them; and only those exact
@@ -390,11 +406,19 @@ mod block_record_address_tests {
         let width = coin_blocks::INITIAL_BLOCK_BITS;
         for path in [0u64, 1, 0b101101, 63] {
             let block = coin_blocks::block_id(width, path).unwrap();
-            for tag in [BLOCK_FRONTIER_TAG, BLOCK_ROOT_TAG, BLOCK_OWNER_TAG, BLOCK_ESCROW_COUNT_TAG] {
+            for tag in [
+                BLOCK_FRONTIER_TAG,
+                BLOCK_ROOT_TAG,
+                BLOCK_OWNER_TAG,
+                BLOCK_ESCROW_COUNT_TAG,
+            ] {
                 let address = block_record_address(tag, block);
                 assert!(is_accumulator_record(&address));
                 // The address falls in the block it describes.
-                assert_eq!(coin_blocks::block_for_address(width, &address).unwrap(), block);
+                assert_eq!(
+                    coin_blocks::block_for_address(width, &address).unwrap(),
+                    block
+                );
                 // Moved into another block's prefix, it is no longer a record.
                 let mut moved = address;
                 moved[0] ^= 0x80;
@@ -412,7 +436,10 @@ mod block_record_address_tests {
         let wide = coin_blocks::block_id(width + 3, 0b101010101).unwrap();
         let address = block_record_address(BLOCK_ROOT_TAG, wide);
         assert!(is_accumulator_record(&address));
-        assert_eq!(coin_blocks::block_for_address(width + 3, &address).unwrap(), wide);
+        assert_eq!(
+            coin_blocks::block_for_address(width + 3, &address).unwrap(),
+            wide
+        );
     }
 }
 
@@ -440,14 +467,20 @@ mod tests {
         let restored = VectorCommitmentTree {
             root: quil_tries::deserialize_go_tree(&blob).unwrap(),
         };
-        assert_eq!(super::super::materialize::coin_identity_address(&restored).unwrap(), address);
+        assert_eq!(
+            super::super::materialize::coin_identity_address(&restored).unwrap(),
+            address
+        );
         // A coin's address is its identity, not its placement: the same output
         // in the same frame has one address wherever it lands in the
         // accumulator. That is what lets the address choose the block, and
         // therefore the shard that stores and appends it.
         let (elsewhere, other_tree) = create_coin(&[7; 32], 42, &output, 900_001).unwrap();
         assert_eq!(elsewhere, address);
-        assert_eq!(read_coin(&other_tree, &[7; 32]).unwrap().unwrap().position, 900_001);
+        assert_eq!(
+            read_coin(&other_tree, &[7; 32]).unwrap().unwrap().position,
+            900_001
+        );
         let coin = read_coin(&restored, &[7; 32]).unwrap().unwrap();
         assert_eq!(coin.frame_number, 42);
         assert_eq!(coin.position, 3);
@@ -563,7 +596,9 @@ mod tests {
         // Every record the accumulator owns uses a raw codec, so a scan must
         // skip the whole family — including the per-block frontiers and roots,
         // which are the ones a hand-listed set forgets.
-        let block = super::super::coin_blocks::block_id(super::super::coin_blocks::INITIAL_BLOCK_BITS, 3).unwrap();
+        let block =
+            super::super::coin_blocks::block_id(super::super::coin_blocks::INITIAL_BLOCK_BITS, 3)
+                .unwrap();
         for address in [
             // (The shape and summary records are left alone: this fixture
             // writes junk, and those two have decode contracts the snapshot
@@ -594,10 +629,8 @@ mod tests {
         // The snapshot is the sharded tree: it must equal a direct build over
         // the same records, and skip every reserved accumulator record rather
         // than mistaking one for a coin.
-        let shape = super::super::coin_blocks::shape(
-            super::super::coin_blocks::INITIAL_BLOCK_BITS,
-        )
-        .unwrap();
+        let shape = super::super::coin_blocks::shape(super::super::coin_blocks::INITIAL_BLOCK_BITS)
+            .unwrap();
         let expected = ShardedCoinTree::build(&context, shape, &records).unwrap();
         let actual = load_committed_snapshot(&state, &network, &application, limits).unwrap();
         assert_eq!(actual.coins(), records.len() as u64);
@@ -608,10 +641,11 @@ mod tests {
             assert_eq!(a.siblings, b.siblings);
             assert_eq!(a.right, b.right);
             // And the path reaches the application root.
-            let owner = quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(
-                &record.owner,
-            )
-            .unwrap();
+            let owner =
+                quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(
+                    &record.owner,
+                )
+                .unwrap();
             assert_eq!(
                 ShardedCoinTree::root_from_path(&context, &owner, &record.commitment, &a).unwrap(),
                 actual.root()

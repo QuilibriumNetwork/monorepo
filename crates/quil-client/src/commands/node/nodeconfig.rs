@@ -192,7 +192,9 @@ fn switch(name: Option<&str>) -> anyhow::Result<()> {
         None => {
             let configs = list_configs()?;
             if configs.is_empty() {
-                anyhow::bail!("No configurations found. Create one with 'qclient node config create'");
+                anyhow::bail!(
+                    "No configurations found. Create one with 'qclient node config create'"
+                );
             }
             println!("Available configurations:");
             for (i, c) in configs.iter().enumerate() {
@@ -208,7 +210,10 @@ fn switch(name: Option<&str>) -> anyhow::Result<()> {
     let configs_dir = system::node_config_home_dir()?;
     let source = configs_dir.join(&name);
     if !nodeconfig::has_node_config_files(&source) {
-        anyhow::bail!("{} is not a valid config directory (needs config.yml + keys.yml)", source.display());
+        anyhow::bail!(
+            "{} is not a valid config directory (needs config.yml + keys.yml)",
+            source.display()
+        );
     }
     let default_link = configs_dir.join("default");
     // Replace any existing `default` symlink/dir entry.
@@ -225,8 +230,8 @@ fn switch(name: Option<&str>) -> anyhow::Result<()> {
 fn set(global: GlobalArgs, key: &str, value: &str) -> anyhow::Result<()> {
     let network = global.network.as_deref().filter(|s| !s.is_empty());
     let dir = nodeconfig::default_node_config_dir(network)?;
-    let mut cfg = quil_config::load_config(&dir)
-        .map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let mut cfg =
+        quil_config::load_config(&dir).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
 
     match key {
         "p2p.listenMultiaddr" => cfg.p2p.listen_multiaddr = value.to_string(),
@@ -251,7 +256,10 @@ fn clean(global: GlobalArgs, dry_run: bool) -> anyhow::Result<()> {
         for key in keys {
             match key.last_line - key.first_line {
                 0 => println!("  {} (line {})", key.path, key.first_line),
-                _ => println!("  {} (lines {}-{})", key.path, key.first_line, key.last_line),
+                _ => println!(
+                    "  {} (lines {}-{})",
+                    key.path, key.first_line, key.last_line
+                ),
             }
         }
     };
@@ -265,7 +273,11 @@ fn clean(global: GlobalArgs, dry_run: bool) -> anyhow::Result<()> {
         CleanOutcome::Cleaned { keys, backup } => {
             println!("Commented out {} obsolete settings:", keys.len());
             lines(&keys);
-            println!("Updated {}; the original is in {}", path.display(), backup.display());
+            println!(
+                "Updated {}; the original is in {}",
+                path.display(),
+                backup.display()
+            );
         }
     }
     Ok(())
@@ -276,7 +288,10 @@ fn clean(global: GlobalArgs, dry_run: bool) -> anyhow::Result<()> {
 enum CleanOutcome {
     NothingToClean,
     DryRun(Vec<quil_config::CleanedKey>),
-    Cleaned { keys: Vec<quil_config::CleanedKey>, backup: PathBuf },
+    Cleaned {
+        keys: Vec<quil_config::CleanedKey>,
+        backup: PathBuf,
+    },
 }
 
 /// Comment out the retired settings of the config file at `path` (a
@@ -285,8 +300,10 @@ enum CleanOutcome {
 /// if that fails. Returns the resolved path and the outcome.
 fn clean_config_file(path: &Path, dry_run: bool) -> anyhow::Result<(PathBuf, CleanOutcome)> {
     let path = std::fs::canonicalize(path).with_context(|| format!("find {}", path.display()))?;
-    let original = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let cleaned = quil_config::clean_retired_keys(&original).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let original =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let cleaned = quil_config::clean_retired_keys(&original)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     if cleaned.keys.is_empty() {
         return Ok((path, CleanOutcome::NothingToClean));
     }
@@ -299,38 +316,76 @@ fn clean_config_file(path: &Path, dry_run: bool) -> anyhow::Result<(PathBuf, Cle
     let removed: Vec<String> = cleaned.keys.iter().map(|key| key.path.clone()).collect();
     let written = std::fs::read_to_string(&path).unwrap_or_default();
     if let Err(e) = quil_config::verify_cleaned(&original, &written, &removed) {
-        let saved = std::fs::read_to_string(&backup).with_context(|| format!("read {}", backup.display()))?;
+        let saved = std::fs::read_to_string(&backup)
+            .with_context(|| format!("read {}", backup.display()))?;
         replace_file(&path, &saved, &permissions)?;
-        anyhow::bail!("{}: {e}; restored it from {}", path.display(), backup.display());
+        anyhow::bail!(
+            "{}: {e}; restored it from {}",
+            path.display(),
+            backup.display()
+        );
     }
-    Ok((path, CleanOutcome::Cleaned { keys: cleaned.keys, backup }))
+    Ok((
+        path,
+        CleanOutcome::Cleaned {
+            keys: cleaned.keys,
+            backup,
+        },
+    ))
 }
 
 /// Write `contents` to the first free of `<file>.bak`, `<file>.bak.1`, …
 /// beside `path`, with the original's permissions.
-fn write_backup(path: &Path, contents: &str, permissions: &std::fs::Permissions) -> anyhow::Result<PathBuf> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.yml".into());
+fn write_backup(
+    path: &Path,
+    contents: &str,
+    permissions: &std::fs::Permissions,
+) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.yml".into());
     for n in 0..100 {
-        let backup = path.with_file_name(if n == 0 { format!("{name}.bak") } else { format!("{name}.bak.{n}") });
+        let backup = path.with_file_name(if n == 0 {
+            format!("{name}.bak")
+        } else {
+            format!("{name}.bak.{n}")
+        });
         match new_private_file(&backup) {
             Ok(mut file) => {
                 file.write_all(contents.as_bytes())
                     .and_then(|()| file.sync_all())
                     .and_then(|()| std::fs::set_permissions(&backup, permissions.clone()))
-                    .with_context(|| format!("write backup {}; nothing changed", backup.display()))?;
+                    .with_context(|| {
+                        format!("write backup {}; nothing changed", backup.display())
+                    })?;
                 return Ok(backup);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("create backup {}; nothing changed", backup.display())),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("create backup {}; nothing changed", backup.display())
+                })
+            }
         }
     }
-    anyhow::bail!("no free backup name beside {}; nothing changed", path.display())
+    anyhow::bail!(
+        "no free backup name beside {}; nothing changed",
+        path.display()
+    )
 }
 
 /// Replace `path` atomically: write a temporary file beside it with the
 /// given permissions, then rename it over `path`.
-fn replace_file(path: &Path, contents: &str, permissions: &std::fs::Permissions) -> anyhow::Result<()> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+fn replace_file(
+    path: &Path,
+    contents: &str,
+    permissions: &std::fs::Permissions,
+) -> anyhow::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let temp = path.with_file_name(format!(".{name}.clean-{}.tmp", std::process::id()));
     let written = new_private_file(&temp).and_then(|mut file| {
         file.write_all(contents.as_bytes())?;
@@ -373,24 +428,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = config_in(dir.path(), RETIRED);
         #[cfg(unix)]
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
         let (resolved, outcome) = clean_config_file(&path, false).unwrap();
         let (keys, backup) = match outcome {
             CleanOutcome::Cleaned { keys, backup } => (keys, backup),
             other => panic!("{other:?}"),
         };
-        assert_eq!(keys.iter().map(|key| key.path.as_str()).collect::<Vec<_>>(), ["p2p.d", "engine.framePublish"]);
+        assert_eq!(
+            keys.iter().map(|key| key.path.as_str()).collect::<Vec<_>>(),
+            ["p2p.d", "engine.framePublish"]
+        );
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), RETIRED);
         assert_eq!(backup, resolved.with_file_name("config.yml.bak"));
         let cleaned = std::fs::read_to_string(&resolved).unwrap();
-        assert!(cleaned.contains("  # obsolete, no effect: d: 8\n  bootstrapPeer: x\n"), "{cleaned}");
+        assert!(
+            cleaned.contains("  # obsolete, no effect: d: 8\n  bootstrapPeer: x\n"),
+            "{cleaned}"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777, 0o640);
-            assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o640);
+            assert_eq!(
+                std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
         }
-        assert_eq!(clean_config_file(&path, false).unwrap().1, CleanOutcome::NothingToClean);
+        assert_eq!(
+            clean_config_file(&path, false).unwrap().1,
+            CleanOutcome::NothingToClean
+        );
         let entries = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(entries, 2, "config.yml and its backup only");
     }
@@ -402,7 +473,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = config_in(dir.path(), RETIRED);
         let (_, outcome) = clean_config_file(&path, true).unwrap();
-        assert!(matches!(&outcome, CleanOutcome::DryRun(keys) if keys.len() == 2), "{outcome:?}");
+        assert!(
+            matches!(&outcome, CleanOutcome::DryRun(keys) if keys.len() == 2),
+            "{outcome:?}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), RETIRED);
         let refused = "p2p:\n  network: 1\n  d: &degree 8\n";
         std::fs::write(&path, refused).unwrap();
@@ -425,14 +499,23 @@ mod tests {
         let link = dir.path().join("default");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let (resolved, outcome) = clean_config_file(&link.join("config.yml"), false).unwrap();
-        assert_eq!(resolved, std::fs::canonicalize(target.join("config.yml")).unwrap());
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(target.join("config.yml")).unwrap()
+        );
         let backup = match outcome {
             CleanOutcome::Cleaned { backup, .. } => backup,
             other => panic!("{other:?}"),
         };
         assert_eq!(backup, resolved.with_file_name("config.yml.bak.1"));
-        assert_eq!(std::fs::read_to_string(target.join("config.yml.bak")).unwrap(), "older backup");
+        assert_eq!(
+            std::fs::read_to_string(target.join("config.yml.bak")).unwrap(),
+            "older backup"
+        );
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), RETIRED);
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

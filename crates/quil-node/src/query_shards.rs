@@ -37,20 +37,27 @@ pub async fn run_query_prover_root(
 ) -> anyhow::Result<()> {
     let falcon_key = falcon_identity(config, config_dir)?;
     let mut client = quil_rpc::ArchiveClient::connect_mtls(archive_arg, &falcon_key).await?;
-    let head = client.get_global_frame(0).await.ok().and_then(|frame| frame.header);
+    let head = client
+        .get_global_frame(0)
+        .await
+        .ok()
+        .and_then(|frame| frame.header);
     let prover = client.get_forest_head(vec![0xffu8; 32], 0).await?;
-    println!("{}", serde_json::json!({ "prover_root_query": {
-        "endpoint": archive_arg,
-        "head": head.as_ref().map(|h| serde_json::json!({
-            "frame": h.frame_number,
-            "output": hex::encode(&h.output[..h.output.len().min(8)]),
-            "prover_tree_commitment": hex::encode(&h.prover_tree_commitment),
-        })),
-        "prover_shard_head": prover.map(|(version, root)| serde_json::json!({
-            "version": version,
-            "root": hex::encode(root),
-        })),
-    }}));
+    println!(
+        "{}",
+        serde_json::json!({ "prover_root_query": {
+            "endpoint": archive_arg,
+            "head": head.as_ref().map(|h| serde_json::json!({
+                "frame": h.frame_number,
+                "output": hex::encode(&h.output[..h.output.len().min(8)]),
+                "prover_tree_commitment": hex::encode(&h.prover_tree_commitment),
+            })),
+            "prover_shard_head": prover.map(|(version, root)| serde_json::json!({
+                "version": version,
+                "root": hex::encode(root),
+            })),
+        }})
+    );
     Ok(())
 }
 
@@ -67,7 +74,10 @@ pub(crate) fn falcon_key_unavailable(keys_path: &Path, e: impl std::fmt::Display
 
 /// The node's Falcon network identity (the :8340 mTLS key), self-contained
 /// like `keys::init`.
-pub(crate) fn falcon_identity(config: &quil_config::Config, config_dir: &Path) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn falcon_identity(
+    config: &quil_config::Config,
+    config_dir: &Path,
+) -> anyhow::Result<Vec<u8>> {
     let keys_path =
         quil_keys::resolve_existing_keystore_path(&config.key.key_store_file, config_dir)?;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
@@ -179,8 +189,10 @@ pub async fn run_query_shards(
             .ok()
             .flatten()
             .map(|(v, _)| v);
-        let all_bits: Vec<Vec<bool>> =
-            shards.iter().map(|s| grid_prefix_bits(&s.prefix).1).collect();
+        let all_bits: Vec<Vec<bool>> = shards
+            .iter()
+            .map(|s| grid_prefix_bits(&s.prefix).1)
+            .collect();
         let forest_by_bits: std::collections::HashMap<Vec<bool>, u64> = match forest_version {
             Some(ver) => {
                 let fc = client.clone();
@@ -237,7 +249,10 @@ pub async fn run_query_shards(
         let mat_nonzero = rows.iter().filter(|(_, _, _, m, _, _)| *m > 0).count();
         let latest_nonzero = rows.iter().filter(|(_, _, _, _, l, _)| *l > 0).count();
 
-        println!("  head frame: {}", head_frame.map(|n| n.to_string()).unwrap_or("?".into()));
+        println!(
+            "  head frame: {}",
+            head_frame.map(|n| n.to_string()).unwrap_or("?".into())
+        );
         println!(
             "  grid: {} rows | depths {} | overlaps(prefix-of-another): {}",
             rows.len(),
@@ -270,7 +285,10 @@ pub async fn run_query_shards(
         }
     }
 
-    println!("\n=== QUERY COMPLETE ({reached}/{} archives reached) ===", endpoints.len());
+    println!(
+        "\n=== QUERY COMPLETE ({reached}/{} archives reached) ===",
+        endpoints.len()
+    );
     if reached == 0 {
         anyhow::bail!("no reachable archive answered GetAppShards");
     }
