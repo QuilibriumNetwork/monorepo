@@ -46,6 +46,22 @@ impl OverlayDb {
         self.snapshot().iterator(mode)
     }
 
+    /// [`Self::raw_iterator`]. The overlay reads its base through its own read
+    /// view, so RocksDB read options do not apply.
+    pub(crate) fn raw_iterator_opt(&self, _options: rocksdb::ReadOptions) -> OverlayRawCursor {
+        self.raw_iterator()
+    }
+
+    /// [`Self::iterator`]; read options do not apply, as for
+    /// [`Self::raw_iterator_opt`].
+    pub(crate) fn iterator_opt(
+        &self,
+        mode: rocksdb::IteratorMode<'_>,
+        _options: rocksdb::ReadOptions,
+    ) -> OverlayIterator {
+        self.iterator(mode)
+    }
+
     pub(crate) fn range(&self, lower: Vec<u8>, upper: Vec<u8>) -> OverlayIterator {
         self.snapshot().range(lower, upper)
     }

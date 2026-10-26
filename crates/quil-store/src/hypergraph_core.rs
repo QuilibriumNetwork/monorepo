@@ -22,7 +22,7 @@ macro_rules! impl_hypergraph_storage {
                 matches: &dyn Fn(&[u8]) -> bool,
             ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
                 const READ_BEFORE_SEEK: usize = 4;
-                let mut it = self.db.raw_iterator();
+                let mut it = self.db.raw_iterator_opt(sweep_read_options());
                 it.seek(prefix);
                 let mut out = Vec::new();
                 let mut key_len: Option<usize> = None;
@@ -86,10 +86,10 @@ macro_rules! impl_hypergraph_storage {
             ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
                 use std::collections::HashMap;
                 let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
-                for entry in self
-                    .db
-                    .iterator(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward))
-                {
+                for entry in self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+                    sweep_read_options(),
+                ) {
                     let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
                     if !k.starts_with(prefix) {
                         break;
@@ -749,10 +749,10 @@ macro_rules! impl_hypergraph_storage {
                 // Legacy (unversioned) keyspace fills any vertex not yet re-written v2.
                 let old_prefix =
                     crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
-                for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                    &old_prefix,
-                    rocksdb::Direction::Forward,
-                )) {
+                for entry in self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(&old_prefix, rocksdb::Direction::Forward),
+                    sweep_read_options(),
+                ) {
                     let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
                     if !k.starts_with(&old_prefix) {
                         break;

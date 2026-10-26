@@ -139,7 +139,12 @@ fn scan(
     upper: Option<&[u8]>,
     mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let mut it = db.raw_iterator();
+    // A pass reads whole payload ranges, mostly ones it then deletes: keep
+    // their blocks out of the block cache, as the store's shard sweeps do,
+    // so a pass does not displace the point-read working set.
+    let mut options = rocksdb::ReadOptions::default();
+    options.fill_cache(false);
+    let mut it = db.raw_iterator_opt(options);
     it.seek(lower);
     while let (Some(key), Some(value)) = (it.key(), it.value()) {
         if upper.map_or(!key.starts_with(lower), |upper| key >= upper) {
@@ -694,6 +699,43 @@ mod tests {
             app_address: APP,
             data_address: [key; 32],
         }
+    }
+
+    #[test]
+    fn scans_do_not_fill_the_block_cache() {
+        const RECORDS: u32 = 4096;
+        const BLOB: usize = 4096;
+        let dir = std::env::temp_dir().join(format!(
+            "quil-eviction-scan-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            // The default 256 MiB block cache holds every block written here.
+            let db = quil_store::RocksDb::open(&dir).unwrap();
+            let prefix = [0xe1u8; 4];
+            for n in 0..RECORDS {
+                let key = [prefix.as_slice(), &n.to_be_bytes()].concat();
+                db.inner().put(key, vec![0xab; BLOB]).unwrap();
+            }
+            // Reads now come from table files, through the block cache.
+            db.inner().flush().unwrap();
+            let before = db.memory_usage().block_cache;
+            let mut rows = 0u32;
+            scan(&db.inner(), &prefix, None, |_, _| {
+                rows += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(rows, RECORDS);
+            let added = db.memory_usage().block_cache.saturating_sub(before);
+            assert!(
+                added < 1 << 20,
+                "scanning 16 MiB of payload added {added} bytes to the block cache"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
