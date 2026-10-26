@@ -16,8 +16,6 @@ pub enum ConfigCommand {
     PublicRpc { value: Option<String> },
     /// Set custom RPC URL (`domain:port`, or `clear`).
     SetCustomRpc { value: Option<String> },
-    /// Set signature check setting (`enable`/`disable`, toggles if omitted).
-    SignatureCheck { value: Option<String> },
 }
 
 pub fn run(cmd: &ConfigCommand) -> anyhow::Result<()> {
@@ -26,7 +24,6 @@ pub fn run(cmd: &ConfigCommand) -> anyhow::Result<()> {
         ConfigCommand::CreateDefault => config::create_default(),
         ConfigCommand::PublicRpc { value } => public_rpc(value.as_deref()),
         ConfigCommand::SetCustomRpc { value } => set_custom_rpc(value.as_deref()),
-        ConfigCommand::SignatureCheck { value } => signature_check(value.as_deref()),
     }
 }
 
@@ -34,7 +31,6 @@ fn print() -> anyhow::Result<()> {
     let cfg = config::load()?;
     println!("Data Directory: {}", cfg.data_dir);
     println!("Symlink Path: {}", cfg.symlink_path);
-    println!("Signature Check: {}", cfg.signature_check);
     println!("Public RPC: {}", cfg.public_rpc);
     Ok(())
 }
@@ -92,26 +88,6 @@ fn validate_custom_rpc(custom_rpc: &str) -> anyhow::Result<()> {
     if !custom_rpc.contains('.') || !custom_rpc.contains(':') {
         anyhow::bail!("custom RPC URL must be in format domain:port (e.g. example.com:8080)");
     }
-    Ok(())
-}
-
-fn signature_check(value: Option<&str>) -> anyhow::Result<()> {
-    let mut cfg = config::load()?;
-    match value.map(|v| v.to_lowercase()) {
-        Some(v) if v == "enable" => cfg.signature_check = true,
-        Some(v) if v == "disable" => cfg.signature_check = false,
-        Some(v) => anyhow::bail!("Invalid value '{v}'. Please use 'enable' or 'disable'."),
-        None => cfg.signature_check = !cfg.signature_check,
-    }
-    config::save(&cfg)?;
-    let status = if cfg.signature_check {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    println!(
-        "Signature check has been set to {status} and will be persisted across future commands unless reset."
-    );
     Ok(())
 }
 

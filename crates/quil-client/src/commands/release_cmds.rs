@@ -27,6 +27,7 @@ pub async fn download_signatures(version: Option<&str>) -> anyhow::Result<()> {
             dest.display()
         );
     }
+    release::check_digest_label(&digest, &base)?;
     release::write_signature_files(&dest, &base, &digest, &sigs)?;
     println!("Wrote the signature files to {}", dest.display());
     Ok(())

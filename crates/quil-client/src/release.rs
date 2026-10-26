@@ -6,6 +6,11 @@
 //! quorum of the [`SIGNATORIES`](quil_config::SIGNATORIES) Ed448 keys sign
 //! its digest file.
 //!
+//! The signed digest file starts with the label `SHA3-256(<file name>)=`,
+//! and a release verifies only under the file name its label names, so a
+//! release signed for one version, type or platform never passes for
+//! another.
+//!
 //! A release is held in memory until it verifies: nothing is written under
 //! the install tree before that, and the verified files reach their final
 //! names by atomic rename from private temporary files beside them.
@@ -211,6 +216,23 @@ pub fn digest_checksum(digest_file: &[u8]) -> anyhow::Result<Vec<u8>> {
     hex::decode(&parts[1][..64]).map_err(|e| anyhow::anyhow!("invalid digest hex: {e}"))
 }
 
+/// Fail unless a `.dgst` file's label, `SHA3-256(<file name>)=` as the
+/// signers' `openssl sha3-256` writes it, names `base`. The signatures
+/// cover the label, so this binds the signed checksum to the release type,
+/// version and platform that `base` names.
+pub fn check_digest_label(digest_file: &[u8], base: &str) -> anyhow::Result<()> {
+    let text = String::from_utf8_lossy(digest_file);
+    let label = text.split_whitespace().next().unwrap_or("");
+    if label != format!("SHA3-256({base})=") {
+        let shown: String = label.chars().take(120).collect();
+        anyhow::bail!(
+            "the digest file of {base} is signed for another file ({shown:?}); refusing a \
+             release served under another name"
+        );
+    }
+    Ok(())
+}
+
 /// A downloaded release, held in memory until it verifies.
 pub struct Release {
     /// The binary's file name, `type-version-os-arch`.
@@ -224,8 +246,9 @@ pub struct Release {
 }
 
 impl Release {
-    /// Check that the binary matches the digest file and that at least
-    /// `quorum` of `signatories` signed it. Returns the count of valid
+    /// Check that the binary matches the digest file, that at least
+    /// `quorum` of `signatories` signed it, and that its label names
+    /// `base` ([`check_digest_label`]). Returns the count of valid
     /// signatures.
     pub fn verify_with(&self, signatories: &[&str], quorum: usize) -> anyhow::Result<usize> {
         let checksum = {
@@ -239,6 +262,7 @@ impl Release {
         if count < quorum {
             anyhow::bail!("signature quorum not met ({count}/{quorum})");
         }
+        check_digest_label(&self.digest, &self.base)?;
         Ok(count)
     }
 
@@ -483,6 +507,136 @@ mod tests {
         let sum = digest_checksum(f).unwrap();
         assert_eq!(sum.len(), 32);
         assert_eq!(sum[0], 0xaa);
+    }
+
+    #[test]
+    fn digest_label_must_name_the_release_file() {
+        let digest = format!("SHA3-256({BASE})= {}\n", "ab".repeat(32));
+        assert!(check_digest_label(digest.as_bytes(), BASE).is_ok());
+        for other in [
+            "node-2.1.0.24-linux-amd64",
+            "node-2.1.0.25-linux-arm64",
+            "node-2.1.0.25-darwin-arm64",
+            "qclient-2.1.0.25-linux-amd64",
+            "node-2.1.0.2-linux-amd64",
+            "node-2.1.0.25-linux-amd6",
+        ] {
+            let err = check_digest_label(digest.as_bytes(), other).unwrap_err();
+            assert!(err.to_string().contains("signed for another file"), "{err}");
+        }
+        for bad in [
+            "",
+            "ab",
+            "SHA3-256()= ab",
+            "SHA3-256(node-2.1.0.25-linux-amd64) ab",
+        ] {
+            assert!(check_digest_label(bad.as_bytes(), BASE).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A published release (qclient 2.1.0.23 for linux-amd64, as served on
+    /// releases.quilibrium.com) still verifies: the production signatories
+    /// reach the quorum over its digest file, whose label names its file.
+    #[test]
+    fn published_release_digest_verifies_under_its_own_name() {
+        const DGST: &str = "SHA3-256(qclient-2.1.0.23-linux-amd64)= \
+             032a78caf3b838a168cd90ead806138ded0d5553939abb4254bb63f17a02d283\n";
+        const SIGS: &[(usize, &str)] = &[
+            (
+                1,
+                "ec05fcec946f71faf7932a0a0166e904dca473a94fc443159c3541303235d6950718629c322a95cf5875a0b5910cf62cdaae7a7456d544be00749a34a4bcc166faa35c68af3e05f9a07b2f859a816c2444c340d1ca1360ed7146642abed9dc3082994286ce2dfea3ca1289fca0d6fbed1a00",
+            ),
+            (
+                2,
+                "7c3663ff9a97a2cbeaea6c766b30c54191b1891378aecfdc962e11e289c8e569ba01d1278e3d3e5866f199626afd0a4077cf1be6a578686e0083dff92117458e0635b512e6a79d5bec18320a3606d3e1c2e343bfd1d175028186f2051a0d42d37ecb46e5e9d6e7e8cc1dbc00bc5ef2e51000",
+            ),
+            (
+                8,
+                "f5836adcee782f2514c4778c71c809d4d56ca30d3dd11df1e8956473706fc13b7b3d9e9ba628f841b165be0c97bde9d7660d352e3717f0fa00870d08e2ec5b11473222b9807ce801a8bcaf08e10c45632d429100d4d4ffeb881e7e7c8e53c61ffe89daad5fe5b5cb37b934acdada83912a00",
+            ),
+            (
+                11,
+                "835e971e8bd4b1ecd8777ecafbb58ed18f6905ddb20cb6be122077ff9e42b7ae4b071094cc76a33e128cd4dc6238613169f088dcbdbdae91006b3c4d968de0283c8004be814bdaad649edc7767cf7de9e4725bfc35a807e28fdb196e0789ce74ee7a5c349a7732fb5409830f81dad82f0900",
+            ),
+            (
+                13,
+                "01209709b5be9bdcc3ed00fa2e9062754464aa3a08ba75bfe5fa790e15d210f8844a42d47e69663dbc7d797c91da287245e147bddf28c4b00031cdc5ec79ee79597cc2b5021bed6aa150958d7e7edd1677cc32ce28e8cca4f21dc067addf91305182508ec95df0b2d836cb0dc09a722c0200",
+            ),
+            (
+                14,
+                "37b2fed784e9cd3dcd64185be559367e1433cff93396c1326eaf719e261042bbd299beb2a98032eef6a4d5b97fab4418c0b5ef6150fb71b00009f64d2e51eb7c72acc4465f99bf9dc83d769b3a92ed44225ce654306bea56a9007667cce0e22290ccf76460d1cc30e72b5fc4ff394c972100",
+            ),
+            (
+                17,
+                "bdd76d21dcbeb709c2abe8d13da0429df74147978b925e521b8afc65eff05c5c5a6b334cced2a1732cb145765fdd2aeb63d8cc7ab01e83ff00549ff699c6f70f8fb2a612aeb3bd88c83e020a15c6e5bf254267eab527b9af178dad0b2d12cf82b61a9aeee1f6f0b1192ff9da12d04a561700",
+            ),
+        ];
+        let sigs: Vec<(usize, Vec<u8>)> = SIGS
+            .iter()
+            .map(|(i, sig)| (*i, hex::decode(sig).unwrap()))
+            .collect();
+        let count = verify_quorum(DGST.as_bytes(), &sigs).unwrap();
+        assert!(count >= quil_config::signatory_quorum(), "{count}");
+        check_digest_label(DGST.as_bytes(), "qclient-2.1.0.23-linux-amd64").unwrap();
+        assert!(check_digest_label(DGST.as_bytes(), "qclient-2.1.0.24-linux-amd64").is_err());
+        assert!(check_digest_label(DGST.as_bytes(), "node-2.1.0.23-linux-amd64").is_err());
+    }
+
+    /// The release fix refuses a downgrade by the requested version; a
+    /// release-origin attacker could instead serve an older signed release
+    /// under the newer version's name. Its label names the older file, so it
+    /// is refused and nothing is written.
+    #[test]
+    fn release_signed_for_another_file_is_not_installed() {
+        use sha3::{Digest, Sha3_256};
+        let (signers, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        for signed_as in [
+            "node-2.1.0.24-linux-amd64",
+            "node-2.1.0.25-linux-arm64",
+            "qclient-2.1.0.25-linux-amd64",
+        ] {
+            let digest = format!(
+                "SHA3-256({signed_as})= {}\n",
+                hex::encode(Sha3_256::digest(b"old"))
+            );
+            let served = Release {
+                base: BASE.to_string(),
+                bin: b"old".to_vec(),
+                sigs: [1, 2]
+                    .iter()
+                    .map(|&i| (i, signers[i - 1].sign(digest.as_bytes()).unwrap()))
+                    .collect(),
+                digest: digest.into_bytes(),
+            };
+            let err = served.install_with(&dest, &keys, 2).unwrap_err();
+            assert!(err.to_string().contains("signed for another file"), "{err}");
+            assert!(!dest.exists(), "{signed_as}: nothing is written");
+        }
+    }
+
+    #[test]
+    fn installed_release_renamed_to_another_version_does_not_verify() {
+        let (_, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (bin_path, _) = release(b"bin", b"bin", &[1, 2])
+            .install_with(&tmp.path().join("2.1.0.25"), &keys, 2)
+            .unwrap();
+        let renamed = tmp.path().join("2.1.0.26");
+        std::fs::create_dir(&renamed).unwrap();
+        let new_base = "node-2.1.0.26-linux-amd64";
+        for suffix in ["", ".dgst", ".dgst.sig.1", ".dgst.sig.2"] {
+            std::fs::copy(
+                bin_path.with_file_name(format!("{BASE}{suffix}")),
+                renamed.join(format!("{new_base}{suffix}")),
+            )
+            .unwrap();
+        }
+        assert!(verify_installed_with(&renamed.join(new_base), &keys, 2).is_err());
+        assert_eq!(verify_installed_with(&bin_path, &keys, 2).unwrap(), 2);
     }
 
     const BASE: &str = "node-2.1.0.25-linux-amd64";
@@ -739,5 +893,35 @@ mod tests {
         .unwrap();
         assert_eq!(linked_version(&link, "node").as_deref(), Some("2.1.0.25"));
         assert_eq!(linked_version(&link, "qclient"), None);
+    }
+
+    /// A release-origin attacker serves an older quorum-signed release under
+    /// the newer version's file name; the downgrade refusal compares only the
+    /// requested version, which is the newer one.
+    #[test]
+    fn reproduces_relabelled_old_release_installed() {
+        use sha3::{Digest, Sha3_256};
+        let (signers, hex_keys) = signatories();
+        let keys = keys(&hex_keys);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("2.1.0.25");
+        let digest = format!(
+            "SHA3-256(node-2.1.0.24-linux-amd64)= {}\n",
+            hex::encode(Sha3_256::digest(b"older release"))
+        );
+        let old = Release {
+            base: BASE.to_string(),
+            bin: b"older release".to_vec(),
+            sigs: [1, 2]
+                .iter()
+                .map(|&i| (i, signers[i - 1].sign(digest.as_bytes()).unwrap()))
+                .collect(),
+            digest: digest.into_bytes(),
+        };
+        let result = old.install_with(&dest, &keys, 2);
+        assert!(
+            result.is_err() && !dest.join(BASE).exists(),
+            "older signed release node-2.1.0.24 installed as {BASE}: {result:?}"
+        );
     }
 }

@@ -30,12 +30,17 @@ pub enum KeyCommand {
         key_hex: String,
     },
     /// (DANGEROUS) Sign a raw payload: `<name> <payloadHex> [domainHex]`.
+    /// `q-prover-key` signs only under a non-empty domain.
     Sign {
         name: String,
         payload_hex: String,
         domain_hex: Option<String>,
     },
 }
+
+/// The node's Falcon prover key. The node signs its consensus votes, peer
+/// info and transport handshakes with it under the empty domain.
+const PROVER_KEY_NAME: &str = "q-prover-key";
 
 struct KeyCtx {
     key_manager: std::sync::Arc<quil_keys::FileKeyManager>,
@@ -193,6 +198,13 @@ fn sign(
             .map_err(|e| anyhow::anyhow!("decode domain hex: {e}"))?,
         _ => Vec::new(),
     };
+    if name == PROVER_KEY_NAME && domain.is_empty() {
+        anyhow::bail!(
+            "refusing to sign with {PROVER_KEY_NAME} under the empty domain, under which the \
+             node signs its consensus votes, peer info and transport handshakes; pass the \
+             domain (hex) of the protocol the payload is for"
+        );
+    }
     let sig = signer
         .sign_with_domain(&payload, &domain)
         .map_err(|e| anyhow::anyhow!("sign payload: {e}"))?;
@@ -239,6 +251,39 @@ fn key_type_name(kt: u8) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A keystore holding the prover key and another Falcon key.
+    fn kc_with_prover_key() -> (KeyCtx, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let km = quil_keys::FileKeyManager::new(
+            dir.path().join("keys.yml"),
+            "",
+            PROVER_KEY_NAME.to_string(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key(PROVER_KEY_NAME).unwrap();
+        km.create_falcon_key("other-falcon-key").unwrap();
+        let kc = KeyCtx {
+            key_manager: std::sync::Arc::new(km),
+            alias_store: None,
+        };
+        (kc, dir)
+    }
+
+    #[test]
+    fn prover_key_signs_only_under_a_domain() {
+        let (kc, _dir) = kc_with_prover_key();
+        for domain in [None, Some(""), Some("0x")] {
+            let err = sign(&kc, PROVER_KEY_NAME, "00", domain).unwrap_err();
+            assert!(
+                err.to_string().contains("empty domain"),
+                "{domain:?}: {err}"
+            );
+        }
+        sign(&kc, PROVER_KEY_NAME, "00", Some("74657374")).unwrap();
+        sign(&kc, "other-falcon-key", "00", None).unwrap();
+    }
+
     #[test]
     fn key_type_round_trip() {
         assert_eq!(parse_key_type("falcon512").unwrap(), 8);
@@ -246,5 +291,30 @@ mod tests {
         assert_eq!(parse_key_type("decaf").unwrap(), 4);
         assert_eq!(key_type_name(8), "Falcon-512");
         assert!(parse_key_type("nope").is_err());
+    }
+
+    /// `key sign` must not turn the prover key into a signing oracle for
+    /// the empty domain, under which the node signs its consensus votes,
+    /// peer info and transport handshakes.
+    #[test]
+    fn reproduces_prover_key_signs_under_empty_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let km = quil_keys::FileKeyManager::new(
+            dir.path().join("keys.yml"),
+            "",
+            "q-prover-key".to_string(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_falcon_key("q-prover-key").unwrap();
+        let kc = KeyCtx {
+            key_manager: std::sync::Arc::new(km),
+            alias_store: None,
+        };
+        let result = sign(&kc, "q-prover-key", "00", None);
+        assert!(
+            result.is_err(),
+            "q-prover-key signed a raw payload under the empty domain"
+        );
     }
 }

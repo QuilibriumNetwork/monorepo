@@ -1,7 +1,7 @@
 //! Shared runtime context passed to every command.
 //!
-//! Carries the resolved global flags (`--network`, `--signature-check`,
-//! `-y/--yes`) and the loaded client config, and offers helpers to load
+//! Carries the resolved global flags (`--network`, `-y/--yes`) and the
+//! loaded client config, and offers helpers to load
 //! the node config, build a key manager, and derive connection options.
 
 use std::path::{Path, PathBuf};
@@ -19,9 +19,7 @@ use crate::{config, keys, nodeconfig};
 pub struct GlobalArgs {
     /// `--network` / `QUILIBRIUM_NETWORK` — selects the node config set.
     pub network: Option<String>,
-    /// `--signature-check` — verify the binary's release signatures.
-    pub signature_check: bool,
-    /// `-y/--yes` — auto-approve prompts, bypass signature check.
+    /// `-y/--yes` — auto-approve prompts.
     pub yes: bool,
 }
 

@@ -17,12 +17,18 @@ struct GlobalFlags {
     #[arg(long, global = true, env = "QUILIBRIUM_NETWORK")]
     network: Option<String>,
 
-    /// Verify the binary's release signatures before running
-    /// (default true, or the value of QUILIBRIUM_SIGNATURE_CHECK).
-    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true, action = clap::ArgAction::Set)]
-    signature_check: bool,
+    /// Accepted and ignored, so commands written for the Go client keep
+    /// working: qclient runs no startup self-check, and it verifies every
+    /// release it downloads regardless.
+    #[arg(
+        long = "signature-check",
+        global = true,
+        hide = true,
+        action = clap::ArgAction::Set
+    )]
+    _signature_check: Option<bool>,
 
-    /// Auto-approve prompts and bypass the signature check.
+    /// Auto-approve prompts.
     #[arg(short = 'y', long = "yes", global = true, default_value_t = false)]
     yes: bool,
 }
@@ -31,7 +37,6 @@ impl From<&GlobalFlags> for GlobalArgs {
     fn from(f: &GlobalFlags) -> Self {
         GlobalArgs {
             network: f.network.clone(),
-            signature_check: f.signature_check,
             yes: f.yes,
         }
     }
@@ -176,6 +181,22 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+
+    /// The Go client's `--signature-check` still parses, and help no longer
+    /// offers a check that qclient never ran.
+    #[test]
+    fn the_signature_check_flag_is_hidden_and_accepted() {
+        use clap::Parser;
+        for args in [
+            ["qclient", "--signature-check=false", "config", "print"],
+            ["qclient", "config", "print", "--signature-check=true"],
+        ] {
+            super::Cli::try_parse_from(args).unwrap();
+        }
+        let help = super::Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--signature-check"), "{help}");
+        assert!(!help.contains("bypass"), "{help}");
+    }
 
     #[test]
     fn the_version_flag_reports_the_release_and_subpatch() {

@@ -17,18 +17,12 @@ pub struct ClientConfig {
     pub data_dir: String,
     #[serde(rename = "symlinkPath", default)]
     pub symlink_path: String,
-    #[serde(rename = "signatureCheck", default = "default_true")]
-    pub signature_check: bool,
     #[serde(rename = "publicRpc", default)]
     pub public_rpc: bool,
     #[serde(rename = "customRpc", default)]
     pub custom_rpc: String,
     #[serde(rename = "nodeSymlinkName", default)]
     pub node_symlink_name: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl ClientConfig {
@@ -40,7 +34,6 @@ impl ClientConfig {
             symlink_path: system::default_qclient_symlink_path()
                 .to_string_lossy()
                 .into_owned(),
-            signature_check: true,
             public_rpc: false,
             custom_rpc: String::new(),
             node_symlink_name: String::new(),
@@ -119,7 +112,7 @@ mod tests {
         let cfg = ClientConfig::default_for_create();
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(yaml.contains("dataDir:"));
-        assert!(yaml.contains("signatureCheck: true"));
+        assert!(!yaml.contains("signatureCheck"));
         assert!(yaml.contains("publicRpc: false"));
         let back: ClientConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
@@ -127,7 +120,8 @@ mod tests {
 
     #[test]
     fn parses_go_written_yaml() {
-        // A config as the Go client would emit it.
+        // A config as the Go client would emit it. Its signatureCheck key,
+        // which nothing reads, is ignored.
         let go_yaml = "dataDir: /var/quilibrium/bin/qclient\n\
                        symlinkPath: /usr/local/bin/qclient\n\
                        signatureCheck: true\n\
@@ -141,9 +135,8 @@ mod tests {
 
     #[test]
     fn missing_fields_default_sensibly() {
-        // Partial config still loads; signatureCheck defaults to true.
+        // Partial config still loads.
         let cfg: ClientConfig = serde_yaml::from_str("publicRpc: true\n").unwrap();
-        assert!(cfg.signature_check);
         assert!(cfg.public_rpc);
         assert!(cfg.custom_rpc.is_empty());
     }
