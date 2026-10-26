@@ -41,6 +41,51 @@ pub async fn remote_exists(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A/B reproducers of the release-install findings. They call only
+/// functions whose signatures predate the fix, so they run unchanged on the
+/// code before and after it.
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    /// The version from the release list named the install directory and
+    /// binary unchecked, so a crafted list could point both outside the
+    /// install tree.
+    #[test]
+    fn reproduces_server_version_used_as_path() {
+        for version in ["../../../../etc/cron.d/x", "2.1.0.25/../../x", "/etc"] {
+            if let Ok(name) = release_filename(crate::system::RELEASE_TYPE_NODE, version) {
+                let path = std::path::Path::new(crate::system::BINARY_PATH)
+                    .join(crate::system::RELEASE_TYPE_NODE)
+                    .join(version)
+                    .join(&name);
+                panic!(
+                    "server version {version:?} used as a path: the binary would be written to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// One signatory's valid signature, listed once per required signer,
+    /// must count once rather than meet the quorum alone.
+    #[test]
+    fn reproduces_repeated_signature_meeting_quorum() {
+        const DGST: &[u8] =
+            include_bytes!("../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
+        const SIG_1: &[u8] = include_bytes!(
+            "../../quil-node/tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"
+        );
+        let quorum = quil_config::signatory_quorum();
+        let sigs: Vec<(usize, Vec<u8>)> = (0..quorum).map(|_| (1, SIG_1.to_vec())).collect();
+        let count = verify_quorum(DGST, &sigs).unwrap();
+        assert!(
+            count < quorum,
+            "signatory #1's signature, listed {quorum} times, met the quorum alone ({count} valid)"
+        );
+    }
+}
+
 /// Fetch the latest version string for a release type (`node` or `qclient`).
 /// The `/release` (or `/qclient-release`) endpoint's first line is a
 /// filename `type-VERSION-os-arch`; the version is the 2nd `-`-segment.
