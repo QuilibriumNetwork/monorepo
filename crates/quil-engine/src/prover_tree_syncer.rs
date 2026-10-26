@@ -559,6 +559,10 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     fn materialized(&self) -> u64;
     /// Consecutive descendants ending at a certified frame authenticate a
     /// frame with no certificate of its own. The actor verifies the whole chain.
+    /// Replay and validation that read committed GLOBAL state while a GLOBAL
+    /// state sync installs its chunks refuse with its wait
+    /// ([`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`]),
+    /// which recovery waits out ([`waiting_out_global_sync`]).
     async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64>;
     async fn validate(
         &self,
@@ -571,6 +575,10 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
         predecessor: Option<AppShardFrame>,
     ) -> Result<()>;
     fn inherited(&self);
+    /// The worker's core, named in recovery's log lines; `None` when unknown.
+    fn core_id(&self) -> Option<u32> {
+        None
+    }
     /// `(source filter, sealed roots)` of the certified state a shard with no
     /// frame of its own syncs against (`app_handoff::origin_anchors`).
     async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
@@ -637,6 +645,9 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
 impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
     fn materialized(&self) -> u64 {
         self.materialized_frame()
+    }
+    fn core_id(&self) -> Option<u32> {
+        Some(self.core_id)
     }
     async fn replay(&self, frame: AppShardFrame, descendants: Vec<AppShardFrame>) -> Result<u64> {
         self.replay_archive_frame(frame, descendants).await
@@ -789,6 +800,95 @@ impl std::fmt::Display for ShardRecoveryProgress {
     }
 }
 
+/// How often a recovery waiting out a GLOBAL state sync install asks again
+/// ([`waiting_out_global_sync`]).
+const GLOBAL_SYNC_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long one recovery attempt waits in total, its turn held, for GLOBAL
+/// state sync installs ([`waiting_out_global_sync`]). A regular node's
+/// master installs the GLOBAL prover tree from an archive every few
+/// minutes, in chunks over seconds to minutes, and committed GLOBAL state is
+/// withheld until the last chunk is in. On a node whose installs took 250 to
+/// 580 s of every 8 to 10 minutes, replays refused by them failed their
+/// attempts and handed their turns back, and 30 of 73 successor sessions
+/// stayed blocked below their predecessor's seal (2026-10-26). Past the
+/// budget the refusal fails the attempt, as before, and the next one waits
+/// again.
+const GLOBAL_SYNC_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// One recovery attempt's waits for GLOBAL state sync installs, within
+/// [`GLOBAL_SYNC_WAIT_BUDGET`].
+#[derive(Default)]
+struct GlobalSyncWait {
+    /// Milliseconds the attempt's waited-out requests took.
+    waited_ms: AtomicU64,
+    /// The attempt warned that its budget ran out.
+    exhausted: AtomicBool,
+}
+
+/// `attempt`, an engine request of `duty` for frame `frame` that reads
+/// committed GLOBAL state, with a GLOBAL state sync install waited out:
+/// while it refuses with
+/// [`quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS`],
+/// it is asked again every [`GLOBAL_SYNC_POLL`], while the engine runs and
+/// within what is left of `wait`'s budget. Once that is spent, the refusal
+/// is returned, as it was before any wait. A wait is logged when it starts
+/// and when it ends, not per request.
+async fn waiting_out_global_sync<T, F, Fut>(
+    wait: &GlobalSyncWait,
+    target: &dyn ShardRecoveryTarget,
+    filter: &[u8],
+    frame: u64,
+    duty: &'static str,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+    let started = tokio::time::Instant::now();
+    let mut waiting = false;
+    loop {
+        let result = attempt().await;
+        let waited = started.elapsed();
+        let refused = matches!(&result, Err(error) if global_sync_in_progress(error));
+        let spent =
+            std::time::Duration::from_millis(wait.waited_ms.load(Ordering::Relaxed)) + waited;
+        if refused && target.running() && spent + GLOBAL_SYNC_POLL <= GLOBAL_SYNC_WAIT_BUDGET {
+            if !waiting {
+                waiting = true;
+                tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter), frame,
+                    duty, poll_secs = GLOBAL_SYNC_POLL.as_secs(),
+                    budget_secs = GLOBAL_SYNC_WAIT_BUDGET.as_secs(),
+                    "archive recovery waits for this node's GLOBAL state sync to finish \
+                    installing, which withholds committed GLOBAL state; an expected wait");
+            }
+            tokio::time::sleep(GLOBAL_SYNC_POLL).await;
+            continue;
+        }
+        wait.waited_ms
+            .fetch_add(waited.as_millis() as u64, Ordering::Relaxed);
+        if refused {
+            if target.running() && !wait.exhausted.swap(true, Ordering::Relaxed) {
+                tracing::warn!(core_id = target.core_id(), filter = %hex::encode(filter), frame,
+                    duty, waited_secs = spent.as_secs(),
+                    budget_secs = GLOBAL_SYNC_WAIT_BUDGET.as_secs(), scope = "this node",
+                    action = "this node's master installs the GLOBAL prover tree from an archive; \
+                    check how long its installs take; the next attempt waits again; report it \
+                    with this line if it persists",
+                    "archive recovery stopped waiting for this node's GLOBAL state sync to \
+                    finish installing; the attempt fails and is retried");
+            }
+        } else if waiting {
+            tracing::info!(core_id = target.core_id(), filter = %hex::encode(filter), frame, duty,
+                waited_secs = waited.as_secs(), succeeded = result.is_ok(),
+                "archive recovery resumed after this node's GLOBAL state sync finished installing");
+        }
+        return result;
+    }
+}
+
 /// Common recovery path for thread and separate-process workers. A saved
 /// lineage replays certified bodies; an empty worker fetches and authenticates
 /// the archive checkpoint before tree writes, then waits for actor installation.
@@ -838,6 +938,7 @@ pub(crate) async fn recover_shard_from_latest(
     if let Some(mismatch) = target.sealed_state_mismatch().await {
         return yielded(install_sealed_state(syncer, filter, mismatch, target).await);
     }
+    let sync_wait = &GlobalSyncWait::default();
     if let Some(local) = local {
         recovery_phase("replaying_frames");
         let committed_tip = target.committed_tip().await;
@@ -870,7 +971,19 @@ pub(crate) async fn recover_shard_from_latest(
                 &verify,
                 |frame, child| async move {
                     let at = Instant::now();
-                    let advanced = target.replay(frame, child).await;
+                    let number = frame
+                        .header
+                        .as_ref()
+                        .map_or(0, |header| header.frame_number);
+                    let advanced = waiting_out_global_sync(
+                        sync_wait,
+                        target,
+                        filter,
+                        number,
+                        "archive replay",
+                        move || target.replay(frame.clone(), child.clone()),
+                    )
+                    .await;
                     replay_us.fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
                     advanced
                 },
@@ -912,7 +1025,20 @@ pub(crate) async fn recover_shard_from_latest(
         None,
         &anchors,
         committed_tip,
-        |anchor, predecessor| target.validate(anchor, predecessor),
+        |anchor: AppShardFrame, predecessor: Option<AppShardFrame>| {
+            let number = anchor
+                .header
+                .as_ref()
+                .map_or(0, |header| header.frame_number);
+            waiting_out_global_sync(
+                sync_wait,
+                target,
+                filter,
+                number,
+                "archive sync anchor validation",
+                move || target.validate(anchor.clone(), predecessor.clone()),
+            )
+        },
         |frame| target.discarded_base_roots(frame),
     )
     .await;
@@ -1151,8 +1277,20 @@ async fn reanchor_shard_at_fence(
     else {
         return Ok(ShardRecoveryProgress::NotReady(REANCHOR_NO_TIP));
     };
-    let mut validate = |anchor, predecessor| {
-        let validated = target.validate(anchor, predecessor);
+    let sync_wait = &GlobalSyncWait::default();
+    let mut validate = |anchor: AppShardFrame, predecessor: Option<AppShardFrame>| {
+        let number = anchor
+            .header
+            .as_ref()
+            .map_or(0, |header| header.frame_number);
+        let validated = waiting_out_global_sync(
+            sync_wait,
+            target,
+            filter,
+            number,
+            "shard re-anchor validation",
+            move || target.validate(anchor.clone(), predecessor.clone()),
+        );
         async move { validated.await.map_err(on_this_node("validation")) }
     };
     let Some(frame) = syncer.get_app_shard_frame(filter, committed).await? else {
@@ -5582,5 +5720,160 @@ mod tests {
             .unwrap()
             .iter()
             .any(|call| call.starts_with("install")));
+    }
+
+    /// Refuses its first `refusals` replays with a GLOBAL state sync's wait,
+    /// as an engine does while its master installs the GLOBAL prover tree,
+    /// then replays as `Target` does.
+    struct SyncInstalling {
+        inner: Target,
+        refusals: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SyncInstalling {
+        fn new(inner: Target, refusals: usize) -> Self {
+            Self {
+                inner,
+                refusals: refusals.into(),
+                refused: 0.into(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for SyncInstalling {
+        fn materialized(&self) -> u64 {
+            self.inner.materialized()
+        }
+        async fn replay(
+            &self,
+            frame: AppShardFrame,
+            descendants: Vec<AppShardFrame>,
+        ) -> Result<u64> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.refusals.load(SeqCst) > 0 {
+                self.refusals.fetch_sub(1, SeqCst);
+                self.refused.fetch_add(1, SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ));
+            }
+            self.inner.replay(frame, descendants).await
+        }
+        async fn validate(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<bool> {
+            self.inner.validate(anchor, predecessor).await
+        }
+        async fn install(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<()> {
+            self.inner.install(anchor, predecessor).await
+        }
+        fn inherited(&self) {
+            panic!("a certified archive tip must never use unanchored inheritance")
+        }
+    }
+
+    fn replaying_target(calls: &Arc<Mutex<Vec<String>>>) -> Target {
+        Target {
+            calls: calls.clone(),
+            cursor: 129.into(),
+            valid: false,
+            install_ok: false,
+            blocked: false.into(),
+            unblock_at: 0,
+        }
+    }
+
+    /// A replay refused while this node's master installs a GLOBAL state sync
+    /// waits the install out within its attempt and goes on once it is in:
+    /// the attempt replays its batch and counts no failure. It failed the
+    /// attempt, its worker handed its recovery turn back and queued behind
+    /// every other, and on a node whose installs took 250 to 580 s of every 8
+    /// to 10 minutes 30 of 73 successor sessions stayed blocked below their
+    /// predecessor's seal (2026-10-26).
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_waits_out_a_global_sync_install_and_counts_no_failure() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = SyncInstalling::new(replaying_target(&calls), 5);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let result = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None),
+            )
+            .await
+            .unwrap();
+        let ShardRecoveryProgress::Replayed {
+            materialized, turn, ..
+        } = result
+        else {
+            panic!("expected a replay: {result:?}")
+        };
+        assert_eq!((materialized, turn.frames), (161, 32));
+        assert_eq!(target.refused.load(std::sync::atomic::Ordering::SeqCst), 5);
+        let waited = started.elapsed();
+        assert!(
+            waited >= 5 * GLOBAL_SYNC_POLL && waited < GLOBAL_SYNC_WAIT_BUDGET,
+            "{waited:?}"
+        );
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            (recovery.consecutive_failures, recovery.last_error_unix_ms),
+            (0, 0)
+        );
+        assert!(
+            recovery.failures_by_class.is_empty(),
+            "{:?}",
+            recovery.failures_by_class
+        );
+    }
+
+    /// An install that does not finish within the attempt's budget fails the
+    /// attempt with its wait, as before, once the budget is spent: the turn
+    /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`].
+    #[tokio::test(start_paused = true)]
+    async fn a_global_sync_install_past_the_budget_fails_the_attempt() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = SyncInstalling::new(replaying_target(&calls), usize::MAX);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let error = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], Some(frame(130)), &target, &[], None),
+            )
+            .await
+            .unwrap_err();
+        assert!(global_sync_in_progress(&error), "{error}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= GLOBAL_SYNC_WAIT_BUDGET - GLOBAL_SYNC_POLL
+                && waited <= GLOBAL_SYNC_WAIT_BUDGET + GLOBAL_SYNC_POLL,
+            "{waited:?}"
+        );
+        assert!(
+            target.refused.load(std::sync::atomic::Ordering::SeqCst)
+                > (GLOBAL_SYNC_WAIT_BUDGET.as_secs() / GLOBAL_SYNC_POLL.as_secs()) as usize
+        );
+        assert_eq!(target.materialized(), 129);
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(recovery.consecutive_failures, 1);
     }
 }
