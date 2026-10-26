@@ -62,7 +62,8 @@ fn format_claimable_rewards(result: anyhow::Result<Option<(u128, u64)>>) -> Stri
 pub(super) fn format_legacy_coins(result: anyhow::Result<Option<(u128, usize, usize)>>) -> String {
     match result {
         Ok(Some((total, unshielded, shielded))) => format!(
-            "Unshielded legacy coins: {total} base units across {unshielded} coins ({shielded} already shielded)"
+            "Unshielded legacy coins: {} QUIL ({total} base units) across {unshielded} coins ({shielded} already shielded)",
+            quil_amount(total)
         ),
         Ok(None) => "Unshielded legacy coins: none (this node has no Ed448 identity)".into(),
         Err(error) => format!("Unshielded legacy coins: unavailable ({})", reason(&error)),
@@ -76,6 +77,10 @@ pub(super) fn format_confidential_coins(
     quil: bool,
 ) -> String {
     match result {
+        Ok(Some((total, coins))) if quil => format!(
+            "Confidential QUIL coins: {} QUIL ({total} base units) across {coins} coins reported unspent by the configured node (not a finalized balance)",
+            quil_amount(total)
+        ),
         Ok(Some((total, coins))) => format!(
             "Confidential coins: {total} base units across {coins} coins reported unspent by the configured node (not a finalized balance)"
         ),
@@ -83,6 +88,14 @@ pub(super) fn format_confidential_coins(
         Ok(None) => "Confidential coins: none exist in this application yet (no root published)".into(),
         Err(error) => format!("Confidential coins: unavailable ({})", reason(&error)),
     }
+}
+
+/// `units` of QUIL as a decimal QUIL amount, as the rewards line shows it.
+pub(super) fn quil_amount(units: u128) -> String {
+    crate::util::float_string_12(
+        &num_bigint::BigInt::from(units),
+        &crate::util::conversion_factor(),
+    )
 }
 
 /// A refusal's own message rather than tonic's whole status dump.

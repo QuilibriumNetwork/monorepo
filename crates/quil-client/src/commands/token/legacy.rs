@@ -130,7 +130,10 @@ pub async fn run(tc: &TokenCtx, application: &[u8; 32]) -> anyhow::Result<()> {
         );
     }
     let (unshielded_total, unshielded, shielded) = tally(&coins)?;
-    println!("{unshielded_total} base units across {unshielded} unshielded legacy coins ({shielded} already shielded)");
+    println!(
+        "{} QUIL ({unshielded_total} base units) across {unshielded} unshielded legacy coins ({shielded} already shielded)",
+        super::balance::quil_amount(unshielded_total)
+    );
     Ok(())
 }
 
