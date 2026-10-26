@@ -13,11 +13,11 @@ path = "src/lib.rs"
 
 [dependencies]
 bitcoin_hashes = "0.13"
-elliptic-curve = { version = "0.13", features = ["serde", "sec1"] }
+elliptic-curve = { version = "0.13", features = ["hash2curve", "serde", "sec1"] }
 getrandom = "0.2"
 hex = "0.4"
-k256 = { version = "0.13", features = ["serde"] }
-p256 = { version = "0.13", features = ["serde"] }
+k256 = { version = "0.13", features = ["hash2curve", "serde"] }
+p256 = { version = "0.13", features = ["hash2curve", "serde"] }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.12"
