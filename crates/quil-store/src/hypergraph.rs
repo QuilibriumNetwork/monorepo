@@ -2456,6 +2456,88 @@ mod tests {
         assert_eq!(seen.len(), 2);
     }
 
+    // A removes-phase blob of any age hides its vertex, so deleting a blob
+    // from version 0 must take the unversioned one an old store still holds.
+    #[test]
+    fn deleting_from_version_zero_takes_the_unversioned_blob() {
+        use quil_types::store::HypergraphStore;
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xffu8; 32],
+        };
+        let (legacy, kept) = (vec![0xAAu8; 64], vec![0xBBu8; 64]);
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &legacy,
+                b"",
+                3,
+            )
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &kept,
+                b"",
+                3,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        store
+            .save_vertex_underlying("vertex", "removes", &shard, &legacy, b"")
+            .unwrap();
+        store
+            .save_vertex_underlying("vertex", "removes", &shard, &kept, b"")
+            .unwrap();
+
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .delete_vertex_underlying_versions_from(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &legacy,
+                0,
+            )
+            .unwrap();
+        store
+            .delete_vertex_underlying_versions_from(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &kept,
+                1,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            HypergraphStore::load_vertex_underlying_raw(
+                &store, "vertex", "removes", &shard, &legacy
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            HypergraphStore::load_vertex_underlying_raw(&store, "vertex", "removes", &shard, &kept)
+                .unwrap()
+                .as_deref(),
+            Some(&b""[..]),
+            "a deletion from a later version keeps the unversioned blob"
+        );
+    }
+
     // A captured snapshot must read the versioned (v2) latest blob too, or a
     // generation-isolated read (sync full-load) would miss committed state.
     #[test]

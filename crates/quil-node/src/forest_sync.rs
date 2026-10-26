@@ -20,6 +20,10 @@ use tracing::{info, warn};
 
 pub(crate) const EMPTY_PHASE_ROOT: [u8; 32] = *b"SPARSE_MERKLE_PLACEHOLDER_HASH__";
 
+/// The GLOBAL prover tree. The prover-tree resets wiped all four of its
+/// phases on the archives and reseeded phase 0 only.
+const PROVER_SHARD: [u8; 32] = [0xff; 32];
+
 /// One whole-tree sync per tree at a time. The initial, periodic and
 /// gossip-bootstrap prover-tree syncs (and a state-jump) each walked the same
 /// tree from the same archives at once; a sync that waits here finds the
@@ -106,23 +110,24 @@ enum PhaseSource {
 
 /// Resolve a committed root independently of the peer's advancing live head.
 /// Empty source state is successful only when the local physical tree is empty
-/// too; sync cannot delete stale state just by skipping a missing peer phase.
+/// too (see [`empty_source`]); sync cannot delete stale state just by skipping
+/// a missing peer phase.
 async fn resolve_phase_source(
     source: &mut impl PhaseSourceLookup,
-    crdt: &quil_hypergraph::HypergraphCrdt,
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     shard: &[u8],
     phase: u32,
     expected: &[u8],
 ) -> Result<Option<PhaseSource>> {
-    let empty_local = || -> Result<Option<PhaseSource>> {
-        Ok(
-            is_empty_phase_root(&crdt.current_forest_phase_root(shard, phase as usize)?)
-                .then_some(PhaseSource::Empty),
-        )
-    };
     if let Some(anchor) = phase_anchor(expected)? {
         if is_empty_phase_root(&anchor) {
-            return empty_local();
+            return empty_source(
+                crdt,
+                shard,
+                phase,
+                "the committed root of this phase is empty",
+            )
+            .await;
         }
         if let Some((version, global_frame)) = source.resolve(shard, phase, &anchor).await? {
             return Ok(Some(PhaseSource::Tree {
@@ -147,7 +152,7 @@ async fn resolve_phase_source(
         return Ok(None);
     }
     match source.head(shard, phase).await? {
-        None => empty_local(),
+        None => empty_source(crdt, shard, phase, "the archive holds no such phase").await,
         Some((version, root)) => {
             let root = phase_anchor(&root)?
                 .ok_or_else(|| QuilError::InvalidArgument("peer forest head has no root".into()))?;
@@ -158,6 +163,35 @@ async fn resolve_phase_source(
             }))
         }
     }
+}
+
+/// The source holds nothing in `phase`: in step when the local tree is empty
+/// too, otherwise refused, except for an auxiliary phase (removes or
+/// hyperedges) of the GLOBAL prover tree. A store that synced that tree before
+/// the prover-tree resets keeps the phases they emptied, which no sync would
+/// ever remove, and its tombstones hide re-created allocations; such a phase
+/// is emptied here. Phase 0 and application shards stay refused.
+async fn empty_source(
+    crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+    shard: &[u8],
+    phase: u32,
+    reason: &'static str,
+) -> Result<Option<PhaseSource>> {
+    let local = crdt.current_forest_phase_root(shard, phase as usize)?;
+    if is_empty_phase_root(&local) {
+        return Ok(Some(PhaseSource::Empty));
+    }
+    if shard != PROVER_SHARD.as_slice() || phase == 0 {
+        return Ok(None);
+    }
+    let (c, sid) = (crdt.clone(), shard.to_vec());
+    let leaves =
+        tokio::task::spawn_blocking(move || c.wipe_shard_phase(&sid, phase as usize, local))
+            .await
+            .map_err(|e| QuilError::Internal(format!("phase wipe task: {e}")))??;
+    info!(shard = %hex::encode(shard), phase, leaves, reason,
+        "prover tree sync: emptied a local phase that predates the prover-tree reset");
+    Ok(Some(PhaseSource::Empty))
 }
 
 /// `(set, phase)` string pair — the blob keyspace keying, matching the CRDT.
@@ -1085,6 +1119,85 @@ mod tests {
             );
             assert_eq!(crdt.current_forest_phase_root(&app, 0).unwrap(), before);
         }
+    }
+
+    /// The GLOBAL prover tree's auxiliary phases hold nothing on an archive
+    /// since the prover-tree resets. A store that synced removes before them
+    /// empties such a phase, unanchored or against an empty committed root,
+    /// so its sync converges and the vertices it removed read again. Phase 0
+    /// and application shards keep refusing stale local data.
+    #[tokio::test]
+    async fn absent_prover_aux_phase_empties_stale_local_data() {
+        let (_dir, crdt) = fixture();
+        let at = |app: [u8; 32], byte: u8| quil_hypergraph::Location {
+            app_address: app,
+            data_address: [byte; 32],
+        };
+        for app in [PROVER_SHARD, [5; 32]] {
+            crdt.add_vertex(&at(app, 1), b"allocation").unwrap();
+            crdt.remove_vertex(&at(app, 1)).unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let mut peer = Peer {
+            head: None,
+            resolved: None,
+            head_calls: 0,
+            resolve_calls: 0,
+        };
+        for (app, phase) in [([5; 32], 1), (PROVER_SHARD, 0)] {
+            let before = crdt
+                .current_forest_phase_root(&app, phase as usize)
+                .unwrap();
+            assert!(!is_empty_phase_root(&before));
+            assert_eq!(
+                resolve_phase_source(&mut peer, &crdt, &app, phase, &[])
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                crdt.current_forest_phase_root(&app, phase as usize)
+                    .unwrap(),
+                before
+            );
+        }
+        assert_eq!(crdt.get_vertex_data(&at(PROVER_SHARD, 1)), None);
+
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &PROVER_SHARD, 1, &[])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert!(is_empty_phase_root(
+            &crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap()
+        ));
+        assert_eq!(
+            crdt.get_vertex_data(&at(PROVER_SHARD, 1)).as_deref(),
+            Some(&b"allocation"[..])
+        );
+        assert_eq!(crdt.get_vertex_data(&at([5; 32], 1)), None);
+
+        crdt.add_vertex(&at(PROVER_SHARD, 2), b"allocation")
+            .unwrap();
+        crdt.remove_vertex(&at(PROVER_SHARD, 2)).unwrap();
+        crdt.commit(2).unwrap();
+        assert!(!is_empty_phase_root(
+            &crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap()
+        ));
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &PROVER_SHARD, 1, &[0; 32])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
+        assert!(is_empty_phase_root(
+            &crdt.current_forest_phase_root(&PROVER_SHARD, 1).unwrap()
+        ));
+        assert_eq!(
+            crdt.get_vertex_data(&at(PROVER_SHARD, 2)).as_deref(),
+            Some(&b"allocation"[..])
+        );
     }
 
     #[tokio::test]

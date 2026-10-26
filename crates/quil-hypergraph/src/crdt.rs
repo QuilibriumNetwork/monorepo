@@ -3916,21 +3916,7 @@ impl HypergraphCrdt {
                 // The whole phase tree postdates the target, which reads it as
                 // never committed: remove it rather than leave an empty tree,
                 // whose root reads differently.
-                let (all, _) =
-                    quil_forest::diff_leaves_under_prefix(&reader, head, &nothing, 0, &[], None)
-                        .map_err(|e| QuilError::Internal(format!("rewind phase listing: {e}")))?;
-                for (key, _) in all {
-                    let mut id = app.to_vec();
-                    id.extend_from_slice(&key.0);
-                    self.store.delete_vertex_underlying_versions_from(
-                        txn.as_ref(),
-                        set,
-                        kind,
-                        &shard,
-                        &id,
-                        0,
-                    )?;
-                }
+                self.stage_phase_wipe(&forest, txn.as_ref(), &shard, phase_idx, head)?;
                 wiped.push(phase_idx);
                 continue;
             }
@@ -4054,18 +4040,120 @@ impl HypergraphCrdt {
                 .insert((app.to_vec(), phase_idx), version);
         }
         for phase_idx in wiped {
-            forest
-                .reset_shard_phase_tree(&app, PHASES[phase_idx])
-                .map_err(|e| QuilError::Internal(format!("rewind phase reset: {e}")))?;
-            let (set, kind) = PHASE_STR[phase_idx];
-            self.store.clear_phase_root_versions(set, kind, &app)?;
-            self.phase_versions
-                .write()
-                .unwrap()
-                .remove(&(app.to_vec(), phase_idx));
+            self.finish_phase_wipe(&forest, &app, phase_idx)?;
         }
         drop(forest);
         self.rebucket_app_locked(&app)
+    }
+
+    /// Empty one phase tree of the single-shard tree `shard_id` (a 32-byte
+    /// application address) whose current root is `expected`, deleting every
+    /// blob version of its leaves, so the phase reads as never committed and
+    /// none of its records shadows another phase (any removes-phase blob hides
+    /// its vertex). Sync uses it for a phase its source holds nothing in, which
+    /// a reset emptied on the source after this store last synced it. Refused
+    /// while mutations of the shard are staged, and once the phase no longer
+    /// has the root `expected`. Size buckets are not rebuilt: an application
+    /// whose size accounting reads the phase needs [`Self::rebucket_app`] (the
+    /// prover shard has none). Returns how many leaves the phase held.
+    pub fn wipe_shard_phase(
+        &self,
+        shard_id: &[u8],
+        phase_idx: usize,
+        expected: [u8; 32],
+    ) -> Result<usize> {
+        let app: [u8; 32] = shard_id
+            .try_into()
+            .map_err(|_| QuilError::InvalidArgument("a phase wipe needs a 32-byte shard".into()))?;
+        if phase_idx >= PHASES.len() {
+            return Err(QuilError::InvalidArgument(
+                "invalid forest phase scope".into(),
+            ));
+        }
+        let shard = ShardKey {
+            l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3),
+            l2: app,
+        };
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        if self
+            .pending
+            .read()
+            .unwrap()
+            .iter()
+            .any(|((key, _), values)| key.l2 == app && !values.is_empty())
+            || self
+                .pending_blobs
+                .read()
+                .unwrap()
+                .iter()
+                .any(|((key, _), values)| key.l2 == app && !values.is_empty())
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "cannot wipe a phase with staged shard mutations".into(),
+            ));
+        }
+        let forest = self.forest.read().unwrap();
+        let root = self.read_shard_phase_root_checked(&forest, &app, phase_idx)?;
+        if root != expected {
+            return Err(QuilError::ExecutionUnavailable(
+                "phase changed before its wipe; retry".into(),
+            ));
+        }
+        if root == [0; 32] {
+            return Ok(0); // never committed
+        }
+        // A migrated tree has no head marker; its root reads at the forest version.
+        let head = self
+            .resolve_phase_version_checked(&forest, &app, phase_idx)?
+            .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
+        let txn = self.store.new_transaction(false)?;
+        let leaves = self.stage_phase_wipe(&forest, txn.as_ref(), &shard, phase_idx, head)?;
+        txn.commit()?;
+        self.finish_phase_wipe(&forest, &app, phase_idx)?;
+        Ok(leaves)
+    }
+
+    /// Stage into `txn` the deletion of every blob version of the leaves the
+    /// whole phase tree of `shard` holds at `head`, for a phase
+    /// [`Self::finish_phase_wipe`] empties once `txn` commits. Returns how
+    /// many leaves the tree held.
+    fn stage_phase_wipe(
+        &self,
+        forest: &Forest,
+        txn: &dyn quil_types::store::Transaction,
+        shard: &ShardKey,
+        phase_idx: usize,
+        head: u64,
+    ) -> Result<usize> {
+        let reader = forest.shard_phase_reader(&shard.l2, PHASES[phase_idx]);
+        let nothing = Forest::in_memory().shard_phase_reader(&shard.l2, PHASES[phase_idx]);
+        let (set, kind) = PHASE_STR[phase_idx];
+        let (all, _) = quil_forest::diff_leaves_under_prefix(&reader, head, &nothing, 0, &[], None)
+            .map_err(|e| QuilError::Internal(format!("phase wipe listing: {e}")))?;
+        for (key, _) in &all {
+            let mut id = shard.l2.to_vec();
+            id.extend_from_slice(&key.0);
+            self.store
+                .delete_vertex_underlying_versions_from(txn, set, kind, shard, &id, 0)?;
+        }
+        Ok(all.len())
+    }
+
+    /// Reset a phase tree whose blobs [`Self::stage_phase_wipe`] deleted: it
+    /// reads as never committed, and no root index entry resolves to its old
+    /// versions. The caller holds the forest and commit locks.
+    fn finish_phase_wipe(&self, forest: &Forest, shard_id: &[u8], phase_idx: usize) -> Result<()> {
+        forest
+            .reset_shard_phase_tree(shard_id, PHASES[phase_idx])
+            .map_err(|e| QuilError::Internal(format!("phase reset: {e}")))?;
+        let (set, kind) = PHASE_STR[phase_idx];
+        self.store.clear_phase_root_versions(set, kind, shard_id)?;
+        self.phase_versions
+            .write()
+            .unwrap()
+            .remove(&(shard_id.to_vec(), phase_idx));
+        Ok(())
     }
 
     /// Confine each application's phase trees to the kept shards in `keep`
@@ -6432,5 +6520,81 @@ mod sync_value_binding_tests {
         assert!(sync_one([1; 32], &unbound).is_err());
         assert!(sync_one([0xff; 32], &unbound).is_ok());
         quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
+    }
+}
+
+#[cfg(test)]
+mod phase_wipe_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use std::sync::Arc;
+
+    fn at(app: [u8; 32], byte: u8) -> Location {
+        Location {
+            app_address: app,
+            data_address: [byte; 32],
+        }
+    }
+
+    /// A phase wipe empties one phase tree with the blobs of its leaves, so a
+    /// vertex it removed reads again, and leaves the shard's other phases and
+    /// other shards alone. Staged writes of the shard refuse it, and so does a
+    /// phase that moved past the root it was asked to wipe.
+    #[test]
+    fn a_phase_wipe_empties_one_phase_and_its_blobs_only() {
+        let hg = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        hg.set_unified_tree(true);
+        let (prover, other) = ([0xff; 32], [5; 32]);
+        for app in [prover, other] {
+            hg.add_vertex(&at(app, 1), b"kept").unwrap();
+            hg.remove_vertex(&at(app, 1)).unwrap();
+            hg.add_hyperedge(&at(app, 2), b"edge").unwrap();
+        }
+        hg.commit(1).unwrap();
+        let roots = |app: &[u8; 32]| {
+            (0..4)
+                .map(|phase| hg.current_forest_phase_root(app, phase).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let (before, other_before) = (roots(&prover), roots(&other));
+        assert_ne!(before[1], [0; 32]);
+        assert_eq!(hg.get_vertex_data(&at(prover, 1)), None);
+
+        hg.add_vertex(&at(prover, 3), b"staged").unwrap();
+        assert!(
+            hg.wipe_shard_phase(&prover, 1, before[1]).is_err(),
+            "staged writes refuse a wipe"
+        );
+        assert_eq!(roots(&prover), before);
+        hg.commit(2).unwrap();
+        let before = roots(&prover);
+        assert!(
+            hg.wipe_shard_phase(&prover, 1, [7; 32]).is_err(),
+            "a moved phase refuses a wipe"
+        );
+        assert_eq!(roots(&prover), before);
+
+        assert_eq!(hg.wipe_shard_phase(&prover, 1, before[1]).unwrap(), 1);
+        let after = roots(&prover);
+        assert_eq!(after[1], [0; 32]);
+        assert_eq!(
+            (after[0], after[2], after[3]),
+            (before[0], before[2], before[3])
+        );
+        assert_eq!(roots(&other), other_before);
+        assert_eq!(
+            hg.get_vertex_data(&at(prover, 1)).as_deref(),
+            Some(&b"kept"[..])
+        );
+        assert_eq!(hg.get_vertex_data(&at(other, 1)), None);
+        assert_eq!(
+            hg.get_hyperedge_data(&at(prover, 2)).as_deref(),
+            Some(&b"edge"[..])
+        );
+        assert_eq!(
+            hg.wipe_shard_phase(&prover, 1, [0; 32]).unwrap(),
+            0,
+            "an emptied phase has nothing left"
+        );
     }
 }

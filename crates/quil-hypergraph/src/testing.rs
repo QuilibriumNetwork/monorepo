@@ -330,6 +330,31 @@ impl HypergraphStore for MemStore {
             .insert((scope, key.to_vec()), data.to_vec());
         Ok(())
     }
+    /// Only the latest blob is kept, so only a deletion of every version applies.
+    fn delete_vertex_underlying_versions_from(
+        &self,
+        _txn: &dyn Transaction,
+        set: &str,
+        phase: &str,
+        shard: &ShardKey,
+        key: &[u8],
+        first: u64,
+    ) -> Result<()> {
+        if first != 0 {
+            return Err(QuilError::Internal(
+                "this store keeps no blob versions to delete".into(),
+            ));
+        }
+        self.nodes
+            .lock()
+            .unwrap()
+            .remove(&Self::node_key(set, phase, shard, key));
+        self.per_vertex
+            .lock()
+            .unwrap()
+            .remove(&(Self::vertex_scope(set, phase, shard), key.to_vec()));
+        Ok(())
+    }
     fn page_vertex_underlying_fixed(
         &self,
         set: &str,

@@ -674,6 +674,12 @@ macro_rules! impl_hypergraph_storage {
                 for key in stale {
                     batch.delete(&key);
                 }
+                if first == 0 {
+                    // The unversioned blob predates every version: it goes too.
+                    batch.delete(&crate::encoding::hypergraph_vertex_data_key(
+                        set_type, phase_type, shard_key, vertex_key,
+                    ));
+                }
                 Ok(())
             }
 
