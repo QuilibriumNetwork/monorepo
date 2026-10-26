@@ -113,16 +113,29 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// application validation succeeds — so a re-proposed/unverified block at a
 /// finalized digest can no longer overwrite the finalized frame (the
 /// "preserve finalized app shard frames" fix).
+///
+/// The store is bounded by [`BlockStoreLimits`]. Each block carries a view:
+/// the latest certificate's view when it arrived, raised when a notarization
+/// or finalization names it. Once a view finalizes, blocks more than
+/// `keep_views` below it are dropped: consensus no longer builds on or votes
+/// for them, and the window leaves the slower readers of finalized bodies
+/// (materialization, recovery) time to take them. A reader that takes them
+/// later than that holds the window at the lowest view it still has to take
+/// ([`BlockStore::hold_from`]). Over a cap, the store evicts first the
+/// candidates (blocks no certificate names and this node never verified),
+/// then the blocks of the oldest views, but never a verified or certified
+/// block of the latest `protected_views` views or of the held window. A
+/// body that arrives after a certificate named it is stored as certified.
 #[derive(Clone, Default)]
 pub struct BlockStore {
-    inner: Arc<Mutex<HashMap<Digest, StoredBlock>>>,
+    inner: Arc<Mutex<Blocks>>,
 }
 
 /// A [`BlockStore`] handle that does not keep the blocks alive: once the
 /// host that owns the store stops, its bodies are freed.
 #[derive(Clone)]
 pub struct WeakBlockStore {
-    inner: std::sync::Weak<Mutex<HashMap<Digest, StoredBlock>>>,
+    inner: std::sync::Weak<Mutex<Blocks>>,
 }
 
 impl WeakBlockStore {
@@ -131,10 +144,358 @@ impl WeakBlockStore {
     }
 }
 
+/// How long a [`BlockStore`] keeps blocks, and how many it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockStoreLimits {
+    /// Views below the latest finalized view whose blocks are kept.
+    pub keep_views: u64,
+    /// Views below the latest certified view whose verified or certified
+    /// blocks are never evicted over a cap.
+    pub protected_views: u64,
+    /// Blocks held at most, unless protected.
+    pub max_blocks: usize,
+    /// Bytes held at most, unless protected.
+    pub max_bytes: usize,
+    /// Candidates (blocks no certificate names and this node never
+    /// verified) held at most.
+    pub max_candidate_blocks: usize,
+    /// Candidate bytes held at most.
+    pub max_candidate_bytes: usize,
+}
+
+impl Default for BlockStoreLimits {
+    /// Sized for an application shard, whose finalizer may hold finalized
+    /// bodies here until its engine materializes them. The candidate caps
+    /// hold eight GLOBAL frames of the 16 MiB maximum, or 1024 smaller
+    /// blocks; honest members deliver about one proposal per view.
+    fn default() -> Self {
+        Self {
+            keep_views: 1024,
+            protected_views: 32,
+            max_blocks: 4096,
+            max_bytes: 512 << 20,
+            max_candidate_blocks: 1024,
+            max_candidate_bytes: 128 << 20,
+        }
+    }
+}
+
+impl BlockStoreLimits {
+    /// GLOBAL: its finalizer takes each finalized body when the finalization
+    /// is reported, and proposals and ancestors are also kept in the clock
+    /// store, so a shorter window suffices.
+    pub fn global() -> Self {
+        Self {
+            keep_views: 128,
+            ..Self::default()
+        }
+    }
+}
+
+/// Reports the lowest view whose finalized bodies a reader of a
+/// [`BlockStore`] still has to take, if any.
+pub type BlockHold = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Minimum interval between two eviction log lines of one store.
+const EVICTION_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 struct StoredBlock {
     bytes: Vec<u8>,
     verified: bool,
+    /// A notarization or finalization names this digest.
+    certified: bool,
+    /// The view consensus last placed this block at (see [`BlockStore`]).
+    view: u64,
+    /// Arrival order of the digest.
+    seq: u64,
+}
+
+impl StoredBlock {
+    /// This node verified or built the block, or a certificate names it.
+    fn vouched(&self) -> bool {
+        self.verified || self.certified
+    }
+}
+
+struct Blocks {
+    map: HashMap<Digest, StoredBlock>,
+    limits: BlockStoreLimits,
+    /// Names the store in its log lines.
+    scope: String,
+    bytes: usize,
+    candidates: usize,
+    candidate_bytes: usize,
+    /// The highest view a certificate named.
+    certified_view: u64,
+    /// The highest finalized view.
+    finalized_view: u64,
+    /// Digests certificates named, with the highest such view, so that a
+    /// body arriving after its certificate is stored as certified. Pruned
+    /// with the window, and at most `max_blocks` of them.
+    certified_digests: HashMap<Digest, u64>,
+    /// What [`BlockStore::hold_from`] reported at the latest finalization.
+    held_view: Option<u64>,
+    hold: Option<BlockHold>,
+    next_seq: u64,
+    evicted: Evicted,
+}
+
+/// Blocks evicted over a cap since the last eviction log line.
+#[derive(Default)]
+struct Evicted {
+    candidates: u64,
+    vouched: u64,
+    bytes: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+/// One eviction log line.
+struct EvictionReport {
+    scope: String,
+    candidates: u64,
+    vouched: u64,
+    bytes: u64,
+    held_blocks: usize,
+    held_bytes: usize,
+    since_previous: Option<std::time::Duration>,
+}
+
+impl EvictionReport {
+    fn log(&self) {
+        let window = match self.since_previous {
+            Some(elapsed) => format!("the last {}s", elapsed.as_secs()),
+            None => "the store started".to_string(),
+        };
+        if self.vouched > 0 {
+            tracing::warn!(
+                scope = %self.scope,
+                candidates = self.candidates,
+                vouched = self.vouched,
+                bytes = self.bytes,
+                held_blocks = self.held_blocks,
+                held_bytes = self.held_bytes,
+                "consensus block store over its limits since {window}: evicted verified or \
+                 certified blocks of old views; a body still needed is read from storage or \
+                 fetched again; report this line if it repeats"
+            );
+        } else {
+            tracing::info!(
+                scope = %self.scope,
+                candidates = self.candidates,
+                bytes = self.bytes,
+                held_blocks = self.held_blocks,
+                held_bytes = self.held_bytes,
+                "consensus block store over its limits since {window}: evicted candidate blocks \
+                 no certificate names (peer deliveries or proposals that did not notarize)"
+            );
+        }
+    }
+}
+
+impl Default for Blocks {
+    fn default() -> Self {
+        Self::new(BlockStoreLimits::default(), "consensus".to_string())
+    }
+}
+
+impl Blocks {
+    fn new(limits: BlockStoreLimits, scope: String) -> Self {
+        Self {
+            map: HashMap::new(),
+            limits,
+            scope,
+            bytes: 0,
+            candidates: 0,
+            candidate_bytes: 0,
+            certified_view: 0,
+            finalized_view: 0,
+            certified_digests: HashMap::new(),
+            held_view: None,
+            hold: None,
+            next_seq: 0,
+            evicted: Evicted::default(),
+        }
+    }
+
+    /// Store `bytes` under `digest`, replacing what is held there.
+    fn insert(&mut self, digest: Digest, bytes: Vec<u8>, verified: bool) -> Option<EvictionReport> {
+        let (view, seq, certified) = match self.take(&digest) {
+            Some(old) => (old.view.max(self.certified_view), old.seq, old.certified),
+            None => {
+                self.next_seq += 1;
+                match self.certified_digests.get(&digest) {
+                    Some(view) => (self.certified_view.max(*view), self.next_seq, true),
+                    None => (self.certified_view, self.next_seq, false),
+                }
+            }
+        };
+        self.add(
+            digest,
+            StoredBlock {
+                bytes,
+                verified,
+                certified,
+                view,
+                seq,
+            },
+        );
+        self.enforce_caps()
+    }
+
+    fn add(&mut self, digest: Digest, block: StoredBlock) {
+        let len = block.bytes.len();
+        self.bytes += len;
+        if !block.vouched() {
+            self.candidates += 1;
+            self.candidate_bytes += len;
+        }
+        self.map.insert(digest, block);
+    }
+
+    fn take(&mut self, digest: &Digest) -> Option<StoredBlock> {
+        let block = self.map.remove(digest)?;
+        let len = block.bytes.len();
+        self.bytes -= len;
+        if !block.vouched() {
+            self.candidates -= 1;
+            self.candidate_bytes -= len;
+        }
+        Some(block)
+    }
+
+    fn note_certificate(&mut self, view: u64) {
+        if self.certified_view == 0 && view > 0 {
+            // Blocks restored before any certificate take the first view one
+            // names, so the window does not drop them at the first
+            // finalization.
+            for block in self.map.values_mut() {
+                block.view = block.view.max(view);
+            }
+        }
+        self.certified_view = self.certified_view.max(view);
+    }
+
+    /// A certificate names `digest`; `view` is its view, when it is one of
+    /// this store's.
+    fn certify(&mut self, digest: &Digest, view: Option<u64>) {
+        if let Some(view) = view {
+            self.note_certificate(view);
+        }
+        let view = view.unwrap_or(self.certified_view);
+        let known = self.certified_digests.entry(*digest).or_insert(view);
+        *known = (*known).max(view);
+        while self.certified_digests.len() > self.limits.max_blocks {
+            let Some(oldest) = self
+                .certified_digests
+                .iter()
+                .min_by_key(|(_, view)| **view)
+                .map(|(digest, _)| *digest)
+            else {
+                break;
+            };
+            self.certified_digests.remove(&oldest);
+        }
+        if let Some(mut block) = self.take(digest) {
+            block.certified = true;
+            block.view = block.view.max(view);
+            self.add(*digest, block);
+        }
+    }
+
+    /// `view` finalized, and a reader still has to take the finalized bodies
+    /// from `held` on.
+    fn finalize(&mut self, view: u64, held: Option<u64>) {
+        self.note_certificate(view);
+        self.held_view = held;
+        if view <= self.finalized_view {
+            return;
+        }
+        self.finalized_view = view;
+        let anchor = held.map_or(view, |held| held.min(view));
+        let below = anchor.saturating_sub(self.limits.keep_views);
+        let stale: Vec<Digest> = self
+            .map
+            .iter()
+            .filter(|(_, block)| block.view < below)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in stale {
+            self.take(&digest);
+        }
+        self.certified_digests
+            .retain(|_, certified| *certified >= below);
+    }
+
+    fn enforce_caps(&mut self) -> Option<EvictionReport> {
+        let limits = self.limits;
+        while self.candidates > limits.max_candidate_blocks
+            || self.candidate_bytes > limits.max_candidate_bytes
+        {
+            let Some(victim) = self.eviction_victim(|block| !block.vouched()) else {
+                break;
+            };
+            self.evict(&victim);
+        }
+        let mut floor = self.certified_view.saturating_sub(limits.protected_views);
+        if let Some(held) = self.held_view {
+            floor = floor.min(held.saturating_sub(limits.keep_views));
+        }
+        while self.map.len() > limits.max_blocks || self.bytes > limits.max_bytes {
+            let Some(victim) = self.eviction_victim(|block| !block.vouched() || block.view < floor)
+            else {
+                break;
+            };
+            self.evict(&victim);
+        }
+        self.eviction_report(std::time::Instant::now())
+    }
+
+    /// The block to evict first among the `eligible`: candidates before
+    /// vouched blocks, then the lowest view, then the earliest arrival.
+    fn eviction_victim(&self, eligible: impl Fn(&StoredBlock) -> bool) -> Option<Digest> {
+        self.map
+            .iter()
+            .filter(|(_, block)| eligible(*block))
+            .min_by_key(|(_, block)| (block.vouched(), block.view, block.seq))
+            .map(|(digest, _)| *digest)
+    }
+
+    fn evict(&mut self, digest: &Digest) {
+        if let Some(block) = self.take(digest) {
+            if block.vouched() {
+                self.evicted.vouched += 1;
+            } else {
+                self.evicted.candidates += 1;
+            }
+            self.evicted.bytes += block.bytes.len() as u64;
+        }
+    }
+
+    /// At most one report per [`EVICTION_REPORT_INTERVAL`]; the first
+    /// eviction after a quiet interval is reported at once.
+    fn eviction_report(&mut self, now: std::time::Instant) -> Option<EvictionReport> {
+        if self.evicted.candidates == 0 && self.evicted.vouched == 0 {
+            return None;
+        }
+        let since_previous = self
+            .evicted
+            .last_report
+            .map(|last| now.saturating_duration_since(last));
+        if since_previous.is_some_and(|elapsed| elapsed < EVICTION_REPORT_INTERVAL) {
+            return None;
+        }
+        self.evicted.last_report = Some(now);
+        Some(EvictionReport {
+            scope: self.scope.clone(),
+            candidates: std::mem::take(&mut self.evicted.candidates),
+            vouched: std::mem::take(&mut self.evicted.vouched),
+            bytes: std::mem::take(&mut self.evicted.bytes),
+            held_blocks: self.map.len(),
+            held_bytes: self.bytes,
+            since_previous,
+        })
+    }
 }
 
 impl BlockStore {
@@ -147,29 +508,36 @@ impl BlockStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A store bounded by `limits`, named `scope` in its log lines.
+    pub fn with_limits(limits: BlockStoreLimits, scope: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Blocks::new(limits, scope.into()))),
+        }
+    }
+
     /// Insert an unverified block candidate. Candidates may be replaced until
     /// one exact byte sequence passes application validation and is sealed.
     /// Once sealed, peer ingress cannot substitute different bytes for the
     /// consensus digest that was actually verified.
     pub fn put(&self, digest: Digest, bytes: Vec<u8>) {
-        let mut inner = self.inner.lock();
-        match inner.get_mut(&digest) {
-            Some(stored) if stored.verified => {}
-            Some(stored) => stored.bytes = bytes,
-            None => {
-                inner.insert(
-                    digest,
-                    StoredBlock {
-                        bytes,
-                        verified: false,
-                    },
-                );
+        let report = {
+            let mut inner = self.inner.lock();
+            let sealed = inner.map.get(&digest).is_some_and(|stored| stored.verified);
+            if sealed {
+                None
+            } else {
+                inner.insert(digest, bytes, false)
             }
+        };
+        if let Some(report) = report {
+            report.log();
         }
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
         self.inner
             .lock()
+            .map
             .get(digest)
             .map(|stored| stored.bytes.clone())
     }
@@ -178,6 +546,7 @@ impl BlockStore {
     pub fn get_bounded(&self, digest: &Digest, max_bytes: usize) -> Option<Vec<u8>> {
         self.inner
             .lock()
+            .map
             .get(digest)
             .filter(|stored| stored.bytes.len() <= max_bytes)
             .map(|stored| stored.bytes.clone())
@@ -187,21 +556,18 @@ impl BlockStore {
     /// locally). Idempotent: once a digest is sealed, a later `seal`/`put`
     /// cannot substitute different bytes for it.
     pub fn seal(&self, digest: Digest, bytes: Vec<u8>) {
-        let mut inner = self.inner.lock();
-        if inner
-            .get(&digest)
-            .map(|stored| stored.verified)
-            .unwrap_or(false)
-        {
-            return;
+        let report = {
+            let mut inner = self.inner.lock();
+            let sealed = inner.map.get(&digest).is_some_and(|stored| stored.verified);
+            if sealed {
+                None
+            } else {
+                inner.insert(digest, bytes, true)
+            }
+        };
+        if let Some(report) = report {
+            report.log();
         }
-        inner.insert(
-            digest,
-            StoredBlock {
-                bytes,
-                verified: true,
-            },
-        );
     }
 
     /// Return the current bytes together with whether this node's application
@@ -211,8 +577,52 @@ impl BlockStore {
     pub fn get_with_verification(&self, digest: &Digest) -> Option<(Vec<u8>, bool)> {
         self.inner
             .lock()
+            .map
             .get(digest)
             .map(|stored| (stored.bytes.clone(), stored.verified))
+    }
+
+    /// A certificate of `view` names `digest`: its block, if held, is one
+    /// consensus or its finalizer may still need, at least until `view`
+    /// leaves the window.
+    pub fn certified(&self, digest: &Digest, view: u64) {
+        self.inner.lock().certify(digest, Some(view));
+    }
+
+    /// A finalization this node recorded earlier names `digest`, at a view
+    /// that may belong to another consensus instance: keep its block as a
+    /// certified one without moving this store's views.
+    pub fn recorded_final(&self, digest: &Digest) {
+        self.inner.lock().certify(digest, None);
+    }
+
+    /// A certificate of `view` that names no block (a nullification).
+    pub fn observe_certificate(&self, view: u64) {
+        self.inner.lock().note_certificate(view);
+    }
+
+    /// `view` finalized: drop the blocks more than `keep_views` below it, or
+    /// below the view the hold reports if that is lower.
+    pub fn finalized(&self, view: u64) {
+        // Asked outside the store's lock: the reader takes its own lock, and
+        // holds it while it reads the store.
+        let hold = self.inner.lock().hold.clone();
+        let held = hold.and_then(|hold| hold());
+        self.inner.lock().finalize(view, held);
+    }
+
+    /// Let a reader that takes finalized bodies later than their
+    /// finalization (the application finalizer delivers them in order) hold
+    /// the window: `hold` reports the lowest view it still has to take. Asked
+    /// at each finalization, outside the store's lock.
+    pub fn hold_from(&self, hold: BlockHold) {
+        self.inner.lock().hold = Some(hold);
+    }
+
+    /// The blocks and bytes held.
+    pub fn usage(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.map.len(), inner.bytes)
     }
 }
 
@@ -1232,12 +1642,21 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Notarization(n) => {
                 let digest = n.proposal.payload;
                 let view: u64 = n.proposal.round.view().get();
+                self.store.certified(&digest, view);
                 let bytes = self.store.get(&digest);
                 self.finalizer.on_notarized(view, digest, bytes);
+            }
+            Activity::Certification(n) => {
+                self.store
+                    .certified(&n.proposal.payload, n.proposal.round.view().get());
+            }
+            Activity::Nullification(n) => {
+                self.store.observe_certificate(n.round.view().get());
             }
             Activity::Finalization(f) => {
                 let digest = f.proposal.payload;
                 let view: u64 = f.proposal.round.view().get();
+                self.store.certified(&digest, view);
                 // Distinguish "we sealed the exact validated/built bytes" from
                 // "we only learned the finalization cert" (bytes present but
                 // never locally verified) — the finalizer needs it to decide
@@ -1252,14 +1671,17 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
                 let cert = Some(crate::app_cert::encode_finalization(&f));
                 self.finalizer
                     .on_finalized(view, digest, bytes, cert, locally_verified);
+                // Views far below this one, and below what a finalizer still
+                // holds (`BlockStore::hold_from`), leave the store's window.
+                self.store.finalized(view);
             }
             Activity::ConflictingNotarize(_)
             | Activity::ConflictingFinalize(_)
             | Activity::NullifyFinalize(_) => {
                 self.finalizer.on_equivocation(0);
             }
-            // Individual votes / nullifies / certifications are not surfaced to
-            // the Quilibrium layer (simplex handles quorum internally).
+            // Individual votes and nullifies are not surfaced to the
+            // Quilibrium layer (simplex handles quorum internally).
             _ => {}
         }
         Feedback::Ok
@@ -1311,6 +1733,164 @@ mod block_store_seal_tests {
         store.put(block, b"racing replacement".to_vec());
         store.seal(block, validated.clone());
         assert_eq!(store.get_with_verification(&block), Some((validated, true)));
+    }
+}
+
+#[cfg(test)]
+mod block_store_bound_tests {
+    use super::*;
+
+    fn digest_n(n: u32) -> Digest {
+        let mut identity = [0u8; 32];
+        identity[..4].copy_from_slice(&n.to_be_bytes());
+        identity[31] = 0xb5;
+        digest_from_identity(identity)
+    }
+
+    fn held(store: &BlockStore, digests: impl IntoIterator<Item = u32>) -> usize {
+        digests
+            .into_iter()
+            .filter(|n| store.get(&digest_n(*n)).is_some())
+            .count()
+    }
+
+    /// Candidate bytes are capped as well as their count.
+    #[test]
+    fn candidate_bytes_are_capped() {
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=100 {
+            store.put(digest_n(n), vec![3; 4 << 10]);
+        }
+        assert_eq!(store.usage(), (16, 64 << 10));
+        assert_eq!(held(&store, 85..=100), 16);
+    }
+
+    /// A finalization drops the blocks more than `keep_views` below it and
+    /// keeps the rest, certified or not.
+    #[test]
+    fn finalization_drops_only_blocks_below_the_window() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for view in 1..=30u32 {
+            store.observe_certificate(view.into());
+            store.put(digest_n(view), vec![view as u8; 8]);
+            if view % 2 == 0 {
+                store.certified(&digest_n(view), view.into());
+            }
+        }
+        store.finalized(30);
+        assert_eq!(held(&store, 1..=19), 0);
+        assert_eq!(held(&store, 20..=30), 11);
+        assert_eq!(store.usage(), (11, 88));
+        // An older finalization reported late prunes nothing more.
+        store.finalized(25);
+        assert_eq!(store.usage().0, 11);
+    }
+
+    /// A block restored at startup, before any certificate, takes the view
+    /// of the first one, so that finalization does not drop it.
+    #[test]
+    fn blocks_restored_before_any_certificate_survive_the_first_finalization() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.put(digest_n(1), vec![1; 8]);
+        store.seal(digest_n(2), vec![2; 8]);
+        store.finalized(500);
+        assert_eq!(held(&store, 1..=2), 2);
+        store.finalized(600);
+        assert_eq!(held(&store, 1..=2), 0);
+    }
+
+    /// Over the byte cap, candidates go first, then vouched blocks of old
+    /// views; verified or certified blocks of the latest views stay even
+    /// when they alone exceed the cap.
+    #[test]
+    fn over_the_byte_cap_recent_vouched_blocks_stay() {
+        let limits = BlockStoreLimits {
+            keep_views: 1000,
+            protected_views: 2,
+            max_bytes: 10 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.observe_certificate(1);
+        store.seal(digest_n(1), vec![1; 3 << 10]);
+        store.observe_certificate(10);
+        store.seal(digest_n(2), vec![2; 3 << 10]);
+        store.put(digest_n(3), vec![3; 2 << 10]);
+        store.put(digest_n(4), vec![4; 2 << 10]);
+        assert_eq!(held(&store, 1..=4), 4);
+        // A certified candidate is vouched for: the plain candidate goes.
+        store.certified(&digest_n(4), 10);
+        store.put(digest_n(5), vec![5; 2 << 10]);
+        assert!(store.get(&digest_n(3)).is_none());
+        assert_eq!(held(&store, [1, 2, 4, 5]), 4);
+        // Room for a recent verified block: the last candidate, then the
+        // verified block of view 1 (below the protected views) go.
+        store.seal(digest_n(6), vec![6; 4 << 10]);
+        assert_eq!(held(&store, [1, 3, 5]), 0);
+        assert_eq!(held(&store, [2, 4, 6]), 3);
+        // Protected blocks alone may exceed the cap.
+        store.seal(digest_n(7), vec![7; 4 << 10]);
+        assert_eq!(held(&store, [2, 4, 6, 7]), 4);
+        assert_eq!(store.usage(), (4, 13 << 10));
+    }
+
+    /// A reader still taking finalized bodies holds the window at the lowest
+    /// view it has to take; once it lets go, the next finalization prunes.
+    #[test]
+    fn a_hold_keeps_bodies_a_reader_has_not_taken() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let pending = Arc::new(std::sync::Mutex::new(Some(5u64)));
+        let hold = pending.clone();
+        store.hold_from(Arc::new(move || *hold.lock().unwrap()));
+        for view in 1..=30u32 {
+            store.observe_certificate(view.into());
+            store.put(digest_n(view), vec![view as u8; 8]);
+            store.certified(&digest_n(view), view.into());
+        }
+        store.finalized(30);
+        assert_eq!(held(&store, 1..=30), 30);
+        *pending.lock().unwrap() = None;
+        store.finalized(31);
+        assert_eq!(held(&store, 1..=20), 0);
+        assert_eq!(held(&store, 21..=30), 10);
+    }
+
+    /// A body that arrives after a certificate named it is stored as a
+    /// certified block, not as an evictable candidate.
+    #[test]
+    fn a_body_arriving_after_its_certificate_is_kept_as_certified() {
+        let limits = BlockStoreLimits {
+            max_candidate_blocks: 4,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.observe_certificate(10);
+        store.certified(&digest_n(1), 10);
+        store.put(digest_n(1), vec![1; 8]);
+        for n in 2..=20 {
+            store.put(digest_n(n), vec![2; 8]);
+        }
+        assert_eq!(
+            store.get_with_verification(&digest_n(1)),
+            Some((vec![1; 8], false))
+        );
+        assert_eq!(held(&store, 2..=20), 4);
     }
 }
 
@@ -1666,5 +2246,49 @@ mod liveness_tests {
         }
         let seen = liveness.snapshot();
         assert_eq!((seen.blocked, seen.blocked_peers), (3, 2));
+    }
+}
+
+#[cfg(test)]
+mod block_store_flood_reproducer {
+    use super::*;
+
+    fn candidate(n: u32) -> Digest {
+        let mut identity = [0u8; 32];
+        identity[..4].copy_from_slice(&n.to_be_bytes());
+        identity[31] = 0xf1;
+        digest_from_identity(identity)
+    }
+
+    /// A peer that sends GLOBAL blocks under distinct digests (any decodable
+    /// frame with a fresh `output`) has each stored as a candidate. The store
+    /// must stay bounded (at most 1024 candidates by default) and keep the
+    /// verified block consensus still needs.
+    #[test]
+    fn reproduces_unbounded_candidate_flood() {
+        let store = BlockStore::new();
+        let verified = candidate(0);
+        store.seal(verified, vec![1; 1024]);
+        let flood: u32 = 4096;
+        for n in 1..=flood {
+            store.put(candidate(n), vec![2; 64]);
+        }
+        let held = (1..=flood)
+            .filter(|n| store.get(&candidate(*n)).is_some())
+            .count();
+        assert!(
+            held <= 1024,
+            "block store grows without bound: it holds all {held} of {flood} flooded peer \
+             candidates"
+        );
+        assert!(
+            store.get(&candidate(flood)).is_some(),
+            "the newest candidate was evicted before older flood candidates"
+        );
+        assert_eq!(
+            store.get_with_verification(&verified),
+            Some((vec![1; 1024], true)),
+            "the flood displaced the verified block"
+        );
     }
 }

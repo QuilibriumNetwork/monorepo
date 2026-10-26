@@ -9,6 +9,10 @@ use quil_cw_consensus::adapters::{digest_from_identity, BlockStore, Digest, Prop
 use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
 use std::time::{Duration, Instant};
 
+/// Largest encoded GLOBAL frame a member proposes or accepts (the default
+/// `max_frame_bytes` of [`GlobalParentLimits`]).
+pub const MAX_GLOBAL_FRAME_BYTES: usize = 16 << 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct GlobalParentLimits {
     pub branch: MaterializerBranchLimits,
@@ -68,7 +72,7 @@ impl Default for GlobalParentLimits {
                 },
                 max_metadata_entries: 100_000,
                 max_metadata_bytes: 32 << 20,
-                max_frame_bytes: 16 << 20,
+                max_frame_bytes: MAX_GLOBAL_FRAME_BYTES,
                 max_frame_items: 100_000,
             },
             max_ancestors: 32,

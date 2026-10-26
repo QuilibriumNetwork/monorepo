@@ -54,8 +54,8 @@ impl GlobalConsensusTransport for Cw8340Transport {
 /// Routes demuxed inbound `:8340` messages into the engine's channels.
 pub struct CwInboundRouter {
     inbound: [tokio::sync::mpsc::UnboundedSender<Message<FalconPublicKey>>; 3],
-    /// Feed a peer-delivered frame's bytes into the engine's `BlockStore`
-    /// (channel 3); no sender attribution needed (frames are self-validating).
+    /// Feed a committee member's frame bytes into the engine's `BlockStore`
+    /// (channel 3).
     ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     resolve_peer: PeerResolver,
     /// Our own committee Falcon key — the attributed sender for locally-injected
@@ -63,6 +63,48 @@ pub struct CwInboundRouter {
     inject_from: FalconPublicKey,
     /// When each member was last heard, for the GLOBAL stall watch.
     contact: Arc<quil_engine::global_stall::GlobalContact>,
+    /// Messages dropped because their sender is not a committee member.
+    unresolved: std::sync::Mutex<UnresolvedDrops>,
+}
+
+/// Minimum interval between two summaries of unresolved-sender drops.
+const UNRESOLVED_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Drops of messages from senders outside the committee since the last
+/// summary, per channel.
+#[derive(Default)]
+struct UnresolvedDrops {
+    counts: [u64; 4],
+    latest_peer: Vec<u8>,
+    last_summary: Option<std::time::Instant>,
+}
+
+impl UnresolvedDrops {
+    /// Count a drop on `channel` from `from`; the summary line to log, at
+    /// most one per [`UNRESOLVED_LOG_INTERVAL`].
+    fn record(&mut self, channel: u64, from: &[u8], now: std::time::Instant) -> Option<String> {
+        if let Some(count) = self.counts.get_mut(channel as usize) {
+            *count += 1;
+        }
+        self.latest_peer = from.to_vec();
+        let since_previous = self
+            .last_summary
+            .map(|last| now.saturating_duration_since(last));
+        if since_previous.is_some_and(|elapsed| elapsed < UNRESOLVED_LOG_INTERVAL) {
+            return None;
+        }
+        self.last_summary = Some(now);
+        let [vote, certificate, resolver, block] = std::mem::take(&mut self.counts);
+        let window = match since_previous {
+            Some(elapsed) => format!("the last {}s", elapsed.as_secs()),
+            None => "startup".to_string(),
+        };
+        Some(format!(
+            "since {window}: vote={vote} certificate={certificate} resolver={resolver} \
+             block={block}, latest peer {}",
+            bs58::encode(&self.latest_peer).into_string()
+        ))
+    }
 }
 
 impl CwInboundRouter {
@@ -90,21 +132,41 @@ impl CwInboundRouter {
         let _ = self.inbound[1].send(inbound_message(self.inject_from.clone(), msg));
     }
 
+    /// Whether `from` (an inbound mTLS peer identity) is a committee member.
+    pub fn is_member(&self, from: &[u8]) -> bool {
+        (self.resolve_peer)(from).is_some()
+    }
+
     /// Feed a received `:8340` message (identified by its channel bitmask) into
-    /// the engine, if the bitmask is a CW channel. Channels 0/1/2 (vote/cert/
-    /// resolver) need the sender's committee key; channel 3 (block) does not.
+    /// the engine, if the bitmask is a CW channel. Every channel needs the
+    /// sender's committee key: only members send votes, certificates,
+    /// resolver messages and blocks, and a block from anyone else would only
+    /// take room in the `BlockStore`.
     pub fn route(&self, bitmask: &[u8], from: &[u8], data: Vec<u8>) -> bool {
         let Some(channel) = quil_engine::bitmasks::global_cw_channel_of(bitmask) else {
             return false;
+        };
+        let Some(from_pk) = (self.resolve_peer)(from) else {
+            // It WAS a cw message, just undeliverable.
+            let summary = self
+                .unresolved
+                .lock()
+                .ok()
+                .and_then(|mut drops| drops.record(channel, from, std::time::Instant::now()));
+            if let Some(summary) = summary {
+                tracing::info!(
+                    "cw inbound: dropped GLOBAL consensus messages from senders outside the \
+                     committee {summary}; a committee member whose peer id does not resolve \
+                     here cannot vote or deliver blocks to this node; report this line if the \
+                     peer is a member"
+                );
+            }
+            return true;
         };
         if channel == 3 {
             (self.ingest_block)(data);
             return true;
         }
-        let Some(from_pk) = (self.resolve_peer)(from) else {
-            tracing::debug!("cw inbound: unresolved sender, dropping");
-            return true; // it WAS a cw message, just undeliverable
-        };
         self.contact.heard(&from_pk);
         let _ = self.inbound[channel as usize].send(inbound_message(from_pk, data));
         true
@@ -238,5 +300,67 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         resolve_peer: deps.resolve_peer,
         inject_from,
         contact,
+        unresolved: Default::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router(ingested: Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> CwInboundRouter {
+        let member = FalconPublicKey::from_bytes(&[7u8; 897]).unwrap();
+        let resolved = member.clone();
+        let inbound = [(); 3].map(|_| tokio::sync::mpsc::unbounded_channel().0);
+        CwInboundRouter {
+            inbound,
+            ingest_block: Arc::new(move |bytes: Vec<u8>| ingested.lock().unwrap().push(bytes)),
+            resolve_peer: Arc::new(move |from: &[u8]| {
+                (from == b"member").then(|| resolved.clone())
+            }),
+            inject_from: member.clone(),
+            contact: Arc::new(quil_engine::global_stall::GlobalContact::new([member])),
+            unresolved: Default::default(),
+        }
+    }
+
+    /// A block from a peer outside the committee is dropped before it reaches
+    /// the block store; a member's block is stored as before.
+    #[test]
+    fn only_committee_members_deliver_blocks() {
+        let ingested = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = router(ingested.clone());
+        let block = quil_engine::bitmasks::GLOBAL_CW_BLOCK;
+        assert!(router.route(block, b"stranger", b"junk".to_vec()));
+        assert!(ingested.lock().unwrap().is_empty());
+        assert!(router.route(block, b"member", b"frame".to_vec()));
+        assert_eq!(*ingested.lock().unwrap(), vec![b"frame".to_vec()]);
+        assert!(!router.route(&[0x00, 0x00, 0x00], b"member", Vec::new()));
+    }
+
+    /// Drops from outside the committee are counted per channel and
+    /// summarised at most once a minute.
+    #[test]
+    fn unresolved_drops_are_summarised() {
+        let mut drops = UnresolvedDrops::default();
+        let start = std::time::Instant::now();
+        let first = drops.record(3, b"stranger", start).unwrap();
+        assert!(first.contains("block=1"), "{first}");
+        assert_eq!(drops.record(0, b"stranger", start), None);
+        assert_eq!(drops.record(3, b"stranger", start), None);
+        let next = drops
+            .record(1, b"stranger", start + UNRESOLVED_LOG_INTERVAL)
+            .unwrap();
+        assert!(
+            next.contains("vote=1 certificate=1 resolver=0 block=1"),
+            "{next}"
+        );
+    }
+
+    #[test]
+    fn members_are_the_resolved_identities() {
+        let router = router(Default::default());
+        assert!(router.is_member(b"member"));
+        assert!(!router.is_member(b"stranger"));
+    }
 }

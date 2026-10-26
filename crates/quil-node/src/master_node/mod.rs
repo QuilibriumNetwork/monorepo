@@ -11,6 +11,7 @@ pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod archive_sync;
 mod committee_builds;
 mod committee_peer_policy;
+pub(crate) mod consensus_intake;
 pub(crate) mod direct_delivery;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
@@ -1249,6 +1250,14 @@ pub(crate) async fn start(
     let activation_waits = Arc::new(activation_wait::ActivationWaits::new(
         archive_mode && !consensus_committee.is_empty(),
     ));
+    // Admission of peers' `SubmitGlobalConsensus` deliveries: committee
+    // members (the configured committee, or as the router resolves them) and
+    // every other caller each get a bounded budget and their own queue to the
+    // message loop.
+    let (consensus_intake, remote_consensus) = consensus_intake::ConsensusIntake::new(
+        consensus_intake::committee_members(&consensus_committee_peer_ids, cw_router.clone()),
+    );
+    let consensus_intake = Arc::new(consensus_intake);
 
     // Bind the fixed global committee (genesis archives' Falcon pubkeys) into the
     // receive-path frame validator so CW-finalized global frames arriving over
@@ -1686,6 +1695,7 @@ pub(crate) async fn start(
             genesis_seed: config.engine.genesis_seed.clone(),
             msg_rx,
             consensus_loopback_rx,
+            remote_consensus,
             global_msg_tx: global_msg_tx.clone(),
             archive_pool: archive_pool.clone(),
             mtls_seed,
@@ -1781,7 +1791,7 @@ pub(crate) async fn start(
             archive_pool: archive_pool.clone(),
             app_frame_misses: archive_mode.then_some(frame_miss_tx),
             spawner: detached_spawner.clone(),
-            consensus_loopback_tx: consensus_loopback_tx.clone(),
+            consensus_intake: consensus_intake.clone(),
         },
     )?;
 
