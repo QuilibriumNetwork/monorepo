@@ -181,7 +181,8 @@ impl FrameProver for StubFrameProver {
             timestamp,
             difficulty,
             output,
-            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous_frame.output)?.to_vec(),
+            parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&previous_frame.output)?
+                .to_vec(),
             prover: signer.public_key().to_vec(),
             prover_tree_commitment: prover_root.to_vec(),
             requests_root: request_root.to_vec(),
@@ -546,7 +547,6 @@ impl InMemoryNetwork {
     }
 }
 
-
 // ===================================================================
 // Tests
 // ===================================================================
@@ -714,13 +714,21 @@ impl AppShardHarness {
         let harness = Self::build_inner(provers, registry, None, true, None, None, Some(head));
         for worker in &harness.workers {
             let (reply, replayed) = tokio::sync::oneshot::channel();
-            worker.handle.send(quil_engine::app_engine::AppEngineMessage::ReplayArchiveFrame {
-                frame: frame.clone(),
-                descendants: Vec::new(),
-                reply,
-            });
-            let through = replayed.await.expect("replay answered").expect("the head replays");
-            assert_eq!(Some(through), frame.header.as_ref().map(|header| header.frame_number));
+            worker.handle.send(
+                quil_engine::app_engine::AppEngineMessage::ReplayArchiveFrame {
+                    frame: frame.clone(),
+                    descendants: Vec::new(),
+                    reply,
+                },
+            );
+            let through = replayed
+                .await
+                .expect("replay answered")
+                .expect("the head replays");
+            assert_eq!(
+                Some(through),
+                frame.header.as_ref().map(|header| header.frame_number)
+            );
         }
         for worker in &harness.workers {
             worker.handle.set_cw_transport_ready();
@@ -763,7 +771,15 @@ impl AppShardHarness {
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         seed: fn(&quil_hypergraph::HypergraphCrdt),
     ) -> Self {
-        Self::build_inner(provers, registry, None, true, Some(global), Some(seed), None)
+        Self::build_inner(
+            provers,
+            registry,
+            None,
+            true,
+            Some(global),
+            Some(seed),
+            None,
+        )
     }
 
     fn build_inner(
@@ -889,25 +905,29 @@ impl AppShardHarness {
             let fee_manager: Arc<dyn quil_types::consensus::DynamicFeeManager> =
                 Arc::new(quil_engine::InMemoryDynamicFeeManager::new(32));
 
-            let execution_engine = Arc::new(match (session_global.as_ref(), hypergraph_dep.as_ref()) {
-                (Some(_), Some(crdt)) => build_test_exec_manager_on(
-                    crdt.clone(),
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                    false,
-                ),
-                _ => build_test_exec_manager(
-                    Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
-                    /* include_global */ false,
-                ),
-            });
+            let execution_engine =
+                Arc::new(match (session_global.as_ref(), hypergraph_dep.as_ref()) {
+                    (Some(_), Some(crdt)) => build_test_exec_manager_on(
+                        crdt.clone(),
+                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                        false,
+                    ),
+                    _ => build_test_exec_manager(
+                        Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
+                        /* include_global */ false,
+                    ),
+                });
 
             let bls_signer = prover.signer_clone();
             let deps = quil_engine::app_engine::AppEngineDeps {
-            delivery_frame_source: None,
-                clock_store: member_clock.clone().unwrap_or_else(|| clock_store as Arc<dyn ClockStore>),
+                delivery_frame_source: None,
+                clock_store: member_clock
+                    .clone()
+                    .unwrap_or_else(|| clock_store as Arc<dyn ClockStore>),
                 global_anchor_store: None,
                 global_hypergraph: session_global.clone(),
-                storage_source_hypergraph: None, topology: None,
+                storage_source_hypergraph: None,
+                topology: None,
                 prover_registry: registry.clone() as Arc<dyn ProverRegistry>,
                 frame_prover,
                 message_collector,
@@ -932,8 +952,13 @@ impl AppShardHarness {
                 ),
                 kv_db: kv_db_dep,
                 app_consensus_cw: app_cw,
-            db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
-            unified_cutover_hook: None,
+                db_config: quil_config::DbConfig {
+                    path: String::new(),
+                    worker_path_prefix: String::new(),
+                    worker_paths: vec![],
+                    ..Default::default()
+                }, // ephemeral journal in tests
+                unified_cutover_hook: None,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -977,8 +1002,10 @@ impl AppShardHarness {
             workers.iter().map(|w| w.handle.clone()).collect();
         // Each worker's committee Falcon pubkey, so the CW event drain can
         // tag `CwIn.from` when routing `CwOut` to peers (in-memory transport).
-        let all_pubkeys: Vec<Vec<u8>> =
-            workers.iter().map(|w| w.prover.bls_pubkey.clone()).collect();
+        let all_pubkeys: Vec<Vec<u8>> = workers
+            .iter()
+            .map(|w| w.prover.bls_pubkey.clone())
+            .collect();
         let events_per_worker: Vec<Arc<Mutex<Vec<String>>>> =
             workers.iter().map(|w| w.events.clone()).collect();
         let full_frames_per_worker: Vec<Arc<Mutex<Vec<Vec<u8>>>>> =
@@ -1070,9 +1097,11 @@ impl AppShardHarness {
                             // seeded in-process), so the bootstrap converges at
                             // once — as the production syncer reports for an
                             // empty shard — and un-gates propose/vote.
-                            my_handle.send(quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
-                                synced_to_frame: 0,
-                            });
+                            my_handle.send(
+                                quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
+                                    synced_to_frame: 0,
+                                },
+                            );
                         }
                         E::CwOut { channel, bytes, .. } => {
                             events_log.lock().push("CwOut".into());
@@ -1103,7 +1132,11 @@ impl AppShardHarness {
             }
         }
 
-        Self { filter, workers, tasks }
+        Self {
+            filter,
+            workers,
+            tasks,
+        }
     }
 
     /// Stop engines cooperatively and wait for engines and event drains.
@@ -1206,9 +1239,7 @@ pub fn build_genesis_seed_hex(provers: &[TestProver]) -> String {
 /// 0`) binds the ZERO-ANCHOR ρ_N, since there is no global VDF output to bind
 /// freshness to. Synthetic headers must be stamped or they are (correctly)
 /// rejected as not matching their own digest.
-pub fn stamp_app_frame_output(
-    h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader,
-) {
+pub fn stamp_app_frame_output(h: &mut quil_execution::global_intrinsic::frame_header::FrameHeader) {
     stamp_anchored_app_frame_output(h, &[]);
 }
 
@@ -1383,14 +1414,19 @@ pub fn build_tier2_archive_rig_with_key_manager(
         }),
         requests: vec![],
     };
-    let txn = clock_store.new_transaction(false).expect("clock transaction");
-    clock_store.put_global_clock_frame(&referenced_frame, txn.as_ref())
+    let txn = clock_store
+        .new_transaction(false)
+        .expect("clock transaction");
+    clock_store
+        .put_global_clock_frame(&referenced_frame, txn.as_ref())
         .expect("seed referenced frame");
     txn.commit().expect("commit referenced frame");
 
     // 4. Build prover registry and refresh from the seeded store.
     let prover_registry = Arc::new(SharedProverRegistry::new());
-    prover_registry.refresh_from_store(hg_store.as_ref()).unwrap();
+    prover_registry
+        .refresh_from_store(hg_store.as_ref())
+        .unwrap();
 
     // 5. KeyManager (quil_types::crypto::KeyManager — verifies sigs).
     //    Caller-provided so adversarial tests can plug in real BLS
@@ -1612,10 +1648,10 @@ pub fn build_test_pipeline_with_registry(
             Arc::new(quil_hypergraph::testing::StubProver)
                 as Arc<dyn quil_types::crypto::InclusionProver>,
         ))),
-        replica_store: Some(quil_store::replica_store::ReplicaStore::new(
-            Arc::new(quil_store::RocksDb::open_in_memory().expect("in-memory replica db"))
-                as Arc<dyn quil_types::store::KvDb>,
-        )),
+        replica_store: Some(quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().expect("in-memory replica db"),
+        )
+            as Arc<dyn quil_types::store::KvDb>)),
         storage_for_filter: None,
         remote_storage_confirm: None,
         pending_shard_changes: None,

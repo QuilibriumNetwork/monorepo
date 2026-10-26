@@ -135,14 +135,23 @@ impl DeliverySources {
             observe_read(&mut self.slow_reads, filter, collected.read, now);
             match collected.missing {
                 Ok(missing) => self.missing = Some(missing),
-                Err(error) => debug!(filter = hex::encode(filter), %error, "delivery sources unavailable"),
+                Err(error) => {
+                    debug!(filter = hex::encode(filter), %error, "delivery sources unavailable")
+                }
             }
         }
         if let Some(missing) = self.missing.as_ref() {
-            let unobtained = self.unobtained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let unobtained = self
+                .unobtained
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             report(&mut self.outage, filter, missing, &unobtained, now);
         }
-        if self.sweep.as_ref().is_some_and(|sweep| !sweep.is_finished()) {
+        if self
+            .sweep
+            .as_ref()
+            .is_some_and(|sweep| !sweep.is_finished())
+        {
             return;
         }
         self.sweep = Some(tokio::spawn(run_sweep(
@@ -158,8 +167,16 @@ impl DeliverySources {
 /// Log the start, bounded repeats and end of a wait for a source frame that
 /// could not be obtained. The first such frame in delivery order holds up
 /// every later delivery of the shard, so the line names it.
-fn report(outage: &mut Outage, filter: &[u8], missing: &[Source], unobtained: &HashMap<Source, Waiting>, now: Instant) {
-    let first = missing.iter().find_map(|source| unobtained.get(source).map(|waiting| (source, waiting)));
+fn report(
+    outage: &mut Outage,
+    filter: &[u8],
+    missing: &[Source],
+    unobtained: &HashMap<Source, Waiting>,
+    now: Instant,
+) {
+    let first = missing
+        .iter()
+        .find_map(|source| unobtained.get(source).map(|waiting| (source, waiting)));
     let event = outage.observe(now.into_std(), first.is_none());
     let filter = hex::encode(filter);
     match (event, first) {
@@ -170,7 +187,10 @@ fn report(outage: &mut Outage, filter: &[u8], missing: &[Source], unobtained: &H
             "this shard's deliveries wait for another shard's frame that no archive returned; the outputs \
              executed in it, and every later delivery of this shard, are not proposed until an archive \
              serves it; report this line if it persists"),
-        (Some(OutageEvent::Continues { secs, .. }), Some(((source_filter, source_frame), waiting))) => warn!(
+        (
+            Some(OutageEvent::Continues { secs, .. }),
+            Some(((source_filter, source_frame), waiting)),
+        ) => warn!(
             filter = %filter, source_filter = %hex::encode(source_filter), source_frame,
             waiting_sources = unobtained.len(), failures = waiting.failures, secs,
             scope = "network", action = "report",
@@ -217,12 +237,18 @@ async fn run_sweep(
     let due: Vec<Source> = match &missing {
         Ok(missing) => {
             let now = Instant::now();
-            let mut unobtained = unobtained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut unobtained = unobtained
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // A source no longer missing was delivered or obtained.
             unobtained.retain(|source, _| missing.contains(source));
             missing
                 .iter()
-                .filter(|source| unobtained.get(*source).is_none_or(|waiting| waiting.retry_at <= now))
+                .filter(|source| {
+                    unobtained
+                        .get(*source)
+                        .is_none_or(|waiting| waiting.retry_at <= now)
+                })
                 .cloned()
                 .collect()
         }
@@ -234,43 +260,75 @@ async fn run_sweep(
 
 /// Fetch `due` in order, each within [`FETCH_DEADLINE`], storing what
 /// arrives (on a blocking thread) and scheduling the retry of what does not.
-async fn fetch_due(due: Vec<Source>, fetch: DeliveryFrameSource, clock_store: Arc<dyn ClockStore>, unobtained: Unobtained) {
+async fn fetch_due(
+    due: Vec<Source>,
+    fetch: DeliveryFrameSource,
+    clock_store: Arc<dyn ClockStore>,
+    unobtained: Unobtained,
+) {
     for (filter, frame_number) in due {
-        let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch(filter.clone(), frame_number)).await.ok().flatten();
+        let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch(filter.clone(), frame_number))
+            .await
+            .ok()
+            .flatten();
         let stored = match fetched {
             Some(frame) => {
                 let (clock_store, source_filter) = (clock_store.clone(), filter.clone());
-                let stored = tokio::task::spawn_blocking(move || store(clock_store.as_ref(), &source_filter, frame_number, &frame))
-                    .await
-                    .unwrap_or(Err(Unstored::Failed));
+                let stored = tokio::task::spawn_blocking(move || {
+                    store(clock_store.as_ref(), &source_filter, frame_number, &frame)
+                })
+                .await
+                .unwrap_or(Err(Unstored::Failed));
                 match stored {
                     Ok(()) => true,
                     Err(Unstored::NotRequested) => {
-                        warn!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame is not the one requested");
+                        warn!(
+                            filter = hex::encode(&filter),
+                            frame = frame_number,
+                            "delivery source frame is not the one requested"
+                        );
                         false
                     }
                     Err(Unstored::Failed) => {
-                        warn!(filter = hex::encode(&filter), frame = frame_number, "storing a delivery's source frame failed");
+                        warn!(
+                            filter = hex::encode(&filter),
+                            frame = frame_number,
+                            "storing a delivery's source frame failed"
+                        );
                         false
                     }
                 }
             }
             None => {
-                debug!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame not available yet");
+                debug!(
+                    filter = hex::encode(&filter),
+                    frame = frame_number,
+                    "delivery source frame not available yet"
+                );
                 false
             }
         };
         let now = Instant::now();
-        let mut unobtained = unobtained.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unobtained = unobtained
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let source = (filter, frame_number);
         if stored {
             let earlier = unobtained.remove(&source);
-            info!(filter = hex::encode(&source.0), frame = frame_number,
+            info!(
+                filter = hex::encode(&source.0),
+                frame = frame_number,
                 failures = earlier.as_ref().map_or(0, |waiting| waiting.failures),
-                waited_secs = earlier.map_or(0, |waiting| now.duration_since(waiting.since).as_secs()),
-                "fetched a delivery's source frame");
+                waited_secs =
+                    earlier.map_or(0, |waiting| now.duration_since(waiting.since).as_secs()),
+                "fetched a delivery's source frame"
+            );
         } else {
-            let waiting = unobtained.entry(source).or_insert(Waiting { since: now, failures: 0, retry_at: now });
+            let waiting = unobtained.entry(source).or_insert(Waiting {
+                since: now,
+                failures: 0,
+                retry_at: now,
+            });
             waiting.failures += 1;
             waiting.retry_at = now + retry_after(waiting.failures);
         }
@@ -279,13 +337,22 @@ async fn fetch_due(due: Vec<Source>, fetch: DeliveryFrameSource, clock_store: Ar
 
 /// The wait after the `failures`-th failed fetch of one source frame.
 fn retry_after(failures: u32) -> Duration {
-    FIRST_RETRY.saturating_mul(1 << failures.saturating_sub(1).min(16)).min(MAX_RETRY)
+    FIRST_RETRY
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MAX_RETRY)
 }
 
 /// Store `frame`, fetched as frame `frame_number` of `filter`, unless it is
 /// another frame or the store fails. Blocks; does not log.
-fn store(clock_store: &dyn ClockStore, filter: &[u8], frame_number: u64, frame: &AppShardFrame) -> Result<(), Unstored> {
-    let Some(header) = frame.header.as_ref() else { return Err(Unstored::NotRequested) };
+fn store(
+    clock_store: &dyn ClockStore,
+    filter: &[u8],
+    frame_number: u64,
+    frame: &AppShardFrame,
+) -> Result<(), Unstored> {
+    let Some(header) = frame.header.as_ref() else {
+        return Err(Unstored::NotRequested);
+    };
     if header.address != filter || header.frame_number != frame_number {
         return Err(Unstored::NotRequested);
     }
@@ -296,10 +363,14 @@ fn store(clock_store: &dyn ClockStore, filter: &[u8], frame_number: u64, frame: 
         .new_transaction(false)
         .ok()
         .and_then(|txn| {
-            clock_store.stage_shard_clock_frame(&selector, frame, txn.as_ref()).ok()?;
+            clock_store
+                .stage_shard_clock_frame(&selector, frame, txn.as_ref())
+                .ok()?;
             txn.commit().ok()?;
             let txn = clock_store.new_transaction(false).ok()?;
-            clock_store.commit_shard_clock_frame(filter, frame_number, &selector, txn.as_ref(), true).ok()?;
+            clock_store
+                .commit_shard_clock_frame(filter, frame_number, &selector, txn.as_ref(), true)
+                .ok()?;
             txn.commit().ok()
         })
         .ok_or(Unstored::Failed)
@@ -378,7 +449,12 @@ mod tests {
         clock: &Arc<dyn ClockStore>,
     ) {
         let missing = missing.to_vec();
-        sources.sweep(&FILTER, Box::new(move || Ok(missing)), fetch.clone(), clock.clone());
+        sources.sweep(
+            &FILTER,
+            Box::new(move || Ok(missing)),
+            fetch.clone(),
+            clock.clone(),
+        );
         tokio::time::sleep(TICK).await;
     }
 
@@ -409,7 +485,8 @@ mod tests {
             let reading = reading.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                while !reading.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5) {
+                while !reading.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(5)
+                {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 let _ = messages_tx.send(());
@@ -429,7 +506,10 @@ mod tests {
         };
         let _ = release.send(());
         sender.join().unwrap();
-        assert!(handled_while_reading, "the select loop waited for the sweep's store read");
+        assert!(
+            handled_while_reading,
+            "the select loop waited for the sweep's store read"
+        );
     }
 
     /// A sweep still running is not started again: one fetch at a time.
@@ -442,7 +522,11 @@ mod tests {
         let mut sources = DeliverySources::default();
         tick(&mut sources, &missing, &fetch, &clock).await;
         tick(&mut sources, &missing, &fetch, &clock).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "a second fetch started beside the running one");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a second fetch started beside the running one"
+        );
     }
 
     /// A fetch that never answers is abandoned at its deadline, and the frame
@@ -486,7 +570,9 @@ mod tests {
         let fetch = source(calls.clone(), Some(frame(&SOURCE, 7)));
         let mut sources = DeliverySources::default();
         tick(&mut sources, &[(SOURCE.to_vec(), 7)], &fetch, &clock).await;
-        let stored = clock.get_shard_clock_frame(&SOURCE, 7, false).expect("the fetched frame is stored");
+        let stored = clock
+            .get_shard_clock_frame(&SOURCE, 7, false)
+            .expect("the fetched frame is stored");
         assert_eq!(stored.header.map(|header| header.frame_number), Some(7));
         // Another frame than the one asked for is not stored.
         tick(&mut sources, &[(SOURCE.to_vec(), 8)], &fetch, &clock).await;
@@ -508,9 +594,17 @@ mod tests {
         }
         let reported = logs.lines_with("no archive returned");
         assert_eq!(reported.len(), 1, "{reported:?}");
-        assert!(reported[0].contains(&format!("source_filter={}", hex::encode(SOURCE))), "{}", reported[0]);
+        assert!(
+            reported[0].contains(&format!("source_filter={}", hex::encode(SOURCE))),
+            "{}",
+            reported[0]
+        );
         assert!(reported[0].contains("source_frame=7"), "{}", reported[0]);
-        assert!(reported[0].contains(&format!("filter={}", hex::encode(FILTER))), "{}", reported[0]);
+        assert!(
+            reported[0].contains(&format!("filter={}", hex::encode(FILTER))),
+            "{}",
+            reported[0]
+        );
         // The delivery no longer needs it: the next read finds that, and the
         // tick after it logs the end.
         tick(&mut sources, &[], &fetch, &clock).await;
@@ -527,14 +621,33 @@ mod tests {
         let mut slow_reads = Outage::default();
         let start = Instant::now();
         observe_read(&mut slow_reads, &FILTER, Duration::from_millis(30), start);
-        observe_read(&mut slow_reads, &FILTER, Duration::from_secs(41), start + TICK);
-        observe_read(&mut slow_reads, &FILTER, Duration::from_secs(38), start + 2 * TICK);
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            Duration::from_secs(41),
+            start + TICK,
+        );
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            Duration::from_secs(38),
+            start + 2 * TICK,
+        );
         let slow = logs.lines_with("is slow");
         assert_eq!(slow.len(), 1, "{slow:?}");
         assert!(slow[0].contains("read_secs=41"), "{}", slow[0]);
-        assert!(slow[0].contains(&format!("filter={}", hex::encode(FILTER))), "{}", slow[0]);
+        assert!(
+            slow[0].contains(&format!("filter={}", hex::encode(FILTER))),
+            "{}",
+            slow[0]
+        );
         assert!(logs.lines_with("still slow").is_empty());
-        observe_read(&mut slow_reads, &FILTER, Duration::from_millis(40), start + 3 * TICK);
+        observe_read(
+            &mut slow_reads,
+            &FILTER,
+            Duration::from_millis(40),
+            start + 3 * TICK,
+        );
         assert_eq!(logs.lines_with("fast again").len(), 1);
     }
 }

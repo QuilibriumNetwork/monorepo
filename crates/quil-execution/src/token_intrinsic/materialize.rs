@@ -1,8 +1,8 @@
 //! Shared coin field storage, content addresses, spend markers and token metadata.
 
 use num_bigint::BigInt;
-use sha2::{Digest, Sha512};
 use quil_types::error::{QuilError, Result};
+use sha2::{Digest, Sha512};
 
 pub const TOKEN_CONFIG_OUTER_KEY: [u8; 1] = [16u8 << 2];
 
@@ -75,10 +75,20 @@ pub fn create_lattice_coin_vertex_tree(
     coin_type_hash: &[u8; 32],
 ) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
-    tree.insert(&[0x00], frame_number, &[], &BigInt::from(frame_number.len()))
-        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
-    tree.insert(&[1u8 << 2], one_time_key, &[], &BigInt::from(one_time_key.len()))
-        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    tree.insert(
+        &[0x00],
+        frame_number,
+        &[],
+        &BigInt::from(frame_number.len()),
+    )
+    .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    tree.insert(
+        &[1u8 << 2],
+        one_time_key,
+        &[],
+        &BigInt::from(one_time_key.len()),
+    )
+    .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
     tree.insert(&[2u8 << 2], cv, &[], &BigInt::from(cv.len()))
         .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
     if !memo.is_empty() {
@@ -139,9 +149,7 @@ pub fn materialize_token_deploy(
     let mut outer = match state.get(domain, &metadata_addr, &va_disc)? {
         Some(blob) if !blob.is_empty() => {
             let root = quil_tries::deserialize_go_tree(&blob).map_err(|e| {
-                QuilError::Internal(format!(
-                    "token deploy: outer tree deserialize: {e}"
-                ))
+                QuilError::Internal(format!("token deploy: outer tree deserialize: {e}"))
             })?;
             quil_tries::VectorCommitmentTree { root }
         }
@@ -152,19 +160,22 @@ pub fn materialize_token_deploy(
     // from KZG; a vestigial go-tree annotation, not a forest leaf).
     let inner = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
     let inner_commit = crate::hypergraph_state::tree_content_digest(&inner);
-    let inner_blob = quil_tries::serialize_go_tree(inner.root.as_ref()).map_err(|e| {
-        QuilError::Internal(format!("token deploy: inner tree serialize: {e}"))
-    })?;
+    let inner_blob = quil_tries::serialize_go_tree(inner.root.as_ref())
+        .map_err(|e| QuilError::Internal(format!("token deploy: inner tree serialize: {e}")))?;
 
     let inner_size = BigInt::from(inner_blob.len() as u64);
     outer
-        .insert(&TOKEN_CONFIG_OUTER_KEY, &inner_blob, &inner_commit, &inner_size)
+        .insert(
+            &TOKEN_CONFIG_OUTER_KEY,
+            &inner_blob,
+            &inner_commit,
+            &inner_size,
+        )
         .map_err(|e| QuilError::Internal(format!("token deploy: outer insert: {e}")))?;
 
     // Node commitments retired to non-KZG (forest-irrelevant); serialize as-is.
-    let outer_blob = quil_tries::serialize_go_tree(outer.root.as_ref()).map_err(|e| {
-        QuilError::Internal(format!("token deploy: outer serialize: {e}"))
-    })?;
+    let outer_blob = quil_tries::serialize_go_tree(outer.root.as_ref())
+        .map_err(|e| QuilError::Internal(format!("token deploy: outer serialize: {e}")))?;
 
     state.set(domain, &metadata_addr, &va_disc, frame_number, outer_blob)?;
     Ok(metadata_addr)
@@ -190,7 +201,8 @@ pub fn materialize_token_deploy(
 pub fn token_deploy_domain(config: &super::config::TokenConfiguration) -> Result<[u8; 32]> {
     let config_tree = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
     let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
-    let mut preimage = Vec::with_capacity(super::constants::TOKEN_PREFIX.len() + config_commit.len());
+    let mut preimage =
+        Vec::with_capacity(super::constants::TOKEN_PREFIX.len() + config_commit.len());
     preimage.extend_from_slice(super::constants::TOKEN_PREFIX);
     preimage.extend_from_slice(&config_commit);
     quil_crypto::poseidon::hash_bytes_to_32(&preimage)
@@ -264,8 +276,7 @@ mod tests {
             owner_public_key: vec![0x01u8; 32],
             ..Default::default()
         };
-        let domain =
-            materialize_token_deploy_init(&state, &cfg, 1, prover.as_ref()).unwrap();
+        let domain = materialize_token_deploy_init(&state, &cfg, 1, prover.as_ref()).unwrap();
 
         let va = vertex_adds_discriminator().unwrap();
         let blob = state
@@ -291,8 +302,7 @@ mod tests {
         // Config sub-tree sealed at [16<<2] (non-empty).
         assert!(outer.get(&[16u8 << 2]).is_some());
         // Derived domain is deterministic (poseidon of prefix‖config_commit).
-        let domain2 =
-            materialize_token_deploy_init(&state, &cfg, 2, prover.as_ref()).unwrap();
+        let domain2 = materialize_token_deploy_init(&state, &cfg, 2, prover.as_ref()).unwrap();
         assert_eq!(domain, domain2);
     }
 

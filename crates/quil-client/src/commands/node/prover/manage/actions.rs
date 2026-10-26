@@ -11,8 +11,7 @@ use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
 use quil_types::proto::global::{
-    message_request::Request, MessageRequest, ProverLeave, ProverPause,
-    ProverReject, ProverResume,
+    message_request::Request, MessageRequest, ProverLeave, ProverPause, ProverReject, ProverResume,
 };
 use quil_types::proto::node::{
     node_service_client::NodeServiceClient, GetNodeInfoRequest, GetShardInfoRequest,
@@ -51,8 +50,10 @@ pub async fn fetch_rewards(client: Client, km: Arc<FileKeyManager>) -> Msg {
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let public = km.get_public_key_bytes_by_id("q-prover-key")?;
         crate::commands::token::balance::read_claimable_rewards(client, &public).await
-    }).await.unwrap_or_else(|_| Err(anyhow::anyhow!("reward query timed out")))
-        .map_err(|e| e.to_string());
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("reward query timed out")))
+    .map_err(|e| e.to_string());
     #[cfg(not(feature = "confidential-tokens"))]
     let result = {
         let _ = (client, km);

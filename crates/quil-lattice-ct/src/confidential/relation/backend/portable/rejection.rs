@@ -85,25 +85,45 @@ impl RejectionParameters {
             }
             let mut numerator = BigUint::from(mantissa);
             let mut denominator = BigUint::from(1u8);
-            if exponent >= 0 { numerator <<= exponent as usize; }
-            else { denominator <<= (-exponent) as usize; }
-            Ok(Rational { numerator, denominator })
+            if exponent >= 0 {
+                numerator <<= exponent as usize;
+            } else {
+                denominator <<= (-exponent) as usize;
+            }
+            Ok(Rational {
+                numerator,
+                denominator,
+            })
         }
         let variance = rational(variance_mantissa, variance_exponent)?;
         let repetition = rational(repetition_mantissa, repetition_exponent)?;
-        if repetition.numerator < repetition.denominator { return Err(RejectionError::Parameter); }
-        Ok(Self { variance, repetition })
+        if repetition.numerator < repetition.denominator {
+            return Err(RejectionError::Parameter);
+        }
+        Ok(Self {
+            variance,
+            repetition,
+        })
     }
 
     /// Square the exact native standard deviation in integer arithmetic.
     /// Native floating-point multiplication must not round the variance first.
     pub fn from_standard_deviation_components(
-        mantissa: u128, exponent: i32,
-        repetition_mantissa: u128, repetition_exponent: i32,
+        mantissa: u128,
+        exponent: i32,
+        repetition_mantissa: u128,
+        repetition_exponent: i32,
     ) -> Result<Self, RejectionError> {
-        let mut parameters = Self::from_binary_components(mantissa, exponent, repetition_mantissa, repetition_exponent)?;
-        parameters.variance.numerator = &parameters.variance.numerator * &parameters.variance.numerator;
-        parameters.variance.denominator = &parameters.variance.denominator * &parameters.variance.denominator;
+        let mut parameters = Self::from_binary_components(
+            mantissa,
+            exponent,
+            repetition_mantissa,
+            repetition_exponent,
+        )?;
+        parameters.variance.numerator =
+            &parameters.variance.numerator * &parameters.variance.numerator;
+        parameters.variance.denominator =
+            &parameters.variance.denominator * &parameters.variance.denominator;
         Ok(parameters)
     }
 
@@ -313,28 +333,112 @@ mod tests {
         let mut bytes = [0; 16];
         let mut exponent = 0;
         let mut precision = 0;
-        for value in [f64::from_bits(1), f64::MIN_POSITIVE, 0.1, 1.55, 8.0, f64::MAX] {
-            assert_eq!(unsafe { ffi::quil_fixture_rejection_parts(value, 0, bytes.as_mut_ptr(), &mut exponent, &mut precision) }, 0);
-            let exact = RejectionParameters::from_binary_components(u128::from_le_bytes(bytes), exponent, 2, 0).unwrap();
+        for value in [
+            f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            0.1,
+            1.55,
+            8.0,
+            f64::MAX,
+        ] {
+            assert_eq!(
+                unsafe {
+                    ffi::quil_fixture_rejection_parts(
+                        value,
+                        0,
+                        bytes.as_mut_ptr(),
+                        &mut exponent,
+                        &mut precision,
+                    )
+                },
+                0
+            );
+            let exact = RejectionParameters::from_binary_components(
+                u128::from_le_bytes(bytes),
+                exponent,
+                2,
+                0,
+            )
+            .unwrap();
             let reference = positive_binary64(value).unwrap();
-            let squared = RejectionParameters::from_standard_deviation_components(u128::from_le_bytes(bytes), exponent, 2, 0).unwrap();
-            assert_eq!(&squared.variance.numerator * &reference.denominator * &reference.denominator,
-                       &reference.numerator * &reference.numerator * &squared.variance.denominator);
-            assert_eq!(&exact.variance.numerator * &reference.denominator,
-                       &reference.numerator * &exact.variance.denominator);
+            let squared = RejectionParameters::from_standard_deviation_components(
+                u128::from_le_bytes(bytes),
+                exponent,
+                2,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                &squared.variance.numerator * &reference.denominator * &reference.denominator,
+                &reference.numerator * &reference.numerator * &squared.variance.denominator
+            );
+            assert_eq!(
+                &exact.variance.numerator * &reference.denominator,
+                &reference.numerator * &exact.variance.denominator
+            );
         }
-        assert_eq!(unsafe { ffi::quil_fixture_rejection_parts(0.0, 1, bytes.as_mut_ptr(), &mut exponent, &mut precision) }, 0);
+        assert_eq!(
+            unsafe {
+                ffi::quil_fixture_rejection_parts(
+                    0.0,
+                    1,
+                    bytes.as_mut_ptr(),
+                    &mut exponent,
+                    &mut precision,
+                )
+            },
+            0
+        );
         assert!((53..=128).contains(&precision));
         assert_eq!(exponent, -127);
-        assert_eq!(u128::from_le_bytes(bytes), (1u128 << 127) + (1u128 << (128 - precision)));
-        assert_eq!(unsafe { ffi::quil_fixture_rejection_parts(0.0, 2, bytes.as_mut_ptr(), &mut exponent, &mut precision) }, 0);
+        assert_eq!(
+            u128::from_le_bytes(bytes),
+            (1u128 << 127) + (1u128 << (128 - precision))
+        );
+        assert_eq!(
+            unsafe {
+                ffi::quil_fixture_rejection_parts(
+                    0.0,
+                    2,
+                    bytes.as_mut_ptr(),
+                    &mut exponent,
+                    &mut precision,
+                )
+            },
+            0
+        );
         assert_eq!(u128::from_le_bytes(bytes), 1u128 << 127);
-        assert!(RejectionParameters::from_binary_components(u128::from_le_bytes(bytes), exponent, 2, 0).is_ok());
+        assert!(RejectionParameters::from_binary_components(
+            u128::from_le_bytes(bytes),
+            exponent,
+            2,
+            0
+        )
+        .is_ok());
         for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(unsafe { ffi::quil_fixture_rejection_parts(value, 0, bytes.as_mut_ptr(), &mut exponent, &mut precision) }, -1);
+            assert_eq!(
+                unsafe {
+                    ffi::quil_fixture_rejection_parts(
+                        value,
+                        0,
+                        bytes.as_mut_ptr(),
+                        &mut exponent,
+                        &mut precision,
+                    )
+                },
+                -1
+            );
         }
-        for args in [(0, 0, 2, 0), (1, i32::MIN, 2, 0), (1, i32::MAX, 2, 0), (1, 0, 1, -1)] {
-            assert!(matches!(RejectionParameters::from_binary_components(args.0, args.1, args.2, args.3), Err(RejectionError::Parameter)));
+        for args in [
+            (0, 0, 2, 0),
+            (1, i32::MIN, 2, 0),
+            (1, i32::MAX, 2, 0),
+            (1, 0, 1, -1),
+        ] {
+            assert!(matches!(
+                RejectionParameters::from_binary_components(args.0, args.1, args.2, args.3),
+                Err(RejectionError::Parameter)
+            ));
         }
     }
 
@@ -343,13 +447,26 @@ mod tests {
         // Python Decimal at 180 digits: floor(2^256 * exp(-1)/2) and
         // floor(2^256 * exp(1/4)/(exp(1)+exp(-1))), little endian.
         for (kind, vv, threshold) in [
-            (RejectionKind::Standard, 0, "76ed8352e85c1298993bb65ad5024ced867c2a48c1636f5d8d6fde596cac162f"),
-            (RejectionKind::SignFiltered, 0, "76ed8352e85c1298993bb65ad5024ced867c2a48c1636f5d8d6fde596cac162f"),
-            (RejectionKind::Bimodal, 4, "1b6ae21e6c98fc77d9bac0394d57350ce2a14f62023dcda4b24ebb2d0bd9826a"),
+            (
+                RejectionKind::Standard,
+                0,
+                "76ed8352e85c1298993bb65ad5024ced867c2a48c1636f5d8d6fde596cac162f",
+            ),
+            (
+                RejectionKind::SignFiltered,
+                0,
+                "76ed8352e85c1298993bb65ad5024ced867c2a48c1636f5d8d6fde596cac162f",
+            ),
+            (
+                RejectionKind::Bimodal,
+                4,
+                "1b6ae21e6c98fc77d9bac0394d57350ce2a14f62023dcda4b24ebb2d0bd9826a",
+            ),
         ] {
             let params = RejectionParameters::from_binary64(8.0, 2.0).unwrap();
-            let mut draw: [u8; 32] = std::array::from_fn(|i|
-                u8::from_str_radix(&threshold[2*i..2*i+2], 16).unwrap());
+            let mut draw: [u8; 32] = std::array::from_fn(|i| {
+                u8::from_str_radix(&threshold[2 * i..2 * i + 2], 16).unwrap()
+            });
             assert_eq!(decide_256(kind, 8, vv, &draw, &params), Ok(false));
             draw[0] += 1; // These independently computed thresholds do not carry.
             assert_eq!(decide_256(kind, 8, vv, &draw, &params), Ok(true));
@@ -357,11 +474,23 @@ mod tests {
         let params = RejectionParameters::from_binary64(8.0, 2.0).unwrap();
         let mut half = [0; 32];
         half[31] = 128;
-        assert_eq!(decide_256(RejectionKind::Standard, 0, 0, &half, &params), Ok(false));
+        assert_eq!(
+            decide_256(RejectionKind::Standard, 0, 0, &half, &params),
+            Ok(false)
+        );
         half[0] = 1;
-        assert_eq!(decide_256(RejectionKind::Standard, 0, 0, &half, &params), Ok(true));
-        assert_eq!(decide_256(RejectionKind::Standard, 0, -1, &half, &params), Err(RejectionError::Parameter));
-        assert_eq!(decide_256(RejectionKind::Standard, i64::MAX, 0, &half, &params), Err(RejectionError::ExponentRange));
+        assert_eq!(
+            decide_256(RejectionKind::Standard, 0, 0, &half, &params),
+            Ok(true)
+        );
+        assert_eq!(
+            decide_256(RejectionKind::Standard, 0, -1, &half, &params),
+            Err(RejectionError::Parameter)
+        );
+        assert_eq!(
+            decide_256(RejectionKind::Standard, i64::MAX, 0, &half, &params),
+            Err(RejectionError::ExponentRange)
+        );
     }
 
     #[test]

@@ -92,9 +92,7 @@ enum Commands {
     /// Compute operations.
     Compute(commands::compute::ComputeArgs),
     /// Download and install the latest (or a specific) qclient release.
-    Update {
-        version: Option<String>,
-    },
+    Update { version: Option<String> },
     /// Download the release signature files for the qclient binary.
     DownloadSignatures {
         #[arg(long)]
@@ -137,7 +135,9 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Alias { command } => commands::alias::run(global, command),
         Commands::Key { command } => commands::key::run(global, command),
         Commands::Link => commands::link::run(),
-        Commands::Diagnostics { command } => commands::node::diagnostics_logs::run_identity(command),
+        Commands::Diagnostics { command } => {
+            commands::node::diagnostics_logs::run_identity(command)
+        }
 
         // Async (RPC-bearing) commands run on a Tokio runtime.
         Commands::Token(args) => runtime()?.block_on(commands::token::run(global, args)),
@@ -151,9 +151,9 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Update { version } => {
             runtime()?.block_on(commands::release_cmds::update(version.as_deref()))
         }
-        Commands::DownloadSignatures { version } => {
-            runtime()?.block_on(commands::release_cmds::download_signatures(version.as_deref()))
-        }
+        Commands::DownloadSignatures { version } => runtime()?.block_on(
+            commands::release_cmds::download_signatures(version.as_deref()),
+        ),
     }
 }
 
@@ -170,6 +170,9 @@ mod tests {
 
     #[test]
     fn the_version_flag_reports_the_release_and_subpatch() {
-        assert_eq!(super::Cli::command().get_version(), Some(quil_config::display_version()));
+        assert_eq!(
+            super::Cli::command().get_version(),
+            Some(quil_config::display_version())
+        );
     }
 }

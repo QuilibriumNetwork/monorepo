@@ -126,8 +126,12 @@ fn report_result(answer: Result<ArchiveShardInfo, String>) -> Result<ShardList, 
     if info.sizes.is_empty() && info.failed_shard_keys == 0 {
         return Err("reported no shards".into());
     }
-    ShardList::from_complete(&info)
-        .ok_or_else(|| format!("partial answer: {} shard keys failed", info.failed_shard_keys))
+    ShardList::from_complete(&info).ok_or_else(|| {
+        format!(
+            "partial answer: {} shard keys failed",
+            info.failed_shard_keys
+        )
+    })
 }
 
 /// One archive's answer: its shard list, or why there is none.
@@ -166,9 +170,22 @@ pub(crate) fn format_comparison(reports: &[ArchiveReport]) -> (String, usize) {
     };
 
     let mut out = String::new();
-    let _ = writeln!(out, "Archive shard lists: {} archives, {answered} answered.", reports.len());
-    let width = reports.iter().map(|r| r.endpoint.len()).max().unwrap_or(0).max("ENDPOINT".len());
-    let _ = writeln!(out, "{:<width$}  {:>6}  {:>6}  {:<8}  STATUS", "ENDPOINT", "SHARDS", "FROZEN", "DIGEST");
+    let _ = writeln!(
+        out,
+        "Archive shard lists: {} archives, {answered} answered.",
+        reports.len()
+    );
+    let width = reports
+        .iter()
+        .map(|r| r.endpoint.len())
+        .max()
+        .unwrap_or(0)
+        .max("ENDPOINT".len());
+    let _ = writeln!(
+        out,
+        "{:<width$}  {:>6}  {:>6}  {:<8}  STATUS",
+        "ENDPOINT", "SHARDS", "FROZEN", "DIGEST"
+    );
     for report in reports {
         let (shards, frozen, digest, status) = match &report.result {
             Ok(list) => {
@@ -177,11 +194,25 @@ pub(crate) fn format_comparison(reports: &[ArchiveReport]) -> (String, usize) {
                     Some(_) => "differs",
                     None => "no majority",
                 };
-                (list.filters.len().to_string(), list.frozen.len().to_string(), list.digest(), status.to_string())
+                (
+                    list.filters.len().to_string(),
+                    list.frozen.len().to_string(),
+                    list.digest(),
+                    status.to_string(),
+                )
             }
-            Err(error) => ("-".into(), "-".into(), "-".into(), format!("error: {error}")),
+            Err(error) => (
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                format!("error: {error}"),
+            ),
         };
-        let _ = writeln!(out, "{:<width$}  {shards:>6}  {frozen:>6}  {digest:<8}  {status}", report.endpoint);
+        let _ = writeln!(
+            out,
+            "{:<width$}  {shards:>6}  {frozen:>6}  {digest:<8}  {status}",
+            report.endpoint
+        );
     }
 
     match (majority, groups.len()) {
@@ -204,13 +235,22 @@ pub(crate) fn format_comparison(reports: &[ArchiveReport]) -> (String, usize) {
                 m.digest(),
                 groups[0].1.len()
             );
-            let _ = writeln!(out, "Filters that differ from the majority view, by archive:");
+            let _ = writeln!(
+                out,
+                "Filters that differ from the majority view, by archive:"
+            );
             for report in reports {
                 let Ok(list) = &report.result else { continue };
                 if list.filters == m.filters {
                     continue;
                 }
-                write_differences(&mut out, &report.endpoint, list, &list.only_in(m), &m.only_in(list));
+                write_differences(
+                    &mut out,
+                    &report.endpoint,
+                    list,
+                    &list.only_in(m),
+                    &m.only_in(list),
+                );
             }
         }
         (None, n) => {
@@ -218,11 +258,20 @@ pub(crate) fn format_comparison(reports: &[ArchiveReport]) -> (String, usize) {
                 out,
                 "No majority view: no single largest group among the {n} lists of the {answered} answering archives."
             );
-            let _ = writeln!(out, "Filters not every answering archive lists, by archive:");
+            let _ = writeln!(
+                out,
+                "Filters not every answering archive lists, by archive:"
+            );
             let lists: Vec<&ShardList> = groups.iter().map(|(list, _)| *list).collect();
-            let all: BTreeSet<Vec<u8>> = lists.iter().flat_map(|l| l.filters.iter().cloned()).collect();
-            let common: BTreeSet<Vec<u8>> =
-                all.iter().filter(|f| lists.iter().all(|l| l.filters.contains(*f))).cloned().collect();
+            let all: BTreeSet<Vec<u8>> = lists
+                .iter()
+                .flat_map(|l| l.filters.iter().cloned())
+                .collect();
+            let common: BTreeSet<Vec<u8>> = all
+                .iter()
+                .filter(|f| lists.iter().all(|l| l.filters.contains(*f)))
+                .cloned()
+                .collect();
             for report in reports {
                 let Ok(list) = &report.result else { continue };
                 let extra: Vec<Vec<u8>> = list.filters.difference(&common).cloned().collect();
@@ -236,9 +285,20 @@ pub(crate) fn format_comparison(reports: &[ArchiveReport]) -> (String, usize) {
 
 /// `extra`: filters this archive lists that the reference does not;
 /// `missing`: filters the reference lists that this archive does not.
-fn write_differences(out: &mut String, endpoint: &str, list: &ShardList, extra: &[Vec<u8>], missing: &[Vec<u8>]) {
+fn write_differences(
+    out: &mut String,
+    endpoint: &str,
+    list: &ShardList,
+    extra: &[Vec<u8>],
+    missing: &[Vec<u8>],
+) {
     use std::fmt::Write as _;
-    let _ = writeln!(out, "{endpoint} ({} shards, digest {}):", list.filters.len(), list.digest());
+    let _ = writeln!(
+        out,
+        "{endpoint} ({} shards, digest {}):",
+        list.filters.len(),
+        list.digest()
+    );
     for filter in extra {
         let _ = writeln!(out, "  extra    {}", hex::encode(filter));
     }
@@ -259,7 +319,10 @@ mod tests {
     }
 
     fn ok(endpoint: &str, list: ShardList) -> ArchiveReport {
-        ArchiveReport { endpoint: endpoint.into(), result: Ok(list) }
+        ArchiveReport {
+            endpoint: endpoint.into(),
+            result: Ok(list),
+        }
     }
 
     /// The parent `01` split into `02` and `03`; one archive still lists `01`.
@@ -270,7 +333,10 @@ mod tests {
         let reports = vec![
             ok("a.example:8340", split.clone()),
             ok("stale.example:8340", stale.clone()),
-            ArchiveReport { endpoint: "down.example:8340".into(), result: Err("connect: timed out".into()) },
+            ArchiveReport {
+                endpoint: "down.example:8340".into(),
+                result: Err("connect: timed out".into()),
+            },
             ok("b.example:8340", split.clone()),
         ];
         let (s, t) = (split.digest(), stale.digest());
@@ -294,21 +360,40 @@ mod tests {
     #[test]
     fn agreeing_archives_print_no_differences() {
         let split = list(&[2, 3], &[]);
-        let (out, answered) = format_comparison(&[ok("a:1", split.clone()), ok("b:1", split.clone())]);
+        let (out, answered) =
+            format_comparison(&[ok("a:1", split.clone()), ok("b:1", split.clone())]);
         assert_eq!(answered, 2);
-        assert!(out.ends_with(&format!("All 2 answering archives agree: 2 shards, digest {}.\n", split.digest())), "{out}");
+        assert!(
+            out.ends_with(&format!(
+                "All 2 answering archives agree: 2 shards, digest {}.\n",
+                split.digest()
+            )),
+            "{out}"
+        );
         assert!(!out.contains("differs") && !out.contains("extra"), "{out}");
     }
 
     #[test]
     fn an_even_split_has_no_majority_and_names_the_filters_not_all_list() {
-        let (out, _) = format_comparison(&[ok("a:1", list(&[2, 3, 9], &[])), ok("b:1", list(&[1, 9], &[]))]);
+        let (out, _) = format_comparison(&[
+            ok("a:1", list(&[2, 3, 9], &[])),
+            ok("b:1", list(&[1, 9], &[])),
+        ]);
         assert!(out.contains("No majority view: no single largest group among the 2 lists of the 2 answering archives.\n"), "{out}");
         assert_eq!(out.matches("no majority\n").count(), 2, "{out}");
         assert!(out.contains("a:1 (3 shards, digest "), "{out}");
-        assert!(out.contains("  extra    ab02\n  extra    ab03\n  missing  ab01\n"), "{out}");
-        assert!(out.contains("  extra    ab01\n  missing  ab02\n  missing  ab03\n"), "{out}");
-        assert!(!out.contains("ab09"), "a filter every archive lists is no difference: {out}");
+        assert!(
+            out.contains("  extra    ab02\n  extra    ab03\n  missing  ab01\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  extra    ab01\n  missing  ab02\n  missing  ab03\n"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("ab09"),
+            "a filter every archive lists is no difference: {out}"
+        );
     }
 
     #[test]
@@ -328,27 +413,47 @@ mod tests {
 
     #[test]
     fn frozen_differences_alone_do_not_split_the_view() {
-        let (out, _) = format_comparison(&[ok("a:1", list(&[2, 3], &[2])), ok("b:1", list(&[2, 3], &[]))]);
+        let (out, _) = format_comparison(&[
+            ok("a:1", list(&[2, 3], &[2])),
+            ok("b:1", list(&[2, 3], &[])),
+        ]);
         assert!(out.contains("All 2 answering archives agree"), "{out}");
     }
 
     #[test]
     fn no_answer_is_reported_and_counts_as_none_answered() {
-        let (out, answered) =
-            format_comparison(&[ArchiveReport { endpoint: "a:1".into(), result: Err("refused".into()) }]);
+        let (out, answered) = format_comparison(&[ArchiveReport {
+            endpoint: "a:1".into(),
+            result: Err("refused".into()),
+        }]);
         assert_eq!(answered, 0, "the command then exits non-zero");
-        assert!(out.contains("error: refused\n") && out.ends_with("No archive answered.\n"), "{out}");
+        assert!(
+            out.contains("error: refused\n") && out.ends_with("No archive answered.\n"),
+            "{out}"
+        );
     }
 
     #[test]
     fn a_partial_or_empty_answer_is_not_compared() {
         let mut info = ArchiveShardInfo::default();
-        assert_eq!(report_result(Ok(info.clone())), Err("reported no shards".into()));
+        assert_eq!(
+            report_result(Ok(info.clone())),
+            Err("reported no shards".into())
+        );
         info.sizes.insert(vec![0xab, 2], 1);
-        assert_eq!(report_result(Ok(info.clone())).map(|l| l.filters.len()), Ok(1));
+        assert_eq!(
+            report_result(Ok(info.clone())).map(|l| l.filters.len()),
+            Ok(1)
+        );
         info.failed_shard_keys = 1;
-        assert_eq!(report_result(Ok(info)), Err("partial answer: 1 shard keys failed".into()));
-        assert_eq!(report_result(Err("connect: refused\ndetail".into())), Err("connect: refused".into()));
+        assert_eq!(
+            report_result(Ok(info)),
+            Err("partial answer: 1 shard keys failed".into())
+        );
+        assert_eq!(
+            report_result(Err("connect: refused\ndetail".into())),
+            Err("connect: refused".into())
+        );
     }
 
     #[test]
@@ -360,8 +465,21 @@ mod tests {
         }
         use clap::Parser as _;
         assert!(Cli::try_parse_from(["shards", "--archive", "a:1", "--rpc", "b:1"]).is_err());
-        assert_eq!(Cli::try_parse_from(["shards", "--archive", "a:1", "--archive", "b:1"]).unwrap().args.archives.len(), 2);
-        assert_eq!(Cli::try_parse_from(["shards", "--rpc", "b:1"]).unwrap().args.rpc, "b:1");
+        assert_eq!(
+            Cli::try_parse_from(["shards", "--archive", "a:1", "--archive", "b:1"])
+                .unwrap()
+                .args
+                .archives
+                .len(),
+            2
+        );
+        assert_eq!(
+            Cli::try_parse_from(["shards", "--rpc", "b:1"])
+                .unwrap()
+                .args
+                .rpc,
+            "b:1"
+        );
     }
 
     #[test]

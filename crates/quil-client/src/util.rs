@@ -75,7 +75,8 @@ pub fn float_string_12(num: &BigInt, den: &BigInt) -> String {
     const PREC: u32 = 12;
     let scale = BigInt::from(10).pow(PREC);
 
-    let negative = (num.sign() == num_bigint::Sign::Minus) ^ (den.sign() == num_bigint::Sign::Minus);
+    let negative =
+        (num.sign() == num_bigint::Sign::Minus) ^ (den.sign() == num_bigint::Sign::Minus);
     let num_abs = num.magnitude();
     let den_abs = den.magnitude();
     let num_abs = BigInt::from(num_abs.clone());
@@ -168,6 +169,9 @@ mod tests {
     fn rounds_half_away_from_zero() {
         // den = 8e9, so 1 base unit = 0.000000000125 QUIL exactly -> 12 dp.
         let one_unit = BigInt::from(1u64);
-        assert_eq!(float_string_12(&one_unit, &conversion_factor()), "0.000000000125");
+        assert_eq!(
+            float_string_12(&one_unit, &conversion_factor()),
+            "0.000000000125"
+        );
     }
 }

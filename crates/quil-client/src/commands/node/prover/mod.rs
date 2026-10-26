@@ -15,20 +15,20 @@ use quil_types::proto::node::node_service_client::NodeServiceClient;
 use quil_types::proto::node::GetWorkerInfoRequest;
 
 use crate::context::GlobalArgs;
-use crate::util::UNITS_PER_QUIL;
 use crate::rpc::ConnectOpts;
+use crate::util::UNITS_PER_QUIL;
 
 pub mod epoch;
+mod gossip_traffic;
 mod join;
+pub(crate) mod local_execution;
 mod manage;
 mod merge;
 mod ops;
 mod shardinfo;
 mod shards;
 pub(crate) mod sign;
-mod gossip_traffic;
 mod status;
-pub(crate) mod local_execution;
 
 #[derive(Debug, Subcommand)]
 pub enum ProverCommand {
@@ -79,26 +79,18 @@ pub enum ProverCommand {
         filters: Vec<String>,
     },
     /// Confirm prover shard allocations for the given filters.
-    Confirm {
-        filters: Vec<String>,
-    },
+    Confirm { filters: Vec<String> },
     /// Reject prover shard allocations for the given filters.
-    Reject {
-        filters: Vec<String>,
-    },
+    Reject { filters: Vec<String> },
     /// Pause the prover for a shard filter.
     Pause {
         /// Hex-encoded 32-byte shard filter (default: all-0xFF).
         filter: Option<String>,
     },
     /// Resume the prover for a shard filter.
-    Resume {
-        filter: Option<String>,
-    },
+    Resume { filter: Option<String> },
     /// Update the reward delegate address (32-byte hex).
-    Delegate {
-        address: String,
-    },
+    Delegate { address: String },
     /// Submit an alt-shard-update: `<v-adds> <v-removes> <he-adds> <he-removes>` roots.
     AltShardUpdate {
         /// The four root hashes (hex), in order.
@@ -173,13 +165,8 @@ impl ProverCtx {
         client: &mut NodeServiceClient<Channel>,
         request: quil_types::proto::global::MessageRequest,
     ) -> anyhow::Result<()> {
-        crate::send::send_message_request(
-            client,
-            &self.key_manager,
-            vec![0xFFu8; 32],
-            request,
-        )
-        .await
+        crate::send::send_message_request(client, &self.key_manager, vec![0xFFu8; 32], request)
+            .await
     }
 }
 
@@ -193,7 +180,12 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         return merge::run(configs);
     }
 
-    if let ProverCommand::Manage { help_text: true, width, .. } = cmd {
+    if let ProverCommand::Manage {
+        help_text: true,
+        width,
+        ..
+    } = cmd
+    {
         print!("{}", manage::help_text(*width));
         return Ok(());
     }
@@ -203,14 +195,25 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         ProverCommand::Status => status::run(&pc).await,
         ProverCommand::Shards => shards::run(&pc).await,
         ProverCommand::Shardinfo => shardinfo::run(&pc).await,
-        ProverCommand::Manage { render: true, width, height, keys, color, timeout, .. } => {
-            manage::render(&pc, manage::RenderOptions {
-                width: *width,
-                height: *height,
-                keys: keys.split_whitespace().map(str::to_string).collect(),
-                color: *color,
-                timeout: std::time::Duration::from_secs(*timeout),
-            })
+        ProverCommand::Manage {
+            render: true,
+            width,
+            height,
+            keys,
+            color,
+            timeout,
+            ..
+        } => {
+            manage::render(
+                &pc,
+                manage::RenderOptions {
+                    width: *width,
+                    height: *height,
+                    keys: keys.split_whitespace().map(str::to_string).collect(),
+                    color: *color,
+                    timeout: std::time::Duration::from_secs(*timeout),
+                },
+            )
             .await
         }
         ProverCommand::Manage { .. } => manage::run(&pc).await,
@@ -227,7 +230,9 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
 }
 
 /// `workerByFilter` — map hex filter → core id from `GetWorkerInfo`.
-pub(crate) async fn worker_by_filter(client: &mut NodeServiceClient<Channel>) -> HashMap<String, u32> {
+pub(crate) async fn worker_by_filter(
+    client: &mut NodeServiceClient<Channel>,
+) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     if let Ok(resp) = client
         .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
@@ -273,9 +278,14 @@ pub(crate) fn format_storage(bytes: u64) -> String {
 /// really is — only the rendering changes.
 /// Decimal GB, with small nonzero amounts distinct from an empty shard.
 pub(crate) fn format_gb(v: &BigInt) -> String {
-    if v.sign() != Sign::Plus { return "0.0".into(); }
-    let tenths = (v * BigInt::from(10) + BigInt::from(500_000_000u64)) / BigInt::from(1_000_000_000u64);
-    if tenths == BigInt::from(0) { return "<0.1".into(); }
+    if v.sign() != Sign::Plus {
+        return "0.0".into();
+    }
+    let tenths =
+        (v * BigInt::from(10) + BigInt::from(500_000_000u64)) / BigInt::from(1_000_000_000u64);
+    if tenths == BigInt::from(0) {
+        return "<0.1".into();
+    }
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
@@ -286,25 +296,49 @@ const FRAMES_PER_DAY: u64 = 24 * 60 * 60 / 10; // 8640
 /// positive rewards as `<0.1` instead of presenting them as zero.
 pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
     let raw = per_frame * BigInt::from(FRAMES_PER_DAY);
-    if raw.sign() != Sign::Plus { return "0.0".to_string(); }
+    if raw.sign() != Sign::Plus {
+        return "0.0".to_string();
+    }
     let tenths = (raw + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
-    if tenths.sign() != Sign::Plus { return "<0.1".to_string(); }
+    if tenths.sign() != Sign::Plus {
+        return "<0.1".to_string();
+    }
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
 
 pub(crate) fn format_quil_daily_units(v: &BigInt) -> String {
     let negative = v.sign() == Sign::Minus;
     let magnitude = if negative { -v } else { v.clone() };
-    let tenths = (&magnitude + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
-    let text = if magnitude > BigInt::from(0) && tenths == BigInt::from(0) { "<0.1".into() }
-        else { format!("{}.{}", &tenths / 10, &tenths % 10) };
+    let tenths =
+        (&magnitude + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
+    let text = if magnitude > BigInt::from(0) && tenths == BigInt::from(0) {
+        "<0.1".into()
+    } else {
+        format!("{}.{}", &tenths / 10, &tenths % 10)
+    };
     format!("~{}{text}", if negative { "-" } else { "" })
 }
-pub(crate) fn observed_quil_daily(per_frame: &BigInt, cadence: &quil_types::proto::node::FrameCadence, day: bool, now: u64) -> Option<BigInt> {
-    if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 { return None; }
-    let w = if day { cadence.day.as_ref()? } else { cadence.hour.as_ref()? };
-    if w.observed_seconds < 60 || w.observed_seconds > w.window_seconds { return None; }
-    Some(per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400) / BigInt::from(w.observed_seconds))
+pub(crate) fn observed_quil_daily(
+    per_frame: &BigInt,
+    cadence: &quil_types::proto::node::FrameCadence,
+    day: bool,
+    now: u64,
+) -> Option<BigInt> {
+    if now < cadence.last_observed_unix_seconds || now - cadence.last_observed_unix_seconds > 90 {
+        return None;
+    }
+    let w = if day {
+        cadence.day.as_ref()?
+    } else {
+        cadence.hour.as_ref()?
+    };
+    if w.observed_seconds < 60 || w.observed_seconds > w.window_seconds {
+        return None;
+    }
+    Some(
+        per_frame * BigInt::from(w.advanced_frames) * BigInt::from(86400)
+            / BigInt::from(w.observed_seconds),
+    )
 }
 
 #[cfg(test)]
@@ -320,8 +354,14 @@ mod tests {
 
     #[test]
     fn format_gb_uses_decimal_units_and_retains_small_shards() {
-        for (bytes, expected) in [(0, "0.0"), (2048, "<0.1"), (49_999_999, "<0.1"),
-            (50_000_000, "0.1"), (1_000_000_000, "1.0"), (1_673_583_448, "1.7")] {
+        for (bytes, expected) in [
+            (0, "0.0"),
+            (2048, "<0.1"),
+            (49_999_999, "<0.1"),
+            (50_000_000, "0.1"),
+            (1_000_000_000, "1.0"),
+            (1_673_583_448, "1.7"),
+        ] {
             assert_eq!(format_gb(&BigInt::from(bytes)), expected);
         }
     }
@@ -337,15 +377,30 @@ mod tests {
         assert_eq!(format_quil_daily_round(&half), "0.5");
         assert_eq!(format_quil_daily_round(&(half + BigInt::from(1))), "0.5");
         // A reported total of 269.9 QUIL/day.
-        assert_eq!(format_quil_daily_round(&BigInt::from(249_921_760u64)), "269.9");
+        assert_eq!(
+            format_quil_daily_round(&BigInt::from(249_921_760u64)),
+            "269.9"
+        );
         // 8e9 units (one QUIL) per day is 1.0, not 80x more.
-        assert_eq!(format_quil_daily_round(&BigInt::from(UNITS_PER_QUIL / FRAMES_PER_DAY)), "1.0");
-        assert_eq!(format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL)), "~1.0");
-        assert_eq!(format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL / 20 - 1)), "~<0.1");
+        assert_eq!(
+            format_quil_daily_round(&BigInt::from(UNITS_PER_QUIL / FRAMES_PER_DAY)),
+            "1.0"
+        );
+        assert_eq!(
+            format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL)),
+            "~1.0"
+        );
+        assert_eq!(
+            format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL / 20 - 1)),
+            "~<0.1"
+        );
         // Per-shard rates observed on a live node collapse to a handful of
         // tiers, and the ~15x spread that drives a join decision survives.
         assert_eq!(format_quil_daily_round(&BigInt::from(359_840u64)), "0.4");
         assert_eq!(format_quil_daily_round(&BigInt::from(5_432_000u64)), "5.9");
-        assert_eq!(format_quil_daily_round(&BigInt::from(21_440_000u64)), "23.2");
+        assert_eq!(
+            format_quil_daily_round(&BigInt::from(21_440_000u64)),
+            "23.2"
+        );
     }
 }

@@ -14,9 +14,9 @@
 //! used for Falcon peer identities in `libp2p-identity`).
 
 use fn_dsa::{
-    signature_size, sign_key_size, vrfy_key_size, DomainContext, KeyPairGenerator,
-    KeyPairGeneratorStandard, SigningKey, SigningKeyStandard, VerifyingKey,
-    VerifyingKeyStandard, FN_DSA_LOGN_512, HASH_ID_RAW,
+    sign_key_size, signature_size, vrfy_key_size, DomainContext, KeyPairGenerator,
+    KeyPairGeneratorStandard, SigningKey, SigningKeyStandard, VerifyingKey, VerifyingKeyStandard,
+    FN_DSA_LOGN_512, HASH_ID_RAW,
 };
 
 use quil_types::crypto::{BlsAggregateOutput, BlsConstructor, KeyType, Signer};
@@ -44,7 +44,12 @@ impl FalconSigner {
         let mut kg = KeyPairGeneratorStandard::default();
         let mut signing_key = vec![0u8; sign_key_size(LOGN)];
         let mut public_key = vec![0u8; vrfy_key_size(LOGN)];
-        kg.keygen(LOGN, &mut rand::rngs::OsRng, &mut signing_key, &mut public_key);
+        kg.keygen(
+            LOGN,
+            &mut rand::rngs::OsRng,
+            &mut signing_key,
+            &mut public_key,
+        );
         Self {
             signing_key,
             public_key,
@@ -185,10 +190,15 @@ impl BlsConstructor for FalconKeyConstructor {
         if n == 0 || n != messages.len() || signature.len() != n * FALCON_SIGNATURE_LEN {
             return false;
         }
-        public_keys.iter().zip(messages.iter()).enumerate().all(|(i, (pk, msg))| {
-            let component = &signature[i * FALCON_SIGNATURE_LEN..(i + 1) * FALCON_SIGNATURE_LEN];
-            falcon_verify(pk, component, msg, context)
-        })
+        public_keys
+            .iter()
+            .zip(messages.iter())
+            .enumerate()
+            .all(|(i, (pk, msg))| {
+                let component =
+                    &signature[i * FALCON_SIGNATURE_LEN..(i + 1) * FALCON_SIGNATURE_LEN];
+                falcon_verify(pk, component, msg, context)
+            })
     }
 
     fn verify_signatures_batch(&self, items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)]) -> bool {
@@ -255,7 +265,12 @@ mod tests {
         // short / empty pk and sig → false, never panics.
         assert!(!falcon_verify(&[], &sig, b"m", &[]));
         assert!(!falcon_verify(s.public_key(), &[1, 2, 3], b"m", &[]));
-        assert!(!falcon_verify(&vec![0u8; FALCON_PUBLIC_KEY_LEN], &sig, b"m", &[]));
+        assert!(!falcon_verify(
+            &vec![0u8; FALCON_PUBLIC_KEY_LEN],
+            &sig,
+            b"m",
+            &[]
+        ));
     }
 
     #[test]
@@ -330,7 +345,10 @@ mod tests {
         let sig_a = a.sign_with_domain(&m_a, ctx).unwrap();
         let sig_b = b.sign_with_domain(&m_b, ctx).unwrap();
         let agg = c
-            .aggregate(&[pk_a.as_slice(), pk_b.as_slice()], &[sig_a.as_slice(), sig_b.as_slice()])
+            .aggregate(
+                &[pk_a.as_slice(), pk_b.as_slice()],
+                &[sig_a.as_slice(), sig_b.as_slice()],
+            )
             .unwrap();
         assert!(c.verify_multi_pubkey_multi_message_raw(
             &[pk_a.as_slice(), pk_b.as_slice()],
@@ -361,7 +379,10 @@ mod tests {
             .aggregate_public_keys(&[pk_a.as_slice(), pk_b.as_slice()])
             .unwrap();
         let full = c
-            .aggregate(&[pk_a.as_slice(), pk_b.as_slice()], &[sig_a.as_slice(), sig_b.as_slice()])
+            .aggregate(
+                &[pk_a.as_slice(), pk_b.as_slice()],
+                &[sig_a.as_slice(), sig_b.as_slice()],
+            )
             .unwrap();
         assert_eq!(pk_only, full.public_key);
         assert_eq!(pk_only.len(), 2 * FALCON_PUBLIC_KEY_LEN);

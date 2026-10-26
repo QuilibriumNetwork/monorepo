@@ -11,9 +11,7 @@ use rand::RngCore;
 
 use quil_keys::FileKeyManager;
 use quil_types::crypto::Signer;
-use quil_types::proto::compute::{
-    Application, CodeExecute, ExecuteOperation, ExecutionContext,
-};
+use quil_types::proto::compute::{Application, CodeExecute, ExecuteOperation, ExecutionContext};
 use quil_types::proto::global::{message_request::Request, MessageRequest};
 
 use crate::alias_store::{self, Store};
@@ -74,7 +72,10 @@ fn resolve(store: &Option<Store>, input: &str, expected: usize) -> anyhow::Resul
     if let Some(s) = store {
         if let Some((addr, _)) = s.resolve(input) {
             if addr.len() != expected {
-                anyhow::bail!("alias {input:?} resolved to {} bytes, expected {expected}", addr.len());
+                anyhow::bail!(
+                    "alias {input:?} resolved to {} bytes, expected {expected}",
+                    addr.len()
+                );
             }
             return Ok(addr);
         }
@@ -133,7 +134,9 @@ async fn execute(global: GlobalArgs, address: &str, rest: &[String]) -> anyhow::
     let identifier: Vec<u8> = if !arguments.is_empty() {
         arguments.concat().into_bytes()
     } else if let Some(p) = &party_id {
-        let n: u64 = p.parse().map_err(|_| anyhow::anyhow!("invalid party ID: {p}"))?;
+        let n: u64 = p
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid party ID: {p}"))?;
         format!("party_{n}").into_bytes()
     } else {
         b"default".to_vec()

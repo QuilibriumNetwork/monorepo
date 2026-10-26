@@ -58,16 +58,26 @@ pub fn decode(data: &[u8]) -> Option<StorageSnapshotRoots> {
     for (phase, root) in roots.iter_mut().enumerate() {
         root.copy_from_slice(&data[24 + 32 * phase..24 + 32 * (phase + 1)]);
     }
-    Some(StorageSnapshotRoots { epoch: word(0), frame: word(1), anchor: word(2), roots })
+    Some(StorageSnapshotRoots {
+        epoch: word(0),
+        frame: word(1),
+        anchor: word(2),
+        roots,
+    })
 }
 
 /// The shard and snapshot a record's tree holds.
-pub fn from_tree(tree: &quil_tries::VectorCommitmentTree) -> Option<(Vec<u8>, StorageSnapshotRoots)> {
+pub fn from_tree(
+    tree: &quil_tries::VectorCommitmentTree,
+) -> Option<(Vec<u8>, StorageSnapshotRoots)> {
     let filter = read_field(tree, CLASS, "ShardFilter")?;
     Some((filter, decode(&read_field(tree, CLASS, "Snapshot")?)?))
 }
 
-pub fn to_tree(filter: &[u8], snapshot: &StorageSnapshotRoots) -> Result<quil_tries::VectorCommitmentTree> {
+pub fn to_tree(
+    filter: &[u8],
+    snapshot: &StorageSnapshotRoots,
+) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     write_type(&mut tree, CLASS)?;
     write_field(&mut tree, CLASS, "ShardFilter", filter)?;
@@ -76,20 +86,36 @@ pub fn to_tree(filter: &[u8], snapshot: &StorageSnapshotRoots) -> Result<quil_tr
 }
 
 /// `filter`'s snapshot for `epoch` in committed `state`, once recorded.
-pub fn read(state: &HypergraphState, epoch: u64, filter: &[u8]) -> Result<Option<StorageSnapshotRoots>> {
+pub fn read(
+    state: &HypergraphState,
+    epoch: u64,
+    filter: &[u8],
+) -> Result<Option<StorageSnapshotRoots>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-    Ok(match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &snapshot_address(epoch, filter)?, &va_disc)? {
-        Some(blob) if !blob.is_empty() => from_tree(&crate::prover_registry::rebuild_vertex_tree_from_blob(&blob))
+    Ok(
+        match state.get(
+            &GLOBAL_INTRINSIC_ADDRESS[..],
+            &snapshot_address(epoch, filter)?,
+            &va_disc,
+        )? {
+            Some(blob) if !blob.is_empty() => from_tree(
+                &crate::prover_registry::rebuild_vertex_tree_from_blob(&blob),
+            )
             .filter(|(held, snapshot)| held == filter && snapshot.epoch == epoch)
             .map(|(_, snapshot)| snapshot),
-        _ => None,
-    })
+            _ => None,
+        },
+    )
 }
 
 /// Record the roots of `header`, executed in GLOBAL frame `frame`, as its
 /// shard's snapshot for the next epoch: the first such header at or after
 /// that epoch's snapshot frame, in a hash-proof epoch. True when it recorded.
-pub fn record(state: &HypergraphState, frame: u64, header: &super::frame_header::FrameHeader) -> Result<bool> {
+pub fn record(
+    state: &HypergraphState,
+    frame: u64,
+    header: &super::frame_header::FrameHeader,
+) -> Result<bool> {
     let epoch = quil_types::consensus::epoch_for_frame(frame) + 1;
     if !quil_types::consensus::hash_storage_proofs_at(epoch)
         || frame < quil_types::consensus::storage_snapshot_frame(epoch)
@@ -97,20 +123,35 @@ pub fn record(state: &HypergraphState, frame: u64, header: &super::frame_header:
     {
         return Ok(false);
     }
-    let Ok(roots) = header.state_roots.iter()
+    let Ok(roots) = header
+        .state_roots
+        .iter()
         .map(|root| <[u8; 32]>::try_from(root.as_slice()))
         .collect::<std::result::Result<Vec<_>, _>>()
     else {
         return Ok(false);
     };
-    let Ok(roots) = <[[u8; 32]; 4]>::try_from(roots) else { return Ok(false) };
+    let Ok(roots) = <[[u8; 32]; 4]>::try_from(roots) else {
+        return Ok(false);
+    };
     if read(state, epoch, &header.address)?.is_some() {
         return Ok(false);
     }
-    let snapshot = StorageSnapshotRoots { epoch, frame: header.frame_number, anchor: header.global_frame_number, roots };
+    let snapshot = StorageSnapshotRoots {
+        epoch,
+        frame: header.frame_number,
+        anchor: header.global_frame_number,
+        roots,
+    };
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     let blob = crate::prover_registry::vertex_tree_to_blob(&to_tree(&header.address, &snapshot)?);
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &snapshot_address(epoch, &header.address)?, &va_disc, frame, blob)?;
+    state.set(
+        &GLOBAL_INTRINSIC_ADDRESS[..],
+        &snapshot_address(epoch, &header.address)?,
+        &va_disc,
+        frame,
+        blob,
+    )?;
     Ok(true)
 }
 
@@ -136,7 +177,9 @@ pub fn sources(
         .iter()
         .filter(|change| change.effective_epoch == epoch)
         .find_map(|change| match change.kind {
-            ShardChangeKind::Split if change.children.iter().any(|child| child == filter) => Some(vec![change.parent.clone()]),
+            ShardChangeKind::Split if change.children.iter().any(|child| child == filter) => {
+                Some(vec![change.parent.clone()])
+            }
             ShardChangeKind::Merge if change.parent == filter => Some(change.children.clone()),
             _ => None,
         })
@@ -148,7 +191,14 @@ pub fn sources(
     }
     parents
         .into_iter()
-        .map(|parent| lookup(&parent).filter(|snapshot| snapshot.epoch == epoch).map(|snapshot| Source { filter: parent, snapshot }))
+        .map(|parent| {
+            lookup(&parent)
+                .filter(|snapshot| snapshot.epoch == epoch)
+                .map(|snapshot| Source {
+                    filter: parent,
+                    snapshot,
+                })
+        })
         .collect()
 }
 
@@ -198,7 +248,10 @@ pub fn decode_plan(data: &[u8]) -> Option<Vec<(Vec<u8>, Vec<Source>)>> {
         for _ in 0..sources_len {
             let len = u16::from_be_bytes(take(2)?.try_into().ok()?) as usize;
             let source = take(len)?.to_vec();
-            sources.push(Source { filter: source, snapshot: decode(take(ENCODED_LEN)?)? });
+            sources.push(Source {
+                filter: source,
+                snapshot: decode(take(ENCODED_LEN)?)?,
+            });
         }
         plan.push((filter, sources));
     }
@@ -211,14 +264,37 @@ mod tests {
     use quil_types::store::{PendingShardChange, ShardChangeKind};
 
     fn snapshot(epoch: u64, seed: u8) -> StorageSnapshotRoots {
-        StorageSnapshotRoots { epoch, frame: 40 + seed as u64, anchor: 300, roots: [[seed; 32], [0; 32], [seed ^ 1; 32], [0; 32]] }
+        StorageSnapshotRoots {
+            epoch,
+            frame: 40 + seed as u64,
+            anchor: 300,
+            roots: [[seed; 32], [0; 32], [seed ^ 1; 32], [0; 32]],
+        }
     }
 
     #[test]
     fn a_plan_survives_its_encoding() {
         let plan = vec![
-            (vec![1, 2], vec![Source { filter: vec![1], snapshot: snapshot(4, 1) }]),
-            (vec![3], vec![Source { filter: vec![3, 0], snapshot: snapshot(4, 2) }, Source { filter: vec![3, 1], snapshot: snapshot(4, 3) }]),
+            (
+                vec![1, 2],
+                vec![Source {
+                    filter: vec![1],
+                    snapshot: snapshot(4, 1),
+                }],
+            ),
+            (
+                vec![3],
+                vec![
+                    Source {
+                        filter: vec![3, 0],
+                        snapshot: snapshot(4, 2),
+                    },
+                    Source {
+                        filter: vec![3, 1],
+                        snapshot: snapshot(4, 3),
+                    },
+                ],
+            ),
         ];
         let encoded = encode_plan(&plan);
         assert_eq!(decode_plan(&encoded), Some(plan));
@@ -234,20 +310,50 @@ mod tests {
         assert_eq!(decode(&encode(&record)[1..]), None);
         let tree = to_tree(&[1, 2, 3], &record).unwrap();
         assert_eq!(from_tree(&tree), Some((vec![1, 2, 3], record)));
-        assert_eq!(snapshot_address(7, &[1]).unwrap(), snapshot_address(11, &[1]).unwrap(), "a ring of four epochs");
-        assert_ne!(snapshot_address(7, &[1]).unwrap(), snapshot_address(8, &[1]).unwrap());
+        assert_eq!(
+            snapshot_address(7, &[1]).unwrap(),
+            snapshot_address(11, &[1]).unwrap(),
+            "a ring of four epochs"
+        );
+        assert_ne!(
+            snapshot_address(7, &[1]).unwrap(),
+            snapshot_address(8, &[1]).unwrap()
+        );
     }
 
     struct StubProver;
     impl quil_types::crypto::InclusionProver for StubProver {
-        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64)
-            -> Result<Box<dyn quil_types::crypto::Multiproof>> {
-            Err(quil_types::error::QuilError::Internal("batch not supported".into()))
+        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![0u8; 64])
         }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> Result<Box<dyn quil_types::crypto::Multiproof>> {
+            Err(quil_types::error::QuilError::Internal(
+                "batch not supported".into(),
+            ))
+        }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     /// The first header executed at or after an epoch's snapshot frame names
@@ -257,12 +363,16 @@ mod tests {
         let length = quil_types::consensus::epoch_length_frames();
         let epoch = 6;
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
-        let state = HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
-            std::sync::Arc::new(StubProver),
-        )));
+        let state =
+            HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                std::sync::Arc::new(StubProver),
+            )));
         let at = quil_types::consensus::storage_snapshot_frame(epoch);
-        assert_eq!(at, (epoch - 1) * length + quil_types::consensus::STORAGE_SNAPSHOT_OFFSET);
+        assert_eq!(
+            at,
+            (epoch - 1) * length + quil_types::consensus::STORAGE_SNAPSHOT_OFFSET
+        );
         let header = |frame_number: u64, seed: u8| super::super::frame_header::FrameHeader {
             address: vec![0xA0, 7],
             frame_number,
@@ -270,16 +380,41 @@ mod tests {
             state_roots: vec![vec![seed; 32], vec![0; 32], vec![seed; 32], vec![0; 32]],
             ..Default::default()
         };
-        assert!(!record(&state, at - 1, &header(50, 1)).unwrap(), "before the snapshot frame");
-        assert!(!record(&state, at, &super::super::frame_header::FrameHeader {
-            state_roots: vec![vec![1; 32]], ..header(51, 1)
-        }).unwrap(), "not four roots");
+        assert!(
+            !record(&state, at - 1, &header(50, 1)).unwrap(),
+            "before the snapshot frame"
+        );
+        assert!(
+            !record(
+                &state,
+                at,
+                &super::super::frame_header::FrameHeader {
+                    state_roots: vec![vec![1; 32]],
+                    ..header(51, 1)
+                }
+            )
+            .unwrap(),
+            "not four roots"
+        );
         assert!(record(&state, at, &header(52, 2)).unwrap());
-        assert!(!record(&state, at + 1, &header(53, 3)).unwrap(), "recorded once");
+        assert!(
+            !record(&state, at + 1, &header(53, 3)).unwrap(),
+            "recorded once"
+        );
         let recorded = read(&state, epoch, &[0xA0, 7]).unwrap().unwrap();
-        assert_eq!((recorded.frame, recorded.anchor, recorded.roots[0]), (52, at - 3, [2; 32]));
-        assert_eq!(read(&state, epoch + 4, &[0xA0, 7]).unwrap(), None, "a ring slot holds one epoch");
-        assert!(!record(&state, epoch * length + 1, &header(54, 4)).unwrap(), "the epoch after's snapshot frame is not here yet");
+        assert_eq!(
+            (recorded.frame, recorded.anchor, recorded.roots[0]),
+            (52, at - 3, [2; 32])
+        );
+        assert_eq!(
+            read(&state, epoch + 4, &[0xA0, 7]).unwrap(),
+            None,
+            "a ring slot holds one epoch"
+        );
+        assert!(
+            !record(&state, epoch * length + 1, &header(54, 4)).unwrap(),
+            "the epoch after's snapshot frame is not here yet"
+        );
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
@@ -294,23 +429,59 @@ mod tests {
             _ => None,
         };
         let own = sources(&parent, 9, &[], lookup).unwrap();
-        assert_eq!(own, vec![Source { filter: parent.clone(), snapshot: snapshot(9, 1) }]);
-        assert_eq!(sources(&other, 9, &[], lookup), None, "recorded for another epoch");
+        assert_eq!(
+            own,
+            vec![Source {
+                filter: parent.clone(),
+                snapshot: snapshot(9, 1)
+            }]
+        );
+        assert_eq!(
+            sources(&other, 9, &[], lookup),
+            None,
+            "recorded for another epoch"
+        );
         assert_eq!(sources(&[0xC0], 9, &[], lookup), None, "not recorded");
         let split = PendingShardChange {
-            kind: ShardChangeKind::Split, parent: parent.clone(), children: vec![left.clone(), right.clone()],
-            effective_epoch: 9, proposed_frame: 1,
+            kind: ShardChangeKind::Split,
+            parent: parent.clone(),
+            children: vec![left.clone(), right.clone()],
+            effective_epoch: 9,
+            proposed_frame: 1,
         };
-        assert_eq!(sources(&right, 9, std::slice::from_ref(&split), lookup).unwrap(),
-            vec![Source { filter: parent.clone(), snapshot: snapshot(9, 1) }], "a split child reads its parent");
-        assert_eq!(sources(&right, 10, std::slice::from_ref(&split), lookup), None, "a change of another epoch");
+        assert_eq!(
+            sources(&right, 9, std::slice::from_ref(&split), lookup).unwrap(),
+            vec![Source {
+                filter: parent.clone(),
+                snapshot: snapshot(9, 1)
+            }],
+            "a split child reads its parent"
+        );
+        assert_eq!(
+            sources(&right, 10, std::slice::from_ref(&split), lookup),
+            None,
+            "a change of another epoch"
+        );
         let merge = PendingShardChange {
-            kind: ShardChangeKind::Merge, parent: parent.clone(), children: vec![right.clone(), left.clone()],
-            effective_epoch: 9, proposed_frame: 1,
+            kind: ShardChangeKind::Merge,
+            parent: parent.clone(),
+            children: vec![right.clone(), left.clone()],
+            effective_epoch: 9,
+            proposed_frame: 1,
         };
-        assert_eq!(sources(&parent, 9, &[merge], lookup).unwrap(), vec![
-            Source { filter: left, snapshot: snapshot(9, 2) },
-            Source { filter: right, snapshot: snapshot(9, 3) },
-        ], "a merge reads each source");
+        assert_eq!(
+            sources(&parent, 9, &[merge], lookup).unwrap(),
+            vec![
+                Source {
+                    filter: left,
+                    snapshot: snapshot(9, 2)
+                },
+                Source {
+                    filter: right,
+                    snapshot: snapshot(9, 3)
+                },
+            ],
+            "a merge reads each source"
+        );
     }
 }

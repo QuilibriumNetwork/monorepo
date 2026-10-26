@@ -212,8 +212,7 @@ pub const EPOCH_LENGTH_FRAMES: u64 = 720;
 /// all mainnet nodes agree on 720. Lets e2e/integration harnesses exercise the
 /// full epoch-aligned join→confirm→activate pipeline in a handful of frames
 /// instead of 720+.
-static EPOCH_LENGTH_OVERRIDE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static EPOCH_LENGTH_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Override the epoch length (frames per storage epoch) for tests/testnet.
 /// `0` restores the mainnet `EPOCH_LENGTH_FRAMES` default. CONSENSUS PARAMETER —
@@ -226,7 +225,11 @@ pub fn set_epoch_length_frames(frames: u64) {
 #[inline]
 pub fn epoch_length_frames() -> u64 {
     let o = EPOCH_LENGTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if o == 0 { EPOCH_LENGTH_FRAMES } else { o }
+    if o == 0 {
+        EPOCH_LENGTH_FRAMES
+    } else {
+        o
+    }
 }
 
 /// Epoch length for testnet/devnet (`network != 0`): a short epoch so the
@@ -309,11 +312,15 @@ static COMMITTEE_HANDOFF_POLICY: std::sync::RwLock<Option<CommitteeHandoffPolicy
 /// CONSENSUS PARAMETER — every node materializing global frames must install
 /// the same value before evaluating any frame. Tests and network bootstrap only.
 pub fn set_committee_handoff_policy(policy: Option<CommitteeHandoffPolicy>) {
-    *COMMITTEE_HANDOFF_POLICY.write().unwrap_or_else(|e| e.into_inner()) = policy;
+    *COMMITTEE_HANDOFF_POLICY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = policy;
 }
 
 pub fn committee_handoff_policy() -> Option<CommitteeHandoffPolicy> {
-    *COMMITTEE_HANDOFF_POLICY.read().unwrap_or_else(|e| e.into_inner())
+    *COMMITTEE_HANDOFF_POLICY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether committee sessions govern GLOBAL frame `frame`: a policy is
@@ -345,7 +352,9 @@ pub fn committee_handoff_chain_id(network: u8) -> [u8; 32] {
 /// `QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY=1` selects mainnet's flag day
 /// instead.
 pub fn init_committee_handoff_for_network(network: u8) {
-    set_committee_handoff_policy(committee_handoff_policy_for_network(network, |name| std::env::var(name).ok()));
+    set_committee_handoff_policy(committee_handoff_policy_for_network(network, |name| {
+        std::env::var(name).ok()
+    }));
 }
 
 fn committee_handoff_policy_for_network(
@@ -372,7 +381,11 @@ fn committee_handoff_policy_for_network(
     Some(CommitteeHandoffPolicy {
         activation_frame,
         chain_id: committee_handoff_chain_id(network),
-        legacy_history: if discard { LegacyHistory::Discard } else { LegacyHistory::Migrate },
+        legacy_history: if discard {
+            LegacyHistory::Discard
+        } else {
+            LegacyHistory::Migrate
+        },
         membership_boundary_frame,
         first_session_boundary_frame,
     })
@@ -420,7 +433,9 @@ fn seniority_succession_epoch_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's seniority succession epoch from its network, and
@@ -430,7 +445,9 @@ pub fn init_seniority_succession_epoch(network: u8) -> u64 {
     *SENIORITY_SUCCESSION_EPOCH.get_or_init(|| {
         seniority_succession_epoch_for(
             network,
-            std::env::var("QUIL_SENIORITY_SUCCESSION_EPOCH").ok().as_deref(),
+            std::env::var("QUIL_SENIORITY_SUCCESSION_EPOCH")
+                .ok()
+                .as_deref(),
         )
     })
 }
@@ -553,14 +570,21 @@ fn hash_storage_proof_epoch_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's hash storage proof epoch from its network, and return
 /// it. Called at startup before any frame is processed; the first call decides.
 pub fn init_hash_storage_proof_epoch(network: u8) -> u64 {
     *HASH_STORAGE_PROOF_EPOCH.get_or_init(|| {
-        hash_storage_proof_epoch_for(network, std::env::var("QUIL_HASH_STORAGE_PROOF_EPOCH").ok().as_deref())
+        hash_storage_proof_epoch_for(
+            network,
+            std::env::var("QUIL_HASH_STORAGE_PROOF_EPOCH")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -586,7 +610,10 @@ pub const STORAGE_SNAPSHOT_OFFSET: u64 = 16;
 /// The GLOBAL frame whose crossing snapshots leaf data for `target_epoch`'s
 /// registrations (made during the epoch before it).
 pub fn storage_snapshot_frame(target_epoch: u64) -> u64 {
-    target_epoch.saturating_sub(1).saturating_mul(epoch_length_frames()) + STORAGE_SNAPSHOT_OFFSET
+    target_epoch
+        .saturating_sub(1)
+        .saturating_mul(epoch_length_frames())
+        + STORAGE_SNAPSHOT_OFFSET
 }
 
 /// The epoch whose registrations snapshot their leaf data at an app frame
@@ -723,8 +750,7 @@ impl ProverAllocationInfo {
                 // fixtures (which leave it zero) on the always-active path — they
                 // have no deferred activation.
                 if self.join_confirm_frame_number > 0 {
-                    let activation_epoch =
-                        epoch_for_frame(self.join_confirm_frame_number) + 1;
+                    let activation_epoch = epoch_for_frame(self.join_confirm_frame_number) + 1;
                     if current_epoch < activation_epoch {
                         return EffectiveStatus::Joining;
                     }
@@ -753,8 +779,7 @@ impl ProverAllocationInfo {
                 // it until the boundary. A leave that never confirmed in its E+1
                 // slot is implicitly departed (ExpiredLeaving).
                 if self.leave_confirm_frame_number > 0 {
-                    let deactivation_epoch =
-                        epoch_for_frame(self.leave_confirm_frame_number) + 1;
+                    let deactivation_epoch = epoch_for_frame(self.leave_confirm_frame_number) + 1;
                     if current_epoch < deactivation_epoch {
                         EffectiveStatus::Leaving
                     } else {
@@ -810,11 +835,15 @@ impl ProverAllocationInfo {
     /// expired, rejected, kicked, historic or unknown.
     pub fn phase(&self, frame: u64) -> Option<AllocationPhase> {
         Some(match self.effective_status(frame) {
-            EffectiveStatus::Joining if self.join_confirm_frame_number > 0 => AllocationPhase::Activating,
+            EffectiveStatus::Joining if self.join_confirm_frame_number > 0 => {
+                AllocationPhase::Activating
+            }
             EffectiveStatus::Joining => AllocationPhase::Joining,
             EffectiveStatus::Active => AllocationPhase::Active,
             EffectiveStatus::Paused => AllocationPhase::Paused,
-            EffectiveStatus::Leaving if self.leave_confirm_frame_number > 0 => AllocationPhase::Departing,
+            EffectiveStatus::Leaving if self.leave_confirm_frame_number > 0 => {
+                AllocationPhase::Departing
+            }
             EffectiveStatus::Leaving => AllocationPhase::Leaving,
             _ => return None,
         })
@@ -855,10 +884,14 @@ impl ProverAllocationInfo {
     /// (or a genesis/test allocation without a join frame).
     pub fn join_wait(&self, frame: u64) -> Option<JoinWait> {
         match self.phase(frame)? {
-            AllocationPhase::Joining if self.join_frame_number > 0 =>
-                Some(JoinWait::Confirmation { epoch: epoch_for_frame(self.join_frame_number) + 1 }),
-            AllocationPhase::Activating =>
-                Some(JoinWait::Activation { frame: epoch_start_frame(epoch_for_frame(self.join_confirm_frame_number) + 1) }),
+            AllocationPhase::Joining if self.join_frame_number > 0 => {
+                Some(JoinWait::Confirmation {
+                    epoch: epoch_for_frame(self.join_frame_number) + 1,
+                })
+            }
+            AllocationPhase::Activating => Some(JoinWait::Activation {
+                frame: epoch_start_frame(epoch_for_frame(self.join_confirm_frame_number) + 1),
+            }),
             _ => None,
         }
     }
@@ -1040,8 +1073,12 @@ impl LifecycleMembers {
     pub fn add(&mut self, address: Vec<u8>, alloc: &ProverAllocationInfo, frame: u64) {
         match alloc.effective_status(frame) {
             EffectiveStatus::Active => self.active.push(address),
-            EffectiveStatus::Joining if alloc.join_confirm_frame_number > 0 => self.activating.push(address),
-            EffectiveStatus::Leaving if alloc.leave_confirm_frame_number == 0 => self.leaving.push(address),
+            EffectiveStatus::Joining if alloc.join_confirm_frame_number > 0 => {
+                self.activating.push(address)
+            }
+            EffectiveStatus::Leaving if alloc.leave_confirm_frame_number == 0 => {
+                self.leaving.push(address)
+            }
             _ => {}
         }
     }
@@ -1064,7 +1101,9 @@ impl LifecycleMembers {
 pub trait ProverRegistry: Send + Sync {
     /// Identify a supported registry implementation before reconstructing an
     /// isolated execution context. Custom registries must opt in explicitly.
-    fn as_any(&self) -> Option<&dyn std::any::Any> { None }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;
     /// Whether the registry holds the store's contents yet. A node loads its
     /// canonical registry in the background at startup and reads it empty
@@ -1081,11 +1120,13 @@ pub trait ProverRegistry: Send + Sync {
     fn get_lifecycle_view(&self, address: &[u8], frame: u64) -> Result<ProverLifecycleView> {
         let prover = self.get_prover_info(address)?;
         let summaries = self.get_prover_shard_summaries(frame)?;
-        let filters: std::collections::BTreeSet<_> = prover.iter()
+        let filters: std::collections::BTreeSet<_> = prover
+            .iter()
             .flat_map(|p| p.allocations.iter())
             .map(|a| a.confirmation_filter.clone())
             .chain(summaries.iter().map(|s| s.filter.clone()))
-            .filter(|f| !f.is_empty()).collect();
+            .filter(|f| !f.is_empty())
+            .collect();
         let mut members = HashMap::new();
         let mut reward_rings = HashMap::new();
         for filter in filters {
@@ -1095,7 +1136,11 @@ pub trait ProverRegistry: Send + Sync {
             let mut shard = LifecycleMembers::default();
             for status in [ProverStatus::Active, ProverStatus::Leaving] {
                 for p in self.get_provers_by_status(&filter, status)? {
-                    if let Some(alloc) = p.allocations.iter().find(|a| a.confirmation_filter == filter && a.status == status) {
+                    if let Some(alloc) = p
+                        .allocations
+                        .iter()
+                        .find(|a| a.confirmation_filter == filter && a.status == status)
+                    {
                         shard.add(p.address.clone(), alloc, frame);
                     }
                 }
@@ -1103,17 +1148,30 @@ pub trait ProverRegistry: Send + Sync {
             shard.sort();
             members.insert(filter, shard);
         }
-        Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
+        Ok(ProverLifecycleView {
+            prover,
+            summaries,
+            members,
+            reward_rings,
+        })
     }
     /// A current or explicitly projected reward position. Concurrent
     /// registries override this to read committee and allocations atomically.
-    fn get_reward_ring_estimate(&self, address: &[u8], filter: &[u8], frame: u64)
-        -> Result<Option<crate::reward_ring::RewardRingEstimate>> {
+    fn get_reward_ring_estimate(
+        &self,
+        address: &[u8],
+        filter: &[u8],
+        frame: u64,
+    ) -> Result<Option<crate::reward_ring::RewardRingEstimate>> {
         let committee = self.get_active_provers(filter, frame)?;
         let all = self.get_provers(filter)?;
         Ok(crate::reward_ring::estimate_reward_ring(
-            &committee.iter().collect::<Vec<_>>(), &all.iter().collect::<Vec<_>>(),
-            address, filter, frame))
+            &committee.iter().collect::<Vec<_>>(),
+            &all.iter().collect::<Vec<_>>(),
+            address,
+            filter,
+            frame,
+        ))
     }
     /// A member's registered storage leaf root for `leaf_id`, as
     /// `(leaf_root, num_blocks, epoch)`, or `None` if not registered. `leaf_id`
@@ -1138,10 +1196,19 @@ pub trait ProverRegistry: Send + Sync {
     }
     /// The snapshot `filter`'s registrations for `epoch` commit to, once
     /// GLOBAL has recorded it, or `None`.
-    fn get_storage_snapshot(&self, _filter: &[u8], _epoch: u64) -> Result<Option<StorageSnapshotRoots>> {
+    fn get_storage_snapshot(
+        &self,
+        _filter: &[u8],
+        _epoch: u64,
+    ) -> Result<Option<StorageSnapshotRoots>> {
         Ok(None)
     }
-    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> Result<Vec<u8>>;
+    fn get_next_prover(
+        &self,
+        input: &[u8; 32],
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<Vec<u8>>;
     fn get_ordered_provers(
         &self,
         input: &[u8; 32],
@@ -1179,11 +1246,8 @@ pub trait ProverRegistry: Send + Sync {
         }
         Ok(by_address.into_values().collect())
     }
-    fn get_provers_by_status(
-        &self,
-        filter: &[u8],
-        status: ProverStatus,
-    ) -> Result<Vec<ProverInfo>>;
+    fn get_provers_by_status(&self, filter: &[u8], status: ProverStatus)
+        -> Result<Vec<ProverInfo>>;
     /// Touch the prover's last-active-frame counter under `filter`.
     /// Default: no-op (test stubs don't care; only the persistent
     /// registry overrides). Production maintains an in-memory cache
@@ -1223,10 +1287,7 @@ pub trait ProverRegistry: Send + Sync {
     /// registry's internal `current_frame` — that one only advances
     /// when the materializer runs, so it lags on observer-only
     /// nodes).
-    fn get_prover_shard_summaries(
-        &self,
-        frame_number: u64,
-    ) -> Result<Vec<ProverShardSummary>>;
+    fn get_prover_shard_summaries(&self, frame_number: u64) -> Result<Vec<ProverShardSummary>>;
     /// Drop stale Joining vertices that never confirmed.
     /// Default: no-op (test stubs don't track orphan lifecycle).
     /// Production walks the prover cache and removes entries past
@@ -1337,11 +1398,16 @@ pub struct ShardDetail {
 /// Provides shard-level info.
 pub trait ShardInfoProvider: Send + Sync {
     /// Local lifecycle scoring strategy, unavailable on older providers.
-    fn allocation_scoring_strategy(&self) -> &'static str { "" }
+    fn allocation_scoring_strategy(&self) -> &'static str {
+        ""
+    }
 
     /// One committed GLOBAL cursor per filter, from a single snapshot.
     /// Missing coverage/session data stays unavailable; zero is a real cursor.
-    fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {
+    fn get_global_app_heads(
+        &self,
+        filters: &[Vec<u8>],
+    ) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {
         Ok(vec![None; filters.len()])
     }
 
@@ -1374,7 +1440,9 @@ pub(crate) mod epoch_tests {
     static EPOCH_LENGTH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
-        EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        EPOCH_LENGTH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Each live allocation has one phase, a confirmed join or leave its own,
@@ -1392,12 +1460,17 @@ pub(crate) mod epoch_tests {
         };
         let allocations = [
             with(ProverStatus::Joining, &|a| a.join_frame_number = 10 * e),
-            with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1),
+            with(ProverStatus::Active, &|a| {
+                a.join_confirm_frame_number = 10 * e + 1
+            }),
             with(ProverStatus::Active, &|_| {}),
             with(ProverStatus::Active, &|_| {}),
             with(ProverStatus::Paused, &|_| {}),
             with(ProverStatus::Leaving, &|a| a.leave_frame_number = 10 * e),
-            with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; }),
+            with(ProverStatus::Leaving, &|a| {
+                a.leave_frame_number = 9 * e;
+                a.leave_confirm_frame_number = 10 * e + 2;
+            }),
             with(ProverStatus::Joining, &|a| a.join_frame_number = 2 * e),
             with(ProverStatus::Active, &|a| a.epoch = 8),
         ];
@@ -1407,7 +1480,17 @@ pub(crate) mod epoch_tests {
                 counts.add(phase);
             }
         }
-        assert_eq!(counts, PhaseCounts { joining: 1, activating: 1, active: 2, paused: 1, leaving: 1, departing: 1 });
+        assert_eq!(
+            counts,
+            PhaseCounts {
+                joining: 1,
+                activating: 1,
+                active: 2,
+                paused: 1,
+                leaving: 1,
+                departing: 1
+            }
+        );
     }
 
     /// A join waits for its confirmation in the epoch after the join, then,
@@ -1426,7 +1509,10 @@ pub(crate) mod epoch_tests {
         a.status = ProverStatus::Active;
         a.join_confirm_frame_number = 1276 * e + 8;
         a.epoch = 1277;
-        assert_eq!(a.join_wait(1276 * e + 9), Some(JoinWait::Activation { frame: 1277 * e }));
+        assert_eq!(
+            a.join_wait(1276 * e + 9),
+            Some(JoinWait::Activation { frame: 1277 * e })
+        );
         assert_eq!(a.join_wait(1277 * e), None, "active from the boundary");
         a.join_frame_number = 0;
         a.join_confirm_frame_number = 0;
@@ -1478,7 +1564,10 @@ pub(crate) mod epoch_tests {
         let _guard = epoch_length_guard();
         let e = epoch_for_frame(frame_in_epoch(3));
         let a = active_alloc(vec![0xAB; 32], e);
-        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Active);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(3)),
+            EffectiveStatus::Active
+        );
     }
 
     #[test]
@@ -1541,15 +1630,24 @@ pub(crate) mod epoch_tests {
         let a = confirmed_alloc(vec![0xAB; 32], join_confirm, 4);
         // During the confirm epoch (E+1 = 3) the byte is Active but the prover
         // is NOT yet in the committee — reads as Joining (deferred activation).
-        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Joining);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(3)),
+            EffectiveStatus::Joining
+        );
         // It owns the slot (is_live) but is not yet a committee member — the
         // lifecycle `active` bucket (which excludes Joining), not is_allocated,
         // is what gates committee/coverage counting.
         assert!(a.effective_status(frame_in_epoch(3)).is_live());
         // At the activation boundary E+2 = 4, it becomes Active.
-        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::Active);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(4)),
+            EffectiveStatus::Active
+        );
         // If it then fails to re-confirm, epoch 5 reads ExpiredEpoch.
-        assert_eq!(a.effective_status(frame_in_epoch(5)), EffectiveStatus::ExpiredEpoch);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(5)),
+            EffectiveStatus::ExpiredEpoch
+        );
     }
 
     #[test]
@@ -1559,12 +1657,18 @@ pub(crate) mod epoch_tests {
         let mut a = active_alloc(vec![0xAB; 32], 4);
         a.status = ProverStatus::Leaving;
         a.leave_confirm_frame_number = 3 * EPOCH_LENGTH_FRAMES + 5; // epoch 3
-        // Serving notice through the rest of epoch 3 — still counted as Leaving
-        // (live coverage), keeps the committee frozen.
-        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Leaving);
+                                                                    // Serving notice through the rest of epoch 3 — still counted as Leaving
+                                                                    // (live coverage), keeps the committee frozen.
+        assert_eq!(
+            a.effective_status(frame_in_epoch(3)),
+            EffectiveStatus::Leaving
+        );
         assert!(a.effective_status(frame_in_epoch(3)).is_live());
         // Departs at epoch 4.
-        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::ExpiredLeaving);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(4)),
+            EffectiveStatus::ExpiredLeaving
+        );
         assert!(a.effective_status(frame_in_epoch(4)).is_terminal());
     }
 
@@ -1576,10 +1680,16 @@ pub(crate) mod epoch_tests {
         let mut a = active_alloc(vec![0xAB; 32], 0);
         a.status = ProverStatus::Joining;
         a.join_frame_number = 2 * EPOCH_LENGTH_FRAMES + 10; // epoch 2
-        // Still valid through its confirm epoch (3).
-        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Joining);
+                                                            // Still valid through its confirm epoch (3).
+        assert_eq!(
+            a.effective_status(frame_in_epoch(3)),
+            EffectiveStatus::Joining
+        );
         // Past it → ExpiredJoining.
-        assert_eq!(a.effective_status(frame_in_epoch(4)), EffectiveStatus::ExpiredJoining);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(4)),
+            EffectiveStatus::ExpiredJoining
+        );
     }
 
     #[test]
@@ -1589,9 +1699,19 @@ pub(crate) mod epoch_tests {
         // ahead, epoch field = 6). It must stay Active for the rest of epoch 5,
         // NOT demote to Joining — this is what the two-slot {current,next}
         // registration buys. join_confirm is old (activation in the past).
-        let a = confirmed_alloc(vec![0xCD; 32], EPOCH_LENGTH_FRAMES + 1 /* epoch 1 */, 6);
-        assert_eq!(a.effective_status(frame_in_epoch(5)), EffectiveStatus::Active);
-        assert_eq!(a.effective_status(frame_in_epoch(6)), EffectiveStatus::Active);
+        let a = confirmed_alloc(
+            vec![0xCD; 32],
+            EPOCH_LENGTH_FRAMES + 1, /* epoch 1 */
+            6,
+        );
+        assert_eq!(
+            a.effective_status(frame_in_epoch(5)),
+            EffectiveStatus::Active
+        );
+        assert_eq!(
+            a.effective_status(frame_in_epoch(6)),
+            EffectiveStatus::Active
+        );
     }
 
     #[test]
@@ -1628,8 +1748,14 @@ pub(crate) mod epoch_tests {
         // Leave proposed in epoch 2.
         let a = leaving(frame_in_epoch(2));
         // Epoch 2 (proposal epoch) and epoch 3 (the E+1 notice slot) → still Leaving.
-        assert_eq!(a.effective_status(frame_in_epoch(2)), EffectiveStatus::Leaving);
-        assert_eq!(a.effective_status(frame_in_epoch(3)), EffectiveStatus::Leaving);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(2)),
+            EffectiveStatus::Leaving
+        );
+        assert_eq!(
+            a.effective_status(frame_in_epoch(3)),
+            EffectiveStatus::Leaving
+        );
         assert!(a.is_live(frame_in_epoch(3)));
         // Epoch 4 (past E+1) → ExpiredLeaving + terminal, no longer live.
         assert_eq!(
@@ -1653,7 +1779,7 @@ pub(crate) mod epoch_tests {
             ..active_alloc(vec![0xCD; 32], 100)
         };
         let boundary = 3 * EPOCH_LENGTH_FRAMES; // first frame of epoch 3
-        // One frame BEFORE the boundary (last frame of epoch 2) → still deferred.
+                                                // One frame BEFORE the boundary (last frame of epoch 2) → still deferred.
         assert_eq!(
             a.effective_status(boundary - 1),
             EffectiveStatus::Joining,
@@ -1677,7 +1803,10 @@ pub(crate) mod epoch_tests {
             join_frame_number: 0,
             ..active_alloc(vec![0x11; 32], 0)
         };
-        assert_eq!(a.effective_status(frame_in_epoch(50)), EffectiveStatus::Joining);
+        assert_eq!(
+            a.effective_status(frame_in_epoch(50)),
+            EffectiveStatus::Joining
+        );
     }
 
     /// `join_confirm_frame_number == 0` (genesis/legacy) means NO deferred
@@ -1751,11 +1880,28 @@ pub(crate) mod epoch_tests {
         };
         let cases = [
             (1u8, with(ProverStatus::Active, &|_| {})),
-            (2, with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1)),
+            (
+                2,
+                with(ProverStatus::Active, &|a| {
+                    a.join_confirm_frame_number = 10 * e + 1
+                }),
+            ),
             (3, with(ProverStatus::Active, &|a| a.epoch = 8)),
-            (4, with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; })),
-            (5, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 2 * e)),
-            (6, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 9 * e + 3)),
+            (
+                4,
+                with(ProverStatus::Leaving, &|a| {
+                    a.leave_frame_number = 9 * e;
+                    a.leave_confirm_frame_number = 10 * e + 2;
+                }),
+            ),
+            (
+                5,
+                with(ProverStatus::Leaving, &|a| a.leave_frame_number = 2 * e),
+            ),
+            (
+                6,
+                with(ProverStatus::Leaving, &|a| a.leave_frame_number = 9 * e + 3),
+            ),
             (7, with(ProverStatus::Paused, &|_| {})),
         ];
         let mut members = LifecycleMembers::default();
@@ -1774,11 +1920,16 @@ mod hash_storage_proof_epoch_tests {
     #[test]
     fn only_a_test_network_reads_the_hash_storage_proof_setting() {
         for setting in [None, Some("4"), Some("0"), Some("bad")] {
-            assert_eq!(super::hash_storage_proof_epoch_for(0, setting),
-                super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap_or(u64::MAX));
+            assert_eq!(
+                super::hash_storage_proof_epoch_for(0, setting),
+                super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap_or(u64::MAX)
+            );
         }
         assert_eq!(super::hash_storage_proof_epoch_for(1, Some("4")), 4);
-        assert_eq!(super::hash_storage_proof_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(
+            super::hash_storage_proof_epoch_for(1, Some("bad")),
+            u64::MAX
+        );
         assert_eq!(super::hash_storage_proof_epoch_for(1, None), u64::MAX);
     }
 
@@ -1789,7 +1940,10 @@ mod hash_storage_proof_epoch_tests {
         let epoch = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
         assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 943_920);
         assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 943_200);
-        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET, 943_216);
+        assert_eq!(
+            (epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET,
+            943_216
+        );
     }
 }
 
@@ -1828,22 +1982,43 @@ mod committee_handoff_policy_tests {
         assert_eq!(mainnet.activation_frame % 720, 0, "an epoch boundary");
         assert_eq!(mainnet.legacy_history, LegacyHistory::Discard);
         assert_eq!(mainnet.membership_boundary_frame, 862_560);
-        assert_eq!(mainnet.membership_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(
+            mainnet.membership_boundary_frame % 720,
+            0,
+            "an epoch boundary"
+        );
         assert_eq!(mainnet.first_session_boundary_frame, 864_000);
-        assert_eq!(mainnet.first_session_boundary_frame % 720, 0, "an epoch boundary");
+        assert_eq!(
+            mainnet.first_session_boundary_frame % 720,
+            0,
+            "an epoch boundary"
+        );
         assert_eq!(mainnet.chain_id, committee_handoff_chain_id(0));
 
-        assert_eq!(committee_handoff_policy_for_network(1, |_| None), None, "other networks opt in");
+        assert_eq!(
+            committee_handoff_policy_for_network(1, |_| None),
+            None,
+            "other networks opt in"
+        );
         let testnet = committee_handoff_policy_for_network(1, env).unwrap();
-        assert_eq!((testnet.activation_frame, testnet.legacy_history), (5, LegacyHistory::Migrate));
-        assert_eq!(testnet.membership_boundary_frame, 5, "on from activation unless set");
+        assert_eq!(
+            (testnet.activation_frame, testnet.legacy_history),
+            (5, LegacyHistory::Migrate)
+        );
+        assert_eq!(
+            testnet.membership_boundary_frame, 5,
+            "on from activation unless set"
+        );
         let drill = committee_handoff_policy_for_network(1, |name| match name {
             "QUIL_COMMITTEE_HANDOFF_FRAME" => Some("9".to_string()),
             "QUIL_COMMITTEE_HANDOFF_DISCARD_LEGACY" => Some("1".to_string()),
             _ => None,
         })
         .unwrap();
-        assert_eq!((drill.activation_frame, drill.legacy_history), (9, LegacyHistory::Discard));
+        assert_eq!(
+            (drill.activation_frame, drill.legacy_history),
+            (9, LegacyHistory::Discard)
+        );
         assert_ne!(drill.chain_id, mainnet.chain_id);
     }
 }
@@ -1853,11 +2028,16 @@ mod seniority_succession_epoch_tests {
     #[test]
     fn only_a_test_network_reads_the_seniority_succession_setting() {
         for setting in [None, Some("4"), Some("0"), Some("bad")] {
-            assert_eq!(super::seniority_succession_epoch_for(0, setting),
-                super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX));
+            assert_eq!(
+                super::seniority_succession_epoch_for(0, setting),
+                super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX)
+            );
         }
         assert_eq!(super::seniority_succession_epoch_for(1, Some("4")), 4);
-        assert_eq!(super::seniority_succession_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(
+            super::seniority_succession_epoch_for(1, Some("bad")),
+            u64::MAX
+        );
         assert_eq!(super::seniority_succession_epoch_for(1, None), u64::MAX);
     }
 
@@ -1866,25 +2046,36 @@ mod seniority_succession_epoch_tests {
     #[test]
     fn succession_is_active_from_the_first_frame_of_its_epoch() {
         super::set_seniority_succession_epoch_for_thread(Some(u64::MAX));
-        assert!(!super::seniority_succession_active(u64::MAX - 1), "inert while unset");
+        assert!(
+            !super::seniority_succession_active(u64::MAX - 1),
+            "inert while unset"
+        );
         super::set_seniority_succession_epoch_for_thread(Some(10));
         let first = 10 * super::epoch_length_frames();
         assert!(!super::seniority_succession_active(first - 1));
         assert!(super::seniority_succession_active(first));
         super::set_seniority_succession_epoch_for_thread(None);
-        assert_eq!(super::seniority_succession_epoch(),
-            super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX));
+        assert_eq!(
+            super::seniority_succession_epoch(),
+            super::MAINNET_SENIORITY_SUCCESSION_EPOCH.unwrap_or(u64::MAX)
+        );
     }
 
     #[test]
     fn mainnet_succession_shares_the_hash_storage_proof_epoch() {
-        assert_eq!(super::MAINNET_SENIORITY_SUCCESSION_EPOCH, super::MAINNET_HASH_STORAGE_PROOF_EPOCH);
+        assert_eq!(
+            super::MAINNET_SENIORITY_SUCCESSION_EPOCH,
+            super::MAINNET_HASH_STORAGE_PROOF_EPOCH
+        );
         assert!(super::MAINNET_SENIORITY_SUCCESSION_EPOCH.is_some());
     }
 
     #[test]
     fn the_quiet_period_is_two_epochs() {
         assert_eq!(super::SENIORITY_SUCCESSION_QUIET_FRAMES, 1_440);
-        assert_eq!(super::seniority_succession_quiet_frames(), 2 * super::epoch_length_frames());
+        assert_eq!(
+            super::seniority_succession_quiet_frames(),
+            2 * super::epoch_length_frames()
+        );
     }
 }

@@ -189,8 +189,8 @@ pub fn branch_score(br: &Branch, cfg: &Params) -> BigInt {
     let scale_bi = BigInt::from(SCALE);
     let blend_scaled = (BigInt::from(unique) * &scale_bi) / BigInt::from(m as u64);
     // div_bonus = SCALE + (beta_numer · blend_scaled / beta_denom)
-    let div_bonus = &scale_bi
-        + (BigInt::from(cfg.beta_numer) * &blend_scaled) / BigInt::from(cfg.beta_denom);
+    let div_bonus =
+        &scale_bi + (BigInt::from(cfg.beta_numer) * &blend_scaled) / BigInt::from(cfg.beta_denom);
 
     // Step 3: final = raw · div_bonus / SCALE
     (raw * div_bonus) / scale_bi
@@ -475,7 +475,9 @@ mod tests {
         // bounded score under exponential decay. The sum of
         // α^i · f0 converges; no panic or overflow should occur.
         let cfg = Params::default_params();
-        let frames: Vec<Frame> = (0..100).map(|i| frame(0, SCALE, &format!("p-{}", i))).collect();
+        let frames: Vec<Frame> = (0..100)
+            .map(|i| frame(0, SCALE, &format!("p-{}", i)))
+            .collect();
         let b = branch(frames);
         let score = branch_score(&b, &cfg);
         assert!(score > BigInt::zero());

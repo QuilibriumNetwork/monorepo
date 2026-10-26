@@ -27,7 +27,10 @@ fn commit(state: &HypergraphState, number: u64) {
     state.abort();
     state
         .crdt()
-        .commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key())
+        .commit_with_global_cursor(
+            number,
+            &quil_store::encoding::global_materialized_cursor_key(),
+        )
         .unwrap();
 }
 
@@ -63,8 +66,12 @@ async fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Op
 /// Every finalized frame must verify against the session its certificate names.
 fn verify(view: &CommittedView, frame: &AppShardFrame) -> quil_cw_consensus::handoff::Session {
     let header = frame.header.as_ref().unwrap();
-    let signature = header.public_key_signature_bls48581.as_ref().expect("finalized frames carry a certificate");
-    let certificate = quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).unwrap();
+    let signature = header
+        .public_key_signature_bls48581
+        .as_ref()
+        .expect("finalized frames carry a certificate");
+    let certificate =
+        quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).unwrap();
     frames::verify(
         view,
         &frames::FrameClaim {
@@ -85,7 +92,13 @@ fn verify(view: &CommittedView, frame: &AppShardFrame) -> quil_cw_consensus::han
 async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     common::init_tracing();
     quil_types::consensus::set_committee_handoff_policy(Some(
-        quil_types::consensus::CommitteeHandoffPolicy { activation_frame: 0, chain_id: [0x51; 32], legacy_history: quil_types::consensus::LegacyHistory::Migrate, membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX},
+        quil_types::consensus::CommitteeHandoffPolicy {
+            activation_frame: 0,
+            chain_id: [0x51; 32],
+            legacy_history: quil_types::consensus::LegacyHistory::Migrate,
+            membership_boundary_frame: u64::MAX,
+            first_session_boundary_frame: u64::MAX,
+        },
     ));
     let filter = vec![0x55u8; 32];
     let provers: Vec<TestProver> = (0..4).map(|_| TestProver::generate()).collect();
@@ -98,7 +111,10 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
         Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
         Arc::new(quil_hypergraph::testing::StubProver),
     ));
-    global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+    global.set_forest(quil_forest::Forest::with_namespace(
+        db.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
     let state = HypergraphState::new(global.clone());
     commit(&state, 1);
     let first = quil_cw_consensus::handoff::Session {
@@ -125,7 +141,10 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
         for frame in &early {
             assert_eq!(verify(&view, frame), first);
         }
-        assert_eq!(early[0].header.as_ref().unwrap().parent_selector, first.genesis);
+        assert_eq!(
+            early[0].header.as_ref().unwrap().parent_selector,
+            first.genesis
+        );
     }
 
     // The global scheduler replaces the committee with three of its members.
@@ -134,7 +153,10 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
         &state,
         3,
         vec![filter.clone()],
-        vec![DesiredCommittee { filter: filter.clone(), members: successors.clone() }],
+        vec![DesiredCommittee {
+            filter: filter.clone(),
+            members: successors.clone(),
+        }],
     )
     .unwrap();
     commit(&state, 3);
@@ -144,7 +166,11 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     let prefix = TYPE_COMMITTEE_HANDOFF.to_be_bytes();
     let submission = until(Duration::from_secs(120), || {
         harness.workers.iter().find_map(|w| {
-            w.coverage_published.lock().iter().find(|b| b.starts_with(&prefix)).cloned()
+            w.coverage_published
+                .lock()
+                .iter()
+                .find(|b| b.starts_with(&prefix))
+                .cloned()
         })
     })
     .await
@@ -152,22 +178,42 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     let submission = CertificateSubmission::from_canonical_bytes(&submission).unwrap();
     assert_eq!(submission.seal.request, request.id().unwrap());
     let sealed_at = submission.seal.checkpoint.frame;
-    assert!(sealed_at >= 3, "the seal follows the data frames it checkpoints");
+    assert!(
+        sealed_at >= 3,
+        "the seal follows the data frames it checkpoints"
+    );
     // GLOBAL executed the source's data frames through the sealed checkpoint.
-    handoff::record_session_tip(&state, 4, &submission.seal.session, &submission.seal.checkpoint).unwrap();
-    assert!(handoff::apply_submission(&state, 4, &submission).unwrap(), "a single source activates its successor");
+    handoff::record_session_tip(
+        &state,
+        4,
+        &submission.seal.session,
+        &submission.seal.checkpoint,
+    )
+    .unwrap();
+    assert!(
+        handoff::apply_submission(&state, 4, &submission).unwrap(),
+        "a single source activates its successor"
+    );
     commit(&state, 4);
-    assert!(matches!(handoff::status(&state, &first.id().unwrap()).unwrap(), Status::Closed(_)));
+    assert!(matches!(
+        handoff::status(&state, &first.id().unwrap()).unwrap(),
+        Status::Closed(_)
+    ));
     let second = handoff::head(&state, &filter).unwrap().unwrap();
-    assert_eq!((second.generation, second.base_frame, &second.members), (2, sealed_at, &successors));
+    assert_eq!(
+        (second.generation, second.base_frame, &second.members),
+        (2, sealed_at, &successors)
+    );
     assert!(schedule::seal_submitted(&CommittedView::capture(&global).unwrap(), &first).unwrap());
 
     // The three authorized members restart in the successor's namespace and
     // extend its authorized genesis; the fourth has no session to run.
     let resumed = until(Duration::from_secs(120), || {
         let frames = finalized(&harness);
-        let after: Vec<_> = frames.into_iter()
-            .filter(|f| f.header.as_ref().unwrap().frame_number > sealed_at).collect();
+        let after: Vec<_> = frames
+            .into_iter()
+            .filter(|f| f.header.as_ref().unwrap().frame_number > sealed_at)
+            .collect();
         (after.len() >= 2).then_some(after)
     })
     .await
@@ -180,8 +226,13 @@ async fn session_seals_on_a_scheduled_change_and_resumes_under_its_successor() {
     }
     let next = resumed[0].header.as_ref().unwrap();
     assert_eq!(next.frame_number, sealed_at + 1);
-    assert_eq!(next.parent_selector, second.genesis, "the successor extends its authorized genesis");
-    assert!(finalized(&harness).iter().all(|f| f.header.as_ref().unwrap().frame_number != 0));
+    assert_eq!(
+        next.parent_selector, second.genesis,
+        "the successor extends its authorized genesis"
+    );
+    assert!(finalized(&harness)
+        .iter()
+        .all(|f| f.header.as_ref().unwrap().frame_number != 0));
     // Join every consensus host before the stores drop: a detached host
     // can close RocksDB while the process exits (`AppShardHarness::shutdown`).
     harness.shutdown().await;

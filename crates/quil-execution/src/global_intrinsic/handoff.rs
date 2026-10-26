@@ -210,8 +210,12 @@ impl Request {
             }
             .validate()?;
         }
-        let old: Vec<_> = self.sources.iter().map(|s| s.filter.clone())
-            .chain(self.vacant.iter().cloned()).collect();
+        let old: Vec<_> = self
+            .sources
+            .iter()
+            .map(|s| s.filter.clone())
+            .chain(self.vacant.iter().cloned())
+            .collect();
         let new: Vec<_> = self
             .targets
             .iter()
@@ -369,7 +373,10 @@ impl SealSubmission {
             }
         }
         c.finish()?;
-        Ok(Self { submission: CertificateSubmission { seal, certificate }, drain })
+        Ok(Self {
+            submission: CertificateSubmission { seal, certificate },
+            drain,
+        })
     }
 }
 
@@ -377,7 +384,12 @@ impl SealSubmission {
 /// changes or five minutes pass: every closing member resubmits about once a
 /// minute, and the refusal was otherwise invisible (#699). `executed` is the
 /// source frame GLOBAL has executed through.
-pub fn note_refused_seal(frame: u64, sealed: &SealSubmission, executed: Option<u64>, error: &QuilError) {
+pub fn note_refused_seal(
+    frame: u64,
+    sealed: &SealSubmission,
+    executed: Option<u64>,
+    error: &QuilError,
+) {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant};
@@ -388,10 +400,15 @@ pub fn note_refused_seal(frame: u64, sealed: &SealSubmission, executed: Option<u
     let reason = error.to_string();
     let now = Instant::now();
     {
-        let Ok(mut logged) = LOGGED.lock() else { return };
+        let Ok(mut logged) = LOGGED.lock() else {
+            return;
+        };
         logged.retain(|_, (at, _)| now.duration_since(*at) < QUIET);
         let key = (seal.session, seal.request);
-        if logged.get(&key).is_some_and(|(_, previous)| *previous == reason) {
+        if logged
+            .get(&key)
+            .is_some_and(|(_, previous)| *previous == reason)
+        {
             return;
         }
         logged.insert(key, (now, reason.clone()));
@@ -425,13 +442,20 @@ fn seal_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_SEAL_DRAIN_FRAME;
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's seal drain frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_seal_drain_frame(network: u8) -> u64 {
-    *SEAL_DRAIN_FRAME.get_or_init(|| seal_drain_frame_for(network, std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().as_deref()))
+    *SEAL_DRAIN_FRAME.get_or_init(|| {
+        seal_drain_frame_for(
+            network,
+            std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().as_deref(),
+        )
+    })
 }
 
 pub fn seal_drain_frame() -> u64 {
@@ -439,7 +463,10 @@ pub fn seal_drain_frame() -> u64 {
         return frame;
     }
     *SEAL_DRAIN_FRAME.get_or_init(|| {
-        std::env::var("QUIL_SEAL_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_SEAL_DRAIN_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -470,14 +497,19 @@ fn seal_recovery_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_SEAL_RECOVERY_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's seal recovery frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_seal_recovery_frame(network: u8) -> u64 {
     *SEAL_RECOVERY_FRAME.get_or_init(|| {
-        seal_recovery_frame_for(network, std::env::var("QUIL_SEAL_RECOVERY_FRAME").ok().as_deref())
+        seal_recovery_frame_for(
+            network,
+            std::env::var("QUIL_SEAL_RECOVERY_FRAME").ok().as_deref(),
+        )
     })
 }
 
@@ -486,7 +518,10 @@ pub fn seal_recovery_frame() -> u64 {
         return frame;
     }
     *SEAL_RECOVERY_FRAME.get_or_init(|| {
-        std::env::var("QUIL_SEAL_RECOVERY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_SEAL_RECOVERY_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -517,7 +552,9 @@ fn seal_checkpoint_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_SEAL_CHECKPOINT_DRAIN_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's seal checkpoint drain frame from its network, and
@@ -525,7 +562,12 @@ fn seal_checkpoint_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// call decides.
 pub fn init_seal_checkpoint_drain_frame(network: u8) -> u64 {
     *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
-        seal_checkpoint_drain_frame_for(network, std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().as_deref())
+        seal_checkpoint_drain_frame_for(
+            network,
+            std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -534,7 +576,10 @@ pub fn seal_checkpoint_drain_frame() -> u64 {
         return frame;
     }
     *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
-        std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -565,7 +610,9 @@ fn fenced_successor_eligibility_frame_for(network: u8, setting: Option<&str>) ->
     if network == 0 {
         return MAINNET_FENCED_SUCCESSOR_ELIGIBILITY_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's fenced successor eligibility frame from its network,
@@ -573,8 +620,12 @@ fn fenced_successor_eligibility_frame_for(network: u8, setting: Option<&str>) ->
 /// call decides.
 pub fn init_fenced_successor_eligibility_frame(network: u8) -> u64 {
     *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
-        fenced_successor_eligibility_frame_for(network,
-            std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().as_deref())
+        fenced_successor_eligibility_frame_for(
+            network,
+            std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -583,7 +634,10 @@ pub fn fenced_successor_eligibility_frame() -> u64 {
         return frame;
     }
     *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
-        std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -615,7 +669,9 @@ fn presence_report_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_PRESENCE_REPORT_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's presence report frame from its network, and return
@@ -623,7 +679,10 @@ fn presence_report_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// decides.
 pub fn init_presence_report_frame(network: u8) -> u64 {
     *PRESENCE_REPORT_FRAME.get_or_init(|| {
-        presence_report_frame_for(network, std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().as_deref())
+        presence_report_frame_for(
+            network,
+            std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().as_deref(),
+        )
     })
 }
 
@@ -632,7 +691,10 @@ pub fn presence_report_frame() -> u64 {
         return frame;
     }
     *PRESENCE_REPORT_FRAME.get_or_init(|| {
-        std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_PRESENCE_REPORT_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -665,7 +727,9 @@ fn presence_credit_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_PRESENCE_CREDIT_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's presence credit frame from its network, and return
@@ -673,7 +737,10 @@ fn presence_credit_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// decides.
 pub fn init_presence_credit_frame(network: u8) -> u64 {
     *PRESENCE_CREDIT_FRAME.get_or_init(|| {
-        presence_credit_frame_for(network, std::env::var("QUIL_PRESENCE_CREDIT_FRAME").ok().as_deref())
+        presence_credit_frame_for(
+            network,
+            std::env::var("QUIL_PRESENCE_CREDIT_FRAME").ok().as_deref(),
+        )
     })
 }
 
@@ -685,7 +752,10 @@ pub fn presence_credit_frame() -> u64 {
     if let Some(frame) = PRESENCE_CREDIT_OVERRIDE.with(|cell| cell.get()) {
         return frame;
     }
-    PRESENCE_CREDIT_FRAME.get().copied().unwrap_or_else(|| presence_credit_frame_for(0, None))
+    PRESENCE_CREDIT_FRAME
+        .get()
+        .copied()
+        .unwrap_or_else(|| presence_credit_frame_for(0, None))
 }
 
 /// Set the presence credit frame for the calling thread only (tests).
@@ -722,7 +792,9 @@ fn presence_exclusion_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_PRESENCE_EXCLUSION_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's presence exclusion frame from its network, and
@@ -730,7 +802,12 @@ fn presence_exclusion_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// call decides.
 pub fn init_presence_exclusion_frame(network: u8) -> u64 {
     *PRESENCE_EXCLUSION_FRAME.get_or_init(|| {
-        presence_exclusion_frame_for(network, std::env::var("QUIL_PRESENCE_EXCLUSION_FRAME").ok().as_deref())
+        presence_exclusion_frame_for(
+            network,
+            std::env::var("QUIL_PRESENCE_EXCLUSION_FRAME")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -741,7 +818,10 @@ pub fn presence_exclusion_frame() -> u64 {
     if let Some(frame) = PRESENCE_EXCLUSION_OVERRIDE.with(|cell| cell.get()) {
         return frame;
     }
-    PRESENCE_EXCLUSION_FRAME.get().copied().unwrap_or_else(|| presence_exclusion_frame_for(0, None))
+    PRESENCE_EXCLUSION_FRAME
+        .get()
+        .copied()
+        .unwrap_or_else(|| presence_exclusion_frame_for(0, None))
 }
 
 /// Set the presence exclusion frame for the calling thread only (tests).
@@ -776,14 +856,19 @@ fn early_fence_frame_for(network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return MAINNET_EARLY_FENCE_FRAME.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's early fence frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_early_fence_frame(network: u8) -> u64 {
     *EARLY_FENCE_FRAME.get_or_init(|| {
-        early_fence_frame_for(network, std::env::var("QUIL_EARLY_FENCE_FRAME").ok().as_deref())
+        early_fence_frame_for(
+            network,
+            std::env::var("QUIL_EARLY_FENCE_FRAME").ok().as_deref(),
+        )
     })
 }
 
@@ -792,7 +877,10 @@ pub fn early_fence_frame() -> u64 {
         return frame;
     }
     *EARLY_FENCE_FRAME.get_or_init(|| {
-        std::env::var("QUIL_EARLY_FENCE_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+        std::env::var("QUIL_EARLY_FENCE_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
     })
 }
 
@@ -852,7 +940,8 @@ pub struct CommittedView {
 
 impl CommittedView {
     pub fn capture(crdt: &Arc<quil_hypergraph::HypergraphCrdt>) -> Result<Self> {
-        let _probe = quil_types::thread_probe::section(quil_types::thread_probe::Section::GlobalViewCapture);
+        let _probe =
+            quil_types::thread_probe::section(quil_types::thread_probe::Section::GlobalViewCapture);
         HypergraphState::new(crdt.clone())
             .require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
         let snapshot = crdt.capture_committed_snapshot()?;
@@ -873,8 +962,13 @@ impl CommittedView {
         // its own commit. Until the last one lands, the records mix the old
         // state with part of the new: a head whose session is not in yet, or
         // an old head whose status already closed.
-        if quil_hypergraph::crdt::snapshot_sync_incomplete(snapshot.as_ref(), &GLOBAL_INTRINSIC_ADDRESS)? {
-            return Err(QuilError::ExecutionUnavailable(GLOBAL_SYNC_IN_PROGRESS.into()));
+        if quil_hypergraph::crdt::snapshot_sync_incomplete(
+            snapshot.as_ref(),
+            &GLOBAL_INTRINSIC_ADDRESS,
+        )? {
+            return Err(QuilError::ExecutionUnavailable(
+                GLOBAL_SYNC_IN_PROGRESS.into(),
+            ));
         }
         Ok(Self { snapshot, frame })
     }
@@ -993,7 +1087,9 @@ pub fn session_at_generation(
     let Some(bytes) = read(state, b"generation", &generation_key(filter, generation)?)? else {
         return Ok(None);
     };
-    let id = bytes.try_into().map_err(|_| QuilError::Store("corrupt handoff generation index".into()))?;
+    let id = bytes
+        .try_into()
+        .map_err(|_| QuilError::Store("corrupt handoff generation index".into()))?;
     let value = session(state, &id)?
         .ok_or_else(|| QuilError::Store("handoff generation has no session".into()))?;
     if value.filter != filter || value.generation != generation {
@@ -1020,11 +1116,15 @@ fn create_session(state: &HypergraphState, frame: u64, value: &Session) -> Resul
 }
 
 pub fn manages_application(state: &impl Records, filter: &[u8]) -> Result<bool> {
-    let app = filter.get(..32).ok_or_else(|| invalid("filter lacks application address"))?;
+    let app = filter
+        .get(..32)
+        .ok_or_else(|| invalid("filter lacks application address"))?;
     match read(state, b"managed-app", app)?.as_deref() {
         None => Ok(false),
         Some([1]) => Ok(true),
-        Some(_) => Err(QuilError::Store("corrupt handoff application marker".into())),
+        Some(_) => Err(QuilError::Store(
+            "corrupt handoff application marker".into(),
+        )),
     }
 }
 
@@ -1220,7 +1320,9 @@ fn submitted_checkpoint(state: &impl Records, id: &[u8; 32]) -> Result<Option<Ch
     };
     match terminal(state, &request, id)? {
         Some(end) => Ok(Some(end.checkpoint)),
-        None if closed => Err(QuilError::Store("closed session has no seal or fence".into())),
+        None if closed => Err(QuilError::Store(
+            "closed session has no seal or fence".into(),
+        )),
         None => Ok(None),
     }
 }
@@ -1253,7 +1355,11 @@ fn terminal(state: &impl Records, request: &[u8; 32], id: &[u8; 32]) -> Result<O
         if seal.session != *id || seal.request != *request {
             return Err(QuilError::Store("submitted-session seal mismatch".into()));
         }
-        return Ok(Some(Terminal { digest: seal.digest(), checkpoint: seal.checkpoint, fenced: false }));
+        return Ok(Some(Terminal {
+            digest: seal.digest(),
+            checkpoint: seal.checkpoint,
+            fenced: false,
+        }));
     }
     let Some(bytes) = read(state, b"fence", &key)? else {
         return Ok(None);
@@ -1261,7 +1367,11 @@ fn terminal(state: &impl Records, request: &[u8; 32], id: &[u8; 32]) -> Result<O
     let mut cursor = Cursor::new(&bytes)?;
     let checkpoint = Checkpoint::read(&mut cursor)?;
     cursor.finish()?;
-    Ok(Some(Terminal { digest: fence_digest(request, id, &checkpoint), checkpoint, fenced: true }))
+    Ok(Some(Terminal {
+        digest: fence_digest(request, id, &checkpoint),
+        checkpoint,
+        fenced: true,
+    }))
 }
 
 /// Whether GLOBAL fenced this closing session instead of receiving its seal.
@@ -1279,7 +1389,12 @@ pub fn verify_submission(
     frame: u64,
     submission: &CertificateSubmission,
 ) -> Result<Request> {
-    verify_submission_at(state, frame, submission, session_tip(state, &submission.seal.session)?)
+    verify_submission_at(
+        state,
+        frame,
+        submission,
+        session_tip(state, &submission.seal.session)?,
+    )
 }
 
 /// [`verify_submission`] against `executed`, the source's executed tip once
@@ -1308,16 +1423,22 @@ pub fn verify_submission_at(
     let checkpoint = &submission.seal.checkpoint;
     let drained = match executed {
         Some(tip) if tip.frame > checkpoint.frame => {
-            return Err(invalid("sealed checkpoint is below the source's executed frames"));
+            return Err(invalid(
+                "sealed checkpoint is below the source's executed frames",
+            ));
         }
         Some(tip) if tip.frame == checkpoint.frame && tip.digest != checkpoint.digest => {
-            return Err(invalid("sealed checkpoint differs from the source's executed frame"));
+            return Err(invalid(
+                "sealed checkpoint differs from the source's executed frame",
+            ));
         }
         Some(tip) => tip.frame == checkpoint.frame,
         None => checkpoint.frame == source.base_frame,
     };
     if !drained {
-        return Err(invalid("source frames through the sealed checkpoint are not yet executed"));
+        return Err(invalid(
+            "source frames through the sealed checkpoint are not yet executed",
+        ));
     }
     if let Some(previous) = read(
         state,
@@ -1361,7 +1482,13 @@ pub fn verify_closing_certificate(
         return Err(invalid("source is not closing for this request"));
     }
     // A fence is terminal: the successor was, or will be, authorized from it.
-    if read(state, b"fence", &seal_key(&submission.seal.request, &submission.seal.session))?.is_some() {
+    if read(
+        state,
+        b"fence",
+        &seal_key(&submission.seal.request, &submission.seal.session),
+    )?
+    .is_some()
+    {
         return Err(invalid("source was fenced after its closing timeout"));
     }
     // A re-seal of a seal at the base names the genesis at a nonzero view:
@@ -1421,7 +1548,9 @@ pub(crate) fn activate_with(
     members: Option<Vec<Vec<u8>>>,
 ) -> Result<bool> {
     if members.is_some() && request.targets.len() != 1 {
-        return Err(invalid("replacement members need a request with one target"));
+        return Err(invalid(
+            "replacement members need a request with one target",
+        ));
     }
     {
         let request_id = request.id()?;
@@ -1456,7 +1585,11 @@ pub(crate) fn activate_with(
         for source in &request.sources {
             set_status(state, frame, &source.id()?, 2, Some(&request_id))?;
         }
-        for target in request.targets.iter().filter(|t| !t.committee.members.is_empty()) {
+        for target in request
+            .targets
+            .iter()
+            .filter(|t| !t.committee.members.is_empty())
+        {
             let base_frame = match target.previous {
                 Some(previous) => {
                     closed_checkpoint(state, &previous)?
@@ -1478,7 +1611,9 @@ pub(crate) fn activate_with(
                 genesis: quil_crypto::poseidon::hash_bytes_to_32(&output)?,
                 base_frame,
                 authorization,
-                members: members.clone().unwrap_or_else(|| target.committee.members.clone()),
+                members: members
+                    .clone()
+                    .unwrap_or_else(|| target.committee.members.clone()),
             };
             let id = create_session(state, frame, &next)?;
             // The authorization names the complete source partition; the new
@@ -1503,8 +1638,12 @@ pub(crate) fn activate_with(
 /// at, where its committee was chosen; `None` for a session no request
 /// authorized (a first session) or without an origin record.
 pub fn scheduled_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
-    let Some(bytes) = read(state, b"origin", id)? else { return Ok(None) };
-    let Ok(request_id) = <[u8; 32]>::try_from(bytes.as_slice()) else { return Ok(None) };
+    let Some(bytes) = read(state, b"origin", id)? else {
+        return Ok(None);
+    };
+    let Ok(request_id) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+        return Ok(None);
+    };
     Ok(request(state, &request_id)?.map(|request| request.frame))
 }
 
@@ -1547,7 +1686,12 @@ pub fn session_tip(state: &impl Records, id: &[u8; 32]) -> Result<Option<Checkpo
 
 /// Advance [`session_tip`] to `tip` if it is higher. `frame` is the GLOBAL
 /// frame executing it, which an advance records as [`session_tip_frame`].
-pub fn record_session_tip(state: &HypergraphState, frame: u64, id: &[u8; 32], tip: &Checkpoint) -> Result<()> {
+pub fn record_session_tip(
+    state: &HypergraphState,
+    frame: u64,
+    id: &[u8; 32],
+    tip: &Checkpoint,
+) -> Result<()> {
     if session_tip(state, id)?.is_some_and(|current| current.frame >= tip.frame) {
         return Ok(());
     }
@@ -1585,7 +1729,11 @@ pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u
 /// advanced ([`session_tip_frame`]); zero for a `frame` not after it. Without
 /// a record, the frames since the [`presence_report_frame`]: a lower bound,
 /// since the session has not advanced from it on. `None` before that frame.
-pub fn frames_since_tip_advance(state: &impl Records, id: &[u8; 32], frame: u64) -> Result<Option<u64>> {
+pub fn frames_since_tip_advance(
+    state: &impl Records,
+    id: &[u8; 32],
+    frame: u64,
+) -> Result<Option<u64>> {
     if let Some(recorded) = session_tip_frame(state, id)? {
         return Ok(Some(frame.saturating_sub(recorded)));
     }
@@ -1601,10 +1749,20 @@ pub fn session_rings(state: &impl Records, id: &[u8; 32]) -> Result<Option<Vec<u
 }
 
 /// Record [`session_rings`] once. A recorded snapshot is never replaced.
-pub fn record_session_rings(state: &HypergraphState, frame: u64, id: &[u8; 32], rings: &[u8]) -> Result<()> {
-    let members = session(state, id)?.ok_or_else(|| invalid("ring snapshot for an absent session"))?.members.len();
+pub fn record_session_rings(
+    state: &HypergraphState,
+    frame: u64,
+    id: &[u8; 32],
+    rings: &[u8],
+) -> Result<()> {
+    let members = session(state, id)?
+        .ok_or_else(|| invalid("ring snapshot for an absent session"))?
+        .members
+        .len();
     if rings.len() != members {
-        return Err(invalid("ring snapshot does not cover the session's members"));
+        return Err(invalid(
+            "ring snapshot does not cover the session's members",
+        ));
     }
     if read(state, b"rings", id)?.is_some() {
         return Err(invalid("session rings already recorded"));
@@ -1616,11 +1774,16 @@ pub fn record_session_rings(state: &HypergraphState, frame: u64, id: &[u8; 32], 
 /// activated, its source's seal is recorded, or the source was fenced.
 /// Proposers leave such copies out (every member of a closing committee
 /// submits, and resubmits until its own view shows the seal recorded).
-pub fn submission_settled(state: &impl Records, submission: &CertificateSubmission) -> Result<bool> {
+pub fn submission_settled(
+    state: &impl Records,
+    submission: &CertificateSubmission,
+) -> Result<bool> {
     let key = seal_key(&submission.seal.request, &submission.seal.session);
-    Ok(read(state, b"activated", &submission.seal.request)?.is_some()
-        || read(state, b"seal", &key)?.is_some()
-        || read(state, b"fence", &key)?.is_some())
+    Ok(
+        read(state, b"activated", &submission.seal.request)?.is_some()
+            || read(state, b"seal", &key)?.is_some()
+            || read(state, b"fence", &key)?.is_some(),
+    )
 }
 
 /// Whether the committee-handoff flag day ([`LegacyHistory::Discard`]) has
@@ -1634,7 +1797,13 @@ pub fn flag_day_applied(state: &impl Records) -> Result<bool> {
 
 /// Record that the flag day ran at `frame`.
 pub fn record_flag_day(state: &HypergraphState, frame: u64) -> Result<()> {
-    write(state, frame, b"flag-day", b"legacy-discarded", &frame.to_be_bytes())
+    write(
+        state,
+        frame,
+        b"flag-day",
+        b"legacy-discarded",
+        &frame.to_be_bytes(),
+    )
 }
 
 /// A member's prover address and ring key, read from its allocation on the
@@ -1649,12 +1818,16 @@ fn member_ring_key(
     let va_disc = vertex_adds_discriminator()?;
     for filter in filters {
         let address = super::materialize::allocation_address(member, filter)?;
-        let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else { continue };
+        let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else {
+            continue;
+        };
         if blob.is_empty() {
             continue;
         }
         let allocation = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-        let Some(prover) = read_field(&allocation, "allocation:ProverAllocation", "Prover") else { continue };
+        let Some(prover) = read_field(&allocation, "allocation:ProverAllocation", "Prover") else {
+            continue;
+        };
         if let Some(key) = super::prover_rings::read_key(&allocation) {
             return Ok((prover, key));
         }
@@ -1667,10 +1840,23 @@ fn member_ring_key(
             .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover, &va_disc)?
             .map(|blob| crate::prover_registry::rebuild_vertex_tree_from_blob(&blob))
             .map_or(0, |tree| u64_of(&tree, "prover:Prover", "Seniority"));
-        let confirmed = u64_of(&allocation, "allocation:ProverAllocation", "JoinConfirmFrameNumber");
-        return Ok((prover, super::prover_rings::preexisting(confirmed, seniority)));
+        let confirmed = u64_of(
+            &allocation,
+            "allocation:ProverAllocation",
+            "JoinConfirmFrameNumber",
+        );
+        return Ok((
+            prover,
+            super::prover_rings::preexisting(confirmed, seniority),
+        ));
     }
-    Ok((member.to_vec(), super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 }))
+    Ok((
+        member.to_vec(),
+        super::prover_rings::RingKey {
+            cohort: u64::MAX,
+            seniority: 0,
+        },
+    ))
 }
 
 /// Under the seniority ring rule, a new session's rings are fixed when it is
@@ -1690,31 +1876,49 @@ fn record_member_rings(
         return Ok(());
     }
     let mut filters: Vec<&[u8]> = vec![created.filter.as_slice()];
-    filters.extend(sources.iter().map(Vec::as_slice).filter(|f| *f != created.filter.as_slice()));
+    filters.extend(
+        sources
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|f| *f != created.filter.as_slice()),
+    );
     let keyed = created
         .members
         .iter()
         .map(|member| member_ring_key(state, member, &filters))
         .collect::<Result<Vec<_>>>()?;
-    let ranked: Vec<(&[u8], super::prover_rings::RingKey)> =
-        keyed.iter().map(|(address, key)| (address.as_slice(), *key)).collect();
+    let ranked: Vec<(&[u8], super::prover_rings::RingKey)> = keyed
+        .iter()
+        .map(|(address, key)| (address.as_slice(), *key))
+        .collect();
     let rings = super::prover_rings::assign(&ranked, one_cohort);
     record_session_rings(state, frame, id, &rings)?;
     let va_disc = vertex_adds_discriminator()?;
     for (member, ring) in created.members.iter().zip(&rings) {
         for filter in &filters {
             let address = super::materialize::allocation_address(member, filter)?;
-            let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else { continue };
+            let Some(blob) = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)? else {
+                continue;
+            };
             if blob.is_empty() {
                 continue;
             }
             let mut allocation = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-            if crate::global_schema::read_field(&allocation, "allocation:ProverAllocation", "Ring").as_deref()
+            if crate::global_schema::read_field(&allocation, "allocation:ProverAllocation", "Ring")
+                .as_deref()
                 != Some(&[*ring][..])
             {
-                crate::global_schema::write_field(&mut allocation, "allocation:ProverAllocation", "Ring", &[*ring])?;
+                crate::global_schema::write_field(
+                    &mut allocation,
+                    "allocation:ProverAllocation",
+                    "Ring",
+                    &[*ring],
+                )?;
                 state.set(
-                    &GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc, frame,
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &address,
+                    &va_disc,
+                    frame,
                     crate::prover_registry::vertex_tree_to_blob(&allocation),
                 )?;
             }

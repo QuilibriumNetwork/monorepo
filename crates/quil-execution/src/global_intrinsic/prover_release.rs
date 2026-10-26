@@ -68,14 +68,22 @@ impl Release {
     /// [`Self::ENCODED_LEN`] long.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let [a, b, c, patch, s0, s1] = <[u8; Self::ENCODED_LEN]>::try_from(bytes).ok()?;
-        Some(Self { version: [a, b, c], patch, subpatch: u16::from_be_bytes([s0, s1]) })
+        Some(Self {
+            version: [a, b, c],
+            patch,
+            subpatch: u16::from_be_bytes([s0, s1]),
+        })
     }
 }
 
 impl std::fmt::Display for Release {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let [major, minor, patch_version] = self.version;
-        write!(f, "{major}.{minor}.{patch_version}.{}.{}", self.patch, self.subpatch)
+        write!(
+            f,
+            "{major}.{minor}.{patch_version}.{}.{}",
+            self.patch, self.subpatch
+        )
     }
 }
 
@@ -86,7 +94,9 @@ impl std::str::FromStr for Release {
     fn from_str(text: &str) -> Result<Self, String> {
         let invalid = || format!("release {text:?} is not major.minor.patch.patch_number.subpatch");
         let parts: Vec<&str> = text.split('.').collect();
-        let [major, minor, patch_version, patch, subpatch] = parts.as_slice() else { return Err(invalid()) };
+        let [major, minor, patch_version, patch, subpatch] = parts.as_slice() else {
+            return Err(invalid());
+        };
         let byte = |part: &str| part.parse::<u8>().map_err(|_| invalid());
         Ok(Self {
             version: [byte(major)?, byte(minor)?, byte(patch_version)?],
@@ -133,14 +143,20 @@ fn frame_for(mainnet: Option<u64>, network: u8, setting: Option<&str>) -> u64 {
     if network == 0 {
         return mainnet.unwrap_or(u64::MAX);
     }
-    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
 }
 
 /// Fix this process's confirm release frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_confirm_release_frame(network: u8) -> u64 {
     *CONFIRM_RELEASE_FRAME.get_or_init(|| {
-        frame_for(MAINNET_CONFIRM_RELEASE_FRAME, network, std::env::var(CONFIRM_RELEASE_ENV).ok().as_deref())
+        frame_for(
+            MAINNET_CONFIRM_RELEASE_FRAME,
+            network,
+            std::env::var(CONFIRM_RELEASE_ENV).ok().as_deref(),
+        )
     })
 }
 
@@ -151,7 +167,10 @@ pub fn confirm_release_frame() -> u64 {
     if let Some(frame) = CONFIRM_RELEASE_OVERRIDE.with(|cell| cell.get()) {
         return frame;
     }
-    CONFIRM_RELEASE_FRAME.get().copied().unwrap_or_else(|| MAINNET_CONFIRM_RELEASE_FRAME.unwrap_or(u64::MAX))
+    CONFIRM_RELEASE_FRAME
+        .get()
+        .copied()
+        .unwrap_or_else(|| MAINNET_CONFIRM_RELEASE_FRAME.unwrap_or(u64::MAX))
 }
 
 /// Set the confirm release frame for the calling thread only (tests).
@@ -162,7 +181,10 @@ pub fn set_confirm_release_frame_for_thread(frame: Option<u64>) {
 /// A schedule's steps must name strictly ascending frames, so the step in
 /// force at a frame is unambiguous.
 pub fn validate_schedule(schedule: &[ReleaseMinimum]) -> Result<(), String> {
-    match schedule.windows(2).find(|pair| pair[0].from_frame >= pair[1].from_frame) {
+    match schedule
+        .windows(2)
+        .find(|pair| pair[0].from_frame >= pair[1].from_frame)
+    {
         Some(pair) => Err(format!(
             "release eligibility steps must be in strictly ascending frames: {} is not after {}",
             pair[1].from_frame, pair[0].from_frame
@@ -173,20 +195,22 @@ pub fn validate_schedule(schedule: &[ReleaseMinimum]) -> Result<(), String> {
 
 /// Parse `frame=release,...` (empty: no steps) and validate it.
 pub fn parse_schedule(text: &str) -> Result<Vec<ReleaseMinimum>, String> {
-    let schedule = text
-        .split(',')
-        .map(str::trim)
-        .filter(|step| !step.is_empty())
-        .map(|step| {
-            let (frame, minimum) = step
-                .split_once('=')
-                .ok_or_else(|| format!("release eligibility step {step:?} is not frame=release"))?;
-            Ok(ReleaseMinimum {
-                from_frame: frame.trim().parse().map_err(|_| format!("release eligibility frame {frame:?} is not a number"))?,
-                minimum: minimum.trim().parse()?,
+    let schedule =
+        text.split(',')
+            .map(str::trim)
+            .filter(|step| !step.is_empty())
+            .map(|step| {
+                let (frame, minimum) = step.split_once('=').ok_or_else(|| {
+                    format!("release eligibility step {step:?} is not frame=release")
+                })?;
+                Ok(ReleaseMinimum {
+                    from_frame: frame.trim().parse().map_err(|_| {
+                        format!("release eligibility frame {frame:?} is not a number")
+                    })?,
+                    minimum: minimum.trim().parse()?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, String>>()?;
     validate_schedule(&schedule)?;
     Ok(schedule)
 }
@@ -208,14 +232,19 @@ pub fn init_release_eligibility(network: u8) -> Result<&'static [ReleaseMinimum]
     if let Some(schedule) = RELEASE_ELIGIBILITY.get() {
         return Ok(schedule);
     }
-    let schedule = schedule_for(network, std::env::var(RELEASE_ELIGIBILITY_ENV).ok().as_deref())?;
+    let schedule = schedule_for(
+        network,
+        std::env::var(RELEASE_ELIGIBILITY_ENV).ok().as_deref(),
+    )?;
     Ok(RELEASE_ELIGIBILITY.get_or_init(|| schedule))
 }
 
 /// The schedule [`init_release_eligibility`] fixed; without it the mainnet
 /// schedule, whatever the environment says.
 fn process_schedule() -> &'static [ReleaseMinimum] {
-    RELEASE_ELIGIBILITY.get().map_or(MAINNET_RELEASE_ELIGIBILITY, Vec::as_slice)
+    RELEASE_ELIGIBILITY
+        .get()
+        .map_or(MAINNET_RELEASE_ELIGIBILITY, Vec::as_slice)
 }
 
 /// The minimum release a session formed at GLOBAL `frame` requires of its
@@ -223,7 +252,11 @@ fn process_schedule() -> &'static [ReleaseMinimum] {
 /// before the first step.
 pub fn minimum_release_at(frame: u64) -> Option<Release> {
     let at = |schedule: &[ReleaseMinimum]| {
-        schedule.iter().take_while(|step| step.from_frame <= frame).last().map(|step| step.minimum)
+        schedule
+            .iter()
+            .take_while(|step| step.from_frame <= frame)
+            .last()
+            .map(|step| step.minimum)
     };
     RELEASE_ELIGIBILITY_OVERRIDE
         .with(|cell| cell.borrow().as_deref().map(at))
@@ -232,7 +265,9 @@ pub fn minimum_release_at(frame: u64) -> Option<Release> {
 
 /// Set the release eligibility schedule for the calling thread only (tests);
 /// `None` restores the process schedule.
-pub fn set_release_eligibility_for_thread(schedule: Option<Vec<ReleaseMinimum>>) -> Result<(), String> {
+pub fn set_release_eligibility_for_thread(
+    schedule: Option<Vec<ReleaseMinimum>>,
+) -> Result<(), String> {
     if let Some(schedule) = schedule.as_deref() {
         validate_schedule(schedule)?;
     }
@@ -265,7 +300,8 @@ pub fn confirmed_release(op: &ProverConfirm) -> Option<Release> {
 /// release) is not. The release is authenticated but self-attested (see the
 /// module documentation).
 pub fn seat_eligible(recorded: Option<&Release>, frame: u64) -> bool {
-    minimum_release_at(frame).is_none_or(|minimum| recorded.is_some_and(|release| *release >= minimum))
+    minimum_release_at(frame)
+        .is_none_or(|minimum| recorded.is_some_and(|release| *release >= minimum))
 }
 
 const ALLOCATION: &str = "allocation:ProverAllocation";
@@ -304,21 +340,39 @@ mod tests {
 
     #[test]
     fn releases_order_by_version_then_patch_then_subpatch() {
-        let r = |version, patch, subpatch| Release { version, patch, subpatch };
+        let r = |version, patch, subpatch| Release {
+            version,
+            patch,
+            subpatch,
+        };
         assert!(r([2, 1, 0], 25, 92) > r([2, 1, 0], 25, 91));
         assert!(r([2, 1, 0], 26, 0) > r([2, 1, 0], 25, 900));
         assert!(r([2, 2, 0], 0, 0) > r([2, 1, 9], 255, u16::MAX));
         assert_eq!(r([2, 1, 0], 25, 92).to_string(), "2.1.0.25.92");
         assert_eq!("2.1.0.25.92".parse::<Release>(), Ok(r([2, 1, 0], 25, 92)));
-        assert_eq!(Release::current().to_string().parse::<Release>(), Ok(Release::current()));
-        for invalid in ["2.1.0.25", "2.1.0.25.92.1", "2.1.0.256.0", "2.1.0.25.65536", "2.1.x.25.0", ""] {
+        assert_eq!(
+            Release::current().to_string().parse::<Release>(),
+            Ok(Release::current())
+        );
+        for invalid in [
+            "2.1.0.25",
+            "2.1.0.25.92.1",
+            "2.1.0.256.0",
+            "2.1.0.25.65536",
+            "2.1.x.25.0",
+            "",
+        ] {
             assert!(invalid.parse::<Release>().is_err(), "{invalid}");
         }
     }
 
     #[test]
     fn a_release_round_trips_through_its_six_bytes() {
-        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 0x0102 };
+        let release = Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch: 0x0102,
+        };
         assert_eq!(release.to_bytes(), [2, 1, 0, 25, 1, 2]);
         assert_eq!(Release::from_bytes(&release.to_bytes()), Some(release));
         assert_eq!(Release::from_bytes(&[2, 1, 0, 25, 1]), None);
@@ -338,37 +392,74 @@ mod tests {
         assert!(MAINNET_RELEASE_ELIGIBILITY.is_empty());
         assert_eq!(confirm_release_frame(), u64::MAX);
         assert_eq!(release_for_confirm(u64::MAX - 1), None);
-        assert_eq!(minimum_release_at(u64::MAX), None, "an empty schedule gates nothing");
+        assert_eq!(
+            minimum_release_at(u64::MAX),
+            None,
+            "an empty schedule gates nothing"
+        );
         assert!(seat_eligible(None, u64::MAX));
         assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, None), u64::MAX);
-        assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, Some("7")), u64::MAX);
+        assert_eq!(
+            frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 0, Some("7")),
+            u64::MAX
+        );
         assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 1, Some("7")), 7);
-        assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 1, Some("soon")), u64::MAX);
+        assert_eq!(
+            frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 1, Some("soon")),
+            u64::MAX
+        );
         assert_eq!(frame_for(MAINNET_CONFIRM_RELEASE_FRAME, 1, None), u64::MAX);
         assert_eq!(schedule_for(0, None), Ok(Vec::new()));
-        assert_eq!(schedule_for(0, Some("7=2.1.0.25.92")), Ok(Vec::new()), "mainnet ignores the setting");
+        assert_eq!(
+            schedule_for(0, Some("7=2.1.0.25.92")),
+            Ok(Vec::new()),
+            "mainnet ignores the setting"
+        );
         assert_eq!(schedule_for(1, None), Ok(Vec::new()));
         let release: Release = "2.1.0.25.92".parse().unwrap();
-        assert_eq!(schedule_for(1, Some("7=2.1.0.25.92")), Ok(vec![ReleaseMinimum { from_frame: 7, minimum: release }]));
+        assert_eq!(
+            schedule_for(1, Some("7=2.1.0.25.92")),
+            Ok(vec![ReleaseMinimum {
+                from_frame: 7,
+                minimum: release
+            }])
+        );
         assert!(schedule_for(1, Some("soon=2.1.0.25.92")).is_err());
     }
 
     #[test]
     fn a_schedule_must_name_strictly_ascending_frames() {
-        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
-        let step = |from_frame| ReleaseMinimum { from_frame, minimum: release };
+        let release = Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch: 92,
+        };
+        let step = |from_frame| ReleaseMinimum {
+            from_frame,
+            minimum: release,
+        };
         assert!(validate_schedule(&[]).is_ok());
         assert!(validate_schedule(&[step(5), step(9)]).is_ok());
-        assert!(validate_schedule(&[step(9), step(5)]).is_err(), "descending");
+        assert!(
+            validate_schedule(&[step(9), step(5)]).is_err(),
+            "descending"
+        );
         assert!(validate_schedule(&[step(5), step(5)]).is_err(), "repeated");
         assert!(validate_schedule(MAINNET_RELEASE_ELIGIBILITY).is_ok());
         assert_eq!(parse_schedule(""), Ok(Vec::new()));
-        assert_eq!(parse_schedule(" 5=2.1.0.25.92, 9=2.1.0.25.92 "), Ok(vec![step(5), step(9)]));
+        assert_eq!(
+            parse_schedule(" 5=2.1.0.25.92, 9=2.1.0.25.92 "),
+            Ok(vec![step(5), step(9)])
+        );
         assert!(parse_schedule("9=2.1.0.25.92,5=2.1.0.25.92").is_err());
         assert!(parse_schedule("5:2.1.0.25.92").is_err());
         assert!(parse_schedule("5=2.1.0.25").is_err());
         assert!(set_release_eligibility_for_thread(Some(vec![step(9), step(5)])).is_err());
-        assert_eq!(minimum_release_at(u64::MAX), None, "a rejected schedule is not installed");
+        assert_eq!(
+            minimum_release_at(u64::MAX),
+            None,
+            "a rejected schedule is not installed"
+        );
     }
 
     #[test]
@@ -380,20 +471,37 @@ mod tests {
         assert_eq!(signed_release(99, Some(&release)), None);
         assert_eq!(signed_release(100, Some(&release)), Some(&release));
         assert_eq!(signed_release(100, None), None);
-        let early = ProverConfirm { frame_number: 99, release: Some(release), ..Default::default() };
+        let early = ProverConfirm {
+            frame_number: 99,
+            release: Some(release),
+            ..Default::default()
+        };
         assert_eq!(confirmed_release(&early), None);
-        let due = ProverConfirm { frame_number: 100, ..early };
+        let due = ProverConfirm {
+            frame_number: 100,
+            ..early
+        };
         assert_eq!(confirmed_release(&due), Some(release));
         set_confirm_release_frame_for_thread(None);
     }
 
     #[test]
     fn a_step_applies_from_its_frame_and_a_later_step_raises_the_minimum_from_its_own() {
-        let r = |subpatch| Release { version: [2, 1, 0], patch: 25, subpatch };
+        let r = |subpatch| Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch,
+        };
         let (old, first, raised) = (r(80), r(90), r(95));
         set_release_eligibility_for_thread(Some(vec![
-            ReleaseMinimum { from_frame: 100, minimum: first },
-            ReleaseMinimum { from_frame: 200, minimum: raised },
+            ReleaseMinimum {
+                from_frame: 100,
+                minimum: first,
+            },
+            ReleaseMinimum {
+                from_frame: 200,
+                minimum: raised,
+            },
         ]))
         .unwrap();
         assert_eq!(minimum_release_at(99), None);
@@ -407,7 +515,10 @@ mod tests {
         assert!(!seat_eligible(None, 100), "an absent release fails closed");
         assert!(!seat_eligible(Some(&old), 100));
         assert!(seat_eligible(Some(&first), 199));
-        assert!(!seat_eligible(Some(&first), 200), "raised from the later step's frame");
+        assert!(
+            !seat_eligible(Some(&first), 200),
+            "raised from the later step's frame"
+        );
         assert!(seat_eligible(Some(&raised), 200));
         set_release_eligibility_for_thread(None).unwrap();
         assert!(seat_eligible(None, 200));
@@ -417,7 +528,11 @@ mod tests {
     fn a_release_is_recorded_on_and_read_from_an_allocation() {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         assert_eq!(read_release(&tree), None);
-        let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+        let release = Release {
+            version: [2, 1, 0],
+            patch: 25,
+            subpatch: 92,
+        };
         write_release(&mut tree, &release).unwrap();
         assert_eq!(read_release(&tree), Some(release));
         assert_eq!(

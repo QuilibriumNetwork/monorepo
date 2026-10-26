@@ -81,7 +81,11 @@ fn shard_is_an_in_place_subtree_and_split_is_zero_copy() {
     for (i, r) in subshards.iter().enumerate() {
         println!("(2) sub-shard A.{i} root = {}", hex::encode(r));
     }
-    assert_eq!(subshards.len(), 4, "4 sub-shards, read with ZERO new commit");
+    assert_eq!(
+        subshards.len(),
+        4,
+        "4 sub-shards, read with ZERO new commit"
+    );
 
     // ---- (3) a leaf proof verifies to the SINGLE app root.
     let probe = key(0x0, 1, 1);
@@ -90,7 +94,10 @@ fn shard_is_an_in_place_subtree_and_split_is_zero_copy() {
     proof
         .verify_existence(RootHash(app_root), probe, &[0xAA, 1u8])
         .expect("(3) leaf must verify against the single app root");
-    println!("(3) leaf {} verified against app root", hex::encode(probe.0));
+    println!(
+        "(3) leaf {} verified against app root",
+        hex::encode(probe.0)
+    );
 
     // ---- (4) the app root is INVARIANT: splitting shard A (re-reading deeper
     //          subtree roots) touched nothing.

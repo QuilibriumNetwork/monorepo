@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use quil_execution::canonical_cursor::{read_lp, read_u32, read_u64};
 use quil_execution::global_intrinsic::handoff::{presence::PresenceReport, TYPE_PRESENCE_REPORT};
 use quil_execution::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROVER_LEAVE};
 use quil_execution::global_intrinsic::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
 use quil_execution::global_intrinsic::prover_ops::{
-    ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_SENIORITY_MERGE,
-    TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
+    ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT,
+    TYPE_PROVER_SENIORITY_MERGE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
-use quil_execution::canonical_cursor::{read_lp, read_u32, read_u64};
 use quil_execution::message_envelope::CanonicalMessageBundle;
 use quil_types::error::Result;
 use tracing::info;
@@ -62,7 +62,10 @@ const PRESENCE_REPORT: &str = "presence_report";
 /// publication, and the requests workers send through the master are frame
 /// headers, handoffs and presence reports.
 pub(crate) fn describe(inner: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
-    let Some(prefix) = inner.get(..4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])) else {
+    let Some(prefix) = inner
+        .get(..4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    else {
         return ("unknown", Vec::new());
     };
     let or_lenient = |kind, decoded: Result<Vec<Vec<u8>>>| match decoded {
@@ -70,14 +73,40 @@ pub(crate) fn describe(inner: &[u8]) -> (&'static str, Vec<Vec<u8>>) {
         Err(_) => (kind, lenient_filters(prefix, inner)),
     };
     match prefix {
-        TYPE_PROVER_JOIN => or_lenient("join", ProverJoin::from_canonical_bytes(inner).map(|op| op.filters)),
-        TYPE_PROVER_CONFIRM => or_lenient("confirm", ProverConfirm::from_canonical_bytes(inner)
-            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters })),
-        TYPE_PROVER_REJECT => or_lenient("reject", ProverReject::from_canonical_bytes(inner)
-            .map(|op| if op.filters.is_empty() { vec![op.filter] } else { op.filters })),
-        TYPE_PROVER_LEAVE => or_lenient("leave", ProverLeave::from_canonical_bytes(inner).map(|op| op.filters)),
-        TYPE_PRESENCE_REPORT => (PRESENCE_REPORT,
-            PresenceReport::from_canonical_bytes(inner).map(|report| vec![report.filter]).unwrap_or_default()),
+        TYPE_PROVER_JOIN => or_lenient(
+            "join",
+            ProverJoin::from_canonical_bytes(inner).map(|op| op.filters),
+        ),
+        TYPE_PROVER_CONFIRM => or_lenient(
+            "confirm",
+            ProverConfirm::from_canonical_bytes(inner).map(|op| {
+                if op.filters.is_empty() {
+                    vec![op.filter]
+                } else {
+                    op.filters
+                }
+            }),
+        ),
+        TYPE_PROVER_REJECT => or_lenient(
+            "reject",
+            ProverReject::from_canonical_bytes(inner).map(|op| {
+                if op.filters.is_empty() {
+                    vec![op.filter]
+                } else {
+                    op.filters
+                }
+            }),
+        ),
+        TYPE_PROVER_LEAVE => or_lenient(
+            "leave",
+            ProverLeave::from_canonical_bytes(inner).map(|op| op.filters),
+        ),
+        TYPE_PRESENCE_REPORT => (
+            PRESENCE_REPORT,
+            PresenceReport::from_canonical_bytes(inner)
+                .map(|report| vec![report.filter])
+                .unwrap_or_default(),
+        ),
         TYPE_PROVER_SENIORITY_MERGE => ("seniority_merge", Vec::new()),
         TYPE_SHARD_SPLIT => ("shard_split", Vec::new()),
         TYPE_SHARD_MERGE => ("shard_merge", Vec::new()),
@@ -106,7 +135,12 @@ fn lenient_filters(prefix: u32, inner: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn filter_list(filters: &[Vec<u8>]) -> String {
-    filters.iter().take(MAX_LOGGED_FILTERS).map(hex::encode).collect::<Vec<_>>().join(",")
+    filters
+        .iter()
+        .take(MAX_LOGGED_FILTERS)
+        .map(hex::encode)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl OwnProverOps {
@@ -116,14 +150,30 @@ impl OwnProverOps {
         let (kind, filters) = describe(inner);
         // Each class evicts only its own oldest entry.
         let presence = |op: &Submitted| op.kind == PRESENCE_REPORT;
-        let (cap, same) = if kind == PRESENCE_REPORT { (MAX_TRACKED_PRESENCE, true) } else { (MAX_TRACKED, false) };
+        let (cap, same) = if kind == PRESENCE_REPORT {
+            (MAX_TRACKED_PRESENCE, true)
+        } else {
+            (MAX_TRACKED, false)
+        };
         if ops.values().filter(|op| presence(op) == same).count() >= cap {
-            let oldest = ops.iter().filter(|(_, op)| presence(op) == same).min_by_key(|(_, op)| op.frame);
+            let oldest = ops
+                .iter()
+                .filter(|(_, op)| presence(op) == same)
+                .min_by_key(|(_, op)| op.frame);
             if let Some(oldest) = oldest.map(|(key, _)| key.clone()) {
                 ops.remove(&oldest);
             }
         }
-        ops.insert(inner.to_vec(), Submitted { kind, filters, frame, last_observed: frame, observed: 0 });
+        ops.insert(
+            inner.to_vec(),
+            Submitted {
+                kind,
+                filters,
+                frame,
+                last_observed: frame,
+                observed: 0,
+            },
+        );
     }
 
     /// Stop tracking an operation whose publication failed.
@@ -134,15 +184,27 @@ impl OwnProverOps {
     }
 
     /// Match an authenticated GLOBAL frame's bundles.
-    pub fn observe_frame(&self, frame_number: u64, bundles: &[quil_types::proto::global::MessageBundle]) {
+    pub fn observe_frame(
+        &self,
+        frame_number: u64,
+        bundles: &[quil_types::proto::global::MessageBundle],
+    ) {
         if self.0.lock().map_or(true, |ops| ops.is_empty()) {
             return;
         }
         let requests: Vec<Vec<u8>> = bundles
             .iter()
-            .filter_map(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle).ok())
+            .filter_map(|bundle| {
+                crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle).ok()
+            })
             .filter_map(|bytes| CanonicalMessageBundle::from_canonical_bytes(&bytes).ok())
-            .flat_map(|bundle| bundle.requests.into_iter().flatten().map(|request| request.inner_bytes))
+            .flat_map(|bundle| {
+                bundle
+                    .requests
+                    .into_iter()
+                    .flatten()
+                    .map(|request| request.inner_bytes)
+            })
             .collect();
         self.observe_requests(frame_number, &requests);
     }
@@ -214,7 +276,11 @@ mod tests {
         ops.observe_requests(100 + INCLUSION_WINDOW_FRAMES - 1, &[]);
         assert_eq!(ops.tracked(), 1, "still inside its window");
         ops.observe_requests(100 + INCLUSION_WINDOW_FRAMES, &[]);
-        assert_eq!(ops.tracked(), 0, "reported as not included once its window has passed");
+        assert_eq!(
+            ops.tracked(),
+            0,
+            "reported as not included once its window has passed"
+        );
     }
 
     /// Gossip and the archive poller can both deliver a frame; it counts
@@ -226,10 +292,23 @@ mod tests {
         for frame in [102, 101, 102, 103, 103] {
             ops.observe_requests(frame, &[]);
         }
-        let observed = ops.0.lock().unwrap().get(b"join".as_slice()).map(|op| op.observed);
-        assert_eq!(observed, Some(2), "frames 102 and 103; 101 arrived after 102");
+        let observed = ops
+            .0
+            .lock()
+            .unwrap()
+            .get(b"join".as_slice())
+            .map(|op| op.observed);
+        assert_eq!(
+            observed,
+            Some(2),
+            "frames 102 and 103; 101 arrived after 102"
+        );
         ops.observe_requests(101, &[b"join".to_vec()]);
-        assert_eq!(ops.tracked(), 0, "a late copy of an earlier frame still resolves it");
+        assert_eq!(
+            ops.tracked(),
+            0,
+            "a late copy of an earlier frame still resolves it"
+        );
     }
 
     #[test]
@@ -242,13 +321,27 @@ mod tests {
             session: [2; 32],
             filter: vec![0x21; 32],
             proposals: vec![PresenceProposal {
-                header: FrameHeader { address: vec![0x21; 32], frame_number: 9, rank: 6, ..Default::default() },
-                epoch: 3, view: 6, parent: 5, payload: [5; 32],
-                votes: vec![NotarizeVote { signer: 1, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
+                header: FrameHeader {
+                    address: vec![0x21; 32],
+                    frame_number: 9,
+                    rank: 6,
+                    ..Default::default()
+                },
+                epoch: 3,
+                view: 6,
+                parent: 5,
+                payload: [5; 32],
+                votes: vec![NotarizeVote {
+                    signer: 1,
+                    signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+                }],
             }],
             nullifies: Vec::new(),
         };
-        assert_eq!(describe(&report.to_canonical_bytes().unwrap()), ("presence_report", vec![vec![0x21; 32]]));
+        assert_eq!(
+            describe(&report.to_canonical_bytes().unwrap()),
+            ("presence_report", vec![vec![0x21; 32]])
+        );
     }
 
     /// Presence reports have their own bound: a burst of them never evicts
@@ -265,7 +358,10 @@ mod tests {
             ops.submitted(&report, 11 + n as u64);
         }
         assert_eq!(ops.tracked(), 1 + MAX_TRACKED_PRESENCE);
-        assert!(ops.0.lock().unwrap().contains_key(&join), "the join is still tracked");
+        assert!(
+            ops.0.lock().unwrap().contains_key(&join),
+            "the join is still tracked"
+        );
     }
 
     #[test]
@@ -296,29 +392,60 @@ mod tests {
         let filters: Vec<Vec<u8>> = (0..103u8).map(|i| vec![i; 32]).collect();
         let confirm = ProverConfirm {
             frame_number: 9,
-            public_key_signature_bls48581: Some(AddressedSignature { signature: vec![1; 666], address: vec![2; 32] }),
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![1; 666],
+                address: vec![2; 32],
+            }),
             filters: filters.clone(),
             ..Default::default()
         }
         .to_canonical_bytes()
         .unwrap();
-        assert!(ProverConfirm::from_canonical_bytes(&confirm).is_err(), "over the decoder's limit");
+        assert!(
+            ProverConfirm::from_canonical_bytes(&confirm).is_err(),
+            "over the decoder's limit"
+        );
         assert_eq!(describe(&confirm), ("confirm", filters.clone()));
-        let reject = ProverReject { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        let reject = ProverReject {
+            filters: filters.clone(),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         assert_eq!(describe(&reject), ("reject", filters.clone()));
-        let leave = ProverLeave { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        let leave = ProverLeave {
+            filters: filters.clone(),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         assert_eq!(describe(&leave), ("leave", filters.clone()));
-        let join = ProverJoin { filters: filters.clone(), ..Default::default() }.to_canonical_bytes().unwrap();
+        let join = ProverJoin {
+            filters: filters.clone(),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         assert_eq!(describe(&join), ("join", filters));
         let mut truncated = TYPE_PROVER_LEAVE.to_be_bytes().to_vec();
         truncated.extend_from_slice(&u32::MAX.to_be_bytes());
         truncated.extend_from_slice(&[0, 0, 0, 1, 7, 0, 0]);
-        assert_eq!(describe(&truncated), ("leave", vec![vec![7]]), "as far as its bytes go");
+        assert_eq!(
+            describe(&truncated),
+            ("leave", vec![vec![7]]),
+            "as far as its bytes go"
+        );
     }
 
     #[test]
     fn a_seniority_merge_is_named() {
-        let merge = quil_execution::global_intrinsic::prover_ops::ProverSeniorityMerge { frame_number: 9, ..Default::default() };
-        assert_eq!(describe(&merge.to_canonical_bytes().unwrap()), ("seniority_merge", Vec::new()));
+        let merge = quil_execution::global_intrinsic::prover_ops::ProverSeniorityMerge {
+            frame_number: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            describe(&merge.to_canonical_bytes().unwrap()),
+            ("seniority_merge", Vec::new())
+        );
     }
 }

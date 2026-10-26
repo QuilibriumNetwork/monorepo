@@ -33,8 +33,8 @@ pub mod frame_header;
 pub mod handoff;
 pub mod intrinsic;
 pub mod kick_verify;
-pub mod materialize;
 pub mod leaf_root_registration;
+pub mod materialize;
 pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;
@@ -48,30 +48,30 @@ pub mod reassignment;
 pub mod seniority_merge;
 pub mod seniority_succession;
 pub mod sig_with_pop;
-pub mod storage_epoch_proof;
 pub mod storage_binding;
+pub mod storage_epoch_proof;
 pub mod storage_seat;
 pub mod storage_snapshot;
 pub mod verify;
 
 pub use addressed_signature::{
-    AddressedSignature, TYPE_BLS48581_ADDRESSED_SIGNATURE, MAX_ADDRESSED_SIG_LEN,
+    AddressedSignature, MAX_ADDRESSED_SIG_LEN, TYPE_BLS48581_ADDRESSED_SIGNATURE,
 };
-pub use prover_filter_ops::{
-    ProverLeave, ProverPause, ProverResume, MAX_PROVER_FILTERS_COUNT,
-    MAX_PROVER_FILTER_LEN, TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
-};
-pub use prover_join::{ProverJoin, TYPE_PROVER_JOIN};
-pub use leaf_root_registration::{
-    LeafRootRegistration, leaf_id_bytes, TYPE_LEAF_ROOT_REGISTRATION,
-};
-pub use seniority_merge::{SeniorityMerge, TYPE_SENIORITY_MERGE};
-pub use sig_with_pop::{SignatureWithPop, TYPE_BLS48581_SIG_WITH_POP};
 pub use frame_header::{
     FrameHeader, GlobalFrameHeader, TYPE_FRAME_HEADER, TYPE_GLOBAL_FRAME_HEADER,
 };
-pub use prover_ops::{
-    ProverConfirm, ProverReject, ProverKick, ProverUpdate, ProverSeniorityMerge,
-    ShardSplit, ShardMerge, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT, TYPE_PROVER_KICK,
-    TYPE_PROVER_UPDATE, TYPE_PROVER_SENIORITY_MERGE, TYPE_SHARD_SPLIT, TYPE_SHARD_MERGE,
+pub use leaf_root_registration::{
+    leaf_id_bytes, LeafRootRegistration, TYPE_LEAF_ROOT_REGISTRATION,
 };
+pub use prover_filter_ops::{
+    ProverLeave, ProverPause, ProverResume, MAX_PROVER_FILTERS_COUNT, MAX_PROVER_FILTER_LEN,
+    TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
+};
+pub use prover_join::{ProverJoin, TYPE_PROVER_JOIN};
+pub use prover_ops::{
+    ProverConfirm, ProverKick, ProverReject, ProverSeniorityMerge, ProverUpdate, ShardMerge,
+    ShardSplit, TYPE_PROVER_CONFIRM, TYPE_PROVER_KICK, TYPE_PROVER_REJECT,
+    TYPE_PROVER_SENIORITY_MERGE, TYPE_PROVER_UPDATE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
+};
+pub use seniority_merge::{SeniorityMerge, TYPE_SENIORITY_MERGE};
+pub use sig_with_pop::{SignatureWithPop, TYPE_BLS48581_SIG_WITH_POP};

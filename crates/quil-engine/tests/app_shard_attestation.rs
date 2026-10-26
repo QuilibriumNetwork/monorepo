@@ -33,16 +33,11 @@
 //!     verified). Catches multi-proof packing + per-signer challenge
 //!     derivation regressions.
 
-
 use quil_crypto::{FalconKeyConstructor, WesolowskiFrameProver};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;
 use quil_execution::global_intrinsic::prover_shard_update::verify_frame_header_attestation;
-use quil_execution::hypergraph_intrinsic::canonical::{
-    AggregateSignature, Bls48581G2PublicKey,
-};
-use quil_types::consensus::{
-    ProverAllocationInfo, ProverInfo, ProverStatus,
-};
+use quil_execution::hypergraph_intrinsic::canonical::{AggregateSignature, Bls48581G2PublicKey};
+use quil_types::consensus::{ProverAllocationInfo, ProverInfo, ProverStatus};
 use quil_types::crypto::{BlsConstructor, FrameProver, Signer};
 
 /// Construct the byte buffer that a vote signs: `filter || stateID || rank:u64(BE)`.
@@ -178,8 +173,13 @@ fn bitmask_full(n: usize) -> Vec<u8> {
 fn build_and_verify_partial(
     committee_size: usize,
     signer_count: usize,
-) -> Result<(quil_execution::global_intrinsic::frame_header::FrameHeader, Vec<ProverInfo>), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        quil_execution::global_intrinsic::frame_header::FrameHeader,
+        Vec<ProverInfo>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     build_and_verify_partial_with_filter(committee_size, signer_count, &test_filter())
 }
 
@@ -187,8 +187,13 @@ fn build_and_verify_partial_with_filter(
     committee_size: usize,
     signer_count: usize,
     filter: &[u8],
-) -> Result<(quil_execution::global_intrinsic::frame_header::FrameHeader, Vec<ProverInfo>), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        quil_execution::global_intrinsic::frame_header::FrameHeader,
+        Vec<ProverInfo>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     assert!(signer_count >= 1 && signer_count <= committee_size);
     let bls = FalconKeyConstructor;
     let frame_prover = WesolowskiFrameProver::new(2048);
@@ -196,8 +201,7 @@ fn build_and_verify_partial_with_filter(
     let app_address = filter.clone(); // live invariant — Go alias
 
     let signers = build_committee(&bls, committee_size, &filter);
-    let active_provers: Vec<ProverInfo> =
-        signers.iter().map(|(_, info)| info.clone()).collect();
+    let active_provers: Vec<ProverInfo> = signers.iter().map(|(_, info)| info.clone()).collect();
     let prover_address = active_provers[0].address.clone();
     let requests_root = vec![0u8; 64];
     let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 666]; 4];
@@ -208,9 +212,17 @@ fn build_and_verify_partial_with_filter(
     let fee_multiplier_vote: u64 = 0;
 
     let mut proto = frame_prover.prove_frame_header(
-        &[], &app_address, &requests_root, &state_roots,
-        &prover_address, timestamp, difficulty, fee_multiplier_vote, frame_number,
-        &[], 0,
+        &[],
+        &app_address,
+        &requests_root,
+        &state_roots,
+        &prover_address,
+        timestamp,
+        difficulty,
+        fee_multiplier_vote,
+        frame_number,
+        &[],
+        0,
     )?;
     stamp_app_frame_output(&mut proto, rank);
 
@@ -255,16 +267,14 @@ fn build_and_verify_partial_with_filter(
     } else {
         use sha3::{Digest, Sha3_256};
         let challenge: [u8; 32] = Sha3_256::digest(&proto.parent_selector).into();
-        let ids: Vec<&[u8]> =
-            active_provers.iter().map(|p| p.address.as_slice()).collect();
+        let ids: Vec<&[u8]> = active_provers
+            .iter()
+            .map(|p| p.address.as_slice())
+            .collect();
         let mut proofs: Vec<Vec<u8>> = Vec::with_capacity(signer_count);
         for i in 0..signer_count {
-            proofs.push(frame_prover.calculate_multi_proof(
-                &challenge,
-                difficulty,
-                &ids,
-                i as u32,
-            )?);
+            proofs
+                .push(frame_prover.calculate_multi_proof(&challenge, difficulty, &ids, i as u32)?);
         }
         let mut packed = Vec::with_capacity(signer_count * 666 + 4 + 516 * signer_count);
         packed.extend_from_slice(&agg.signature);
@@ -305,12 +315,8 @@ fn build_and_verify_partial_with_filter(
         spends: Vec::new(),
     };
 
-    let returned = verify_frame_header_attestation(
-        &frame_header,
-        &frame_prover,
-        &bls,
-        &active_provers,
-    )?;
+    let returned =
+        verify_frame_header_attestation(&frame_header, &frame_prover, &bls, &active_provers)?;
     assert_eq!(returned.len(), (committee_size + 7) / 8);
     Ok((frame_header, active_provers))
 }
@@ -341,8 +347,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
 
     // 1. Build the committee + signers.
     let signers = build_committee(&bls, committee_size, &filter);
-    let active_provers: Vec<ProverInfo> =
-        signers.iter().map(|(_, info)| info.clone()).collect();
+    let active_provers: Vec<ProverInfo> = signers.iter().map(|(_, info)| info.clone()).collect();
 
     // 2. Run the VDF for the frame header. Genesis-like parent so the
     //    test stays cheap; we only need a valid output for the
@@ -357,8 +362,8 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
     let fee_multiplier_vote: u64 = 0;
 
     let mut proto = frame_prover.prove_frame_header(
-        &[],                              // previous_frame_output
-        &app_address,                     // address — must match verifier
+        &[],          // previous_frame_output
+        &app_address, // address — must match verifier
         &requests_root,
         &state_roots,
         &prover_address,
@@ -373,8 +378,7 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
 
     // 3. Each signer produces a vote. The payload + domain must
     //    byte-exactly match what the verifier reconstructs.
-    let identity =
-        quil_crypto::poseidon::hash_bytes_to_32(&proto.output)?.to_vec();
+    let identity = quil_crypto::poseidon::hash_bytes_to_32(&proto.output)?.to_vec();
     let vote_payload = make_vote_message(&app_address, rank, &identity);
     let mut domain = b"appshard".to_vec();
     domain.extend_from_slice(&app_address);
@@ -414,12 +418,8 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
             .collect();
         let mut multi_proofs: Vec<Vec<u8>> = Vec::with_capacity(committee_size);
         for i in 0..committee_size {
-            let proof = frame_prover.calculate_multi_proof(
-                &challenge,
-                difficulty,
-                &ids,
-                i as u32,
-            )?;
+            let proof =
+                frame_prover.calculate_multi_proof(&challenge, difficulty, &ids, i as u32)?;
             assert_eq!(proof.len(), 516);
             multi_proofs.push(proof);
         }
@@ -469,12 +469,8 @@ fn build_and_verify(committee_size: usize) -> Result<(), Box<dyn std::error::Err
 
     // 6. Verify — must succeed. The function's return value is the
     //    raw bitmask, which we cross-check against what we emitted.
-    let recovered_bitmask = verify_frame_header_attestation(
-        &frame_header,
-        &frame_prover,
-        &bls,
-        &active_provers,
-    )?;
+    let recovered_bitmask =
+        verify_frame_header_attestation(&frame_header, &frame_prover, &bls, &active_provers)?;
     assert_eq!(
         recovered_bitmask, bitmask,
         "verifier-returned bitmask differs from producer's"
@@ -522,8 +518,7 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
     let app_address = app_address_from_filter(&filter);
 
     let signers = build_committee(&bls, 1, &filter);
-    let active_provers: Vec<ProverInfo> =
-        signers.iter().map(|(_, info)| info.clone()).collect();
+    let active_provers: Vec<ProverInfo> = signers.iter().map(|(_, info)| info.clone()).collect();
     let prover_address = active_provers[0].address.clone();
     let requests_root = vec![0u8; 64];
     let state_roots: Vec<Vec<u8>> = vec![vec![0u8; 666]; 4];
@@ -594,19 +589,14 @@ fn signing_with_raw_filter_instead_of_app_address_must_fail_verify() {
         spends: Vec::new(),
     };
 
-    let result = verify_frame_header_attestation(
-        &frame_header,
-        &frame_prover,
-        &bls,
-        &active_provers,
-    );
+    let result =
+        verify_frame_header_attestation(&frame_header, &frame_prover, &bls, &active_provers);
     assert!(
         result.is_err(),
         "expected verifier to reject sig over raw-filter payload, got {:?}",
         result
     );
 }
-
 
 // =====================================================================
 // Condition 1 — shard-frame BLS + VDF-multiproof + 2/3 quorum gate
@@ -649,12 +639,8 @@ fn shard_frame_quorum_outcome_with_filter(
     // the verified, bit-packed worker bitmask.
     let bls = FalconKeyConstructor;
     let frame_prover = WesolowskiFrameProver::new(2048);
-    let bitmask_bytes = verify_frame_header_attestation(
-        &frame_header,
-        &frame_prover,
-        &bls,
-        &active_provers,
-    )?;
+    let bitmask_bytes =
+        verify_frame_header_attestation(&frame_header, &frame_prover, &bls, &active_provers)?;
 
     // Expand bitmask → participant indices (invoke_frame_header.rs:1529).
     let participant_indices: Vec<usize> =
@@ -739,10 +725,8 @@ fn two_shards_each_enforce_quorum_independently() {
         f
     };
     // Both shards independently reach a valid 3-of-3 quorum.
-    shard_frame_quorum_outcome_with_filter(3, 3, &shard_a)
-        .expect("shard A: 3-of-3 must be valid");
-    shard_frame_quorum_outcome_with_filter(3, 3, &shard_b)
-        .expect("shard B: 3-of-3 must be valid");
+    shard_frame_quorum_outcome_with_filter(3, 3, &shard_a).expect("shard A: 3-of-3 must be valid");
+    shard_frame_quorum_outcome_with_filter(3, 3, &shard_b).expect("shard B: 3-of-3 must be valid");
     // A degenerate 1-of-3 on shard B is rejected without affecting shard A.
     shard_frame_quorum_outcome_with_filter(3, 1, &shard_b)
         .expect_err("shard B: 1-of-3 must fail quorum independently");

@@ -119,7 +119,11 @@ fn classify(len: usize, byte: impl Fn(usize) -> Option<u8>, data: &[u8]) -> Goss
         APP_FILTER_LEN => GossipClass::ShardFrames,
         33 => match byte(0) {
             Some(0) => GossipClass::Votes,
-            Some(1) if data.first().is_some_and(|b| b & !CW_NONCE_FLAG == CW_VOTE_CHANNEL) => {
+            Some(1)
+                if data
+                    .first()
+                    .is_some_and(|b| b & !CW_NONCE_FLAG == CW_VOTE_CHANNEL) =>
+            {
                 GossipClass::Votes
             }
             Some(1) => GossipClass::ShardConsensus,
@@ -218,7 +222,10 @@ pub struct GossipTraffic {
 
 impl Default for GossipTraffic {
     fn default() -> Self {
-        Self { started: Instant::now(), classes: Default::default() }
+        Self {
+            started: Instant::now(),
+            classes: Default::default(),
+        }
     }
 }
 
@@ -272,7 +279,9 @@ impl GossipTrafficSnapshot {
 
     /// Every class together.
     pub fn total(&self) -> ClassTraffic {
-        self.classes.iter().fold(ClassTraffic::default(), |total, class| total.add(*class))
+        self.classes
+            .iter()
+            .fold(ClassTraffic::default(), |total, class| total.add(*class))
     }
 
     /// The traffic between `earlier` and this snapshot.
@@ -319,7 +328,11 @@ struct Mbps(f64);
 impl Mbps {
     fn of(flow: Flow, over: Duration) -> Mbps {
         let secs = over.as_secs_f64();
-        Mbps(if secs > 0.0 { flow.bytes as f64 * 8.0 / 1e6 / secs } else { 0.0 })
+        Mbps(if secs > 0.0 {
+            flow.bytes as f64 * 8.0 / 1e6 / secs
+        } else {
+            0.0
+        })
     }
 }
 
@@ -404,11 +417,29 @@ mod tests {
             (vec![], vec![1], Other),
         ];
         for (bitmask, data, class) in cases {
-            assert_eq!(GossipClass::of_bitmask(&bitmask, &data), class, "{}", hex::encode(&bitmask));
-            assert_eq!(GossipClass::of_topic(&hex::encode(&bitmask), &data), class, "{}", hex::encode(&bitmask));
+            assert_eq!(
+                GossipClass::of_bitmask(&bitmask, &data),
+                class,
+                "{}",
+                hex::encode(&bitmask)
+            );
+            assert_eq!(
+                GossipClass::of_topic(&hex::encode(&bitmask), &data),
+                class,
+                "{}",
+                hex::encode(&bitmask)
+            );
         }
-        assert_eq!(GossipClass::of_topic("0", &[]), GossipClass::Other, "odd-length topic");
-        assert_eq!(GossipClass::of_topic("zz", &[]), GossipClass::Other, "not hex");
+        assert_eq!(
+            GossipClass::of_topic("0", &[]),
+            GossipClass::Other,
+            "odd-length topic"
+        );
+        assert_eq!(
+            GossipClass::of_topic("zz", &[]),
+            GossipClass::Other,
+            "not hex"
+        );
         for class in GossipClass::ALL {
             assert_eq!(GossipClass::from_name(class.name()), Some(class));
         }
@@ -436,36 +467,113 @@ mod tests {
         let before = traffic.snapshot();
 
         let votes = before.class(GossipClass::Votes);
-        assert_eq!(votes.received, Flow { messages: 3, bytes: 300 });
-        assert_eq!(votes.unique, Flow { messages: 1, bytes: 100 });
-        assert_eq!(votes.sent, Flow { messages: 2, bytes: 200 });
+        assert_eq!(
+            votes.received,
+            Flow {
+                messages: 3,
+                bytes: 300
+            }
+        );
+        assert_eq!(
+            votes.unique,
+            Flow {
+                messages: 1,
+                bytes: 100
+            }
+        );
+        assert_eq!(
+            votes.sent,
+            Flow {
+                messages: 2,
+                bytes: 200
+            }
+        );
         assert_eq!(votes.published, Flow::default());
         let consensus = before.class(GossipClass::ShardConsensus);
-        assert_eq!(consensus.sent, Flow { messages: 2, bytes: 600 });
-        assert_eq!(consensus.published, Flow { messages: 1, bytes: 300 });
+        assert_eq!(
+            consensus.sent,
+            Flow {
+                messages: 2,
+                bytes: 600
+            }
+        );
+        assert_eq!(
+            consensus.published,
+            Flow {
+                messages: 1,
+                bytes: 300
+            }
+        );
         assert_eq!(consensus.received, Flow::default());
-        assert_eq!(before.class(GossipClass::PeerInfo).received, Flow { messages: 1, bytes: 50 });
-        for class in [GossipClass::ShardFrames, GossipClass::Global, GossipClass::Other] {
-            assert_eq!(before.class(class), ClassTraffic::default(), "{}", class.name());
+        assert_eq!(
+            before.class(GossipClass::PeerInfo).received,
+            Flow {
+                messages: 1,
+                bytes: 50
+            }
+        );
+        for class in [
+            GossipClass::ShardFrames,
+            GossipClass::Global,
+            GossipClass::Other,
+        ] {
+            assert_eq!(
+                before.class(class),
+                ClassTraffic::default(),
+                "{}",
+                class.name()
+            );
         }
-        assert_eq!(before.total().received, Flow { messages: 4, bytes: 350 });
-        assert_eq!(before.total().sent, Flow { messages: 4, bytes: 800 });
+        assert_eq!(
+            before.total().received,
+            Flow {
+                messages: 4,
+                bytes: 350
+            }
+        );
+        assert_eq!(
+            before.total().sent,
+            Flow {
+                messages: 4,
+                bytes: 800
+            }
+        );
 
         traffic.observe(TrafficKind::Received, &peer_info, &[1], 70);
         let interval = traffic.snapshot().since(&before);
-        assert_eq!(interval.class(GossipClass::PeerInfo).received, Flow { messages: 1, bytes: 70 });
+        assert_eq!(
+            interval.class(GossipClass::PeerInfo).received,
+            Flow {
+                messages: 1,
+                bytes: 70
+            }
+        );
         assert_eq!(interval.class(GossipClass::Votes), ClassTraffic::default());
 
         let status = before.to_proto();
         assert_eq!(status.classes.len(), GossipClass::ALL.len());
         let votes = status.classes.iter().find(|c| c.class == "votes").unwrap();
-        assert_eq!((votes.received_messages, votes.received_bytes, votes.unique_bytes, votes.sent_bytes), (3, 300, 100, 200));
+        assert_eq!(
+            (
+                votes.received_messages,
+                votes.received_bytes,
+                votes.unique_bytes,
+                votes.sent_bytes
+            ),
+            (3, 300, 100, 200)
+        );
     }
 
     #[test]
     fn rates_are_megabits_per_second_of_the_interval() {
-        let flow = Flow { messages: 10, bytes: 75_000_000 };
-        assert_eq!(Mbps::of(flow, Duration::from_secs(600)).to_string(), "1.000");
+        let flow = Flow {
+            messages: 10,
+            bytes: 75_000_000,
+        };
+        assert_eq!(
+            Mbps::of(flow, Duration::from_secs(600)).to_string(),
+            "1.000"
+        );
         assert_eq!(Mbps::of(flow, Duration::ZERO).to_string(), "0.000");
     }
 }

@@ -73,10 +73,19 @@ pub struct CanonicalPeerInfo {
 
 impl CanonicalPeerInfo {
     pub fn build_fingerprint(&self) -> Option<[u8; 32]> {
-        let mut matches = self.capabilities.iter()
+        let mut matches = self
+            .capabilities
+            .iter()
             .filter(|c| c.protocol_identifier == BUILD_FINGERPRINT_CAPABILITY_ID);
-        let fingerprint = matches.next()?.additional_metadata.as_slice().try_into().ok()?;
-        if matches.next().is_some() { return None; }
+        let fingerprint = matches
+            .next()?
+            .additional_metadata
+            .as_slice()
+            .try_into()
+            .ok()?;
+        if matches.next().is_some() {
+            return None;
+        }
         Some(fingerprint)
     }
 
@@ -84,10 +93,20 @@ impl CanonicalPeerInfo {
     /// none (a build older than the capability), more than one, or a
     /// malformed one.
     pub fn release_subpatch(&self) -> Option<u32> {
-        let mut matches = self.capabilities.iter()
+        let mut matches = self
+            .capabilities
+            .iter()
             .filter(|c| c.protocol_identifier == RELEASE_SUBPATCH_CAPABILITY_ID);
-        let subpatch = matches.next()?.additional_metadata.as_slice().try_into().ok().map(u32::from_be_bytes)?;
-        if matches.next().is_some() { return None; }
+        let subpatch = matches
+            .next()?
+            .additional_metadata
+            .as_slice()
+            .try_into()
+            .ok()
+            .map(u32::from_be_bytes)?;
+        if matches.next().is_some() {
+            return None;
+        }
         Some(subpatch)
     }
 
@@ -95,7 +114,10 @@ impl CanonicalPeerInfo {
     /// release (`2.1.0.25`) when it advertises no subpatch, and empty when
     /// its version fields are malformed.
     pub fn release(&self) -> String {
-        let (Ok([major, minor, patch]), [number]) = (<[u8; 3]>::try_from(self.version.as_slice()), self.patch_number.as_slice()) else {
+        let (Ok([major, minor, patch]), [number]) = (
+            <[u8; 3]>::try_from(self.version.as_slice()),
+            self.patch_number.as_slice(),
+        ) else {
             return String::new();
         };
         match self.release_subpatch() {
@@ -347,7 +369,11 @@ pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
             info.last_received_frame = r.read_u64()?;
             info.last_global_head_frame = r.read_u64()?;
         }
-        _ => return Err(QuilError::P2p("PeerInfo: invalid frame trailer length".into())),
+        _ => {
+            return Err(QuilError::P2p(
+                "PeerInfo: invalid frame trailer length".into(),
+            ))
+        }
     }
     Ok(info)
 }
@@ -459,7 +485,9 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(512) }
+        Self {
+            buf: Vec::with_capacity(512),
+        }
     }
     fn write_u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_be_bytes());
@@ -515,7 +543,7 @@ pub fn encode_key_registry(
         let mut ik = Vec::new();
         ik.extend_from_slice(&ED448_PUBLIC_KEY_TYPE.to_be_bytes()); // 4 bytes
         ik.extend_from_slice(ed448_pubkey); // 57 bytes
-        // Total: 61 bytes (matches Go's identityKeyLen <= 61 check)
+                                            // Total: 61 bytes (matches Go's identityKeyLen <= 61 check)
         w.write_bytes(&ik);
     } else {
         w.write_u32(0);
@@ -527,7 +555,7 @@ pub fn encode_key_registry(
         let mut pk = Vec::new();
         pk.extend_from_slice(&BLS48581_G2_PUBLIC_KEY_TYPE.to_be_bytes()); // 4 bytes
         pk.extend_from_slice(bls_pubkey); // 585 bytes
-        // Total: 589 bytes (matches Go's proverKeyLen <= 589 check)
+                                          // Total: 589 bytes (matches Go's proverKeyLen <= 589 check)
         w.write_bytes(&pk);
     } else {
         w.write_u32(0);
@@ -651,14 +679,16 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
     // identity_to_prover: wrapped Ed448Signature.
     let i2p_blob = r.read_bytes()?;
     if !i2p_blob.is_empty() {
-        let inner = decode_wrapped_signature(&i2p_blob, ED448_SIGNATURE_TYPE, "identity_to_prover")?;
+        let inner =
+            decode_wrapped_signature(&i2p_blob, ED448_SIGNATURE_TYPE, "identity_to_prover")?;
         out.identity_to_prover_sig = inner;
     }
 
     // prover_to_identity: wrapped BLS48581Signature.
     let p2i_blob = r.read_bytes()?;
     if !p2i_blob.is_empty() {
-        let inner = decode_wrapped_signature(&p2i_blob, BLS48581_SIGNATURE_TYPE, "prover_to_identity")?;
+        let inner =
+            decode_wrapped_signature(&p2i_blob, BLS48581_SIGNATURE_TYPE, "prover_to_identity")?;
         out.prover_to_identity_sig = inner;
     }
 
@@ -680,7 +710,8 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
         } else {
             raw_value.to_vec()
         };
-        out.keys_by_purpose.push(KeysByPurposeEntry { purpose, value });
+        out.keys_by_purpose
+            .push(KeysByPurposeEntry { purpose, value });
     }
 
     // last_updated: u64 big-endian.
@@ -691,7 +722,10 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
 
 fn decode_wrapped_signature(blob: &[u8], expect_type: u32, name: &str) -> Result<Vec<u8>> {
     if blob.len() < 12 {
-        return Err(QuilError::P2p(format!("KeyRegistry: {} sig blob too short", name)));
+        return Err(QuilError::P2p(format!(
+            "KeyRegistry: {} sig blob too short",
+            name
+        )));
     }
     let inner_type = u32::from_be_bytes(blob[..4].try_into().unwrap());
     if inner_type != expect_type {
@@ -702,13 +736,20 @@ fn decode_wrapped_signature(blob: &[u8], expect_type: u32, name: &str) -> Result
     }
     let pubkey_len = u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize;
     if 8 + pubkey_len + 4 > blob.len() {
-        return Err(QuilError::P2p(format!("KeyRegistry: {} sig pubkey overruns", name)));
+        return Err(QuilError::P2p(format!(
+            "KeyRegistry: {} sig pubkey overruns",
+            name
+        )));
     }
     let sig_len_offset = 8 + pubkey_len;
-    let sig_len = u32::from_be_bytes(blob[sig_len_offset..sig_len_offset + 4].try_into().unwrap()) as usize;
+    let sig_len =
+        u32::from_be_bytes(blob[sig_len_offset..sig_len_offset + 4].try_into().unwrap()) as usize;
     let sig_start = sig_len_offset + 4;
     if sig_start + sig_len > blob.len() {
-        return Err(QuilError::P2p(format!("KeyRegistry: {} sig payload overruns", name)));
+        return Err(QuilError::P2p(format!(
+            "KeyRegistry: {} sig payload overruns",
+            name
+        )));
     }
     Ok(blob[sig_start..sig_start + sig_len].to_vec())
 }
@@ -764,7 +805,10 @@ mod tests {
             };
             let bytes = encode_canonical_peer_info(&info, &[], &[]);
             let decoded = decode_canonical_peer_info(&bytes).unwrap();
-            assert_eq!((decoded.last_received_frame, decoded.last_global_head_frame), (received, head));
+            assert_eq!(
+                (decoded.last_received_frame, decoded.last_global_head_frame),
+                (received, head)
+            );
             assert_eq!(encode_canonical_peer_info(&decoded, &[], &[]), bytes);
         }
     }
@@ -801,16 +845,30 @@ mod tests {
 
     #[test]
     fn release_names_the_subpatch_when_advertised() {
-        let mut info = CanonicalPeerInfo { version: vec![2, 1, 0], patch_number: vec![25], ..Default::default() };
-        assert_eq!((info.release_subpatch(), info.release()), (None, "2.1.0.25".to_string()));
+        let mut info = CanonicalPeerInfo {
+            version: vec![2, 1, 0],
+            patch_number: vec![25],
+            ..Default::default()
+        };
+        assert_eq!(
+            (info.release_subpatch(), info.release()),
+            (None, "2.1.0.25".to_string())
+        );
         info.capabilities.push(CanonicalCapability {
             protocol_identifier: RELEASE_SUBPATCH_CAPABILITY_ID,
             additional_metadata: 92u32.to_be_bytes().to_vec(),
         });
-        let decoded = decode_canonical_peer_info(&encode_canonical_peer_info(&info, &[], &[])).unwrap();
-        assert_eq!((decoded.release_subpatch(), decoded.release()), (Some(92), "2.1.0.25.92".to_string()));
+        let decoded =
+            decode_canonical_peer_info(&encode_canonical_peer_info(&info, &[], &[])).unwrap();
+        assert_eq!(
+            (decoded.release_subpatch(), decoded.release()),
+            (Some(92), "2.1.0.25.92".to_string())
+        );
         info.capabilities.push(info.capabilities[0].clone());
-        assert_eq!((info.release_subpatch(), info.release()), (None, "2.1.0.25".to_string()));
+        assert_eq!(
+            (info.release_subpatch(), info.release()),
+            (None, "2.1.0.25".to_string())
+        );
         info.capabilities.truncate(1);
         info.capabilities[0].additional_metadata.pop();
         assert_eq!(info.release_subpatch(), None);
@@ -854,7 +912,10 @@ mod tests {
         assert_eq!(decoded.peer_id, info.peer_id);
         assert_eq!(decoded.reachability.len(), 1);
         assert_eq!(decoded.reachability[0].filter, vec![0xFF; 32]);
-        assert_eq!(decoded.reachability[0].stream_multiaddrs[0], "/ip4/1.2.3.4/tcp/8340");
+        assert_eq!(
+            decoded.reachability[0].stream_multiaddrs[0],
+            "/ip4/1.2.3.4/tcp/8340"
+        );
         assert_eq!(decoded.timestamp, 1700000000);
         assert_eq!(decoded.version, vec![2, 1, 0]);
         assert_eq!(decoded.capabilities.len(), 2);
@@ -878,10 +939,10 @@ mod tests {
         // Go produces 894 bytes for this test case.
         // Header: 00000123 0000003d 00000110 [57 zeros] 0000024d 00000117 [585 zeros] ...
         let kr = encode_key_registry(
-            &[0u8; 57],   // ed448 pubkey
-            &[0u8; 585],  // bls pubkey
-            &[0u8; 114],  // identity_to_prover sig
-            &[0u8; 74],   // prover_to_identity sig
+            &[0u8; 57],  // ed448 pubkey
+            &[0u8; 585], // bls pubkey
+            &[0u8; 114], // identity_to_prover sig
+            &[0u8; 74],  // prover_to_identity sig
             1000,
         );
         // Print hex for manual comparison
@@ -898,8 +959,16 @@ mod tests {
         assert_eq!(&kr[8..12], &0x0110u32.to_be_bytes(), "Ed448PublicKey type");
         // 57 bytes of key at [12..69]
         let prover_key_offset = 69;
-        assert_eq!(&kr[prover_key_offset..prover_key_offset+4], &589u32.to_be_bytes(), "prover_key len = 589");
-        assert_eq!(&kr[prover_key_offset+4..prover_key_offset+8], &0x0117u32.to_be_bytes(), "BLS G2 type");
+        assert_eq!(
+            &kr[prover_key_offset..prover_key_offset + 4],
+            &589u32.to_be_bytes(),
+            "prover_key len = 589"
+        );
+        assert_eq!(
+            &kr[prover_key_offset + 4..prover_key_offset + 8],
+            &0x0117u32.to_be_bytes(),
+            "BLS G2 type"
+        );
         // Total should match Go's 894 bytes
         assert_eq!(kr.len(), 894, "total length must match Go");
     }
@@ -1016,7 +1085,8 @@ mod tests {
         let pubkey = ed448_rust::PublicKey::from(&privkey);
         let pubkey_bytes = pubkey.as_byte();
         assert_eq!(
-            hex::encode(pubkey_bytes), go_pubkey_hex,
+            hex::encode(pubkey_bytes),
+            go_pubkey_hex,
             "Ed448 public key must match Go"
         );
 
@@ -1034,7 +1104,8 @@ mod tests {
         };
         let msg_to_sign = encode_canonical_peer_info(&info, pubkey_bytes.as_slice(), &[]);
         assert_eq!(
-            hex::encode(&msg_to_sign), go_msg_hex,
+            hex::encode(&msg_to_sign),
+            go_msg_hex,
             "msg_to_sign must match Go"
         );
 
@@ -1042,7 +1113,8 @@ mod tests {
         let sig = privkey.sign(&msg_to_sign, None).expect("sign failed");
         assert_eq!(sig.len(), 114);
         assert_eq!(
-            hex::encode(&sig), go_sig_hex,
+            hex::encode(&sig),
+            go_sig_hex,
             "Ed448 signature must match Go (deterministic)"
         );
 
@@ -1074,10 +1146,7 @@ mod tests {
 
     #[test]
     fn worker_reachability_thread_mode_repeats_master_addrs() {
-        let workers = vec![
-            (1u32, vec![0xAA; 32]),
-            (2u32, vec![0xBB; 32]),
-        ];
+        let workers = vec![(1u32, vec![0xAA; 32]), (2u32, vec![0xBB; 32])];
         let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
         let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
 
@@ -1107,10 +1176,7 @@ mod tests {
 
     #[test]
     fn worker_reachability_process_mode_uses_per_worker_addrs() {
-        let workers = vec![
-            (1u32, vec![0xAA; 32]),
-            (2u32, vec![0xBB; 32]),
-        ];
+        let workers = vec![(1u32, vec![0xAA; 32]), (2u32, vec![0xBB; 32])];
         let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
         let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
         let worker_p2p = vec![
@@ -1225,15 +1291,8 @@ mod tests {
         let master_pubsub = "/ip4/1.2.3.4/udp/8336/quic-v1";
         let master_stream = vec!["/ip4/1.2.3.4/tcp/8340".to_string()];
 
-        let r = build_worker_reachability(
-            &workers,
-            master_pubsub,
-            &master_stream,
-            &[],
-            &[],
-            &[],
-            &[],
-        );
+        let r =
+            build_worker_reachability(&workers, master_pubsub, &master_stream, &[], &[], &[], &[]);
         assert_eq!(r.len(), 1, "only the active worker should be advertised");
         assert_eq!(r[0].filter, vec![0xBB; 32]);
     }
@@ -1264,7 +1323,7 @@ mod tests {
             &workers,
             master_pubsub,
             &master_stream,
-            &[], // p2p empty
+            &[],                                      // p2p empty
             &["/ip4/10.0.0.1/tcp/32500".to_string()], // stream non-empty -> process mode
             &[],
             &[],
@@ -1355,10 +1414,10 @@ mod tests {
     #[test]
     fn peek_key_registry_timestamp_matches_full_decode() {
         let encoded = encode_key_registry(
-            &vec![0xAA; 57], // ed448 pubkey
-            &vec![0xBB; 585], // bls pubkey
-            &vec![0xCC; 114], // identity_to_prover_sig (Ed448)
-            &vec![0xDD; 74],  // prover_to_identity_sig (BLS)
+            &vec![0xAA; 57],   // ed448 pubkey
+            &vec![0xBB; 585],  // bls pubkey
+            &vec![0xCC; 114],  // identity_to_prover_sig (Ed448)
+            &vec![0xDD; 74],   // prover_to_identity_sig (BLS)
             1_725_000_000_000, // last_updated_ms
         );
         let peeked = peek_key_registry_timestamp(&encoded).expect("peek");

@@ -55,9 +55,15 @@ pub(crate) struct PrunePlan {
 fn one_history(entries: &mut [IndexEntry], head: Option<u64>) -> bool {
     entries.sort_by_key(|(_, version, frame)| (*version, *frame));
     match head {
-        None => entries.windows(2).all(|pair| pair[0].1 < pair[1].1 && pair[0].2 <= pair[1].2),
-        Some(head) => entries.windows(2).all(|pair| pair[0].1 < pair[1].1)
-            && entries.last().is_none_or(|(_, version, _)| *version <= head),
+        None => entries
+            .windows(2)
+            .all(|pair| pair[0].1 < pair[1].1 && pair[0].2 <= pair[1].2),
+        Some(head) => {
+            entries.windows(2).all(|pair| pair[0].1 < pair[1].1)
+                && entries
+                    .last()
+                    .is_none_or(|(_, version, _)| *version <= head)
+        }
     }
 }
 
@@ -82,16 +88,29 @@ pub(crate) fn plan_prune(
             .flatten()
             .and_then(&cull)
             .and_then(|cull| {
-                let current = entries.iter().filter(|(_, _, frame)| *frame <= cull).map(|(_, v, _)| *v).max()?;
-                let later = entries.iter().filter(|(_, _, frame)| *frame > cull).map(|(_, v, _)| *v).min();
+                let current = entries
+                    .iter()
+                    .filter(|(_, _, frame)| *frame <= cull)
+                    .map(|(_, v, _)| *v)
+                    .max()?;
+                let later = entries
+                    .iter()
+                    .filter(|(_, _, frame)| *frame > cull)
+                    .map(|(_, v, _)| *v)
+                    .min();
                 Some(later.map_or(current, |later| current.min(later)))
             })
             .filter(|watermark| *watermark > 0);
         if !clean {
             plan.restarted += 1;
         }
-        if let Some(application) = shard_id.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) {
-            let slot = keyspaces.entry((set, phase, application)).or_insert(Some(u64::MAX));
+        if let Some(application) = shard_id
+            .get(..32)
+            .and_then(|a| <[u8; 32]>::try_from(a).ok())
+        {
+            let slot = keyspaces
+                .entry((set, phase, application))
+                .or_insert(Some(u64::MAX));
             *slot = match (*slot, watermark) {
                 (Some(least), Some(watermark)) => Some(least.min(watermark)),
                 _ => None,
@@ -99,7 +118,10 @@ pub(crate) fn plan_prune(
         }
         let Some(watermark) = watermark else { continue };
         plan.delete_roots.extend(
-            entries.iter().filter(|(_, version, _)| *version < watermark).map(|(key, _, _)| key.clone()),
+            entries
+                .iter()
+                .filter(|(_, version, _)| *version < watermark)
+                .map(|(key, _, _)| key.clone()),
         );
         let phase_idx = usize::from(set) * 2 + usize::from(phase);
         if phase_idx < 4 {
@@ -108,7 +130,9 @@ pub(crate) fn plan_prune(
     }
     plan.blobs = keyspaces
         .into_iter()
-        .filter_map(|(keyspace, watermark)| watermark.filter(|w| *w != u64::MAX).map(|w| (keyspace, w)))
+        .filter_map(|(keyspace, watermark)| {
+            watermark.filter(|w| *w != u64::MAX).map(|w| (keyspace, w))
+        })
         .collect();
     plan.blobs.sort();
     plan.trees.sort();
@@ -121,7 +145,10 @@ mod tests {
     use super::*;
 
     fn tree(entries: &[(u64, u64)]) -> Vec<IndexEntry> {
-        entries.iter().map(|(v, f)| (format!("root-{v}-{f}").into_bytes(), *v, *f)).collect()
+        entries
+            .iter()
+            .map(|(v, f)| (format!("root-{v}-{f}").into_bytes(), *v, *f))
+            .collect()
     }
 
     fn app(byte: u8, suffix: &[u8]) -> Vec<u8> {
@@ -132,7 +159,10 @@ mod tests {
 
     #[test]
     fn a_clean_tree_keeps_everything_committed_after_its_cull_frame() {
-        let trees = HashMap::from([((0, 0, app(1, &[])), tree(&[(1, 10), (2, 20), (3, 30), (4, 40)]))]);
+        let trees = HashMap::from([(
+            (0, 0, app(1, &[])),
+            tree(&[(1, 10), (2, 20), (3, 30), (4, 40)]),
+        )]);
         let plan = plan_prune(trees, |newest| newest.checked_sub(15), |_| None);
         // Cull 25: version 2 was current then, so versions 2..4 stay readable.
         assert_eq!(plan.trees, vec![(app(1, &[]), 0, 2)]);
@@ -146,11 +176,20 @@ mod tests {
     #[test]
     fn a_tree_whose_versions_restart_is_never_pruned() {
         let trees = HashMap::from([
-            ((0, 0, app(2, &[])), tree(&[(5, 10), (6, 11), (7, 12), (1, 40), (2, 41)])),
+            (
+                (0, 0, app(2, &[])),
+                tree(&[(5, 10), (6, 11), (7, 12), (1, 40), (2, 41)]),
+            ),
             ((0, 0, app(3, &[])), tree(&[(3, 5), (3, 60)])),
         ]);
         let plan = plan_prune(trees, |newest| newest.checked_sub(1), |_| None);
-        assert_eq!(plan, PrunePlan { restarted: 2, ..Default::default() });
+        assert_eq!(
+            plan,
+            PrunePlan {
+                restarted: 2,
+                ..Default::default()
+            }
+        );
     }
 
     /// A GLOBAL tree with a break at its start (versions 0–3 at frames
@@ -160,9 +199,20 @@ mod tests {
     fn falling_frames_under_rising_versions_prune_conservatively_with_a_head() {
         let key = (0, 0, app(6, &[]));
         let entries = tree(&[(0, 40), (1, 4), (2, 32), (3, 40), (4, 50), (5, 60), (6, 70)]);
-        let strict = plan_prune(HashMap::from([(key.clone(), entries.clone())]), |newest| newest.checked_sub(15), |_| None);
-        assert_eq!(strict.restarted, 1, "without its head the tree is left alone");
-        let plan = plan_prune(HashMap::from([(key.clone(), entries)]), |newest| newest.checked_sub(15), |_| Some(6));
+        let strict = plan_prune(
+            HashMap::from([(key.clone(), entries.clone())]),
+            |newest| newest.checked_sub(15),
+            |_| None,
+        );
+        assert_eq!(
+            strict.restarted, 1,
+            "without its head the tree is left alone"
+        );
+        let plan = plan_prune(
+            HashMap::from([(key.clone(), entries)]),
+            |newest| newest.checked_sub(15),
+            |_| Some(6),
+        );
         // Cull 55: version 4 (frame 50) was current; nothing after the cull is below it.
         assert_eq!(plan.trees, vec![(app(6, &[]), 0, 4)]);
         assert_eq!(plan.blobs, vec![((0, 0, [6; 32]), 4)]);
@@ -170,8 +220,16 @@ mod tests {
 
         // A version committed after the cull below the current one bounds it.
         let anomaly = tree(&[(1, 10), (2, 60), (3, 20), (4, 70)]);
-        let plan = plan_prune(HashMap::from([(key, anomaly)]), |newest| newest.checked_sub(15), |_| Some(4));
-        assert_eq!(plan.trees, vec![(app(6, &[]), 0, 2)], "cull 55: version 3 is current, version 2 is later");
+        let plan = plan_prune(
+            HashMap::from([(key, anomaly)]),
+            |newest| newest.checked_sub(15),
+            |_| Some(4),
+        );
+        assert_eq!(
+            plan.trees,
+            vec![(app(6, &[]), 0, 2)],
+            "cull 55: version 3 is current, version 2 is later"
+        );
     }
 
     /// A reset restarts versions: before the new history passes the old one,
@@ -181,15 +239,43 @@ mod tests {
     fn a_restart_is_still_refused_with_its_head_known() {
         let key = (0, 0, app(7, &[]));
         let before = tree(&[(5, 10), (6, 11), (7, 12), (1, 40), (2, 41)]);
-        assert_eq!(plan_prune(HashMap::from([(key.clone(), before)]), |n| n.checked_sub(1), |_| Some(2)).restarted, 1);
-        let after = tree(&[(5, 10), (6, 11), (7, 12), (1, 40), (5, 44), (6, 45), (7, 46), (8, 47)]);
-        assert_eq!(plan_prune(HashMap::from([(key, after)]), |n| n.checked_sub(1), |_| Some(8)).restarted, 1);
+        assert_eq!(
+            plan_prune(
+                HashMap::from([(key.clone(), before)]),
+                |n| n.checked_sub(1),
+                |_| Some(2)
+            )
+            .restarted,
+            1
+        );
+        let after = tree(&[
+            (5, 10),
+            (6, 11),
+            (7, 12),
+            (1, 40),
+            (5, 44),
+            (6, 45),
+            (7, 46),
+            (8, 47),
+        ]);
+        assert_eq!(
+            plan_prune(
+                HashMap::from([(key, after)]),
+                |n| n.checked_sub(1),
+                |_| Some(8)
+            )
+            .restarted,
+            1
+        );
     }
 
     /// An archive's unified tree carries GLOBAL frames and shard frames.
     #[test]
     fn a_tree_committed_under_two_frame_sequences_is_never_pruned() {
-        let trees = HashMap::from([((0, 0, app(4, &[])), tree(&[(1, 500), (2, 250), (3, 501), (4, 251)]))]);
+        let trees = HashMap::from([(
+            (0, 0, app(4, &[])),
+            tree(&[(1, 500), (2, 250), (3, 501), (4, 251)]),
+        )]);
         let plan = plan_prune(trees, |newest| newest.checked_sub(10), |_| None);
         assert_eq!(plan.restarted, 1);
         assert!(plan.trees.is_empty() && plan.blobs.is_empty() && plan.delete_roots.is_empty());
@@ -205,12 +291,27 @@ mod tests {
                 ((0, 0, app(5, &[2])), second),
             ])
         };
-        let plan = plan_prune(base(tree(&[(1, 10), (4, 12), (5, 30)])), |newest| newest.checked_sub(10), |_| None);
+        let plan = plan_prune(
+            base(tree(&[(1, 10), (4, 12), (5, 30)])),
+            |newest| newest.checked_sub(10),
+            |_| None,
+        );
         assert_eq!(plan.blobs, vec![((0, 0, [5; 32]), 2)]);
-        let young = plan_prune(base(tree(&[(1, 29), (2, 30)])), |newest| newest.checked_sub(10), |_| None);
-        assert!(young.blobs.is_empty(), "the young tree still reads old blob versions");
+        let young = plan_prune(
+            base(tree(&[(1, 29), (2, 30)])),
+            |newest| newest.checked_sub(10),
+            |_| None,
+        );
+        assert!(
+            young.blobs.is_empty(),
+            "the young tree still reads old blob versions"
+        );
         assert_eq!(young.trees, vec![(app(5, &[1]), 0, 2)]);
-        let restarted = plan_prune(base(tree(&[(4, 10), (1, 30)])), |newest| newest.checked_sub(10), |_| None);
+        let restarted = plan_prune(
+            base(tree(&[(4, 10), (1, 30)])),
+            |newest| newest.checked_sub(10),
+            |_| None,
+        );
         assert!(restarted.blobs.is_empty());
     }
 }

@@ -31,7 +31,10 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::{mpsc::{self, UnboundedSender}, Semaphore};
+use tokio::sync::{
+    mpsc::{self, UnboundedSender},
+    Semaphore,
+};
 use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
@@ -161,16 +164,30 @@ pub async fn render(pc: &ProverCtx, opts: RenderOptions) -> anyhow::Result<()> {
     let mut pending = 3;
     while pending > 0 {
         let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await else {
-            eprintln!("render: {pending} of 3 node answers missing after {}s", opts.timeout.as_secs());
+            eprintln!(
+                "render: {pending} of 3 node answers missing after {}s",
+                opts.timeout.as_secs()
+            );
             break;
         };
-        if matches!(msg, Msg::RewardRefresh(_) | Msg::ShardRefresh(_) | Msg::DataRefresh { .. }) {
+        if matches!(
+            msg,
+            Msg::RewardRefresh(_) | Msg::ShardRefresh(_) | Msg::DataRefresh { .. }
+        ) {
             pending -= 1;
         }
-        dropped.extend(apply_msg(&mut model, msg).into_iter().filter(|cmd| !matches!(cmd, Cmd::Fetch)));
+        dropped.extend(
+            apply_msg(&mut model, msg)
+                .into_iter()
+                .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
+        );
     }
     for key in &opts.keys {
-        dropped.extend(handle_key(&mut model, parse_key(key)?).into_iter().filter(|cmd| !matches!(cmd, Cmd::Fetch)));
+        dropped.extend(
+            handle_key(&mut model, parse_key(key)?)
+                .into_iter()
+                .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
+        );
     }
     for cmd in &dropped {
         eprintln!("render: not run (read-only): {}", command_name(cmd));
@@ -188,7 +205,10 @@ pub fn help_text(width: u16) -> String {
 /// `Space`, `Backspace`, arrows, `PageUp`/`PageDown`, `Home`/`End`, optionally
 /// prefixed with `Ctrl+`.
 fn parse_key(name: &str) -> anyhow::Result<KeyEvent> {
-    let (modifiers, key) = match name.strip_prefix("Ctrl+").or_else(|| name.strip_prefix("ctrl+")) {
+    let (modifiers, key) = match name
+        .strip_prefix("Ctrl+")
+        .or_else(|| name.strip_prefix("ctrl+"))
+    {
         Some(key) => (KeyModifiers::CONTROL, key),
         None => (KeyModifiers::NONE, name),
     };
@@ -237,7 +257,11 @@ struct RefreshState {
 
 impl Default for RefreshState {
     fn default() -> Self {
-        Self { node: Arc::new(Semaphore::new(1)), shards: Arc::new(Semaphore::new(1)), rewards: Arc::new(Semaphore::new(1)) }
+        Self {
+            node: Arc::new(Semaphore::new(1)),
+            shards: Arc::new(Semaphore::new(1)),
+            rewards: Arc::new(Semaphore::new(1)),
+        }
     }
 }
 
@@ -249,9 +273,13 @@ fn spawn_refresh(
     loading: Option<Msg>,
     fetch: impl std::future::Future<Output = Msg> + Send + 'static,
 ) {
-    let Ok(permit) = gate.clone().try_acquire_owned() else { return; };
+    let Ok(permit) = gate.clone().try_acquire_owned() else {
+        return;
+    };
     let tx = tx.clone();
-    if let Some(loading) = loading { let _ = tx.send(loading); }
+    if let Some(loading) = loading {
+        let _ = tx.send(loading);
+    }
     tokio::spawn(async move {
         let _permit = permit;
         let _ = tx.send(fetch.await);
@@ -272,9 +300,24 @@ fn spawn_action(
     match cmd {
         Cmd::Quit => {}
         Cmd::Fetch => {
-            spawn_refresh(&refresh.node, &tx, None, actions::fetch_data(client.clone()));
-            spawn_refresh(&refresh.rewards, &tx, None, actions::fetch_rewards(client.clone(), km));
-            spawn_refresh(&refresh.shards, &tx, Some(Msg::ShardLoading), actions::fetch_shards(client));
+            spawn_refresh(
+                &refresh.node,
+                &tx,
+                None,
+                actions::fetch_data(client.clone()),
+            );
+            spawn_refresh(
+                &refresh.rewards,
+                &tx,
+                None,
+                actions::fetch_rewards(client.clone(), km),
+            );
+            spawn_refresh(
+                &refresh.shards,
+                &tx,
+                Some(Msg::ShardLoading),
+                actions::fetch_shards(client),
+            );
         }
         Cmd::Join(filters) => {
             tokio::spawn(async move {
@@ -329,9 +372,16 @@ mod refresh_tests {
             wait.await.unwrap();
             Msg::ShardRefresh(Err("test failure".into()))
         });
-        spawn_refresh(&state.shards, &tx, None, async { panic!("duplicate shard query") });
+        spawn_refresh(&state.shards, &tx, None, async {
+            panic!("duplicate shard query")
+        });
         spawn_refresh(&state.node, &tx, None, async {
-            Msg::DataRefresh { node_info: None, shard_info: None, worker_info: None, err: None }
+            Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            }
         });
         assert!(matches!(rx.recv().await, Some(Msg::ShardLoading)));
         assert!(matches!(rx.recv().await, Some(Msg::DataRefresh { .. })));
@@ -351,9 +401,15 @@ mod render_tests {
 
     #[test]
     fn keys_parse_by_name() {
-        assert_eq!(parse_key("n").unwrap(), KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(
+            parse_key("n").unwrap(),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
+        );
         assert_eq!(parse_key("Tab").unwrap().code, KeyCode::Tab);
-        assert_eq!(parse_key("Ctrl+o").unwrap(), KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(
+            parse_key("Ctrl+o").unwrap(),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
+        );
         assert_eq!(parse_key("Space").unwrap().code, KeyCode::Char(' '));
         assert!(parse_key("Hyper").is_err());
     }

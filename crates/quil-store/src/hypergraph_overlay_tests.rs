@@ -20,39 +20,83 @@ fn shard_reset_clears_all_flat_versions_atomically_only_in_its_overlay() {
     let db = open(directory.path());
     let primary = RocksHypergraphStore::new(db.clone());
     let target = shard();
-    let neighbor = ShardKey { l2: [8; 32], ..target.clone() };
-    let phases = [("vertex", "adds"), ("vertex", "removes"),
-        ("hyperedge", "adds"), ("hyperedge", "removes")];
+    let neighbor = ShardKey {
+        l2: [8; 32],
+        ..target.clone()
+    };
+    let phases = [
+        ("vertex", "adds"),
+        ("vertex", "removes"),
+        ("hyperedge", "adds"),
+        ("hyperedge", "removes"),
+    ];
     let txn = primary.new_transaction(false).unwrap();
     for (set, phase) in phases {
         for shard in [&target, &neighbor] {
             let key = [shard.l2, [1; 32]].concat();
-            HypergraphStore::save_vertex_underlying(&primary, txn.as_ref(), set, phase, shard, &key, b"legacy").unwrap();
+            HypergraphStore::save_vertex_underlying(
+                &primary,
+                txn.as_ref(),
+                set,
+                phase,
+                shard,
+                &key,
+                b"legacy",
+            )
+            .unwrap();
             for version in 0..=2 {
-                primary.save_vertex_underlying_versioned(txn.as_ref(), set, phase, shard, &key, &[version as u8], version).unwrap();
+                primary
+                    .save_vertex_underlying_versioned(
+                        txn.as_ref(),
+                        set,
+                        phase,
+                        shard,
+                        &key,
+                        &[version as u8],
+                        version,
+                    )
+                    .unwrap();
             }
         }
     }
     txn.commit().unwrap();
     let before = rows(&db);
     let sequence = db.latest_sequence_number();
-    for budget in [OverlayLimits { max_delta_entries: 1, ..limits() }, limits()] {
+    for budget in [
+        OverlayLimits {
+            max_delta_entries: 1,
+            ..limits()
+        },
+        limits(),
+    ] {
         let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), budget).unwrap());
         let store = OverlayHypergraphStore::new(overlay.clone());
         let cleared = store.clear_shard_underlying(&target).is_ok();
         assert_eq!(cleared, budget.max_delta_entries > 1);
         if !cleared {
-            assert_eq!(overlay.stats().delta_entries, 0, "a failed transaction publishes no phase deletions");
+            assert_eq!(
+                overlay.stats().delta_entries,
+                0,
+                "a failed transaction publishes no phase deletions"
+            );
         }
         for (set, phase) in phases {
             for shard in [&target, &neighbor] {
                 let key = [shard.l2, [1; 32]].concat();
                 let removed = cleared && shard == &target;
-                assert_eq!(store.load_vertex_underlying(set, phase, shard, &key).unwrap(),
-                    (!removed).then(|| b"legacy".to_vec()));
+                assert_eq!(
+                    store
+                        .load_vertex_underlying(set, phase, shard, &key)
+                        .unwrap(),
+                    (!removed).then(|| b"legacy".to_vec())
+                );
                 for version in 0..=2 {
-                    assert_eq!(store.load_vertex_underlying_at(set, phase, shard, &key, version).unwrap(),
-                        (!removed).then(|| vec![version as u8]));
+                    assert_eq!(
+                        store
+                            .load_vertex_underlying_at(set, phase, shard, &key, version)
+                            .unwrap(),
+                        (!removed).then(|| vec![version as u8])
+                    );
                 }
             }
         }
@@ -75,7 +119,16 @@ fn tentative_vertex_walk_seeks_past_retained_versions() {
     for n in 0..20u8 {
         for version in 0..200u64 {
             let blob = format!("{n}-{version}");
-            primary.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &sk, &vertex(n), blob.as_bytes(), version)
+            primary
+                .save_vertex_underlying_versioned(
+                    txn.as_ref(),
+                    "vertex",
+                    "adds",
+                    &sk,
+                    &vertex(n),
+                    blob.as_bytes(),
+                    version,
+                )
                 .unwrap();
         }
     }
@@ -83,20 +136,44 @@ fn tentative_vertex_walk_seeks_past_retained_versions() {
     let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
     let store = OverlayHypergraphStore::new(overlay.clone());
     let txn = store.new_transaction(false).unwrap();
-    store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &sk, &vertex(3), b"branch", 500).unwrap();
+    store
+        .save_vertex_underlying_versioned(
+            txn.as_ref(),
+            "vertex",
+            "adds",
+            &sk,
+            &vertex(3),
+            b"branch",
+            500,
+        )
+        .unwrap();
     txn.commit().unwrap();
 
     let before = overlay.stats().read_operations;
     let mut walked = Vec::new();
-    HypergraphStore::for_each_vertex_underlying(&store, "vertex", "adds", &sk, &mut |vk, blob| walked.push((vk, blob)))
-        .unwrap();
+    HypergraphStore::for_each_vertex_underlying(&store, "vertex", "adds", &sk, &mut |vk, blob| {
+        walked.push((vk, blob))
+    })
+    .unwrap();
     let reads = overlay.stats().read_operations - before;
     walked.sort();
     let newest: Vec<_> = (0..20u8)
-        .map(|n| (vertex(n), if n == 3 { b"branch".to_vec() } else { format!("{n}-199").into_bytes() }))
+        .map(|n| {
+            (
+                vertex(n),
+                if n == 3 {
+                    b"branch".to_vec()
+                } else {
+                    format!("{n}-199").into_bytes()
+                },
+            )
+        })
         .collect();
     assert_eq!(walked, newest);
-    assert!(reads < 20 * 50, "{reads} reads for 20 vertices of 200 versions");
+    assert!(
+        reads < 20 * 50,
+        "{reads} reads for 20 vertices of 200 versions"
+    );
 }
 
 fn open(path: &std::path::Path) -> quil_forest::CoordinatedDb {
@@ -449,13 +526,16 @@ fn tentative_transactions_reject_foreign_branches_abort_and_poison_failed_batche
     );
     txn.abort().unwrap();
     assert_eq!(first.get(b"aborted").unwrap(), None);
-    let small = Arc::new(ExecutionOverlay::capture(
-        db.clone(),
-        OverlayLimits {
-            max_delta_entries: 1,
-            ..limits()
-        },
-    ).unwrap());
+    let small = Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            OverlayLimits {
+                max_delta_entries: 1,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let store = OverlayHypergraphStore::new(small.clone());
     let txn = store.new_transaction(false).unwrap();
     txn.set(b"first", b"accepted").unwrap();
@@ -486,13 +566,16 @@ fn tentative_budget_failures_are_errors_not_absent_records_or_empty_pages() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
     seed(&RocksHypergraphStore::new(db.clone()));
-    let overlay = Arc::new(ExecutionOverlay::capture(
-        db.clone(),
-        OverlayLimits {
-            max_read_operations: 0,
-            ..limits()
-        },
-    ).unwrap());
+    let overlay = Arc::new(
+        ExecutionOverlay::capture(
+            db.clone(),
+            OverlayLimits {
+                max_read_operations: 0,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let branch = OverlayHypergraphStore::new(overlay);
     assert!(branch
         .get_node_by_path("vertex", "adds", &shard(), &[])
@@ -533,13 +616,16 @@ fn tentative_budget_failures_are_errors_not_absent_records_or_empty_pages() {
     assert!(snapshot
         .load_vertex_underlying_raw("vertex", "adds", &shard(), &vertex(1))
         .is_err());
-    let denied = OverlayHypergraphStore::new(Arc::new(ExecutionOverlay::capture(
-        db,
-        OverlayLimits {
-            max_cursors: 0,
-            ..limits()
-        },
-    ).unwrap()));
+    let denied = OverlayHypergraphStore::new(Arc::new(
+        ExecutionOverlay::capture(
+            db,
+            OverlayLimits {
+                max_cursors: 0,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    ));
     assert!(denied.capture_tree_snapshot().is_err());
     assert!(denied
         .page_vertex_underlying_fixed(
@@ -680,13 +766,16 @@ fn real_crdt_commits_forest_blobs_history_and_cursor_only_to_the_branch() {
 fn failed_size_initialization_remains_uninitialized_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    let overlay = Arc::new(ExecutionOverlay::capture(
-        db,
-        OverlayLimits {
-            max_read_operations: 0,
-            ..limits()
-        },
-    ).unwrap());
+    let overlay = Arc::new(
+        ExecutionOverlay::capture(
+            db,
+            OverlayLimits {
+                max_read_operations: 0,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    );
     let store = Arc::new(OverlayHypergraphStore::new(overlay));
     let crdt = quil_hypergraph::HypergraphCrdt::new(
         store.clone(),
@@ -822,13 +911,16 @@ fn tentative_topology_and_maintenance_marker_share_the_hypergraph_batch() {
     let txn = base.new_transaction(false).unwrap();
     assert!(branch_shards.put_app_shard(txn.as_ref(), &next).is_err());
     txn.abort().unwrap();
-    let limited = OverlayShardsStore::new(Arc::new(ExecutionOverlay::capture(
-        db,
-        OverlayLimits {
-            max_read_operations: 0,
-            ..limits()
-        },
-    ).unwrap()));
+    let limited = OverlayShardsStore::new(Arc::new(
+        ExecutionOverlay::capture(
+            db,
+            OverlayLimits {
+                max_read_operations: 0,
+                ..limits()
+            },
+        )
+        .unwrap(),
+    ));
     assert!(limited.range_app_shards().is_err());
     assert!(limited.all_pending_shard_changes().is_err());
 }

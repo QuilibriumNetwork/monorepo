@@ -35,7 +35,13 @@ struct Row {
 
 impl Row {
     fn add(&mut self, class: &GossipClassTraffic, secs: f64) {
-        let rate = |bytes: u64| if secs > 0.0 { bytes as f64 * 8.0 / 1e6 / secs } else { 0.0 };
+        let rate = |bytes: u64| {
+            if secs > 0.0 {
+                bytes as f64 * 8.0 / 1e6 / secs
+            } else {
+                0.0
+            }
+        };
         self.received += rate(class.received_bytes);
         self.unique += rate(class.unique_bytes);
         self.sent += rate(class.sent_bytes);
@@ -107,7 +113,10 @@ pub(crate) fn render(master: Option<&GossipTraffic>, workers: &[WorkerInfo]) -> 
     for process in std::iter::once(master).chain(own.iter().copied()) {
         let secs = process.uptime_ms as f64 / 1000.0;
         for class in &process.classes {
-            let row = CLASSES.iter().position(|(name, _)| *name == class.class).unwrap_or(OTHER);
+            let row = CLASSES
+                .iter()
+                .position(|(name, _)| *name == class.class)
+                .unwrap_or(OTHER);
             rows[row].add(class, secs);
         }
     }
@@ -153,7 +162,13 @@ mod tests {
     use quil_types::proto::node::node_service_server::NodeService as _;
     use quil_types::proto::node::{GetNodeInfoRequest, NodeInfoResponse, WorkerExecution};
 
-    fn class(name: &str, received: u64, unique: u64, sent: u64, published: u64) -> GossipClassTraffic {
+    fn class(
+        name: &str,
+        received: u64,
+        unique: u64,
+        sent: u64,
+        published: u64,
+    ) -> GossipClassTraffic {
         GossipClassTraffic {
             class: name.into(),
             received_messages: received / 1000,
@@ -170,7 +185,11 @@ mod tests {
     fn worker(core_id: u32, traffic: Option<GossipTraffic>) -> WorkerInfo {
         WorkerInfo {
             core_id,
-            execution: Some(WorkerExecution { state: "running".into(), gossip_traffic: traffic, ..Default::default() }),
+            execution: Some(WorkerExecution {
+                state: "running".into(),
+                gossip_traffic: traffic,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -187,14 +206,31 @@ mod tests {
         counters.record(TrafficKind::Sent, GossipClass::ShardFrames, 90_000);
         counters.record(TrafficKind::Published, GossipClass::ShardFrames, 90_000);
         let server = quil_rpc::NodeRpcServer::default().with_gossip_traffic(counters.clone());
-        let response = server.get_node_info(tonic::Request::new(GetNodeInfoRequest {})).await.unwrap().into_inner();
+        let response = server
+            .get_node_info(tonic::Request::new(GetNodeInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         let decoded = NodeInfoResponse::decode(response.encode_to_vec().as_slice()).unwrap();
         let traffic = decoded.gossip_traffic.expect("reported");
         let names: Vec<&str> = traffic.classes.iter().map(|c| c.class.as_str()).collect();
         assert_eq!(names, CLASSES.map(|(name, _)| name));
-        let by = |name: &str| traffic.classes.iter().find(|c| c.class == name).unwrap().clone();
-        assert_eq!(by("votes"), class("votes", 1_400, 700, 0, 0).with_messages(2, 1, 0, 0));
-        assert_eq!(by("shard_frames"), class("shard_frames", 0, 0, 90_000, 90_000).with_messages(0, 0, 1, 1));
+        let by = |name: &str| {
+            traffic
+                .classes
+                .iter()
+                .find(|c| c.class == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by("votes"),
+            class("votes", 1_400, 700, 0, 0).with_messages(2, 1, 0, 0)
+        );
+        assert_eq!(
+            by("shard_frames"),
+            class("shard_frames", 0, 0, 90_000, 90_000).with_messages(0, 0, 1, 1)
+        );
         for name in ["shard_consensus", "global", "peer_info", "other"] {
             assert_eq!(by(name), class(name, 0, 0, 0, 0));
         }
@@ -202,9 +238,16 @@ mod tests {
 
         // A node without counters, like an older one, leaves the field out.
         let older = quil_rpc::NodeRpcServer::default();
-        let response = older.get_node_info(tonic::Request::new(GetNodeInfoRequest {})).await.unwrap().into_inner();
+        let response = older
+            .get_node_info(tonic::Request::new(GetNodeInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
         assert_eq!(response.gossip_traffic, None);
-        assert_eq!(render(None, &[]), "Gossip Traffic:     not reported by this node");
+        assert_eq!(
+            render(None, &[]),
+            "Gossip Traffic:     not reported by this node"
+        );
     }
 
     trait WithMessages {
@@ -227,7 +270,13 @@ mod tests {
         let master = GossipTraffic {
             uptime_ms: 7_200_000,
             classes: vec![
-                class("shard_consensus", 900_000_000, 300_000_000, 1_800_000_000, 9_000_000),
+                class(
+                    "shard_consensus",
+                    900_000_000,
+                    300_000_000,
+                    1_800_000_000,
+                    9_000_000,
+                ),
                 class("votes", 0, 0, 0, 0),
                 class("global", 3_600_000_000, 450_000_000, 5_400_000_000, 0),
                 class("peer_info", 450_000_000, 45_000_000, 900_000_000, 900_000),
@@ -239,12 +288,31 @@ mod tests {
         let own = GossipTraffic {
             uptime_ms: 3_600_000,
             classes: vec![
-                class("shard_consensus", 2_700_000_000, 900_000_000, 9_000_000_000, 45_000_000),
-                class("shard_frames", 450_000_000, 90_000_000, 900_000_000, 4_500_000),
+                class(
+                    "shard_consensus",
+                    2_700_000_000,
+                    900_000_000,
+                    9_000_000_000,
+                    45_000_000,
+                ),
+                class(
+                    "shard_frames",
+                    450_000_000,
+                    90_000_000,
+                    900_000_000,
+                    4_500_000,
+                ),
                 class("votes", 225_000_000, 45_000_000, 540_000_000, 2_700_000),
             ],
         };
-        let workers = [worker(1, Some(own)), worker(2, None), WorkerInfo { core_id: 3, ..Default::default() }];
+        let workers = [
+            worker(1, Some(own)),
+            worker(2, None),
+            WorkerInfo {
+                core_id: 3,
+                ..Default::default()
+            },
+        ];
         let text = render(Some(&master), &workers);
         println!("{text}");
         let expected = "\

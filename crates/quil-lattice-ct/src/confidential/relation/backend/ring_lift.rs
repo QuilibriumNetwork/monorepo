@@ -63,9 +63,7 @@ impl CompiledAmountRelation {
     /// transaction-context binding). Membership hashes are native proof-ring
     /// rows (`native_membership_rows`); selections use `selection_backend_rows`.
     pub fn ring_backend_plans(&self) -> impl Iterator<Item = Result<RingLiftPlan, LiftError>> + '_ {
-        self.ring
-            .iter()
-            .map(|row| RingLiftPlan::new(row, self))
+        self.ring.iter().map(|row| RingLiftPlan::new(row, self))
     }
 
     pub fn lift_ring_witness(&self, plan: &RingLiftPlan) -> Result<LiftWitness, LiftError> {
@@ -84,12 +82,23 @@ impl RingLiftPlan {
     // QPF6 selects from public data only; private assignments cannot affect it.
     // Variable bounds (1 for binary handles, the declared coefficient bound for
     // short handles) are public relation structure, not witness values.
-    fn new_with_radix(row: &RingEquation, relation: &CompiledAmountRelation, radix_bits: u32) -> Result<Self, LiftError> {
-        if ![8, 12, 16, 18].contains(&radix_bits) { return Err(LiftError::InvalidShape); }
+    fn new_with_radix(
+        row: &RingEquation,
+        relation: &CompiledAmountRelation,
+        radix_bits: u32,
+    ) -> Result<Self, LiftError> {
+        if ![8, 12, 16, 18].contains(&radix_bits) {
+            return Err(LiftError::InvalidShape);
+        }
         let planes = (64 - Poly::Q.leading_zeros()).div_ceil(radix_bits) as usize;
         let base = 1i128 << radix_bits;
         let valid = |p: &Poly| p.c.len() == Poly::D && p.c.iter().all(|&v| v < Poly::Q);
-        if !valid(&row.rhs) || row.terms.iter().any(|(p, i)| relation.variable_bound(*i).is_none() || !valid(p)) {
+        if !valid(&row.rhs)
+            || row
+                .terms
+                .iter()
+                .any(|(p, i)| relation.variable_bound(*i).is_none() || !valid(p))
+        {
             return Err(LiftError::InvalidShape);
         }
         let var_bound = |i: &usize| i128::from(relation.variable_bound(*i).unwrap_or(0));
@@ -117,7 +126,10 @@ impl RingLiftPlan {
             *bound = row
                 .terms
                 .iter()
-                .flat_map(|(p, i)| p.c.iter().map(move |&v| digit(centered(v), plane, radix_bits).abs() * var_bound(i)))
+                .flat_map(|(p, i)| {
+                    p.c.iter()
+                        .map(move |&v| digit(centered(v), plane, radix_bits).abs() * var_bound(i))
+                })
                 .sum::<i128>()
                 + row
                     .rhs
@@ -138,7 +150,8 @@ impl RingLiftPlan {
             return Err(LiftError::ResidualMayWrap);
         }
         Ok(Self {
-            radix_bits, planes,
+            radix_bits,
+            planes,
             terms: row.terms.clone(),
             rhs: row.rhs.clone(),
             quotient_bits,
@@ -211,7 +224,9 @@ impl RingLiftPlan {
             Zeroizing::new(self.rhs.c.iter().map(|&v| -convert(v)).collect::<Vec<_>>());
         for (coefficient, index) in &self.terms {
             let input = relation.witness(*index).ok_or(LiftError::InvalidWitness)?;
-            let bound = relation.variable_bound(*index).ok_or(LiftError::InvalidWitness)?;
+            let bound = relation
+                .variable_bound(*index)
+                .ok_or(LiftError::InvalidWitness)?;
             // Variable coefficients are small non-negative integers (bits or
             // digits), never centered residues.
             if input.c.len() != Poly::D || input.c.iter().any(|&v| v > bound) {
@@ -247,13 +262,15 @@ impl RingLiftPlan {
             let residual = self.evaluate(relation, Some(plane))?;
             let mut next = Zeroizing::new(vec![0; Poly::D]);
             for k in 0..Poly::D {
-                let value = residual[k] - digit(i128::from(Poly::Q), plane, self.radix_bits) * quotient[k]
+                let value = residual[k]
+                    - digit(i128::from(Poly::Q), plane, self.radix_bits) * quotient[k]
                     + if plane == 0 { 0 } else { carries[plane - 1][k] };
                 if value % (1i128 << self.radix_bits) != 0 {
                     return Err(LiftError::InvalidWitness);
                 }
                 next[k] = value / (1i128 << self.radix_bits);
-                if !in_range(next[k], self.carry_bits) || (plane == self.planes - 1 && next[k] != 0) {
+                if !in_range(next[k], self.carry_bits) || (plane == self.planes - 1 && next[k] != 0)
+                {
                     return Err(LiftError::InvalidWitness);
                 }
             }
@@ -289,7 +306,8 @@ impl RingLiftPlan {
                 return false;
             };
             (0..Poly::D).all(|k| {
-                let value = residual[k] - digit(i128::from(Poly::Q), plane, self.radix_bits) * witness.quotient[k]
+                let value = residual[k]
+                    - digit(i128::from(Poly::Q), plane, self.radix_bits) * witness.quotient[k]
                     + if plane == 0 {
                         0
                     } else {
@@ -357,7 +375,11 @@ mod tests {
         };
         let rhs = a.mul(&b);
         let mut relation = CompiledAmountRelation {
-            binary: vec![b], short: Vec::new(), short_bound: Vec::new(), exact_ring: Vec::new(), ring: vec![RingEquation {
+            binary: vec![b],
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            exact_ring: Vec::new(),
+            ring: vec![RingEquation {
                 terms: vec![(a, 0)],
                 rhs,
             }],
@@ -393,9 +415,14 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         // This diagnostic uses the example fixture's explicit expected domains.
         let tx = Transfer::decode(&bytes, &[1; 32], &[2; 32]).unwrap();
-        let public = tx.statement.public_relation(CompileLimits {
-            max_inputs: 2, max_outputs: 2, max_depth: 32,
-        }).unwrap();
+        let public = tx
+            .statement
+            .public_relation(CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            })
+            .unwrap();
         let radices = [8u32, 12, 16, 18];
         let exact = public.relation.exact_ring.len();
         let mut totals = [(exact, 0usize, exact, 0usize, 0i128); 4];
@@ -406,7 +433,9 @@ mod tests {
             for (slot, &bits) in radices.iter().enumerate() {
                 let (rows, auxiliary, direct, rejected, max_residual) = &mut totals[slot];
                 if plan.direct_residual_bound().is_some() {
-                    *rows += 1; *direct += 1; continue;
+                    *rows += 1;
+                    *direct += 1;
+                    continue;
                 }
                 let base = 1i128 << bits;
                 let planes = 36u32.div_ceil(bits) as usize;
@@ -417,9 +446,19 @@ mod tests {
                 let mut maximum = 0i128;
                 let mut carry = 0i128;
                 for plane in 0..planes {
-                    let bound = plan.terms.iter().flat_map(|(p, _)| &p.c)
-                        .map(|&v| digit_at(centered(v), plane).abs()).sum::<i128>()
-                        + plan.rhs.c.iter().map(|&v| digit_at(centered(v), plane).abs()).max().unwrap()
+                    let bound = plan
+                        .terms
+                        .iter()
+                        .flat_map(|(p, _)| &p.c)
+                        .map(|&v| digit_at(centered(v), plane).abs())
+                        .sum::<i128>()
+                        + plan
+                            .rhs
+                            .c
+                            .iter()
+                            .map(|&v| digit_at(centered(v), plane).abs())
+                            .max()
+                            .unwrap()
                         + digit_at(i128::from(Poly::Q), plane) * z_bound;
                     maximum = maximum.max(bound);
                     carry = (carry + bound) / base;
@@ -428,7 +467,10 @@ mod tests {
                 let carry_bits = signed_bits(carry).unwrap();
                 let residual = maximum + (base + 1) * (1i128 << (carry_bits - 1));
                 *max_residual = (*max_residual).max(residual);
-                if residual >= PROOF_MODULUS / 2 { *rejected += 1; continue; }
+                if residual >= PROOF_MODULUS / 2 {
+                    *rejected += 1;
+                    continue;
+                }
                 if bits == plan.radix_bits {
                     assert_eq!(carry_bits, plan.carry_bits);
                     assert_eq!(residual, plan.residual_bound);
@@ -437,24 +479,39 @@ mod tests {
                 *auxiliary += plan.quotient_bits as usize + (planes - 1) * carry_bits as usize;
             }
         }
-        for (bits, (rows, auxiliary, direct, rejected, maximum)) in radices.into_iter().zip(totals) {
+        for (bits, (rows, auxiliary, direct, rejected, maximum)) in radices.into_iter().zip(totals)
+        {
             eprintln!("lift_radix_census depth={} radix_bits={bits} accepted_rows={rows} auxiliary_binary_polynomials={auxiliary} direct_rows={direct} rejected_plans={rejected} max_residual_bound={maximum} proof_half_modulus={}", tx.statement.depth, PROOF_MODULUS / 2);
         }
     }
 
     #[test]
     fn alternate_radices_preserve_assignments_and_emitted_equations() {
-        let a = Poly { c: (0..Poly::D).map(|i| match i % 4 {
-            0 => Poly::Q - 1 - i as u64,
-            1 => Poly::Q / 2 - i as u64,
-            2 => 1 << 18,
-            _ => 1,
-        }).collect() };
-        let b = Poly { c: (0..Poly::D).map(|i| u64::from(i % 3 != 0)).collect() };
+        let a = Poly {
+            c: (0..Poly::D)
+                .map(|i| match i % 4 {
+                    0 => Poly::Q - 1 - i as u64,
+                    1 => Poly::Q / 2 - i as u64,
+                    2 => 1 << 18,
+                    _ => 1,
+                })
+                .collect(),
+        };
+        let b = Poly {
+            c: (0..Poly::D).map(|i| u64::from(i % 3 != 0)).collect(),
+        };
         let rhs = a.mul(&b);
         let relation = CompiledAmountRelation {
-            binary: vec![b], short: Vec::new(), short_bound: Vec::new(), exact_ring: Vec::new(), ring: vec![RingEquation { terms: vec![(a, 0)], rhs }],
-            scalar: Vec::new(), input_commitment_planes: Vec::new(),
+            binary: vec![b],
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            exact_ring: Vec::new(),
+            ring: vec![RingEquation {
+                terms: vec![(a, 0)],
+                rhs,
+            }],
+            scalar: Vec::new(),
+            input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),
         };
         let reference = RingLiftPlan::new(&relation.ring[0], &relation).unwrap();
@@ -471,30 +528,51 @@ mod tests {
             // Independent public p-ring checker rejects an incorrect carry.
             witness.carries[0][0] += 1;
             assert!(!plan.validate_local_witness(&relation, &witness));
-            assert!(!plan.encode_binary_witness(&witness).unwrap().validate_local_witness(&relation));
+            assert!(!plan
+                .encode_binary_witness(&witness)
+                .unwrap()
+                .validate_local_witness(&relation));
             witness.carries[0][0] -= 1;
             witness.carries[0][0] = 1i128 << (plan.carry_bits - 1);
-            assert!(matches!(plan.encode_binary_witness(&witness), Err(LiftError::InvalidWitness)));
+            assert!(matches!(
+                plan.encode_binary_witness(&witness),
+                Err(LiftError::InvalidWitness)
+            ));
         }
     }
 
     #[test]
     fn alternate_radix_rejects_unsafe_public_bound() {
-        let coefficient = Poly { c: vec![Poly::Q / 2; Poly::D] };
-        let row = RingEquation { terms: vec![(coefficient, 0); 4096], rhs: Poly::zero() };
-        let relation = CompiledAmountRelation {
-            binary: vec![Poly::zero()], short: Vec::new(), short_bound: Vec::new(),
-            ring: Vec::new(), exact_ring: Vec::new(), scalar: Vec::new(),
-            input_commitment_planes: Vec::new(), membership: membership::MembershipConstraints::default(),
+        let coefficient = Poly {
+            c: vec![Poly::Q / 2; Poly::D],
         };
-        assert!(matches!(RingLiftPlan::new_with_radix(&row, &relation, 18), Err(LiftError::ResidualMayWrap)));
+        let row = RingEquation {
+            terms: vec![(coefficient, 0); 4096],
+            rhs: Poly::zero(),
+        };
+        let relation = CompiledAmountRelation {
+            binary: vec![Poly::zero()],
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
+            scalar: Vec::new(),
+            input_commitment_planes: Vec::new(),
+            membership: membership::MembershipConstraints::default(),
+        };
+        assert!(matches!(
+            RingLiftPlan::new_with_radix(&row, &relation, 18),
+            Err(LiftError::ResidualMayWrap)
+        ));
         assert!(RingLiftPlan::new_with_radix(&row, &relation, 8).is_ok());
         let fallback = RingLiftPlan::new(&row, &relation).unwrap();
         assert_eq!(fallback.radix_bits, 8);
         assert_eq!(fallback.plane_count(), 5);
         for bits in [0, 1, 63] {
-            assert!(matches!(RingLiftPlan::new_with_radix(&row, &relation, bits), Err(LiftError::InvalidShape)));
+            assert!(matches!(
+                RingLiftPlan::new_with_radix(&row, &relation, bits),
+                Err(LiftError::InvalidShape)
+            ));
         }
     }
-
 }

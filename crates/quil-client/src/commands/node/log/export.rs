@@ -15,8 +15,8 @@ use std::process::{Child, Command, Stdio};
 
 use clap::{Args, ValueEnum};
 use quil_rpc::log_export::{
-    bundle_texts, compact_ts, file_readers, parse_when, preview, produce, write_token_map, ExportOptions, RecordReader,
-    Selection, SourceInfo, BUNDLE_LOG, MAX_WINDOW_SECS,
+    bundle_texts, compact_ts, file_readers, parse_when, preview, produce, write_token_map,
+    ExportOptions, RecordReader, Selection, SourceInfo, BUNDLE_LOG, MAX_WINDOW_SECS,
 };
 
 use crate::context::GlobalArgs;
@@ -55,7 +55,6 @@ impl MinLevel {
     }
 }
 
-
 // Arguments of `qclient node log export` (no doc comment: clap would let it
 // override the subcommand help on `LogCommand::Export`).
 #[derive(Debug, Args)]
@@ -93,7 +92,6 @@ pub struct ExportArgs {
     pub out: Option<PathBuf>,
 }
 
-
 /// Removes a staging directory unless disarmed.
 pub(crate) struct StagingGuard(pub Option<PathBuf>);
 
@@ -111,7 +109,6 @@ pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     s.push(suffix);
     PathBuf::from(s)
 }
-
 
 /// The records `args` selects at `now`.
 pub(crate) fn selection(args: &ExportArgs, now: i64) -> anyhow::Result<Selection> {
@@ -167,19 +164,44 @@ pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
             anyhow::bail!("{} already exists", p.display());
         }
     }
-    std::fs::create_dir_all(&staging).map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", staging.display()))?;
     let mut guard = StagingGuard(Some(staging.clone()));
 
     let log_path = staging.join(BUNDLE_LOG);
-    let file = File::create(&log_path).map_err(|e| anyhow::anyhow!("create {}: {e}", log_path.display()))?;
+    let file = File::create(&log_path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", log_path.display()))?;
     // The log directory's home names the operator even when qclient runs
     // as root.
-    let home_paths: Vec<PathBuf> = super::configured_log_dir(global).ok().flatten().into_iter().collect();
-    let options = ExportOptions { keep_self: args.keep_self, home_paths: &home_paths, ..ExportOptions::default() };
-    let export = produce(readers, child, &source, &selection, io::BufWriter::new(file), &options)?;
+    let home_paths: Vec<PathBuf> = super::configured_log_dir(global)
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect();
+    let options = ExportOptions {
+        keep_self: args.keep_self,
+        home_paths: &home_paths,
+        ..ExportOptions::default()
+    };
+    let export = produce(
+        readers,
+        child,
+        &source,
+        &selection,
+        io::BufWriter::new(file),
+        &options,
+    )?;
     drop(export.out);
 
-    print!("{}", preview(&export.manifest, &export.stats, &format!("Bundle: {}", out.display()), &map_path));
+    print!(
+        "{}",
+        preview(
+            &export.manifest,
+            &export.stats,
+            &format!("Bundle: {}", out.display()),
+            &map_path
+        )
+    );
     if !confirm(global, "Type yes to write the bundle: ")? {
         println!("Nothing written.");
         return Ok(());
@@ -189,10 +211,18 @@ pub fn run(global: &GlobalArgs, args: &ExportArgs) -> anyhow::Result<()> {
     std::fs::write(staging.join("manifest.json"), &manifest_text)?;
     std::fs::write(staging.join("SHA256SUMS"), sums)?;
     write_token_map(&map_path, &out.display().to_string(), &export.token_map)?;
-    std::fs::rename(&staging, &out).map_err(|e| anyhow::anyhow!("rename to {}: {e}", out.display()))?;
+    std::fs::rename(&staging, &out)
+        .map_err(|e| anyhow::anyhow!("rename to {}: {e}", out.display()))?;
     guard.0 = None;
-    println!("Wrote {} ({} lines).", out.display(), export.stats.lines_kept);
-    println!("The token map {} holds the original values: keep it private and never share it.", map_path.display());
+    println!(
+        "Wrote {} ({} lines).",
+        out.display(),
+        export.stats.lines_kept
+    );
+    println!(
+        "The token map {} holds the original values: keep it private and never share it.",
+        map_path.display()
+    );
     Ok(())
 }
 
@@ -210,7 +240,9 @@ pub(crate) fn open_source(
         LogSource::Files => match super::configured_log_dir(global)? {
             Some(dir) if dir.is_dir() => Some(dir),
             Some(dir) => anyhow::bail!("log directory not found: {}", dir.display()),
-            None => anyhow::bail!("the node writes no log files (logger.path is none); use --source journal"),
+            None => anyhow::bail!(
+                "the node writes no log files (logger.path is none); use --source journal"
+            ),
         },
     };
     match &log_dir {
@@ -226,14 +258,26 @@ pub(crate) fn open_source(
                 anyhow::bail!("the journal source needs Linux (systemd); use --source files");
             }
             let mut cmd = Command::new("journalctl");
-            cmd.args(["--utc", "-o", "cat", "--no-pager", "-u", system::NODE_SERVICE_NAME])
-                .arg("--since")
-                .arg(format!("@{since}"))
-                .arg("--until")
-                .arg(format!("@{until}"))
-                .stdout(Stdio::piped());
-            let mut spawned = cmd.spawn().map_err(|e| anyhow::anyhow!("run journalctl: {e}"))?;
-            let stdout = spawned.stdout.take().ok_or_else(|| anyhow::anyhow!("journalctl: no stdout"))?;
+            cmd.args([
+                "--utc",
+                "-o",
+                "cat",
+                "--no-pager",
+                "-u",
+                system::NODE_SERVICE_NAME,
+            ])
+            .arg("--since")
+            .arg(format!("@{since}"))
+            .arg("--until")
+            .arg(format!("@{until}"))
+            .stdout(Stdio::piped());
+            let mut spawned = cmd
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("run journalctl: {e}"))?;
+            let stdout = spawned
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("journalctl: no stdout"))?;
             let reader: Box<dyn BufRead> = Box::new(BufReader::new(stdout));
             Ok((
                 vec![RecordReader::new(vec![("journal".to_string(), reader)])],
@@ -243,7 +287,6 @@ pub(crate) fn open_source(
         }
     }
 }
-
 
 /// Ask the operator to type yes, unless the global --yes is set.
 pub(crate) fn confirm(global: &GlobalArgs, question: &str) -> io::Result<bool> {
@@ -265,7 +308,6 @@ fn configured_log_dir_if_present(global: &GlobalArgs) -> Option<PathBuf> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,7 +316,14 @@ mod tests {
     /// are the ones kept as context.
     #[test]
     fn levels_rank_as_the_export_does() {
-        let ranks = [MinLevel::Trace, MinLevel::Debug, MinLevel::Info, MinLevel::Warn, MinLevel::Error].map(MinLevel::rank);
+        let ranks = [
+            MinLevel::Trace,
+            MinLevel::Debug,
+            MinLevel::Info,
+            MinLevel::Warn,
+            MinLevel::Error,
+        ]
+        .map(MinLevel::rank);
         assert_eq!(ranks, [0, 1, 2, 3, 4]);
         assert_eq!(MinLevel::Warn.rank(), quil_rpc::log_export::WARN_RANK);
     }

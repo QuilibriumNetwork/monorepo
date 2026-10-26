@@ -6,35 +6,32 @@ mod falcon;
 mod frame_prover;
 mod inclusion;
 mod key_manager;
-pub mod poseidon;
 pub mod porep;
+pub mod poseidon;
 pub mod sdr;
-pub mod storage_hash;
-pub mod storage_proof;
 pub mod seal;
 mod secp256k1;
 pub mod sntrup761;
+pub mod storage_hash;
+pub mod storage_proof;
 
-pub use falcon::{
-    falcon_public_from_signing_key, falcon_verify, FalconKeyConstructor, FalconSigner,
-    FALCON_PUBLIC_KEY_LEN,
-    FALCON_SIGNATURE_LEN, FALCON_SIGNING_KEY_LEN,
-};
 pub use bulletproof_adapter::Decaf448BulletproofProver;
 pub use ed25519::{ed25519_verify, Ed25519Signer};
-pub use ed448::{
-    ed448_verify, peer_id_multihash_from_ed448_pubkey, Ed448Signer,
-};
-pub use secp256k1::{secp256k1_sha256_verify, secp256k1_sha3_verify, Secp256k1Signer};
-pub use sntrup761::{
-    Sntrup761KeyPair, SNTRUP761_CIPHERTEXT_LEN, SNTRUP761_PUBLIC_KEY_LEN,
-    SNTRUP761_SECRET_KEY_LEN, SNTRUP761_SHARED_SECRET_LEN,
+pub use ed448::{ed448_verify, peer_id_multihash_from_ed448_pubkey, Ed448Signer};
+pub use falcon::{
+    falcon_public_from_signing_key, falcon_verify, FalconKeyConstructor, FalconSigner,
+    FALCON_PUBLIC_KEY_LEN, FALCON_SIGNATURE_LEN, FALCON_SIGNING_KEY_LEN,
 };
 #[cfg(feature = "vdf-prover")]
 pub use frame_prover::{WesolowskiFrameProver, GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME};
 pub use inclusion::KzgInclusionProver;
 pub use key_manager::DefaultKeyManager;
 pub use poseidon::{hash_bytes_to_32, hash_elements};
+pub use secp256k1::{secp256k1_sha256_verify, secp256k1_sha3_verify, Secp256k1Signer};
+pub use sntrup761::{
+    Sntrup761KeyPair, SNTRUP761_CIPHERTEXT_LEN, SNTRUP761_PUBLIC_KEY_LEN, SNTRUP761_SECRET_KEY_LEN,
+    SNTRUP761_SHARED_SECRET_LEN,
+};
 
 /// Initialize the crypto subsystem. Must be called before any BLS operations.
 pub fn init() {

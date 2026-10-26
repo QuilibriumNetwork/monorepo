@@ -73,10 +73,14 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         // The mint authority: a keystore key id, resolved to its public key.
         // Application authority keys are post-quantum only (Falcon-512).
         if let Some(id) = config.get("authoritykey") {
-            let signer = dc.key_manager.get_signer_by_id(id)
+            let signer = dc
+                .key_manager
+                .get_signer_by_id(id)
                 .map_err(|e| anyhow::anyhow!("mint authority key {id}: {e}"))?;
             anyhow::ensure!(
-                quil_execution::token_intrinsic::signature::is_post_quantum_authority(signer.key_type() as u32),
+                quil_execution::token_intrinsic::signature::is_post_quantum_authority(
+                    signer.key_type() as u32
+                ),
                 "mint authority keys must be post-quantum (Falcon-512): {id} is not"
             );
             strat.authority = Some(quil_types::proto::token::Authority {
@@ -94,7 +98,9 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
             strat.payment_address = address;
         }
         if let Some(v) = config.get("price") {
-            let baseline: u128 = v.parse().map_err(|_| anyhow::anyhow!("price is not a number: {v}"))?;
+            let baseline: u128 = v
+                .parse()
+                .map_err(|_| anyhow::anyhow!("price is not a number: {v}"))?;
             strat.fee_basis = Some(quil_types::proto::token::FeeBasis {
                 r#type: quil_types::proto::token::FeeBasisType::PerUnit as i32,
                 baseline: BigInt::from(baseline).to_bytes_be().1,
@@ -113,7 +119,8 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
         cfg.units = parse_bigint_be(v).map_err(|_| anyhow::anyhow!("invalid units value: {v}"))?;
     }
     if let Some(v) = config.get("supply") {
-        cfg.supply = parse_bigint_be(v).map_err(|_| anyhow::anyhow!("invalid supply value: {v}"))?;
+        cfg.supply =
+            parse_bigint_be(v).map_err(|_| anyhow::anyhow!("invalid supply value: {v}"))?;
     }
 
     let keys = dc.deploy_keys()?;
@@ -124,7 +131,8 @@ pub async fn run(dc: &DeployCtx, args: &[String]) -> anyhow::Result<()> {
     let domain = quil_execution::token_intrinsic::materialize::token_deploy_domain(
         &quil_execution::token_intrinsic::conversions::token_config_from_proto(&cfg)
             .map_err(|e| anyhow::anyhow!("token configuration: {e}"))?,
-    ).map_err(|e| anyhow::anyhow!("deploy domain: {e}"))?;
+    )
+    .map_err(|e| anyhow::anyhow!("deploy domain: {e}"))?;
 
     let mut client = dc.connect().await?;
     let request = MessageRequest {

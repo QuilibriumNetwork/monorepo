@@ -82,12 +82,17 @@ impl GlobalTimeReel {
 
     pub fn get_head(&self) -> Option<Arc<quil_types::proto::global::GlobalFrame>> {
         let inner = self.inner.read().unwrap();
-        inner.head.as_ref().and_then(|id| inner.nodes.get(id).map(|n| n.frame.clone()))
+        inner
+            .head
+            .as_ref()
+            .and_then(|id| inner.nodes.get(id).map(|n| n.frame.clone()))
     }
 
     pub fn get_head_frame_number(&self) -> u64 {
         let inner = self.inner.read().unwrap();
-        inner.head.as_ref()
+        inner
+            .head
+            .as_ref()
             .and_then(|id| inner.nodes.get(id))
             .and_then(|n| n.frame.header.as_ref())
             .map(|h| h.frame_number)
@@ -105,10 +110,7 @@ impl GlobalTimeReel {
         (inner.nodes.len(), pending_total, inner.equivocators.len())
     }
 
-    pub fn insert(
-        &self,
-        frame: Arc<quil_types::proto::global::GlobalFrame>,
-    ) -> Result<(), String> {
+    pub fn insert(&self, frame: Arc<quil_types::proto::global::GlobalFrame>) -> Result<(), String> {
         let mut inner = self.inner.write().unwrap();
         self.insert_inner(&mut inner, frame)
     }
@@ -141,22 +143,13 @@ impl GlobalTimeReel {
                         if !is_equal_frame(eh, frame.header.as_ref().unwrap())
                             && has_overlapping_bits(&existing.frame, &frame)
                         {
-                            let equivocators = inner.equivocators
-                                .entry(frame_number)
-                                .or_default();
-                            extract_overlapping_bits(
-                                &existing.frame,
-                                &frame,
-                                equivocators,
-                            );
+                            let equivocators = inner.equivocators.entry(frame_number).or_default();
+                            extract_overlapping_bits(&existing.frame, &frame, equivocators);
                             let _ = self.event_tx.send(GlobalEvent {
                                 event_type: TimeReelEventType::EquivocationDetected,
                                 frame: frame.clone(),
                                 old_head: None,
-                                message: format!(
-                                    "equivocation at frame {}",
-                                    frame_number,
-                                ),
+                                message: format!("equivocation at frame {}", frame_number,),
                             });
                         }
                     }
@@ -171,10 +164,7 @@ impl GlobalTimeReel {
 
         // Non-archive pseudo-root: accept first frame if tree is empty
         if inner.root.is_none() && inner.nodes.is_empty() {
-            info!(
-                frame = frame_number,
-                "accepting first frame as pseudo-root"
-            );
+            info!(frame = frame_number, "accepting first frame as pseudo-root");
             return self.insert_genesis(inner, frame, &frame_id);
         }
 
@@ -184,9 +174,8 @@ impl GlobalTimeReel {
         if let Some(pid) = parent_id {
             // Verify parent selector matches
             if let Some(parent_node) = inner.nodes.get(&pid) {
-                let expected = compute_poseidon_selector(
-                    &parent_node.frame.header.as_ref().unwrap().output,
-                );
+                let expected =
+                    compute_poseidon_selector(&parent_node.frame.header.as_ref().unwrap().output);
                 if expected != parent_selector_owned {
                     return Err("parent selector mismatch".into());
                 }
@@ -200,7 +189,8 @@ impl GlobalTimeReel {
                 };
 
                 inner.nodes.insert(frame_id.clone(), new_node);
-                inner.frames_by_number
+                inner
+                    .frames_by_number
                     .entry(frame_number)
                     .or_default()
                     .push(frame_id.clone());
@@ -217,7 +207,9 @@ impl GlobalTimeReel {
         }
 
         // Parent not found — check if frame is ahead of head (non-archive orphan)
-        let head_frame_num = inner.head.as_ref()
+        let head_frame_num = inner
+            .head
+            .as_ref()
             .and_then(|id| inner.nodes.get(id))
             .and_then(|n| n.frame.header.as_ref())
             .map(|h| h.frame_number)
@@ -225,7 +217,8 @@ impl GlobalTimeReel {
 
         if inner.head.is_some() && frame_number > head_frame_num {
             let selector_key = hex::encode(&parent_selector_owned);
-            inner.pending_frames
+            inner
+                .pending_frames
                 .entry(selector_key)
                 .or_default()
                 .push(PendingFrame {
@@ -240,7 +233,8 @@ impl GlobalTimeReel {
                 depth: 1,
             };
             inner.nodes.insert(frame_id.clone(), new_node);
-            inner.frames_by_number
+            inner
+                .frames_by_number
                 .entry(frame_number)
                 .or_default()
                 .push(frame_id.clone());
@@ -251,7 +245,8 @@ impl GlobalTimeReel {
 
         // Parent not found and not ahead — buffer as pending
         let selector_key = hex::encode(&parent_selector_owned);
-        inner.pending_frames
+        inner
+            .pending_frames
             .entry(selector_key)
             .or_default()
             .push(PendingFrame {
@@ -281,7 +276,8 @@ impl GlobalTimeReel {
         let frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
 
         inner.nodes.insert(frame_id.to_string(), node);
-        inner.frames_by_number
+        inner
+            .frames_by_number
             .entry(frame_number)
             .or_default()
             .push(frame_id.to_string());
@@ -319,7 +315,9 @@ impl GlobalTimeReel {
             None => return,
         };
 
-        let parent_depth = inner.nodes.get(parent_frame_id)
+        let parent_depth = inner
+            .nodes
+            .get(parent_frame_id)
             .map(|n| n.depth)
             .unwrap_or(0);
 
@@ -353,7 +351,8 @@ impl GlobalTimeReel {
 
             let frame_number = pending_header.frame_number;
             inner.nodes.insert(pending_id.clone(), new_node);
-            inner.frames_by_number
+            inner
+                .frames_by_number
                 .entry(frame_number)
                 .or_default()
                 .push(pending_id.clone());
@@ -368,7 +367,9 @@ impl GlobalTimeReel {
 
     fn evaluate_fork_choice(&self, inner: &mut Inner, new_node_id: &str) {
         let new_depth = inner.nodes.get(new_node_id).map(|n| n.depth).unwrap_or(0);
-        let new_frame_num = inner.nodes.get(new_node_id)
+        let new_frame_num = inner
+            .nodes
+            .get(new_node_id)
             .and_then(|n| n.frame.header.as_ref())
             .map(|h| h.frame_number)
             .unwrap_or(0);
@@ -387,15 +388,15 @@ impl GlobalTimeReel {
         }
 
         let head_id = inner.head.as_ref().unwrap().clone();
-        let head_frame_num = inner.nodes.get(&head_id)
+        let head_frame_num = inner
+            .nodes
+            .get(&head_id)
             .and_then(|n| n.frame.header.as_ref())
             .map(|h| h.frame_number)
             .unwrap_or(0);
         let head_depth = inner.nodes.get(&head_id).map(|n| n.depth).unwrap_or(0);
 
-        if new_frame_num > head_frame_num
-            && new_frame_num - head_frame_num > MAX_TREE_DEPTH
-        {
+        if new_frame_num > head_frame_num && new_frame_num - head_frame_num > MAX_TREE_DEPTH {
             let old_head_frame = inner.nodes.get(&head_id).map(|n| n.frame.clone());
             inner.head = Some(new_node_id.to_string());
             self.send_head_event(inner, new_node_id, old_head_frame);
@@ -415,12 +416,14 @@ impl GlobalTimeReel {
         }
 
         // Find max depth among leaves
-        let max_depth = leaves.iter()
+        let max_depth = leaves
+            .iter()
             .filter_map(|id| inner.nodes.get(id).map(|n| n.depth))
             .max()
             .unwrap_or(0);
 
-        let competing: Vec<String> = leaves.into_iter()
+        let competing: Vec<String> = leaves
+            .into_iter()
             .filter(|id| inner.nodes.get(id).map(|n| n.depth).unwrap_or(0) == max_depth)
             .collect();
 
@@ -435,19 +438,15 @@ impl GlobalTimeReel {
         }
 
         // Build branches for fork choice
-        let branches: Vec<Branch> = competing.iter()
+        let branches: Vec<Branch> = competing
+            .iter()
             .map(|id| node_to_branch(inner, id))
             .collect();
 
-        let prev_choice = competing.iter()
-            .position(|id| *id == head_id)
-            .unwrap_or(0);
+        let prev_choice = competing.iter().position(|id| *id == head_id).unwrap_or(0);
 
-        let chosen_index = fork_choice::fork_choice(
-            &branches,
-            &inner.fork_choice_params,
-            prev_choice,
-        );
+        let chosen_index =
+            fork_choice::fork_choice(&branches, &inner.fork_choice_params, prev_choice);
         let chosen_id = competing[chosen_index].clone();
 
         if chosen_id != head_id {
@@ -469,7 +468,9 @@ impl GlobalTimeReel {
         };
 
         let is_fork = if let Some(ref old_frame) = old_head_frame {
-            let old_id = old_frame.header.as_ref()
+            let old_id = old_frame
+                .header
+                .as_ref()
                 .map(|h| compute_frame_id(h))
                 .unwrap_or_default();
             !is_ancestor(inner, &old_id, new_head_id)
@@ -479,7 +480,11 @@ impl GlobalTimeReel {
 
         let event_type = if is_fork {
             info!(
-                old = old_head_frame.as_ref().and_then(|f| f.header.as_ref()).map(|h| h.frame_number).unwrap_or(0),
+                old = old_head_frame
+                    .as_ref()
+                    .and_then(|f| f.header.as_ref())
+                    .map(|h| h.frame_number)
+                    .unwrap_or(0),
                 new = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0),
                 "reorganization detected"
             );
@@ -508,7 +513,9 @@ impl GlobalTimeReel {
 
         let min_depth_to_keep = head_depth - MAX_TREE_DEPTH + 1;
 
-        let to_remove: Vec<String> = inner.nodes.iter()
+        let to_remove: Vec<String> = inner
+            .nodes
+            .iter()
             .filter(|(_, n)| n.depth < min_depth_to_keep)
             .map(|(id, _)| id.clone())
             .collect();
@@ -519,7 +526,10 @@ impl GlobalTimeReel {
 
         for id in &to_remove {
             if let Some(node) = inner.nodes.remove(id) {
-                let frame_num = node.frame.header.as_ref()
+                let frame_num = node
+                    .frame
+                    .header
+                    .as_ref()
                     .map(|h| h.frame_number)
                     .unwrap_or(0);
                 if let Some(list) = inner.frames_by_number.get_mut(&frame_num) {
@@ -539,10 +549,16 @@ impl GlobalTimeReel {
         }
 
         // Update root to a surviving node at min_depth_to_keep
-        let new_root = inner.nodes.iter()
+        let new_root = inner
+            .nodes
+            .iter()
             .filter(|(_, n)| n.depth == min_depth_to_keep)
             .min_by_key(|(_, n)| {
-                n.frame.header.as_ref().map(|h| h.frame_number).unwrap_or(u64::MAX)
+                n.frame
+                    .header
+                    .as_ref()
+                    .map(|h| h.frame_number)
+                    .unwrap_or(u64::MAX)
             })
             .map(|(id, _)| id.clone());
         if let Some(nr) = new_root {
@@ -574,8 +590,7 @@ fn compute_frame_id(header: &quil_types::proto::global::GlobalFrameHeader) -> St
         hex::encode(&header.output),
         hex::encode(&header.parent_selector),
     );
-    let hash = quil_crypto::poseidon::hash_bytes_to_32(data.as_bytes())
-        .unwrap_or([0u8; 32]);
+    let hash = quil_crypto::poseidon::hash_bytes_to_32(data.as_bytes()).unwrap_or([0u8; 32]);
     hex::encode(hash)
 }
 
@@ -612,11 +627,15 @@ fn has_overlapping_bits(
     a: &quil_types::proto::global::GlobalFrame,
     b: &quil_types::proto::global::GlobalFrame,
 ) -> bool {
-    let a_mask = a.header.as_ref()
+    let a_mask = a
+        .header
+        .as_ref()
         .and_then(|h| h.public_key_signature_bls48581.as_ref())
         .map(|sig| sig.bitmask.as_slice())
         .unwrap_or(&[]);
-    let b_mask = b.header.as_ref()
+    let b_mask = b
+        .header
+        .as_ref()
         .and_then(|h| h.public_key_signature_bls48581.as_ref())
         .map(|sig| sig.bitmask.as_slice())
         .unwrap_or(&[]);
@@ -637,11 +656,15 @@ fn extract_overlapping_bits(
     b: &quil_types::proto::global::GlobalFrame,
     equivocators: &mut HashSet<usize>,
 ) {
-    let a_mask = a.header.as_ref()
+    let a_mask = a
+        .header
+        .as_ref()
         .and_then(|h| h.public_key_signature_bls48581.as_ref())
         .map(|sig| sig.bitmask.as_slice())
         .unwrap_or(&[]);
-    let b_mask = b.header.as_ref()
+    let b_mask = b
+        .header
+        .as_ref()
         .and_then(|h| h.public_key_signature_bls48581.as_ref())
         .map(|sig| sig.bitmask.as_slice())
         .unwrap_or(&[]);
@@ -663,7 +686,9 @@ fn find_leaf_nodes(inner: &Inner) -> Vec<NodeId> {
     let head_id = match &inner.head {
         Some(id) => id.clone(),
         None => {
-            return inner.nodes.iter()
+            return inner
+                .nodes
+                .iter()
                 .filter(|(_, n)| n.children.is_empty())
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -672,7 +697,9 @@ fn find_leaf_nodes(inner: &Inner) -> Vec<NodeId> {
 
     let head_root = find_root(inner, &head_id);
 
-    inner.nodes.iter()
+    inner
+        .nodes
+        .iter()
         .filter(|(_, n)| n.children.is_empty())
         .filter(|(id, _)| find_root(inner, id) == head_root)
         .map(|(id, _)| id.clone())
@@ -729,13 +756,12 @@ fn node_to_branch(inner: &Inner, leaf_id: &str) -> Branch {
 
     lineage.reverse();
 
-    let frames: Vec<Frame> = lineage.iter()
+    let frames: Vec<Frame> = lineage
+        .iter()
         .filter_map(|id| inner.nodes.get(id))
         .map(|n| {
             let header = n.frame.header.as_ref();
-            let mut prover_addr = header
-                .map(|h| h.output.clone())
-                .unwrap_or_default();
+            let mut prover_addr = header.map(|h| h.output.clone()).unwrap_or_default();
             prover_addr.truncate(32);
 
             let seniority = compute_frame_seniority(inner, &n.frame);
@@ -751,10 +777,7 @@ fn node_to_branch(inner: &Inner, leaf_id: &str) -> Branch {
     Branch { frames }
 }
 
-fn compute_frame_seniority(
-    inner: &Inner,
-    frame: &quil_types::proto::global::GlobalFrame,
-) -> u64 {
+fn compute_frame_seniority(inner: &Inner, frame: &quil_types::proto::global::GlobalFrame) -> u64 {
     let header = match frame.header.as_ref() {
         Some(h) => h,
         None => return SCALE / 64,
@@ -830,7 +853,12 @@ mod tests {
         let mut output = vec![0u8; 32];
         output[0] = (frame_number & 0xFF) as u8;
         output[1] = ((frame_number >> 8) & 0xFF) as u8;
-        make_frame(frame_number, 1000 + frame_number as i64 * 10_000, &output, &selector)
+        make_frame(
+            frame_number,
+            1000 + frame_number as i64 * 10_000,
+            &output,
+            &selector,
+        )
     }
 
     #[test]
@@ -902,10 +930,7 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert_eq!(event.event_type, TimeReelEventType::NewHead);
-        assert_eq!(
-            event.frame.header.as_ref().unwrap().frame_number,
-            0,
-        );
+        assert_eq!(event.frame.header.as_ref().unwrap().frame_number, 0,);
     }
 
     #[test]

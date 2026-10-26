@@ -96,7 +96,10 @@ pub struct AutonatSummary {
 
 impl Default for AutonatSummary {
     fn default() -> Self {
-        Self { nat_status: "unknown", probe_failure: None }
+        Self {
+            nat_status: "unknown",
+            probe_failure: None,
+        }
     }
 }
 
@@ -232,11 +235,18 @@ pub(crate) enum PendingNotice {
     /// A server confirmed this node at a new IP.
     Started { transport: ExternalTransport },
     /// Still waiting after [`PENDING_WARN_AFTER`].
-    Stale { transport: ExternalTransport, secs: u64 },
+    Stale {
+        transport: ExternalTransport,
+        secs: u64,
+    },
     /// The move ended: `moved`, `current_reconfirmed`, `replaced`,
     /// `expired`, or `current_dropped`/`current_expired` with its transport's
     /// address.
-    Resolved { transport: ExternalTransport, secs: u64, outcome: &'static str },
+    Resolved {
+        transport: ExternalTransport,
+        secs: u64,
+        outcome: &'static str,
+    },
 }
 
 /// Log a pending-move notice. These lines concern this node's own address.
@@ -254,7 +264,11 @@ pub(crate) fn log_pending(notice: &PendingNotice) {
              announces the old address; see the 'AutoNAT probes of this node' lines, and report \
              this line if probes succeed"
         ),
-        PendingNotice::Resolved { transport, secs, outcome } => info!(
+        PendingNotice::Resolved {
+            transport,
+            secs,
+            outcome,
+        } => info!(
             transport = transport.as_str(),
             pending_secs = secs,
             outcome,
@@ -268,18 +282,31 @@ pub(crate) fn log_pending(notice: &PendingNotice) {
 pub(crate) enum HoldNotice {
     /// AutoNAT holds the node private while `addr` is held; a server
     /// confirmed it `confirmed_secs` ago.
-    Kept { transport: ExternalTransport, addr: String, confirmed_secs: u64 },
+    Kept {
+        transport: ExternalTransport,
+        addr: String,
+        confirmed_secs: u64,
+    },
     /// No server confirmed `addr` for `unconfirmed_secs`, and
     /// `unreachable_probes` probes since found the node unreachable, so it
     /// was dropped.
-    Dropped { transport: ExternalTransport, addr: String, unconfirmed_secs: u64, unreachable_probes: u32 },
+    Dropped {
+        transport: ExternalTransport,
+        addr: String,
+        unconfirmed_secs: u64,
+        unreachable_probes: u32,
+    },
 }
 
 /// Log a hold notice; `failures` counts the failing probes since the last
 /// dial-back (`dial_error=6`). These lines concern this node's own address.
 pub(crate) fn log_hold(notice: &HoldNotice, nat_status: &'static str, failures: &str) {
     match notice {
-        HoldNotice::Kept { transport, addr, confirmed_secs } => info!(
+        HoldNotice::Kept {
+            transport,
+            addr,
+            confirmed_secs,
+        } => info!(
             transport = transport.as_str(),
             address = %addr,
             confirmed_secs,
@@ -295,7 +322,12 @@ pub(crate) fn log_hold(notice: &HoldNotice, nat_status: &'static str, failures: 
              reachable node. A static public address can be set with p2p.announceListenMultiaddr \
              and p2p.announceStreamListenMultiaddr"
         ),
-        HoldNotice::Dropped { transport, addr, unconfirmed_secs, unreachable_probes } => warn!(
+        HoldNotice::Dropped {
+            transport,
+            addr,
+            unconfirmed_secs,
+            unreachable_probes,
+        } => warn!(
             transport = transport.as_str(),
             address = %addr,
             unconfirmed_secs,
@@ -353,7 +385,10 @@ impl Applied {
     /// published value instead, which also carries AutoNAT's view.
     #[cfg(test)]
     pub(crate) fn changed(self) -> bool {
-        matches!(self, Applied::Confirm(ConfirmOutcome::Accepted) | Applied::Expired(true))
+        matches!(
+            self,
+            Applied::Confirm(ConfirmOutcome::Accepted) | Applied::Expired(true)
+        )
     }
 }
 
@@ -373,7 +408,10 @@ struct Held {
 impl Held {
     /// A probe at `now` found the node unreachable at this address.
     fn miss(&mut self, now: Instant) {
-        if self.last_miss_at.is_some_and(|last| now.saturating_duration_since(last) < MISS_SPACING) {
+        if self
+            .last_miss_at
+            .is_some_and(|last| now.saturating_duration_since(last) < MISS_SPACING)
+        {
             return;
         }
         self.last_miss_at = Some(now);
@@ -438,19 +476,25 @@ impl ExternalAddrTracker {
     /// status already reflects the probe when its event reaches the swarm:
     /// the behaviour updates it while handling the response and drains its
     /// queued events before handling the next one.
-    pub(crate) fn apply(&mut self, event: ExternalAddrEvent<'_>, nat: &NatStatus, now: Instant) -> Applied {
+    pub(crate) fn apply(
+        &mut self,
+        event: ExternalAddrEvent<'_>,
+        nat: &NatStatus,
+        now: Instant,
+    ) -> Applied {
         let applied = match event {
             ExternalAddrEvent::Expired(addr) => Applied::Expired(self.on_expired(addr)),
-            ExternalAddrEvent::Confirmed(addr, server) => Applied::Confirm(self.confirm_at(addr, server, now)),
+            ExternalAddrEvent::Confirmed(addr, server) => {
+                Applied::Confirm(self.confirm_at(addr, server, now))
+            }
             ExternalAddrEvent::Failed(ProbeMiss::Unreachable) => {
                 for held in &mut self.current {
                     held.miss(now);
                 }
                 Applied::Nothing
             }
-            ExternalAddrEvent::Failed(ProbeMiss::Inconclusive) | ExternalAddrEvent::StatusChanged => {
-                Applied::Nothing
-            }
+            ExternalAddrEvent::Failed(ProbeMiss::Inconclusive)
+            | ExternalAddrEvent::StatusChanged => Applied::Nothing,
         };
         self.note_status(nat, now);
         applied
@@ -492,7 +536,9 @@ impl ExternalAddrTracker {
     /// later, and [`DROP_AFTER_UNREACHABLE`] probes that found the node
     /// unreachable since the confirmation.
     fn is_stale(&self, held: &Held, now: Instant) -> bool {
-        let since = self.left_public_at.map_or(held.confirmed_at, |left| left.max(held.confirmed_at));
+        let since = self
+            .left_public_at
+            .map_or(held.confirmed_at, |left| left.max(held.confirmed_at));
         now.saturating_duration_since(since) >= KEEP_UNCONFIRMED
             && held.unreachable_probes >= DROP_AFTER_UNREACHABLE
     }
@@ -509,7 +555,11 @@ impl ExternalAddrTracker {
                 continue;
             }
             let held = self.current.remove(i);
-            if let Some(j) = self.pending.iter().position(|p| p.transport == held.transport) {
+            if let Some(j) = self
+                .pending
+                .iter()
+                .position(|p| p.transport == held.transport)
+            {
                 self.end_pending(j, "current_dropped");
             }
             self.holds.push(HoldNotice::Dropped {
@@ -541,7 +591,12 @@ impl ExternalAddrTracker {
     }
 
     /// `server` dialed us back on `address` at `now`.
-    fn confirm_at(&mut self, address: &Multiaddr, server: ProbeServer, now: Instant) -> ConfirmOutcome {
+    fn confirm_at(
+        &mut self,
+        address: &Multiaddr,
+        server: ProbeServer,
+        now: Instant,
+    ) -> ConfirmOutcome {
         let addr = without_peer_id(address);
         let Some((transport, port)) = transport_and_port(&addr) else {
             return ConfirmOutcome::Rejected("transport");
@@ -563,8 +618,20 @@ impl ExternalAddrTracker {
             return ConfirmOutcome::Rejected("not_routable");
         }
         let pending = self.pending.iter().position(|p| p.transport == transport);
-        let new_move = |addr| PendingMove { transport, addr, server, since: None, warned: false };
-        let held = |addr| Held { transport, addr, confirmed_at: now, unreachable_probes: 0, last_miss_at: None };
+        let new_move = |addr| PendingMove {
+            transport,
+            addr,
+            server,
+            since: None,
+            warned: false,
+        };
+        let held = |addr| Held {
+            transport,
+            addr,
+            confirmed_at: now,
+            unreachable_probes: 0,
+            last_miss_at: None,
+        };
         match self.current.iter().position(|h| h.transport == transport) {
             Some(i) if self.current[i].addr == addr => {
                 // A server still sees us here, so a different pending IP
@@ -578,7 +645,10 @@ impl ExternalAddrTracker {
                 ConfirmOutcome::Unchanged
             }
             Some(i) => match pending {
-                Some(j) if self.pending[j].addr == addr && self.pending[j].server.independent_of(&server) => {
+                Some(j)
+                    if self.pending[j].addr == addr
+                        && self.pending[j].server.independent_of(&server) =>
+                {
                     self.end_pending(j, "moved");
                     self.current.remove(i);
                     self.current.insert(0, held(addr));
@@ -607,7 +677,10 @@ impl ExternalAddrTracker {
                 // Nothing to protect: the first confirmation is taken, as
                 // at startup. A pending move ends with its transport's
                 // address, so none can be left here.
-                debug_assert!(pending.is_none(), "a pending move without a current address");
+                debug_assert!(
+                    pending.is_none(),
+                    "a pending move without a current address"
+                );
                 if let Some(j) = pending {
                     self.end_pending(j, "moved");
                 }
@@ -628,7 +701,11 @@ impl ExternalAddrTracker {
             return false;
         };
         let held = self.current.remove(i);
-        if let Some(j) = self.pending.iter().position(|p| p.transport == held.transport) {
+        if let Some(j) = self
+            .pending
+            .iter()
+            .position(|p| p.transport == held.transport)
+        {
             self.end_pending(j, "current_expired");
         }
         if self.current.is_empty() {
@@ -652,18 +729,29 @@ impl ExternalAddrTracker {
             .ended
             .drain(..)
             .filter_map(|(transport, since, outcome)| {
-                since.map(|since| PendingNotice::Resolved { transport, secs: age(since), outcome })
+                since.map(|since| PendingNotice::Resolved {
+                    transport,
+                    secs: age(since),
+                    outcome,
+                })
             })
             .collect();
         for p in &mut self.pending {
             match p.since {
                 None => {
                     p.since = Some(now);
-                    notices.push(PendingNotice::Started { transport: p.transport });
+                    notices.push(PendingNotice::Started {
+                        transport: p.transport,
+                    });
                 }
-                Some(since) if !p.warned && now.saturating_duration_since(since) >= PENDING_WARN_AFTER => {
+                Some(since)
+                    if !p.warned && now.saturating_duration_since(since) >= PENDING_WARN_AFTER =>
+                {
                     p.warned = true;
-                    notices.push(PendingNotice::Stale { transport: p.transport, secs: age(since) });
+                    notices.push(PendingNotice::Stale {
+                        transport: p.transport,
+                        secs: age(since),
+                    });
                 }
                 _ => {}
             }
@@ -716,11 +804,17 @@ mod tests {
         static NEXT: AtomicU16 = AtomicU16::new(1);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n);
-        ProbeServer { peer: PeerId::random(), ip: Some(IpAddr::V6(ip)) }
+        ProbeServer {
+            peer: PeerId::random(),
+            ip: Some(IpAddr::V6(ip)),
+        }
     }
 
     fn server_on(ip: &str) -> ProbeServer {
-        ProbeServer { peer: PeerId::random(), ip: Some(ip.parse().unwrap()) }
+        ProbeServer {
+            peer: PeerId::random(),
+            ip: Some(ip.parse().unwrap()),
+        }
     }
 
     #[test]
@@ -733,7 +827,10 @@ mod tests {
             ConfirmOutcome::Accepted
         );
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
-        assert_eq!(t.snapshot().last_change, Some(ExternalAddrChange::Confirmed));
+        assert_eq!(
+            t.snapshot().last_change,
+            Some(ExternalAddrChange::Confirmed)
+        );
     }
 
     #[test]
@@ -804,18 +901,33 @@ mod tests {
         t.on_confirmed(&ma("/ip4/203.0.113.7/tcp/8336"), any_server());
         assert!(t.pending_notices(at(0)).is_empty());
         t.on_confirmed(&b, server_on("192.0.2.44"));
-        assert_eq!(t.pending_notices(at(0)), vec![Started { transport: ExternalTransport::Tcp }]);
+        assert_eq!(
+            t.pending_notices(at(0)),
+            vec![Started {
+                transport: ExternalTransport::Tcp
+            }]
+        );
         t.on_confirmed(&b, server_on("192.0.2.44"));
         assert!(t.pending_notices(at(10)).is_empty());
         assert_eq!(
             t.pending_notices(at(31)),
-            vec![Stale { transport: ExternalTransport::Tcp, secs: 31 * 60 }]
+            vec![Stale {
+                transport: ExternalTransport::Tcp,
+                secs: 31 * 60
+            }]
         );
         assert!(t.pending_notices(at(40)).is_empty());
-        assert_eq!(t.on_confirmed(&b, server_on("192.0.2.45")), ConfirmOutcome::Accepted);
+        assert_eq!(
+            t.on_confirmed(&b, server_on("192.0.2.45")),
+            ConfirmOutcome::Accepted
+        );
         assert_eq!(
             t.pending_notices(at(45)),
-            vec![Resolved { transport: ExternalTransport::Tcp, secs: 45 * 60, outcome: "moved" }]
+            vec![Resolved {
+                transport: ExternalTransport::Tcp,
+                secs: 45 * 60,
+                outcome: "moved"
+            }]
         );
         assert!(t.pending_notices(at(50)).is_empty());
     }
@@ -826,13 +938,22 @@ mod tests {
     fn a_server_of_unknown_ip_does_not_count_twice() {
         let mut t = tracker();
         t.on_confirmed(&ma("/ip4/203.0.113.7/tcp/8336"), any_server());
-        let unknown = || ProbeServer { peer: PeerId::random(), ip: None };
+        let unknown = || ProbeServer {
+            peer: PeerId::random(),
+            ip: None,
+        };
         let b = ma("/ip4/198.51.100.9/tcp/8336");
         assert_eq!(t.on_confirmed(&b, unknown()), ConfirmOutcome::Pending);
         assert_eq!(t.on_confirmed(&b, unknown()), ConfirmOutcome::Pending);
-        assert_eq!(t.on_confirmed(&b, server_on("192.0.2.44")), ConfirmOutcome::Pending);
+        assert_eq!(
+            t.on_confirmed(&b, server_on("192.0.2.44")),
+            ConfirmOutcome::Pending
+        );
         assert_eq!(t.on_confirmed(&b, unknown()), ConfirmOutcome::Pending);
-        assert_eq!(t.on_confirmed(&b, server_on("192.0.2.45")), ConfirmOutcome::Accepted);
+        assert_eq!(
+            t.on_confirmed(&b, server_on("192.0.2.45")),
+            ConfirmOutcome::Accepted
+        );
     }
 
     /// One server's claim is dropped once another server still reaches us
@@ -857,14 +978,20 @@ mod tests {
         t.on_confirmed(&ma("/ip4/203.0.113.7/tcp/8336"), any_server());
         assert_eq!(
             addrs(&t),
-            vec!["/ip4/203.0.113.7/tcp/8336", "/ip4/203.0.113.7/udp/8336/quic-v1"]
+            vec![
+                "/ip4/203.0.113.7/tcp/8336",
+                "/ip4/203.0.113.7/udp/8336/quic-v1"
+            ]
         );
         // Replacing the QUIC address moves it to the front and keeps TCP.
         t.on_confirmed(&ma("/ip4/198.51.100.9/udp/8336/quic-v1"), any_server());
         t.on_confirmed(&ma("/ip4/198.51.100.9/udp/8336/quic-v1"), any_server());
         assert_eq!(
             addrs(&t),
-            vec!["/ip4/198.51.100.9/udp/8336/quic-v1", "/ip4/203.0.113.7/tcp/8336"]
+            vec![
+                "/ip4/198.51.100.9/udp/8336/quic-v1",
+                "/ip4/203.0.113.7/tcp/8336"
+            ]
         );
     }
 
@@ -930,7 +1057,12 @@ mod tests {
         t0 + Duration::from_secs(60 * m)
     }
 
-    fn confirm(t: &mut ExternalAddrTracker, addr: &Multiaddr, nat: &NatStatus, at: Instant) -> Applied {
+    fn confirm(
+        t: &mut ExternalAddrTracker,
+        addr: &Multiaddr,
+        nat: &NatStatus,
+        at: Instant,
+    ) -> Applied {
         t.apply(ExternalAddrEvent::Confirmed(addr, any_server()), nat, at)
     }
 
@@ -939,7 +1071,10 @@ mod tests {
     fn unreachable(t: &mut ExternalAddrTracker, n: u32, nat: &NatStatus, at: Instant) {
         for k in 0..n {
             let when = at + MISS_SPACING * k;
-            assert_eq!(t.apply(ExternalAddrEvent::Failed(ProbeMiss::Unreachable), nat, when), Applied::Nothing);
+            assert_eq!(
+                t.apply(ExternalAddrEvent::Failed(ProbeMiss::Unreachable), nat, when),
+                Applied::Nothing
+            );
         }
     }
 
@@ -962,24 +1097,49 @@ mod tests {
         assert!(t.hold_notices().is_empty());
         unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, 5));
         assert!(!t.expire_unconfirmed(minutes(t0, 5)));
-        assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/udp/8336/quic-v1", "/ip4/203.0.113.7/tcp/8336"]);
+        assert_eq!(
+            addrs(&t),
+            vec![
+                "/ip4/203.0.113.7/udp/8336/quic-v1",
+                "/ip4/203.0.113.7/tcp/8336"
+            ]
+        );
         assert_eq!(t.pending.len(), 1);
-        assert_eq!(t.snapshot().last_change, Some(ExternalAddrChange::Confirmed));
+        assert_eq!(
+            t.snapshot().last_change,
+            Some(ExternalAddrChange::Confirmed)
+        );
         assert_eq!(
             t.hold_notices(),
             vec![
-                HoldNotice::Kept { transport: ExternalTransport::Quic, addr: q.to_string(), confirmed_secs: 4 * 60 },
-                HoldNotice::Kept { transport: ExternalTransport::Tcp, addr: a.to_string(), confirmed_secs: 5 * 60 },
+                HoldNotice::Kept {
+                    transport: ExternalTransport::Quic,
+                    addr: q.to_string(),
+                    confirmed_secs: 4 * 60
+                },
+                HoldNotice::Kept {
+                    transport: ExternalTransport::Tcp,
+                    addr: a.to_string(),
+                    confirmed_secs: 5 * 60
+                },
             ]
         );
         // Further private outcomes and flips do not repeat the line.
-        t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private, minutes(t0, 6));
+        t.apply(
+            ExternalAddrEvent::StatusChanged,
+            &NatStatus::Private,
+            minutes(t0, 6),
+        );
         confirm(&mut t, &a, &NatStatus::Private, minutes(t0, 7));
         unreachable(&mut t, 3, &NatStatus::Private, minutes(t0, 8));
         assert!(t.hold_notices().is_empty());
         // After a public spell, the next private run reports again.
         t.apply(ExternalAddrEvent::StatusChanged, &public(), minutes(t0, 9));
-        t.apply(ExternalAddrEvent::StatusChanged, &NatStatus::Private, minutes(t0, 10));
+        t.apply(
+            ExternalAddrEvent::StatusChanged,
+            &NatStatus::Private,
+            minutes(t0, 10),
+        );
         assert_eq!(t.hold_notices().len(), 2);
     }
 
@@ -990,7 +1150,11 @@ mod tests {
         let a = ma("/ip4/203.0.113.7/tcp/8336");
         for nat in [NatStatus::Private, NatStatus::Unknown, public()] {
             let mut t = tracker();
-            assert_eq!(confirm(&mut t, &a, &nat, t0), Applied::Confirm(ConfirmOutcome::Accepted), "{nat:?}");
+            assert_eq!(
+                confirm(&mut t, &a, &nat, t0),
+                Applied::Confirm(ConfirmOutcome::Accepted),
+                "{nat:?}"
+            );
             assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
         }
     }
@@ -1005,9 +1169,18 @@ mod tests {
         let a = ma("/ip4/203.0.113.7/tcp/8336");
         confirm(&mut t, &a, &NatStatus::Unknown, t0);
         for _ in 0..50 {
-            t.apply(ExternalAddrEvent::Failed(ProbeMiss::Inconclusive), &NatStatus::Private, minutes(t0, 1));
+            t.apply(
+                ExternalAddrEvent::Failed(ProbeMiss::Inconclusive),
+                &NatStatus::Private,
+                minutes(t0, 1),
+            );
         }
-        unreachable(&mut t, DROP_AFTER_UNREACHABLE - 1, &NatStatus::Private, minutes(t0, 1));
+        unreachable(
+            &mut t,
+            DROP_AFTER_UNREACHABLE - 1,
+            &NatStatus::Private,
+            minutes(t0, 1),
+        );
         t.hold_notices();
         assert!(!t.expire_unconfirmed(minutes(t0, 10 * WINDOW)));
         unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, 10 * WINDOW));
@@ -1029,7 +1202,10 @@ mod tests {
         assert!(t.hold_notices().is_empty());
         // The next dial-back brings it back, needing one server again.
         let at = minutes(t0, WINDOW + 10);
-        assert_eq!(confirm(&mut t, &a, &NatStatus::Private, at), Applied::Confirm(ConfirmOutcome::Accepted));
+        assert_eq!(
+            confirm(&mut t, &a, &NatStatus::Private, at),
+            Applied::Confirm(ConfirmOutcome::Accepted)
+        );
         assert_eq!(t.hold_notices().len(), 1);
     }
 
@@ -1043,18 +1219,30 @@ mod tests {
         let mut kept = tracker();
         confirm(&mut kept, &a, &public(), t0);
         for _ in 0..50 {
-            kept.apply(ExternalAddrEvent::Failed(ProbeMiss::Inconclusive), &public(), minutes(t0, 1));
+            kept.apply(
+                ExternalAddrEvent::Failed(ProbeMiss::Inconclusive),
+                &public(),
+                minutes(t0, 1),
+            );
         }
         assert!(!kept.expire_unconfirmed(minutes(t0, 10 * WINDOW)));
         assert_eq!(addrs(&kept), vec!["/ip4/203.0.113.7/tcp/8336"]);
 
         let mut lost = tracker();
         confirm(&mut lost, &a, &public(), t0);
-        unreachable(&mut lost, DROP_AFTER_UNREACHABLE, &public(), minutes(t0, 20));
+        unreachable(
+            &mut lost,
+            DROP_AFTER_UNREACHABLE,
+            &public(),
+            minutes(t0, 20),
+        );
         assert!(!lost.expire_unconfirmed(minutes(t0, WINDOW - 1)));
         assert!(lost.expire_unconfirmed(minutes(t0, WINDOW)));
         assert!(addrs(&lost).is_empty());
-        assert!(matches!(lost.hold_notices()[..], [HoldNotice::Dropped { .. }]));
+        assert!(matches!(
+            lost.hold_notices()[..],
+            [HoldNotice::Dropped { .. }]
+        ));
     }
 
     /// A few minutes of lost uplink bring a burst of timeouts, retried at
@@ -1070,7 +1258,11 @@ mod tests {
         // confirmation.
         let burst = minutes(t0, 50);
         for k in 0..12u32 {
-            t.apply(ExternalAddrEvent::Failed(ProbeMiss::Unreachable), &public(), burst + Duration::from_secs(30) * k);
+            t.apply(
+                ExternalAddrEvent::Failed(ProbeMiss::Unreachable),
+                &public(),
+                burst + Duration::from_secs(30) * k,
+            );
         }
         assert!(t.current[0].unreachable_probes <= 4);
         for at in [minutes(t0, WINDOW), minutes(t0, 2 * WINDOW)] {
@@ -1094,7 +1286,11 @@ mod tests {
         for k in 0..DROP_AFTER_UNREACHABLE {
             let at = minutes(t0, 5) + MISS_SPACING * k;
             assert_eq!(
-                t.apply(ExternalAddrEvent::Confirmed(&mapped, any_server()), &public(), at),
+                t.apply(
+                    ExternalAddrEvent::Confirmed(&mapped, any_server()),
+                    &public(),
+                    at
+                ),
                 Applied::Confirm(ConfirmOutcome::Rejected("port"))
             );
         }
@@ -1125,7 +1321,9 @@ mod tests {
         );
         assert!(!t.expire_unconfirmed(minutes(t0, 3 * WINDOW - 1)));
         assert!(t.expire_unconfirmed(minutes(t0, 3 * WINDOW)));
-        assert!(matches!(t.hold_notices()[..], [HoldNotice::Dropped { unconfirmed_secs, .. }] if unconfirmed_secs == 3 * WINDOW * 60));
+        assert!(
+            matches!(t.hold_notices()[..], [HoldNotice::Dropped { unconfirmed_secs, .. }] if unconfirmed_secs == 3 * WINDOW * 60)
+        );
     }
 
     /// An entry already past its window when AutoNAT turns private is
@@ -1136,7 +1334,12 @@ mod tests {
         let mut t = tracker();
         let a = ma("/ip4/203.0.113.7/tcp/8336");
         confirm(&mut t, &a, &NatStatus::Unknown, t0);
-        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        unreachable(
+            &mut t,
+            DROP_AFTER_UNREACHABLE,
+            &NatStatus::Unknown,
+            minutes(t0, 1),
+        );
         unreachable(&mut t, 1, &NatStatus::Private, minutes(t0, WINDOW));
         assert!(t.hold_notices().is_empty());
         assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
@@ -1155,7 +1358,10 @@ mod tests {
             let at = minutes(t0, k * WINDOW);
             unreachable(&mut t, DROP_AFTER_UNREACHABLE - 1, &NatStatus::Private, at);
             assert!(!t.expire_unconfirmed(at));
-            assert_eq!(confirm(&mut t, &a, &NatStatus::Private, at), Applied::Confirm(ConfirmOutcome::Unchanged));
+            assert_eq!(
+                confirm(&mut t, &a, &NatStatus::Private, at),
+                Applied::Confirm(ConfirmOutcome::Unchanged)
+            );
         }
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
     }
@@ -1168,7 +1374,12 @@ mod tests {
         let a = ma("/ip4/203.0.113.7/tcp/8336");
         let q = ma("/ip4/203.0.113.7/udp/8336/quic-v1");
         confirm(&mut t, &a, &NatStatus::Unknown, t0);
-        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        unreachable(
+            &mut t,
+            DROP_AFTER_UNREACHABLE,
+            &NatStatus::Unknown,
+            minutes(t0, 1),
+        );
         confirm(&mut t, &q, &NatStatus::Unknown, minutes(t0, 30));
         assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/udp/8336/quic-v1"]);
@@ -1184,11 +1395,25 @@ mod tests {
         let b = ma("/ip4/198.51.100.9/tcp/8336");
         confirm(&mut t, &a, &NatStatus::Unknown, t0);
         assert_eq!(
-            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")), &NatStatus::Unknown, t0),
+            t.apply(
+                ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")),
+                &NatStatus::Unknown,
+                t0
+            ),
             Applied::Confirm(ConfirmOutcome::Pending)
         );
-        assert_eq!(t.pending_notices(t0), vec![PendingNotice::Started { transport: ExternalTransport::Tcp }]);
-        unreachable(&mut t, DROP_AFTER_UNREACHABLE, &NatStatus::Unknown, minutes(t0, 1));
+        assert_eq!(
+            t.pending_notices(t0),
+            vec![PendingNotice::Started {
+                transport: ExternalTransport::Tcp
+            }]
+        );
+        unreachable(
+            &mut t,
+            DROP_AFTER_UNREACHABLE,
+            &NatStatus::Unknown,
+            minutes(t0, 1),
+        );
         assert!(t.expire_unconfirmed(minutes(t0, WINDOW)));
         assert!(t.pending.is_empty());
         assert_eq!(
@@ -1212,12 +1437,20 @@ mod tests {
         confirm(&mut t, &a, &public(), t0);
         let private = NatStatus::Private;
         assert_eq!(
-            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")), &private, t0),
+            t.apply(
+                ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.44")),
+                &private,
+                t0
+            ),
             Applied::Confirm(ConfirmOutcome::Pending)
         );
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
         assert_eq!(
-            t.apply(ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.45")), &private, t0),
+            t.apply(
+                ExternalAddrEvent::Confirmed(&b, server_on("192.0.2.45")),
+                &private,
+                t0
+            ),
             Applied::Confirm(ConfirmOutcome::Accepted)
         );
         assert_eq!(addrs(&t), vec!["/ip4/198.51.100.9/tcp/8336"]);
@@ -1235,11 +1468,17 @@ mod tests {
         assert!(!first.changed());
         assert_eq!(t.pending.len(), 1);
         // Expiry of the pending address drops it; A stays.
-        assert_eq!(t.apply(ExternalAddrEvent::Expired(&b), &public(), t0), Applied::Expired(false));
+        assert_eq!(
+            t.apply(ExternalAddrEvent::Expired(&b), &public(), t0),
+            Applied::Expired(false)
+        );
         assert!(t.pending.is_empty());
         assert_eq!(addrs(&t), vec!["/ip4/203.0.113.7/tcp/8336"]);
         // So B needs two fresh servers again; expiry of A ends that move.
-        assert_eq!(confirm(&mut t, &b, &public(), t0), Applied::Confirm(ConfirmOutcome::Pending));
+        assert_eq!(
+            confirm(&mut t, &b, &public(), t0),
+            Applied::Confirm(ConfirmOutcome::Pending)
+        );
         let expired = t.apply(ExternalAddrEvent::Expired(&a), &public(), t0);
         assert_eq!(expired, Applied::Expired(true));
         assert!(expired.changed());
@@ -1249,7 +1488,10 @@ mod tests {
 
     #[test]
     fn transport_of_reads_tcp_and_quic() {
-        assert_eq!(transport_of("/ip4/0.0.0.0/tcp/8336"), Some(ExternalTransport::Tcp));
+        assert_eq!(
+            transport_of("/ip4/0.0.0.0/tcp/8336"),
+            Some(ExternalTransport::Tcp)
+        );
         assert_eq!(
             transport_of("/ip4/0.0.0.0/udp/8336/quic-v1"),
             Some(ExternalTransport::Quic)

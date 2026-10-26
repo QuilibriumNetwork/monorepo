@@ -139,7 +139,11 @@ pub fn verify_vertex_membership(
     let key = data_address_of(&vertex.vertex_address);
     vertex
         .shard_proof
-        .verify_existence(shard_root, KeyHash(crate::shard_path_key_hash(key).0), &leaf_value)
+        .verify_existence(
+            shard_root,
+            KeyHash(crate::shard_path_key_hash(key).0),
+            &leaf_value,
+        )
         .map_err(|e| {
             anyhow::anyhow!("forest membership: Level-1 shard inclusion proof failed: {e}")
         })?;
@@ -255,12 +259,16 @@ mod tests {
         let vertex = forest
             .build_vertex_membership_proof(&shard, Phase::VertexAdds, 0, &addr, &blob)
             .unwrap();
-        let expected =
-            vec![(commitment_key.clone(), commitment_val.clone()), (type_key.clone(), type_val.clone())];
+        let expected = vec![
+            (commitment_key.clone(), commitment_val.clone()),
+            (type_key.clone(), type_val.clone()),
+        ];
         verify_vertex_membership(&root, &vertex, &expected).expect("membership verifies");
 
         // Wire round-trip preserves verification.
-        let mp = MembershipProof { inputs: vec![vertex.clone()] };
+        let mp = MembershipProof {
+            inputs: vec![vertex.clone()],
+        };
         let decoded = MembershipProof::from_bytes(&mp.to_bytes()).unwrap();
         verify_vertex_membership(&root, &decoded.inputs[0], &expected)
             .expect("membership verifies after wire round-trip");

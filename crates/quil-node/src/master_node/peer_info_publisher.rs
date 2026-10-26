@@ -54,10 +54,7 @@ const TOPIC_PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(120)
 /// first PeerInfo publish is guaranteed to fail — and the next attempt is a
 /// whole republish period away, 30 minutes on mainnet. Waiting for a
 /// subscriber first turns that hole into a few seconds of delay.
-async fn wait_for_topic_peer(
-    handle: &quil_p2p::node::P2PHandle,
-    bitmask: &[u8],
-) -> usize {
+async fn wait_for_topic_peer(handle: &quil_p2p::node::P2PHandle, bitmask: &[u8]) -> usize {
     wait_for_topic_peer_with(TOPIC_PEER_WAIT, || {
         let handle = handle.clone();
         let bitmask = bitmask.to_vec();
@@ -162,8 +159,12 @@ fn announceable(addr: &str) -> bool {
     let mut parts = addr.trim_start_matches('/').split('/');
     match (parts.next(), parts.next()) {
         (Some(""), _) | (None, _) => false,
-        (Some("ip4"), Some(ip)) => ip.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| !ip.is_unspecified()),
-        (Some("ip6"), Some(ip)) => ip.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| !ip.is_unspecified()),
+        (Some("ip4"), Some(ip)) => ip
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| !ip.is_unspecified()),
+        (Some("ip6"), Some(ip)) => ip
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| !ip.is_unspecified()),
         (Some("ip4" | "ip6"), None) => false,
         _ => true,
     }
@@ -197,11 +198,17 @@ fn select_pubsub_addr(
 /// `announceStreamListenMultiaddr` override when set; else the stream listen
 /// port on the IP of `pubsub_addr`, or on the stream listen IP when it names
 /// one.
-fn select_stream_addrs(announce_stream: &str, stream_listen: &str, pubsub_addr: &str) -> Vec<String> {
+fn select_stream_addrs(
+    announce_stream: &str,
+    stream_listen: &str,
+    pubsub_addr: &str,
+) -> Vec<String> {
     if !announce_stream.is_empty() {
         vec![announce_stream.to_string()]
     } else if !stream_listen.is_empty() {
-        crate::util::multiaddr::extract_stream_addr(pubsub_addr, stream_listen).into_iter().collect()
+        crate::util::multiaddr::extract_stream_addr(pubsub_addr, stream_listen)
+            .into_iter()
+            .collect()
     } else {
         Vec::new()
     }
@@ -331,7 +338,10 @@ async fn announce_change_due(
 #[derive(Debug, PartialEq, Eq)]
 enum ReachabilityNotice {
     /// No confirmed external address for `for_secs`, with AutoNAT's view.
-    Unconfirmed { for_secs: u64, autonat: AutonatSummary },
+    Unconfirmed {
+        for_secs: u64,
+        autonat: AutonatSummary,
+    },
     /// An address is confirmed again after `after_secs` without one.
     Confirmed { after_secs: u64 },
 }
@@ -353,7 +363,9 @@ async fn monitor_unconfirmed(
     loop {
         if !rx.borrow_and_update().addrs.is_empty() {
             if last_warn.take().is_some() {
-                notify(ReachabilityNotice::Confirmed { after_secs: since.elapsed().as_secs() });
+                notify(ReachabilityNotice::Confirmed {
+                    after_secs: since.elapsed().as_secs(),
+                });
             }
             if !watching || rx.changed().await.is_err() {
                 return std::future::pending().await;
@@ -396,7 +408,12 @@ enum UnconfirmedCause {
 fn unconfirmed_cause(autonat: &AutonatSummary) -> UnconfirmedCause {
     match &autonat.probe_failure {
         Some(run) if run.unreachable => UnconfirmedCause::Unreachable,
-        Some(run) if matches!(run.class, "io" | "bad_request" | "internal" | "unsupported_protocol") => {
+        Some(run)
+            if matches!(
+                run.class,
+                "io" | "bad_request" | "internal" | "unsupported_protocol"
+            ) =>
+        {
             UnconfirmedCause::ProbesFailing
         }
         _ => UnconfirmedCause::Unsettled,
@@ -501,8 +518,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
     // pool stays empty.
     if archive_mode {
         pi_caps.push(quil_p2p::CanonicalCapability {
-            protocol_identifier:
-                quil_execution::capabilities::ARCHIVE_PROTOCOL_V1,
+            protocol_identifier: quil_execution::capabilities::ARCHIVE_PROTOCOL_V1,
             additional_metadata: Vec::new(),
         });
     }
@@ -541,7 +557,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
             addr if addr.is_empty() => "none".to_string(),
             addr => addr,
         };
-        let port = |addr: &str| port_of(addr).map_or_else(|| "unknown".to_string(), |p| p.to_string());
+        let port =
+            |addr: &str| port_of(addr).map_or_else(|| "unknown".to_string(), |p| p.to_string());
         let p2p_port = port(&pi_listen_fallback);
         let p2p_protocol = p2p_protocol(&pi_listen_fallback);
         let stream_port = port(&pi_stream_listen);
@@ -847,8 +864,15 @@ mod tests {
         #[test]
         fn the_override_wins_over_confirmed_addresses() {
             assert_eq!(
-                select_pubsub_addr("/dns4/node.example.com/tcp/8336", &strings(&[TCP_A]), LISTEN),
-                ("/dns4/node.example.com/tcp/8336".to_string(), AnnounceSource::Override)
+                select_pubsub_addr(
+                    "/dns4/node.example.com/tcp/8336",
+                    &strings(&[TCP_A]),
+                    LISTEN
+                ),
+                (
+                    "/dns4/node.example.com/tcp/8336".to_string(),
+                    AnnounceSource::Override
+                )
             );
         }
 
@@ -859,7 +883,11 @@ mod tests {
                 (TCP_B.to_string(), AnnounceSource::Confirmed)
             );
             assert_eq!(
-                select_pubsub_addr("", &strings(&[TCP_B, QUIC_A]), "/ip4/0.0.0.0/udp/8336/quic-v1"),
+                select_pubsub_addr(
+                    "",
+                    &strings(&[TCP_B, QUIC_A]),
+                    "/ip4/0.0.0.0/udp/8336/quic-v1"
+                ),
                 (QUIC_A.to_string(), AnnounceSource::Confirmed)
             );
         }
@@ -871,10 +899,16 @@ mod tests {
                 (QUIC_A.to_string(), AnnounceSource::Confirmed)
             );
             // A wildcard listen address is no address; a specific one is.
-            assert_eq!(select_pubsub_addr("", &[], LISTEN), (String::new(), AnnounceSource::Fallback));
+            assert_eq!(
+                select_pubsub_addr("", &[], LISTEN),
+                (String::new(), AnnounceSource::Fallback)
+            );
             assert_eq!(
                 select_pubsub_addr("", &[], "/ip4/192.0.2.10/tcp/8336"),
-                ("/ip4/192.0.2.10/tcp/8336".to_string(), AnnounceSource::Fallback)
+                (
+                    "/ip4/192.0.2.10/tcp/8336".to_string(),
+                    AnnounceSource::Fallback
+                )
             );
         }
 
@@ -891,7 +925,12 @@ mod tests {
             ] {
                 assert!(!announceable(addr), "{addr}");
             }
-            for addr in [TCP_A, QUIC_A, "/ip6/2001:db8::7/tcp/8336", "/dns4/node.example.com/tcp/8336"] {
+            for addr in [
+                TCP_A,
+                QUIC_A,
+                "/ip6/2001:db8::7/tcp/8336",
+                "/dns4/node.example.com/tcp/8336",
+            ] {
                 assert!(announceable(addr), "{addr}");
             }
         }
@@ -911,7 +950,12 @@ mod tests {
             let workers = vec![(1, vec![0x11; 32]), (2, vec![0x22; 32]), (3, Vec::new())];
             let none: Vec<String> = Vec::new();
             let wildcard_workers = strings(&["/ip4/0.0.0.0/tcp/40001", "/ip6/::/tcp/40002"]);
-            let thread_mode = WorkerAddrs { p2p: &none, stream: &none, announce_p2p: &none, announce_stream: &none };
+            let thread_mode = WorkerAddrs {
+                p2p: &none,
+                stream: &none,
+                announce_p2p: &none,
+                announce_stream: &none,
+            };
             let process_mode = WorkerAddrs {
                 p2p: &wildcard_workers,
                 stream: &wildcard_workers,
@@ -924,8 +968,13 @@ mod tests {
                         for worker_addrs in [&thread_mode, &process_mode] {
                             let (pubsub, _) = select_pubsub_addr(announce, &[], listen);
                             let stream = select_stream_addrs("", stream_listen, &pubsub);
-                            let reachability = build_reachability(&pubsub, &stream, &workers, worker_addrs);
-                            assert_eq!(reachability.len(), 3, "{listen} {announce} {stream_listen}");
+                            let reachability =
+                                build_reachability(&pubsub, &stream, &workers, worker_addrs);
+                            assert_eq!(
+                                reachability.len(),
+                                3,
+                                "{listen} {announce} {stream_listen}"
+                            );
                             assert_eq!(
                                 every_address(&reachability),
                                 Vec::<String>::new(),
@@ -942,7 +991,12 @@ mod tests {
         fn peer_info_announces_the_confirmed_address_with_its_stream_port() {
             let workers = vec![(1, vec![0x11; 32])];
             let none: Vec<String> = Vec::new();
-            let thread_mode = WorkerAddrs { p2p: &none, stream: &none, announce_p2p: &none, announce_stream: &none };
+            let thread_mode = WorkerAddrs {
+                p2p: &none,
+                stream: &none,
+                announce_p2p: &none,
+                announce_stream: &none,
+            };
             let (pubsub, source) = select_pubsub_addr("", &strings(&[TCP_A]), LISTEN);
             assert_eq!(source, AnnounceSource::Confirmed);
             let stream = select_stream_addrs("", "/ip4/0.0.0.0/tcp/8340", &pubsub);
@@ -950,7 +1004,10 @@ mod tests {
             assert_eq!(reachability.len(), 2);
             for record in &reachability {
                 assert_eq!(record.pubsub_multiaddrs, strings(&[TCP_A]));
-                assert_eq!(record.stream_multiaddrs, strings(&["/ip4/203.0.113.7/tcp/8340"]));
+                assert_eq!(
+                    record.stream_multiaddrs,
+                    strings(&["/ip4/203.0.113.7/tcp/8340"])
+                );
             }
             assert_eq!(reachability[0].filter, vec![0xFF; 32]);
         }
@@ -965,15 +1022,27 @@ mod tests {
         #[test]
         fn the_reason_names_the_override_or_the_last_change() {
             let none = ConfirmedExternalAddrs::default();
-            assert_eq!(announce_reason(AnnounceSource::Override, &confirmed(&[TCP_A])), "override");
-            assert_eq!(announce_reason(AnnounceSource::Fallback, &none), "unconfirmed");
-            assert_eq!(announce_reason(AnnounceSource::Confirmed, &confirmed(&[TCP_A])), "confirmed");
+            assert_eq!(
+                announce_reason(AnnounceSource::Override, &confirmed(&[TCP_A])),
+                "override"
+            );
+            assert_eq!(
+                announce_reason(AnnounceSource::Fallback, &none),
+                "unconfirmed"
+            );
+            assert_eq!(
+                announce_reason(AnnounceSource::Confirmed, &confirmed(&[TCP_A])),
+                "confirmed"
+            );
             let expired = ConfirmedExternalAddrs {
                 addrs: Vec::new(),
                 last_change: Some(ExternalAddrChange::Expired),
                 ..Default::default()
             };
-            assert_eq!(announce_reason(AnnounceSource::Fallback, &expired), "expired");
+            assert_eq!(
+                announce_reason(AnnounceSource::Fallback, &expired),
+                "expired"
+            );
         }
 
         /// Keep the sender alive past the assertions; a dropped sender
@@ -1029,7 +1098,10 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_further_change_restarts_the_settle_window() {
             let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
-            let _driver = drive(tx, vec![(0, confirmed(&[TCP_A])), (30, confirmed(&[TCP_B]))]);
+            let _driver = drive(
+                tx,
+                vec![(0, confirmed(&[TCP_A])), (30, confirmed(&[TCP_B]))],
+            );
             let started = tokio::time::Instant::now();
             announce_change_due(&mut rx, selected, "", None, SETTLE, GAP).await;
             assert_eq!(started.elapsed(), Duration::from_secs(30) + SETTLE);
@@ -1038,9 +1110,14 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_change_that_reverts_before_settling_publishes_nothing() {
             let (tx, mut rx) = watch::channel(confirmed(&[TCP_A]));
-            let _driver = drive(tx, vec![(5, confirmed(&[TCP_B])), (30, confirmed(&[TCP_A]))]);
+            let _driver = drive(
+                tx,
+                vec![(5, confirmed(&[TCP_B])), (30, confirmed(&[TCP_A]))],
+            );
             let due = announce_change_due(&mut rx, selected, TCP_A, None, SETTLE, GAP);
-            assert!(tokio::time::timeout(Duration::from_secs(3_000), due).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_secs(3_000), due)
+                .await
+                .is_err());
         }
 
         /// A change that leaves the selected address alone (a QUIC address
@@ -1050,7 +1127,9 @@ mod tests {
             let (tx, mut rx) = watch::channel(confirmed(&[TCP_A]));
             let _driver = drive(tx, vec![(5, confirmed(&[QUIC_A, TCP_A]))]);
             let due = announce_change_due(&mut rx, selected, TCP_A, None, SETTLE, GAP);
-            assert!(tokio::time::timeout(Duration::from_secs(3_000), due).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_secs(3_000), due)
+                .await
+                .is_err());
         }
 
         #[tokio::test(start_paused = true)]
@@ -1058,11 +1137,12 @@ mod tests {
             let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
             let _driver = drive(tx, vec![(5, confirmed(&[TCP_A]))]);
             let announce = "/dns4/node.example.com/tcp/8336";
-            let select = |ext: &ConfirmedExternalAddrs| {
-                select_pubsub_addr(announce, &ext.addrs, LISTEN).0
-            };
+            let select =
+                |ext: &ConfirmedExternalAddrs| select_pubsub_addr(announce, &ext.addrs, LISTEN).0;
             let due = announce_change_due(&mut rx, select, announce, None, SETTLE, GAP);
-            assert!(tokio::time::timeout(Duration::from_secs(3_000), due).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_secs(3_000), due)
+                .await
+                .is_err());
         }
 
         /// AutoNAT's view changes with every failed probe; that alone does
@@ -1130,7 +1210,10 @@ mod tests {
         }
 
         fn unconfirmed(for_secs: u64) -> ReachabilityNotice {
-            ReachabilityNotice::Unconfirmed { for_secs, autonat: AutonatSummary::default() }
+            ReachabilityNotice::Unconfirmed {
+                for_secs,
+                autonat: AutonatSummary::default(),
+            }
         }
 
         fn failing(class: &'static str, unreachable: bool) -> AutonatSummary {
@@ -1153,12 +1236,26 @@ mod tests {
             assert_eq!(unconfirmed_cause(&failing("dial_error", true)), Unreachable);
             assert_eq!(unconfirmed_cause(&failing("timeout", true)), Unreachable);
             for class in ["io", "bad_request", "internal", "unsupported_protocol"] {
-                assert_eq!(unconfirmed_cause(&failing(class, false)), ProbesFailing, "{class}");
+                assert_eq!(
+                    unconfirmed_cause(&failing(class, false)),
+                    ProbesFailing,
+                    "{class}"
+                );
             }
             // A NAT that drops dial-backs gives timeouts: never "a port
             // forward does not help".
-            for class in ["timeout", "dial_error", "connection_closed", "dial_refused", "no_server"] {
-                assert_eq!(unconfirmed_cause(&failing(class, false)), Unsettled, "{class}");
+            for class in [
+                "timeout",
+                "dial_error",
+                "connection_closed",
+                "dial_refused",
+                "no_server",
+            ] {
+                assert_eq!(
+                    unconfirmed_cause(&failing(class, false)),
+                    Unsettled,
+                    "{class}"
+                );
             }
             assert_eq!(unconfirmed_cause(&AutonatSummary::default()), Unsettled);
         }
@@ -1170,11 +1267,20 @@ mod tests {
             let notices = monitor(rx);
             tokio::time::sleep(Duration::from_secs(300)).await;
             let view = failing("timeout", false);
-            tx.send_replace(ConfirmedExternalAddrs { autonat: view.clone(), ..Default::default() });
+            tx.send_replace(ConfirmedExternalAddrs {
+                autonat: view.clone(),
+                ..Default::default()
+            });
             tokio::time::sleep(Duration::from_secs(400)).await;
             assert_eq!(
                 *notices.lock().unwrap(),
-                vec![(600, ReachabilityNotice::Unconfirmed { for_secs: 600, autonat: view })]
+                vec![(
+                    600,
+                    ReachabilityNotice::Unconfirmed {
+                        for_secs: 600,
+                        autonat: view
+                    }
+                )]
             );
         }
 
@@ -1214,10 +1320,7 @@ mod tests {
                 ..Default::default()
             });
             tokio::time::sleep(Duration::from_secs(700)).await;
-            assert_eq!(
-                *notices.lock().unwrap(),
-                vec![(2_660, unconfirmed(600))]
-            );
+            assert_eq!(*notices.lock().unwrap(), vec![(2_660, unconfirmed(600))]);
         }
     }
 
@@ -1244,8 +1347,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gives_up_at_the_cap_when_no_peer_ever_appears() {
         let started = tokio::time::Instant::now();
-        let peers =
-            wait_for_topic_peer_with(Duration::from_secs(5), || async { Ok(0) }).await;
+        let peers = wait_for_topic_peer_with(Duration::from_secs(5), || async { Ok(0) }).await;
 
         assert_eq!(peers, 0);
         assert_eq!(started.elapsed(), Duration::from_secs(5));
@@ -1256,8 +1358,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn does_not_delay_when_peers_are_already_present() {
         let started = tokio::time::Instant::now();
-        let peers =
-            wait_for_topic_peer_with(Duration::from_secs(120), || async { Ok(7) }).await;
+        let peers = wait_for_topic_peer_with(Duration::from_secs(120), || async { Ok(7) }).await;
 
         assert_eq!(peers, 7);
         assert_eq!(started.elapsed(), Duration::ZERO);
@@ -1269,7 +1370,9 @@ mod tests {
     async fn stops_waiting_when_the_swarm_is_gone() {
         let started = tokio::time::Instant::now();
         let peers = wait_for_topic_peer_with(Duration::from_secs(120), || async {
-            Err(quil_types::error::QuilError::P2p("p2p command channel closed".into()))
+            Err(quil_types::error::QuilError::P2p(
+                "p2p command channel closed".into(),
+            ))
         })
         .await;
 
@@ -1280,10 +1383,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn caps_a_stalled_subscriber_query() {
         let started = tokio::time::Instant::now();
-        let peers = wait_for_topic_peer_with(Duration::from_secs(5), || {
-            std::future::pending()
-        })
-        .await;
+        let peers =
+            wait_for_topic_peer_with(Duration::from_secs(5), || std::future::pending()).await;
 
         assert_eq!(peers, 0);
         assert_eq!(started.elapsed(), Duration::from_secs(5));
@@ -1298,5 +1399,4 @@ mod tests {
         assert_eq!(peers, 0);
         assert_eq!(started.elapsed(), max_wait);
     }
-
 }

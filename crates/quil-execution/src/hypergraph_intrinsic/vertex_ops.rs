@@ -58,12 +58,14 @@ pub fn verify_vertex_add_proofs(proofs: &[Vec<u8>]) -> Result<()> {
     for (i, chunk) in proofs.iter().enumerate() {
         let field = confidential::decode(chunk).ok_or_else(|| {
             QuilError::InvalidArgument(format!(
-                "VertexAdd: confidential field {} failed to decode", i
+                "VertexAdd: confidential field {} failed to decode",
+                i
             ))
         })?;
         if !confidential::verify_structural(&field) {
             return Err(QuilError::InvalidArgument(format!(
-                "VertexAdd: confidential field {} is structurally invalid", i
+                "VertexAdd: confidential field {} is structurally invalid",
+                i
             )));
         }
     }
@@ -75,9 +77,7 @@ pub fn verify_vertex_add_proofs(proofs: &[Vec<u8>]) -> Result<()> {
 /// 32-byte commitment as the leaf "statement" so the commitment is bound in
 /// committed state (the reader checks recovered plaintext against it). Malformed
 /// chunks are skipped — `verify_vertex_add_proofs` already gated them at validate.
-pub fn encrypted_to_vertex_tree(
-    proofs: &[Vec<u8>],
-) -> Result<quil_tries::VectorCommitmentTree> {
+pub fn encrypted_to_vertex_tree(proofs: &[Vec<u8>]) -> Result<quil_tries::VectorCommitmentTree> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     for (i, chunk) in proofs.iter().enumerate() {
         let field = match confidential::decode(chunk) {
@@ -86,8 +86,13 @@ pub fn encrypted_to_vertex_tree(
         };
         let value = confidential::encode(&field);
         let key = (i as u64).to_be_bytes();
-        tree.insert(&key, &value, &field.commitment, &BigInt::from(value.len() as i64))
-            .map_err(|e| QuilError::Internal(format!("vertex tree insert: {}", e)))?;
+        tree.insert(
+            &key,
+            &value,
+            &field.commitment,
+            &BigInt::from(value.len() as i64),
+        )
+        .map_err(|e| QuilError::Internal(format!("vertex tree insert: {}", e)))?;
     }
     Ok(tree)
 }
@@ -211,10 +216,7 @@ pub fn vertex_add_signing_message(
 /// message = append(message, h.Domain[:]...)
 /// message = append(message, h.DataAddress[:]...)
 /// ```
-pub fn vertex_remove_signing_message(
-    domain: &[u8],
-    data_address: &[u8],
-) -> Result<Vec<u8>> {
+pub fn vertex_remove_signing_message(domain: &[u8], data_address: &[u8]) -> Result<Vec<u8>> {
     if domain.len() != 32 {
         return Err(QuilError::InvalidArgument(
             "vertex remove signing message: invalid domain length".into(),
@@ -495,8 +497,9 @@ mod tests {
     #[test]
     fn encrypted_to_vertex_tree_keys_are_be_u64_indices() {
         let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
-        let chunks: Vec<Vec<u8>> =
-            (0..3u8).map(|i| sample_confidential_chunk(&kp.public, i, &[i; 16])).collect();
+        let chunks: Vec<Vec<u8>> = (0..3u8)
+            .map(|i| sample_confidential_chunk(&kp.public, i, &[i; 16]))
+            .collect();
         let tree = encrypted_to_vertex_tree(&chunks).unwrap();
         for (i, chunk) in chunks.iter().enumerate() {
             let key = (i as u64).to_be_bytes();
@@ -577,11 +580,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn sample_vertex_add_with_proofs() -> VertexAdd {
-        let proofs: Vec<Vec<u8>> = vec![
-            vec![0x11u8; 16],
-            vec![0x22u8; 32],
-            vec![0x33u8; 8],
-        ];
+        let proofs: Vec<Vec<u8>> = vec![vec![0x11u8; 16], vec![0x22u8; 32], vec![0x33u8; 8]];
         let packed = pack_vertex_add_proof_chunks(&proofs).unwrap();
         VertexAdd {
             domain: vec![0xAAu8; 32],

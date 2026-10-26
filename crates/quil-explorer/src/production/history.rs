@@ -67,7 +67,12 @@ pub fn live_start(head: u64) -> u64 {
 
 /// The lowest row frame `index` records exactly.
 pub fn first_exact_row(index: &ProductionIndex) -> u64 {
-    row_frame_at_or_after(index.first_indexed.unwrap_or(index.start).saturating_add(ROW_LEAD))
+    row_frame_at_or_after(
+        index
+            .first_indexed
+            .unwrap_or(index.start)
+            .saturating_add(ROW_LEAD),
+    )
 }
 
 /// The frame an advance of `index` stops at: `head`, or the next row frame
@@ -144,7 +149,9 @@ pub fn attach_census(row: &mut Row, summary: &Summary, head: u64) {
 /// stepped-over frame could still change should the store gain that frame
 /// or its outcomes later. Only final rows are saved (see [`persist`]).
 pub fn is_final(index: &ProductionIndex, row: &Row) -> bool {
-    index.stepped_over.is_none_or(|n| n.saturating_add(ROW_LEAD) < row.frame)
+    index
+        .stepped_over
+        .is_none_or(|n| n.saturating_add(ROW_LEAD) < row.frame)
 }
 
 /// The lowest row frame held with the live index's first row at
@@ -164,7 +171,11 @@ pub fn row_of(index: &ProductionIndex, view: &IndexView) -> Option<Row> {
     let mut row = Row {
         frame,
         epoch: quil_types::consensus::epoch_for_frame(frame),
-        timestamp_ms: index.window.back().filter(|e| e.frame == frame).and_then(|e| e.timestamp),
+        timestamp_ms: index
+            .window
+            .back()
+            .filter(|e| e.frame == frame)
+            .and_then(|e| e.timestamp),
         window_complete: view.window_complete,
         missing_frames_in_window: view.missing_frames,
         outcome_less_frames_in_window: view.outcome_less_frames,
@@ -295,7 +306,9 @@ impl Rows {
 
     /// The final rows, ascending by frame.
     pub fn final_rows(&self) -> impl Iterator<Item = &Row> {
-        self.rows.values().filter(|row| !self.provisional.contains(&row.frame))
+        self.rows
+            .values()
+            .filter(|row| !self.provisional.contains(&row.frame))
     }
 
     /// The rows held in `lo..=hi`.
@@ -419,12 +432,17 @@ pub struct Query {
     pub bucket: Bucket,
 }
 
-pub fn parse_query(params: &std::collections::HashMap<String, String>) -> Result<Query, &'static str> {
+pub fn parse_query(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<Query, &'static str> {
     let frame = |name: &str, invalid: &'static str| match super::param(params, name) {
         None => Ok(None),
         Some(v) => v.parse::<u64>().map(Some).map_err(|_| invalid),
     };
-    let bucket = match super::param(params, "bucket").map(str::to_lowercase).as_deref() {
+    let bucket = match super::param(params, "bucket")
+        .map(str::to_lowercase)
+        .as_deref()
+    {
         None | Some("row") => Bucket::Row,
         Some("epoch") => Bucket::Epoch,
         Some(_) => return Err("invalid bucket"),
@@ -470,7 +488,11 @@ impl Spread {
     fn of(values: &[u64]) -> Option<Self> {
         let (min, max) = (*values.iter().min()?, *values.iter().max()?);
         let mean = values.iter().sum::<u64>() as f64 / values.len() as f64;
-        Some(Self { min, mean: (mean * 10.0).round() / 10.0, max })
+        Some(Self {
+            min,
+            mean: (mean * 10.0).round() / 10.0,
+            max,
+        })
     }
 }
 
@@ -507,7 +529,11 @@ fn rollup<'a>(rows: impl Iterator<Item = &'a Row>) -> Vec<EpochRollup> {
     epochs
         .into_iter()
         .map(|(epoch, group)| {
-            let complete: Vec<u64> = group.iter().filter(|r| r.window_complete).map(|r| r.producing_shards).collect();
+            let complete: Vec<u64> = group
+                .iter()
+                .filter(|r| r.window_complete)
+                .map(|r| r.producing_shards)
+                .collect();
             let census: Vec<&Census> = group.iter().filter_map(|r| r.census.as_ref()).collect();
             let live: Vec<u64> = census.iter().map(|c| c.live_shards).collect();
             let live_producing: Vec<u64> = census.iter().map(|c| c.classes.producing).collect();
@@ -596,7 +622,12 @@ impl Backfill {
     /// Plan the rows below `first_live_row`. `earliest` is the store's
     /// earliest GLOBAL frame (`None` when it holds none); `retained_from`
     /// the lowest frame whose request bodies it keeps (`None`: all).
-    pub fn new(first_live_row: u64, earliest: Option<u64>, retained_from: Option<u64>, decoders: Decoders) -> Self {
+    pub fn new(
+        first_live_row: u64,
+        earliest: Option<u64>,
+        retained_from: Option<u64>,
+        decoders: Decoders,
+    ) -> Self {
         let depth = depth_floor(first_live_row);
         let (floor_frame, floor) = match earliest {
             None => (first_live_row, Floor::EarliestStoredFrame),
@@ -605,13 +636,22 @@ impl Backfill {
                 let lowest = retained_from.map_or(earliest, |r| r.max(earliest));
                 let stored = row_frame_at_or_after(lowest.saturating_add(ROW_LEAD));
                 if stored > depth {
-                    (stored, if pruned { Floor::RequestRetention } else { Floor::EarliestStoredFrame })
+                    (
+                        stored,
+                        if pruned {
+                            Floor::RequestRetention
+                        } else {
+                            Floor::EarliestStoredFrame
+                        },
+                    )
                 } else {
                     (depth, Floor::HistoryDepth)
                 }
             }
         };
-        let next_hi = first_live_row.checked_sub(ROW_FRAMES).filter(|hi| *hi >= floor_frame);
+        let next_hi = first_live_row
+            .checked_sub(ROW_FRAMES)
+            .filter(|hi| *hi >= floor_frame);
         Self {
             decoders,
             floor_frame,
@@ -639,7 +679,11 @@ impl Backfill {
     }
 
     pub fn state(&self) -> BackfillState {
-        BackfillState { complete: self.done, floor_frame: Some(self.floor_frame), floor: Some(self.floor) }
+        BackfillState {
+            complete: self.done,
+            floor_frame: Some(self.floor_frame),
+            floor: Some(self.floor),
+        }
     }
 
     /// Index at most `budget` frames, publishing each segment's rows to
@@ -666,7 +710,9 @@ impl Backfill {
                     continue;
                 };
                 let lo = run_lo.max(hi.saturating_sub((SEGMENT_ROWS - 1) * ROW_FRAMES));
-                self.next_hi = lo.checked_sub(ROW_FRAMES).filter(|n| *n >= self.floor_frame);
+                self.next_hi = lo
+                    .checked_sub(ROW_FRAMES)
+                    .filter(|n| *n >= self.floor_frame);
                 self.job = Some(Job {
                     lo,
                     hi,
@@ -680,7 +726,9 @@ impl Backfill {
             }
             let job = self.job.as_mut().expect("a job");
             let target = advance_target(&job.index, job.hi);
-            let advance = job.index.advance(source, target, budget - out.indexed, materialized);
+            let advance = job
+                .index
+                .advance(source, target, budget - out.indexed, materialized);
             out.indexed += advance.indexed;
             job.frames += advance.indexed;
             job.missing += advance.missing.len() as u64;

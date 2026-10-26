@@ -25,8 +25,8 @@
 
 use super::canonical::AggregateSignature;
 use super::types::{
-    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy,
-    HypergraphUpdate, VertexAdd, VertexRemove,
+    HyperedgeAdd, HyperedgeRemove, HypergraphConfiguration, HypergraphDeploy, HypergraphUpdate,
+    VertexAdd, VertexRemove,
 };
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::{hypergraph as pb, keys as keys_pb};
@@ -38,9 +38,7 @@ use quil_types::proto::{hypergraph as pb, keys as keys_pb};
 impl HypergraphConfiguration {
     /// Convert from prost proto. Returns `None` if `pb` is `None`,
     /// matching the Go `HypergraphConfigurationFromProtobuf` nil behaviour.
-    pub fn from_proto(
-        pb: Option<&pb::HypergraphConfiguration>,
-    ) -> Option<Self> {
+    pub fn from_proto(pb: Option<&pb::HypergraphConfiguration>) -> Option<Self> {
         pb.map(|p| Self {
             read_public_key: p.read_public_key.clone(),
             write_public_key: p.write_public_key.clone(),
@@ -161,16 +159,15 @@ pub fn aggregate_sig_from_proto(
 }
 
 /// Convert an in-crate [`AggregateSignature`] back to the prost shape.
-pub fn aggregate_sig_to_proto(
-    sig: &AggregateSignature,
-) -> keys_pb::Bls48581AggregateSignature {
+pub fn aggregate_sig_to_proto(sig: &AggregateSignature) -> keys_pb::Bls48581AggregateSignature {
     keys_pb::Bls48581AggregateSignature {
         signature: sig.signature.clone(),
-        public_key: sig.public_key.as_ref().map(|pk| {
-            keys_pb::Bls48581g2PublicKey {
+        public_key: sig
+            .public_key
+            .as_ref()
+            .map(|pk| keys_pb::Bls48581g2PublicKey {
                 key_value: pk.key_value.clone(),
-            }
-        }),
+            }),
         bitmask: sig.bitmask.clone(),
     }
 }
@@ -386,8 +383,8 @@ impl HyperedgeRemove {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::canonical::Bls48581G2PublicKey;
+    use super::*;
 
     // -----------------------------------------------------------------
     // HypergraphConfiguration proto round-trip

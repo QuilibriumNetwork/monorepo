@@ -63,7 +63,10 @@ impl ClientConfig {
 
 /// `~/.quilibrium/qclient-config.yaml` (`client/utils/client.go`).
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    Ok(system::user_quilibrium_dir()?.join(format!("{}-config.yaml", system::RELEASE_TYPE_QCLIENT)))
+    Ok(
+        system::user_quilibrium_dir()?
+            .join(format!("{}-config.yaml", system::RELEASE_TYPE_QCLIENT)),
+    )
 }
 
 /// `~/.quilibrium` (`GetConfigDir`).

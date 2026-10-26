@@ -97,7 +97,11 @@ impl HistoryFile {
 
     /// The file's contents for `rows`, ascending by frame.
     pub fn encode(&self, rows: &[&Row]) -> std::io::Result<Vec<u8>> {
-        let saved = Saved { format: FORMAT, params: Params::current(self.network), rows: rows.to_vec() };
+        let saved = Saved {
+            format: FORMAT,
+            params: Params::current(self.network),
+            rows: rows.to_vec(),
+        };
         serde_json::to_vec(&saved).map_err(std::io::Error::other)
     }
 
@@ -143,7 +147,10 @@ impl HistoryFile {
         };
         let current = Params::current(self.network);
         if saved.params != current {
-            return Loaded::Outdated(format!("computed with {:?}, this node computes {current:?}", saved.params));
+            return Loaded::Outdated(format!(
+                "computed with {:?}, this node computes {current:?}",
+                saved.params
+            ));
         }
         let ordered = saved.rows.iter().all(|r| r.frame % ROW_FRAMES == 0)
             && saved.rows.windows(2).all(|w| w[0].frame < w[1].frame);
@@ -153,10 +160,20 @@ impl HistoryFile {
                 saved.rows.len()
             ));
         }
-        let Some(newest) = saved.rows.last() else { return Loaded::Rows(Vec::new()) };
+        let Some(newest) = saved.rows.last() else {
+            return Loaded::Rows(Vec::new());
+        };
         let stored = match source.frame(newest.frame) {
-            Ok(frame) => frame.and_then(|f| f.header).filter(|h| h.frame_number == newest.frame).map(|h| h.timestamp),
-            Err(e) => return Loaded::Invalid(format!("cannot read GLOBAL frame {} to check it: {e}", newest.frame)),
+            Ok(frame) => frame
+                .and_then(|f| f.header)
+                .filter(|h| h.frame_number == newest.frame)
+                .map(|h| h.timestamp),
+            Err(e) => {
+                return Loaded::Invalid(format!(
+                    "cannot read GLOBAL frame {} to check it: {e}",
+                    newest.frame
+                ))
+            }
         };
         match stored {
             None => Loaded::Invalid(format!("the store lacks GLOBAL frame {}, its newest row's", newest.frame)),
@@ -216,7 +233,9 @@ impl Saver {
     /// Save when a final row was recorded since the last save, at most once
     /// per [`SAVE_INTERVAL`].
     pub fn save_due(&mut self, file: &HistoryFile, rows: &RwLock<Rows>, now: Instant) {
-        let recent = self.last.is_some_and(|at| now.saturating_duration_since(at) < SAVE_INTERVAL);
+        let recent = self
+            .last
+            .is_some_and(|at| now.saturating_duration_since(at) < SAVE_INTERVAL);
         if recent || !rows.read().unsaved {
             return;
         }
@@ -235,7 +254,11 @@ impl Saver {
         let (body, count, last_row) = {
             let held = rows.read();
             let saved: Vec<&Row> = held.final_rows().collect();
-            (file.encode(&saved), saved.len(), saved.last().map(|r| r.frame))
+            (
+                file.encode(&saved),
+                saved.len(),
+                saved.last().map(|r| r.frame),
+            )
         };
         match body.and_then(|body| file.write(&body).map(|()| body.len())) {
             Ok(bytes) => {
@@ -277,7 +300,10 @@ pub(crate) struct TempPath(pub PathBuf);
 #[cfg(test)]
 impl TempPath {
     pub fn new(tag: &str) -> Self {
-        Self(std::env::temp_dir().join(format!("quil-explorer-history-{}-{tag}.json", std::process::id())))
+        Self(std::env::temp_dir().join(format!(
+            "quil-explorer-history-{}-{tag}.json",
+            std::process::id()
+        )))
     }
 
     pub fn file(&self) -> HistoryFile {

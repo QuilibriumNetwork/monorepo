@@ -57,11 +57,15 @@ pub(crate) fn describe_request(request: &[u8]) -> (&'static str, String) {
     match worker_submission(request) {
         Some(WorkerSubmission::FrameHeader) => (
             "reward_proof",
-            FrameHeader::from_canonical_bytes(request).map(|h| hex::encode(h.address)).unwrap_or_default(),
+            FrameHeader::from_canonical_bytes(request)
+                .map(|h| hex::encode(h.address))
+                .unwrap_or_default(),
         ),
         Some(WorkerSubmission::PresenceReport) => (
             "presence_report",
-            PresenceReport::from_canonical_bytes(request).map(|r| hex::encode(r.filter)).unwrap_or_default(),
+            PresenceReport::from_canonical_bytes(request)
+                .map(|r| hex::encode(r.filter))
+                .unwrap_or_default(),
         ),
         Some(kind) => (kind.name(), String::new()),
         None => ("other", String::new()),
@@ -88,7 +92,12 @@ pub(crate) fn track_worker_request(request: &[u8], frame: Option<u64>) -> bool {
         let last = UNTRACKED_WARNED.load(std::sync::atomic::Ordering::Relaxed);
         if now >= last.saturating_add(UNTRACKED_WARN_SECS)
             && UNTRACKED_WARNED
-                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
                 .is_ok()
         {
             let (kind, filter) = describe_request(request);
@@ -145,9 +154,12 @@ pub(crate) fn prover_bundle(request: Vec<u8>) -> Result<Vec<u8>, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    CanonicalMessageBundle { requests: vec![Some(request)], timestamp }
-        .to_canonical_bytes()
-        .map_err(|e| e.to_string())
+    CanonicalMessageBundle {
+        requests: vec![Some(request)],
+        timestamp,
+    }
+    .to_canonical_bytes()
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -156,31 +168,64 @@ mod tests {
 
     #[test]
     fn only_frame_headers_handoff_submissions_and_presence_reports_are_worker_submissions() {
-        let header = FrameHeader { address: vec![7; 32], frame_number: 9, ..Default::default() }
-            .to_canonical_bytes()
-            .unwrap();
-        assert_eq!(worker_submission(&header), Some(WorkerSubmission::FrameHeader));
+        let header = FrameHeader {
+            address: vec![7; 32],
+            frame_number: 9,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        assert_eq!(
+            worker_submission(&header),
+            Some(WorkerSubmission::FrameHeader)
+        );
         let mut handoff = TYPE_COMMITTEE_HANDOFF.to_be_bytes().to_vec();
         handoff.extend_from_slice(b"seal");
-        assert_eq!(worker_submission(&handoff), Some(WorkerSubmission::CommitteeHandoff));
+        assert_eq!(
+            worker_submission(&handoff),
+            Some(WorkerSubmission::CommitteeHandoff)
+        );
         let mut presence = TYPE_PRESENCE_REPORT.to_be_bytes().to_vec();
         presence.extend_from_slice(b"report");
-        assert_eq!(worker_submission(&presence), Some(WorkerSubmission::PresenceReport));
-        assert!(WorkerSubmission::PresenceReport.tracked(), "its inclusion is logged for a standalone worker too");
+        assert_eq!(
+            worker_submission(&presence),
+            Some(WorkerSubmission::PresenceReport)
+        );
+        assert!(
+            WorkerSubmission::PresenceReport.tracked(),
+            "its inclusion is logged for a standalone worker too"
+        );
         // Reports are relayed only while the presence report frame is set.
-        quil_execution::global_intrinsic::handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        quil_execution::global_intrinsic::handoff::set_presence_report_frame_for_thread(Some(
+            u64::MAX,
+        ));
         assert!(!WorkerSubmission::PresenceReport.active());
-        assert!(WorkerSubmission::FrameHeader.active() && WorkerSubmission::CommitteeHandoff.active());
+        assert!(
+            WorkerSubmission::FrameHeader.active() && WorkerSubmission::CommitteeHandoff.active()
+        );
         quil_execution::global_intrinsic::handoff::set_presence_report_frame_for_thread(Some(0));
         assert!(WorkerSubmission::PresenceReport.active());
-        quil_execution::global_intrinsic::handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
-        assert!(!WorkerSubmission::FrameHeader.tracked() && !WorkerSubmission::CommitteeHandoff.tracked());
-        let mut join = quil_execution::global_intrinsic::TYPE_PROVER_JOIN.to_be_bytes().to_vec();
+        quil_execution::global_intrinsic::handoff::set_presence_report_frame_for_thread(Some(
+            u64::MAX,
+        ));
+        assert!(
+            !WorkerSubmission::FrameHeader.tracked()
+                && !WorkerSubmission::CommitteeHandoff.tracked()
+        );
+        let mut join = quil_execution::global_intrinsic::TYPE_PROVER_JOIN
+            .to_be_bytes()
+            .to_vec();
         join.extend_from_slice(b"join");
-        assert_eq!(worker_submission(&join), None, "a worker submits no lifecycle ops");
+        assert_eq!(
+            worker_submission(&join),
+            None,
+            "a worker submits no lifecycle ops"
+        );
         assert_eq!(worker_submission(&[0x03]), None);
 
-        let bundle = CanonicalMessageBundle::from_canonical_bytes(&prover_bundle(header.clone()).unwrap()).unwrap();
+        let bundle =
+            CanonicalMessageBundle::from_canonical_bytes(&prover_bundle(header.clone()).unwrap())
+                .unwrap();
         let requests: Vec<_> = bundle.requests.into_iter().flatten().collect();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].inner_type_prefix, TYPE_FRAME_HEADER);

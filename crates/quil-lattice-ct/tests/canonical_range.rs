@@ -13,10 +13,15 @@ fn residual(value: &[u8; BITS], complement: &[u8; BITS]) -> Option<i128> {
     if value.iter().chain(complement).any(|&bit| bit > 1) {
         return None;
     }
-    Some(value.iter().zip(complement).enumerate().fold(
-        -i128::from(Poly::Q - 1),
-        |sum, (bit, (&a, &b))| sum + ((i128::from(a) + i128::from(b)) << bit),
-    ))
+    Some(
+        value
+            .iter()
+            .zip(complement)
+            .enumerate()
+            .fold(-i128::from(Poly::Q - 1), |sum, (bit, (&a, &b))| {
+                sum + ((i128::from(a) + i128::from(b)) << bit)
+            }),
+    )
 }
 
 fn accepts(value: &[u8; BITS], complement: &[u8; BITS]) -> bool {

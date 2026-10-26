@@ -316,7 +316,8 @@ impl ClockStore for OverlayClockStore {
         self.read()?.global(number)
     }
     fn get_global_clock_frame_header(&self, number: u64) -> Result<g::GlobalFrameHeader> {
-        let header: g::GlobalFrameHeader = self.read()?.message(&e::clock_global_frame_key(number))?;
+        let header: g::GlobalFrameHeader =
+            self.read()?.message(&e::clock_global_frame_key(number))?;
         if header.frame_number != number {
             return Err(malformed("clock frame number mismatch"));
         }

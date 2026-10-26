@@ -149,7 +149,14 @@ pub fn partition_leaves<F: Fn(&[u32]) -> u64>(
         }
     }
     let mut out = Vec::new();
-    rec(base.to_vec(), leaf_max_bytes, branch_factor, max_depth, size_of, &mut out);
+    rec(
+        base.to_vec(),
+        leaf_max_bytes,
+        branch_factor,
+        max_depth,
+        size_of,
+        &mut out,
+    );
     out
 }
 
@@ -187,7 +194,12 @@ pub fn compute_confirm_leaf_roots<F: Fn(&[u32]) -> Vec<u8>>(
         let leaf_id = leaf_id_bytes(filter, prefix);
         let data = leaf_data_for(prefix);
         let (replica, leaf) = quil_crypto::sdr::build_leaf_replica(
-            &data, member, &leaf_id, epoch, block_poly_size, params,
+            &data,
+            member,
+            &leaf_id,
+            epoch,
+            block_poly_size,
+            params,
         );
         entries.push(LeafRootEntry {
             prefix: prefix.clone(),
@@ -196,7 +208,13 @@ pub fn compute_confirm_leaf_roots<F: Fn(&[u32]) -> Vec<u8>>(
         });
         replicas.push((prefix.clone(), replica));
     }
-    (ConfirmLeafRoots { filter: filter.to_vec(), entries }, replicas)
+    (
+        ConfirmLeafRoots {
+            filter: filter.to_vec(),
+            entries,
+        },
+        replicas,
+    )
 }
 
 /// Real `leaf_data_for` oracle: the canonical, member-INDEPENDENT byte string
@@ -252,7 +270,9 @@ pub fn leaf_data_at(
         out.extend_from_slice(&p.to_be_bytes());
     }
     let full_path = build_app_shard_full_prefix(&shard_key.l2, relative_prefix);
-    out.extend_from_slice(&HypergraphCrdt::serialize_phase_subtrees_at(snapshot, shard_key, &full_path)?);
+    out.extend_from_slice(&HypergraphCrdt::serialize_phase_subtrees_at(
+        snapshot, shard_key, &full_path,
+    )?);
     Ok(out)
 }
 
@@ -268,34 +288,51 @@ pub fn sync_app_shard_to_own_crdt(
     frame_number: u64,
 ) -> quil_types::error::Result<usize> {
     use quil_types::error::QuilError;
-    let app: [u8; 32] = filter.get(..32).and_then(|a| a.try_into().ok())
-        .ok_or_else(|| QuilError::InvalidArgument("seed filter lacks an application address".into()))?;
+    let app: [u8; 32] = filter
+        .get(..32)
+        .and_then(|a| a.try_into().ok())
+        .ok_or_else(|| {
+            QuilError::InvalidArgument("seed filter lacks an application address".into())
+        })?;
     let bits = if own.unified_tree() {
-        let bits = own.canonical_bits_for_filter(filter)
+        let bits = own
+            .canonical_bits_for_filter(filter)
             .filter(|bits| bits.len() <= 256 && (filter.len() != 33 || filter[32] < 64))
             .ok_or_else(|| QuilError::InvalidArgument("invalid unified seed filter".into()))?;
         Some(bits)
-    } else { None };
+    } else {
+        None
+    };
     if std::ptr::eq(source, own) {
         return Ok(0);
     }
-    let matches = |key: &[u8]| key.len() == 64 && bits.as_ref().is_none_or(|bits| {
-        key[..32] == app && bits.iter().enumerate().all(|(i, bit)| {
-            (key[32 + i / 8] >> (7 - i % 8) & 1 != 0) == *bit
-        })
-    });
+    let matches = |key: &[u8]| {
+        key.len() == 64
+            && bits.as_ref().is_none_or(|bits| {
+                key[..32] == app
+                    && bits
+                        .iter()
+                        .enumerate()
+                        .all(|(i, bit)| (key[32 + i / 8] >> (7 - i % 8) & 1 != 0) == *bit)
+            })
+    };
     let mut copied = 0usize;
     let mut failure = None;
     source.for_each_vertex_adds_blob_matching(&app, &matches, &mut |key, blob| {
-        if blob.is_empty() || failure.is_some() { return; }
+        if blob.is_empty() || failure.is_some() {
+            return;
+        }
         let mut id = [0u8; 64];
         id.copy_from_slice(&key);
         let loc = quil_hypergraph::addressing::Location::from_id(&id);
         if bits.is_some() {
             match own.get_vertex_data_checked(&loc) {
                 Ok(Some(existing)) if existing == blob => return,
-                Ok(_) => {},
-                Err(error) => { failure = Some(error); return; }
+                Ok(_) => {}
+                Err(error) => {
+                    failure = Some(error);
+                    return;
+                }
             }
         }
         match own.add_vertex(&loc, &blob) {
@@ -303,8 +340,12 @@ pub fn sync_app_shard_to_own_crdt(
             Err(error) => failure = Some(error),
         }
     })?;
-    if let Some(error) = failure { return Err(error); }
-    if copied > 0 { own.commit(frame_number)?; }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if copied > 0 {
+        own.commit(frame_number)?;
+    }
     Ok(copied)
 }
 
@@ -350,9 +391,14 @@ pub(crate) fn has_committed_shard_data(crdt: &HypergraphCrdt, filter: &[u8]) -> 
         // A sync can install a complete subtree without populating write-time
         // size buckets. Decode the wire bit length and packed path before
         // reading the committed forest.
-        return [("vertex", "adds"), ("vertex", "removes"),
-                ("hyperedge", "adds"), ("hyperedge", "removes")].iter()
-            .any(|(set, phase)| crdt.unified_subtree_leaf_count(set, phase, &filter[..32], &bits) > 0);
+        return [
+            ("vertex", "adds"),
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ]
+        .iter()
+        .any(|(set, phase)| crdt.unified_subtree_leaf_count(set, phase, &filter[..32], &bits) > 0);
     }
     let (app, sub_prefix) = split_coverage_filter(filter);
     let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3).to_vec();
@@ -435,13 +481,24 @@ pub fn compute_storage_confirm(
     block_poly_size: u64,
     params: &quil_crypto::sdr::SdrParams,
     frame_number: u64,
-    snapshots: &[(Vec<u8>, Vec<quil_execution::global_intrinsic::storage_snapshot::Source>)],
+    snapshots: &[(
+        Vec<u8>,
+        Vec<quil_execution::global_intrinsic::storage_snapshot::Source>,
+    )],
 ) -> quil_types::error::Result<
     Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
 > {
     use quil_execution::global_intrinsic::leaf_id_bytes;
     if quil_types::consensus::hash_storage_proofs_at(epoch) {
-        return snapshot_storage_confirm(crdt, replica_store, filters, member, epoch, frame_number, snapshots);
+        return snapshot_storage_confirm(
+            crdt,
+            replica_store,
+            filters,
+            member,
+            epoch,
+            frame_number,
+            snapshots,
+        );
     }
     let mut all = Vec::with_capacity(filters.len());
     for filter in filters {
@@ -480,7 +537,13 @@ pub fn compute_storage_confirm(
         let oracle = |p: &[u32]| -> Vec<u8> { data_map.get(p).cloned().unwrap_or_default() };
 
         let (groups, replicas) = compute_confirm_leaf_roots(
-            filter, member, epoch, &prefixes, block_poly_size, params, &oracle,
+            filter,
+            member,
+            epoch,
+            &prefixes,
+            block_poly_size,
+            params,
+            &oracle,
         );
         for (prefix, replica) in &replicas {
             let lid = leaf_id_bytes(filter, prefix);
@@ -512,12 +575,17 @@ fn snapshot_storage_confirm(
     member: &[u8],
     epoch: u64,
     frame_number: u64,
-    snapshots: &[(Vec<u8>, Vec<quil_execution::global_intrinsic::storage_snapshot::Source>)],
+    snapshots: &[(
+        Vec<u8>,
+        Vec<quil_execution::global_intrinsic::storage_snapshot::Source>,
+    )],
 ) -> quil_types::error::Result<
     Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
 > {
     use quil_execution::global_intrinsic::leaf_id_bytes;
-    use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+    use quil_execution::global_intrinsic::leaf_root_registration::{
+        ConfirmLeafRoots, LeafRootEntry,
+    };
     let unavailable = |what: String| quil_types::error::QuilError::ExecutionUnavailable(what);
     let mut all = Vec::with_capacity(filters.len());
     for (index, filter) in filters.iter().enumerate() {
@@ -525,35 +593,59 @@ fn snapshot_storage_confirm(
             // The bound shard (first) waits for its snapshot; a shard a
             // recorded change creates from it waits only while its sources are
             // known, rather than hold the renewal up for one never recorded.
-            let sources = snapshots.iter().find(|(shard, _)| shard == filter).map(|(_, sources)| sources);
+            let sources = snapshots
+                .iter()
+                .find(|(shard, _)| shard == filter)
+                .map(|(_, sources)| sources);
             if let Some(sources) = sources {
                 crate::storage_snapshot::request_member(
-                    crdt.clone(), replica_store.clone(), member.to_vec(), filter.clone(), epoch, sources.clone(),
+                    crdt.clone(),
+                    replica_store.clone(),
+                    member.to_vec(),
+                    filter.clone(),
+                    epoch,
+                    sources.clone(),
                 );
             }
             if (index == 0 || sources.is_some())
-                && frame_number < quil_types::consensus::storage_snapshot_frame(epoch) + storage_snapshot_grace()
+                && frame_number
+                    < quil_types::consensus::storage_snapshot_frame(epoch)
+                        + storage_snapshot_grace()
             {
                 return Err(unavailable(format!(
-                    "leaf snapshot of {} for epoch {epoch} not encoded yet", hex::encode(filter)
+                    "leaf snapshot of {} for epoch {epoch} not encoded yet",
+                    hex::encode(filter)
                 )));
             }
             tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
                 "no leaf snapshot for the epoch: renewing without a storage registration; this seat's frames carry \
                  no storage attestation that epoch");
-            all.push(ConfirmLeafRoots { filter: filter.clone(), entries: Vec::new() });
+            all.push(ConfirmLeafRoots {
+                filter: filter.clone(),
+                entries: Vec::new(),
+            });
             continue;
         };
         let mut entries = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
             let lid = leaf_id_bytes(filter, &prefix);
-            let stored = replica_store.get_hash(epoch, &lid)?.ok_or_else(|| unavailable(format!(
-                "leaf {} of the epoch {epoch} snapshot has no replica", hex::encode(&lid)
-            )))?;
+            let stored = replica_store.get_hash(epoch, &lid)?.ok_or_else(|| {
+                unavailable(format!(
+                    "leaf {} of the epoch {epoch} snapshot has no replica",
+                    hex::encode(&lid)
+                ))
+            })?;
             let nodes = (stored.replica.len() / quil_crypto::storage_proof::NODE_BYTES) as u64;
-            entries.push(LeafRootEntry { prefix, leaf_root: stored.registration_root, num_blocks: nodes });
+            entries.push(LeafRootEntry {
+                prefix,
+                leaf_root: stored.registration_root,
+                num_blocks: nodes,
+            });
         }
-        all.push(ConfirmLeafRoots { filter: filter.clone(), entries });
+        all.push(ConfirmLeafRoots {
+            filter: filter.clone(),
+            entries,
+        });
     }
     Ok(all)
 }
@@ -588,11 +680,23 @@ pub fn build_member_frame_openings(
         for prefix in prefixes {
             let lid = leaf_id_bytes(filter, prefix);
             if hash {
-                let Some(stored) = replica_store.get_hash(epoch, &lid)? else { continue };
-                let Some(cap) = quil_crypto::storage_proof::MerkleCap::from_bytes(&stored.cap) else { continue };
+                let Some(stored) = replica_store.get_hash(epoch, &lid)? else {
+                    continue;
+                };
+                let Some(cap) = quil_crypto::storage_proof::MerkleCap::from_bytes(&stored.cap)
+                else {
+                    continue;
+                };
                 openings.extend((0..queries).filter_map(|q| {
                     quil_crypto::storage_proof::build_opening(
-                        &stored.replica, &cap, &stored.registration_root, &lid, epoch, member, q, rho_n,
+                        &stored.replica,
+                        &cap,
+                        &stored.registration_root,
+                        &lid,
+                        epoch,
+                        member,
+                        q,
+                        rho_n,
                     )
                 }));
                 continue;
@@ -636,7 +740,9 @@ pub fn build_vote_openings(
     // is ever attested (breaks storage rewards for every split app).
     let prefixes = if quil_types::consensus::hash_storage_proofs_at(epoch) {
         // The leaves registered are the snapshot's, not the live data's.
-        replica_store.get_partition(epoch, filter)?.unwrap_or_default()
+        replica_store
+            .get_partition(epoch, filter)?
+            .unwrap_or_default()
     } else {
         let (app, sub_prefix) = split_coverage_filter(filter);
         let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
@@ -662,7 +768,10 @@ pub fn build_vote_openings(
         return Ok(Vec::new());
     }
     let att = quil_types::proto::global::StorageAttestation {
-        openings: openings.iter().map(quil_crypto::porep::StorageOpening::to_proto).collect(),
+        openings: openings
+            .iter()
+            .map(quil_crypto::porep::StorageOpening::to_proto)
+            .collect(),
     };
     Ok(prost::Message::encode_to_vec(&att))
 }
@@ -714,8 +823,11 @@ pub fn partition_shard_leaves(
         // no replicas and attested nothing (every child frame after a split
         // paid 0). The forest's Merkle-sum index sees the data regardless.
         let app: Option<[u8; 32]> = shard_key.get(3..35).and_then(|a| a.try_into().ok());
-        let Some(bits) = quil_forest::shard_bit_path_from_prefix(prefix) else { return 0 };
-        app.and_then(|app| crdt.unified_live_size_at_bits(&app, &bits)).unwrap_or(0)
+        let Some(bits) = quil_forest::shard_bit_path_from_prefix(prefix) else {
+            return 0;
+        };
+        app.and_then(|app| crdt.unified_live_size_at_bits(&app, &bits))
+            .unwrap_or(0)
     };
     let leaves = partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of);
     // DIAGNOSTIC: the committed size THIS crdt reports for the shard subtree.
@@ -739,8 +851,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use quil_hypergraph::Location;
     use quil_hypergraph::testing::{MemStore, StubProver};
+    use quil_hypergraph::Location;
     use quil_types::crypto::InclusionProver;
     use quil_types::store::HypergraphStore;
 
@@ -754,7 +866,10 @@ mod tests {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE.to_vec(),
+        ));
         crdt.set_unified_tree(unified);
         (db, crdt)
     }
@@ -767,19 +882,34 @@ mod tests {
         let (_db, crdt) = seed_test_crdt(true);
         let app = [0x5Bu8; 32];
         let filter = app.to_vec();
-        let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        let mut shard_key =
+            quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
         shard_key.extend_from_slice(&app);
         let typed = shard_key_from_bytes(&shard_key).unwrap();
-        let addresses: Vec<[u8; 32]> = [0x00u8, 0x13, 0x80, 0x81, 0xF7].iter().map(|&b| {
-            let mut a = [b; 32];
-            a[31] = b.wrapping_add(1);
-            a
-        }).collect();
+        let addresses: Vec<[u8; 32]> = [0x00u8, 0x13, 0x80, 0x81, 0xF7]
+            .iter()
+            .map(|&b| {
+                let mut a = [b; 32];
+                a[31] = b.wrapping_add(1);
+                a
+            })
+            .collect();
         for (i, address) in addresses.iter().enumerate() {
-            crdt.add_vertex(&Location { app_address: app, data_address: *address }, &vec![i as u8 + 1; 300]).unwrap();
+            crdt.add_vertex(
+                &Location {
+                    app_address: app,
+                    data_address: *address,
+                },
+                &vec![i as u8 + 1; 300],
+            )
+            .unwrap();
         }
         crdt.commit(1).unwrap();
-        crdt.remove_vertex(&Location { app_address: app, data_address: addresses[2] }).unwrap();
+        crdt.remove_vertex(&Location {
+            app_address: app,
+            data_address: addresses[2],
+        })
+        .unwrap();
         crdt.commit(2).unwrap();
         let snapshot = crdt.capture_committed_snapshot().unwrap();
         // The whole shard, and the sub-prefixes of each address's first six bits.
@@ -797,14 +927,36 @@ mod tests {
             };
             prefixes.push(vec![nibble(app_path_len)]);
         }
-        let live: Vec<Vec<u8>> = prefixes.iter().map(|p| leaf_data_for(&crdt, &filter, &typed, p).unwrap()).collect();
+        let live: Vec<Vec<u8>> = prefixes
+            .iter()
+            .map(|p| leaf_data_for(&crdt, &filter, &typed, p).unwrap())
+            .collect();
         for (prefix, expected) in prefixes.iter().zip(&live) {
-            assert_eq!(&leaf_data_at(snapshot.as_ref(), &filter, &typed, prefix).unwrap(), expected, "prefix {prefix:?}");
+            assert_eq!(
+                &leaf_data_at(snapshot.as_ref(), &filter, &typed, prefix).unwrap(),
+                expected,
+                "prefix {prefix:?}"
+            );
         }
-        crdt.add_vertex(&Location { app_address: app, data_address: [0x13; 32] }, &vec![0xEE; 64]).unwrap();
+        crdt.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: [0x13; 32],
+            },
+            &vec![0xEE; 64],
+        )
+        .unwrap();
         crdt.commit(3).unwrap();
-        assert_ne!(leaf_data_for(&crdt, &filter, &typed, &[]).unwrap(), live[0], "the live state moved on");
-        assert_eq!(leaf_data_at(snapshot.as_ref(), &filter, &typed, &[]).unwrap(), live[0], "the snapshot did not");
+        assert_ne!(
+            leaf_data_for(&crdt, &filter, &typed, &[]).unwrap(),
+            live[0],
+            "the live state moved on"
+        );
+        assert_eq!(
+            leaf_data_at(snapshot.as_ref(), &filter, &typed, &[]).unwrap(),
+            live[0],
+            "the snapshot did not"
+        );
     }
 
     #[test]
@@ -814,33 +966,73 @@ mod tests {
         let app = [0x71; 32];
         let bits = vec![true, false, true, true, false, true, false, true, true];
         let filter = quil_forest::encode_shard_bit_path(&app, &bits);
-        let mut address = [0; 32]; address[0] = 0xb5; address[1] = 0x80;
-        let covered = Location { app_address: app, data_address: address };
+        let mut address = [0; 32];
+        address[0] = 0xb5;
+        address[1] = 0x80;
+        let covered = Location {
+            app_address: app,
+            data_address: address,
+        };
         address[1] = 0;
-        let sibling = Location { app_address: app, data_address: address };
-        let distant = Location { app_address: app, data_address: [0; 32] };
-        for (location, value) in [(&covered, b"covered".as_slice()), (&sibling, b"sibling"), (&distant, b"distant")] {
+        let sibling = Location {
+            app_address: app,
+            data_address: address,
+        };
+        let distant = Location {
+            app_address: app,
+            data_address: [0; 32],
+        };
+        for (location, value) in [
+            (&covered, b"covered".as_slice()),
+            (&sibling, b"sibling"),
+            (&distant, b"distant"),
+        ] {
             source.add_vertex(location, value).unwrap();
         }
         source.commit(1).unwrap();
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 2).unwrap(), 1,
-            "worker must not copy unrelated sub-shards of its application");
-        assert_eq!(own.get_vertex_data_checked(&covered).unwrap(), Some(b"covered".to_vec()));
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &own, &filter, 2).unwrap(),
+            1,
+            "worker must not copy unrelated sub-shards of its application"
+        );
+        assert_eq!(
+            own.get_vertex_data_checked(&covered).unwrap(),
+            Some(b"covered".to_vec())
+        );
         assert_eq!(own.get_vertex_data_checked(&sibling).unwrap(), None);
         assert_eq!(own.get_vertex_data_checked(&distant).unwrap(), None);
         let shard = quil_hypergraph::shard_key_for_location(&covered);
         let path = build_app_shard_full_prefix(&app, &quil_forest::bit_path_to_prefix(&bits));
-        let roots = |crdt: &HypergraphCrdt| crdt.phase_set_metadata_at_path(&shard, &path).unwrap()
-            .map(|m| m.map(|m| m.commitment));
-        assert_eq!(roots(&source), roots(&own), "covered commitments are unchanged by omitted siblings");
+        let roots = |crdt: &HypergraphCrdt| {
+            crdt.phase_set_metadata_at_path(&shard, &path)
+                .unwrap()
+                .map(|m| m.map(|m| m.commitment))
+        };
+        assert_eq!(
+            roots(&source),
+            roots(&own),
+            "covered commitments are unchanged by omitted siblings"
+        );
         let sequence = db.inner().latest_sequence_number();
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 3).unwrap(), 0);
-        assert_eq!(db.inner().latest_sequence_number(), sequence,
-            "an unchanged retry must not create blob/tree history");
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &own, &filter, 3).unwrap(),
+            0
+        );
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            sequence,
+            "an unchanged retry must not create blob/tree history"
+        );
         source.add_vertex(&covered, b"updated").unwrap();
         source.commit(4).unwrap();
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 5).unwrap(), 1);
-        assert_eq!(own.get_vertex_data_checked(&covered).unwrap(), Some(b"updated".to_vec()));
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &own, &filter, 5).unwrap(),
+            1
+        );
+        assert_eq!(
+            own.get_vertex_data_checked(&covered).unwrap(),
+            Some(b"updated".to_vec())
+        );
         assert_eq!(roots(&source), roots(&own));
     }
 
@@ -848,25 +1040,48 @@ mod tests {
     fn worker_seed_preserves_root_and_legacy_scope_and_rejects_invalid_unified_filters() {
         let (_, source) = seed_test_crdt(true);
         let app = [0x71; 32];
-        let a = Location { app_address: app, data_address: [0; 32] };
-        let b = Location { app_address: app, data_address: [0xff; 32] };
-        source.add_vertex(&a, b"a").unwrap(); source.add_vertex(&b, b"b").unwrap();
+        let a = Location {
+            app_address: app,
+            data_address: [0; 32],
+        };
+        let b = Location {
+            app_address: app,
+            data_address: [0xff; 32],
+        };
+        source.add_vertex(&a, b"a").unwrap();
+        source.add_vertex(&b, b"b").unwrap();
         source.commit(1).unwrap();
         let (_, root) = seed_test_crdt(true);
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &root, &app, 2).unwrap(), 2);
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &root, &app, 2).unwrap(),
+            2
+        );
         let (_, legacy) = seed_test_crdt(false);
         let child = quil_forest::encode_shard_bit_path(&app, &[true]);
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &legacy, &child, 2).unwrap(), 2,
-            "legacy whole-app roots retain their existing seed semantics");
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &legacy, &child, 2).unwrap(),
+            2,
+            "legacy whole-app roots retain their existing seed semantics"
+        );
         let (_, byte_suffix) = seed_test_crdt(true);
         let filter = [app.to_vec(), vec![63]].concat();
-        assert_eq!(sync_app_shard_to_own_crdt(&source, &byte_suffix, &filter, 2).unwrap(), 1);
+        assert_eq!(
+            sync_app_shard_to_own_crdt(&source, &byte_suffix, &filter, 2).unwrap(),
+            1
+        );
         assert!(byte_suffix.get_vertex_data_checked(&a).unwrap().is_none());
-        assert_eq!(byte_suffix.get_vertex_data_checked(&b).unwrap(), Some(b"b".to_vec()));
+        assert_eq!(
+            byte_suffix.get_vertex_data_checked(&b).unwrap(),
+            Some(b"b".to_vec())
+        );
         let (db, invalid) = seed_test_crdt(true);
         let before = db.inner().latest_sequence_number();
-        for filter in [vec![1; 31], [app.to_vec(), vec![0, 1, 0x81]].concat(),
-            [app.to_vec(), vec![64]].concat(), quil_forest::encode_shard_bit_path(&app, &vec![false; 257])] {
+        for filter in [
+            vec![1; 31],
+            [app.to_vec(), vec![0, 1, 0x81]].concat(),
+            [app.to_vec(), vec![64]].concat(),
+            quil_forest::encode_shard_bit_path(&app, &vec![false; 257]),
+        ] {
             assert!(sync_app_shard_to_own_crdt(&source, &invalid, &filter, 2).is_err());
         }
         assert_eq!(db.inner().latest_sequence_number(), before);
@@ -877,11 +1092,22 @@ mod tests {
         // A cluster worker wires its own CRDT as the storage source.
         let (db, own) = seed_test_crdt(false);
         let app = [0x71; 32];
-        own.add_vertex(&Location { app_address: app, data_address: [0; 32] }, b"a").unwrap();
+        own.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: [0; 32],
+            },
+            b"a",
+        )
+        .unwrap();
         own.commit(1).unwrap();
         let before = db.inner().latest_sequence_number();
         assert_eq!(sync_app_shard_to_own_crdt(&own, &own, &app, 2).unwrap(), 0);
-        assert_eq!(db.inner().latest_sequence_number(), before, "no re-add or commit of its own data");
+        assert_eq!(
+            db.inner().latest_sequence_number(),
+            before,
+            "no re-add or commit of its own data"
+        );
     }
 
     /// A bit-path filter names its subtree in sentinel prefix form; a legacy
@@ -905,9 +1131,13 @@ mod tests {
     #[test]
     fn split_readiness_uses_committed_forest_after_reopen_without_size_buckets() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
-        let store: Arc<dyn HypergraphStore> = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let store: Arc<dyn HypergraphStore> =
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE.to_vec(),
+        ));
         crdt.set_unified_tree(true);
         let app = [0x71; 32];
         // A non-byte-aligned path exercises the wire bit length and padding.
@@ -920,22 +1150,38 @@ mod tests {
         let mut address = [0; 32];
         address[0] = 0xb5;
         address[1] = 0x80;
-        let location = Location { app_address: app, data_address: address };
-        crdt.add_vertex(&location, b"committed covered data").unwrap();
-        assert!(!has_committed_shard_data(&crdt, &filter), "staged writes are not possession");
+        let location = Location {
+            app_address: app,
+            data_address: address,
+        };
+        crdt.add_vertex(&location, b"committed covered data")
+            .unwrap();
+        assert!(
+            !has_committed_shard_data(&crdt, &filter),
+            "staged writes are not possession"
+        );
         crdt.commit(1).unwrap();
         assert!(has_committed_shard_data(&crdt, &filter));
         assert!(!has_committed_shard_data(&crdt, &sibling_filter));
         drop(crdt);
 
         let reopened = HypergraphCrdt::new(store, Arc::new(StubProver));
-        reopened.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        reopened.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE.to_vec(),
+        ));
         reopened.set_unified_tree(true);
-        assert!(reopened.total_size().is_zero(), "fixture has not warmed write-time metadata");
+        assert!(
+            reopened.total_size().is_zero(),
+            "fixture has not warmed write-time metadata"
+        );
         assert!(has_committed_shard_data(&reopened, &filter));
         assert!(has_committed_shard_data(&reopened, &app));
         assert!(!has_committed_shard_data(&reopened, &sibling_filter));
-        assert!(!has_committed_shard_data(&reopened, &filter[..34]), "malformed filter stays gated");
+        assert!(
+            !has_committed_shard_data(&reopened, &filter[..34]),
+            "malformed filter stays gated"
+        );
     }
 
     #[test]
@@ -943,9 +1189,13 @@ mod tests {
         use quil_forest::{SubtreeSyncAnchor, PHASES};
         let open = || {
             let db = quil_store::RocksDb::open_in_memory().unwrap();
-            let store: Arc<dyn HypergraphStore> = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+            let store: Arc<dyn HypergraphStore> =
+                Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
             let crdt = HypergraphCrdt::new(store, Arc::new(StubProver));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE.to_vec(),
+            ));
             crdt.set_unified_tree(true);
             (db, crdt)
         };
@@ -956,24 +1206,47 @@ mod tests {
         for i in 1..=3u8 {
             let mut address = [i; 32];
             address[0] = 0xa0 | i;
-            source.add_vertex(&Location { app_address: app, data_address: address }, &[i; 40]).unwrap();
+            source
+                .add_vertex(
+                    &Location {
+                        app_address: app,
+                        data_address: address,
+                    },
+                    &[i; 40],
+                )
+                .unwrap();
         }
         source.commit(1).unwrap();
         let (version, _) = source.serve_forest_head(&app, 0).unwrap();
-        let source_forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE.to_vec());
+        let source_forest = quil_forest::Forest::with_namespace(
+            source_db.inner(),
+            quil_store::FOREST_NAMESPACE.to_vec(),
+        );
         let reader = source_forest.shard_phase_reader(&app, PHASES[0]);
         let subtree = source.sub_shard_commitment_for_filter("vertex", "adds", &filter);
         let pinned = SubtreeSyncAnchor::SubtreeRoot(subtree.as_slice().try_into().unwrap());
 
         let (_db, target) = open();
-        let mut plan = target.prepare_phase_sync(&reader, version, &app, 0, &bits, Some(pinned)).unwrap();
+        let mut plan = target
+            .prepare_phase_sync(&reader, version, &app, 0, &bits, Some(pinned))
+            .unwrap();
         assert_eq!(plan.remaining().len(), 3);
-        let blob = |plan: &quil_hypergraph::crdt::ForestSyncPlan, n: usize| plan.remaining()[..n].iter()
-            .map(|(key, _)| vec![key[0] & 0x0f; 40]).collect::<Vec<_>>();
+        let blob = |plan: &quil_hypergraph::crdt::ForestSyncPlan, n: usize| {
+            plan.remaining()[..n]
+                .iter()
+                .map(|(key, _)| vec![key[0] & 0x0f; 40])
+                .collect::<Vec<_>>()
+        };
         let first = blob(&plan, 1);
         target.apply_sync_chunk(&mut plan, &first).unwrap();
-        assert!(target.unified_subtree_leaf_count("vertex", "adds", &app, &bits) > 0, "leaves are installed");
-        assert!(!has_committed_shard_data(&target, &filter), "but the subtree is not staged");
+        assert!(
+            target.unified_subtree_leaf_count("vertex", "adds", &app, &bits) > 0,
+            "leaves are installed"
+        );
+        assert!(
+            !has_committed_shard_data(&target, &filter),
+            "but the subtree is not staged"
+        );
         let rest = blob(&plan, 2);
         target.apply_sync_chunk(&mut plan, &rest).unwrap();
         target.finish_phase_sync(&plan).unwrap();
@@ -1035,8 +1308,8 @@ mod tests {
 
     #[test]
     fn confirm_leaf_roots_produce_verifiable_openings() {
-        use std::collections::HashMap;
         use quil_execution::global_intrinsic::leaf_id_bytes;
+        use std::collections::HashMap;
         quil_crypto::init();
         let poly_size = 16u64;
         let params = quil_crypto::sdr::SdrParams::default();
@@ -1052,12 +1325,20 @@ mod tests {
         let leaf_data_for = |p: &[u32]| -> Vec<u8> {
             let seed = p[0] as u8;
             let nodes = 4 * poly_size as usize;
-            (0..nodes * 32).map(|i| (i as u8).wrapping_add(seed)).collect()
+            (0..nodes * 32)
+                .map(|i| (i as u8).wrapping_add(seed))
+                .collect()
         };
 
         // The worker builds the confirm leaf roots + replicas.
         let (groups, replicas) = compute_confirm_leaf_roots(
-            &filter, &member, epoch, &prefixes, poly_size, &params, &leaf_data_for,
+            &filter,
+            &member,
+            epoch,
+            &prefixes,
+            poly_size,
+            &params,
+            &leaf_data_for,
         );
         assert_eq!(groups.entries.len(), 2);
         assert_eq!(groups.filter, filter);
@@ -1066,7 +1347,10 @@ mod tests {
         let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &groups.entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert(
+                (member.clone(), lid, epoch),
+                (e.leaf_root.clone(), e.num_blocks, epoch),
+            );
         }
 
         // Per-frame openings built from the stored replicas.
@@ -1096,10 +1380,10 @@ mod tests {
 
     #[test]
     fn real_crdt_leaf_data_produces_verifiable_openings() {
-        use std::collections::HashMap;
         use quil_execution::global_intrinsic::leaf_id_bytes;
-        use quil_hypergraph::Location;
         use quil_hypergraph::addressing::shard_key_for_location;
+        use quil_hypergraph::Location;
+        use std::collections::HashMap;
         quil_crypto::init();
 
         // A real shard with committed vertices.
@@ -1107,8 +1391,12 @@ mod tests {
         let app = 0x77u8;
         let filter = vec![app; 32]; // app-shard filter == app_address
         for d in 0u8..3 {
-            let loc = Location { app_address: [app; 32], data_address: [d; 32] };
-            crdt.add_vertex(&loc, &vec![d.wrapping_add(1); 256]).unwrap();
+            let loc = Location {
+                app_address: [app; 32],
+                data_address: [d; 32],
+            };
+            crdt.add_vertex(&loc, &vec![d.wrapping_add(1); 256])
+                .unwrap();
         }
         crdt.commit(1).unwrap();
         let shard_key = shard_key_for_location(&Location {
@@ -1145,7 +1433,10 @@ mod tests {
         let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &groups.entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert(
+                (member.clone(), lid, epoch),
+                (e.leaf_root.clone(), e.num_blocks, epoch),
+            );
         }
         let mut openings = Vec::new();
         for (prefix, replica) in &replicas {
@@ -1180,7 +1471,10 @@ mod tests {
         let filter = vec![app; 32];
         for d in 0u8..3 {
             crdt.add_vertex(
-                &Location { app_address: [app; 32], data_address: [d; 32] },
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
                 &vec![d.wrapping_add(1); 256],
             )
             .unwrap();
@@ -1239,15 +1533,21 @@ mod tests {
     /// commitment is the leaf data's.
     #[test]
     fn hash_epoch_confirm_and_openings_verify_without_kzg() {
-        use std::collections::HashMap;
         use quil_execution::global_intrinsic::leaf_id_bytes;
         use quil_hypergraph::Location;
+        use std::collections::HashMap;
         let (_db, crdt) = seed_test_crdt(true);
         let app = 0x55u8;
         let filter = vec![app; 32];
         for d in 0u8..3 {
-            crdt.add_vertex(&Location { app_address: [app; 32], data_address: [d; 32] }, &vec![d.wrapping_add(9); 256])
-                .unwrap();
+            crdt.add_vertex(
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
+                &vec![d.wrapping_add(9); 256],
+            )
+            .unwrap();
         }
         crdt.commit(1).unwrap();
         let replica_store = quil_store::replica_store::ReplicaStore::new(Arc::new(
@@ -1258,50 +1558,130 @@ mod tests {
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
         let params = quil_crypto::sdr::SdrParams::default();
         let confirm_frame = quil_types::consensus::storage_snapshot_frame(epoch) + 30;
-        let confirm = |frame| compute_storage_confirm(&crdt, &replica_store, std::slice::from_ref(&filter), &member,
-            epoch, 64, &params, frame, &[]);
-        assert!(confirm(confirm_frame).unwrap_err().is_execution_unavailable(), "waits for the snapshot");
-        assert!(confirm(confirm_frame + storage_snapshot_grace()).unwrap()[0].entries.is_empty(),
-            "past the grace it renews without a registration");
+        let confirm = |frame| {
+            compute_storage_confirm(
+                &crdt,
+                &replica_store,
+                std::slice::from_ref(&filter),
+                &member,
+                epoch,
+                64,
+                &params,
+                frame,
+                &[],
+            )
+        };
+        assert!(
+            confirm(confirm_frame)
+                .unwrap_err()
+                .is_execution_unavailable(),
+            "waits for the snapshot"
+        );
+        assert!(
+            confirm(confirm_frame + storage_snapshot_grace()).unwrap()[0]
+                .entries
+                .is_empty(),
+            "past the grace it renews without a registration"
+        );
         let source = crate::storage_snapshot::current_source(&crdt, &filter, epoch);
-        let captured = crate::storage_snapshot::capture_at(&crdt, &filter, epoch, std::slice::from_ref(&source)).unwrap();
+        let captured = crate::storage_snapshot::capture_at(
+            &crdt,
+            &filter,
+            epoch,
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
         crate::storage_snapshot::encode_member(&captured, &member, &replica_store).unwrap();
         let roots = confirm(confirm_frame).unwrap();
         // A shard a recorded change creates whose sources are not recorded
         // registers nothing, and does not hold up the bound shard's renewal.
         let child = [filter.as_slice(), &[0x01]].concat();
-        let with_child = compute_storage_confirm(&crdt, &replica_store, &[filter.clone(), child.clone()], &member,
-            epoch, 64, &params, confirm_frame, &[]).unwrap();
+        let with_child = compute_storage_confirm(
+            &crdt,
+            &replica_store,
+            &[filter.clone(), child.clone()],
+            &member,
+            epoch,
+            64,
+            &params,
+            confirm_frame,
+            &[],
+        )
+        .unwrap();
         assert_eq!(with_child[0], roots[0]);
-        assert_eq!((with_child[1].filter.clone(), with_child[1].entries.len()), (child, 0));
+        assert_eq!(
+            (with_child[1].filter.clone(), with_child[1].entries.len()),
+            (child, 0)
+        );
         let mut registry: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
         for entry in &roots[0].entries {
             let registered = quil_crypto::storage_proof::parse_registration_root(&entry.leaf_root)
                 .expect("a hash registration root");
             let data = captured.leaf_data(&entry.prefix).unwrap();
             let nodes = quil_crypto::storage_proof::data_nodes(&data);
-            assert_eq!(registered.comm_d,
-                quil_crypto::storage_proof::MerkleTree::from_nodes(&nodes).unwrap().commitment(quil_crypto::storage_proof::Tree::Data),
-                "the data commitment is the leaf data's");
-            assert_eq!(entry.num_blocks as usize, nodes.len() / quil_crypto::storage_proof::NODE_BYTES);
+            assert_eq!(
+                registered.comm_d,
+                quil_crypto::storage_proof::MerkleTree::from_nodes(&nodes)
+                    .unwrap()
+                    .commitment(quil_crypto::storage_proof::Tree::Data),
+                "the data commitment is the leaf data's"
+            );
+            assert_eq!(
+                entry.num_blocks as usize,
+                nodes.len() / quil_crypto::storage_proof::NODE_BYTES
+            );
             let lid = leaf_id_bytes(&filter, &entry.prefix);
-            registry.insert((member.clone(), lid), (entry.leaf_root.clone(), entry.num_blocks, epoch));
+            registry.insert(
+                (member.clone(), lid),
+                (entry.leaf_root.clone(), entry.num_blocks, epoch),
+            );
         }
-        let covered = vec![(filter.clone(), roots[0].entries.iter().map(|e| e.prefix.clone()).collect())];
+        let covered = vec![(
+            filter.clone(),
+            roots[0].entries.iter().map(|e| e.prefix.clone()).collect(),
+        )];
         let rho_n = [0x3Cu8; 32];
-        let openings = build_member_frame_openings(&replica_store, &covered, &member, epoch, &rho_n, 64, 2).unwrap();
+        let openings =
+            build_member_frame_openings(&replica_store, &covered, &member, epoch, &rho_n, 64, 2)
+                .unwrap();
         assert_eq!(openings.len(), 2 * roots[0].entries.len());
-        assert!(openings.iter().all(|o| o.proof.is_empty() && o.commitment.is_empty()), "no KZG fields");
+        assert!(
+            openings
+                .iter()
+                .all(|o| o.proof.is_empty() && o.commitment.is_empty()),
+            "no KZG fields"
+        );
         let attestation = quil_types::proto::global::StorageAttestation {
-            openings: openings.iter().map(quil_crypto::porep::StorageOpening::to_proto).collect(),
+            openings: openings
+                .iter()
+                .map(quil_crypto::porep::StorageOpening::to_proto)
+                .collect(),
         };
-        let root = quil_crypto::porep::compute_storage_attestation_root(&openings, 9, &rho_n, &[], 64);
+        let root =
+            quil_crypto::porep::compute_storage_attestation_root(&openings, 9, &rho_n, &[], 64);
         assert_eq!(root.len(), 32);
         let lookup = |m: &[u8], l: &[u8], _: u64| registry.get(&(m.to_vec(), l.to_vec())).cloned();
-        assert_eq!(quil_crypto::porep::explain_frame_storage_attestation_registered(
-            &root, &attestation, 9, &rho_n, &[], 64, epoch, lookup), Ok(()));
-        let failed = quil_crypto::porep::audit_frame_storage_attestations(&openings, &rho_n, 64, epoch, u64::MAX,
-            |m: &[u8], l: &[u8]| registry.get(&(m.to_vec(), l.to_vec())).cloned());
+        assert_eq!(
+            quil_crypto::porep::explain_frame_storage_attestation_registered(
+                &root,
+                &attestation,
+                9,
+                &rho_n,
+                &[],
+                64,
+                epoch,
+                lookup
+            ),
+            Ok(())
+        );
+        let failed = quil_crypto::porep::audit_frame_storage_attestations(
+            &openings,
+            &rho_n,
+            64,
+            epoch,
+            u64::MAX,
+            |m: &[u8], l: &[u8]| registry.get(&(m.to_vec(), l.to_vec())).cloned(),
+        );
         assert!(failed.is_empty(), "{failed:?}");
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
@@ -1318,32 +1698,56 @@ mod tests {
             replica_store.put(epoch, b"leaf", &[epoch as u8]).unwrap();
         }
         let retired_below = AtomicU64::new(0);
-        assert!(retire_unchallengeable_replicas(&replica_store, &retired_below, 6, b"f", 1));
+        assert!(retire_unchallengeable_replicas(
+            &replica_store,
+            &retired_below,
+            6,
+            b"f",
+            1
+        ));
         assert_eq!(retired_below.load(Ordering::Acquire), 5);
         for epoch in 3..=4 {
-            assert!(replica_store.get(epoch, b"leaf").unwrap().is_none(), "epoch {epoch} is evicted");
+            assert!(
+                replica_store.get(epoch, b"leaf").unwrap().is_none(),
+                "epoch {epoch} is evicted"
+            );
         }
         for epoch in 5..=7 {
-            assert_eq!(replica_store.get(epoch, b"leaf").unwrap(), Some(vec![epoch as u8]));
+            assert_eq!(
+                replica_store.get(epoch, b"leaf").unwrap(),
+                Some(vec![epoch as u8])
+            );
         }
         replica_store.put(4, b"leaf", b"late").unwrap();
         assert!(
             !retire_unchallengeable_replicas(&replica_store, &retired_below, 6, b"f", 2),
             "an applied boundary is not evicted or logged again",
         );
-        assert!(retire_unchallengeable_replicas(&replica_store, &retired_below, 7, b"f", 3));
+        assert!(retire_unchallengeable_replicas(
+            &replica_store,
+            &retired_below,
+            7,
+            b"f",
+            3
+        ));
         assert!(replica_store.get(4, b"leaf").unwrap().is_none());
         assert!(replica_store.get(5, b"leaf").unwrap().is_none());
         assert_eq!(replica_store.get(6, b"leaf").unwrap(), Some(vec![6]));
         // A low epoch cannot underflow the boundary.
-        assert!(!retire_unchallengeable_replicas(&replica_store, &AtomicU64::new(0), 0, b"f", 4));
+        assert!(!retire_unchallengeable_replicas(
+            &replica_store,
+            &AtomicU64::new(0),
+            0,
+            b"f",
+            4
+        ));
     }
 
     #[test]
     fn member_frame_openings_verify_against_confirm_roots() {
-        use std::collections::HashMap;
         use quil_execution::global_intrinsic::leaf_id_bytes;
         use quil_hypergraph::Location;
+        use std::collections::HashMap;
         quil_crypto::init();
 
         // Confirm: persist replicas + register roots.
@@ -1352,7 +1756,10 @@ mod tests {
         let filter = vec![app; 32];
         for d in 0u8..3 {
             crdt.add_vertex(
-                &Location { app_address: [app; 32], data_address: [d; 32] },
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
                 &vec![d.wrapping_add(1); 256],
             )
             .unwrap();
@@ -1382,7 +1789,10 @@ mod tests {
         let mut prefixes: Vec<Vec<u32>> = Vec::new();
         for e in &roots[0].entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert(
+                (member.clone(), lid, epoch),
+                (e.leaf_root.clone(), e.num_blocks, epoch),
+            );
             prefixes.push(e.prefix.clone());
         }
 
@@ -1391,7 +1801,13 @@ mod tests {
         let rho_n = quil_crypto::porep::derive_storage_beacon(42, &vec![0x9u8; 516]);
         let covered = vec![(filter.clone(), prefixes)];
         let openings = build_member_frame_openings(
-            &replica_store, &covered, &member, epoch, &rho_n, poly_size, 2,
+            &replica_store,
+            &covered,
+            &member,
+            epoch,
+            &rho_n,
+            poly_size,
+            2,
         )
         .unwrap();
         assert!(!openings.is_empty(), "covered leaves must yield openings");
@@ -1414,9 +1830,9 @@ mod tests {
 
     #[test]
     fn vote_openings_roundtrip_and_verify() {
-        use std::collections::HashMap;
         use quil_execution::global_intrinsic::leaf_id_bytes;
         use quil_hypergraph::Location;
+        use std::collections::HashMap;
         quil_crypto::init();
 
         let crdt = make_crdt();
@@ -1424,7 +1840,10 @@ mod tests {
         let filter = vec![app; 32];
         for d in 0u8..3 {
             crdt.add_vertex(
-                &Location { app_address: [app; 32], data_address: [d; 32] },
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
                 &vec![d.wrapping_add(1); 256],
             )
             .unwrap();
@@ -1440,30 +1859,53 @@ mod tests {
 
         // Confirm: persist replicas + register roots (production constants).
         let roots = compute_storage_confirm(
-            &crdt, &replica_store, std::slice::from_ref(&filter), &member, epoch, poly_size, &params, 0, &[],
+            &crdt,
+            &replica_store,
+            std::slice::from_ref(&filter),
+            &member,
+            epoch,
+            poly_size,
+            &params,
+            0,
+            &[],
         )
         .unwrap();
         let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &roots[0].entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert(
+                (member.clone(), lid, epoch),
+                (e.leaf_root.clone(), e.num_blocks, epoch),
+            );
         }
 
         // Producer builds the vote blob; aggregator decodes it.
         let rho_n = quil_crypto::porep::derive_storage_beacon(42, &vec![0x9u8; 516]);
-        let blob = build_vote_openings(&crdt, &replica_store, &filter, &member, epoch, &rho_n).unwrap();
+        let blob =
+            build_vote_openings(&crdt, &replica_store, &filter, &member, epoch, &rho_n).unwrap();
         assert!(!blob.is_empty(), "a covered member must attach openings");
         let openings = decode_vote_openings(&blob);
         assert!(!openings.is_empty());
 
         // Aggregator assembles the frame attestation (single-member committee).
         let (att, root) = quil_crypto::porep::build_frame_storage_attestation(
-            &openings, 100, &rho_n, &[0x01u8], poly_size,
+            &openings,
+            100,
+            &rho_n,
+            &[0x01u8],
+            poly_size,
         );
         let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(
-                &root, &att, 100, &rho_n, &[0x01u8], poly_size, epoch, good,
+                &root,
+                &att,
+                100,
+                &rho_n,
+                &[0x01u8],
+                poly_size,
+                epoch,
+                good,
             ),
             "decoded vote openings must assemble into a verifiable frame attestation"
         );

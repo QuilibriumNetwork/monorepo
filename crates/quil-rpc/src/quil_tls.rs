@@ -74,8 +74,7 @@ pub fn build_quil_tls_cert(falcon_signing_key: &[u8]) -> Result<QuilTlsCert, Qui
     let mut to_sign = Vec::with_capacity(TLS_CERT_DERIVATION_CTX.len() + ed25519_pub.len());
     to_sign.extend_from_slice(TLS_CERT_DERIVATION_CTX);
     to_sign.extend_from_slice(&ed25519_pub);
-    let falcon_signer =
-        quil_crypto::FalconSigner::from_bytes(falcon_signing_key, falcon_pubkey);
+    let falcon_signer = quil_crypto::FalconSigner::from_bytes(falcon_signing_key, falcon_pubkey);
     let xsign = falcon_signer
         .sign_with_domain(&to_sign, &[])
         .map_err(|e| QuilTlsError::Ed448(format!("falcon sign: {:?}", e)))?;
@@ -306,8 +305,7 @@ impl Default for XsignClientCertVerifier {
     /// `build_quil_server_tls_config`).
     fn default() -> Self {
         Self {
-            supported: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms,
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
 }
@@ -373,8 +371,8 @@ impl XsignClientCertVerifier {
             ));
         }
 
-        let blob = hex::decode(dns)
-            .map_err(|e| rustls::Error::General(format!("decode SAN hex: {e}")))?;
+        let blob =
+            hex::decode(dns).map_err(|e| rustls::Error::General(format!("decode SAN hex: {e}")))?;
         // 897-byte Falcon pubkey || 666-byte Falcon signature
         if blob.len() != 897 + 666 {
             return Err(rustls::Error::General(format!(
@@ -490,11 +488,10 @@ pub fn build_quil_server_tls_config(
         return Err(QuilTlsError::Rcgen("no cert in pem output".into()));
     }
 
-    let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(
-        &mut tls_cert.key_pem.as_bytes(),
-    )
-    .map_err(|e| QuilTlsError::Rcgen(format!("parse key pem: {}", e)))?
-    .ok_or_else(|| QuilTlsError::Rcgen("no private key in pem".into()))?;
+    let key_der: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut tls_cert.key_pem.as_bytes())
+            .map_err(|e| QuilTlsError::Rcgen(format!("parse key pem: {}", e)))?
+            .ok_or_else(|| QuilTlsError::Rcgen("no private key in pem".into()))?;
 
     let verifier: Arc<dyn ClientCertVerifier> = Arc::new(XsignClientCertVerifier::default());
 
@@ -534,7 +531,10 @@ mod tests {
         assert_eq!(a.leaf_key_pem, b.leaf_key_pem);
         let k2 = falcon_signing_key();
         let c = build_worker_channel_cert(&k2).unwrap();
-        assert_ne!(a.ca_cert_pem, c.ca_cert_pem, "different node keys must yield different CAs");
+        assert_ne!(
+            a.ca_cert_pem, c.ca_cert_pem,
+            "different node keys must yield different CAs"
+        );
     }
 
     /// Real in-process mTLS handshake (no cluster mode needed): a client bearing
@@ -576,14 +576,15 @@ mod tests {
             .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
 
-        let make_client = |ccert: rustls::pki_types::CertificateDer<'static>,
-                           ckey: rustls::pki_types::PrivateKeyDer<'static>| {
-            let cfg = rustls::ClientConfig::builder()
-                .with_root_certificates((*roots).clone())
-                .with_client_auth_cert(vec![ccert], ckey)
-                .unwrap();
-            TlsConnector::from(Arc::new(cfg))
-        };
+        let make_client =
+            |ccert: rustls::pki_types::CertificateDer<'static>,
+             ckey: rustls::pki_types::PrivateKeyDer<'static>| {
+                let cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates((*roots).clone())
+                    .with_client_auth_cert(vec![ccert], ckey)
+                    .unwrap();
+                TlsConnector::from(Arc::new(cfg))
+            };
         let sni = rustls::pki_types::ServerName::try_from(WORKER_CHANNEL_SAN).unwrap();
 
         // Same node key → handshake succeeds both sides.
@@ -762,7 +763,12 @@ mod tests {
         let mut signed = Vec::new();
         signed.extend_from_slice(TLS_CERT_DERIVATION_CTX);
         signed.extend_from_slice(&ed25519_pub);
-        assert!(quil_crypto::falcon_verify(falcon_pub, signature, &signed, &[]));
+        assert!(quil_crypto::falcon_verify(
+            falcon_pub,
+            signature,
+            &signed,
+            &[]
+        ));
     }
 
     // =================================================================
@@ -837,10 +843,7 @@ mod tests {
         assert_eq!(encoded[0], 0x30); // SEQUENCE
         assert_eq!(encoded[1], 0x53); // length 83
         assert_eq!(&encoded[2..5], &[0x02, 0x01, 0x01]); // INTEGER 1
-        assert_eq!(
-            &encoded[5..12],
-            &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]
-        ); // AlgorithmIdentifier (Ed25519 OID 1.3.101.112)
+        assert_eq!(&encoded[5..12], &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]); // AlgorithmIdentifier (Ed25519 OID 1.3.101.112)
         assert_eq!(&encoded[12..16], &[0x04, 0x22, 0x04, 0x20]); // wrapping OCTET STRING(seed)
     }
 
@@ -918,10 +921,7 @@ mod tests {
         let pem = pkcs8_der_to_pem("PRIVATE KEY", &der);
         // Extract the body between BEGIN and END markers, remove
         // newlines, base64-decode, and verify round-trip.
-        let body: String = pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect();
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(body.as_bytes())
             .unwrap();
@@ -978,10 +978,9 @@ mod tests {
     /// forgery: present someone else's cert, sign with your own key.
     fn signing_key_from_key(falcon_sk: &[u8]) -> Arc<dyn rustls::sign::SigningKey> {
         let tls = build_quil_tls_cert(falcon_sk).unwrap();
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
-                .unwrap()
-                .unwrap();
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
         rustls::crypto::ring::sign::any_supported_type(&key).unwrap()
     }
 
@@ -1112,10 +1111,9 @@ mod tests {
         // Legit client: presents its own cert signed with its own key.
         let sk = falcon_signing_key();
         let tls = build_quil_tls_cert(&sk).unwrap();
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
-                .unwrap()
-                .unwrap();
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
         let client_cfg = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(XsignServerVerifier::new()))

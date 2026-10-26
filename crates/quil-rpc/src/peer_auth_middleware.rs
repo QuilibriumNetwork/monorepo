@@ -61,8 +61,7 @@ pub struct AuthenticatedPeer {
 /// [`quil_tls::build_quil_tls_cert`](crate::quil_tls::build_quil_tls_cert):
 /// `hex(falcon_pub_897 || xsign_666)`.
 pub fn peer_identity_from_cert(cert_der: &[u8]) -> Option<(Vec<u8>, PeerId)> {
-    const BLOB_LEN: usize =
-        quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN;
+    const BLOB_LEN: usize = quil_crypto::FALCON_PUBLIC_KEY_LEN + quil_crypto::FALCON_SIGNATURE_LEN;
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
     let san = cert.subject_alternative_name().ok().flatten()?;
     for name in &san.value.general_names {
@@ -185,7 +184,10 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|c| c.to_vec())
             .collect();
-        assert!(!der_blocks.is_empty(), "cert_pem should produce at least one DER block");
+        assert!(
+            !der_blocks.is_empty(),
+            "cert_pem should produce at least one DER block"
+        );
         let (pubkey, peer_id) = peer_identity_from_cert(&der_blocks[0])
             .expect("cert SAN should decode to a valid peer identity");
         assert_eq!(
@@ -205,7 +207,10 @@ mod tests {
             cert_der: der_blocks[0].clone(),
         });
         let out = peer_auth_interceptor(req).unwrap();
-        let ap = out.extensions().get::<AuthenticatedPeer>().expect("auth set");
+        let ap = out
+            .extensions()
+            .get::<AuthenticatedPeer>()
+            .expect("auth set");
         assert_eq!(
             ap.falcon_public_key.len(),
             quil_crypto::FALCON_PUBLIC_KEY_LEN

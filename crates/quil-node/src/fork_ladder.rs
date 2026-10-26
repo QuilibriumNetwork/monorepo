@@ -72,12 +72,26 @@ pub fn run_fork_ladder(
     println!("target (rocksdb) : {}", path.display());
     println!("head frame       : {}", head_fn);
     println!("head rank        : {}", head_rank);
-    println!("head fp          : {}", poseidon_hex(head.header.as_ref().map(|h| h.output.as_slice()).unwrap_or(&[])));
+    println!(
+        "head fp          : {}",
+        poseidon_hex(
+            head.header
+                .as_ref()
+                .map(|h| h.output.as_slice())
+                .unwrap_or(&[])
+        )
+    );
     println!();
-    println!("{:>10}  {:>10}  {}", "frame", "rank", "fp (poseidon(output))");
+    println!(
+        "{:>10}  {:>10}  {}",
+        "frame", "rank", "fp (poseidon(output))"
+    );
 
     // Descending unique frame numbers.
-    let mut frames: Vec<u64> = offsets.iter().map(|off| head_fn.saturating_sub(*off)).collect();
+    let mut frames: Vec<u64> = offsets
+        .iter()
+        .map(|off| head_fn.saturating_sub(*off))
+        .collect();
     frames.sort_unstable_by(|a, b| b.cmp(a));
     frames.dedup();
 

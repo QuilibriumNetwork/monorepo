@@ -57,16 +57,25 @@ impl SpawnGate {
 
     fn refuse(&self) {
         let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         let last = self.last_warn_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= WARN_EVERY_MS
-            && self.last_warn_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            && self
+                .last_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
         {
             let since = total - self.reported.swap(total, Ordering::Relaxed);
             tracing::warn!(
-                gate = self.name, cap = self.cap, dropped_since_last_line = since, dropped_total = total,
+                gate = self.name,
+                cap = self.cap,
+                dropped_since_last_line = since,
+                dropped_total = total,
                 scope = "this node: work arriving from peers faster than it is processed",
-                action = "excess work was dropped and is retried by its sender; a steady count means \
+                action =
+                    "excess work was dropped and is retried by its sender; a steady count means \
                     this node's blocking pool or storage is saturated: report it with this line",
                 "task cap reached",
             );
@@ -101,14 +110,26 @@ mod tests {
         static GATE: SpawnGate = SpawnGate::new("test-wait-gate", 1);
         let held = GATE.try_enter().expect("the only slot");
         let wait = std::time::Duration::from_millis(50);
-        assert!(GATE.enter_within(wait).await.is_none(), "no slot frees within the wait");
+        assert!(
+            GATE.enter_within(wait).await.is_none(),
+            "no slot frees within the wait"
+        );
         assert_eq!(GATE.dropped_total(), 1);
         let release = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             drop(held);
         });
-        assert!(GATE.enter_within(std::time::Duration::from_secs(5)).await.is_some(), "the freed slot is handed over");
+        assert!(
+            GATE.enter_within(std::time::Duration::from_secs(5))
+                .await
+                .is_some(),
+            "the freed slot is handed over"
+        );
         release.await.unwrap();
-        assert_eq!(GATE.dropped_total(), 1, "a caller served within its wait is not counted");
+        assert_eq!(
+            GATE.dropped_total(),
+            1,
+            "a caller served within its wait is not counted"
+        );
     }
 }

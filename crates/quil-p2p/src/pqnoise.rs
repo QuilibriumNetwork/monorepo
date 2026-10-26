@@ -40,9 +40,7 @@ use clatter::transportstate::TransportState;
 use clatter::{Handshaker, KeyPair, PqHandshake};
 
 use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{
-    Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _,
-};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
 
 use quil_types::error::{QuilError, Result};
 
@@ -122,8 +120,8 @@ pub async fn pq_handshake_initiator<S: AsyncRead + AsyncWrite + Unpin>(
     ed448_seed: &[u8; 57],
     ed448_pubkey: &[u8],
 ) -> Result<PqNoiseResult> {
-    let static_kem = Sntrup761::genkey()
-        .map_err(|e| QuilError::Crypto(format!("sntrup761 keygen: {:?}", e)))?;
+    let static_kem =
+        Sntrup761::genkey().map_err(|e| QuilError::Crypto(format!("sntrup761 keygen: {:?}", e)))?;
     let mut hs = Handshake::new(noise_pqxx(), &[], true, Some(static_kem), None, None, None)
         .map_err(|e| QuilError::Crypto(format!("pqnoise init: {:?}", e)))?;
 
@@ -136,7 +134,14 @@ pub async fn pq_handshake_initiator<S: AsyncRead + AsyncWrite + Unpin>(
     let hash_bytes = transport.get_handshake_hash().as_slice().to_vec();
 
     // Initiator authenticates first, then verifies the responder.
-    send_identity(stream, &mut transport, ed448_seed, ed448_pubkey, &hash_bytes).await?;
+    send_identity(
+        stream,
+        &mut transport,
+        ed448_seed,
+        ed448_pubkey,
+        &hash_bytes,
+    )
+    .await?;
     let remote_public_key = recv_identity(stream, &mut transport, &hash_bytes).await?;
 
     Ok(PqNoiseResult {
@@ -151,8 +156,8 @@ pub async fn pq_handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
     ed448_seed: &[u8; 57],
     ed448_pubkey: &[u8],
 ) -> Result<PqNoiseResult> {
-    let static_kem = Sntrup761::genkey()
-        .map_err(|e| QuilError::Crypto(format!("sntrup761 keygen: {:?}", e)))?;
+    let static_kem =
+        Sntrup761::genkey().map_err(|e| QuilError::Crypto(format!("sntrup761 keygen: {:?}", e)))?;
     let mut hs = Handshake::new(noise_pqxx(), &[], false, Some(static_kem), None, None, None)
         .map_err(|e| QuilError::Crypto(format!("pqnoise init: {:?}", e)))?;
 
@@ -165,7 +170,14 @@ pub async fn pq_handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Responder verifies the initiator first, then authenticates.
     let remote_public_key = recv_identity(stream, &mut transport, &hash_bytes).await?;
-    send_identity(stream, &mut transport, ed448_seed, ed448_pubkey, &hash_bytes).await?;
+    send_identity(
+        stream,
+        &mut transport,
+        ed448_seed,
+        ed448_pubkey,
+        &hash_bytes,
+    )
+    .await?;
 
     Ok(PqNoiseResult {
         transport,

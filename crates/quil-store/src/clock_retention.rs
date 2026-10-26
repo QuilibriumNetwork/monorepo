@@ -98,11 +98,19 @@ impl RocksClockStore {
             }
             result.scanned += 1;
             last = Some(key.to_vec());
-            let header = global::AppShardFrame::decode(value).ok().and_then(|frame| frame.header);
-            let number = key.len().checked_sub(8).map(|at| u64::from_be_bytes(key[at..].try_into().unwrap()));
+            let header = global::AppShardFrame::decode(value)
+                .ok()
+                .and_then(|frame| frame.header);
+            let number = key
+                .len()
+                .checked_sub(8)
+                .map(|at| u64::from_be_bytes(key[at..].try_into().unwrap()));
             match header {
-                Some(header) if Some(header.frame_number) == number && !header.address.is_empty() => {
-                    let canonical = encoding::clock_shard_frame_key(&header.address, header.frame_number);
+                Some(header)
+                    if Some(header.frame_number) == number && !header.address.is_empty() =>
+                {
+                    let canonical =
+                        encoding::clock_shard_frame_key(&header.address, header.frame_number);
                     match self.db.get(&canonical).map_err(store)? {
                         Some(stored) if stored.as_slice() == value => {
                             result.deleted += 1;
@@ -118,10 +126,16 @@ impl RocksClockStore {
             it.next();
         }
         it.status().map_err(store)?;
-        result.next = if exhausted { None } else { last.or_else(|| after.map(<[u8]>::to_vec)) };
+        result.next = if exhausted {
+            None
+        } else {
+            last.or_else(|| after.map(<[u8]>::to_vec))
+        };
         drop(it);
         if !dry_run && !batch.is_empty() {
-            self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)?;
+            self.db
+                .write_disjoint(batch, &rocksdb::WriteOptions::default())
+                .map_err(store)?;
         }
         Ok(result)
     }
@@ -144,11 +158,18 @@ impl RocksClockStore {
         let mut result = CandidatePrune::default();
         let head = self.get_latest_frame_number();
         let cursor = self.get_global_materialized_cursor();
-        let Some(limit) = head.zip(cursor).map(|(h, c)| h.min(c)).and_then(|top| top.checked_sub(margin)) else {
+        let Some(limit) = head
+            .zip(cursor)
+            .map(|(h, c)| h.min(c))
+            .and_then(|top| top.checked_sub(margin))
+        else {
             return Ok(result);
         };
         result.limit = Some(limit);
-        let prefix = [encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME_CANDIDATE];
+        let prefix = [
+            encoding::CLOCK_FRAME,
+            encoding::CLOCK_GLOBAL_FRAME_CANDIDATE,
+        ];
         let mut batch = quil_forest::DisjointBatch::new(encoding::GLOBAL_CANDIDATE_PREFIXES);
         let mut it = self.db.raw_iterator();
         it.seek(encoding::clock_global_frame_candidate_key(from, &[]));
@@ -165,7 +186,12 @@ impl RocksClockStore {
                 break;
             }
             result.examined += 1;
-            if self.db.get(encoding::clock_global_frame_key(number)).map_err(store)?.is_none() {
+            if self
+                .db
+                .get(encoding::clock_global_frame_key(number))
+                .map_err(store)?
+                .is_none()
+            {
                 result.kept_in_holes += 1;
                 it.next();
                 continue;
@@ -194,7 +220,9 @@ impl RocksClockStore {
         it.status().map_err(store)?;
         drop(it);
         if !dry_run && !batch.is_empty() {
-            self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)?;
+            self.db
+                .write_disjoint(batch, &rocksdb::WriteOptions::default())
+                .map_err(store)?;
         }
         Ok(result)
     }
@@ -215,21 +243,34 @@ impl RocksClockStore {
     /// backfill wrote back are removed too. Only a node that neither executes
     /// GLOBAL frames nor serves history may call this.
     pub fn prune_global_frame_requests(&self, keep: u64) -> Result<RequestPrune> {
-        let Some(limit) = self.get_latest_frame_number().and_then(|head| head.checked_sub(keep)) else {
+        let Some(limit) = self
+            .get_latest_frame_number()
+            .and_then(|head| head.checked_sub(keep))
+        else {
             return Ok(RequestPrune::default());
         };
         let recorded = self.global_requests_retained_from();
         let previous = recorded.unwrap_or(0);
         if limit <= previous {
-            return Ok(RequestPrune { retained_from: recorded, frames: 0 });
+            return Ok(RequestPrune {
+                retained_from: recorded,
+                frames: 0,
+            });
         }
         let _writes = self.global_memory.writes.lock().unwrap();
         let mut batch = quil_forest::DisjointBatch::new(encoding::GLOBAL_REQUEST_PREFIXES);
         let start = encoding::clock_global_frame_request_key(0, 0);
         let end = encoding::clock_global_frame_request_key(limit, 0);
         batch.delete_range(&start, &end).map_err(store)?;
-        batch.put(encoding::clock_global_requests_retained_index(), limit.to_be_bytes()).map_err(store)?;
-        self.db.write_disjoint(batch, &rocksdb::WriteOptions::default()).map_err(store)?;
+        batch
+            .put(
+                encoding::clock_global_requests_retained_index(),
+                limit.to_be_bytes(),
+            )
+            .map_err(store)?;
+        self.db
+            .write_disjoint(batch, &rocksdb::WriteOptions::default())
+            .map_err(store)?;
         let mut cache = self.global_memory.cache.write().unwrap();
         cache.generation = cache.generation.wrapping_add(1);
         cache.frames.retain(|n, _| *n >= limit);
@@ -238,7 +279,10 @@ impl RocksClockStore {
         // Reclaim the space now rather than at some later compaction.
         let first = encoding::clock_global_frame_request_key(previous, 0);
         self.db.compact_range(Some(&first), Some(&end));
-        Ok(RequestPrune { retained_from: Some(limit), frames: limit - previous })
+        Ok(RequestPrune {
+            retained_from: Some(limit),
+            frames: limit - previous,
+        })
     }
 }
 
@@ -250,7 +294,9 @@ mod tests {
     fn open(dir: &std::path::Path) -> RocksClockStore {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        RocksClockStore::new(quil_forest::CoordinatedDb::new(rocksdb::DB::open(&opts, dir).unwrap()))
+        RocksClockStore::new(quil_forest::CoordinatedDb::new(
+            rocksdb::DB::open(&opts, dir).unwrap(),
+        ))
     }
 
     fn app_frame(filter: &[u8], number: u64, output: u8) -> global::AppShardFrame {
@@ -267,13 +313,18 @@ mod tests {
 
     fn stage(s: &RocksClockStore, frame: &global::AppShardFrame, selector: &[u8]) {
         let txn = s.new_transaction(false).unwrap();
-        s.stage_shard_clock_frame(selector, frame, txn.as_ref()).unwrap();
+        s.stage_shard_clock_frame(selector, frame, txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
     }
 
     fn put_canonical(s: &RocksClockStore, frame: &global::AppShardFrame) {
         let header = frame.header.as_ref().unwrap();
-        s.db.put(encoding::clock_shard_frame_key(&header.address, header.frame_number), frame.encode_to_vec()).unwrap();
+        s.db.put(
+            encoding::clock_shard_frame_key(&header.address, header.frame_number),
+            frame.encode_to_vec(),
+        )
+        .unwrap();
     }
 
     /// Only a staged copy whose canonical copy is identical goes; a staged
@@ -295,38 +346,60 @@ mod tests {
         stage(&s, &pending, &[0x99; 32]);
         let staged_count = |s: &RocksClockStore| {
             let prefix = [encoding::CLOCK_FRAME, encoding::CLOCK_SHARD_STAGED];
-            s.db.iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward))
-                .map(|e| e.unwrap().0)
-                .take_while(|k| k.starts_with(&prefix))
-                .count()
+            s.db.iterator(rocksdb::IteratorMode::From(
+                &prefix,
+                rocksdb::Direction::Forward,
+            ))
+            .map(|e| e.unwrap().0)
+            .take_while(|k| k.starts_with(&prefix))
+            .count()
         };
 
-        let dry = s.prune_committed_staged_shard_frames(None, usize::MAX, true).unwrap();
-        assert_eq!((dry.scanned, dry.deleted, dry.differing, dry.uncommitted), (7, 5, 1, 1));
+        let dry = s
+            .prune_committed_staged_shard_frames(None, usize::MAX, true)
+            .unwrap();
+        assert_eq!(
+            (dry.scanned, dry.deleted, dry.differing, dry.uncommitted),
+            (7, 5, 1, 1)
+        );
         assert_eq!(staged_count(&s), 7, "a dry run deletes nothing");
 
-        let first = s.prune_committed_staged_shard_frames(None, 3, false).unwrap();
+        let first = s
+            .prune_committed_staged_shard_frames(None, 3, false)
+            .unwrap();
         assert_eq!(first.scanned, 3);
         assert!(first.next.is_some());
         let mut next = first.next.clone();
         let mut deleted = first.deleted;
         while let Some(after) = next {
-            let pass = s.prune_committed_staged_shard_frames(Some(&after), 3, false).unwrap();
+            let pass = s
+                .prune_committed_staged_shard_frames(Some(&after), 3, false)
+                .unwrap();
             deleted += pass.deleted;
             next = pass.next;
         }
         assert_eq!(deleted, 5);
-        assert_eq!(staged_count(&s), 2, "the losing and the uncommitted frame remain");
+        assert_eq!(
+            staged_count(&s),
+            2,
+            "the losing and the uncommitted frame remain"
+        );
         for frame in &committed {
             let n = frame.header.as_ref().unwrap().frame_number;
             assert_eq!(s.get_shard_clock_frame(&filter, n, false).unwrap(), *frame);
         }
         // The remaining staged frame still commits normally.
         let txn = s.new_transaction(false).unwrap();
-        s.commit_shard_clock_frame(&filter, 9, &[0x99; 32], txn.as_ref(), false).unwrap();
+        s.commit_shard_clock_frame(&filter, 9, &[0x99; 32], txn.as_ref(), false)
+            .unwrap();
         txn.commit().unwrap();
         assert_eq!(s.get_shard_clock_frame(&filter, 9, false).unwrap(), pending);
-        assert_eq!(s.prune_committed_staged_shard_frames(None, usize::MAX, false).unwrap().deleted, 0);
+        assert_eq!(
+            s.prune_committed_staged_shard_frames(None, usize::MAX, false)
+                .unwrap()
+                .deleted,
+            0
+        );
     }
 
     fn candidate(number: u64, output: u8) -> global::GlobalFrame {
@@ -336,13 +409,20 @@ mod tests {
                 output: vec![output; 516],
                 ..Default::default()
             }),
-            requests: vec![global::MessageBundle::default(), global::MessageBundle { timestamp: 7, ..Default::default() }],
+            requests: vec![
+                global::MessageBundle::default(),
+                global::MessageBundle {
+                    timestamp: 7,
+                    ..Default::default()
+                },
+            ],
         }
     }
 
     fn put_candidate(s: &RocksClockStore, frame: &global::GlobalFrame) {
         let txn = s.new_transaction(false).unwrap();
-        s.put_global_clock_frame_candidate(frame, txn.as_ref()).unwrap();
+        s.put_global_clock_frame_candidate(frame, txn.as_ref())
+            .unwrap();
         txn.commit().unwrap();
     }
 
@@ -361,36 +441,59 @@ mod tests {
         for number in 1..=20u64 {
             put_candidate(&s, &candidate(number, number as u8));
             if number != 4 {
-                s.put_global_frame(&candidate(number, number as u8), None).unwrap();
+                s.put_global_frame(&candidate(number, number as u8), None)
+                    .unwrap();
             }
         }
         // A nullified view's candidate at an old height goes too.
         put_candidate(&s, &candidate(6, 0x66));
-        assert_eq!(s.prune_global_candidates(5, 0, usize::MAX, false).unwrap(), CandidatePrune::default(),
-            "no executed cursor: nothing is old enough");
+        assert_eq!(
+            s.prune_global_candidates(5, 0, usize::MAX, false).unwrap(),
+            CandidatePrune::default(),
+            "no executed cursor: nothing is old enough"
+        );
         s.put_global_materialized_cursor(15).unwrap();
 
         let dry = s.prune_global_candidates(5, 0, usize::MAX, true).unwrap();
         assert_eq!(dry.limit, Some(10));
         assert_eq!((dry.examined, dry.pruned, dry.kept_in_holes), (11, 10, 1));
         assert_eq!(dry.pruned_request_keys, 20);
-        assert!(s.get_global_clock_frame_candidate(1, &identity(&candidate(1, 1))).unwrap().requests.len() == 2);
+        assert!(
+            s.get_global_clock_frame_candidate(1, &identity(&candidate(1, 1)))
+                .unwrap()
+                .requests
+                .len()
+                == 2
+        );
 
         let first = s.prune_global_candidates(5, 0, 4, false).unwrap();
         assert_eq!((first.examined, first.next_from), (4, Some(5)));
-        let rest = s.prune_global_candidates(5, first.next_from.unwrap(), usize::MAX, false).unwrap();
+        let rest = s
+            .prune_global_candidates(5, first.next_from.unwrap(), usize::MAX, false)
+            .unwrap();
         assert_eq!(first.pruned + rest.pruned, 10);
         assert_eq!(rest.next_from, None);
 
-        let remaining = s.range_global_clock_frame_candidates(0, u64::MAX, 64).unwrap();
-        let heights: Vec<u64> = remaining.iter().map(|f| f.header.as_ref().unwrap().frame_number).collect();
+        let remaining = s
+            .range_global_clock_frame_candidates(0, u64::MAX, 64)
+            .unwrap();
+        let heights: Vec<u64> = remaining
+            .iter()
+            .map(|f| f.header.as_ref().unwrap().frame_number)
+            .collect();
         assert_eq!(heights, vec![4, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
         assert_eq!(remaining[0].requests.len(), 2, "the hole keeps its body");
         // A pruned candidate reads back as its canonical record (the getter's fallback).
-        let pruned = s.get_global_clock_frame_candidate(2, &identity(&candidate(2, 2))).unwrap();
+        let pruned = s
+            .get_global_clock_frame_candidate(2, &identity(&candidate(2, 2)))
+            .unwrap();
         assert_eq!(pruned.header.unwrap().frame_number, 2);
-        let request = encoding::clock_global_frame_request_candidate_key(&identity(&candidate(2, 2)), 2, 0);
-        assert!(s.db.get(request).unwrap().is_none(), "request bodies go with their header");
+        let request =
+            encoding::clock_global_frame_request_candidate_key(&identity(&candidate(2, 2)), 2, 0);
+        assert!(
+            s.db.get(request).unwrap().is_none(),
+            "request bodies go with their header"
+        );
     }
 
     /// Request bodies more than `keep` frames below the head go, headers stay,
@@ -405,32 +508,66 @@ mod tests {
         }
         let bodies = |s: &RocksClockStore| {
             let prefix = [encoding::CLOCK_FRAME, encoding::CLOCK_GLOBAL_FRAME_REQUEST];
-            s.db.iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward))
-                .map(|e| e.unwrap().0)
-                .take_while(|k| k.starts_with(&prefix))
-                .map(|k| u64::from_be_bytes(k[2..10].try_into().unwrap()))
-                .collect::<Vec<_>>()
+            s.db.iterator(rocksdb::IteratorMode::From(
+                &prefix,
+                rocksdb::Direction::Forward,
+            ))
+            .map(|e| e.unwrap().0)
+            .take_while(|k| k.starts_with(&prefix))
+            .map(|k| u64::from_be_bytes(k[2..10].try_into().unwrap()))
+            .collect::<Vec<_>>()
         };
         assert_eq!(bodies(&s).len(), 20);
         assert_eq!(s.global_requests_retained_from(), None);
-        assert_eq!(s.prune_global_frame_requests(10).unwrap(), RequestPrune::default(), "nothing is old enough");
+        assert_eq!(
+            s.prune_global_frame_requests(10).unwrap(),
+            RequestPrune::default(),
+            "nothing is old enough"
+        );
 
         let pass = s.prune_global_frame_requests(3).unwrap();
-        assert_eq!(pass, RequestPrune { retained_from: Some(7), frames: 7 });
+        assert_eq!(
+            pass,
+            RequestPrune {
+                retained_from: Some(7),
+                frames: 7
+            }
+        );
         assert_eq!(s.global_requests_retained_from(), Some(7));
         assert!(bodies(&s).iter().all(|n| *n >= 7));
         assert_eq!(bodies(&s).len(), 8);
         for n in 1..=10 {
             let frame = s.get_global_frame(n).unwrap();
-            assert_eq!(frame.header, candidate(n, n as u8).header, "every header stays");
+            assert_eq!(
+                frame.header,
+                candidate(n, n as u8).header,
+                "every header stays"
+            );
             assert_eq!(frame.requests.len(), if n < 7 { 0 } else { 2 });
         }
-        assert_eq!(s.prune_global_frame_requests(3).unwrap().frames, 0, "a repeat at the same head removes nothing");
+        assert_eq!(
+            s.prune_global_frame_requests(3).unwrap().frames,
+            0,
+            "a repeat at the same head removes nothing"
+        );
 
-        s.db.put(encoding::clock_global_frame_request_key(2, 0), b"written back").unwrap();
+        s.db.put(
+            encoding::clock_global_frame_request_key(2, 0),
+            b"written back",
+        )
+        .unwrap();
         s.put_global_frame(&candidate(11, 11), None).unwrap();
-        assert_eq!(s.prune_global_frame_requests(3).unwrap(), RequestPrune { retained_from: Some(8), frames: 1 });
-        assert!(bodies(&s).iter().all(|n| *n >= 8), "bodies written back below the boundary go too");
+        assert_eq!(
+            s.prune_global_frame_requests(3).unwrap(),
+            RequestPrune {
+                retained_from: Some(8),
+                frames: 1
+            }
+        );
+        assert!(
+            bodies(&s).iter().all(|n| *n >= 8),
+            "bodies written back below the boundary go too"
+        );
         assert_eq!(s.get_global_frame(11).unwrap().requests.len(), 2);
         assert_eq!(s.get_earliest_frame_number(), Some(1));
     }

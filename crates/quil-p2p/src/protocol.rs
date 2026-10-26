@@ -60,8 +60,8 @@ pub fn decode_rpc(data: &[u8]) -> Result<(pb::Rpc, usize), DecodeError> {
         });
     }
 
-    let rpc = pb::Rpc::decode(&data[varint_len..total])
-        .map_err(|e| DecodeError::Proto(e.to_string()))?;
+    let rpc =
+        pb::Rpc::decode(&data[varint_len..total]).map_err(|e| DecodeError::Proto(e.to_string()))?;
 
     Ok((rpc, total))
 }
@@ -106,9 +106,7 @@ pub fn graft_rpc(bitmasks: &[Vec<u8>]) -> pb::Rpc {
             iwant: Vec::new(),
             graft: bitmasks
                 .iter()
-                .map(|b| pb::ControlGraft {
-                    bitmask: b.clone(),
-                })
+                .map(|b| pb::ControlGraft { bitmask: b.clone() })
                 .collect(),
             prune: Vec::new(),
             idontwant: Vec::new(),
@@ -196,10 +194,7 @@ fn decode_varint(data: &[u8]) -> Result<(u64, usize), DecodeError> {
         }
         shift += 7;
     }
-    Err(DecodeError::Incomplete {
-        need: 1,
-        have: 0,
-    })
+    Err(DecodeError::Incomplete { need: 1, have: 0 })
 }
 
 #[derive(Debug)]

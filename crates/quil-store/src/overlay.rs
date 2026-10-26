@@ -102,7 +102,9 @@ pub(crate) struct OverlayDbSnapshot {
 
 impl OverlayDbSnapshot {
     fn record_failure(&self) {
-        if let Ok(view) = &self.view { view.record_execution_failure(); }
+        if let Ok(view) = &self.view {
+            view.record_execution_failure();
+        }
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -237,7 +239,7 @@ impl OverlayRawCursor {
             Err(e) => {
                 self.snapshot.record_failure();
                 self.failure = Some(e.to_string());
-            },
+            }
         }
     }
 }
@@ -358,13 +360,10 @@ impl OverlayTxn {
         }
     }
     pub(crate) fn for_store<'a>(txn: &'a dyn Transaction, db: &OverlayDb) -> Result<&'a Self> {
-        let txn = txn
-            .as_any()
-            .downcast_ref::<Self>()
-            .ok_or_else(|| {
-                db.0.record_execution_failure();
-                error("tentative hypergraph write requires an OverlayTxn")
-            })?;
+        let txn = txn.as_any().downcast_ref::<Self>().ok_or_else(|| {
+            db.0.record_execution_failure();
+            error("tentative hypergraph write requires an OverlayTxn")
+        })?;
         if !Arc::ptr_eq(&txn.db.0, &db.0) {
             db.0.record_execution_failure();
             return Err(error(
@@ -383,8 +382,10 @@ impl OverlayTxn {
             match mutation {
                 OverlayMutation::Put(k, v) if k == key => return Ok(Some(v.clone())),
                 OverlayMutation::Delete(k) if k == key => return Ok(None),
-                OverlayMutation::DeleteRange(a, b) if a.as_slice() <= key && key < b.as_slice() => return Ok(None),
-                _ => {},
+                OverlayMutation::DeleteRange(a, b) if a.as_slice() <= key && key < b.as_slice() => {
+                    return Ok(None)
+                }
+                _ => {}
             }
         }
         self.db.get(key)
@@ -392,7 +393,11 @@ impl OverlayTxn {
 
     pub(crate) fn poison(&self, cause: impl std::fmt::Display) {
         self.db.0.record_execution_failure();
-        self.batch.lock().unwrap().failure.get_or_insert_with(|| cause.to_string());
+        self.batch
+            .lock()
+            .unwrap()
+            .failure
+            .get_or_insert_with(|| cause.to_string());
     }
 
     fn check_batch(&self, batch: &OverlayBatch) -> Result<()> {
@@ -567,7 +572,10 @@ pub(crate) fn newest_version_within<S: BoundedCursorSource>(
     last: &[u8],
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     fn row(cursor: &impl PageCursor) -> Option<(Vec<u8>, Vec<u8>)> {
-        cursor.key().zip(cursor.value()).map(|(k, v)| (k.to_vec(), v.to_vec()))
+        cursor
+            .key()
+            .zip(cursor.value())
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
     }
     let mut upper = last.to_vec();
     upper.push(0);
@@ -575,7 +583,9 @@ pub(crate) fn newest_version_within<S: BoundedCursorSource>(
     if !S::REVERSE_SEEK_BOUNDED {
         cursor.seek(lower);
         cursor.status()?;
-        let Some(first) = row(&cursor) else { return Ok(None) };
+        let Some(first) = row(&cursor) else {
+            return Ok(None);
+        };
         cursor.next();
         cursor.status()?;
         if !cursor.valid() {

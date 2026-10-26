@@ -75,7 +75,9 @@ pub fn encode_commitment(root: &[u8; 32], beacon_frame: u64) -> Vec<u8> {
 /// bytes.
 pub fn decode_commitment(bytes: &[u8]) -> Option<([u8; 32], u64)> {
     let (root, frame) = bytes.split_at_checked(32)?;
-    let root = <[u8; 32]>::try_from(root).ok().filter(|root| quil_crypto::storage_hash::from_bytes(root).is_some())?;
+    let root = <[u8; 32]>::try_from(root)
+        .ok()
+        .filter(|root| quil_crypto::storage_hash::from_bytes(root).is_some())?;
     Some((root, u64::from_be_bytes(frame.try_into().ok()?)))
 }
 
@@ -165,7 +167,11 @@ impl SeatSlot {
             sealed_at: self.sealed_at,
             frames: self.frames,
             accumulator: self.accumulator,
-            chained: self.chained.iter().map(|chained| (chained.frame, chained.beacon)).collect(),
+            chained: self
+                .chained
+                .iter()
+                .map(|chained| (chained.frame, chained.beacon))
+                .collect(),
             open: self.outcome == Outcome::Open,
         }
     }
@@ -182,7 +188,8 @@ impl SeatSlot {
             known.insert(frame, time);
             Ok(time)
         };
-        self.chained.iter()
+        self.chained
+            .iter()
             .map(|chained| Ok(at(chained.executed)?.saturating_sub(at(chained.beacon)?)))
             .collect()
     }
@@ -219,7 +226,12 @@ pub fn seat_address(member: &[u8], filter: &[u8]) -> Result<[u8; 32]> {
 }
 
 /// Fold one committed frame into a seat's chain.
-pub fn accumulate(accumulator: &[u8; 32], frame_number: u64, rho_n: &[u8], root: &[u8; 32]) -> [u8; 32] {
+pub fn accumulate(
+    accumulator: &[u8; 32],
+    frame_number: u64,
+    rho_n: &[u8],
+    root: &[u8; 32],
+) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update(DST_FRAMES);
     h.update(accumulator);
@@ -232,7 +244,11 @@ pub fn accumulate(accumulator: &[u8; 32], frame_number: u64, rho_n: &[u8], root:
 
 /// The chain over `frames` from the start.
 pub fn chain<'a>(frames: impl IntoIterator<Item = (u64, &'a [u8], &'a [u8; 32])>) -> [u8; 32] {
-    frames.into_iter().fold([0u8; 32], |acc, (frame, rho_n, root)| accumulate(&acc, frame, rho_n, root))
+    frames
+        .into_iter()
+        .fold([0u8; 32], |acc, (frame, rho_n, root)| {
+            accumulate(&acc, frame, rho_n, root)
+        })
 }
 
 /// GLOBAL frames `[from, until)` in which an epoch proof may settle `epoch`:
@@ -242,14 +258,19 @@ pub fn settlement_window(epoch: u64) -> (u64, u64) {
     let length = quil_types::consensus::epoch_length_frames();
     let next = epoch.saturating_add(1).saturating_mul(length);
     (
-        next.saturating_add(super::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW).saturating_add(1),
+        next.saturating_add(super::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW)
+            .saturating_add(1),
         next.saturating_add(length),
     )
 }
 
 impl Seat {
     pub fn new(member: [u8; 32], filter: Vec<u8>) -> Self {
-        Self { member, filter, slots: Vec::new() }
+        Self {
+            member,
+            filter,
+            slots: Vec::new(),
+        }
     }
 
     pub fn slot(&self, epoch: u64) -> Option<&SeatSlot> {
@@ -268,7 +289,12 @@ impl Seat {
         leaves.sort();
         leaves.dedup();
         self.slots.retain(|slot| slot.epoch != epoch);
-        self.slots.push(SeatSlot { epoch, leaves, registered_at: frame, ..Default::default() });
+        self.slots.push(SeatSlot {
+            epoch,
+            leaves,
+            registered_at: frame,
+            ..Default::default()
+        });
         self.slots.sort_by_key(|slot| slot.epoch);
         self.prune(quil_types::consensus::epoch_for_frame(frame));
     }
@@ -276,7 +302,8 @@ impl Seat {
     /// Drop slots no settlement or kick can still need: two epochs past
     /// their own.
     pub fn prune(&mut self, current_epoch: u64) {
-        self.slots.retain(|slot| slot.epoch.saturating_add(2) >= current_epoch);
+        self.slots
+            .retain(|slot| slot.epoch.saturating_add(2) >= current_epoch);
         while self.slots.len() > MAX_SLOTS {
             self.slots.remove(0);
         }
@@ -304,14 +331,23 @@ impl Seat {
     /// False when nothing is held: no sealed open registration for the epoch,
     /// nothing to hold, or this GLOBAL frame already held one.
     pub fn hold(
-        &mut self, epoch: u64, frame: u64, app_frame: u64, amount: &num_bigint::BigInt, committee: usize,
+        &mut self,
+        epoch: u64,
+        frame: u64,
+        app_frame: u64,
+        amount: &num_bigint::BigInt,
+        committee: usize,
     ) -> bool {
-        let Some(slot) = self.slot_mut(epoch) else { return false };
+        let Some(slot) = self.slot_mut(epoch) else {
+            return false;
+        };
         if !slot.is_sealed() || slot.outcome != Outcome::Open {
             return false;
         }
         if app_frame > slot.counted_through {
-            slot.expected = slot.expected.saturating_add(PROPOSAL / committee.max(1) as u64);
+            slot.expected = slot
+                .expected
+                .saturating_add(PROPOSAL / committee.max(1) as u64);
             slot.counted_through = app_frame;
         }
         if slot.held_through >= frame || amount.sign() != num_bigint::Sign::Plus {
@@ -332,18 +368,32 @@ impl Seat {
     /// sealed open registration for the epoch, or the frame is not past the
     /// last one chained (a frame applied again).
     pub fn commit(
-        &mut self, epoch: u64, frame_number: u64, beacon: u64, executed: u64, rho_n: &[u8], root: &[u8; 32],
+        &mut self,
+        epoch: u64,
+        frame_number: u64,
+        beacon: u64,
+        executed: u64,
+        rho_n: &[u8],
+        root: &[u8; 32],
     ) -> bool {
-        let Some(slot) = self.slot_mut(epoch) else { return false };
+        let Some(slot) = self.slot_mut(epoch) else {
+            return false;
+        };
         let last = slot.chained.last().map_or(0, |chained| chained.frame);
-        if !slot.is_sealed() || slot.outcome != Outcome::Open || frame_number <= last
+        if !slot.is_sealed()
+            || slot.outcome != Outcome::Open
+            || frame_number <= last
             || slot.chained.len() >= MAX_CHAINED
         {
             return false;
         }
         slot.accumulator = accumulate(&slot.accumulator, frame_number, rho_n, root);
         slot.frames += 1;
-        slot.chained.push(Chained { frame: frame_number, beacon, executed });
+        slot.chained.push(Chained {
+            frame: frame_number,
+            beacon,
+            executed,
+        });
         true
     }
 
@@ -391,11 +441,18 @@ impl Seat {
     }
 
     pub fn from_tree(tree: &quil_tries::VectorCommitmentTree) -> Result<Self> {
-        let field = |name| read_field(tree, CLASS, name)
-            .ok_or_else(|| QuilError::InvalidArgument(format!("storage seat has no {name}")));
-        let member = <[u8; 32]>::try_from(field("Member")?.as_slice())
-            .map_err(|_| QuilError::InvalidArgument("storage seat member is not 32 bytes".into()))?;
-        Ok(Self { member, filter: field("ShardFilter")?, slots: decode_slots(&field("Slots")?)? })
+        let field = |name| {
+            read_field(tree, CLASS, name)
+                .ok_or_else(|| QuilError::InvalidArgument(format!("storage seat has no {name}")))
+        };
+        let member = <[u8; 32]>::try_from(field("Member")?.as_slice()).map_err(|_| {
+            QuilError::InvalidArgument("storage seat member is not 32 bytes".into())
+        })?;
+        Ok(Self {
+            member,
+            filter: field("ShardFilter")?,
+            slots: decode_slots(&field("Slots")?)?,
+        })
     }
 }
 
@@ -408,9 +465,10 @@ pub fn read(state: &HypergraphState, member: &[u8; 32], filter: &[u8]) -> Result
 pub fn read_address(state: &HypergraphState, address: &[u8; 32]) -> Result<Option<Seat>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)? {
-        Some(blob) if !blob.is_empty() => {
-            Seat::from_tree(&crate::prover_registry::rebuild_vertex_tree_from_blob(&blob)).map(Some)
-        }
+        Some(blob) if !blob.is_empty() => Seat::from_tree(
+            &crate::prover_registry::rebuild_vertex_tree_from_blob(&blob),
+        )
+        .map(Some),
         _ => Ok(None),
     }
 }
@@ -420,7 +478,13 @@ pub fn write(state: &HypergraphState, frame: u64, seat: &Seat) -> Result<()> {
     let address = seat_address(&seat.member, &seat.filter)?;
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     let blob = crate::prover_registry::vertex_tree_to_blob(&seat.to_tree()?);
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc, frame, blob)
+    state.set(
+        &GLOBAL_INTRINSIC_ADDRESS[..],
+        &address,
+        &va_disc,
+        frame,
+        blob,
+    )
 }
 
 /// Epochs whose queues are kept: a queue is swept two epochs after its own,
@@ -445,7 +509,11 @@ fn expiry_bucket(seat: &[u8; 32]) -> u8 {
 /// another epoch.
 fn read_expiry(state: &HypergraphState, epoch: u64, bucket: u8) -> Result<Vec<u8>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-    let stored = match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &expiry_address(epoch, bucket)?, &va_disc)? {
+    let stored = match state.get(
+        &GLOBAL_INTRINSIC_ADDRESS[..],
+        &expiry_address(epoch, bucket)?,
+        &va_disc,
+    )? {
         Some(blob) if !blob.is_empty() => {
             let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
             read_field(&tree, EXPIRY_CLASS, "Seats").unwrap_or_default()
@@ -453,23 +521,46 @@ fn read_expiry(state: &HypergraphState, epoch: u64, bucket: u8) -> Result<Vec<u8
         _ => Vec::new(),
     };
     Ok(match stored.split_at_checked(8) {
-        Some((held, seats)) if held == epoch.to_be_bytes() && seats.len() % 32 == 0 => seats.to_vec(),
+        Some((held, seats)) if held == epoch.to_be_bytes() && seats.len() % 32 == 0 => {
+            seats.to_vec()
+        }
         _ => Vec::new(),
     })
 }
 
-fn write_expiry(state: &HypergraphState, frame: u64, epoch: u64, bucket: u8, seats: &[u8]) -> Result<()> {
+fn write_expiry(
+    state: &HypergraphState,
+    frame: u64,
+    epoch: u64,
+    bucket: u8,
+    seats: &[u8],
+) -> Result<()> {
     let mut tree = quil_tries::VectorCommitmentTree::new();
     write_type(&mut tree, EXPIRY_CLASS)?;
-    write_field(&mut tree, EXPIRY_CLASS, "Seats", &[&epoch.to_be_bytes()[..], seats].concat())?;
+    write_field(
+        &mut tree,
+        EXPIRY_CLASS,
+        "Seats",
+        &[&epoch.to_be_bytes()[..], seats].concat(),
+    )?;
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
-    state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &expiry_address(epoch, bucket)?, &va_disc, frame,
-        crate::prover_registry::vertex_tree_to_blob(&tree))
+    state.set(
+        &GLOBAL_INTRINSIC_ADDRESS[..],
+        &expiry_address(epoch, bucket)?,
+        &va_disc,
+        frame,
+        crate::prover_registry::vertex_tree_to_blob(&tree),
+    )
 }
 
 /// Queue the seat at `seat` for `epoch`'s expiry sweep, at GLOBAL frame
 /// `frame`: once, when it chains its first root of the epoch.
-pub fn enqueue_expiry(state: &HypergraphState, frame: u64, epoch: u64, seat: &[u8; 32]) -> Result<()> {
+pub fn enqueue_expiry(
+    state: &HypergraphState,
+    frame: u64,
+    epoch: u64,
+    seat: &[u8; 32],
+) -> Result<()> {
     let bucket = expiry_bucket(seat);
     let mut seats = read_expiry(state, epoch, bucket)?;
     if seats.chunks_exact(32).any(|queued| queued == seat) {
@@ -489,7 +580,13 @@ pub fn expiry_buckets_due(frame: u64) -> Option<(u64, Vec<u8>)> {
     let frames = EXPIRY_BUCKETS.min(length);
     let offset = frame.checked_sub(current * length)?;
     (offset < frames).then(|| {
-        (epoch, (offset..EXPIRY_BUCKETS).step_by(frames as usize).map(|bucket| bucket as u8).collect())
+        (
+            epoch,
+            (offset..EXPIRY_BUCKETS)
+                .step_by(frames as usize)
+                .map(|bucket| bucket as u8)
+                .collect(),
+        )
     })
 }
 
@@ -497,14 +594,18 @@ pub fn expiry_buckets_due(frame: u64) -> Option<(u64, Vec<u8>)> {
 /// each queued seat whose settlement window ended, and returns those whose
 /// member committed roots it never proved, to be kicked.
 pub fn sweep_expiries(state: &HypergraphState, frame: u64) -> Result<Vec<Seat>> {
-    let Some((epoch, buckets)) = expiry_buckets_due(frame) else { return Ok(Vec::new()) };
+    let Some((epoch, buckets)) = expiry_buckets_due(frame) else {
+        return Ok(Vec::new());
+    };
     if !quil_types::consensus::hash_storage_proofs_at(epoch) {
         return Ok(Vec::new());
     }
     let mut kicks = Vec::new();
     for bucket in buckets {
         for address in take_expiry(state, frame, epoch, bucket)? {
-            let Some(mut seat) = read_address(state, &address)? else { continue };
+            let Some(mut seat) = read_address(state, &address)? else {
+                continue;
+            };
             let before = seat.clone();
             let kick = seat.expire(frame);
             if seat != before {
@@ -520,13 +621,21 @@ pub fn sweep_expiries(state: &HypergraphState, frame: u64) -> Result<Vec<Seat>> 
 
 /// Take `epoch`'s queued seats in `bucket` for the sweep at GLOBAL frame
 /// `frame`, emptying the bucket.
-pub fn take_expiry(state: &HypergraphState, frame: u64, epoch: u64, bucket: u8) -> Result<Vec<[u8; 32]>> {
+pub fn take_expiry(
+    state: &HypergraphState,
+    frame: u64,
+    epoch: u64,
+    bucket: u8,
+) -> Result<Vec<[u8; 32]>> {
     let seats = read_expiry(state, epoch, bucket)?;
     if seats.is_empty() {
         return Ok(Vec::new());
     }
     write_expiry(state, frame, epoch, bucket, &[])?;
-    Ok(seats.chunks_exact(32).map(|seat| seat.try_into().expect("32 bytes")).collect())
+    Ok(seats
+        .chunks_exact(32)
+        .map(|seat| seat.try_into().expect("32 bytes"))
+        .collect())
 }
 
 pub fn encode_slots(slots: &[SeatSlot]) -> Vec<u8> {
@@ -608,7 +717,11 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
             if len > MAX_PREFIX {
                 return Err(invalid("prefix too long"));
             }
-            leaves.push((0..len).map(|_| read_u32(data, &mut c)).collect::<Result<Vec<u32>>>()?);
+            leaves.push(
+                (0..len)
+                    .map(|_| read_u32(data, &mut c))
+                    .collect::<Result<Vec<u32>>>()?,
+            );
         }
         let registered_at = read_u64(data, &mut c)?;
         let sealed_at = match byte(&mut c)? {
@@ -628,9 +741,16 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
             let gap = read_varint(data, &mut c).ok_or_else(|| invalid("bad frame gap"))?;
             let step = read_varint(data, &mut c).ok_or_else(|| invalid("bad beacon step"))?;
             let lag = read_varint(data, &mut c).ok_or_else(|| invalid("bad execution lag"))?;
-            frame = frame.checked_add(gap).filter(|_| gap > 0).ok_or_else(|| invalid("frames not ascending"))?;
+            frame = frame
+                .checked_add(gap)
+                .filter(|_| gap > 0)
+                .ok_or_else(|| invalid("frames not ascending"))?;
             beacon = beacon.wrapping_add(unzigzag(step) as u64);
-            chained.push(Chained { frame, beacon, executed: beacon.wrapping_add(lag) });
+            chained.push(Chained {
+                frame,
+                beacon,
+                executed: beacon.wrapping_add(lag),
+            });
         }
         let expected = read_u64(data, &mut c)?;
         let counted_through = read_u64(data, &mut c)?;
@@ -647,8 +767,18 @@ pub fn decode_slots(data: &[u8]) -> Result<Vec<SeatSlot>> {
             _ => return Err(invalid("bad outcome")),
         };
         slots.push(SeatSlot {
-            epoch, leaves, registered_at, sealed_at, frames, accumulator, chained, expected, counted_through,
-            held_through, pending, outcome,
+            epoch,
+            leaves,
+            registered_at,
+            sealed_at,
+            frames,
+            accumulator,
+            chained,
+            expected,
+            counted_through,
+            held_through,
+            pending,
+            outcome,
         });
     }
     if c != data.len() {
@@ -709,15 +839,38 @@ mod tests {
         seat.hold(9, 100, 39, &BigInt::from(123_456_789u64), 4);
         seat.commit(9, 40, 530, 532, &[3; 32], &[4; 32]);
         seat.commit(9, 300, 526, 540, &[3; 32], &[4; 32]);
-        seat.register(10, &[vec![2, 1]], 9 * quil_types::consensus::epoch_length_frames() + 30);
+        seat.register(
+            10,
+            &[vec![2, 1]],
+            9 * quil_types::consensus::epoch_length_frames() + 30,
+        );
         let back = Seat::from_tree(&seat.to_tree().unwrap()).unwrap();
         assert_eq!(back, seat);
-        assert_eq!(back.slot(9).unwrap().leaves, vec![vec![0], vec![1]], "leaves are kept sorted");
-        assert_eq!(back.slot(9).unwrap().chained, vec![
-            Chained { frame: 40, beacon: 530, executed: 532 },
-            Chained { frame: 300, beacon: 526, executed: 540 },
-        ]);
-        assert_eq!(back.slot(9).unwrap().view().chained, vec![(40, 530), (300, 526)], "members list beacon frames");
+        assert_eq!(
+            back.slot(9).unwrap().leaves,
+            vec![vec![0], vec![1]],
+            "leaves are kept sorted"
+        );
+        assert_eq!(
+            back.slot(9).unwrap().chained,
+            vec![
+                Chained {
+                    frame: 40,
+                    beacon: 530,
+                    executed: 532
+                },
+                Chained {
+                    frame: 300,
+                    beacon: 526,
+                    executed: 540
+                },
+            ]
+        );
+        assert_eq!(
+            back.slot(9).unwrap().view().chained,
+            vec![(40, 530), (300, 526)],
+            "members list beacon frames"
+        );
         let encoded = encode_slots(&seat.slots);
         assert!(decode_slots(&encoded[..encoded.len() - 1]).is_err());
         assert!(decode_slots(&[encoded.as_slice(), &[0]].concat()).is_err());
@@ -734,34 +887,83 @@ mod tests {
     #[test]
     fn only_a_sealed_registration_holds_rewards_once_per_global_frame() {
         let mut seat = Seat::new([7; 32], vec![1]);
-        seat.register(5, &[vec![]], 4 * quil_types::consensus::epoch_length_frames() + 20);
+        seat.register(
+            5,
+            &[vec![]],
+            4 * quil_types::consensus::epoch_length_frames() + 20,
+        );
         assert!(!seat.hold(5, 100, 30, &BigInt::from(10), 4), "unsealed");
         assert!(seat.seal(5, 4 * quil_types::consensus::epoch_length_frames() + 25));
-        assert!(!seat.hold(6, 100, 30, &BigInt::from(10), 4), "no registration for that epoch");
+        assert!(
+            !seat.hold(6, 100, 30, &BigInt::from(10), 4),
+            "no registration for that epoch"
+        );
         assert!(seat.hold(5, 100, 30, &BigInt::from(10), 4));
-        assert!(!seat.hold(5, 100, 30, &BigInt::from(10), 4), "the same app frame again");
-        assert!(!seat.hold(5, 100, 31, &BigInt::from(10), 4), "another app frame in the same GLOBAL frame");
+        assert!(
+            !seat.hold(5, 100, 30, &BigInt::from(10), 4),
+            "the same app frame again"
+        );
+        assert!(
+            !seat.hold(5, 100, 31, &BigInt::from(10), 4),
+            "another app frame in the same GLOBAL frame"
+        );
         assert!(seat.hold(5, 101, 32, &BigInt::from(5), 4));
         let slot = seat.slot(5).unwrap();
         assert_eq!(slot.pending_amount(), BigInt::from(15));
-        assert_eq!(slot.expected, 3 * PROPOSAL / 4, "every app frame counts toward the proposals expected");
+        assert_eq!(
+            slot.expected,
+            3 * PROPOSAL / 4,
+            "every app frame counts toward the proposals expected"
+        );
     }
 
     #[test]
     fn commitments_chain_in_frame_order_and_match_the_chain_of_their_list() {
         let mut seat = sealed_seat(5);
         assert!(seat.commit(5, 10, 301, 302, &[1; 32], &[2; 32]));
-        assert!(!seat.commit(5, 10, 301, 303, &[1; 32], &[2; 32]), "a frame applied again");
-        assert!(!seat.commit(5, 9, 300, 303, &[1; 32], &[2; 32]), "an earlier frame");
+        assert!(
+            !seat.commit(5, 10, 301, 303, &[1; 32], &[2; 32]),
+            "a frame applied again"
+        );
+        assert!(
+            !seat.commit(5, 9, 300, 303, &[1; 32], &[2; 32]),
+            "an earlier frame"
+        );
         // GLOBAL never executed frame 11.
         assert!(seat.commit(5, 12, 303, 304, &[3; 32], &[4; 32]));
         let slot = seat.slot(5).unwrap();
-        assert_eq!((slot.frames, slot.chained.clone()), (2, vec![
-            Chained { frame: 10, beacon: 301, executed: 302 },
-            Chained { frame: 12, beacon: 303, executed: 304 },
-        ]));
-        assert_eq!(slot.accumulator, chain([(10, &[1u8; 32][..], &[2u8; 32]), (12, &[3u8; 32][..], &[4u8; 32])]));
-        assert_ne!(slot.accumulator, chain([(12, &[3u8; 32][..], &[4u8; 32]), (10, &[1u8; 32][..], &[2u8; 32])]));
+        assert_eq!(
+            (slot.frames, slot.chained.clone()),
+            (
+                2,
+                vec![
+                    Chained {
+                        frame: 10,
+                        beacon: 301,
+                        executed: 302
+                    },
+                    Chained {
+                        frame: 12,
+                        beacon: 303,
+                        executed: 304
+                    },
+                ]
+            )
+        );
+        assert_eq!(
+            slot.accumulator,
+            chain([
+                (10, &[1u8; 32][..], &[2u8; 32]),
+                (12, &[3u8; 32][..], &[4u8; 32])
+            ])
+        );
+        assert_ne!(
+            slot.accumulator,
+            chain([
+                (12, &[3u8; 32][..], &[4u8; 32]),
+                (10, &[1u8; 32][..], &[2u8; 32])
+            ])
+        );
     }
 
     #[test]
@@ -772,21 +974,48 @@ mod tests {
         }
         // Twenty frames of a four-member committee: five proposals expected.
         assert_eq!(seat.slot(5).unwrap().expected, 5 * PROPOSAL);
-        assert_eq!(seat.clone().settle(5, 900, 0), Some(BigInt::from(0)), "no commitment");
+        assert_eq!(
+            seat.clone().settle(5, 900, 0),
+            Some(BigInt::from(0)),
+            "no commitment"
+        );
         assert!(seat.commit(5, 41, 300, 301, &[1; 32], &[2; 32]));
         assert!(seat.commit(5, 45, 304, 305, &[1; 32], &[2; 32]));
-        assert_eq!(seat.clone().settle(5, 900, 2), Some(BigInt::from(80)), "two of five: 40%");
-        assert_eq!(seat.clone().settle(5, 900, 1), Some(BigInt::from(40)), "one of them late: 20%");
-        assert_eq!(seat.clone().settle(5, 900, 9), Some(BigInt::from(80)), "never more than were chained");
+        assert_eq!(
+            seat.clone().settle(5, 900, 2),
+            Some(BigInt::from(80)),
+            "two of five: 40%"
+        );
+        assert_eq!(
+            seat.clone().settle(5, 900, 1),
+            Some(BigInt::from(40)),
+            "one of them late: 20%"
+        );
+        assert_eq!(
+            seat.clone().settle(5, 900, 9),
+            Some(BigInt::from(80)),
+            "never more than were chained"
+        );
         let mut busy = seat.clone();
         for frame in [49, 53, 57, 58] {
             assert!(busy.commit(5, frame, 310, 311, &[1; 32], &[2; 32]));
         }
-        assert_eq!(busy.settle(5, 900, 6), Some(BigInt::from(200)), "more than expected: all of it");
+        assert_eq!(
+            busy.settle(5, 900, 6),
+            Some(BigInt::from(200)),
+            "more than expected: all of it"
+        );
         assert_eq!(seat.settle(5, 900, 2), Some(BigInt::from(80)));
-        assert_eq!(seat.slot(5).unwrap().chained, vec![], "nothing left to list");
+        assert_eq!(
+            seat.slot(5).unwrap().chained,
+            vec![],
+            "nothing left to list"
+        );
         assert_eq!(seat.settle(5, 901, 2), None, "settled once");
-        assert!(!seat.hold(5, 200, 70, &BigInt::from(10), 4), "a settled epoch holds nothing more");
+        assert!(
+            !seat.hold(5, 200, 70, &BigInt::from(10), 4),
+            "a settled epoch holds nothing more"
+        );
     }
 
     /// A root counts as published only if GLOBAL executed it within the
@@ -804,47 +1033,96 @@ mod tests {
             }
         };
         assert!(seat.commit(5, 41, 300, 301, &[1; 32], &[2; 32]), "10 s");
-        assert!(seat.commit(5, 42, 300, 306, &[1; 32], &[2; 32]), "60 s: the window's edge");
+        assert!(
+            seat.commit(5, 42, 300, 306, &[1; 32], &[2; 32]),
+            "60 s: the window's edge"
+        );
         assert!(seat.commit(5, 43, 301, 308, &[1; 32], &[2; 32]), "70 s");
-        assert!(seat.commit(5, 44, 319, 320, &[1; 32], &[2; 32]), "one frame, but 300 s");
+        assert!(
+            seat.commit(5, 44, 319, 320, &[1; 32], &[2; 32]),
+            "one frame, but 300 s"
+        );
         assert!(seat.commit(5, 45, 320, 322, &[1; 32], &[2; 32]), "20 s");
         let slot = seat.slot(5).unwrap();
         let times = slot.response_times(timestamp).unwrap();
         assert_eq!(times, vec![10_000, 60_000, 70_000, 300_000, 20_000]);
-        assert_eq!(times.iter().filter(|&&time| time <= RESPONSE_WINDOW_MS).count(), 3);
-        assert!(slot.response_times(|frame| if frame == 322 {
-            Err(QuilError::ExecutionUnavailable("gap".into()))
-        } else {
-            timestamp(frame)
-        })
-        .is_err(), "a missing GLOBAL frame waits, never counts either way");
+        assert_eq!(
+            times
+                .iter()
+                .filter(|&&time| time <= RESPONSE_WINDOW_MS)
+                .count(),
+            3
+        );
+        assert!(
+            slot.response_times(|frame| if frame == 322 {
+                Err(QuilError::ExecutionUnavailable("gap".into()))
+            } else {
+                timestamp(frame)
+            })
+            .is_err(),
+            "a missing GLOBAL frame waits, never counts either way"
+        );
     }
 
     #[test]
     fn a_commitment_names_its_root_and_beacon_frame() {
-        let root = quil_crypto::storage_hash::to_bytes(&quil_crypto::storage_hash::key_digest(b"openings"));
+        let root = quil_crypto::storage_hash::to_bytes(&quil_crypto::storage_hash::key_digest(
+            b"openings",
+        ));
         let bytes = encode_commitment(&root, 1234);
         assert_eq!(bytes.len(), 40);
         assert_eq!(decode_commitment(&bytes), Some((root, 1234)));
-        assert_eq!(decode_commitment(&root), None, "a bare root names no beacon frame");
+        assert_eq!(
+            decode_commitment(&root),
+            None,
+            "a bare root names no beacon frame"
+        );
         assert_eq!(decode_commitment(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode_commitment(&[[0xFF; 32].as_slice(), &1234u64.to_be_bytes()].concat()), None, "not a root");
+        assert_eq!(
+            decode_commitment(&[[0xFF; 32].as_slice(), &1234u64.to_be_bytes()].concat()),
+            None,
+            "not a root"
+        );
         assert!(commitment_acceptable(&[], 1234), "no commitment");
         assert!(commitment_acceptable(&bytes, 1234) && commitment_acceptable(&bytes, 1230));
-        assert!(!commitment_acceptable(&bytes, 1235), "a beacon before the anchor");
+        assert!(
+            !commitment_acceptable(&bytes, 1235),
+            "a beacon before the anchor"
+        );
         assert!(!commitment_acceptable(&root, 1000), "a bare root");
     }
 
     struct StubProver;
     impl quil_types::crypto::InclusionProver for StubProver {
-        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-        fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64)
-            -> Result<Box<dyn quil_types::crypto::Multiproof>> {
+        fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![0u8; 64])
+        }
+        fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+            Ok(true)
+        }
+        fn prove_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+        ) -> Result<Box<dyn quil_types::crypto::Multiproof>> {
             Err(QuilError::Internal("batch not supported".into()))
         }
-        fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        fn verify_multiple(
+            &self,
+            _: &[&[u8]],
+            _: &[&[u8]],
+            _: &[u64],
+            _: u64,
+            _: &[u8],
+            _: &[u8],
+        ) -> bool {
+            true
+        }
     }
 
     /// A member that commits a root and is never heard from again is still
@@ -855,15 +1133,21 @@ mod tests {
         let length = quil_types::consensus::epoch_length_frames();
         let epoch = 5;
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
-        let state = HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
-            std::sync::Arc::new(StubProver),
-        )));
+        let state =
+            HypergraphState::new(std::sync::Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                std::sync::Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new()),
+                std::sync::Arc::new(StubProver),
+            )));
         let frame = epoch * length + 30;
         let mut addresses = Vec::new();
         // Members 1 and 2 commit and vanish, 3 commits and settles, 4 never
         // commits.
-        for (member, commits, settles) in [(1u8, true, false), (2, true, false), (3, true, true), (4, false, false)] {
+        for (member, commits, settles) in [
+            (1u8, true, false),
+            (2, true, false),
+            (3, true, true),
+            (4, false, false),
+        ] {
             let mut seat = sealed_seat(epoch);
             seat.member = [member; 32];
             if commits {
@@ -883,21 +1167,42 @@ mod tests {
         }
         let close = settlement_window(epoch).1;
         assert_eq!(close, (epoch + 2) * length);
-        assert!(sweep_expiries(&state, close - 1).unwrap().is_empty(), "the window is still open");
+        assert!(
+            sweep_expiries(&state, close - 1).unwrap().is_empty(),
+            "the window is still open"
+        );
         let mut kicked = Vec::new();
         for frame in close..close + EXPIRY_BUCKETS + 2 {
-            kicked.extend(sweep_expiries(&state, frame).unwrap().into_iter().map(|seat| seat.member[0]));
+            kicked.extend(
+                sweep_expiries(&state, frame)
+                    .unwrap()
+                    .into_iter()
+                    .map(|seat| seat.member[0]),
+            );
         }
         kicked.sort();
-        assert_eq!(kicked, vec![1, 2], "each unproven committer once; the settled one and the idle one not");
+        assert_eq!(
+            kicked,
+            vec![1, 2],
+            "each unproven committer once; the settled one and the idle one not"
+        );
         for member in [1u8, 2] {
             let seat = read(&state, &[member; 32], &[1, 2, 3]).unwrap().unwrap();
-            assert!(matches!(seat.slot(epoch).unwrap().outcome, Outcome::Expired(_)));
+            assert!(matches!(
+                seat.slot(epoch).unwrap().outcome,
+                Outcome::Expired(_)
+            ));
         }
         for address in &addresses {
             let bucket = expiry_bucket(address);
-            assert!(read_expiry(&state, epoch, bucket).unwrap().is_empty(), "swept");
-            assert!(read_expiry(&state, epoch + 4, bucket).unwrap().is_empty(), "a ring slot holds one epoch");
+            assert!(
+                read_expiry(&state, epoch, bucket).unwrap().is_empty(),
+                "swept"
+            );
+            assert!(
+                read_expiry(&state, epoch + 4, bucket).unwrap().is_empty(),
+                "a ring slot holds one epoch"
+            );
         }
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
@@ -912,8 +1217,9 @@ mod tests {
                 due.extend(buckets.into_iter().map(|bucket| (epoch, bucket)));
             }
         }
-        let expected: Vec<(u64, u8)> =
-            (0..4).flat_map(|epoch| (0..EXPIRY_BUCKETS as u8).map(move |bucket| (epoch, bucket))).collect();
+        let expected: Vec<(u64, u8)> = (0..4)
+            .flat_map(|epoch| (0..EXPIRY_BUCKETS as u8).map(move |bucket| (epoch, bucket)))
+            .collect();
         due.sort();
         assert_eq!(due, expected);
     }

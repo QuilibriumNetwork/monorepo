@@ -131,7 +131,8 @@ async fn tier2_joiner_lifecycle_emits_self_confirm_after_join() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // Sanity: joiner is now in the registry.
     assert!(
@@ -359,7 +360,8 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // Verify Joining status.
     let joining = archive.prover_registry.read(|r| {
@@ -423,14 +425,18 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
             tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             for bundle in &joiner_transport.drain_outbound() {
-                if let Ok(r) =
-                    archive.materializer.materialize_synced(&build_global_frame_with_bundle(17, bundle))
+                if let Ok(r) = archive
+                    .materializer
+                    .materialize_synced(&build_global_frame_with_bundle(17, bundle))
                 {
                     confirm_result_processed += r.processed;
                     confirm_result_skipped += r.skipped;
                 }
             }
-            archive.prover_registry.refresh_from_store(archive.hg_store.as_ref()).unwrap();
+            archive
+                .prover_registry
+                .refresh_from_store(archive.hg_store.as_ref())
+                .unwrap();
             status_after_confirm = archive.prover_registry.read(|r| {
                 r.get_prover_info(&joiner.address).and_then(|info| {
                     info.allocations
@@ -531,9 +537,8 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
 
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(),
-    );
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -585,7 +590,8 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // 2. Joiner self-confirms after the window.
     joiner_pipeline.lifecycle.set_sync_complete();
@@ -639,7 +645,8 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     }
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // Verify allocation is now Active.
     let status_after_confirm = archive.prover_registry.read(|r| {
@@ -770,7 +777,8 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     // 4. Refresh and assert: joiner's allocation last_active advanced.
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let alloc_after = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -901,7 +909,8 @@ async fn tier2_composite_end_to_end() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // -----------------------------------------------------------------
     // Phase B — lifecycle emits ProverConfirm; archive flips to Active
@@ -958,7 +967,8 @@ async fn tier2_composite_end_to_end() {
     }
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     let status_after = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
@@ -1004,7 +1014,8 @@ async fn tier2_composite_end_to_end() {
             clock_store: clock_store as Arc<dyn ClockStore>,
             global_anchor_store: None,
             global_hypergraph: None,
-            storage_source_hypergraph: None, topology: None,
+            storage_source_hypergraph: None,
+            topology: None,
             prover_registry: registry_for_engine.clone()
                 as Arc<dyn quil_types::consensus::ProverRegistry>,
             frame_prover: Arc::new(StubFrameProver) as Arc<dyn FrameProver>,
@@ -1034,7 +1045,12 @@ async fn tier2_composite_end_to_end() {
             ),
             kv_db: None,
             app_consensus_cw: false,
-            db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
+            db_config: quil_config::DbConfig {
+                path: String::new(),
+                worker_path_prefix: String::new(),
+                worker_paths: vec![],
+                ..Default::default()
+            }, // ephemeral journal in tests
             unified_cutover_hook: None,
         };
         let (engine, handle) =
@@ -1045,9 +1061,7 @@ async fn tier2_composite_end_to_end() {
         let pk = joiner_for_engine.bls_signer.public_key().to_vec();
         let bls_factory: std::sync::Arc<
             dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
-        > = std::sync::Arc::new(move || {
-            Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
-        });
+        > = std::sync::Arc::new(move || Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk)));
         tokio::spawn(async move {
             engine.run(bls_factory).await;
         });
@@ -1058,9 +1072,11 @@ async fn tier2_composite_end_to_end() {
                 use quil_engine::app_engine::AppEngineEvent::*;
                 if matches!(ev, ShardDataBootstrapRequested { .. }) {
                     // Empty harness shard: the bootstrap converges at once.
-                    bootstrap_handle.send(quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
-                        synced_to_frame: 0,
-                    });
+                    bootstrap_handle.send(
+                        quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
+                            synced_to_frame: 0,
+                        },
+                    );
                 }
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
@@ -1233,7 +1249,8 @@ async fn tier2_composite_end_to_end() {
     // -----------------------------------------------------------------
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let post_last_active = archive.prover_registry.read(|r| {
         r.get_prover_info(&joiner.address)
             .expect("joiner")
@@ -1273,7 +1290,10 @@ async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
     #[async_trait::async_trait]
     impl ProverMessageTransport for BlockedTransport {
         async fn latest_global_frame_header(&self) -> QResult<gpb::GlobalFrameHeader> {
-            Ok(gpb::GlobalFrameHeader { frame_number: 10, ..Default::default() })
+            Ok(gpb::GlobalFrameHeader {
+                frame_number: 10,
+                ..Default::default()
+            })
         }
         async fn publish_prover_bundle(&self, bytes: Vec<u8>) -> QResult<()> {
             // The test must reach actual canonical encoding and transport.
@@ -1291,30 +1311,52 @@ async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
         count: AtomicUsize::new(0),
     });
     let test_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    let mut rig = build_test_pipeline_with_registry(&prover, test_transport,
-        Arc::new(TestProverRegistry::new()));
+    let mut rig = build_test_pipeline_with_registry(
+        &prover,
+        test_transport,
+        Arc::new(TestProverRegistry::new()),
+    );
     Arc::get_mut(&mut rig.pipeline).unwrap().transport = transport.clone();
     let first = vec![0xA1; 35];
     rig.pipeline.dispatch(LifecycleAction::RejectLeaves {
-        filters: vec![first.clone()], frame_number: 10,
+        filters: vec![first.clone()],
+        frame_number: 10,
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
-        .await.unwrap().unwrap().forget();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.started.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
     rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
-        filters: vec![first.clone()], frame_number: 11,
+        filters: vec![first.clone()],
+        frame_number: 11,
     });
     rig.pipeline.dispatch(LifecycleAction::ProposeLeave {
-        filters: vec![vec![0xB2; 35]], frame_number: 11,
+        filters: vec![vec![0xB2; 35]],
+        frame_number: 11,
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
-        .await.unwrap().unwrap().forget();
-    assert_eq!(transport.count.load(Ordering::SeqCst), 2,
-        "only the rejection and the independent filter may publish");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.started.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    assert_eq!(
+        transport.count.load(Ordering::SeqCst),
+        2,
+        "only the rejection and the independent filter may publish"
+    );
     transport.release.add_permits(2);
     // Repeating the conflicting operation immediately remains fenced whether
     // the first task is still finishing or has recorded successful publication.
     rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
-        filters: vec![first], frame_number: 12,
+        filters: vec![first],
+        frame_number: 12,
     });
     tokio::task::yield_now().await;
     assert_eq!(transport.count.load(Ordering::SeqCst), 2);
@@ -1347,26 +1389,44 @@ impl Recording {
 #[async_trait::async_trait]
 impl quil_engine::prover_message_transport::ProverMessageTransport for Recording {
     async fn latest_global_frame_header(&self) -> QResult<gpb::GlobalFrameHeader> {
-        Ok(gpb::GlobalFrameHeader { frame_number: 10, ..Default::default() })
+        Ok(gpb::GlobalFrameHeader {
+            frame_number: 10,
+            ..Default::default()
+        })
     }
     async fn publish_prover_bundle(&self, bytes: Vec<u8>) -> QResult<()> {
         use quil_execution::global_intrinsic::prover_filter_ops::{ProverLeave, TYPE_PROVER_LEAVE};
         use quil_execution::global_intrinsic::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
-        use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM};
+        use quil_execution::global_intrinsic::prover_ops::{
+            ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM,
+        };
         use quil_execution::message_envelope::CanonicalMessageBundle;
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call == self.fail_call {
-            return Err(quil_types::error::QuilError::Internal("no archive accepted".into()));
+            return Err(quil_types::error::QuilError::Internal(
+                "no archive accepted".into(),
+            ));
         }
         let bundle = CanonicalMessageBundle::from_canonical_bytes(&bytes)?;
-        let inner = &bundle.requests[0].as_ref().expect("one request").inner_bytes;
+        let inner = &bundle.requests[0]
+            .as_ref()
+            .expect("one request")
+            .inner_bytes;
         let decoded = match u32::from_be_bytes(inner[..4].try_into().unwrap()) {
-            TYPE_PROVER_CONFIRM => ProverConfirm::from_canonical_bytes(inner).map(|op| ("confirm", op.filters)),
-            TYPE_PROVER_LEAVE => ProverLeave::from_canonical_bytes(inner).map(|op| ("leave", op.filters)),
-            TYPE_PROVER_JOIN => ProverJoin::from_canonical_bytes(inner).map(|op| ("join", op.filters)),
+            TYPE_PROVER_CONFIRM => {
+                ProverConfirm::from_canonical_bytes(inner).map(|op| ("confirm", op.filters))
+            }
+            TYPE_PROVER_LEAVE => {
+                ProverLeave::from_canonical_bytes(inner).map(|op| ("leave", op.filters))
+            }
+            TYPE_PROVER_JOIN => {
+                ProverJoin::from_canonical_bytes(inner).map(|op| ("join", op.filters))
+            }
             _ => ProverReject::from_canonical_bytes(inner).map(|op| ("reject", op.filters)),
         };
-        self.published.lock().push(decoded.map_err(|e| e.to_string()));
+        self.published
+            .lock()
+            .push(decoded.map_err(|e| e.to_string()));
         Ok(())
     }
 }
@@ -1380,7 +1440,11 @@ fn recording_rig(fail_call: usize) -> (TestPipelineRig, Arc<Recording>) {
         published: Mutex::new(Vec::new()),
     });
     let test_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
-    let mut rig = build_test_pipeline_with_registry(&prover, test_transport, Arc::new(TestProverRegistry::new()));
+    let mut rig = build_test_pipeline_with_registry(
+        &prover,
+        test_transport,
+        Arc::new(TestProverRegistry::new()),
+    );
     Arc::get_mut(&mut rig.pipeline).unwrap().transport = transport.clone();
     (rig, transport)
 }
@@ -1405,13 +1469,22 @@ async fn a_long_confirm_is_split_and_a_failed_message_is_retried_alone() {
 
     // 103 seats: two messages; the second fails to publish.
     let seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
-    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 1 });
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: seats.clone(),
+        frame_number: 1,
+    });
     transport.wait_for(2).await;
-    assert_eq!(*transport.published.lock(), vec![Ok(("confirm", seats[..MAX_FILTERS_PER_OP].to_vec()))]);
+    assert_eq!(
+        *transport.published.lock(),
+        vec![Ok(("confirm", seats[..MAX_FILTERS_PER_OP].to_vec()))]
+    );
     // The next cycles ask for all 103 again; only the failed message's seats
     // go out, once its attempt has finished.
     for _ in 0..100 {
-        rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 2 });
+        rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+            filters: seats.clone(),
+            frame_number: 2,
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if transport.calls() >= 3 {
             break;
@@ -1420,16 +1493,26 @@ async fn a_long_confirm_is_split_and_a_failed_message_is_retried_alone() {
     transport.wait_for(3).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(transport.calls(), 3, "nothing published twice");
-    assert_eq!(transport.published.lock()[1], Ok(("confirm", seats[MAX_FILTERS_PER_OP..].to_vec())));
+    assert_eq!(
+        transport.published.lock()[1],
+        Ok(("confirm", seats[MAX_FILTERS_PER_OP..].to_vec()))
+    );
 
     // 250 seats: three messages, each decodable.
     let seats: Vec<Vec<u8>> = (1000..1250).map(seat).collect();
-    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves { filters: seats.clone(), frame_number: 3 });
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: seats.clone(),
+        frame_number: 3,
+    });
     transport.wait_for(6).await;
     let published = transport.published.lock()[2..].to_vec();
     assert_eq!(
         published,
-        vec![Ok(("confirm", seats[..100].to_vec())), Ok(("confirm", seats[100..200].to_vec())), Ok(("confirm", seats[200..].to_vec()))]
+        vec![
+            Ok(("confirm", seats[..100].to_vec())),
+            Ok(("confirm", seats[100..200].to_vec())),
+            Ok(("confirm", seats[200..].to_vec()))
+        ]
     );
 }
 
@@ -1442,18 +1525,32 @@ async fn a_long_leave_or_reject_is_split_and_a_failed_message_is_retried_alone()
     use quil_engine::provers::lifecycle::LifecycleAction;
     for kind in ["leave", "reject"] {
         let action = |filters: Vec<Vec<u8>>, frame_number: u64| match kind {
-            "leave" => LifecycleAction::ProposeLeave { filters, frame_number },
-            _ => LifecycleAction::RejectLeaves { filters, frame_number },
+            "leave" => LifecycleAction::ProposeLeave {
+                filters,
+                frame_number,
+            },
+            _ => LifecycleAction::RejectLeaves {
+                filters,
+                frame_number,
+            },
         };
         let (rig, transport) = recording_rig(1);
         // 103 seats and a filter longer than any node decodes: two messages;
         // the second fails to publish.
         let mut seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
         seats.insert(50, vec![0xEE; 65]);
-        let sendable: Vec<Vec<u8>> = seats.iter().filter(|filter| filter.len() <= 64).cloned().collect();
+        let sendable: Vec<Vec<u8>> = seats
+            .iter()
+            .filter(|filter| filter.len() <= 64)
+            .cloned()
+            .collect();
         rig.pipeline.dispatch(action(seats.clone(), 1));
         transport.wait_for(2).await;
-        assert_eq!(*transport.published.lock(), vec![Ok((kind, sendable[..100].to_vec()))], "{kind}");
+        assert_eq!(
+            *transport.published.lock(),
+            vec![Ok((kind, sendable[..100].to_vec()))],
+            "{kind}"
+        );
         // The next cycles ask for every seat again; only the failed message's
         // seats go out.
         for _ in 0..100 {
@@ -1466,7 +1563,11 @@ async fn a_long_leave_or_reject_is_split_and_a_failed_message_is_retried_alone()
         transport.wait_for(3).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(transport.calls(), 3, "{kind}: nothing published twice");
-        assert_eq!(transport.published.lock()[1], Ok((kind, sendable[100..].to_vec())), "{kind}");
+        assert_eq!(
+            transport.published.lock()[1],
+            Ok((kind, sendable[100..].to_vec())),
+            "{kind}"
+        );
     }
 }
 
@@ -1478,12 +1579,19 @@ async fn a_long_join_goes_on_after_a_failed_message() {
     use quil_engine::provers::lifecycle::LifecycleAction;
     let (rig, transport) = recording_rig(0);
     let seats: Vec<Vec<u8>> = (0..250).map(seat).collect();
-    let join = |frame_number: u64| LifecycleAction::ProposeJoin { filters: seats.clone(), worker_ids: Vec::new(), frame_number };
+    let join = |frame_number: u64| LifecycleAction::ProposeJoin {
+        filters: seats.clone(),
+        worker_ids: Vec::new(),
+        frame_number,
+    };
     rig.pipeline.dispatch(join(1));
     transport.wait_for(3).await;
     assert_eq!(
         *transport.published.lock(),
-        vec![Ok(("join", seats[100..200].to_vec())), Ok(("join", seats[200..].to_vec()))],
+        vec![
+            Ok(("join", seats[100..200].to_vec())),
+            Ok(("join", seats[200..].to_vec()))
+        ],
         "the messages after the failed one still go out"
     );
     for _ in 0..100 {
@@ -1496,7 +1604,10 @@ async fn a_long_join_goes_on_after_a_failed_message() {
     transport.wait_for(4).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(transport.calls(), 4, "nothing published twice");
-    assert_eq!(transport.published.lock()[2], Ok(("join", seats[..100].to_vec())));
+    assert_eq!(
+        transport.published.lock()[2],
+        Ok(("join", seats[..100].to_vec()))
+    );
 }
 
 /// A seat whose leaf roots exceed what every node decodes (a group of 257
@@ -1507,44 +1618,88 @@ async fn a_long_join_goes_on_after_a_failed_message() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_seat_over_a_decode_limit_does_not_hold_up_its_message() {
     use quil_engine::provers::lifecycle::LifecycleAction;
-    use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+    use quil_execution::global_intrinsic::leaf_root_registration::{
+        ConfirmLeafRoots, LeafRootEntry,
+    };
     let (mut rig, transport) = recording_rig(usize::MAX);
     let bad = seat(5);
     let asked: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let (asked_by, over) = (asked.clone(), bad.clone());
-    let remote: quil_engine::prover_pipeline::RemoteStorageConfirm =
-        Arc::new(move |filter: &[u8], _: &[Vec<u8>], _: u64, _: std::time::Duration, _: &[quil_engine::prover_pipeline::SnapshotSources]| -> QResult<Option<Vec<ConfirmLeafRoots>>> {
+    let remote: quil_engine::prover_pipeline::RemoteStorageConfirm = Arc::new(
+        move |filter: &[u8],
+              _: &[Vec<u8>],
+              _: u64,
+              _: std::time::Duration,
+              _: &[quil_engine::prover_pipeline::SnapshotSources]|
+              -> QResult<Option<Vec<ConfirmLeafRoots>>> {
             *asked_by.lock().entry(filter.to_vec()).or_default() += 1;
             let entries = if filter == over.as_slice() { 257 } else { 1 };
-            Ok(Some(vec![ConfirmLeafRoots { filter: filter.to_vec(), entries: vec![LeafRootEntry::default(); entries] }]))
-        });
-    Arc::get_mut(&mut rig.pipeline).unwrap().remote_storage_confirm = Some(remote);
+            Ok(Some(vec![ConfirmLeafRoots {
+                filter: filter.to_vec(),
+                entries: vec![LeafRootEntry::default(); entries],
+            }]))
+        },
+    );
+    Arc::get_mut(&mut rig.pipeline)
+        .unwrap()
+        .remote_storage_confirm = Some(remote);
 
     let seats: Vec<Vec<u8>> = (0..103).map(seat).collect();
-    let good: Vec<Vec<u8>> = seats.iter().filter(|filter| **filter != bad).cloned().collect();
-    rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: seats.clone(), frame_number: 1 });
+    let good: Vec<Vec<u8>> = seats
+        .iter()
+        .filter(|filter| **filter != bad)
+        .cloned()
+        .collect();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmJoins {
+        filters: seats.clone(),
+        frame_number: 1,
+    });
     transport.wait_for(2).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(
         *transport.published.lock(),
-        vec![Ok(("confirm", good[..100].to_vec())), Ok(("confirm", good[100..].to_vec()))],
+        vec![
+            Ok(("confirm", good[..100].to_vec())),
+            Ok(("confirm", good[100..].to_vec()))
+        ],
         "every other seat goes out"
     );
     for frame_number in 2..10 {
-        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: seats.clone(), frame_number });
+        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins {
+            filters: seats.clone(),
+            frame_number,
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(asked.lock().get(&bad).copied(), Some(1), "not prepared again within the fence");
+    assert_eq!(
+        asked.lock().get(&bad).copied(),
+        Some(1),
+        "not prepared again within the fence"
+    );
     assert_eq!(transport.calls(), 2, "nothing published twice");
     // Past the retry fence it is still not prepared again within the epoch;
     // the next epoch's renewal prepares it again.
     let epoch_length = quil_types::consensus::epoch_length_frames();
-    assert!(epoch_length > 40, "a frame past the retry fence in the same epoch");
+    assert!(
+        epoch_length > 40,
+        "a frame past the retry fence in the same epoch"
+    );
     for (frame_number, asked_times) in [(40, 1), (epoch_length + 1, 2)] {
-        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins { filters: vec![bad.clone()], frame_number });
+        rig.pipeline.dispatch(LifecycleAction::ConfirmJoins {
+            filters: vec![bad.clone()],
+            frame_number,
+        });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(asked.lock().get(&bad).copied(), Some(asked_times), "frame {frame_number}");
+        assert_eq!(
+            asked.lock().get(&bad).copied(),
+            Some(asked_times),
+            "frame {frame_number}"
+        );
     }
-    assert_eq!(transport.calls(), 2, "an over-limit seat alone publishes nothing");
+    assert_eq!(
+        transport.calls(),
+        2,
+        "an over-limit seat alone publishes nothing"
+    );
 }

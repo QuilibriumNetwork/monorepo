@@ -58,7 +58,11 @@ pub enum LogCommand {
 
 pub fn run(global: GlobalArgs, cmd: &LogCommand) -> anyhow::Result<()> {
     match cmd {
-        LogCommand::View { lines, follow, core } => view(&global, *lines, *follow, *core),
+        LogCommand::View {
+            lines,
+            follow,
+            core,
+        } => view(&global, *lines, *follow, *core),
         LogCommand::Clean => clean(&global).map(|_| ()),
         LogCommand::Export(args) => export::run(&global, args),
     }
@@ -73,14 +77,22 @@ pub fn run(global: GlobalArgs, cmd: &LogCommand) -> anyhow::Result<()> {
 /// and a relative `logger.path` is taken from the current directory.
 pub(crate) fn configured_log_dir(global: &GlobalArgs) -> anyhow::Result<Option<PathBuf>> {
     let network = global.network.as_deref().filter(|s| !s.is_empty());
-    let service = if network.is_none() { service_location() } else { None };
-    let (config_dir, node_dir) = match service.filter(|s| nodeconfig::has_node_config_files(&s.config_dir())) {
-        Some(service) => (service.config_dir(), Some(service.working_dir)),
-        None => (nodeconfig::default_node_config_dir(network)?, None),
+    let service = if network.is_none() {
+        service_location()
+    } else {
+        None
     };
-    let config = quil_config::load_config(&config_dir)
-        .map_err(|e| anyhow::anyhow!("load config: {e}"))?;
-    Ok(config.logger.log_dir(&config_dir).map(|dir| from_node_dir(node_dir.as_deref(), dir)))
+    let (config_dir, node_dir) =
+        match service.filter(|s| nodeconfig::has_node_config_files(&s.config_dir())) {
+            Some(service) => (service.config_dir(), Some(service.working_dir)),
+            None => (nodeconfig::default_node_config_dir(network)?, None),
+        };
+    let config =
+        quil_config::load_config(&config_dir).map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    Ok(config
+        .logger
+        .log_dir(&config_dir)
+        .map(|dir| from_node_dir(node_dir.as_deref(), dir)))
 }
 
 /// `path` as the node resolves it: a relative path from its working
@@ -112,7 +124,10 @@ impl ServiceLocation {
     /// `None` unless the unit is loaded and its directory is a plain path.
     fn parse(show: &str) -> Option<Self> {
         let mut loaded = false;
-        let mut location = Self { working_dir: PathBuf::from("/"), config: PathBuf::from(".config") };
+        let mut location = Self {
+            working_dir: PathBuf::from("/"),
+            config: PathBuf::from(".config"),
+        };
         for line in show.lines() {
             if let Some(state) = line.strip_prefix("LoadState=") {
                 loaded = state == "loaded";
@@ -130,7 +145,10 @@ impl ServiceLocation {
                 let argv = exec.split("argv[]=").nth(1)?.split(" ;").next()?;
                 let mut args = argv.split_whitespace().skip(1);
                 while let Some(arg) = args.next() {
-                    if let Some(dir) = arg.strip_prefix("--config=").or_else(|| arg.strip_prefix("-c=")) {
+                    if let Some(dir) = arg
+                        .strip_prefix("--config=")
+                        .or_else(|| arg.strip_prefix("-c="))
+                    {
                         location.config = PathBuf::from(dir);
                     } else if arg == "--config" || arg == "-c" {
                         location.config = PathBuf::from(args.next()?);
@@ -148,7 +166,16 @@ fn service_location() -> Option<ServiceLocation> {
         return None;
     }
     let show = Command::new("systemctl")
-        .args(["show", system::NODE_SERVICE_NAME, "-p", "LoadState", "-p", "WorkingDirectory", "-p", "ExecStart"])
+        .args([
+            "show",
+            system::NODE_SERVICE_NAME,
+            "-p",
+            "LoadState",
+            "-p",
+            "WorkingDirectory",
+            "-p",
+            "ExecStart",
+        ])
         .output()
         .ok()
         .filter(|out| out.status.success())?;
@@ -181,7 +208,14 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
         None if system::os_type() == "linux" => {
             // Stderr only: every core's lines are in the service's journal.
             let mut cmd = Command::new("journalctl");
-            cmd.args(["--utc", "-o", "cat", "--no-pager", "-u", system::NODE_SERVICE_NAME]);
+            cmd.args([
+                "--utc",
+                "-o",
+                "cat",
+                "--no-pager",
+                "-u",
+                system::NODE_SERVICE_NAME,
+            ]);
             if follow {
                 cmd.arg("-f");
             }
@@ -191,7 +225,10 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
         None => {
             let file = Path::new(system::LOG_PATH).join("node.err");
             if !file.exists() {
-                anyhow::bail!("the node logs to stderr only and {} is missing", file.display());
+                anyhow::bail!(
+                    "the node logs to stderr only and {} is missing",
+                    file.display()
+                );
             }
             let mut cmd = Command::new("tail");
             if follow {
@@ -201,7 +238,9 @@ fn view(global: &GlobalArgs, lines: u64, follow: bool, core: u32) -> anyhow::Res
             cmd
         }
     };
-    let status = cmd.status().map_err(|e| anyhow::anyhow!("run {:?}: {e}", cmd.get_program()))?;
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("run {:?}: {e}", cmd.get_program()))?;
     if !status.success() {
         anyhow::bail!("{:?} exited with {status}", cmd.get_program());
     }
@@ -215,7 +254,10 @@ pub(crate) fn clean(global: &GlobalArgs) -> anyhow::Result<usize> {
         return Ok(0);
     };
     let removed = remove_rotated_logs(&dir)?;
-    println!("Removed {removed} rotated log file(s) from {}", dir.display());
+    println!(
+        "Removed {removed} rotated log file(s) from {}",
+        dir.display()
+    );
     Ok(removed)
 }
 
@@ -244,10 +286,21 @@ mod tests {
 
     #[test]
     fn live_logs_are_never_rotated_logs() {
-        for rotated in ["master.log.20261017T120000.gz", "worker-3.log.20261017T120000", "worker-12.log.1"] {
+        for rotated in [
+            "master.log.20261017T120000.gz",
+            "worker-3.log.20261017T120000",
+            "worker-12.log.1",
+        ] {
             assert!(is_rotated_log(rotated), "{rotated}");
         }
-        for kept in ["master.log", "worker-3.log", "node.log", "other.log.gz", "worker-.log.1", "worker-x.log.1"] {
+        for kept in [
+            "master.log",
+            "worker-3.log",
+            "node.log",
+            "other.log.gz",
+            "worker-.log.1",
+            "worker-x.log.1",
+        ] {
             assert!(!is_rotated_log(kept), "{kept}");
         }
     }
@@ -258,13 +311,21 @@ mod tests {
     fn cleaning_keeps_live_logs() {
         let dir = std::env::temp_dir().join(format!("qclient-log-clean-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let names = ["master.log", "master.log.20261017T120000.gz", "worker-2.log", "worker-2.log.20261017T120000.gz", "notes.txt"];
+        let names = [
+            "master.log",
+            "master.log.20261017T120000.gz",
+            "worker-2.log",
+            "worker-2.log.20261017T120000.gz",
+            "notes.txt",
+        ];
         for name in names {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         assert_eq!(remove_rotated_logs(&dir).unwrap(), 2);
-        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         left.sort();
         assert_eq!(left, ["master.log", "notes.txt", "worker-2.log"]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -278,7 +339,10 @@ mod tests {
             ExecStart={ path=/usr/local/bin/quilibrium-node ; argv[]=/usr/local/bin/quilibrium-node --config /root/.quilibrium/configs/default ; ignore_errors=no ; pid=0 }\n\
             WorkingDirectory=\n";
         let service = ServiceLocation::parse(show).expect("a loaded unit");
-        assert_eq!(service.config_dir(), PathBuf::from("/root/.quilibrium/configs/default"));
+        assert_eq!(
+            service.config_dir(),
+            PathBuf::from("/root/.quilibrium/configs/default")
+        );
         assert_eq!(service.working_dir, PathBuf::from("/"));
     }
 
@@ -292,16 +356,31 @@ mod tests {
             WorkingDirectory=-/srv/node\n";
         let service = ServiceLocation::parse(show).expect("a loaded unit");
         assert_eq!(service.config_dir(), PathBuf::from("/srv/node/.config"));
-        assert_eq!(from_node_dir(Some(&service.working_dir), PathBuf::from(".log")), PathBuf::from("/srv/node/.log"));
-        assert_eq!(from_node_dir(Some(&service.working_dir), PathBuf::from("/var/log/q")), PathBuf::from("/var/log/q"));
-        assert_eq!(from_node_dir(None, PathBuf::from(".log")), PathBuf::from(".log"));
+        assert_eq!(
+            from_node_dir(Some(&service.working_dir), PathBuf::from(".log")),
+            PathBuf::from("/srv/node/.log")
+        );
+        assert_eq!(
+            from_node_dir(Some(&service.working_dir), PathBuf::from("/var/log/q")),
+            PathBuf::from("/var/log/q")
+        );
+        assert_eq!(
+            from_node_dir(None, PathBuf::from(".log")),
+            PathBuf::from(".log")
+        );
     }
 
     /// No service, or one whose directory qclient cannot resolve: the
     /// config resolves as before.
     #[test]
     fn without_a_usable_service_nothing_changes() {
-        assert_eq!(ServiceLocation::parse("LoadState=not-found\nWorkingDirectory=\n"), None);
-        assert_eq!(ServiceLocation::parse("LoadState=loaded\nWorkingDirectory=~\n"), None);
+        assert_eq!(
+            ServiceLocation::parse("LoadState=not-found\nWorkingDirectory=\n"),
+            None
+        );
+        assert_eq!(
+            ServiceLocation::parse("LoadState=loaded\nWorkingDirectory=~\n"),
+            None
+        );
     }
 }

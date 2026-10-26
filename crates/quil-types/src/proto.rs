@@ -96,8 +96,15 @@ mod tests {
     fn the_diagnostics_schema_has_no_string_fields() {
         const PACKAGE: &str = "quilibrium.node.diagnostics.pb";
         let pool = crate::protojson::descriptor_pool();
-        let messages: Vec<_> = pool.all_messages().filter(|m| m.package_name() == PACKAGE).collect();
-        assert!(messages.len() >= 4, "{} diagnostics messages", messages.len());
+        let messages: Vec<_> = pool
+            .all_messages()
+            .filter(|m| m.package_name() == PACKAGE)
+            .collect();
+        assert!(
+            messages.len() >= 4,
+            "{} diagnostics messages",
+            messages.len()
+        );
         for message in messages {
             for field in message.fields() {
                 match field.kind() {

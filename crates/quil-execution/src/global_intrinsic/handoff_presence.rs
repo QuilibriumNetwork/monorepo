@@ -24,10 +24,15 @@
 
 use std::collections::BTreeSet;
 
-use quil_cw_consensus::handoff::{put_bytes, Cursor, Session, SessionVotes, MAX_FILTER_BYTES, MAX_RECORD_BYTES};
+use quil_cw_consensus::handoff::{
+    put_bytes, Cursor, Session, SessionVotes, MAX_FILTER_BYTES, MAX_RECORD_BYTES,
+};
 use quil_types::error::{QuilError, Result};
 
-use super::{head, presence_report_frame, read, session, status, write, Records, Status, TYPE_PRESENCE_REPORT};
+use super::{
+    head, presence_report_frame, read, session, status, write, Records, Status,
+    TYPE_PRESENCE_REPORT,
+};
 use crate::global_intrinsic::frame_header::FrameHeader;
 use crate::hypergraph_state::HypergraphState;
 
@@ -108,7 +113,11 @@ impl PresenceReport {
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = TYPE_PRESENCE_REPORT.to_be_bytes().to_vec();
-        out.push(if self.nullifies.is_empty() { VERSION } else { VERSION_NULLIFY });
+        out.push(if self.nullifies.is_empty() {
+            VERSION
+        } else {
+            VERSION_NULLIFY
+        });
         out.extend_from_slice(&self.session);
         put_bytes(&mut out, &self.filter)?;
         out.extend_from_slice(&(self.proposals.len() as u32).to_be_bytes());
@@ -168,7 +177,14 @@ impl PresenceReport {
                 let signature = c.take(SIGNATURE_BYTES)?.to_vec();
                 votes.push(NotarizeVote { signer, signature });
             }
-            proposals.push(PresenceProposal { header, epoch, view, parent, payload, votes });
+            proposals.push(PresenceProposal {
+                header,
+                epoch,
+                view,
+                parent,
+                payload,
+                votes,
+            });
         }
         let mut nullifies = Vec::new();
         if version == VERSION_NULLIFY {
@@ -177,7 +193,11 @@ impl PresenceReport {
                 let view = c.u64()?;
                 let signer = c.u32()?;
                 let signature = c.take(SIGNATURE_BYTES)?.to_vec();
-                nullifies.push(NullifyVote { view, signer, signature });
+                nullifies.push(NullifyVote {
+                    view,
+                    signer,
+                    signature,
+                });
             }
             // One encoding per report: version 3 only with a nullify.
             if nullifies.is_empty() {
@@ -185,24 +205,39 @@ impl PresenceReport {
             }
         }
         c.finish()?;
-        let report = Self { session, filter, proposals, nullifies };
+        let report = Self {
+            session,
+            filter,
+            proposals,
+            nullifies,
+        };
         report.validate()?;
         Ok(report)
     }
 
     /// The votes the report carries over all its proposals and nullifies.
     pub fn vote_count(&self) -> usize {
-        self.proposals.iter().map(|proposal| proposal.votes.len()).sum::<usize>() + self.nullifies.len()
+        self.proposals
+            .iter()
+            .map(|proposal| proposal.votes.len())
+            .sum::<usize>()
+            + self.nullifies.len()
     }
 
     fn validate(&self) -> Result<()> {
         if !(32..=MAX_FILTER_BYTES).contains(&self.filter.len()) {
             return Err(invalid("invalid full shard filter length"));
         }
-        if (self.proposals.is_empty() && self.nullifies.is_empty()) || self.proposals.len() > MAX_PRESENCE_PROPOSALS {
+        if (self.proposals.is_empty() && self.nullifies.is_empty())
+            || self.proposals.len() > MAX_PRESENCE_PROPOSALS
+        {
             return Err(invalid("proposal count out of range"));
         }
-        if self.proposals.windows(2).any(|pair| pair[0].view >= pair[1].view) {
+        if self
+            .proposals
+            .windows(2)
+            .any(|pair| pair[0].view >= pair[1].view)
+        {
             return Err(invalid("proposals must be in ascending view order"));
         }
         if self.vote_count() > MAX_PRESENCE_VOTES {
@@ -226,7 +261,11 @@ impl PresenceReport {
                     return Err(invalid("duplicate signer"));
                 }
             }
-            if proposal.votes.windows(2).any(|pair| pair[0].signer >= pair[1].signer) {
+            if proposal
+                .votes
+                .windows(2)
+                .any(|pair| pair[0].signer >= pair[1].signer)
+            {
                 return Err(invalid("votes must be in ascending signer order"));
             }
         }
@@ -241,7 +280,11 @@ impl PresenceReport {
                 return Err(invalid("duplicate signer"));
             }
         }
-        if self.nullifies.windows(2).any(|pair| pair[0].signer >= pair[1].signer) {
+        if self
+            .nullifies
+            .windows(2)
+            .any(|pair| pair[0].signer >= pair[1].signer)
+        {
             return Err(invalid("nullifies must be in ascending signer order"));
         }
         Ok(())
@@ -305,7 +348,10 @@ impl PresenceOp {
 /// refuses them before the frame by its own check
 /// ([`PresenceOp::require_active`]).
 pub fn check_encoding(bytes: &[u8], frame: Option<u64>) -> Result<()> {
-    check_encoding_in(bytes, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+    check_encoding_in(
+        bytes,
+        frame.map_or(EncodingGate::Admission, EncodingGate::Global),
+    )
 }
 
 /// Where presence encodings are judged ([`check_encoding_in`]).
@@ -334,7 +380,9 @@ pub fn check_encoding_in(bytes: &[u8], gate: EncodingGate) -> Result<()> {
         EncodingGate::App => false,
     };
     if op.extended() && !admitted {
-        return Err(invalid("encoding not accepted here: a GLOBAL operation of the presence exclusion frame"));
+        return Err(invalid(
+            "encoding not accepted here: a GLOBAL operation of the presence exclusion frame",
+        ));
     }
     Ok(())
 }
@@ -343,7 +391,9 @@ pub fn check_encoding_in(bytes: &[u8], gate: EncodingGate) -> Result<()> {
 /// [`super::presence_exclusion_frame`].
 pub fn require_nullifies_active(report: &PresenceReport, frame: u64) -> Result<()> {
     if !report.nullifies.is_empty() && frame < super::presence_exclusion_frame() {
-        return Err(invalid("nullify votes are not accepted before the presence exclusion frame"));
+        return Err(invalid(
+            "nullify votes are not accepted before the presence exclusion frame",
+        ));
     }
     Ok(())
 }
@@ -375,8 +425,11 @@ pub fn verify(
     let epoch = quil_types::consensus::epoch_for_frame(frame);
     for proposal in &report.proposals {
         let anchor = proposal.header.global_frame_number;
-        if anchor == 0 || anchor >= frame || quil_types::consensus::epoch_for_frame(anchor) != epoch {
-            return Err(invalid("anchor is not an earlier frame of the inclusion epoch"));
+        if anchor == 0 || anchor >= frame || quil_types::consensus::epoch_for_frame(anchor) != epoch
+        {
+            return Err(invalid(
+                "anchor is not an earlier frame of the inclusion epoch",
+            ));
         }
     }
     let session = session(state, &report.session)?.ok_or_else(|| invalid("unknown session"))?;
@@ -398,7 +451,9 @@ pub fn verify(
     // epoch's record lacks, so a session's reports per epoch are bounded by
     // its members. Checked before any signature.
     if !marks_new_member(state, frame, &session, report)? {
-        return Err(invalid("marks no member not already recorded present this epoch"));
+        return Err(invalid(
+            "marks no member not already recorded present this epoch",
+        ));
     }
     for proposal in &report.proposals {
         let header = &proposal.header;
@@ -409,7 +464,9 @@ pub fn verify(
             return Err(invalid("round epoch is not the session generation"));
         }
         if header.rank != proposal.view || proposal.view == 0 || proposal.parent >= proposal.view {
-            return Err(invalid("proposal view differs from the header rank or follows no parent"));
+            return Err(invalid(
+                "proposal view differs from the header rank or follows no parent",
+            ));
         }
         if header.frame_number <= session.base_frame {
             return Err(invalid("header frame is not above the session base"));
@@ -421,7 +478,9 @@ pub fn verify(
     if !report.nullifies.is_empty() {
         let floor = nullify_floor(state, &session, epoch)?;
         if report.nullifies.iter().any(|vote| vote.view <= floor) {
-            return Err(invalid("nullify view is not above the views recorded in earlier epochs"));
+            return Err(invalid(
+                "nullify view is not above the views recorded in earlier epochs",
+            ));
         }
     }
     // The votes that add a mark are verified first, each signature before
@@ -445,7 +504,10 @@ pub fn verify(
             })
         })
         .chain(report.nullifies.iter().enumerate().map(|(index, cast)| {
-            (marked(&recorded, cast.signer) || marked(&covered, cast.signer), Check::Nullify(index))
+            (
+                marked(&recorded, cast.signer) || marked(&covered, cast.signer),
+                Check::Nullify(index),
+            )
         }))
         .collect();
     order.sort_by_key(|(old, _)| *old);
@@ -464,13 +526,20 @@ pub fn verify(
                     vote.signer,
                     &vote.signature,
                 ) {
-                    return Err(invalid("vote is not a session member's notarize of the proposal"));
+                    return Err(invalid(
+                        "vote is not a session member's notarize of the proposal",
+                    ));
                 }
                 if !output_checked[index] {
                     let output = anchor_output(proposal.header.global_frame_number)?;
-                    crate::global_intrinsic::prover_shard_update::verify_app_frame_output(&proposal.header, &output)
-                        .map_err(|_| invalid("header output does not match its fields and anchor"))?;
-                    if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)? != proposal.payload {
+                    crate::global_intrinsic::prover_shard_update::verify_app_frame_output(
+                        &proposal.header,
+                        &output,
+                    )
+                    .map_err(|_| invalid("header output does not match its fields and anchor"))?;
+                    if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)?
+                        != proposal.payload
+                    {
                         return Err(invalid("payload is not the digest of the header output"));
                     }
                     output_checked[index] = true;
@@ -478,8 +547,15 @@ pub fn verify(
             }
             Check::Nullify(index) => {
                 let vote = &report.nullifies[index];
-                if !votes.verify_nullify(session.generation, vote.view, vote.signer, &vote.signature) {
-                    return Err(invalid("vote is not a session member's nullify of a round of the session"));
+                if !votes.verify_nullify(
+                    session.generation,
+                    vote.view,
+                    vote.signer,
+                    &vote.signature,
+                ) {
+                    return Err(invalid(
+                        "vote is not a session member's nullify of a round of the session",
+                    ));
                 }
             }
         }
@@ -494,12 +570,19 @@ fn marked(marks: &[bool], signer: u32) -> bool {
 
 /// The members of `session` recorded present and protected in `frame`'s
 /// epoch, none before [`super::presence_credit_frame`].
-fn recorded_marks(state: &impl Records, frame: u64, session: &Session) -> Result<(Vec<bool>, Vec<bool>)> {
+fn recorded_marks(
+    state: &impl Records,
+    frame: u64,
+    session: &Session,
+) -> Result<(Vec<bool>, Vec<bool>)> {
     if frame < super::presence_credit_frame() {
         return Ok((Vec::new(), Vec::new()));
     }
     let epoch = quil_types::consensus::epoch_for_frame(frame);
-    Ok((present(state, session, epoch)?.unwrap_or_default(), protected(state, session, epoch)?.unwrap_or_default()))
+    Ok((
+        present(state, session, epoch)?.unwrap_or_default(),
+        protected(state, session, epoch)?.unwrap_or_default(),
+    ))
 }
 
 /// Notarize votes a proposal must carry for its voters to earn credit: one
@@ -532,7 +615,9 @@ struct Watermark {
 fn read_watermark(state: &impl Records, filter: &[u8]) -> Result<Option<Watermark>> {
     let mut key = Vec::new();
     put_bytes(&mut key, filter)?;
-    let Some(bytes) = read(state, NULLIFY_FLOOR, &key)? else { return Ok(None) };
+    let Some(bytes) = read(state, NULLIFY_FLOOR, &key)? else {
+        return Ok(None);
+    };
     let corrupt = || QuilError::Store("corrupt nullify watermark".into());
     let mut c = Cursor::new(&bytes).map_err(|_| corrupt())?;
     if c.u8().map_err(|_| corrupt())? != RECORD_VERSION {
@@ -543,7 +628,12 @@ fn read_watermark(state: &impl Records, filter: &[u8]) -> Result<Option<Watermar
     let floor = c.u64().map_err(|_| corrupt())?;
     let top = c.u64().map_err(|_| corrupt())?;
     c.finish().map_err(|_| corrupt())?;
-    Ok(Some(Watermark { session, epoch, floor, top }))
+    Ok(Some(Watermark {
+        session,
+        epoch,
+        floor,
+        top,
+    }))
 }
 
 /// The highest nullify view of `session` that GLOBAL recorded in an epoch
@@ -560,7 +650,13 @@ pub fn nullify_floor(state: &impl Records, session: &Session, epoch: u64) -> Res
 }
 
 /// Record `view` as a nullify view of `session` recorded in `epoch`.
-fn note_nullify_view(state: &HypergraphState, frame: u64, session: &Session, epoch: u64, view: u64) -> Result<()> {
+fn note_nullify_view(
+    state: &HypergraphState,
+    frame: u64,
+    session: &Session,
+    epoch: u64,
+    view: u64,
+) -> Result<()> {
     let id = session.id()?;
     let floor = nullify_floor(state, session, epoch)?;
     let top = match read_watermark(state, &session.filter)? {
@@ -608,7 +704,12 @@ fn slot_key(filter: &[u8], epoch: u64) -> Result<Vec<u8>> {
 /// Encoding: version (1) ‖ epoch (u64) ‖ count (u32) ‖ per session: ID ‖
 /// bitmap (u32 length ‖ ⌈members / 8⌉ bytes, member `i` at bit `i % 8` of
 /// byte `i / 8`).
-fn read_slot(state: &impl Records, kind: &[u8], filter: &[u8], epoch: u64) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+fn read_slot(
+    state: &impl Records,
+    kind: &[u8],
+    filter: &[u8],
+    epoch: u64,
+) -> Result<Vec<([u8; 32], Vec<u8>)>> {
     let Some(bytes) = read(state, kind, &slot_key(filter, epoch)?)? else {
         return Ok(Vec::new());
     };
@@ -624,7 +725,9 @@ fn read_slot(state: &impl Records, kind: &[u8], filter: &[u8], epoch: u64) -> Re
     let mut entries: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(count);
     for _ in 0..count {
         let id: [u8; 32] = c.array().map_err(|_| corrupt())?;
-        let bitmap = c.bytes(quil_cw_consensus::handoff::MAX_MEMBERS.div_ceil(8)).map_err(|_| corrupt())?;
+        let bitmap = c
+            .bytes(quil_cw_consensus::handoff::MAX_MEMBERS.div_ceil(8))
+            .map_err(|_| corrupt())?;
         if entries.last().is_some_and(|(last, _)| *last >= id) {
             return Err(corrupt());
         }
@@ -639,7 +742,9 @@ fn decode_bitmap(bitmap: &[u8], members: usize) -> Result<Vec<bool>> {
     if bitmap.len() != members.div_ceil(8) {
         return Err(corrupt());
     }
-    let bits: Vec<bool> = (0..bitmap.len() * 8).map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1).collect();
+    let bits: Vec<bool> = (0..bitmap.len() * 8)
+        .map(|i| (bitmap[i / 8] >> (i % 8)) & 1 == 1)
+        .collect();
     if bits[members..].iter().any(|&bit| bit) {
         return Err(corrupt());
     }
@@ -658,7 +763,12 @@ fn encode_bitmap(marks: &[bool]) -> Vec<u8> {
 
 /// The members of `session` marked in `kind`'s records for `epoch`, by
 /// member index; `None` while none is.
-pub(super) fn marks(state: &impl Records, kind: &[u8], session: &Session, epoch: u64) -> Result<Option<Vec<bool>>> {
+pub(super) fn marks(
+    state: &impl Records,
+    kind: &[u8],
+    session: &Session,
+    epoch: u64,
+) -> Result<Option<Vec<bool>>> {
     let id = session.id()?;
     read_slot(state, kind, &session.filter, epoch)?
         .into_iter()
@@ -686,7 +796,9 @@ pub(super) fn set_marks(
         Err(index) => entries.insert(index, (id, bitmap)),
     }
     if entries.len() > MAX_SLOT_SESSIONS {
-        return Err(invalid("too many sessions of the filter recorded this epoch"));
+        return Err(invalid(
+            "too many sessions of the filter recorded this epoch",
+        ));
     }
     let mut out = vec![RECORD_VERSION];
     out.extend_from_slice(&epoch.to_be_bytes());
@@ -723,8 +835,13 @@ pub fn protected(state: &impl Records, session: &Session, epoch: u64) -> Result<
 /// Whether member `member` of `session` is recorded present or protected in
 /// `epoch`.
 pub fn recorded(state: &impl Records, session: &Session, epoch: u64, member: u32) -> Result<bool> {
-    Ok(marked(&present(state, session, epoch)?.unwrap_or_default(), member)
-        || marked(&protected(state, session, epoch)?.unwrap_or_default(), member))
+    Ok(
+        marked(&present(state, session, epoch)?.unwrap_or_default(), member)
+            || marked(
+                &protected(state, session, epoch)?.unwrap_or_default(),
+                member,
+            ),
+    )
 }
 
 /// Whether `report`, included in GLOBAL frame `frame`, adds a mark for
@@ -733,7 +850,12 @@ pub fn recorded(state: &impl Records, session: &Session, epoch: u64, member: u32
 /// ([`protected`]). Always true before [`super::presence_credit_frame`],
 /// when nothing is recorded. A signer index outside the session counts as
 /// new here; its signature check refuses it.
-pub fn marks_new_member(state: &impl Records, frame: u64, session: &Session, report: &PresenceReport) -> Result<bool> {
+pub fn marks_new_member(
+    state: &impl Records,
+    frame: u64,
+    session: &Session,
+    report: &PresenceReport,
+) -> Result<bool> {
     if frame < super::presence_credit_frame() {
         return Ok(true);
     }
@@ -795,8 +917,12 @@ pub fn apply(
     super::atomic(state, || {
         let session = session(state, &report.session)?.ok_or_else(|| invalid("unknown session"))?;
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let mut applied = Applied { members: session.members.len(), ..Applied::default() };
-        let mut marked = present(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
+        let mut applied = Applied {
+            members: session.members.len(),
+            ..Applied::default()
+        };
+        let mut marked =
+            present(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
         for proposal in &report.proposals {
             let anchor = proposal.header.global_frame_number;
             // Credit only a proposal enough members notarized that one of
@@ -806,7 +932,10 @@ pub fn apply(
             let led = proposal.votes.len() >= credited_votes(session.members.len());
             for vote in &proposal.votes {
                 let index = vote.signer as usize;
-                let member = session.members.get(index).ok_or_else(|| invalid("vote signer is not a session member"))?;
+                let member = session
+                    .members
+                    .get(index)
+                    .ok_or_else(|| invalid("vote signer is not a session member"))?;
                 if !marked[index] {
                     marked[index] = true;
                     applied.marked += 1;
@@ -821,7 +950,8 @@ pub fn apply(
             set_marks(state, frame, PRESENCE, &session, epoch, &marked)?;
         }
         if !report.nullifies.is_empty() {
-            let mut covered = protected(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
+            let mut covered = protected(state, &session, epoch)?
+                .unwrap_or_else(|| vec![false; session.members.len()]);
             for vote in &report.nullifies {
                 let index = vote.signer as usize;
                 if index >= covered.len() {
@@ -833,7 +963,12 @@ pub fn apply(
                 }
             }
             set_marks(state, frame, PROTECTED, &session, epoch, &covered)?;
-            let highest = report.nullifies.iter().map(|vote| vote.view).max().unwrap_or(0);
+            let highest = report
+                .nullifies
+                .iter()
+                .map(|vote| vote.view)
+                .max()
+                .unwrap_or(0);
             note_nullify_view(state, frame, &session, epoch, highest)?;
         }
         tracing::info!(
@@ -856,7 +991,13 @@ pub fn apply(
 /// Raise `LastActiveFrameNumber` of `member`'s allocation on `filter` to
 /// `anchor`. False, writing nothing, without such an allocation or when its
 /// recorded activity is not older than `anchor`.
-fn credit_activity(state: &HypergraphState, frame: u64, member: &[u8], filter: &[u8], anchor: u64) -> Result<bool> {
+fn credit_activity(
+    state: &HypergraphState,
+    frame: u64,
+    member: &[u8],
+    filter: &[u8],
+    anchor: u64,
+) -> Result<bool> {
     use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
     const CLASS: &str = "allocation:ProverAllocation";
     let address = crate::global_intrinsic::materialize::allocation_address(member, filter)?;
@@ -874,7 +1015,12 @@ fn credit_activity(state: &HypergraphState, frame: u64, member: &[u8], filter: &
     if current >= anchor {
         return Ok(false);
     }
-    write_field(&mut allocation, CLASS, "LastActiveFrameNumber", &anchor.to_be_bytes())?;
+    write_field(
+        &mut allocation,
+        CLASS,
+        "LastActiveFrameNumber",
+        &anchor.to_be_bytes(),
+    )?;
     state.set(
         &GLOBAL_INTRINSIC_ADDRESS[..],
         &address,

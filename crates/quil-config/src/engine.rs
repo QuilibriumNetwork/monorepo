@@ -9,7 +9,10 @@ pub struct EngineConfig {
     pub genesis_seed: String,
     #[serde(default = "default_worker_base_listen")]
     pub data_worker_base_listen_multiaddr: String,
-    #[serde(default = "default_worker_base_p2p_port", alias = "dataWorkerBaseP2PPort")]
+    #[serde(
+        default = "default_worker_base_p2p_port",
+        alias = "dataWorkerBaseP2PPort"
+    )]
     pub data_worker_base_p2p_port: u16,
     #[serde(default = "default_worker_base_stream_port")]
     pub data_worker_base_stream_port: u16,
@@ -50,7 +53,10 @@ pub struct EngineConfig {
     /// is retried on the next poll tick) — devnet sets this so recovery from
     /// a network partition is instantaneous. `0`/absent falls back to the
     /// default below. See `quil_rpc::ArchiveEndpointPool`.
-    #[serde(default = "default_archive_blacklist_ttl_secs", alias = "archiveBlacklistTtl")]
+    #[serde(
+        default = "default_archive_blacklist_ttl_secs",
+        alias = "archiveBlacklistTtl"
+    )]
     pub archive_blacklist_ttl_secs: i64,
     #[serde(default = "default_alert_key")]
     pub alert_key: String,
@@ -92,14 +98,24 @@ fn default_consensus_leader_timeout_secs() -> u64 {
 }
 
 // Defaults
-fn default_worker_base_listen() -> String { "/ip4/0.0.0.0/tcp/%d".into() }
-fn default_worker_base_p2p_port() -> u16 { 25000 }
-fn default_worker_base_stream_port() -> u16 { 32500 }
+fn default_worker_base_listen() -> String {
+    "/ip4/0.0.0.0/tcp/%d".into()
+}
+fn default_worker_base_p2p_port() -> u16 {
+    25000
+}
+fn default_worker_base_stream_port() -> u16 {
+    32500
+}
 // Short enough that transient network blips don't permanently drain the
 // archive pool, long enough that we don't hammer a struggling endpoint into
 // the ground. `-1` disables banning (see `archive_blacklist_ttl_secs`).
-fn default_archive_blacklist_ttl_secs() -> i64 { 60 }
-fn default_reward_strategy() -> String { "reward-greedy".into() }
+fn default_archive_blacklist_ttl_secs() -> i64 {
+    60
+}
+fn default_reward_strategy() -> String {
+    "reward-greedy".into()
+}
 fn default_alert_key() -> String {
     "3ade80f96515e34caaf0c346b842d1f82d2841840f27e12826f4c14326a6bd15d13796c0421f8c440809fceb66c0a5c3c88f93deae16ee3100".into()
 }

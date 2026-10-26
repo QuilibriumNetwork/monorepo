@@ -109,16 +109,16 @@ fn mint_behavior_to_proto(flags: u32) -> Result<i32> {
 
 pub fn mint_strategy_to_proto(m: &TokenMintStrategy) -> Result<pb::TokenMintStrategy> {
     let authority = if !m.authority.is_empty() {
-        Some(authority_to_proto(
-            &Authority::from_canonical_bytes(&m.authority)?,
-        ))
+        Some(authority_to_proto(&Authority::from_canonical_bytes(
+            &m.authority,
+        )?))
     } else {
         None
     };
     let fee_basis = if !m.fee_basis.is_empty() {
-        Some(fee_basis_to_proto(
-            &FeeBasisStruct::from_canonical_bytes(&m.fee_basis)?,
-        ))
+        Some(fee_basis_to_proto(&FeeBasisStruct::from_canonical_bytes(
+            &m.fee_basis,
+        )?))
     } else {
         None
     };
@@ -263,13 +263,30 @@ mod tests {
             (3, MINT_WITH_SIGNATURE),
             (4, MINT_WITH_PAYMENT),
         ] {
-            assert_eq!(super::mint_behavior_from_proto(wire).unwrap(), flags as u32, "wire {wire}");
-            assert_eq!(super::mint_behavior_to_proto(flags as u32).unwrap(), wire, "flags {flags}");
+            assert_eq!(
+                super::mint_behavior_from_proto(wire).unwrap(),
+                flags as u32,
+                "wire {wire}"
+            );
+            assert_eq!(
+                super::mint_behavior_to_proto(flags as u32).unwrap(),
+                wire,
+                "flags {flags}"
+            );
         }
         // The two that a cast silently confused.
-        assert_eq!(super::mint_behavior_from_proto(4).unwrap(), MINT_WITH_PAYMENT as u32);
-        assert_ne!(super::mint_behavior_from_proto(4).unwrap(), MINT_WITH_SIGNATURE as u32);
-        assert_eq!(super::mint_behavior_from_proto(3).unwrap(), MINT_WITH_SIGNATURE as u32);
+        assert_eq!(
+            super::mint_behavior_from_proto(4).unwrap(),
+            MINT_WITH_PAYMENT as u32
+        );
+        assert_ne!(
+            super::mint_behavior_from_proto(4).unwrap(),
+            MINT_WITH_SIGNATURE as u32
+        );
+        assert_eq!(
+            super::mint_behavior_from_proto(3).unwrap(),
+            MINT_WITH_SIGNATURE as u32
+        );
         // A behaviour neither side knows is refused, not stored.
         assert!(super::mint_behavior_from_proto(5).is_err());
         assert!(super::mint_behavior_to_proto(1 << 6).is_err());
@@ -279,7 +296,11 @@ mod tests {
 
     #[test]
     fn authority_round_trip() {
-        let pb = pb::Authority { key_type: 2, public_key: vec![0xAAu8; 585], can_burn: true };
+        let pb = pb::Authority {
+            key_type: 2,
+            public_key: vec![0xAAu8; 585],
+            can_burn: true,
+        };
         let a = authority_from_proto(&pb);
         let back = authority_to_proto(&a);
         assert_eq!(back, pb);
@@ -287,7 +308,10 @@ mod tests {
 
     #[test]
     fn fee_basis_round_trip() {
-        let pb = pb::FeeBasis { r#type: 1, baseline: vec![0xBBu8; 32] };
+        let pb = pb::FeeBasis {
+            r#type: 1,
+            baseline: vec![0xBBu8; 32],
+        };
         let f = fee_basis_from_proto(&pb);
         let back = fee_basis_to_proto(&f);
         assert_eq!(back, pb);
@@ -298,12 +322,17 @@ mod tests {
         let pb = pb::TokenConfiguration {
             behavior: 0x3F,
             mint_strategy: Some(pb::TokenMintStrategy {
-                mint_behavior: 1, proof_basis: 0,
-                verkle_root: vec![], authority: None,
-                payment_address: vec![], fee_basis: None,
+                mint_behavior: 1,
+                proof_basis: 0,
+                verkle_root: vec![],
+                authority: None,
+                payment_address: vec![],
+                fee_basis: None,
             }),
-            units: vec![0x01], supply: vec![0xFF; 32],
-            name: "QUIL".into(), symbol: "Q".into(),
+            units: vec![0x01],
+            supply: vec![0xFF; 32],
+            name: "QUIL".into(),
+            symbol: "Q".into(),
             additional_reference: vec![vec![0xAAu8; 64]],
             owner_public_key: vec![0xBBu8; 585],
         };
@@ -315,9 +344,14 @@ mod tests {
     #[test]
     fn token_config_canonical_round_trip() {
         let pb = pb::TokenConfiguration {
-            behavior: 7, mint_strategy: None,
-            units: vec![], supply: vec![], name: "T".into(), symbol: "T".into(),
-            additional_reference: vec![], owner_public_key: vec![0xCCu8; 585],
+            behavior: 7,
+            mint_strategy: None,
+            units: vec![],
+            supply: vec![],
+            name: "T".into(),
+            symbol: "T".into(),
+            additional_reference: vec![],
+            owner_public_key: vec![0xCCu8; 585],
         };
         let c = token_config_from_proto(&pb).unwrap();
         let cb = c.to_canonical_bytes().unwrap();
@@ -330,9 +364,14 @@ mod tests {
     fn token_deploy_round_trip() {
         let pb = pb::TokenDeploy {
             config: Some(pb::TokenConfiguration {
-                behavior: 1, mint_strategy: None, units: vec![], supply: vec![],
-                name: "X".into(), symbol: "X".into(),
-                additional_reference: vec![], owner_public_key: vec![0xAAu8; 585],
+                behavior: 1,
+                mint_strategy: None,
+                units: vec![],
+                supply: vec![],
+                name: "X".into(),
+                symbol: "X".into(),
+                additional_reference: vec![],
+                owner_public_key: vec![0xAAu8; 585],
             }),
             rdf_schema: b"schema".to_vec(),
         };
@@ -340,5 +379,4 @@ mod tests {
         let back = token_deploy_to_proto(&d).unwrap();
         assert_eq!(back, pb);
     }
-
 }

@@ -48,7 +48,11 @@ const BOOT_RESET_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::BOOT_RESET_
 /// Whether the one-time boot cutover reset has already been applied — the
 /// frame-gated reset paths check this so they never re-apply on top of it.
 pub fn boot_reset_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(BOOT_RESET_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(BOOT_RESET_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Marker recording that the SECOND coordinated grid reset (grid-reset v2, mainnet
@@ -59,7 +63,11 @@ const GRID_RESET_V2_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::GRID_RES
 
 /// Whether the grid-reset v2 prover wipe has already run on this node.
 pub fn grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(GRID_RESET_V2_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(GRID_RESET_V2_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Record that grid-reset v2 has run (called after a successful v2 prover wipe).
@@ -72,11 +80,16 @@ pub fn mark_grid_reset_v2_applied(hg: &quil_store::RocksHypergraphStore) {
 /// Marker for prover-reset v3 (mainnet frame 747_000) — the complete tree
 /// wipe+reseed paired with the per-node worker-filter reset. DISTINCT from v1/v2
 /// so their guards don't suppress it and the v3 wipe runs exactly once.
-const PROVER_RESET_V3_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V3_MARKER_KEY;
+const PROVER_RESET_V3_MARKER_KEY: &[u8] =
+    quil_engine::frame_maintenance::PROVER_RESET_V3_MARKER_KEY;
 
 /// Whether the prover-reset v3 wipe has already run on this node.
 pub fn prover_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(PROVER_RESET_V3_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(PROVER_RESET_V3_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Record that prover-reset v3 has run (after a successful v3 prover wipe).
@@ -98,7 +111,11 @@ const WORKER_RESET_V3_MARKER_KEY: &[u8] = b"\x00__quil_worker_reset_v3__";
 // Retained migration query; current startup does not run this reset.
 #[allow(dead_code)]
 pub fn worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(WORKER_RESET_V3_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(WORKER_RESET_V3_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Record that the prover-reset v3 worker-filter reset has run.
@@ -113,11 +130,16 @@ pub fn mark_worker_reset_v3_applied(hg: &quil_store::RocksHypergraphStore) {
 /// Marker for prover-reset v4 (mainnet frame 755_000) — the re-baseline after the
 /// boot-clobber (`normalize_quil_token_grid`) was removed. DISTINCT from v2/v3 so
 /// their guards don't suppress it and the v4 wipe runs exactly once.
-const PROVER_RESET_V4_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V4_MARKER_KEY;
+const PROVER_RESET_V4_MARKER_KEY: &[u8] =
+    quil_engine::frame_maintenance::PROVER_RESET_V4_MARKER_KEY;
 
 /// Whether the prover-reset v4 wipe has already run on this node.
 pub fn prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(PROVER_RESET_V4_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(PROVER_RESET_V4_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Record that prover-reset v4 has run (after a successful v4 prover wipe).
@@ -131,11 +153,16 @@ pub fn mark_prover_reset_v4_applied(hg: &quil_store::RocksHypergraphStore) {
 /// old-binary fleet re-joined with post-v4 and re-baselines to sentinel now that
 /// every seeder is sentinel. DISTINCT from v2/v3/v4 so their guards don't
 /// suppress it and the v5 wipe runs exactly once.
-const PROVER_RESET_V5_MARKER_KEY: &[u8] = quil_engine::frame_maintenance::PROVER_RESET_V5_MARKER_KEY;
+const PROVER_RESET_V5_MARKER_KEY: &[u8] =
+    quil_engine::frame_maintenance::PROVER_RESET_V5_MARKER_KEY;
 
 /// Whether the prover-reset v5 wipe has already run on this node.
 pub fn prover_reset_v5_applied(hg: &quil_store::RocksHypergraphStore) -> bool {
-    hg.raw_db().get(PROVER_RESET_V5_MARKER_KEY).ok().flatten().is_some()
+    hg.raw_db()
+        .get(PROVER_RESET_V5_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 /// Record that prover-reset v5 has run (after a successful v5 prover wipe).
@@ -266,12 +293,21 @@ pub fn boot_apply_cutover_reset(
     // Deterministic reseed/commit frame — the cutover constant, identical on
     // every node (NOT the local head, which varies).
     let reset_frame = unified_tree_cutover_frame();
-    info!(head, reset_frame, network, "BOOT cutover reset: applying the full flag-day reset now (not frame-gated)…");
+    info!(
+        head,
+        reset_frame,
+        network,
+        "BOOT cutover reset: applying the full flag-day reset now (not frame-gated)…"
+    );
 
     // 1. Consolidate (idempotent). Best-effort — a failure here still lets the
     //    grid/prover reset proceed (they rebuild from committed vertices).
-    match quil_forest_migrate::run_unified_consolidation_in_place(hg.as_ref(), shards_store, 0, head)
-    {
+    match quil_forest_migrate::run_unified_consolidation_in_place(
+        hg.as_ref(),
+        shards_store,
+        0,
+        head,
+    ) {
         Ok(n) => info!(apps = n, "boot cutover reset: consolidation complete"),
         Err(e) => warn!(error = %e, "boot cutover reset: consolidation FAILED (continuing)"),
     }
@@ -320,7 +356,11 @@ pub fn boot_apply_cutover_reset(
                 }
             }
             let _ = txn.commit();
-            info!(removed_rows, genesis_shards = genesis_prefixes.len(), "boot cutover reset: QUIL grid rebuilt to genesis");
+            info!(
+                removed_rows,
+                genesis_shards = genesis_prefixes.len(),
+                "boot cutover reset: QUIL grid rebuilt to genesis"
+            );
         }
         Err(e) => warn!(error = %e, "boot cutover reset: shards txn open failed — grid NOT reset"),
     }
@@ -334,7 +374,10 @@ pub fn boot_apply_cutover_reset(
         genesis_seed,
         &[],
     ) {
-        Ok(seeded) => info!(seeded, "boot cutover reset: prover tree wiped + rebuilt from genesis committee"),
+        Ok(seeded) => info!(
+            seeded,
+            "boot cutover reset: prover tree wiped + rebuilt from genesis committee"
+        ),
         Err(e) => warn!(error = %e, "boot cutover reset: prover-tree reset FAILED"),
     }
 
@@ -412,7 +455,10 @@ pub fn boot_consolidate_and_gate(
             head,
         ) {
             Ok(n) => match hg.raw_db().put(MARKER_KEY, [1u8]) {
-                Ok(()) => info!(apps = n, "unified consolidation complete — marker persisted"),
+                Ok(()) => info!(
+                    apps = n,
+                    "unified consolidation complete — marker persisted"
+                ),
                 Err(e) => warn!(
                     error = %e,
                     "unified consolidation done but marker write FAILED — will re-run next boot"
@@ -428,7 +474,12 @@ pub fn boot_consolidate_and_gate(
 
     let active = head >= unified_tree_cutover_frame();
     crdt.set_unified_tree(active);
-    info!(head, cutover = unified_tree_cutover_frame(), active, "unified-tree gate set at boot");
+    info!(
+        head,
+        cutover = unified_tree_cutover_frame(),
+        active,
+        "unified-tree gate set at boot"
+    );
     active
 }
 
@@ -458,7 +509,10 @@ pub fn gate_unified_at_frame(
         ) {
             Ok(_) => {
                 crdt.set_unified_tree(true);
-                info!(frame = frame_number, "unified app-tree commitment ACTIVATED at cutover");
+                info!(
+                    frame = frame_number,
+                    "unified app-tree commitment ACTIVATED at cutover"
+                );
             }
             Err(e) => {
                 warn!(error = %e, frame = frame_number,

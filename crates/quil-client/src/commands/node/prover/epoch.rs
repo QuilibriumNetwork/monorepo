@@ -93,10 +93,15 @@ pub fn confirmed_phase(
     eff: EffectiveStatus,
     epoch_length: u64,
 ) -> Option<(&'static str, u64)> {
-    let boundary = |confirm: u64| epoch_start_frame(epoch_for_frame(confirm, epoch_length) + 1, epoch_length);
+    let boundary =
+        |confirm: u64| epoch_start_frame(epoch_for_frame(confirm, epoch_length) + 1, epoch_length);
     match eff {
-        EffectiveStatus::Joining if t.join_confirm_frame > 0 => Some(("activating", boundary(t.join_confirm_frame))),
-        EffectiveStatus::Leaving if t.leave_confirm_frame > 0 => Some(("departing", boundary(t.leave_confirm_frame))),
+        EffectiveStatus::Joining if t.join_confirm_frame > 0 => {
+            Some(("activating", boundary(t.join_confirm_frame)))
+        }
+        EffectiveStatus::Leaving if t.leave_confirm_frame > 0 => {
+            Some(("departing", boundary(t.leave_confirm_frame)))
+        }
         _ => None,
     }
 }
@@ -115,7 +120,11 @@ pub struct AllocationTiming<'a> {
 
 /// `computeEffectiveStatus` — map raw status + timing + current frame to
 /// the effective lifecycle state.
-pub fn compute_effective_status(a: &AllocationTiming, current_frame: u64, epoch_length: u64) -> EffectiveStatus {
+pub fn compute_effective_status(
+    a: &AllocationTiming,
+    current_frame: u64,
+    epoch_length: u64,
+) -> EffectiveStatus {
     let el = epoch_len(epoch_length);
     let current_epoch = current_frame / el;
 
@@ -306,7 +315,9 @@ impl ActionHint {
     /// when absolute. The bare verb when unbounded, which for a Next Action
     /// reads as "available now".
     pub fn render(&self, unit: ThresholdUnit, clock: ThresholdClock) -> String {
-        let Some(f) = self.at_frame else { return self.label.clone() };
+        let Some(f) = self.at_frame else {
+            return self.label.clone();
+        };
         if unit == ThresholdUnit::Absolute {
             return format!("{}@f{}", self.label, f);
         }
@@ -315,7 +326,11 @@ impl ActionHint {
         }
         let left = f - clock.frame;
         match clock.seconds_per_frame {
-            Some(spf) => format!("{} in {left}f (~{})", self.label, fmt_estimate(left as f64 * spf)),
+            Some(spf) => format!(
+                "{} in {left}f (~{})",
+                self.label,
+                fmt_estimate(left as f64 * spf)
+            ),
             None => format!("{} in {left}f", self.label),
         }
     }
@@ -415,12 +430,20 @@ mod tests {
             leave_confirm_frame,
             epoch: 3,
         };
-        let phase = |t: AllocationTiming, frame| confirmed_phase(&t, compute_effective_status(&t, frame, 720), 720);
+        let phase = |t: AllocationTiming, frame| {
+            confirmed_phase(&t, compute_effective_status(&t, frame, 720), 720)
+        };
         assert_eq!(phase(timing(raw_status::JOINING, 0, 0), 1_600), None);
-        assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_200), Some(("activating", 2_880)));
+        assert_eq!(
+            phase(timing(raw_status::ACTIVE, 2_165, 0), 2_200),
+            Some(("activating", 2_880))
+        );
         assert_eq!(phase(timing(raw_status::ACTIVE, 2_165, 0), 2_880), None);
         assert_eq!(phase(timing(raw_status::LEAVING, 0, 0), 1_600), None);
-        assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_200), Some(("departing", 2_880)));
+        assert_eq!(
+            phase(timing(raw_status::LEAVING, 0, 2_165), 2_200),
+            Some(("departing", 2_880))
+        );
         assert_eq!(phase(timing(raw_status::LEAVING, 0, 2_165), 2_880), None);
     }
 
@@ -450,7 +473,7 @@ mod tests {
     fn active_data_shard_expires_when_epoch_stale() {
         let mut t = timing(raw_status::ACTIVE);
         t.epoch = 1; // registered for epoch 1
-        // current frame in epoch 3 -> stale
+                     // current frame in epoch 3 -> stale
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredEpoch
@@ -461,7 +484,7 @@ mod tests {
     fn joining_expires_past_confirm_epoch() {
         let mut t = timing(raw_status::JOINING);
         t.join_frame = 720; // epoch 1 -> must confirm epoch 2
-        // current epoch 3 -> expired
+                            // current epoch 3 -> expired
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredJoining
@@ -474,16 +497,40 @@ mod tests {
     #[test]
     fn thresholds_render_relative_absolute_and_now() {
         let renew = ActionHint::at("renew", 897_120);
-        let clock = |frame, seconds_per_frame| ThresholdClock { frame, seconds_per_frame };
-        assert_eq!(renew.render(ThresholdUnit::Relative, clock(896_608, None)), "renew in 512f");
-        assert_eq!(renew.render(ThresholdUnit::Relative, clock(896_608, Some(18.87))), "renew in 512f (~2h41m)");
-        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_119, Some(10.0))), "renew in 1f (~<1m)");
-        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_120, Some(10.0))), "renew now");
-        assert_eq!(renew.render(ThresholdUnit::Relative, clock(897_200, None)), "renew now");
-        assert_eq!(renew.render(ThresholdUnit::Absolute, clock(896_608, Some(18.87))), "renew@f897120");
+        let clock = |frame, seconds_per_frame| ThresholdClock {
+            frame,
+            seconds_per_frame,
+        };
+        assert_eq!(
+            renew.render(ThresholdUnit::Relative, clock(896_608, None)),
+            "renew in 512f"
+        );
+        assert_eq!(
+            renew.render(ThresholdUnit::Relative, clock(896_608, Some(18.87))),
+            "renew in 512f (~2h41m)"
+        );
+        assert_eq!(
+            renew.render(ThresholdUnit::Relative, clock(897_119, Some(10.0))),
+            "renew in 1f (~<1m)"
+        );
+        assert_eq!(
+            renew.render(ThresholdUnit::Relative, clock(897_120, Some(10.0))),
+            "renew now"
+        );
+        assert_eq!(
+            renew.render(ThresholdUnit::Relative, clock(897_200, None)),
+            "renew now"
+        );
+        assert_eq!(
+            renew.render(ThresholdUnit::Absolute, clock(896_608, Some(18.87))),
+            "renew@f897120"
+        );
         let free = ActionHint::text("(pause|leave)");
         for unit in [ThresholdUnit::Relative, ThresholdUnit::Absolute] {
-            assert_eq!(free.render(unit, clock(896_608, Some(10.0))), "(pause|leave)");
+            assert_eq!(
+                free.render(unit, clock(896_608, Some(10.0))),
+                "(pause|leave)"
+            );
         }
         assert_eq!(ThresholdUnit::default(), ThresholdUnit::Relative);
         assert_eq!(ThresholdUnit::Relative.toggled(), ThresholdUnit::Absolute);

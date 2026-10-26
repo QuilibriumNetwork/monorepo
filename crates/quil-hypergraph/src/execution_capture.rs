@@ -76,7 +76,13 @@ impl HypergraphCrdt {
     /// ([`quil_forest::CoordinatedDb::enable_watched_journal`]); a no-op for
     /// a forest over no database.
     pub fn enable_watched_journal(&self) {
-        if let Some(db) = self.forest.read().ok().as_ref().and_then(|forest| forest.db()) {
+        if let Some(db) = self
+            .forest
+            .read()
+            .ok()
+            .as_ref()
+            .and_then(|forest| forest.db())
+        {
             let _ = db.enable_watched_journal();
         }
     }

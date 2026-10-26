@@ -22,8 +22,14 @@ impl ClosingCertificate {
     fn authenticate(&self, submission: &CertificateSubmission) -> io::Result<()> {
         // This session's own finalization, a re-seal at its base included;
         // whether GLOBAL accepts it yet is GLOBAL's to decide.
-        verify_seal_with(&self.session, &submission.seal.request, &submission.seal, &submission.certificate, true)
-            .ok_or_else(|| invalid("closing certificate does not authenticate under its session"))?;
+        verify_seal_with(
+            &self.session,
+            &submission.seal.request,
+            &submission.seal,
+            &submission.certificate,
+            true,
+        )
+        .ok_or_else(|| invalid("closing certificate does not authenticate under its session"))?;
         Ok(())
     }
 
@@ -34,7 +40,8 @@ impl ClosingCertificate {
             Err(error) => return Err(error),
         };
         let mut bytes = Vec::new();
-        file.take(MAX_RECORD_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        file.take(MAX_RECORD_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(invalid("closing certificate record exceeds size limit"));
         }
@@ -48,19 +55,31 @@ impl ClosingCertificate {
             return Err(invalid("closing certificate exceeds size limit"));
         }
         let submission = CertificateSubmission {
-            seal: Seal::decode(seal).map_err(invalid)?, certificate: certificate.to_vec(),
+            seal: Seal::decode(seal).map_err(invalid)?,
+            certificate: certificate.to_vec(),
         };
         self.authenticate(&submission)?;
-        let parent = self.path.parent().ok_or_else(|| invalid("closing certificate has no parent directory"))?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| invalid("closing certificate has no parent directory"))?;
         if let Some(existing) = self.load()? {
             // A re-seal finalized beside the seal it extends ends the session
             // at the same checkpoint: the first recorded one stands.
             let (old, new) = (&existing.seal, &submission.seal);
-            let same_end = old.request == new.request && old.session == new.session
-                && quil_cw_consensus::handoff::Checkpoint { view: 0, ..old.checkpoint.clone() }
-                    == quil_cw_consensus::handoff::Checkpoint { view: 0, ..new.checkpoint.clone() };
+            let same_end = old.request == new.request
+                && old.session == new.session
+                && quil_cw_consensus::handoff::Checkpoint {
+                    view: 0,
+                    ..old.checkpoint.clone()
+                } == quil_cw_consensus::handoff::Checkpoint {
+                    view: 0,
+                    ..new.checkpoint.clone()
+                };
             if !same_end {
-                return Err(invalid("another terminal seal is already recorded for this session"));
+                return Err(invalid(
+                    "another terminal seal is already recorded for this session",
+                ));
             }
             // Complete a rename whose directory sync was interrupted.
             std::fs::File::open(&self.path)?.sync_all()?;

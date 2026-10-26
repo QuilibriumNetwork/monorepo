@@ -12,7 +12,9 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
 
     let resp = client
-        .get_shard_info(tonic::Request::new(GetShardInfoRequest { include_all: false }))
+        .get_shard_info(tonic::Request::new(GetShardInfoRequest {
+            include_all: false,
+        }))
         .await
         .map_err(|e| anyhow::anyhow!("get shard info: {e}"))?
         .into_inner();
@@ -30,7 +32,9 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut unknown = 0;
     let mut adjusted = [BigInt::from(0), BigInt::from(0)];
     let mut adjusted_known = [0usize; 2];
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     for shard in &resp.shards {
         let filter_hex = hex::encode(&shard.filter);
         let worker_str = workers
@@ -39,12 +43,33 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             .unwrap_or_default();
 
         let reward = BigInt::from_bytes_be(Sign::Plus, &shard.estimated_reward);
-        if shard.ring_known == Some(false) { unknown += 1; } else { total += &reward; }
+        if shard.ring_known == Some(false) {
+            unknown += 1;
+        } else {
+            total += &reward;
+        }
 
-        let forecasts: Vec<_> = [false, true].iter().enumerate().map(|(i, day)| {
-            let value = if shard.ring_known == Some(false) { None } else { shard.frame_cadence.as_ref().and_then(|c| super::observed_quil_daily(&reward, c, *day, now)) };
-            if let Some(v) = value { adjusted[i] += &v; adjusted_known[i] += 1; super::format_quil_daily_units(&v) } else { "-".into() }
-        }).collect();
+        let forecasts: Vec<_> = [false, true]
+            .iter()
+            .enumerate()
+            .map(|(i, day)| {
+                let value = if shard.ring_known == Some(false) {
+                    None
+                } else {
+                    shard
+                        .frame_cadence
+                        .as_ref()
+                        .and_then(|c| super::observed_quil_daily(&reward, c, *day, now))
+                };
+                if let Some(v) = value {
+                    adjusted[i] += &v;
+                    adjusted_known[i] += 1;
+                    super::format_quil_daily_units(&v)
+                } else {
+                    "-".into()
+                }
+            })
+            .collect();
         println!(
             "  Filter: {}  Shards: {:<6} Provers: {:<4} Ring: {}  Reward [Q/d 60m/24h/theory]: {}/{}/{}{}",
             filter_hex,
@@ -62,8 +87,28 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
         if unknown > 0 { "Known" } else { "Total" },
         format_quil_daily_round(&total)
     );
-    println!("Observed-cadence estimates [Q/d 60m/24h]: {}", (0..2).map(|i| if adjusted_known[i] == 0 { "-".into() } else { format!("{}{}", super::format_quil_daily_units(&adjusted[i]), if adjusted_known[i] < resp.shards.len() { "+" } else { "" }) }).collect::<Vec<_>>().join("/"));
-    if unknown > 0 { println!("Unknown reward estimates: {unknown}"); }
+    println!(
+        "Observed-cadence estimates [Q/d 60m/24h]: {}",
+        (0..2)
+            .map(|i| if adjusted_known[i] == 0 {
+                "-".into()
+            } else {
+                format!(
+                    "{}{}",
+                    super::format_quil_daily_units(&adjusted[i]),
+                    if adjusted_known[i] < resp.shards.len() {
+                        "+"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    if unknown > 0 {
+        println!("Unknown reward estimates: {unknown}");
+    }
     println!(
         "Difficulty: {}  Frame: {}",
         resp.difficulty, resp.frame_number

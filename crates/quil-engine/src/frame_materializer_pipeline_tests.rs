@@ -3,8 +3,7 @@
 //! legacy fallback, busy leases and authentication failures.
 use super::*;
 use crate::global_finalization::{
-    FinalizationStep, FinalizedFrameAnnouncer, GlobalFinalizationLimits,
-    GlobalFinalizationPipeline,
+    FinalizationStep, FinalizedFrameAnnouncer, GlobalFinalizationLimits, GlobalFinalizationPipeline,
 };
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -14,7 +13,11 @@ struct Announcements {
     gossip: Arc<AtomicUsize>,
 }
 
-fn pipeline(rig: &Rig, prover: Vec<u8>, max_queued: usize) -> (GlobalFinalizationPipeline, Announcements) {
+fn pipeline(
+    rig: &Rig,
+    prover: Vec<u8>,
+    max_queued: usize,
+) -> (GlobalFinalizationPipeline, Announcements) {
     let heads = Arc::new(AtomicUsize::new(0));
     let gossip = Arc::new(AtomicUsize::new(0));
     let announcer = FinalizedFrameAnnouncer::new(
@@ -71,15 +74,26 @@ fn a_frame_waits_for_its_sequenced_ingest_before_executing() {
     let pipeline = pipeline.with_sequenced_ingest({
         let (ready, seen_frames) = (ready.clone(), seen_frames.clone());
         Arc::new(move |frame: &GlobalFrame| {
-            seen_frames.lock().unwrap().push(frame.header.as_ref().unwrap().frame_number);
+            seen_frames
+                .lock()
+                .unwrap()
+                .push(frame.header.as_ref().unwrap().frame_number);
             Ok(ready.load(Ordering::SeqCst))
         })
     });
     assert!(pipeline.offer(input.clone()));
     assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
     assert!(matches!(pipeline.step(1), FinalizationStep::Retry(_)));
-    assert_eq!(rig.source.last_materialized_frame(), 0, "nothing executes before its ingest");
-    assert_ne!(rig.clock.get_latest_global_clock_frame().ok(), Some(input.clone()), "nor becomes canonical");
+    assert_eq!(
+        rig.source.last_materialized_frame(),
+        0,
+        "nothing executes before its ingest"
+    );
+    assert_ne!(
+        rig.clock.get_latest_global_clock_frame().ok(),
+        Some(input.clone()),
+        "nor becomes canonical"
+    );
 
     ready.store(true, Ordering::SeqCst);
     let FinalizationStep::Published { frame, .. } = pipeline.step(1) else {
@@ -125,7 +139,11 @@ fn pipeline_for_other_prover(rig: &Rig) -> (GlobalFinalizationPipeline, Announce
 fn restart_recovers_only_a_certified_durable_candidate() {
     let rig = Rig::new();
     let mut uncertified = rig.deploy();
-    uncertified.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    uncertified
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     let noop = crate::cw_global_seams::NoopTxn;
     rig.clock
         .put_global_clock_frame_candidate(&uncertified, &noop)
@@ -138,12 +156,20 @@ fn restart_recovers_only_a_certified_durable_candidate() {
 
     // The finalizer overwrites the same candidate key with the certified header.
     let input = certified_deploy(&rig);
-    rig.clock.put_global_clock_frame_candidate(&input, &noop).unwrap();
+    rig.clock
+        .put_global_clock_frame_candidate(&input, &noop)
+        .unwrap();
     // A later proposal or vote persisting it as an ancestor carries no
     // certificate; the stored certificate survives for restart recovery.
     let mut ancestor = input.clone();
-    ancestor.header.as_mut().unwrap().public_key_signature_bls48581 = None;
-    rig.clock.put_global_clock_frame_candidate(&ancestor, &noop).unwrap();
+    ancestor
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
+    rig.clock
+        .put_global_clock_frame_candidate(&ancestor, &noop)
+        .unwrap();
     let (fresh, _) = pipeline_for_other_prover(&rig);
     let FinalizationStep::Published { frame, .. } = fresh.step(1) else {
         panic!("expected recovery from the durable candidate");
@@ -171,7 +197,10 @@ fn a_held_proposal_lease_defers_publication_without_counting_a_failure() {
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
     assert!(rig.clock.get_global_clock_frame(1).is_err());
     drop(lease);
-    assert!(matches!(pipeline.step(1), FinalizationStep::Published { .. }));
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
 }
 
 #[test]
@@ -188,7 +217,10 @@ fn a_store_without_an_execution_receipt_publishes_on_its_certified_head() {
     certify_parent(&mut next, &rig.signer, 0, old.header.as_ref().unwrap().rank);
     let (pipeline, _) = pipeline(&rig, vec![], 8);
     pipeline.offer(next.clone());
-    assert!(matches!(pipeline.step(2), FinalizationStep::Published { .. }));
+    assert!(matches!(
+        pipeline.step(2),
+        FinalizationStep::Published { .. }
+    ));
     assert_eq!(rig.source.last_materialized_frame(), 2);
     assert!(rig
         .db
@@ -206,7 +238,11 @@ fn an_uncertified_canonical_base_falls_back_to_legacy_after_retries() {
     // A legacy writer stored the head without its certificate, so it is not
     // an authenticated base for atomic publication.
     let mut stored = old.clone();
-    stored.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    stored
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     save(rig.clock.as_ref(), &stored);
     let mut next = state_frame(&rig.source, 2, 73, id(&old));
     certify_parent(&mut next, &rig.signer, 0, old.header.as_ref().unwrap().rank);
@@ -372,7 +408,10 @@ fn synced_frames_wait_as_certified_candidates_only_inside_the_admission_window()
     assert_eq!(candidate(1, &input), Some(input.clone()));
     assert_eq!(pipeline.queued(), 1);
     assert!(rig.clock.get_global_clock_frame(1).is_err());
-    assert!(matches!(pipeline.step(1), FinalizationStep::Published { .. }));
+    assert!(matches!(
+        pipeline.step(1),
+        FinalizationStep::Published { .. }
+    ));
     // At or below the head, and beyond the window, it keeps the legacy order.
     assert!(!pipeline.offer_synced(&input));
     let at = |number: u64| {
@@ -380,7 +419,9 @@ fn synced_frames_wait_as_certified_candidates_only_inside_the_admission_window()
         frame.header.as_mut().unwrap().frame_number = number;
         frame
     };
-    assert!(!pipeline.admits(1) && pipeline.admits(2) && pipeline.admits(33) && !pipeline.admits(34));
+    assert!(
+        !pipeline.admits(1) && pipeline.admits(2) && pipeline.admits(33) && !pipeline.admits(34)
+    );
     assert!(!pipeline.offer_synced(&at(34)));
     assert!(pipeline.offer_synced(&at(33)));
     assert_eq!(pipeline.queued(), 1);
@@ -397,7 +438,11 @@ fn a_synced_frame_already_held_as_a_certified_candidate_is_not_rewritten() {
     assert!(pipeline.offer_synced(&input));
     let sequence = rig.db.inner().latest_sequence_number();
     assert!(pipeline.offer_synced(&input));
-    assert_eq!(rig.db.inner().latest_sequence_number(), sequence, "not rewritten");
+    assert_eq!(
+        rig.db.inner().latest_sequence_number(),
+        sequence,
+        "not rewritten"
+    );
     assert_eq!(pipeline.queued(), 1);
 
     let mut other_body = input.clone();
@@ -405,7 +450,10 @@ fn a_synced_frame_already_held_as_a_certified_candidate_is_not_rewritten() {
     assert!(pipeline.offer_synced(&other_body));
     assert_ne!(rig.db.inner().latest_sequence_number(), sequence);
     assert_eq!(
-        rig.clock.get_global_clock_frame_candidate(1, id(&input).as_ref()).unwrap().requests,
+        rig.clock
+            .get_global_clock_frame_candidate(1, id(&input).as_ref())
+            .unwrap()
+            .requests,
         other_body.requests,
     );
 }
@@ -457,7 +505,9 @@ fn a_certified_descendant_publishes_its_notarized_ancestor() {
     let rig = Rig::new();
     let ancestor = rig.deploy();
     let noop = crate::cw_global_seams::NoopTxn;
-    rig.clock.put_global_clock_frame_candidate(&ancestor, &noop).unwrap();
+    rig.clock
+        .put_global_clock_frame_candidate(&ancestor, &noop)
+        .unwrap();
     let rank = ancestor.header.as_ref().unwrap().rank;
     let mut descendant = state_frame(&rig.source, 2, rank + 5, id(&ancestor));
     certify_parent(&mut descendant, &rig.signer, 0, rank);
@@ -477,7 +527,9 @@ fn a_certified_frame_that_does_not_link_implies_nothing() {
     let rig = Rig::new();
     let ancestor = rig.deploy();
     let noop = crate::cw_global_seams::NoopTxn;
-    rig.clock.put_global_clock_frame_candidate(&ancestor, &noop).unwrap();
+    rig.clock
+        .put_global_clock_frame_candidate(&ancestor, &noop)
+        .unwrap();
     let rank = ancestor.header.as_ref().unwrap().rank;
     let unrelated = quil_cw_consensus::adapters::digest_from_identity([9; 32]);
     let mut descendant = state_frame(&rig.source, 2, rank + 5, unrelated);
@@ -504,9 +556,16 @@ fn a_synced_chain_publishes_its_uncertified_ancestor_atomically() {
     let (pipeline, _) = pipeline(&rig, vec![], 8);
     let before = rig.clock.get_latest_global_clock_frame().ok();
 
-    assert!(!pipeline.offer_synced(&ancestor), "alone, the ancestor has no certificate");
+    assert!(
+        !pipeline.offer_synced(&ancestor),
+        "alone, the ancestor has no certificate"
+    );
     assert!(pipeline.offer_synced_chain(&[ancestor.clone(), descendant.clone()]));
-    assert_eq!(rig.clock.get_latest_global_clock_frame().ok(), before, "nothing canonical before publication");
+    assert_eq!(
+        rig.clock.get_latest_global_clock_frame().ok(),
+        before,
+        "nothing canonical before publication"
+    );
     let FinalizationStep::Published { frame, .. } = pipeline.step(1) else {
         panic!("expected the synced ancestor to publish atomically");
     };
@@ -529,9 +588,14 @@ fn a_synced_chain_that_does_not_link_or_certify_is_refused() {
     assert!(!pipeline.offer_synced_chain(&[ancestor.clone(), stranger]));
     assert!(!pipeline.offer_synced_chain(&[ancestor.clone(), uncertified]));
     assert!(!pipeline.offer_synced_chain(&[]));
-    let selector = quil_crypto::poseidon::hash_bytes_to_32(&ancestor.header.as_ref().unwrap().output).unwrap();
-    assert!(rig.clock.get_global_clock_frame_candidate(1, &selector).is_err(),
-        "a refused chain leaves no ancestor candidate");
+    let selector =
+        quil_crypto::poseidon::hash_bytes_to_32(&ancestor.header.as_ref().unwrap().output).unwrap();
+    assert!(
+        rig.clock
+            .get_global_clock_frame_candidate(1, &selector)
+            .is_err(),
+        "a refused chain leaves no ancestor candidate"
+    );
 }
 
 /// While execution trails the head beyond the voting window, an authentic
@@ -553,9 +617,16 @@ fn a_catching_up_worker_hands_finalizations_to_the_legacy_path_without_retrying(
 
     pipeline.offer(input.clone());
     let before = rig.source.execution_counts();
-    assert!(matches!(pipeline.step_within(1, 0), FinalizationStep::Legacy));
+    assert!(matches!(
+        pipeline.step_within(1, 0),
+        FinalizationStep::Legacy
+    ));
     assert_eq!(rig.source.execution_counts(), before, "no atomic attempt");
-    assert_eq!(rig.source.last_materialized_frame(), 0, "nothing executed yet");
+    assert_eq!(
+        rig.source.last_materialized_frame(),
+        0,
+        "nothing executed yet"
+    );
     assert_eq!(rig.clock.get_global_clock_frame(1).unwrap(), input);
     assert_eq!(seen.heads.load(Ordering::SeqCst), 0);
     rig.source.materialize(&input).unwrap();
@@ -563,12 +634,24 @@ fn a_catching_up_worker_hands_finalizations_to_the_legacy_path_without_retrying(
 
     // One attempt allowed: its failure hands the frame over at once.
     let mut stored = input.clone();
-    stored.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    stored
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     save(rig.clock.as_ref(), &stored);
     let mut next = state_frame(&rig.source, 2, 73, id(&input));
-    certify_parent(&mut next, &rig.signer, 0, input.header.as_ref().unwrap().rank);
+    certify_parent(
+        &mut next,
+        &rig.signer,
+        0,
+        input.header.as_ref().unwrap().rank,
+    );
     pipeline.offer(next.clone());
-    assert!(matches!(pipeline.step_within(2, 1), FinalizationStep::Legacy));
+    assert!(matches!(
+        pipeline.step_within(2, 1),
+        FinalizationStep::Legacy
+    ));
     let counts = rig.source.execution_counts();
     assert_eq!((counts.atomic_published, counts.atomic_failed), (0, 1));
     assert_eq!(rig.clock.get_global_clock_frame(2).unwrap(), next);
@@ -584,7 +667,11 @@ fn a_finalization_handed_over_after_failed_attempts_is_not_attempted_again() {
     let old = certified_deploy(&rig);
     rig.source.materialize(&old).unwrap();
     let mut stored = old.clone();
-    stored.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    stored
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     save(rig.clock.as_ref(), &stored);
     let mut next = state_frame(&rig.source, 2, 73, id(&old));
     certify_parent(&mut next, &rig.signer, 0, old.header.as_ref().unwrap().rank);
@@ -599,7 +686,11 @@ fn a_finalization_handed_over_after_failed_attempts_is_not_attempted_again() {
     assert_eq!((failed.atomic_published, failed.atomic_failed), (0, 3));
 
     // The worker's canonical path.
-    let attempts = if worker.attempted(2) { 0 } else { crate::global_catch_up::AT_HEAD_ATOMIC_ATTEMPTS };
+    let attempts = if worker.attempted(2) {
+        0
+    } else {
+        crate::global_catch_up::AT_HEAD_ATOMIC_ATTEMPTS
+    };
     let outcome = crate::global_catch_up::attempt_atomically(attempts, || {
         rig.source.materialize_canonical_atomically(&next, limits())
     });
@@ -607,7 +698,11 @@ fn a_finalization_handed_over_after_failed_attempts_is_not_attempted_again() {
     rig.source.materialize(&next).unwrap();
     assert_eq!(rig.source.last_materialized_frame(), 2);
     let counts = rig.source.execution_counts();
-    assert_eq!((counts.atomic_published, counts.atomic_failed), (0, 3), "three attempts, then in place");
+    assert_eq!(
+        (counts.atomic_published, counts.atomic_failed),
+        (0, 3),
+        "three attempts, then in place"
+    );
     assert!(worker.finish_legacy(&next));
     assert!(!worker.attempted(2));
 

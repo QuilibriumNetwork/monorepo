@@ -92,14 +92,21 @@ pub fn convert_shard(
         // Aggregates track the vertex-adds phase, mirroring ShardMetadata.
         if phase == Phase::VertexAdds {
             num_leaves = leaves.len() as u64;
-            total_size = leaves.iter().map(|(_, v)| quil_forest::vertex_leaf_size(v)).sum();
+            total_size = leaves
+                .iter()
+                .map(|(_, v)| quil_forest::vertex_leaf_size(v))
+                .sum();
         }
         phase_leaves[phase as usize] = leaves;
     }
     let roots = forest
         .commit_shard_raw(&shard_key.l2, version, phase_leaves)
         .map_err(|e| anyhow::anyhow!("commit_shard_raw: {e}"))?;
-    Ok(ShardConversion { roots, num_leaves, total_size })
+    Ok(ShardConversion {
+        roots,
+        num_leaves,
+        total_size,
+    })
 }
 
 /// The default shard partition for an app in the address-path forest:
@@ -139,7 +146,10 @@ fn commit_subshard_phase(
     let leaves = per_vertex_phase_leaves(buffer)?;
     if phase == Phase::VertexAdds {
         *num_leaves += leaves.len() as u64;
-        *total_size += leaves.iter().map(|(_, v)| quil_forest::vertex_leaf_size(v)).sum::<u128>();
+        *total_size += leaves
+            .iter()
+            .map(|(_, v)| quil_forest::vertex_leaf_size(v))
+            .sum::<u128>();
     }
     let shard_id = Forest::addr_path_shard_id(app_l2, prefix);
     let root = forest
@@ -233,11 +243,8 @@ pub fn convert_app_at_versions(
         let mut cur_sub: Option<usize> = None;
         let mut buffer: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-        let rows = hg.for_each_vertex_unversioned_ordered(
-            set,
-            ph,
-            app_shard_key,
-            |vk, blob| {
+        let rows = hg
+            .for_each_vertex_unversioned_ordered(set, ph, app_shard_key, |vk, blob| {
                 if seen.contains(vk) {
                     return Ok(()); // superseded by a v2 rewrite
                 }
@@ -259,8 +266,14 @@ pub fn convert_app_at_versions(
                         let mut taken = std::mem::take(&mut buffer);
                         taken.append(&mut v2_bufs[c]);
                         let root = commit_subshard_phase(
-                            forest, &app_shard_key.l2, &prefixes[c], phase, version,
-                            taken, &mut num_leaves, &mut total_size,
+                            forest,
+                            &app_shard_key.l2,
+                            &prefixes[c],
+                            phase,
+                            version,
+                            taken,
+                            &mut num_leaves,
+                            &mut total_size,
                         )
                         .map_err(|e| quil_types::error::QuilError::Store(e.to_string()))?;
                         phase_roots[phase as usize][c] = Some(root);
@@ -274,17 +287,22 @@ pub fn convert_app_at_versions(
                     }
                 }
                 Ok(())
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("stream {set}/{ph}: {e}"))?;
+            })
+            .map_err(|e| anyhow::anyhow!("stream {set}/{ph}: {e}"))?;
 
         // Flush the final contiguous run (combined with its v2 leaves).
         if let Some(c) = cur_sub {
             let mut taken = std::mem::take(&mut buffer);
             taken.append(&mut v2_bufs[c]);
             let root = commit_subshard_phase(
-                forest, &app_shard_key.l2, &prefixes[c], phase, version,
-                taken, &mut num_leaves, &mut total_size,
+                forest,
+                &app_shard_key.l2,
+                &prefixes[c],
+                phase,
+                version,
+                taken,
+                &mut num_leaves,
+                &mut total_size,
             )?;
             phase_roots[phase as usize][c] = Some(root);
             sub_has_state[c] = true;
@@ -295,8 +313,14 @@ pub fn convert_app_at_versions(
             if !v2_bufs[si].is_empty() {
                 let taken = std::mem::take(&mut v2_bufs[si]);
                 let root = commit_subshard_phase(
-                    forest, &app_shard_key.l2, &prefixes[si], phase, version,
-                    taken, &mut num_leaves, &mut total_size,
+                    forest,
+                    &app_shard_key.l2,
+                    &prefixes[si],
+                    phase,
+                    version,
+                    taken,
+                    &mut num_leaves,
+                    &mut total_size,
                 )?;
                 phase_roots[phase as usize][si] = Some(root);
                 sub_has_state[si] = true;
@@ -328,8 +352,14 @@ pub fn convert_app_at_versions(
                             continue;
                         }
                         let root = commit_subshard_phase(
-                            forest, &app_shard_key.l2, &prefixes[si], phase, version,
-                            buf, &mut num_leaves, &mut total_size,
+                            forest,
+                            &app_shard_key.l2,
+                            &prefixes[si],
+                            phase,
+                            version,
+                            buf,
+                            &mut num_leaves,
+                            &mut total_size,
                         )?;
                         phase_roots[phase as usize][si] = Some(root);
                         sub_has_state[si] = true;
@@ -343,8 +373,14 @@ pub fn convert_app_at_versions(
         for si in 0..n {
             if phase_roots[phase as usize][si].is_none() {
                 let root = commit_subshard_phase(
-                    forest, &app_shard_key.l2, &prefixes[si], phase, version,
-                    Vec::new(), &mut num_leaves, &mut total_size,
+                    forest,
+                    &app_shard_key.l2,
+                    &prefixes[si],
+                    phase,
+                    version,
+                    Vec::new(),
+                    &mut num_leaves,
+                    &mut total_size,
                 )?;
                 phase_roots[phase as usize][si] = Some(root);
             }
@@ -361,13 +397,23 @@ pub fn convert_app_at_versions(
     let mut app_phase_roots = [[0u8; 32]; 4];
     for p in 0..4 {
         let shards: Vec<(Vec<bool>, [u8; 32])> = (0..n)
-            .map(|si| (bit_paths[si].clone(), phase_roots[p][si].unwrap_or([0u8; 32])))
+            .map(|si| {
+                (
+                    bit_paths[si].clone(),
+                    phase_roots[p][si].unwrap_or([0u8; 32]),
+                )
+            })
             .collect();
         app_phase_roots[p] = app_root_from_shard_paths(&shards);
     }
     let app_root = rollup_phase_roots(&app_phase_roots);
     Ok(Some((
-        AppEntry { app_root, num_leaves, total_size, metadata: Vec::new() },
+        AppEntry {
+            app_root,
+            num_leaves,
+            total_size,
+            metadata: Vec::new(),
+        },
         nonempty,
     )))
 }
@@ -416,7 +462,10 @@ pub fn convert_db(
         if addr.len() >= 32 {
             let mut l2 = [0u8; 32];
             l2.copy_from_slice(&addr[..32]);
-            shard_keys.insert(ShardKey { l2, l1: get_bloom_filter_indices(&addr, 256, 3) });
+            shard_keys.insert(ShardKey {
+                l2,
+                l1: get_bloom_filter_indices(&addr, 256, 3),
+            });
         }
     }
     let lo = head_frame.saturating_sub(LOOKBACK);
@@ -447,7 +496,10 @@ pub fn convert_db(
         shards_converted += nonempty_shards;
         apps_converted += 1;
         let g = global_tree_index(&shard_key.l2);
-        global_apps.entry(g).or_default().push((shard_key.l2.to_vec(), app_entry));
+        global_apps
+            .entry(g)
+            .or_default()
+            .push((shard_key.l2.to_vec(), app_entry));
     }
 
     // L1: commit each touched global tree. Record each bucket's head version
@@ -466,7 +518,11 @@ pub fn convert_db(
         global_roots.insert(g, root);
     }
 
-    Ok(ConvertReport { shards: shards_converted, apps: apps_converted, global_roots })
+    Ok(ConvertReport {
+        shards: shards_converted,
+        apps: apps_converted,
+        global_roots,
+    })
 }
 
 /// Install the JMT forest on `crdt` — namespaced into `hg`'s own DB — iff
@@ -640,7 +696,12 @@ pub fn shards_for_app_from_store(
             }
         }
     }
-    move |app: &[u8; 32]| by_app.get(app).cloned().unwrap_or_else(|| quil_shards_for_app(app))
+    move |app: &[u8; 32]| {
+        by_app
+            .get(app)
+            .cloned()
+            .unwrap_or_else(|| quil_shards_for_app(app))
+    }
 }
 
 /// Like [`run_conversion_in_place`] but sources each app's shard set from the
@@ -654,7 +715,13 @@ pub fn run_conversion_in_place_with_shards(
     head_frame: u64,
 ) -> anyhow::Result<ConvertReport> {
     let forest = Forest::with_namespace(hg.raw_db(), quil_store::FOREST_NAMESPACE.to_vec());
-    convert_db(hg, &forest, version, head_frame, shards_for_app_from_store(shards_store))
+    convert_db(
+        hg,
+        &forest,
+        version,
+        head_frame,
+        shards_for_app_from_store(shards_store),
+    )
 }
 
 /// UNIFIED-APP-TREE consolidation (the unified-app-tree cutover, run in
@@ -710,7 +777,9 @@ fn fold_app_into_single_tree(
     app_shard_key: &ShardKey,
     chunk: usize,
 ) -> anyhow::Result<bool> {
-    let snapshot = hg.capture_tree_snapshot()?.ok_or_else(|| anyhow::anyhow!("consolidation snapshot unavailable"))?;
+    let snapshot = hg
+        .capture_tree_snapshot()?
+        .ok_or_else(|| anyhow::anyhow!("consolidation snapshot unavailable"))?;
     crate::consolidation::fold_snapshot(snapshot.as_ref(), forest, app_shard_key, chunk)
 }
 
@@ -731,7 +800,6 @@ mod tests {
     use num_bigint::BigInt;
     use quil_forest::rollup_phase_roots;
     use quil_tries::{serialize_go_tree, VectorCommitmentTree};
-
 
     fn open_db(path: &std::path::Path) -> quil_forest::CoordinatedDb {
         let mut opts = rocksdb::Options::default();
@@ -754,21 +822,29 @@ mod tests {
         let hg = RocksHypergraphStore::new(open_db(src.path()));
         let forest = Forest::new(open_db(dst.path()));
 
-        let shard_key = ShardKey { l2: [0xAAu8; 32], l1: [0u8; 3] };
+        let shard_key = ShardKey {
+            l2: [0xAAu8; 32],
+            l1: [0u8; 3],
+        };
         // Two vertices in vertex_adds, each with fields.
         let v1 = vec![0x11u8; 64];
         let v2 = vec![0x22u8; 64];
         let type_key = vec![0xFFu8; 32];
         let blob1 = vertex_blob(&[(&type_key, b"prover:Prover"), (&[0x00u8; 32], &[1u8])]);
         let blob2 = vertex_blob(&[(&type_key, b"reward:ProverReward")]);
-        hg.save_vertex_underlying("vertex", "adds", &shard_key, &v1, &blob1).unwrap();
-        hg.save_vertex_underlying("vertex", "adds", &shard_key, &v2, &blob2).unwrap();
+        hg.save_vertex_underlying("vertex", "adds", &shard_key, &v1, &blob1)
+            .unwrap();
+        hg.save_vertex_underlying("vertex", "adds", &shard_key, &v2, &blob2)
+            .unwrap();
 
         let sc = convert_shard(&hg, &forest, &shard_key, 0).unwrap();
         // Per-vertex-subtree model: 2 vertices → 2 leaves (one per vertex, NOT
         // one per flattened field).
         assert_eq!(sc.num_leaves, 2);
-        assert_eq!(sc.roots.commitment, rollup_phase_roots(&sc.roots.phase_roots));
+        assert_eq!(
+            sc.roots.commitment,
+            rollup_phase_roots(&sc.roots.phase_roots)
+        );
         // Empty phases (removes/hyperedges) share the same empty-tree root.
         assert_eq!(sc.roots.phase_roots[1], sc.roots.phase_roots[2]);
 
@@ -802,7 +878,10 @@ mod tests {
         let dst_legacy = tempfile::tempdir().unwrap();
         let dst_unified = tempfile::tempdir().unwrap();
         let hg = RocksHypergraphStore::new(open_db(src.path()));
-        let app_key = ShardKey { l2: QUIL_TOKEN, l1: [0u8; 3] };
+        let app_key = ShardKey {
+            l2: QUIL_TOKEN,
+            l1: [0u8; 3],
+        };
         let type_key = vec![0xFFu8; 32];
 
         // 3 vertices in QUIL sub-shards 0, 1, 63 (by the top-6 address bits).
@@ -813,26 +892,35 @@ mod tests {
             let mut vk = QUIL_TOKEN.to_vec();
             vk.extend_from_slice(&data_addr);
             let blob = vertex_blob(&[(&type_key, b"token:Coin")]);
-            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob)
+                .unwrap();
         }
 
         // Legacy: 64-way split → per-sub-shard trees + hash_pair rollup.
         let forest_legacy = Forest::new(open_db(dst_legacy.path()));
-        let (legacy, _) = convert_app(&hg, &forest_legacy, &app_key, 0, &quil_shards_for_app(&QUIL_TOKEN))
-            .unwrap()
-            .unwrap();
+        let (legacy, _) = convert_app(
+            &hg,
+            &forest_legacy,
+            &app_key,
+            0,
+            &quil_shards_for_app(&QUIL_TOKEN),
+        )
+        .unwrap()
+        .unwrap();
 
         // Unified consolidation: SINGLE empty prefix → ONE app tree.
         let forest_unified = Forest::new(open_db(dst_unified.path()));
-        let (unified, nonempty) =
-            convert_app(&hg, &forest_unified, &app_key, 0, &[Vec::new()]).unwrap().unwrap();
+        let (unified, nonempty) = convert_app(&hg, &forest_unified, &app_key, 0, &[Vec::new()])
+            .unwrap()
+            .unwrap();
 
         // The unified commitment IS the rollup of the ONE app tree's four native
         // phase JMT roots (no per-sub-shard `app_root_from_shard_paths`).
         let mut phase_roots = [[0u8; 32]; 4];
         for (i, ph) in PHASES.iter().enumerate() {
-            phase_roots[i] =
-                forest_unified.app_subtree_root(&QUIL_TOKEN, *ph, 0, &[]).unwrap();
+            phase_roots[i] = forest_unified
+                .app_subtree_root(&QUIL_TOKEN, *ph, 0, &[])
+                .unwrap();
         }
         assert_eq!(
             unified.app_root,
@@ -842,8 +930,14 @@ mod tests {
         let jmt_root = phase_roots[Phase::VertexAdds as usize]; // for the leaf proof below
         assert_eq!(unified.num_leaves, 3, "all 3 vertices in the one app tree");
         assert_eq!(nonempty, 1, "one non-empty shard = the whole app");
-        assert_ne!(unified.app_root, legacy.app_root, "unified != legacy rollup (the fork)");
-        assert_eq!(unified.num_leaves, legacy.num_leaves, "same leaves, invariant to sharding");
+        assert_ne!(
+            unified.app_root, legacy.app_root,
+            "unified != legacy rollup (the fork)"
+        );
+        assert_eq!(
+            unified.num_leaves, legacy.num_leaves,
+            "same leaves, invariant to sharding"
+        );
 
         // A vertex proves DIRECTLY against the unified app root (shard=subtree).
         let mut probe = [0u8; 32];
@@ -877,7 +971,10 @@ mod tests {
         let hg = RocksHypergraphStore::new(open_db(src.path()));
         let forest = Forest::new(open_db(dst.path()));
 
-        let app_key = ShardKey { l2: [0xAAu8; 32], l1: [0u8; 3] };
+        let app_key = ShardKey {
+            l2: [0xAAu8; 32],
+            l1: [0u8; 3],
+        };
         // QUIL-style 64-way split.
         let prefixes: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
 
@@ -896,10 +993,13 @@ mod tests {
         for (first, _sub) in cases {
             let (_addr, vk) = mk(first);
             let blob = vertex_blob(&[(&type_key, b"x"), (&[first; 32], &[first])]);
-            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob)
+                .unwrap();
         }
 
-        let (entry, nonempty) = convert_app(&hg, &forest, &app_key, 0, &prefixes).unwrap().unwrap();
+        let (entry, nonempty) = convert_app(&hg, &forest, &app_key, 0, &prefixes)
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.num_leaves, 3, "all three vertices counted");
         assert_eq!(nonempty, 3, "three distinct sub-shards carry state");
 
@@ -925,16 +1025,26 @@ mod tests {
         // app root.
         let dst2 = tempfile::tempdir().unwrap();
         let forest2 = Forest::new(open_db(dst2.path()));
-        let (entry2, _) = convert_app(&hg, &forest2, &app_key, 0, &prefixes).unwrap().unwrap();
+        let (entry2, _) = convert_app(&hg, &forest2, &app_key, 0, &prefixes)
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.app_root, entry2.app_root, "app root is deterministic");
     }
 
     /// Seed one vertex (in vertex_adds) for `shard_addr` and register the
     /// shard in the alt-shard index so `range_alt_shard_addresses` finds it.
-    fn seed_shard(hg: &RocksHypergraphStore, db: &quil_forest::CoordinatedDb, shard_addr: [u8; 32], tag: u8) {
+    fn seed_shard(
+        hg: &RocksHypergraphStore,
+        db: &quil_forest::CoordinatedDb,
+        shard_addr: [u8; 32],
+        tag: u8,
+    ) {
         // Key with the SAME l1 the converter reconstructs (bloom indices of the
         // address), as production does — else the per-vertex read misses it.
-        let sk = ShardKey { l2: shard_addr, l1: get_bloom_filter_indices(&shard_addr, 256, 3) };
+        let sk = ShardKey {
+            l2: shard_addr,
+            l1: get_bloom_filter_indices(&shard_addr, 256, 3),
+        };
         hg.save_vertex_underlying(
             "vertex",
             "adds",
@@ -971,7 +1081,11 @@ mod tests {
         let report = convert_db(&hg, &forest, 0, 0, quil_shards_for_app).unwrap();
         assert_eq!(report.shards, 2);
         assert_eq!(report.apps, 2);
-        assert_eq!(report.global_roots.len(), 2, "two distinct global trees touched");
+        assert_eq!(
+            report.global_roots.len(),
+            2,
+            "two distinct global trees touched"
+        );
         assert!(report.global_roots.contains_key(&0x2a));
         assert!(report.global_roots.contains_key(&0x40));
     }
@@ -988,7 +1102,10 @@ mod tests {
         // (id[32..]) fall in different top-6-bit shards: 0x00 → shard 0,
         // 0xFF → shard 63. id = [app(32) | data(32)].
         let quil = quil_execution::domains::QUIL_TOKEN;
-        let sk = ShardKey { l2: quil, l1: get_bloom_filter_indices(&quil, 256, 3) };
+        let sk = ShardKey {
+            l2: quil,
+            l1: get_bloom_filter_indices(&quil, 256, 3),
+        };
         for data0 in [0x00u8, 0xFFu8] {
             let mut id = [0u8; 64];
             id[..32].copy_from_slice(&quil);
@@ -1017,11 +1134,19 @@ mod tests {
         // Shards 0 and 63 committed non-empty vertex-adds trees; a third
         // (empty) shard did not — the split routed each vertex by its address.
         let empty = forest
-            .shard_phase_root(&Forest::addr_path_shard_id(&quil, &[1u32]), Phase::VertexAdds, 0)
+            .shard_phase_root(
+                &Forest::addr_path_shard_id(&quil, &[1u32]),
+                Phase::VertexAdds,
+                0,
+            )
             .unwrap();
         for i in [0u32, 63u32] {
             let root = forest
-                .shard_phase_root(&Forest::addr_path_shard_id(&quil, &[i]), Phase::VertexAdds, 0)
+                .shard_phase_root(
+                    &Forest::addr_path_shard_id(&quil, &[i]),
+                    Phase::VertexAdds,
+                    0,
+                )
                 .unwrap();
             assert!(root.is_some(), "shard {i} committed");
             assert_ne!(root, empty, "shard {i} is non-empty, unlike shard 1");
@@ -1047,7 +1172,10 @@ mod tests {
         // QUIL carries state ONLY in the hypergraph, keyed under the SAME l1 the
         // consolidation reconstructs (`bloom(l2)`), across three sub-shards.
         let quil = QUIL_TOKEN;
-        let app_key = ShardKey { l2: quil, l1: get_bloom_filter_indices(&quil, 256, 3) };
+        let app_key = ShardKey {
+            l2: quil,
+            l1: get_bloom_filter_indices(&quil, 256, 3),
+        };
         let type_key = vec![0xFFu8; 32];
         for (b0, tag) in [(0x00u8, 0xA1u8), (0x04, 0xB2), (0xFC, 0xC3)] {
             let mut data_addr = [0u8; 32];
@@ -1056,17 +1184,22 @@ mod tests {
             let mut vk = quil.to_vec();
             vk.extend_from_slice(&data_addr);
             let blob = vertex_blob(&[(&type_key, b"token:Coin")]);
-            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob).unwrap();
+            hg.save_vertex_underlying("vertex", "adds", &app_key, &vk, &blob)
+                .unwrap();
         }
 
         // Precondition: BOTH legacy enumeration sources are empty, so the pre-fix
         // consolidation (alt-shard ∪ recent-commits) would never reach QUIL.
         assert!(
-            HypergraphStore::range_alt_shard_addresses(&hg).unwrap().is_empty(),
+            HypergraphStore::range_alt_shard_addresses(&hg)
+                .unwrap()
+                .is_empty(),
             "QUIL is NOT in the alt-shard index (historical, prover-only recent writes)"
         );
         assert!(
-            HypergraphStore::get_root_commits(&hg, 0).unwrap().is_empty(),
+            HypergraphStore::get_root_commits(&hg, 0)
+                .unwrap()
+                .is_empty(),
             "no recent shard commit lists QUIL"
         );
 
@@ -1105,8 +1238,13 @@ mod tests {
 
         // The app tree is now POPULATED (was [0;32] = empty before the fold).
         let forest = Forest::with_namespace(src_db.clone(), quil_store::FOREST_NAMESPACE.to_vec());
-        let vadds_root = forest.app_subtree_root(&quil, Phase::VertexAdds, 0, &[]).unwrap();
-        assert_ne!(vadds_root, [0u8; 32], "unified app tree is non-empty after the fold");
+        let vadds_root = forest
+            .app_subtree_root(&quil, Phase::VertexAdds, 0, &[])
+            .unwrap();
+        assert_ne!(
+            vadds_root, [0u8; 32],
+            "unified app tree is non-empty after the fold"
+        );
 
         // A seeded vertex proves DIRECTLY against the unified app root (shard =
         // subtree at the empty prefix) — the leaf really landed in the app tree.
@@ -1139,7 +1277,10 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let hg = RocksHypergraphStore::new(open_db(src.path()));
         let quil = QUIL_TOKEN;
-        let app_key = ShardKey { l2: quil, l1: get_bloom_filter_indices(&quil, 256, 3) };
+        let app_key = ShardKey {
+            l2: quil,
+            l1: get_bloom_filter_indices(&quil, 256, 3),
+        };
         let type_key = vec![0xFFu8; 32];
 
         // Seed 7 distinct QUIL vertices (spanning sub-shards, in address order).
@@ -1175,19 +1316,32 @@ mod tests {
         assert!(fold_app_into_single_tree(&hg, &forest_single, &app_key, 10_000).unwrap());
 
         // The chunked head is the LAST version (3, for 4 chunks); the single head is 0.
-        let head_chunked = forest_chunked.read_head_version(&quil, Phase::VertexAdds).unwrap();
-        let head_single = forest_single.read_head_version(&quil, Phase::VertexAdds).unwrap();
-        assert_eq!(head_chunked, Some(3), "chunk=2 over 7 leaves ⇒ versions 0..3");
+        let head_chunked = forest_chunked
+            .read_head_version(&quil, Phase::VertexAdds)
+            .unwrap();
+        let head_single = forest_single
+            .read_head_version(&quil, Phase::VertexAdds)
+            .unwrap();
+        assert_eq!(
+            head_chunked,
+            Some(3),
+            "chunk=2 over 7 leaves ⇒ versions 0..3"
+        );
         assert_eq!(head_single, Some(0), "single chunk ⇒ version 0");
 
         // ROOT PARITY: the chunked tree at its head == the single tree at its head,
         // despite different version numbers (history-independent final set).
-        let root_chunked =
-            forest_chunked.app_subtree_root(&quil, Phase::VertexAdds, 3, &[]).unwrap();
-        let root_single =
-            forest_single.app_subtree_root(&quil, Phase::VertexAdds, 0, &[]).unwrap();
+        let root_chunked = forest_chunked
+            .app_subtree_root(&quil, Phase::VertexAdds, 3, &[])
+            .unwrap();
+        let root_single = forest_single
+            .app_subtree_root(&quil, Phase::VertexAdds, 0, &[])
+            .unwrap();
         assert_ne!(root_chunked, [0u8; 32], "populated");
-        assert_eq!(root_chunked, root_single, "chunked fold root == single-commit root");
+        assert_eq!(
+            root_chunked, root_single,
+            "chunked fold root == single-commit root"
+        );
 
         // Every seeded leaf proves against the CHUNKED tree's final-version root —
         // i.e. no leaf was lost across the version chaining.
@@ -1197,7 +1351,11 @@ mod tests {
             let (val, proof) = forest_chunked
                 .shard_phase_get_with_proof_raw(&quil, Phase::VertexAdds, 3, a)
                 .unwrap();
-            assert_eq!(val.as_deref(), Some(&expected[..]), "leaf present at final version");
+            assert_eq!(
+                val.as_deref(),
+                Some(&expected[..]),
+                "leaf present at final version"
+            );
             proof
                 .verify_existence(
                     jmt::RootHash(root_chunked),
@@ -1215,19 +1373,27 @@ mod tests {
         let db = open_db(src.path());
         let hg = RocksHypergraphStore::new(db.clone());
         let forest = Forest::new(open_db(dst.path()));
-        let shard_key = ShardKey { l2: [0xBBu8; 32], l1: [0u8; 3] };
+        let shard_key = ShardKey {
+            l2: [0xBBu8; 32],
+            l1: [0u8; 3],
+        };
 
         // Seed a WHOLE-TREE blob (no per-vertex rows): a tree whose leaves are
         // (vertex_address, per_vertex_blob).
         let v1 = vec![0x33u8; 64];
         let inner = vertex_blob(&[(&[0xFFu8; 32], b"prover:Prover")]);
         let mut outer = VectorCommitmentTree::new();
-        outer.insert(&v1, &inner, &[], &BigInt::from(inner.len() as u64)).unwrap();
+        outer
+            .insert(&v1, &inner, &[], &BigInt::from(inner.len() as u64))
+            .unwrap();
         let tree_blob = quil_tries::serialize_tree(outer.root.as_ref()).unwrap();
         let key = quil_store::encoding::hypergraph_tree_blob_key("vertex", "adds", &shard_key);
         db.put(&key, &tree_blob).unwrap();
 
         let sc = convert_shard(&hg, &forest, &shard_key, 0).unwrap();
-        assert_eq!(sc.num_leaves, 1, "fallback path flattened the one vertex field");
+        assert_eq!(
+            sc.num_leaves, 1,
+            "fallback path flattened the one vertex field"
+        );
     }
 }

@@ -20,7 +20,10 @@ const GLOBAL_ADDRESS: [u8; 32] = [0xFFu8; 32];
 /// A bundle of GLOBAL frame `frame_number` in canonical bytes, judged at
 /// that frame: the frame's number, not this process's history, decides
 /// which presence encodings it may carry.
-fn canonical_bundle(bundle: &quil_types::proto::global::MessageBundle, frame_number: u64) -> Result<Vec<u8>> {
+fn canonical_bundle(
+    bundle: &quil_types::proto::global::MessageBundle,
+    frame_number: u64,
+) -> Result<Vec<u8>> {
     crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number))
 }
 
@@ -45,11 +48,7 @@ pub fn process_global_frame_with_rewards(
     reward_issuer: Option<&dyn RewardIssuance>,
     prover_registry: Option<&dyn ProverRegistry>,
 ) -> Result<(usize, usize)> {
-    let frame_number = frame
-        .header
-        .as_ref()
-        .map(|h| h.frame_number)
-        .unwrap_or(0);
+    let frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -70,7 +69,9 @@ pub fn process_global_frame_with_rewards(
         let request_bytes = match canonical_bundle(bundle, frame_number) {
             Ok(b) => b,
             Err(e) => {
-                if e.is_execution_unavailable() { return Err(e); }
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -94,12 +95,12 @@ pub fn process_global_frame_with_rewards(
         // skipping validate would silently accept unsigned join /
         // kick / seniority_merge / shard_split / shard_merge /
         // frame_header messages.
-        if let Err(e) = execution_manager.validate_message(
-            frame_number,
-            &GLOBAL_ADDRESS,
-            &request_bytes,
-        ) {
-            if e.is_execution_unavailable() { return Err(e); }
+        if let Err(e) =
+            execution_manager.validate_message(frame_number, &GLOBAL_ADDRESS, &request_bytes)
+        {
+            if e.is_execution_unavailable() {
+                return Err(e);
+            }
             debug!(
                 frame = frame_number,
                 index = i,
@@ -120,7 +121,9 @@ pub fn process_global_frame_with_rewards(
                 applied += 1;
             }
             Err(e) => {
-                if e.is_execution_unavailable() { return Err(e); }
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(
                     frame = frame_number,
                     index = i,
@@ -139,21 +142,34 @@ pub fn process_global_frame_with_rewards(
         let difficulty = header.map(|h| h.difficulty as u64).unwrap_or(0);
         // Build prover allocation maps from registry
         if let Ok(provers) = registry.get_all_active_app_shard_provers() {
-            let alloc_maps: Vec<std::collections::HashMap<String, quil_types::consensus::ProverAllocation>> =
-                provers.iter().map(|p| {
-                    p.allocations.iter()
+            let alloc_maps: Vec<
+                std::collections::HashMap<String, quil_types::consensus::ProverAllocation>,
+            > = provers
+                .iter()
+                .map(|p| {
+                    p.allocations
+                        .iter()
                         .filter(|a| a.status == quil_types::consensus::ProverStatus::Active)
                         .map(|a| {
-                            (hex::encode(&a.confirmation_filter), quil_types::consensus::ProverAllocation {
-                                ring: 0,
-                                shards: 1,
-                                state_size: 1,
-                            })
+                            (
+                                hex::encode(&a.confirmation_filter),
+                                quil_types::consensus::ProverAllocation {
+                                    ring: 0,
+                                    shards: 1,
+                                    state_size: 1,
+                                },
+                            )
                         })
                         .collect()
-                }).collect();
+                })
+                .collect();
 
-            match issuer.calculate(difficulty, 1, crate::provers::proposer::DEFAULT_UNITS, &alloc_maps) {
+            match issuer.calculate(
+                difficulty,
+                1,
+                crate::provers::proposer::DEFAULT_UNITS,
+                &alloc_maps,
+            ) {
                 Ok(rewards) => {
                     let total: BigInt = rewards.iter().sum();
                     if !total.is_zero() {
@@ -193,9 +209,7 @@ pub fn process_global_frame_with_rewards(
 
     debug!(
         frame = frame_number,
-        applied,
-        skipped,
-        "frame processing complete"
+        applied, skipped, "frame processing complete"
     );
 
     Ok((applied, skipped))
@@ -237,24 +251,35 @@ pub fn process_global_frame_with_fees(
         let cost_basis = match execution_manager.get_cost(&request_bytes) {
             Ok(c) => c,
             Err(e) => {
-                if e.is_execution_unavailable() { return Err(e); }
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 skipped += 1;
                 continue;
             }
         };
 
-        let fee_multiplier = match crate::rewards::fee_multiplier_for_cost(execution_manager.pricing_network(), difficulty, world_state_bytes, &cost_basis, 1) {
+        let fee_multiplier = match crate::rewards::fee_multiplier_for_cost(
+            execution_manager.pricing_network(),
+            difficulty,
+            world_state_bytes,
+            &cost_basis,
+            1,
+        ) {
             Ok(fee) => fee,
-            Err(_) => { skipped += 1; continue; }
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
 
         // Validate before processing.
-        if let Err(e) = execution_manager.validate_message(
-            frame_number,
-            &GLOBAL_ADDRESS,
-            &request_bytes,
-        ) {
-            if e.is_execution_unavailable() { return Err(e); }
+        if let Err(e) =
+            execution_manager.validate_message(frame_number, &GLOBAL_ADDRESS, &request_bytes)
+        {
+            if e.is_execution_unavailable() {
+                return Err(e);
+            }
             debug!(
                 frame = frame_number,
                 error = %e,
@@ -272,7 +297,9 @@ pub fn process_global_frame_with_fees(
         ) {
             Ok(_) => applied += 1,
             Err(e) => {
-                if e.is_execution_unavailable() { return Err(e); }
+                if e.is_execution_unavailable() {
+                    return Err(e);
+                }
                 debug!(frame = frame_number, index = i, error = %e, "skipping");
                 skipped += 1;
             }
@@ -303,15 +330,15 @@ mod tests {
 
     fn mgr() -> ExecutionEngineManager {
         let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
-        let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
-            Arc::new(MemStore::new());
+        let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             hg_store,
             inclusion_prover.clone(),
         ));
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
-        let hg_resolver: std::sync::Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-            std::sync::Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
+        let hg_resolver: std::sync::Arc<
+            dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver,
+        > = std::sync::Arc::new(quil_execution::testing::NoopHypergraphConfigResolver);
         ExecutionEngineManager::new(
             inclusion_prover,
             stubs.key_manager.clone(),
@@ -365,7 +392,11 @@ mod tests {
             session: [2; 32],
             filter: vec![0x21; 32],
             proposals: Vec::new(),
-            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
+            nullifies: vec![NullifyVote {
+                view: 1,
+                signer: 0,
+                signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+            }],
         };
         let claim = PresenceClaim {
             filter: vec![0x21; 32],
@@ -374,38 +405,45 @@ mod tests {
             signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
         };
         let bundle = |inner: Vec<u8>| MessageBundle {
-            requests: vec![MessageRequest { request: Some(Request::PresenceReport(inner)), ..Default::default() }],
+            requests: vec![MessageRequest {
+                request: Some(Request::PresenceReport(inner)),
+                ..Default::default()
+            }],
             timestamp: 1,
         };
         handoff::set_presence_exclusion_frame_for_thread(Some(100));
-        for inner in [report.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
-            assert!(canonical_bundle(&bundle(inner.clone()), 100).is_ok(), "at the frame");
-            assert!(canonical_bundle(&bundle(inner.clone()), 1_000).is_ok(), "past it");
-            assert!(canonical_bundle(&bundle(inner), 99).is_err(), "below it, as a build without it");
+        for inner in [
+            report.to_canonical_bytes().unwrap(),
+            claim.to_canonical_bytes().unwrap(),
+        ] {
+            assert!(
+                canonical_bundle(&bundle(inner.clone()), 100).is_ok(),
+                "at the frame"
+            );
+            assert!(
+                canonical_bundle(&bundle(inner.clone()), 1_000).is_ok(),
+                "past it"
+            );
+            assert!(
+                canonical_bundle(&bundle(inner), 99).is_err(),
+                "below it, as a build without it"
+            );
         }
         handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
     #[test]
     fn process_empty_frame() {
-        let (applied, skipped) = process_global_frame(
-            &mgr(),
-            &empty_frame(1),
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame(&mgr(), &empty_frame(1), &BigInt::from(1)).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(skipped, 0);
     }
 
     #[test]
     fn process_frame_with_empty_bundles() {
-        let (applied, skipped) = process_global_frame(
-            &mgr(),
-            &frame_with_bundles(1, 3),
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame(&mgr(), &frame_with_bundles(1, 3), &BigInt::from(1)).unwrap();
         // Empty bundles produce prost-encoded bytes that the engine
         // will attempt to decode. The engine either processes them
         // (as no-ops) or skips them — either way no panic.
@@ -415,33 +453,21 @@ mod tests {
     #[test]
     fn process_frame_extracts_frame_number() {
         let frame = empty_frame(42);
-        assert_eq!(
-            frame.header.as_ref().unwrap().frame_number,
-            42
-        );
+        assert_eq!(frame.header.as_ref().unwrap().frame_number, 42);
     }
 
     #[test]
     fn process_frame_bytes_decodes_and_processes() {
         let frame = empty_frame(10);
         let bytes = frame.encode_to_vec();
-        let (applied, skipped) = process_global_frame_bytes(
-            &mgr(),
-            &bytes,
-            &BigInt::from(1),
-        )
-        .unwrap();
+        let (applied, skipped) =
+            process_global_frame_bytes(&mgr(), &bytes, &BigInt::from(1)).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(skipped, 0);
     }
 
     #[test]
     fn process_frame_bytes_rejects_garbage() {
-        assert!(process_global_frame_bytes(
-            &mgr(),
-            &[0xDE, 0xAD],
-            &BigInt::from(1),
-        )
-        .is_err());
+        assert!(process_global_frame_bytes(&mgr(), &[0xDE, 0xAD], &BigInt::from(1),).is_err());
     }
 }

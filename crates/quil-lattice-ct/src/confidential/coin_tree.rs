@@ -6,11 +6,11 @@
 //! and an explicit node allocation cap. This is not a persistent store,
 //! admitted-root history or spent-image index.
 
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::membership::{MembershipKey, Node, MAX_DEPTH, NODE_BYTES},
     AmountCommitment,
 };
-use super::relation::membership::IDENTITY_BYTES;
 
 pub const ROOT_RECORD_BYTES: usize = 8 + 32 + 1 + 8 + NODE_BYTES;
 const VERSION: &[u8; 8] = b"QCT3RT\0\x02";
@@ -114,47 +114,78 @@ pub struct IndexedTree {
 }
 impl IndexedTree {
     pub fn new(context: &[u8; 32], max_depth: usize) -> Result<Self, TreeError> {
-        if !(1..=MAX_DEPTH).contains(&max_depth) { return Err(TreeError::Depth); }
+        if !(1..=MAX_DEPTH).contains(&max_depth) {
+            return Err(TreeError::Depth);
+        }
         let key = MembershipKey::derive(context);
-        Ok(Self { context: *context, zeros: zero_nodes(&key, max_depth), key })
+        Ok(Self {
+            context: *context,
+            zeros: zero_nodes(&key, max_depth),
+            key,
+        })
     }
 
     /// At most twice `root.depth` completed-node lookups, including the one
     /// partially populated sibling subtree at the right edge. No full scan.
     /// The reconstructed leaf-to-root path is checked before returning it.
     pub fn auth_path<E>(
-        &self, root: &RootRecord, coin: &CoinRecord,
+        &self,
+        root: &RootRecord,
+        coin: &CoinRecord,
         mut lookup: impl FnMut(u8, u64) -> Result<Option<Node>, E>,
     ) -> Result<AuthPath, IndexedWitnessError<E>> {
         use IndexedWitnessError as Error;
         root.validate().map_err(Error::Tree)?;
-        if root.context != self.context { return Err(Error::Tree(TreeError::Context)); }
+        if root.context != self.context {
+            return Err(Error::Tree(TreeError::Context));
+        }
         let depth = usize::from(root.depth);
-        if depth >= self.zeros.len() { return Err(Error::Tree(TreeError::Depth)); }
-        if coin.position >= root.coins { return Err(Error::Tree(TreeError::MissingCoin)); }
-        let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| Error::Tree(TreeError::Encoding))?;
+        if depth >= self.zeros.len() {
+            return Err(Error::Tree(TreeError::Depth));
+        }
+        if coin.position >= root.coins {
+            return Err(Error::Tree(TreeError::MissingCoin));
+        }
+        let owner =
+            Node::from_identity_bytes(&coin.owner).map_err(|_| Error::Tree(TreeError::Encoding))?;
         let mut node = self.key.leaf(&owner, &coin.commitment);
-        let mut path = AuthPath { siblings: Vec::with_capacity(depth), right: Vec::with_capacity(depth) };
+        let mut path = AuthPath {
+            siblings: Vec::with_capacity(depth),
+            right: Vec::with_capacity(depth),
+        };
         let mut index = coin.position;
         for level in 0..depth {
             let sibling = self.subtree(root.coins, level, index ^ 1, &mut lookup)?;
             let right = index & 1 != 0;
-            node = if right { self.key.parent(&sibling, &node) } else { self.key.parent(&node, &sibling) };
-            path.siblings.push(sibling); path.right.push(right);
+            node = if right {
+                self.key.parent(&sibling, &node)
+            } else {
+                self.key.parent(&node, &sibling)
+            };
+            path.siblings.push(sibling);
+            path.right.push(right);
             index >>= 1;
         }
-        if node != root.root { return Err(Error::RootMismatch); }
+        if node != root.root {
+            return Err(Error::RootMismatch);
+        }
         Ok(path)
     }
 
     fn subtree<E>(
-        &self, count: u64, level: usize, index: u64,
+        &self,
+        count: u64,
+        level: usize,
+        index: u64,
         lookup: &mut impl FnMut(u8, u64) -> Result<Option<Node>, E>,
     ) -> Result<Node, IndexedWitnessError<E>> {
         let start = index << level;
-        if start >= count { return Ok(self.zeros[level].clone()); }
+        if start >= count {
+            return Ok(self.zeros[level].clone());
+        }
         if start + (1u64 << level) <= count {
-            return lookup(level as u8, index).map_err(IndexedWitnessError::Lookup)?
+            return lookup(level as u8, index)
+                .map_err(IndexedWitnessError::Lookup)?
                 .ok_or(IndexedWitnessError::MissingNode);
         }
         // A partially occupied subtree has level >= 1. Only the side
@@ -239,10 +270,7 @@ impl CoinTree {
             .map(|&i| (coins[i].address, coins[i].position as usize))
             .collect();
         index.sort_unstable_by_key(|(address, _)| *address);
-        if index
-            .windows(2)
-            .any(|pair| pair[0].0 == pair[1].0)
-        {
+        if index.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(TreeError::DuplicateAddress);
         }
         let key = MembershipKey::derive(context);
@@ -405,7 +433,11 @@ impl Frontier {
         self.count += 1;
     }
     /// Append the coin at the next position. Capacity is `2^max_depth` leaves.
-    pub fn append(&mut self, owner: &[u8; IDENTITY_BYTES], commitment: &AmountCommitment) -> Result<u64, TreeError> {
+    pub fn append(
+        &mut self,
+        owner: &[u8; IDENTITY_BYTES],
+        commitment: &AmountCommitment,
+    ) -> Result<u64, TreeError> {
         if self.count >= (1u64 << self.max_depth) {
             return Err(TreeError::Capacity);
         }
@@ -417,14 +449,27 @@ impl Frontier {
     /// Append while exposing the newly completed leaf and parent subtrees.
     /// Over N appends this emits fewer than 2N nodes in total; a single append
     /// emits at most max_depth + 1. Existing append/root encoding is unchanged.
-    pub fn append_with_nodes(&mut self, owner: &[u8; IDENTITY_BYTES], commitment: &AmountCommitment) -> Result<(u64, Vec<CompletedNode>), TreeError> {
-        if self.count >= (1u64 << self.max_depth) { return Err(TreeError::Capacity); }
+    pub fn append_with_nodes(
+        &mut self,
+        owner: &[u8; IDENTITY_BYTES],
+        commitment: &AmountCommitment,
+    ) -> Result<(u64, Vec<CompletedNode>), TreeError> {
+        if self.count >= (1u64 << self.max_depth) {
+            return Err(TreeError::Capacity);
+        }
         let owner = Node::from_identity_bytes(owner).map_err(|_| TreeError::Encoding)?;
         let position = self.count;
         let mut nodes = Vec::new();
-        self.append_leaf_with(self.key.leaf(&owner, commitment), &mut |level, index, node| {
-            nodes.push(CompletedNode { level, index, node: node.clone() });
-        });
+        self.append_leaf_with(
+            self.key.leaf(&owner, commitment),
+            &mut |level, index, node| {
+                nodes.push(CompletedNode {
+                    level,
+                    index,
+                    node: node.clone(),
+                });
+            },
+        );
         Ok((position, nodes))
     }
 
@@ -482,7 +527,9 @@ impl Frontier {
         if count > (1u64 << max_depth) {
             return Err(TreeError::Capacity);
         }
-        let expected = (0..=max_depth).filter(|level| count >> level & 1 == 1).count();
+        let expected = (0..=max_depth)
+            .filter(|level| count >> level & 1 == 1)
+            .count();
         if bytes.len() != FRONTIER_HEADER_BYTES + expected * NODE_BYTES {
             return Err(TreeError::Encoding);
         }
@@ -492,7 +539,8 @@ impl Frontier {
         for level in 0..=max_depth {
             if count >> level & 1 == 1 {
                 frontier.filled[level] = Some(
-                    Node::from_bytes(&bytes[offset..offset + NODE_BYTES]).map_err(|_| TreeError::Encoding)?,
+                    Node::from_bytes(&bytes[offset..offset + NODE_BYTES])
+                        .map_err(|_| TreeError::Encoding)?,
                 );
                 offset += NODE_BYTES;
             }
@@ -531,9 +579,13 @@ mod tests {
         let mut nodes = BTreeMap::new();
         for count in 1..=records.len() {
             let coin = &records[count - 1];
-            let (_, emitted) = frontier.append_with_nodes(&coin.owner, &coin.commitment).unwrap();
+            let (_, emitted) = frontier
+                .append_with_nodes(&coin.owner, &coin.commitment)
+                .unwrap();
             assert!(emitted.len() <= 9);
-            for node in emitted { assert!(nodes.insert((node.level, node.index), node.node).is_none()); }
+            for node in emitted {
+                assert!(nodes.insert((node.level, node.index), node.node).is_none());
+            }
             assert!(nodes.len() < 2 * count);
             let tree = CoinTree::build(&context, &records[..count], 8, 100).unwrap();
             for depth in [tree.current_depth(), 8] {
@@ -541,23 +593,46 @@ mod tests {
                 assert_eq!(root, tree.root_at_depth(depth).unwrap());
                 for coin in &records[..count] {
                     let mut reads = 0;
-                    let path = reader.auth_path(&root, coin, |level, index| -> Result<_, ()> {
-                        reads += 1; Ok(nodes.get(&(level, index)).cloned())
-                    }).unwrap();
+                    let path = reader
+                        .auth_path(&root, coin, |level, index| -> Result<_, ()> {
+                            reads += 1;
+                            Ok(nodes.get(&(level, index)).cloned())
+                        })
+                        .unwrap();
                     assert!(reads <= 2 * depth);
                     let full = tree.auth_path(&coin.address, depth).unwrap();
-                    assert_eq!(path.siblings, full.siblings); assert_eq!(path.right, full.right);
+                    assert_eq!(path.siblings, full.siblings);
+                    assert_eq!(path.right, full.right);
                 }
             }
         }
         let root = frontier.root_at_depth(8).unwrap();
-        assert!(matches!(reader.auth_path(&root, &records[0], |_, _| Ok::<_, ()>(None)), Err(IndexedWitnessError::MissingNode)));
-        assert!(matches!(reader.auth_path(&root, &records[0], |_, _| Err::<Option<Node>, _>("disk error")), Err(IndexedWitnessError::Lookup("disk error"))));
-        assert!(matches!(reader.auth_path(&root, &records[0], |_, _| Ok::<_, ()>(Some(Node::zero()))), Err(IndexedWitnessError::RootMismatch)));
-        let mut wrong = root.clone(); wrong.context[0] ^= 1;
-        assert!(matches!(reader.auth_path(&wrong, &records[0], |_, _| Ok::<_, ()>(None)), Err(IndexedWitnessError::Tree(TreeError::Context))));
-        let mut absent = coins(1).remove(0); absent.position = root.coins;
-        assert!(matches!(reader.auth_path(&root, &absent, |_, _| Ok::<_, ()>(None)), Err(IndexedWitnessError::Tree(TreeError::MissingCoin))));
+        assert!(matches!(
+            reader.auth_path(&root, &records[0], |_, _| Ok::<_, ()>(None)),
+            Err(IndexedWitnessError::MissingNode)
+        ));
+        assert!(matches!(
+            reader.auth_path(&root, &records[0], |_, _| Err::<Option<Node>, _>(
+                "disk error"
+            )),
+            Err(IndexedWitnessError::Lookup("disk error"))
+        ));
+        assert!(matches!(
+            reader.auth_path(&root, &records[0], |_, _| Ok::<_, ()>(Some(Node::zero()))),
+            Err(IndexedWitnessError::RootMismatch)
+        ));
+        let mut wrong = root.clone();
+        wrong.context[0] ^= 1;
+        assert!(matches!(
+            reader.auth_path(&wrong, &records[0], |_, _| Ok::<_, ()>(None)),
+            Err(IndexedWitnessError::Tree(TreeError::Context))
+        ));
+        let mut absent = coins(1).remove(0);
+        absent.position = root.coins;
+        assert!(matches!(
+            reader.auth_path(&root, &absent, |_, _| Ok::<_, ()>(None)),
+            Err(IndexedWitnessError::Tree(TreeError::MissingCoin))
+        ));
     }
 
     #[test]
@@ -567,24 +642,35 @@ mod tests {
         let context = [3; 32];
         let key = MembershipKey::derive(&context);
         let mut coin = coins(1).remove(0);
-        let mut full = vec![key.leaf(&Node::from_identity_bytes(&coin.owner).unwrap(), &coin.commitment)];
-        for level in 0..32 { full.push(key.parent(&full[level], &full[level])); }
+        let mut full = vec![key.leaf(
+            &Node::from_identity_bytes(&coin.owner).unwrap(),
+            &coin.commitment,
+        )];
+        for level in 0..32 {
+            full.push(key.parent(&full[level], &full[level]));
+        }
         let reader = IndexedTree::new(&context, 32).unwrap();
         for count in [4097u64, (1u64 << 32) - 1, 1u64 << 32] {
             let mut frontier = Frontier::new(&context, 32).unwrap();
             frontier.count = count;
             for level in 0..=32 {
-                frontier.filled[level] = if (count >> level) & 1 == 1 { Some(full[level].clone()) } else { None };
+                frontier.filled[level] = if (count >> level) & 1 == 1 {
+                    Some(full[level].clone())
+                } else {
+                    None
+                };
             }
             let root = frontier.root_at_depth(frontier.current_depth()).unwrap();
             for position in [0, count / 2, count - 1] {
                 coin.position = position;
                 let mut reads = 0;
-                reader.auth_path(&root, &coin, |level, index| -> Result<_, ()> {
-                    reads += 1;
-                    assert!((index + 1) << level <= count);
-                    Ok(Some(full[usize::from(level)].clone()))
-                }).unwrap();
+                reader
+                    .auth_path(&root, &coin, |level, index| -> Result<_, ()> {
+                        reads += 1;
+                        assert!((index + 1) << level <= count);
+                        Ok(Some(full[usize::from(level)].clone()))
+                    })
+                    .unwrap();
                 assert!(reads <= 2 * usize::from(root.depth));
             }
         }
@@ -636,32 +722,68 @@ mod tests {
         }
         // Swapping positions changes the root: leaf order is committed.
         let mut records = coins(3);
-        let original = CoinTree::build(&context, &records, 8, 100).unwrap().root_at_depth(8).unwrap();
+        let original = CoinTree::build(&context, &records, 8, 100)
+            .unwrap()
+            .root_at_depth(8)
+            .unwrap();
         records[0].position = 1;
         records[1].position = 0;
-        assert_ne!(CoinTree::build(&context, &records, 8, 100).unwrap().root_at_depth(8).unwrap(), original);
+        assert_ne!(
+            CoinTree::build(&context, &records, 8, 100)
+                .unwrap()
+                .root_at_depth(8)
+                .unwrap(),
+            original
+        );
     }
     #[test]
     fn frontier_matches_full_reconstruction_and_round_trips() {
         let context = [3; 32];
         let records = coins(9);
         let mut frontier = Frontier::new(&context, 8).unwrap();
-        assert_eq!(frontier.root_at_depth(8).unwrap(), CoinTree::build(&context, &[], 8, 100).unwrap().root_at_depth(8).unwrap());
-        assert_eq!(frontier.root_at_depth(1).unwrap().root, CoinTree::build(&context, &[], 8, 100).unwrap().root_at_depth(1).unwrap().root);
+        assert_eq!(
+            frontier.root_at_depth(8).unwrap(),
+            CoinTree::build(&context, &[], 8, 100)
+                .unwrap()
+                .root_at_depth(8)
+                .unwrap()
+        );
+        assert_eq!(
+            frontier.root_at_depth(1).unwrap().root,
+            CoinTree::build(&context, &[], 8, 100)
+                .unwrap()
+                .root_at_depth(1)
+                .unwrap()
+                .root
+        );
         for count in 1..=records.len() {
             let coin = &records[count - 1];
-            assert_eq!(frontier.append(&coin.owner, &coin.commitment).unwrap(), coin.position);
+            assert_eq!(
+                frontier.append(&coin.owner, &coin.commitment).unwrap(),
+                coin.position
+            );
             let tree = CoinTree::build(&context, &records[..count], 8, 100).unwrap();
             assert_eq!(frontier.count(), tree.coins());
             assert_eq!(frontier.current_depth(), tree.current_depth());
             for depth in tree.current_depth()..=8 {
-                assert_eq!(frontier.root_at_depth(depth).unwrap(), tree.root_at_depth(depth).unwrap());
+                assert_eq!(
+                    frontier.root_at_depth(depth).unwrap(),
+                    tree.root_at_depth(depth).unwrap()
+                );
             }
-            assert!(frontier.root_at_depth(tree.current_depth().saturating_sub(1)).is_err() || tree.current_depth() == 1);
+            assert!(
+                frontier
+                    .root_at_depth(tree.current_depth().saturating_sub(1))
+                    .is_err()
+                    || tree.current_depth() == 1
+            );
             let bytes = frontier.encode();
             let decoded = Frontier::decode(&bytes, &context, 8).unwrap();
             assert_eq!(decoded.count(), frontier.count());
-            assert_eq!(decoded.root_at_depth(8).unwrap(), frontier.root_at_depth(8).unwrap());
+            assert_eq!(
+                decoded.root_at_depth(8).unwrap(),
+                frontier.root_at_depth(8).unwrap()
+            );
             assert_eq!(tree.frontier().encode(), bytes);
             assert!(Frontier::decode(&bytes, &[4; 32], 8).is_err());
             assert!(Frontier::decode(&bytes, &context, 7).is_err());
@@ -673,10 +795,21 @@ mod tests {
         assert!(frontier.root_at_depth(9).is_err());
         // Capacity is 2^max_depth leaves.
         let mut tiny = Frontier::new(&context, 1).unwrap();
-        tiny.append(&records[0].owner, &records[0].commitment).unwrap();
-        tiny.append(&records[1].owner, &records[1].commitment).unwrap();
-        assert_eq!(tiny.root_at_depth(1).unwrap(), CoinTree::build(&context, &records[..2], 1, 100).unwrap().root_at_depth(1).unwrap());
-        assert!(matches!(tiny.append(&records[2].owner, &records[2].commitment), Err(TreeError::Capacity)));
+        tiny.append(&records[0].owner, &records[0].commitment)
+            .unwrap();
+        tiny.append(&records[1].owner, &records[1].commitment)
+            .unwrap();
+        assert_eq!(
+            tiny.root_at_depth(1).unwrap(),
+            CoinTree::build(&context, &records[..2], 1, 100)
+                .unwrap()
+                .root_at_depth(1)
+                .unwrap()
+        );
+        assert!(matches!(
+            tiny.append(&records[2].owner, &records[2].commitment),
+            Err(TreeError::Capacity)
+        ));
         assert!(Frontier::new(&context, 0).is_err());
         assert!(Frontier::new(&context, 33).is_err());
     }
@@ -723,10 +856,16 @@ mod tests {
         assert!(RootRecord::decode(&bad, &context).is_err());
         let mut gap = coins(3);
         gap[2].position = 3;
-        assert!(matches!(CoinTree::build(&context, &gap, 3, 100), Err(TreeError::Position)));
+        assert!(matches!(
+            CoinTree::build(&context, &gap, 3, 100),
+            Err(TreeError::Position)
+        ));
         let mut repeat = coins(3);
         repeat[2].position = 1;
-        assert!(matches!(CoinTree::build(&context, &repeat, 3, 100), Err(TreeError::Position)));
+        assert!(matches!(
+            CoinTree::build(&context, &repeat, 3, 100),
+            Err(TreeError::Position)
+        ));
         records[1].address = records[0].address;
         assert!(matches!(
             CoinTree::build(&context, &records, 3, 100),

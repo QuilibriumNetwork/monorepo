@@ -181,9 +181,8 @@ impl DispatchService for DispatchRpcServer {
             .ok_or_else(|| Status::invalid_argument("missing message"))?;
         // Routing filter is the 3-byte L1 shard bloom index of the inbox
         // address — matches Go's `up2p.GetBloomFilterIndices(addr,256,3)`.
-        let filter = filter_for_address(&msg.address).ok_or_else(|| {
-            Status::invalid_argument("address too short to derive filter")
-        })?;
+        let filter = filter_for_address(&msg.address)
+            .ok_or_else(|| Status::invalid_argument("address too short to derive filter"))?;
         if !self.is_responsible(&filter) {
             return Err(Status::permission_denied("not responsible for filter"));
         }
@@ -235,15 +234,11 @@ impl DispatchService for DispatchRpcServer {
         Ok(Response::new(InboxMessageResponse { messages }))
     }
 
-    async fn put_hub(
-        &self,
-        request: Request<HubPut>,
-    ) -> Result<Response<()>, Status> {
+    async fn put_hub(&self, request: Request<HubPut>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         if let Some(add) = req.add {
-            let filter = filter_for_address(&add.address).ok_or_else(|| {
-                Status::invalid_argument("hub add address too short for filter")
-            })?;
+            let filter = filter_for_address(&add.address)
+                .ok_or_else(|| Status::invalid_argument("hub add address too short for filter"))?;
             if !self.is_responsible(&filter) {
                 return Err(Status::permission_denied("not responsible for filter"));
             }
@@ -297,10 +292,7 @@ impl DispatchService for DispatchRpcServer {
         Ok(Response::new(()))
     }
 
-    async fn get_hub(
-        &self,
-        request: Request<HubRequest>,
-    ) -> Result<Response<HubResponse>, Status> {
+    async fn get_hub(&self, request: Request<HubRequest>) -> Result<Response<HubResponse>, Status> {
         let req = request.into_inner();
         if !self.is_responsible(&req.filter) {
             return Err(Status::permission_denied("not responsible for filter"));
@@ -438,7 +430,11 @@ mod tests {
     fn valid_delete_signatures_accepted() {
         let (hub_pk, inbox_pk, hub_sig, inbox_sig) = signed(DOMAIN_DELETE);
         assert!(verify_hub_signatures(
-            DOMAIN_DELETE, &hub_pk, &inbox_pk, &hub_sig, &inbox_sig
+            DOMAIN_DELETE,
+            &hub_pk,
+            &inbox_pk,
+            &hub_sig,
+            &inbox_sig
         ));
     }
 
@@ -448,7 +444,11 @@ mod tests {
         // the domain separation is load-bearing.
         let (hub_pk, inbox_pk, hub_sig, inbox_sig) = signed(DOMAIN_ADD);
         assert!(!verify_hub_signatures(
-            DOMAIN_DELETE, &hub_pk, &inbox_pk, &hub_sig, &inbox_sig
+            DOMAIN_DELETE,
+            &hub_pk,
+            &inbox_pk,
+            &hub_sig,
+            &inbox_sig
         ));
     }
 
@@ -476,7 +476,11 @@ mod tests {
         let (hub_pk, inbox_pk, _hub_sig, _inbox_sig) = signed(DOMAIN_ADD);
         // Empty signatures (as the pre-fix code left them) must fail.
         assert!(!verify_hub_signatures(
-            DOMAIN_ADD, &hub_pk, &inbox_pk, &[], &[]
+            DOMAIN_ADD,
+            &hub_pk,
+            &inbox_pk,
+            &[],
+            &[]
         ));
     }
 

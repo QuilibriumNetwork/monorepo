@@ -8,41 +8,70 @@ use std::io;
 /// Only call inside the freshly executed worker, never the node process.
 pub fn apply_address_space_limit(bytes: u64) -> io::Result<()> {
     if bytes == 0 || bytes >= i64::MAX as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid worker address-space limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid worker address-space limit",
+        ));
     }
     #[cfg(target_os = "linux")]
     unsafe {
-        let mut old = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_AS, &mut old) != 0 {
             return Err(io::Error::last_os_error());
         }
         let cap = (bytes as libc::rlim_t).min(old.rlim_cur).min(old.rlim_max);
-        let limit = libc::rlimit { rlim_cur: cap, rlim_max: cap };
+        let limit = libc::rlimit {
+            rlim_cur: cap,
+            rlim_max: cap,
+        };
         if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
-    Err(io::Error::new(io::ErrorKind::Unsupported, "worker address-space cap is only supported on Linux"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "worker address-space cap is only supported on Linux",
+    ))
 }
 
 pub fn apply_to_current_worker(cpu_seconds: u64) -> io::Result<()> {
     if !(1..=3600).contains(&cpu_seconds) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "worker CPU seconds must be 1..=3600"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker CPU seconds must be 1..=3600",
+        ));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // Do not raise an inherited limit, including an already stricter soft
         // limit. Set both limits so native code cannot extend its CPU budget.
         unsafe {
-            let mut old = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-            if libc::getrlimit(libc::RLIMIT_CPU, &mut old) != 0 { return Err(io::Error::last_os_error()); }
-            let cap = (cpu_seconds as libc::rlim_t).min(old.rlim_cur).min(old.rlim_max);
-            let cpu = libc::rlimit { rlim_cur: cap, rlim_max: cap };
-            let core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut old = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_CPU, &mut old) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let cap = (cpu_seconds as libc::rlim_t)
+                .min(old.rlim_cur)
+                .min(old.rlim_max);
+            let cpu = libc::rlimit {
+                rlim_cur: cap,
+                rlim_max: cap,
+            };
+            let core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             if libc::setrlimit(libc::RLIMIT_CORE, &core) != 0
-                || libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0 {
+                || libc::setrlimit(libc::RLIMIT_CPU, &cpu) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             // Linux can pipe a core dump to a collector despite RLIMIT_CORE=0.
@@ -54,7 +83,10 @@ pub fn apply_to_current_worker(cpu_seconds: u64) -> io::Result<()> {
         Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Err(io::Error::new(io::ErrorKind::Unsupported, "worker resource limits unsupported on this OS"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "worker resource limits unsupported on this OS",
+    ))
 }
 
 /// Exit code of a worker that stopped because its parent died. Disjoint from
@@ -73,10 +105,15 @@ pub const PARENT_PID_ENV: &str = "QUIL_PROOF_WORKER_PARENT_PID";
 /// one, a startup parent of 1 or less is init that adopted the worker.
 #[cfg(unix)]
 fn watched_parent(named: Option<&str>, startup: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
-    let Some(named) = named else { return Ok((startup > 1).then_some(startup)) };
+    let Some(named) = named else {
+        return Ok((startup > 1).then_some(startup));
+    };
     match named.parse::<libc::pid_t>() {
         Ok(pid) if pid >= 1 => Ok((startup == pid).then_some(pid)),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid proof worker parent PID")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid proof worker parent PID",
+        )),
     }
 }
 
@@ -98,24 +135,30 @@ pub fn exit_when_orphaned() -> io::Result<()> {
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let named = std::env::var_os(PARENT_PID_ENV).map(|value| value.into_string().unwrap_or_default());
+        let named =
+            std::env::var_os(PARENT_PID_ENV).map(|value| value.into_string().unwrap_or_default());
         // The parent may have died between our exec and the calls above.
         let parent = match watched_parent(named.as_deref(), startup)? {
             Some(parent) if unsafe { libc::getppid() } == parent => parent,
             _ => unsafe { libc::_exit(ORPHANED_EXIT) },
         };
-        std::thread::Builder::new().name("proof-worker-parent-watch".into()).spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if unsafe { libc::getppid() } != parent {
-                // No unwinding or atexit handlers: native proof code may be
-                // mid-computation on other threads.
-                unsafe { libc::_exit(ORPHANED_EXIT) };
-            }
-        })?;
+        std::thread::Builder::new()
+            .name("proof-worker-parent-watch".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if unsafe { libc::getppid() } != parent {
+                    // No unwinding or atexit handlers: native proof code may be
+                    // mid-computation on other threads.
+                    unsafe { libc::_exit(ORPHANED_EXIT) };
+                }
+            })?;
         Ok(())
     }
     #[cfg(not(unix))]
-    Err(io::Error::new(io::ErrorKind::Unsupported, "worker orphan handling unsupported on this OS"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "worker orphan handling unsupported on this OS",
+    ))
 }
 
 #[cfg(all(test, unix))]

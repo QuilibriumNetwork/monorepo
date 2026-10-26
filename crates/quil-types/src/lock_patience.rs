@@ -22,7 +22,9 @@ impl Patience {
     }
 
     pub fn for_duration(patience: Duration) -> Self {
-        Self { deadline: Instant::now() + patience }
+        Self {
+            deadline: Instant::now() + patience,
+        }
     }
 
     /// `None` when poisoned, or still held when the deadline passes.
@@ -76,12 +78,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         });
         taken_rx.recv().unwrap();
-        assert!(Patience::new().write(&lock).is_some(), "a brief reader is waited out");
+        assert!(
+            Patience::new().write(&lock).is_some(),
+            "a brief reader is waited out"
+        );
         reader.join().unwrap();
 
         let _guard = lock.read().unwrap();
         let started = Instant::now();
-        assert!(Patience::for_duration(Duration::from_millis(30)).write(&lock).is_none());
+        assert!(Patience::for_duration(Duration::from_millis(30))
+            .write(&lock)
+            .is_none());
         assert!(started.elapsed() >= Duration::from_millis(30));
     }
 

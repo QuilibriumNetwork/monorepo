@@ -87,7 +87,9 @@ impl ShutdownSignal {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            Self { listener: signal(SignalKind::terminate()).ok() }
+            Self {
+                listener: signal(SignalKind::terminate()).ok(),
+            }
         }
         #[cfg(not(unix))]
         Self { interrupt: false }
@@ -97,7 +99,9 @@ impl ShutdownSignal {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            Self { listener: signal(SignalKind::interrupt()).ok() }
+            Self {
+                listener: signal(SignalKind::interrupt()).ok(),
+            }
         }
         #[cfg(not(unix))]
         Self { interrupt: true }

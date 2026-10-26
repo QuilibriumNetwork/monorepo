@@ -144,7 +144,9 @@ pub async fn run(dc: &DeployCtx, domain_arg: &str, args: &[String]) -> anyhow::R
 }
 
 fn parse_bigint_be(s: &str) -> anyhow::Result<Vec<u8>> {
-    let n: BigInt = s.parse().map_err(|_| anyhow::anyhow!("invalid integer: {s}"))?;
+    let n: BigInt = s
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid integer: {s}"))?;
     if n == BigInt::from(0) {
         return Ok(Vec::new());
     }

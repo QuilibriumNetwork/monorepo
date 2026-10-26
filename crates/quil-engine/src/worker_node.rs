@@ -26,7 +26,8 @@ use crate::app_engine::{AppConsensusEngine, AppEngineDeps, AppEngineHandle, AppE
 use crate::message_collector::MessageCollector;
 
 /// Resolver replies being relayed to a shard's members at once.
-static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate = crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
+static RESOLVER_RELAY_TASKS: crate::spawn_gate::SpawnGate =
+    crate::spawn_gate::SpawnGate::new("resolver-relay", 64);
 
 /// Async factory for the gRPC channel that the worker uses to stream
 /// from the master. The worker spawns a reconnect loop and calls this
@@ -160,7 +161,8 @@ pub struct WorkerOnlyNode {
     /// Optional receiver for engine events — consumed by the
     /// publish pump when proxy mode is enabled. When `None`, the
     /// worker runs receive-only (legacy behavior).
-    engine_event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<crate::app_engine::AppEngineEvent>>>,
+    engine_event_rx:
+        std::sync::Mutex<Option<mpsc::UnboundedReceiver<crate::app_engine::AppEngineEvent>>>,
     /// Optional publish path (via master's PubSubProxy). When set,
     /// engine-produced messages are forwarded to the master for
     /// broadcast.
@@ -229,8 +231,9 @@ const MASTER_RELAY_RETRY_AFTER: Duration = Duration::from_secs(600);
 /// after five seconds.
 const MASTER_RELAY_TIMEOUT: Duration = Duration::from_secs(8);
 
-type MasterClient =
-    quil_types::proto::global::global_service_client::GlobalServiceClient<tonic::transport::Channel>;
+type MasterClient = quil_types::proto::global::global_service_client::GlobalServiceClient<
+    tonic::transport::Channel,
+>;
 
 /// A standalone worker's channel to its master's `GlobalService` calls that
 /// act as the node. The worker connects under a synthetic identity: members
@@ -275,14 +278,18 @@ impl MasterRelay {
     }
 
     fn recently(marker: &std::sync::Mutex<Option<std::time::Instant>>) -> bool {
-        marker.lock().unwrap().is_some_and(|since| since.elapsed() < MASTER_RELAY_RETRY_AFTER)
+        marker
+            .lock()
+            .unwrap()
+            .is_some_and(|since| since.elapsed() < MASTER_RELAY_RETRY_AFTER)
     }
 
     async fn client(&self) -> Option<MasterClient> {
         let factory = self.factory.clone()?;
         let mut client = self.client.lock().await;
         if client.is_none() {
-            let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await else {
+            let Ok(Ok(channel)) = tokio::time::timeout(MASTER_RELAY_TIMEOUT, factory()).await
+            else {
                 return None;
             };
             *client = Some(MasterClient::new(channel));
@@ -298,13 +305,31 @@ impl MasterRelay {
     /// members it names. False: send it to the topic (no master channel, a
     /// master without the relay, a failure, or a recipient the master could
     /// not reach).
-    async fn relay_direct(&self, filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>) -> bool {
+    async fn relay_direct(
+        &self,
+        filter: Vec<u8>,
+        channel: u64,
+        data: Vec<u8>,
+        recipients: Vec<Vec<u8>>,
+    ) -> bool {
         if Self::recently(&self.direct_unsupported) {
             return false;
         }
-        let Some(mut client) = self.client().await else { return false };
-        let request = quil_types::proto::global::SendShardConsensusDirectRequest { filter, channel, data, recipients };
-        match tokio::time::timeout(MASTER_RELAY_TIMEOUT, client.send_shard_consensus_direct(request)).await {
+        let Some(mut client) = self.client().await else {
+            return false;
+        };
+        let request = quil_types::proto::global::SendShardConsensusDirectRequest {
+            filter,
+            channel,
+            data,
+            recipients,
+        };
+        match tokio::time::timeout(
+            MASTER_RELAY_TIMEOUT,
+            client.send_shard_consensus_direct(request),
+        )
+        .await
+        {
             Ok(Ok(response)) => response.into_inner().delivered,
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
                 *self.direct_unsupported.lock().unwrap() = Some(std::time::Instant::now());
@@ -323,12 +348,22 @@ impl MasterRelay {
         if Self::recently(&self.submit_unsupported) {
             return MasterSubmission::Unavailable;
         }
-        let Some(mut client) = self.client().await else { return MasterSubmission::Unavailable };
-        let request = quil_types::proto::global::SubmitWorkerProverMessageRequest { core_id, request };
-        match tokio::time::timeout(MASTER_RELAY_TIMEOUT, client.submit_worker_prover_message(request)).await {
+        let Some(mut client) = self.client().await else {
+            return MasterSubmission::Unavailable;
+        };
+        let request =
+            quil_types::proto::global::SubmitWorkerProverMessageRequest { core_id, request };
+        match tokio::time::timeout(
+            MASTER_RELAY_TIMEOUT,
+            client.submit_worker_prover_message(request),
+        )
+        .await
+        {
             Ok(Ok(response)) if response.get_ref().accepted => MasterSubmission::Queued,
             Ok(Ok(_)) => MasterSubmission::Held,
-            Ok(Err(status)) if status.code() == tonic::Code::InvalidArgument => MasterSubmission::Refused,
+            Ok(Err(status)) if status.code() == tonic::Code::InvalidArgument => {
+                MasterSubmission::Refused
+            }
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
                 *self.submit_unsupported.lock().unwrap() = Some(std::time::Instant::now());
                 MasterSubmission::Unavailable
@@ -342,14 +377,21 @@ impl MasterRelay {
 
     /// Historical legacy committees, rebuilt by the master (which holds the
     /// GLOBAL verifier and archive access).
-    pub(crate) fn historical_committee_source(self: &Arc<Self>) -> crate::historical_committee::HistoricalCommitteeSource {
+    pub(crate) fn historical_committee_source(
+        self: &Arc<Self>,
+    ) -> crate::historical_committee::HistoricalCommitteeSource {
         let relay = self.clone();
         Arc::new(move |filter: Vec<u8>, anchor: u64| {
             let relay = relay.clone();
             Box::pin(async move {
-                let unavailable = |reason: String| quil_types::error::QuilError::ExecutionUnavailable(reason);
-                let mut client = relay.client().await.ok_or_else(|| unavailable("no master channel".into()))?;
-                let request = quil_types::proto::global::GetHistoricalCommitteesRequest { filter, anchor };
+                let unavailable =
+                    |reason: String| quil_types::error::QuilError::ExecutionUnavailable(reason);
+                let mut client = relay
+                    .client()
+                    .await
+                    .ok_or_else(|| unavailable("no master channel".into()))?;
+                let request =
+                    quil_types::proto::global::GetHistoricalCommitteesRequest { filter, anchor };
                 let response = tokio::time::timeout(
                     crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
                     client.get_historical_committees(request),
@@ -357,8 +399,20 @@ impl MasterRelay {
                 .await
                 .map_err(|_| unavailable("master historical committees timed out".into()))?
                 .map_err(|status| unavailable(format!("master historical committees: {status}")))?;
-                Ok(response.into_inner().committees.into_iter().map(|c| c.members).collect())
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = quil_types::error::Result<Vec<Vec<Vec<u8>>>>> + Send>>
+                Ok(response
+                    .into_inner()
+                    .committees
+                    .into_iter()
+                    .map(|c| c.members)
+                    .collect())
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = quil_types::error::Result<Vec<Vec<Vec<u8>>>>,
+                            > + Send,
+                    >,
+                >
         })
     }
 
@@ -386,21 +440,28 @@ fn worker_global_submissions(
     core_id: u32,
     halted: Arc<std::sync::atomic::AtomicBool>,
 ) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
-    let handoff_prefix = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
-    let presence_prefix = quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes();
+    let handoff_prefix =
+        quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
+    let presence_prefix =
+        quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes();
     // Storage epoch proof parts are handed over from the storage job thread,
     // outside the runtime.
     let runtime = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |canonical: Vec<u8>| {
         if halted.load(std::sync::atomic::Ordering::Relaxed) {
-            tracing::debug!(core_id, "holding back GLOBAL submission — coverage halt active");
+            tracing::debug!(
+                core_id,
+                "holding back GLOBAL submission — coverage halt active"
+            );
             crate::presence_reports::publication_failed(&canonical);
             return;
         }
         let (relay, publish) = (relay.clone(), publish.clone());
-        let spawn = |task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| match &runtime {
-            Some(runtime) => drop(runtime.spawn(task)),
-            None => drop(tokio::spawn(task)),
+        let spawn = |task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
+            match &runtime {
+                Some(runtime) => drop(runtime.spawn(task)),
+                None => drop(tokio::spawn(task)),
+            }
         };
         spawn(Box::pin(async move {
             let handoff = canonical.starts_with(&handoff_prefix);
@@ -421,7 +482,10 @@ fn worker_global_submissions(
             }
             if outcome != MasterSubmission::Unavailable {
                 if outcome == MasterSubmission::Refused {
-                    warn!(core_id, handoff, "master refused this worker's GLOBAL submission");
+                    warn!(
+                        core_id,
+                        handoff, "master refused this worker's GLOBAL submission"
+                    );
                 }
                 return;
             }
@@ -440,11 +504,16 @@ fn worker_global_submissions(
             }
             let Some(publish) = publish else { return };
             let bundle = quil_execution::message_envelope::CanonicalMessageRequest::wrap(canonical)
-                .and_then(|request| quil_execution::message_envelope::CanonicalMessageBundle {
-                    requests: vec![Some(request)],
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
-                }.to_canonical_bytes());
+                .and_then(|request| {
+                    quil_execution::message_envelope::CanonicalMessageBundle {
+                        requests: vec![Some(request)],
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    }
+                    .to_canonical_bytes()
+                });
             match bundle {
                 Ok(bytes) => publish(crate::bitmasks::GLOBAL_PROVER.to_vec(), bytes).await,
                 Err(error) => warn!(%error, "committee handoff submission could not be encoded"),
@@ -515,27 +584,47 @@ impl WorkerOnlyNode {
 
     /// Have the master deliver a resolver message directly to the committee
     /// members it names (see [`MasterRelay::relay_direct`]).
-    async fn relay_direct(&self, filter: Vec<u8>, channel: u64, data: Vec<u8>, recipients: Vec<Vec<u8>>) -> bool {
-        self.master_relay.relay_direct(filter, channel, data, recipients).await
+    async fn relay_direct(
+        &self,
+        filter: Vec<u8>,
+        channel: u64,
+        data: Vec<u8>,
+        recipients: Vec<Vec<u8>>,
+    ) -> bool {
+        self.master_relay
+            .relay_direct(filter, channel, data, recipients)
+            .await
     }
 
     /// Recover bounded historical registration proofs through the master.
-    pub fn with_storage_history_source(mut self, source: crate::storage_history::GlobalVertexProofSource) -> Self {
+    pub fn with_storage_history_source(
+        mut self,
+        source: crate::storage_history::GlobalVertexProofSource,
+    ) -> Self {
         self.storage_history_source = Some(source);
         self
     }
 
-    pub fn with_global_anchor_source(mut self, source: crate::global_anchor::GlobalAnchorSource) -> Self {
+    pub fn with_global_anchor_source(
+        mut self,
+        source: crate::global_anchor::GlobalAnchorSource,
+    ) -> Self {
         self.global_anchor_source = Some(source);
         self
     }
 
-    pub fn with_outgoing_history_source(mut self, source: crate::app_handoff::OutgoingHistorySource) -> Self {
+    pub fn with_outgoing_history_source(
+        mut self,
+        source: crate::app_handoff::OutgoingHistorySource,
+    ) -> Self {
         self.outgoing_history_source = Some(source);
         self
     }
 
-    pub fn with_delivery_frame_source(mut self, source: crate::app_engine::DeliveryFrameSource) -> Self {
+    pub fn with_delivery_frame_source(
+        mut self,
+        source: crate::app_engine::DeliveryFrameSource,
+    ) -> Self {
         self.delivery_frame_source = Some(source);
         self
     }
@@ -624,7 +713,10 @@ impl WorkerOnlyNode {
         // and the master's channel comes up while the sync below runs; the
         // calls that need the synced state answer `Unavailable` until the
         // worker is ready, and a Respawn waits for it (see `respawns`).
-        let listen_addr: std::net::SocketAddr = self.config.listen_addr.parse()
+        let listen_addr: std::net::SocketAddr = self
+            .config
+            .listen_addr
+            .parse()
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
         // mTLS the master↔worker (DataIpc) channel when the node layer supplied
         // cert materials (cluster mode). The server then REQUIRES a client cert
@@ -642,7 +734,12 @@ impl WorkerOnlyNode {
             ),
             _ => None,
         };
-        let server_handle = tokio::spawn(serve_data_ipc(self.clone(), listen_addr, channel_tls, self.cancel.clone()));
+        let server_handle = tokio::spawn(serve_data_ipc(
+            self.clone(),
+            listen_addr,
+            channel_tls,
+            self.cancel.clone(),
+        ));
 
         // 0. Initial prover-tree sync from archive. Remote workers
         // start with an empty CRDT; without this sync the prover
@@ -652,12 +749,12 @@ impl WorkerOnlyNode {
         if let Some(syncer) = self.prover_tree_syncer.as_ref() {
             info!("performing initial prover-tree sync from archive");
             match syncer.sync_prover_tree(&[]).await {
-                Ok(_converged) => {
-                    match self.refresh_registry() {
-                        Ok(()) => info!("initial prover-tree sync complete"),
-                        Err(error) => warn!(%error, "initial prover registry refresh failed; will retry"),
+                Ok(_converged) => match self.refresh_registry() {
+                    Ok(()) => info!("initial prover-tree sync complete"),
+                    Err(error) => {
+                        warn!(%error, "initial prover registry refresh failed; will retry")
                     }
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "initial prover-tree sync failed — worker may have stale/empty prover state");
                 }
@@ -677,30 +774,32 @@ impl WorkerOnlyNode {
         // build the committee. Trust-the-peer sync (empty expected root).
         if let Some(syncer) = self.prover_tree_syncer.clone() {
             let this = self.clone();
-            tokio::spawn(periodic_prover_tree_syncs(self.cancel.clone(), self.config.core_id, move || {
-                let (this, syncer) = (this.clone(), syncer.clone());
-                async move {
-                    // Anchor against the last-seen global frame header's
-                    // certified prover-tree roots. Empty
-                    // only before the first global frame arrives, in which
-                    // case we fall back to trust-the-peer for that window.
-                    let anchor = {
-                        this.latest_prover_tree_anchor.lock().unwrap().clone()
-                    };
-                    match syncer.sync_prover_tree(&anchor).await {
-                        Ok(_) => {
-                            if let Err(error) = this.refresh_registry() {
-                                tracing::warn!(%error, "periodic prover registry refresh failed");
+            tokio::spawn(periodic_prover_tree_syncs(
+                self.cancel.clone(),
+                self.config.core_id,
+                move || {
+                    let (this, syncer) = (this.clone(), syncer.clone());
+                    async move {
+                        // Anchor against the last-seen global frame header's
+                        // certified prover-tree roots. Empty
+                        // only before the first global frame arrives, in which
+                        // case we fall back to trust-the-peer for that window.
+                        let anchor = { this.latest_prover_tree_anchor.lock().unwrap().clone() };
+                        match syncer.sync_prover_tree(&anchor).await {
+                            Ok(_) => {
+                                if let Err(error) = this.refresh_registry() {
+                                    tracing::warn!(%error, "periodic prover registry refresh failed");
+                                }
+                                None
                             }
-                            None
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "periodic prover-tree sync failed");
-                            Some(e.to_string())
+                            Err(e) => {
+                                tracing::debug!(error = %e, "periodic prover-tree sync failed");
+                                Some(e.to_string())
+                            }
                         }
                     }
-                }
-            }));
+                },
+            ));
         }
 
         // Resolver traffic of this worker's shard, every 30 s.
@@ -731,7 +830,8 @@ impl WorkerOnlyNode {
         // a Respawn received while starting; the listener has been up since
         // the start of `run`.
         info!(core_id, listen = %listen_addr, "worker ready for DataIPC commands");
-        self.respawns.set_ready(respawn_apply(self.clone()), core_id);
+        self.respawns
+            .set_ready(respawn_apply(self.clone()), core_id);
 
         // 3. Connect to master for message streaming. Skipped when no
         // factory is supplied (single-process tests, etc.).
@@ -746,7 +846,8 @@ impl WorkerOnlyNode {
                     factory,
                     worker_ref,
                     stream_cancel,
-                ).await;
+                )
+                .await;
             });
         } else {
             info!("no channel factory — worker will not stream from master");
@@ -947,8 +1048,16 @@ impl WorkerOnlyNode {
     pub async fn respawn(&self, filter: Vec<u8>) -> Result<Respawned> {
         let _respawn = self.respawn_lock.lock().await;
         let core_id = self.config.core_id;
-        if !filter.is_empty() && self.running_engine().is_some_and(|handle| handle.filter == filter) {
-            info!(core_id, filter = hex::encode(&filter), "worker already runs this filter; Respawn keeps its engine");
+        if !filter.is_empty()
+            && self
+                .running_engine()
+                .is_some_and(|handle| handle.filter == filter)
+        {
+            info!(
+                core_id,
+                filter = hex::encode(&filter),
+                "worker already runs this filter; Respawn keeps its engine"
+            );
             return Ok(Respawned::Kept);
         }
         *self.bound_since.lock().unwrap() = std::time::Instant::now();
@@ -1057,17 +1166,17 @@ impl WorkerOnlyNode {
             unified_cutover_hook: None,
         };
 
-        let (engine, handle) = AppConsensusEngine::new(
-            core_id,
-            filter.clone(),
-            deps,
-            self.engine_event_tx.clone(),
-        );
-        let engine = engine.with_storage_history_source(self.storage_history_source.clone())
+        let (engine, handle) =
+            AppConsensusEngine::new(core_id, filter.clone(), deps, self.engine_event_tx.clone());
+        let engine = engine
+            .with_storage_history_source(self.storage_history_source.clone())
             .with_outgoing_history_source(self.outgoing_history_source.clone())
             .with_global_anchor_source(self.global_anchor_source.clone())
             .with_historical_committee_source(
-                self.config.channel_factory.is_some().then(|| self.master_relay.historical_committee_source()),
+                self.config
+                    .channel_factory
+                    .is_some()
+                    .then(|| self.master_relay.historical_committee_source()),
             );
 
         let transport_handle = handle.clone();
@@ -1112,7 +1221,8 @@ impl WorkerOnlyNode {
         // Subscribe to per-shard bitmasks on the worker's own p2p so
         // peer-published shard traffic flows in. No-op when running in
         // proxy mode (worker_p2p is None there).
-        self.subscribe_to_shard_bitmasks(&filter, transport_handle, engine_cancel).await;
+        self.subscribe_to_shard_bitmasks(&filter, transport_handle, engine_cancel)
+            .await;
 
         Ok(Respawned::Applied)
     }
@@ -1120,11 +1230,20 @@ impl WorkerOnlyNode {
     /// The handle of the engine this worker runs: `None` when it runs
     /// none, or its engine was stopped or has exited.
     fn running_engine(&self) -> Option<AppEngineHandle> {
-        let stopped = self.engine_cancel.lock().ok()?.as_ref().is_none_or(|cancel| cancel.is_cancelled());
+        let stopped = self
+            .engine_cancel
+            .lock()
+            .ok()?
+            .as_ref()
+            .is_none_or(|cancel| cancel.is_cancelled());
         if stopped {
             return None;
         }
-        self.engine_handle.lock().ok()?.clone().filter(|handle| handle.is_running())
+        self.engine_handle
+            .lock()
+            .ok()?
+            .clone()
+            .filter(|handle| handle.is_running())
     }
 
     /// The DB config whose `cw_app_storage_base` is this worker's own data
@@ -1148,7 +1267,9 @@ impl WorkerOnlyNode {
         ready_handle: AppEngineHandle,
         cancel: CancellationToken,
     ) {
-        let Some(p2p) = self.worker_p2p.clone() else { return };
+        let Some(p2p) = self.worker_p2p.clone() else {
+            return;
+        };
         let bitmasks = vec![
             crate::bitmasks::shard_frame_bitmask(filter),
             crate::bitmasks::shard_consensus_bitmask(filter),
@@ -1183,20 +1304,24 @@ impl WorkerOnlyNode {
         let core_id = self.config.core_id;
         tokio::spawn(async move {
             let sole_member = || {
-                let frame = clock.get_latest_global_clock_frame().ok()
-                    .and_then(|frame| frame.header.map(|h| h.frame_number)).unwrap_or(0);
+                let frame = clock
+                    .get_latest_global_clock_frame()
+                    .ok()
+                    .and_then(|frame| frame.header.map(|h| h.frame_number))
+                    .unwrap_or(0);
                 if let Some(global) = global.as_ref() {
                     match crate::app_handoff::resolve(global, &filter, frame) {
                         Ok(crate::app_handoff::SessionChoice::Session(session)) => {
                             return session.members.len() == 1 && session.members[0] == public_key;
                         }
-                        Ok(crate::app_handoff::SessionChoice::Legacy) => {},
+                        Ok(crate::app_handoff::SessionChoice::Legacy) => {}
                         _ => return false,
                     }
                 } else if quil_types::consensus::committee_handoff_policy().is_some() {
                     return false;
                 }
-                registry.get_active_provers(&filter, frame)
+                registry
+                    .get_active_provers(&filter, frame)
                     .is_ok_and(|members| members.len() == 1 && members[0].public_key == public_key)
             };
             let readiness = wait_for_cw_transport(
@@ -1204,7 +1329,8 @@ impl WorkerOnlyNode {
                 || p2p.subscribed_peer_count(count_topic.clone()),
                 sole_member,
                 &cancel,
-            ).await;
+            )
+            .await;
             match readiness {
                 Ok(true) => {
                     tokio::select! {
@@ -1218,7 +1344,7 @@ impl WorkerOnlyNode {
                         }
                     }
                 }
-                Ok(false) => {},
+                Ok(false) => {}
                 Err(error) => warn!(core_id, %error, "cluster CW transport readiness failed"),
             }
         });
@@ -1227,7 +1353,9 @@ impl WorkerOnlyNode {
     /// Inverse of [`Self::subscribe_to_shard_bitmasks`]. Idempotent —
     /// safe to call when nothing was previously subscribed.
     async fn unsubscribe_active_shards(&self) {
-        let Some(p2p) = self.worker_p2p.clone() else { return };
+        let Some(p2p) = self.worker_p2p.clone() else {
+            return;
+        };
         let previous: Vec<Vec<u8>> = {
             let mut tracked = self.active_shard_subscriptions.lock().unwrap();
             std::mem::take(&mut *tracked)
@@ -1255,7 +1383,9 @@ impl WorkerOnlyNode {
                 }
             }
         };
-        let Some(header) = frame.header.as_ref() else { return };
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
         let expected = &header.prover_tree_commitment;
         if expected.is_empty() {
             return;
@@ -1305,7 +1435,9 @@ impl WorkerOnlyNode {
         if quil_types::consensus::committee_handoff_policy().is_none() {
             return;
         }
-        let Some(hg) = self.hypergraph.as_ref() else { return };
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return;
+        };
         if let Err(error) = hg.checkpoint_frame_cursor(
             frame_number.saturating_sub(1),
             &quil_store::encoding::global_materialized_cursor_key(),
@@ -1319,15 +1451,13 @@ impl WorkerOnlyNode {
     /// syncer up to 3 times, after a jittered delay, checks convergence,
     /// refreshes the prover registry after each attempt. The 5-frame
     /// cooldown (`sync_cooldown_until`) prevents sync-storms.
-    async fn perform_blocking_prover_sync(
-        &self,
-        frame_number: u64,
-        expected_roots: &[Vec<u8>],
-    ) {
+    async fn perform_blocking_prover_sync(&self, frame_number: u64, expected_roots: &[Vec<u8>]) {
         const MAX_ATTEMPTS: usize = 3;
         const COOLDOWN_FRAMES: u64 = 5;
 
-        let cooldown = self.sync_cooldown_until.load(std::sync::atomic::Ordering::Relaxed);
+        let cooldown = self
+            .sync_cooldown_until
+            .load(std::sync::atomic::Ordering::Relaxed);
         if frame_number < cooldown {
             tracing::debug!(
                 frame = frame_number,
@@ -1338,7 +1468,9 @@ impl WorkerOnlyNode {
         }
 
         let Some(syncer) = self.prover_tree_syncer.as_ref() else {
-            warn!("prover tree sync: no syncer wired — worker will run with stale/empty prover tree");
+            warn!(
+                "prover tree sync: no syncer wired — worker will run with stale/empty prover tree"
+            );
             return;
         };
 
@@ -1352,17 +1484,11 @@ impl WorkerOnlyNode {
         for attempt in 0..MAX_ATTEMPTS {
             tokio::time::sleep(blocking_prover_sync_delay(attempt)).await;
             if attempt > 0 {
-                info!(
-                    attempt = attempt + 1,
-                    "retrying prover tree sync"
-                );
+                info!(attempt = attempt + 1, "retrying prover tree sync");
             }
             match syncer.sync_prover_tree(expected_roots).await {
                 Ok(true) => {
-                    info!(
-                        attempt = attempt + 1,
-                        "prover tree sync converged"
-                    );
+                    info!(attempt = attempt + 1, "prover tree sync converged");
                     self.checkpoint_authenticated_global_state(frame_number);
                     // Refresh the prover registry from the just-synced store.
                     if let Err(error) = self.refresh_registry() {
@@ -1474,7 +1600,9 @@ impl WorkerOnlyNode {
             // channel needs no key (self-describing), so an unresolved sender is
             // only fatal for votes/certs — a benign transient until the peer's
             // PeerInfo propagates. Mirrors the master's inbound CW routing.
-            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_admit(filter, data, &self.local_cw_tag) {
+            if let Some((channel, cw_bytes)) =
+                crate::bitmasks::shard_cw_admit(filter, data, &self.local_cw_tag)
+            {
                 let from_key = self
                     .peer_key_by_id
                     .lock()
@@ -1549,8 +1677,11 @@ pub enum Respawned {
 
 /// Applies one Respawn: the worker's `respawn`, or a test's stand-in.
 type RespawnApply = Arc<
-    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<Respawned, String>> + Send>>
-        + Send
+    dyn Fn(
+            Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<Respawned, String>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -1629,11 +1760,16 @@ impl RespawnQueue {
         apply: RespawnApply,
         core_id: u32,
     ) -> std::result::Result<Respawned, tonic::Status> {
-        let Some(outcome) = self.enqueue(filter, apply, core_id)? else { return Ok(Respawned::AtReady) };
+        let Some(outcome) = self.enqueue(filter, apply, core_id)? else {
+            return Ok(Respawned::AtReady);
+        };
         match outcome.await {
             Ok(Ok(respawned)) => Ok(respawned),
             Ok(Err(error)) if error == RESPAWN_SUPERSEDED => Err(tonic::Status::aborted(error)),
-            Ok(Err(error)) => Err(tonic::Status::internal(format!("respawn failed: {}", error))),
+            Ok(Err(error)) => Err(tonic::Status::internal(format!(
+                "respawn failed: {}",
+                error
+            ))),
             Err(_) => Err(tonic::Status::internal("respawn ended without an outcome")),
         }
     }
@@ -1645,22 +1781,44 @@ impl RespawnQueue {
         filter: Vec<u8>,
         apply: RespawnApply,
         core_id: u32,
-    ) -> std::result::Result<Option<tokio::sync::oneshot::Receiver<std::result::Result<Respawned, String>>>, tonic::Status> {
-        let mut state = self.state.lock().map_err(|_| tonic::Status::internal("respawn queue poisoned"))?;
+    ) -> std::result::Result<
+        Option<tokio::sync::oneshot::Receiver<std::result::Result<Respawned, String>>>,
+        tonic::Status,
+    > {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| tonic::Status::internal("respawn queue poisoned"))?;
         let state = &mut *state;
         if !state.ready {
             info!(core_id, filter = hex::encode(&filter),
                 "Respawn received while starting; applied once the initial prover-tree sync completes");
-            state.queued = (!filter.is_empty()).then(|| QueuedRespawn { filter, waiters: Vec::new() });
+            state.queued = (!filter.is_empty()).then(|| QueuedRespawn {
+                filter,
+                waiters: Vec::new(),
+            });
             return Ok(None);
         }
         let (answer, outcome) = tokio::sync::oneshot::channel();
-        if let Some(applying) = state.applying.as_mut().filter(|applying| applying.filter == filter) {
+        if let Some(applying) = state
+            .applying
+            .as_mut()
+            .filter(|applying| applying.filter == filter)
+        {
             // Being applied already: answer with that outcome rather than
             // apply it twice, and drop an older request still waiting.
-            info!(core_id, filter = hex::encode(&filter), "Respawn received for the filter being applied; answered when it completes");
+            info!(
+                core_id,
+                filter = hex::encode(&filter),
+                "Respawn received for the filter being applied; answered when it completes"
+            );
             applying.waiters.push(answer);
-            for waiter in state.queued.take().into_iter().flat_map(|queued| queued.waiters) {
+            for waiter in state
+                .queued
+                .take()
+                .into_iter()
+                .flat_map(|queued| queued.waiters)
+            {
                 let _ = waiter.send(Err(RESPAWN_SUPERSEDED.to_string()));
             }
             return Ok(Some(outcome));
@@ -1674,7 +1832,10 @@ impl RespawnQueue {
                 for waiter in replaced.into_iter().flat_map(|queued| queued.waiters) {
                     let _ = waiter.send(Err(RESPAWN_SUPERSEDED.to_string()));
                 }
-                state.queued = Some(QueuedRespawn { filter, waiters: vec![answer] });
+                state.queued = Some(QueuedRespawn {
+                    filter,
+                    waiters: vec![answer],
+                });
             }
         }
         if !state.running {
@@ -1687,10 +1848,16 @@ impl RespawnQueue {
     /// Mark the worker ready, and apply the Respawn it accepted while
     /// starting, if any.
     fn set_ready(self: &Arc<Self>, apply: RespawnApply, core_id: u32) {
-        let Ok(mut state) = self.state.lock() else { return };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
         state.ready = true;
         if let Some(queued) = state.queued.as_ref() {
-            info!(core_id, filter = hex::encode(&queued.filter), "applying the Respawn received while starting");
+            info!(
+                core_id,
+                filter = hex::encode(&queued.filter),
+                "applying the Respawn received while starting"
+            );
             if !state.running {
                 state.running = true;
                 tokio::spawn(self.clone().drain(apply));
@@ -1735,7 +1902,11 @@ impl RespawnQueue {
     /// The filter of the latest Respawn waiting or being applied, if any.
     fn pending(&self) -> Option<Vec<u8>> {
         let state = self.state.lock().ok()?;
-        state.queued.as_ref().or(state.applying.as_ref()).map(|request| request.filter.clone())
+        state
+            .queued
+            .as_ref()
+            .or(state.applying.as_ref())
+            .map(|request| request.filter.clone())
     }
 }
 
@@ -1767,9 +1938,15 @@ async fn serve_data_ipc(
     let core_id = worker.config.core_id;
     let mut pause = DATA_IPC_BIND_RETRY_FIRST;
     loop {
-        let Some(incoming) = bind_data_ipc(core_id, listen_addr, &cancel).await else { return };
+        let Some(incoming) = bind_data_ipc(core_id, listen_addr, &cancel).await else {
+            return;
+        };
         let started = std::time::Instant::now();
-        info!("DataIPC gRPC server starting on {} (mtls={})", listen_addr, tls.is_some());
+        info!(
+            "DataIPC gRPC server starting on {} (mtls={})",
+            listen_addr,
+            tls.is_some()
+        );
         let mut builder = Server::builder()
             // Reap dead master connections (h2 PING) so a master that
             // dies without FIN doesn't leave the stream fd behind. TCP
@@ -1788,7 +1965,9 @@ async fn serve_data_ipc(
         let served = builder
             .add_service(
                 quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
-                    DataIpcServiceImpl { worker: worker.clone() },
+                    DataIpcServiceImpl {
+                        worker: worker.clone(),
+                    },
                 ),
             )
             .serve_with_incoming_shutdown(incoming, cancel.cancelled())
@@ -1822,7 +2001,11 @@ async fn bind_data_ipc(
     let mut outage = crate::outage::Outage::default();
     let mut backoff = DATA_IPC_BIND_RETRY_FIRST;
     loop {
-        let bound = tonic::transport::server::TcpIncoming::new(listen_addr, true, Some(Duration::from_secs(60)));
+        let bound = tonic::transport::server::TcpIncoming::new(
+            listen_addr,
+            true,
+            Some(Duration::from_secs(60)),
+        );
         let now = std::time::Instant::now();
         match bound {
             Ok(incoming) => {
@@ -1835,13 +2018,17 @@ async fn bind_data_ipc(
             Err(error) => {
                 let error = error_chain(&*error);
                 match outage.observe(now, false) {
-                    Some(OutageEvent::Began) => warn!(core_id, listen = %listen_addr, error = %error,
+                    Some(OutageEvent::Began) => {
+                        warn!(core_id, listen = %listen_addr, error = %error,
                         scope = "local", action = "check",
                         "DataIPC listener cannot bind; the master cannot reach this worker until it does; \
-                         check that the address belongs to this host and that no old worker process holds the port"),
-                    Some(OutageEvent::Continues { secs, failures }) => warn!(core_id, listen = %listen_addr,
+                         check that the address belongs to this host and that no old worker process holds the port")
+                    }
+                    Some(OutageEvent::Continues { secs, failures }) => {
+                        warn!(core_id, listen = %listen_addr,
                         error = %error, secs, failures, scope = "local", action = "check",
-                        "DataIPC listener still cannot bind"),
+                        "DataIPC listener still cannot bind")
+                    }
                     _ => {}
                 }
             }
@@ -1879,7 +2066,9 @@ fn deliver_to_engine(
     handle: Option<crate::app_engine::AppEngineHandle>,
     request: quil_types::proto::node::DeliverShardConsensusRequest,
 ) -> bool {
-    let Some(handle) = handle.filter(|handle| handle.filter == request.filter) else { return false };
+    let Some(handle) = handle.filter(|handle| handle.filter == request.filter) else {
+        return false;
+    };
     if request.channel == crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL {
         crate::resolver_traffic::ResolverTraffic::process().note_received(
             &request.filter,
@@ -1909,9 +2098,13 @@ fn start_payload_eviction<R>(
 where
     R: Fn(&[u8]) -> bool + Send + 'static,
 {
-    let bound = handle.map(|handle| handle.filter.clone()).unwrap_or_default();
+    let bound = handle
+        .map(|handle| handle.filter.clone())
+        .unwrap_or_default();
     let serving = handle.is_some_and(|handle| handle.is_running());
-    if let Some(reason) = crate::worker_payload_eviction::deferral(&bound, &keep, serving, bound_for) {
+    if let Some(reason) =
+        crate::worker_payload_eviction::deferral(&bound, &keep, serving, bound_for)
+    {
         info!(core_id, reason, "worker payload eviction deferred");
         return Some(reason);
     }
@@ -1921,25 +2114,35 @@ where
     let flag = evicting.clone();
     // A rebind stops the engine the passes start for.
     let engine = handle.cloned();
-    let serving: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || engine.as_ref().is_some_and(|h| h.is_running()));
+    let serving: Arc<dyn Fn() -> bool + Send + Sync> =
+        Arc::new(move || engine.as_ref().is_some_and(|h| h.is_running()));
     tokio::spawn(async move {
-        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage, serving).await;
+        crate::worker_payload_eviction::run_passes(
+            core_id,
+            hex::encode(&bound),
+            crdt,
+            keep,
+            storage,
+            serving,
+        )
+        .await;
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     None
 }
 
 #[tonic::async_trait]
-impl quil_types::proto::node::data_ipc_service_server::DataIpcService
-    for DataIpcServiceImpl
-{
+impl quil_types::proto::node::data_ipc_service_server::DataIpcService for DataIpcServiceImpl {
     /// A committee member's message the master received directly, for this
     /// worker's shard. Handed to the engine exactly as the topic copy would
     /// be; the engine checks `from` against the committee.
     async fn deliver_shard_consensus(
         &self,
         request: tonic::Request<quil_types::proto::node::DeliverShardConsensusRequest>,
-    ) -> std::result::Result<tonic::Response<quil_types::proto::node::DeliverShardConsensusResponse>, tonic::Status> {
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::node::DeliverShardConsensusResponse>,
+        tonic::Status,
+    > {
         self.ready()?;
         let handle = self
             .worker
@@ -1948,7 +2151,9 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
             .clone();
         let accepted = deliver_to_engine(handle, request.into_inner());
-        Ok(tonic::Response::new(quil_types::proto::node::DeliverShardConsensusResponse { accepted }))
+        Ok(tonic::Response::new(
+            quil_types::proto::node::DeliverShardConsensusResponse { accepted },
+        ))
     }
 
     /// The engine this worker runs and its latest execution report, for the
@@ -1958,12 +2163,17 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     async fn get_worker_execution(
         &self,
         _request: tonic::Request<quil_types::proto::node::GetWorkerExecutionRequest>,
-    ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetWorkerExecutionResponse>, tonic::Status> {
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::node::GetWorkerExecutionResponse>,
+        tonic::Status,
+    > {
         self.ready()?;
         let handle = self.worker.running_engine();
         let (filter, execution) = match (self.worker.respawns.pending(), handle) {
             (Some(pending), handle) => {
-                let execution = handle.filter(|handle| handle.filter == pending).map(|handle| handle.execution());
+                let execution = handle
+                    .filter(|handle| handle.filter == pending)
+                    .map(|handle| handle.execution());
                 (pending, execution)
             }
             (None, Some(handle)) => (handle.filter.clone(), Some(handle.execution())),
@@ -1972,54 +2182,91 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         // A standalone worker runs its own swarm: its gossip traffic is not
         // in the master's.
         let execution = execution.map(|mut execution| {
-            execution.gossip_traffic = self.worker.worker_p2p.as_ref().map(|p2p| p2p.gossip_traffic().to_proto());
+            execution.gossip_traffic = self
+                .worker
+                .worker_p2p
+                .as_ref()
+                .map(|p2p| p2p.gossip_traffic().to_proto());
             execution
         });
-        Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
-            filter,
-            // A store that refuses writes reads as blocked by it, to the
-            // master's lifecycle and health report alike.
-            execution: crate::worker_execution::with_store_state(self.worker.config.core_id, execution),
-            now_unix_ms: crate::worker_execution::now_ms(),
-        }))
+        Ok(tonic::Response::new(
+            quil_types::proto::node::GetWorkerExecutionResponse {
+                filter,
+                // A store that refuses writes reads as blocked by it, to the
+                // master's lifecycle and health report alike.
+                execution: crate::worker_execution::with_store_state(
+                    self.worker.config.core_id,
+                    execution,
+                ),
+                now_unix_ms: crate::worker_execution::now_ms(),
+            },
+        ))
     }
 
     async fn get_app_fee_snapshot(
-        &self, request: tonic::Request<quil_types::proto::node::GetAppFeeSnapshotRequest>,
-    ) -> std::result::Result<tonic::Response<quil_types::proto::node::GetAppFeeSnapshotResponse>, tonic::Status> {
-        let application: [u8; 32] = request.into_inner().application.as_slice().try_into()
+        &self,
+        request: tonic::Request<quil_types::proto::node::GetAppFeeSnapshotRequest>,
+    ) -> std::result::Result<
+        tonic::Response<quil_types::proto::node::GetAppFeeSnapshotResponse>,
+        tonic::Status,
+    > {
+        let application: [u8; 32] = request
+            .into_inner()
+            .application
+            .as_slice()
+            .try_into()
             .map_err(|_| tonic::Status::invalid_argument("application must be 32 bytes"))?;
-        let handle = self.worker.engine_handle.lock().map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?.clone()
+        let handle = self
+            .worker
+            .engine_handle
+            .lock()
+            .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
+            .clone()
             .ok_or_else(|| tonic::Status::unavailable("worker has no active engine"))?;
         if handle.filter.as_slice() != application.as_slice() {
-            return Err(tonic::Status::unavailable("worker does not execute this full application"));
+            return Err(tonic::Status::unavailable(
+                "worker does not execute this full application",
+            ));
         }
-        let s = handle.fee_snapshot().filter(|s| s.application == application)
-            .ok_or_else(|| tonic::Status::unavailable("materialized pricing snapshot unavailable"))?;
-        Ok(tonic::Response::new(quil_types::proto::node::GetAppFeeSnapshotResponse {
-            application: s.application.to_vec(), frame_number: s.frame_number,
-            global_frame_number: s.global_frame_number, difficulty: s.difficulty,
-            world_state_bytes: s.world_state_bytes, fee_multiplier_vote: s.fee_multiplier_vote,
-        }))
+        let s = handle
+            .fee_snapshot()
+            .filter(|s| s.application == application)
+            .ok_or_else(|| {
+                tonic::Status::unavailable("materialized pricing snapshot unavailable")
+            })?;
+        Ok(tonic::Response::new(
+            quil_types::proto::node::GetAppFeeSnapshotResponse {
+                application: s.application.to_vec(),
+                frame_number: s.frame_number,
+                global_frame_number: s.global_frame_number,
+                difficulty: s.difficulty,
+                world_state_bytes: s.world_state_bytes,
+                fee_multiplier_vote: s.fee_multiplier_vote,
+            },
+        ))
     }
 
     async fn respawn(
         &self,
         request: tonic::Request<quil_types::proto::node::RespawnRequest>,
-    ) -> std::result::Result<
-        tonic::Response<quil_types::proto::node::RespawnResponse>,
-        tonic::Status,
-    > {
+    ) -> std::result::Result<tonic::Response<quil_types::proto::node::RespawnResponse>, tonic::Status>
+    {
         // Accepted while starting too: an older master sends its Respawn
         // only once. The respawn itself runs in a task of its own, so a
         // master that stops waiting cannot cancel it half-way.
         let filter = request.into_inner().filter;
         let core_id = self.worker.config.core_id;
-        let respawned = self.worker.respawns.respawn(filter, respawn_apply(self.worker.clone()), core_id).await?;
-        Ok(tonic::Response::new(quil_types::proto::node::RespawnResponse {
-            deferred: respawned == Respawned::AtReady,
-            kept: respawned == Respawned::Kept,
-        }))
+        let respawned = self
+            .worker
+            .respawns
+            .respawn(filter, respawn_apply(self.worker.clone()), core_id)
+            .await?;
+        Ok(tonic::Response::new(
+            quil_types::proto::node::RespawnResponse {
+                deferred: respawned == Respawned::AtReady,
+                kept: respawned == Respawned::Kept,
+            },
+        ))
     }
 
     async fn create_join_proof(
@@ -2098,20 +2345,35 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             .elapsed();
         // As in `respawn`: on a network with committee sessions this
         // worker's own store holds the authorization records.
-        let storage = crate::app_engine::cw_app_storage_base(&worker.consensus_db_config(), worker.config.core_id)
-            .map(|base| {
-                let global = quil_types::consensus::committee_handoff_policy().and(worker.hypergraph.clone());
-                let member = worker.local_bls_pubkey.clone();
-                (base, move |shard: &[u8]| global.as_ref().is_none_or(|global|
-                    crate::app_handoff::retains_worker(global, shard, &member)))
-            });
+        let storage = crate::app_engine::cw_app_storage_base(
+            &worker.consensus_db_config(),
+            worker.config.core_id,
+        )
+        .map(|base| {
+            let global =
+                quil_types::consensus::committee_handoff_policy().and(worker.hypergraph.clone());
+            let member = worker.local_bls_pubkey.clone();
+            (base, move |shard: &[u8]| {
+                global
+                    .as_ref()
+                    .is_none_or(|global| crate::app_handoff::retains_worker(global, shard, &member))
+            })
+        });
         let deferred = start_payload_eviction(
-            worker.config.core_id, handle.as_ref(), bound_for, &worker.evicting, crdt, keep, storage,
+            worker.config.core_id,
+            handle.as_ref(),
+            bound_for,
+            &worker.evicting,
+            crdt,
+            keep,
+            storage,
         );
-        Ok(tonic::Response::new(quil_types::proto::node::EvictPayloadResponse {
-            started: deferred.is_none(),
-            deferred: deferred.unwrap_or_default().to_string(),
-        }))
+        Ok(tonic::Response::new(
+            quil_types::proto::node::EvictPayloadResponse {
+                started: deferred.is_none(),
+                deferred: deferred.unwrap_or_default().to_string(),
+            },
+        ))
     }
 
     async fn prepare_storage_confirm(
@@ -2123,8 +2385,11 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     > {
         self.ready()?;
         let req = request.into_inner();
-        let snapshots = quil_execution::global_intrinsic::storage_snapshot::decode_plan(&req.snapshot_sources)
-            .ok_or_else(|| tonic::Status::invalid_argument("undecodable storage snapshot sources"))?;
+        let snapshots =
+            quil_execution::global_intrinsic::storage_snapshot::decode_plan(&req.snapshot_sources)
+                .ok_or_else(|| {
+                    tonic::Status::invalid_argument("undecodable storage snapshot sources")
+                })?;
         // Only the worker executing this shard holds its data. The master's
         // own store does not, so its confirm registered leaves this worker
         // could never prove, and every frame it attested was rejected. With
@@ -2141,9 +2406,12 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             .is_some_and(|handle| handle.filter == req.filter);
         let from_snapshot = snapshots.iter().any(|(shard, _)| *shard == req.filter);
         if !(bound || from_snapshot) || req.filter.is_empty() {
-            return Err(tonic::Status::failed_precondition("worker is not bound to this filter"));
+            return Err(tonic::Status::failed_precondition(
+                "worker is not bound to this filter",
+            ));
         }
-        let (Some(crdt), Some(kv)) = (self.worker.hypergraph.clone(), self.worker.kv_db.clone()) else {
+        let (Some(crdt), Some(kv)) = (self.worker.hypergraph.clone(), self.worker.kv_db.clone())
+        else {
             return Err(tonic::Status::unavailable("worker has no shard storage"));
         };
         let member = self.worker.local_prover_address.clone();
@@ -2155,7 +2423,11 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         // The bound shard first, then the shards a recorded change creates
         // from it, all from this worker's store.
         let mut filters = vec![filter.clone()];
-        filters.extend(req.targets.into_iter().filter(|target| !target.is_empty() && *target != filter));
+        filters.extend(
+            req.targets
+                .into_iter()
+                .filter(|target| !target.is_empty() && *target != filter),
+        );
         let roots = tokio::task::spawn_blocking(move || {
             encode_worker_storage_confirm(
                 &crdt,
@@ -2169,15 +2441,22 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         })
         .await
         .map_err(|e| tonic::Status::internal(format!("storage confirm task: {e}")))?
-        .map_err(|e| tonic::Status::unavailable(format!("storage confirm preparation failed: {e}")))?;
+        .map_err(|e| {
+            tonic::Status::unavailable(format!("storage confirm preparation failed: {e}"))
+        })?;
         // Before its data sync completes the worker has nothing to encode; an
         // empty registration would leave it unattested for the next epoch.
         // In a hash-proof epoch the renewal registers what the epoch's leaf
         // snapshot encoded, and past its grace renews without one on purpose.
         if !quil_types::consensus::hash_storage_proofs_at(epoch)
-            && roots.iter().filter(|group| group.filter == filter).all(|group| group.entries.is_empty())
+            && roots
+                .iter()
+                .filter(|group| group.filter == filter)
+                .all(|group| group.entries.is_empty())
         {
-            return Err(tonic::Status::failed_precondition("worker holds no data for this filter yet"));
+            return Err(tonic::Status::failed_precondition(
+                "worker holds no data for this filter yet",
+            ));
         }
         Ok(tonic::Response::new(
             quil_types::proto::node::PrepareStorageConfirmResponse {
@@ -2242,17 +2521,22 @@ async fn stream_global_messages_from_master(
             return;
         }
 
-        info!(endpoint = master_endpoint, "connecting to master for message stream");
+        info!(
+            endpoint = master_endpoint,
+            "connecting to master for message stream"
+        );
 
         match channel_factory().await {
             Ok(channel) => {
                 info!("connected to master, starting message stream");
                 backoff = Duration::from_secs(1); // reset backoff
 
-                let mut client = quil_types::proto::global::global_service_client::GlobalServiceClient::new(channel);
-                let request = tonic::Request::new(
-                    quil_types::proto::global::StreamGlobalMessagesRequest {},
-                );
+                let mut client =
+                    quil_types::proto::global::global_service_client::GlobalServiceClient::new(
+                        channel,
+                    );
+                let request =
+                    tonic::Request::new(quil_types::proto::global::StreamGlobalMessagesRequest {});
 
                 match client.stream_global_messages(request).await {
                     Ok(response) => {
@@ -2384,8 +2668,8 @@ pub fn worker_listen_addr(
     // Tier 2 / 3: construct from template. Core 1 → base_stream_port,
     // core 2 → base_stream_port + 1, etc. Use the template's `%d`
     // replacement so the host portion matches what the operator configured.
-    let port = base_stream_port
-        .saturating_add(core_id.saturating_sub(1).min(u16::MAX as u32) as u16);
+    let port =
+        base_stream_port.saturating_add(core_id.saturating_sub(1).min(u16::MAX as u32) as u16);
     if base_listen.contains("%d") {
         // Template has `%d` — build a multiaddr, then extract `host:port`
         // so the return value is always a socket address (the caller
@@ -2496,7 +2780,10 @@ mod tests {
         let filter = vec![app; 32];
         for d in 0u8..3 {
             crdt.add_vertex(
-                &Location { app_address: [app; 32], data_address: [d; 32] },
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
                 &vec![d.wrapping_add(1); 256],
             )
             .unwrap();
@@ -2514,17 +2801,36 @@ mod tests {
         for epoch in first..=first + 3 {
             let frame = epoch * quil_types::consensus::epoch_length_frames() + 1;
             let roots = encode_worker_storage_confirm(
-                &crdt, &replicas, &retired_below, std::slice::from_ref(&filter), &member, frame, &[],
+                &crdt,
+                &replicas,
+                &retired_below,
+                std::slice::from_ref(&filter),
+                &member,
+                frame,
+                &[],
             )
             .expect("worker confirm");
-            leaves = roots[0].entries.iter().map(|e| leaf_id_bytes(&filter, &e.prefix)).collect();
+            leaves = roots[0]
+                .entries
+                .iter()
+                .map(|e| leaf_id_bytes(&filter, &e.prefix))
+                .collect();
             assert!(!leaves.is_empty(), "the shard's data is encoded");
         }
-        assert!(replicas.get(first - 3, b"backlog").unwrap().is_none(), "the backlog is evicted");
+        assert!(
+            replicas.get(first - 3, b"backlog").unwrap().is_none(),
+            "the backlog is evicted"
+        );
         for leaf in &leaves {
-            assert!(replicas.get(first + 1, leaf).unwrap().is_none(), "epoch E+1 is evicted");
+            assert!(
+                replicas.get(first + 1, leaf).unwrap().is_none(),
+                "epoch E+1 is evicted"
+            );
             for epoch in first + 2..=first + 4 {
-                assert!(replicas.get(epoch, leaf).unwrap().is_some(), "epoch {epoch} is kept");
+                assert!(
+                    replicas.get(epoch, leaf).unwrap().is_some(),
+                    "epoch {epoch} is kept"
+                );
             }
         }
     }
@@ -2553,9 +2859,14 @@ mod tests {
         }
         .to_canonical_bytes()
         .unwrap();
-        let mut seal = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes().to_vec();
+        let mut seal = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
+            .to_be_bytes()
+            .to_vec();
         seal.extend_from_slice(b"closing seal");
-        assert_eq!(relay.submit(4, header.clone()).await, MasterSubmission::Unavailable);
+        assert_eq!(
+            relay.submit(4, header.clone()).await,
+            MasterSubmission::Unavailable
+        );
 
         let settle = || async {
             for _ in 0..50 {
@@ -2566,7 +2877,10 @@ mod tests {
         submit(header.clone());
         submit(seal.clone());
         settle().await;
-        assert!(published.lock().unwrap().is_empty(), "nothing leaves during a halt");
+        assert!(
+            published.lock().unwrap().is_empty(),
+            "nothing leaves during a halt"
+        );
 
         halted.store(false, std::sync::atomic::Ordering::Relaxed);
         submit(header);
@@ -2575,7 +2889,11 @@ mod tests {
         let published = published.lock().unwrap();
         assert_eq!(published.len(), 1, "only the seal is gossiped");
         assert_eq!(published[0].0, crate::bitmasks::GLOBAL_PROVER.to_vec());
-        let bundle = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(&published[0].1).unwrap();
+        let bundle =
+            quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(
+                &published[0].1,
+            )
+            .unwrap();
         let requests: Vec<_> = bundle.requests.into_iter().flatten().collect();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].inner_bytes, seal);
@@ -2593,12 +2911,22 @@ mod tests {
         };
         let (handle, mut engine) = crate::app_engine::AppEngineHandle::for_test(vec![1; 32]);
         assert!(!deliver_to_engine(None, request(vec![1; 32])), "no engine");
-        assert!(!deliver_to_engine(Some(handle.clone()), request(vec![2; 32])), "another shard");
+        assert!(
+            !deliver_to_engine(Some(handle.clone()), request(vec![2; 32])),
+            "another shard"
+        );
         assert!(engine.try_recv().is_err());
         assert!(deliver_to_engine(Some(handle), request(vec![1; 32])));
         match engine.try_recv().unwrap() {
-            crate::app_engine::AppEngineMessage::CwIn { channel, from, data } => {
-                assert_eq!((channel, from, data), (2, vec![5; 897], b"certificate".to_vec()));
+            crate::app_engine::AppEngineMessage::CwIn {
+                channel,
+                from,
+                data,
+            } => {
+                assert_eq!(
+                    (channel, from, data),
+                    (2, vec![5; 897], b"certificate".to_vec())
+                );
             }
             _ => panic!("expected CwIn"),
         }
@@ -2613,7 +2941,10 @@ mod tests {
         let count = peers.clone();
         let task = tokio::spawn(async move {
             wait_for_cw_transport(
-                async { installation.await.unwrap(); Ok(()) },
+                async {
+                    installation.await.unwrap();
+                    Ok(())
+                },
                 || {
                     let count = count.load(Ordering::SeqCst);
                     queried.send(()).unwrap();
@@ -2621,24 +2952,52 @@ mod tests {
                 },
                 || false,
                 &CancellationToken::new(),
-            ).await
+            )
+            .await
         });
         tokio::task::yield_now().await;
-        assert!(queries.try_recv().is_err(), "peer checks must follow subscription acknowledgement");
+        assert!(
+            queries.try_recv().is_err(),
+            "peer checks must follow subscription acknowledgement"
+        );
         installed.send(()).unwrap();
         queries.recv().await.unwrap();
-        assert!(!task.is_finished(), "a subscribed worker without a peer must still wait");
+        assert!(
+            !task.is_finished(),
+            "a subscribed worker without a peer must still wait"
+        );
         peers.store(1, Ordering::SeqCst);
-        assert!(tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap().unwrap());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
     async fn cluster_singleton_still_requires_successful_subscription() {
         let cancel = CancellationToken::new();
-        assert!(wait_for_cw_transport(async { Ok(()) }, || std::future::ready(Ok(0)), || true, &cancel).await.unwrap());
-        let denied = wait_for_cw_transport(async { Err(QuilError::P2p("subscription failed".into())) },
-            || std::future::ready(Ok(0)), || true, &cancel).await;
-        assert!(denied.is_err(), "singleton status cannot bypass a failed subscription");
+        assert!(wait_for_cw_transport(
+            async { Ok(()) },
+            || std::future::ready(Ok(0)),
+            || true,
+            &cancel
+        )
+        .await
+        .unwrap());
+        let denied = wait_for_cw_transport(
+            async { Err(QuilError::P2p("subscription failed".into())) },
+            || std::future::ready(Ok(0)),
+            || true,
+            &cancel,
+        )
+        .await;
+        assert!(
+            denied.is_err(),
+            "singleton status cannot bypass a failed subscription"
+        );
     }
 
     #[tokio::test]
@@ -2655,14 +3014,32 @@ mod tests {
                     }
                     Ok(())
                 };
-                wait_for_cw_transport(subscription, || {
-                    if let Some(entered) = entered.take() { entered.send(()).unwrap(); }
-                    std::future::pending::<Result<usize>>()
-                }, || false, &child_cancel).await
+                wait_for_cw_transport(
+                    subscription,
+                    || {
+                        if let Some(entered) = entered.take() {
+                            entered.send(()).unwrap();
+                        }
+                        std::future::pending::<Result<usize>>()
+                    },
+                    || false,
+                    &child_cancel,
+                )
+                .await
             });
-            if installed { receive.await.unwrap(); } else { tokio::task::yield_now().await; }
+            if installed {
+                receive.await.unwrap();
+            } else {
+                tokio::task::yield_now().await;
+            }
             cancel.cancel();
-            assert!(!tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap().unwrap());
+            assert!(
+                !tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            );
         }
     }
 
@@ -2682,13 +3059,33 @@ mod tests {
         let evicting = Arc::new(AtomicBool::new(false));
         let start = |handle: Option<&AppEngineHandle>, bound_for: Duration, keep: Vec<Vec<u8>>| {
             let no_storage: Option<(std::path::PathBuf, fn(&[u8]) -> bool)> = None;
-            start_payload_eviction(1, handle, bound_for, &evicting, crdt.clone(), keep, no_storage)
+            start_payload_eviction(
+                1,
+                handle,
+                bound_for,
+                &evicting,
+                crdt.clone(),
+                keep,
+                no_storage,
+            )
         };
-        assert_eq!(start(None, settled, vec![bound.clone()]), Some("binding is not protected"));
-        assert_eq!(start(Some(&handle), settled, vec![vec![8; 32]]), Some("binding is not protected"));
-        assert_eq!(start(Some(&handle), Duration::from_secs(1), vec![bound.clone()]), Some("binding has not settled"));
+        assert_eq!(
+            start(None, settled, vec![bound.clone()]),
+            Some("binding is not protected")
+        );
+        assert_eq!(
+            start(Some(&handle), settled, vec![vec![8; 32]]),
+            Some("binding is not protected")
+        );
+        assert_eq!(
+            start(Some(&handle), Duration::from_secs(1), vec![bound.clone()]),
+            Some("binding has not settled")
+        );
         evicting.store(true, Ordering::SeqCst);
-        assert_eq!(start(Some(&handle), settled, vec![bound.clone()]), Some("an eviction is running"));
+        assert_eq!(
+            start(Some(&handle), settled, vec![bound.clone()]),
+            Some("an eviction is running")
+        );
         evicting.store(false, Ordering::SeqCst);
         assert_eq!(start(Some(&handle), settled, vec![bound.clone()]), None);
         for _ in 0..200 {
@@ -2697,7 +3094,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!evicting.load(Ordering::SeqCst), "the finished run is cleared");
+        assert!(
+            !evicting.load(Ordering::SeqCst),
+            "the finished run is cleared"
+        );
     }
 
     #[test]
@@ -2846,11 +3246,18 @@ mod data_ipc_bind_tests {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(!binding.is_finished(), "the port is held");
         drop(holder);
-        let bound = tokio::time::timeout(Duration::from_secs(5), binding).await.expect("bound after release").unwrap();
+        let bound = tokio::time::timeout(Duration::from_secs(5), binding)
+            .await
+            .expect("bound after release")
+            .unwrap();
         assert!(bound.is_some());
         let warns = logs.lines_with("DataIPC listener cannot bind");
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].contains("core_id=3") && warns[0].contains(&listen_addr.to_string()), "{}", warns[0]);
+        assert!(
+            warns[0].contains("core_id=3") && warns[0].contains(&listen_addr.to_string()),
+            "{}",
+            warns[0]
+        );
         assert!(warns[0].contains("in use"), "names the error: {}", warns[0]);
         let bound_lines = logs.lines_with("DataIPC listener bound after");
         assert_eq!(bound_lines.len(), 1, "{bound_lines:?}");
@@ -2913,13 +3320,29 @@ mod respawn_queue_tests {
     async fn a_respawn_received_while_starting_is_applied_once_ready() {
         let recorder = Recorder::default();
         let queue = Arc::new(RespawnQueue::default());
-        assert!(queue.respawn(vec![1; 32], recorder.apply(), 1).await.is_ok(), "accepted while starting");
-        assert!(queue.respawn(vec![2; 32], recorder.apply(), 1).await.is_ok());
+        assert!(
+            queue
+                .respawn(vec![1; 32], recorder.apply(), 1)
+                .await
+                .is_ok(),
+            "accepted while starting"
+        );
+        assert!(queue
+            .respawn(vec![2; 32], recorder.apply(), 1)
+            .await
+            .is_ok());
         tokio::task::yield_now().await;
-        assert!(recorder.applied().is_empty(), "nothing is applied before the worker is ready");
+        assert!(
+            recorder.applied().is_empty(),
+            "nothing is applied before the worker is ready"
+        );
         queue.set_ready(recorder.apply(), 1);
         assert!(eventually(|| recorder.applied().len() == 1).await);
-        assert_eq!(recorder.applied(), vec![vec![2u8; 32]], "the latest request wins");
+        assert_eq!(
+            recorder.applied(),
+            vec![vec![2u8; 32]],
+            "the latest request wins"
+        );
 
         let cleared = Recorder::default();
         let queue = Arc::new(RespawnQueue::default());
@@ -2929,7 +3352,10 @@ mod respawn_queue_tests {
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
-        assert!(cleared.applied().is_empty(), "an empty filter clears the request");
+        assert!(
+            cleared.applied().is_empty(),
+            "an empty filter clears the request"
+        );
     }
 
     /// A respawn runs to its end when the master stops waiting for it.
@@ -2943,11 +3369,16 @@ mod respawn_queue_tests {
             let (queue, apply) = (queue.clone(), recorder.apply());
             tokio::spawn(async move { queue.respawn(vec![1; 32], apply, 1).await })
         };
-        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified())
+            .await
+            .unwrap();
         call.abort();
         let _ = call.await;
         recorder.release.notify_one();
-        assert!(eventually(|| recorder.done.load(Ordering::SeqCst)).await, "the respawn ran to its end");
+        assert!(
+            eventually(|| recorder.done.load(Ordering::SeqCst)).await,
+            "the respawn ran to its end"
+        );
     }
 
     /// Requests run one at a time; a newer one replaces one still waiting.
@@ -2962,7 +3393,9 @@ mod respawn_queue_tests {
             tokio::spawn(async move { queue.respawn(filter, apply, 1).await })
         };
         let first = call(vec![1; 32]);
-        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified())
+            .await
+            .unwrap();
         let second = call(vec![2; 32]);
         for _ in 0..5 {
             tokio::task::yield_now().await;
@@ -2974,7 +3407,10 @@ mod respawn_queue_tests {
         assert_eq!(recorder.applied(), vec![vec![1u8; 32]], "one at a time");
         recorder.release.notify_one();
         assert!(first.await.unwrap().is_ok());
-        assert_eq!(second.await.unwrap().unwrap_err().code(), tonic::Code::Aborted);
+        assert_eq!(
+            second.await.unwrap().unwrap_err().code(),
+            tonic::Code::Aborted
+        );
         assert!(third.await.unwrap().is_ok());
         assert_eq!(recorder.applied(), vec![vec![1u8; 32], vec![3u8; 32]]);
     }
@@ -2992,15 +3428,25 @@ mod respawn_queue_tests {
             tokio::spawn(async move { queue.respawn(filter, apply, 1).await })
         };
         let first = call(vec![1; 32]);
-        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified()).await.unwrap();
-        assert_eq!(queue.pending(), Some(vec![1u8; 32]), "the filter being applied is reported");
+        tokio::time::timeout(Duration::from_secs(2), recorder.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.pending(),
+            Some(vec![1u8; 32]),
+            "the filter being applied is reported"
+        );
         let second = call(vec![1; 32]);
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
         recorder.release.notify_one();
         assert_eq!(first.await.unwrap().unwrap(), Respawned::Applied);
-        assert_eq!(second.await.unwrap().unwrap(), Respawned::Applied, "answered by the same application");
+        assert_eq!(
+            second.await.unwrap().unwrap(),
+            Respawned::Applied,
+            "answered by the same application"
+        );
         for _ in 0..5 {
             tokio::task::yield_now().await;
         }
@@ -3023,7 +3469,9 @@ mod respawn_queue_tests {
             channel_factory: None,
         };
         let signer: Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
-            Arc::new(|| -> Box<dyn quil_types::crypto::Signer> { unreachable!("no engine starts in this test") });
+            Arc::new(|| -> Box<dyn quil_types::crypto::Signer> {
+                unreachable!("no engine starts in this test")
+            });
         Arc::new(WorkerOnlyNode::new(
             config,
             Arc::new(quil_store::testing::InMemoryClockStore::new()),
@@ -3043,7 +3491,12 @@ mod respawn_queue_tests {
     async fn reported_filter(service: &DataIpcServiceImpl) -> Vec<u8> {
         use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
         let request = tonic::Request::new(quil_types::proto::node::GetWorkerExecutionRequest {});
-        service.get_worker_execution(request).await.unwrap().into_inner().filter
+        service
+            .get_worker_execution(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .filter
     }
 
     /// A Respawn of the filter the running engine runs keeps that engine:
@@ -3055,10 +3508,16 @@ mod respawn_queue_tests {
         let cancel = CancellationToken::new();
         *worker.engine_handle.lock().unwrap() = Some(handle);
         *worker.engine_cancel.lock().unwrap() = Some(cancel.clone());
-        let respawned = tokio::time::timeout(Duration::from_secs(5), worker.respawn(vec![7; 32])).await;
-        assert!(matches!(respawned, Ok(Ok(Respawned::Kept))), "a running engine is kept");
+        let respawned =
+            tokio::time::timeout(Duration::from_secs(5), worker.respawn(vec![7; 32])).await;
+        assert!(
+            matches!(respawned, Ok(Ok(Respawned::Kept))),
+            "a running engine is kept"
+        );
         assert!(!cancel.is_cancelled(), "the engine is not stopped");
-        assert!(worker.running_engine().is_some_and(|handle| handle.filter == vec![7u8; 32]));
+        assert!(worker
+            .running_engine()
+            .is_some_and(|handle| handle.filter == vec![7u8; 32]));
     }
 
     /// An engine that has exited runs nothing, so the worker reports no
@@ -3068,16 +3527,32 @@ mod respawn_queue_tests {
     async fn an_exited_engine_reports_no_filter() {
         let worker = idle_worker();
         worker.respawns.state.lock().unwrap().ready = true;
-        let service = DataIpcServiceImpl { worker: worker.clone() };
+        let service = DataIpcServiceImpl {
+            worker: worker.clone(),
+        };
         let (handle, engine) = AppEngineHandle::for_test(vec![7; 32]);
         *worker.engine_handle.lock().unwrap() = Some(handle);
         *worker.engine_cancel.lock().unwrap() = Some(CancellationToken::new());
-        assert_eq!(reported_filter(&service).await, vec![7u8; 32], "a running engine is reported");
+        assert_eq!(
+            reported_filter(&service).await,
+            vec![7u8; 32],
+            "a running engine is reported"
+        );
         drop(engine);
-        assert!(reported_filter(&service).await.is_empty(), "an exited engine runs nothing");
+        assert!(
+            reported_filter(&service).await.is_empty(),
+            "an exited engine runs nothing"
+        );
         assert!(worker.running_engine().is_none());
-        worker.respawns.state.lock().unwrap().applying = Some(QueuedRespawn { filter: vec![8; 32], waiters: Vec::new() });
-        assert_eq!(reported_filter(&service).await, vec![8u8; 32], "a Respawn being applied is reported");
+        worker.respawns.state.lock().unwrap().applying = Some(QueuedRespawn {
+            filter: vec![8; 32],
+            waiters: Vec::new(),
+        });
+        assert_eq!(
+            reported_filter(&service).await,
+            vec![8u8; 32],
+            "a Respawn being applied is reported"
+        );
     }
 
     /// While the worker starts, a payload eviction is refused as starting,
@@ -3085,8 +3560,11 @@ mod respawn_queue_tests {
     #[tokio::test]
     async fn a_payload_eviction_while_starting_answers_starting() {
         use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
-        let service = DataIpcServiceImpl { worker: idle_worker() };
-        let request = tonic::Request::new(quil_types::proto::node::EvictPayloadRequest { keep: Vec::new() });
+        let service = DataIpcServiceImpl {
+            worker: idle_worker(),
+        };
+        let request =
+            tonic::Request::new(quil_types::proto::node::EvictPayloadRequest { keep: Vec::new() });
         let status = service.evict_payload(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), WORKER_STARTING);
@@ -3125,7 +3603,8 @@ fn blocking_prover_sync_delay(attempt: usize) -> Duration {
     if attempt == 0 {
         crate::prover_tree_syncer::sync_jitter(BLOCKING_PROVER_SYNC_JITTER)
     } else {
-        BLOCKING_PROVER_SYNC_RETRY + crate::prover_tree_syncer::sync_jitter(BLOCKING_PROVER_SYNC_RETRY)
+        BLOCKING_PROVER_SYNC_RETRY
+            + crate::prover_tree_syncer::sync_jitter(BLOCKING_PROVER_SYNC_RETRY)
     }
 }
 
@@ -3165,13 +3644,19 @@ fn log_prover_tree_sync(
     let failed = error.is_some();
     let error = error.unwrap_or_default();
     match outage.observe(now, !failed) {
-        Some(OutageEvent::Began) => tracing::warn!(core_id, error = %error, scope = "local", action = "check",
+        Some(OutageEvent::Began) => {
+            tracing::warn!(core_id, error = %error, scope = "local", action = "check",
             "periodic prover-tree sync failing; this worker's GLOBAL view stops advancing; \
-             check its connection to the master and the master's GLOBAL sync"),
+             check its connection to the master and the master's GLOBAL sync")
+        }
         Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(core_id, secs, failures,
             error = %error, scope = "local", action = "check", "periodic prover-tree sync still failing"),
-        Some(OutageEvent::Ended { secs, failures }) => tracing::info!(core_id, secs, failures,
-            "periodic prover-tree sync recovered"),
+        Some(OutageEvent::Ended { secs, failures }) => tracing::info!(
+            core_id,
+            secs,
+            failures,
+            "periodic prover-tree sync recovered"
+        ),
         None => {}
     }
 }
@@ -3195,12 +3680,24 @@ mod prover_tree_sync_log_tests {
         }
         let warns = logs.lines_with("prover-tree sync failing");
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].contains("core_id=7") && warns[0].contains("master unreachable"), "{}", warns[0]);
-        assert!(warns[0].contains("scope") && warns[0].contains("check"), "{}", warns[0]);
+        assert!(
+            warns[0].contains("core_id=7") && warns[0].contains("master unreachable"),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains("scope") && warns[0].contains("check"),
+            "{}",
+            warns[0]
+        );
         log_prover_tree_sync(&mut outage, 7, at(40), None);
         let recovered = logs.lines_with("prover-tree sync recovered");
         assert_eq!(recovered.len(), 1);
-        assert!(recovered[0].contains("secs=40") && recovered[0].contains("failures=4"), "{}", recovered[0]);
+        assert!(
+            recovered[0].contains("secs=40") && recovered[0].contains("failures=4"),
+            "{}",
+            recovered[0]
+        );
     }
 
     /// A sync slowed by a timing-out archive is followed by a full pause, not
@@ -3220,7 +3717,9 @@ mod prover_tree_sync_log_tests {
                     if first {
                         tokio::time::sleep(Duration::from_secs(35)).await;
                     }
-                    runs.lock().unwrap().push((start, tokio::time::Instant::now()));
+                    runs.lock()
+                        .unwrap()
+                        .push((start, tokio::time::Instant::now()));
                     None
                 }
             }
@@ -3232,8 +3731,11 @@ mod prover_tree_sync_log_tests {
         assert!(runs.len() >= 5, "{} syncs", runs.len());
         for pair in runs.windows(2) {
             let pause = pair[1].0 - pair[0].1;
-            assert!((PROVER_TREE_SYNC_PERIOD..=PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER).contains(&pause),
-                "pause {pause:?} after a sync");
+            assert!(
+                (PROVER_TREE_SYNC_PERIOD..=PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER)
+                    .contains(&pause),
+                "pause {pause:?} after a sync"
+            );
         }
     }
 
@@ -3242,14 +3744,32 @@ mod prover_tree_sync_log_tests {
     #[test]
     fn prover_tree_sync_delays_are_jittered_within_their_bounds() {
         let distinct = |delays: Vec<Duration>, low: Duration, high: Duration| {
-            assert!(delays.iter().all(|delay| (low..=high).contains(delay)), "{delays:?}");
-            delays.into_iter().collect::<std::collections::HashSet<_>>().len()
+            assert!(
+                delays.iter().all(|delay| (low..=high).contains(delay)),
+                "{delays:?}"
+            );
+            delays
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         };
         let periodic = (0..64).map(|_| periodic_prover_tree_sync_pause()).collect();
-        assert!(distinct(periodic, PROVER_TREE_SYNC_PERIOD, PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER) > 1);
+        assert!(
+            distinct(
+                periodic,
+                PROVER_TREE_SYNC_PERIOD,
+                PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER
+            ) > 1
+        );
         let first = (0..64).map(|_| blocking_prover_sync_delay(0)).collect();
         assert!(distinct(first, Duration::ZERO, BLOCKING_PROVER_SYNC_JITTER) > 1);
         let retry = (0..64).map(|_| blocking_prover_sync_delay(1)).collect();
-        assert!(distinct(retry, BLOCKING_PROVER_SYNC_RETRY, BLOCKING_PROVER_SYNC_RETRY * 2) > 1);
+        assert!(
+            distinct(
+                retry,
+                BLOCKING_PROVER_SYNC_RETRY,
+                BLOCKING_PROVER_SYNC_RETRY * 2
+            ) > 1
+        );
     }
 }

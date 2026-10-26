@@ -228,7 +228,11 @@ mod tests {
     #[test]
     fn publicly_bounded_small_rows_need_no_lifting_witness() {
         let relation = CompiledAmountRelation {
-            binary: vec![Poly::one()], short: Vec::new(), short_bound: Vec::new(), ring: Vec::new(), exact_ring: Vec::new(),
+            binary: vec![Poly::one()],
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: Vec::new(),
             input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),
@@ -275,7 +279,11 @@ mod tests {
         };
         let rhs = a.mul(&b);
         let relation = CompiledAmountRelation {
-            binary: vec![b], short: Vec::new(), short_bound: Vec::new(), ring: Vec::new(), exact_ring: Vec::new(),
+            binary: vec![b],
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: Vec::new(),
             input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),

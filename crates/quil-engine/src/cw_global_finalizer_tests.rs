@@ -123,11 +123,22 @@ fn a_replayed_finalization_of_a_canonical_frame_is_not_rewritten_or_reannounced(
     let bytes = encode_global_frame(&frame).unwrap();
     sink.on_finalized(4, digest, Some(bytes.clone()), None, true);
     assert_eq!(jobs.try_recv().unwrap(), (frame.clone(), 1));
-    assert_eq!((heads.load(Ordering::SeqCst), gossip.load(Ordering::SeqCst)), (1, 1));
+    assert_eq!(
+        (heads.load(Ordering::SeqCst), gossip.load(Ordering::SeqCst)),
+        (1, 1)
+    );
 
     let sequence = db.inner().latest_sequence_number();
     sink.on_finalized(4, digest, Some(bytes), None, true);
-    assert_eq!(db.inner().latest_sequence_number(), sequence, "not rewritten");
-    assert_eq!((heads.load(Ordering::SeqCst), gossip.load(Ordering::SeqCst)), (1, 1), "not announced again");
+    assert_eq!(
+        db.inner().latest_sequence_number(),
+        sequence,
+        "not rewritten"
+    );
+    assert_eq!(
+        (heads.load(Ordering::SeqCst), gossip.load(Ordering::SeqCst)),
+        (1, 1),
+        "not announced again"
+    );
     assert_eq!(jobs.try_recv().unwrap(), (frame, 1));
 }

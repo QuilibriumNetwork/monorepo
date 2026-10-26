@@ -651,17 +651,20 @@ mod tests {
 
         assert_eq!(power_g, delta(n, 1, &y, &z),);
     }
-    
+
     pub fn generate_little_endian_number(bit_size: usize) -> [u8; 56] {
         use self::rand::Rng;
 
         // Ensure bit_size is a power of two.
-        assert!(bit_size.is_power_of_two(), "bit_size must be a power of two");
-    
+        assert!(
+            bit_size.is_power_of_two(),
+            "bit_size must be a power of two"
+        );
+
         // Initialize the array with zeros.
         let mut bytes = [0u8; 56];
         let mut rng = rand::thread_rng();
-    
+
         // Determine how many full bytes and extra bits are needed.
         let full_bytes = bit_size / 8;
         let rem_bits = bit_size % 8;
@@ -706,7 +709,9 @@ mod tests {
             let mut rng = rand::thread_rng();
 
             // 0. Create witness data
-            let values: Vec<Scalar> = (0..m).map(|_| Scalar::from_bits(generate_little_endian_number(n))).collect();
+            let values: Vec<Scalar> = (0..m)
+                .map(|_| Scalar::from_bits(generate_little_endian_number(n)))
+                .collect();
             let blindings: Vec<Scalar> = (0..m).map(|_| Scalar::random(&mut rng)).collect();
 
             let mut transcript = Transcript::new(b"AggregatedRangeProofTest");

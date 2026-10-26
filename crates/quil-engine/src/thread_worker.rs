@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use quil_types::error::{QuilError, Result};
-use quil_types::thread_probe::{install as install_probe, probed, Section as ProbeSection, ThreadProbe};
+use quil_types::thread_probe::{
+    install as install_probe, probed, Section as ProbeSection, ThreadProbe,
+};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
@@ -34,13 +36,14 @@ pub enum MasterToWorker {
     /// `leader_for_rank` would fail and the loop would die).
     /// Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
     /// state from `worker_allocator.go:421-440`.
-    Respawn { filter: Vec<u8>, start_consensus: bool },
+    Respawn {
+        filter: Vec<u8>,
+        start_consensus: bool,
+    },
     /// Remove application payload outside `keep` from this worker's store,
     /// once its running engine serves only kept scopes and the binding has
     /// settled.
-    EvictPayload {
-        keep: Vec<Vec<u8>>,
-    },
+    EvictPayload { keep: Vec<Vec<u8>> },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
         challenge: [u8; 32],
@@ -95,10 +98,7 @@ pub enum WorkerToMaster {
         timeout_data: Vec<u8>,
     },
     /// Periodic heartbeat from an active shard worker.
-    ShardHeartbeat {
-        core_id: u32,
-        filter: Vec<u8>,
-    },
+    ShardHeartbeat { core_id: u32, filter: Vec<u8> },
     /// An outbound commonware-simplex message for a shard's committee.
     /// The master publishes it on `shard_cw_bitmask(filter)` with the channel
     /// tagged into the payload (`shard_cw_frame_payload(channel, bytes)`).
@@ -125,10 +125,7 @@ pub enum WorkerToMaster {
     /// `filter`. Master removes the registry entry and unsubscribes
     /// from per-shard bitmasks (no peer here will produce or relay
     /// shard messages once we leave it).
-    ShardDeactivated {
-        core_id: u32,
-        filter: Vec<u8>,
-    },
+    ShardDeactivated { core_id: u32, filter: Vec<u8> },
 }
 
 /// State of a single worker thread.
@@ -232,13 +229,11 @@ pub struct WorkerOwnedDeps {
     /// the shard subtree from an archive and the engine fast-forwards its cursor.
     /// `None` in shared-state mode (or when no archive/key is wired), where the
     /// event is simply skipped. Mirrors the `worker_node.rs` (multi-process) path.
-    pub shard_syncer:
-        Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
+    pub shard_syncer: Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
     /// Unified-cutover consolidation hook bound to THIS worker's CRDT/store
     /// (see `AppEngineDeps::unified_cutover_hook`). Built by the node
     /// (`worker_state_builder`); `None` skips consolidation (still flips).
-    pub unified_cutover_hook:
-        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
+    pub unified_cutover_hook: Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
     /// Fetches certified frames of other shards, for the outputs this shard
     /// owns but did not execute (see `AppEngineDeps::delivery_frame_source`).
     pub delivery_frame_source: Option<crate::app_engine::DeliveryFrameSource>,
@@ -272,13 +267,18 @@ fn recovery_withheld(
 ) -> bool {
     let gate = gate.read().unwrap_or_else(|e| e.into_inner()).clone();
     let (frame, seat) = gate.map_or((0, None), |gate| gate(filter));
-    match (&seat, withheld.swap(seat.is_some(), std::sync::atomic::Ordering::Relaxed)) {
+    match (
+        &seat,
+        withheld.swap(seat.is_some(), std::sync::atomic::Ordering::Relaxed),
+    ) {
         (Some(seat), false) => info!(core_id, filter = %hex::encode(filter), frame = seat.frame,
             allocation_epoch = seat.allocation_epoch, current_epoch = seat.current_epoch,
             reason = seat.cause.reason(), scope = "this node's worker", action = seat.cause.action(),
             "archive recovery withheld for a seat this node gives up"),
-        (None, true) => info!(core_id, filter = %hex::encode(filter), frame, scope = "this node's worker",
-            "archive recovery resumes: this node no longer gives up the seat"),
+        (None, true) => {
+            info!(core_id, filter = %hex::encode(filter), frame, scope = "this node's worker",
+            "archive recovery resumes: this node no longer gives up the seat")
+        }
         _ => {}
     }
     seat.is_some()
@@ -334,7 +334,10 @@ impl ShardData {
                 self.forget(core_id);
                 let now = std::time::Instant::now();
                 let mut warned = self.warned.lock().unwrap();
-                if warned.get(&core_id).is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT) {
+                if warned
+                    .get(&core_id)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT)
+                {
                     warned.insert(core_id, now);
                     warn!(core_id, error = %quil_forest::storage_health::redact_paths(&error.to_string()),
                         scope = "this node",
@@ -449,15 +452,29 @@ impl ThreadWorkerManager {
     /// stopped change only the allocation, which [`Self::restart_worker`]
     /// applies. Returns whether the thread ended.
     pub fn stop_worker(&self, core_id: u32, deadline: std::time::Duration) -> bool {
-        let Some(tx) = self.workers.lock().unwrap().get(&core_id).map(|w| w.tx.clone()) else {
+        let Some(tx) = self
+            .workers
+            .lock()
+            .unwrap()
+            .get(&core_id)
+            .map(|w| w.tx.clone())
+        else {
             return true;
         };
-        if tx.try_send(MasterToWorker::Respawn { filter: Vec::new(), start_consensus: true }).is_ok() {
+        if tx
+            .try_send(MasterToWorker::Respawn {
+                filter: Vec::new(),
+                start_consensus: true,
+            })
+            .is_ok()
+        {
             std::thread::sleep(ENGINE_TEARDOWN);
         }
         let handle = {
             let mut workers = self.workers.lock().unwrap();
-            let Some(w) = workers.get_mut(&core_id) else { return true };
+            let Some(w) = workers.get_mut(&core_id) else {
+                return true;
+            };
             w.cancel.cancel();
             *w.execution_handle.lock().unwrap() = None;
             w.handle.take()
@@ -472,9 +489,19 @@ impl ThreadWorkerManager {
     /// still runs is never replaced.
     pub fn restart_worker(&self, core_id: u32) -> Result<()> {
         match self.workers.lock().unwrap().get(&core_id) {
-            None => return Err(QuilError::InvalidArgument(format!("worker {core_id} has no state to restart"))),
-            Some(w) if w.handle.as_ref().is_some_and(|handle| !handle.is_finished()) => {
-                return Err(QuilError::ExecutionUnavailable(format!("worker {core_id}'s thread still runs")));
+            None => {
+                return Err(QuilError::InvalidArgument(format!(
+                    "worker {core_id} has no state to restart"
+                )))
+            }
+            Some(w)
+                if w.handle
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished()) =>
+            {
+                return Err(QuilError::ExecutionUnavailable(format!(
+                    "worker {core_id}'s thread still runs"
+                )));
             }
             Some(_) => {}
         }
@@ -507,10 +534,7 @@ impl ThreadWorkerManager {
 
     /// Returns persisted worker state for the given core, when a
     /// store is wired and an entry exists.
-    pub fn load_persisted(
-        &self,
-        core_id: u32,
-    ) -> Option<quil_types::store::PersistedWorkerInfo> {
+    pub fn load_persisted(&self, core_id: u32) -> Option<quil_types::store::PersistedWorkerInfo> {
         self.worker_store
             .lock()
             .unwrap()
@@ -1225,7 +1249,10 @@ impl WorkerManager for ThreadWorkerManager {
     }
 
     fn set_recovery_gate(&self, gate: crate::worker_allocator::RecoveryGate) {
-        *self.recovery_gate.write().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+        *self
+            .recovery_gate
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(gate);
     }
 
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
@@ -1242,12 +1269,7 @@ impl WorkerManager for ThreadWorkerManager {
             .map_err(|e| QuilError::ExecutionUnavailable(format!("payload eviction: {e}")))
     }
 
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         // Spawn-if-missing happens before mutate because spawn_worker
         // returns Result and we want to surface that error path.
         {
@@ -1308,7 +1330,9 @@ impl WorkerManager for ThreadWorkerManager {
     fn retire_worker(&self, core_id: u32) -> Result<()> {
         if !self.is_draining(core_id) {
             return Err(QuilError::InvalidArgument(format!(
-                "worker {core_id} is within the configured count of {}", self.num_cores)));
+                "worker {core_id} is within the configured count of {}",
+                self.num_cores
+            )));
         }
         let (state, running) = {
             let mut workers = self.workers.lock().unwrap();
@@ -1316,7 +1340,8 @@ impl WorkerManager for ThreadWorkerManager {
                 None => return Ok(()),
                 Some(w) if !w.filter.is_empty() || w.pending_filter_frame != 0 => {
                     return Err(QuilError::InvalidArgument(format!(
-                        "worker {core_id} still holds a seat or a pending join")));
+                        "worker {core_id} still holds a seat or a pending join"
+                    )));
                 }
                 Some(_) => {}
             }
@@ -1337,7 +1362,9 @@ impl WorkerManager for ThreadWorkerManager {
         let configured = self.num_cores;
         let join = move || {
             let started = std::time::Instant::now();
-            let ended = state.handle.is_none_or(|handle| join_within(vec![(core_id, handle)], RETIRE_DEADLINE).is_empty());
+            let ended = state.handle.is_none_or(|handle| {
+                join_within(vec![(core_id, handle)], RETIRE_DEADLINE).is_empty()
+            });
             if ended {
                 info!(core_id, configured, running, waited_ms = started.elapsed().as_millis() as u64,
                     scope = "this node",
@@ -1349,7 +1376,10 @@ impl WorkerManager for ThreadWorkerManager {
                     "draining worker removed from the pool, but its thread has not ended");
             }
         };
-        if let Err(error) = std::thread::Builder::new().name(format!("retire-worker-{core_id}")).spawn(join) {
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("retire-worker-{core_id}"))
+            .spawn(join)
+        {
             warn!(core_id, %error, scope = "this node", "could not start the thread that waits for a retired worker");
         }
         Ok(())
@@ -1365,12 +1395,17 @@ impl WorkerManager for ThreadWorkerManager {
     }
 
     fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
-        self.workers.lock().unwrap().values().filter_map(|w| {
-            let slot = w.execution_handle.lock().unwrap();
-            let h = slot.as_ref()?;
-            // A queued rebind must never attribute the previous engine to the new filter.
-            (h.filter == w.filter).then(|| (w.core_id, w.filter.clone(), h.execution()))
-        }).collect()
+        self.workers
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|w| {
+                let slot = w.execution_handle.lock().unwrap();
+                let h = slot.as_ref()?;
+                // A queued rebind must never attribute the previous engine to the new filter.
+                (h.filter == w.filter).then(|| (w.core_id, w.filter.clone(), h.execution()))
+            })
+            .collect()
     }
 
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
@@ -1451,7 +1486,8 @@ fn snapshot_state(w: &WorkerState) -> WorkerState {
 fn join_within(mut handles: Vec<(u32, JoinHandle<()>)>, deadline: std::time::Duration) -> Vec<u32> {
     let started = std::time::Instant::now();
     loop {
-        let (finished, running): (Vec<_>, Vec<_>) = handles.into_iter().partition(|(_, h)| h.is_finished());
+        let (finished, running): (Vec<_>, Vec<_>) =
+            handles.into_iter().partition(|(_, h)| h.is_finished());
         for (core_id, handle) in finished {
             if handle.join().is_err() {
                 warn!(core_id, "worker thread panicked while stopping");
@@ -1523,38 +1559,81 @@ mod tests {
     /// node gives up is, until the seat is served again.
     #[test]
     fn the_allocators_recovery_gate_reaches_thread_workers() {
-        use quil_types::consensus::{epoch_length_frames, ProverAllocationInfo, ProverInfo, ProverStatus};
+        use quil_types::consensus::{
+            epoch_length_frames, ProverAllocationInfo, ProverInfo, ProverStatus,
+        };
         use std::sync::atomic::{AtomicBool, Ordering};
         let e = epoch_length_frames();
         let filter = vec![3u8; 32];
         let manager = Arc::new(ThreadWorkerManager::new_with_count(1));
         let withheld = AtomicBool::new(false);
-        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "no gate installed");
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            "no gate installed"
+        );
         let lapsed = ProverAllocationInfo {
-            status: ProverStatus::Active, confirmation_filter: filter.clone(), rejection_filter: vec![],
-            join_frame_number: 1, leave_frame_number: 0, pause_frame_number: 0, resume_frame_number: 0,
-            kick_frame_number: 0, join_confirm_frame_number: 2, join_reject_frame_number: 0,
-            leave_confirm_frame_number: 0, leave_reject_frame_number: 0, last_active_frame_number: 100,
-            last_signed_frame_number: 0, epoch: 2, ring: 0, vertex_address: vec![],
+            status: ProverStatus::Active,
+            confirmation_filter: filter.clone(),
+            rejection_filter: vec![],
+            join_frame_number: 1,
+            leave_frame_number: 0,
+            pause_frame_number: 0,
+            resume_frame_number: 0,
+            kick_frame_number: 0,
+            join_confirm_frame_number: 2,
+            join_reject_frame_number: 0,
+            leave_confirm_frame_number: 0,
+            leave_reject_frame_number: 0,
+            last_active_frame_number: 100,
+            last_signed_frame_number: 0,
+            epoch: 2,
+            ring: 0,
+            vertex_address: vec![],
         };
         let prover = ProverInfo {
-            public_key: vec![0xBB; 585], address: vec![0xAA; 32], status: ProverStatus::Active,
-            kick_frame_number: 0, allocations: vec![lapsed], available_storage: 0, seniority: 100,
+            public_key: vec![0xBB; 585],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![lapsed],
+            available_storage: 0,
+            seniority: 100,
             delegate_address: vec![],
         };
         let allocator = Arc::new(crate::worker_allocator::WorkerAllocator::new(
-            manager.clone(), Arc::new(crate::test_support::TestProverRegistry::with_prover(prover)), vec![0xAA; 32]));
+            manager.clone(),
+            Arc::new(crate::test_support::TestProverRegistry::with_prover(prover)),
+            vec![0xAA; 32],
+        ));
         allocator.install_recovery_gate();
-        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "before the first reconcile");
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            "before the first reconcile"
+        );
         allocator.on_new_frame(3 * e + 5).unwrap();
-        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "in its recovery epoch");
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            "in its recovery epoch"
+        );
         allocator.on_new_frame(20 * e + 5).unwrap();
-        assert!(recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "lapsed 18 epochs");
+        assert!(
+            recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            "lapsed 18 epochs"
+        );
         assert!(withheld.load(Ordering::Relaxed));
         // A renewal of the seat starts: it is served again.
-        let renewal = allocator.submission_attempts
-            .begin(std::slice::from_ref(&filter), 20 * e + 5, crate::submission_attempts::OpKind::Confirm).unwrap();
-        assert!(!recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter), "its renewal runs");
+        let renewal = allocator
+            .submission_attempts
+            .begin(
+                std::slice::from_ref(&filter),
+                20 * e + 5,
+                crate::submission_attempts::OpKind::Confirm,
+            )
+            .unwrap();
+        assert!(
+            !recovery_withheld(&manager.recovery_gate, &withheld, 1, &filter),
+            "its renewal runs"
+        );
         assert!(!withheld.load(Ordering::Relaxed), "withholding ended");
         drop(renewal);
     }
@@ -1571,9 +1650,19 @@ mod tests {
         let stuck = std::thread::spawn(move || {
             let _ = wait.recv();
         });
-        let running = join_within(vec![(1, slow), (2, stuck)], std::time::Duration::from_secs(1));
-        assert!(closed.load(std::sync::atomic::Ordering::SeqCst), "a thread finishing within the deadline is joined");
-        assert_eq!(running, vec![2], "a thread still running at the deadline is reported");
+        let running = join_within(
+            vec![(1, slow), (2, stuck)],
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "a thread finishing within the deadline is joined"
+        );
+        assert_eq!(
+            running,
+            vec![2],
+            "a thread still running at the deadline is reported"
+        );
         drop(release);
     }
 
@@ -1583,9 +1672,11 @@ mod tests {
         let _rx = mgr.take_master_rx().unwrap();
         mgr.allocate_worker(1, b"test-filter").unwrap();
         mgr.allocate_worker(2, b"other-filter").unwrap();
-        let running = tokio::task::spawn_blocking(move || mgr.shutdown_workers(std::time::Duration::from_secs(5)))
-            .await
-            .unwrap();
+        let running = tokio::task::spawn_blocking(move || {
+            mgr.shutdown_workers(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
         assert!(running.is_empty(), "workers still running: {running:?}");
         #[cfg(target_os = "linux")]
         {
@@ -1594,17 +1685,31 @@ mod tests {
             // for a moment; by then it carries PF_EXITING. A thread that was
             // never joined is still running without it.
             const PF_EXITING: u64 = 0x4;
-            let names: Vec<String> = std::fs::read_dir("/proc/self/task").unwrap()
+            let names: Vec<String> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
                 .filter_map(|task| {
                     let path = task.ok()?.path();
-                    let name = std::fs::read_to_string(path.join("comm")).ok()?.trim().to_string();
+                    let name = std::fs::read_to_string(path.join("comm"))
+                        .ok()?
+                        .trim()
+                        .to_string();
                     let stat = std::fs::read_to_string(path.join("stat")).ok()?;
-                    let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
+                    let flags: u64 = stat
+                        .rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .nth(6)?
+                        .parse()
+                        .ok()?;
                     (flags & PF_EXITING == 0).then_some(name)
                 })
                 .collect();
-            assert!(!names.iter().any(|name| name == "worker-1" || name == "worker-2"),
-                "a joined worker thread is gone: {names:?}");
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name == "worker-1" || name == "worker-2"),
+                "a joined worker thread is gone: {names:?}"
+            );
         }
     }
 
@@ -1627,32 +1732,63 @@ mod tests {
         mgr.set_worker_filter(1, b"active-filter", true).unwrap();
         assert!(ready(&mut rx).await);
         let stopping = mgr.clone();
-        let stopped = tokio::task::spawn_blocking(move || stopping.stop_worker(1, std::time::Duration::from_secs(5)));
+        let stopped = tokio::task::spawn_blocking(move || {
+            stopping.stop_worker(1, std::time::Duration::from_secs(5))
+        });
         assert!(stopped.await.unwrap(), "the worker thread ends");
         #[cfg(target_os = "linux")]
         {
-            let running = std::fs::read_dir("/proc/self/task").unwrap().filter_map(|task| {
-                let path = task.ok()?.path();
-                let name = std::fs::read_to_string(path.join("comm")).ok()?;
-                let stat = std::fs::read_to_string(path.join("stat")).ok()?;
-                let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
-                (name.trim() == "worker-1" && flags & 0x4 == 0).then_some(())
-            }).count();
+            let running = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|task| {
+                    let path = task.ok()?.path();
+                    let name = std::fs::read_to_string(path.join("comm")).ok()?;
+                    let stat = std::fs::read_to_string(path.join("stat")).ok()?;
+                    let flags: u64 = stat
+                        .rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .nth(6)?
+                        .parse()
+                        .ok()?;
+                    (name.trim() == "worker-1" && flags & 0x4 == 0).then_some(())
+                })
+                .count();
             assert_eq!(running, 0, "no worker-1 thread runs while stopped");
         }
-        assert!(mgr.worker_execution().is_empty(), "a stopped worker reports nothing of its own");
-        while let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {}
+        assert!(
+            mgr.worker_execution().is_empty(),
+            "a stopped worker reports nothing of its own"
+        );
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {}
         mgr.set_worker_filter(1, b"moved-filter", true).unwrap();
         let workers = mgr.range_workers().unwrap();
-        assert_eq!((workers[0].filter.as_slice(), workers[0].allocated), (&b"moved-filter"[..], true));
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await.is_err(),
-            "a stopped worker runs nothing");
+        assert_eq!(
+            (workers[0].filter.as_slice(), workers[0].allocated),
+            (&b"moved-filter"[..], true)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "a stopped worker runs nothing"
+        );
         mgr.restart_worker(1).unwrap();
         assert!(ready(&mut rx).await, "the new thread starts");
-        assert!(ready(&mut rx).await, "and applies the allocation it has now");
-        assert!(mgr.restart_worker(2).is_err(), "only a known worker restarts");
+        assert!(
+            ready(&mut rx).await,
+            "and applies the allocation it has now"
+        );
+        assert!(
+            mgr.restart_worker(2).is_err(),
+            "only a known worker restarts"
+        );
         let mgr_done = mgr.clone();
-        let running = tokio::task::spawn_blocking(move || mgr_done.shutdown_workers(std::time::Duration::from_secs(5)));
+        let running = tokio::task::spawn_blocking(move || {
+            mgr_done.shutdown_workers(std::time::Duration::from_secs(5))
+        });
         assert!(running.await.unwrap().is_empty());
     }
 
@@ -1679,10 +1815,12 @@ mod tests {
                 return Err("the store cannot be opened".into());
             }
             let db = Arc::new(quil_store::RocksDb::open(&dir).map_err(|e| e.to_string())?);
-            db.inner().register_store(quil_forest::StoreRole::Worker(core_id));
+            db.inner()
+                .register_store(quil_forest::StoreRole::Worker(core_id));
             let clock_store: Arc<dyn quil_types::store::ClockStore> =
                 Arc::new(quil_store::RocksClockStore::new(db.inner()));
-            let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> = Arc::new(quil_tries::ShaInclusionProver);
+            let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
+                Arc::new(quil_tries::ShaInclusionProver);
             let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
                 Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
                 inclusion_prover.clone(),
@@ -1693,7 +1831,11 @@ mod tests {
                 crdt.clone(),
                 Arc::new(quil_execution::testing::NoopCircuitCompiler),
                 clock_store.clone(),
-                Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone())),
+                Arc::new(
+                    quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(
+                        crdt.clone(),
+                    ),
+                ),
                 true,
             ));
             Ok(WorkerOwnedDeps {
@@ -1766,8 +1908,11 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let temp = TempDir(std::env::temp_dir()
-            .join(format!("quil-worker-reopen-{}-{}", std::process::id(), rand::random::<u64>())));
+        let temp = TempDir(std::env::temp_dir().join(format!(
+            "quil-worker-reopen-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        )));
         let dir = temp.0.clone();
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mgr = Arc::new(ThreadWorkerManager::new());
@@ -1776,21 +1921,35 @@ mod tests {
         let drain = |rx: &mut mpsc::Receiver<WorkerToMaster>| while rx.try_recv().is_ok() {};
         let stop = |mgr: &Arc<ThreadWorkerManager>| {
             let mgr = mgr.clone();
-            tokio::task::spawn_blocking(move || mgr.stop_worker(1, std::time::Duration::from_secs(10)))
+            tokio::task::spawn_blocking(move || {
+                mgr.stop_worker(1, std::time::Duration::from_secs(10))
+            })
         };
 
         mgr.set_worker_filter(1, b"pinned-filter", false).unwrap();
-        assert!(worker_ready(&mut rx).await, "the worker starts on its own store");
+        assert!(
+            worker_ready(&mut rx).await,
+            "the worker starts on its own store"
+        );
         assert!(store_open_becomes(true).await);
         assert!(stop(&mgr).await.unwrap());
-        assert!(store_open_becomes(false).await, "its store closes with the worker");
+        assert!(
+            store_open_becomes(false).await,
+            "its store closes with the worker"
+        );
         drain(&mut rx);
 
         mgr.restart_worker(1).unwrap();
-        assert!(worker_ready(&mut rx).await && worker_ready(&mut rx).await, "restarted on its allocation");
+        assert!(
+            worker_ready(&mut rx).await && worker_ready(&mut rx).await,
+            "restarted on its allocation"
+        );
         assert!(store_open_becomes(true).await, "the store is reopened");
         assert!(mgr.worker_running(1));
-        assert!(mgr.restart_worker(1).is_err(), "a running worker is never replaced");
+        assert!(
+            mgr.restart_worker(1).is_err(),
+            "a running worker is never replaced"
+        );
         assert!(stop(&mgr).await.unwrap());
         assert!(!mgr.worker_running(1));
         assert!(store_open_becomes(false).await);
@@ -1798,12 +1957,19 @@ mod tests {
 
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         mgr.restart_worker(1).unwrap();
-        assert!(!worker_ready(&mut rx).await, "no worker runs without its own store");
+        assert!(
+            !worker_ready(&mut rx).await,
+            "no worker runs without its own store"
+        );
         assert!(!mgr.worker_running(1), "its thread ended");
-        assert!(!quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(1)));
+        assert!(!quil_forest::storage_health::store_open(
+            quil_forest::StoreRole::Worker(1)
+        ));
         assert!(mgr.worker_execution().is_empty(), "it reports nothing");
         let mgr_done = mgr.clone();
-        let running = tokio::task::spawn_blocking(move || mgr_done.shutdown_workers(std::time::Duration::from_secs(5)));
+        let running = tokio::task::spawn_blocking(move || {
+            mgr_done.shutdown_workers(std::time::Duration::from_secs(5))
+        });
         assert!(running.await.unwrap().is_empty());
         drop(temp);
     }
@@ -1819,8 +1985,14 @@ mod tests {
     #[test]
     fn automatic_worker_count_honors_cpu_quota() {
         let expected = std::thread::available_parallelism()
-            .map(|n| n.get() as u32).unwrap_or(4).saturating_sub(1).max(1);
-        assert_eq!(ThreadWorkerManager::new_with_count(0).num_worker_cores(), expected);
+            .map(|n| n.get() as u32)
+            .unwrap_or(4)
+            .saturating_sub(1)
+            .max(1);
+        assert_eq!(
+            ThreadWorkerManager::new_with_count(0).num_worker_cores(),
+            expected
+        );
         assert_eq!(ThreadWorkerManager::new_with_count(3).num_worker_cores(), 3);
     }
 
@@ -1840,10 +2012,7 @@ mod tests {
         mgr.allocate_worker(1, b"test-filter").unwrap();
 
         // Should receive Ready event
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            rx.recv(),
-        ).await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
 
         match msg {
             Ok(Some(WorkerToMaster::Ready { core_id })) => {
@@ -1873,9 +2042,7 @@ mod tests {
 
     /// In-memory `WorkerStore` for the persist-across-restart path.
     #[derive(Default)]
-    struct MemWorkerStore(
-        std::sync::Mutex<HashMap<u32, quil_types::store::PersistedWorkerInfo>>,
-    );
+    struct MemWorkerStore(std::sync::Mutex<HashMap<u32, quil_types::store::PersistedWorkerInfo>>);
     impl quil_types::store::WorkerStore for MemWorkerStore {
         fn get_worker(
             &self,
@@ -1935,21 +2102,40 @@ mod tests {
         mgr.set_worker_filter(3, b"seat", false).unwrap();
         mgr.set_worker_filter(4, &[], false).unwrap();
         mgr.set_pending_filter_frame(4, 90).unwrap();
-        assert_eq!(mgr.draining_workers(), std::collections::HashSet::from([2, 3, 4]));
+        assert_eq!(
+            mgr.draining_workers(),
+            std::collections::HashSet::from([2, 3, 4])
+        );
         assert!(!mgr.is_draining(1) && mgr.is_draining(5));
 
         assert!(mgr.retire_worker(1).is_err(), "within the configured count");
         assert!(mgr.retire_worker(3).is_err(), "still holds a seat");
         assert!(mgr.retire_worker(4).is_err(), "still holds a join");
         mgr.retire_worker(2).unwrap();
-        let cores: Vec<u32> = { let mut c: Vec<u32> = mgr.range_workers().unwrap().iter().map(|w| w.core_id).collect(); c.sort(); c };
+        let cores: Vec<u32> = {
+            let mut c: Vec<u32> = mgr
+                .range_workers()
+                .unwrap()
+                .iter()
+                .map(|w| w.core_id)
+                .collect();
+            c.sort();
+            c
+        };
         assert_eq!(cores, vec![1, 3, 4]);
-        assert!(store.get_worker(2).unwrap().is_none(), "its record is deleted");
+        assert!(
+            store.get_worker(2).unwrap().is_none(),
+            "its record is deleted"
+        );
         assert!(store.get_worker(3).unwrap().is_some());
         mgr.retire_worker(2).unwrap();
         let mgr = Arc::new(mgr);
         let done = mgr.clone();
-        tokio::task::spawn_blocking(move || done.shutdown_workers(std::time::Duration::from_secs(5))).await.unwrap();
+        tokio::task::spawn_blocking(move || {
+            done.shutdown_workers(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
     }
 
     /// Toggling manual-management mode flushes through to the store while
@@ -1988,7 +2174,10 @@ mod tests {
         let workers = mgr.range_workers().unwrap();
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].filter, b"active-filter");
-        assert!(workers[0].allocated, "a worker running consensus is allocated");
+        assert!(
+            workers[0].allocated,
+            "a worker running consensus is allocated"
+        );
         mgr.set_worker_filter(1, b"joining-filter", false).unwrap();
         assert!(!mgr.range_workers().unwrap()[0].allocated);
     }
@@ -2019,15 +2208,32 @@ mod tests {
     fn shard_data_is_withdrawn_during_an_eviction_and_read_again_after() {
         let db = quil_store::RocksDb::open_in_memory().unwrap();
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
-        let crdt = quil_hypergraph::HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let crdt = quil_hypergraph::HypergraphCrdt::new(
+            store,
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        );
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         let filter = vec![0x21; 32];
-        db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(&filter), 9u64.to_be_bytes()).unwrap();
+        db.inner()
+            .put(
+                quil_store::encoding::consensus_materialized_cursor_key(&filter),
+                9u64.to_be_bytes(),
+            )
+            .unwrap();
         let table = ShardData::default();
         table.publish(3, &crdt);
-        assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter.clone(), 9)])]));
+        assert_eq!(
+            table.snapshot(),
+            HashMap::from([(3, vec![(filter.clone(), 9)])])
+        );
         table.forget(3);
-        assert!(table.snapshot().is_empty(), "withdrawn while the passes run");
+        assert!(
+            table.snapshot().is_empty(),
+            "withdrawn while the passes run"
+        );
         table.publish(3, &crdt);
         assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter, 9)])]));
     }
@@ -2040,14 +2246,22 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(self_test_with(&key, |_| false), 0);
         let test = started.elapsed();
-        eprintln!("falcon self-test: keygen {keygen:?}, {FALCON_SELF_TEST_MESSAGES} sign+verify {test:?}");
-        assert!(test < std::time::Duration::from_millis(100), "self-test took {test:?}");
+        eprintln!(
+            "falcon self-test: keygen {keygen:?}, {FALCON_SELF_TEST_MESSAGES} sign+verify {test:?}"
+        );
+        assert!(
+            test < std::time::Duration::from_millis(100),
+            "self-test took {test:?}"
+        );
     }
 
     #[test]
     fn falcon_self_test_counts_every_corrupt_signature() {
         let key = self_test_key();
         assert_eq!(self_test_with(&key, |_| true), FALCON_SELF_TEST_MESSAGES);
-        assert_eq!(self_test_with(&key, |n| n % 4 == 0), FALCON_SELF_TEST_MESSAGES / 4);
+        assert_eq!(
+            self_test_with(&key, |n| n % 4 == 0),
+            FALCON_SELF_TEST_MESSAGES / 4
+        );
     }
 }

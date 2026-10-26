@@ -14,7 +14,8 @@ pub(crate) static SHARD_FRAME_VERIFY_TASKS: quil_engine::spawn_gate::SpawnGate =
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
-    pub remote_workers: Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
+    pub remote_workers:
+        Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
     /// This node's committee key, as a shard CW addressee tag: a transmission
     /// that names another member is dropped before it reaches a shard engine.
     pub local_cw_tag: [u8; quil_engine::bitmasks::SHARD_CW_ADDRESSEE_LEN],
@@ -22,9 +23,8 @@ pub(crate) struct MessageLoopArgs {
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub msg_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
     pub consensus_loopback_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
-    pub global_msg_tx: tokio::sync::broadcast::Sender<
-        quil_types::proto::global::StreamGlobalMessagesResponse,
-    >,
+    pub global_msg_tx:
+        tokio::sync::broadcast::Sender<quil_types::proto::global::StreamGlobalMessagesResponse>,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub mtls_seed: Option<[u8; 57]>,
     /// The FALCON network-identity signing key (`q-prover-key`) for outbound
@@ -41,18 +41,19 @@ pub(crate) struct MessageLoopArgs {
     /// Commonware-simplex inbound router, set post-spawn at the
     /// activation site when `config.engine.consensus_committee` is non-empty.
     /// Unset (the default) → the simplex path is off and this adds no overhead.
-    pub cw_router:
-        Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
+    pub cw_router: Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
     /// Atomic GLOBAL finalization pipeline (archives with CW GLOBAL consensus).
-    pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
+    pub global_finalization:
+        Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
     /// Reports when readers of the two cells above start and stop falling back.
     pub activation_waits: Arc<super::activation_wait::ActivationWaits>,
-    pub peer_info_cache: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
-    >>,
-    pub shard_engines: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >>,
+    pub peer_info_cache:
+        Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
+    pub shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
     pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
     pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
@@ -96,7 +97,9 @@ pub(crate) struct MessageLoopArgs {
 fn submission_engines<'a, H>(bitmask: &[u8], entries: &'a [(Vec<u8>, H)]) -> Vec<&'a H> {
     entries
         .iter()
-        .filter(|(filter, _)| bitmask == quil_engine::bitmasks::app_prover_bitmask(filter).as_slice())
+        .filter(|(filter, _)| {
+            bitmask == quil_engine::bitmasks::app_prover_bitmask(filter).as_slice()
+        })
         .map(|(_, handle)| handle)
         .collect()
 }
@@ -130,7 +133,9 @@ fn unrouted_shard_message(
     }
     if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data) {
         if let Some(addr) = frame.header.as_ref().map(|h| h.address.clone()) {
-            if !addr.is_empty() && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice() {
+            if !addr.is_empty()
+                && bitmask == quil_engine::bitmasks::shard_frame_bitmask(&addr).as_slice()
+            {
                 super::worker_manager::mirror_shard_frame_to_clock_store(clock_store, &addr, data);
             }
         }
@@ -139,7 +144,10 @@ fn unrouted_shard_message(
 
 /// An app-shard frame an archive fetched to fill a gap, fed back through the
 /// consensus loopback under the frame's own gossip topic, as if gossiped.
-pub(crate) fn gap_fetched_frame_message(filter: &[u8], data: Vec<u8>) -> quil_p2p::node::ReceivedMessage {
+pub(crate) fn gap_fetched_frame_message(
+    filter: &[u8],
+    data: Vec<u8>,
+) -> quil_p2p::node::ReceivedMessage {
     quil_p2p::node::ReceivedMessage {
         bitmask: quil_engine::bitmasks::shard_frame_bitmask(filter),
         data,
@@ -158,7 +166,9 @@ fn shard_sender_key(
     keys.resolve(peer, peer_info_key, || {
         use quil_execution::global_intrinsic::handoff::{self, CommittedView};
         let view = CommittedView::capture(global).ok()?;
-        handoff::head(&view, filter).ok()?.map(|session| session.members)
+        handoff::head(&view, filter)
+            .ok()?
+            .map(|session| session.members)
     })
 }
 
@@ -237,7 +247,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
     );
     let router_for_recv = message_router.clone();
 
-    let reward_issuer: Arc<quil_engine::OptRewardIssuance> = Arc::new(quil_engine::OptRewardIssuance);
+    let reward_issuer: Arc<quil_engine::OptRewardIssuance> =
+        Arc::new(quil_engine::OptRewardIssuance);
     let archive_mode_for_recv: bool = archive_mode_recv;
 
     // Bundle every cache/map we want to size-report in the 30s
@@ -1864,12 +1875,23 @@ mod tests {
         let app = [0x11u8; 32];
         let shard = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
         let other = quil_forest::encode_shard_bit_path(&[0x22u8; 32], &[true]);
-        let entries = vec![(shard(&[false]), 1u8), (shard(&[true, false]), 2), (other.clone(), 3), (shard(&[true, true]), 4)];
+        let entries = vec![
+            (shard(&[false]), 1u8),
+            (shard(&[true, false]), 2),
+            (other.clone(), 3),
+            (shard(&[true, true]), 4),
+        ];
         let topic = quil_engine::bitmasks::app_prover_bitmask(&app);
         assert_eq!(submission_engines(&topic, &entries), vec![&1, &2, &4]);
         let own_frames = quil_engine::bitmasks::shard_frame_bitmask(&shard(&[false]));
-        assert!(submission_engines(&own_frames, &entries).is_empty(), "a per-shard topic is not a submission");
-        assert_eq!(submission_engines(&quil_engine::bitmasks::app_prover_bitmask(&other), &entries), vec![&3]);
+        assert!(
+            submission_engines(&own_frames, &entries).is_empty(),
+            "a per-shard topic is not a submission"
+        );
+        assert_eq!(
+            submission_engines(&quil_engine::bitmasks::app_prover_bitmask(&other), &entries),
+            vec![&3]
+        );
     }
 
     /// A cluster master (no archive ingest) mirrors a frame on its shard's
@@ -1894,19 +1916,41 @@ mod tests {
             ..Default::default()
         };
         let topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
-        unrouted_shard_message(&topic, &prost::Message::encode_to_vec(&frame(7)), &clock, None);
-        assert_eq!(clock.get_shard_clock_frame(&filter, 7, false).unwrap(), frame(7));
-        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        unrouted_shard_message(
+            &topic,
+            &prost::Message::encode_to_vec(&frame(7)),
+            &clock,
+            None,
+        );
+        assert_eq!(
+            clock.get_shard_clock_frame(&filter, 7, false).unwrap(),
+            frame(7)
+        );
+        assert_eq!(
+            clock.get_latest_shard_clock_frame(&filter).unwrap(),
+            frame(7)
+        );
         unrouted_shard_message(&[], &prost::Message::encode_to_vec(&frame(8)), &clock, None);
-        assert!(clock.get_shard_clock_frame(&filter, 8, false).is_err(), "not a shard-frame message");
+        assert!(
+            clock.get_shard_clock_frame(&filter, 8, false).is_err(),
+            "not a shard-frame message"
+        );
 
         let handed = std::cell::RefCell::new(Vec::new());
         let ingest = |data: &[u8]| handed.borrow_mut().push(data.to_vec());
         let forged = prost::Message::encode_to_vec(&frame(u64::MAX / 2));
         unrouted_shard_message(&topic, &forged, &clock, Some(&ingest));
         assert_eq!(*handed.borrow(), vec![forged.clone()]);
-        assert!(clock.get_shard_clock_frame(&filter, u64::MAX / 2, false).is_err(), "not stored before verification");
-        assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap(), frame(7));
+        assert!(
+            clock
+                .get_shard_clock_frame(&filter, u64::MAX / 2, false)
+                .is_err(),
+            "not stored before verification"
+        );
+        assert_eq!(
+            clock.get_latest_shard_clock_frame(&filter).unwrap(),
+            frame(7)
+        );
         assert_eq!(gap_fetched_frame_message(&filter, forged).bitmask, topic);
     }
 }

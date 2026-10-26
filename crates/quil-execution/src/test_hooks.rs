@@ -24,7 +24,10 @@ pub fn registry_load_delay() {
     if DONE.swap(true, Ordering::SeqCst) {
         return;
     }
-    tracing::warn!(delay_ms = ms, "TEST HOOK: delaying the first prover registry load");
+    tracing::warn!(
+        delay_ms = ms,
+        "TEST HOOK: delaying the first prover registry load"
+    );
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 

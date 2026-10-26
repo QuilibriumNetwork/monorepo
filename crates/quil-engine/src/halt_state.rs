@@ -150,14 +150,20 @@ mod tests {
     fn halt_event(filter: Vec<u8>) -> ControlEvent {
         ControlEvent {
             event_type: ControlEventType::CoverageHalt,
-            data: ControlEventData::Coverage { filter, duration: u64::MAX },
+            data: ControlEventData::Coverage {
+                filter,
+                duration: u64::MAX,
+            },
         }
     }
 
     fn resume_event(filter: Vec<u8>) -> ControlEvent {
         ControlEvent {
             event_type: ControlEventType::CoverageResume,
-            data: ControlEventData::Coverage { filter, duration: 0 },
+            data: ControlEventData::Coverage {
+                filter,
+                duration: 0,
+            },
         }
     }
 
@@ -202,12 +208,18 @@ mod tests {
         // re-fire the channel — the boolean didn't transition.
         s.apply(&halt_event(vec![0x02]));
         let polled = tokio::time::timeout(std::time::Duration::from_millis(10), rx.changed()).await;
-        assert!(polled.is_err(), "channel should not fire when boolean is unchanged");
+        assert!(
+            polled.is_err(),
+            "channel should not fire when boolean is unchanged"
+        );
 
         // Resuming one of two leaves any_halted=true — still no fire.
         s.apply(&resume_event(vec![0x01]));
         let polled = tokio::time::timeout(std::time::Duration::from_millis(10), rx.changed()).await;
-        assert!(polled.is_err(), "channel should not fire while another halt is active");
+        assert!(
+            polled.is_err(),
+            "channel should not fire while another halt is active"
+        );
 
         // Resuming the last one transitions back to false.
         s.apply(&resume_event(vec![0x02]));
@@ -220,7 +232,10 @@ mod tests {
         let s = HaltState::new();
         let warn_event = ControlEvent {
             event_type: ControlEventType::CoverageWarn,
-            data: ControlEventData::Coverage { filter: vec![0x01], duration: 120 },
+            data: ControlEventData::Coverage {
+                filter: vec![0x01],
+                duration: 120,
+            },
         };
         assert!(!s.apply(&warn_event));
         assert!(!s.any_halted());

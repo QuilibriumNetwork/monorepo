@@ -6,9 +6,9 @@ pub mod dispatch_service;
 pub mod forest_read_cache;
 pub mod forest_sync_reader;
 pub mod frame_sync;
+pub mod global_service;
 pub mod log_export;
 pub mod mixnet_service;
-pub mod global_service;
 pub mod node_service;
 pub mod onion_exit;
 pub mod onion_service;
@@ -26,22 +26,24 @@ pub use archive_client::{
     build_quil_client_config, ArchiveClient, ArchiveClientError, QuilPqNoiseConnector,
     QuilTlsConnector,
 };
+pub use archive_shard_list::{ArchiveShardListTracker, EndCause, ShardList, ShardListEvent};
+pub use forest_sync_reader::RemoteTreeReader;
 pub use frame_sync::{
     run_archive_poller, ArchiveEndpointPool, ArchivePollerConfig, GossipFreshness,
 };
-pub use archive_shard_list::{ArchiveShardListTracker, EndCause, ShardList, ShardListEvent};
-pub use shard_info_refresh::{
-    fetch_shard_info_from_endpoint, fetch_shard_sizes_from_archive, ArchiveShardInfo,
-    ShardInfoRefreshError,
-};
-pub use forest_sync_reader::RemoteTreeReader;
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler, SubmitRefusal};
+pub use node_service::{
+    NodeRpcServer, SendHandler, TraversalProofGenerator, WorkerControl, WorkerEntry,
+};
 pub use prover_counts::{
     census_global_prover_phase, class_for_type_hash, list_provers, DecodedProver, ProverCensus,
     TypeCount, KNOWN_TYPE_HASHES,
 };
-pub use node_service::{NodeRpcServer, SendHandler, TraversalProofGenerator, WorkerControl, WorkerEntry};
 pub use quil_tls::{
     build_quil_server_tls_config, build_quil_tls_cert, AcceptAnyClientCert, QuilTlsCert,
     QuilTlsError, XsignClientCertVerifier,
+};
+pub use shard_info_refresh::{
+    fetch_shard_info_from_endpoint, fetch_shard_sizes_from_archive, ArchiveShardInfo,
+    ShardInfoRefreshError,
 };

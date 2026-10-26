@@ -18,8 +18,8 @@ use commonware_consensus::simplex::{
 use commonware_consensus::types::{Epoch, View, ViewDelta};
 use commonware_consensus::Monitor;
 use commonware_cryptography::{Sha256, Signer as _};
-use commonware_parallel::Sequential;
 use commonware_p2p::simulated::{Config as NetConfig, Link, Network, Oracle, Receiver, Sender};
+use commonware_parallel::Sequential;
 use commonware_runtime::buffer::paged::CacheRef;
 use commonware_runtime::{deterministic, Quota, Runner, Spawner as _, Supervisor as _};
 use commonware_utils::{ordered::Set, NZUsize, NZU16};
@@ -35,7 +35,10 @@ type Chan = (
 
 const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
 
-async fn register_one(oracle: &mut Oracle<FalconPublicKey, deterministic::Context>, v: FalconPublicKey) -> (Chan, Chan, Chan) {
+async fn register_one(
+    oracle: &mut Oracle<FalconPublicKey, deterministic::Context>,
+    v: FalconPublicKey,
+) -> (Chan, Chan, Chan) {
     let control = oracle.control(v);
     let vote = control.register(0, TEST_QUOTA).await.unwrap();
     let cert = control.register(1, TEST_QUOTA).await.unwrap();
@@ -50,8 +53,9 @@ fn falcon_simplex_finalizes() {
     let namespace = b"global".to_vec();
 
     // Generate Falcon keys up front (keygen uses OS entropy; see falcon_base).
-    let sks: Vec<FalconPrivateKey> =
-        (0..n).map(|_| FalconPrivateKey::random(commonware_utils::test_rng())).collect();
+    let sks: Vec<FalconPrivateKey> = (0..n)
+        .map(|_| FalconPrivateKey::random(commonware_utils::test_rng()))
+        .collect();
     let participants: Vec<FalconPublicKey> = sks.iter().map(|s| s.public_key()).collect();
     let part_set: Set<FalconPublicKey> = participants.clone().try_into().unwrap();
     let schemes: Vec<SimplexFalconScheme> = sks
@@ -87,11 +91,18 @@ fn falcon_simplex_finalizes() {
         }
 
         // Fully connect.
-        let link = Link { latency: Duration::from_millis(10), jitter: Duration::from_millis(1), success_rate: 1.0 };
+        let link = Link {
+            latency: Duration::from_millis(10),
+            jitter: Duration::from_millis(1),
+            success_rate: 1.0,
+        };
         for v1 in participants.iter() {
             for v2 in participants.iter() {
                 if v1 != v2 {
-                    oracle.add_link(v1.clone(), v2.clone(), link.clone()).await.unwrap();
+                    oracle
+                        .add_link(v1.clone(), v2.clone(), link.clone())
+                        .await
+                        .unwrap();
                 }
             }
         }
@@ -121,7 +132,8 @@ fn falcon_simplex_finalizes() {
                 certify_latency: (10.0, 5.0),
                 should_certify: mocks::application::Certifier::Always,
             };
-            let (actor, application) = mocks::application::Application::new(vctx.child("app"), app_cfg);
+            let (actor, application) =
+                mocks::application::Application::new(vctx.child("app"), app_cfg);
             actor.start();
 
             let blocker = oracle.control(v.clone());

@@ -26,7 +26,12 @@ pub(super) enum Build {
 impl Build {
     pub(super) fn of(fingerprint: Option<Option<[u8; 32]>>) -> Self {
         match fingerprint {
-            Some(Some(fingerprint)) => Build::Known([fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3]]),
+            Some(Some(fingerprint)) => Build::Known([
+                fingerprint[0],
+                fingerprint[1],
+                fingerprint[2],
+                fingerprint[3],
+            ]),
             Some(None) => Build::NoFingerprint,
             None => Build::NoPeerInfo,
         }
@@ -62,13 +67,18 @@ pub(super) const BEHIND_FRAMES: u64 = 360;
 /// Member indices grouped by key, the largest known group first and the
 /// unknown ones (`known` false) after it, e.g. `6d91a5e8: 0,1,3; fca80080: 2;
 /// no peer info: 4; this node: 5`.
-fn grouped<K: Ord + Clone>(keys: &[K], known: impl Fn(&K) -> bool, name: impl Fn(&K) -> String) -> String {
+fn grouped<K: Ord + Clone>(
+    keys: &[K],
+    known: impl Fn(&K) -> bool,
+    name: impl Fn(&K) -> String,
+) -> String {
     let mut by_key: BTreeMap<K, Vec<usize>> = BTreeMap::new();
     for (index, key) in keys.iter().enumerate() {
         by_key.entry(key.clone()).or_default().push(index);
     }
     let mut groups: Vec<_> = by_key.into_iter().collect();
-    groups.sort_by_key(|(key, members)| (!known(key), std::cmp::Reverse(members.len()), key.clone()));
+    groups
+        .sort_by_key(|(key, members)| (!known(key), std::cmp::Reverse(members.len()), key.clone()));
     groups
         .iter()
         .map(|(key, members)| {
@@ -83,22 +93,30 @@ fn grouped<K: Ord + Clone>(keys: &[K], known: impl Fn(&K) -> bool, name: impl Fn
 /// members without a fingerprint or PeerInfo, then this node, last, e.g.
 /// `6d91a5e8: 0,1,3; fca80080: 2; no peer info: 4; this node: 5`.
 pub(super) fn groups(builds: &[Build]) -> String {
-    grouped(builds, |build| matches!(build, Build::Known(_)), |build| match build {
-        Build::Known(prefix) => hex::encode(prefix),
-        Build::NoFingerprint => "no fingerprint".to_string(),
-        Build::NoPeerInfo => "no peer info".to_string(),
-        Build::ThisNode => "this node".to_string(),
-    })
+    grouped(
+        builds,
+        |build| matches!(build, Build::Known(_)),
+        |build| match build {
+            Build::Known(prefix) => hex::encode(prefix),
+            Build::NoFingerprint => "no fingerprint".to_string(),
+            Build::NoPeerInfo => "no peer info".to_string(),
+            Build::ThisNode => "this node".to_string(),
+        },
+    )
 }
 
 /// Member indices grouped by release, like [`groups`], e.g.
 /// `2.1.0.25.92: 0,1,3; 2.1.0.25: 2; no peer info: 4; this node: 5`.
 pub(super) fn release_groups(releases: &[Release]) -> String {
-    grouped(releases, |release| matches!(release, Release::Known(_)), |release| match release {
-        Release::Known(release) => release.clone(),
-        Release::NoPeerInfo => "no peer info".to_string(),
-        Release::ThisNode => "this node".to_string(),
-    })
+    grouped(
+        releases,
+        |release| matches!(release, Release::Known(_)),
+        |release| match release {
+            Release::Known(release) => release.clone(),
+            Release::NoPeerInfo => "no peer info".to_string(),
+            Release::ThisNode => "this node".to_string(),
+        },
+    )
 }
 
 /// Members whose reported GLOBAL head trails `global_head` by more than
@@ -169,7 +187,15 @@ mod tests {
     #[test]
     fn members_are_grouped_by_build_largest_first() {
         let (a, b) = ([0x6d, 0x91, 0xa5, 0xe8], [0xfc, 0xa8, 0x00, 0x80]);
-        let builds = [Build::Known(a), Build::Known(b), Build::ThisNode, Build::Known(a), Build::NoPeerInfo, Build::NoFingerprint, Build::Known(a)];
+        let builds = [
+            Build::Known(a),
+            Build::Known(b),
+            Build::ThisNode,
+            Build::Known(a),
+            Build::NoPeerInfo,
+            Build::NoFingerprint,
+            Build::Known(a),
+        ];
         assert_eq!(
             groups(&builds),
             "6d91a5e8: 0,3,6; fca80080: 1; no fingerprint: 5; no peer info: 4; this node: 2"
@@ -193,9 +219,19 @@ mod tests {
             release_groups(&releases),
             "2.1.0.25.92: 0,3; 2.1.0.25: 1; malformed version: 5; no peer info: 4; this node: 2"
         );
-        let heads = [Some(908_800), Some(907_919), None, Some(908_440), Some(0), Some(908_439)];
+        let heads = [
+            Some(908_800),
+            Some(907_919),
+            None,
+            Some(908_440),
+            Some(0),
+            Some(908_439),
+        ];
         assert_eq!(behind_global(&heads, 908_800), ["1@907919", "5@908439"]);
-        assert!(behind_global(&heads, 0).is_empty(), "no local head, nobody is behind");
+        assert!(
+            behind_global(&heads, 0).is_empty(),
+            "no local head, nobody is behind"
+        );
     }
 
     #[test]
@@ -215,12 +251,24 @@ mod tests {
     fn a_committee_is_logged_on_a_new_session_and_every_half_hour() {
         let mut builds = CommitteeBuilds::default();
         let start = Instant::now();
-        assert!(!builds.due(b"f", [1; 32], start), "first sight only records");
+        assert!(
+            !builds.due(b"f", [1; 32], start),
+            "first sight only records"
+        );
         assert!(!builds.due(b"f", [1; 32], start + Duration::from_secs(60)));
-        assert!(builds.due(b"f", [2; 32], start + Duration::from_secs(120)), "new session");
+        assert!(
+            builds.due(b"f", [2; 32], start + Duration::from_secs(120)),
+            "new session"
+        );
         assert!(!builds.due(b"f", [2; 32], start + Duration::from_secs(1800)));
-        assert!(builds.due(b"f", [2; 32], start + Duration::from_secs(1920)), "half an hour later");
+        assert!(
+            builds.due(b"f", [2; 32], start + Duration::from_secs(1920)),
+            "half an hour later"
+        );
         builds.retain(&std::collections::BTreeSet::new());
-        assert!(!builds.due(b"f", [2; 32], start + Duration::from_secs(1980)), "forgotten once unserved");
+        assert!(
+            !builds.due(b"f", [2; 32], start + Duration::from_secs(1980)),
+            "forgotten once unserved"
+        );
     }
 }

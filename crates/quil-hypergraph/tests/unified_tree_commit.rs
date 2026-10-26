@@ -44,8 +44,14 @@ fn propose_split_children_descends_to_the_real_branch() {
         a
     };
     for (b0, tag) in [(0x00u8, 1u8), (0x00, 2), (0x10, 3), (0x10, 4)] {
-        c.add_vertex(&Location { app_address: app, data_address: addr(b0, tag) }, &[0xCC, b0])
-            .unwrap();
+        c.add_vertex(
+            &Location {
+                app_address: app,
+                data_address: addr(b0, tag),
+            },
+            &[0xCC, b0],
+        )
+        .unwrap();
     }
     c.commit(1).unwrap();
 
@@ -66,17 +72,31 @@ fn propose_split_children_descends_to_the_real_branch() {
         );
     }
     // The branch is at bit 3 (bits 0-2 uniform-false, diverge at bit 3).
-    assert_eq!(decode_shard_bit_path(&children[0], 32).unwrap().1, vec![false, false, false, false]);
-    assert_eq!(decode_shard_bit_path(&children[1], 32).unwrap().1, vec![false, false, false, true]);
+    assert_eq!(
+        decode_shard_bit_path(&children[0], 32).unwrap().1,
+        vec![false, false, false, false]
+    );
+    assert_eq!(
+        decode_shard_bit_path(&children[1], 32).unwrap().1,
+        vec![false, false, false, true]
+    );
 
     // A single-leaf app is unsplittable → None (the guard).
     let single = fresh();
     single.set_unified_tree(true);
     single
-        .add_vertex(&Location { app_address: app, data_address: addr(0x00, 9) }, &[0xAB])
+        .add_vertex(
+            &Location {
+                app_address: app,
+                data_address: addr(0x00, 9),
+            },
+            &[0xAB],
+        )
         .unwrap();
     single.commit(1).unwrap();
-    assert!(single.propose_split_children("vertex", "adds", &app, &[], 16).is_none());
+    assert!(single
+        .propose_split_children("vertex", "adds", &app, &[], 16)
+        .is_none());
 }
 
 /// Deep-bifurcation flip: shards persisted as SENTINEL-tagged bit-path prefixes
@@ -98,7 +118,11 @@ fn sentinel_bit_path_prefixes_route_to_deep_bit_paths() {
     );
     let subs = c.app_sub_shards(&app);
     assert_eq!(subs.len(), 2);
-    assert_eq!(subs[0].1, vec![false, false, false, false], "deep bit-path decoded from sentinel prefix");
+    assert_eq!(
+        subs[0].1,
+        vec![false, false, false, false],
+        "deep bit-path decoded from sentinel prefix"
+    );
     assert_eq!(subs[1].1, vec![false, false, false, true]);
 }
 
@@ -114,31 +138,52 @@ fn shard_bit_path_source_swaps_directly_stored_over_canonical() {
 
     let canonical = c.app_sub_shards(&app);
     assert_eq!(canonical.len(), 64);
-    assert!(canonical.iter().all(|(_, b)| b.len() == 6), "64-way canonical = 6-bit paths");
+    assert!(
+        canonical.iter().all(|(_, b)| b.len() == 6),
+        "64-way canonical = 6-bit paths"
+    );
     let canonical_bits: Vec<Vec<bool>> = canonical.iter().map(|(_, b)| b.clone()).collect();
 
     // Directly-stored = the SAME bits → identical (routing swap is a no-op).
     c.set_app_shard_bit_paths(app, canonical_bits.clone());
-    assert_eq!(c.app_sub_shards(&app), canonical, "directly-stored canonical == canonical");
+    assert_eq!(
+        c.app_sub_shards(&app),
+        canonical,
+        "directly-stored canonical == canonical"
+    );
 
     // A DEEP 7-bit path for shard 0 — impossible in the Vec<u32> form (64-way
     // canonical is always 6 bits). The source now serves it.
     let mut deep = canonical_bits.clone();
     deep[0] = vec![false; 7];
     c.set_app_shard_bit_paths(app, deep);
-    assert_eq!(c.app_sub_shards(&app)[0].1, vec![false; 7], "deep bit-path is served");
+    assert_eq!(
+        c.app_sub_shards(&app)[0].1,
+        vec![false; 7],
+        "deep bit-path is served"
+    );
 
     // Clear → back to canonical.
     c.set_app_shard_bit_paths(app, vec![]);
-    assert_eq!(c.app_sub_shards(&app), canonical, "cleared → canonical source");
+    assert_eq!(
+        c.app_sub_shards(&app),
+        canonical,
+        "cleared → canonical source"
+    );
 }
 
 #[test]
 fn unified_split_app_commits_identically_to_single_shard() {
     let app = *b"quil-app-address-0123456789abcd!"; // 32B
-    // Two vertices in DIFFERENT 64-way sub-shards: top-6-bits 0 and 63.
-    let v0 = Location { app_address: app, data_address: [0x00u8; 32] };
-    let v63 = Location { app_address: app, data_address: [0xFCu8; 32] };
+                                                    // Two vertices in DIFFERENT 64-way sub-shards: top-6-bits 0 and 63.
+    let v0 = Location {
+        app_address: app,
+        data_address: [0x00u8; 32],
+    };
+    let v63 = Location {
+        app_address: app,
+        data_address: [0xFCu8; 32],
+    };
     let d0 = b"vertex-zero".to_vec();
     let d63 = b"vertex-sixty-three".to_vec();
 
@@ -199,8 +244,14 @@ fn sub_shard_commitment_reads_in_place_subtrees_under_unified() {
     use quil_types::store::ShardKey;
 
     let app = *b"quil-app-address-0123456789abcd!";
-    let v0 = Location { app_address: app, data_address: [0x00u8; 32] }; // shard [0]
-    let v63 = Location { app_address: app, data_address: [0xFCu8; 32] }; // shard [63]
+    let v0 = Location {
+        app_address: app,
+        data_address: [0x00u8; 32],
+    }; // shard [0]
+    let v63 = Location {
+        app_address: app,
+        data_address: [0xFCu8; 32],
+    }; // shard [63]
 
     let c = fresh();
     c.set_shard_partition(app, 1); // 64-way
@@ -209,7 +260,10 @@ fn sub_shard_commitment_reads_in_place_subtrees_under_unified() {
     c.add_vertex(&v63, b"b").unwrap();
     let _ = c.commit(1).expect("commit");
 
-    let sk = ShardKey { l1: [0u8; 3], l2: app };
+    let sk = ShardKey {
+        l1: [0u8; 3],
+        l2: app,
+    };
 
     // Empty prefix == the app-phase root (compute_shard_root) — shards compose.
     let app_root = c.compute_shard_root("vertex", "adds", &sk);
@@ -264,12 +318,36 @@ fn sentinel_shard_metadata_size_and_count_are_read_correctly() {
         a[31] = tag;
         a
     };
-    c.add_vertex(&Location { app_address: app, data_address: mk(0x00, 1) }, &[0xAB; 10]).unwrap();
-    c.add_vertex(&Location { app_address: app, data_address: mk(0x00, 2) }, &[0xAB; 10]).unwrap();
-    c.add_vertex(&Location { app_address: app, data_address: mk(0x20, 3) }, &[0xCD; 20]).unwrap();
+    c.add_vertex(
+        &Location {
+            app_address: app,
+            data_address: mk(0x00, 1),
+        },
+        &[0xAB; 10],
+    )
+    .unwrap();
+    c.add_vertex(
+        &Location {
+            app_address: app,
+            data_address: mk(0x00, 2),
+        },
+        &[0xAB; 10],
+    )
+    .unwrap();
+    c.add_vertex(
+        &Location {
+            app_address: app,
+            data_address: mk(0x20, 3),
+        },
+        &[0xCD; 20],
+    )
+    .unwrap();
     c.commit(1).unwrap();
 
-    let sk = ShardKey { l1: [0u8; 3], l2: app };
+    let sk = ShardKey {
+        l1: [0u8; 3],
+        l2: app,
+    };
     // Rebuild the metadata full-path exactly as `build_app_shard_full_prefix`:
     // `get_full_path(app) ‖ (sentinel-prefix elems as i32)`.
     let full_path = |bits: &[bool]| -> Vec<i32> {
@@ -288,13 +366,25 @@ fn sentinel_shard_metadata_size_and_count_are_read_correctly() {
         .expect("meta [0,0,1]");
 
     // Deep shard [0,0,0]: 2 vertices, 20 bytes of live data — NOT zero.
-    let a = m000[0].as_ref().expect("deep shard [0,0,0] has metadata (not None)");
+    let a = m000[0]
+        .as_ref()
+        .expect("deep shard [0,0,0] has metadata (not None)");
     assert_eq!(a.leaf_count, 2, "two vertices routed to [0,0,0]");
-    assert_ne!(a.size.to_string(), "0", "deep shard [0,0,0] reports non-zero size");
+    assert_ne!(
+        a.size.to_string(),
+        "0",
+        "deep shard [0,0,0] reports non-zero size"
+    );
     // Deep shard [0,0,1]: 1 vertex, 20 bytes.
-    let b = m001[0].as_ref().expect("deep shard [0,0,1] has metadata (not None)");
+    let b = m001[0]
+        .as_ref()
+        .expect("deep shard [0,0,1] has metadata (not None)");
     assert_eq!(b.leaf_count, 1, "one vertex routed to [0,0,1]");
-    assert_ne!(b.size.to_string(), "0", "deep shard [0,0,1] reports non-zero size");
+    assert_ne!(
+        b.size.to_string(),
+        "0",
+        "deep shard [0,0,1] reports non-zero size"
+    );
 
     println!("sentinel shard metadata size/count read correctly — item #1 is a NON-issue");
 }

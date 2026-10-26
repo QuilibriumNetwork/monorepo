@@ -22,13 +22,13 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use quil_p2p::ed448_identity::Ed448Identity;
-use quil_types::proto::node::{GetHyperedgeDataRequest, GetNodeInfoRequest, GetVertexDataRequest};
 use quil_execution::global_intrinsic::seniority_succession::{
     plan_submissions, retro_parts, GlobalReader, GlobalSnapshot, PredecessorState, Submissions,
     SuccessionCandidate, TargetStanding,
 };
 use quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+use quil_p2p::ed448_identity::Ed448Identity;
+use quil_types::proto::node::{GetHyperedgeDataRequest, GetNodeInfoRequest, GetVertexDataRequest};
 
 use crate::context::GlobalArgs;
 
@@ -121,7 +121,13 @@ fn node_keys(configs: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
     let primary = quil_config::load_config(std::path::Path::new(&configs[0]))
         .map_err(|e| anyhow::anyhow!("invalid config directory: {}: {e}", configs[0]))?;
     let mut dirs: Vec<String> = vec![configs[0].clone()];
-    dirs.extend(primary.engine.multisig_prover_enrollment_paths.iter().cloned());
+    dirs.extend(
+        primary
+            .engine
+            .multisig_prover_enrollment_paths
+            .iter()
+            .cloned(),
+    );
     dirs.extend(configs[1..].iter().cloned());
     let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
     for dir in &dirs {
@@ -170,7 +176,10 @@ fn dry_run_score(peer_ids: &[String]) -> anyhow::Result<()> {
         }
         // These rewards have no decimals, so the integer shortcut matches Go.
         let max = 157208i64;
-        let actual: i64 = f.reward.parse().map_err(|_| anyhow::anyhow!("bad reward {:?}", f.reward))?;
+        let actual: i64 = f
+            .reward
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad reward {:?}", f.reward))?;
         if actual == 0 {
             continue;
         }
@@ -268,18 +277,37 @@ pub(crate) fn render_plan(
     use std::fmt::Write;
     let mut out = String::new();
     let epoch = quil_types::consensus::epoch_for_frame(frame);
-    let _ = writeln!(out, "Seniority merges and successions at GLOBAL frame {frame} (epoch {epoch}):");
+    let _ = writeln!(
+        out,
+        "Seniority merges and successions at GLOBAL frame {frame} (epoch {epoch}):"
+    );
     let Some(seniority) = plan.seniority else {
-        let _ = writeln!(out, "  This prover:  {}, no prover record on GLOBAL; it must join first.", prover_name(prover));
+        let _ = writeln!(
+            out,
+            "  This prover:  {}, no prover record on GLOBAL; it must join first.",
+            prover_name(prover)
+        );
         return out;
     };
-    let _ = writeln!(out, "  This prover:  {}, seniority {seniority}", prover_name(prover));
+    let _ = writeln!(
+        out,
+        "  This prover:  {}, seniority {seniority}",
+        prover_name(prover)
+    );
     if let Some(kick) = plan.kicked {
-        let _ = writeln!(out, "  This prover was kicked at frame {kick}; it takes no merge or succession.");
+        let _ = writeln!(
+            out,
+            "  This prover was kicked at frame {kick}; it takes no merge or succession."
+        );
         return out;
     }
     for (peer, (_, standing)) in peers.iter().zip(&plan.keys) {
-        let _ = writeln!(out, "  Peer key {}: {}", tail(peer), standing_text(standing));
+        let _ = writeln!(
+            out,
+            "  Peer key {}: {}",
+            tail(peer),
+            standing_text(standing)
+        );
     }
     match &plan.merge {
         Some(merge) => {
@@ -292,11 +320,18 @@ pub(crate) fn render_plan(
             );
         }
         None => {
-            let _ = writeln!(out, "  Merge:        none (no unconsumed peer key adds seniority)");
+            let _ = writeln!(
+                out,
+                "  Merge:        none (no unconsumed peer key adds seniority)"
+            );
         }
     }
     for candidate in &plan.successions {
-        render_succession(&mut out, candidate, missing_links.contains(&candidate.predecessor));
+        render_succession(
+            &mut out,
+            candidate,
+            missing_links.contains(&candidate.predecessor),
+        );
     }
     out
 }
@@ -349,7 +384,9 @@ fn render_succession(out: &mut String, candidate: &SuccessionCandidate, missing_
         preview.successor_seniority,
         preview.new_seniority,
         preview.predecessor_seniority(),
-        preview.predecessor_seniority().saturating_sub(amounts.debit),
+        preview
+            .predecessor_seniority()
+            .saturating_sub(amounts.debit),
     );
     if candidate.submits() {
         let _ = writeln!(out, "    Blocking conditions: none; the node submits it with its next seniority merge proposal.");
@@ -376,7 +413,11 @@ fn render_allocations(out: &mut String, predecessor: &PredecessorState, frame: u
         } else {
             format!("shard {}", hex::encode(&allocation.confirmation_filter))
         };
-        let _ = writeln!(out, "      {shard}: {:?}", allocation.effective_status(frame));
+        let _ = writeln!(
+            out,
+            "      {shard}: {:?}",
+            allocation.effective_status(frame)
+        );
     }
 }
 
@@ -417,7 +458,10 @@ const PREFETCH_ROUNDS: usize = 80;
 
 /// Read what the plan needs from the local node over RPC, then render it
 /// at the frame after the node's GLOBAL head, with the node's epoch length.
-async fn simulate_with_node(pc: &super::ProverCtx, keys: &[(String, Vec<u8>)]) -> anyhow::Result<String> {
+async fn simulate_with_node(
+    pc: &super::ProverCtx,
+    keys: &[(String, Vec<u8>)],
+) -> anyhow::Result<String> {
     let mut client = pc.connect().await?;
     let info = client
         .get_node_info(tonic::Request::new(GetNodeInfoRequest::default()))
@@ -469,7 +513,8 @@ async fn simulate_with_node(pc: &super::ProverCtx, keys: &[(String, Vec<u8>)]) -
     anyhow::bail!("GLOBAL reads did not settle after {PREFETCH_ROUNDS} rounds")
 }
 
-type NodeClient = quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>;
+type NodeClient =
+    quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>;
 
 fn global_id(address: &[u8; 32]) -> Vec<u8> {
     let mut id = GLOBAL_INTRINSIC_ADDRESS.to_vec();
@@ -477,7 +522,10 @@ fn global_id(address: &[u8; 32]) -> Vec<u8> {
     id
 }
 
-async fn fetch_vertex(client: &mut NodeClient, address: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+async fn fetch_vertex(
+    client: &mut NodeClient,
+    address: &[u8; 32],
+) -> anyhow::Result<Option<Vec<u8>>> {
     let response = client
         .get_vertex_data(tonic::Request::new(GetVertexDataRequest {
             address: global_id(address),
@@ -508,8 +556,9 @@ async fn fetch_hyperedge(client: &mut NodeClient, address: &[u8; 32]) -> anyhow:
 mod tests {
     use super::*;
     use quil_execution::global_intrinsic::materialize::{
-        allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree, create_spent_merge_tree,
-        extend_prover_allocation_hyperedge_blob, prover_address_from_pubkey, spent_join_merge_address,
+        allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree,
+        create_spent_merge_tree, extend_prover_allocation_hyperedge_blob,
+        prover_address_from_pubkey, spent_join_merge_address,
     };
     use quil_execution::global_schema::write_field;
     use quil_execution::prover_registry::vertex_tree_to_blob;
@@ -534,40 +583,90 @@ mod tests {
     fn snapshot() -> GlobalSnapshot {
         let mut snapshot = GlobalSnapshot::default();
         let mut x = create_prover_vertex_tree(&key(0xA1), 5_000_000).unwrap();
-        write_field(&mut x, "prover:Prover", "LastSeniorityFrameNumber", &(F - 10_000).to_be_bytes()).unwrap();
-        snapshot.vertices.insert(address(0xA1), vertex_tree_to_blob(&x));
+        write_field(
+            &mut x,
+            "prover:Prover",
+            "LastSeniorityFrameNumber",
+            &(F - 10_000).to_be_bytes(),
+        )
+        .unwrap();
+        snapshot
+            .vertices
+            .insert(address(0xA1), vertex_tree_to_blob(&x));
         let y = create_prover_vertex_tree(&key(0xB2), 100_000).unwrap();
-        snapshot.vertices.insert(address(0xB2), vertex_tree_to_blob(&y));
+        snapshot
+            .vertices
+            .insert(address(0xB2), vertex_tree_to_blob(&y));
         let marker = create_spent_merge_tree(&address(0xA1)).unwrap();
-        snapshot.vertices.insert(spent_join_merge_address(&[0x11; 57]).unwrap(), vertex_tree_to_blob(&marker));
-        add_allocation(&mut snapshot, &[0x5A; 32], 1, &[
-            ("JoinFrameNumber", F - 100_000),
-            ("Epoch", 1_240),
-            ("LastSignedFrameNumber", F - 10_000),
-        ]);
+        snapshot.vertices.insert(
+            spent_join_merge_address(&[0x11; 57]).unwrap(),
+            vertex_tree_to_blob(&marker),
+        );
+        add_allocation(
+            &mut snapshot,
+            &[0x5A; 32],
+            1,
+            &[
+                ("JoinFrameNumber", F - 100_000),
+                ("Epoch", 1_240),
+                ("LastSignedFrameNumber", F - 10_000),
+            ],
+        );
         snapshot
     }
 
-    fn add_allocation(snapshot: &mut GlobalSnapshot, filter: &[u8], status: u8, fields: &[(&str, u64)]) {
+    fn add_allocation(
+        snapshot: &mut GlobalSnapshot,
+        filter: &[u8],
+        status: u8,
+        fields: &[(&str, u64)],
+    ) {
         let at = allocation_address(&key(0xA1), filter).unwrap();
         let mut tree = create_allocation_vertex_tree(&address(0xA1), filter, 0).unwrap();
-        write_field(&mut tree, "allocation:ProverAllocation", "Status", &[status]).unwrap();
+        write_field(
+            &mut tree,
+            "allocation:ProverAllocation",
+            "Status",
+            &[status],
+        )
+        .unwrap();
         for (field, value) in fields {
-            write_field(&mut tree, "allocation:ProverAllocation", field, &value.to_be_bytes()).unwrap();
+            write_field(
+                &mut tree,
+                "allocation:ProverAllocation",
+                field,
+                &value.to_be_bytes(),
+            )
+            .unwrap();
         }
         snapshot.vertices.insert(at, vertex_tree_to_blob(&tree));
-        let existing = snapshot.hyperedges.get(&address(0xA1)).cloned().unwrap_or_default();
+        let existing = snapshot
+            .hyperedges
+            .get(&address(0xA1))
+            .cloned()
+            .unwrap_or_default();
         let hyperedge = extend_prover_allocation_hyperedge_blob(&existing, &[(at, &tree)]).unwrap();
         snapshot.hyperedges.insert(address(0xA1), hyperedge);
     }
 
     /// The peer key is worth 5,000,000 in the first retro epoch.
     fn fixture_retro(keys: &[Vec<u8>]) -> [u64; 5] {
-        if keys.iter().any(|key| key[0] == 0x11) { [5_000_000, 0, 0, 0, 0] } else { [0; 5] }
+        if keys.iter().any(|key| key[0] == 0x11) {
+            [5_000_000, 0, 0, 0, 0]
+        } else {
+            [0; 5]
+        }
     }
 
     fn simulate(snapshot: &GlobalSnapshot, missing_links: &[[u8; 32]]) -> String {
-        let plan = plan_submissions(snapshot, F, &address(0xB2), &[vec![0x11; 57]], &fixture_retro).unwrap();
+        let plan = plan_submissions(
+            snapshot,
+            F,
+            &address(0xB2),
+            &[vec![0x11; 57]],
+            &fixture_retro,
+        )
+        .unwrap();
         let rendered = render_plan(F, &address(0xB2), &[PEER.to_string()], &plan, missing_links);
         // The dry run's output for the fixture, for review.
         println!("{rendered}");
@@ -600,7 +699,12 @@ mod tests {
     fn the_dry_run_lists_every_blocking_condition() {
         set_seniority_succession_epoch_for_thread(Some(u64::MAX));
         let mut snapshot = snapshot();
-        add_allocation(&mut snapshot, &[0x6B; 32], 2, &[("PauseFrameNumber", F - 500)]);
+        add_allocation(
+            &mut snapshot,
+            &[0x6B; 32],
+            2,
+            &[("PauseFrameNumber", F - 500)],
+        );
         let (x, y) = (prover_name(&address(0xA1)), prover_name(&address(0xB2)));
         let (data, paused) = (hex::encode([0x5A; 32]), hex::encode([0x6B; 32]));
         let peer = tail(PEER);
@@ -629,7 +733,9 @@ mod tests {
     fn the_dry_run_proposes_a_merge_of_an_unconsumed_key() {
         set_seniority_succession_epoch_for_thread(Some(1_200));
         let mut snapshot = snapshot();
-        snapshot.vertices.remove(&spent_join_merge_address(&[0x11; 57]).unwrap());
+        snapshot
+            .vertices
+            .remove(&spent_join_merge_address(&[0x11; 57]).unwrap());
         let rendered = simulate(&snapshot, &[]);
         assert!(rendered.contains(&format!("Peer key {}: unconsumed\n", tail(PEER))));
         assert!(rendered.ends_with(

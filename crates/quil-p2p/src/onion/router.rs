@@ -64,12 +64,16 @@ impl Circuit {
 
     /// Record bytes sent through this circuit.
     pub fn record_sent(&self, bytes: u64) {
-        self.stats.total_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .total_bytes_sent
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record bytes received through this circuit.
     pub fn record_received(&self, bytes: u64) {
-        self.stats.total_bytes_received.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .total_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Get a snapshot of the current statistics.
@@ -243,7 +247,11 @@ impl OnionRouter {
     }
 
     /// Decrypt one layer of a received cell (used by relays).
-    pub fn decrypt_layer(shared_secret: &[u8], direction: u8, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    pub fn decrypt_layer(
+        shared_secret: &[u8],
+        direction: u8,
+        ciphertext: &[u8],
+    ) -> Option<Vec<u8>> {
         decrypt_layer(shared_secret, direction, ciphertext)
     }
 
@@ -456,10 +464,7 @@ mod tests {
         let secret1 = b"hop1-secret-32-bytes-long!!!!!!";
         let secret2 = b"hop2-secret-32-bytes-long!!!!!!";
 
-        let hops = vec![
-            make_hop(b"peer1", secret1),
-            make_hop(b"peer2", secret2),
-        ];
+        let hops = vec![make_hop(b"peer1", secret1), make_hop(b"peer2", secret2)];
 
         let cid = router.create_circuit(hops).await;
         let plaintext = b"response data from exit node";

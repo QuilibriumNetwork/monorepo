@@ -27,10 +27,22 @@ pub const TOKEN_PROTOCOL_V1: u32 = 0x00040001;
 
 pub fn token_engine_capabilities() -> Vec<Capability> {
     vec![
-        Capability { protocol_identifier: TOKEN_PROTOCOL_V1, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: DOUBLE_RATCHET_PROTOCOL, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: TRIPLE_RATCHET_PROTOCOL, additional_metadata: Vec::new() },
-        Capability { protocol_identifier: ONION_ROUTING_PROTOCOL, additional_metadata: Vec::new() },
+        Capability {
+            protocol_identifier: TOKEN_PROTOCOL_V1,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: DOUBLE_RATCHET_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: TRIPLE_RATCHET_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
+        Capability {
+            protocol_identifier: ONION_ROUTING_PROTOCOL,
+            additional_metadata: Vec::new(),
+        },
     ]
 }
 
@@ -40,8 +52,9 @@ pub fn token_engine_capabilities() -> Vec<Capability> {
 
 // Re-export from the canonical token_intrinsic modules.
 pub use crate::token_intrinsic::{
-    TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE, TYPE_TRANSACTION,
-    TYPE_PENDING_TRANSACTION, TYPE_MINT_TRANSACTION, TYPE_LATTICE_TRANSACTION, TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SHIELD, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_SETTLEMENT,
+    TYPE_LATTICE_MINT, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM,
+    TYPE_LATTICE_SETTLEMENT, TYPE_LATTICE_SHIELD, TYPE_LATTICE_TRANSACTION, TYPE_MINT_TRANSACTION,
+    TYPE_PENDING_TRANSACTION, TYPE_TOKEN_DEPLOY, TYPE_TOKEN_UPDATE, TYPE_TRANSACTION,
 };
 
 /// Structural classification only; this does not validate payloads or proofs.
@@ -106,9 +119,11 @@ impl MessageKindToken {
 /// rejected here, but remain recognized by `is_token_type_prefix` so execution
 /// routes them to explicit rejection rather than silently skipping them.
 pub fn peek_token_message_kind(input: &[u8]) -> Result<MessageKindToken> {
-    let prefix: [u8; 4] = input.get(..4).ok_or_else(||
-        QuilError::InvalidArgument("token dispatch: input too short".into()))?
-        .try_into().expect("checked prefix length");
+    let prefix: [u8; 4] = input
+        .get(..4)
+        .ok_or_else(|| QuilError::InvalidArgument("token dispatch: input too short".into()))?
+        .try_into()
+        .expect("checked prefix length");
     match u32::from_be_bytes(prefix) {
         TYPE_TOKEN_DEPLOY => Ok(MessageKindToken::TokenDeploy),
         TYPE_TOKEN_UPDATE => Ok(MessageKindToken::TokenUpdate),
@@ -119,10 +134,13 @@ pub fn peek_token_message_kind(input: &[u8]) -> Result<MessageKindToken> {
         TYPE_LATTICE_SHIELD => Ok(MessageKindToken::Shield),
         TYPE_LATTICE_MINT_CLAIM => Ok(MessageKindToken::MintClaim),
         TYPE_LATTICE_SETTLEMENT => Ok(MessageKindToken::Settlement),
-        TYPE_TRANSACTION | TYPE_PENDING_TRANSACTION | TYPE_MINT_TRANSACTION =>
-            Err(QuilError::InvalidArgument("token dispatch: retired token type".into())),
+        TYPE_TRANSACTION | TYPE_PENDING_TRANSACTION | TYPE_MINT_TRANSACTION => Err(
+            QuilError::InvalidArgument("token dispatch: retired token type".into()),
+        ),
         other => Err(QuilError::InvalidArgument(format!(
-            "token dispatch: unknown type prefix 0x{:08x}", other))),
+            "token dispatch: unknown type prefix 0x{:08x}",
+            other
+        ))),
     }
 }
 
@@ -139,9 +157,7 @@ pub fn request_is_token_op(request: &MessageRequest) -> bool {
     )
 }
 
-pub fn token_kind_for_request(
-    request: &MessageRequest,
-) -> Option<MessageKindToken> {
+pub fn token_kind_for_request(request: &MessageRequest) -> Option<MessageKindToken> {
     match request.request.as_ref()? {
         MessageRequestInner::TokenDeploy(_) => Some(MessageKindToken::TokenDeploy),
         MessageRequestInner::TokenUpdate(_) => Some(MessageKindToken::TokenUpdate),
@@ -162,10 +178,7 @@ pub fn token_kind_for_request(
 /// Cost for a token `MessageRequest`. Deploy/update cost is the
 /// serialized config size. QCT3 payload pricing is handled by the
 /// execution manager; this helper does not price confidential operations.
-pub fn get_cost_from_request(
-    request: &MessageRequest,
-    _tx_cost_hint: i64,
-) -> Result<BigInt> {
+pub fn get_cost_from_request(request: &MessageRequest, _tx_cost_hint: i64) -> Result<BigInt> {
     let Some(req) = &request.request else {
         return Ok(BigInt::from(0));
     };
@@ -216,7 +229,6 @@ pub fn is_token_type_prefix(tp: u32) -> bool {
     )
 }
 
-
 // =====================================================================
 // Tests
 // =====================================================================
@@ -244,9 +256,11 @@ mod tests {
     fn make_transaction() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
-            request: Some(MessageRequestInner::TokenOperation(token_pb::TokenOperation {
-                ..Default::default()
-            })),
+            request: Some(MessageRequestInner::TokenOperation(
+                token_pb::TokenOperation {
+                    ..Default::default()
+                },
+            )),
         }
     }
 
@@ -261,10 +275,7 @@ mod tests {
             token_engine_capabilities()[0].protocol_identifier,
             TOKEN_PROTOCOL_V1
         );
-        assert_eq!(
-            TOKEN_PROTOCOL_V1,
-            crate::capabilities::TOKEN_PROTOCOL_V1
-        );
+        assert_eq!(TOKEN_PROTOCOL_V1, crate::capabilities::TOKEN_PROTOCOL_V1);
     }
 
     #[test]
@@ -287,7 +298,11 @@ mod tests {
 
     #[test]
     fn retired_prefixes_remain_routed_to_rejection() {
-        for prefix in [TYPE_TRANSACTION, TYPE_PENDING_TRANSACTION, TYPE_MINT_TRANSACTION] {
+        for prefix in [
+            TYPE_TRANSACTION,
+            TYPE_PENDING_TRANSACTION,
+            TYPE_MINT_TRANSACTION,
+        ] {
             assert!(is_token_type_prefix(prefix));
             assert!(peek_token_message_kind(&prefix.to_be_bytes()).is_err());
         }
@@ -298,10 +313,13 @@ mod tests {
     #[test]
     fn confidential_carrier_classifies_only_current_confidential_operations() {
         for kind in MessageKindToken::all() {
-            let request = MessageRequest { timestamp: 0,
-                request: Some(MessageRequestInner::TokenOperation(token_pb::TokenOperation {
-                    canonical_bytes: kind.type_prefix().to_be_bytes().to_vec(),
-                })),
+            let request = MessageRequest {
+                timestamp: 0,
+                request: Some(MessageRequestInner::TokenOperation(
+                    token_pb::TokenOperation {
+                        canonical_bytes: kind.type_prefix().to_be_bytes().to_vec(),
+                    },
+                )),
             };
             let expected = match kind {
                 MessageKindToken::TokenDeploy | MessageKindToken::TokenUpdate => None,
@@ -323,16 +341,16 @@ mod tests {
 
     #[test]
     fn is_token_op_false_for_none_request() {
-        let req = MessageRequest { timestamp: 0, request: None };
+        let req = MessageRequest {
+            timestamp: 0,
+            request: None,
+        };
         assert!(!request_is_token_op(&req));
     }
 
     #[test]
     fn empty_confidential_carrier_has_no_kind() {
-        assert_eq!(
-            token_kind_for_request(&make_transaction()),
-            None
-        );
+        assert_eq!(token_kind_for_request(&make_transaction()), None);
     }
 
     #[test]
@@ -356,11 +374,12 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn cost_for_non_token_is_zero() {
-        let req = MessageRequest { timestamp: 0, request: None };
+        let req = MessageRequest {
+            timestamp: 0,
+            request: None,
+        };
         assert_eq!(get_cost_from_request(&req, 0).unwrap(), BigInt::from(0));
     }
 }

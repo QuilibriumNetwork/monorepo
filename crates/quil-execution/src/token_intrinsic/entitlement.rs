@@ -68,7 +68,9 @@ pub fn verify(leaf: &[u8; 32], proof: &[u8], root: &[u8]) -> Result<()> {
         };
     }
     if current.as_slice() != root {
-        return Err(invalid("entitlement is not in the token's entitlement root"));
+        return Err(invalid(
+            "entitlement is not in the token's entitlement root",
+        ));
     }
     Ok(())
 }
@@ -102,7 +104,11 @@ pub fn build(leaves: &[[u8; 32]]) -> Result<([u8; 32], Vec<Vec<u8>>)> {
         }
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         for pair in level.chunks(2) {
-            next.push(if pair.len() == 2 { node(&pair[0], &pair[1]) } else { pair[0] });
+            next.push(if pair.len() == 2 {
+                node(&pair[0], &pair[1])
+            } else {
+                pair[0]
+            });
         }
         for (leaf, position) in proofs.iter_mut().zip(positions.iter_mut()) {
             let sibling = *position ^ 1;
@@ -122,7 +128,9 @@ mod tests {
     use super::*;
 
     fn leaves(count: u8) -> Vec<[u8; 32]> {
-        (0..count).map(|i| leaf(&[1; 32], 3, &[i; 897], 10 + i as u128)).collect()
+        (0..count)
+            .map(|i| leaf(&[1; 32], 3, &[i; 897], 10 + i as u128))
+            .collect()
     }
 
     #[test]
@@ -161,6 +169,9 @@ mod tests {
         assert!(verify(&base, &vec![0; LEVEL_BYTES * (MAX_DEPTH + 1)], &[0; 32]).is_err());
         assert!(verify(&base, &[2; LEVEL_BYTES], &[0; 32]).is_err());
         assert!(verify(&base, &[], &base).is_ok());
-        assert_ne!(consumed_marker(&[1; 32], &base).unwrap(), consumed_marker(&[2; 32], &base).unwrap());
+        assert_ne!(
+            consumed_marker(&[1; 32], &base).unwrap(),
+            consumed_marker(&[2; 32], &base).unwrap()
+        );
     }
 }

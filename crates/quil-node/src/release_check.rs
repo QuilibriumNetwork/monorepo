@@ -105,12 +105,11 @@ pub fn verify_release_signatures_with(
         path: dgst_path.clone(),
         source: e,
     })?;
-    let dgst_str = std::str::from_utf8(&dgst_contents).map_err(|e| {
-        ReleaseCheckError::DgstNotUtf8 {
+    let dgst_str =
+        std::str::from_utf8(&dgst_contents).map_err(|e| ReleaseCheckError::DgstNotUtf8 {
             path: dgst_path.clone(),
             source: e,
-        }
-    })?;
+        })?;
 
     // Format produced by Go releases: `SHA3-256(<file>)= <hex>\n`.
     // Match Go's parser: split on ' ', second token is the hex digest,
@@ -151,11 +150,12 @@ pub fn verify_release_signatures_with(
             idx: one_idx,
             detail: format!("hex decode: {}", e),
         })?;
-        let pubkey =
-            PublicKey::try_from(pk_bytes.as_slice()).map_err(|e| ReleaseCheckError::SignatoryDecode {
+        let pubkey = PublicKey::try_from(pk_bytes.as_slice()).map_err(|e| {
+            ReleaseCheckError::SignatoryDecode {
                 idx: one_idx,
                 detail: format!("ed448 key parse: {:?}", e),
-            })?;
+            }
+        })?;
         // Go does `ed448.Verify(pubkey, digest, sig, "")` — the message
         // is the *full digest file contents* (incl. label + trailing
         // newline), context is empty.
@@ -291,8 +291,7 @@ mod tests {
         let bad_sig = attacker_sk.sign(&dgst_bytes, None).unwrap();
         std::fs::write(append_suffix(&exe, ".dgst.sig.1"), &bad_sig).unwrap();
 
-        let err =
-            verify_release_signatures_with(&exe, &[real_pk_hex.as_str()]).unwrap_err();
+        let err = verify_release_signatures_with(&exe, &[real_pk_hex.as_str()]).unwrap_err();
         match err {
             ReleaseCheckError::BadSignature { idx, .. } => assert_eq!(idx, 1),
             other => panic!("expected BadSignature, got {:?}", other),
@@ -346,28 +345,47 @@ mod tests {
     /// `REL_PREFIX` below.
     #[test]
     fn production_signatories_offline() {
-        const DGST: &[u8] = include_bytes!(
-            "../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst"
-        );
+        const DGST: &[u8] =
+            include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst");
         // (one-based signatory index, signature bytes) pairs for
         // every `.dgst.sig.N` present in the release. Quorum on N=17
         // is 7; the published set has exactly 7 here.
         let sigs: &[(usize, &[u8])] = &[
-            (1,  include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1")),
-            (2,  include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2")),
-            (10, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10")),
-            (13, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13")),
-            (14, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14")),
-            (16, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16")),
-            (17, include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17")),
+            (
+                1,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.1"),
+            ),
+            (
+                2,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.2"),
+            ),
+            (
+                10,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.10"),
+            ),
+            (
+                13,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.13"),
+            ),
+            (
+                14,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.14"),
+            ),
+            (
+                16,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.16"),
+            ),
+            (
+                17,
+                include_bytes!("../tests/fixtures/release/node-2.1.0.22-linux-amd64.dgst.sig.17"),
+            ),
         ];
 
         let mut valid = 0;
         for (one_idx, sig) in sigs {
             let pk_hex = SIGNATORIES[one_idx - 1];
             let pk_bytes = hex::decode(pk_hex).expect("signatory hex");
-            let pubkey =
-                PublicKey::try_from(pk_bytes.as_slice()).expect("ed448 key parse");
+            let pubkey = PublicKey::try_from(pk_bytes.as_slice()).expect("ed448 key parse");
             assert!(
                 pubkey.verify(DGST, sig, None).is_ok(),
                 "signatory #{} ({}…) failed to verify against committed .dgst fixture",
@@ -460,11 +478,7 @@ mod tests {
             .output()
         {
             Ok(out) if out.status.success() => Ok(out.stdout),
-            Ok(out) => Err(format!(
-                "curl {}: exit {}",
-                url,
-                out.status
-            )),
+            Ok(out) => Err(format!("curl {}: exit {}", url, out.status)),
             Err(e) => Err(format!("spawn curl: {}", e)),
         }
     }

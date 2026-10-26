@@ -27,10 +27,18 @@ fn main() {
         args[0].as_str(),
         "prove" | "verify" | "verify-binding"
     ));
-    assert!(args.len() == 4 || args[0] != "prove", "explicit domains are for saved-fixture verification");
+    assert!(
+        args.len() == 4 || args[0] != "prove",
+        "explicit domains are for saved-fixture verification"
+    );
     let parse_domain = |value: &str| -> [u8; 32] {
-        assert!(value.len() == 64 && value.is_ascii(), "expected 32-byte hex domain");
-        std::array::from_fn(|i| u8::from_str_radix(&value[2*i..2*i+2], 16).expect("hex domain"))
+        assert!(
+            value.len() == 64 && value.is_ascii(),
+            "expected 32-byte hex domain"
+        );
+        std::array::from_fn(|i| {
+            u8::from_str_radix(&value[2 * i..2 * i + 2], 16).expect("hex domain")
+        })
     };
     // Expected domains are supplied by the benchmark caller, never inferred
     // from the unverified transaction. Existing example fixtures keep defaults.
@@ -115,7 +123,10 @@ fn main() {
                 let accepted = native::verify_owned(public, &changed.proof, budget)
                     .expect("native rejection check must complete without a backend error");
                 assert!(!accepted, "proof accepted changed {field}");
-                println!("transfer_binding depth={depth} field={field} rejected=true seconds={:.3}", check_start.elapsed().as_secs_f64());
+                println!(
+                    "transfer_binding depth={depth} field={field} rejected=true seconds={:.3}",
+                    check_start.elapsed().as_secs_f64()
+                );
             }
         }
         return;

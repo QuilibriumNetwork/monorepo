@@ -96,12 +96,16 @@ fn error(status: StatusCode, message: &str) -> Response {
 /// 503 with `Retry-After`, for work the explorer limits instead of queueing.
 pub(crate) fn busy(message: &str, retry_after_secs: u64) -> Response {
     let mut resp = error(StatusCode::SERVICE_UNAVAILABLE, message);
-    resp.headers_mut().insert("Retry-After", HeaderValue::from(retry_after_secs));
+    resp.headers_mut()
+        .insert("Retry-After", HeaderValue::from(retry_after_secs));
     resp
 }
 
 fn token_scan_busy() -> Response {
-    busy("a full token scan is already running; retry shortly", TOKEN_SCAN_RETRY_SECS)
+    busy(
+        "a full token scan is already running; retry shortly",
+        TOKEN_SCAN_RETRY_SECS,
+    )
 }
 
 fn method_not_allowed() -> Response {
@@ -190,7 +194,10 @@ fn frame_body(
             .iter()
             .map(|o| serde_json::json!({ "status": o.status.name(), "error": o.error }))
             .collect();
-        object.insert("requestOutcomes".to_string(), serde_json::Value::Array(outcomes));
+        object.insert(
+            "requestOutcomes".to_string(),
+            serde_json::Value::Array(outcomes),
+        );
     }
     serde_json::to_vec(&body).map_err(|e| QuilError::Serialization(e.to_string()))
 }
@@ -242,7 +249,12 @@ fn render_messages(records: &[crate::RecentMessage]) -> axum::body::Bytes {
     let size: usize = records
         .iter()
         .map(|r| {
-            2 * (r.from.len() + r.bitmask.len() + r.seqno.len() + r.signature.len() + r.key.len() + r.data.len())
+            2 * (r.from.len()
+                + r.bitmask.len()
+                + r.seqno.len()
+                + r.signature.len()
+                + r.key.len()
+                + r.data.len())
                 + 140
         })
         .sum();
@@ -294,7 +306,11 @@ pub async fn handle_messages(
             }
         }
     }
-    build_response(StatusCode::OK, messages_body(&state.messages, limit, Instant::now()), None)
+    build_response(
+        StatusCode::OK,
+        messages_body(&state.messages, limit, Instant::now()),
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -411,8 +427,12 @@ pub async fn handle_peers(method: Method, State(state): State<ExplorerState>) ->
     if !is_get(&method) {
         return method_not_allowed();
     }
-    let peers: Vec<quil_p2p::CanonicalPeerInfo> =
-        state.peer_info_cache.read().values().map(peer_fields).collect();
+    let peers: Vec<quil_p2p::CanonicalPeerInfo> = state
+        .peer_info_cache
+        .read()
+        .values()
+        .map(peer_fields)
+        .collect();
     let mut response: Vec<PeerInfoJson> = peers.iter().map(peer_json).collect();
     // Sort by last_seen desc, tie-break peer_id asc (Go's slices.SortFunc).
     response.sort_by(|a, b| {
@@ -476,7 +496,8 @@ fn peer_releases<'a>(
     now_ms: i64,
     global_head: u64,
 ) -> PeerReleasesJson {
-    let mut groups: BTreeMap<String, (ReleaseGroupJson, BTreeMap<Option<String>, usize>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (ReleaseGroupJson, BTreeMap<Option<String>, usize>)> =
+        BTreeMap::new();
     let (mut peers, mut stale_peers) = (0, 0);
     for info in infos {
         if now_ms.saturating_sub(info.timestamp) > RELEASE_CENSUS_MAX_AGE_MS {
@@ -485,36 +506,68 @@ fn peer_releases<'a>(
         }
         peers += 1;
         let release = info.release();
-        let (group, builds) = groups.entry(release.clone()).or_insert_with(|| (ReleaseGroupJson {
-            release,
-            subpatch: info.release_subpatch(),
-            peers: 0,
-            archives: 0,
-            behind_global: 0,
-            global_head_min: 0,
-            global_head_max: 0,
-            builds: Vec::new(),
-        }, BTreeMap::new()));
+        let (group, builds) = groups.entry(release.clone()).or_insert_with(|| {
+            (
+                ReleaseGroupJson {
+                    release,
+                    subpatch: info.release_subpatch(),
+                    peers: 0,
+                    archives: 0,
+                    behind_global: 0,
+                    global_head_min: 0,
+                    global_head_max: 0,
+                    builds: Vec::new(),
+                },
+                BTreeMap::new(),
+            )
+        });
         group.peers += 1;
         group.archives += usize::from(info.is_archive());
         let head = info.last_global_head_frame;
         if head > 0 {
-            group.global_head_min = if group.global_head_min == 0 { head } else { group.global_head_min.min(head) };
+            group.global_head_min = if group.global_head_min == 0 {
+                head
+            } else {
+                group.global_head_min.min(head)
+            };
             group.global_head_max = group.global_head_max.max(head);
-            group.behind_global += usize::from(head.saturating_add(RELEASE_CENSUS_BEHIND_FRAMES) < global_head);
+            group.behind_global +=
+                usize::from(head.saturating_add(RELEASE_CENSUS_BEHIND_FRAMES) < global_head);
         }
-        *builds.entry(info.build_fingerprint().map(hex::encode)).or_default() += 1;
+        *builds
+            .entry(info.build_fingerprint().map(hex::encode))
+            .or_default() += 1;
     }
     let mut releases: Vec<ReleaseGroupJson> = groups
         .into_values()
         .map(|(mut group, builds)| {
-            group.builds = builds.into_iter().map(|(build_fingerprint, peers)| BuildCountJson { build_fingerprint, peers }).collect();
-            group.builds.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| a.build_fingerprint.cmp(&b.build_fingerprint)));
+            group.builds = builds
+                .into_iter()
+                .map(|(build_fingerprint, peers)| BuildCountJson {
+                    build_fingerprint,
+                    peers,
+                })
+                .collect();
+            group.builds.sort_by(|a, b| {
+                b.peers
+                    .cmp(&a.peers)
+                    .then_with(|| a.build_fingerprint.cmp(&b.build_fingerprint))
+            });
             group
         })
         .collect();
-    releases.sort_by(|a, b| b.peers.cmp(&a.peers).then_with(|| b.release.cmp(&a.release)));
-    PeerReleasesJson { global_head, behind_frames: RELEASE_CENSUS_BEHIND_FRAMES, peers, stale_peers, releases }
+    releases.sort_by(|a, b| {
+        b.peers
+            .cmp(&a.peers)
+            .then_with(|| b.release.cmp(&a.release))
+    });
+    PeerReleasesJson {
+        global_head,
+        behind_frames: RELEASE_CENSUS_BEHIND_FRAMES,
+        peers,
+        stale_peers,
+        releases,
+    }
 }
 
 pub async fn handle_peer_releases(method: Method, State(state): State<ExplorerState>) -> Response {
@@ -803,7 +856,10 @@ pub async fn handle_prover_shards(method: Method, State(state): State<ExplorerSt
     }
 
     let frame_number = state.current_frame.load(Ordering::Relaxed);
-    let summaries = match state.prover_registry.get_prover_shard_summaries(frame_number) {
+    let summaries = match state
+        .prover_registry
+        .get_prover_shard_summaries(frame_number)
+    {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
@@ -1091,7 +1147,10 @@ pub async fn handle_key_prover(
 /// succeeded (unknown, never an empty registry).
 fn all_provers(state: &ExplorerState, frame: u64) -> Option<(u64, Arc<Vec<ProverInfo>>)> {
     snapshot_for(&state.provers_snapshot, frame, Instant::now(), || {
-        let summaries = state.prover_registry.get_prover_shard_summaries(frame).ok()?;
+        let summaries = state
+            .prover_registry
+            .get_prover_shard_summaries(frame)
+            .ok()?;
         let mut filters: Vec<Vec<u8>> = vec![Vec::new()];
         filters.extend(summaries.into_iter().map(|s| s.filter));
         state.prover_registry.get_provers_on_filters(&filters).ok()
@@ -1119,7 +1178,9 @@ fn snapshot_for<T>(
         }
     }
     let Some(value) = build() else {
-        return slot.as_ref().map(|(built_frame, _, v)| (*built_frame, Arc::clone(v)));
+        return slot
+            .as_ref()
+            .map(|(built_frame, _, v)| (*built_frame, Arc::clone(v)));
     };
     let value = Arc::new(value);
     *slot = Some((frame, now, Arc::clone(&value)));
@@ -1129,7 +1190,10 @@ fn snapshot_for<T>(
 /// The answer of an endpoint that needs the prover snapshot before its
 /// first successful build.
 fn provers_unavailable() -> Response {
-    error(StatusCode::SERVICE_UNAVAILABLE, "prover registry not read yet")
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "prover registry not read yet",
+    )
 }
 
 /// Per-allocation inactivity assessment, mirroring
@@ -1325,7 +1389,9 @@ fn select_eviction_risk<'a>(
         .iter()
         // Only a ratio below `min_ratio` is left out: a NaN `min_ratio`
         // keeps every entry.
-        .filter(|e| e.risk_ratio.partial_cmp(&selection.min_ratio) != Some(std::cmp::Ordering::Less))
+        .filter(|e| {
+            e.risk_ratio.partial_cmp(&selection.min_ratio) != Some(std::cmp::Ordering::Less)
+        })
         .filter(|e| selection.address.as_deref().is_none_or(|a| e.address == a))
         .filter(|e| selection.filter.as_deref().is_none_or(|f| e.filter == f))
         .collect();
@@ -1505,7 +1571,12 @@ fn assess_eviction(
     let pending: std::collections::HashSet<(String, String)> =
         limit_evictions_to_shard_floor(stale, &active_by_filter)
             .into_iter()
-            .map(|c| (hex::encode(&c.prover_address), hex::encode(&c.confirmation_filter)))
+            .map(|c| {
+                (
+                    hex::encode(&c.prover_address),
+                    hex::encode(&c.confirmation_filter),
+                )
+            })
             .collect();
     for entry in &mut entries {
         entry.eviction_pending = pending.contains(&(entry.address.clone(), entry.filter.clone()));
@@ -1557,7 +1628,9 @@ pub(crate) fn eviction_at(state: &ExplorerState, frame: u64, now: Instant) -> Ar
     let eviction = Arc::new(assess_eviction(
         frame,
         now,
-        provers.as_ref().map(|(built, provers)| (*built, provers.as_slice())),
+        provers
+            .as_ref()
+            .map(|(built, provers)| (*built, provers.as_slice())),
         &halts,
     ));
     *state.eviction.write() = Some(Arc::clone(&eviction));
@@ -1607,7 +1680,11 @@ pub async fn handle_seniority(
     };
     let mut provers: Vec<&ProverInfo> = snapshot.iter().collect();
     // Seniority descending; ties broken by address ascending for stability.
-    provers.sort_by(|a, b| b.seniority.cmp(&a.seniority).then_with(|| a.address.cmp(&b.address)));
+    provers.sort_by(|a, b| {
+        b.seniority
+            .cmp(&a.seniority)
+            .then_with(|| a.address.cmp(&b.address))
+    });
     let mut entries: Vec<SeniorityEntry> = provers
         .iter()
         .enumerate()
@@ -1702,7 +1779,11 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
     }
     let frame = state.current_frame.load(Ordering::Relaxed);
     let eviction = served_eviction(&state, frame, Instant::now());
-    let app_shards = state.production_snapshot.read().as_ref().map(|s| s.report.stats());
+    let app_shards = state
+        .production_snapshot
+        .read()
+        .as_ref()
+        .map(|s| s.report.stats());
     let app_shard_history = state.production_history.read().stats();
 
     let response = StatsResponse {
@@ -1773,14 +1854,23 @@ pub(crate) struct ShardSets {
 impl ShardSets {
     /// Read the grid with `read` when due at `now`.
     pub(crate) fn refresh(&mut self, now: Instant, read: impl FnOnce() -> production::GridView) {
-        let every = if self.grid.unavailable.is_some() || self.failed.is_some() { GRID_RETRY } else { PROVER_CACHE_TTL };
-        if self.refreshed.is_some_and(|at| now.saturating_duration_since(at) < every) {
+        let every = if self.grid.unavailable.is_some() || self.failed.is_some() {
+            GRID_RETRY
+        } else {
+            PROVER_CACHE_TTL
+        };
+        if self
+            .refreshed
+            .is_some_and(|at| now.saturating_duration_since(at) < every)
+        {
             return;
         }
         self.refreshed = Some(now);
         let grid = read();
         match grid.unavailable {
-            Some(reason) if self.read_at.is_some() && self.grid.unavailable.is_none() => self.failed = Some(reason),
+            Some(reason) if self.read_at.is_some() && self.grid.unavailable.is_none() => {
+                self.failed = Some(reason)
+            }
             _ => {
                 self.grid = grid;
                 self.read_at = Some(now);
@@ -1809,7 +1899,11 @@ fn read_grid(state: &ExplorerState, head: u64) -> production::GridView {
         } else {
             production::GridSource::LocalStore
         };
-        return production::GridView { source, unavailable: Some(production::NO_REGISTRY), ..Default::default() };
+        return production::GridView {
+            source,
+            unavailable: Some(production::NO_REGISTRY),
+            ..Default::default()
+        };
     };
     let registry: Vec<Vec<u8>> = summaries.into_iter().map(|s| s.filter).collect();
     match &state.archive_grid {
@@ -1828,7 +1922,11 @@ fn stored_head(state: &ExplorerState, head: u64) -> Option<(u64, i64)> {
     if let Ok(header) = state.clock_store.get_global_clock_frame_header(head) {
         return Some((header.frame_number, header.timestamp));
     }
-    let header = state.clock_store.get_latest_global_clock_frame().ok()?.header?;
+    let header = state
+        .clock_store
+        .get_latest_global_clock_frame()
+        .ok()?
+        .header?;
     Some((header.frame_number, header.timestamp))
 }
 
@@ -1847,7 +1945,8 @@ pub(crate) fn build_production_report(
     sets.refresh(now, || read_grid(state, head));
     let kept = sets.kept(now);
     let shard_sets = lap();
-    let active = all_provers(state, head).map(|(frame, provers)| (frame, active_allocations_by_filter(&provers, head)));
+    let active = all_provers(state, head)
+        .map(|(frame, provers)| (frame, active_allocations_by_filter(&provers, head)));
     let census = lap();
     // Halts from the eviction assessment at this head, made here unless one
     // was: one shards-store scan per head serves the report, `/stats` and
@@ -1913,10 +2012,17 @@ pub async fn handle_shard_production(
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
     let Some(snapshot) = state.production_snapshot.read().clone() else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "production index not built yet");
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "production index not built yet",
+        );
     };
     if class.is_none() && filter.is_none() {
-        return build_response(StatusCode::OK, snapshot.body.clone(), Some(production::CACHE_CONTROL));
+        return build_response(
+            StatusCode::OK,
+            snapshot.body.clone(),
+            Some(production::CACHE_CONTROL),
+        );
     }
     json_ok(
         &snapshot.report.response(class, filter.as_deref()),
@@ -1949,7 +2055,11 @@ pub async fn handle_shard_production_history(
             Err(message) => return error(StatusCode::BAD_REQUEST, message),
         }
     };
-    build_response(StatusCode::OK, body, Some(production::history::CACHE_CONTROL))
+    build_response(
+        StatusCode::OK,
+        body,
+        Some(production::history::CACHE_CONTROL),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2006,8 +2116,8 @@ fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
 
 /// The reserved (non-coin) vertex addresses under the token domain.
 fn is_reserved_token_addr(addr: &[u8]) -> bool {
-    use quil_execution::token_intrinsic::legacy_migration::MIGRATION_RECEIPT_ADDRESS;
     use quil_execution::token_intrinsic::constants::LEGACY_ACCUMULATOR_ROOT_ADDRESS as ACC_ROOT_ADDRESS;
+    use quil_execution::token_intrinsic::legacy_migration::MIGRATION_RECEIPT_ADDRESS;
     addr == MIGRATION_RECEIPT_ADDRESS.as_slice()
         || addr == ACC_ROOT_ADDRESS.as_slice()
         || addr == [0xFFu8; 32].as_slice() // token metadata/config vertex
@@ -2037,7 +2147,8 @@ fn decode_coin(domain: &[u8], address: &[u8; 32], blob: &[u8]) -> Option<CoinJso
     let root = quil_tries::deserialize_go_tree(blob).ok().flatten();
     let tree = quil_tries::VectorCommitmentTree { root };
     let ty = tree.get(&[0xFFu8; 32])?; // every coin carries a type leaf
-    let transparent = quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(domain).ok()?;
+    let transparent =
+        quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(domain).ok()?;
     let private = quil_execution::token_intrinsic::materialize::coin_type_hash(domain).ok()?;
     let addr_hex = hex::encode(address);
     if ty == transparent.as_slice() {
@@ -2186,8 +2297,7 @@ pub async fn handle_token_supply(
     let live_public = if want_scan {
         let transparent =
             quil_execution::token_intrinsic::legacy_migration::transparent_type_hash(&domain).ok();
-        let private =
-            quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).ok();
+        let private = quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).ok();
         // 1. Transparent coins + value-hidden coin count (QUIL_TOKEN domain).
         let (mut tcoins, mut tsum, mut hidden) = (0u64, 0u128, 0u64);
         let mut coin_cb = |vk: Vec<u8>, blob: Vec<u8>| {
@@ -2212,7 +2322,10 @@ pub async fn handle_token_supply(
                 hidden += 1;
             }
         };
-        let mut scanned = state.crdt.for_each_vertex_adds_blob(&domain, &mut coin_cb).unwrap_or(0);
+        let mut scanned = state
+            .crdt
+            .for_each_vertex_adds_blob(&domain, &mut coin_cb)
+            .unwrap_or(0);
         // 2. Earned/mined reward balances (GLOBAL intrinsic domain, plaintext).
         let (mut rprovers, mut rsum) = (0u64, 0u128);
         let mut reward_cb = |_vk: Vec<u8>, blob: Vec<u8>| {
@@ -2290,7 +2403,10 @@ pub async fn handle_token_coin(
     };
     match decode_coin(&domain, &addr, &blob) {
         Some(coin) => json_ok(&coin, None),
-        None => error(StatusCode::UNPROCESSABLE_ENTITY, "vertex is not a decodable coin"),
+        None => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "vertex is not a decodable coin",
+        ),
     }
 }
 
@@ -2387,7 +2503,10 @@ pub async fn handle_token_coins(
             truncated = true;
         }
     };
-    let scanned = state.crdt.for_each_vertex_adds_blob(&domain, &mut cb).unwrap_or(0);
+    let scanned = state
+        .crdt
+        .for_each_vertex_adds_blob(&domain, &mut cb)
+        .unwrap_or(0);
 
     let response = OwnerCoinsResponse {
         owner: hex::encode(owner),
@@ -2432,11 +2551,10 @@ pub async fn handle_token_reward(
         Ok(a) => a,
         Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
     };
-    let reward_addr =
-        match quil_execution::global_intrinsic::materialize::reward_address(&prover) {
-            Ok(a) => a,
-            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "reward address"),
-        };
+    let reward_addr = match quil_execution::global_intrinsic::materialize::reward_address(&prover) {
+        Ok(a) => a,
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "reward address"),
+    };
     let mut id = [0u8; 64];
     id[..32].copy_from_slice(&quil_execution::domains::GLOBAL);
     id[32..].copy_from_slice(&reward_addr);
@@ -2480,7 +2598,13 @@ mod tests {
         String::from_utf8(serde_json::to_vec(v).unwrap()).unwrap()
     }
 
-    fn peer(subpatch: Option<u32>, fingerprint: u8, archive: bool, head: u64, timestamp: i64) -> quil_p2p::CanonicalPeerInfo {
+    fn peer(
+        subpatch: Option<u32>,
+        fingerprint: u8,
+        archive: bool,
+        head: u64,
+        timestamp: i64,
+    ) -> quil_p2p::CanonicalPeerInfo {
         let mut capabilities = vec![quil_p2p::CanonicalCapability {
             protocol_identifier: quil_p2p::BUILD_FINGERPRINT_CAPABILITY_ID,
             additional_metadata: vec![fingerprint; 32],
@@ -2514,19 +2638,53 @@ mod tests {
             peer(Some(93), 2, false, 0, now - 1_000),
             peer(None, 3, false, 9_000, now - 1_000),
             peer(None, 4, false, 9_700, now - 1_000),
-            peer(Some(92), 5, false, 9_000, now - RELEASE_CENSUS_MAX_AGE_MS - 1),
+            peer(
+                Some(92),
+                5,
+                false,
+                9_000,
+                now - RELEASE_CENSUS_MAX_AGE_MS - 1,
+            ),
         ];
         let census = peer_releases(&peers, now, 10_000);
-        assert_eq!((census.global_head, census.peers, census.stale_peers), (10_000, 5, 1));
-        let summary: Vec<_> = census.releases.iter()
-            .map(|g| (g.release.as_str(), g.subpatch, g.peers, g.archives, g.behind_global, g.global_head_min, g.global_head_max))
+        assert_eq!(
+            (census.global_head, census.peers, census.stale_peers),
+            (10_000, 5, 1)
+        );
+        let summary: Vec<_> = census
+            .releases
+            .iter()
+            .map(|g| {
+                (
+                    g.release.as_str(),
+                    g.subpatch,
+                    g.peers,
+                    g.archives,
+                    g.behind_global,
+                    g.global_head_min,
+                    g.global_head_max,
+                )
+            })
             .collect();
-        assert_eq!(summary, [
-            ("2.1.0.25.93", Some(93), 3, 1, 0, 9_990, 10_000),
-            ("2.1.0.25", None, 2, 0, 1, 9_000, 9_700),
-        ]);
-        let builds: Vec<_> = census.releases[0].builds.iter().map(|b| (b.build_fingerprint.clone(), b.peers)).collect();
-        assert_eq!(builds, [(Some(hex::encode([1u8; 32])), 2), (Some(hex::encode([2u8; 32])), 1)]);
+        assert_eq!(
+            summary,
+            [
+                ("2.1.0.25.93", Some(93), 3, 1, 0, 9_990, 10_000),
+                ("2.1.0.25", None, 2, 0, 1, 9_000, 9_700),
+            ]
+        );
+        let builds: Vec<_> = census.releases[0]
+            .builds
+            .iter()
+            .map(|b| (b.build_fingerprint.clone(), b.peers))
+            .collect();
+        assert_eq!(
+            builds,
+            [
+                (Some(hex::encode([1u8; 32])), 2),
+                (Some(hex::encode([2u8; 32])), 1)
+            ]
+        );
         assert!(to_str(&census).contains("\"release\":\"2.1.0.25.93\""));
     }
 
@@ -2546,7 +2704,10 @@ mod tests {
         };
         let domain = quil_execution::domains::QUIL_TOKEN;
         let th = transparent_type_hash(&domain).unwrap();
-        let coin = TransparentCoin { owner_address: [0x7Au8; 32], amount: 16_000_000_000 }; // 2 QUIL
+        let coin = TransparentCoin {
+            owner_address: [0x7Au8; 32],
+            amount: 16_000_000_000,
+        }; // 2 QUIL
         let tree = create_transparent_coin_tree(&coin, &th, &[0x33u8; 32]).unwrap();
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
 
@@ -2556,7 +2717,10 @@ mod tests {
         assert_eq!(c.owner.as_deref(), Some(hex::encode([0x7Au8; 32]).as_str()));
         assert_eq!(c.amount_subunits.as_deref(), Some("16000000000"));
         assert_eq!(c.amount_quil.as_deref(), Some("2"));
-        assert_eq!(c.origin.as_deref(), Some(hex::encode([0x33u8; 32]).as_str()));
+        assert_eq!(
+            c.origin.as_deref(),
+            Some(hex::encode([0x33u8; 32]).as_str())
+        );
         assert_eq!(c.commitment, None);
     }
 
@@ -2572,12 +2736,17 @@ mod tests {
 
     #[test]
     fn reward_balance_decodes_as_public_quil() {
-        use quil_execution::global_intrinsic::materialize::{read_reward_balance, set_reward_balance};
+        use quil_execution::global_intrinsic::materialize::{
+            read_reward_balance, set_reward_balance,
+        };
         let mut tree = quil_tries::VectorCommitmentTree::new();
         let mut bal = [0u8; 32];
         bal[24..].copy_from_slice(&(2u64 * 8_000_000_000).to_be_bytes()); // 2 QUIL
         set_reward_balance(&mut tree, &bal).unwrap();
-        assert_eq!(quil_execution::global_schema::read_type(&tree), Some("reward:ProverReward"));
+        assert_eq!(
+            quil_execution::global_schema::read_type(&tree),
+            Some("reward:ProverReward")
+        );
         let raw = read_reward_balance(&tree);
         assert_eq!(be_bytes_to_u128(&raw), 16_000_000_000);
         assert_eq!(quil_str(be_bytes_to_u128(&raw)), "2");
@@ -2588,10 +2757,18 @@ mod tests {
         // A `coin:Coin`-typed vertex (lattice/decaf) must decode as value-hidden
         // with no owner. Build a minimal tree with just the private type leaf.
         let domain = quil_execution::domains::QUIL_TOKEN;
-        let private = quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).unwrap();
+        let private =
+            quil_execution::token_intrinsic::materialize::coin_type_hash(&domain).unwrap();
         let mut tree = quil_tries::VectorCommitmentTree::new();
-        tree.insert(&[2u8 << 2], &[0xCDu8; 40], &[], &num_bigint::BigInt::from(40)).unwrap();
-        tree.insert(&[0xFFu8; 32], &private, &[], &num_bigint::BigInt::from(32)).unwrap();
+        tree.insert(
+            &[2u8 << 2],
+            &[0xCDu8; 40],
+            &[],
+            &num_bigint::BigInt::from(40),
+        )
+        .unwrap();
+        tree.insert(&[0xFFu8; 32], &private, &[], &num_bigint::BigInt::from(32))
+            .unwrap();
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
 
         let c = decode_coin(&domain, &[0x01u8; 32], &blob).unwrap();
@@ -2599,7 +2776,10 @@ mod tests {
         assert!(c.value_hidden);
         assert_eq!(c.owner, None);
         assert_eq!(c.amount_subunits, None);
-        assert_eq!(c.commitment.as_deref(), Some(hex::encode([0xCDu8; 40]).as_str()));
+        assert_eq!(
+            c.commitment.as_deref(),
+            Some(hex::encode([0xCDu8; 40]).as_str())
+        );
     }
 
     #[test]
@@ -2784,7 +2964,10 @@ mod tests {
         assert!(s.contains(r#""cores":0"#));
         // 64-bit frame fields emitted as NUMBERS (custom-JSON path).
         assert!(s.contains(r#""last_received_frame":0"#));
-        assert!(s.contains(r#""release":"2.1.0.25","subpatch":null,"build_fingerprint":null"#), "{s}");
+        assert!(
+            s.contains(r#""release":"2.1.0.25","subpatch":null,"build_fingerprint":null"#),
+            "{s}"
+        );
 
         let with_cap = PeerInfoJson {
             capabilities: Some(vec![PeerCapabilityJson {
@@ -2794,7 +2977,12 @@ mod tests {
             ..empty
         };
         let s = to_str(&with_cap);
-        assert!(s.contains(r#""capabilities":[{"protocol_identifier":7,"additional_metadata":"AQID"}]"#), "{s}");
+        assert!(
+            s.contains(
+                r#""capabilities":[{"protocol_identifier":7,"additional_metadata":"AQID"}]"#
+            ),
+            "{s}"
+        );
     }
 
     #[test]
@@ -2836,10 +3024,16 @@ mod tests {
         let old = r#"{"current_frame":7,"eviction_threshold":360,"total_provers":2,"by_status":{"active":2},"total_seniority":5,"eviction_pending":1,"at_risk":1,"halted_shards":0"#;
         let history = r#""app_shard_history":{"rows":0,"first_row_frame":null,"last_row_frame":null,"backfill_complete":false}"#;
         let provers = r#""provers_as_of_frame":7,"provers_stale":false"#;
-        assert_eq!(to_str(&stats(None)), format!(r#"{old},"app_shards":null,{history},{provers}}}"#));
+        assert_eq!(
+            to_str(&stats(None)),
+            format!(r#"{old},"app_shards":null,{history},{provers}}}"#)
+        );
 
         let (none, empty) = (HashMap::new(), BTreeSet::new());
-        let grid = production::GridView { grid: Some(BTreeSet::new()), ..Default::default() };
+        let grid = production::GridView {
+            grid: Some(BTreeSet::new()),
+            ..Default::default()
+        };
         let report = production::assemble(
             &production::IndexView::default(),
             &production::Inputs {
@@ -2877,12 +3071,20 @@ mod tests {
         let mut cache = HashMap::new();
         let t0 = Instant::now();
         cache_insert(&mut cache, t0, "old".into(), vec![1]);
-        cache_insert(&mut cache, t0 + PROVER_CACHE_TTL / 2, "live".into(), vec![2]);
+        cache_insert(
+            &mut cache,
+            t0 + PROVER_CACHE_TTL / 2,
+            "live".into(),
+            vec![2],
+        );
         // Past the first entry's expiry, before the second's.
         let now = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
         cache_insert(&mut cache, now, "new".into(), vec![3]);
         assert!(!cache.contains_key("old"));
-        assert_eq!(cache.get("live").map(|(_, body)| body.clone()), Some(vec![2]));
+        assert_eq!(
+            cache.get("live").map(|(_, body)| body.clone()),
+            Some(vec![2])
+        );
         assert!(cache.contains_key("new"));
     }
 
@@ -2894,9 +3096,16 @@ mod tests {
             cache_insert(&mut cache, t0, format!("k{n}"), vec![1]);
         }
         assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
-        assert!(!cache.contains_key(&format!("k{}", CACHE_MAX_ENTRIES)), "a new key past the bound is not cached");
+        assert!(
+            !cache.contains_key(&format!("k{}", CACHE_MAX_ENTRIES)),
+            "a new key past the bound is not cached"
+        );
         cache_insert(&mut cache, t0, "k0".into(), vec![2]);
-        assert_eq!(cache.get("k0").map(|(_, body)| body.clone()), Some(vec![2]), "a held key is refreshed");
+        assert_eq!(
+            cache.get("k0").map(|(_, body)| body.clone()),
+            Some(vec![2]),
+            "a held key is refreshed"
+        );
         let later = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
         cache_insert(&mut cache, later, "fresh".into(), vec![3]);
         assert_eq!(cache.len(), 1, "expired entries make room");
@@ -2907,19 +3116,44 @@ mod tests {
         let state = empty_state();
         let held = state.token_scan.clone().try_acquire_owned().unwrap();
         let owner = "11".repeat(32);
-        let coins = || handle_token_coins(Method::GET, State(state.clone()), Path(owner.clone()), Query(HashMap::new()));
+        let coins = || {
+            handle_token_coins(
+                Method::GET,
+                State(state.clone()),
+                Path(owner.clone()),
+                Query(HashMap::new()),
+            )
+        };
         let busy = coins().await;
         assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(busy.headers()["Retry-After"], TOKEN_SCAN_RETRY_SECS.to_string().as_str());
+        assert_eq!(
+            busy.headers()["Retry-After"],
+            TOKEN_SCAN_RETRY_SECS.to_string().as_str()
+        );
         let scan = HashMap::from([("scan".to_string(), "1".to_string())]);
-        let supply = handle_token_supply(Method::GET, State(state.clone()), Query(scan.clone())).await;
+        let supply =
+            handle_token_supply(Method::GET, State(state.clone()), Query(scan.clone())).await;
         assert_eq!(supply.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let plain = handle_token_supply(Method::GET, State(state.clone()), Query(HashMap::new())).await;
-        assert_eq!(plain.status(), StatusCode::OK, "the supply without a scan is not held back");
+        let plain =
+            handle_token_supply(Method::GET, State(state.clone()), Query(HashMap::new())).await;
+        assert_eq!(
+            plain.status(),
+            StatusCode::OK,
+            "the supply without a scan is not held back"
+        );
         drop(held);
         assert_eq!(coins().await.status(), StatusCode::OK);
-        assert_eq!(handle_token_supply(Method::GET, State(state.clone()), Query(scan)).await.status(), StatusCode::OK);
-        assert_eq!(state.token_scan.available_permits(), 1, "a finished scan returns its permit");
+        assert_eq!(
+            handle_token_supply(Method::GET, State(state.clone()), Query(scan))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            state.token_scan.available_permits(),
+            1,
+            "a finished scan returns its permit"
+        );
     }
 
     /// An explorer over an empty in-memory store.
@@ -2929,13 +3163,18 @@ mod tests {
 
     /// An explorer over an in-memory store holding only the shard rows
     /// `rows`, sized by `sizes` (an archive's provider).
-    fn state_with_shards(rows: &[quil_types::store::ShardInfo], sizes: Option<crate::AppShardsProvider>) -> ExplorerState {
+    fn state_with_shards(
+        rows: &[quil_types::store::ShardInfo],
+        sizes: Option<crate::AppShardsProvider>,
+    ) -> ExplorerState {
         use quil_types::store::{KvDb as _, ShardsStore as _};
         let db = quil_store::RocksDb::open_in_memory().expect("an in-memory store");
         let raw = db.inner();
         let txn = db.new_batch(false).unwrap();
         for row in rows {
-            quil_store::RocksShardsStore::new(raw.clone()).put_app_shard(txn.as_ref(), row).unwrap();
+            quil_store::RocksShardsStore::new(raw.clone())
+                .put_app_shard(txn.as_ref(), row)
+                .unwrap();
         }
         txn.commit().unwrap();
         let hg = Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
@@ -2997,7 +3236,10 @@ mod tests {
         ring.push_received(&[1], &[2], &[3]);
         let t0 = Instant::now();
         let first = messages_body(&ring, 50, t0);
-        assert_eq!(first.as_ptr(), messages_body(&ring, 50, t0 + Duration::from_secs(30)).as_ptr());
+        assert_eq!(
+            first.as_ptr(),
+            messages_body(&ring, 50, t0 + Duration::from_secs(30)).as_ptr()
+        );
         // A push within the window is not shown yet; beyond it, it is.
         ring.push_received(&[4], &[2], &[3]);
         let soon = messages_body(&ring, 50, t0 + MESSAGES_CACHE_MAX_AGE / 2);
@@ -3013,7 +3255,10 @@ mod tests {
     #[test]
     fn parse_hex_id_validation() {
         assert!(parse_hex_id("zz").is_err()); // not hex
-        assert_eq!(parse_hex_id(&"ab".repeat(10)).unwrap_err(), "identifier must be 64 bytes");
+        assert_eq!(
+            parse_hex_id(&"ab".repeat(10)).unwrap_err(),
+            "identifier must be 64 bytes"
+        );
         assert!(parse_hex_id(&"ab".repeat(64)).is_ok()); // 64 bytes
     }
 
@@ -3086,19 +3331,33 @@ mod tests {
 
         // Under-provisioned shard (below consensus quorum) -> exempt, mirroring
         // the evictor: no halt entry and long inactive, yet not at risk.
-        let under: HashMap<Vec<u8>, u64> =
-            [(vec![0xAAu8], quorum - 1)].into_iter().collect();
+        let under: HashMap<Vec<u8>, u64> = [(vec![0xAAu8], quorum - 1)].into_iter().collect();
         assert!(assess_allocation(&a, frame, &HashMap::new(), &under).is_none());
 
         // Global allocation (empty filter) -> never at risk.
-        assert!(assess_allocation(&active_alloc(vec![], 81_000), frame, &HashMap::new(), &census).is_none());
+        assert!(assess_allocation(
+            &active_alloc(vec![], 81_000),
+            frame,
+            &HashMap::new(),
+            &census
+        )
+        .is_none());
 
         // last_active 0 or not-yet-inactive -> None.
-        assert!(assess_allocation(&active_alloc(vec![0xBB], 0), frame, &HashMap::new(), &census).is_none());
-        assert!(
-            assess_allocation(&active_alloc(vec![0xBB], frame + 5), frame, &HashMap::new(), &census)
-                .is_none()
-        );
+        assert!(assess_allocation(
+            &active_alloc(vec![0xBB], 0),
+            frame,
+            &HashMap::new(),
+            &census
+        )
+        .is_none());
+        assert!(assess_allocation(
+            &active_alloc(vec![0xBB], frame + 5),
+            frame,
+            &HashMap::new(),
+            &census
+        )
+        .is_none());
 
         // Non-active allocation -> None.
         let mut paused = active_alloc(vec![0xCC], 81_000);
@@ -3215,7 +3474,10 @@ mod tests {
         for p in &provers {
             let alloc = &p.allocations[0];
             let fresh = |a| allocation_fresh_at(alloc, frame, 0, threshold, a);
-            assert_eq!(fresh(activation), alloc.last_signed_frame_number == frame - 100);
+            assert_eq!(
+                fresh(activation),
+                alloc.last_signed_frame_number == frame - 100
+            );
             assert_eq!(fresh(default), alloc.last_active_frame_number == frame - 10);
         }
     }
@@ -3279,22 +3541,25 @@ mod tests {
                 entry("cc", "02", 200, false),
             ]
         };
-        let pick_at = |min_ratio: f64, address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
-            let selection = EvictionRiskSelection {
-                min_ratio,
-                address: address.map(String::from),
-                filter: filter.map(String::from),
-                limit,
+        let pick_at =
+            |min_ratio: f64, address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
+                let selection = EvictionRiskSelection {
+                    min_ratio,
+                    address: address.map(String::from),
+                    filter: filter.map(String::from),
+                    limit,
+                };
+                let entries = entries();
+                let (selected, total) = select_eviction_risk(&entries, &selection);
+                let selected = selected
+                    .into_iter()
+                    .map(|e| (e.address.clone(), e.filter.clone(), e.eviction_pending))
+                    .collect::<Vec<_>>();
+                (selected, total)
             };
-            let entries = entries();
-            let (selected, total) = select_eviction_risk(&entries, &selection);
-            let selected = selected
-                .into_iter()
-                .map(|e| (e.address.clone(), e.filter.clone(), e.eviction_pending))
-                .collect::<Vec<_>>();
-            (selected, total)
+        let pick = |address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
+            pick_at(0.0, address, filter, limit)
         };
-        let pick = |address: Option<&str>, filter: Option<&str>, limit: Option<usize>| pick_at(0.0, address, filter, limit);
         let rows = |r: &[(&str, &str, bool)]| {
             r.iter()
                 .map(|&(a, f, p)| (a.to_string(), f.to_string(), p))
@@ -3306,7 +3571,10 @@ mod tests {
             pick(Some("aa"), None, None),
             (rows(&[("aa", "01", true), ("aa", "02", false)]), 2)
         );
-        assert_eq!(pick(Some("bb"), None, None), (rows(&[("bb", "01", false)]), 1));
+        assert_eq!(
+            pick(Some("bb"), None, None),
+            (rows(&[("bb", "01", false)]), 1)
+        );
         assert_eq!(
             pick(None, Some("02"), None),
             (rows(&[("aa", "02", false), ("cc", "02", false)]), 2)
@@ -3316,7 +3584,10 @@ mod tests {
             pick(None, None, Some(2)),
             (rows(&[("aa", "01", true), ("bb", "01", false)]), 4)
         );
-        assert_eq!(pick(Some("aa"), Some("02"), Some(1)), (rows(&[("aa", "02", false)]), 1));
+        assert_eq!(
+            pick(Some("aa"), Some("02"), Some(1)),
+            (rows(&[("aa", "02", false)]), 1)
+        );
         let (none, total) = pick(None, Some("01"), Some(0));
         assert!(none.is_empty());
         assert_eq!(total, 2);
@@ -3347,7 +3618,9 @@ mod tests {
     /// prover (b0).
     fn assessed_provers(frame: u64) -> Vec<ProverInfo> {
         let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
-        let mut provers: Vec<ProverInfo> = (0..4).map(|i| prover_on(0xA0 + i, 0xAA, frame - 10)).collect();
+        let mut provers: Vec<ProverInfo> = (0..4)
+            .map(|i| prover_on(0xA0 + i, 0xAA, frame - 10))
+            .collect();
         provers.push(prover_on(0xA4, 0xAA, frame - 200));
         provers.push(prover_on(0xA5, 0xAA, start + 100));
         let mut kicked = prover_on(0xB0, 0xAA, 0);
@@ -3362,9 +3635,25 @@ mod tests {
         let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 5000;
         let provers = assessed_provers(frame);
         let halts = HashMap::from([(vec![0xBB], u64::MAX), (vec![0xCC], 50)]);
-        let e = assess_eviction(frame, Instant::now(), Some((frame - 1, provers.as_slice())), &halts);
-        assert_eq!((e.frame, e.provers_as_of_frame, e.total_provers, e.total_seniority), (frame, Some(frame - 1), 7, 7));
-        assert_eq!(e.by_status, BTreeMap::from([("active".to_string(), 6), ("kicked".to_string(), 1)]));
+        let e = assess_eviction(
+            frame,
+            Instant::now(),
+            Some((frame - 1, provers.as_slice())),
+            &halts,
+        );
+        assert_eq!(
+            (
+                e.frame,
+                e.provers_as_of_frame,
+                e.total_provers,
+                e.total_seniority
+            ),
+            (frame, Some(frame - 1), 7, 7)
+        );
+        assert_eq!(
+            e.by_status,
+            BTreeMap::from([("active".to_string(), 6), ("kicked".to_string(), 1)])
+        );
         // Provers past the threshold, and past half of it.
         assert_eq!((e.eviction_pending, e.at_risk), (1, 2));
         assert_eq!(e.halted, BTreeSet::from([vec![0xBB]]));
@@ -3373,20 +3662,46 @@ mod tests {
         let order: Vec<(&str, u64, bool)> = e
             .entries
             .iter()
-            .map(|x| (x.address.as_str(), x.frames_until_eviction, x.eviction_pending))
+            .map(|x| {
+                (
+                    x.address.as_str(),
+                    x.frames_until_eviction,
+                    x.eviction_pending,
+                )
+            })
             .collect();
         assert_eq!(
             order,
-            [("a5", 0, true), ("a4", 160, false), ("a0", 350, false), ("a1", 350, false), ("a2", 350, false), ("a3", 350, false)]
+            [
+                ("a5", 0, true),
+                ("a4", 160, false),
+                ("a0", 350, false),
+                ("a1", 350, false),
+                ("a2", 350, false),
+                ("a3", 350, false)
+            ]
         );
-        assert!(e.entries.iter().all(|x| x.current_frame == frame && x.shard_progressing));
+        assert!(e
+            .entries
+            .iter()
+            .all(|x| x.current_frame == frame && x.shard_progressing));
         // Before the registry is read: placeholders, halts still counted.
         let unread = assess_eviction(frame, Instant::now(), None, &halts);
-        assert_eq!((unread.provers_as_of_frame, unread.total_provers, unread.entries.len(), unread.halted.len()), (None, 0, 0, 1));
+        assert_eq!(
+            (
+                unread.provers_as_of_frame,
+                unread.total_provers,
+                unread.entries.len(),
+                unread.halted.len()
+            ),
+            (None, 0, 0, 1)
+        );
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -3399,30 +3714,60 @@ mod tests {
         state.current_frame.store(frame + 1, Ordering::Relaxed);
         let provers = assessed_provers(frame);
         let halts = HashMap::from([(vec![0xBB], u64::MAX)]);
-        *state.eviction.write() = Some(Arc::new(assess_eviction(frame, Instant::now(), Some((frame, provers.as_slice())), &halts)));
+        *state.eviction.write() = Some(Arc::new(assess_eviction(
+            frame,
+            Instant::now(),
+            Some((frame, provers.as_slice())),
+            &halts,
+        )));
 
         let stats = body_json(handle_stats(Method::GET, State(state.clone())).await).await;
         let count = |key: &str| stats[key].as_u64();
         assert_eq!(
-            (count("current_frame"), count("total_provers"), count("eviction_pending"), count("at_risk"), count("halted_shards")),
+            (
+                count("current_frame"),
+                count("total_provers"),
+                count("eviction_pending"),
+                count("at_risk"),
+                count("halted_shards")
+            ),
             (Some(frame), Some(7), Some(1), Some(2), Some(1))
         );
-        assert_eq!((count("provers_as_of_frame"), stats["provers_stale"].as_bool()), (Some(frame), Some(false)));
+        assert_eq!(
+            (
+                count("provers_as_of_frame"),
+                stats["provers_stale"].as_bool()
+            ),
+            (Some(frame), Some(false))
+        );
 
-        let query = HashMap::from([("min_ratio".to_string(), "0.5".to_string()), ("limit".to_string(), "1".to_string())]);
+        let query = HashMap::from([
+            ("min_ratio".to_string(), "0.5".to_string()),
+            ("limit".to_string(), "1".to_string()),
+        ]);
         let risk = handle_eviction_risk(Method::GET, State(state.clone()), Query(query)).await;
         assert_eq!(risk.status(), StatusCode::OK);
         assert_eq!(risk.headers()["X-Total-Count"], "2");
         let risk = body_json(risk).await;
         assert_eq!(risk.as_array().map(Vec::len), Some(1));
         assert_eq!(
-            (risk[0]["address"].as_str(), risk[0]["eviction_pending"].as_bool(), risk[0]["current_frame"].as_u64()),
+            (
+                risk[0]["address"].as_str(),
+                risk[0]["eviction_pending"].as_bool(),
+                risk[0]["current_frame"].as_u64()
+            ),
             (Some("a5"), Some(true), Some(frame))
         );
 
         // An assessment made before the registry was read: 503, as before.
-        *state.eviction.write() = Some(Arc::new(assess_eviction(frame, Instant::now(), None, &halts)));
-        let unread = handle_eviction_risk(Method::GET, State(state.clone()), Query(HashMap::new())).await;
+        *state.eviction.write() = Some(Arc::new(assess_eviction(
+            frame,
+            Instant::now(),
+            None,
+            &halts,
+        )));
+        let unread =
+            handle_eviction_risk(Method::GET, State(state.clone()), Query(HashMap::new())).await;
         assert_eq!(unread.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -3431,25 +3776,48 @@ mod tests {
     #[tokio::test]
     async fn provers_shards_leave_out_a_global_row() {
         let row = |l2: [u8; 32], prefix: Vec<u32>| {
-            let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(&l2, 256, 3).to_vec();
+            let mut shard_key =
+                quil_hypergraph::addressing::get_bloom_filter_indices(&l2, 256, 3).to_vec();
             shard_key.extend_from_slice(&l2);
-            quil_types::store::ShardInfo { shard_key, prefix, size: vec![], data_shards: 0, commitment: vec![] }
+            quil_types::store::ShardInfo {
+                shard_key,
+                prefix,
+                size: vec![],
+                data_shards: 0,
+                commitment: vec![],
+            }
         };
         let quil = quil_execution::domains::QUIL_TOKEN;
         let (global, other) = (quil_execution::domains::GLOBAL, [0xaa; 32]);
         let rows = [row(quil, vec![0]), row(global, vec![]), row(other, vec![])];
-        let sized: crate::AppShardsProvider = Arc::new(|_: &[u8], _: &[u32]| Some((vec![1], 1, Default::default())));
+        let sized: crate::AppShardsProvider =
+            Arc::new(|_: &[u8], _: &[u32]| Some((vec![1], 1, Default::default())));
         let state = state_with_shards(&rows, Some(sized));
         let sizes = compute_shard_sizes(&state);
-        let app = |l2: [u8; 32], prefix: &[u32]| hex::encode(quil_forest::shard_prefix_to_filter(&l2, prefix));
+        let app = |l2: [u8; 32], prefix: &[u32]| {
+            hex::encode(quil_forest::shard_prefix_to_filter(&l2, prefix))
+        };
         let mut keys: Vec<&String> = sizes.keys().collect();
         keys.sort();
         let mut expected = vec![app(quil, &[0]), app(other, &[])];
         expected.sort();
-        assert_eq!(keys, expected.iter().collect::<Vec<_>>(), "QUIL and another app; GLOBAL out");
+        assert_eq!(
+            keys,
+            expected.iter().collect::<Vec<_>>(),
+            "QUIL and another app; GLOBAL out"
+        );
         let listed = body_json(handle_prover_shards(Method::GET, State(state)).await).await;
-        let filters: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|s| s["filter"].as_str()).collect();
-        assert_eq!(filters, expected.iter().map(String::as_str).collect::<Vec<_>>(), "every sized app shard, not GLOBAL");
+        let filters: Vec<&str> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["filter"].as_str())
+            .collect();
+        assert_eq!(
+            filters,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "every sized app shard, not GLOBAL"
+        );
     }
 
     #[test]
@@ -3459,12 +3827,18 @@ mod tests {
         let latest = Arc::new(assess_eviction(10, t0, None, &HashMap::new()));
         *state.eviction.write() = Some(Arc::clone(&latest));
         // Within the bound the latest serves, whatever the head.
-        assert!(Arc::ptr_eq(&served_eviction(&state, 12, t0 + EVICTION_SERVE_MAX_AGE / 2), &latest));
+        assert!(Arc::ptr_eq(
+            &served_eviction(&state, 12, t0 + EVICTION_SERVE_MAX_AGE / 2),
+            &latest
+        ));
         // Past it, one is made at the head, kept and shared at that head.
         let later = t0 + EVICTION_SERVE_MAX_AGE;
         let made = served_eviction(&state, 12, later);
         assert_eq!(made.frame, 12);
-        assert!(Arc::ptr_eq(&made, &eviction_at(&state, 12, later + PROVER_SNAPSHOT_MAX_AGE / 2)));
+        assert!(Arc::ptr_eq(
+            &made,
+            &eviction_at(&state, 12, later + PROVER_SNAPSHOT_MAX_AGE / 2)
+        ));
         assert!(Arc::ptr_eq(&made, state.eviction.read().as_ref().unwrap()));
         // A new head is assessed anew.
         assert_eq!(eviction_at(&state, 13, later).frame, 13);
@@ -3484,8 +3858,14 @@ mod tests {
             requests: vec![MessageBundle::default(), MessageBundle::default()],
         };
         let outcomes = [
-            RequestOutcome { status: RequestStatus::Succeeded, error: String::new() },
-            RequestOutcome { status: RequestStatus::Failed, error: "no".into() },
+            RequestOutcome {
+                status: RequestStatus::Succeeded,
+                error: String::new(),
+            },
+            RequestOutcome {
+                status: RequestStatus::Failed,
+                error: "no".into(),
+            },
         ];
         // The body as the handler built it before: protojson, parsed into a
         // value, `requestOutcomes` added, written again.
@@ -3498,7 +3878,10 @@ mod tests {
                 { "status": RequestStatus::Failed.name(), "error": "no" },
             ]),
         );
-        assert_eq!(frame_body(&frame, &outcomes).unwrap(), serde_json::to_vec(&v).unwrap());
+        assert_eq!(
+            frame_body(&frame, &outcomes).unwrap(),
+            serde_json::to_vec(&v).unwrap()
+        );
         let without = frame_body(&frame, &[]).unwrap();
         assert!(without.windows(20).any(|w| w == b"\"requestOutcomes\":[]"));
     }
@@ -3511,7 +3894,11 @@ mod tests {
         }
         let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
         // As `get_hyperedge_extrinsic_ids` lists them: the 64-byte keys.
-        let listed = tree.leaves().into_iter().filter(|(key, _)| key.len() == 64).count();
+        let listed = tree
+            .leaves()
+            .into_iter()
+            .filter(|(key, _)| key.len() == 64)
+            .count();
         assert_eq!((extrinsic_count(&blob), listed), (3, 3));
         let empty = quil_tries::serialize_go_tree(None).unwrap();
         assert_eq!(extrinsic_count(&empty), 0);
@@ -3536,10 +3923,22 @@ mod tests {
 
     #[test]
     fn status_param_parsing() {
-        assert!(matches!(parse_prover_status("active"), Some(StatusParam::Known(ProverStatus::Active))));
-        assert!(matches!(parse_prover_status("ACTIVE"), Some(StatusParam::Known(ProverStatus::Active))));
-        assert!(matches!(parse_prover_status("2"), Some(StatusParam::Known(ProverStatus::Active))));
-        assert!(matches!(parse_prover_status("200"), Some(StatusParam::NumericEmpty)));
+        assert!(matches!(
+            parse_prover_status("active"),
+            Some(StatusParam::Known(ProverStatus::Active))
+        ));
+        assert!(matches!(
+            parse_prover_status("ACTIVE"),
+            Some(StatusParam::Known(ProverStatus::Active))
+        ));
+        assert!(matches!(
+            parse_prover_status("2"),
+            Some(StatusParam::Known(ProverStatus::Active))
+        ));
+        assert!(matches!(
+            parse_prover_status("200"),
+            Some(StatusParam::NumericEmpty)
+        ));
         assert!(parse_prover_status("nonsense").is_none());
     }
 
@@ -3562,9 +3961,17 @@ mod tests {
         let next = snapshot_for(&slot, 11, t1, || build(3)).unwrap();
         assert_eq!((builds.get(), next.0, *next.1), (2, 11, 3));
         // The same frame shares within the max age and rebuilds past it.
-        assert_eq!(*snapshot_for(&slot, 11, t1 + half, || build(4)).unwrap().1, 3);
+        assert_eq!(
+            *snapshot_for(&slot, 11, t1 + half, || build(4)).unwrap().1,
+            3
+        );
         assert_eq!(builds.get(), 2);
-        assert_eq!(*snapshot_for(&slot, 11, t1 + PROVER_SNAPSHOT_MAX_AGE, || build(5)).unwrap().1, 5);
+        assert_eq!(
+            *snapshot_for(&slot, 11, t1 + PROVER_SNAPSHOT_MAX_AGE, || build(5))
+                .unwrap()
+                .1,
+            5
+        );
         assert_eq!(builds.get(), 3);
     }
 
@@ -3575,7 +3982,10 @@ mod tests {
             grid: Some(BTreeSet::from([vec![tag]])),
             ..Default::default()
         };
-        let failed = || production::GridView { unavailable: Some(production::NO_REGISTRY), ..Default::default() };
+        let failed = || production::GridView {
+            unavailable: Some(production::NO_REGISTRY),
+            ..Default::default()
+        };
         let reads = std::cell::Cell::new(0u32);
         let read = |grid: production::GridView| {
             reads.set(reads.get() + 1);
@@ -3586,29 +3996,50 @@ mod tests {
         // A failed first read leaves the grid unavailable (values unknown),
         // read again every GRID_RETRY, not on every build.
         sets.refresh(t0, || read(failed()));
-        assert_eq!((sets.grid.unavailable, sets.kept(t0), reads.get()), (Some(production::NO_REGISTRY), None, 1));
+        assert_eq!(
+            (sets.grid.unavailable, sets.kept(t0), reads.get()),
+            (Some(production::NO_REGISTRY), None, 1)
+        );
         sets.refresh(t0 + GRID_RETRY / 2, || read(good(1)));
         assert_eq!(reads.get(), 1);
         let t1 = t0 + GRID_RETRY;
         sets.refresh(t1, || read(good(1)));
-        assert_eq!((sets.grid.live.len(), sets.grid.unavailable, reads.get()), (1, None, 2));
+        assert_eq!(
+            (sets.grid.live.len(), sets.grid.unavailable, reads.get()),
+            (1, None, 2)
+        );
         // A good grid is read again once PROVER_CACHE_TTL old; a failed
         // re-read keeps it, flagged with its age, and retries sooner.
         sets.refresh(t1 + PROVER_CACHE_TTL / 2, || read(failed()));
         assert_eq!(reads.get(), 2);
         let t2 = t1 + PROVER_CACHE_TTL;
         sets.refresh(t2, || read(failed()));
-        assert_eq!((sets.grid.live.clone(), sets.grid.unavailable, reads.get()), (BTreeSet::from([vec![1]]), None, 3));
-        assert_eq!(sets.kept(t2), Some((production::NO_REGISTRY, PROVER_CACHE_TTL)));
+        assert_eq!(
+            (sets.grid.live.clone(), sets.grid.unavailable, reads.get()),
+            (BTreeSet::from([vec![1]]), None, 3)
+        );
+        assert_eq!(
+            sets.kept(t2),
+            Some((production::NO_REGISTRY, PROVER_CACHE_TTL))
+        );
         sets.refresh(t2 + GRID_RETRY, || read(good(2)));
-        assert_eq!((sets.grid.live.clone(), sets.kept(t2 + GRID_RETRY), reads.get()), (BTreeSet::from([vec![2]]), None, 4));
+        assert_eq!(
+            (
+                sets.grid.live.clone(),
+                sets.kept(t2 + GRID_RETRY),
+                reads.get()
+            ),
+            (BTreeSet::from([vec![2]]), None, 4)
+        );
     }
 
     #[test]
     fn snapshot_for_keeps_the_last_snapshot_when_a_build_fails() {
         let slot = Mutex::new(None);
         let t0 = Instant::now();
-        let read = |frame, value: Option<u32>| snapshot_for(&slot, frame, t0, || value).map(|(f, v)| (f, *v));
+        let read = |frame, value: Option<u32>| {
+            snapshot_for(&slot, frame, t0, || value).map(|(f, v)| (f, *v))
+        };
         // Nothing built yet: unknown (never an empty answer), nothing kept.
         assert_eq!(read(10, None), None);
         assert!(slot.lock().is_none());

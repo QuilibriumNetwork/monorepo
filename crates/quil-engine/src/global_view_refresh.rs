@@ -69,7 +69,9 @@ impl Reason {
             Self::EpochBoundary => "epoch boundary",
             Self::SealBeforeClosingRequest => "seal before its closing request",
             Self::SealedSessionAwaitsSuccessor => "sealed session awaits its successor",
-            Self::StorageRecordAwaited => "storage snapshot, seal or settlement not in the view yet",
+            Self::StorageRecordAwaited => {
+                "storage snapshot, seal or settlement not in the view yet"
+            }
         }
     }
 }
@@ -89,7 +91,11 @@ pub enum Decision {
     Pull(EarlyPull),
     /// A pull is wanted but its budget for this epoch is spent; reported once
     /// per epoch.
-    Exhausted { epoch: u64, wanted: EarlyPull, max: u32 },
+    Exhausted {
+        epoch: u64,
+        wanted: EarlyPull,
+        max: u32,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -160,12 +166,17 @@ impl ViewRefresh {
     pub fn request(&self, reason: Reason, through: u64, now: Instant) -> bool {
         let mut guard = self.lock();
         let state = &mut *guard;
-        let Some(length) = state.epoch_length else { return false };
+        let Some(length) = state.epoch_length else {
+            return false;
+        };
         let slot = match reason {
             Reason::EpochBoundary => return false,
             Reason::SealBeforeClosingRequest => &mut state.seal,
             Reason::SealedSessionAwaitsSuccessor => {
-                if state.successor_asked.is_some_and(|at| now.saturating_duration_since(at) < SUCCESSOR_INTERVAL) {
+                if state
+                    .successor_asked
+                    .is_some_and(|at| now.saturating_duration_since(at) < SUCCESSOR_INTERVAL)
+                {
                     return false;
                 }
                 state.successor_asked = Some(now);
@@ -182,7 +193,9 @@ impl ViewRefresh {
             // The epoch's budgets reset at the next decision.
             return true;
         }
-        let gap_over = state.last_end.map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
+        let gap_over = state
+            .last_end
+            .map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
         state.used < MAX_PER_EPOCH
             && (reason != Reason::StorageRecordAwaited || state.storage_used < STORAGE_PER_EPOCH)
             && (reason != Reason::SealBeforeClosingRequest
@@ -237,9 +250,13 @@ impl ViewRefresh {
     pub fn decide(&self, view: Option<u64>, head: Option<u64>, now: Instant) -> Decision {
         let mut guard = self.lock();
         let state = &mut *guard;
-        let Some(length) = state.epoch_length else { return Decision::Idle };
+        let Some(length) = state.epoch_length else {
+            return Decision::Idle;
+        };
         // Without a committed view the periodic pull establishes one.
-        let (Some(view), Some(head)) = (view, head) else { return Decision::Idle };
+        let (Some(view), Some(head)) = (view, head) else {
+            return Decision::Idle;
+        };
         let reach = head.saturating_sub(1);
         if state.running.is_some() || reach <= view {
             return Decision::Idle;
@@ -254,24 +271,42 @@ impl ViewRefresh {
             state.reported = [false; 4];
         }
         let boundary = epoch * length;
-        let pending = |slot: Option<u64>| slot.filter(|through| *through > view && *through <= reach);
+        let pending =
+            |slot: Option<u64>| slot.filter(|through| *through > view && *through <= reach);
         let wanted = if view < boundary {
-            EarlyPull { reason: Reason::EpochBoundary, through: boundary }
+            EarlyPull {
+                reason: Reason::EpochBoundary,
+                through: boundary,
+            }
         } else if let Some(through) = pending(state.seal) {
-            EarlyPull { reason: Reason::SealBeforeClosingRequest, through }
+            EarlyPull {
+                reason: Reason::SealBeforeClosingRequest,
+                through,
+            }
         } else if let Some(through) = pending(state.successor) {
-            EarlyPull { reason: Reason::SealedSessionAwaitsSuccessor, through }
+            EarlyPull {
+                reason: Reason::SealedSessionAwaitsSuccessor,
+                through,
+            }
         } else if let Some(through) = pending(state.storage) {
-            EarlyPull { reason: Reason::StorageRecordAwaited, through }
+            EarlyPull {
+                reason: Reason::StorageRecordAwaited,
+                through,
+            }
         } else {
             return Decision::Idle;
         };
         // A waiting seal skips the gap once for each frame it needs, while its
         // budget lasts, whichever reason the pull is for: any pull reaches it.
         let seal_skip = pending(state.seal).filter(|through| {
-            state.seal_used < SEAL_PER_EPOCH && state.seal_skipped.map_or(true, |skipped| *through > skipped)
+            state.seal_used < SEAL_PER_EPOCH
+                && state
+                    .seal_skipped
+                    .map_or(true, |skipped| *through > skipped)
         });
-        let gap_over = state.last_end.map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
+        let gap_over = state
+            .last_end
+            .map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
         if !gap_over && seal_skip.is_none() {
             return Decision::Idle;
         }
@@ -340,13 +375,26 @@ mod tests {
         let refresh = enabled();
         let now = Instant::now();
         // The boundary frame 922320's own header binds the state before it.
-        assert_eq!(refresh.decide(Some(922315), Some(922320), now), Decision::Idle);
-        assert_eq!(refresh.decide(Some(922315), Some(922321), now), pull(Reason::EpochBoundary, 922320));
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922320), now),
+            Decision::Idle
+        );
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922321), now),
+            pull(Reason::EpochBoundary, 922320)
+        );
         refresh.begin(922320);
-        assert_eq!(refresh.decide(Some(922315), Some(922322), now), Decision::Idle, "one pull at a time");
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922322), now),
+            Decision::Idle,
+            "one pull at a time"
+        );
         refresh.end(now);
         // Once the view holds the boundary, the head moving on is periodic work.
-        assert_eq!(refresh.decide(Some(922320), Some(922330), now + MIN_GAP * 2), Decision::Idle);
+        assert_eq!(
+            refresh.decide(Some(922320), Some(922330), now + MIN_GAP * 2),
+            Decision::Idle
+        );
     }
 
     /// A storage record this node waits for (a renewal's snapshot, its
@@ -363,25 +411,55 @@ mod tests {
         assert!(refresh.request(SNAPSHOT, 922340, now));
         assert!(refresh.request(SNAPSHOT, 922338, now), "requests add up");
         assert_eq!(refresh.requested(SNAPSHOT), Some(922340));
-        assert_eq!(refresh.decide(Some(view), Some(922340), now), Decision::Idle, "not bindable yet");
-        assert_eq!(refresh.decide(Some(view), Some(922341), now), pull(SNAPSHOT, 922340));
+        assert_eq!(
+            refresh.decide(Some(view), Some(922340), now),
+            Decision::Idle,
+            "not bindable yet"
+        );
+        assert_eq!(
+            refresh.decide(Some(view), Some(922341), now),
+            pull(SNAPSHOT, 922340)
+        );
         refresh.begin(922340);
         refresh.end(now);
         refresh.settle(922340);
         assert_eq!(refresh.requested(SNAPSHOT), None, "the view reached it");
         assert!(refresh.request(SNAPSHOT, 922341, now));
-        assert_eq!(refresh.decide(Some(922340), Some(922342), now), Decision::Idle, "a pull just ended");
-        assert_eq!(refresh.decide(Some(922340), Some(922342), now + MIN_GAP), pull(SNAPSHOT, 922341));
+        assert_eq!(
+            refresh.decide(Some(922340), Some(922342), now),
+            Decision::Idle,
+            "a pull just ended"
+        );
+        assert_eq!(
+            refresh.decide(Some(922340), Some(922342), now + MIN_GAP),
+            pull(SNAPSHOT, 922341)
+        );
         for pulls in 2..STORAGE_PER_EPOCH {
             now += MIN_GAP;
             let through = 922340 + u64::from(pulls);
             assert!(refresh.request(SNAPSHOT, through, now));
-            assert_eq!(refresh.decide(Some(view), Some(through + 1), now + MIN_GAP), pull(SNAPSHOT, through));
+            assert_eq!(
+                refresh.decide(Some(view), Some(through + 1), now + MIN_GAP),
+                pull(SNAPSHOT, through)
+            );
         }
         now += MIN_GAP;
-        assert!(!refresh.request(SNAPSHOT, 922360, now), "the epoch's storage pulls are spent");
-        assert!(matches!(refresh.decide(Some(view), Some(922361), now + MIN_GAP), Decision::Exhausted { max: STORAGE_PER_EPOCH, .. }));
-        assert_eq!(refresh.requested(SNAPSHOT), None, "a spent budget drops its request");
+        assert!(
+            !refresh.request(SNAPSHOT, 922360, now),
+            "the epoch's storage pulls are spent"
+        );
+        assert!(matches!(
+            refresh.decide(Some(view), Some(922361), now + MIN_GAP),
+            Decision::Exhausted {
+                max: STORAGE_PER_EPOCH,
+                ..
+            }
+        ));
+        assert_eq!(
+            refresh.requested(SNAPSHOT),
+            None,
+            "a spent budget drops its request"
+        );
     }
 
     /// A record awaited on every frame (a renewal waiting for its snapshot)
@@ -396,7 +474,9 @@ mod tests {
         let (mut view, mut pulls) = (922330u64, 0);
         for head in 922331..922350u64 {
             refresh.request(STORAGE, head - 1, now);
-            if let Decision::Pull(EarlyPull { through, .. }) = refresh.decide(Some(view), Some(head), now) {
+            if let Decision::Pull(EarlyPull { through, .. }) =
+                refresh.decide(Some(view), Some(head), now)
+            {
                 assert_eq!(through, head - 1);
                 pulls += 1;
                 refresh.begin(head - 1);
@@ -406,7 +486,10 @@ mod tests {
             }
             now += MIN_GAP / 2;
         }
-        assert_eq!(pulls, 9, "one pull per gap (every other frame here) while the record is awaited");
+        assert_eq!(
+            pulls, 9,
+            "one pull per gap (every other frame here) while the record is awaited"
+        );
     }
 
     #[test]
@@ -415,7 +498,10 @@ mod tests {
         let now = Instant::now();
         assert!(!refresh.request(SEAL, 922330, now));
         assert_eq!(refresh.requested(SEAL), None);
-        assert_eq!(refresh.decide(Some(922315), Some(922331), now), Decision::Idle);
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922331), now),
+            Decision::Idle
+        );
     }
 
     #[test]
@@ -426,9 +512,18 @@ mod tests {
         refresh.begin(922320);
         refresh.end(start + Duration::from_secs(35));
         let ended = start + Duration::from_secs(35);
-        assert_eq!(refresh.decide(Some(922315), Some(922322), start + MIN_GAP), Decision::Idle);
-        assert_eq!(refresh.decide(Some(922315), Some(922322), ended + MIN_GAP / 2), Decision::Idle);
-        assert_eq!(refresh.decide(Some(922315), Some(922322), ended + MIN_GAP), pull(Reason::EpochBoundary, 922320));
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922322), start + MIN_GAP),
+            Decision::Idle
+        );
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922322), ended + MIN_GAP / 2),
+            Decision::Idle
+        );
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922322), ended + MIN_GAP),
+            pull(Reason::EpochBoundary, 922320)
+        );
     }
 
     #[test]
@@ -437,12 +532,22 @@ mod tests {
         let now = Instant::now();
         refresh.end(now);
         assert!(refresh.request(SEAL, 922330, now));
-        assert_eq!(refresh.decide(Some(922325), Some(922330), now), Decision::Idle, "frame 922330 not bindable yet");
-        assert_eq!(refresh.decide(Some(922325), Some(922331), now), pull(SEAL, 922330));
+        assert_eq!(
+            refresh.decide(Some(922325), Some(922330), now),
+            Decision::Idle,
+            "frame 922330 not bindable yet"
+        );
+        assert_eq!(
+            refresh.decide(Some(922325), Some(922331), now),
+            pull(SEAL, 922330)
+        );
         // A view that already holds the frame needs nothing.
         refresh.settle(922330);
         assert_eq!(refresh.requested(SEAL), None);
-        assert_eq!(refresh.decide(Some(922330), Some(922340), now + MIN_GAP), Decision::Idle);
+        assert_eq!(
+            refresh.decide(Some(922330), Some(922340), now + MIN_GAP),
+            Decision::Idle
+        );
     }
 
     #[test]
@@ -450,11 +555,21 @@ mod tests {
         let refresh = enabled();
         let now = Instant::now();
         refresh.begin(922330);
-        assert!(refresh.request(SEAL, 922330, now), "the running pull reaches it");
-        assert!(!refresh.request(SEAL, 922331, now), "the next pull starts only after this one");
+        assert!(
+            refresh.request(SEAL, 922330, now),
+            "the running pull reaches it"
+        );
+        assert!(
+            !refresh.request(SEAL, 922331, now),
+            "the next pull starts only after this one"
+        );
         refresh.end(now);
         assert!(refresh.request(SEAL, 922331, now));
-        assert_eq!(refresh.requested(SEAL), Some(922331), "the highest frame is kept");
+        assert_eq!(
+            refresh.requested(SEAL),
+            Some(922331),
+            "the highest frame is kept"
+        );
     }
 
     #[test]
@@ -463,11 +578,18 @@ mod tests {
         let mut now = Instant::now();
         refresh.request(SUCCESSOR, 922330, now);
         refresh.request(SUCCESSOR, 922340, now + SUCCESSOR_INTERVAL / 2);
-        assert_eq!(refresh.requested(SUCCESSOR), Some(922330), "a retry inside the interval is dropped");
+        assert_eq!(
+            refresh.requested(SUCCESSOR),
+            Some(922330),
+            "a retry inside the interval is dropped"
+        );
         let mut view = 922325;
         for _ in 0..SUCCESSOR_PER_EPOCH {
             refresh.request(SUCCESSOR, view + 5, now);
-            assert_eq!(refresh.decide(Some(view), Some(view + 6), now), pull(SUCCESSOR, view + 5));
+            assert_eq!(
+                refresh.decide(Some(view), Some(view + 6), now),
+                pull(SUCCESSOR, view + 5)
+            );
             refresh.end(now);
             view += 5;
             refresh.settle(view);
@@ -475,12 +597,20 @@ mod tests {
         }
         refresh.request(SUCCESSOR, view + 5, now);
         let spent = Decision::Exhausted {
-            epoch: 922320 / EPOCH, wanted: EarlyPull { reason: SUCCESSOR, through: view + 5 }, max: SUCCESSOR_PER_EPOCH,
+            epoch: 922320 / EPOCH,
+            wanted: EarlyPull {
+                reason: SUCCESSOR,
+                through: view + 5,
+            },
+            max: SUCCESSOR_PER_EPOCH,
         };
         assert_eq!(refresh.decide(Some(view), Some(view + 6), now), spent);
         // The epoch's other handoffs keep their pulls.
         refresh.request(SEAL, view + 5, now);
-        assert_eq!(refresh.decide(Some(view), Some(view + 6), now), pull(SEAL, view + 5));
+        assert_eq!(
+            refresh.decide(Some(view), Some(view + 6), now),
+            pull(SEAL, view + 5)
+        );
     }
 
     #[test]
@@ -490,27 +620,45 @@ mod tests {
         let mut view = 922325;
         for n in 0..12 {
             refresh.request(SUCCESSOR, view + 5, now);
-            assert_eq!(refresh.decide(Some(view), Some(view + 6), now), pull(SUCCESSOR, view + 5), "successor pull {}", n + 1);
+            assert_eq!(
+                refresh.decide(Some(view), Some(view + 6), now),
+                pull(SUCCESSOR, view + 5),
+                "successor pull {}",
+                n + 1
+            );
             refresh.end(now);
             view += 5;
             now += SUCCESSOR_INTERVAL;
         }
         refresh.request(SUCCESSOR, view + 5, now);
         let spent = Decision::Exhausted {
-            epoch: 922320 / EPOCH, wanted: EarlyPull { reason: SUCCESSOR, through: view + 5 }, max: 12,
+            epoch: 922320 / EPOCH,
+            wanted: EarlyPull {
+                reason: SUCCESSOR,
+                through: view + 5,
+            },
+            max: 12,
         };
         assert_eq!(refresh.decide(Some(view), Some(view + 6), now), spent);
         // Seals keep the rest of the total, and the total still stops.
         for _ in 0..4 {
             refresh.request(SEAL, view + 1, now);
-            assert_eq!(refresh.decide(Some(view), Some(view + 2), now), pull(SEAL, view + 1));
+            assert_eq!(
+                refresh.decide(Some(view), Some(view + 2), now),
+                pull(SEAL, view + 1)
+            );
             refresh.end(now);
             view += 1;
             now += MIN_GAP;
         }
         refresh.request(SEAL, view + 1, now);
         let all = Decision::Exhausted {
-            epoch: 922320 / EPOCH, wanted: EarlyPull { reason: SEAL, through: view + 1 }, max: 16,
+            epoch: 922320 / EPOCH,
+            wanted: EarlyPull {
+                reason: SEAL,
+                through: view + 1,
+            },
+            max: 16,
         };
         assert_eq!(refresh.decide(Some(view), Some(view + 2), now), all);
     }
@@ -522,28 +670,48 @@ mod tests {
         let boundary = 1281 * EPOCH;
         // Boundary pulls that do not converge, then seals.
         for head in boundary + 1..boundary + 1 + 8 {
-            assert_eq!(refresh.decide(Some(boundary - 5), Some(head), now), pull(Reason::EpochBoundary, boundary));
+            assert_eq!(
+                refresh.decide(Some(boundary - 5), Some(head), now),
+                pull(Reason::EpochBoundary, boundary)
+            );
             refresh.end(now);
             now += MIN_GAP;
         }
         let mut view = boundary;
         for _ in 0..SEAL_PER_EPOCH {
             refresh.request(SEAL, view + 1, now);
-            assert_eq!(refresh.decide(Some(view), Some(view + 2), now), pull(SEAL, view + 1));
+            assert_eq!(
+                refresh.decide(Some(view), Some(view + 2), now),
+                pull(SEAL, view + 1)
+            );
             refresh.end(now);
             view += 1;
             now += MIN_GAP;
         }
-        assert!(!refresh.request(SUCCESSOR, view + 1, now), "no pull is coming this epoch");
+        assert!(
+            !refresh.request(SUCCESSOR, view + 1, now),
+            "no pull is coming this epoch"
+        );
         assert_eq!(
             refresh.decide(Some(view), Some(view + 2), now),
             Decision::Exhausted {
-                epoch: boundary / EPOCH, wanted: EarlyPull { reason: SUCCESSOR, through: view + 1 }, max: MAX_PER_EPOCH,
+                epoch: boundary / EPOCH,
+                wanted: EarlyPull {
+                    reason: SUCCESSOR,
+                    through: view + 1
+                },
+                max: MAX_PER_EPOCH,
             },
         );
-        assert_eq!(refresh.decide(Some(view), Some(view + 2), now + MIN_GAP), Decision::Idle);
+        assert_eq!(
+            refresh.decide(Some(view), Some(view + 2), now + MIN_GAP),
+            Decision::Idle
+        );
         // The next boundary pulls despite the spent budget.
-        assert_eq!(refresh.decide(Some(view), Some(923041), now + MIN_GAP * 2), pull(Reason::EpochBoundary, 923040));
+        assert_eq!(
+            refresh.decide(Some(view), Some(923041), now + MIN_GAP * 2),
+            pull(Reason::EpochBoundary, 923040)
+        );
     }
 
     #[test]
@@ -552,16 +720,32 @@ mod tests {
         let now = Instant::now();
         refresh.end(now);
         assert!(refresh.request(SEAL, 922330, now));
-        assert_eq!(refresh.decide(Some(922325), Some(922331), now), pull(SEAL, 922330));
+        assert_eq!(
+            refresh.decide(Some(922325), Some(922331), now),
+            pull(SEAL, 922330)
+        );
         // That pull did not converge: the same frame waits out the gap.
         refresh.end(now + Duration::from_secs(1));
         assert!(!refresh.request(SEAL, 922330, now + Duration::from_secs(2)));
-        assert_eq!(refresh.decide(Some(922325), Some(922331), now + Duration::from_secs(2)), Decision::Idle);
-        assert_eq!(refresh.decide(Some(922325), Some(922331), now + Duration::from_secs(1) + MIN_GAP), pull(SEAL, 922330));
+        assert_eq!(
+            refresh.decide(Some(922325), Some(922331), now + Duration::from_secs(2)),
+            Decision::Idle
+        );
+        assert_eq!(
+            refresh.decide(
+                Some(922325),
+                Some(922331),
+                now + Duration::from_secs(1) + MIN_GAP
+            ),
+            pull(SEAL, 922330)
+        );
         // A later frame skips it again.
         refresh.end(now + Duration::from_secs(22));
         assert!(refresh.request(SEAL, 922331, now + Duration::from_secs(23)));
-        assert_eq!(refresh.decide(Some(922325), Some(922332), now + Duration::from_secs(23)), pull(SEAL, 922331));
+        assert_eq!(
+            refresh.decide(Some(922325), Some(922332), now + Duration::from_secs(23)),
+            pull(SEAL, 922331)
+        );
     }
 
     #[test]
@@ -573,26 +757,46 @@ mod tests {
         // GLOBAL advances: each new frame skips the gap, up to the seals' budget.
         for _ in 0..SEAL_PER_EPOCH {
             assert!(refresh.request(SEAL, view + 1, now));
-            assert_eq!(refresh.decide(Some(view), Some(view + 2), now), pull(SEAL, view + 1));
+            assert_eq!(
+                refresh.decide(Some(view), Some(view + 2), now),
+                pull(SEAL, view + 1)
+            );
             view += 1;
             refresh.end(now);
             refresh.settle(view);
             now += Duration::from_secs(1);
         }
-        assert!(!refresh.request(SEAL, view + 1, now), "the seals' budget is spent");
-        assert_eq!(refresh.decide(Some(view), Some(view + 2), now + MIN_GAP), Decision::Exhausted {
-            epoch: 922320 / EPOCH, wanted: EarlyPull { reason: SEAL, through: view + 1 }, max: SEAL_PER_EPOCH,
-        });
+        assert!(
+            !refresh.request(SEAL, view + 1, now),
+            "the seals' budget is spent"
+        );
+        assert_eq!(
+            refresh.decide(Some(view), Some(view + 2), now + MIN_GAP),
+            Decision::Exhausted {
+                epoch: 922320 / EPOCH,
+                wanted: EarlyPull {
+                    reason: SEAL,
+                    through: view + 1
+                },
+                max: SEAL_PER_EPOCH,
+            }
+        );
         // A successor still pulls, after the gap.
         refresh.request(SUCCESSOR, view + 1, now + MIN_GAP);
-        assert_eq!(refresh.decide(Some(view), Some(view + 2), now + MIN_GAP), pull(SUCCESSOR, view + 1));
+        assert_eq!(
+            refresh.decide(Some(view), Some(view + 2), now + MIN_GAP),
+            pull(SUCCESSOR, view + 1)
+        );
     }
 
     #[test]
     fn a_seal_waiting_behind_an_unconverged_boundary_pull_does_not_wait_out_the_gap() {
         let refresh = enabled();
         let now = Instant::now();
-        assert_eq!(refresh.decide(Some(922315), Some(922321), now), pull(Reason::EpochBoundary, 922320));
+        assert_eq!(
+            refresh.decide(Some(922315), Some(922321), now),
+            pull(Reason::EpochBoundary, 922320)
+        );
         let ended = now + Duration::from_secs(35);
         refresh.end(ended);
         // The view is still behind the boundary; a seal needs frame 922321.

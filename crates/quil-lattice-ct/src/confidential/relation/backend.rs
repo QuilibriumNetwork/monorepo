@@ -4,17 +4,17 @@
 //! binary auxiliary range encoding. Selection rows retain quadratic handles.
 use super::*;
 
+#[cfg(feature = "native-proof")]
+pub mod native;
 pub mod portable;
 pub mod ring_lift;
 pub mod submission;
-#[cfg(feature = "native-proof")]
-pub mod native;
 
+pub mod worker_client;
+pub mod worker_limits;
 /// Process lifecycle boundary for a trusted, separately executed verifier.
 pub mod worker_process;
 pub mod worker_request;
-pub mod worker_limits;
-pub mod worker_client;
 
 /// Public handles for one quadratic selection row over the backend ring:
 /// Σ_k w_k · (s·(one_k − zero_k) + zero_k − selected_k) = 0, with s a scalar
@@ -35,8 +35,7 @@ impl SelectionRow {
 
     /// Every handle referenced by the row, selector first.
     pub fn handles(&self) -> impl Iterator<Item = usize> + '_ {
-        std::iter::once(self.selector)
-            .chain(self.terms.iter().flat_map(|&(_, z, o, s)| [z, o, s]))
+        std::iter::once(self.selector).chain(self.terms.iter().flat_map(|&(_, z, o, s)| [z, o, s]))
     }
 
     /// Private-assignment check, not a proof verifier. A native frontend emits
@@ -46,22 +45,27 @@ impl SelectionRow {
             let (p, bound) = (relation.witness(i)?, relation.variable_bound(i)?);
             (p.c.len() == Poly::D && p.c.iter().all(|&v| v <= bound)).then_some(p)
         };
-        let Some(selector) = fetch(self.selector) else { return false };
+        let Some(selector) = fetch(self.selector) else {
+            return false;
+        };
         if selector.c[1..].iter().any(|&v| v != 0) || self.terms.is_empty() {
             return false;
         }
         let s = i128::from(selector.c[0]);
         let mut residual = vec![0i128; Poly::D];
         for &(w, z, o, sel) in &self.terms {
-            let (Some(zero), Some(one), Some(selected)) = (fetch(z), fetch(o), fetch(sel)) else { return false };
+            let (Some(zero), Some(one), Some(selected)) = (fetch(z), fetch(o), fetch(sel)) else {
+                return false;
+            };
             for i in 0..Poly::D {
                 residual[i] += i128::from(w)
-                    * (s * (i128::from(one.c[i]) - i128::from(zero.c[i]))
-                        + i128::from(zero.c[i])
+                    * (s * (i128::from(one.c[i]) - i128::from(zero.c[i])) + i128::from(zero.c[i])
                         - i128::from(selected.c[i]));
             }
         }
-        residual.into_iter().all(|v| v.rem_euclid(PROOF_MODULUS) == 0)
+        residual
+            .into_iter()
+            .all(|v| v.rem_euclid(PROOF_MODULUS) == 0)
     }
 }
 
@@ -157,8 +161,10 @@ mod tests {
     fn selection_translation_requires_one_whole_node_choice() {
         let mut relation = CompiledAmountRelation {
             binary: vec![Poly::one(), Poly::zero(), Poly::one(), Poly::one()],
-            short: Vec::new(), short_bound: Vec::new(),
-            ring: Vec::new(), exact_ring: Vec::new(),
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: Vec::new(),
             input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),
@@ -183,8 +189,10 @@ mod tests {
     fn scalar_translation_requires_public_bounds_and_binary_inputs() {
         let mut relation = CompiledAmountRelation {
             binary: vec![Poly::one()],
-            short: Vec::new(), short_bound: Vec::new(),
-            ring: Vec::new(), exact_ring: Vec::new(),
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
             scalar: vec![ScalarEquation {
                 terms: vec![(1, 0, 0)],
                 rhs: 1,

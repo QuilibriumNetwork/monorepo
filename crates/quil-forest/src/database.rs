@@ -10,8 +10,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
 use crate::storage_health::{StoreRole, StoreState};
+use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
 use rocksdb::{
     DBIterator, DBRawIterator, IteratorMode, ReadOptions, Snapshot, WriteBatch, WriteOptions, DB,
 };
@@ -78,7 +78,10 @@ struct WatchedJournal {
 
 impl WatchedJournal {
     fn starting_at(sequence: u64) -> Self {
-        Self { floor: sequence, keys: BTreeMap::new() }
+        Self {
+            floor: sequence,
+            keys: BTreeMap::new(),
+        }
     }
 
     fn record(&mut self, sequence: u64, write: WatchedWrite) {
@@ -431,7 +434,10 @@ impl CoordinatedDb {
         let mut guard = self.lock_writes()?;
         if self.0.watched.is_some() {
             let last = guard.ledger.watched;
-            guard.ledger.journal.get_or_insert_with(|| WatchedJournal::starting_at(last));
+            guard
+                .ledger
+                .journal
+                .get_or_insert_with(|| WatchedJournal::starting_at(last));
         }
         Ok(())
     }
@@ -441,7 +447,10 @@ impl CoordinatedDb {
     /// first request starts the journal at the last watched write, which
     /// lists exactly what follows it; one reader is assumed, whose caches
     /// are at `sequence` or later from now on.
-    pub fn watched_writes_since(&self, sequence: u64) -> Result<Option<Vec<Vec<u8>>>, DatabaseCommitError> {
+    pub fn watched_writes_since(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<Vec<Vec<u8>>>, DatabaseCommitError> {
         let mut guard = self.lock_writes()?;
         if self.0.watched.is_none() {
             return Ok(None);
@@ -464,7 +473,14 @@ impl CoordinatedDb {
         let from = self.0.db.latest_sequence_number();
         let snapshot = self.0.db.snapshot();
         let to = self.0.db.latest_sequence_number();
-        (snapshot, ScanPoint { database: self.0.instance, from, to })
+        (
+            snapshot,
+            ScanPoint {
+                database: self.0.instance,
+                from,
+                to,
+            },
+        )
     }
     pub fn latest_sequence_number(&self) -> u64 {
         self.0.db.latest_sequence_number()
@@ -559,7 +575,9 @@ impl DatabaseWriteGuard<'_> {
             .0
             .watched
             .as_ref()
-            .map_or(WatchedWrite::None, |prefixes| watched_writes(batch.data(), prefixes, list));
+            .map_or(WatchedWrite::None, |prefixes| {
+                watched_writes(batch.data(), prefixes, list)
+            });
         let written = match self.database.0.state.take_fault() {
             Some(fault) => Err(fault),
             None => self.database.0.db.write_opt(batch, options),
@@ -569,7 +587,14 @@ impl DatabaseWriteGuard<'_> {
             let sequence = self.database.0.db.latest_sequence_number();
             self.ledger.watched = sequence;
             if let Some(journal) = self.ledger.journal.as_mut() {
-                journal.record(sequence, if written.is_ok() { watched } else { WatchedWrite::Unlisted });
+                journal.record(
+                    sequence,
+                    if written.is_ok() {
+                        watched
+                    } else {
+                        WatchedWrite::Unlisted
+                    },
+                );
             }
         }
         if let Err(error) = written {
@@ -584,7 +609,11 @@ impl DatabaseWriteGuard<'_> {
     /// The sequence after the last write that may have written a watched key,
     /// or `None` when this database watches no keys.
     pub fn watched_write_sequence(&self) -> Option<u64> {
-        self.database.0.watched.as_ref().map(|_| self.ledger.watched)
+        self.database
+            .0
+            .watched
+            .as_ref()
+            .map(|_| self.ledger.watched)
     }
 
     fn write_batch(
@@ -630,7 +659,9 @@ impl DatabaseWriteGuard<'_> {
 /// write with `cause`, without its own log line (the caller reports a group
 /// of stores at once). Whether it was open and not stopped before.
 pub(crate) fn stop_writes(database: &Weak<DatabaseInner>, cause: String) -> bool {
-    let Some(inner) = database.upgrade() else { return false };
+    let Some(inner) = database.upgrade() else {
+        return false;
+    };
     let _barrier = inner.writes.lock();
     inner.state.latch_quietly(cause)
 }
@@ -795,15 +826,28 @@ mod watched_write_tests {
         assert!(may_write(&|b| b.merge([0x21, 0x01, 9], b"v")));
         assert!(!may_write(&|b| b.delete([0x22])));
         // Range deletions intersecting a prefix, or spanning it.
-        assert!(may_write(&|b| b.delete_range(&[0x20, 0x01, 0xff, 5][..], &[0x20, 0x02][..])));
+        assert!(may_write(
+            &|b| b.delete_range(&[0x20, 0x01, 0xff, 5][..], &[0x20, 0x02][..])
+        ));
         assert!(may_write(&|b| b.delete_range(&[0x00][..], &[0xff][..])));
-        assert!(may_write(&|b| b.delete_range(&[0x20, 0x01, 0xfe][..], &[0x20, 0x01, 0xff, 0][..])));
+        assert!(may_write(&|b| b.delete_range(
+            &[0x20, 0x01, 0xfe][..],
+            &[0x20, 0x01, 0xff, 0][..]
+        )));
         // Ranges ending at a prefix or starting after it do not.
-        assert!(!may_write(&|b| b.delete_range(&[0x20][..], &[0x20, 0x01, 0xff][..])));
-        assert!(!may_write(&|b| b.delete_range(&[0x20, 0x02][..], &[0x21, 0x01][..])));
-        assert!(!may_write(&|b| b.delete_range(&[0x21, 0x02][..], &[0x30][..])));
+        assert!(!may_write(
+            &|b| b.delete_range(&[0x20][..], &[0x20, 0x01, 0xff][..])
+        ));
+        assert!(!may_write(
+            &|b| b.delete_range(&[0x20, 0x02][..], &[0x21, 0x01][..])
+        ));
+        assert!(!may_write(
+            &|b| b.delete_range(&[0x21, 0x02][..], &[0x30][..])
+        ));
         // An empty or reversed range writes nothing.
-        assert!(!may_write(&|b| b.delete_range(&[0x21, 0x01, 5][..], &[0x21, 0x01, 5][..])));
+        assert!(!may_write(
+            &|b| b.delete_range(&[0x21, 0x01, 5][..], &[0x21, 0x01, 5][..])
+        ));
         // Large values use multi-byte lengths.
         assert!(!may_write(&|b| b.put([0x30], vec![1u8; 70_000])));
         assert!(may_write(&|b| {
@@ -832,22 +876,35 @@ mod watched_write_tests {
     #[test]
     fn the_ledger_records_only_watched_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
-        let watched = |db: &CoordinatedDb| db.lock_writes().unwrap().watched_write_sequence().unwrap();
+        let db =
+            CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let watched =
+            |db: &CoordinatedDb| db.lock_writes().unwrap().watched_write_sequence().unwrap();
         let start = watched(&db);
         db.put([0x05], b"v").unwrap();
-        assert_eq!(watched(&db), start, "an unwatched write leaves the ledger alone");
+        assert_eq!(
+            watched(&db),
+            start,
+            "an unwatched write leaves the ledger alone"
+        );
         db.put([0x21, 0x01, 3], b"v").unwrap();
         let after = db.latest_sequence_number();
         assert_eq!(watched(&db), after);
         db.delete([0x07]).unwrap();
         assert_eq!(watched(&db), after);
         let (_snapshot, sequence, recorded) = db.execution_snapshot().unwrap();
-        assert_eq!((sequence, recorded), (db.latest_sequence_number(), Some(after)));
+        assert_eq!(
+            (sequence, recorded),
+            (db.latest_sequence_number(), Some(after))
+        );
         // The point a capture would record, without capturing.
         assert_eq!(
             db.current_capture_point().unwrap(),
-            Some(CapturePoint { database: db.instance(), sequence, watched: after })
+            Some(CapturePoint {
+                database: db.instance(),
+                sequence,
+                watched: after
+            })
         );
 
         let plain_dir = tempfile::tempdir().unwrap();
@@ -863,13 +920,18 @@ mod watched_write_tests {
     #[test]
     fn the_journal_lists_watched_keys_written_after_a_sequence() {
         let dir = tempfile::tempdir().unwrap();
-        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let db =
+            CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
         let listed = |since| db.watched_writes_since(since).unwrap();
         // Nothing is journaled before a reader asks.
         db.put([0x21, 0x01, 1], b"v").unwrap();
         assert!(db.lock_writes().unwrap().ledger.journal.is_none());
         let start = db.latest_sequence_number();
-        assert_eq!(listed(start - 1), None, "a write before the first request is not listed");
+        assert_eq!(
+            listed(start - 1),
+            None,
+            "a write before the first request is not listed"
+        );
         assert_eq!(listed(start), Some(Vec::new()));
 
         db.put([0x21, 0x01, 3], b"v").unwrap();
@@ -877,18 +939,32 @@ mod watched_write_tests {
         let first = db.latest_sequence_number();
         db.delete([0x20, 0x01, 0xff, 9]).unwrap();
         db.put([0x21, 0x01, 3], b"w").unwrap();
-        assert_eq!(listed(start), Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]]));
-        assert_eq!(listed(first), Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]]),
-            "a key written again after the sequence is listed once");
+        assert_eq!(
+            listed(start),
+            Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]])
+        );
+        assert_eq!(
+            listed(first),
+            Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]]),
+            "a key written again after the sequence is listed once"
+        );
         let latest = db.latest_sequence_number();
         assert_eq!(listed(latest), Some(Vec::new()));
-        assert_eq!(listed(first), None, "the reader's caches are past `first` now");
+        assert_eq!(
+            listed(first),
+            None,
+            "the reader's caches are past `first` now"
+        );
 
         let mut range = WriteBatch::default();
         range.delete_range(&[0x21, 0x01][..], &[0x21, 0x02][..]);
         db.write(range).unwrap();
         let reset = db.latest_sequence_number();
-        assert_eq!(listed(latest), None, "a range deletion cannot be listed key by key");
+        assert_eq!(
+            listed(latest),
+            None,
+            "a range deletion cannot be listed key by key"
+        );
         db.put([0x21, 0x01, 4], b"v").unwrap();
         assert_eq!(listed(reset), Some(vec![vec![0x21, 0x01, 4]]));
 
@@ -903,7 +979,8 @@ mod watched_write_tests {
     #[test]
     fn the_journal_bound_counts_keys_since_the_last_request() {
         let dir = tempfile::tempdir().unwrap();
-        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let db =
+            CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
         let versioned = |address: u8, version: u64| {
             let mut key = vec![0x21, 0x01, address];
             key.extend_from_slice(&version.to_be_bytes());
@@ -919,7 +996,10 @@ mod watched_write_tests {
                 batch.put(versioned((version % 7) as u8, version), b"v");
             }
             db.write(batch).unwrap();
-            let listed = db.watched_writes_since(seen).unwrap().expect("within the bound since the last request");
+            let listed = db
+                .watched_writes_since(seen)
+                .unwrap()
+                .expect("within the bound since the last request");
             assert_eq!(listed.len() as u64, third, "every version is its own key");
             seen = db.latest_sequence_number();
         }
@@ -929,7 +1009,11 @@ mod watched_write_tests {
             batch.put(versioned(9, version), b"v");
         }
         db.write(batch).unwrap();
-        assert_eq!(db.watched_writes_since(seen).unwrap(), None, "past its bound the journal starts over");
+        assert_eq!(
+            db.watched_writes_since(seen).unwrap(),
+            None,
+            "past its bound the journal starts over"
+        );
         let after = db.latest_sequence_number();
         assert_eq!(db.watched_writes_since(after).unwrap(), Some(Vec::new()));
     }
@@ -954,11 +1038,26 @@ mod prefix_set_tests {
     #[test]
     fn ranges_mark_exactly_the_spanned_prefixes_across_word_boundaries() {
         for (lower, upper, first, last) in [
-            (&[0x00, 0x3e][..], &[0x00, 0x41, 0x00][..], [0x00, 0x3e], [0x00, 0x41]),
+            (
+                &[0x00, 0x3e][..],
+                &[0x00, 0x41, 0x00][..],
+                [0x00, 0x3e],
+                [0x00, 0x41],
+            ),
             (&[][..], &[0x00][..], [0x00, 0x00], [0x00, 0xff]),
             (&[0x7f, 0xff][..], &[0x80][..], [0x7f, 0xff], [0x80, 0xff]),
-            (&[0x05][..], &[0x05, 0x00, 0x01][..], [0x05, 0x00], [0x05, 0x00]),
-            (&[0xff, 0xff][..], &[0xff, 0xff, 0x01][..], [0xff, 0xff], [0xff, 0xff]),
+            (
+                &[0x05][..],
+                &[0x05, 0x00, 0x01][..],
+                [0x05, 0x00],
+                [0x05, 0x00],
+            ),
+            (
+                &[0xff, 0xff][..],
+                &[0xff, 0xff, 0x01][..],
+                [0xff, 0xff],
+                [0xff, 0xff],
+            ),
         ] {
             let mut set = KeyPrefixSet::default();
             set.mark_range(lower, upper);
@@ -966,7 +1065,11 @@ mod prefix_set_tests {
             for i in 0..=0xffff_usize {
                 let prefix = [(i >> 8) as u8, i as u8];
                 let inside = (index(first)..=index(last)).contains(&i);
-                assert_eq!(set.contains(prefix), inside, "{lower:?}..{upper:?} at {prefix:?}");
+                assert_eq!(
+                    set.contains(prefix),
+                    inside,
+                    "{lower:?}..{upper:?} at {prefix:?}"
+                );
             }
         }
         let mut whole = KeyPrefixSet::default();

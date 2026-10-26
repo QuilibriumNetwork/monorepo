@@ -1,7 +1,9 @@
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 use quil_crypto::sdr::{self, SdrParams};
-use quil_crypto::storage_proof::{self, encode_leaf, prove_seal, Registered, SealProof, SealStatement};
+use quil_crypto::storage_proof::{
+    self, encode_leaf, prove_seal, Registered, SealProof, SealStatement,
+};
 
 use crate::config::Val;
 use crate::seal::{self, EpochStatement, FrameOpenings, Held, Opened};
@@ -10,7 +12,9 @@ const EPOCH: u64 = 4;
 const QUERIES: u32 = 2;
 
 fn data(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+        .collect()
 }
 
 /// One member's encoded leaf.
@@ -32,8 +36,17 @@ impl Fixture {
 
     fn at(leaf: &[u8], epoch: u64, bytes: usize, seed: u8) -> Self {
         let member = vec![7u8; 32];
-        let encoded = encode_leaf(&data(bytes, seed), &sdr::replica_key(&member, leaf, epoch), &SdrParams::default());
-        Self { member, leaf: leaf.to_vec(), epoch, encoded }
+        let encoded = encode_leaf(
+            &data(bytes, seed),
+            &sdr::replica_key(&member, leaf, epoch),
+            &SdrParams::default(),
+        );
+        Self {
+            member,
+            leaf: leaf.to_vec(),
+            epoch,
+            encoded,
+        }
     }
 
     fn statement<'a>(&'a self, beacon: &'a [u8]) -> SealStatement<'a> {
@@ -52,11 +65,23 @@ impl Fixture {
     }
 
     fn seal(&self, statement: &SealStatement, count: usize) -> SealProof {
-        prove_seal(&self.encoded.replica, statement, &SdrParams::default(), count).unwrap()
+        prove_seal(
+            &self.encoded.replica,
+            statement,
+            &SdrParams::default(),
+            count,
+        )
+        .unwrap()
     }
 
     fn held(&self) -> Held<'_> {
-        Held { member: &self.member, leaf_id: &self.leaf, epoch: self.epoch, n: self.encoded.n, comm_r: self.encoded.comm_r }
+        Held {
+            member: &self.member,
+            leaf_id: &self.leaf,
+            epoch: self.epoch,
+            n: self.encoded.n,
+            comm_r: self.encoded.comm_r,
+        }
     }
 
     /// This member's opening of `query` at beacon `rho`.
@@ -74,7 +99,11 @@ impl Fixture {
         .unwrap();
         Opened {
             value: opening.value.try_into().unwrap(),
-            path: opening.path_commits.into_iter().map(|node| node.try_into().unwrap()).collect(),
+            path: opening
+                .path_commits
+                .into_iter()
+                .map(|node| node.try_into().unwrap())
+                .collect(),
         }
     }
 }
@@ -91,9 +120,19 @@ struct Epoch {
 impl Epoch {
     fn new() -> Self {
         Self {
-            sealed: vec![Fixture::of(b"leaf-a", 200 * 30, 1), Fixture::of(b"leaf-b", 70 * 30, 2)],
-            held: vec![Fixture::at(b"leaf-a", EPOCH - 1, 150 * 30, 4), Fixture::at(b"leaf-c", EPOCH - 1, 600 * 30, 5)],
-            frames: vec![(11, b"rho-11".to_vec(), vec![0]), (12, b"rho-12".to_vec(), vec![0, 1]), (15, b"rho-15".to_vec(), vec![1])],
+            sealed: vec![
+                Fixture::of(b"leaf-a", 200 * 30, 1),
+                Fixture::of(b"leaf-b", 70 * 30, 2),
+            ],
+            held: vec![
+                Fixture::at(b"leaf-a", EPOCH - 1, 150 * 30, 4),
+                Fixture::at(b"leaf-c", EPOCH - 1, 600 * 30, 5),
+            ],
+            frames: vec![
+                (11, b"rho-11".to_vec(), vec![0]),
+                (12, b"rho-12".to_vec(), vec![0, 1]),
+                (15, b"rho-15".to_vec(), vec![1]),
+            ],
             count: 8,
         }
     }
@@ -104,19 +143,37 @@ impl Epoch {
             .frames
             .iter()
             .map(|(number, rho, held)| {
-                let values: Vec<Opened> =
-                    held.iter().flat_map(|&h| (0..QUERIES).map(move |q| (h, q))).map(|(h, q)| self.held[h].open(q, rho)).collect();
-                let root = storage_proof::openings_root(*number, &values.iter().map(|o| o.value).collect::<Vec<_>>()).unwrap();
+                let values: Vec<Opened> = held
+                    .iter()
+                    .flat_map(|&h| (0..QUERIES).map(move |q| (h, q)))
+                    .map(|(h, q)| self.held[h].open(q, rho))
+                    .collect();
+                let root = storage_proof::openings_root(
+                    *number,
+                    &values.iter().map(|o| o.value).collect::<Vec<_>>(),
+                )
+                .unwrap();
                 opened.extend(values);
-                FrameOpenings { frame_number: *number, rho_n: rho, root, held: held.clone() }
+                FrameOpenings {
+                    frame_number: *number,
+                    rho_n: rho,
+                    root,
+                    held: held.clone(),
+                }
             })
             .collect();
         (frames, opened)
     }
 
     fn statement(&self) -> (EpochStatement<'_>, Vec<SealProof>, Vec<Opened>) {
-        let seals: Vec<SealStatement> = self.sealed.iter().map(|f| f.statement(b"beacon")).collect();
-        let plain: Vec<SealProof> = self.sealed.iter().zip(&seals).map(|(f, s)| f.seal(s, self.count)).collect();
+        let seals: Vec<SealStatement> =
+            self.sealed.iter().map(|f| f.statement(b"beacon")).collect();
+        let plain: Vec<SealProof> = self
+            .sealed
+            .iter()
+            .zip(&seals)
+            .map(|(f, s)| f.seal(s, self.count))
+            .collect();
         let (frames, opened) = self.openings();
         let statement = EpochStatement {
             seals,
@@ -140,8 +197,13 @@ fn an_honest_seal_proves_and_verifies() {
     let proving = started.elapsed();
     let started = std::time::Instant::now();
     assert_eq!(seal::verify(&statement, &params, 16, &proof), Ok(()));
-    eprintln!("16 challenges, n = {}: prove {proving:?}, verify {:?}, {} bytes (plain seal {} bytes)",
-        fixture.encoded.n, started.elapsed(), proof.len(), plain.to_bytes().len());
+    eprintln!(
+        "16 challenges, n = {}: prove {proving:?}, verify {:?}, {} bytes (plain seal {} bytes)",
+        fixture.encoded.n,
+        started.elapsed(),
+        proof.len(),
+        plain.to_bytes().len()
+    );
     // Another beacon is another statement.
     assert!(seal::verify(&fixture.statement(b"other beacon"), &params, 16, &proof).is_err());
     // A flipped byte does not verify.
@@ -156,19 +218,40 @@ fn an_honest_seal_proves_and_verifies() {
 #[test]
 fn one_proof_covers_several_leaves() {
     let params = SdrParams::default();
-    let fixtures = [Fixture::of(b"leaf-a", 300 * 30, 1), Fixture::of(b"leaf-b", 40 * 30, 2), Fixture::of(b"leaf-c", 1100 * 30, 3)];
+    let fixtures = [
+        Fixture::of(b"leaf-a", 300 * 30, 1),
+        Fixture::of(b"leaf-b", 40 * 30, 2),
+        Fixture::of(b"leaf-c", 1100 * 30, 3),
+    ];
     let beacons: [&[u8]; 3] = [b"beacon-a", b"beacon-b", b"beacon-c"];
-    let statements: Vec<SealStatement> = fixtures.iter().zip(beacons).map(|(f, b)| f.statement(b)).collect();
-    let seals: Vec<SealProof> = fixtures.iter().zip(&statements).map(|(f, s)| f.seal(s, 8)).collect();
+    let statements: Vec<SealStatement> = fixtures
+        .iter()
+        .zip(beacons)
+        .map(|(f, b)| f.statement(b))
+        .collect();
+    let seals: Vec<SealProof> = fixtures
+        .iter()
+        .zip(&statements)
+        .map(|(f, s)| f.seal(s, 8))
+        .collect();
     let refs: Vec<&SealProof> = seals.iter().collect();
     let proof = seal::prove_many(&statements, &params, 8, &refs).unwrap();
     assert_eq!(seal::verify_many(&statements, &params, 8, &proof), Ok(()));
     let reordered = vec![statements[1], statements[0], statements[2]];
-    assert!(seal::verify_many(&reordered, &params, 8, &proof).is_err(), "another order");
-    assert!(seal::verify_many(&statements[..2], &params, 8, &proof).is_err(), "a leaf left out");
+    assert!(
+        seal::verify_many(&reordered, &params, 8, &proof).is_err(),
+        "another order"
+    );
+    assert!(
+        seal::verify_many(&statements[..2], &params, 8, &proof).is_err(),
+        "a leaf left out"
+    );
     let mut altered = statements.clone();
     altered[2].beacon = b"beacon-x";
-    assert!(seal::verify_many(&altered, &params, 8, &proof).is_err(), "another beacon for one leaf");
+    assert!(
+        seal::verify_many(&altered, &params, 8, &proof).is_err(),
+        "another beacon for one leaf"
+    );
     // Proving a statement with another leaf's seal fails before any proof.
     let swapped: Vec<&SealProof> = vec![&seals[1], &seals[0], &seals[2]];
     assert!(seal::prove_many(&statements, &params, 8, &swapped).is_err());
@@ -186,13 +269,22 @@ fn one_proof_covers_an_epochs_seals_and_openings() {
 
     let mut other_root = statement.clone();
     other_root.frames[1].root = statement.frames[0].root;
-    assert!(seal::verify_epoch(&other_root, &params, &proof).is_err(), "another committed root");
+    assert!(
+        seal::verify_epoch(&other_root, &params, &proof).is_err(),
+        "another committed root"
+    );
     let mut fewer = statement.clone();
     fewer.frames.pop();
-    assert!(seal::verify_epoch(&fewer, &params, &proof).is_err(), "a frame left out");
+    assert!(
+        seal::verify_epoch(&fewer, &params, &proof).is_err(),
+        "a frame left out"
+    );
     let mut other_held = statement.clone();
     other_held.frames[0].held = vec![1];
-    assert!(seal::verify_epoch(&other_held, &params, &proof).is_err(), "another registration opened");
+    assert!(
+        seal::verify_epoch(&other_held, &params, &proof).is_err(),
+        "another registration opened"
+    );
 
     // A committed root the values do not hash to cannot be proven.
     let mut wrong = statement.clone();
@@ -321,12 +413,16 @@ fn a_path_of_another_depth_is_rejected() {
 #[test]
 fn a_public_index_copy_other_than_the_verifiers_is_rejected() {
     // The committed copy of `Pub`'s node column, entry 1.
-    rejected(PUB, |t| bump(cell(t, 1, seal::pubc::WIDTH + seal::pubc::P_NODE)));
+    rejected(PUB, |t| {
+        bump(cell(t, 1, seal::pubc::WIDTH + seal::pubc::P_NODE))
+    });
 }
 
 #[test]
 fn a_leaf_key_copy_other_than_the_verifiers_is_rejected() {
-    rejected(LEAVES, |t| bump(cell(t, 0, seal::lvs::WIDTH + seal::lvs::P_KEY)));
+    rejected(LEAVES, |t| {
+        bump(cell(t, 0, seal::lvs::WIDTH + seal::lvs::P_KEY))
+    });
 }
 
 #[test]
@@ -342,7 +438,9 @@ fn an_opened_value_other_than_committed_is_rejected() {
 
 #[test]
 fn an_opening_index_copy_other_than_the_verifiers_is_rejected() {
-    rejected(OPUB, |t| bump(cell(t, 0, seal::opb::WIDTH + seal::opb::P_IDX)));
+    rejected(OPUB, |t| {
+        bump(cell(t, 0, seal::opb::WIDTH + seal::opb::P_IDX))
+    });
 }
 
 #[test]
@@ -351,7 +449,9 @@ fn an_opening_path_off_the_replica_tree_is_rejected() {
     rejected(MERKLE, |t| {
         let width = t.width;
         let rows = t.values.len() / width;
-        let row = (0..rows).find(|&r| t.values[r * width + seal::mrk::OPEN] == Val::ONE).expect("an opening path");
+        let row = (0..rows)
+            .find(|&r| t.values[r * width + seal::mrk::OPEN] == Val::ONE)
+            .expect("an opening path");
         bump(cell(t, row, seal::mrk::SIB));
     });
 }
@@ -366,7 +466,11 @@ fn seal_costs() {
     let sizes = std::env::var("QUIL_SEAL_NODES").unwrap_or_else(|_| "4096,65536".into());
     let params = SdrParams::default();
     let mut fixtures = Vec::new();
-    for (i, nodes) in sizes.split(',').map(|s| s.trim().parse::<usize>().unwrap()).enumerate() {
+    for (i, nodes) in sizes
+        .split(',')
+        .map(|s| s.trim().parse::<usize>().unwrap())
+        .enumerate()
+    {
         let started = std::time::Instant::now();
         let fixture = Fixture::of(format!("leaf-{i}").as_bytes(), nodes * 30, i as u8);
         let encoding = started.elapsed();
@@ -391,10 +495,16 @@ fn seal_costs() {
         );
         fixtures.push((fixture, plain));
     }
-    let copies: usize = std::env::var("QUIL_SEAL_COPIES").ok().and_then(|c| c.parse().ok()).unwrap_or(1);
-    let statements: Vec<SealStatement> =
-        (0..copies).flat_map(|_| fixtures.iter().map(|(f, _)| f.statement(b"beacon"))).collect();
-    let seals: Vec<&SealProof> = (0..copies).flat_map(|_| fixtures.iter().map(|(_, s)| s)).collect();
+    let copies: usize = std::env::var("QUIL_SEAL_COPIES")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(1);
+    let statements: Vec<SealStatement> = (0..copies)
+        .flat_map(|_| fixtures.iter().map(|(f, _)| f.statement(b"beacon")))
+        .collect();
+    let seals: Vec<&SealProof> = (0..copies)
+        .flat_map(|_| fixtures.iter().map(|(_, s)| s))
+        .collect();
     let started = std::time::Instant::now();
     let proof = seal::prove_many(&statements, &params, 64, &seals).unwrap();
     let proving = started.elapsed();
@@ -417,14 +527,33 @@ fn seal_costs() {
 #[test]
 #[ignore]
 fn opening_costs() {
-    let env = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
-    let (frames, leaves, nodes) = (env("QUIL_OPEN_FRAMES", 45), env("QUIL_OPEN_LEAVES", 4), env("QUIL_OPEN_NODES", 65536));
+    let env = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let (frames, leaves, nodes) = (
+        env("QUIL_OPEN_FRAMES", 45),
+        env("QUIL_OPEN_LEAVES", 4),
+        env("QUIL_OPEN_NODES", 65536),
+    );
     let params = SdrParams::default();
-    let held: Vec<Fixture> = (0..leaves).map(|l| Fixture::at(format!("held-{l}").as_bytes(), EPOCH, nodes * 30, l as u8)).collect();
+    let held: Vec<Fixture> = (0..leaves)
+        .map(|l| Fixture::at(format!("held-{l}").as_bytes(), EPOCH, nodes * 30, l as u8))
+        .collect();
     let epoch = Epoch {
         sealed: Vec::new(),
         held,
-        frames: (0..frames).map(|f| (f as u64 + 1, format!("rho-{f}").into_bytes(), (0..leaves).collect())).collect(),
+        frames: (0..frames)
+            .map(|f| {
+                (
+                    f as u64 + 1,
+                    format!("rho-{f}").into_bytes(),
+                    (0..leaves).collect(),
+                )
+            })
+            .collect(),
         count: 0,
     };
     let (statement, _, opened) = epoch.statement();

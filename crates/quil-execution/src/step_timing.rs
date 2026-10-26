@@ -47,7 +47,10 @@ impl Drop for Collection {
 #[must_use]
 pub fn section(name: &'static str) -> Section {
     let collecting = SECTIONS.with(|sections| sections.borrow().is_some());
-    Section { name, started: collecting.then(Instant::now) }
+    Section {
+        name,
+        started: collecting.then(Instant::now),
+    }
 }
 
 pub struct Section {
@@ -84,7 +87,10 @@ mod tests {
             drop(super::section("inner"));
         }
         let sections = collection.finish();
-        let names: Vec<_> = sections.iter().map(|(name, count, _)| (*name, *count)).collect();
+        let names: Vec<_> = sections
+            .iter()
+            .map(|(name, count, _)| (*name, *count))
+            .collect();
         assert_eq!(names, vec![("inner", 3), ("outer", 3)]);
         drop(super::section("after"));
         // An abandoned collection stops too.

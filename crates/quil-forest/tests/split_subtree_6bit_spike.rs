@@ -71,8 +71,14 @@ fn six_bit_shard_boundary_composes_and_round_trips() {
     let shard_x = n2.subtree_hash::<Sha256>(0, 4); // 2nd-nibbles [0,4)
     let shard_y = n2.subtree_hash::<Sha256>(4, 4); // 2nd-nibbles [4,8)
     println!("(B) app_root  = {}", hex::encode(app_root));
-    println!("    shard_X   = {}  (top-6-bits 000000)", hex::encode(shard_x));
-    println!("    shard_Y   = {}  (top-6-bits 000001)", hex::encode(shard_y));
+    println!(
+        "    shard_X   = {}  (top-6-bits 000000)",
+        hex::encode(shard_x)
+    );
+    println!(
+        "    shard_Y   = {}  (top-6-bits 000001)",
+        hex::encode(shard_y)
+    );
     assert_ne!(shard_x, shard_y);
 
     // (C) sub-ranges nest: [0,4)=X and [4,8)=Y both live under [0,8); [0,8) and
@@ -83,7 +89,10 @@ fn six_bit_shard_boundary_composes_and_round_trips() {
     let half_hi = n2.subtree_hash::<Sha256>(8, 8); // [8,16) (empty here)
     assert_ne!(half_lo, shard_x);
     assert_ne!(half_lo, shard_y);
-    println!("(C) nested: X,Y ⊂ [0,8)={}  ; [0,8),[8,16) ⊂ node", hex::encode(half_lo));
+    println!(
+        "(C) nested: X,Y ⊂ [0,8)={}  ; [0,8),[8,16) ⊂ node",
+        hex::encode(half_lo)
+    );
     let _ = half_hi;
 
     // (D) a leaf inside shard X round-trips against the SINGLE app root.

@@ -126,7 +126,11 @@ pub const NON_MAINNET_GLOBAL_UNCOVERED_SHARD_TX: u64 = 1;
 /// Fewest active provers with which an application shard produces its own
 /// frames: 3 on mainnet (the halt-risk floor), 1 elsewhere.
 pub fn min_active_provers_for_shard_frames(network: u8) -> u64 {
-    if network == crate::pricing::MAINNET_NETWORK { 3 } else { 1 }
+    if network == crate::pricing::MAINNET_NETWORK {
+        3
+    } else {
+        1
+    }
 }
 
 /// Whether the global venue executes an application's bundles: exactly when
@@ -164,8 +168,12 @@ mod uncovered_shard_tx_tests {
                 assert_ne!(produces, super::shard_is_globally_executed(network, active));
             }
         }
-        assert!(super::shard_is_globally_executed(0, 2) && !super::shard_is_globally_executed(0, 3));
-        assert!(super::shard_is_globally_executed(1, 0) && !super::shard_is_globally_executed(1, 1));
+        assert!(
+            super::shard_is_globally_executed(0, 2) && !super::shard_is_globally_executed(0, 3)
+        );
+        assert!(
+            super::shard_is_globally_executed(1, 0) && !super::shard_is_globally_executed(1, 1)
+        );
     }
 }
 

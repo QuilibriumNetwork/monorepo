@@ -84,11 +84,11 @@ fn migrate_then_forest_commit_end_to_end() {
 
     // --- 1. Seed: a KZG-style CRDT commit persists per-vertex blobs + shard
     //        commits, so the converter's enumeration finds the shard. ---------
-    let crdt = HypergraphCrdt::new(
-        hg.clone() as Arc<dyn HypergraphStore>,
-        Arc::new(StubProver),
-    );
-    let loc = Location { app_address: [0x2a; 32], data_address: [0x07; 32] };
+    let crdt = HypergraphCrdt::new(hg.clone() as Arc<dyn HypergraphStore>, Arc::new(StubProver));
+    let loc = Location {
+        app_address: [0x2a; 32],
+        data_address: [0x07; 32],
+    };
     crdt.add_vertex(&loc, &vertex_blob(&[(&[0xFFu8; 32], b"prover:Prover")]))
         .unwrap();
     let head = 5u64;
@@ -97,20 +97,28 @@ fn migrate_then_forest_commit_end_to_end() {
     assert!(seed_commits.contains_key(&sk), "seeded shard committed");
     // The CRDT is forest-native — the seed commit produces 32-byte forest roots
     // (into the CRDT's default in-memory forest) and persists blobs to the store.
-    assert_eq!(seed_commits[&sk][0].len(), 32, "forest-native CRDT commits 32-byte roots");
+    assert_eq!(
+        seed_commits[&sk][0].len(),
+        32,
+        "forest-native CRDT commits 32-byte roots"
+    );
     // The rocks DB itself has no forest namespace yet (in-memory forest ≠ DB).
-    assert!(!hg.has_forest_data(), "no forest data in the DB before migration");
+    assert!(
+        !hg.has_forest_data(),
+        "no forest data in the DB before migration"
+    );
 
     // --- 2. Migrate the DB in place (adds the forest under FOREST_NAMESPACE). -
     let report = quil_forest_migrate::run_conversion_in_place(hg.as_ref(), 0, head).unwrap();
-    assert!(report.shards >= 1, "migration converted the seeded shard (shards={})", report.shards);
+    assert!(
+        report.shards >= 1,
+        "migration converted the seeded shard (shards={})",
+        report.shards
+    );
     assert!(hg.has_forest_data(), "forest data present after migration");
 
     // --- 3. Fresh CRDT on the migrated DB: install the forest and commit. ----
-    let crdt2 = HypergraphCrdt::new(
-        hg.clone() as Arc<dyn HypergraphStore>,
-        Arc::new(StubProver),
-    );
+    let crdt2 = HypergraphCrdt::new(hg.clone() as Arc<dyn HypergraphStore>, Arc::new(StubProver));
     assert!(
         quil_forest_migrate::install_forest_if_migrated(&crdt2, hg.as_ref()),
         "forest installed on a migrated DB"
@@ -120,12 +128,17 @@ fn migrate_then_forest_commit_end_to_end() {
     // the forest-native commit path on the migrated DB.
     crdt2
         .add_vertex(
-            &Location { app_address: [0x2a; 32], data_address: [0x08; 32] },
+            &Location {
+                app_address: [0x2a; 32],
+                data_address: [0x08; 32],
+            },
             &vertex_blob(&[(&[0xFFu8; 32], b"reward:ProverReward")]),
         )
         .unwrap();
     let forest_commits = crdt2.commit(head + 1).unwrap();
-    let roots = forest_commits.get(&sk).expect("shard committed on forest path");
+    let roots = forest_commits
+        .get(&sk)
+        .expect("shard committed on forest path");
     assert_eq!(
         roots[0].len(),
         32,
@@ -137,15 +150,15 @@ fn migrate_then_forest_commit_end_to_end() {
     //        per-phase head version persisted into the forest during crdt2's
     //        commit. This is the restart-robustness the DB-staged head version
     //        buys over the ephemeral map alone. -----------------------------
-    let crdt3 = HypergraphCrdt::new(
-        hg.clone() as Arc<dyn HypergraphStore>,
-        Arc::new(StubProver),
-    );
+    let crdt3 = HypergraphCrdt::new(hg.clone() as Arc<dyn HypergraphStore>, Arc::new(StubProver));
     assert!(
         quil_forest_migrate::install_forest_if_migrated(&crdt3, hg.as_ref()),
         "forest installs on the restarted CRDT"
     );
-    let new_loc = Location { app_address: [0x2a; 32], data_address: [0x08; 32] };
+    let new_loc = Location {
+        app_address: [0x2a; 32],
+        data_address: [0x08; 32],
+    };
     let vertex_id = new_loc.to_id().to_vec();
     let mp = crdt3
         .build_membership_proof(
