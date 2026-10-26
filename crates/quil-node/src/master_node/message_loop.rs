@@ -972,7 +972,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     "verified peer build identity"
                                                 );
                                             }
-                                            cache.insert(info.peer_id.clone(), info.clone());
+                                            // A delayed copy of an older record never
+                                            // replaces a newer one.
+                                            if super::peer_info_file::supersedes(cache.get(&info.peer_id), &info) {
+                                                cache.insert(info.peer_id.clone(), info.clone());
+                                            }
                                         }
                                         // Only ARCHIVE-capable peers go into the
                                         // poll pool. Plain peers reject every

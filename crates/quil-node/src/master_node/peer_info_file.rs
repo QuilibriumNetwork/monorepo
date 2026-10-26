@@ -187,10 +187,7 @@ pub(super) fn restore(
     }
     let mut cache = cache.write();
     for info in accepted {
-        if cache
-            .get(&info.peer_id)
-            .is_none_or(|held| held.timestamp < info.timestamp)
-        {
+        if supersedes(cache.get(&info.peer_id), &info) {
             cache.insert(info.peer_id.clone(), info);
             restored.loaded += 1;
         } else {
@@ -332,6 +329,16 @@ impl HourlyNotice {
     }
 }
 
+/// Whether `info` replaces the record held for its peer: a peer's records
+/// are ordered by their timestamp, so a delayed copy of an older record
+/// (gossip relayed late, a restored file) never replaces a newer one.
+pub(super) fn supersedes(
+    held: Option<&quil_p2p::CanonicalPeerInfo>,
+    info: &quil_p2p::CanonicalPeerInfo,
+) -> bool {
+    held.is_none_or(|held| held.timestamp < info.timestamp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +373,19 @@ mod tests {
         let info = quil_p2p::decode_canonical_peer_info(&wire).unwrap();
         assert!(verified(&info));
         info
+    }
+
+    /// A delayed copy of an older record never replaces a newer one, from
+    /// gossip or from the file.
+    #[test]
+    fn only_a_newer_record_supersedes_the_held_one() {
+        let older = signed(1_000, &FILTER);
+        let mut newer = older.clone();
+        newer.timestamp = 2_000;
+        assert!(supersedes(None, &older));
+        assert!(supersedes(Some(&older), &newer));
+        assert!(!supersedes(Some(&newer), &older));
+        assert!(!supersedes(Some(&older), &older));
     }
 
     fn cache_of(records: impl IntoIterator<Item = quil_p2p::CanonicalPeerInfo>) -> PeerInfoCache {
