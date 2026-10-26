@@ -391,6 +391,9 @@ pub(crate) struct WorkerAppState {
     pub witness_index: Arc<std::sync::OnceLock<Arc<crate::witness_index::NodeWitnessIndex>>>,
 }
 
+/// Each thread worker's stores, by core (filled as workers start).
+pub(crate) type WorkerStoresByCore = Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>>;
+
 /// Shard filter → stores of the thread worker covering it. Filled on shard
 /// activation from the per-core stores the worker builder registers.
 pub(crate) type WorkerAppStates =
@@ -487,6 +490,8 @@ pub(crate) struct WorkerManagerArgs {
     pub bls_pubkey: Vec<u8>,
     /// Filter → covering thread worker's stores (see [`WorkerAppState`]).
     pub worker_app_states: WorkerAppStates,
+    /// Core → thread worker's stores, from the worker's start.
+    pub worker_stores_by_core: WorkerStoresByCore,
     pub shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >>,
@@ -543,6 +548,7 @@ pub(crate) fn init(
         bls_pubkey,
         shard_engines,
         worker_app_states,
+        worker_stores_by_core,
         remote_worker_manager_for_halt,
         pi_worker_manager,
         prover_message_transport,
@@ -730,6 +736,22 @@ pub(crate) fn init(
                         Err(e) => failed("bundle encode failed", &e),
                     }
                 });
+            // A worker's storage seat part is proved here with the member's
+            // other seats, and the proof goes out the same way
+            // (`storage_epoch_batch`).
+            let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
+                let publish = coverage_publish.clone();
+                Arc::new(move |bytes: Vec<u8>| {
+                    use quil_engine::storage_epoch_batch::{deliver, is_seat_message, SeatMessage};
+                    if !is_seat_message(&bytes) {
+                        return publish(bytes);
+                    }
+                    match SeatMessage::from_bytes(&bytes) {
+                        Ok(message) => deliver(message, publish.clone()),
+                        Err(error) => warn!(%error, "a worker's storage seat message does not decode"),
+                    }
+                })
+            };
             // Per-worker state builder: each thread-mode worker opens
             // its own RocksDB (resolved from db.worker_paths /
             // worker_path_prefix / fallback) and builds its own
@@ -749,13 +771,14 @@ pub(crate) fn init(
             let proof_worker_for_builder = proof_worker.clone();
             let network_for_builder = config.p2p.network;
             // Per-core stores, mapped to shard filters on activation.
-            let worker_stores_by_core: Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>> =
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
             let worker_stores_for_builder = worker_stores_by_core.clone();
             // Global frames live in the master's store; a worker's own store
             // holds only its app-shard chain.
             let master_clock_for_builder: Arc<dyn quil_types::store::ClockStore> =
                 clock_store.clone();
+            // Workers are built on their own threads, outside any runtime;
+            // the snapshot sync below runs on this one.
+            let runtime_for_builder = tokio::runtime::Handle::try_current().ok();
             let worker_state_builder: Arc<
                 dyn Fn(u32) -> std::result::Result<
                     quil_engine::thread_worker::WorkerOwnedDeps,
@@ -852,7 +875,7 @@ pub(crate) fn init(
                 let shard_syncer: Option<
                     Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>,
                 > = falcon_sk_for_builder.clone().map(|sk| {
-                    Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                    let syncer = Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
                         // No fixed source: with no archive in the pool the attempt
                         // fails as "no archive known yet" and retries next gap.
                         master_stream_addr: String::new(),
@@ -861,8 +884,15 @@ pub(crate) fn init(
                         crdt: crdt.clone(),
                         archive_pool: Some(archive_pool_for_builder.clone()),
                         discover_archives_from_master: false,
-                    })
-                        as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
+                    });
+                    // Storage snapshot sources this process does not hold are
+                    // synced through the first worker's syncer (one per process).
+                    if let Some(runtime) = runtime_for_builder.clone().or_else(|| tokio::runtime::Handle::try_current().ok()) {
+                        quil_engine::storage_snapshot::install_remote(
+                            syncer.storage_snapshot_remote(crate::prover_tree_syncer_prod::snapshot_scratch_dir(&path), runtime),
+                        );
+                    }
+                    syncer as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
                 });
                 // (B) Unified-cutover consolidation hook bound to THIS worker's
                 // store: fold the covered app's pre-cutover per-sub-shard trees

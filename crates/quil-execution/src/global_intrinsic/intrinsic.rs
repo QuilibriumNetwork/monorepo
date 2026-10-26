@@ -411,6 +411,14 @@ impl GlobalIntrinsic {
                 self.verify_presence_report(frame_number, &report, &state)?;
                 Ok(true)
             }
+            super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
+                let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
+                    "storage epoch proof validation requires authenticated global state".into()))?;
+                let state = HypergraphState::new(crdt.clone());
+                let proof = super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                self.verify_storage_epoch_proof(frame_number, &proof, &state)?;
+                Ok(true)
+            }
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
@@ -470,6 +478,7 @@ impl GlobalIntrinsic {
             TYPE_PROVER_CONFIRM => {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                verify::validate_confirm_leaf_roots(&op, frame_number)?;
                 if let Some(pt) = prover_tree {
                     let sig_ok = verify::verify_prover_confirm(
                         &op, pt, self.key_manager.as_ref(),
@@ -1073,6 +1082,7 @@ impl GlobalIntrinsic {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 // Confirm applies to each filter in the confirm message.
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                verify::validate_confirm_leaf_roots(&op, frame_number)?;
                 // Signed at or after the release frame, or ignored.
                 let release = super::prover_release::confirmed_release(&op);
                 // A join confirm records the prover's seniority for its rings
@@ -1218,6 +1228,16 @@ impl GlobalIntrinsic {
                             let blob = crate::prover_registry::vertex_tree_to_blob(&tree);
                             state.set(domain, &addr, &va_disc, frame_number, blob)?;
                         }
+                        // Hash storage proofs: the seat records the whole
+                        // registration, which every commitment opens and the
+                        // epoch proof seals.
+                        if quil_types::consensus::hash_storage_proofs_at(epoch) && !group.entries.is_empty() {
+                            let prefixes: Vec<Vec<u32>> = group.entries.iter().map(|entry| entry.prefix.clone()).collect();
+                            let mut seat = super::storage_seat::read(state, &member, &group.filter)?
+                                .unwrap_or_else(|| super::storage_seat::Seat::new(member, group.filter.clone()));
+                            seat.register(epoch, &prefixes, frame_number);
+                            super::storage_seat::write(state, frame_number, &seat)?;
+                        }
                     }
                 }
                 Ok(())
@@ -1292,6 +1312,33 @@ impl GlobalIntrinsic {
                 // Validation only: an accepted report writes nothing yet.
                 let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
                 self.verify_presence_report(frame_number, &report, state)
+            }
+            super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
+                let proof = super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                let Some(settlements) = self.verify_storage_epoch_proof(frame_number, &proof, state)? else {
+                    return Ok(());
+                };
+                let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                for (part, settlement) in proof.seats.iter().zip(&settlements) {
+                    for (address, tree) in &settlement.sealed {
+                        let blob = crate::prover_registry::vertex_tree_to_blob(tree);
+                        state.set(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc, frame_number, blob)?;
+                    }
+                    super::storage_seat::write(state, frame_number, &settlement.seat)?;
+                    if let Some(released) = &settlement.released {
+                        super::prover_shard_update::credit_storage_settlement(state, frame_number, &proof.member, released)?;
+                    }
+                    let settled = settlement.seat.slot(part.epoch).filter(|_| part.settles);
+                    tracing::info!(frame = frame_number, epoch = part.epoch, member = %hex::encode(proof.member),
+                        shard = %hex::encode(&part.shard_filter), seats = proof.seats.len(),
+                        sealed_leaves = settlement.sealed.len(), frames = part.frames.len(), timely = settlement.timely,
+                        slowest_ms = settlement.slowest_ms,
+                        expected_proposals = settled.map_or(0.0, |slot| slot.expected as f64 / super::storage_seat::PROPOSAL as f64),
+                        held = %settled.map(|slot| slot.pending_amount().to_string()).unwrap_or_default(),
+                        released = ?settlement.released.as_ref().map(|r| r.to_string()),
+                        "storage epoch proof accepted");
+                }
+                Ok(())
             }
             TYPE_SHARD_SPLIT => {
                 let op = super::prover_ops::ShardSplit::from_canonical_bytes(input)?;
@@ -2169,8 +2216,12 @@ impl GlobalIntrinsic {
         }
 
         // Anchor is in lockstep. If there's no attestation payload, there are no
-        // openings to audit — nothing more to do.
-        if op.storage_attestation.is_empty() {
+        // openings to audit — nothing more to do. A hash-proof epoch carries
+        // none to audit either: its frames commit a root the member's epoch
+        // proof covers (`storage_seat`, decided 2026-10-21).
+        if op.storage_attestation.is_empty()
+            || quil_types::consensus::hash_storage_proofs_at(quil_types::consensus::epoch_for_frame(op.global_frame_number))
+        {
             return Ok(());
         }
         let att = <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
@@ -2244,8 +2295,12 @@ impl GlobalIntrinsic {
             &audited,
             &rho_n,
             quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            active_epoch,
         );
         for member in failed {
+            tracing::warn!(frame = frame_number, epoch = active_epoch, member = %hex::encode(&member),
+                hash = quil_types::consensus::hash_storage_proofs_at(active_epoch),
+                "storage audit failed: kicking the member");
             self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
         }
         Ok(())
@@ -2422,6 +2477,7 @@ impl GlobalIntrinsic {
             if execute {
                 handoff::record_session_tip(state, frame_number, &id, &tip)?;
                 if self.reward_issuance.is_some() && self.hypergraph.is_some() {
+                    self.commit_drained_storage(frame_number, &op, state)?;
                     super::prover_shard_update::materialize_settlement_records(&op, frame_number, state)?;
                     #[cfg(feature = "confidential-tokens")]
                     crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
@@ -2463,6 +2519,57 @@ impl GlobalIntrinsic {
         Ok(SealDrain { executed, complete })
     }
 
+    /// A drained header's openings root joins its proposer's storage seat as
+    /// an executed frame's does, so its member proves it like the others; a
+    /// drained frame earns no reward, and executed this late its root rarely
+    /// counts as published.
+    fn commit_drained_storage(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        let epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+        if op.global_frame_number == 0 || !quil_types::consensus::hash_storage_proofs_at(epoch) {
+            return Ok(());
+        }
+        let Ok(member) = <[u8; 32]>::try_from(op.prover.as_slice()) else { return Ok(()) };
+        let Some(commitment) = self.storage_commitment(frame_number, op)? else { return Ok(()) };
+        let Some(mut seat) = super::storage_seat::read(state, &member, &op.address)? else { return Ok(()) };
+        if seat.commit(epoch, op.frame_number, commitment.beacon, frame_number, &commitment.rho_n, &commitment.root) {
+            super::storage_seat::write(state, frame_number, &seat)?;
+            if seat.first_commitment(epoch) {
+                let address = super::storage_seat::seat_address(&member, &op.address)?;
+                super::storage_seat::enqueue_expiry(state, frame_number, epoch, &address)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the seats whose epoch's settlement window ended, a bucket of the
+    /// epoch's expiry queue at a time (`storage_seat::enqueue_expiry`),
+    /// kicking each member that committed roots it never proved — also one
+    /// that never takes part in its shard again, which the frame path
+    /// (`StorageFrame::kicks`) would never reach. Where seats are written
+    /// (the archive-mode deps of `invoke_frame_header`) only.
+    fn sweep_storage_expiries(&self, frame_number: u64, state: &HypergraphState) -> Result<()> {
+        use super::storage_seat;
+        if self.reward_issuance.is_none() || self.hypergraph.is_none() {
+            return Ok(());
+        }
+        let kicks = storage_seat::sweep_expiries(state, frame_number)?;
+        if kicks.is_empty() {
+            return Ok(());
+        }
+        let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+        for seat in kicks {
+            tracing::warn!(frame = frame_number, member = %hex::encode(seat.member), shard = %hex::encode(&seat.filter),
+                "storage epoch proof missing for committed openings: kicking the member (expiry sweep)");
+            self.kick_prover_by_address(frame_number, &seat.member, state, &va_disc)?;
+        }
+        Ok(())
+    }
+
     /// Check a committee-handoff seal submission, its drain headers included,
     /// without writing anything.
     pub fn verify_seal_submission(
@@ -2478,6 +2585,41 @@ impl GlobalIntrinsic {
             super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
         }
         Ok(())
+    }
+
+    /// Check a storage epoch proof against committed state
+    /// (`storage_epoch_proof::check`), returning what it changes; `None` when
+    /// this frame already applied it. Its seal beacons and the settled roots'
+    /// response times are GLOBAL frame outputs and timestamps from this
+    /// node's clock store: a node that lacks one cannot tell, and waits
+    /// rather than decide otherwise.
+    pub fn verify_storage_epoch_proof(
+        &self,
+        frame_number: u64,
+        proof: &super::storage_epoch_proof::StorageEpochProof,
+        state: &HypergraphState,
+    ) -> Result<Option<Vec<super::storage_epoch_proof::Settlement>>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal("storage epoch proof: clock_store not installed".into())
+        })?;
+        let changes = match self.shards_store.as_ref() {
+            Some(store) if proof.seats.iter().any(|seat| seat.seals) => store.all_pending_shard_changes()?,
+            _ => Vec::new(),
+        };
+        let bits = |filter: &[u8]| match self.hypergraph.as_ref() {
+            Some(hypergraph) => hypergraph.canonical_bits_for_filter(filter),
+            None => quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits),
+        };
+        let context = super::storage_epoch_proof::SealContext { changes: &changes, bits: &bits };
+        let header = |frame: u64| clock_store.get_global_clock_frame_header(frame).map_err(|_| {
+            QuilError::ExecutionUnavailable(format!("storage epoch proof: GLOBAL frame {frame} header unavailable"))
+        });
+        super::storage_epoch_proof::check(
+            frame_number, proof, state,
+            |frame| header(frame).map(|header| header.output),
+            |frame| header(frame).map(|header| header.timestamp),
+            &context,
+        )
     }
 
     /// Check a presence report against `state`, with each proposal's anchor
@@ -2664,7 +2806,16 @@ impl GlobalIntrinsic {
         // `global_frame_number` are header fields and `state_size` derives from
         // committed state, so every node withholds identically. An empty shard
         // (`state_size == 0`) has nothing to attest and is unaffected.
-        let unproven_storage = op.global_frame_number > 0
+        // Hash-proof epochs gate each participant on its own sealed
+        // registration instead (`StorageFrame`, decided 2026-10-21): the
+        // proposer's attestation no longer decides the committee's reward.
+        // The first header of the shard at or after the next epoch's snapshot
+        // frame names the state its registrations for that epoch commit to.
+        super::storage_snapshot::record(state, frame_number, op)?;
+        let storage_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+        let hash_storage = op.global_frame_number > 0 && quil_types::consensus::hash_storage_proofs_at(storage_epoch);
+        let unproven_storage = !hash_storage
+            && op.global_frame_number > 0
             && state_size_u64 > 0
             && op.storage_attestation.is_empty();
         if unproven_storage {
@@ -2752,6 +2903,15 @@ impl GlobalIntrinsic {
         });
 
         timing.mark("sizes");
+        let mut storage = if hash_storage {
+            Some(super::prover_shard_update::StorageFrame {
+                epoch: storage_epoch,
+                commitment: self.storage_commitment(frame_number, op)?,
+                kicks: Vec::new(),
+            })
+        } else {
+            None
+        };
         let participants = participant_indices.len();
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
@@ -2766,6 +2926,7 @@ impl GlobalIntrinsic {
             shard_md,
             committed_fees,
             session,
+            storage.as_mut(),
         )?;
         timing.mark("rewards/activity");
 
@@ -2781,8 +2942,54 @@ impl GlobalIntrinsic {
         // inherit it via sync.
         self.audit_storage_attestation_timed(frame_number, op, &bitmask_bytes, state, va_disc, &mut timing)?;
         timing.mark("storage audit verify");
+        // Members whose seat closed an epoch without proving the roots they
+        // committed in it, after the activity update for the same reason.
+        for member in storage.map(|storage| storage.kicks).unwrap_or_default() {
+            tracing::warn!(frame = frame_number, member = %hex::encode(&member), shard = %hex::encode(&op.address),
+                "storage epoch proof missing for committed openings: kicking the member");
+            self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
+        }
+        timing.mark("storage epoch kicks");
         timing.finish(frame_number, op, participants);
         Ok(())
+    }
+
+    /// A hash-epoch frame's commitment as GLOBAL frame `frame_number` chains
+    /// it (`storage_seat::decode_commitment`): its beacon frame must be at or
+    /// after the frame's anchor and before `frame_number`. `None` when the
+    /// frame commits nothing GLOBAL can chain; its proposer then published
+    /// nothing in it.
+    fn storage_commitment(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<Option<super::prover_shard_update::StorageCommitment>> {
+        let Some((root, beacon)) = super::storage_seat::decode_commitment(&op.storage_attestation_root) else {
+            return Ok(None);
+        };
+        if beacon < op.global_frame_number || beacon >= frame_number {
+            tracing::warn!(frame = frame_number, shard = %hex::encode(&op.address), app_frame = op.frame_number,
+                anchor = op.global_frame_number, beacon, "storage commitment names a beacon frame outside \
+                [anchor, this frame): not chained");
+            return Ok(None);
+        }
+        Ok(Some(super::prover_shard_update::StorageCommitment { root, beacon, rho_n: self.storage_beacon(beacon)? }))
+    }
+
+    /// The storage beacon of GLOBAL frame `global_frame_number`, from this
+    /// node's clock store; a node that lacks the frame waits rather than
+    /// decide otherwise.
+    fn storage_beacon(&self, global_frame_number: u64) -> Result<Vec<u8>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal("storage beacon: clock_store not installed".into())
+        })?;
+        let output = clock_store
+            .get_global_clock_frame_header(global_frame_number)
+            .map(|header| header.output)
+            .map_err(|_| QuilError::ExecutionUnavailable(format!(
+                "storage beacon: anchored global frame {global_frame_number} unavailable"
+            )))?;
+        Ok(quil_crypto::porep::derive_storage_beacon(global_frame_number, &output))
     }
 
     /// Go parity (`global_shard_split.go` / `global_shard_merge.go`
@@ -3049,6 +3256,7 @@ impl GlobalIntrinsic {
         self.reconcile_orphaned_blocks(frame_number, state, &flipped)?;
         #[cfg(not(feature = "confidential-tokens"))]
         let _ = flipped;
+        self.sweep_storage_expiries(frame_number, state)?;
         self.reconcile_committee_sessions(frame_number, state)?;
         self.log_local_shard_grid_once_per_epoch(frame_number, state);
         state.stage_records([quil_types::store::RecordMutation {
@@ -6214,6 +6422,230 @@ mod tests {
                 "a change applying later is not registered ahead");
             assert_eq!(registrations(ShardChangeKind::Split, &parent, registered, u64::MAX), [true, false, false, false],
                 "nothing before the release activates");
+        }
+
+        /// Hash storage proofs: a confirm registers `comm_D ‖ comm_C ‖ comm_R`
+        /// for the next epoch on the member's seat, which counts only once an
+        /// epoch proof sealing it — answering the beacon of the frame after
+        /// the registration — is accepted before that epoch begins, once. In
+        /// the epoch, the rewards held for the roots it committed are paid
+        /// when a proof of those roots settles it, inside its window.
+        #[test]
+        fn a_seat_is_sealed_and_settled_by_epoch_proofs() {
+            use crate::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+            use crate::global_intrinsic::storage_epoch_proof::{self as epoch_proof, CommittedFrame, EpochClaim, StorageEpochProof};
+            use crate::global_intrinsic::storage_seat;
+            use quil_crypto::storage_proof;
+            use crate::global_intrinsic::{storage_binding, storage_snapshot};
+            let epoch_frames = quil_types::consensus::EPOCH_LENGTH_FRAMES;
+            let confirm_frame = epoch_frames * 7 + 5;
+            let epoch = quil_types::consensus::epoch_for_frame(confirm_frame) + 1;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            let app = [0x81u8; 32];
+            let filter = app.to_vec();
+            let state = make_state();
+            let (member, _) = seed_prover(&state, &[0xC4u8; 897], &filter, 1, true);
+            // The shard's state at its snapshot: a few vertices in an app tree.
+            let forest = quil_forest::Forest::in_memory();
+            let mut entries: Vec<storage_binding::Entry> = (0u8..9)
+                .map(|i| storage_binding::Entry { phase: 0, address: [i.wrapping_mul(29); 32], value: vec![i; 90 + i as usize] })
+                .collect();
+            entries.sort_by(|a, b| a.address.cmp(&b.address));
+            let leaves: Vec<(Vec<u8>, Vec<u8>)> = entries.iter()
+                .map(|entry| (entry.address.to_vec(), quil_tries::vertex_leaf_value(&entry.value).unwrap()))
+                .collect();
+            forest.commit_app_shards(&app, 1, 0, [(Vec::new(), [leaves, Vec::new(), Vec::new(), Vec::new()])].into()).unwrap();
+            let mut roots = [[0u8; 32]; 4];
+            for (phase, root) in quil_forest::PHASES.iter().zip(roots.iter_mut()) {
+                *root = forest.app_subtree_root(&app, *phase, 1, &[]).unwrap();
+            }
+            let snapshot = quil_types::consensus::StorageSnapshotRoots { epoch, frame: 50, anchor: confirm_frame - 3, roots };
+            let prefix = vec![quil_forest::BIT_PATH_PREFIX_SENTINEL];
+            let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
+            let params = quil_crypto::sdr::SdrParams::default();
+            let data = storage_binding::leaf_data(&filter, &prefix, &entries);
+            let encoded = storage_proof::encode_leaf(&data, &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch), &params);
+            let confirm = |leaf_root: Vec<u8>, num_blocks| ProverConfirm {
+                filter: vec![],
+                frame_number: confirm_frame,
+                public_key_signature_bls48581: signed_by(&member),
+                filters: vec![filter.clone()],
+                leaf_roots: vec![ConfirmLeafRoots {
+                    filter: filter.clone(),
+                    entries: vec![LeafRootEntry { prefix: prefix.clone(), leaf_root, num_blocks }],
+                }],
+                release: None,
+            };
+            let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+            let output = vec![0x5Au8; 516];
+            clock.seed_frame(quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: confirm_frame + 1,
+                    output: output.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_clock_store(clock.clone());
+
+            assert!(gi.invoke_step(confirm_frame, &confirm(vec![0x11; 74], 4).to_canonical_bytes().unwrap(), &state).is_err(),
+                "a KZG root does not register a hash-proof epoch");
+            gi.invoke_step(confirm_frame, &confirm(encoded.registration_root(), encoded.n).to_canonical_bytes().unwrap(), &state)
+                .unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let address = materialize::leaf_root_address(&member, &leaf_id).unwrap();
+            let registration = || rebuild_vertex_tree_from_blob(
+                &state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc).unwrap().unwrap());
+            assert_eq!(materialize::leaf_root_registration_for_epoch(&registration(), epoch), None, "unsealed");
+            let seat = || storage_seat::read(&state, &member, &filter).unwrap().unwrap();
+            assert_eq!(seat().slot(epoch).unwrap().leaves, vec![prefix.clone()]);
+            assert!(!seat().sealed_for(epoch));
+
+            // The seal: an epoch proof two epochs before the registration's.
+            let registered = storage_proof::parse_registration_root(&encoded.registration_root()).unwrap();
+            let claim = EpochClaim {
+                member,
+                seats: vec![epoch_proof::SeatClaim {
+                    seal_epoch: epoch,
+                    seals: vec![epoch_proof::SealedLeaf {
+                        leaf_id: leaf_id.clone(),
+                        n: encoded.n,
+                        registered,
+                        beacon: quil_crypto::porep::derive_storage_beacon(confirm_frame + 1, &output),
+                    }],
+                    settle_epoch: epoch - 2,
+                    ..Default::default()
+                }],
+            };
+            let seal_beacon = quil_crypto::porep::derive_storage_beacon(confirm_frame + 1, &output);
+            let leaf_claim = |comm_d, n| storage_binding::LeafClaim {
+                filter: &filter, prefix: &prefix, leaf_id: &leaf_id, member: &member, epoch, beacon: &seal_beacon,
+                bits: Vec::new(), sources: vec![(Vec::new(), roots)], comm_d, n,
+            };
+            let proof_of = |phase: u8, address: &[u8; 32]| {
+                if quil_forest::subtree_proof::same_root(&roots[phase as usize], &quil_forest::subtree_proof::EMPTY_ROOT) {
+                    return Ok(quil_forest::subtree_proof::CompactProof { leaf: None, siblings: Vec::new() });
+                }
+                forest.shard_phase_get_with_proof_raw(&app, quil_forest::PHASES[phase as usize], 1, address)
+                    .map(|(_, proof)| quil_forest::subtree_proof::CompactProof::of(&proof))
+                    .map_err(|e| e.to_string())
+            };
+            let binding = storage_binding::prove(&leaf_claim(registered.comm_d, encoded.n), &entries, &proof_of).unwrap();
+            let witness = epoch_proof::prepare(&member, &claim.seats[0], &[&encoded.replica], &[]).unwrap();
+            let sealing = StorageEpochProof {
+                member,
+                seats: vec![epoch_proof::SeatProof {
+                    shard_filter: filter.clone(),
+                    epoch: epoch - 2,
+                    seals: true,
+                    bindings: vec![binding],
+                    ..Default::default()
+                }],
+                proof: epoch_proof::prove(&claim, &[witness]).unwrap(),
+            };
+            let rebind = |bindings: Vec<storage_binding::LeafBinding>| {
+                let mut proof = sealing.clone();
+                proof.seats[0].bindings = bindings;
+                proof
+            };
+            let bytes = sealing.to_canonical_bytes();
+            assert!(gi.invoke_step(confirm_frame + 2, &bytes, &state).is_err(), "no snapshot recorded for the shard");
+            let snapshot_address = storage_snapshot::snapshot_address(epoch, &filter).unwrap();
+            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &snapshot_address, &vertex_adds_discriminator().unwrap(), 300,
+                vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot).unwrap())).unwrap();
+            let unbound = rebind(Vec::new());
+            assert!(gi.invoke_step(confirm_frame + 2, &unbound.to_canonical_bytes(), &state).is_err(), "no binding");
+            // The binding of data other than the snapshot's.
+            let mut others = entries.clone();
+            others[3].value[0] ^= 1;
+            let other_data = storage_proof::data_nodes(&storage_binding::leaf_data(&filter, &prefix, &others));
+            let other_tree = storage_proof::MerkleTree::from_nodes(&other_data).unwrap();
+            let other_binding = storage_binding::prove(
+                &leaf_claim(other_tree.commitment(storage_proof::Tree::Data), encoded.n), &others, &proof_of,
+            ).unwrap();
+            let rebound = rebind(vec![other_binding]);
+            assert!(gi.invoke_step(confirm_frame + 2, &rebound.to_canonical_bytes(), &state).is_err(),
+                "a binding of other data");
+            assert!(gi.invoke_step(confirm_frame + 1, &bytes, &state).is_err(), "before its beacon frame is past");
+            assert!(gi.invoke_step(epoch * epoch_frames, &bytes, &state).is_err(), "once its epoch has begun");
+            let other = StorageEpochProof { member: [0x77; 32], ..sealing.clone() };
+            assert!(gi.invoke_step(confirm_frame + 2, &other.to_canonical_bytes(), &state).is_err(), "another member");
+            let mut tampered = sealing.clone();
+            tampered.proof[100] ^= 1;
+            assert!(gi.invoke_step(confirm_frame + 2, &tampered.to_canonical_bytes(), &state).is_err(), "a tampered proof");
+
+            gi.invoke_step(confirm_frame + 2, &bytes, &state).unwrap();
+            assert_eq!(materialize::leaf_root_registration_for_epoch(&registration(), epoch),
+                Some((encoded.registration_root(), encoded.n)));
+            assert!(seat().sealed_for(epoch));
+            gi.invoke_step(confirm_frame + 2, &bytes, &state).expect("the same frame applied again");
+            assert!(gi.invoke_step(confirm_frame + 3, &bytes, &state).is_err(), "sealed once");
+
+            // In the epoch: two committed frames, eight held rewards of a
+            // four-member committee (two proposals expected). GLOBAL executed
+            // the first root 20 s after its beacon, the second 90 s after.
+            let held = vec![epoch_proof::HeldLeaf { leaf_id: leaf_id.clone(), n: encoded.n, comm_r: registered.comm_r }];
+            let replicas = [epoch_proof::HeldReplica { replica: &encoded.replica, cap: &encoded.replica_cap }];
+            let mut frames = Vec::new();
+            let mut updated = seat();
+            let (first, second) = (epoch * epoch_frames + 3, epoch * epoch_frames + 6);
+            let execution = [(40u64, [0x21u8; 32], first, first + 2), (43, [0x22; 32], second, second + 9)];
+            for (frame_number, rho, beacon, executed) in execution {
+                let opened = epoch_proof::frame_openings(&member, epoch, &held, &replicas, &rho).unwrap();
+                let root = epoch_proof::openings_root(frame_number, &opened).unwrap();
+                assert!(updated.commit(epoch, frame_number, beacon, executed, &rho, &root));
+                frames.push(CommittedFrame { frame_number, rho_n: rho, root });
+            }
+            let at = |frame_number: u64, timestamp: i64| quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number, timestamp, ..Default::default() }),
+                ..Default::default()
+            };
+            let start = 1_800_000_000_000i64;
+            for (frame_number, timestamp) in [(first, start), (first + 2, start + 20_000), (second, start + 30_000)] {
+                clock.seed_frame(at(frame_number, timestamp));
+            }
+            for frame in 0..8 {
+                assert!(updated.hold(epoch, epoch * epoch_frames + 10 + frame, 40 + frame, &num_bigint::BigInt::from(125), 4));
+            }
+            storage_seat::write(&state, epoch * epoch_frames + 20, &updated).unwrap();
+
+            let seat_claim = epoch_proof::SeatClaim {
+                settle_epoch: epoch, held, frames: frames.clone(), seal_epoch: epoch + 2, ..Default::default()
+            };
+            let witness = epoch_proof::prepare(&member, &seat_claim, &[], &replicas).unwrap();
+            let claim = EpochClaim { member, seats: vec![seat_claim] };
+            let settling = StorageEpochProof {
+                member,
+                seats: vec![epoch_proof::SeatProof {
+                    shard_filter: filter.clone(),
+                    epoch,
+                    settles: true,
+                    frames: frames.clone(),
+                    ..Default::default()
+                }],
+                proof: epoch_proof::prove(&claim, &[witness]).unwrap(),
+            };
+            let (from, until) = storage_seat::settlement_window(epoch);
+            let bytes = settling.to_canonical_bytes();
+            assert!(gi.invoke_step(from - 1, &bytes, &state).is_err(), "frames anchored in the epoch may still arrive");
+            assert!(gi.invoke_step(until, &bytes, &state).is_err(), "past its window");
+            let mut missing = settling.clone();
+            missing.seats[0].frames.truncate(1);
+            assert!(gi.invoke_step(from, &missing.to_canonical_bytes(), &state).is_err(), "a frame left out");
+            let balance = || {
+                let address = materialize::reward_address(&member).unwrap();
+                state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc).unwrap()
+                    .map(|blob| materialize::read_reward_balance(&rebuild_vertex_tree_from_blob(&blob)))
+                    .map_or(num_bigint::BigInt::from(0), |bytes| num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes))
+            };
+            let before = balance();
+            assert!(gi.invoke_step(from, &bytes, &state).is_err(), "a root's executing frame is not here: wait");
+            clock.seed_frame(at(second + 9, start + 120_000));
+            gi.invoke_step(from, &bytes, &state).unwrap();
+            assert_eq!(balance() - before, num_bigint::BigInt::from(500), "one of two proposals answered in time: half");
+            assert_eq!(seat().slot(epoch).unwrap().outcome, storage_seat::Outcome::Settled(from));
+            assert!(gi.invoke_step(from + 1, &bytes, &state).is_err(), "settled once");
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         }
 
         // A live width run: every regular joined the QUIL root after it had

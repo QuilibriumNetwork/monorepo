@@ -871,6 +871,89 @@ fn read_u64_field(
     Some(u64::from_be_bytes(arr))
 }
 
+/// One epoch's registration in a leaf-root registration vertex.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistrationSlot {
+    pub epoch: u64,
+    /// `None` only for a slot written without one (never by this code).
+    pub leaf_root: Option<Vec<u8>>,
+    pub num_blocks: u64,
+    /// Hash-proof slots: the GLOBAL frame that recorded the registration.
+    pub registered_at: Option<u64>,
+    /// Hash-proof slots: the GLOBAL frame its seal proof was accepted in.
+    pub sealed_at: Option<u64>,
+}
+
+const REGISTRATION_CLASS: &str = "leafroot:LeafRootRegistration";
+
+/// Per slot (prev, current, next): epoch, leaf root, block count, registered
+/// at, sealed at.
+const SLOT_FIELDS: [[&str; 5]; 3] = [
+    ["PrevEpoch", "PrevLeafRoot", "PrevNumBlocks", "PrevRegisteredAt", "PrevSealedAt"],
+    ["Epoch", "LeafRoot", "NumBlocks", "RegisteredAt", "SealedAt"],
+    ["NextEpoch", "NextLeafRoot", "NextNumBlocks", "NextRegisteredAt", "NextSealedAt"],
+];
+
+/// A registration vertex's slots, by ascending epoch.
+pub fn registration_slots(tree: &quil_tries::VectorCommitmentTree) -> Vec<RegistrationSlot> {
+    let cls = REGISTRATION_CLASS;
+    SLOT_FIELDS
+        .iter()
+        .filter_map(|[epoch, root, blocks, registered, sealed]| {
+            Some(RegistrationSlot {
+                epoch: read_u64_field(tree, cls, epoch)?,
+                leaf_root: read_field(tree, cls, root),
+                num_blocks: read_u64_field(tree, cls, blocks).unwrap_or(0),
+                registered_at: read_u64_field(tree, cls, registered),
+                sealed_at: read_u64_field(tree, cls, sealed),
+            })
+        })
+        .collect()
+}
+
+/// Write a registration vertex holding `slots` (at most three, ascending).
+/// Assigns from the top: highest epoch → next slot, the one below → current,
+/// the one below that → prev. This keeps the historical layouts byte-identical
+/// (1 slot ⇒ `Epoch` only; 2 slots ⇒ `Epoch`+`NextEpoch`) and only writes the
+/// `Prev*` fields once a third, older epoch is retained; the hash-proof frames
+/// only for slots that have them.
+fn write_registration(
+    member: &[u8],
+    shard_filter: &[u8],
+    prefix_bytes: &[u8],
+    frame_number: u64,
+    slots: &[RegistrationSlot],
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let cls = REGISTRATION_CLASS;
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    write_type(&mut tree, cls)?;
+    write_field(&mut tree, cls, "Member", member)?;
+    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
+    write_field(&mut tree, cls, "Prefix", prefix_bytes)?;
+    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
+    let cur_idx = slots.len().saturating_sub(2); // len1→0, len2→0, len3→1
+    let placed = [
+        (cur_idx.checked_sub(1).and_then(|i| slots.get(i)), &SLOT_FIELDS[0]),
+        (slots.get(cur_idx), &SLOT_FIELDS[1]),
+        (slots.get(cur_idx + 1), &SLOT_FIELDS[2]),
+    ];
+    // The order the fields were always written in: current, next, then prev.
+    for (slot, names) in [placed[1], placed[2], placed[0]] {
+        let Some(slot) = slot else { continue };
+        let [epoch, root, blocks, registered, sealed] = names;
+        write_field(&mut tree, cls, epoch, &slot.epoch.to_be_bytes())?;
+        write_field(&mut tree, cls, root, slot.leaf_root.as_deref().unwrap_or(&[]))?;
+        write_field(&mut tree, cls, blocks, &slot.num_blocks.to_be_bytes())?;
+        if let Some(frame) = slot.registered_at {
+            write_field(&mut tree, cls, registered, &frame.to_be_bytes())?;
+        }
+        if let Some(frame) = slot.sealed_at {
+            write_field(&mut tree, cls, sealed, &frame.to_be_bytes())?;
+        }
+    }
+    Ok(tree)
+}
+
 /// Upsert a member's leaf-root registration into the **two-slot** {current,next}
 /// vertex. The audit needs the registration for the epoch a member is currently
 /// proving AND the next epoch it has pre-confirmed to coexist (a member confirms
@@ -879,6 +962,10 @@ fn read_u64_field(
 /// epochs**, stored epoch-sorted (orders 3..5 = lower "current", 7..9 = higher
 /// "next"). A same-epoch re-register overwrites that slot's value. Two fixed
 /// slots ⇒ no per-epoch address growth.
+///
+/// A registration for a hash-proof epoch records `frame_number` as the frame
+/// that recorded it and is unsealed until a seal proof for it is accepted
+/// ([`mark_registration_sealed`]); re-registering the epoch unseals it.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_leaf_root_registration(
     existing: Option<&quil_tries::VectorCommitmentTree>,
@@ -890,108 +977,66 @@ pub fn upsert_leaf_root_registration(
     new_num_blocks: u64,
     frame_number: u64,
 ) -> Result<quil_tries::VectorCommitmentTree> {
-    let cls = "leafroot:LeafRootRegistration";
-
-    // Gather the existing slots (prev + current + next, whichever are present).
-    let mut slots: Vec<(u64, Vec<u8>, u64)> = Vec::new();
-    if let Some(t) = existing {
-        if let Some(e) = read_u64_field(t, cls, "PrevEpoch") {
-            slots.push((
-                e,
-                read_field(t, cls, "PrevLeafRoot").unwrap_or_default(),
-                read_u64_field(t, cls, "PrevNumBlocks").unwrap_or(0),
-            ));
-        }
-        if let Some(e) = read_u64_field(t, cls, "Epoch") {
-            slots.push((
-                e,
-                read_field(t, cls, "LeafRoot").unwrap_or_default(),
-                read_u64_field(t, cls, "NumBlocks").unwrap_or(0),
-            ));
-        }
-        if let Some(e) = read_u64_field(t, cls, "NextEpoch") {
-            slots.push((
-                e,
-                read_field(t, cls, "NextLeafRoot").unwrap_or_default(),
-                read_u64_field(t, cls, "NextNumBlocks").unwrap_or(0),
-            ));
-        }
-    }
+    let mut slots = existing.map(registration_slots).unwrap_or_default();
     // Merge the new registration: same-epoch overwrites, else add.
-    slots.retain(|(e, _, _)| *e != new_epoch);
-    slots.push((new_epoch, new_leaf_root.to_vec(), new_num_blocks));
+    slots.retain(|slot| slot.epoch != new_epoch);
+    slots.push(RegistrationSlot {
+        epoch: new_epoch,
+        leaf_root: Some(new_leaf_root.to_vec()),
+        num_blocks: new_num_blocks,
+        registered_at: quil_types::consensus::hash_storage_proofs_at(new_epoch).then_some(frame_number),
+        sealed_at: None,
+    });
     // Keep the THREE highest epochs (drop the lowest if 4+), epoch-sorted
     // ascending so the vertex bytes are deterministic across nodes. The third
     // (oldest retained) epoch covers the anchor-lagged storage audit window: an
     // opening produced ~K frames before the audit is still anchored to the
     // previous epoch just after a boundary, and a two-slot vertex would have
     // already evicted it → spurious kick + seniority-zero. See the schema note.
-    slots.sort_by_key(|(e, _, _)| *e);
+    slots.sort_by_key(|slot| slot.epoch);
     while slots.len() > 3 {
         slots.remove(0);
     }
+    write_registration(member, shard_filter, &pack_prefix(prefix), frame_number, &slots)
+}
 
-    let mut tree = quil_tries::VectorCommitmentTree::new();
-    write_type(&mut tree, cls)?;
-    write_field(&mut tree, cls, "Member", member)?;
-    write_field(&mut tree, cls, "ShardFilter", shard_filter)?;
-    write_field(&mut tree, cls, "Prefix", &pack_prefix(prefix))?;
-    write_field(&mut tree, cls, "RegistrationFrameNumber", &frame_number.to_be_bytes())?;
-    // Assign from the top: highest epoch → next slot, the one below → current
-    // slot, the one below that → prev slot. This keeps the historical layouts
-    // byte-identical (1 slot ⇒ `Epoch` only; 2 slots ⇒ `Epoch`+`NextEpoch`) and
-    // only writes the `Prev*` fields once a third, older epoch is retained.
-    let cur_idx = slots.len().saturating_sub(2); // len1→0, len2→0, len3→1
-    if let Some((e, lr, nb)) = slots.get(cur_idx) {
-        write_field(&mut tree, cls, "Epoch", &e.to_be_bytes())?;
-        write_field(&mut tree, cls, "LeafRoot", lr)?;
-        write_field(&mut tree, cls, "NumBlocks", &nb.to_be_bytes())?;
-    }
-    if let Some((e, lr, nb)) = slots.get(cur_idx + 1) {
-        write_field(&mut tree, cls, "NextEpoch", &e.to_be_bytes())?;
-        write_field(&mut tree, cls, "NextLeafRoot", lr)?;
-        write_field(&mut tree, cls, "NextNumBlocks", &nb.to_be_bytes())?;
-    }
-    if cur_idx >= 1 {
-        if let Some((e, lr, nb)) = slots.get(cur_idx - 1) {
-            write_field(&mut tree, cls, "PrevEpoch", &e.to_be_bytes())?;
-            write_field(&mut tree, cls, "PrevLeafRoot", lr)?;
-            write_field(&mut tree, cls, "PrevNumBlocks", &nb.to_be_bytes())?;
-        }
-    }
-    Ok(tree)
+/// The registration vertex with `epoch`'s slot sealed at `frame_number`; every
+/// other field unchanged. `None` when it has no slot for `epoch`.
+pub fn mark_registration_sealed(
+    tree: &quil_tries::VectorCommitmentTree,
+    epoch: u64,
+    frame_number: u64,
+) -> Result<Option<quil_tries::VectorCommitmentTree>> {
+    let cls = REGISTRATION_CLASS;
+    let mut slots = registration_slots(tree);
+    let Some(slot) = slots.iter_mut().find(|slot| slot.epoch == epoch) else {
+        return Ok(None);
+    };
+    slot.sealed_at = Some(frame_number);
+    let field = |name| {
+        read_field(tree, cls, name)
+            .ok_or_else(|| QuilError::InvalidArgument(format!("leaf registration has no {name}")))
+    };
+    let registered = read_u64_field(tree, cls, "RegistrationFrameNumber").unwrap_or(0);
+    write_registration(&field("Member")?, &field("ShardFilter")?, &field("Prefix")?, registered, &slots).map(Some)
 }
 
 /// Look up the registered `(leaf_root, num_blocks)` for `member`+`leaf_id` at the
-/// given `active_epoch`, checking BOTH slots of the two-slot registration. The
-/// audit cross-checks an opening against whichever slot matches the epoch being
-/// proved. `None` if neither slot is for `active_epoch`.
+/// given `active_epoch`, checking every slot of the registration. The audit
+/// cross-checks an opening against whichever slot matches the epoch being
+/// proved; the prev slot covers the anchor-lagged audit window, so a member is
+/// not spuriously kicked for an opening still anchored to the just-departed
+/// epoch. A hash-proof epoch's registration counts only once sealed. `None` if
+/// no slot is for `active_epoch`.
 pub fn leaf_root_registration_for_epoch(
     tree: &quil_tries::VectorCommitmentTree,
     active_epoch: u64,
 ) -> Option<(Vec<u8>, u64)> {
-    let cls = "leafroot:LeafRootRegistration";
-    if read_u64_field(tree, cls, "Epoch") == Some(active_epoch) {
-        return Some((
-            read_field(tree, cls, "LeafRoot")?,
-            read_u64_field(tree, cls, "NumBlocks").unwrap_or(0),
-        ));
+    let slot = registration_slots(tree).into_iter().find(|slot| slot.epoch == active_epoch)?;
+    if quil_types::consensus::hash_storage_proofs_at(active_epoch) && slot.sealed_at.is_none() {
+        return None;
     }
-    if read_u64_field(tree, cls, "NextEpoch") == Some(active_epoch) {
-        return Some((
-            read_field(tree, cls, "NextLeafRoot")?,
-            read_u64_field(tree, cls, "NextNumBlocks").unwrap_or(0),
-        ));
-    }
-    // Prev slot: retained for the anchor-lagged audit window so a member is not
-    // spuriously kicked for an opening still anchored to the just-departed epoch.
-    if read_u64_field(tree, cls, "PrevEpoch") == Some(active_epoch) {
-        return Some((
-            read_field(tree, cls, "PrevLeafRoot")?,
-            read_u64_field(tree, cls, "PrevNumBlocks").unwrap_or(0),
-        ));
-    }
-    None
+    Some((slot.leaf_root?, slot.num_blocks))
 }
 
 /// Full leaf-root registration materialize output — the single vertex tree to

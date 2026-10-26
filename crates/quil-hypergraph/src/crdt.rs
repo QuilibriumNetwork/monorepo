@@ -4253,6 +4253,151 @@ impl HypergraphCrdt {
         Ok(out)
     }
 
+    /// [`Self::serialize_phase_subtrees`] over committed state as `snapshot`
+    /// captured it ([`Self::capture_committed_snapshot`]), so a leaf's data can
+    /// be read after the state has moved on (storage-proof snapshots). Pages
+    /// the application's rows from the first address `full_path` admits and
+    /// stops past the last one; the bytes equal the live serializer's at the
+    /// commit the snapshot was captured at.
+    pub fn serialize_phase_subtrees_at(
+        snapshot: &dyn quil_types::store::SnapshotReadable,
+        shard_key: &ShardKey,
+        full_path: &[i32],
+    ) -> Result<Vec<u8>> {
+        const LIMITS: quil_types::store::VertexPageLimits =
+            quil_types::store::VertexPageLimits { max_entries: 4096, max_bytes: 256 << 20 };
+        let domain = shard_key.l2;
+        let (lower, upper) = path_address_bounds(full_path);
+        let mut out: Vec<u8> = Vec::new();
+        for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+            out.push(phase_idx as u8);
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut after = address_before(&lower);
+            'pages: loop {
+                let page = snapshot.page_vertex_underlying_fixed(set, phase, shard_key, &domain, after.as_ref(), LIMITS)?;
+                for (address, blob) in &page.entries {
+                    if *address > upper {
+                        break 'pages;
+                    }
+                    let key = [domain.as_slice(), address.as_slice()].concat();
+                    if id_matches_path(&key, full_path) {
+                        entries.push((key, blob.clone()));
+                    }
+                }
+                match (page.has_more, page.entries.last()) {
+                    (true, Some((last, _))) => after = Some(*last),
+                    _ => break,
+                }
+            }
+            out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for (key, val) in &entries {
+                out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+                out.extend_from_slice(key);
+                out.extend_from_slice(&(val.len() as u32).to_be_bytes());
+                out.extend_from_slice(val);
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- storage-proof snapshots at certified roots ----------------------
+
+    /// Whether a shard header's phase root names an empty phase.
+    pub fn is_empty_phase_root(root: &[u8]) -> bool {
+        root == [0u8; 32] || root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__"
+    }
+
+    /// The retained version of each phase of `app`'s unified tree at which
+    /// the subtree at `bits` had `roots` (a shard header's), `None` for an
+    /// empty phase. `None` overall when a non-empty phase is not retained
+    /// here: this node never held that state, or has pruned it. Takes the
+    /// bits rather than a filter, so a store that holds only a synced subtree
+    /// (and not the app's shard grid) answers the same.
+    pub fn snapshot_versions(&self, app: &[u8; 32], bits: &[bool], roots: &[[u8; 32]; 4]) -> Option<[Option<u64>; 4]> {
+        const LOOKBACK: usize = 720;
+        let forest = self.forest.read().ok()?;
+        let mut versions = [None; 4];
+        for (phase, root) in roots.iter().enumerate() {
+            if Self::is_empty_phase_root(root) {
+                continue;
+            }
+            let head = self.resolve_phase_version_with(&forest, app, phase)?;
+            versions[phase] = Some(forest.app_subtree_version_of(app, PHASES[phase], head, bits, *root, LOOKBACK)?);
+        }
+        Some(versions)
+    }
+
+    /// Summed leaf size of phase `phase_idx` under `bits` in `app`'s unified
+    /// tree at `version` (the forest's Merkle-sum index).
+    pub fn unified_phase_size_at(&self, app: &[u8; 32], phase_idx: usize, version: u64, bits: &[bool]) -> Result<u128> {
+        let forest = self.forest.read().map_err(|_| QuilError::ExecutionUnavailable("forest lock poisoned".into()))?;
+        forest.app_subtree_size(app, PHASES[phase_idx], version, bits)
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("subtree size at version {version}: {e}")))
+    }
+
+    /// A raw-key proof of `key` in phase `phase_idx` of `app`'s unified tree
+    /// at `version`, for a key present or not (storage bindings).
+    pub fn unified_phase_proof_at(
+        &self,
+        app: &[u8; 32],
+        phase_idx: usize,
+        version: u64,
+        key: &[u8; 32],
+    ) -> Result<quil_forest::subtree_proof::CompactProof> {
+        let forest = self.forest.read().map_err(|_| QuilError::ExecutionUnavailable("forest lock poisoned".into()))?;
+        let (_, proof) = forest.shard_phase_get_with_proof_raw(app, PHASES[phase_idx], version, key)
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("proof at version {version}: {e}")))?;
+        Ok(quil_forest::subtree_proof::CompactProof::of(&proof))
+    }
+
+    /// Every `(app ‖ address, blob)` of phase `phase_idx` whose address
+    /// starts with `bits`, in `app`'s unified tree at `version`, ascending by
+    /// address. A removal (phases 1 and 3) is its key alone, with an empty
+    /// value, however this node holds its tombstone. An added leaf whose blob
+    /// is not retained at that version fails the read rather than reading as
+    /// absent.
+    pub fn unified_phase_entries_at(
+        &self,
+        app: &[u8; 32],
+        phase_idx: usize,
+        version: u64,
+        bits: &[bool],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        const PAGE_LEAVES: usize = 4096;
+        const PAGE_BYTES: usize = 64 << 20;
+        let (first, last) = bit_address_bounds(bits);
+        let shard = ShardKey { l1: crate::addressing::get_bloom_filter_indices(app, 256, 3), l2: *app };
+        let (set, phase) = PHASE_STR[phase_idx];
+        let mut entries = Vec::new();
+        let mut after: Option<[u8; 32]> = None;
+        loop {
+            let (leaves, more) = {
+                let forest = self.forest.read().map_err(|_| QuilError::ExecutionUnavailable("forest lock poisoned".into()))?;
+                forest.serve_leaves(app, PHASES[phase_idx], version, &first, &last, after.as_ref(), PAGE_LEAVES, PAGE_BYTES)
+                    .map_err(|e| QuilError::ExecutionUnavailable(format!("subtree leaves at version {version}: {e}")))?
+            };
+            for (key, value) in &leaves {
+                let id = [app.as_slice(), key.0.as_slice()].concat();
+                if phase_idx % 2 == 1 {
+                    entries.push((id, Vec::new()));
+                    continue;
+                }
+                let blob = self.store.load_vertex_underlying_at(set, phase, &shard, &id, version)?.unwrap_or_default();
+                if blob.is_empty() && quil_forest::vertex_leaf_size(value) > 0 {
+                    return Err(QuilError::ExecutionUnavailable(format!(
+                        "the blob of {} (phase {phase_idx}) is not retained at version {version}", hex::encode(&id)
+                    )));
+                }
+                entries.push((id, blob));
+            }
+            match (more, leaves.last()) {
+                (true, Some((key, _))) => after = Some(key.0),
+                _ => break,
+            }
+        }
+        Ok(entries)
+    }
+
     // ---- snapshots (unchanged, width-agnostic) --------------------------
 
     pub fn prepare_snapshot_publication(
@@ -4524,6 +4669,51 @@ fn deserialize_buckets(b: &[u8]) -> HashMap<Vec<u8>, (u64, i128)> {
         m.insert(k, (c, s));
     }
     m
+}
+
+/// The lowest and highest data address a 64-byte id matching `path` can have:
+/// the path's bits past the 32-byte application are the address's leading
+/// bits ([`id_matches_path`] reads the id as one bit string).
+fn path_address_bounds(path: &[i32]) -> ([u8; 32], [u8; 32]) {
+    let (mut lower, mut upper) = ([0u8; 32], [0xFFu8; 32]);
+    for (level, &nibble) in path.iter().enumerate() {
+        for j in 0..6 {
+            let Some(bit) = (level * 6 + j).checked_sub(256) else { continue };
+            if bit >= 256 {
+                return (lower, upper);
+            }
+            let mask = 0x80u8 >> (bit % 8);
+            if (nibble >> (5 - j)) & 1 == 1 {
+                lower[bit / 8] |= mask;
+            } else {
+                upper[bit / 8] &= !mask;
+            }
+        }
+    }
+    (lower, upper)
+}
+
+/// The lowest and highest 32-byte addresses that start with `bits`.
+fn bit_address_bounds(bits: &[bool]) -> ([u8; 32], [u8; 32]) {
+    let (mut lower, mut upper) = ([0u8; 32], [0xFFu8; 32]);
+    for (bit, &set) in bits.iter().take(256).enumerate() {
+        let mask = 0x80u8 >> (bit % 8);
+        if set {
+            lower[bit / 8] |= mask;
+        } else {
+            upper[bit / 8] &= !mask;
+        }
+    }
+    (lower, upper)
+}
+
+/// The address just below `address`, `None` below zero.
+fn address_before(address: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut before = *address;
+    let index = before.iter().rposition(|&b| b != 0)?;
+    before[index] -= 1;
+    before[index + 1..].fill(0xFF);
+    Some(before)
 }
 
 fn id_matches_path(id: &[u8], path: &[i32]) -> bool {

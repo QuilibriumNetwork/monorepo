@@ -35,6 +35,7 @@ members = [
     "crates/quil-config",
     "crates/quil-lifecycle",
     "crates/quil-crypto",
+    "crates/quil-storage-stark",
     "crates/quil-tries",
     "crates/quil-tries-ffi",
     "crates/quil-forest",
@@ -145,6 +146,8 @@ opt-level = 3
 
 # Workspace crates whose own code is the hot path in tests.
 [profile.test.package.bls48581]
+opt-level = 3
+[profile.test.package.quil-storage-stark]
 opt-level = 3
 [profile.test.package.dkls23]
 opt-level = 3

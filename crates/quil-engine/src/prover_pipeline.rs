@@ -105,6 +105,12 @@ pub struct ProverPipeline {
     pub pending_shard_changes: Option<std::sync::Arc<
         dyn Fn() -> Vec<quil_types::store::PendingShardChange> + Send + Sync,
     >>,
+    /// A shard's storage snapshot for an epoch, once GLOBAL has recorded it
+    /// (hash storage proofs; the prover registry's). A confirm's registrations
+    /// are read from each shard's snapshot sources.
+    pub storage_snapshot: Option<std::sync::Arc<
+        dyn Fn(&[u8], u64) -> Option<quil_types::consensus::StorageSnapshotRoots> + Send + Sync,
+    >>,
     /// Local global-message collector, for LOOPBACK of ops this node generates
     /// for ITSELF (ShardSplit/ShardMerge from the coverage orchestrator, which
     /// runs on the frame producer). A producer must include its own generated op
@@ -120,9 +126,12 @@ pub struct ProverPipeline {
 }
 
 pub type RemoteStorageConfirm = std::sync::Arc<
-    dyn Fn(&[u8], &[Vec<u8>], u64, std::time::Duration) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
+    dyn Fn(&[u8], &[Vec<u8>], u64, std::time::Duration, &[SnapshotSources]) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>>
         + Send + Sync,
 >;
+
+/// The storage snapshot sources of one shard a confirm registers.
+pub type SnapshotSources = (Vec<u8>, Vec<quil_execution::global_intrinsic::storage_snapshot::Source>);
 
 /// A filter-carrying op other than a join or confirm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1528,7 +1537,38 @@ impl ProverPipeline {
             release = %confirm.release.map_or_else(|| "none".to_string(), |release| release.to_string()),
             "submitting ProverConfirm");
         crate::metrics::inc_prover_confirms_submitted();
+        // A hash-proof registration is sealed once this node's view shows it
+        // recorded, which may trail GLOBAL by a registry pull; ask for an
+        // early one.
+        if quil_types::consensus::hash_storage_proofs_at(quil_types::consensus::epoch_for_frame(frame_number) + 1)
+            && confirm.leaf_roots.iter().any(|group| !group.entries.is_empty())
+        {
+            crate::global_view_refresh::shared().request(
+                crate::global_view_refresh::Reason::StorageRecordAwaited, frame_number + 2, std::time::Instant::now(),
+            );
+        }
         self.publish_prover_message(bytes, frame_number).await
+    }
+
+    /// Each of `filters`' storage snapshot sources for `epoch` that GLOBAL has
+    /// recorded (hash storage proofs; `storage_snapshot::sources`).
+    fn snapshot_sources(
+        &self,
+        filters: &[Vec<u8>],
+        changes: &[quil_types::store::PendingShardChange],
+        epoch: u64,
+    ) -> Vec<SnapshotSources> {
+        let Some(lookup) = self.storage_snapshot.as_ref() else { return Vec::new() };
+        if !quil_types::consensus::hash_storage_proofs_at(epoch) {
+            return Vec::new();
+        }
+        filters
+            .iter()
+            .filter_map(|filter| {
+                quil_execution::global_intrinsic::storage_snapshot::sources(filter, epoch, changes, |shard| lookup(shard, epoch))
+                    .map(|sources| (filter.clone(), sources))
+            })
+            .collect()
     }
 
     /// Partition committed shard data into PoRep leaves, encode and persist the
@@ -1581,6 +1621,28 @@ impl ProverPipeline {
             .filter(|filter| !filter.is_empty())
             .map(|filter| (filter.clone(), self.storage_for_filter.as_ref().and_then(|resolve| resolve(filter))))
             .collect();
+        // Each seat's shards with the snapshot sources they register.
+        let sources = |filter: &[u8], targets: &[Vec<u8>]| {
+            let encoded: Vec<Vec<u8>> = std::iter::once(filter.to_vec()).chain(targets.iter().cloned()).collect();
+            let snapshots = self.snapshot_sources(&encoded, &changes, epoch);
+            // GLOBAL records the seat's snapshot a frame or two after its
+            // frame; a regular node sees it at its next registry pull, which
+            // may come after the renewal's grace. Ask for an early one,
+            // reaching the frame before this one: a pull reaches the state
+            // before the head, so asking for this frame would stay out of
+            // reach while the renewal asks again every frame.
+            if self.storage_snapshot.is_some()
+                && quil_types::consensus::hash_storage_proofs_at(epoch)
+                && frame_number >= quil_types::consensus::storage_snapshot_frame(epoch)
+                && !snapshots.iter().any(|(shard, _)| shard.as_slice() == filter)
+            {
+                crate::global_view_refresh::shared().request(
+                    crate::global_view_refresh::Reason::StorageRecordAwaited, frame_number.saturating_sub(1),
+                    std::time::Instant::now(),
+                );
+            }
+            (encoded, snapshots)
+        };
         let mut answers = match self.remote_storage_confirm.as_ref() {
             Some(remote) => {
                 let mut requests: Vec<(Vec<u8>, Vec<Vec<u8>>)> = confirm_encoding_plan(filters, &changes, epoch)
@@ -1592,7 +1654,10 @@ impl ProverPipeline {
                     &requests,
                     REMOTE_PREPARATIONS,
                     remote_round_deadline(),
-                    |filter, targets, timeout| remote(filter, targets, frame_number, timeout),
+                    |filter, targets, timeout| {
+                        let (_, snapshots) = sources(filter, targets);
+                        remote(filter, targets, frame_number, timeout, &snapshots)
+                    },
                 );
                 late_seats().record(&answers);
                 answers
@@ -1608,10 +1673,10 @@ impl ProverPipeline {
             }
             let worker = local.get(filter).cloned().flatten();
             let (filter_crdt, filter_replicas) = match worker.as_ref() {
-                Some((worker_crdt, worker_replicas)) => (worker_crdt.as_ref(), worker_replicas),
-                None => (crdt.as_ref(), replica_store),
+                Some((worker_crdt, worker_replicas)) => (worker_crdt, worker_replicas),
+                None => (crdt, replica_store),
             };
-            let encoded: Vec<Vec<u8>> = std::iter::once(filter.to_vec()).chain(targets.iter().cloned()).collect();
+            let (encoded, snapshots) = sources(filter, targets);
             match crate::app_shard_metadata::compute_storage_confirm(
                 filter_crdt,
                 filter_replicas,
@@ -1620,6 +1685,8 @@ impl ProverPipeline {
                 epoch,
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 &quil_crypto::sdr::SdrParams::default(),
+                frame_number,
+                &snapshots,
             ) {
                 Ok(roots) => Ok(Prepared::Roots(roots)),
                 Err(error) if worker.is_some() => stopped_mid_encode(&workers, filter, error),

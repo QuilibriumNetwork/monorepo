@@ -1396,6 +1396,30 @@ pub(crate) fn spawn_all(
                     describe_request, log_reward_proof, prover_bundle, track_worker_request, unpublished,
                     worker_submission, WorkerSubmission,
                 };
+                // A storage seat part is proved here with the member's other
+                // seats (`storage_epoch_batch`); the proof goes out like any
+                // other submission, unless a coverage halt holds it.
+                if quil_engine::storage_epoch_batch::is_seat_message(&request) {
+                    let message = quil_engine::storage_epoch_batch::SeatMessage::from_bytes(&request)
+                        .map_err(|error| error.to_string())?;
+                    // Called from the storage job thread, outside the runtime.
+                    let (transport, halt, runtime) = (transport.clone(), halt.clone(), tokio::runtime::Handle::current());
+                    let publish: quil_engine::storage_epoch_batch::Publish = Arc::new(move |proof: Vec<u8>| {
+                        if halt.any_halted() {
+                            tracing::debug!("holding back a storage epoch proof — coverage halt active");
+                            return;
+                        }
+                        let Ok(bundle) = prover_bundle(proof) else { return };
+                        let transport = transport.clone();
+                        runtime.spawn(async move {
+                            if let Err(error) = transport.publish_prover_bundle(bundle).await {
+                                tracing::warn!(%error, "storage epoch proof: transport submission failed");
+                            }
+                        });
+                    });
+                    quil_engine::storage_epoch_batch::deliver(message, publish);
+                    return Ok(true);
+                }
                 let kind = worker_submission(&request)
                     .ok_or_else(|| "not a frame header, committee-handoff submission or presence report".to_string())?;
                 if !kind.active() {

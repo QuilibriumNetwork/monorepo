@@ -348,6 +348,9 @@ pub(crate) async fn start(
                     discover_archives_from_master: true,
                 });
             worker_node = worker_node.with_outgoing_history_source(prod_syncer.outgoing_history_source());
+            quil_engine::storage_snapshot::install_remote(prod_syncer.storage_snapshot_remote(
+                crate::prover_tree_syncer_prod::snapshot_scratch_dir(&db_path), tokio::runtime::Handle::current(),
+            ));
             let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> = prod_syncer;
             let delivery_syncer = syncer.clone();
             worker_node = worker_node

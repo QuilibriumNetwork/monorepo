@@ -1803,6 +1803,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
             shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>;
         let sizes_for_poller = committed_shard_sizes.clone();
         let archive_mode_poller = archive_mode;
+        // The head the poller is catching up to: the lifecycle proposes this
+        // node's prover operations only there (`at_head` below).
+        let head_target = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let head_for_poller = head_target.clone();
+        let lifecycle_deferred = std::sync::atomic::AtomicBool::new(false);
         // Non-archive nodes follow the chain over the `GLOBAL_FRAME` gossip mesh;
         // hand the poller the freshness signal so it sources frames from the
         // gossip-populated store and pauses its RPC head-poll while the mesh is
@@ -1867,6 +1872,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         let poller_config = quil_rpc::ArchivePollerConfig {
             gossip_freshness: poller_gossip_freshness,
             far_behind_jump,
+            head_target: Some(head_target),
             // With atomic finalization, a certified frame fetched from a peer
             // waits as a durable candidate and is published together with its
             // execution state, instead of entering the canonical clock first.
@@ -2140,7 +2146,28 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // prover pipeline, and the evaluate() output would
                 // be ignored anyway since there are no workers to
                 // bind allocations to.
+                //
+                // Nor while this node replays a backlog (after a restart, or
+                // when it fell behind): an operation planned at a replayed
+                // frame is signed for a frame GLOBAL may already be past (a
+                // confirm from an earlier epoch is refused), and the
+                // lifecycle's cooldowns, retry fences and inclusion windows,
+                // counted in frames, would run out at replay speed. The state
+                // above still follows every frame; the lifecycle evaluates
+                // again at the head, seconds later.
+                let head = head_for_poller.load(std::sync::atomic::Ordering::Relaxed);
+                let at_head = frame_num.saturating_add(1) >= head;
                 if !archive_mode_poller {
+                    if !at_head {
+                        if !lifecycle_deferred.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::info!(frame = frame_num, head,
+                                "prover lifecycle waits until this node reaches the GLOBAL head");
+                        }
+                    } else if lifecycle_deferred.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(frame = frame_num, "prover lifecycle resumes at the GLOBAL head");
+                    }
+                }
+                if !archive_mode_poller && at_head {
                     let evaluated = {
                         let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
                         pl_for_poller.evaluate(
@@ -3618,7 +3645,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             let cw_signer: Arc<dyn quil_types::crypto::Signer> =
                                                 Arc::from(bls_signer);
                                             let leader_provider =
-                                                Arc::new(quil_engine::leader_provider::GlobalLeaderProvider::new(
+                                                quil_engine::leader_provider::GlobalLeaderProvider::new(
                                                     sync_pr.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
                                                     sync_fp.clone(),
                                                     sync_da.clone() as Arc<dyn quil_types::consensus::DifficultyAdjuster>,
@@ -3633,7 +3660,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     // CRDT for the prover_tree_commitment the leader
                                                     // binds into each frame header + VDF challenge.
                                                     Some(sync_crdt.clone()),
-                                                ));
+                                                );
+                                            let leader_provider = Arc::new(leader_provider);
 
                                             let selected_parent_execution = sync_mat.as_ref().map(|materializer| {
                                                 Arc::new(quil_engine::frame_materializer::GlobalParentExecutor::new(

@@ -413,6 +413,127 @@ pub const STORAGE_AUDIT_SAMPLE: u64 = 1024;
 /// from ρ_N, so this only affects how many openings are carried + audited.
 pub const STORAGE_QUERIES_PER_LEAF: u32 = 2;
 
+/// One epoch of a member's storage seat on a shard, as GLOBAL recorded it
+/// (hash storage proofs; `quil_execution::global_intrinsic::storage_seat`):
+/// the leaves it registered, whether its epoch proof sealed them, and the
+/// roots its proposals committed ([`ProverRegistry::get_storage_seat_slot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageSeatSlot {
+    pub epoch: u64,
+    /// Sorted: the order a commitment opens them in.
+    pub leaves: Vec<Vec<u32>>,
+    /// The GLOBAL frame that recorded the registration (the frame after it
+    /// is the seal's beacon).
+    pub registered_at: u64,
+    pub sealed_at: Option<u64>,
+    /// Roots committed, and their chain.
+    pub frames: u64,
+    pub accumulator: [u8; 32],
+    /// The app frames chained, ascending, each with the GLOBAL frame it
+    /// anchors to: what the member's epoch proof lists. GLOBAL never executes
+    /// a header that missed its GLOBAL frame, so these can be fewer than the
+    /// member's finalized frames. Empty once the epoch is closed.
+    pub chained: Vec<(u64, u64)>,
+    /// No epoch proof settled the epoch and its window has not closed.
+    pub open: bool,
+}
+
+/// The certified state a shard's storage registrations for `epoch` commit to
+/// (hash storage proofs; `quil_execution::global_intrinsic::storage_snapshot`):
+/// the state roots of the first header of the shard GLOBAL executed at or
+/// after [`storage_snapshot_frame`]`(epoch)`, one per phase, with that header's
+/// app frame and anchor ([`ProverRegistry::get_storage_snapshot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageSnapshotRoots {
+    pub epoch: u64,
+    pub frame: u64,
+    pub anchor: u64,
+    pub roots: [[u8; 32]; 4],
+}
+
+/// Challenges a seal proof answers (hash storage proofs): each opens one
+/// node's labels on every layer and those of its parents, so a replica that
+/// is not the member's encoding on a fraction ε of its nodes escapes with
+/// probability (1−ε)^64 — about 4% at ε = 5% and 0.1% at ε = 10%. Decided
+/// 2026-10-20.
+pub const STORAGE_SEAL_CHALLENGES: usize = 64;
+
+/// Serialized storage epoch proofs a GLOBAL proposal carries at most. GLOBAL
+/// verifies every one (decided 2026-10-20); they cluster once the epoch's
+/// registrations land, and one is about 0.5–0.75 MB.
+pub const STORAGE_SEAL_BYTES_PER_FRAME: usize = 4 << 20;
+
+/// The epoch whose registrations, openings and audits use the hash storage
+/// proofs (`quil_crypto::storage_proof`: SHA3-256 Merkle commitments and seal
+/// proofs) instead of KZG over BLS48-581, which is not post-quantum. Members
+/// register for an epoch during the one before it, so the first hash
+/// registrations land in the epoch before this one. Consensus-affecting:
+/// every archive and prover must run a build with it before then.
+pub const MAINNET_HASH_STORAGE_PROOF_EPOCH: Option<u64> = Some(1311);
+
+static HASH_STORAGE_PROOF_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static HASH_STORAGE_PROOF_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn hash_storage_proof_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's hash storage proof epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call decides.
+pub fn init_hash_storage_proof_epoch(network: u8) -> u64 {
+    *HASH_STORAGE_PROOF_EPOCH.get_or_init(|| {
+        hash_storage_proof_epoch_for(network, std::env::var("QUIL_HASH_STORAGE_PROOF_EPOCH").ok().as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_hash_storage_proof_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+pub fn hash_storage_proof_epoch() -> u64 {
+    if let Some(epoch) = HASH_STORAGE_PROOF_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *HASH_STORAGE_PROOF_EPOCH.get_or_init(|| hash_storage_proof_epoch_for(0, None))
+}
+
+/// Whether `epoch`'s storage registrations, openings and audits are hash-based.
+pub fn hash_storage_proofs_at(epoch: u64) -> bool {
+    epoch >= hash_storage_proof_epoch()
+}
+
+/// GLOBAL frames into an epoch at which leaf data is snapshotted for the next
+/// epoch's hash registrations: after the epoch's first session pass (frames
+/// 0–7 of an epoch hand committees over), well before renewals are needed.
+pub const STORAGE_SNAPSHOT_OFFSET: u64 = 16;
+
+/// The GLOBAL frame whose crossing snapshots leaf data for `target_epoch`'s
+/// registrations (made during the epoch before it).
+pub fn storage_snapshot_frame(target_epoch: u64) -> u64 {
+    target_epoch.saturating_sub(1).saturating_mul(epoch_length_frames()) + STORAGE_SNAPSHOT_OFFSET
+}
+
+/// The epoch whose registrations snapshot their leaf data at an app frame
+/// anchored at `anchor` whose predecessor was anchored at `previous_anchor`:
+/// the shard's state just before its first frame anchored at or after
+/// [`storage_snapshot_frame`]. Every member and archive executes the same
+/// certified chain, so all of them snapshot the same state. `None` when this
+/// frame crosses no snapshot of a hash-proof epoch.
+pub fn storage_snapshot_crossed(previous_anchor: u64, anchor: u64) -> Option<u64> {
+    let target = epoch_for_frame(anchor) + 1;
+    let at = storage_snapshot_frame(target);
+    (hash_storage_proofs_at(target) && previous_anchor < at && at <= anchor).then_some(target)
+}
+
+/// Set the hash storage proof epoch for the calling thread only (tests).
+pub fn set_hash_storage_proof_epoch_for_thread(epoch: Option<u64>) {
+    HASH_STORAGE_PROOF_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The effective state of an allocation at a given frame, with the
 /// 720-frame grace window applied. Prefer this over reading
 /// `alloc.status` directly anywhere the protocol's implicit
@@ -932,6 +1053,20 @@ pub trait ProverRegistry: Send + Sync {
         _leaf_id: &[u8],
         _epoch: u64,
     ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(None)
+    }
+    /// `member`'s storage seat on `filter` for `epoch`, or `None`.
+    fn get_storage_seat_slot(
+        &self,
+        _member: &[u8],
+        _filter: &[u8],
+        _epoch: u64,
+    ) -> Result<Option<StorageSeatSlot>> {
+        Ok(None)
+    }
+    /// The snapshot `filter`'s registrations for `epoch` commit to, once
+    /// GLOBAL has recorded it, or `None`.
+    fn get_storage_snapshot(&self, _filter: &[u8], _epoch: u64) -> Result<Option<StorageSnapshotRoots>> {
         Ok(None)
     }
     fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> Result<Vec<u8>>;
@@ -1559,6 +1694,30 @@ pub(crate) mod epoch_tests {
         assert_eq!(members.activating, vec![vec![2]]);
         assert_eq!(members.leaving, vec![vec![6]]);
         assert_eq!(members.staying(), 2);
+    }
+}
+
+#[cfg(test)]
+mod hash_storage_proof_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_hash_storage_proof_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::hash_storage_proof_epoch_for(0, setting),
+                super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap_or(u64::MAX));
+        }
+        assert_eq!(super::hash_storage_proof_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::hash_storage_proof_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::hash_storage_proof_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet's first hash-proof epoch begins at GLOBAL frame 943,920, and
+    /// its snapshot and registrations come in the epoch before.
+    #[test]
+    fn mainnet_hash_storage_proofs_begin_at_frame_943920() {
+        let epoch = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
+        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 943_920);
+        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 943_200);
+        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET, 943_216);
     }
 }
 

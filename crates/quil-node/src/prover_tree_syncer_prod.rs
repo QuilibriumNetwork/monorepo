@@ -1633,7 +1633,129 @@ impl ProverTreeSyncer for ProdProverTreeSyncer {
     }
 }
 
+/// A storage snapshot source synced into a database of its own, removed when
+/// the capture reading it is done. Fields drop in order: the store's handles
+/// before its directory.
+struct ScratchSnapshot {
+    _crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    _db: Arc<quil_store::RocksDb>,
+    _dir: ScratchDir,
+}
+
+struct ScratchDir(std::path::PathBuf);
+
+/// Where storage snapshot sources are synced for the store at `db_path`: a
+/// sibling of it, never inside a database's own directory.
+pub fn snapshot_scratch_dir(db_path: &std::path::Path) -> std::path::PathBuf {
+    let name = db_path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "store".into());
+    db_path.with_file_name(format!("{name}-storage-snapshots"))
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            warn!(dir = %self.0.display(), %error, "could not remove a storage snapshot scratch store");
+        }
+    }
+}
+
 impl ProdProverTreeSyncer {
+    /// Hash storage proofs: this node's way to read a storage snapshot source
+    /// it does not hold (`quil_engine::storage_snapshot::install_remote`) —
+    /// a joiner's, a split or merge child's, a state-jumper's. The source's
+    /// subtree is synced pinned to its certified roots, from an archive that
+    /// retains them, into a scratch store under `scratch`.
+    pub fn storage_snapshot_remote(
+        self: &Arc<Self>,
+        scratch: std::path::PathBuf,
+        runtime: tokio::runtime::Handle,
+    ) -> Arc<quil_engine::storage_snapshot::RemoteSnapshot> {
+        // Stores left by a process that stopped mid-capture.
+        let _ = std::fs::remove_dir_all(&scratch);
+        let syncer = self.clone();
+        Arc::new(move |filter: &[u8], app: &[u8; 32], bits: &[bool], roots: &[[u8; 32]; 4]| {
+            runtime.block_on(syncer.sync_snapshot_source(&scratch, filter, app, bits, roots))
+        })
+    }
+
+    async fn sync_snapshot_source(
+        &self,
+        scratch: &std::path::Path,
+        filter: &[u8],
+        app: &[u8; 32],
+        bits: &[bool],
+        roots: &[[u8; 32]; 4],
+    ) -> Result<quil_engine::storage_snapshot::Synced> {
+        let first = self.resolve_addr().await?;
+        let mut endpoints = vec![first.clone()];
+        if let Some(pool) = self.archive_pool.as_ref() {
+            endpoints.extend(pool.get_all().await.into_iter().filter(|endpoint| *endpoint != first));
+        }
+        let mut failure = QuilError::ExecutionUnavailable("no archive retains the storage snapshot".into());
+        for addr in endpoints {
+            match self.sync_snapshot_source_from(&addr, scratch, filter, app, bits, roots).await {
+                Ok(synced) => return Ok(synced),
+                Err(error) => {
+                    warn!(peer = %addr, filter = %hex::encode(filter), %error, "storage snapshot source not synced from this archive");
+                    failure = error;
+                }
+            }
+        }
+        Err(failure)
+    }
+
+    async fn sync_snapshot_source_from(
+        &self,
+        addr: &str,
+        scratch: &std::path::Path,
+        filter: &[u8],
+        app: &[u8; 32],
+        bits: &[bool],
+        roots: &[[u8; 32]; 4],
+    ) -> Result<quil_engine::storage_snapshot::Synced> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = scratch.join(format!(
+            "{}-{}-{}", hex::encode(&filter[..filter.len().min(40)]), std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| QuilError::Internal(format!("scratch store {}: {e}", dir.display())))?;
+        let guard = ScratchDir(dir.clone());
+        let db = Arc::new(quil_store::RocksDb::open(&dir)?);
+        let crdt = crate::master_node::worker_manager::build_thread_worker_hypergraph(
+            &db, Arc::new(quil_tries::ShaInclusionProver), false,
+        );
+        crdt.set_unified_tree(true);
+        let mut client = ArchiveClient::connect_mtls(addr, &self.falcon_signing_key)
+            .await
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("archive connect: {e}")))?;
+        let handle = tokio::runtime::Handle::current();
+        for (phase, root) in roots.iter().enumerate() {
+            if is_empty_phase_root(root) {
+                continue;
+            }
+            let phase = phase as u32;
+            let version = match quil_rpc::forest_sync_reader::resolve_forest_root(&client, filter.to_vec(), phase, root.to_vec()).await {
+                Ok(Some((version, _))) => version,
+                Ok(None) => return Err(QuilError::ExecutionUnavailable(format!(
+                    "{addr} does not retain phase {phase} of the storage snapshot of {}", hex::encode(filter)
+                ))),
+                Err(e) => return Err(QuilError::ExecutionUnavailable(format!("resolve storage snapshot root: {e}"))),
+            };
+            let got = crate::forest_sync::sync_subtree_one_phase(
+                &mut client, &handle, &crdt, app, filter, phase, version, bits.to_vec(), Some(*root),
+            ).await?;
+            if got != *root {
+                return Err(QuilError::InvalidArgument(format!(
+                    "synced phase {phase} of {} to {} instead of its snapshot root", hex::encode(filter), hex::encode(got)
+                )));
+            }
+        }
+        Ok(quil_engine::storage_snapshot::Synced {
+            crdt: crdt.clone(),
+            keep: Box::new(ScratchSnapshot { _crdt: crdt, _db: db, _dir: guard }),
+        })
+    }
+
     async fn sync_shard_tree_from(&self, addr: &str, filter: &[u8], expected_roots: &[Vec<u8>]) -> Result<bool> {
         let n = filter.len().min(32);
         let mut l2 = [0u8; 32];

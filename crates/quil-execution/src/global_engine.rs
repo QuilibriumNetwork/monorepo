@@ -92,6 +92,7 @@ pub use crate::global_intrinsic::{
 };
 
 pub use crate::global_intrinsic::handoff::{TYPE_COMMITTEE_HANDOFF, TYPE_PRESENCE_REPORT};
+pub use crate::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
 
 /// The set of global operations the engine dispatches on. Each
 /// variant maps one-to-one with a `MessageRequest` oneof case.
@@ -111,6 +112,7 @@ pub enum MessageKindGlobal {
     ShardMerge,
     CommitteeHandoff,
     PresenceReport,
+    StorageEpochProof,
 }
 
 impl MessageKindGlobal {
@@ -130,6 +132,7 @@ impl MessageKindGlobal {
             Self::ShardMerge => TYPE_SHARD_MERGE,
             Self::CommitteeHandoff => TYPE_COMMITTEE_HANDOFF,
             Self::PresenceReport => TYPE_PRESENCE_REPORT,
+            Self::StorageEpochProof => TYPE_STORAGE_EPOCH_PROOF,
         }
     }
 
@@ -149,10 +152,11 @@ impl MessageKindGlobal {
             Self::ShardMerge => "shard_merge",
             Self::CommitteeHandoff => "committee_handoff",
             Self::PresenceReport => "presence_report",
+            Self::StorageEpochProof => "storage_epoch_proof",
         }
     }
 
-    pub const fn all() -> [MessageKindGlobal; 14] {
+    pub const fn all() -> [MessageKindGlobal; 15] {
         [
             Self::ProverJoin,
             Self::ProverLeave,
@@ -168,6 +172,7 @@ impl MessageKindGlobal {
             Self::ShardMerge,
             Self::CommitteeHandoff,
             Self::PresenceReport,
+            Self::StorageEpochProof,
         ]
     }
 }
@@ -198,6 +203,7 @@ pub fn peek_global_message_kind(input: &[u8]) -> Result<MessageKindGlobal> {
         TYPE_SHARD_MERGE => Ok(MessageKindGlobal::ShardMerge),
         TYPE_COMMITTEE_HANDOFF => Ok(MessageKindGlobal::CommitteeHandoff),
         TYPE_PRESENCE_REPORT => Ok(MessageKindGlobal::PresenceReport),
+        TYPE_STORAGE_EPOCH_PROOF => Ok(MessageKindGlobal::StorageEpochProof),
         other => Err(QuilError::InvalidArgument(format!(
             "global dispatch: unknown type prefix 0x{:08x}",
             other
@@ -229,6 +235,7 @@ pub fn request_is_global_op(request: &MessageRequest) -> bool {
             | Some(MessageRequestInner::ShardMerge(_))
             | Some(MessageRequestInner::CommitteeHandoff(_))
             | Some(MessageRequestInner::PresenceReport(_))
+            | Some(MessageRequestInner::StorageEpochProof(_))
     )
 }
 
@@ -251,6 +258,7 @@ pub fn global_kind_for_request(request: &MessageRequest) -> Option<MessageKindGl
         MessageRequestInner::ShardMerge(_) => Some(MessageKindGlobal::ShardMerge),
         MessageRequestInner::CommitteeHandoff(_) => Some(MessageKindGlobal::CommitteeHandoff),
         MessageRequestInner::PresenceReport(_) => Some(MessageKindGlobal::PresenceReport),
+        MessageRequestInner::StorageEpochProof(_) => Some(MessageKindGlobal::StorageEpochProof),
         _ => None,
     }
 }
@@ -273,6 +281,7 @@ pub fn is_global_type_prefix(tp: u32) -> bool {
             | TYPE_SHARD_MERGE
             | TYPE_COMMITTEE_HANDOFF
             | TYPE_PRESENCE_REPORT
+            | TYPE_STORAGE_EPOCH_PROOF
     )
 }
 
@@ -383,7 +392,7 @@ mod tests {
             .iter()
             .map(|k| k.type_prefix())
             .collect();
-        assert_eq!(ids.len(), 14);
+        assert_eq!(ids.len(), 15);
     }
 
     #[test]
@@ -391,7 +400,7 @@ mod tests {
         use std::collections::HashSet;
         let labels: HashSet<&str> =
             MessageKindGlobal::all().iter().map(|k| k.label()).collect();
-        assert_eq!(labels.len(), 14);
+        assert_eq!(labels.len(), 15);
     }
 
     #[test]

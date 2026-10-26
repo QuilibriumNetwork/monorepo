@@ -41,6 +41,10 @@ pub struct TestProverRegistry {
     /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
     #[allow(clippy::type_complexity)]
     leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
+    /// Storage seat slots, keyed by `(member, filter, epoch)`
+    /// ([`Self::set_storage_seat_slot`] / [`ProverRegistry::get_storage_seat_slot`]).
+    #[allow(clippy::type_complexity)]
+    seat_slots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), quil_types::consensus::StorageSeatSlot>>,
 }
 
 impl Default for TestProverRegistry {
@@ -56,7 +60,13 @@ impl TestProverRegistry {
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
             leaf_roots: Mutex::new(std::collections::HashMap::new()),
+            seat_slots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record `member`'s storage seat slot on `filter` for `slot.epoch`.
+    pub fn set_storage_seat_slot(&self, member: &[u8], filter: &[u8], slot: quil_types::consensus::StorageSeatSlot) {
+        self.seat_slots.lock().unwrap().insert((member.to_vec(), filter.to_vec(), slot.epoch), slot);
     }
 
     /// Register a member's storage leaf root so `get_leaf_root` returns it (the
@@ -109,6 +119,14 @@ impl TestProverRegistry {
 }
 
 impl ProverRegistry for TestProverRegistry {
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Result<Option<quil_types::consensus::StorageSeatSlot>> {
+        Ok(self.seat_slots.lock().unwrap().get(&(member.to_vec(), filter.to_vec(), epoch)).cloned())
+    }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
         Ok(self
             .provers

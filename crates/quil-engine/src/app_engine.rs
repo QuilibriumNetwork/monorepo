@@ -917,6 +917,37 @@ fn cw_session_parent(
 }
 
 impl AppLeaderProvider {
+    /// The openings root this member commits in app frame `frame_number`,
+    /// anchored in hash-proof epoch `epoch` with beacon `rho_n`, from its
+    /// sealed registration's replicas; `None` without one (the frame then
+    /// counts as a proposal the member missed when its epoch settles).
+    fn storage_commitment(&self, epoch: u64, frame_number: u64, rho_n: &[u8]) -> Option<[u8; 32]> {
+        let kv = self.kv_db.as_ref()?;
+        let slot = match self.prover_registry.get_storage_seat_slot(&self.local_prover_address, &self.filter, epoch) {
+            Ok(Some(slot)) if slot.sealed_at.is_some() && slot.open && !slot.leaves.is_empty() => slot,
+            _ => {
+                info!(frame = frame_number, epoch,
+                    "app-shard proof: no sealed storage registration for the epoch — frame commits no openings root");
+                return None;
+            }
+        };
+        let replicas = quil_store::replica_store::ReplicaStore::new(kv.clone());
+        match crate::storage_snapshot::commitment(
+            &replicas, &self.local_prover_address, &self.filter, &slot, frame_number, rho_n,
+        ) {
+            Ok(root) => {
+                info!(frame = frame_number, epoch, leaves = slot.leaves.len(),
+                    "app-shard proof: storage openings root committed");
+                Some(root)
+            }
+            Err(error) => {
+                warn!(frame = frame_number, epoch, %error,
+                    "app-shard proof: storage openings root not computed — frame commits none");
+                None
+            }
+        }
+    }
+
     /// A leader over a private selected-parent branch: its frame chain, state,
     /// execution manager and outflows, the parent as the materialized height,
     /// and a copy of the pending messages (collection would prune the public
@@ -1647,7 +1678,25 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             &storage_attestation_root,
             anchor_gfn,
         )?;
-        if storage_active {
+        let storage_epoch = quil_types::consensus::epoch_for_frame(anchor_gfn);
+        if storage_active && quil_types::consensus::hash_storage_proofs_at(storage_epoch) {
+            // Hash storage proofs (decided 2026-10-21): the frame commits one
+            // root over the replica nodes a beacon chose, which this member's
+            // epoch proof proves later; no openings ride the frame. The beacon
+            // is this node's freshest GLOBAL frame's, not the anchor's: the
+            // root counts only if GLOBAL executes it within the response
+            // window of that frame (`storage_seat::RESPONSE_WINDOW_MS`).
+            let (beacon_frame, beacon_output) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                .and_then(|frame| frame.header)
+                .map(|header| (header.frame_number, header.output))
+                .filter(|(number, _)| *number >= anchor_gfn)
+                .unwrap_or((anchor_gfn, anchor_output.clone()));
+            let beacon = quil_crypto::porep::derive_storage_beacon(beacon_frame, &beacon_output);
+            if let Some(root) = self.storage_commitment(storage_epoch, frame_number, &beacon) {
+                header.storage_attestation_root =
+                    quil_execution::global_intrinsic::storage_seat::encode_commitment(&root, beacon_frame);
+            }
+        } else if storage_active {
             // PROPOSER SELF-ATTESTATION (CW PoRep port). Legacy Jolteon assembled
             // the committee `StorageAttestation` from every member's per-vote
             // openings at QC time. Simplex votes carry no payload, so under CW the
@@ -1682,7 +1731,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     &rho_n,
                 )
                 .unwrap_or_default();
-                if opening_blob.is_empty() && !self.private_parent {
+                // A hash-proof epoch attests only replicas its snapshot encoded
+                // and its renewal registered (`storage_snapshot`); encoding the
+                // live data here would replace them with unregistered ones.
+                if opening_blob.is_empty() && !self.private_parent
+                    && !quil_types::consensus::hash_storage_proofs_at(epoch)
+                {
                     // (1) worker-side shard-data sync into its OWN store.
                     if let Some(source) = self.storage_source_hypergraph.as_ref() {
                         match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
@@ -1714,6 +1768,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                         epoch,
                         quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                         &quil_crypto::sdr::SdrParams::default(),
+                        frame_number,
+                        &[],
                     ) {
                         warn!(frame = frame_number, error = %e, "storage self-seal failed");
                     }
@@ -2665,6 +2721,183 @@ impl AppConsensusEngine {
             &frame.to_be_bytes())
     }
 
+    /// Hash storage proofs (decided 2026-10-21): this member's epoch proof
+    /// for its seat on the shard, during the epoch after the one it settles.
+    /// It seals the registration for the epoch after next once GLOBAL has
+    /// recorded it and the frame after it exists, and proves the roots
+    /// committed the epoch before once their settlement window is open. Both
+    /// go in one proof; settling alone waits until a registration can no
+    /// longer land. Proving runs in the background, and a proof GLOBAL does
+    /// not record is proven and sent again later.
+    fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame};
+        let current = epoch_for_frame(global_frame_number);
+        let (epoch, seal_epoch) = (current.saturating_sub(1), current + 1);
+        if !hash_storage_proofs_at(epoch) && !hash_storage_proofs_at(seal_epoch) {
+            return;
+        }
+        let (Some(kv), Some(publish)) = (self.kv_db.clone(), self.coverage_publish.clone()) else { return };
+        let Ok(member) = <[u8; 32]>::try_from(self.local_prover_address.as_slice()) else { return };
+        let slot = |e: u64| self.prover_registry.get_storage_seat_slot(&member, &self.filter, e).ok().flatten();
+        let next = slot(seal_epoch).filter(|slot| {
+            hash_storage_proofs_at(seal_epoch) && slot.sealed_at.is_none() && !slot.leaves.is_empty()
+        });
+        let seal = next.clone().filter(|slot| slot.registered_at + 1 < global_frame_number);
+        let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let registration_closed = global_frame_number
+            >= storage_snapshot_frame(seal_epoch) + crate::app_shard_metadata::storage_snapshot_grace()
+                + crate::storage_snapshot::seal_retry_frames();
+        // Settling shares a proof with the seal when one can still come: a
+        // registration GLOBAL recorded whose beacon frame is not here yet, or
+        // one that may still land.
+        let awaiting_seal = seal.is_none()
+            && hash_storage_proofs_at(seal_epoch)
+            && (next.is_some() || (slot(seal_epoch).is_none() && !registration_closed));
+        let settle = slot(epoch).filter(|slot| {
+            hash_storage_proofs_at(epoch) && slot.sealed_at.is_some() && slot.open && slot.frames > 0
+                && (from..until).contains(&global_frame_number) && !awaiting_seal
+        });
+        if seal.is_none() && settle.is_none() {
+            crate::storage_epoch_batch::forget_prepared(&member, &self.filter, epoch);
+            return;
+        }
+        // GLOBAL frames this proof reads that this worker does not hold (a
+        // standalone worker stores them only from its start) come from its
+        // own master in the background; the job runs again next frame.
+        let recover = |numbers: Vec<u64>| {
+            let (Some(source), Ok(runtime)) = (self.global_anchor_source.clone(), tokio::runtime::Handle::try_current())
+            else {
+                return;
+            };
+            let store = self.global_anchor_store.clone();
+            runtime.spawn(async move {
+                for number in numbers {
+                    if let Err(error) = crate::global_anchor::ensure_global_anchor(store.as_ref(), &source, number).await {
+                        debug!(frame = number, %error, "GLOBAL frame for a storage epoch proof not recovered yet");
+                    }
+                }
+            });
+        };
+        let missing = |number: u64| self.global_anchor_store.get_global_clock_frame(number).is_err();
+        let beacon_output = match &seal {
+            Some(slot) => match self.global_anchor_store.get_global_clock_frame(slot.registered_at + 1).ok()
+                .and_then(|frame| frame.header.map(|header| header.output))
+            {
+                Some(output) => output,
+                None => {
+                    recover(vec![slot.registered_at + 1]);
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        let beacons = match &settle {
+            Some(slot) => match crate::storage_snapshot::chained_beacons(self.global_anchor_store.as_ref(), slot) {
+                Some(beacons) => beacons,
+                None => {
+                    let absent: Vec<u64> = slot.chained.iter().map(|&(_, anchor)| anchor).filter(|&n| missing(n)).collect();
+                    warn!(epoch, frames = ?absent,
+                        "storage epoch proof: GLOBAL frames chained frames anchor to are not stored here; recovering them");
+                    recover(absent);
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        // A part sent before is owed still in this node's view, which may
+        // trail GLOBAL by a registry pull (minutes): ask for an early one, so
+        // the view learns the seal (proposals commit roots only for a seal
+        // they see) and a part GLOBAL applied is not sent again.
+        if let Some(sent) = crate::storage_snapshot::epoch_proof_sent_at(&member, &self.filter, epoch) {
+            crate::global_view_refresh::shared().request(
+                crate::global_view_refresh::Reason::StorageRecordAwaited, sent + 4, std::time::Instant::now(),
+            );
+        }
+        let Some(attempt) = crate::storage_snapshot::claim_epoch_proof(&member, &self.filter, epoch, global_frame_number)
+        else {
+            return;
+        };
+        let (filter, replicas) = (self.filter.clone(), quil_store::replica_store::ReplicaStore::new(kv));
+        let crdt = self.hypergraph.clone();
+        // This seat's part of the member's epoch proof goes to the node, which
+        // proves it with the member's other seats (`storage_epoch_batch`),
+        // waiting for the parts announced to it; a part sent again is proved
+        // alone.
+        let announce = |seals: bool, settles: bool| {
+            use crate::storage_epoch_batch::{SeatKey, SeatMessage};
+            if attempt == 1 {
+                let key = SeatKey { filter: self.filter.clone(), seals, settles };
+                publish(SeatMessage::Announce(member, key).to_bytes());
+            }
+        };
+        match (seal.is_some(), settle.is_some()) {
+            (true, true) if attempt > 1 => {}
+            (seals, settles) => announce(seals, settles),
+        }
+        // What each half of the part is prepared from: a retry reuses a half
+        // prepared from the same inputs.
+        let seal_inputs = seal.as_ref().map(|slot| crate::storage_epoch_batch::PartInputs::Seal {
+            registered_at: slot.registered_at, leaves: slot.leaves.clone(), beacon_output: beacon_output.clone(),
+        });
+        let settle_inputs = settle.as_ref().map(|slot| crate::storage_epoch_batch::PartInputs::Settle {
+            frames: slot.frames, accumulator: slot.accumulator,
+        });
+        crate::storage_snapshot::spawn("epoch proof part", move || {
+            let prove = |seals: bool, settles: bool| -> quil_types::error::Result<()> {
+                let withdraw = |error: quil_types::error::QuilError| {
+                    use crate::storage_epoch_batch::{SeatKey, SeatMessage};
+                    publish(SeatMessage::Withdraw(member, SeatKey { filter: filter.clone(), seals, settles }).to_bytes());
+                    error
+                };
+                let started = std::time::Instant::now();
+                let (mut seat, reused) = crate::storage_epoch_batch::prepare_reusing(
+                    &member, &filter, epoch,
+                    seal_inputs.clone().filter(|_| seals),
+                    settle_inputs.clone().filter(|_| settles),
+                    |seals, settles| {
+                        // The sealed registration's bindings read the
+                        // snapshot its data was taken from.
+                        let captured = match (seal.as_ref().filter(|_| seals), crdt.as_ref()) {
+                            (Some(_), Some(crdt)) => Some(crate::storage_snapshot::captured_for(crdt, &replicas, &filter, epoch + 2)?),
+                            (Some(_), None) => return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                                "no shard store to read the sealed snapshot from".into(),
+                            )),
+                            _ => None,
+                        };
+                        crate::storage_snapshot::prepare_member_seat(
+                            &replicas, &member, &filter, epoch,
+                            seal.as_ref().filter(|_| seals).zip(captured.as_deref())
+                                .map(|(slot, captured)| (slot, beacon_output.as_slice(), captured)),
+                            settle.as_ref().filter(|_| settles).map(|slot| (slot, beacons.as_slice())),
+                        )
+                    },
+                )
+                .map_err(withdraw)?;
+                seat.solo = attempt > 1;
+                let bytes = seat.to_bytes();
+                info!(epoch, seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
+                    bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
+                    "storage epoch proof part prepared for the node");
+                publish(bytes);
+                Ok(())
+            };
+            match (seal.is_some(), settle.is_some()) {
+                // A seal that fails here, or one GLOBAL refused once, must not
+                // keep the settlement out: the held rewards and the seat ride
+                // on it. Send the parts apart.
+                (true, true) if attempt > 1 => {
+                    let settled = prove(false, true);
+                    prove(true, false).and(settled)
+                }
+                (true, true) => prove(true, true).or_else(|error| {
+                    warn!(epoch, %error, "storage epoch proof with the seal failed; settling alone");
+                    prove(false, true)
+                }),
+                (seals, settles) => prove(seals, settles),
+            }
+        });
+    }
+
     /// Run a frame's `requests` through the execution engines on the
     /// blocking thread pool, off the engine's `tokio::select!` task.
     /// Materialization is CPU- and DB-bound; running it inline on the
@@ -2688,6 +2921,7 @@ impl AppConsensusEngine {
             Some(e) => e,
             None => return Ok((0, 0)),
         };
+        self.prove_storage_epoch_if_due(global_frame_number);
         let collector = self.message_collector.clone();
         // Price from the network size certified by global consensus on the
         // anchored global frame — identical on every member — never from this
@@ -5024,6 +5258,17 @@ impl AppConsensusEngine {
                     self.heal_disagreeing_pre_state();
                     if let Err(error) = self.discard_legacy_history_if_due().await {
                         warn!(core_id = self.core_id, %error, "legacy app history could not be discarded; will retry");
+                    }
+                    // The epoch proof job also runs from here, not only when a
+                    // frame materializes: a joiner materializes nothing before
+                    // consensus starts, and a stalled committee nothing at all,
+                    // yet a seal or a settlement left undone kicks the member
+                    // (an in-process engine receives no GLOBAL frame messages).
+                    // `claim_epoch_proof` paces the attempts.
+                    if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                        .and_then(|frame| frame.header).map(|header| header.frame_number)
+                    {
+                        self.prove_storage_epoch_if_due(head);
                     }
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
@@ -7368,6 +7613,14 @@ impl AppConsensusEngine {
             );
             self.shard_frame_number = expected_shard_frame;
         }
+
+        // Run the epoch proof job from GLOBAL frames too (and from the retry
+        // timer, for an in-process engine, which receives no GLOBAL frame
+        // messages), not only when a frame materializes: a joiner's first
+        // registration must be sealed before consensus starts, and a member
+        // whose committee stalls in the settlement window must still settle
+        // what it committed, or it is kicked.
+        self.prove_storage_epoch_if_due(global_frame_number);
 
         // Update difficulty from global frame header
         self.current_difficulty.store(
@@ -12403,6 +12656,37 @@ mod tests {
         };
         let (engine, handle) = AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
         (engine, handle, received)
+    }
+
+    /// A member whose committee runs consensus but materializes nothing (a
+    /// stalled committee) still settles its storage epoch, from GLOBAL frames:
+    /// GLOBAL kicks a member that committed roots and never proved them.
+    #[tokio::test]
+    async fn a_stalled_member_settles_its_storage_epoch_from_global_frames() {
+        use crate::storage_epoch_batch::SeatMessage;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
+        let epoch = 5;
+        let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        registry.set_storage_seat_slot(&[1; 32], &engine.filter, quil_types::consensus::StorageSeatSlot {
+            epoch, leaves: vec![vec![0]], registered_at: 1, sealed_at: Some(2), frames: 1,
+            accumulator: [0; 32], chained: Vec::new(), open: true,
+        });
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: until - 1, ..Default::default() }),
+            ..Default::default()
+        };
+        engine.handle_global_frame_message(&crate::consensus_wire::encode_global_frame(&frame).unwrap());
+        let announced = published.lock().unwrap().iter()
+            .any(|bytes| matches!(SeatMessage::from_bytes(bytes), Ok(SeatMessage::Announce(..))));
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(announced, "a settlement due on a running, stalled committee is prepared from a GLOBAL frame");
     }
 
     /// This node's prover (`test_engine`'s), allocated to the engine's shard

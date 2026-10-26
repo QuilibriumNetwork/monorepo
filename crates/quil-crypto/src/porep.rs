@@ -234,7 +234,7 @@ where
     F: Fn(&[u8], &[u8]) -> Option<(Vec<u8>, u64, u64)>,
 {
     let audited = audit_storage_registry(openings, rho_n, active_epoch, sample_size, lookup);
-    audit_storage_possession(&audited, rho_n, poly_size)
+    audit_storage_possession(&audited, rho_n, poly_size, active_epoch)
 }
 
 /// Step (a) of [`audit_frame_storage_attestations`]: the openings sampled this
@@ -277,12 +277,14 @@ where
 }
 
 /// Step (b) of [`audit_frame_storage_attestations`]: possession + path of each
-/// sampled opening whose registry check passed. Returns the distinct members
-/// with a failing opening, first failure first.
+/// sampled opening whose registry check passed, under `active_epoch`'s
+/// scheme. Returns the distinct members with a failing opening, first failure
+/// first.
 pub fn audit_storage_possession(
     audited: &[(&StorageOpening, bool)],
     rho_n: &[u8],
     poly_size: u64,
+    active_epoch: u64,
 ) -> Vec<Vec<u8>> {
     use rayon::prelude::*;
     use std::collections::HashSet;
@@ -290,9 +292,12 @@ pub fn audit_storage_possession(
     // they run in parallel: one after another they were most of a shard
     // header's GLOBAL execution time. The result is the same as checking them
     // in turn.
+    // The scheme is the audited epoch's, decided here rather than per opening
+    // on the pool's threads (the registry check pins every opening to it).
+    let hash = quil_types::consensus::hash_storage_proofs_at(active_epoch);
     let verified: Vec<bool> = audited
         .par_iter()
-        .map(|(o, registry_ok)| *registry_ok && opening_possession_verifies(o, rho_n, poly_size))
+        .map(|(o, registry_ok)| *registry_ok && opening_possession_verifies(o, rho_n, poly_size, hash))
         .collect();
     // Failed members in opening order, as before: every node kicks the same
     // members in the same order.
@@ -306,13 +311,15 @@ pub fn audit_storage_possession(
     failed
 }
 
-/// `verify_storage_attestation` of one opening, remembered. GLOBAL executes a
-/// frame's shard headers two or three times (proposal check, vote,
-/// publication), and each time the audit re-checked the same openings against
-/// the same beacon. The check is a pure function of the opening, `rho_n` and
-/// `poly_size`, and the key hashes all of them, so a remembered verdict is the
-/// verdict the check would return.
-fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64) -> bool {
+/// The possession check of one opening, remembered: the hash scheme's
+/// [`crate::storage_proof::verify_opening`] when `hash`, else
+/// `verify_storage_attestation`. GLOBAL executes a frame's shard headers two
+/// or three times (proposal check, vote, publication), and each time the audit
+/// re-checked the same openings against the same beacon. The check is a pure
+/// function of the scheme, the opening, `rho_n` and `poly_size`, and the key
+/// hashes all of them, so a remembered verdict is the verdict the check would
+/// return.
+fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64, hash: bool) -> bool {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
     /// A frame carries a few thousand openings: a few frames' worth, about
@@ -320,11 +327,15 @@ fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64)
     const MAX_ENTRIES: usize = 1 << 14;
     static REMEMBERED: LazyLock<Mutex<HashMap<[u8; 32], bool>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
-    let key = possession_check_key(o, rho_n, poly_size);
+    let key = possession_check_key(o, rho_n, poly_size, hash);
     if let Some(ok) = REMEMBERED.lock().ok().and_then(|seen| seen.get(&key).copied()) {
         return ok;
     }
-    let ok = verify_storage_attestation(std::slice::from_ref(o), 0, rho_n, &[], poly_size);
+    let ok = if hash {
+        crate::storage_proof::verify_opening(o, rho_n)
+    } else {
+        verify_storage_attestation(std::slice::from_ref(o), 0, rho_n, &[], poly_size)
+    };
     if let Ok(mut seen) = REMEMBERED.lock() {
         if seen.len() >= MAX_ENTRIES {
             seen.clear();
@@ -335,13 +346,14 @@ fn opening_possession_verifies(o: &StorageOpening, rho_n: &[u8], poly_size: u64)
 }
 
 /// Every input of one opening's possession check, length-prefixed.
-fn possession_check_key(o: &StorageOpening, rho_n: &[u8], poly_size: u64) -> [u8; 32] {
+fn possession_check_key(o: &StorageOpening, rho_n: &[u8], poly_size: u64, hash: bool) -> [u8; 32] {
     fn field(h: &mut Sha3_256, bytes: &[u8]) {
         h.update((bytes.len() as u64).to_be_bytes());
         h.update(bytes);
     }
     let mut h = Sha3_256::new();
     field(&mut h, DST_POSSESSION_CHECK);
+    h.update([u8::from(hash)]);
     field(&mut h, rho_n);
     h.update(poly_size.to_be_bytes());
     field(&mut h, &o.shard_id);
@@ -793,6 +805,13 @@ fn update_frame_transcript(
     }
 }
 
+/// Whether an opening set is hash-based ([`crate::storage_proof`]): its epoch
+/// is at or after `quil_types::consensus::hash_storage_proof_epoch()`. A set
+/// mixing schemes fails verification either way.
+fn uses_hash_proofs(openings: &[StorageOpening]) -> bool {
+    openings.first().is_some_and(|o| quil_types::consensus::hash_storage_proofs_at(o.epoch))
+}
+
 /// The committee's `storage_attestation_root` for the FrameHeader: the 74-byte
 /// **aggregate proof point** `A = Σ_k γ^k · π_k` over the canonical opening set
 /// (a compressed BLS48-581 G1 element), where `γ` is the Fiat-Shamir challenge
@@ -810,6 +829,9 @@ pub fn compute_storage_attestation_root(
     bitmask: &[u8],
     poly_size: u64,
 ) -> Vec<u8> {
+    if uses_hash_proofs(openings) {
+        return crate::storage_proof::attestation_root(openings, frame_number, rho_n, bitmask);
+    }
     let idx = canonical_indexed(openings, rho_n, poly_size);
     if idx.is_empty() {
         return Vec::new();
@@ -841,6 +863,11 @@ pub fn verify_storage_attestation(
         // No openings to satisfy this frame; the caller enforces the
         // participation quorum separately.
         return true;
+    }
+    if uses_hash_proofs(openings) {
+        return openings.iter().all(|o| {
+            quil_types::consensus::hash_storage_proofs_at(o.epoch) && crate::storage_proof::verify_opening(o, rho_n)
+        });
     }
     if poly_size == 0 {
         return false;
@@ -1612,6 +1639,41 @@ mod tests {
         assert_eq!(parallel.len(), 2, "m1 unregistered and m2 tampered: {parallel:?}");
     }
 
+    /// A registered member's opening with a field too short to decode is
+    /// rejected and its member kicked, as any bad opening is: the KZG decoder
+    /// indexed past such bytes and panicked GLOBAL execution on every archive
+    /// that sampled it (found 2026-10-20).
+    #[test]
+    fn a_truncated_kzg_opening_is_rejected_not_a_panic() {
+        use std::collections::HashMap;
+        bls48581::init();
+        let poly_size = 16u64;
+        let rho_n = [0xA1u8; 32];
+        let openings = build_attestation(&rho_n, poly_size);
+        let epoch = openings[0].epoch;
+        let reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = openings
+            .iter()
+            .map(|o| ((o.member_id.clone(), o.shard_id.clone()), (o.leaf_root.clone(), o.num_blocks, epoch)))
+            .collect();
+        let lookup = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let truncations: [fn(&mut StorageOpening); 6] = [
+            |o| o.commitment.clear(),
+            |o| o.proof.truncate(10),
+            |o| o.value.clear(),
+            |o| o.commitment = [&[0x04u8][..], &o.commitment[1..]].concat(),
+            |o| if let Some(c) = o.path_commits.first_mut() { c.truncate(1) } else { o.proof.clear() },
+            |o| if let Some(p) = o.path_proofs.first_mut() { p.clear() } else { o.commitment.truncate(73) },
+        ];
+        for (case, truncate) in truncations.iter().enumerate() {
+            let mut bad = openings.clone();
+            truncate(&mut bad[0]);
+            let failed = audit_frame_storage_attestations(&bad, &rho_n, poly_size, epoch, u64::MAX, &lookup);
+            assert_eq!(failed.first(), Some(&bad[0].member_id), "case {case}");
+            let root = compute_storage_attestation_root(&bad, 1, &rho_n, &[], poly_size);
+            assert!(!verify_frame_storage_attestation(&root, &bad, 1, &rho_n, &[], poly_size), "case {case}");
+        }
+    }
+
     #[test]
     fn audit_selector_edges_and_determinism() {
         let rho = [0x11u8; 32];
@@ -1849,7 +1911,7 @@ mod tests {
                 let expected = verify_storage_attestation(std::slice::from_ref(v), 0, rho, &[], poly_size);
                 verdicts[usize::from(expected)] += 1;
                 for _ in 0..2 {
-                    assert_eq!(opening_possession_verifies(v, rho, poly_size), expected, "opening {i}");
+                    assert_eq!(opening_possession_verifies(v, rho, poly_size, false), expected, "opening {i}");
                 }
             }
         }

@@ -147,6 +147,16 @@ impl SparseMerkleLeafNode {
         self.key_hash
     }
 
+    /// The leaf's key, for a verifier that reads what a proof shows of it.
+    pub fn key_bytes(&self) -> [u8; 32] {
+        self.key_hash.0
+    }
+
+    /// The hash of the leaf's value.
+    pub fn value_hash_bytes(&self) -> [u8; 32] {
+        self.value_hash.0
+    }
+
     pub(crate) fn hash<H: SimpleHasher>(&self) -> [u8; 32] {
         let mut hasher = H::new();
         hasher.update(LEAF_DOMAIN_SEPARATOR);

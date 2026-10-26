@@ -48,6 +48,9 @@ struct CollectedMessage {
     /// Its shard frames passed the collector's verifier (or that of the public
     /// collector a private proposal copied it from).
     verified: bool,
+    /// It carries a storage epoch proof, which a proposal takes only up to
+    /// `STORAGE_SEAL_BYTES_PER_FRAME`.
+    seal: bool,
 }
 
 impl CollectedMessage {
@@ -59,8 +62,17 @@ impl CollectedMessage {
         } else {
             None
         };
-        Self { hash: message_key(&data), data, shard, proof, verified: false }
+        let seal = carries_storage_seal(&data);
+        Self { hash: message_key(&data), data, shard, proof, verified: false, seal }
     }
+}
+
+/// Whether a collected message carries a storage epoch proof.
+fn carries_storage_seal(data: &[u8]) -> bool {
+    use quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
+    quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data).is_ok_and(|bundle| {
+        bundle.requests.iter().flatten().any(|request| request.inner_type_prefix == TYPE_STORAGE_EPOCH_PROOF)
+    })
 }
 
 /// The identity of a message for deduplication and consumption: a bundle's
@@ -1006,8 +1018,19 @@ impl MessageCollector {
         let others_cap = max_bytes - proof_bytes.min(max_bytes / 2);
         let mut copied = Copied { taken: Vec::new(), bytes: 0, max_items };
         let mut waiting = Vec::new();
+        // Storage epoch proofs are large (about 0.5–0.75 MB each) and cluster
+        // after each epoch's snapshot; past their share they wait.
+        let seal_budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let seal_len = |candidate: &Candidate| if candidate.2.seal { candidate.2.data.len() } else { 0 };
+        let mut seal_bytes = 0usize;
+        let mut seals_left = 0usize;
         for candidate in others {
-            if !copied.take(vec![candidate], others_cap) {
+            let len = seal_len(&candidate);
+            if seal_bytes + len > seal_budget {
+                seals_left += 1;
+            } else if copied.take(vec![candidate], others_cap) {
+                seal_bytes += len;
+            } else {
                 waiting.push(candidate);
             }
         }
@@ -1018,10 +1041,13 @@ impl MessageCollector {
                 proofs_left += 1;
             }
         }
-        let mut others_left = 0usize;
+        let mut others_left = seals_left;
         for candidate in waiting {
-            if !copied.take(vec![candidate], max_bytes) {
+            let len = seal_len(&candidate);
+            if seal_bytes + len > seal_budget || !copied.take(vec![candidate], max_bytes) {
                 others_left += 1;
+            } else {
+                seal_bytes += len;
             }
         }
         if proofs_left + others_left > 0 {
@@ -1558,6 +1584,39 @@ mod tests {
         let fh = FrameHeader { address: vec![addr; 32], frame_number: frame, rank: copy, global_frame_number: 99, ..Default::default() };
         let req = CanonicalMessageRequest { inner_type_prefix: TYPE_FRAME_HEADER, inner_bytes: fh.to_canonical_bytes().unwrap() };
         CanonicalMessageBundle { requests: vec![Some(req)], timestamp }.to_canonical_bytes().unwrap()
+    }
+
+    /// Storage epoch proofs share at most `STORAGE_SEAL_BYTES_PER_FRAME` of a
+    /// proposal; the rest wait for a later one, behind nothing else.
+    #[test]
+    fn a_proposal_takes_seal_proofs_only_up_to_their_budget() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let seal = |member: u8| {
+            let seal = StorageEpochProof {
+                member: [member; 32],
+                seats: vec![quil_execution::global_intrinsic::storage_epoch_proof::SeatProof {
+                    seals: true, ..Default::default()
+                }],
+                proof: vec![member; budget / 2 + 1],
+            };
+            let req = CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: seal.to_canonical_bytes(),
+            };
+            CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }.to_canonical_bytes().unwrap()
+        };
+        let mc = MessageCollector::new();
+        assert!(mc.add_message(1, seal(1)));
+        assert!(mc.add_message(1, seal(2)));
+        assert!(mc.add_message(1, b"other".to_vec()));
+        let taken = mc.snapshot_for_proposal(1, 4 * budget, 100, None, &[]).unwrap();
+        assert_eq!(taken.len(), 2, "one seal and the other message");
+        assert!(taken.iter().any(|(data, _)| data == b"other"));
+        let first: Vec<Vec<u8>> = taken.into_iter().map(|(data, _)| data).filter(|d| d != b"other").collect();
+        let next = mc.snapshot_for_proposal(1, 4 * budget, 100, None, &first).unwrap();
+        assert_eq!(next.len(), 2, "the second seal once the first is consumed: {}", next.len());
     }
 
     fn counting_verifier(

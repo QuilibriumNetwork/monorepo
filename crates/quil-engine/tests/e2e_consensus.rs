@@ -525,6 +525,8 @@ async fn worker_active_storage_attestation() {
                 epoch,
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 &quil_crypto::sdr::SdrParams::default(),
+                0,
+                &[],
             )
             .expect("compute leaf roots for registration");
             for cr in &roots {
@@ -902,6 +904,7 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
         storage_for_filter: None,
         remote_storage_confirm: None,
         pending_shard_changes: None,
+        storage_snapshot: None,
         local_message_collector: None,
         current_frame: None,
     });

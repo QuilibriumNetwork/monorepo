@@ -25,6 +25,8 @@ memchr = "2"
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-crypto = { path = "../quil-crypto" }
+# Epoch storage proofs (Plonky3; Rust 1.93 or later).
+quil-storage-stark = { path = "../quil-storage-stark" }
 # Commonware-simplex finalization-cert verify (reward attribution for CW-finalized
 # app-shard frames). Acyclic: quil-cw-consensus doesn't depend on us.
 quil-cw-consensus = { path = "../quil-cw-consensus" }

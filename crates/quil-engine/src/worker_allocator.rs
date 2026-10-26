@@ -881,14 +881,34 @@ impl WorkerAllocator {
         Ok(())
     }
 
-    /// Free a worker, unless its committee session is still closing.
+    /// Free a worker, unless its committee session is still closing or its
+    /// seat still owes a storage epoch proof.
     fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
         if retained {
             debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
-                "committee session still counts this member; worker stays bound until its seal is recorded");
+                "committee session or storage settlement still needs this member; worker stays bound");
             return Ok(());
         }
         self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
+    /// for roots it committed: a sealed, open slot of the previous or current
+    /// epoch with committed roots, whose settlement window has not closed.
+    /// Only the shard's engine proves a seat, and GLOBAL kicks a member that
+    /// committed roots and never proved them, so the worker stays bound (and
+    /// its engine running) until the epoch settles or its window closes.
+    fn owes_storage_settlement(&self, filter: &[u8], frame_number: u64) -> bool {
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
+        let current = epoch_for_frame(frame_number);
+        [current.saturating_sub(1), current].into_iter().any(|epoch| {
+            hash_storage_proofs_at(epoch)
+                && self.prover_registry.get_storage_seat_slot(&self.local_prover_address, filter, epoch).ok().flatten()
+                    .is_some_and(|slot| {
+                        slot.sealed_at.is_some() && slot.open && slot.frames > 0
+                            && frame_number < quil_execution::global_intrinsic::storage_seat::settlement_window(epoch).1
+                    })
+        })
     }
 
     /// The frame GLOBAL committed for each of `filters` that has one
@@ -1570,7 +1590,7 @@ impl WorkerAllocator {
                 (Some(global), Some(member)) if !worker.filter.is_empty() =>
                     crate::app_handoff::retains_worker(global, &worker.filter, member),
                 _ => false,
-            };
+            } || (!worker.filter.is_empty() && self.owes_storage_settlement(&worker.filter, frame_number));
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -3144,6 +3164,48 @@ mod tests {
                 assert!(!worker.allocated);
             }
         }
+    }
+
+    /// A departing member whose seat committed roots in its last epoch keeps
+    /// its worker, engine running, until that epoch settles or its settlement
+    /// window closes: only the engine proves the seat, and GLOBAL kicks a
+    /// member that committed roots and never proved them.
+    #[test]
+    fn a_departing_worker_stays_bound_while_its_seat_owes_a_settlement() {
+        let e = EPOCH_LENGTH_FRAMES;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        for open in [true, false] {
+            let wm = Arc::new(MockWorkerManager::new());
+            let filter = vec![0x02; 32];
+            wm.allocate_worker(1, &filter).unwrap();
+            wm.set_allocated(1, true).unwrap();
+            let mut leaving = make_alloc(filter.clone());
+            leaving.status = ProverStatus::Leaving;
+            leaving.leave_frame_number = e + 1;
+            leaving.leave_confirm_frame_number = 2 * e + 10;
+            let prover = ProverInfo {
+                public_key: vec![0xBB; 585], address: vec![0xAA; 32],
+                status: ProverStatus::Active, kick_frame_number: 0,
+                allocations: vec![leaving], available_storage: 0,
+                seniority: 100, delegate_address: vec![],
+            };
+            let registry = TestProverRegistry::with_prover(prover);
+            // The last epoch it served (2) committed roots; settling it is
+            // owed until the end of epoch 3.
+            registry.set_storage_seat_slot(&[0xAA; 32], &filter, quil_types::consensus::StorageSeatSlot {
+                epoch: 2, leaves: vec![vec![0]], registered_at: e + 20, sealed_at: Some(e + 30), frames: 3,
+                accumulator: [0; 32], chained: Vec::new(), open,
+            });
+            let allocator = WorkerAllocator::new(wm.clone(), Arc::new(registry), vec![0xAA; 32]);
+            allocator.on_new_frame(3 * e).unwrap();
+            let worker = wm.range_workers().unwrap().remove(0);
+            assert_eq!(worker.filter.is_empty(), !open, "open={open}: bound only while the settlement is owed");
+            assert_eq!(worker.allocated, open, "open={open}: the owed seat's engine keeps running");
+            allocator.on_new_frame(4 * e).unwrap();
+            let worker = wm.range_workers().unwrap().remove(0);
+            assert!(worker.filter.is_empty(), "open={open}: departs once the settlement window closes");
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     #[test]

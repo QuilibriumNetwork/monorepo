@@ -388,6 +388,9 @@ fn worker_global_submissions(
 ) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
     let handoff_prefix = quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
     let presence_prefix = quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes();
+    // Storage epoch proof parts are handed over from the storage job thread,
+    // outside the runtime.
+    let runtime = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |canonical: Vec<u8>| {
         if halted.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!(core_id, "holding back GLOBAL submission — coverage halt active");
@@ -395,7 +398,11 @@ fn worker_global_submissions(
             return;
         }
         let (relay, publish) = (relay.clone(), publish.clone());
-        tokio::spawn(async move {
+        let spawn = |task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| match &runtime {
+            Some(runtime) => drop(runtime.spawn(task)),
+            None => drop(tokio::spawn(task)),
+        };
+        spawn(Box::pin(async move {
             let handoff = canonical.starts_with(&handoff_prefix);
             let outcome = relay.submit(core_id, canonical.clone()).await;
             // A presence report goes only through the master, which answers
@@ -418,6 +425,12 @@ fn worker_global_submissions(
                 }
                 return;
             }
+            if crate::storage_epoch_batch::is_seat_message(&canonical) {
+                // Only the node proves a member's seats; the part is sent
+                // again when the worker next retries.
+                warn!(core_id, "storage epoch proof part not taken: the master is unreachable or an older build");
+                return;
+            }
             if !handoff {
                 if relay.warn_proof_lost() {
                     warn!(core_id,
@@ -436,7 +449,7 @@ fn worker_global_submissions(
                 Ok(bytes) => publish(crate::bitmasks::GLOBAL_PROVER.to_vec(), bytes).await,
                 Err(error) => warn!(%error, "committee handoff submission could not be encoded"),
             }
-        });
+        }));
     })
 }
 
@@ -2110,9 +2123,15 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
     > {
         self.ready()?;
         let req = request.into_inner();
+        let snapshots = quil_execution::global_intrinsic::storage_snapshot::decode_plan(&req.snapshot_sources)
+            .ok_or_else(|| tonic::Status::invalid_argument("undecodable storage snapshot sources"))?;
         // Only the worker executing this shard holds its data. The master's
         // own store does not, so its confirm registered leaves this worker
-        // could never prove, and every frame it attested was rejected.
+        // could never prove, and every frame it attested was rejected. With
+        // the shard's recorded snapshot (hash storage proofs) the worker
+        // assigned a joining seat encodes before it runs the shard: the
+        // snapshot is synced from an archive, and the replicas it proves
+        // later land here.
         let bound = self
             .worker
             .engine_handle
@@ -2120,7 +2139,8 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
             .map_err(|_| tonic::Status::unavailable("worker handle unavailable"))?
             .as_ref()
             .is_some_and(|handle| handle.filter == req.filter);
-        if !bound || req.filter.is_empty() {
+        let from_snapshot = snapshots.iter().any(|(shard, _)| *shard == req.filter);
+        if !(bound || from_snapshot) || req.filter.is_empty() {
             return Err(tonic::Status::failed_precondition("worker is not bound to this filter"));
         }
         let (Some(crdt), Some(kv)) = (self.worker.hypergraph.clone(), self.worker.kv_db.clone()) else {
@@ -2128,6 +2148,8 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         };
         let member = self.worker.local_prover_address.clone();
         let retired_below = self.worker.replicas_retired_below.clone();
+        // A confirm in epoch E registers, and encodes, the leaves for E + 1.
+        let epoch = quil_types::consensus::epoch_for_frame(req.frame_number) + 1;
         let frame_number = req.frame_number;
         let filter = req.filter;
         // The bound shard first, then the shards a recorded change creates
@@ -2142,6 +2164,7 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
                 &filters,
                 &member,
                 frame_number,
+                &snapshots,
             )
         })
         .await
@@ -2149,7 +2172,11 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         .map_err(|e| tonic::Status::unavailable(format!("storage confirm preparation failed: {e}")))?;
         // Before its data sync completes the worker has nothing to encode; an
         // empty registration would leave it unattested for the next epoch.
-        if roots.iter().filter(|group| group.filter == filter).all(|group| group.entries.is_empty()) {
+        // In a hash-proof epoch the renewal registers what the epoch's leaf
+        // snapshot encoded, and past its grace renews without one on purpose.
+        if !quil_types::consensus::hash_storage_proofs_at(epoch)
+            && roots.iter().filter(|group| group.filter == filter).all(|group| group.entries.is_empty())
+        {
             return Err(tonic::Status::failed_precondition("worker holds no data for this filter yet"));
         }
         Ok(tonic::Response::new(
@@ -2168,12 +2195,13 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
 /// window the master's reconfirmation applies to the stores it encodes
 /// (#734): nothing else evicts a standalone worker's store.
 fn encode_worker_storage_confirm(
-    crdt: &quil_hypergraph::HypergraphCrdt,
+    crdt: &std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
     replicas: &quil_store::replica_store::ReplicaStore,
     retired_below: &std::sync::atomic::AtomicU64,
     filters: &[Vec<u8>],
     member: &[u8],
     frame_number: u64,
+    snapshots: &[crate::prover_pipeline::SnapshotSources],
 ) -> Result<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>> {
     let current_epoch = quil_types::consensus::epoch_for_frame(frame_number);
     crate::app_shard_metadata::retire_unchallengeable_replicas(
@@ -2191,6 +2219,8 @@ fn encode_worker_storage_confirm(
         current_epoch + 1,
         quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
         &quil_crypto::sdr::SdrParams::default(),
+        frame_number,
+        snapshots,
     )
 }
 
@@ -2472,6 +2502,7 @@ mod tests {
             .unwrap();
         }
         crdt.commit(1).unwrap();
+        let crdt = Arc::new(crdt);
         let replicas = quil_store::replica_store::ReplicaStore::new(Arc::new(
             quil_store::RocksDb::open_in_memory().unwrap(),
         ));
@@ -2483,7 +2514,7 @@ mod tests {
         for epoch in first..=first + 3 {
             let frame = epoch * quil_types::consensus::epoch_length_frames() + 1;
             let roots = encode_worker_storage_confirm(
-                &crdt, &replicas, &retired_below, std::slice::from_ref(&filter), &member, frame,
+                &crdt, &replicas, &retired_below, std::slice::from_ref(&filter), &member, frame, &[],
             )
             .expect("worker confirm");
             leaves = roots[0].entries.iter().map(|e| leaf_id_bytes(&filter, &e.prefix)).collect();

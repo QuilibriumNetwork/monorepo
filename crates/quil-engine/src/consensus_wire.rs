@@ -869,6 +869,9 @@ pub fn decode_message_bundle(
                 if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
                     quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(&req.inner_bytes)?;
                 }
+                if req.inner_type_prefix == quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF {
+                    quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(&req.inner_bytes)?;
+                }
                 requests.push(canonical_request_to_proto(req));
             }
         }
@@ -949,6 +952,9 @@ fn canonical_request_to_proto(
         quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT =>
             quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(inner)
                 .ok().map(|_| Request::PresenceReport(inner.to_vec())),
+        quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF =>
+            quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(inner)
+                .ok().map(|_| Request::StorageEpochProof(inner.to_vec())),
         prover_ops::TYPE_SHARD_SPLIT => prover_ops::ShardSplit::from_canonical_bytes(inner)
             .ok()
             .map(|s| Request::ShardSplit(conversions::shard_split_to_proto(&s))),
@@ -1073,6 +1079,9 @@ pub fn proto_message_bundle_to_canonical_bytes(
         if let Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) = &req.request {
             quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
         }
+        if let Some(quil_types::proto::global::message_request::Request::StorageEpochProof(bytes)) = &req.request {
+            quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(bytes)?;
+        }
         match proto_message_request_to_canonical(req) {
             Some(canon_req) => requests.push(Some(canon_req)),
             None => requests.push(None),
@@ -1136,6 +1145,10 @@ fn proto_message_request_to_canonical(
         }
         Request::PresenceReport(bytes) => {
             quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes).ok()?;
+            bytes.clone()
+        }
+        Request::StorageEpochProof(bytes) => {
+            quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(bytes).ok()?;
             bytes.clone()
         }
         Request::ShardSplit(p) => conversions::shard_split_from_proto(p)

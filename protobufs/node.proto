@@ -744,6 +744,10 @@ message PrepareStorageConfirmRequest {
   // next epoch. The worker also encodes and returns their leaves from its
   // own store, so its prover is registered for the shard it then holds.
   repeated bytes targets = 3;
+  // Hash storage proofs: each shard's snapshot sources, as the master
+  // resolved them from GLOBAL's records (`storage_snapshot::encode_plan`).
+  // The worker takes a snapshot it has not encoded from them.
+  bytes snapshot_sources = 4;
 }
 
 message PrepareStorageConfirmResponse {

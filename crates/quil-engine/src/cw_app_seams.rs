@@ -723,29 +723,31 @@ impl GlobalProposer for AppSeamProposer {
     }
 
     fn verify_with_context(&self, context: ProposalContext, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
+        let canonical = self.requests_root_check.as_ref();
+        let leader = context.leader;
         let Some(parents) = self.private_parents.as_ref() else {
-            return self.verify(context.view, context.parent, digest, bytes);
+            return self.verify_with(canonical, leader, context.view, context.parent, digest, bytes);
         };
         match parents.is_canonical_parent(context.parent) {
             Ok(false) => match parents.prepare(context.parent, context.parent_view) {
-                Ok(parent) => self.verify_with(Some(&parent.check), context.view, context.parent, digest, bytes),
+                Ok(parent) => self.verify_with(Some(&parent.check), leader, context.view, context.parent, digest, bytes),
                 Err(error) => {
                     tracing::debug!(view = context.view, %error, "cw app verify: selected parent not executable privately");
                     // The canonical check then fails for lack of the parent;
                     // the private failure is the reason.
-                    let verified = self.verify(context.view, context.parent, digest, bytes);
+                    let verified = self.verify_with(canonical, leader, context.view, context.parent, digest, bytes);
                     if !verified {
                         self.note(Step::Verify, context.view, "selected parent not executable privately", error.to_string());
                     }
                     verified
                 }
             },
-            Ok(true) | Err(_) => self.verify(context.view, context.parent, digest, bytes),
+            Ok(true) | Err(_) => self.verify_with(canonical, leader, context.view, context.parent, digest, bytes),
         }
     }
 
     fn verify(&self, view: u64, parent: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool {
-        self.verify_with(self.requests_root_check.as_ref(), view, parent, digest, bytes)
+        self.verify_with(self.requests_root_check.as_ref(), None, view, parent, digest, bytes)
     }
 
     /// Waits while the proposal's anchored GLOBAL frame is just ahead of this
@@ -867,6 +869,7 @@ impl AppSeamProposer {
     fn verify_with(
         &self,
         requests_root_check: Option<&AppRequestsRootCheck>,
+        leader: Option<[u8; 32]>,
         view: u64,
         parent: Digest,
         digest: Digest,
@@ -903,6 +906,20 @@ impl AppSeamProposer {
                 "frame {} rank {}, shard matches {}, parent matches {}", header.frame_number, header.rank,
                 header.address == self.filter, header.parent_selector == parent.as_ref(),
             ));
+            return false;
+        }
+        // Hash storage proofs (decided 2026-10-21): GLOBAL chains a frame's
+        // openings root into its proposer's storage seat and kicks a member
+        // that never proves what was chained there, so a frame must name the
+        // view's leader as its proposer.
+        let hash_storage = header.global_frame_number > 0
+            && quil_types::consensus::hash_storage_proofs_at(
+                quil_types::consensus::epoch_for_frame(header.global_frame_number),
+            );
+        if let Some(leader) = leader.filter(|leader| hash_storage && header.prover.as_slice() != leader) {
+            tracing::warn!(view, frame = header.frame_number, prover = %hex::encode(&header.prover),
+                leader = %hex::encode(leader), "cw app verify: the frame names another proposer than the view's leader");
+            self.note(Step::Verify, view, "proposer is not the view's leader", format!("frame {}", header.frame_number));
             return false;
         }
         if app_frame_digest(&frame) != Some(digest) {
@@ -1796,6 +1813,23 @@ impl Drop for StopOnDrop {
 }
 
 impl AppConsensusCwHandle {
+    /// A handle whose host has already returned: an engine with it counts as
+    /// running consensus, and materializes nothing.
+    #[cfg(test)]
+    pub(crate) fn idle_for_test() -> Self {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
+            inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
+            ingest_block: Arc::new(|_| {}),
+            shutdown,
+            adopted_genesis: None,
+            finalized: Default::default(),
+            thread: std::thread::spawn(|| {}),
+            outbound_task: tokio::spawn(std::future::pending()),
+        }
+    }
+
     /// The host thread has returned without being asked: its engine stopped
     /// (an actor panicked, for instance) and this shard is taking no part in
     /// consensus until the owner rebuilds the host.
@@ -3272,7 +3306,7 @@ mod tests {
                 ..Default::default()
             };
             let context = ProposalContext {
-                epoch: 0, view: 43, parent_view: 42, parent: digest_from_identity([7; 32]),
+                epoch: 0, view: 43, parent_view: 42, parent: digest_from_identity([7; 32]), leader: None,
             };
             (frame.clone(), context, app_frame_digest(&frame).unwrap(), Some(encode_app_frame(&frame)))
         };

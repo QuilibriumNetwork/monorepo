@@ -363,6 +363,10 @@ pub(crate) async fn start(
     // application state the master's stores do not hold.
     let worker_app_states: worker_manager::WorkerAppStates =
         Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // core → thread worker's stores, from its start (a worker pinned to a
+    // shard it is joining holds the shard's registrations before it runs it).
+    let worker_stores_by_core: worker_manager::WorkerStoresByCore =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
@@ -625,6 +629,7 @@ pub(crate) async fn start(
             prover_address,
             bls_pubkey: bls_pubkey.clone(),
             worker_app_states: worker_app_states.clone(),
+            worker_stores_by_core: worker_stores_by_core.clone(),
             shard_engines: shard_engines.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
@@ -942,12 +947,18 @@ pub(crate) async fn start(
         // hypergraph and replica store, the ones it attests from.
         storage_for_filter: Some({
             let states = worker_app_states.clone();
+            let by_core = worker_stores_by_core.clone();
+            let workers = worker_manager.clone();
             Arc::new(move |filter: &[u8]| {
-                states.read().get(filter).map(|state| (
+                // The worker running the shard; before it runs it (a join
+                // not yet active), the worker pinned to it, which will.
+                let state = states.read().get(filter).cloned().or_else(|| {
+                    let core = workers.range_workers().ok()?.into_iter().find(|w| w.filter == filter)?.core_id;
+                    by_core.read().get(&core).cloned()
+                })?;
+                Some((
                     state.crdt.clone(),
-                    quil_store::replica_store::ReplicaStore::new(
-                        state.db.clone() as Arc<dyn quil_types::store::KvDb>,
-                    ),
+                    quil_store::replica_store::ReplicaStore::new(state.db.clone() as Arc<dyn quil_types::store::KvDb>),
                 ))
             })
         }),
@@ -956,19 +967,26 @@ pub(crate) async fn start(
         remote_storage_confirm: Some({
             let cell = remote_worker_manager_for_halt.clone();
             let runtime = tokio::runtime::Handle::current();
-            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration| {
+            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration,
+                           snapshots: &[quil_engine::prover_pipeline::SnapshotSources]| {
                 let Some(manager) = cell.get().cloned() else {
                     return Ok(None);
                 };
-                if !manager.serves_filter(filter) {
+                if !manager.prepares_storage_confirm(filter, snapshots) {
                     return Ok(None);
                 }
-                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout))
+                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout, snapshots))
             })
         }),
         pending_shard_changes: Some({
             let shards_store = shards_store.clone();
             Arc::new(move || shards_store.all_pending_shard_changes().unwrap_or_default())
+        }),
+        storage_snapshot: Some({
+            let registry = prover_registry.clone();
+            Arc::new(move |filter: &[u8], epoch: u64| {
+                quil_types::consensus::ProverRegistry::get_storage_snapshot(registry.as_ref(), filter, epoch).ok().flatten()
+            })
         }),
         // Loopback deps so a frame PRODUCER (which runs the coverage orchestrator)
         // includes its OWN ShardSplit/ShardMerge ops even when the remote publish

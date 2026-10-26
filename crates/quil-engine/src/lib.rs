@@ -58,6 +58,8 @@ pub mod prover_message_transport;
 pub mod prover_pipeline;
 pub mod own_prover_ops;
 pub mod presence_reports;
+pub mod storage_epoch_batch;
+pub mod storage_snapshot;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;

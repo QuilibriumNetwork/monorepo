@@ -655,6 +655,10 @@ pub struct ArchivePollerConfig {
     /// the whole gap. `None` (default / archives) → always forward-fill. See
     /// [`FarBehindJump`].
     pub far_behind_jump: Option<FarBehindJump>,
+    /// Set to the head each tick catches up to before `on_frame` fires for
+    /// its frames, so `on_frame` can tell a backlog frame from the head.
+    /// Stored, not raised: each tick says what it reached for.
+    pub head_target: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for ArchivePollerConfig {
@@ -670,6 +674,7 @@ impl Default for ArchivePollerConfig {
             forward_fill: false,
             startup_barrier: None,
             far_behind_jump: None,
+            head_target: None,
         }
     }
 }
@@ -911,6 +916,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     last_rpc_poll = tokio::time::Instant::now();
                 }
                 let target = gf.head();
+                if let Some(head_target) = config.head_target.as_ref() {
+                    head_target.store(target, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Drain contiguous store-present frames (gossip delivered them);
                 // fire on_frame exactly as the RPC path would, just without the
                 // network round-trip.
@@ -1087,6 +1095,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         }
         // The endpoint is ahead — we're going to make progress this tick.
         no_progress = 0;
+        if let Some(head_target) = config.head_target.as_ref() {
+            head_target.store(new_number, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // 1b. Runtime far-behind rescue (non-archive): if we've fallen a long way
         // behind the network head mid-run, snapshot-jump to a recent target
@@ -1946,6 +1957,8 @@ mod forward_fill_tests {
         _tmp: tempfile::TempDir,
         store: Arc<RocksClockStore>,
         seen: Arc<std::sync::Mutex<Vec<u64>>>,
+        /// The head target each `on_frame` saw.
+        targets: Arc<std::sync::Mutex<Vec<u64>>>,
         cancel: CancellationToken,
         poller: tokio::task::JoinHandle<()>,
     }
@@ -1985,15 +1998,21 @@ mod forward_fill_tests {
 
         let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(vec![]));
         let seen_cb = seen.clone();
+        let targets: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let targets_cb = targets.clone();
+        let head_target = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let head_cb = head_target.clone();
         let config = ArchivePollerConfig {
             poll_interval: Duration::from_millis(20),
             call_timeout: Duration::from_secs(1),
             forward_fill: true,
             gossip_freshness: gossip,
             far_behind_jump,
+            head_target: Some(head_target),
             on_frame: Some(Arc::new(move |f: &GlobalFrame| {
                 if let Some(h) = f.header.as_ref() {
                     seen_cb.lock().unwrap().push(h.frame_number);
+                    targets_cb.lock().unwrap().push(head_cb.load(std::sync::atomic::Ordering::Relaxed));
                 }
             })),
             ..Default::default()
@@ -2014,6 +2033,7 @@ mod forward_fill_tests {
             _tmp: tmp,
             store,
             seen,
+            targets,
             cancel,
             poller,
         }
@@ -2075,6 +2095,18 @@ mod forward_fill_tests {
         assert!(await_head_then_stop(&rig, 5).await);
         rig.poller.await.unwrap();
         assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Each frame a tick replays sees the head the tick catches up to, so
+    /// only the head itself reads as caught up (the node's prover lifecycle
+    /// proposes nothing at a replayed frame).
+    #[tokio::test]
+    async fn a_replayed_frame_sees_the_head_its_tick_catches_up_to() {
+        let rig = spawn_poller(FakeArchive::serving(1..=5), &[0], Some(GossipFreshness::new())).await;
+        assert!(await_head_then_stop(&rig, 5).await);
+        rig.poller.await.unwrap();
+        assert_eq!(*rig.seen.lock().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(*rig.targets.lock().unwrap(), vec![5; 5]);
     }
 
     #[tokio::test]

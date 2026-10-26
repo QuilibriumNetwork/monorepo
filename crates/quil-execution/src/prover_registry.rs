@@ -101,6 +101,10 @@ pub struct InMemoryProverRegistry {
     /// `leaf_id_bytes(shard_filter, prefix)`. Populated from
     /// `leafroot:LeafRootRegistration` vertices written by ProverConfirm.
     leaf_root_cache: HashMap<(Vec<u8>, Vec<u8>, u64), LeafRootRecord>,
+    /// Storage seats (hash storage proofs), by (member, shard filter).
+    seat_cache: HashMap<(Vec<u8>, Vec<u8>), Vec<quil_types::consensus::StorageSeatSlot>>,
+    /// Storage snapshots (hash storage proofs), by (shard filter, epoch mod 4).
+    snapshot_cache: HashMap<(Vec<u8>, u8), quil_types::consensus::StorageSnapshotRoots>,
     /// confirmation_filter → sorted list of prover addresses with at
     /// least one allocation under that filter. Sorted lexicographically
     /// by address bytes.
@@ -139,6 +143,8 @@ impl InMemoryProverRegistry {
             diverged: false,
             prover_cache: HashMap::new(),
             leaf_root_cache: HashMap::new(),
+            seat_cache: HashMap::new(),
+            snapshot_cache: HashMap::new(),
             filter_cache: HashMap::new(),
             address_to_filters: HashMap::new(),
             reward_vertex_count: 0,
@@ -192,6 +198,8 @@ impl InMemoryProverRegistry {
         self.diverged = false;
         self.prover_cache.clear();
         self.leaf_root_cache.clear();
+        self.seat_cache.clear();
+        self.snapshot_cache.clear();
         self.filter_cache.clear();
         self.address_to_filters.clear();
         self.reward_vertex_count = 0;
@@ -212,6 +220,21 @@ impl InMemoryProverRegistry {
     ) -> Option<&LeafRootRecord> {
         self.leaf_root_cache
             .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
+    }
+
+    /// `member`'s storage seat on `filter` for `epoch`, or `None`.
+    pub fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Option<&quil_types::consensus::StorageSeatSlot> {
+        self.seat_cache.get(&(member.to_vec(), filter.to_vec()))?.iter().find(|slot| slot.epoch == epoch)
+    }
+
+    /// `filter`'s storage snapshot for `epoch`, once GLOBAL recorded it.
+    pub fn get_storage_snapshot(&self, filter: &[u8], epoch: u64) -> Option<&quil_types::consensus::StorageSnapshotRoots> {
+        self.snapshot_cache.get(&(filter.to_vec(), (epoch % 4) as u8)).filter(|snapshot| snapshot.epoch == epoch)
     }
 
     /// Total cached leaf-root epoch entries across all members (diagnostics).
@@ -397,6 +420,16 @@ impl InMemoryProverRegistry {
                         self.leaf_root_cache.insert(key, rec);
                     }
                 }
+                Some("storage:StorageSeat") => {
+                    if let Some((key, slots)) = decode_seat(&root) {
+                        self.seat_cache.insert(key, slots);
+                    }
+                }
+                Some("storage:StorageSnapshot") => {
+                    if let Some((key, snapshot)) = decode_snapshot(&root) {
+                        self.snapshot_cache.insert(key, snapshot);
+                    }
+                }
                 Some("allocation:ProverAllocation") => {
                     // Handled in pass 2.
                 }
@@ -490,6 +523,8 @@ impl InMemoryProverRegistry {
             (
                 sorted(&self.prover_cache),
                 sorted(&self.leaf_root_cache),
+                sorted(&self.seat_cache),
+                sorted(&self.snapshot_cache),
                 sorted(&self.filter_cache),
                 sorted(&self.address_to_filters),
                 (self.reward_vertex_count, self.prover_vertex_count, self.allocation_vertex_count,
@@ -2382,6 +2417,31 @@ impl ProverRegistryTrait for SharedProverRegistry {
         Ok(guard.get_provers_on_filters(filters).into_iter().cloned().collect())
     }
 
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> QuilResult<Option<quil_types::consensus::StorageSeatSlot>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard.get_storage_seat_slot(member, filter, epoch).cloned())
+    }
+
+    fn get_storage_snapshot(
+        &self,
+        filter: &[u8],
+        epoch: u64,
+    ) -> QuilResult<Option<quil_types::consensus::StorageSnapshotRoots>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard.get_storage_snapshot(filter, epoch).cloned())
+    }
+
     fn get_leaf_root(
         &self,
         member: &[u8],
@@ -3207,6 +3267,32 @@ pub fn allocation_status_breakdown(
     diag
 }
 
+/// A `storage:StorageSnapshot` vertex as its cache entry: `(filter, epoch
+/// mod 4)` and the snapshot. `None` when it does not decode.
+fn decode_snapshot(
+    root: &VectorCommitmentNode,
+) -> Option<((Vec<u8>, u8), quil_types::consensus::StorageSnapshotRoots)> {
+    use crate::global_intrinsic::storage_snapshot;
+    let filter = read_bytes(root, storage_snapshot::CLASS, "ShardFilter");
+    let snapshot = storage_snapshot::decode(&read_bytes(root, storage_snapshot::CLASS, "Snapshot"))?;
+    Some(((filter, (snapshot.epoch % 4) as u8), snapshot))
+}
+
+/// A `storage:StorageSeat` vertex as its cache entry: `(member, filter)` and
+/// its slots. `None` when it does not decode.
+fn decode_seat(
+    root: &VectorCommitmentNode,
+) -> Option<((Vec<u8>, Vec<u8>), Vec<quil_types::consensus::StorageSeatSlot>)> {
+    use crate::global_intrinsic::storage_seat;
+    let member = read_bytes(root, storage_seat::CLASS, "Member");
+    if member.len() != 32 {
+        return None;
+    }
+    let filter = read_bytes(root, storage_seat::CLASS, "ShardFilter");
+    let slots = storage_seat::decode_slots(&read_bytes(root, storage_seat::CLASS, "Slots")).ok()?;
+    Some(((member, filter), slots.iter().map(storage_seat::SeatSlot::view).collect()))
+}
+
 /// Decode a `leafroot:LeafRootRegistration` vertex into one cache entry
 /// per populated epoch slot. Return no entries when required fields are missing.
 fn decode_leaf_root(
@@ -3231,16 +3317,21 @@ fn decode_leaf_root(
     // epoch E was rejected as "no registered leaf ... at epoch E" even though
     // it had confirmed. `leaf_root_registration_for_epoch` already reads all
     // three; this is the same record, read the same way.
-    [("PrevEpoch", "PrevLeafRoot", "PrevNumBlocks"),
-     ("Epoch", "LeafRoot", "NumBlocks"),
-     ("NextEpoch", "NextLeafRoot", "NextNumBlocks")]
+    // A hash-proof epoch's registration counts only once its seal proof was
+    // accepted (`SealedAt`), as `leaf_root_registration_for_epoch` reads it.
+    [("PrevEpoch", "PrevLeafRoot", "PrevNumBlocks", "PrevSealedAt"),
+     ("Epoch", "LeafRoot", "NumBlocks", "SealedAt"),
+     ("NextEpoch", "NextLeafRoot", "NextNumBlocks", "NextSealedAt")]
         .into_iter()
-        .filter_map(|(epoch_field, root_field, blocks_field)| {
+        .filter_map(|(epoch_field, root_field, blocks_field, sealed_field)| {
             let leaf_root = read_bytes(root, cls, root_field);
             if leaf_root.is_empty() {
                 return None;
             }
             let epoch = read_u64_be(root, cls, epoch_field);
+            if quil_types::consensus::hash_storage_proofs_at(epoch) && read_bytes(root, cls, sealed_field).is_empty() {
+                return None;
+            }
             Some((
                 (member.clone(), leaf_id.clone(), epoch),
                 LeafRootRecord { leaf_root, num_blocks: read_u64_be(root, cls, blocks_field), epoch },

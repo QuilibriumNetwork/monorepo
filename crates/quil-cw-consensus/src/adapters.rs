@@ -52,6 +52,9 @@ pub struct ProposalContext {
     pub view: u64,
     pub parent_view: u64,
     pub parent: Digest,
+    /// The view's leader as a prover address (Poseidon of its Falcon key);
+    /// `None` for a context not made by Simplex.
+    pub leader: Option<[u8; 32]>,
 }
 
 impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
@@ -61,8 +64,28 @@ impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
             view: context.view().get(),
             parent_view: context.parent.0.get(),
             parent: context.parent.1,
+            leader: prover_address(&context.leader),
         }
     }
+}
+
+/// A committee member's prover address, `poseidon(public key)`, remembered:
+/// every proposal and vote asks for its leader's.
+fn prover_address(key: &FalconPublicKey) -> Option<[u8; 32]> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static REMEMBERED: LazyLock<Mutex<HashMap<FalconPublicKey, [u8; 32]>>> = LazyLock::new(Default::default);
+    if let Some(address) = REMEMBERED.lock().ok().and_then(|cache| cache.get(key).copied()) {
+        return Some(address);
+    }
+    let address = quil_crypto::poseidon::hash_bytes_to_32(key.as_ref()).ok()?;
+    if let Ok(mut cache) = REMEMBERED.lock() {
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key.clone(), address);
+    }
+    Some(address)
 }
 
 /// Re-exported so seam implementors (quil-engine) needn't depend on commonware-p2p.

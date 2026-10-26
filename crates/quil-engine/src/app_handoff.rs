@@ -4719,7 +4719,7 @@ mod successor_tests {
             staged.clone(),
         ).unwrap();
         let context = |view: u64, parent_view: u64, parent: [u8; 32]| ProposalContext {
-            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent),
+            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent), leader: None,
         };
         let unstaged = source.read(context(18, 17, tip_digest)).unwrap_err();
         assert!(unstaged.to_string().contains("not staged"), "{unstaged}");

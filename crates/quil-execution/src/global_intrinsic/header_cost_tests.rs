@@ -201,7 +201,7 @@ fn measure_global_frame_header_cost() {
         let provers = seats[h].iter().map(|s| prover_info(s, &shard_filter(h), 0)).collect();
         materialize_prover_shard_update_with_fees(
             &header(h, Vec::new()), prior_frame, &state, &registry, &frame_prover, &issuance,
-            WORLD_SIZE, provers, &participants, shard(), 0, None,
+            WORLD_SIZE, provers, &participants, shard(), 0, None, None,
         )
         .unwrap();
         state.commit().unwrap();
@@ -259,7 +259,7 @@ fn measure_global_frame_header_cost() {
             let started = Instant::now();
             materialize_prover_shard_update_with_fees(
                 op, frame, &state, &registry, &frame_prover, &issuance,
-                WORLD_SIZE, provers[h].clone(), &participants, shard(), 0, None,
+                WORLD_SIZE, provers[h].clone(), &participants, shard(), 0, None, None,
             )
             .unwrap();
             let credited = Instant::now();
