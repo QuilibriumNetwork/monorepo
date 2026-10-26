@@ -397,6 +397,68 @@ pub fn epoch_for_frame(frame_number: u64) -> u64 {
     frame_number / epoch_length_frames()
 }
 
+/// The epoch from which signed prover operations cannot be replayed:
+/// `ProverPause`, `ProverResume`, `ProverLeave`, `ProverReject` and
+/// `ProverUpdate` must be signed at most ten frames before, and in the epoch
+/// of, the GLOBAL frame that includes them (a `ProverUpdate` then signs its
+/// frame too), a pause or resume must be signed no earlier than the
+/// allocation's last resume or pause, and a `ProverSeniorityMerge` is refused
+/// when a merge or join earlier in the same frame consumed one of its
+/// targets. Consensus-affecting: every archive and prover must run a build
+/// with it before then. Mainnet epoch 1311 (frame 943,920);
+/// `QUIL_PROVER_OP_REPLAY_GUARD_EPOCH` elsewhere, never by default.
+pub const MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH: Option<u64> = Some(1311);
+
+static PROVER_OP_REPLAY_GUARD_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PROVER_OP_REPLAY_GUARD_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn prover_op_replay_guard_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's prover operation replay guard epoch from its network,
+/// and return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_prover_op_replay_guard_epoch(network: u8) -> u64 {
+    *PROVER_OP_REPLAY_GUARD_EPOCH.get_or_init(|| {
+        prover_op_replay_guard_epoch_for(
+            network,
+            std::env::var("QUIL_PROVER_OP_REPLAY_GUARD_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_prover_op_replay_guard_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX` when the network has none.
+pub fn prover_op_replay_guard_epoch() -> u64 {
+    if let Some(epoch) = PROVER_OP_REPLAY_GUARD_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *PROVER_OP_REPLAY_GUARD_EPOCH.get_or_init(|| prover_op_replay_guard_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` applies the prover operation replay guard.
+pub fn prover_op_replay_guard_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= prover_op_replay_guard_epoch()
+}
+
+/// Set the prover operation replay guard epoch for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_prover_op_replay_guard_epoch_for_thread(epoch: Option<u64>) {
+    PROVER_OP_REPLAY_GUARD_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which a `ProverSeniorityMerge` follows the seniority
 /// succession rules: an Ed448 node key whose spent markers name another,
 /// idle prover can move that prover's seniority to the prover submitting
@@ -2526,6 +2588,40 @@ mod hash_storage_proof_epoch_tests {
         assert_eq!(
             (epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET,
             943_216
+        );
+    }
+}
+
+#[cfg(test)]
+mod prover_op_replay_guard_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_prover_op_replay_guard_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::prover_op_replay_guard_epoch_for(0, setting),
+                super::MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::prover_op_replay_guard_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::prover_op_replay_guard_epoch_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::prover_op_replay_guard_epoch_for(1, None), u64::MAX);
+    }
+
+    #[test]
+    fn the_replay_guard_starts_at_the_first_frame_of_its_epoch() {
+        super::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::prover_op_replay_guard_active(u64::MAX - 1));
+        super::set_prover_op_replay_guard_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::prover_op_replay_guard_active(first - 1));
+        assert!(super::prover_op_replay_guard_active(first));
+        super::set_prover_op_replay_guard_epoch_for_thread(None);
+        assert_eq!(
+            super::prover_op_replay_guard_epoch(),
+            super::MAINNET_PROVER_OP_REPLAY_GUARD_EPOCH.unwrap_or(u64::MAX)
         );
     }
 }

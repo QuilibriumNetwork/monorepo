@@ -1072,6 +1072,7 @@ fn canonical_request_to_proto(
             .map(|r| Request::Reject(conversions::prover_reject_to_proto(&r))),
         prover_ops::TYPE_PROVER_UPDATE => prover_ops::ProverUpdate::from_canonical_bytes(inner)
             .ok()
+            .filter(|u| update_frame_admitted(u.frame_number, gate))
             .map(|u| Request::Update(conversions::prover_update_to_proto(&u))),
         // Global lifecycle ops (kick / shard split / shard merge). Previously
         // `_ => None` dropped these: a global frame carrying one showed an empty
@@ -1192,6 +1193,20 @@ fn canonical_request_to_proto(
 // are skipped with a `None` slot so the bundle structure (count +
 // timestamp) is preserved.
 
+/// Whether the body of a GLOBAL frame may carry a `ProverUpdate` signed at
+/// `signed_frame`: not after the frame. An update carries its signed frame
+/// only from the prover operation replay guard epoch
+/// (`ProverUpdate::signed_frame`), so before it a body whose update claims a
+/// later frame is refused, as a build that reads no signed frame refuses it
+/// (the body no longer matches its requests root there), rather than
+/// accepted by this build alone. Off GLOBAL bodies nothing is refused here.
+fn update_frame_admitted(signed_frame: u64, gate: EncodingGate) -> bool {
+    match gate {
+        EncodingGate::Global(frame) => signed_frame <= frame,
+        EncodingGate::Admission | EncodingGate::App => true,
+    }
+}
+
 /// Re-encode a proto `MessageBundle` as canonical bytes (type prefix
 /// `0x0312`). Used by the frame materializer to feed bundles to the
 /// execution engines, which expect canonical-bytes input matching Go's
@@ -1299,9 +1314,13 @@ fn proto_message_request_to_canonical(
         Request::Reject(p) => conversions::prover_reject_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
-        Request::Update(p) => conversions::prover_update_from_proto(p)
-            .to_canonical_bytes()
-            .ok()?,
+        Request::Update(p) => {
+            let update = conversions::prover_update_from_proto(p);
+            if !update_frame_admitted(update.frame_number, gate) {
+                return None;
+            }
+            update.to_canonical_bytes().ok()?
+        }
         Request::Shard(p) => conversions::frame_header_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
@@ -2315,6 +2334,57 @@ mod tests {
             re_canon, canon_bundle,
             "proto→canonical round-trip must reproduce the original canonical bundle"
         );
+    }
+
+    /// A GLOBAL body carries a `ProverUpdate` signed no later than its
+    /// frame. Before the replay guard epoch an update can carry only a frame
+    /// later than its body's, which a build without the signed frame drops
+    /// (the body then misses its requests root), so this build refuses that
+    /// body too instead of accepting it alone.
+    #[test]
+    fn a_global_body_refuses_an_update_signed_after_its_frame() {
+        use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+        use quil_execution::global_intrinsic::prover_ops::ProverUpdate;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::proto::global::message_request::Request;
+
+        let epoch = quil_types::consensus::epoch_length_frames();
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(2));
+        let signed = 2 * epoch + 5;
+        let update = ProverUpdate {
+            delegate_address: vec![0x12u8; 32],
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 666],
+                address: vec![0xCCu8; 32],
+            }),
+            frame_number: signed,
+        };
+        let bundle = CanonicalMessageBundle {
+            requests: vec![Some(
+                CanonicalMessageRequest::wrap(update.to_canonical_bytes().unwrap()).unwrap(),
+            )],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        for (frame, admitted) in [
+            (Some(signed), true),
+            (Some(signed - 1), false),
+            (None, true),
+        ] {
+            let proto = decode_message_bundle_at(&bundle, frame).unwrap();
+            assert_eq!(
+                matches!(proto.requests[0].request, Some(Request::Update(_))),
+                admitted,
+                "frame {frame:?}"
+            );
+            assert_eq!(
+                proto_message_bundle_to_canonical_bytes_at(&proto, frame).unwrap() == bundle,
+                admitted,
+                "frame {frame:?}"
+            );
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
     }
 
     #[test]

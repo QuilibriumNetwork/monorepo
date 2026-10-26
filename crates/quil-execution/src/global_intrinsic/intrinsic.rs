@@ -389,11 +389,13 @@ impl GlobalIntrinsic {
     /// whose Go counterpart enforces it: `ProverJoin` (10-frame
     /// window in `validate_prover_join_structural`) and
     /// `ProverSeniorityMerge` (10-frame window in
-    /// `verify_prover_seniority_merge`). The other ops
-    /// (Pause/Resume/Confirm/Reject/Update/ShardSplit/Merge) do not
-    /// have per-op replay windows; the frame orchestrator handles
-    /// ordering. ProverConfirm/Reject's 360-720 window is a timing
-    /// constraint relative to JoinFrameNumber, not a freshness gate
+    /// `verify_prover_seniority_merge`). From the prover operation replay
+    /// guard epoch, Pause/Resume/Leave/Reject/Update must also be signed in
+    /// the frame's epoch at most 10 frames before it
+    /// (`verify::validate_prover_op_frame`). ProverConfirm must be signed in
+    /// the frame's epoch (`validate_confirm_epoch`). ShardSplit/Merge have
+    /// no per-op replay window. ProverConfirm/Reject's epoch window is a
+    /// timing constraint relative to JoinFrameNumber, not a freshness gate
     /// (enforced by `validate_confirm_timing`).
     ///
     /// `prover_tree` and `allocation_tree` are optional — when `None`,
@@ -454,6 +456,14 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverPause", op.frame_number, frame_number)?;
+                verify::validate_signed_after(
+                    "ProverPause",
+                    op.frame_number,
+                    frame_number,
+                    allocation_tree,
+                    "ResumeFrameNumber",
+                )?;
                 if let Some(pt) = prover_tree {
                     return verify::verify_prover_pause(
                         &op,
@@ -467,6 +477,14 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_RESUME => {
                 let op = ProverResume::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverResume", op.frame_number, frame_number)?;
+                verify::validate_signed_after(
+                    "ProverResume",
+                    op.frame_number,
+                    frame_number,
+                    allocation_tree,
+                    "PauseFrameNumber",
+                )?;
                 if let Some(pt) = prover_tree {
                     return verify::verify_prover_resume(
                         &op,
@@ -479,6 +497,7 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverLeave", op.frame_number, frame_number)?;
                 if let Some(pt) = prover_tree {
                     let sig_ok = verify::verify_prover_leave(&op, pt, self.key_manager.as_ref())?;
                     if !sig_ok {
@@ -573,6 +592,7 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_REJECT => {
                 let op = ProverReject::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverReject", op.frame_number, frame_number)?;
                 if let Some(pt) = prover_tree {
                     let sig_ok = verify::verify_prover_reject(&op, pt, self.key_manager.as_ref())?;
                     if !sig_ok {
@@ -681,7 +701,12 @@ impl GlobalIntrinsic {
             TYPE_PROVER_UPDATE => {
                 let op = super::prover_ops::ProverUpdate::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
-                    return verify::verify_prover_update(&op, pt, self.key_manager.as_ref());
+                    return verify::verify_prover_update(
+                        &op,
+                        pt,
+                        frame_number,
+                        self.key_manager.as_ref(),
+                    );
                 }
                 Ok(true)
             }
@@ -1133,6 +1158,7 @@ impl GlobalIntrinsic {
         match type_prefix {
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverPause", op.frame_number, frame_number)?;
                 self.invoke_filter_op(
                     frame_number,
                     &op.filter,
@@ -1140,6 +1166,13 @@ impl GlobalIntrinsic {
                     state,
                     &va_disc,
                     |prover_tree, alloc_tree| {
+                        verify::validate_signed_after(
+                            "ProverPause",
+                            op.frame_number,
+                            frame_number,
+                            alloc_tree,
+                            "ResumeFrameNumber",
+                        )?;
                         verify::verify_prover_pause(
                             &op,
                             prover_tree,
@@ -1159,6 +1192,7 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_RESUME => {
                 let op = ProverResume::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverResume", op.frame_number, frame_number)?;
                 self.invoke_filter_op(
                     frame_number,
                     &op.filter,
@@ -1166,6 +1200,13 @@ impl GlobalIntrinsic {
                     state,
                     &va_disc,
                     |prover_tree, alloc_tree| {
+                        verify::validate_signed_after(
+                            "ProverResume",
+                            op.frame_number,
+                            frame_number,
+                            alloc_tree,
+                            "PauseFrameNumber",
+                        )?;
                         verify::verify_prover_resume(
                             &op,
                             prover_tree,
@@ -1185,6 +1226,7 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverLeave", op.frame_number, frame_number)?;
                 for filter in &op.filters {
                     self.invoke_filter_op(
                         frame_number,
@@ -1436,6 +1478,7 @@ impl GlobalIntrinsic {
                         "ProverReject: no filters".into(),
                     ));
                 }
+                verify::validate_prover_op_frame("ProverReject", op.frame_number, frame_number)?;
                 for filter in &op.filters {
                     self.invoke_filter_op(
                         frame_number,
@@ -2353,7 +2396,13 @@ impl GlobalIntrinsic {
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_prover_update(op, &prover_tree, self.key_manager.as_ref())? {
+        let verified = verify::verify_prover_update(
+            op,
+            &prover_tree,
+            frame_number,
+            self.key_manager.as_ref(),
+        )?;
+        if !verified {
             return Err(QuilError::InvalidArgument(
                 "invoke_update: signature verification failed at materialize".into(),
             ));
@@ -2461,6 +2510,19 @@ impl GlobalIntrinsic {
             return Err(QuilError::InvalidArgument(
                 "invoke_step seniority_merge: signature verification failed".into(),
             ));
+        }
+
+        // Validation reads every request of a bundle against committed state,
+        // before any of them runs, so a target consumed earlier in the same
+        // bundle (by another copy of this op, another merge or a join) still
+        // passed it, and each copy added the target's seniority again. From
+        // the prover operation replay guard epoch, refuse the merge here when
+        // the frame's staged state already holds either spent marker of a
+        // target, as validation refuses one in committed state.
+        if quil_types::consensus::prover_op_replay_guard_active(frame_number) {
+            verify::verify_prover_seniority_merge_spent_markers(op, |addr: &[u8; 32]| {
+                state.get(domain, addr, va_disc)
+            })?;
         }
 
         // Collect merge target public keys
@@ -6421,6 +6483,156 @@ mod tests {
             .is_err());
     }
 
+    /// Signed pause, resume, leave and reject operations at `signed`, each
+    /// with the allocation its validation reads (pause: active, resume:
+    /// paused; leave and reject read none here).
+    fn signed_filter_ops(
+        signed: u64,
+    ) -> Vec<(
+        &'static str,
+        Vec<u8>,
+        Option<quil_tries::VectorCommitmentTree>,
+    )> {
+        let sig = || {
+            Some(AddressedSignature {
+                signature: vec![0xBBu8; 666],
+                address: vec![0xCCu8; 32],
+            })
+        };
+        let filter = vec![0xAAu8; 32];
+        vec![
+            (
+                "pause",
+                ProverPause {
+                    filter: filter.clone(),
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                Some(make_alloc_tree(1)),
+            ),
+            (
+                "resume",
+                ProverResume {
+                    filter: filter.clone(),
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                Some(make_alloc_tree(2)),
+            ),
+            (
+                "leave",
+                ProverLeave {
+                    filters: vec![filter.clone()],
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                None,
+            ),
+            (
+                "reject",
+                ProverReject {
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                    filters: vec![filter],
+                    ..Default::default()
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                None,
+            ),
+        ]
+    }
+
+    /// A captured pause, resume, leave or reject used to apply whenever it
+    /// was submitted again. From the replay guard epoch one signed more than
+    /// the freshness window before the including frame, or in an earlier
+    /// epoch, is refused; a fresh one is accepted, and before the epoch an
+    /// old one still is, as on builds without the guard.
+    #[test]
+    fn a_replayed_prover_op_is_refused_from_the_replay_guard_epoch() {
+        let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+        let pt = make_prover_tree();
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 30;
+        let window = verify::PROVER_OP_FRESHNESS_WINDOW;
+        let validate = |signed: u64| -> Vec<(&'static str, Result<bool>)> {
+            signed_filter_ops(signed)
+                .into_iter()
+                .map(|(name, bytes, alloc)| {
+                    (name, gi.validate(at, &bytes, Some(&pt), alloc.as_ref()))
+                })
+                .collect()
+        };
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        for (name, result) in validate(at - window - 1) {
+            assert!(result.unwrap(), "{name}: accepted before the epoch");
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        for (name, result) in validate(at - window) {
+            assert!(result.unwrap(), "{name}: a fresh op is accepted");
+        }
+        for signed in [at - window - 1, 3 * epoch - 1, at + 1] {
+            for (name, result) in validate(signed) {
+                assert!(
+                    result.is_err(),
+                    "{name} signed at {signed}: refused at {at}"
+                );
+            }
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+    }
+
+    /// Pausing and resuming within the freshness window would let an
+    /// earlier pause apply again: from the replay guard epoch a pause signed
+    /// before the allocation's last resume is refused.
+    #[test]
+    fn a_pause_signed_before_the_last_resume_is_refused_from_the_replay_guard_epoch() {
+        let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+        let pt = make_prover_tree();
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 30;
+        let mut resumed = make_alloc_tree(1);
+        write_field(
+            &mut resumed,
+            "allocation:ProverAllocation",
+            "ResumeFrameNumber",
+            &(at - 2).to_be_bytes(),
+        )
+        .unwrap();
+        let pause = |signed: u64| {
+            ProverPause {
+                filter: vec![0xAAu8; 32],
+                frame_number: signed,
+                public_key_signature_bls48581: Some(AddressedSignature {
+                    signature: vec![0xBBu8; 666],
+                    address: vec![0xCCu8; 32],
+                }),
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        assert!(gi
+            .validate(at, &pause(at - 5), Some(&pt), Some(&resumed))
+            .is_err());
+        assert!(gi
+            .validate(at, &pause(at - 2), Some(&pt), Some(&resumed))
+            .unwrap());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        assert!(gi
+            .validate(at, &pause(at - 5), Some(&pt), Some(&resumed))
+            .unwrap());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+    }
+
     #[test]
     fn validate_join_without_frame_prover_ok() {
         // ProverJoin no longer carries a VDF proof (the join VDF was
@@ -6993,6 +7205,52 @@ mod tests {
                 "post-merge seniority must equal existing + SUM-aggregated, \
                  not MAX-of-clock-store-map",
             );
+        }
+
+        /// Validation reads all requests of a bundle against committed
+        /// state before any runs, so each copy of one merge in a bundle
+        /// passed it and added the target's seniority again. From the replay
+        /// guard epoch a copy finding the target's marker in the frame's
+        /// staged state is refused.
+        #[test]
+        fn a_target_merged_earlier_in_the_frame_is_not_credited_again() {
+            let state = make_state();
+            let pk = vec![0xDDu8; 585];
+            let prover_addr = seed_prover(&state, &pk, 100);
+            let op = build_op(prover_addr, vec![(0, vec![0x55u8; 57])]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(0));
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            let once = read_seniority(&state, &prover_addr);
+            assert!(
+                gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                    .is_err(),
+                "the second copy of the merge in the frame is refused"
+            );
+            assert_eq!(read_seniority(&state, &prover_addr), once);
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+        }
+
+        /// Before the replay guard epoch every copy still runs, as on
+        /// builds without the guard.
+        #[test]
+        fn before_the_replay_guard_epoch_a_repeated_merge_still_runs() {
+            let state = make_state();
+            let pk = vec![0xDEu8; 585];
+            let prover_addr = seed_prover(&state, &pk, 100);
+            let op = build_op(prover_addr, vec![(0, vec![0x56u8; 57])]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
         }
 
         // -------------------------------------------------------------

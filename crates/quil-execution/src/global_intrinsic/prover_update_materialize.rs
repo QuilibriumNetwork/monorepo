@@ -110,12 +110,17 @@ pub fn validate_prover_update(
         ));
     }
 
-    // BLS signature over DelegateAddress with PROVER_UPDATE domain.
+    // BLS signature over DelegateAddress (and the signed frame the update
+    // carries from the prover operation replay guard epoch; its freshness is
+    // checked against the including frame by `verify::verify_prover_update`)
+    // with PROVER_UPDATE domain.
     let domain_bytes = prover_update_domain()?;
+    let message =
+        super::prover_verify::prover_update_signing_message(&op.delegate_address, op.frame_number);
     let valid = key_manager.validate_signature(
         KeyType::Falcon512,
         &pubkey,
-        &op.delegate_address,
+        &message,
         &sig.signature,
         &domain_bytes,
     )?;
@@ -322,6 +327,7 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: addr.to_vec(),
             }),
+            frame_number: 0,
         }
     }
 
@@ -349,6 +355,7 @@ mod tests {
         let op = ProverUpdate {
             delegate_address: vec![0xCCu8; 32],
             public_key_signature_bls48581: None,
+            frame_number: 0,
         };
         assert!(validate_prover_update(&op, &state, &AcceptAll).is_err());
     }
@@ -362,6 +369,7 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: vec![0xAAu8; 31], // wrong
             }),
+            frame_number: 0,
         };
         assert!(validate_prover_update(&op, &state, &AcceptAll).is_err());
     }
