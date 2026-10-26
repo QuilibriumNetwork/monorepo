@@ -6,81 +6,30 @@
 //! - default: append the additional config dirs to the primary config's
 //!   `engine.multisigProverEnrollmentPaths` and save.
 //! - `--dry-run`: estimate the effective seniority score from the four
-//!   premainnet retro datasets, matched by peer id; then simulate, against
+//!   premainnet retro datasets, matched by peer id, which the local node
+//!   looks up (`GetRetroSeniority`); then simulate, against
 //!   the local node's GLOBAL state, the seniority succession of the prover
 //!   the configs' peer keys name to this node's prover: the predecessor,
 //!   its seniority, last activity and allocations, the quiet period, the
 //!   resulting seniority, and every condition that blocks it.
 //!
-//! The retro datasets are ~60 MB, so they are loaded at runtime rather
-//! than embedded in the binary. They are looked up under
-//! `$QUIL_PREMAINNET_DATA` (if set), else the crate's `data/premainnet`
-//! directory. (Go embeds them via `go:embed`; the byte-for-byte score
-//! math is preserved.)
+//! The retro datasets and the mainnet snapshot take ~170 MB, which the node
+//! already carries for GLOBAL execution, so qclient asks the node rather
+//! than embedding them too. (Go embeds them via `go:embed`.)
 
-use std::path::PathBuf;
-
-use serde::Deserialize;
+use std::collections::HashMap;
 
 use quil_execution::global_intrinsic::seniority_succession::{
-    plan_submissions, retro_parts, GlobalReader, GlobalSnapshot, PredecessorState, Submissions,
+    plan_submissions, GlobalReader, GlobalSnapshot, PredecessorState, RetroParts, Submissions,
     SuccessionCandidate, TargetStanding,
 };
 use quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
 use quil_p2p::ed448_identity::Ed448Identity;
-use quil_types::proto::node::{GetHyperedgeDataRequest, GetNodeInfoRequest, GetVertexDataRequest};
+use quil_types::proto::node::{
+    GetHyperedgeDataRequest, GetNodeInfoRequest, GetRetroSeniorityRequest, GetVertexDataRequest,
+};
 
 use crate::context::GlobalArgs;
-
-/// Frames-per-day base used by the retro score formulas (`10*6*60*24`).
-const FRAMES_PER_DAY: u64 = 10 * 6 * 60 * 24;
-
-#[derive(Debug, Deserialize)]
-struct FirstRetro {
-    #[serde(rename = "peerId")]
-    peer_id: String,
-    reward: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SecondRetro {
-    #[serde(rename = "peerId")]
-    peer_id: String,
-    #[serde(rename = "janPresence", default)]
-    jan: bool,
-    #[serde(rename = "febPresence", default)]
-    feb: bool,
-    #[serde(rename = "marPresence", default)]
-    mar: bool,
-    #[serde(rename = "aprPresence", default)]
-    apr: bool,
-    #[serde(rename = "mayPresence", default)]
-    may: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct Retro {
-    #[serde(rename = "peerId")]
-    peer_id: String,
-}
-
-fn premainnet_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("QUIL_PREMAINNET_DATA") {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/premainnet")
-}
-
-fn load_json<T: for<'de> Deserialize<'de>>(name: &str) -> anyhow::Result<Vec<T>> {
-    let path = premainnet_dir().join(name);
-    let data = std::fs::read(&path).map_err(|e| {
-        anyhow::anyhow!(
-            "read {}: {e} (set QUIL_PREMAINNET_DATA to the premainnet dataset dir)",
-            path.display()
-        )
-    })?;
-    Ok(serde_json::from_slice(&data)?)
-}
 
 pub fn run(configs: &[String]) -> anyhow::Result<()> {
     if configs.len() <= 1 {
@@ -140,98 +89,93 @@ fn node_keys(configs: &[String]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
 }
 
 /// `--dry-run`: the retro estimate of the configs' peer keys, then what the
-/// node would submit under the seniority succession rules, read from the
-/// local node.
+/// node would submit under the seniority succession rules, both read from
+/// the local node.
 pub async fn dry_run(global: GlobalArgs, configs: &[String]) -> anyhow::Result<()> {
     if configs.is_empty() {
         anyhow::bail!("missing configs");
     }
-    let given = peer_keys(configs)?;
-    let peer_ids: Vec<String> = given.iter().map(|(peer, _)| peer.clone()).collect();
-    if let Err(error) = dry_run_score(&peer_ids) {
-        println!("Effective seniority score: unavailable ({error})");
-    }
-    println!();
+    let given: Vec<Vec<u8>> = peer_keys(configs)?
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect();
     let keys = node_keys(configs)?;
     let pc = super::ProverCtx::load(global)?;
-    match simulate_with_node(&pc, &keys).await {
+    let retro = match pc.connect().await {
+        Ok(mut client) => RetroTable::fetch(&mut client, &keys).await,
+        Err(error) => Err(error),
+    };
+    match &retro {
+        Ok(retro) => println!(
+            "Effective seniority score: {}",
+            retro_score(&retro.parts(&given))
+        ),
+        Err(error) => println!("Effective seniority score: unavailable ({error})"),
+    }
+    println!();
+    let simulated = match &retro {
+        Ok(retro) => simulate_with_node(&pc, &keys, retro).await,
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    };
+    match simulated {
         Ok(rendered) => print!("{rendered}"),
         Err(error) => println!("Seniority succession: not simulated ({error})"),
     }
     Ok(())
 }
 
-fn dry_run_score(peer_ids: &[String]) -> anyhow::Result<()> {
-    let member = |pid: &str| peer_ids.iter().any(|p| p == pid);
+/// The sum of the four retro epochs, which Go's dry run reports as the
+/// effective score (the mainnet snapshot only counts in a succession).
+fn retro_score(parts: &RetroParts) -> u64 {
+    parts[..4].iter().sum()
+}
 
-    let first: Vec<FirstRetro> = load_json("first_retro.json")?;
-    let second: Vec<SecondRetro> = load_json("second_retro.json")?;
-    let third: Vec<Retro> = load_json("third_retro.json")?;
-    let fourth: Vec<Retro> = load_json("fourth_retro.json")?;
+/// The retro seniority of each key, as the node looked it up.
+struct RetroTable(HashMap<Vec<u8>, RetroParts>);
 
-    let mut highest_first = 0u64;
-    for f in &first {
-        if !member(&f.peer_id) {
-            continue;
+impl RetroTable {
+    async fn fetch(client: &mut NodeClient, keys: &[(String, Vec<u8>)]) -> anyhow::Result<Self> {
+        let public_keys: Vec<Vec<u8>> = keys.iter().map(|(_, key)| key.clone()).collect();
+        let response = client
+            .get_retro_seniority(tonic::Request::new(GetRetroSeniorityRequest {
+                public_keys: public_keys.clone(),
+            }))
+            .await
+            .map_err(|e| match e.code() {
+                tonic::Code::Unimplemented => anyhow::anyhow!(
+                    "the node does not serve retro seniority; upgrade it to this qclient's release"
+                ),
+                _ => anyhow::anyhow!("get retro seniority: {e}"),
+            })?
+            .into_inner();
+        if response.keys.len() != public_keys.len() {
+            anyhow::bail!(
+                "get retro seniority: {} answers for {} keys",
+                response.keys.len(),
+                public_keys.len()
+            );
         }
-        // These rewards have no decimals, so the integer shortcut matches Go.
-        let max = 157208i64;
-        let actual: i64 = f
-            .reward
-            .parse()
-            .map_err(|_| anyhow::anyhow!("bad reward {:?}", f.reward))?;
-        if actual == 0 {
-            continue;
+        let mut table = HashMap::with_capacity(public_keys.len());
+        for (key, answer) in public_keys.into_iter().zip(response.keys) {
+            let parts: RetroParts = answer.parts.try_into().map_err(|parts: Vec<u64>| {
+                anyhow::anyhow!("get retro seniority: {} parts, expected 5", parts.len())
+            })?;
+            table.insert(key, parts);
         }
-        // s = (10*6*60*24*92) / (max/actual)  — integer division, as in Go.
-        let denom = (max / actual) as u64;
-        if denom == 0 {
-            continue;
-        }
-        let s = (FRAMES_PER_DAY * 92) / denom;
-        highest_first = highest_first.max(s);
+        Ok(Self(table))
     }
 
-    let mut highest_second = 0u64;
-    for f in &second {
-        if !member(&f.peer_id) {
-            continue;
+    /// The parts of `keys` together: per part, the highest of any key, as
+    /// one lookup over all of them gives.
+    fn parts(&self, keys: &[Vec<u8>]) -> RetroParts {
+        let mut combined = RetroParts::default();
+        for parts in keys.iter().filter_map(|key| self.0.get(key)) {
+            for (total, part) in combined.iter_mut().zip(parts) {
+                *total = (*total).max(*part);
+            }
         }
-        let mut amt = 0u64;
-        if f.jan {
-            amt += FRAMES_PER_DAY * 31;
-        }
-        if f.feb {
-            amt += FRAMES_PER_DAY * 29;
-        }
-        if f.mar {
-            amt += FRAMES_PER_DAY * 31;
-        }
-        if f.apr {
-            amt += FRAMES_PER_DAY * 30;
-        }
-        if f.may {
-            amt += FRAMES_PER_DAY * 31;
-        }
-        highest_second = highest_second.max(amt);
+        combined
     }
-
-    let highest_third = if third.iter().any(|f| member(&f.peer_id)) {
-        FRAMES_PER_DAY * 30
-    } else {
-        0
-    };
-    let highest_fourth = if fourth.iter().any(|f| member(&f.peer_id)) {
-        FRAMES_PER_DAY * 31
-    } else {
-        0
-    };
-
-    println!(
-        "Effective seniority score: {}",
-        highest_first + highest_second + highest_third + highest_fourth
-    );
-    Ok(())
 }
 
 fn merge_configs(primary: &str, others: &[String]) -> anyhow::Result<()> {
@@ -461,6 +405,7 @@ const PREFETCH_ROUNDS: usize = 80;
 async fn simulate_with_node(
     pc: &super::ProverCtx,
     keys: &[(String, Vec<u8>)],
+    retro: &RetroTable,
 ) -> anyhow::Result<String> {
     let mut client = pc.connect().await?;
     let info = client
@@ -482,6 +427,7 @@ async fn simulate_with_node(
     let public_keys: Vec<Vec<u8>> = keys.iter().map(|(_, key)| key.clone()).collect();
     let peers: Vec<String> = keys.iter().map(|(peer, _)| peer.clone()).collect();
 
+    let retro_parts = |keys: &[Vec<u8>]| retro.parts(keys);
     let mut reads = Prefetch::default();
     for _ in 0..PREFETCH_ROUNDS {
         let plan = plan_submissions(&reads, frame, &prover, &public_keys, &retro_parts)?;
@@ -741,5 +687,18 @@ mod tests {
         assert!(rendered.ends_with(
             "  Merge:        1 peer key, adds 5000000; the node submits it with its next seniority merge proposal\n"
         ));
+    }
+
+    #[test]
+    fn retro_parts_combine_by_their_highest_key() {
+        let table = RetroTable(HashMap::from([
+            (vec![1u8], [10, 0, 30, 0, 500]),
+            (vec![2u8], [5, 20, 0, 40, 100]),
+        ]));
+        assert_eq!(table.parts(&[vec![1], vec![2]]), [10, 20, 30, 40, 500]);
+        assert_eq!(table.parts(&[vec![2], vec![3]]), [5, 20, 0, 40, 100]);
+        assert_eq!(table.parts(&[]), [0; 5]);
+        // The dry run reports the retro epochs alone, as Go's does.
+        assert_eq!(retro_score(&table.parts(&[vec![1], vec![2]])), 100);
     }
 }
