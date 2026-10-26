@@ -246,6 +246,7 @@ mod tests {
                 epoch: 3, view: 6, parent: 5, payload: [5; 32],
                 votes: vec![NotarizeVote { signer: 1, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
             }],
+            nullifies: Vec::new(),
         };
         assert_eq!(describe(&report.to_canonical_bytes().unwrap()), ("presence_report", vec![vec![0x21; 32]]));
     }

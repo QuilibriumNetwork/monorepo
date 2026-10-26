@@ -725,39 +725,7 @@ pub fn fence_stalled_sources(
         if frame < fence_due_frame(pending.frame) {
             continue;
         }
-        let checkpoint = match session_tip(state, &id)? {
-            // A tip header certifies its frame's identity and its PRE-state
-            // roots (after the frame before it); nothing certifies the state
-            // after it. The fence names the frame and leaves the roots zero;
-            // the successor committee's first header attests them, since each
-            // of its voters checks that header's pre-state against its own.
-            Some(tip) => quil_cw_consensus::handoff::Checkpoint { state_roots: [[0; 32]; 4], ..tip },
-            None => {
-                let predecessor = origins(state, &id)?
-                    .into_iter()
-                    .find(|(source, checkpoint)| source.filter == session.filter && checkpoint.frame == session.base_frame);
-                let state_roots = match predecessor {
-                    Some((_, origin)) => origin.state_roots,
-                    None => {
-                        tracing::warn!(frame, filter = hex::encode(filter), generation = session.generation,
-                            "committee handoff: stalled session has no executed frame and no same-filter \
-                             predecessor; fenced at its base without certified roots");
-                        [[0; 32]; 4]
-                    }
-                };
-                quil_cw_consensus::handoff::Checkpoint {
-                    frame: session.base_frame,
-                    view: 0,
-                    digest: session.genesis,
-                    state_roots,
-                    history_root: [0; 32],
-                }
-            }
-        };
-        let checkpoint = quil_cw_consensus::handoff::Checkpoint { history_root: [0; 32], ..checkpoint };
-        let mut bytes = Vec::new();
-        checkpoint.write(&mut bytes);
-        write(state, frame, b"fence", &key, &bytes)?;
+        let checkpoint = write_fence(state, frame, filter, &session, &id, &request_id)?;
         tracing::warn!(
             frame,
             filter = hex::encode(filter),
@@ -780,6 +748,196 @@ pub fn fence_stalled_sources(
         }
     }
     Ok(fenced)
+}
+
+/// Record GLOBAL's fence of `session` (ID `id`) of `filter`, closing for
+/// request `request_id`, and return its checkpoint: the session's executed
+/// tip, or its base without one ([`fence_stalled_sources`]).
+fn write_fence(
+    state: &HypergraphState,
+    frame: u64,
+    filter: &[u8],
+    session: &Session,
+    id: &[u8; 32],
+    request_id: &[u8; 32],
+) -> Result<quil_cw_consensus::handoff::Checkpoint> {
+    let checkpoint = match session_tip(state, id)? {
+        // A tip header certifies its frame's identity and its PRE-state
+        // roots (after the frame before it); nothing certifies the state
+        // after it. The fence names the frame and leaves the roots zero;
+        // the successor committee's first header attests them, since each
+        // of its voters checks that header's pre-state against its own.
+        Some(tip) => quil_cw_consensus::handoff::Checkpoint { state_roots: [[0; 32]; 4], ..tip },
+        None => {
+            let predecessor = origins(state, id)?
+                .into_iter()
+                .find(|(source, checkpoint)| source.filter == session.filter && checkpoint.frame == session.base_frame);
+            let state_roots = match predecessor {
+                Some((_, origin)) => origin.state_roots,
+                None => {
+                    tracing::warn!(frame, filter = hex::encode(filter), generation = session.generation,
+                        "committee handoff: stalled session has no executed frame and no same-filter \
+                         predecessor; fenced at its base without certified roots");
+                    [[0; 32]; 4]
+                }
+            };
+            quil_cw_consensus::handoff::Checkpoint {
+                frame: session.base_frame,
+                view: 0,
+                digest: session.genesis,
+                state_roots,
+                history_root: [0; 32],
+            }
+        }
+    };
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint { history_root: [0; 32], ..checkpoint };
+    let mut bytes = Vec::new();
+    checkpoint.write(&mut bytes);
+    write(state, frame, b"fence", &seal_key(request_id, id), &bytes)?;
+    Ok(checkpoint)
+}
+
+/// Kind of the record of the GLOBAL frame an early fence ([`fence_absent`])
+/// was written at, keyed like the fence.
+const FENCE_FRAME: &[u8] = b"fence-frame";
+
+/// The GLOBAL frame GLOBAL fenced closing session `id` at, or will fence it
+/// at if it does not seal: the frame recorded for an early fence
+/// ([`fence_absent`]), else [`fence_due_frame`] of its closing request.
+/// `None` for an active session or one whose request is absent. App provers
+/// date a fence by it when they rewind past one.
+pub fn fence_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
+    let request_id = match status(state, id)? {
+        Status::Active => return Ok(None),
+        Status::Sealing(request_id) | Status::Closed(request_id) => request_id,
+    };
+    if let Some(bytes) = read(state, FENCE_FRAME, &seal_key(&request_id, id))? {
+        let frame = <[u8; 8]>::try_from(bytes.as_slice())
+            .map_err(|_| QuilError::Store("corrupt early fence frame".into()))?;
+        return Ok(Some(u64::from_be_bytes(frame)));
+    }
+    Ok(request(state, &request_id)?.map(|request| fence_due_frame(request.frame)))
+}
+
+/// Whether `request` is a membership change of `filter`: its one source and
+/// its one target are that shard.
+pub(super) fn membership_request(request: &super::Request, filter: &[u8]) -> bool {
+    match (request.sources.as_slice(), request.targets.as_slice()) {
+        ([source], [target]) => {
+            source.filter == filter && target.committee.filter == filter && request.vacant.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Fence early each stalled session [`super::exclusion::evaluate`] decided
+/// to exclude absent members of, authorize its successor with the
+/// decision's committee, and only then record the exclusions: the session
+/// cannot seal below its quorum, and its present members reach the
+/// successor's. An active session is first asked to close for that
+/// committee; a closing one's request committee is replaced by it. The
+/// fence is the session's executed tip, as at its timeout
+/// ([`fence_stalled_sources`]); its GLOBAL frame is recorded
+/// ([`fence_frame`]). Runs before due fences and the membership pass, which
+/// then seat eligibility less the new exclusions. A session already ended,
+/// succeeded, closing for a split or merge, or whose shard a pending split
+/// or merge reserves is left alone, and nobody is excluded. Returns how many
+/// sessions were fenced. A decision refused by a rule (an `InvalidArgument`
+/// error) is undone whole and logged, and the others stand; any other error
+/// (a store failure) fails the whole frame, on every node alike.
+pub fn fence_absent(state: &HypergraphState, frame: u64, decisions: &[super::exclusion::Decision]) -> Result<usize> {
+    let mut fenced = 0;
+    for decision in decisions {
+        let checkpoint = state.changeset_len();
+        match fence_absent_session(state, frame, decision) {
+            Ok(true) => fenced += 1,
+            Ok(false) => {}
+            Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                state.rollback_to(checkpoint);
+                tracing::error!(frame, filter = hex::encode(&decision.filter), %error,
+                    "committee presence: early fence of a stalled session failed; it waits for its timeout");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(fenced)
+}
+
+fn fence_absent_session(state: &HypergraphState, frame: u64, decision: &super::exclusion::Decision) -> Result<bool> {
+    let filter = &decision.filter;
+    let Some(session) = head(state, filter)? else { return Ok(false) };
+    let id = session.id()?;
+    if id != decision.session {
+        return Ok(false);
+    }
+    let request_id = match status(state, &id)? {
+        Status::Sealing(request_id) => request_id,
+        Status::Active => {
+            // A split or merge that named this shard as a target and has not
+            // activated would fail its activation forever once the shard
+            // has another session: leave it to that change.
+            if reserved(state, filter)? {
+                tracing::info!(frame, filter = hex::encode(filter), generation = session.generation,
+                    "committee presence: stalled session's shard is reserved by a pending split or merge; no early fence");
+                return Ok(false);
+            }
+            let targets = vec![DesiredCommittee { filter: filter.clone(), members: decision.committee.clone() }];
+            let request = schedule(state, frame, vec![filter.clone()], targets.clone())?;
+            let request_id = request.id()?;
+            reserve(state, frame, &targets, &request_id)?;
+            request_id
+        }
+        Status::Closed(_) => return Ok(false),
+    };
+    let key = seal_key(&request_id, &id);
+    if read(state, b"seal", &key)?.is_some() || read(state, b"fence", &key)?.is_some() {
+        return Ok(false);
+    }
+    let pending = request(state, &request_id)?
+        .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
+    if !membership_request(&pending, filter) {
+        return Ok(false);
+    }
+    let target = &pending.targets[0];
+    let members = (decision.committee != target.committee.members).then(|| decision.committee.clone());
+    if let Some(members) = &members {
+        Session {
+            chain_id: session.chain_id,
+            filter: filter.clone(),
+            generation: target.generation,
+            genesis: [0; 32],
+            base_frame: 0,
+            authorization: [0; 32],
+            members: members.clone(),
+        }
+        .validate()?;
+    }
+    let checkpoint = write_fence(state, frame, filter, &session, &id, &request_id)?;
+    write(state, frame, FENCE_FRAME, &key, &frame.to_be_bytes())?;
+    if !activate_with(state, frame, &pending, members)? {
+        return Err(invalid("the early fence authorized no successor"));
+    }
+    for (member, next) in decision.excluded.iter().zip(&decision.strikes) {
+        super::exclusion::set_exclusion(state, frame, filter, member, next)?;
+    }
+    tracing::warn!(
+        frame,
+        filter = hex::encode(filter),
+        generation = session.generation,
+        members = session.members.len(),
+        fenced_at = checkpoint.frame,
+        request = hex::encode(request_id),
+        requested_at = pending.frame,
+        committee = decision.committee.len(),
+        committee_quorum = super::exclusion::quorum(decision.committee.len()),
+        excluded = decision.excluded.len(),
+        provers = ?decision.describe_strikes(),
+        "committee presence: stalled session fenced early at its executed tip; its successor seats its present \
+         members and excludes its absent ones",
+    );
+    tracing::info!(frame, request = hex::encode(request_id),
+        "committee handoff: successors authorized from fenced sources");
+    Ok(true)
 }
 
 /// The committee a fence's membership successor takes: its shard's eligible
@@ -844,7 +1002,9 @@ pub fn reconcile_membership(
     }
     let mut created = 0;
     for filter in filters {
-        let members = desired_members(scan, filter, frame);
+        // From the presence exclusion frame, less the members excluded for
+        // absence (`exclusion::seated`).
+        let members = super::exclusion::seated(state, frame, filter, desired_members(scan, filter, frame))?;
         if members.is_empty() {
             continue;
         }

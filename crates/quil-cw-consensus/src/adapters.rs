@@ -574,6 +574,9 @@ struct ViewVotes {
     finalize: std::collections::BTreeSet<u32>,
     /// The notarize votes themselves, per proposal (parent view, digest).
     evidence: std::collections::BTreeMap<(u64, [u8; 32]), Evidence>,
+    /// The nullify votes themselves: round epoch and signature bytes per
+    /// signer; a signer's first vote stays.
+    nullify_evidence: std::collections::BTreeMap<u32, (u64, Vec<u8>)>,
 }
 
 struct Evidence {
@@ -595,6 +598,15 @@ pub struct NotarizedProposal {
     /// certificate could form.
     pub votes: Vec<(u32, Vec<u8>)>,
     pub body: Vec<u8>,
+}
+
+/// One nullify vote of a recent view ([`Liveness::nullify_votes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NullifyKey {
+    /// The round epoch (a session's generation).
+    pub epoch: u64,
+    pub view: u64,
+    pub signer: u32,
 }
 
 /// One notarize vote of a recent view ([`Liveness::notarize_votes`]).
@@ -746,10 +758,20 @@ impl Liveness {
         self.notarize_vote(view, signer, payload, Some((epoch, parent, signature)))
     }
 
+    #[cfg(test)]
     fn nullify(&self, view: u64, signer: u32) {
+        self.nullify_vote(view, signer, None)
+    }
+
+    /// Count a nullify vote and, with `evidence` (round epoch and
+    /// signature), keep it; a signer's first nullify of a view stays.
+    fn nullify_vote(&self, view: u64, signer: u32, evidence: Option<(u64, Vec<u8>)>) {
         self.vote(view, |s, votes| {
             s.nullify_votes += 1;
             votes.nullify.insert(signer);
+            if let Some(evidence) = evidence {
+                votes.nullify_evidence.entry(signer).or_insert(evidence);
+            }
         })
     }
 
@@ -798,8 +820,9 @@ impl Liveness {
         let _ = self.blocks.set(store.downgrade());
     }
 
-    /// Keep the signatures of the notarize votes this consensus reports, for
-    /// [`Self::notarize_votes`] and [`Self::notarized`] (presence reports).
+    /// Keep the signatures of the notarize and nullify votes this consensus
+    /// reports, for [`Self::notarize_votes`], [`Self::notarized`] and
+    /// [`Self::nullify_votes`] (presence reports).
     /// Off by default: then no signature is decoded, copied or stored.
     pub fn keep_votes(&self, keep: bool) {
         self.keep_votes.store(keep, std::sync::atomic::Ordering::Relaxed);
@@ -873,6 +896,22 @@ impl Liveness {
         votes
     }
 
+    /// Every kept nullify vote of the recent views, in ascending view and
+    /// signer order, with its signature bytes where `wanted` asks for them
+    /// and `None` elsewhere ([`Self::notarize_votes`]).
+    pub fn nullify_votes(&self, wanted: impl Fn(&NullifyKey) -> bool) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        let Ok(state) = self.inner.lock() else { return Vec::new() };
+        let mut votes = Vec::new();
+        for (view, recent) in &state.views {
+            for (signer, (epoch, signature)) in &recent.nullify_evidence {
+                let key = NullifyKey { epoch: *epoch, view: *view, signer: *signer };
+                let signature = wanted(&key).then(|| signature.clone());
+                votes.push((key, signature));
+            }
+        }
+        votes
+    }
+
     pub fn decisions(&self) -> Decisions {
         self.inner.lock().map(|state| state.decisions.clone()).unwrap_or_default()
     }
@@ -926,7 +965,14 @@ impl Liveness {
                 };
                 self.notarize_vote(vote.view().get(), signer(vote.signer()), vote.proposal.payload.0, evidence);
             }
-            Activity::Nullify(vote) => self.nullify(vote.view().get(), signer(vote.signer())),
+            Activity::Nullify(vote) => {
+                let evidence = if self.keep_votes.load(std::sync::atomic::Ordering::Relaxed) {
+                    vote.attestation.signature.get().map(|signature| (vote.round.epoch().get(), signature.to_vec()))
+                } else {
+                    None
+                };
+                self.nullify_vote(vote.view().get(), signer(vote.signer()), evidence);
+            }
             Activity::Finalize(vote) => self.finalize(vote.view().get(), signer(vote.signer())),
             Activity::Notarization(cert) => {
                 let view = cert.view().get();
@@ -1265,6 +1311,28 @@ mod liveness_tests {
             digest_from_identity(key.payload),
         );
         assert!(scheme.verify_notarize(&listed, &vote.attestation), "the listed vote verifies as consensus checks it");
+    }
+
+    /// A nullify vote consensus reports keeps its round and signature when
+    /// presence reports ask for votes, so it verifies again from what
+    /// [`Liveness`] returns; otherwise it is only counted.
+    #[test]
+    fn a_reported_nullify_keeps_its_round_and_signature_when_asked() {
+        use commonware_consensus::simplex::types::Nullify;
+        use commonware_consensus::types::{Epoch, Round, View};
+        let (scheme, _) = signed_notarize();
+        let vote = Nullify::sign::<Digest>(&scheme, Round::new(Epoch::new(3), View::new(11))).unwrap();
+        let liveness = Liveness::default();
+        liveness.observe(&Activity::Nullify(vote.clone()));
+        assert_eq!(liveness.snapshot().nullify_votes, 1, "the vote is counted");
+        assert!(liveness.nullify_votes(|_| true).is_empty(), "and its signature not kept");
+        liveness.keep_votes(true);
+        liveness.observe(&Activity::Nullify(vote.clone()));
+        let key = NullifyKey { epoch: 3, view: 11, signer: 1 };
+        let signature = vote.attestation.signature.get().unwrap().to_vec();
+        assert_eq!(liveness.nullify_votes(|_| true), vec![(key, Some(signature))]);
+        assert_eq!(liveness.nullify_votes(|_| false), vec![(key, None)]);
+        assert!(scheme.verify_nullify(&vote), "the listed vote verifies as consensus checks it");
     }
 
     /// Unless presence reports ask for them, notarize votes are only

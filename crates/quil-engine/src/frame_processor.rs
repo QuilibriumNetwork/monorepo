@@ -17,6 +17,13 @@ use quil_execution::ExecutionEngineManager;
 /// `bytes.Repeat([]byte{0xff}, 32)` in the materialize loop.
 const GLOBAL_ADDRESS: [u8; 32] = [0xFFu8; 32];
 
+/// A bundle of GLOBAL frame `frame_number` in canonical bytes, judged at
+/// that frame: the frame's number, not this process's history, decides
+/// which presence encodings it may carry.
+fn canonical_bundle(bundle: &quil_types::proto::global::MessageBundle, frame_number: u64) -> Result<Vec<u8>> {
+    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number))
+}
+
 /// Process all `MessageBundle`s in a `GlobalFrame` through the
 /// execution manager. Returns (applied_count, skipped_count).
 ///
@@ -60,7 +67,7 @@ pub fn process_global_frame_with_rewards(
         // `CanonicalMessageBundle::from_canonical_bytes`; feeding them
         // prost wire bytes silently fails the type-prefix check and
         // skips every message (matches Go's `ToCanonicalBytes()` path).
-        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+        let request_bytes = match canonical_bundle(bundle, frame_number) {
             Ok(b) => b,
             Err(e) => {
                 if e.is_execution_unavailable() { return Err(e); }
@@ -214,7 +221,7 @@ pub fn process_global_frame_with_fees(
     let mut skipped = 0usize;
 
     for (i, bundle) in frame.requests.iter().enumerate() {
-        let request_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+        let request_bytes = match canonical_bundle(bundle, frame_number) {
             Ok(b) => b,
             Err(_) => {
                 skipped += 1;
@@ -340,6 +347,43 @@ mod tests {
             }),
             requests: bundles,
         }
+    }
+
+    /// A fresh process (no frame decoded or committed before) re-processing
+    /// a frame past the presence exclusion frame converts its claim and its
+    /// nullify report, as every node does, and refuses them in a frame below
+    /// it: the frame's number decides, not the process's history.
+    #[test]
+    fn a_fresh_process_converts_post_activation_presence_encodings_by_the_frame() {
+        use quil_execution::global_intrinsic::handoff::{
+            self,
+            exclusion::PresenceClaim,
+            presence::{NullifyVote, PresenceReport},
+        };
+        use quil_types::proto::global::{message_request::Request, MessageRequest};
+        let report = PresenceReport {
+            session: [2; 32],
+            filter: vec![0x21; 32],
+            proposals: Vec::new(),
+            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
+        };
+        let claim = PresenceClaim {
+            filter: vec![0x21; 32],
+            member: vec![9; quil_crypto::FALCON_PUBLIC_KEY_LEN],
+            anchor: 5,
+            signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+        };
+        let bundle = |inner: Vec<u8>| MessageBundle {
+            requests: vec![MessageRequest { request: Some(Request::PresenceReport(inner)), ..Default::default() }],
+            timestamp: 1,
+        };
+        handoff::set_presence_exclusion_frame_for_thread(Some(100));
+        for inner in [report.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
+            assert!(canonical_bundle(&bundle(inner.clone()), 100).is_ok(), "at the frame");
+            assert!(canonical_bundle(&bundle(inner.clone()), 1_000).is_ok(), "past it");
+            assert!(canonical_bundle(&bundle(inner), 99).is_err(), "below it, as a build without it");
+        }
+        handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
     #[test]

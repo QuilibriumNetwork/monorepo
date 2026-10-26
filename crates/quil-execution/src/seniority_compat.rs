@@ -128,6 +128,14 @@ fn mainnet_seniority_for_address(peer_address: &[u8; 32]) -> u64 {
 /// and looked up in the mainnet snapshot; the maximum mainnet value is
 /// taken. The final result is `max(retro_sum, mainnet_max)`.
 pub fn get_aggregated_seniority(peer_ids: &[String]) -> u64 {
+    aggregate_retro_components(&retro_components(peer_ids))
+}
+
+/// The parts [`get_aggregated_seniority`] combines: the highest value of
+/// any of `peer_ids` in each of the four retro epochs, then the highest
+/// mainnet snapshot value. Parts of several key sets combine by their
+/// per-part maximum, as one call over the union would.
+pub fn retro_components(peer_ids: &[String]) -> [u64; 5] {
     let peer_set: std::collections::HashSet<&str> =
         peer_ids.iter().map(|s| s.as_str()).collect();
 
@@ -195,7 +203,6 @@ pub fn get_aggregated_seniority(peer_ids: &[String]) -> u64 {
         }
     }
 
-    let current_aggregated = highest_first + highest_second + highest_third + highest_fourth;
 
     // Mainnet snapshot lookup: decode peer_id base58 → poseidon-hash → 32-byte address.
     let mut highest_mainnet: u64 = 0;
@@ -214,7 +221,17 @@ pub fn get_aggregated_seniority(peer_ids: &[String]) -> u64 {
         }
     }
 
-    current_aggregated.max(highest_mainnet)
+    [highest_first, highest_second, highest_third, highest_fourth, highest_mainnet]
+}
+
+/// `max(sum of the four retro epochs, mainnet)`: the seniority of
+/// [`retro_components`].
+pub fn aggregate_retro_components(parts: &[u64; 5]) -> u64 {
+    let retro = parts[0]
+        .saturating_add(parts[1])
+        .saturating_add(parts[2])
+        .saturating_add(parts[3]);
+    retro.max(parts[4])
 }
 
 #[cfg(test)]

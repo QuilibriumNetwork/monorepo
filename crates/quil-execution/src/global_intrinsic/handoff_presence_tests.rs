@@ -96,7 +96,12 @@ impl Fixture {
     }
 
     fn report(&self, proposals: Vec<PresenceProposal>) -> PresenceReport {
-        PresenceReport { session: self.session.id().unwrap(), filter: self.session.filter.clone(), proposals }
+        PresenceReport {
+            session: self.session.id().unwrap(),
+            filter: self.session.filter.clone(),
+            proposals,
+            nullifies: Vec::new(),
+        }
     }
 
     /// A proposal at `view` anchored to `anchor`, notarized by `signers`
@@ -612,7 +617,9 @@ fn presence_credit_raises_activity_to_the_vote_anchor_and_never_lowers_it() {
     seed_allocation(&f.state, &member(votes[1]), &filter, Some(f.frame + 100));
     commit(&f.state, 2);
     let applied = f.apply(&report).unwrap();
-    assert_eq!(applied, presence::Applied { marked: 3, credited: 1, present: 3, members: f.session.members.len() });
+    assert_eq!(applied, presence::Applied {
+        marked: 3, credited: 1, present: 3, members: f.session.members.len(), ..presence::Applied::default()
+    });
     assert_eq!(last_active(&f.state, &member(votes[0]), &filter), Some(f.anchor), "the anchor, not the inclusion frame");
     assert_eq!(last_active(&f.state, &member(votes[1]), &filter), Some(f.frame + 100), "never lowered");
     assert_eq!(allocation_blob(&f.state, &member(votes[2]), &filter), None, "no allocation is created");

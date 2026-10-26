@@ -3789,6 +3789,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 selected_parent_execution,
                                                 finalization_pipeline,
                                                 committee_hex: active_committee.clone(),
+                                                committee_peer_ids: active_committee_peer_ids.clone(),
                                                 my_signing_key: my_sk,
                                                 my_public_key: my_pk,
                                                 leader_provider,

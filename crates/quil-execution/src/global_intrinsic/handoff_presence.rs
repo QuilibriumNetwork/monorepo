@@ -8,8 +8,12 @@
 //! anchoring the frame's storage beacon. A report carries the proposal's
 //! header, so GLOBAL recomputes that output: a vote it accepts was signed
 //! after its anchor, in the inclusion frame's epoch. A nullify vote signs only
-//! a round and can be signed ahead for every view; it is not evidence, and the
-//! codec cannot carry one.
+//! a round and can be signed ahead for every view; it earns no credit. From
+//! [`super::presence_exclusion_frame`] a report may carry nullify votes too
+//! (version [`VERSION_NULLIFY`]): one proves that its signer's key followed
+//! the session after it was authorized, since the session namespace binds
+//! the authorization, and it protects the signer from exclusion
+//! ([`protected`]), never more.
 //!
 //! GLOBAL validates reports from [`super::presence_report_frame`]. From
 //! [`super::presence_credit_frame`] it also records them ([`apply`]): each
@@ -35,6 +39,10 @@ pub const MAX_PRESENCE_PROPOSALS: usize = 4;
 pub const MAX_PRESENCE_VOTES: usize = 64;
 
 const VERSION: u8 = 1;
+/// The version of a report that carries nullify votes, accepted from
+/// [`super::presence_exclusion_frame`]. A report without them keeps
+/// [`VERSION`] and its encoding.
+pub const VERSION_NULLIFY: u8 = 3;
 const SIGNATURE_BYTES: usize = quil_crypto::FALCON_SIGNATURE_LEN;
 
 fn invalid(message: &str) -> QuilError {
@@ -47,6 +55,16 @@ pub struct NotarizeVote {
     /// The member's index in the session's sorted members.
     pub signer: u32,
     /// Its Falcon signature of the proposal's notarize subject.
+    pub signature: Vec<u8>,
+}
+
+/// One member's nullify vote: its Falcon signature of the round (the
+/// session's generation, `view`) under the session namespace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullifyVote {
+    pub view: u64,
+    /// The member's index in the session's sorted members.
+    pub signer: u32,
     pub signature: Vec<u8>,
 }
 
@@ -67,24 +85,30 @@ pub struct PresenceProposal {
     pub votes: Vec<NotarizeVote>,
 }
 
-/// Notarize votes of one session, the GLOBAL operation [`TYPE_PRESENCE_REPORT`].
+/// Votes of one session's members, the GLOBAL operation [`TYPE_PRESENCE_REPORT`].
 ///
 /// Encoding: type prefix ‖ version ‖ session ID ‖ filter ‖ proposal count
 /// (u32) ‖ per proposal: canonical header bytes ‖ epoch ‖ view ‖ parent ‖
-/// payload ‖ vote count (u32) ‖ per vote: signer (u32) ‖ signature. Proposals
-/// are in ascending view order, and each member votes at most once per report.
+/// payload ‖ vote count (u32) ‖ per vote: signer (u32) ‖ signature; then,
+/// with version [`VERSION_NULLIFY`] only, nullify count (u32) ‖ per nullify:
+/// view ‖ signer (u32) ‖ signature. Proposals are in ascending view order,
+/// nullifies in ascending signer order, and each member votes at most once
+/// per report, notarize or nullify. A version-1 report carries a proposal
+/// and no nullify; a version-3 one carries a nullify and may carry no
+/// proposal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PresenceReport {
     pub session: [u8; 32],
     pub filter: Vec<u8>,
     pub proposals: Vec<PresenceProposal>,
+    pub nullifies: Vec<NullifyVote>,
 }
 
 impl PresenceReport {
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut out = TYPE_PRESENCE_REPORT.to_be_bytes().to_vec();
-        out.push(VERSION);
+        out.push(if self.nullifies.is_empty() { VERSION } else { VERSION_NULLIFY });
         out.extend_from_slice(&self.session);
         put_bytes(&mut out, &self.filter)?;
         out.extend_from_slice(&(self.proposals.len() as u32).to_be_bytes());
@@ -103,13 +127,22 @@ impl PresenceReport {
                 return Err(invalid("report exceeds size limit"));
             }
         }
+        if !self.nullifies.is_empty() {
+            out.extend_from_slice(&(self.nullifies.len() as u32).to_be_bytes());
+            for vote in &self.nullifies {
+                out.extend_from_slice(&vote.view.to_be_bytes());
+                out.extend_from_slice(&vote.signer.to_be_bytes());
+                out.extend_from_slice(&vote.signature);
+            }
+        }
         Ok(out)
     }
 
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(bytes)?;
         c.magic(&TYPE_PRESENCE_REPORT.to_be_bytes())?;
-        if c.u8()? != VERSION {
+        let version = c.u8()?;
+        if version != VERSION && version != VERSION_NULLIFY {
             return Err(invalid("unknown version"));
         }
         let session = c.array()?;
@@ -137,22 +170,36 @@ impl PresenceReport {
             }
             proposals.push(PresenceProposal { header, epoch, view, parent, payload, votes });
         }
+        let mut nullifies = Vec::new();
+        if version == VERSION_NULLIFY {
+            let m = c.count(MAX_PRESENCE_VOTES, 8 + 4 + SIGNATURE_BYTES)?;
+            for _ in 0..m {
+                let view = c.u64()?;
+                let signer = c.u32()?;
+                let signature = c.take(SIGNATURE_BYTES)?.to_vec();
+                nullifies.push(NullifyVote { view, signer, signature });
+            }
+            // One encoding per report: version 3 only with a nullify.
+            if nullifies.is_empty() {
+                return Err(invalid("a nullify report carries no nullify"));
+            }
+        }
         c.finish()?;
-        let report = Self { session, filter, proposals };
+        let report = Self { session, filter, proposals, nullifies };
         report.validate()?;
         Ok(report)
     }
 
-    /// The votes the report carries over all its proposals.
+    /// The votes the report carries over all its proposals and nullifies.
     pub fn vote_count(&self) -> usize {
-        self.proposals.iter().map(|proposal| proposal.votes.len()).sum()
+        self.proposals.iter().map(|proposal| proposal.votes.len()).sum::<usize>() + self.nullifies.len()
     }
 
     fn validate(&self) -> Result<()> {
         if !(32..=MAX_FILTER_BYTES).contains(&self.filter.len()) {
             return Err(invalid("invalid full shard filter length"));
         }
-        if self.proposals.is_empty() || self.proposals.len() > MAX_PRESENCE_PROPOSALS {
+        if (self.proposals.is_empty() && self.nullifies.is_empty()) || self.proposals.len() > MAX_PRESENCE_PROPOSALS {
             return Err(invalid("proposal count out of range"));
         }
         if self.proposals.windows(2).any(|pair| pair[0].view >= pair[1].view) {
@@ -183,8 +230,122 @@ impl PresenceReport {
                 return Err(invalid("votes must be in ascending signer order"));
             }
         }
+        for vote in &self.nullifies {
+            if vote.signature.len() != SIGNATURE_BYTES {
+                return Err(invalid("vote signature has the wrong length"));
+            }
+            if vote.view == 0 {
+                return Err(invalid("nullify of view zero"));
+            }
+            if !signers.insert(vote.signer) {
+                return Err(invalid("duplicate signer"));
+            }
+        }
+        if self.nullifies.windows(2).any(|pair| pair[0].signer >= pair[1].signer) {
+            return Err(invalid("nullifies must be in ascending signer order"));
+        }
         Ok(())
     }
+}
+
+/// A GLOBAL operation of type [`TYPE_PRESENCE_REPORT`]: a presence report
+/// (version 1) or an excluded member's presence claim (version
+/// [`super::exclusion::CLAIM_VERSION`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PresenceOp {
+    Report(PresenceReport),
+    Claim(super::exclusion::PresenceClaim),
+}
+
+impl PresenceOp {
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.starts_with(&TYPE_PRESENCE_REPORT.to_be_bytes())
+            && bytes.get(4) == Some(&super::exclusion::CLAIM_VERSION)
+        {
+            return super::exclusion::PresenceClaim::from_canonical_bytes(bytes).map(Self::Claim);
+        }
+        PresenceReport::from_canonical_bytes(bytes).map(Self::Report)
+    }
+
+    /// Refuse the operation before its activation frame, as an older build
+    /// refuses it, before any state is read: a report before
+    /// [`presence_report_frame`], a claim before
+    /// [`super::presence_exclusion_frame`].
+    pub fn require_active(&self, frame: u64) -> Result<()> {
+        match self {
+            Self::Report(report) => {
+                require_active(frame)?;
+                require_nullifies_active(report, frame)
+            }
+            Self::Claim(_) => super::exclusion::require_claims_active(frame),
+        }
+    }
+}
+
+impl PresenceOp {
+    /// Whether the operation uses an encoding of the presence exclusion
+    /// frame: a claim, or a report carrying nullify votes.
+    pub fn extended(&self) -> bool {
+        match self {
+            Self::Report(report) => !report.nullifies.is_empty(),
+            Self::Claim(_) => true,
+        }
+    }
+}
+
+/// Whether `bytes` encode a [`PresenceOp`] admitted at GLOBAL frame
+/// `frame`: the frame whose body carries them, on every consensus path
+/// (decoding, body binding, processing, materialization, archive ingest).
+/// Before [`super::presence_exclusion_frame`] only version 1 reports are
+/// admitted, as a build without the exclusion frame admits them, so a
+/// GLOBAL frame below it carrying a claim or a nullify report is rejected
+/// by every build alike, whatever the decoding node has seen. With no frame
+/// (gossip, the mempool and the wire codec of a node's own submissions)
+/// they are admitted once the exclusion frame is scheduled; the mempool
+/// refuses them before the frame by its own check
+/// ([`PresenceOp::require_active`]).
+pub fn check_encoding(bytes: &[u8], frame: Option<u64>) -> Result<()> {
+    check_encoding_in(bytes, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+}
+
+/// Where presence encodings are judged ([`check_encoding_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodingGate {
+    /// The body of the GLOBAL frame with this number: claims and nullify
+    /// reports from [`super::presence_exclusion_frame`] on.
+    Global(u64),
+    /// Gossip, the mempool and a node's own submissions: claims and nullify
+    /// reports once the exclusion frame is scheduled.
+    Admission,
+    /// An application shard's frame or messages: never a claim or a nullify
+    /// report, which are GLOBAL operations. A version 1 report keeps the
+    /// treatment a build without them gives it, so application committees
+    /// and archives of every build judge an application frame alike.
+    App,
+}
+
+/// [`check_encoding`] under `gate`.
+pub fn check_encoding_in(bytes: &[u8], gate: EncodingGate) -> Result<()> {
+    let op = PresenceOp::from_canonical_bytes(bytes)?;
+    let activation = super::presence_exclusion_frame();
+    let admitted = match gate {
+        EncodingGate::Global(frame) => frame >= activation,
+        EncodingGate::Admission => activation != u64::MAX,
+        EncodingGate::App => false,
+    };
+    if op.extended() && !admitted {
+        return Err(invalid("encoding not accepted here: a GLOBAL operation of the presence exclusion frame"));
+    }
+    Ok(())
+}
+
+/// Refuse a report that carries nullify votes before
+/// [`super::presence_exclusion_frame`].
+pub fn require_nullifies_active(report: &PresenceReport, frame: u64) -> Result<()> {
+    if !report.nullifies.is_empty() && frame < super::presence_exclusion_frame() {
+        return Err(invalid("nullify votes are not accepted before the presence exclusion frame"));
+    }
+    Ok(())
 }
 
 /// Refuse every report before [`presence_report_frame`].
@@ -209,6 +370,7 @@ pub fn verify(
     anchor_output: impl Fn(u64) -> Result<Vec<u8>>,
 ) -> Result<()> {
     require_active(frame)?;
+    require_nullifies_active(report, frame)?;
     report.validate()?;
     let epoch = quil_types::consensus::epoch_for_frame(frame);
     for proposal in &report.proposals {
@@ -253,41 +415,73 @@ pub fn verify(
             return Err(invalid("header frame is not above the session base"));
         }
     }
+    // A nullify signs only its round and stays valid for the session's
+    // life: one must name a view above every view recorded in an earlier
+    // epoch, so an old one cannot protect its signer again.
+    if !report.nullifies.is_empty() {
+        let floor = nullify_floor(state, &session, epoch)?;
+        if report.nullifies.iter().any(|vote| vote.view <= floor) {
+            return Err(invalid("nullify view is not above the views recorded in earlier epochs"));
+        }
+    }
     // The votes that add a mark are verified first, each signature before
     // its proposal's output, which is checked once: a report whose new
     // marks are forged costs one signature check (about 12 µs), not an
     // output check (about 1.3 ms) or one check per vote it carries.
-    let recorded = recorded_present(state, frame, &session)?;
-    let mut order: Vec<(usize, usize)> = report
+    let (recorded, covered) = recorded_marks(state, frame, &session)?;
+    #[derive(Clone, Copy)]
+    enum Check {
+        Notarize(usize, usize),
+        Nullify(usize),
+    }
+    let mut order: Vec<(bool, Check)> = report
         .proposals
         .iter()
         .enumerate()
-        .flat_map(|(index, proposal)| (0..proposal.votes.len()).map(move |vote| (index, vote)))
+        .flat_map(|(index, proposal)| {
+            let recorded = &recorded;
+            proposal.votes.iter().enumerate().map(move |(vote, cast)| {
+                (marked(recorded, cast.signer), Check::Notarize(index, vote))
+            })
+        })
+        .chain(report.nullifies.iter().enumerate().map(|(index, cast)| {
+            (marked(&recorded, cast.signer) || marked(&covered, cast.signer), Check::Nullify(index))
+        }))
         .collect();
-    order.sort_by_key(|&(index, vote)| marked(&recorded, report.proposals[index].votes[vote].signer));
+    order.sort_by_key(|(old, _)| *old);
     let votes = SessionVotes::new(&session)?;
     let mut output_checked = vec![false; report.proposals.len()];
-    for (index, vote) in order {
-        let proposal = &report.proposals[index];
-        let vote = &proposal.votes[vote];
-        if !votes.verify_notarize(
-            proposal.epoch,
-            proposal.view,
-            proposal.parent,
-            proposal.payload,
-            vote.signer,
-            &vote.signature,
-        ) {
-            return Err(invalid("vote is not a session member's notarize of the proposal"));
-        }
-        if !output_checked[index] {
-            let output = anchor_output(proposal.header.global_frame_number)?;
-            crate::global_intrinsic::prover_shard_update::verify_app_frame_output(&proposal.header, &output)
-                .map_err(|_| invalid("header output does not match its fields and anchor"))?;
-            if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)? != proposal.payload {
-                return Err(invalid("payload is not the digest of the header output"));
+    for (_, check) in order {
+        match check {
+            Check::Notarize(index, vote) => {
+                let proposal = &report.proposals[index];
+                let vote = &proposal.votes[vote];
+                if !votes.verify_notarize(
+                    proposal.epoch,
+                    proposal.view,
+                    proposal.parent,
+                    proposal.payload,
+                    vote.signer,
+                    &vote.signature,
+                ) {
+                    return Err(invalid("vote is not a session member's notarize of the proposal"));
+                }
+                if !output_checked[index] {
+                    let output = anchor_output(proposal.header.global_frame_number)?;
+                    crate::global_intrinsic::prover_shard_update::verify_app_frame_output(&proposal.header, &output)
+                        .map_err(|_| invalid("header output does not match its fields and anchor"))?;
+                    if quil_crypto::poseidon::hash_bytes_to_32(&proposal.header.output)? != proposal.payload {
+                        return Err(invalid("payload is not the digest of the header output"));
+                    }
+                    output_checked[index] = true;
+                }
             }
-            output_checked[index] = true;
+            Check::Nullify(index) => {
+                let vote = &report.nullifies[index];
+                if !votes.verify_nullify(session.generation, vote.view, vote.signer, &vote.signature) {
+                    return Err(invalid("vote is not a session member's nullify of a round of the session"));
+                }
+            }
         }
     }
     Ok(())
@@ -298,13 +492,14 @@ fn marked(marks: &[bool], signer: u32) -> bool {
     marks.get(signer as usize).copied().unwrap_or(false)
 }
 
-/// The members of `session` recorded present in `frame`'s epoch, none
-/// before [`super::presence_credit_frame`].
-fn recorded_present(state: &impl Records, frame: u64, session: &Session) -> Result<Vec<bool>> {
+/// The members of `session` recorded present and protected in `frame`'s
+/// epoch, none before [`super::presence_credit_frame`].
+fn recorded_marks(state: &impl Records, frame: u64, session: &Session) -> Result<(Vec<bool>, Vec<bool>)> {
     if frame < super::presence_credit_frame() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    Ok(present(state, session, quil_types::consensus::epoch_for_frame(frame))?.unwrap_or_default())
+    let epoch = quil_types::consensus::epoch_for_frame(frame);
+    Ok((present(state, session, epoch)?.unwrap_or_default(), protected(state, session, epoch)?.unwrap_or_default()))
 }
 
 /// Notarize votes a proposal must carry for its voters to earn credit: one
@@ -319,6 +514,67 @@ fn recorded_present(state: &impl Records, frame: u64, session: &Session) -> Resu
 /// not credited.
 pub fn credited_votes(members: usize) -> usize {
     members.saturating_sub(members * 2 / 3 + 1) + 1
+}
+
+/// Kind of the handoff record of a filter's nullify view watermark.
+const NULLIFY_FLOOR: &[u8] = b"nullify-floor";
+
+/// The highest nullify views recorded for a filter's session: in `epoch`
+/// (`top`) and before it (`floor`). One record per filter, replaced when
+/// its head session changes.
+struct Watermark {
+    session: [u8; 32],
+    epoch: u64,
+    floor: u64,
+    top: u64,
+}
+
+fn read_watermark(state: &impl Records, filter: &[u8]) -> Result<Option<Watermark>> {
+    let mut key = Vec::new();
+    put_bytes(&mut key, filter)?;
+    let Some(bytes) = read(state, NULLIFY_FLOOR, &key)? else { return Ok(None) };
+    let corrupt = || QuilError::Store("corrupt nullify watermark".into());
+    let mut c = Cursor::new(&bytes).map_err(|_| corrupt())?;
+    if c.u8().map_err(|_| corrupt())? != RECORD_VERSION {
+        return Err(corrupt());
+    }
+    let session = c.array().map_err(|_| corrupt())?;
+    let epoch = c.u64().map_err(|_| corrupt())?;
+    let floor = c.u64().map_err(|_| corrupt())?;
+    let top = c.u64().map_err(|_| corrupt())?;
+    c.finish().map_err(|_| corrupt())?;
+    Ok(Some(Watermark { session, epoch, floor, top }))
+}
+
+/// The highest nullify view of `session` that GLOBAL recorded in an epoch
+/// before `epoch`, 0 if none: a nullify of `epoch` must name a later view.
+/// A session stuck at one view is therefore protected in the first epoch
+/// its nullifies are reported, and judged at the next boundary.
+pub fn nullify_floor(state: &impl Records, session: &Session, epoch: u64) -> Result<u64> {
+    let id = session.id()?;
+    Ok(match read_watermark(state, &session.filter)? {
+        Some(mark) if mark.session == id && mark.epoch < epoch => mark.floor.max(mark.top),
+        Some(mark) if mark.session == id => mark.floor,
+        _ => 0,
+    })
+}
+
+/// Record `view` as a nullify view of `session` recorded in `epoch`.
+fn note_nullify_view(state: &HypergraphState, frame: u64, session: &Session, epoch: u64, view: u64) -> Result<()> {
+    let id = session.id()?;
+    let floor = nullify_floor(state, session, epoch)?;
+    let top = match read_watermark(state, &session.filter)? {
+        Some(mark) if mark.session == id && mark.epoch == epoch => mark.top,
+        _ => 0,
+    };
+    let mut key = Vec::new();
+    put_bytes(&mut key, &session.filter)?;
+    let mut value = vec![RECORD_VERSION];
+    value.extend_from_slice(&id);
+    value.extend_from_slice(&epoch.to_be_bytes());
+    value.extend_from_slice(&floor.to_be_bytes());
+    value.extend_from_slice(&top.max(view).to_be_bytes());
+    write(state, frame, NULLIFY_FLOOR, &key, &value)
 }
 
 /// Kind of the handoff record of a filter's presence marks in an epoch.
@@ -451,17 +707,47 @@ pub fn present(state: &impl Records, session: &Session, epoch: u64) -> Result<Op
     marks(state, PRESENCE, session, epoch)
 }
 
-/// Whether `report`, included in GLOBAL frame `frame`, carries a vote of a
-/// member of `session` not yet recorded present in `frame`'s epoch
-/// ([`present`]). Always true before [`super::presence_credit_frame`],
+/// Kind of the handoff record of a filter's protection marks in an epoch:
+/// members whose nullify votes a report carried ([`protected`]).
+const PROTECTED: &[u8] = b"protected";
+
+/// The members of `session` whose nullify votes an accepted report included
+/// in a frame of `epoch` carried, by member index: they followed the
+/// session, and are not excluded for absence, but earn no credit. `None`
+/// while no such report was recorded. Kept for the current and the previous
+/// epoch only.
+pub fn protected(state: &impl Records, session: &Session, epoch: u64) -> Result<Option<Vec<bool>>> {
+    marks(state, PROTECTED, session, epoch)
+}
+
+/// Whether member `member` of `session` is recorded present or protected in
+/// `epoch`.
+pub fn recorded(state: &impl Records, session: &Session, epoch: u64, member: u32) -> Result<bool> {
+    Ok(marked(&present(state, session, epoch)?.unwrap_or_default(), member)
+        || marked(&protected(state, session, epoch)?.unwrap_or_default(), member))
+}
+
+/// Whether `report`, included in GLOBAL frame `frame`, adds a mark for
+/// `frame`'s epoch: a notarize of a member not yet recorded present
+/// ([`present`]), or a nullify of a member neither present nor protected
+/// ([`protected`]). Always true before [`super::presence_credit_frame`],
 /// when nothing is recorded. A signer index outside the session counts as
 /// new here; its signature check refuses it.
 pub fn marks_new_member(state: &impl Records, frame: u64, session: &Session, report: &PresenceReport) -> Result<bool> {
     if frame < super::presence_credit_frame() {
         return Ok(true);
     }
-    let recorded = recorded_present(state, frame, session)?;
-    Ok(report.proposals.iter().flat_map(|proposal| &proposal.votes).any(|vote| !marked(&recorded, vote.signer)))
+    let (recorded, covered) = recorded_marks(state, frame, session)?;
+    let notarized = report
+        .proposals
+        .iter()
+        .flat_map(|proposal| &proposal.votes)
+        .any(|vote| !marked(&recorded, vote.signer));
+    let nullified = report
+        .nullifies
+        .iter()
+        .any(|vote| !marked(&recorded, vote.signer) && !marked(&covered, vote.signer));
+    Ok(notarized || nullified)
 }
 
 /// What [`apply`] recorded for one report.
@@ -473,6 +759,8 @@ pub struct Applied {
     pub credited: usize,
     /// Members marked present in the epoch after the report.
     pub present: usize,
+    /// Members the report's nullifies marked protected that were not before.
+    pub protected: usize,
     /// The session's members.
     pub members: usize,
 }
@@ -481,7 +769,7 @@ pub struct Applied {
 /// [`super::presence_credit_frame`], record it. Before that frame an
 /// accepted report writes nothing.
 ///
-/// Every vote marks its signer present for the report's session and
+/// Every notarize marks its signer present for the report's session and
 /// `frame`'s epoch ([`present`]). Reports only add marks, so the record is
 /// the union of the epoch's reports, whatever their order. Each voter on a
 /// proposal enough members notarized that one is honest ([`credited_votes`])
@@ -491,9 +779,9 @@ pub struct Applied {
 /// than its vote. A verified notarize is fresh evidence: its payload digests
 /// a header whose output binds an anchor earlier in `frame`'s epoch. A
 /// member without an allocation on the filter is marked, not credited.
-/// Nullify votes, which can be signed ahead for every view, are never
-/// evidence: the codec cannot carry one, and one presented as a notarize
-/// fails its signature check.
+/// A nullify, which can be signed ahead for every view, is no evidence of
+/// work: it only marks its signer protected ([`protected`]), from
+/// [`super::presence_exclusion_frame`], and earns no credit.
 pub fn apply(
     state: &HypergraphState,
     frame: u64,
@@ -507,8 +795,8 @@ pub fn apply(
     super::atomic(state, || {
         let session = session(state, &report.session)?.ok_or_else(|| invalid("unknown session"))?;
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let mut marked = present(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
         let mut applied = Applied { members: session.members.len(), ..Applied::default() };
+        let mut marked = present(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
         for proposal in &report.proposals {
             let anchor = proposal.header.global_frame_number;
             // Credit only a proposal enough members notarized that one of
@@ -529,7 +817,25 @@ pub fn apply(
             }
         }
         applied.present = marked.iter().filter(|&&member| member).count();
-        set_marks(state, frame, PRESENCE, &session, epoch, &marked)?;
+        if !report.proposals.is_empty() {
+            set_marks(state, frame, PRESENCE, &session, epoch, &marked)?;
+        }
+        if !report.nullifies.is_empty() {
+            let mut covered = protected(state, &session, epoch)?.unwrap_or_else(|| vec![false; session.members.len()]);
+            for vote in &report.nullifies {
+                let index = vote.signer as usize;
+                if index >= covered.len() {
+                    return Err(invalid("vote signer is not a session member"));
+                }
+                if !covered[index] && !marked[index] {
+                    covered[index] = true;
+                    applied.protected += 1;
+                }
+            }
+            set_marks(state, frame, PROTECTED, &session, epoch, &covered)?;
+            let highest = report.nullifies.iter().map(|vote| vote.view).max().unwrap_or(0);
+            note_nullify_view(state, frame, &session, epoch, highest)?;
+        }
         tracing::info!(
             frame,
             epoch,
@@ -538,6 +844,7 @@ pub fn apply(
             session = hex::encode(report.session),
             marked = applied.marked,
             present = applied.present,
+            protected = applied.protected,
             members = applied.members,
             credited = applied.credited,
             "committee presence: report recorded session members present for the epoch",

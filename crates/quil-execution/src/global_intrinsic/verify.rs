@@ -500,6 +500,11 @@ where
 /// `lookup_tombstone` is invoked for each target's spent address. The
 /// caller threads state through it. Returning `Ok(Some(_))` means
 /// "marker exists"; `Ok(None)` means "fresh, may merge".
+///
+/// This is the rule before the seniority succession epoch. From that epoch
+/// `seniority_succession::plan_seniority_merge` replaces it: a marker naming
+/// the submitter no longer refuses the merge, because the merge must then
+/// raise the submitter's seniority, which a replay cannot.
 pub fn verify_prover_seniority_merge_spent_markers<F>(
     op: &super::prover_ops::ProverSeniorityMerge,
     mut lookup_tombstone: F,
@@ -924,7 +929,7 @@ pub fn verify_prover_reject(
 // bypass (forged shard rebalancing, forged seniority merges).
 
 /// Compute `poseidon(GLOBAL_INTRINSIC_ADDRESS || tag)`.
-fn intrinsic_domain(tag: &[u8]) -> Result<[u8; 32]> {
+pub(crate) fn intrinsic_domain(tag: &[u8]) -> Result<[u8; 32]> {
     let mut preimage = Vec::with_capacity(32 + tag.len());
     preimage.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
     preimage.extend_from_slice(tag);
@@ -1152,15 +1157,68 @@ pub fn verify_shard_merge(
 /// domain `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_SENIORITY_MERGE")`
 /// - address-binding: `poseidon(pubKeyBytes) == sig.address`
 ///
-/// NOT checked here (requires hypergraph state the dispatcher doesn't
-/// have): spent-merge tombstones, `mergeSeniority > existingSeniority`
-/// via the compat table. Those run in the materialize path.
+/// NOT checked here (requires hypergraph state): the spent markers and
+/// Go's `mergeSeniority > existingSeniority`. Before the seniority
+/// succession epoch the validation path checks the markers
+/// ([`verify_prover_seniority_merge_spent_markers`]) and nothing checks
+/// the increase; from it on, validation and materialization both run
+/// `seniority_succession::plan_seniority_merge`, which checks both.
 pub fn verify_prover_seniority_merge(
     op: &super::prover_ops::ProverSeniorityMerge,
     prover_tree: &quil_tries::VectorCommitmentTree,
     current_frame_number: u64,
     key_manager: &dyn KeyManager,
 ) -> Result<bool> {
+    verify_prover_seniority_merge_with(
+        op,
+        prover_tree,
+        current_frame_number,
+        key_manager,
+        SeniorityMergeConsent::Merge,
+    )
+}
+
+/// What each merge target of a `ProverSeniorityMerge` consents to with its
+/// Ed448 signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeniorityMergeConsent<'a> {
+    /// The target's retro seniority credits the prover: the target signs the
+    /// prover's public key under `"PROVER_SENIORITY_MERGE"`.
+    Merge,
+    /// What the target brought the prover at `predecessor`, which its spent
+    /// markers name, moves to the prover: the target signs
+    /// `prover_public_key || predecessor || frame_be` under
+    /// `"PROVER_SENIORITY_SUCCESSION"`.
+    Succession { predecessor: &'a [u8; 32] },
+}
+
+/// [`verify_prover_seniority_merge`] with the targets' consent named: the
+/// same checks, with each target's signature verified against `consent`.
+pub fn verify_prover_seniority_merge_with(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame_number: u64,
+    key_manager: &dyn KeyManager,
+    consent: SeniorityMergeConsent<'_>,
+) -> Result<bool> {
+    let Some(pubkey) = seniority_merge_signer(op, prover_tree, current_frame_number)? else {
+        return Ok(false);
+    };
+    if !verify_seniority_merge_consents(op, &pubkey, key_manager, consent)? {
+        return Ok(false);
+    }
+    verify_seniority_merge_prover_signature(op, &pubkey, key_manager)
+}
+
+/// The structural checks of [`verify_prover_seniority_merge_with`]: targets
+/// present, the addressed signature well formed and fresh, and the prover
+/// tree's public key bound to its address. The prover's public key, or
+/// `None` when the address does not match it.
+pub fn seniority_merge_signer(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame_number: u64,
+) -> Result<Option<Vec<u8>>> {
     if op.merge_targets.is_empty() {
         return Err(QuilError::InvalidArgument(
             "prover seniority merge: no merge targets".into(),
@@ -1175,7 +1233,7 @@ pub fn verify_prover_seniority_merge(
         ));
     }
     // Freshness: 10-frame window matching Go's `p.FrameNumber+10 < frameNumber`.
-    if op.frame_number + 10 < current_frame_number {
+    if op.frame_number.saturating_add(10) < current_frame_number {
         return Err(QuilError::InvalidArgument(
             "prover seniority merge: outdated request".into(),
         ));
@@ -1196,12 +1254,30 @@ pub fn verify_prover_seniority_merge(
     })?;
     let addr = prover_address_from_pubkey(&pubkey)?;
     if addr.as_slice() != sig.address.as_slice() {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(Some(pubkey))
+}
 
+/// Each merge target's Ed448 consent for `consent`, signed over the
+/// prover's public key `pubkey`.
+pub fn verify_seniority_merge_consents(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    pubkey: &[u8],
+    key_manager: &dyn KeyManager,
+    consent: SeniorityMergeConsent<'_>,
+) -> Result<bool> {
     // Each merge target signs `pubkey` with its own key under the
-    // literal ASCII domain — mirrors Go's :462-468.
+    // literal ASCII domain — mirrors Go's :462-468. A succession target
+    // also names the predecessor and the op's frame.
     const MERGE_TARGET_DOMAIN: &[u8] = b"PROVER_SENIORITY_MERGE";
+    let (consent_message, consent_domain) = match consent {
+        SeniorityMergeConsent::Merge => (pubkey.to_vec(), MERGE_TARGET_DOMAIN),
+        SeniorityMergeConsent::Succession { predecessor } => (
+            super::seniority_succession::succession_consent_message(pubkey, predecessor, op.frame_number),
+            super::seniority_succession::SUCCESSION_DOMAIN,
+        ),
+    };
     for mt in &op.merge_targets {
         // Ed448-only: seniority is Ed448-peer-key-bound (see the join-verify note).
         let key_type = match mt.key_type {
@@ -1215,17 +1291,27 @@ pub fn verify_prover_seniority_merge(
         let ok = key_manager.validate_signature(
             key_type,
             &mt.prover_public_key,
-            &pubkey,
+            &consent_message,
             &mt.signature,
-            MERGE_TARGET_DOMAIN,
+            consent_domain,
         )?;
         if !ok {
             return Ok(false);
         }
     }
+    Ok(true)
+}
 
-    // Main Falcon sig over `frame_be || concat(helper_pubkeys)` under
-    // the poseidon-wrapped domain.
+/// The prover's Falcon signature over `frame_be || concat(target keys)`
+/// under the poseidon-wrapped domain.
+pub fn verify_seniority_merge_prover_signature(
+    op: &super::prover_ops::ProverSeniorityMerge,
+    pubkey: &[u8],
+    key_manager: &dyn KeyManager,
+) -> Result<bool> {
+    let Some(sig) = op.public_key_signature_bls48581.as_ref() else {
+        return Ok(false);
+    };
     let mut message = Vec::with_capacity(8);
     message.extend_from_slice(&op.frame_number.to_be_bytes());
     for mt in &op.merge_targets {
@@ -1234,7 +1320,7 @@ pub fn verify_prover_seniority_merge(
     let domain = intrinsic_domain(b"PROVER_SENIORITY_MERGE")?;
     key_manager.validate_signature(
         KeyType::Falcon512,
-        &pubkey,
+        pubkey,
         &message,
         &sig.signature,
         &domain,

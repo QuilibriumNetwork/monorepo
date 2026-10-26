@@ -1111,9 +1111,17 @@ impl ArchiveAppShardIngest {
             // `rebuilt`: rebuilt from its header, and whether whole.
             let (frame, rebuilt) = match self.buffered.get(address).and_then(|m| m.get(&next)) {
                 Some(f) => (f.clone(), None),
-                None => match self.empty_frame_from_header(address, next, vouched) {
-                    Some((frame, whole)) => (frame, Some(whole)),
-                    None => break false, // gap — wait for the missing frame (or sync)
+                None => match self.committed_held(address, next) {
+                    Some(frame) => {
+                        self.store_for_serving(&frame);
+                        info!(address = %hex::encode(address), frame = next,
+                            "archive sequences the frame GLOBAL committed without a certificate of its own (a sealed session's last frame)");
+                        (frame, None)
+                    }
+                    None => match self.empty_frame_from_header(address, next, vouched) {
+                        Some((frame, whole)) => (frame, Some(whole)),
+                        None => break false, // gap — wait for the missing frame (or sync)
+                    },
                 },
             };
             let fee_multiplier_vote = frame
@@ -1321,6 +1329,22 @@ impl ArchiveAppShardIngest {
             self.execution_deferrals.executed(executed);
         }
         sent
+    }
+
+    /// The frame held without a certificate at `number` of `address` under
+    /// the digest GLOBAL committed there: a sealed session's last frame,
+    /// final through the seal. Its successor's first frame names the
+    /// session's genesis, not this frame, so no certified frame ever links to
+    /// it, and the GLOBAL frame sequencing the successor waited on it forever
+    /// (…091f80, frame 4693, GLOBAL frame 935144, 2026-10-25). Committed state
+    /// is the same on every archive, so every archive takes the same frame.
+    fn committed_held(&self, address: &[u8], number: u64) -> Option<AppShardFrame> {
+        let held = self.held.get(address)?;
+        held.range((number, [0; 32])..=(number, [0xff; 32])).next()?;
+        let digest = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, address, number)
+            .ok()
+            .flatten()?;
+        held.get(&(number, digest)).cloned()
     }
 
     /// Whether a frame `number` of `address` is held without a certificate.
@@ -1541,7 +1565,9 @@ impl ArchiveFrameVerifier {
         let canonical: Vec<Vec<u8>> = frame
             .requests
             .iter()
-            .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+            // As the application committee judges it: an application frame
+            // never carries a claim or a nullify report.
+            .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
             .collect();
         if canonical.len() != frame.requests.len() {
             warn!(
@@ -1946,6 +1972,37 @@ mod tests {
         ingest.admit(&filter, frames[2].clone(), false);
         ingest.retry_pending();
         assert!(clock.get_shard_clock_frame(&filter, 3, false).is_err());
+    }
+
+    /// A sealed session's last frame stays held: its successor's first frame
+    /// names the session's genesis, so no certified frame links to it. GLOBAL's
+    /// sequencing takes it under the digest the seal committed and serves it,
+    /// so the GLOBAL frame sequencing the successor does not wait on it forever
+    /// (…091f80, frame 4693, GLOBAL frame 935144, 2026-10-25); an impostor at
+    /// that height never is taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequencing_takes_the_sealed_last_frame_global_committed() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let mut frames = chain(&filter, 4);
+        frames[3].header.as_mut().unwrap().parent_selector = vec![0x5e; 32];
+        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone())).sequenced();
+        ingest.admit(&filter, frames[0].clone(), true);
+        ingest.admit(&filter, frames[1].clone(), true);
+        let mut impostor = frames[2].clone();
+        impostor.header.as_mut().unwrap().output = vec![0xee; 32];
+        ingest.admit(&filter, impostor, false);
+        ingest.admit(&filter, frames[3].clone(), true);
+        assert!(!ingest.materialize_through(&filter, 4).unwrap(), "an impostor is never sequenced");
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
+        ingest.admit(&filter, frames[2].clone(), false);
+        assert!(ingest.is_held(&filter, 3), "no certified frame links to it");
+        assert!(ingest.materialize_through(&filter, 4).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 4);
+        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        assert!(!ingest.is_held(&filter, 3));
     }
 
     /// An archive that lost a sealed session's last frame (it restarted after
