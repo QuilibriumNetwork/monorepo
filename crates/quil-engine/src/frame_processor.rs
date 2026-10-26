@@ -49,6 +49,7 @@ pub fn process_global_frame_with_rewards(
     prover_registry: Option<&dyn ProverRegistry>,
 ) -> Result<(usize, usize)> {
     let frame_number = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+    execution_manager.prepare_exact_state_sizes(frame_number)?;
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -230,6 +231,7 @@ pub fn process_global_frame_with_fees(
     let header = frame.header.as_ref();
     let frame_number = header.map(|h| h.frame_number).unwrap_or(0);
     let difficulty = header.map(|h| h.difficulty).unwrap_or(0) as u64;
+    execution_manager.prepare_exact_state_sizes(frame_number)?;
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -438,6 +440,33 @@ mod tests {
             process_global_frame(&mgr(), &empty_frame(1), &BigInt::from(1)).unwrap();
         assert_eq!(applied, 0);
         assert_eq!(skipped, 0);
+    }
+
+    /// An overwritten vertex counts once: the size a node keeps
+    /// incrementally must equal the size a restarted or freshly synced node
+    /// rebuilds from committed state, or their world sizes and reward bases
+    /// differ. Runs at GLOBAL frame 943,920, the first frame of epoch 1311,
+    /// from which mainnet counts sizes exactly.
+    #[test]
+    fn reproduces_overwrite_size_drift() {
+        let manager = mgr();
+        let crdt = manager.crdt();
+        let app = [0x42; 32];
+        let vertex = quil_hypergraph::Location {
+            app_address: app,
+            data_address: [0x07; 32],
+        };
+        process_global_frame(&manager, &empty_frame(943_920), &BigInt::from(1)).unwrap();
+        crdt.add_vertex(&vertex, b"original").unwrap();
+        crdt.add_vertex(&vertex, b"replaced").unwrap();
+        crdt.commit(943_920).unwrap();
+        let incremental = crdt.total_size();
+        crdt.rebucket_app(&app).unwrap();
+        let rebuilt = crdt.total_size();
+        assert_eq!(
+            incremental, rebuilt,
+            "incremental size {incremental} != rebuilt size {rebuilt} after overwriting one 8-byte vertex"
+        );
     }
 
     #[test]

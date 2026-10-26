@@ -13,6 +13,7 @@ struct Metadata {
     sizes: HashMap<Vec<u8>, (u64, i128)>,
     covered: Vec<i32>,
     unified: bool,
+    exact: bool,
 }
 
 /// Constructed under a retained execution capture. All fallible locks and
@@ -91,6 +92,7 @@ impl ExecutionCapture<'_> {
         let state = Metadata {
             forest_version: state.forest_version.load(Ordering::Acquire),
             unified: state.unified_tree.load(Ordering::Acquire),
+            exact: state.exact_sizes.load(Ordering::Acquire),
             roots: take(state.prover_root_by_frame)?,
             world_sizes: take(state.world_size_by_frame)?,
             phase_versions: take(state.phase_versions)?,
@@ -169,6 +171,9 @@ impl PreparedCrdtAdoption<'_> {
         self.source
             .unified_tree
             .store(state.unified, Ordering::Release);
+        self.source
+            .exact_sizes
+            .store(state.exact, Ordering::Release);
         self.source.sizes_warmed.store(true, Ordering::Release);
     }
 }
