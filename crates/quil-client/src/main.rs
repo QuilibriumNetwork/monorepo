@@ -92,7 +92,12 @@ enum Commands {
     /// Compute operations.
     Compute(commands::compute::ComputeArgs),
     /// Download and install the latest (or a specific) qclient release.
-    Update { version: Option<String> },
+    Update {
+        version: Option<String>,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Download the release signature files for the qclient binary.
     DownloadSignatures {
         #[arg(long)]
@@ -148,9 +153,13 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Message(args) => runtime()?.block_on(commands::message::run(global, args)),
         Commands::Deploy { command } => runtime()?.block_on(commands::deploy::run(global, command)),
         Commands::Compute(args) => runtime()?.block_on(commands::compute::run(global, args)),
-        Commands::Update { version } => {
-            runtime()?.block_on(commands::release_cmds::update(version.as_deref()))
-        }
+        Commands::Update {
+            version,
+            allow_downgrade,
+        } => runtime()?.block_on(commands::release_cmds::update(
+            version.as_deref(),
+            *allow_downgrade,
+        )),
         Commands::DownloadSignatures { version } => runtime()?.block_on(
             commands::release_cmds::download_signatures(version.as_deref()),
         ),
