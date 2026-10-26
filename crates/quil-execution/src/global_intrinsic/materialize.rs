@@ -35,8 +35,10 @@ pub const STATUS_HISTORIC: u8 = 6;
 /// re-join overwrites it). So we simply stop those bars from honoring a kick
 /// recorded BEFORE this frame, once the chain reaches it: the victim re-joins
 /// with their own key → fresh Active vertex → Status recovers via the normal
-/// lifecycle, and a seniority re-merge (allowed when Seniority==0, see
-/// [`crate::global_intrinsic::verify`]) restores the value `0 + X = X`.
+/// lifecycle, and before the seniority succession epoch the re-join credits
+/// again the retro seniority of merge targets whose join markers name it
+/// (`max(0, X) = X`). From that epoch keys already counting for a prover add
+/// nothing to it ([`crate::global_intrinsic::seniority_succession`]).
 ///
 /// Gating on BOTH `kick_frame_number < FRAME` and `current_frame >= FRAME`
 /// makes the switch deterministic across nodes at exactly this frame (a node

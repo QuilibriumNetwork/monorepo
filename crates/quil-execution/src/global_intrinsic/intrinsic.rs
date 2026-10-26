@@ -704,13 +704,25 @@ impl GlobalIntrinsic {
                 }
                 Ok(true)
             }
-            TYPE_SENIORITY_MERGE => {
-                // This is the *outer* `ProverSeniorityMerge` (0x031A),
-                // not the inner `SeniorityMerge` target record (0x0310).
+            TYPE_SENIORITY_MERGE | super::prover_ops::TYPE_PROVER_SENIORITY_MERGE => {
+                // The op is the *outer* `ProverSeniorityMerge` (0x031A),
+                // not the inner `SeniorityMerge` target record (0x0310),
+                // whose prefix this arm long matched alone; engines route
+                // 0x031A here from the seniority succession epoch
+                // (`is_global_type_prefix_at`).
                 let op = super::prover_ops::ProverSeniorityMerge::from_canonical_bytes(input)?;
                 let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
                     "ProverSeniorityMerge: prover tree unavailable — cannot verify signature".into(),
                 ))?;
+                // From the seniority succession epoch the committed markers
+                // select the op's mode, and validation decides exactly as
+                // materialization does (`invoke_seniority_merge`).
+                if quil_types::consensus::seniority_succession_active(frame_number) {
+                    let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
+                        "seniority merge validation requires authenticated global state".into()))?;
+                    self.validate_seniority_merge(frame_number, &op, &HypergraphState::new(crdt.clone()))?;
+                    return Ok(true);
+                }
                 let sigs_ok = verify::verify_prover_seniority_merge(
                     &op, pt, frame_number, self.key_manager.as_ref(),
                 )?;
@@ -1281,7 +1293,7 @@ impl GlobalIntrinsic {
                 let op = super::prover_ops::ProverUpdate::from_canonical_bytes(input)?;
                 self.invoke_update(frame_number, &op, state, &va_disc)
             }
-            TYPE_SENIORITY_MERGE => {
+            TYPE_SENIORITY_MERGE | super::prover_ops::TYPE_PROVER_SENIORITY_MERGE => {
                 let op = super::prover_ops::ProverSeniorityMerge::from_canonical_bytes(input)?;
                 self.invoke_seniority_merge(frame_number, &op, state, &va_disc)
             }
@@ -1719,7 +1731,33 @@ impl GlobalIntrinsic {
         // The fallback when there are no merge targets (or no
         // matching peer ids) is `0` — Go does **not** fall back to
         // `op.frame_number` for new provers, it just stores zero.
-        let computed_seniority: u64 = {
+        // From the seniority succession epoch a join credits as a merge does
+        // (`seniority_succession::credit_retro`): its unconsumed keys add
+        // only the retro parts they raise in the prover's `RetroCredited`,
+        // keys already counting for the joiner add nothing, and keys counting
+        // for another prover or fitting nothing are skipped. A key counts for
+        // one prover once, even when it was merged before.
+        let succession_rules = quil_types::consensus::seniority_succession_active(frame_number);
+        let join_credit: Option<(u64, super::seniority_succession::RetroParts)> = if succession_rules {
+            use super::seniority_succession::{credit_retro, retro_parts, ProverRetro, TargetMarkers, TargetStanding};
+            let (mut added, mut own) = (Vec::new(), Vec::new());
+            for mt in op.merge_targets.iter().filter(|mt| mt.key_type == 0) {
+                match TargetMarkers::read(state, &mt.prover_public_key)?.standing(&prover_address) {
+                    TargetStanding::Fresh => added.push(mt.prover_public_key.clone()),
+                    TargetStanding::Own => own.push(mt.prover_public_key.clone()),
+                    TargetStanding::Other(_) | TargetStanding::Unusable(_) => {}
+                }
+            }
+            let ledger = state
+                .get(domain, &prover_address, va_disc)?
+                .filter(|blob| !blob.is_empty())
+                .map(|blob| ProverRetro::of(&crate::prover_registry::rebuild_vertex_tree_from_blob(&blob)))
+                .unwrap_or_default();
+            Some(credit_retro(ledger.held, ledger.moved, &added, &own, &retro_parts))
+        } else {
+            None
+        };
+        let computed_seniority: u64 = if succession_rules { 0 } else {
             let mut peer_ids: Vec<String> = Vec::new();
             for mt in &op.merge_targets {
                 // Spent-marker dedup: skip if another prover claimed it.
@@ -1765,14 +1803,37 @@ impl GlobalIntrinsic {
                     } else { None }
                 })
                 .unwrap_or(0);
-            std::cmp::max(existing, computed_seniority)
+            match &join_credit {
+                Some((credit, _)) => existing.saturating_add(*credit),
+                None => std::cmp::max(existing, computed_seniority),
+            }
         } else {
-            computed_seniority
+            join_credit.as_ref().map_or(computed_seniority, |(credit, _)| *credit)
         };
 
-        let output = materialize::materialize_prover_join(
+        let mut output = materialize::materialize_prover_join(
             &pubkey, &op.filters, frame_number, initial_seniority,
         )?;
+        // A rejoin rewrites the prover vertex. From the seniority succession
+        // epoch it keeps `LastSeniorityFrameNumber`, the accrual's
+        // once-per-frame key: a prover active on another shard may accrue
+        // in this frame before and after its rejoin. (A kick that still bars
+        // the prover refused the join above; a forgiven one stays forgiven.
+        // An amnestied prover rejoining from that epoch no longer regains its
+        // own keys' retro: keys already counting for a prover add nothing.)
+        if prover_already_exists && quil_types::consensus::seniority_succession_active(frame_number) {
+            let existing_blob = state.get(domain, &prover_address, va_disc)?.unwrap_or_default();
+            let existing_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_blob);
+            // So does its retro moved out by successions.
+            for field in ["LastSeniorityFrameNumber", "RetroMoved"] {
+                if let Some(value) = read_field(&existing_tree, "prover:Prover", field) {
+                    write_field(&mut output.prover_tree, "prover:Prover", field, &value)?;
+                }
+            }
+        }
+        if let Some((_, parts)) = &join_credit {
+            super::seniority_succession::set_credited_retro(&mut output.prover_tree, parts)?;
+        }
 
         // Write prover vertex
         let prover_blob = crate::prover_registry::vertex_tree_to_blob(&output.prover_tree);
@@ -1810,6 +1871,13 @@ impl GlobalIntrinsic {
         // the consuming prover's address at `merge:SpentMerge.ProverAddress`
         // so a later join cannot re-claim the same target.
         for mt in &op.merge_targets {
+            // From the seniority succession epoch a join stamps only the keys
+            // no join or merge consumed: those it credited.
+            if succession_rules
+                && !super::seniority_succession::TargetMarkers::read(state, &mt.prover_public_key)?.is_empty()
+            {
+                continue;
+            }
             let spent_addr = materialize::spent_join_merge_address(&mt.prover_public_key)?;
             // If a *new-format* marker already exists for someone else,
             // skip. Legacy/empty markers can be overwritten.
@@ -2003,6 +2071,28 @@ impl GlobalIntrinsic {
         super::prover_update_materialize::materialize_prover_update(op, frame_number, state)
     }
 
+    /// Validate a `ProverSeniorityMerge` from the seniority succession epoch
+    /// over committed `state`: the decision `invoke_seniority_merge` makes,
+    /// without writing it. `Err` names why the op is refused.
+    pub fn validate_seniority_merge(
+        &self,
+        frame_number: u64,
+        op: &super::prover_ops::ProverSeniorityMerge,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        super::seniority_succession::plan_seniority_merge(
+            op,
+            frame_number,
+            state,
+            self.key_manager.as_ref(),
+            &super::seniority_succession::retro_parts,
+        )?
+        .map(drop)
+        .ok_or_else(|| QuilError::InvalidArgument(
+            "prover seniority merge: seniority succession is not active".into(),
+        ))
+    }
+
     /// SeniorityMerge invoke_step: merge seniority from old peer keys
     /// into the prover's Seniority field and write spent-merge markers.
     ///
@@ -2021,6 +2111,18 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
+        // From the seniority succession epoch: the same decision validation
+        // makes, over the frame's staged state.
+        if let Some(plan) = super::seniority_succession::plan_seniority_merge(
+            op,
+            frame_number,
+            state,
+            self.key_manager.as_ref(),
+            &super::seniority_succession::retro_parts,
+        )? {
+            return plan.apply(state, frame_number);
+        }
+
         if op.merge_targets.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_step seniority_merge: no merge targets".into(),
@@ -4807,7 +4909,7 @@ impl GlobalIntrinsic {
 /// 2. SHA2-256 hash (key > 42 bytes, so not inlined)
 /// 3. Multihash-wrap: `[0x12, 0x20, <32-byte SHA256>]`
 /// 4. Base58-encode the 34-byte multihash
-fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
+pub(crate) fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
     // Step 1: protobuf encode
     let mut proto = Vec::with_capacity(4 + pubkey.len());
     proto.push(0x08); // field 1 tag (varint)
