@@ -660,15 +660,23 @@ impl P2PNode {
                                 tracing::info!(
                                     interval_secs = summary_secs.as_secs(),
                                     served = stats.served,
+                                    served_requesters = stats.served_clients.len(),
                                     failed = stats.failed,
+                                    failed_requesters = stats.failed_clients.len(),
+                                    failed_by_address = %stats.failed_by_address(),
+                                    failed_by_error = %stats.failed_by_error(),
+                                    most_failed = %stats.top_failed_clients(3),
                                     refused = stats.refused.values().sum::<u32>(),
                                     refused_by_reason = %stats.refused_by_reason(),
                                     request_failures = stats.request_failures,
                                     "AutoNAT dial-back requests of other nodes this node handled: served \
-                                     reached the requester, failed reached none of its addresses, refused \
-                                     were declined by this node (denied: this node's connection limits, \
-                                     usually two connections already held to the requester; throttled: \
-                                     rate limits); background work for the network, no action needed"
+                                     reached the requester, failed reached none of its addresses (by the \
+                                     first address tried: tcp/quic and default 8336, worker, ephemeral or \
+                                     other port; by error: refused, timeout, reset, no_route, wrong_peer), \
+                                     refused were declined by this node (denied: this node's connection \
+                                     limits, usually two connections already held to the requester; \
+                                     throttled: rate limits); background work for the network, no action \
+                                     needed"
                                 );
                             }
                         }

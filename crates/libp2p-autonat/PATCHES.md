@@ -12,7 +12,7 @@ The package is a workspace member, so its unit tests run with the workspace test
 
 `src/v1/behaviour/as_server.rs` (`dial_back_failure`, `start_dial_back`, `take_failed_dial_back`): upstream answered `DialError` to the client whenever any dial to it failed while its request was pending, including another behaviour's dial and a dial-back this server refused itself. The connection limits deny a connection to a peer that already holds the maximum (two on Quilibrium nodes), which is common between nodes that dial each other, so reachable clients saw most probes fail and AutoNAT held them private. The server now records each request under its dial-back's connection id, ignores failures of other dials, answers `DialRefused` (no change of the client's status) when it denied, aborted or skipped its own dial-back or has no transport for any of the addresses, and `DialError` only when the dial-back reached none of the addresses or another peer. The ongoing requests are a struct instead of a tuple, so the helpers can be tested without a response channel.
 
-`ServerStats` and `Behaviour::take_server_stats` count what the server did (served, failed, refused by reason, failed exchanges) for an hourly operator line of the node.
+`ServerStats` and `Behaviour::take_server_stats` count what the server did (served, failed, refused by reason, failed exchanges) for an hourly operator line of the node, with the distinct clients served and failed, the failures by the class of the first address tried (transport and default, worker, ephemeral or other port) and by why the dial-back failed (refused, timeout, reset, no route, wrong peer), and the clients that failed most.
 
 ## Short dial-back address list
 
