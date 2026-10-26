@@ -539,9 +539,10 @@ pub fn set_kick_signed_slot_epoch_for_thread(epoch: Option<u64>) {
 /// wrote into it, and credits a header of an authorized session only once:
 /// one at or below the session's executed tip earns no issuance, fees or
 /// activity. Consensus-affecting: every node that executes GLOBAL frames
-/// must run a build carrying the epoch before it. `None` on mainnet until it
-/// is decided; `QUIL_ANCHORED_ISSUANCE_EPOCH` elsewhere, never by default.
-pub const MAINNET_ANCHORED_ISSUANCE_EPOCH: Option<u64> = None;
+/// must run a build carrying the epoch before it: on mainnet epoch 1311
+/// (frame 943,920), so every archive switches at the same frame;
+/// `QUIL_ANCHORED_ISSUANCE_EPOCH` elsewhere, never by default.
+pub const MAINNET_ANCHORED_ISSUANCE_EPOCH: Option<u64> = Some(1311);
 
 static ANCHORED_ISSUANCE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -2556,7 +2557,7 @@ mod seniority_succession_epoch_tests {
         assert_eq!(super::anchored_issuance_epoch_for(1, Some("4")), 4);
         assert_eq!(super::anchored_issuance_epoch_for(1, Some("x")), u64::MAX);
         assert_eq!(super::anchored_issuance_epoch_for(1, None), u64::MAX);
-        assert_eq!(super::MAINNET_ANCHORED_ISSUANCE_EPOCH, None);
+        assert_eq!(super::MAINNET_ANCHORED_ISSUANCE_EPOCH, Some(1311));
     }
 
     #[test]
