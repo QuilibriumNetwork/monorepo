@@ -2652,11 +2652,6 @@ impl GlobalIntrinsic {
         if openings.is_empty() {
             return Ok(());
         }
-        // Possession verify is γ-independent at k=1, so the bitmask is a
-        // don't-care for the per-opening audit (it bound the aggregate root,
-        // already committee-signed). Accept it to document the contract.
-        let _ = bitmask;
-
         let clock_store = self.clock_store.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: clock_store not installed — cannot recompute ρ_N for audit"
@@ -2671,6 +2666,54 @@ impl GlobalIntrinsic {
         let rho_n =
             quil_crypto::porep::derive_storage_beacon(op.global_frame_number, &global_output);
         let active_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+
+        // The attestation body travels beside the header; only its root is
+        // certified (bound into the frame output). Audit the openings only
+        // when they aggregate to that root: a body that does not was
+        // substituted in relay, names members the committee never attested,
+        // and must get no one kicked. The producer folds an empty bitmask
+        // into the root (a CW header carries no signer aggregate); a root
+        // over the certificate's bitmask is accepted as well.
+        let root_of = |bitmask: &[u8]| {
+            quil_crypto::porep::compute_storage_attestation_root(
+                &openings,
+                op.frame_number,
+                &rho_n,
+                bitmask,
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            )
+        };
+        if op.storage_attestation_root.is_empty()
+            || (root_of(&[]) != op.storage_attestation_root
+                && root_of(bitmask) != op.storage_attestation_root)
+        {
+            tracing::warn!(
+                frame = frame_number,
+                shard = %hex::encode(&op.address),
+                shard_frame = op.frame_number,
+                openings = openings.len(),
+                "storage attestation does not match the frame's certified root: not audited, \
+                 no member kicked (the body was substituted in relay, or the frame certifies none)"
+            );
+            return Ok(());
+        }
+        // The root is `Σ_k γ^k · π_k`, with `γ` hashed over the whole body,
+        // so it binds every opening of a body of two or more. Over a single
+        // opening it is that opening's proof point (`γ^0 = 1`) and binds none
+        // of the opening's other fields, its member included: such a body
+        // gets no one kicked. A producer attaches `STORAGE_QUERIES_PER_LEAF`
+        // openings for each leaf it attests, so no attested body holds one.
+        const _: () = assert!(quil_types::consensus::STORAGE_QUERIES_PER_LEAF >= 2);
+        if openings.len() < 2 {
+            tracing::warn!(
+                frame = frame_number,
+                shard = %hex::encode(&op.address),
+                shard_frame = op.frame_number,
+                "storage attestation holds a single opening, which the frame's certified root \
+                 does not bind: not audited, no member kicked (a producer attaches at least two)"
+            );
+            return Ok(());
+        }
 
         // Registry cross-check: read the on-chain leaf-root registration vertex
         // `(member, leaf_id)` from committed state.
@@ -7205,22 +7248,87 @@ mod tests {
                 path_proofs: vec![],
                 commitment: vec![0u8; 74],
                 value: vec![0u8; 32],
-                proof: vec![0u8; 74],
+                // A valid G1 point per member, so the openings aggregate to a
+                // root the header can certify.
+                proof: <quil_crypto::KzgInclusionProver as quil_types::crypto::InclusionProver>::commit_raw(
+                    &quil_crypto::KzgInclusionProver,
+                    &[member[0] | 1; 64],
+                    16,
+                )
+                .unwrap(),
             }
         }
 
+        /// A header carrying `att` and certifying its root, as its producer
+        /// computes it (empty bitmask, ρ_N of an anchor this test's clock
+        /// store does not hold).
         fn frame_header_with_attestation(
             filter: &[u8],
             global_frame_number: u64,
             att: &quil_types::proto::global::StorageAttestation,
         ) -> crate::global_intrinsic::frame_header::FrameHeader {
+            let openings: Vec<quil_crypto::porep::StorageOpening> = att
+                .openings
+                .iter()
+                .map(quil_crypto::porep::StorageOpening::from_proto)
+                .collect();
+            let rho_n = quil_crypto::porep::derive_storage_beacon(global_frame_number, &[]);
             crate::global_intrinsic::frame_header::FrameHeader {
                 address: filter.to_vec(),
                 frame_number: 5,
                 global_frame_number,
                 storage_attestation: prost::Message::encode_to_vec(att),
+                storage_attestation_root: quil_crypto::porep::compute_storage_attestation_root(
+                    &openings,
+                    5,
+                    &rho_n,
+                    &[],
+                    quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                ),
                 ..Default::default()
             }
+        }
+
+        /// The attestation body travels beside the certified header: a body
+        /// swapped in relay (its openings do not aggregate to the certified
+        /// root) must get no one kicked.
+        #[test]
+        fn storage_audit_ignores_a_body_the_header_does_not_certify() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let victim_pubkey = vec![0xD4u8; 897];
+            let victim_addr = prover_address_from_pubkey(&victim_pubkey).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &victim_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&victim_pubkey, 100).unwrap()),
+                )
+                .unwrap();
+
+            let filter = vec![0x55u8; 32];
+            let shard = vec![0x07u8; 32];
+            let certified = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&[0xE5u8; 32], &shard, 1)],
+            };
+            let mut op = frame_header_with_attestation(&filter, 1_000, &certified);
+            let swapped = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&victim_addr, &shard, 1)],
+            };
+            op.storage_attestation = prost::Message::encode_to_vec(&swapped);
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+            assert_ne!(
+                read_status(&state, &victim_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "a body the header does not certify must get no one kicked",
+            );
         }
 
         #[test]
@@ -7257,8 +7365,14 @@ mod tests {
                 .unwrap();
 
             let filter = vec![0x55u8; 32];
+            // The openings a producer attaches for one leaf: one per query.
             let att = quil_types::proto::global::StorageAttestation {
-                openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 1)],
+                openings: (0..quil_types::consensus::STORAGE_QUERIES_PER_LEAF)
+                    .map(|query| quil_types::proto::global::StorageOpening {
+                        query,
+                        ..storage_opening_proto(&bad_addr, &[0x07u8; 32], 1)
+                    })
+                    .collect(),
             };
             let op = frame_header_with_attestation(&filter, 1_000, &att);
 
@@ -7371,6 +7485,193 @@ mod tests {
             let in_window = frame_header_with_attestation(&filter, 99 - w, &att);
             gi.audit_storage_attestation(100, &in_window, &[], &state, &va_disc)
                 .expect("anchor at the oldest edge of the window is in lockstep");
+        }
+
+        /// The attestation body travels beside the header, which certifies
+        /// only the body's root. A relayer that keeps a certified header but
+        /// rewrites its openings' members must not get those members kicked.
+        #[test]
+        fn reproduces_uncertified_attestation_body_kick() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            // Two registered, active provers the committee never named.
+            let victims: Vec<[u8; 32]> = [0xD5u8, 0xD6]
+                .iter()
+                .map(|b| {
+                    let pubkey = vec![*b; 897];
+                    let addr = prover_address_from_pubkey(&pubkey).unwrap();
+                    state
+                        .set(
+                            &GLOBAL_INTRINSIC_ADDRESS[..],
+                            &addr,
+                            &va_disc,
+                            1,
+                            vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()),
+                        )
+                        .unwrap();
+                    addr
+                })
+                .collect();
+
+            // An opening with a valid G1 proof point, so a body of them
+            // aggregates to a root a header can certify.
+            let shard = vec![0x07u8; 32];
+            let opening = |member: &[u8], seed: u8| quil_types::proto::global::StorageOpening {
+                shard_id: shard.clone(),
+                epoch: 1,
+                member_id: member.to_vec(),
+                query: 0,
+                leaf_root: vec![0u8; 74],
+                num_blocks: 1,
+                path_commits: vec![],
+                path_proofs: vec![],
+                commitment: vec![0u8; 74],
+                value: vec![0u8; 32],
+                proof: quil_crypto::KzgInclusionProver
+                    .commit_raw(&[seed; 64], 16)
+                    .unwrap(),
+            };
+
+            // The committee attests two other members; the header certifies
+            // that body's root as its producer computes it (empty bitmask, ρ_N
+            // of anchor 1000, whose output this test's clock store lacks).
+            let certified: Vec<quil_crypto::porep::StorageOpening> =
+                [opening(&[0xE5u8; 32], 0x11), opening(&[0xE6u8; 32], 0x23)]
+                    .iter()
+                    .map(quil_crypto::porep::StorageOpening::from_proto)
+                    .collect();
+            let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+                &certified,
+                5,
+                &quil_crypto::porep::derive_storage_beacon(1_000, &[]),
+                &[],
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            );
+            assert!(
+                !storage_attestation_root.is_empty(),
+                "the certified openings must aggregate to a root"
+            );
+
+            // The relayed header keeps that root and the openings' proofs, but
+            // its body names the victims instead.
+            let substituted = quil_types::proto::global::StorageAttestation {
+                openings: vec![opening(&victims[0], 0x11), opening(&victims[1], 0x23)],
+            };
+            let op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![0x55u8; 32],
+                frame_number: 5,
+                global_frame_number: 1_000,
+                storage_attestation_root,
+                storage_attestation: prost::Message::encode_to_vec(&substituted),
+                ..Default::default()
+            };
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+
+            for victim in &victims {
+                assert_ne!(
+                    read_status(&state, victim, "prover:Prover"),
+                    Some(STATUS_KICKED),
+                    "GLOBAL kicked prover {} (status 4), named only in a substituted \
+                     attestation body that the header's certified root does not cover",
+                    hex::encode(victim),
+                );
+            }
+        }
+
+        /// A single opening aggregates to its own proof point (`γ^0 = 1`), so
+        /// a one-opening body whose proof is the certified root matches that
+        /// root whatever member it names. Such a body must get no one kicked.
+        #[test]
+        fn reproduces_single_opening_body_matching_certified_root_kick() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let victim_pubkey = vec![0xD7u8; 897];
+            let victim = prover_address_from_pubkey(&victim_pubkey).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &victim,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&victim_pubkey, 100).unwrap()),
+                )
+                .unwrap();
+
+            let shard = vec![0x07u8; 32];
+            let opening =
+                |member: &[u8], proof: Vec<u8>| quil_types::proto::global::StorageOpening {
+                    shard_id: shard.clone(),
+                    epoch: 1,
+                    member_id: member.to_vec(),
+                    query: 0,
+                    leaf_root: vec![0u8; 74],
+                    num_blocks: 1,
+                    path_commits: vec![],
+                    path_proofs: vec![],
+                    commitment: vec![0u8; 74],
+                    value: vec![0u8; 32],
+                    proof,
+                };
+            let proof = |seed: u8| {
+                quil_crypto::KzgInclusionProver
+                    .commit_raw(&[seed; 64], 16)
+                    .unwrap()
+            };
+
+            // The header certifies the root of a two-member body.
+            let rho_n = quil_crypto::porep::derive_storage_beacon(1_000, &[]);
+            let certified: Vec<quil_crypto::porep::StorageOpening> = [
+                opening(&[0xE5u8; 32], proof(0x11)),
+                opening(&[0xE6u8; 32], proof(0x23)),
+            ]
+            .iter()
+            .map(quil_crypto::porep::StorageOpening::from_proto)
+            .collect();
+            let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+                &certified,
+                5,
+                &rho_n,
+                &[],
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            );
+            assert!(
+                !storage_attestation_root.is_empty(),
+                "the certified openings must aggregate to a root"
+            );
+
+            // The relayed body: one opening naming the victim, whose proof is
+            // the certified root itself.
+            let substituted = quil_types::proto::global::StorageAttestation {
+                openings: vec![opening(&victim, storage_attestation_root.clone())],
+            };
+            let op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![0x55u8; 32],
+                frame_number: 5,
+                global_frame_number: 1_000,
+                storage_attestation_root,
+                storage_attestation: prost::Message::encode_to_vec(&substituted),
+                ..Default::default()
+            };
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+
+            assert_ne!(
+                read_status(&state, &victim, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "GLOBAL kicked prover {} (status 4), named only in a substituted one-opening \
+                 attestation body whose proof is the header's certified root",
+                hex::encode(victim),
+            );
         }
 
         // -------------------------------------------------------------
