@@ -61,6 +61,8 @@ pub struct CwInboundRouter {
     /// Our own committee Falcon key — the attributed sender for locally-injected
     /// certificates (see [`Self::feed_finalization_cert`]).
     inject_from: FalconPublicKey,
+    /// When each member was last heard, for the GLOBAL stall watch.
+    contact: Arc<quil_engine::global_stall::GlobalContact>,
 }
 
 impl CwInboundRouter {
@@ -103,6 +105,7 @@ impl CwInboundRouter {
             tracing::debug!("cw inbound: unresolved sender, dropping");
             return true; // it WAS a cw message, just undeliverable
         };
+        self.contact.heard(&from_pk);
         let _ = self.inbound[channel as usize].send(inbound_message(from_pk, data));
         true
     }
@@ -116,6 +119,9 @@ pub struct CwGlobalDeps {
     /// the legacy order (canonical clock write, then materialization).
     pub finalization_pipeline: Option<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>,
     pub committee_hex: Vec<String>,
+    /// The members' peer IDs, parallel to `committee_hex`; logs name a
+    /// member by its tail.
+    pub committee_peer_ids: Vec<String>,
     /// This node's `q-consensus-key` bytes.
     pub my_signing_key: Vec<u8>,
     pub my_public_key: Vec<u8>,
@@ -178,7 +184,12 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         CW_NAMESPACE,
     )?;
 
-    let GlobalConsensusCwHandle { inbound, ingest_block } = activate_global_consensus_cw(
+    let member_labels = if deps.committee_peer_ids.len() == deps.committee_hex.len() {
+        deps.committee_peer_ids.iter().map(|id| quil_engine::global_stall::tail(id)).collect()
+    } else {
+        Vec::new()
+    };
+    let GlobalConsensusCwHandle { inbound, ingest_block, contact } = activate_global_consensus_cw(
         committee.scheme,
         committee.peers,
         deps.leader_provider,
@@ -198,6 +209,7 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         deps.on_prover_fork,
         selected_execution,
         deps.finalization_pipeline,
+        member_labels,
     ).inspect_err(|error| tracing::error!(%error, "GLOBAL consensus recovery refused activation")).ok()?;
 
     tracing::info!("commonware-simplex global consensus started");
@@ -209,5 +221,6 @@ pub fn start_cw_global_consensus(deps: CwGlobalDeps) -> Option<CwInboundRouter> 
         ingest_block,
         resolve_peer: deps.resolve_peer,
         inject_from,
+        contact,
     })
 }

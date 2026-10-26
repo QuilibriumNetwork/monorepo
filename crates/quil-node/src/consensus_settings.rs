@@ -20,6 +20,13 @@ pub(crate) fn initialize(network: u8) {
     if network != 0 && hash_epoch != u64::MAX {
         tracing::warn!(epoch = hash_epoch, "QUIL_HASH_STORAGE_PROOF_EPOCH override active (localnet only)");
     }
+    let succession_epoch = quil_types::consensus::init_seniority_succession_epoch(network);
+    if network != 0 && succession_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = succession_epoch,
+            "QUIL_SENIORITY_SUCCESSION_EPOCH override active (localnet only)"
+        );
+    }
     if network != 0 && frames != quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES {
         tracing::warn!(
             frames,

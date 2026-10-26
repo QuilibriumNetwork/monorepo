@@ -970,16 +970,97 @@ where
     Ok((Some(merge), consumed))
 }
 
+/// Build the seniority succession of `seeds` from the prover at
+/// `predecessor` at `frame_number`: each seed consents to moving what it
+/// brought that prover to this one (`prover key || predecessor || frame`
+/// under `PROVER_SENIORITY_SUCCESSION`), and the prover signs the targets as
+/// it signs a merge.
+fn seniority_succession(
+    frame_number: u64,
+    seeds: &[[u8; 57]],
+    bls_pubkey: &[u8],
+    prover_address: &[u8; 32],
+    bls_signer: &dyn Signer,
+    predecessor: &[u8; 32],
+) -> Result<ProverSeniorityMerge> {
+    use quil_execution::global_intrinsic::seniority_succession::{succession_consent_message, SUCCESSION_DOMAIN};
+    let consent = succession_consent_message(bls_pubkey, predecessor, frame_number);
+    let mut merge_targets = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
+        let signer = quil_crypto::Ed448Signer::from_bytes(seed, &pubkey)?;
+        merge_targets.push(quil_execution::global_intrinsic::SeniorityMerge {
+            signature: <quil_crypto::Ed448Signer as Signer>::sign_with_domain(&signer, &consent, SUCCESSION_DOMAIN)?,
+            key_type: quil_types::crypto::KeyType::Ed448 as u32,
+            prover_public_key: pubkey,
+        });
+    }
+    let mut message: Vec<u8> = Vec::with_capacity(8 + merge_targets.len() * 57);
+    message.extend_from_slice(&frame_number.to_be_bytes());
+    for target in &merge_targets {
+        message.extend_from_slice(&target.prover_public_key);
+    }
+    let domain = ProverPipeline::domain(b"PROVER_SENIORITY_MERGE")?;
+    Ok(ProverSeniorityMerge {
+        frame_number,
+        public_key_signature_bls48581: Some(AddressedSignature {
+            signature: bls_signer.sign_with_domain(&message, &domain)?,
+            address: prover_address.to_vec(),
+        }),
+        merge_targets,
+    })
+}
+
+/// What this node last submitted under the seniority succession rules (each
+/// op's kind, keys and predecessor): the same plan one cooldown later means
+/// GLOBAL did not apply it, and the node holds proposals for the epoch.
+fn last_seniority_submission() -> &'static Mutex<Vec<Vec<u8>>> {
+    static LAST: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether the prover at `address` holds no allocation that would keep a
+/// succession from it at `frame_number` (the rule GLOBAL applies) in
+/// committed GLOBAL state; false when that cannot be read.
+fn prover_idle(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, address: &[u8], frame_number: u64) -> bool {
+    let Ok(address) = <[u8; 32]>::try_from(address) else {
+        return false;
+    };
+    let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+    match quil_execution::global_intrinsic::seniority_succession::PredecessorState::read(&state, &address) {
+        Ok(Some(prover)) => prover
+            .allocations
+            .iter()
+            .all(|allocation| prover.allocation_blocks(allocation, frame_number).is_none()),
+        _ => false,
+    }
+}
+
 /// The last 6 characters of an identifier, as logs name peers and provers.
 fn tail(id: &str) -> &str {
     &id[id.len().saturating_sub(6)..]
 }
 
+/// The operator's action when a target's seniority sits with another prover
+/// that holds no live allocation.
+const SUCCESSION_ACTION: &str = "that prover holds no live allocation: run `qclient node prover merge --dry-run <config dir>` \
+     in the node directory to see whether a seniority succession can move its seniority to this prover, \
+     and what blocks it";
+
 /// Whom a consumed target's seniority went to, and what the operator can do
-/// about it: nothing when it went to this prover.
-fn consumed_target_credit(target: &ConsumedMergeTarget, own: &[u8; 32]) -> (String, Option<&'static str>) {
+/// about it: nothing when it went to this prover. `credited_idle`: the
+/// prover it went to holds no live allocation.
+fn consumed_target_credit(
+    target: &ConsumedMergeTarget,
+    own: &[u8; 32],
+    credited_idle: bool,
+) -> (String, Option<&'static str>) {
     match &target.credited {
         Some(address) if address.as_slice() == own => ("this prover".into(), None),
+        Some(address) if credited_idle => (
+            format!("prover …{}", tail(&hex::encode(address))),
+            Some(SUCCESSION_ACTION),
+        ),
         Some(address) => (
             format!("prover …{}", tail(&hex::encode(address))),
             Some("its seniority counts for that prover; restore that prover's key to recover it"),
@@ -1805,6 +1886,44 @@ impl ProverPipeline {
         }
 
         let bls_signer = self.bls_signer()?;
+        // From the seniority succession epoch the node submits what
+        // `plan_submissions` finds, the same plan the qclient dry run shows.
+        if quil_types::consensus::seniority_succession_active(frame_number) {
+            let Some(crdt) = self.hypergraph.clone() else {
+                // Without GLOBAL state the node cannot tell what GLOBAL would
+                // apply (or whether its prover has a record): send nothing.
+                self.lifecycle.hold_seniority_merge(frame_number);
+                return Ok(());
+            };
+            {
+                let planned = self.succession_rule_ops(frame_number, &crdt, bls_signer.as_ref());
+                drop(bls_signer);
+                let (ops, signature) = match planned {
+                    Ok(planned) => planned,
+                    Err(error) => {
+                        // Look again next epoch rather than every cooldown.
+                        self.lifecycle.hold_seniority_merge(frame_number);
+                        return Err(error);
+                    }
+                };
+                // Nothing GLOBAL would apply, or the same ops as last time:
+                // GLOBAL did not apply them, so look again next epoch.
+                let repeated = {
+                    let mut last = last_seniority_submission().lock().unwrap_or_else(|e| e.into_inner());
+                    let repeated = ops.is_empty() || *last == signature;
+                    *last = if repeated { Vec::new() } else { signature };
+                    repeated
+                };
+                if repeated {
+                    self.lifecycle.hold_seniority_merge(frame_number);
+                    return Ok(());
+                }
+                for op in ops {
+                    self.publish_prover_message(op.to_canonical_bytes()?, frame_number).await?;
+                }
+                return Ok(());
+            }
+        }
         let (merge, consumed) = seniority_merge(
             frame_number,
             &self.multisig_ed448_seeds,
@@ -1827,7 +1946,102 @@ impl ProverPipeline {
             consumed = consumed.len(),
             "submitting ProverSeniorityMerge"
         );
+        if self.hypergraph.is_none() {
+            // Without GLOBAL state this node cannot tell whether the merge
+            // applied: submit it once per epoch.
+            self.lifecycle.hold_seniority_merge(frame_number);
+        }
         self.publish_prover_message(bytes, frame_number).await
+    }
+
+    /// The merge and successions this node's keys can make now under the
+    /// seniority succession rules, signed: a merge when it adds seniority,
+    /// a succession for each predecessor GLOBAL would let succeed now that
+    /// raises this prover's seniority. Reports the keys that count for
+    /// another prover or fit nothing.
+    fn succession_rule_ops(
+        &self,
+        frame_number: u64,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        bls_signer: &dyn Signer,
+    ) -> Result<(Vec<ProverSeniorityMerge>, Vec<Vec<u8>>)> {
+        use quil_execution::global_intrinsic::seniority_succession::{plan_submissions, retro_parts, TargetStanding};
+        let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
+        let keys: Vec<Vec<u8>> =
+            self.multisig_ed448_seeds.iter().map(quil_p2p::ed448_identity::derive_public_key).collect();
+        let plan = plan_submissions(&state, frame_number, &self.prover_address, &keys, &retro_parts)?;
+        let consumed: Vec<ConsumedMergeTarget> = plan
+            .keys
+            .iter()
+            .zip(&keys)
+            .filter_map(|((markers, standing), key)| {
+                let marker = if markers.join.is_some() { "join merge" } else { "seniority merge" };
+                let credited = match standing {
+                    TargetStanding::Fresh => return None,
+                    TargetStanding::Own => Some(self.prover_address.to_vec()),
+                    TargetStanding::Other(prover) => Some(prover.to_vec()),
+                    TargetStanding::Unusable(_) => None,
+                };
+                Some(ConsumedMergeTarget { pubkey: key.clone(), marker, credited })
+            })
+            .collect();
+        self.report_consumed_merge_targets(&consumed, frame_number);
+        let seeds_of = |indexes: &[usize]| -> Vec<[u8; 57]> {
+            indexes.iter().map(|&index| self.multisig_ed448_seeds[index]).collect()
+        };
+        let mut ops = Vec::new();
+        let mut signature: Vec<Vec<u8>> = Vec::new();
+        if let Some(merge) = &plan.merge {
+            signature.push(merge.keys.iter().map(|&index| index as u8).chain([b'm']).collect());
+            let seeds = seeds_of(&merge.keys);
+            let (op, _) = seniority_merge(
+                frame_number,
+                &seeds,
+                &self.bls_pubkey,
+                &self.prover_address,
+                bls_signer,
+                |_| Ok(None),
+            )?;
+            if let Some(op) = op {
+                info!(
+                    frame = frame_number,
+                    peer_keys = seeds.len(),
+                    increment = merge.increment,
+                    "submitting ProverSeniorityMerge"
+                );
+                ops.push(op);
+            }
+        }
+        for candidate in plan.successions.iter().filter(|candidate| candidate.submits()) {
+            let seeds = seeds_of(&candidate.keys);
+            signature.push(
+                candidate.predecessor.iter().copied()
+                    .chain(candidate.keys.iter().map(|&index| index as u8))
+                    .chain([b's'])
+                    .collect(),
+            );
+            info!(
+                frame = frame_number,
+                predecessor = %format!("…{}", tail(&hex::encode(candidate.predecessor))),
+                predecessor_seniority = candidate.preview.predecessor_seniority(),
+                seniority = candidate.preview.successor_seniority,
+                new_seniority = candidate.preview.new_seniority,
+                moved_accrual = candidate.preview.amounts.accrual,
+                peer_keys = candidate.moving,
+                scope = "local",
+                "submitting seniority succession: this node's peer keys move the seniority of the idle prover \
+                 they count for to this prover"
+            );
+            ops.push(seniority_succession(
+                frame_number,
+                &seeds,
+                &self.bls_pubkey,
+                &self.prover_address,
+                bls_signer,
+                &candidate.predecessor,
+            )?);
+        }
+        Ok((ops, signature))
     }
 
     /// Report each consumed merge target once, and at most once per epoch
@@ -1838,7 +2052,11 @@ impl ProverPipeline {
         for target in consumed.iter().filter(|target| consumed_target_reports().due(target, epoch)) {
             let peer = bs58::encode(quil_p2p::peer_id_from_ed448_pubkey(&target.pubkey)).into_string();
             let target_peer = format!("…{}", tail(&peer));
-            match consumed_target_credit(target, &self.prover_address) {
+            let credited_idle = target.credited.as_ref().is_some_and(|credited| {
+                credited.as_slice() != &self.prover_address[..]
+                    && self.hypergraph.as_ref().is_some_and(|crdt| prover_idle(crdt, credited, frame_number))
+            });
+            match consumed_target_credit(target, &self.prover_address, credited_idle) {
                 (credited_to, None) => info!(
                     frame = frame_number,
                     epoch,
@@ -2743,9 +2961,13 @@ mod tests {
         let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OTHER)]), &SEEDS[..1]);
         assert_eq!(merge, None, "GLOBAL refuses a merge naming a consumed target");
         assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "join merge", OTHER)]);
-        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN);
+        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN, false);
         assert_eq!(credited_to, "prover …080808");
         assert!(action.is_some_and(|action| action.contains("restore that prover's key")), "{action:?}");
+        // Held by a prover with no live allocation: the operator can check a
+        // seniority succession.
+        let (_, action) = super::consumed_target_credit(&consumed[0], &OWN, true);
+        assert!(action.is_some_and(|action| action.contains("qclient node prover merge --dry-run")), "{action:?}");
     }
 
     #[test]
@@ -2754,7 +2976,7 @@ mod tests {
         let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OWN)]), &SEEDS[..1]);
         assert_eq!(merge, None);
         assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "seniority merge", OWN)]);
-        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN);
+        let (credited_to, action) = super::consumed_target_credit(&consumed[0], &OWN, true);
         assert_eq!(credited_to, "this prover");
         assert_eq!(action, None, "nothing for the operator to do");
     }
@@ -2765,6 +2987,27 @@ mod tests {
         let (merge, consumed) = merge_with(&global_with_markers(&[(spent, OTHER)]), &SEEDS);
         assert_eq!(merge, Some(merge_of(&SEEDS[1..])), "the prover signs the remaining target alone");
         assert_eq!(consumed, vec![consumed_by(&SEEDS[0], "seniority merge", OTHER)]);
+    }
+
+    #[test]
+    fn a_succession_consents_to_moving_the_named_provers_seniority() {
+        use quil_types::crypto::Signer;
+        let succession =
+            super::seniority_succession(FRAME, &SEEDS[..1], BLS_KEY, &OWN, &prover_signer(), &OTHER).unwrap();
+        let consent =
+            quil_execution::global_intrinsic::seniority_succession::succession_consent_message(BLS_KEY, &OTHER, FRAME);
+        let consented = quil_crypto::Ed448Signer::from_bytes(&SEEDS[0], &pubkey(&SEEDS[0]))
+            .unwrap()
+            .sign_with_domain(&consent, b"PROVER_SENIORITY_SUCCESSION")
+            .unwrap();
+        assert_eq!(succession.merge_targets[0].signature, consented);
+        assert_eq!(succession.merge_targets[0].prover_public_key, pubkey(&SEEDS[0]));
+        let merge = merge_of(&SEEDS[..1]);
+        assert_ne!(succession.merge_targets[0].signature, merge.merge_targets[0].signature, "not a merge consent");
+        assert_eq!(
+            succession.public_key_signature_bls48581, merge.public_key_signature_bls48581,
+            "the prover signs the targets as for a merge"
+        );
     }
 
     #[test]

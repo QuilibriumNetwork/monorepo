@@ -301,13 +301,13 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         let validate_inner = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
             if inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
                 use crate::global_intrinsic::handoff::presence;
-                presence::require_active(frame_number)?;
+                let op = presence::PresenceOp::from_canonical_bytes(inner_bytes)?;
+                op.require_active(frame_number)?;
                 let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) else {
                     return Err(QuilError::ExecutionUnavailable(
                         "presence report validation requires authenticated global state".into()));
                 };
-                let report = presence::PresenceReport::from_canonical_bytes(inner_bytes)?;
-                return intrinsic.verify_presence_report(frame_number, &report, state.as_ref());
+                return intrinsic.verify_presence_op(frame_number, &op, state.as_ref());
             }
             if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                 let state = self.state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
@@ -330,10 +330,21 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                 }
                 return verified;
             }
-            if !crate::global_engine::is_global_type_prefix(inner_tp) {
+            if !crate::global_engine::is_global_type_prefix_at(inner_tp, frame_number) {
                 return Ok(()); // not a global op, skip
             }
             if let (Some(ref intrinsic), Some(ref state)) = (&self.intrinsic, &self.state) {
+                // From the seniority succession epoch a seniority merge is
+                // decided over the GLOBAL state published so far (earlier
+                // messages of the frame included), as its execution decides
+                // it.
+                if inner_tp == crate::global_intrinsic::TYPE_PROVER_SENIORITY_MERGE
+                    && quil_types::consensus::seniority_succession_active(frame_number)
+                {
+                    let op = crate::global_intrinsic::ProverSeniorityMerge::from_canonical_bytes(inner_bytes)?;
+                    let committed = crate::hypergraph_state::HypergraphState::new(state.crdt().clone());
+                    return intrinsic.validate_seniority_merge(frame_number, &op, &committed);
+                }
                 // Extract the prover address from the addressed signature
                 // to load the prover and allocation trees.
                 let (prover_tree, alloc_tree) = load_trees_for_validation(
@@ -427,7 +438,7 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             {
                 return Err(QuilError::ExecutionUnavailable("handoff execution requires authenticated global state".into()));
             }
-            if !crate::global_engine::is_global_type_prefix(inner_tp) {
+            if !crate::global_engine::is_global_type_prefix_at(inner_tp, _frame_number) {
                 return Ok(());
             }
             if let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) {

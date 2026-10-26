@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use quil_types::error::{QuilError, Result};
+use quil_execution::global_intrinsic::handoff::presence::EncodingGate;
 
 // Type prefixes matching Go's canonical_types.go
 pub const PROPOSAL_VOTE_TYPE: u32 = 0x030C;
@@ -735,7 +736,7 @@ pub fn encode_global_frame(
     // tolerate `req_count = 0`.
     put_u32(&mut out, frame.requests.len() as u32);
     for bundle in &frame.requests {
-        let bundle_bytes = proto_message_bundle_to_canonical_bytes(bundle)?;
+        let bundle_bytes = proto_message_bundle_to_canonical_bytes_at(bundle, Some(header.frame_number))?;
         put_bytes(&mut out, &bundle_bytes);
     }
     Ok(out)
@@ -822,11 +823,14 @@ pub fn decode_global_frame(
             req_count, remaining
         )));
     }
+    // Presence encodings of the exclusion frame are judged at this frame's
+    // number, so a frame below it that carries one is rejected here as by a
+    // build without them.
+    let frame_number = header.frame_number;
     let mut requests = Vec::with_capacity(req_count);
     for _ in 0..req_count {
         let bundle_bytes = read_bytes(data, &mut c)?;
-        let bundle = decode_message_bundle(&bundle_bytes)?;
-        requests.push(bundle);
+        requests.push(decode_message_bundle_at(&bundle_bytes, Some(frame_number))?);
     }
 
     Ok(quil_types::proto::global::GlobalFrame {
@@ -849,6 +853,31 @@ pub fn decode_global_frame(
 pub fn decode_message_bundle(
     data: &[u8],
 ) -> Result<quil_types::proto::global::MessageBundle> {
+    decode_message_bundle_gated(data, EncodingGate::Admission)
+}
+
+/// [`decode_message_bundle`] for an application shard's messages, which
+/// never carry a claim or a nullify report (`EncodingGate::App`).
+pub fn decode_app_message_bundle(
+    data: &[u8],
+) -> Result<quil_types::proto::global::MessageBundle> {
+    decode_message_bundle_gated(data, EncodingGate::App)
+}
+
+/// [`decode_message_bundle`] for the body of GLOBAL frame `frame`, whose
+/// number decides which presence encodings it may carry
+/// (`handoff::presence::check_encoding`). `None` off consensus paths.
+pub fn decode_message_bundle_at(
+    data: &[u8],
+    frame: Option<u64>,
+) -> Result<quil_types::proto::global::MessageBundle> {
+    decode_message_bundle_gated(data, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+}
+
+fn decode_message_bundle_gated(
+    data: &[u8],
+    gate: EncodingGate,
+) -> Result<quil_types::proto::global::MessageBundle> {
     use quil_execution::message_envelope::CanonicalMessageBundle;
     use quil_types::proto::global as pb;
 
@@ -867,12 +896,12 @@ pub fn decode_message_bundle(
                     quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(&req.inner_bytes)?;
                 }
                 if req.inner_type_prefix == quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
-                    quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(&req.inner_bytes)?;
+                    quil_execution::global_intrinsic::handoff::presence::check_encoding_in(&req.inner_bytes, gate)?;
                 }
                 if req.inner_type_prefix == quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF {
                     quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(&req.inner_bytes)?;
                 }
-                requests.push(canonical_request_to_proto(req));
+                requests.push(canonical_request_to_proto(req, gate));
             }
         }
     }
@@ -888,6 +917,7 @@ pub fn decode_message_bundle(
 /// converters are not yet ported.
 fn canonical_request_to_proto(
     req: &quil_execution::message_envelope::CanonicalMessageRequest,
+    gate: EncodingGate,
 ) -> quil_types::proto::global::MessageRequest {
     use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_join, prover_ops};
     use quil_execution::global_intrinsic::consensus_types::{AltShardUpdate, TYPE_ALT_SHARD_UPDATE};
@@ -950,7 +980,7 @@ fn canonical_request_to_proto(
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(inner)
                 .ok().map(|_| Request::CommitteeHandoff(inner.to_vec())),
         quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT =>
-            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(inner)
+            quil_execution::global_intrinsic::handoff::presence::check_encoding_in(inner, gate)
                 .ok().map(|_| Request::PresenceReport(inner.to_vec())),
         quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF =>
             quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(inner)
@@ -1067,6 +1097,34 @@ fn canonical_request_to_proto(
 pub fn proto_message_bundle_to_canonical_bytes(
     bundle: &quil_types::proto::global::MessageBundle,
 ) -> Result<Vec<u8>> {
+    proto_message_bundle_to_canonical_gated(bundle, EncodingGate::Admission)
+}
+
+/// [`proto_message_bundle_to_canonical_bytes`] for a bundle of an
+/// application shard's frame or messages: every application path (proposal,
+/// validation, body roots, replay, materialization, archive ingest) refuses
+/// a claim or a nullify report alike, at every frame (`EncodingGate::App`).
+pub fn app_bundle_to_canonical_bytes(
+    bundle: &quil_types::proto::global::MessageBundle,
+) -> Result<Vec<u8>> {
+    proto_message_bundle_to_canonical_gated(bundle, EncodingGate::App)
+}
+
+/// [`proto_message_bundle_to_canonical_bytes`] for a bundle of GLOBAL
+/// frame `frame`, whose number decides which presence encodings it may
+/// carry (`handoff::presence::check_encoding`). Every consensus path
+/// passes its frame; `None` is for gossip and admission only.
+pub fn proto_message_bundle_to_canonical_bytes_at(
+    bundle: &quil_types::proto::global::MessageBundle,
+    frame: Option<u64>,
+) -> Result<Vec<u8>> {
+    proto_message_bundle_to_canonical_gated(bundle, frame.map_or(EncodingGate::Admission, EncodingGate::Global))
+}
+
+fn proto_message_bundle_to_canonical_gated(
+    bundle: &quil_types::proto::global::MessageBundle,
+    gate: EncodingGate,
+) -> Result<Vec<u8>> {
     use quil_execution::message_envelope::{
         CanonicalMessageBundle, CanonicalMessageRequest,
     };
@@ -1077,12 +1135,12 @@ pub fn proto_message_bundle_to_canonical_bytes(
             quil_execution::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
         }
         if let Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) = &req.request {
-            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
+            quil_execution::global_intrinsic::handoff::presence::check_encoding_in(bytes, gate)?;
         }
         if let Some(quil_types::proto::global::message_request::Request::StorageEpochProof(bytes)) = &req.request {
             quil_execution::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(bytes)?;
         }
-        match proto_message_request_to_canonical(req) {
+        match proto_message_request_to_canonical(req, gate) {
             Some(canon_req) => requests.push(Some(canon_req)),
             None => requests.push(None),
         }
@@ -1100,6 +1158,7 @@ pub fn proto_message_bundle_to_canonical_bytes(
 /// yet (alongside the other 22 variants the canonical→proto path drops).
 fn proto_message_request_to_canonical(
     req: &quil_types::proto::global::MessageRequest,
+    gate: EncodingGate,
 ) -> Option<quil_execution::message_envelope::CanonicalMessageRequest> {
     use quil_execution::global_intrinsic::conversions;
     use quil_execution::token_intrinsic::conversions as token_conv;
@@ -1144,7 +1203,7 @@ fn proto_message_request_to_canonical(
             bytes.clone()
         }
         Request::PresenceReport(bytes) => {
-            quil_execution::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes).ok()?;
+            quil_execution::global_intrinsic::handoff::presence::check_encoding_in(bytes, gate).ok()?;
             bytes.clone()
         }
         Request::StorageEpochProof(bytes) => {
@@ -1354,21 +1413,21 @@ mod tests {
             bytes[4..12].copy_from_slice(version);
             bytes[44..76].copy_from_slice(&quil_execution::domains::QUIL_TOKEN);
             let canonical = CanonicalMessageRequest::wrap(bytes.clone()).unwrap();
-            let pb = super::canonical_request_to_proto(&canonical);
+            let pb = super::canonical_request_to_proto(&canonical, EncodingGate::Admission);
             assert!(matches!(pb.request, Some(quil_types::proto::global::message_request::Request::TokenOperation(_))));
             let wire = pb.encode_to_vec();
             assert!(wire.len() < 256 * 1024);
             let decoded = quil_types::proto::global::MessageRequest::decode(wire.as_slice()).unwrap();
-            assert_eq!(super::proto_message_request_to_canonical(&decoded).unwrap().inner_bytes, bytes);
+            assert_eq!(super::proto_message_request_to_canonical(&decoded, EncodingGate::Admission).unwrap().inner_bytes, bytes);
             assert_eq!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&decoded).unwrap(), bytes);
             bytes[4] ^= 1;
-            assert!(super::canonical_request_to_proto(&CanonicalMessageRequest::wrap(bytes.clone()).unwrap()).request.is_none());
+            assert!(super::canonical_request_to_proto(&CanonicalMessageRequest::wrap(bytes.clone()).unwrap(), EncodingGate::Admission).request.is_none());
             let invalid = quil_types::proto::global::MessageRequest {
                 request: Some(quil_types::proto::global::message_request::Request::TokenOperation(
                     quil_types::proto::token::TokenOperation { canonical_bytes: bytes })),
                 ..Default::default()
             };
-            assert!(super::proto_message_request_to_canonical(&invalid).is_none());
+            assert!(super::proto_message_request_to_canonical(&invalid, EncodingGate::Admission).is_none());
             assert!(quil_execution::message_envelope::proto_message_request_to_canonical_inner_bytes(&invalid).is_err());
         }
     }
@@ -1583,7 +1642,8 @@ mod tests {
         };
         let vote = |signer| NotarizeVote { signer, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] };
         let report = PresenceReport { session: [2; 32], filter, proposals: vec![PresenceProposal {
-            header, epoch: 3, view: 6, parent: 5, payload: [5; 32], votes: vec![vote(0), vote(2)] }] };
+            header, epoch: 3, view: 6, parent: 5, payload: [5; 32], votes: vec![vote(0), vote(2)] }],
+            nullifies: Vec::new() };
         // Wire conversion preserves the bytes; authenticated global execution
         // separately verifies the votes against the session and its anchors.
         let inner = report.to_canonical_bytes().unwrap();
@@ -1707,6 +1767,134 @@ mod tests {
         assert_eq!(decoded.requests[1].requests.len(), 1);
         let req1 = &decoded.requests[1].requests[0];
         assert!(req1.request.is_none());
+    }
+
+    /// Claims and nullify reports are encodings of the presence exclusion
+    /// frame: a GLOBAL frame below it that carries one is rejected, as a
+    /// build without them rejects it, and one at or past it is accepted;
+    /// the frame's number decides, not the decoding node's progress.
+    #[test]
+    fn presence_encodings_of_the_exclusion_frame_decode_only_from_it() {
+        use quil_execution::global_intrinsic::frame_header::GlobalFrameHeader as CanonicalGlobalHeader;
+        use quil_execution::global_intrinsic::handoff::{
+            self,
+            exclusion::PresenceClaim,
+            presence::{self, NullifyVote, PresenceReport},
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let report = PresenceReport {
+            session: [2; 32],
+            filter: vec![0x21; 32],
+            proposals: Vec::new(),
+            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN] }],
+        };
+        let claim = PresenceClaim {
+            filter: vec![0x21; 32],
+            member: vec![9; quil_crypto::FALCON_PUBLIC_KEY_LEN],
+            anchor: 5,
+            signature: vec![7; quil_crypto::FALCON_SIGNATURE_LEN],
+        };
+        let frame_of = |number: u64, inner: Vec<u8>| {
+            let header = CanonicalGlobalHeader { frame_number: number, ..Default::default() }.to_canonical_bytes().unwrap();
+            let bundle = CanonicalMessageBundle {
+                timestamp: 1,
+                requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())],
+            }
+            .to_canonical_bytes()
+            .unwrap();
+            let mut frame = Vec::new();
+            put_u32(&mut frame, GLOBAL_FRAME_TYPE);
+            put_bytes(&mut frame, &header);
+            put_u32(&mut frame, 1);
+            put_bytes(&mut frame, &bundle);
+            frame
+        };
+        handoff::set_presence_exclusion_frame_for_thread(Some(100));
+        for inner in [report.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
+            assert!(decode_global_frame(&frame_of(99, inner.clone())).is_err(), "below the frame");
+            let decoded = decode_global_frame(&frame_of(100, inner.clone())).unwrap();
+            assert!(matches!(
+                &decoded.requests[0].requests[0].request,
+                Some(quil_types::proto::global::message_request::Request::PresenceReport(bytes)) if *bytes == inner
+            ));
+            // Still rejected below the frame after this node decoded one past it.
+            assert!(decode_global_frame(&frame_of(99, inner.clone())).is_err(), "the frame's number decides");
+            assert!(presence::check_encoding(&inner, Some(99)).is_err());
+            assert!(presence::check_encoding(&inner, Some(100)).is_ok());
+            assert!(presence::check_encoding(&inner, None).is_ok(), "gossip: the frame is scheduled");
+            // The body binding judges proto requests at the header's frame.
+            let header = |frame_number| quil_types::proto::global::GlobalFrameHeader { frame_number, ..Default::default() };
+            let converted = |frame_number| {
+                proto_message_bundle_to_canonical_bytes_at(&decoded.requests[0], Some(frame_number))
+            };
+            assert!(converted(99).is_err() && converted(100).is_ok());
+            assert!(!crate::frame_validator::global_frame_body_matches_requests_root(&header(99), &decoded.requests));
+        }
+        handoff::set_presence_exclusion_frame_for_thread(None);
+    }
+
+    /// Claims and nullify reports are GLOBAL operations: every application
+    /// path (proposal, validation, body roots, replay, materialization and
+    /// archive ingest share `app_bundle_to_canonical_bytes` and
+    /// `decode_app_message_bundle`) refuses a bundle carrying one at every
+    /// frame, as a build without them refuses it, while GLOBAL accepts it
+    /// from the exclusion frame. A version 1 report keeps its treatment.
+    #[test]
+    fn application_bundles_never_carry_claims_or_nullify_reports() {
+        use quil_execution::global_intrinsic::handoff::{
+            self,
+            exclusion::PresenceClaim,
+            presence::{NotarizeVote, NullifyVote, PresenceProposal, PresenceReport},
+        };
+        use quil_execution::global_intrinsic::FrameHeader;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::proto::global::{message_request::Request, MessageBundle, MessageRequest};
+        let signature = vec![7; quil_crypto::FALCON_SIGNATURE_LEN];
+        let nullify = PresenceReport {
+            session: [2; 32],
+            filter: vec![0x21; 32],
+            proposals: Vec::new(),
+            nullifies: vec![NullifyVote { view: 1, signer: 0, signature: signature.clone() }],
+        };
+        let claim = PresenceClaim {
+            filter: vec![0x21; 32],
+            member: vec![9; quil_crypto::FALCON_PUBLIC_KEY_LEN],
+            anchor: 5,
+            signature: signature.clone(),
+        };
+        let header = FrameHeader {
+            address: vec![0x21; 32], frame_number: 9, rank: 6, difficulty: 100, output: vec![3; 516],
+            parent_selector: vec![4; 32], global_frame_number: 1_441, ..Default::default()
+        };
+        let notarize = PresenceReport {
+            session: [2; 32],
+            filter: vec![0x21; 32],
+            proposals: vec![PresenceProposal {
+                header, epoch: 3, view: 6, parent: 5, payload: [5; 32],
+                votes: vec![NotarizeVote { signer: 0, signature }],
+            }],
+            nullifies: Vec::new(),
+        };
+        let proto = |inner: Vec<u8>| MessageBundle {
+            requests: vec![MessageRequest { request: Some(Request::PresenceReport(inner)), ..Default::default() }],
+            timestamp: 1,
+        };
+        let canonical = |inner: Vec<u8>| {
+            CanonicalMessageBundle { timestamp: 1, requests: vec![Some(CanonicalMessageRequest::wrap(inner).unwrap())] }
+                .to_canonical_bytes()
+                .unwrap()
+        };
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        for inner in [nullify.to_canonical_bytes().unwrap(), claim.to_canonical_bytes().unwrap()] {
+            assert!(app_bundle_to_canonical_bytes(&proto(inner.clone())).is_err(), "an application frame refuses it");
+            assert!(decode_app_message_bundle(&canonical(inner.clone())).is_err(), "an application message too");
+            assert!(proto_message_bundle_to_canonical_bytes_at(&proto(inner.clone()), Some(5)).is_ok(), "GLOBAL takes it");
+            assert!(decode_message_bundle_at(&canonical(inner), Some(5)).is_ok());
+        }
+        let inner = notarize.to_canonical_bytes().unwrap();
+        assert_eq!(app_bundle_to_canonical_bytes(&proto(inner.clone())).unwrap(), canonical(inner.clone()));
+        assert!(decode_app_message_bundle(&canonical(inner)).is_ok());
+        handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
     #[test]

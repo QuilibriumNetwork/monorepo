@@ -1255,9 +1255,9 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // The collected message each kept bundle came from.
         let mut origins: Vec<usize> = Vec::with_capacity(raw_messages.len());
         for (index, raw) in raw_messages.iter().enumerate() {
-            match crate::consensus_wire::decode_message_bundle(raw) {
+            match crate::consensus_wire::decode_app_message_bundle(raw) {
                 Ok(bundle) => {
-                    match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle) {
+                    match crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle) {
                         Ok(canon) => {
                             canonical_requests.push(canon);
                             request_bundles.push(bundle);
@@ -1449,7 +1449,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                             }],
                             timestamp: 0,
                         };
-                        match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle) {
+                        match crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle) {
                             Ok(canon) => {
                                 canonical_requests.push(canon);
                                 request_bundles.push(bundle);
@@ -4037,7 +4037,7 @@ impl AppConsensusEngine {
             }
         }
         let canonical = frame.requests.iter()
-            .map(crate::consensus_wire::proto_message_bundle_to_canonical_bytes)
+            .map(crate::consensus_wire::app_bundle_to_canonical_bytes)
             .collect::<Result<Vec<_>>>()?;
         if self.recompute_requests_root_offloaded(canonical, number).await? != header.requests_root {
             return Err(QuilError::InvalidArgument("archive replay body does not match its certified root".into()));
@@ -7018,7 +7018,7 @@ impl AppConsensusEngine {
         let canonical: Vec<Vec<u8>> = frame
             .requests
             .iter()
-            .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+            .filter_map(|b| crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok())
             .collect();
         let use_forest = self.hypergraph.as_ref().map(|h| h.has_forest()).unwrap_or(false);
         canonical.len() == frame.requests.len()
@@ -7769,7 +7769,7 @@ impl AppConsensusEngine {
                 .requests
                 .iter()
                 .filter_map(|b| {
-                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                    crate::consensus_wire::app_bundle_to_canonical_bytes(b).ok()
                 })
                 .collect();
             if canonical.len() != frame.requests.len() {
@@ -8799,7 +8799,7 @@ pub(crate) fn build_requests_root_check(
                 .requests
                 .iter()
                 .filter_map(|b| {
-                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b)
+                    crate::consensus_wire::app_bundle_to_canonical_bytes(b)
                         .ok()
                 })
                 .collect();
@@ -9094,9 +9094,9 @@ pub(crate) fn record_fee_total(
 /// frame's bundle re-encodes to, so materializing the frame consumes it from
 /// the collector. A message that does not decode is kept as received.
 fn canonical_app_message(data: &[u8]) -> Vec<u8> {
-    crate::consensus_wire::decode_message_bundle(data)
+    crate::consensus_wire::decode_app_message_bundle(data)
         .ok()
-        .and_then(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle).ok())
+        .and_then(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).ok())
         .unwrap_or_else(|| data.to_vec())
 }
 
@@ -9876,7 +9876,7 @@ pub(crate) fn materialize_app_shard_requests(
     // the sequential state loop below; the loop then finds verdicts cached.
     let canonical: Vec<(Vec<u8>, Vec<u8>)> = requests
         .iter()
-        .filter_map(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle).ok())
+        .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
         .map(|bytes| (addr.to_vec(), bytes))
         .collect();
     let preverify_start = std::time::Instant::now();
@@ -9900,7 +9900,7 @@ pub(crate) fn materialize_app_shard_requests(
     let mut spends: Vec<Vec<u8>> = Vec::new();
     for bundle in requests {
         let bundle_bytes =
-            match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+            match crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) {
                 // Re-encode too short / un-encodable are DETERMINISTIC (a pure
                 // function of the bundle bytes, which are part of the finalized
                 // body every replica agreed on via `requests_root`), so every
