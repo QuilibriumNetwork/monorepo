@@ -5,7 +5,7 @@
 //! drains the buffer for the current rank when producing a frame.
 //! Messages older than the retention window are automatically pruned.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,12 @@ fn message_key(data: &[u8]) -> [u8; 32] {
 /// times the consensus depth so a message can't be re-collected before
 /// it ages out.
 const MAX_FINALIZED_HASHES: usize = 8192;
+
+/// Shard frames of one shard a finalized frame carried that the collector
+/// remembers ([`MessageCollector::mark_finalized`]): the newest this many. A
+/// header rides GLOBAL at most `STORAGE_ANCHOR_LOCKSTEP_WINDOW` frames after
+/// its anchor, and a leader carries one frame per shard.
+const INCLUDED_FRAMES_KEPT: usize = 64;
 
 /// Bounded FIFO set of message hashes already included in a finalized
 /// frame. New `add_message` / `collect_for_rank` skip these so a message
@@ -473,6 +479,11 @@ pub struct MessageCollector {
     /// takes the shards that have waited longest.
     included: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     finalizations: std::sync::atomic::AtomicU64,
+    /// The shard frames finalized frames carried, by shard address (the
+    /// newest [`INCLUDED_FRAMES_KEPT`] of each). Another copy of one, in any
+    /// bundle, is a duplicate: GLOBAL credits a shard frame per frame that
+    /// carries it, so carrying it again would credit it again.
+    included_frames: std::sync::Mutex<HashMap<Vec<u8>, BTreeSet<u64>>>,
 }
 
 impl MessageCollector {
@@ -492,6 +503,7 @@ impl MessageCollector {
             verification_ended: std::sync::Condvar::new(),
             included: std::sync::Mutex::new(HashMap::new()),
             finalizations: std::sync::atomic::AtomicU64::new(0),
+            included_frames: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -516,6 +528,11 @@ impl MessageCollector {
         let tips = self.verified_tips.lock().unwrap();
         keys.iter()
             .all(|(address, frame)| tips.get(address).is_some_and(|tip| frame <= tip))
+    }
+
+    /// A frame in `keys` is one a finalized frame carried.
+    fn carries_included(&self, keys: &[(Vec<u8>, u64)]) -> bool {
+        keys_included(&self.included_frames.lock().unwrap(), keys)
     }
 
     /// Whether the collector holds `data` as verified.
@@ -610,6 +627,10 @@ impl MessageCollector {
                 .unwrap()
                 .retain(|address, _| addresses.contains(address));
             self.included
+                .lock()
+                .unwrap()
+                .retain(|address, _| addresses.contains(address));
+            self.included_frames
                 .lock()
                 .unwrap()
                 .retain(|address, _| addresses.contains(address));
@@ -734,6 +755,17 @@ impl MessageCollector {
         }
 
         let checks = extract_shard_frame_checks(&message.data);
+        // A shard frame header decodes with bytes appended or a field in a
+        // second encoding, which would make a copy of a header a distinct
+        // message. Every node encodes headers canonically.
+        if let Some(c) = checks.iter().find(|c| !c.canonical) {
+            tracing::debug!(
+                address = %hex::encode(&c.address),
+                frame_number = c.frame_number,
+                "message collector: shard-frame submit refused — header is not in its canonical encoding"
+            );
+            return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
+        }
 
         // Reject addresses outside the known current shard set before spending
         // certificate-verification work. Missing attestations affect rewards,
@@ -784,6 +816,10 @@ impl MessageCollector {
             .map(|c| (c.address.clone(), c.frame_number))
             .collect();
         if !keys.is_empty() && self.superseded(&keys) {
+            return SubmitOutcome::Duplicate;
+        }
+        // A shard frame a finalized frame already carried, in another bundle.
+        if !keys.is_empty() && self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
         }
         if self
@@ -869,8 +905,9 @@ impl MessageCollector {
             .back()
             .map_or(rank, |last| rank.max(*last));
         let mut buffers = self.buffers.write().unwrap();
-        // Another copy may have been verified while this one was.
-        if message.verified && self.superseded(&keys) {
+        // Another copy may have been verified while this one was, or a
+        // finalized frame carried it meanwhile.
+        if (message.verified && self.superseded(&keys)) || self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
         }
         let (hash, verified) = (message.hash, message.verified);
@@ -1245,11 +1282,25 @@ impl MessageCollector {
             return;
         }
         let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
+        let frames: Vec<(Vec<u8>, u64)> = raw_msgs
+            .iter()
+            .flat_map(|m| extract_shard_frame_keys(m))
+            .collect();
 
         {
             let mut buffers = self.buffers.write().unwrap();
+            let mut included = self.included_frames.lock().unwrap();
+            for (address, frame) in frames {
+                let kept = included.entry(address).or_default();
+                kept.insert(frame);
+                while kept.len() > INCLUDED_FRAMES_KEPT {
+                    kept.pop_first();
+                }
+            }
+            // Held copies of the carried shard frames leave too, however
+            // they are encoded or bundled.
             for buf in buffers.values_mut() {
-                buf.retain(|m| !hashes.contains(&m.hash));
+                buf.retain(|m| !hashes.contains(&m.hash) && !carries_included_frame(&included, m));
             }
             buffers.retain(|_, b| !b.is_empty());
         }
@@ -1443,11 +1494,42 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// (genesis/legacy) OR within `[expected - W, expected]`. Multi-member shards
 /// anchor to `latest − K`, so a strict `== expected` is unsatisfiable; the
 /// window absorbs K + transit.
+///
+/// From the required-anchor epoch
+/// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]) GLOBAL refuses
+/// a shard frame without an anchor, so none rides a frame from then on.
 pub fn anchor_in_lockstep(anchor: u64, frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
     let expected = frame_number.saturating_sub(1);
     let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
-    anchor == 0 || (oldest..=expected).contains(&anchor)
+    if anchor == 0 {
+        return !quil_types::consensus::required_anchor_active(frame_number);
+    }
+    (oldest..=expected).contains(&anchor)
+}
+
+/// Shard `address`'s `frame` is one a finalized frame carried.
+fn frame_included(included: &HashMap<Vec<u8>, BTreeSet<u64>>, address: &[u8], frame: u64) -> bool {
+    included
+        .get(address)
+        .is_some_and(|frames| frames.contains(&frame))
+}
+
+/// A frame in `keys` is one a finalized frame carried.
+fn keys_included(included: &HashMap<Vec<u8>, BTreeSet<u64>>, keys: &[(Vec<u8>, u64)]) -> bool {
+    keys.iter()
+        .any(|(address, frame)| frame_included(included, address, *frame))
+}
+
+/// `message` carries a shard frame a finalized frame carried.
+fn carries_included_frame(
+    included: &HashMap<Vec<u8>, BTreeSet<u64>>,
+    message: &CollectedMessage,
+) -> bool {
+    if let Some(shard) = &message.shard {
+        return frame_included(included, &shard.address, shard.frame);
+    }
+    message.proof && keys_included(included, &extract_shard_frame_keys(&message.data))
 }
 
 /// A shard `FrameHeader` carried by a bundle, with the fields needed for both
@@ -1461,6 +1543,9 @@ struct ShardFrameCheck {
     /// True iff the header commits to a storage attestation
     /// (`storage_attestation_root` non-empty).
     has_attestation: bool,
+    /// The request carries the header's canonical encoding, which every
+    /// node produces: nothing appended, no field in a second encoding.
+    canonical: bool,
 }
 
 fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
@@ -1476,11 +1561,15 @@ fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
         if req.inner_type_prefix == TYPE_FRAME_HEADER {
             if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
                 if !fh.address.is_empty() {
+                    let canonical = fh
+                        .to_canonical_bytes()
+                        .is_ok_and(|bytes| bytes == req.inner_bytes);
                     out.push(ShardFrameCheck {
                         address: fh.address,
                         frame_number: fh.frame_number,
                         global_frame_number: fh.global_frame_number,
                         has_attestation: !fh.storage_attestation_root.is_empty(),
+                        canonical,
                     });
                 }
             }
@@ -1764,6 +1853,90 @@ mod tests {
         }
         .to_canonical_bytes()
         .unwrap()
+    }
+
+    /// A bundle carrying `header` bytes as they are, canonical or not.
+    fn header_bytes_bundle(header: Vec<u8>) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::TYPE_FRAME_HEADER;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header,
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A shard frame a finalized frame carried leaves the collector in every
+    /// copy and is not held again, whatever bundle or member's copy carries
+    /// it; the shard's next frame is.
+    #[test]
+    fn a_shard_frame_a_finalized_frame_carried_is_not_held_again() {
+        let mc = MessageCollector::new();
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 5, 1, 0)),
+            SubmitOutcome::Accepted
+        );
+        mc.mark_finalized(&[shard_bundle(0x11, 5, 0, 0)]);
+        assert_eq!(mc.total_pending(), 0, "another member's copy leaves too");
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x11, 5, 2, 0)),
+            SubmitOutcome::Duplicate
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x11, 6, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x22, 5, 0, 0)),
+            SubmitOutcome::Accepted,
+            "another shard's frame"
+        );
+    }
+
+    /// A header with bytes appended, or a field in another encoding, would
+    /// be a distinct message carrying the same shard frame: it is refused.
+    #[test]
+    fn a_shard_frame_header_not_in_its_canonical_encoding_is_refused() {
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
+        let header = FrameHeader {
+            address: vec![0x11; 32],
+            frame_number: 5,
+            global_frame_number: 99,
+            storage_attestation: vec![0xAB; 8],
+            ..Default::default()
+        };
+        let canonical = header.to_canonical_bytes().unwrap();
+        let mut appended = canonical.clone();
+        appended.extend_from_slice(&[0xEE; 3]);
+        assert_eq!(
+            FrameHeader::from_canonical_bytes(&appended).unwrap(),
+            header
+        );
+        let mc = MessageCollector::new();
+        assert_eq!(
+            mc.add_message_outcome(1, header_bytes_bundle(appended)),
+            SubmitOutcome::Filtered(Refusal::InvalidShardFrame)
+        );
+        assert_eq!(
+            mc.add_message_outcome(1, header_bytes_bundle(canonical)),
+            SubmitOutcome::Accepted
+        );
+    }
+
+    /// From the required-anchor epoch a proof without a GLOBAL anchor rides
+    /// no frame: GLOBAL refuses it then.
+    #[test]
+    fn an_unanchored_proof_rides_no_frame_from_the_required_anchor_epoch() {
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        assert!(anchor_in_lockstep(0, first - 1));
+        assert!(!anchor_in_lockstep(0, first));
+        assert!(anchor_in_lockstep(first - 1, first));
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
     }
 
     /// Storage epoch proofs share at most `STORAGE_SEAL_BYTES_PER_FRAME` of a

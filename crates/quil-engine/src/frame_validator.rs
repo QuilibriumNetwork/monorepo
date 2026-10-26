@@ -1092,6 +1092,19 @@ impl BlsAppFrameValidator {
         self
     }
 
+    /// This node's latest GLOBAL frame when `frame` names no GLOBAL anchor
+    /// and that frame is in or past the required-anchor epoch
+    /// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]): GLOBAL
+    /// refuses such a frame then, so a vote for it would certify a frame no
+    /// GLOBAL frame can carry. `None` otherwise, and without a clock.
+    pub fn unanchored_after_activation(&self, frame: &AppShardFrame) -> Option<u64> {
+        if frame.header.as_ref()?.global_frame_number != 0 {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        quil_types::consensus::required_anchor_active(latest).then_some(latest)
+    }
+
     /// The GLOBAL frame `frame` is anchored to, when this node's clock does
     /// not hold it, with the latest GLOBAL frame it does hold (`None`: none
     /// or no clock). `None` when the anchor is held or the frame has none.

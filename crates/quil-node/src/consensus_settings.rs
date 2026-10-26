@@ -60,6 +60,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_KICK_SIGNED_SLOT_EPOCH override active (localnet only)"
         );
     }
+    let anchor_epoch = quil_types::consensus::init_required_anchor_epoch(network);
+    if network != 0 && anchor_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = anchor_epoch,
+            "QUIL_REQUIRED_ANCHOR_EPOCH override active (localnet only)"
+        );
+    }
     let issuance_epoch = quil_types::consensus::init_anchored_issuance_epoch(network);
     if network != 0 && issuance_epoch != u64::MAX {
         tracing::warn!(

@@ -532,6 +532,65 @@ pub fn set_kick_signed_slot_epoch_for_thread(epoch: Option<u64>) {
     KICK_SIGNED_SLOT_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a shard frame must name its GLOBAL anchor
+/// (`global_frame_number > 0`): GLOBAL refuses a header without one, a
+/// GLOBAL leader carries none, and app voters whose latest GLOBAL frame is
+/// in or past the epoch refuse to vote for one. The lockstep window, the
+/// storage seat and the proof-of-storage gate are all keyed on the anchor.
+/// Consensus-affecting: every node that executes GLOBAL frames must run a
+/// build with it before then. Mainnet epoch 1311 (frame 943,920);
+/// `QUIL_REQUIRED_ANCHOR_EPOCH` elsewhere, never by default.
+pub const MAINNET_REQUIRED_ANCHOR_EPOCH: Option<u64> = Some(1311);
+
+static REQUIRED_ANCHOR_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static REQUIRED_ANCHOR_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn required_anchor_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_REQUIRED_ANCHOR_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's required-anchor epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_required_anchor_epoch(network: u8) -> u64 {
+    *REQUIRED_ANCHOR_EPOCH.get_or_init(|| {
+        required_anchor_epoch_for(
+            network,
+            std::env::var("QUIL_REQUIRED_ANCHOR_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_required_anchor_epoch`]; the mainnet epoch in a
+/// process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn required_anchor_epoch() -> u64 {
+    if let Some(epoch) = REQUIRED_ANCHOR_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *REQUIRED_ANCHOR_EPOCH.get_or_init(|| required_anchor_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` requires shard frames to name their GLOBAL
+/// anchor ([`MAINNET_REQUIRED_ANCHOR_EPOCH`]).
+pub fn required_anchor_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= required_anchor_epoch()
+}
+
+/// Set the required-anchor epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_required_anchor_epoch_for_thread(epoch: Option<u64>) {
+    REQUIRED_ANCHOR_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which GLOBAL prices a shard header's issuance at the
 /// difficulty of the GLOBAL frame it anchors to, read from GLOBAL's own clock
 /// (a header without an anchor at its own difficulty, at least the first of
@@ -2503,6 +2562,35 @@ mod kick_signed_slot_epoch_tests {
         assert_eq!(
             super::kick_signed_slot_epoch(),
             super::MAINNET_KICK_SIGNED_SLOT_EPOCH.unwrap_or(u64::MAX)
+        );
+    }
+}
+
+#[cfg(test)]
+mod required_anchor_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_required_anchor_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::required_anchor_epoch_for(0, setting), 1311);
+        }
+        assert_eq!(super::MAINNET_REQUIRED_ANCHOR_EPOCH, Some(1311));
+        assert_eq!(super::required_anchor_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::required_anchor_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::required_anchor_epoch_for(1, None), u64::MAX);
+    }
+
+    #[test]
+    fn the_anchor_is_required_from_the_first_frame_of_its_epoch() {
+        super::set_required_anchor_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::required_anchor_active(u64::MAX - 1));
+        super::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::required_anchor_active(first - 1));
+        assert!(super::required_anchor_active(first));
+        super::set_required_anchor_epoch_for_thread(None);
+        assert_eq!(
+            super::required_anchor_epoch(),
+            super::MAINNET_REQUIRED_ANCHOR_EPOCH.unwrap_or(u64::MAX)
         );
     }
 }

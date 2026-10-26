@@ -69,6 +69,9 @@ mod storage_watch;
 mod metrics_tui;
 mod rpc_metrics;
 
+#[cfg(test)]
+mod required_anchor_tests;
+
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
 #[command(name = "quil-node", version = quil_config::display_version(), about)]
