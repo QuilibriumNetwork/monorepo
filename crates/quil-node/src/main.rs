@@ -1230,7 +1230,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         }
         (core_id, false) => {
             info!(core_id, "starting as worker node");
-            worker_node::start(sup, &config, core_id, args.parent_process).await?
+            worker_node::start(sup, &config, &args.config, core_id, args.parent_process).await?
         }
     };
 

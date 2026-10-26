@@ -68,6 +68,7 @@ use crate::log_export::redact::format_rfc3339_utc;
 use crate::peer_auth_middleware::AuthenticatedPeer;
 
 pub mod bundle;
+pub mod workers;
 
 pub use bundle::AutoApproval;
 
@@ -325,6 +326,7 @@ struct Exporter(
     fn(
         &AutoApproval,
         &bundle::AutoRequest,
+        &[workers::WorkerLog],
         usize,
         i64,
         &AtomicBool,
@@ -340,11 +342,23 @@ impl std::fmt::Debug for Exporter {
 fn build_automatic(
     auto: &AutoApproval,
     request: &bundle::AutoRequest,
+    workers: &[workers::WorkerLog],
     max: usize,
     now_secs: i64,
     cancel: &AtomicBool,
 ) -> anyhow::Result<bundle::AutoBundle> {
-    bundle::build_automatic(auto, request, max, now_secs, cancel, None)
+    bundle::build_automatic_with_workers(auto, request, workers, max, now_secs, cancel, None)
+}
+
+/// This node's standalone workers, whose lines its automatic approvals
+/// collect ([`workers::collect`]).
+#[derive(Clone)]
+struct WorkerLogs(Arc<dyn workers::WorkerLogSource>);
+
+impl std::fmt::Debug for WorkerLogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerLogs")
+    }
 }
 
 /// A denied or expired request, as its requester can still read it.
@@ -418,6 +432,8 @@ pub struct LogRequests {
     auto_timeout: Duration,
     auto_poll: Duration,
     exporter: Exporter,
+    /// The standalone workers whose lines automatic approvals collect.
+    worker_logs: Option<WorkerLogs>,
     state: Mutex<State>,
 }
 
@@ -511,8 +527,16 @@ impl LogRequests {
             auto_timeout: AUTO_EXPORT_TIMEOUT,
             auto_poll: AUTO_POLL_INTERVAL,
             exporter: Exporter(build_automatic),
+            worker_logs: None,
             state: Mutex::default(),
         }
+    }
+
+    /// Collect the lines of this node's standalone workers, through
+    /// `source`, into the bundles it approves itself.
+    pub fn with_worker_logs(mut self, source: Arc<dyn workers::WorkerLogSource>) -> Self {
+        self.worker_logs = Some(WorkerLogs(source));
+        self
     }
 
     pub fn enabled(&self) -> bool {
@@ -1366,10 +1390,12 @@ impl LogRequests {
             "diagnostics log request automatic approval failed; request denied");
     }
 
-    /// Approve the oldest waiting request from this node's log files;
-    /// whether there was one. The export, the seal and every file write run
-    /// on a blocking task, which stops when the request is denied, its
-    /// export runs over [`AUTO_EXPORT_TIMEOUT`], or this future is dropped.
+    /// Approve the oldest waiting request from this node's log files and
+    /// its standalone workers' lines; whether there was one. The workers'
+    /// lines are collected first; the export, the seal and every file write
+    /// then run on a blocking task, which stops when the request is denied,
+    /// the approval runs over [`AUTO_EXPORT_TIMEOUT`], or this future is
+    /// dropped.
     pub async fn approve_next(self: &Arc<Self>) -> bool {
         let Some(auto) = self.auto.clone() else {
             return false;
@@ -1382,21 +1408,42 @@ impl LogRequests {
         let mut stop = StopOnDrop(Some(cancel.clone()));
         let (queue, exporter) = (self.clone(), self.exporter);
         let max = usize::try_from(self.limits.max_bundle_bytes).unwrap_or(usize::MAX);
-        let export = tokio::task::spawn_blocking(move || {
-            let _done = ExportDone {
-                queue: queue.clone(),
-                token,
+        let worker_logs = self.worker_logs.clone();
+        // Ends the export however it ends: here if the approval is dropped
+        // while collecting, else when the blocking task ends.
+        let done = ExportDone {
+            queue: queue.clone(),
+            token,
+        };
+        let export = async move {
+            let collected = match worker_logs {
+                Some(WorkerLogs(source)) => {
+                    workers::collect(
+                        source.as_ref(),
+                        &auto.log_dir,
+                        &job.request,
+                        max,
+                        &job.cancel,
+                    )
+                    .await
+                }
+                None => Vec::new(),
             };
-            let built = (exporter.0)(
-                &auto,
-                &job.request,
-                max,
-                (now_ms() / 1000) as i64,
-                &job.cancel,
-            );
-            let done = now_ms();
-            queue.settle_auto(&job, built, done.saturating_sub(started), done);
-        });
+            tokio::task::spawn_blocking(move || {
+                let _done = done;
+                let built = (exporter.0)(
+                    &auto,
+                    &job.request,
+                    &collected,
+                    max,
+                    (now_ms() / 1000) as i64,
+                    &job.cancel,
+                );
+                let finished = now_ms();
+                queue.settle_auto(&job, built, finished.saturating_sub(started), finished);
+            })
+            .await
+        };
         match tokio::time::timeout(self.auto_timeout, export).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => self.abort_auto(
@@ -3617,6 +3664,85 @@ mod tests {
         );
     }
 
+    /// One standalone worker, core 4, whose log holds `.0`.
+    struct OneWorker(String);
+
+    #[tonic::async_trait]
+    impl workers::WorkerLogSource for OneWorker {
+        fn cores(&self) -> Vec<u32> {
+            vec![4]
+        }
+
+        async fn export_logs(
+            &self,
+            core: u32,
+            request: quil_types::proto::node::ExportWorkerLogsRequest,
+        ) -> Result<workers::ChunkStream, Status> {
+            assert_eq!(core, 4);
+            assert!(request.max_bytes > 0 && request.until_unix > request.since_unix);
+            let lines = self.0.clone().into_bytes();
+            let summary = quil_types::proto::node::ExportWorkerLogsSummary {
+                line_bytes: lines.len() as u64,
+                files: vec!["worker-4.log".into()],
+                ..Default::default()
+            };
+            let chunk = quil_types::proto::node::ExportWorkerLogsChunk {
+                summary: Some(summary),
+                lines,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok::<_, Status>(
+                chunk,
+            )])))
+        }
+    }
+
+    /// This node's own approval collects its standalone workers' lines into
+    /// the bundle beside its own, and the manifest names each worker.
+    #[tokio::test]
+    async fn an_automatic_bundle_holds_the_standalone_workers_lines() {
+        let (own, listed) = (key(), key());
+        let dir = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let requests = automatic_requests(
+            &config(true, &[&listed]),
+            &own,
+            dir.path(),
+            &log_line(now, 120, "info", "on the master", r#"{"coreId":0}"#),
+        )
+        .with_worker_logs(Arc::new(OneWorker(log_line(
+            now,
+            60,
+            "info",
+            "on a standalone worker",
+            r#"{"coreId":4}"#,
+        ))));
+        let queue = Arc::new(requests);
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let id: [u8; ID_LEN] = submit_fresh(&queue, &listed, &own, 1, &kem.public)
+            .request_id
+            .try_into()
+            .unwrap();
+        assert!(queue.approve_next().await);
+        let (_, path, _, _) = queue.bundle(Some(&listed.peer), &id, now_ms()).unwrap();
+        let sealed = std::fs::read(&path).unwrap();
+        let files =
+            bundle::unpack_bundle(&quil_crypto::seal::open(&sealed, &kem.secret, &id).unwrap())
+                .unwrap();
+        let mut log = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(files[0].as_slice()),
+            &mut log,
+        )
+        .unwrap();
+        assert!(
+            log.contains("on the master") && log.contains("on a standalone worker"),
+            "{log}"
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(&files[1]).unwrap();
+        assert_eq!(manifest["workers"][0]["core"], 4);
+        assert_eq!(manifest["workers"][0]["status"], "collected");
+    }
+
     /// Opened by a test to let a stand-in export end once cancelled.
     static GATE: AtomicBool = AtomicBool::new(false);
 
@@ -3624,6 +3750,7 @@ mod tests {
     fn stalled_export(
         _: &AutoApproval,
         _: &bundle::AutoRequest,
+        _: &[workers::WorkerLog],
         _: usize,
         _: i64,
         cancel: &AtomicBool,

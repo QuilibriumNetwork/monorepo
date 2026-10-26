@@ -104,6 +104,18 @@ pub type PublishFn = Arc<
         + Sync,
 >;
 
+/// Answers the master's `ExportLogs` with this worker's own log lines, as
+/// a stream of messages. The node layer, which owns the log files and
+/// their reader, supplies it.
+pub type LogExportSource = Arc<
+    dyn Fn(
+            quil_types::proto::node::ExportWorkerLogsRequest,
+        ) -> mpsc::Receiver<
+            std::result::Result<quil_types::proto::node::ExportWorkerLogsChunk, tonic::Status>,
+        > + Send
+        + Sync,
+>;
+
 /// A worker-only node that runs on a separate machine.
 pub struct WorkerOnlyNode {
     config: WorkerNodeConfig,
@@ -167,6 +179,8 @@ pub struct WorkerOnlyNode {
     /// engine-produced messages are forwarded to the master for
     /// broadcast.
     publish_fn: Option<PublishFn>,
+    /// This worker's log lines for the master's diagnostics log bundles.
+    log_export: Option<LogExportSource>,
     /// Worker-owned libp2p handle. Present when running in
     /// standalone mode WITHOUT `engine.enable_master_proxy` — the
     /// worker joins the mesh directly with a synthetic peer ID, and
@@ -566,6 +580,7 @@ impl WorkerOnlyNode {
             engine_event_tx,
             engine_event_rx: std::sync::Mutex::new(Some(engine_event_rx)),
             publish_fn: None,
+            log_export: None,
             worker_p2p: None,
             active_shard_subscriptions: std::sync::Mutex::new(Vec::new()),
             peer_key_by_id: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -679,6 +694,13 @@ impl WorkerOnlyNode {
         } else {
             self.prover_registry.refresh()
         }
+    }
+
+    /// Supply the export of this worker's own log lines, which the master
+    /// collects into its diagnostics log bundles (`ExportLogs`).
+    pub fn with_log_export(mut self, export: LogExportSource) -> Self {
+        self.log_export = Some(export);
+        self
     }
 
     /// Supply a publish path (typically backed by a `ProxyPubSub`
@@ -2133,6 +2155,28 @@ where
 
 #[tonic::async_trait]
 impl quil_types::proto::node::data_ipc_service_server::DataIpcService for DataIpcServiceImpl {
+    type ExportLogsStream = tonic::codegen::tokio_stream::wrappers::ReceiverStream<
+        std::result::Result<quil_types::proto::node::ExportWorkerLogsChunk, tonic::Status>,
+    >;
+
+    /// This worker's own log lines of a window, for the master's
+    /// diagnostics log bundle. Answered while the worker starts too: a
+    /// start that does not end is among what its lines explain.
+    async fn export_logs(
+        &self,
+        request: tonic::Request<quil_types::proto::node::ExportWorkerLogsRequest>,
+    ) -> std::result::Result<tonic::Response<Self::ExportLogsStream>, tonic::Status> {
+        let Some(export) = self.worker.log_export.as_ref() else {
+            return Err(tonic::Status::failed_precondition(
+                "this worker process exports no log lines",
+            ));
+        };
+        let lines = export(request.into_inner());
+        Ok(tonic::Response::new(
+            tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(lines),
+        ))
+    }
+
     /// A committee member's message the master received directly, for this
     /// worker's shard. Handed to the engine exactly as the topic copy would
     /// be; the engine checks `from` against the committee.
@@ -3456,6 +3500,10 @@ mod respawn_queue_tests {
 
     /// A worker with no master, store or engine.
     fn idle_worker() -> Arc<WorkerOnlyNode> {
+        Arc::new(idle_node())
+    }
+
+    fn idle_node() -> WorkerOnlyNode {
         let config = WorkerNodeConfig {
             core_id: 1,
             master_endpoint: String::new(),
@@ -3472,7 +3520,7 @@ mod respawn_queue_tests {
             Arc::new(|| -> Box<dyn quil_types::crypto::Signer> {
                 unreachable!("no engine starts in this test")
             });
-        Arc::new(WorkerOnlyNode::new(
+        WorkerOnlyNode::new(
             config,
             Arc::new(quil_store::testing::InMemoryClockStore::new()),
             Arc::new(crate::test_support::TestProverRegistry::new()),
@@ -3484,7 +3532,7 @@ mod respawn_queue_tests {
             signer,
             false,
             1,
-        ))
+        )
     }
 
     /// The filter `service`'s worker reports running.
@@ -3568,6 +3616,56 @@ mod respawn_queue_tests {
         let status = service.evict_payload(request).await.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), WORKER_STARTING);
+    }
+
+    /// The master's log export is answered from the export the node layer
+    /// supplies, while the worker starts too; a worker process without one
+    /// refuses it as a precondition, which the master records as failed.
+    #[tokio::test]
+    async fn log_exports_are_streamed_from_the_supplied_export() {
+        use quil_types::proto::node::data_ipc_service_server::DataIpcService as _;
+        use quil_types::proto::node::{ExportWorkerLogsChunk, ExportWorkerLogsRequest};
+        let request = || {
+            tonic::Request::new(ExportWorkerLogsRequest {
+                since_unix: 1,
+                until_unix: 2,
+                ..Default::default()
+            })
+        };
+        let unwired = DataIpcServiceImpl {
+            worker: idle_worker(),
+        };
+        let status = unwired.export_logs(request()).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let export: LogExportSource = {
+            let asked = asked.clone();
+            Arc::new(move |request: ExportWorkerLogsRequest| {
+                asked.lock().unwrap().push(request.until_unix);
+                let (tx, rx) = mpsc::channel(2);
+                tx.try_send(Ok(ExportWorkerLogsChunk {
+                    summary: Some(Default::default()),
+                    lines: b"line\n".to_vec(),
+                }))
+                .unwrap();
+                rx
+            })
+        };
+        let wired = DataIpcServiceImpl {
+            worker: Arc::new(idle_node().with_log_export(export)),
+        };
+        assert!(!wired.worker.respawns.is_ready(), "the worker is starting");
+        let mut stream = wired.export_logs(request()).await.unwrap().into_inner();
+        let first = std::future::poll_fn(|cx| {
+            tonic::codegen::tokio_stream::Stream::poll_next(std::pin::Pin::new(&mut stream), cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(first.summary.is_some());
+        assert_eq!(first.lines, b"line\n");
+        assert_eq!(*asked.lock().unwrap(), vec![2]);
     }
 }
 

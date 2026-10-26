@@ -22,6 +22,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 pub mod redact;
+pub mod worker;
 
 use redact::{RedactOptions, Redactor};
 
@@ -474,12 +475,37 @@ pub fn file_readers(
     since: i64,
     until: i64,
 ) -> anyhow::Result<(Vec<RecordReader>, Vec<String>)> {
+    readers_of(dir, since, until, None)
+}
+
+/// [`file_readers`] of one core's files only: a standalone worker's own
+/// `worker-N.log` and its rotations, in a directory it may share.
+pub fn core_file_readers(
+    dir: &Path,
+    core: u32,
+    since: i64,
+    until: i64,
+) -> anyhow::Result<(Vec<RecordReader>, Vec<String>)> {
+    readers_of(dir, since, until, Some(core))
+}
+
+fn readers_of(
+    dir: &Path,
+    since: i64,
+    until: i64,
+    core: Option<u32>,
+) -> anyhow::Result<(Vec<RecordReader>, Vec<String>)> {
     let mut names = Vec::new();
     for entry in
         std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?
     {
         if let Ok(name) = entry?.file_name().into_string() {
-            names.push(name);
+            let wanted = core.is_none_or(|core| {
+                parse_log_file_name(&name).is_some_and(|file| file.core == core)
+            });
+            if wanted {
+                names.push(name);
+            }
         }
     }
     let mut readers = Vec::new();
@@ -501,6 +527,30 @@ pub fn file_readers(
         readers.push(reader);
     }
     Ok((readers, used))
+}
+
+/// The longest first line [`live_head_digest`] reads.
+const HEAD_LINE_MAX: usize = 4096;
+
+/// SHA-256 of the first line of `core`'s live log file in `dir`, if it has
+/// a complete one. Lines start with their second and carry the core, so two
+/// hosts' files share it only when they are the same file: a master and a
+/// standalone worker writing one log directory.
+pub fn live_head_digest(dir: &Path, core: u32) -> Option<[u8; 32]> {
+    let name = if core == 0 {
+        "master.log".to_string()
+    } else {
+        format!("worker-{core}.log")
+    };
+    let file = File::open(dir.join(name)).ok()?;
+    let mut line = Vec::new();
+    io::Read::take(BufReader::new(file), HEAD_LINE_MAX as u64)
+        .read_until(b'\n', &mut line)
+        .ok()?;
+    if line.last() != Some(&b'\n') {
+        return None;
+    }
+    Some(Sha256::digest(&line).into())
 }
 
 /// Whether `name` is a rotated node log: `master.log.<suffix>` or
@@ -733,7 +783,7 @@ pub fn home_users(paths: &[PathBuf]) -> Vec<String> {
 /// the user of the process environment and the users whose home
 /// directories `home_paths` and the working directory lie in, so a node
 /// run as root still hides its operator's name.
-fn local_literals(home_paths: &[PathBuf]) -> Vec<(&'static str, String)> {
+pub fn local_literals(home_paths: &[PathBuf]) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -823,6 +873,9 @@ pub struct ExportOptions<'a> {
     pub home_paths: &'a [PathBuf],
     /// Stops the export once set.
     pub cancel: Option<&'a AtomicBool>,
+    /// Host and user names of the other hosts whose lines the export holds
+    /// (standalone workers' [`local_literals`]), tokenized like this host's.
+    pub literals: &'a [(&'static str, String)],
 }
 
 /// Select, redact and gzip the records of `readers` into `out`, and
@@ -843,6 +896,11 @@ pub fn produce<W: Write>(
     });
     let mut opts = RedactOptions::with_bootstrap_endpoints(keep_self);
     opts.literals = local_literals(options.home_paths);
+    for literal in options.literals {
+        if !opts.literals.contains(literal) {
+            opts.literals.push(literal.clone());
+        }
+    }
     let mut redactor = Redactor::new(salt, opts);
 
     let hashing = HashingWriter {
