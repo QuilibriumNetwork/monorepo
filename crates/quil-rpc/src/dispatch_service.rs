@@ -1003,6 +1003,69 @@ mod tests {
     use quil_crypto::Ed448Signer;
     use quil_types::crypto::Signer;
 
+    /// A/B reproducer for security fix 5 (DispatchService inbox). On the
+    /// vulnerable build an inbox key is `0x40 || filter || timestamp`, so a
+    /// put with the address and timestamp of a stored message silently
+    /// overwrites it; the fix appends the message's content hash to the key.
+    /// Uses only APIs present on both builds, so it compiles on each.
+    #[tokio::test]
+    async fn reproduces_inbox_put_overwrite() {
+        let db = quil_store::RocksDb::open_in_memory().expect("in-memory db");
+        let store = Arc::new(RocksInboxStore::new(db.inner()));
+        let server = DispatchRpcServer::with_responsible_filters(store, None);
+
+        // A derivable inbox address and its 3-byte routing filter.
+        let mut address = vec![0u8; 32];
+        address[0] = 0x05;
+        address[3] = 0x31;
+        let filter = filter_for_address(&address).expect("derivable filter");
+
+        // A current timestamp, so the fix's retention window accepts it.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+
+        // Two distinct messages sharing one (address, timestamp).
+        let first = quil_types::proto::channel::InboxMessage {
+            address: address.clone(),
+            timestamp,
+            message: b"original".to_vec(),
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        second.message = b"attacker-replacement".to_vec();
+
+        for msg in [first.clone(), second.clone()] {
+            server
+                .put_inbox_message(Request::new(InboxMessagePut { message: Some(msg) }))
+                .await
+                .expect("put accepted");
+        }
+
+        let stored = server
+            .get_inbox_messages(Request::new(InboxMessageRequest {
+                filter: filter.to_vec(),
+                ..Default::default()
+            }))
+            .await
+            .expect("get")
+            .into_inner()
+            .messages;
+
+        assert_eq!(
+            stored.len(),
+            2,
+            "a put replaced another sender's message: only {} of 2 distinct \
+             messages sharing one address and timestamp survived",
+            stored.len()
+        );
+        assert!(
+            stored.contains(&first) && stored.contains(&second),
+            "both the original and the replacement message must be retained"
+        );
+    }
+
     /// Build an Ed448 keypair from a fixed seed byte (deterministic).
     fn keypair(seed_byte: u8) -> (Ed448Signer, Vec<u8>) {
         let seed = vec![seed_byte; 57];

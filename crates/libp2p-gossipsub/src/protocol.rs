@@ -1427,4 +1427,58 @@ mod tests {
             "one RPC made the codec verify {verified} invalid signatures out of 64 entries"
         );
     }
+
+    /// QUILIBRIUM: a frame of empty publish entries is not decoded entry by entry. Each such
+    /// entry is two bytes on the wire, but a decoded one becomes a message record of hundreds
+    /// of bytes, so decoding them all lets one frame of the node's 16 MiB limit cost
+    /// gigabytes. The frame here is a sixty-fourth of that limit; the cost scales with it.
+    #[test]
+    fn reproduces_empty_entry_frame_decoding() {
+        /// The bytes a vector of records holds.
+        fn held<T>(records: &Vec<T>) -> usize {
+            records.capacity() * std::mem::size_of::<T>()
+        }
+
+        /// The frame limit of the node's gossip (`MAX_MESSAGE_SIZE` in quil-p2p).
+        const FRAME_LIMIT: usize = 16 * 1024 * 1024;
+        /// The most entries an RPC is expected to carry: this crate sends one per RPC.
+        const MAX_DECODED_ENTRIES: usize = 128;
+        let entries = FRAME_LIMIT / 64 / 2;
+
+        // `publish` (field 2), an empty message, repeated.
+        let body: Vec<u8> = [0x12, 0x00].repeat(entries);
+        let mut frame = Vec::with_capacity(body.len() + 10);
+        let mut len = body.len();
+        while len >= 0x80 {
+            frame.push((len as u8 & 0x7f) | 0x80);
+            len >>= 7;
+        }
+        frame.push(len as u8);
+        frame.extend_from_slice(&body);
+        let frame_len = frame.len();
+
+        let mut codec = GossipsubCodec::new(FRAME_LIMIT, ValidationMode::Strict, HashMap::new());
+        let mut buf = BytesMut::from(&frame[..]);
+        let event = codec
+            .decode(&mut buf)
+            .expect("a well-formed frame is not an error")
+            .expect("a whole frame");
+        assert!(buf.is_empty(), "the frame is consumed");
+
+        if let HandlerEvent::Message {
+            rpc,
+            invalid_messages,
+        } = event
+        {
+            let decoded = rpc.messages.len() + invalid_messages.len();
+            let bytes = held(&rpc.messages) + held(&invalid_messages);
+            assert!(
+                decoded <= MAX_DECODED_ENTRIES,
+                "a {frame_len}-byte frame of {entries} empty publish entries was decoded into \
+                 {decoded} message records holding {bytes} bytes ({}x the frame): the codec \
+                 decodes every entry before it checks any",
+                bytes / frame_len,
+            );
+        }
+    }
 }

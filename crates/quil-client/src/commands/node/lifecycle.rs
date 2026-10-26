@@ -116,6 +116,28 @@ fn current_crontab() -> String {
         .unwrap_or_default()
 }
 
+/// A/B reproducer of the auto-update finding; it calls only functions whose
+/// signatures predate the fix.
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    /// The root cron entry ran the file the enabling qclient was started
+    /// from, which an operator's directory lets a non-root user replace.
+    /// Without an installed root-owned qclient the entry is now refused.
+    #[test]
+    fn reproduces_cron_runs_current_exe() {
+        let exe = std::env::current_exe().unwrap();
+        if let Ok(line) = cron_line() {
+            assert!(
+                !line.contains(&*exe.to_string_lossy()),
+                "the root auto-update cron entry runs the executable that enabled it, {}: {line}",
+                exe.display()
+            );
+        }
+    }
+}
+
 fn write_crontab(contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let mut child = std::process::Command::new("crontab")

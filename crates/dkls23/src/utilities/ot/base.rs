@@ -448,6 +448,61 @@ mod tests {
         }
     }
 
+    /// Reproduces a base OT point `h` whose discrete logarithm is public.
+    ///
+    /// The attacker takes `t = hash_as_scalar("Receiver" || seed, sid)`,
+    /// which anybody can compute from the public seed. If `h = t * G`, the
+    /// sender reads the choice bit (`u = r * h` gives `r * G = u / t`, and
+    /// `v - r * G = bit * h`), and the receiver computes the message it did
+    /// not choose (`m1 = H((r - t) * z)`, `m0 = H((r + t) * z)`).
+    #[test]
+    fn reproduces_public_discrete_log_of_base_ot_h() {
+        type Point = <C as CurveArithmetic>::ProjectivePoint;
+
+        for bit in [false, true] {
+            let session_id = rng::get_rng().gen::<[u8; 32]>();
+            let sender = OTSender::<C>::init(&session_id);
+            let receiver = OTReceiver::init();
+
+            let dlog_proof = sender.run_phase1();
+            let (r, enc_proof) = receiver.run_phase1::<C>(&session_id, bit);
+            let (m0, m1) = sender
+                .run_phase2(&session_id, &receiver.seed, &enc_proof)
+                .expect("the sender must accept an honest receiver");
+            let z = receiver
+                .run_phase2_step1::<C>(&session_id, &dlog_proof)
+                .expect("the receiver must accept an honest sender");
+
+            let msg_for_h = ["Receiver".as_bytes(), &receiver.seed].concat();
+            let t = hash_as_scalar::<C>(&msg_for_h, &session_id);
+
+            // The sender's view: u, v and h from the encryption proof.
+            let (u, v) = enc_proof.get_u_and_v();
+            let v = Point::from(v);
+            let h = Point::from(enc_proof.proof0.base_h);
+            let r_g = Point::from(u) * t.invert().unwrap();
+            let read_bit = if v == r_g {
+                Some(false)
+            } else if v - h == r_g {
+                Some(true)
+            } else {
+                None
+            };
+            assert!(
+                read_bit.is_none(),
+                "the OT sender recovered the receiver's choice bit ({bit}) from its own transcript"
+            );
+
+            // The receiver's view: r, z and the public seed.
+            let (r_other, m_other) = if bit { (r + t, m0) } else { (r - t, m1) };
+            let guess = receiver.run_phase2_step2::<C>(&session_id, &r_other, &z);
+            assert!(
+                guess != m_other,
+                "the OT receiver computed the message it did not choose (choice bit {bit})"
+            );
+        }
+    }
+
     /// Batch version for [`test_ot_base`].
     #[test]
     fn test_ot_base_batch() {

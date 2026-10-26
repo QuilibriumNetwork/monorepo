@@ -111,6 +111,10 @@ pub(crate) fn initialize(network: u8) {
 }
 
 #[cfg(test)]
+#[path = "anchored_issuance_tests.rs"]
+mod anchored_issuance_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn local_epoch_override_is_shared_and_cannot_change_mainnet() {
