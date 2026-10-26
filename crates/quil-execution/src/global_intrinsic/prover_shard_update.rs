@@ -86,6 +86,48 @@ pub struct ShardMetadata {
     pub shard_count: u64,
 }
 
+/// The lowest difficulty GLOBAL prices issuance at under the anchored
+/// issuance rules: the first of the square-root generation
+/// ([`crate::pricing::pomw_generation`] one). GLOBAL's own difficulty never
+/// falls below 50,000, so it binds only a header without an anchor.
+pub const ISSUANCE_MIN_DIFFICULTY: u64 = 10_000;
+
+/// How GLOBAL prices and credits one shard header
+/// ([`materialize_prover_shard_update_with_fees`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderIssuance {
+    /// The difficulty issuance is priced at.
+    pub difficulty: u64,
+    /// Whether the header earns issuance, fees and activity. From the
+    /// anchored issuance epoch a header at or below its session's executed
+    /// tip does not: GLOBAL already credited that frame.
+    pub credit: bool,
+}
+
+impl HeaderIssuance {
+    /// The rule before [`quil_types::consensus::anchored_issuance_active`]:
+    /// the difficulty the shard's leader wrote into the header, credited.
+    pub fn claimed(frame_header: &FrameHeader) -> Self {
+        Self {
+            difficulty: u64::from(frame_header.difficulty),
+            credit: true,
+        }
+    }
+}
+
+/// The difficulty GLOBAL prices a header's issuance at under the anchored
+/// issuance rules: that of the GLOBAL frame it anchors to
+/// (`anchor_difficulty`, from GLOBAL's own clock), or for a header without
+/// an anchor its own, and never below [`ISSUANCE_MIN_DIFFICULTY`]. App voters
+/// only bind the header's difficulty into its output and never compare it
+/// with GLOBAL's, so the leader's value cannot price issuance.
+pub fn anchored_issuance_difficulty(
+    frame_header: &FrameHeader,
+    anchor_difficulty: Option<u32>,
+) -> u64 {
+    u64::from(anchor_difficulty.unwrap_or(frame_header.difficulty)).max(ISSUANCE_MIN_DIFFICULTY)
+}
+
 /// Participants from a frame header, grouped by ring.
 #[derive(Debug, Clone)]
 pub struct ShardUpdateContext {
@@ -171,7 +213,10 @@ pub fn verify_settlement_relay(
 
 /// Write the GLOBAL settlement record of every relayed entry not yet recorded.
 /// Idempotent: a header re-carries its window, so most entries are repeats.
-/// Returns the number of records written.
+/// From the committed-credit frame (`settlement_record::committed_credit_frame`)
+/// the relay is only checked: the global commit writes a record together with
+/// the spend that carries it, so a settlement whose spend is rejected, or never
+/// committed, records nothing. Returns the number of records written.
 pub fn materialize_settlement_records(
     frame_header: &FrameHeader,
     current_frame_number: u64,
@@ -179,7 +224,7 @@ pub fn materialize_settlement_records(
 ) -> Result<usize> {
     use crate::token_intrinsic::settlement_record;
     let frames = verify_settlement_relay(frame_header)?;
-    if frames.is_empty() {
+    if frames.is_empty() || current_frame_number >= settlement_record::committed_credit_frame() {
         return Ok(0);
     }
     let va_disc = vertex_adds_discriminator()?;
@@ -897,6 +942,7 @@ pub fn materialize_prover_shard_update(
         0,
         None,
         None,
+        HeaderIssuance::claimed(frame_header),
     )
 }
 
@@ -914,6 +960,9 @@ pub fn materialize_prover_shard_update(
 /// `storage` marks a frame anchored in a hash-proof epoch: each participant's
 /// issuance share is held in its storage seat instead of paid
 /// ([`hold_storage_shares`]); fees are still paid at once.
+///
+/// `issuance` prices the frame's issuance and says whether it is credited at
+/// all ([`HeaderIssuance`]); a frame not credited only resolves its rings.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_prover_shard_update_with_fees(
     frame_header: &FrameHeader,
@@ -929,6 +978,7 @@ pub fn materialize_prover_shard_update_with_fees(
     committed_fees: u128,
     session: Option<[u8; 32]>,
     storage: Option<&mut StorageFrame>,
+    issuance: HeaderIssuance,
 ) -> Result<()> {
     let session_rings = match &session {
         Some(session) => Some(session_member_rings(
@@ -968,6 +1018,16 @@ pub fn materialize_prover_shard_update_with_fees(
         shard_metadata,
         session_rings.as_deref(),
     )?;
+    if !issuance.credit {
+        tracing::info!(
+            shard = %hex::encode(&frame_header.address),
+            shard_frame = frame_header.frame_number,
+            frame = current_frame_number,
+            "shard header at or below its session's executed tip: GLOBAL already \
+             credited this frame, so it earns no issuance, fees or activity again",
+        );
+        return Ok(());
+    }
 
     // Per-ring reward shares: build a single-prover allocation map
     // per ring and divide `outputs[0]` by `ringGroupSize`.
@@ -987,7 +1047,7 @@ pub fn materialize_prover_shard_update_with_fees(
         );
 
         let outputs = reward_issuance.calculate(
-            frame_header.difficulty as u64,
+            issuance.difficulty,
             world_state_size,
             REWARD_UNITS,
             &[alloc_map],
@@ -1941,6 +2001,143 @@ mod tests {
         );
     }
 
+    /// A settlement spending `image`, executed at QUIL shard frame 39 and
+    /// carrying the settlement of `receipt`.
+    #[cfg(feature = "confidential-tokens")]
+    fn settling_spend(
+        tx: u8,
+        image: u8,
+        receipt: u8,
+    ) -> crate::token_intrinsic::global_commit::SpendEntry {
+        crate::token_intrinsic::global_commit::SpendEntry {
+            kind: crate::token_engine::TYPE_LATTICE_SETTLEMENT,
+            tx_id: [tx; 32],
+            source_frame: 39,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[image; 32]],
+            outputs: Vec::new(),
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: Some(relay_entry(receipt)),
+        }
+    }
+
+    /// QUIL shard header 40 relaying `spends` from frame 39, with the
+    /// settlements they carry plus `unspent`, settlements of no relayed spend.
+    #[cfg(feature = "confidential-tokens")]
+    fn settling_header(
+        spends: &[crate::token_intrinsic::global_commit::SpendEntry],
+        unspent: &[u8],
+    ) -> FrameHeader {
+        let mut settlements: Vec<_> = spends.iter().filter_map(|s| s.settlement).collect();
+        settlements.extend(unspent.iter().map(|receipt| relay_entry(*receipt)));
+        settlements.sort();
+        settlements.dedup();
+        let mut header = fake_header(crate::domains::QUIL_TOKEN.to_vec(), 40);
+        header.settlements =
+            crate::token_intrinsic::settlement_record::encode_relay(&[(39, settlements)]).unwrap();
+        let relayed: Vec<Vec<u8>> = spends.iter().map(|s| s.encode().unwrap()).collect();
+        header.spends =
+            crate::token_intrinsic::spend_relay::encode_relay(&[(39, relayed)]).unwrap();
+        header
+    }
+
+    /// What GLOBAL does with a certified QUIL shard header, in its order:
+    /// the settlement relay, then the spend relay. Returns the credited fees.
+    #[cfg(feature = "confidential-tokens")]
+    fn settle(header: &FrameHeader, frame: u64, state: &HypergraphState) -> u128 {
+        materialize_settlement_records(header, frame, state).unwrap();
+        crate::token_intrinsic::global_commit::materialize_relay(
+            state,
+            frame,
+            &header.address,
+            header.frame_number,
+            &header.spends,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "confidential-tokens")]
+    fn settlement_record_of(state: &HypergraphState, receipt: u8) -> Option<Vec<u8>> {
+        let va_disc = vertex_adds_discriminator().unwrap();
+        state
+            .get(&GLOBAL_INTRINSIC_ADDRESS[..], &[receipt; 32], &va_disc)
+            .unwrap()
+            .filter(|blob| !blob.is_empty())
+    }
+
+    /// From the committed-credit frame a relayed settlement is recorded only
+    /// with its committed spend: not for a double spend, a spend citing a
+    /// root the application never had, or a settlement no spend carries.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn settlement_records_follow_only_committed_spends_from_the_activation_frame() {
+        use crate::token_intrinsic::settlement_record::{
+            create_record, set_committed_credit_frame_for_thread,
+        };
+        let honest = settling_spend(1, 20, 1);
+        let double = settling_spend(2, 20, 2);
+        let mut unrooted = settling_spend(3, 21, 3);
+        unrooted.root_digest = Some([9; 32]);
+        let header = settling_header(&[honest, double, unrooted], &[4]);
+
+        set_committed_credit_frame_for_thread(Some(1_001));
+        let before = make_state();
+        assert_eq!(settle(&header, 1_000, &before), 5);
+        for receipt in 1..=4 {
+            assert!(settlement_record_of(&before, receipt).is_some());
+        }
+
+        set_committed_credit_frame_for_thread(Some(1_000));
+        let after = make_state();
+        assert_eq!(settle(&header, 1_000, &after), 5, "only the honest spend");
+        assert_eq!(
+            settlement_record_of(&after, 1),
+            Some(create_record(&relay_entry(1)).unwrap()),
+            "an honest settlement is recorded exactly as before"
+        );
+        assert_eq!(
+            settlement_record_of(&after, 1),
+            settlement_record_of(&before, 1)
+        );
+        for receipt in 2..=4 {
+            assert!(
+                settlement_record_of(&after, receipt).is_none(),
+                "receipt {receipt} has no committed spend"
+            );
+        }
+        // The next header re-carries the window: nothing changes.
+        let mut next = header.clone();
+        next.frame_number = 41;
+        assert_eq!(settle(&next, 1_001, &after), 0);
+        for receipt in 2..=4 {
+            assert!(settlement_record_of(&after, receipt).is_none());
+        }
+        set_committed_credit_frame_for_thread(None);
+    }
+
+    /// A settlement relayed twice, or spent again under another operation
+    /// id, is recorded and credited once.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn a_duplicated_settlement_is_recorded_and_credited_once() {
+        use crate::token_intrinsic::settlement_record::set_committed_credit_frame_for_thread;
+        set_committed_credit_frame_for_thread(Some(1_000));
+        let state = make_state();
+        let spend = settling_spend(1, 20, 1);
+        let header = settling_header(&[spend.clone(), spend.clone()], &[]);
+        assert_eq!(settle(&header, 1_000, &state), 5);
+        let recorded = settlement_record_of(&state, 1).unwrap();
+        // Re-carried, and re-encoded under another operation id.
+        let mut next = settling_header(&[spend, settling_spend(2, 20, 1)], &[]);
+        next.frame_number = 41;
+        assert_eq!(settle(&next, 1_001, &state), 0);
+        assert_eq!(settlement_record_of(&state, 1), Some(recorded));
+        set_committed_credit_frame_for_thread(None);
+    }
+
     #[test]
     fn accrue_active_seniority_is_fixed_10_per_frame_idempotent_and_monotonic() {
         use crate::global_intrinsic::materialize::materialize_prover_join;
@@ -2761,6 +2958,160 @@ mod tests {
         );
     }
 
+    /// Records the difficulty each issuance calculation was priced at.
+    struct DifficultyProbe(std::sync::Mutex<Vec<u64>>);
+    impl RewardIssuance for DifficultyProbe {
+        fn calculate(
+            &self,
+            difficulty: u64,
+            _world_state_bytes: u64,
+            _units: u64,
+            provers: &[HashMap<String, ProverAllocation>],
+        ) -> Result<Vec<BigInt>> {
+            self.0.lock().unwrap().push(difficulty);
+            Ok(provers.iter().map(|_| BigInt::from(8_000)).collect())
+        }
+    }
+
+    /// Under the anchored issuance rules a leader's difficulty below the
+    /// square-root generation (about 32 times the issuance at a 1 TiB world)
+    /// prices nothing: GLOBAL prices the anchor's difficulty. An honest
+    /// header, whose leader wrote GLOBAL's latest difficulty, keeps exactly
+    /// the issuance it had, since issuance depends on difficulty only through
+    /// its generation.
+    #[test]
+    fn anchored_issuance_ignores_the_leaders_difficulty() {
+        let world = 1u64 << 40;
+        let basis = |difficulty| crate::pricing::pomw_basis(difficulty, world, REWARD_UNITS);
+        let mut inflated = fake_header(vec![0xABu8; 32], 10);
+        inflated.difficulty = 1;
+        inflated.global_frame_number = 900;
+        let mut honest = inflated.clone();
+        honest.difficulty = 150_000;
+
+        assert_eq!(
+            anchored_issuance_difficulty(&inflated, Some(160_000)),
+            160_000
+        );
+        assert_eq!(
+            basis(anchored_issuance_difficulty(&inflated, Some(160_000))),
+            basis(u64::from(honest.difficulty)),
+            "an inflated claim earns what an honest one does"
+        );
+        assert!(
+            basis(HeaderIssuance::claimed(&inflated).difficulty)
+                > basis(150_000) * BigInt::from(30),
+            "the leader's claim alone prices over 30 times the issuance"
+        );
+        assert_eq!(
+            basis(anchored_issuance_difficulty(&honest, Some(160_000))),
+            basis(HeaderIssuance::claimed(&honest).difficulty),
+            "an honest header's issuance is unchanged"
+        );
+
+        // A header without an anchor keeps its own difficulty, floored at
+        // the square-root generation.
+        inflated.global_frame_number = 0;
+        honest.global_frame_number = 0;
+        assert_eq!(
+            anchored_issuance_difficulty(&inflated, None),
+            ISSUANCE_MIN_DIFFICULTY
+        );
+        assert_eq!(anchored_issuance_difficulty(&honest, None), 150_000);
+        assert_eq!(crate::pricing::pomw_generation(ISSUANCE_MIN_DIFFICULTY), 1);
+        assert_eq!(
+            crate::pricing::pomw_generation(ISSUANCE_MIN_DIFFICULTY - 1),
+            0
+        );
+    }
+
+    /// The materializer prices issuance at the difficulty it is given, and a
+    /// header it is told not to credit earns no issuance, fees or activity.
+    #[test]
+    fn a_header_not_credited_earns_nothing() {
+        let state = make_state();
+        let filter = vec![0xACu8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=3)
+            .map(|s| fake_prover(s, s as u64, 0, &filter))
+            .collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let mut header = fake_header(filter.clone(), 10);
+        header.difficulty = 1;
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(900);
+        let probe = Arc::new(DifficultyProbe(std::sync::Mutex::new(Vec::new())));
+        let reward_issuance: Arc<dyn RewardIssuance> = probe.clone();
+        let md = ShardMetadata {
+            state_size: 1024,
+            shard_count: 1,
+        };
+        let last_active = |p: &ProverInfo| {
+            let address = allocation_address(&p.public_key, &filter).unwrap();
+            let blob = state
+                .get(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &address,
+                    &vertex_adds_discriminator().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            read_prover_u64(
+                &rebuild_vertex_tree_from_blob(&blob),
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber",
+            )
+        };
+        let materialize = |frame: u64, issuance: HeaderIssuance| {
+            materialize_prover_shard_update_with_fees(
+                &header,
+                frame,
+                &state,
+                &noop_registry(),
+                &noop_frame_prover(),
+                &reward_issuance,
+                4096,
+                provers.clone(),
+                &[0, 1, 2],
+                md,
+                0,
+                None,
+                None,
+                issuance,
+            )
+            .unwrap()
+        };
+
+        materialize(
+            11,
+            HeaderIssuance {
+                difficulty: 160_000,
+                credit: true,
+            },
+        );
+        assert_eq!(*probe.0.lock().unwrap(), vec![160_000]);
+        let credited = reward_balance(&state, &provers[0]);
+        assert_eq!(credited, BigInt::from(1_000 + 300));
+        assert_eq!(last_active(&provers[0]), 11);
+
+        // The same header again in a later GLOBAL frame.
+        materialize(
+            12,
+            HeaderIssuance {
+                difficulty: 160_000,
+                credit: false,
+            },
+        );
+        assert_eq!(probe.0.lock().unwrap().len(), 1, "not priced");
+        assert_eq!(reward_balance(&state, &provers[0]), credited);
+        assert_eq!(last_active(&provers[0]), 11, "activity not refreshed");
+
+        // Before the epoch the leader's difficulty prices it, every time.
+        materialize(13, HeaderIssuance::claimed(&header));
+        assert_eq!(*probe.0.lock().unwrap(), vec![160_000, 1]);
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(2 * 1_300));
+    }
+
     /// Hash-proof epochs (decided 2026-10-21): a participant's issuance share
     /// is held in its storage seat, and only with a sealed registration; each
     /// frame counts toward the proposals expected of it, and a proposer's
@@ -2817,6 +3168,7 @@ mod tests {
                 0,
                 None,
                 Some(&mut storage),
+                HeaderIssuance::claimed(header),
             )
             .unwrap();
             storage.kicks
@@ -3750,8 +4102,9 @@ mod tests {
         };
         let everyone: Vec<usize> = (0..9).collect();
         let reward = |header_frame: u64, members: Vec<ProverInfo>, session: Option<[u8; 32]>| {
+            let header = fake_header(filter.clone(), header_frame);
             materialize_prover_shard_update_with_fees(
-                &fake_header(filter.clone(), header_frame),
+                &header,
                 header_frame + 1,
                 &state,
                 &noop_registry(),
@@ -3764,6 +4117,7 @@ mod tests {
                 0,
                 session,
                 None,
+                HeaderIssuance::claimed(&header),
             )
         };
 
@@ -4008,5 +4362,79 @@ mod tests {
             assert_eq!(blobs(&state), before, "epoch {epoch:?}");
         }
         quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+    }
+  
+    /// A relayed settlement becomes a GLOBAL record only with the committed
+    /// spend that carries it: a spend the global commit rejects (a repeated
+    /// consumption, a root outside the application's history) and a
+    /// settlement no relayed spend carries leave no record. Runs at the
+    /// committed-credit frame, set the way a test network sets it; a build
+    /// without that rule ignores the setting.
+    #[cfg(feature = "confidential-tokens")]
+    #[test]
+    fn reproduces_unbacked_settlement_records() {
+        use crate::token_intrinsic::global_commit::{materialize_relay, SpendEntry};
+        use crate::token_intrinsic::{settlement_record, spend_relay};
+        const FRAME: u64 = 1 << 40;
+        std::env::set_var("QUIL_COMMITTED_CREDIT_FRAME", FRAME.to_string());
+        let spend = |tx: u8, image: u8, receipt: u8| SpendEntry {
+            kind: crate::token_engine::TYPE_LATTICE_SETTLEMENT,
+            tx_id: [tx; 32],
+            source_frame: 39,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[image; 32]],
+            outputs: Vec::new(),
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: Some(relay_entry(receipt)),
+        };
+        let honest = spend(1, 20, 1);
+        let repeated = spend(2, 20, 2);
+        let mut unrooted = spend(3, 21, 3);
+        unrooted.root_digest = Some([9; 32]);
+        let relayed: Vec<Vec<u8>> = [honest, repeated, unrooted]
+            .iter()
+            .map(|s| s.encode().unwrap())
+            .collect();
+        // Receipt 4 is relayed with no spend carrying it.
+        let settlements: Vec<_> = (1..=4).map(relay_entry).collect();
+        let mut header = fake_header(crate::domains::QUIL_TOKEN.to_vec(), 40);
+        header.settlements = settlement_record::encode_relay(&[(39, settlements)]).unwrap();
+        header.spends = spend_relay::encode_relay(&[(39, relayed)]).unwrap();
+
+        // GLOBAL's order for a certified QUIL shard header.
+        let state = make_state();
+        materialize_settlement_records(&header, FRAME, &state).unwrap();
+        let fees = materialize_relay(
+            &state,
+            FRAME,
+            &header.address,
+            header.frame_number,
+            &header.spends,
+        )
+        .unwrap();
+        assert_eq!(fees, 5, "only the first spend of the coin commits");
+
+        let va_disc = vertex_adds_discriminator().unwrap();
+        let record = |receipt: u8| {
+            state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &[receipt; 32], &va_disc)
+                .unwrap()
+                .filter(|blob| !blob.is_empty())
+        };
+        assert_eq!(
+            record(1),
+            Some(settlement_record::create_record(&relay_entry(1)).unwrap()),
+            "the committed spend's settlement is recorded"
+        );
+        for receipt in 2..=4 {
+            assert!(
+                record(receipt).is_none(),
+                "settlement record written for a rejected or absent spend \
+                 (receipt {receipt}): claimable credit without a committed spend"
+            );
+        }
     }
 }

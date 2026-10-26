@@ -1219,7 +1219,10 @@ pub fn activate_global_consensus_cw(
     // Shared block store: `propose` inserts our own frame; the node inserts
     // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
     // read it.
-    let store = BlockStore::new();
+    let store = BlockStore::with_limits(
+        quil_cw_consensus::adapters::BlockStoreLimits::global(),
+        "GLOBAL",
+    );
 
     // Seams over real state. The proposer keeps a clock-store handle so it can
     // recover the parent frame number from the latest committed head when the

@@ -36,7 +36,7 @@ use libp2p_swarm::{
 use web_time::Instant;
 
 use crate::{
-    protocol::{GossipsubCodec, ProtocolConfig},
+    protocol::{GossipsubCodec, ProtocolConfig, RpcRejection},
     rpc::Receiver,
     rpc_proto::proto,
     types::{PeerKind, RawMessage, Rpc, RpcOut},
@@ -61,6 +61,14 @@ pub enum HandlerEvent {
     PeerKind(PeerKind),
     /// A message to be published was dropped because it could not be sent in time.
     MessageDropped(RpcOut),
+    /// QUILIBRIUM: an inbound RPC was dropped before it was decoded, because it carried more
+    /// entries than an RPC may or was malformed. The inbound stream is closed.
+    RpcRejected {
+        /// Why it was dropped.
+        rejection: RpcRejection,
+        /// Its frame's length in bytes.
+        frame_len: usize,
+    },
 }
 
 /// A message sent from the behaviour to the handler.
@@ -353,8 +361,16 @@ impl EnabledHandler {
                     match substream.poll_next_unpin(cx) {
                         Poll::Ready(Some(Ok(message))) => {
                             self.last_io_activity = Instant::now();
-                            self.inbound_substream =
-                                Some(InboundSubstreamState::WaitingInput(substream));
+                            // QUILIBRIUM: a dropped RPC closes the stream like a decoding
+                            // error, and the behaviour hears of it to penalise the sender.
+                            // Each new stream counts towards `MAX_SUBSTREAM_ATTEMPTS`.
+                            if matches!(message, HandlerEvent::RpcRejected { .. }) {
+                                self.inbound_substream =
+                                    Some(InboundSubstreamState::Closing(substream));
+                            } else {
+                                self.inbound_substream =
+                                    Some(InboundSubstreamState::WaitingInput(substream));
+                            }
                             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(message));
                         }
                         Poll::Ready(Some(Err(error))) => {

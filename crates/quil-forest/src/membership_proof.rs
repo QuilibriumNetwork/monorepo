@@ -113,10 +113,28 @@ fn data_address_of(vertex_address: &[u8]) -> &[u8] {
 ///    exact value, in `vertex_blob`'s subtree;
 /// 4. for a split app, `shard_aggregation` binds the (untrusted) sub-shard root
 ///    up to the trusted app phase root.
+///
+/// Each expected field must sit in a leaf whose commitment binds its value:
+/// a leaf carrying a `hash_target` commits that target instead, so its value
+/// is not authenticated by Level 1. Consensus callers whose rule predates
+/// this use [`verify_vertex_membership_with`].
 pub fn verify_vertex_membership(
     phase_root: &[u8; 32],
     vertex: &VertexMembershipProof,
     expected: &[(Vec<u8>, Vec<u8>)],
+) -> anyhow::Result<()> {
+    verify_vertex_membership_with(phase_root, vertex, expected, true)
+}
+
+/// [`verify_vertex_membership`], with the value-binding rule of Level 2 only
+/// when `bind_values` holds (from
+/// `quil_types::consensus::vertex_value_binding_active`). Without it, an
+/// expected field matches the value of a leaf that carries a `hash_target`.
+pub fn verify_vertex_membership_with(
+    phase_root: &[u8; 32],
+    vertex: &VertexMembershipProof,
+    expected: &[(Vec<u8>, Vec<u8>)],
+    bind_values: bool,
 ) -> anyhow::Result<()> {
     // (1) An empty blob is a tombstone / absent vertex — never a valid existence
     // proof, and it has no fields to bind.
@@ -155,8 +173,12 @@ pub fn verify_vertex_membership(
             .map_err(|e| anyhow::anyhow!("forest membership: decode vertex blob: {e}"))?,
     };
     for (exp_key, exp_val) in expected {
-        match tree.get(exp_key) {
-            Some(v) if v == exp_val.as_slice() => {}
+        match tree.get_leaf(exp_key) {
+            Some(leaf) if bind_values && !leaf.value_is_bound() => anyhow::bail!(
+                "forest membership: expected field's value is not bound by the vertex \
+                 commitment"
+            ),
+            Some(leaf) if leaf.value == exp_val.as_slice() => {}
             Some(_) => anyhow::bail!(
                 "forest membership: field value does not match this input's data \
                  (input not bound to the on-chain vertex)"
@@ -319,6 +341,83 @@ mod tests {
         let (root, vertex) = seed_and_prove(&forest, b"S", &addr, &blob);
         let expected = vec![(vec![0x04u8], vec![0xAAu8; 56])];
         assert!(verify_vertex_membership(&root, &vertex, &expected).is_err());
+    }
+
+    /// Rewrite `key`'s leaf to carry `value` while committing its original
+    /// value as `hash_target`, trimming the stored (recomputed) commitment so
+    /// the blob keeps its length.
+    fn with_unbound_value(blob: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let mut root = deserialize_go_tree(blob).unwrap().unwrap();
+        assert!(rewrite(&mut root, key, value));
+        quil_tries::serialize_go_tree(Some(&root)).unwrap()
+    }
+
+    /// A blob whose field leaf commits its honest value as `hash_target` keeps
+    /// the committed leaf (commitment and size) while carrying another value.
+    /// The binding rule rejects the field; the legacy rule reads it.
+    #[test]
+    fn rejects_a_field_value_its_leaf_does_not_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let mut addr = vec![0x2au8; 32];
+        addr.extend_from_slice(&[0x07u8; 32]);
+        let key = vec![0x04u8];
+        let type_key = vec![0xFFu8; 32];
+        let type_val = vec![0xBBu8; 32];
+        let honest = vertex_blob(&[(&key, &[0xAAu8; 48]), (&type_key, &type_val)]);
+        let (root, mut vertex) = seed_and_prove(&forest, b"S", &addr, &honest);
+        let forged_value = vec![0xCCu8; 48];
+        let forged = with_unbound_value(&honest, &key, &forged_value);
+        assert_eq!(
+            quil_tries::vertex_leaf_value(&forged).unwrap(),
+            quil_tries::vertex_leaf_value(&honest).unwrap(),
+            "the rewritten blob keeps the committed leaf value"
+        );
+        vertex.vertex_blob = forged;
+        let expected = vec![(key, forged_value), (type_key, type_val)];
+        verify_vertex_membership_with(&root, &vertex, &expected, false)
+            .expect("the legacy rule reads the unbound value");
+        assert!(verify_vertex_membership(&root, &vertex, &expected).is_err());
+        assert!(verify_vertex_membership_with(&root, &vertex, &expected, true).is_err());
+    }
+
+    /// Vertices may hold `hash_target` leaves (sealed metadata, confidential
+    /// fields); a proof of their other fields still verifies.
+    #[test]
+    fn binding_rule_accepts_bound_fields_beside_a_hash_target_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let mut addr = vec![0x2au8; 32];
+        addr.extend_from_slice(&[0x07u8; 32]);
+        let mut t = VectorCommitmentTree::new();
+        t.insert(&[0x04], &[0xAA; 8], &[], &BigInt::from(8u64))
+            .unwrap();
+        t.insert(&[0x40], &[0xDD; 16], &[0xEE; 64], &BigInt::from(16u64))
+            .unwrap();
+        let blob = quil_tries::serialize_go_tree(t.root.as_ref()).unwrap();
+        let (root, vertex) = seed_and_prove(&forest, b"S", &addr, &blob);
+        verify_vertex_membership(&root, &vertex, &[(vec![0x04u8], vec![0xAAu8; 8])])
+            .expect("a bound field verifies");
+        assert!(
+            verify_vertex_membership(&root, &vertex, &[(vec![0x40u8], vec![0xDDu8; 16])]).is_err(),
+            "a field behind a hash_target is not authenticated"
+        );
     }
 
     #[test]

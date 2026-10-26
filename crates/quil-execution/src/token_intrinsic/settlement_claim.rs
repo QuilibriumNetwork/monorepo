@@ -472,11 +472,12 @@ pub fn admit_bundle(
     if root != claim.global_root {
         return Err(invalid("global root mismatch"));
     }
-    settlement_record::verify_membership(
+    settlement_record::verify_membership_with(
         &claim.network,
         &claim.entry()?,
         &root,
         &claim.forest_proof,
+        quil_types::consensus::vertex_value_binding_active(bound),
     )?;
 
     let disc = vertex_adds_discriminator()?;

@@ -125,6 +125,31 @@ pub fn verify_membership(
     root: &[u8; 32],
     proof: &[u8],
 ) -> Result<()> {
+    verify_membership_with(
+        network,
+        application,
+        receipt,
+        outputs,
+        fee,
+        root,
+        proof,
+        true,
+    )
+}
+
+/// [`verify_membership`] under the consensus rule of the claim's anchor:
+/// `bind_values` from `quil_types::consensus::vertex_value_binding_active`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_membership_with(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    receipt: &[u8; 32],
+    outputs: &[Output],
+    fee: u128,
+    root: &[u8; 32],
+    proof: &[u8],
+    bind_values: bool,
+) -> Result<()> {
     if proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES
         || proof.get(..4) != Some([1u8, 0, 0, 0].as_slice())
     {
@@ -136,10 +161,11 @@ pub fn verify_membership(
     if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != address {
         return Err(invalid());
     }
-    quil_forest::verify_vertex_membership(
+    quil_forest::verify_vertex_membership_with(
         root,
         &membership.inputs[0],
         &fields(network, application, outputs, fee)?,
+        bind_values,
     )
     .map_err(|_| invalid())
 }
@@ -148,6 +174,88 @@ pub fn verify_membership(
 mod tests {
     use super::*;
     use quil_lattice_ct::confidential::{transfer::MEMO_BYTES, AmountOpening, CommitmentKey};
+
+    /// Rewrite the leaf at `key` to carry `value`, committing its original
+    /// value as `hash_target` and trimming the stored (recomputed)
+    /// commitment so the blob keeps its length.
+    fn with_unbound_value(blob: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let mut root = quil_tries::deserialize_go_tree(blob).unwrap().unwrap();
+        assert!(rewrite(&mut root, key, value));
+        quil_tries::serialize_go_tree(Some(&root)).unwrap()
+    }
+
+    /// A record whose outputs-hash leaf commits the authorized hash as its
+    /// `hash_target` keeps the committed record while naming other outputs.
+    /// Under the binding rule only the authorized outputs verify.
+    #[test]
+    fn mint_authorization_rejects_outputs_its_record_does_not_bind() {
+        let network = [1; 32];
+        let app = crate::domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &app);
+        let key = CommitmentKey::derive(&context);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let output = |amount: u128, owner: u8| Output {
+            commitment: key.commit(amount, &opening),
+            owner: [owner; IDENTITY_BYTES],
+            memo: [4; MEMO_BYTES],
+        };
+        let authorized = vec![output(7, 3)];
+        let other = vec![output(7_000_000, 5)];
+        let receipt = [6; 32];
+        let blob = create_record(&network, &app, &authorized, 2).unwrap();
+        let other_hash = fields(&network, &app, &other, 2).unwrap()[2].1.clone();
+        let forged_blob = with_unbound_value(&blob, &[4], &other_hash);
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+        assert_eq!(quil_tries::vertex_leaf_value(&forged_blob).unwrap(), leaf);
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"authorization-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(receipt.to_vec(), leaf)],
+            )
+            .unwrap();
+        let mut address = crate::domains::GLOBAL.to_vec();
+        address.extend_from_slice(&receipt);
+        let prove = |blob: &[u8]| {
+            let membership = forest
+                .build_vertex_membership_proof(
+                    b"authorization-test",
+                    quil_forest::Phase::VertexAdds,
+                    0,
+                    &address,
+                    blob,
+                )
+                .unwrap();
+            quil_forest::MembershipProof {
+                inputs: vec![membership],
+            }
+            .to_bytes()
+        };
+        let honest = prove(&blob);
+        let forged = prove(&forged_blob);
+        verify_membership(&network, &app, &receipt, &authorized, 2, &root, &honest).unwrap();
+        verify_membership_with(&network, &app, &receipt, &other, 2, &root, &forged, false)
+            .expect("the legacy rule reads the unbound outputs hash");
+        assert!(verify_membership(&network, &app, &receipt, &other, 2, &root, &forged).is_err());
+    }
 
     #[test]
     fn mint_authorization_binds_destination_outputs_fee_and_receipt() {
@@ -544,6 +652,84 @@ mod tests {
             blob.len(),
             proof.len(),
             claim_bytes.len()
+        );
+    }
+
+    /// A mint authorization record commits the hash of its authorized outputs.
+    /// A proof whose outputs-hash leaf carries another hash, with the
+    /// authorized hash moved to its `hash_target`, still matches the committed
+    /// record; it must not authorize those other outputs.
+    #[test]
+    fn reproduces_forged_mint_output_accepted() {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let network = [1; 32];
+        let app = crate::domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &app);
+        let key = CommitmentKey::derive(&context);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let output = |amount: u128, owner: u8| Output {
+            commitment: key.commit(amount, &opening),
+            owner: [owner; IDENTITY_BYTES],
+            memo: [4; MEMO_BYTES],
+        };
+        let authorized = vec![output(7, 3)];
+        let other = vec![output(7_000_000, 5)];
+        let receipt = [6; 32];
+        let blob = create_record(&network, &app, &authorized, 2).unwrap();
+        let other_hash = fields(&network, &app, &other, 2).unwrap()[2].1.clone();
+        let mut node = quil_tries::deserialize_go_tree(&blob).unwrap().unwrap();
+        assert!(rewrite(&mut node, &[4], &other_hash));
+        let forged_blob = quil_tries::serialize_go_tree(Some(&node)).unwrap();
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+        assert_eq!(quil_tries::vertex_leaf_value(&forged_blob).unwrap(), leaf);
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"authorization-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(receipt.to_vec(), leaf)],
+            )
+            .unwrap();
+        let mut address = crate::domains::GLOBAL.to_vec();
+        address.extend_from_slice(&receipt);
+        let prove = |blob: &[u8]| {
+            let membership = forest
+                .build_vertex_membership_proof(
+                    b"authorization-test",
+                    quil_forest::Phase::VertexAdds,
+                    0,
+                    &address,
+                    blob,
+                )
+                .unwrap();
+            quil_forest::MembershipProof {
+                inputs: vec![membership],
+            }
+            .to_bytes()
+        };
+        let honest = prove(&blob);
+        let forged = prove(&forged_blob);
+        verify_membership(&network, &app, &receipt, &authorized, 2, &root, &honest).unwrap();
+        assert!(
+            verify_membership(&network, &app, &receipt, &other, 2, &root, &forged).is_err(),
+            "forged mint outputs accepted: the membership proof verified outputs \
+             the authorization record does not bind"
         );
     }
 }

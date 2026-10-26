@@ -30,6 +30,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_HASH_STORAGE_PROOF_EPOCH override active (localnet only)"
         );
     }
+    let binding_epoch = quil_types::consensus::init_vertex_value_binding_epoch(network);
+    if network != 0 && binding_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = binding_epoch,
+            "QUIL_VERTEX_VALUE_BINDING_EPOCH override active (localnet only)"
+        );
+    }
     let succession_epoch = quil_types::consensus::init_seniority_succession_epoch(network);
     if network != 0 && succession_epoch != u64::MAX {
         tracing::warn!(
@@ -43,6 +50,21 @@ pub(crate) fn initialize(network: u8) {
             succession_epoch,
             "seniority penalties apply only from the seniority succession epoch; set \
              QUIL_SENIORITY_SUCCESSION_EPOCH too to start them earlier (localnet only)"
+        );
+    }
+
+    let kick_epoch = quil_types::consensus::init_kick_signed_slot_epoch(network);
+    if network != 0 && kick_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = kick_epoch,
+            "QUIL_KICK_SIGNED_SLOT_EPOCH override active (localnet only)"
+        );
+    }
+    let issuance_epoch = quil_types::consensus::init_anchored_issuance_epoch(network);
+    if network != 0 && issuance_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = issuance_epoch,
+            "QUIL_ANCHORED_ISSUANCE_EPOCH override active (localnet only)"
         );
     }
     if network != 0 && frames != quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES {

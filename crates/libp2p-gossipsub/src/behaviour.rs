@@ -62,6 +62,7 @@ use crate::{
     handler::{Handler, HandlerEvent, HandlerIn},
     mcache::{MessageCache, MessageCacheStats},
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
+    protocol::RejectedRpcStats,
     rpc::Sender,
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
     time_cache::DuplicateCache,
@@ -350,7 +351,16 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
 
     /// Tracks recently sent `IWANT` messages and checks if peers respond to them.
     gossip_promises: GossipPromises,
+
+    /// QUILIBRIUM: inbound RPCs dropped before decoding.
+    rejected_rpcs: RejectedRpcStats,
 }
+
+/// QUILIBRIUM: the behaviour penalty (P7) of a peer per RPC dropped before decoding. P7 is
+/// `behaviour_penalty_weight` times the squared penalty: at the default weight (-10) one
+/// dropped RPC scores -1000, below any usual graylist threshold, until the penalty decays.
+/// No honest peer sends such an RPC.
+const REJECTED_RPC_PENALTY: usize = 10;
 
 impl<D, F> Behaviour<D, F>
 where
@@ -467,6 +477,7 @@ where
             data_transform,
             failed_messages: Default::default(),
             gossip_promises: Default::default(),
+            rejected_rpcs: RejectedRpcStats::default(),
         })
     }
 
@@ -528,6 +539,12 @@ where
     /// Lists all known peers and their associated protocol.
     pub fn peer_protocol(&self) -> impl Iterator<Item = (&PeerId, &PeerKind)> {
         self.connected_peers.iter().map(|(k, v)| (k, &v.kind))
+    }
+
+    /// QUILIBRIUM: inbound RPCs dropped before decoding, because they carried more entries
+    /// than an RPC may or were malformed (see [`RejectedRpcStats`]).
+    pub fn rejected_rpc_stats(&self) -> RejectedRpcStats {
+        self.rejected_rpcs
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -3387,6 +3404,25 @@ where
                         _ => {}
                     }
                 }
+            }
+            HandlerEvent::RpcRejected {
+                rejection,
+                frame_len,
+            } => {
+                // QUILIBRIUM: the codec dropped the RPC undecoded and the handler closed the
+                // stream. The node logs the counts (`rejected_rpc_stats`).
+                tracing::debug!(
+                    peer=%propagation_source,
+                    %rejection,
+                    frame_len,
+                    "Dropped an RPC before decoding it"
+                );
+                if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
+                    peer_score.add_penalty(&propagation_source, REJECTED_RPC_PENALTY);
+                }
+                self.rejected_rpcs.rejected += 1;
+                self.rejected_rpcs.bytes += frame_len as u64;
+                self.rejected_rpcs.last = Some((propagation_source, rejection));
             }
             HandlerEvent::Message {
                 rpc,

@@ -76,12 +76,20 @@ pub enum NodeCommand {
         node: bool,
     },
     /// Download, verify, and install the node binary (+ system service).
-    Install { version: Option<String> },
+    Install {
+        version: Option<String>,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Install a newer node version (optionally restarting the service).
     Update {
         version: Option<String>,
         #[arg(short = 'r', long)]
         restart: bool,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Symlink /usr/local/bin/quilibrium-node to an installed version.
     Link { version: Option<String> },
@@ -101,10 +109,15 @@ pub async fn run(global: GlobalArgs, cmd: &NodeCommand) -> anyhow::Result<()> {
         NodeCommand::Info { config } => info(global, config.as_deref()),
         NodeCommand::Service { action } => service::run(action),
         NodeCommand::Clean { all, logs, node } => clean(&global, *all, *logs, *node),
-        NodeCommand::Install { version } => lifecycle::install(version.as_deref()).await,
-        NodeCommand::Update { version, restart } => {
-            lifecycle::update(version.as_deref(), *restart).await
-        }
+        NodeCommand::Install {
+            version,
+            allow_downgrade,
+        } => lifecycle::install(version.as_deref(), *allow_downgrade).await,
+        NodeCommand::Update {
+            version,
+            restart,
+            allow_downgrade,
+        } => lifecycle::update(version.as_deref(), *restart, *allow_downgrade).await,
         NodeCommand::Link { version } => lifecycle::link(version.as_deref()),
         NodeCommand::Uninstall => lifecycle::uninstall(),
         NodeCommand::AutoUpdate { action } => lifecycle::auto_update(action),

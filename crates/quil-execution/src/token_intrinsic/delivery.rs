@@ -251,6 +251,7 @@ pub fn verify_and_apply(
         return Err(invalid("cited global root mismatch"));
     }
     let parameters = parameter_context(network, application);
+    let bind_values = quil_types::consensus::vertex_value_binding_active(anchor);
     let membership = quil_forest::MembershipProof::from_bytes(&delivery.forest_proof)
         .map_err(|_| invalid("malformed proof"))?;
     let proven = |record: [u8; 32], kind: &str, address: &[u8; 32]| -> Result<()> {
@@ -259,7 +260,7 @@ pub fn verify_and_apply(
         if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != vertex {
             return Err(invalid("proof does not address this delivery"));
         }
-        quil_forest::verify_vertex_membership(
+        quil_forest::verify_vertex_membership_with(
             &root,
             &membership.inputs[0],
             &record_fields(
@@ -269,6 +270,7 @@ pub fn verify_and_apply(
                 &delivery.tx_id,
                 delivery.source_shard,
             )?,
+            bind_values,
         )
         .map_err(|_| invalid("delivery record not proven at the cited root"))
     };

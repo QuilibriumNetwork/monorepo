@@ -1506,6 +1506,18 @@ impl AppSeamFinalizer {
         }
     }
 
+    /// The lowest view whose finalized body this finalizer still has to
+    /// deliver, for the block store's window (`BlockStore::hold_from`); `0`
+    /// while it holds a replayed record, whose view may be another
+    /// instance's.
+    pub fn held_view(&self) -> Option<u64> {
+        let pending = self.pending.lock().ok()?;
+        pending
+            .values()
+            .map(|(view, _, reported)| if *reported { *view } else { 0 })
+            .min()
+    }
+
     /// Whether the engine has reported a finalization (see `reported`).
     pub fn reported(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.reported.clone()
@@ -1558,6 +1570,7 @@ impl AppSeamFinalizer {
             } else {
                 self.store.put(digest, bytes)
             }
+            self.store.recorded_final(&digest);
             // An implied ancestor is only a body: it is delivered again with
             // the certified descendant that links to it.
             let Some(cert) = cert else { continue };
@@ -2339,7 +2352,10 @@ pub fn activate_app_consensus_cw(
         proposer = proposer.with_sealed_bodies(bodies);
     }
     proposer = proposer.with_liveness(session.as_ref().map(|host| host.liveness.clone()));
-    let store = BlockStore::new();
+    let store = BlockStore::with_limits(
+        quil_cw_consensus::adapters::BlockStoreLimits::default(),
+        format!("app shard {}", hex::encode(&proposer.filter)),
+    );
     let sink = Arc::new(AppSeamSink::new(transport.clone(), peers.clone()));
     // A session's handoff proposer waits for the parent before using its
     // private execution; the plain host waits here.
@@ -2392,6 +2408,16 @@ pub fn activate_app_consensus_cw(
         finalizer = finalizer.with_finalized_records(records, cursor);
     }
     let finalizer = Arc::new(finalizer);
+    // Finalized bodies wait in the store until the engine takes them, in
+    // order: keep the window open below the oldest one still waiting.
+    store.hold_from({
+        let finalizer = Arc::downgrade(&finalizer);
+        Arc::new(move || {
+            finalizer
+                .upgrade()
+                .and_then(|finalizer| finalizer.held_view())
+        })
+    });
     let finalized = finalizer.reported();
     // Frames an earlier instance finalized but the engine never materialized
     // go to the engine again, in order, before anything new is finalized.

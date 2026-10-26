@@ -615,3 +615,137 @@ async fn wallet_submits_over_authenticated_rpc() {
     stop.send(()).unwrap();
     serving.await.unwrap();
 }
+
+/// A loopback node serving only fee quotes from `snapshot`; returns its gRPC
+/// multiaddr, its quote count and its shutdown.
+#[cfg(feature = "native-proof")]
+async fn fee_quote_server(
+    snapshot: quil_rpc::node_service::TokenFeeSnapshot,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let server = quil_rpc::node_service::NodeRpcServer::new().with_token_fee_provider(Arc::new(
+        move |application, _global_venue| {
+            assert_eq!(application, quil_execution::domains::QUIL_TOKEN);
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(snapshot.clone())
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let multiaddr = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        listener.local_addr().unwrap().port()
+    );
+    let incoming = futures::stream::unfold(listener, |listener| async {
+        let result = listener.accept().await.map(|(socket, _)| socket);
+        Some((result, listener))
+    });
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async {
+        tonic::transport::Server::builder()
+            .add_service(
+                quil_types::proto::node::node_service_server::NodeServiceServer::new(server),
+            )
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    (multiaddr, calls, stop, serving)
+}
+
+#[cfg(feature = "native-proof")]
+#[tokio::test]
+async fn automatic_quil_fee_is_quoted_by_the_configured_node_and_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_manager = Arc::new(
+        quil_keys::FileKeyManager::new(
+            directory.path().join("keys.yml"),
+            &hex::encode([9; 32]),
+            "q-prover-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap(),
+    );
+    let node_config = quil_config::Config::default();
+    let network = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+        node_config.p2p.network,
+    )
+    .network;
+    // Both quotes are self-consistent global prices at vote one; only the
+    // world size differs. The read node's would charge thousands of QUIL.
+    let snapshot = |world_state_bytes| quil_rpc::node_service::TokenFeeSnapshot {
+        network,
+        observed_frame: 42,
+        global_execution: true,
+        difficulty: 50_000,
+        world_state_bytes,
+        fee_multiplier_vote: 1,
+    };
+    let (configured, configured_calls, stop_configured, configured_serving) =
+        fee_quote_server(snapshot(1 << 40)).await;
+    let (read, read_calls, stop_read, read_serving) = fee_quote_server(snapshot(1 << 24)).await;
+    let mut tc = TokenCtx {
+        node_config,
+        config_dir: directory.path().to_path_buf(),
+        key_manager,
+        connect_opts: crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: read.clone(),
+            ..Default::default()
+        },
+        submit_opts: crate::rpc::ConnectOpts {
+            listen_grpc_multiaddr: configured,
+            ..Default::default()
+        },
+        peer_id_bytes: Vec::new(),
+        max_fee: crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE,
+    };
+    // 4096 bytes in a 1 TiB world cost one unit per byte, plus the headroom.
+    assert_eq!(
+        quoted_quil_fee_for_cost(&tc, None, 4096, false)
+            .await
+            .unwrap(),
+        with_fee_headroom(4096).unwrap()
+    );
+    assert_eq!(
+        (
+            configured_calls.load(std::sync::atomic::Ordering::SeqCst),
+            read_calls.load(std::sync::atomic::Ordering::SeqCst)
+        ),
+        (1, 0)
+    );
+    // An inflated quote from the node that takes the submission is refused
+    // under the default limit, and paid only once the operator raises it.
+    tc.submit_opts.listen_grpc_multiaddr = read;
+    let error = quoted_quil_fee_for_cost(&tc, None, 4096, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("automatic fee limit"), "{error}");
+    tc.max_fee = u128::MAX;
+    assert!(
+        quoted_quil_fee_for_cost(&tc, None, 4096, false)
+            .await
+            .unwrap()
+            > crate::commands::token::DEFAULT_MAX_AUTOMATIC_FEE
+    );
+    // An explicit fee is the operator's own choice and is never quoted.
+    tc.max_fee = 0;
+    assert_eq!(
+        quoted_quil_fee_for_cost(&tc, Some(7), 4096, false)
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(read_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    stop_configured.send(()).unwrap();
+    stop_read.send(()).unwrap();
+    configured_serving.await.unwrap();
+    read_serving.await.unwrap();
+}

@@ -21,6 +21,19 @@ pub fn verify_reward_membership(
     root: &[u8; 32],
     bytes: &[u8],
 ) -> Result<()> {
+    verify_reward_membership_with(owner, value, root, bytes, true)
+}
+
+/// [`verify_reward_membership`] under the consensus rule of the mint's
+/// anchor: `bind_values` from
+/// `quil_types::consensus::vertex_value_binding_active`.
+pub fn verify_reward_membership_with(
+    owner: &[u8; 32],
+    value: u128,
+    root: &[u8; 32],
+    bytes: &[u8],
+    bind_values: bool,
+) -> Result<()> {
     if value == 0
         || bytes.len() > MAX_REWARD_PROOF_BYTES
         || bytes.get(..4) != Some([1u8, 0, 0, 0].as_slice())
@@ -58,7 +71,7 @@ pub fn verify_reward_membership(
             balance.to_vec(),
         ),
     ];
-    quil_forest::verify_vertex_membership(root, &proof.inputs[0], &expected)
+    quil_forest::verify_vertex_membership_with(root, &proof.inputs[0], &expected, bind_values)
         .map_err(|_| QuilError::InvalidArgument("reward witness root or fields mismatch".into()))
 }
 

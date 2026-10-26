@@ -831,6 +831,10 @@ impl GlobalIntrinsic {
                 // 3. Different outputs (the actual equivocation)
                 // 4. Both carry BLS signatures
                 //
+                // From the signed-slot epoch (`kick_signed_slot_active`)
+                // 2 and 3 compare what the votes sign instead: the same
+                // address and non-zero rank, different `Poseidon(output)`.
+                //
                 // When the full cryptographic deps are installed
                 // (BLS constructor + hypergraph + inclusion prover +
                 // clock store + frame prover), we run the full chain:
@@ -2575,6 +2579,29 @@ impl GlobalIntrinsic {
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
     }
 
+    /// The difficulty of the GLOBAL frame a shard frame header anchors to,
+    /// from this node's clock store; `None` for a header without an anchor.
+    /// [`Self::verify_shard_frame_output`] already required that frame.
+    fn anchor_difficulty(&self, op: &super::frame_header::FrameHeader) -> Result<Option<u32>> {
+        if op.global_frame_number == 0 {
+            return Ok(None);
+        }
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "FrameHeader: clock_store not installed — cannot price issuance".into(),
+            )
+        })?;
+        clock_store
+            .get_global_clock_frame_header(op.global_frame_number)
+            .map(|header| Some(header.difficulty))
+            .map_err(|_| {
+                QuilError::ExecutionUnavailable(format!(
+                    "FrameHeader: anchored global frame {} unavailable — cannot price issuance",
+                    op.global_frame_number
+                ))
+            })
+    }
+
     #[cfg(test)]
     fn audit_storage_attestation(
         &self,
@@ -3279,6 +3306,17 @@ impl GlobalIntrinsic {
         )?;
         timing.mark("verify relay/report");
 
+        // From the anchored issuance epoch GLOBAL credits each frame of an
+        // authorized session once: a header at or below the session's
+        // executed tip, read before this header advances it, was credited when
+        // GLOBAL first executed that frame.
+        let anchored_issuance = quil_types::consensus::anchored_issuance_active(frame_number);
+        let executed_tip = match session {
+            Some(session) if anchored_issuance => super::handoff::session_tip(state, &session)?,
+            _ => None,
+        };
+        let credit = !executed_tip.is_some_and(|tip| tip.frame >= op.frame_number);
+
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
         if let Some(session) = session {
@@ -3338,7 +3376,9 @@ impl GlobalIntrinsic {
         };
 
         // Cross-domain settlements the QUIL shard relays become GLOBAL
-        // records here, independent of the reward gates below.
+        // records here, independent of the reward gates below; from the
+        // committed-credit frame only with their committed spends, in the
+        // relay commit below.
         super::prover_shard_update::materialize_settlement_records(op, frame_number, state)?;
         timing.mark("settlements");
         // The shard's accumulator report joins the application's canonical
@@ -3519,6 +3559,34 @@ impl GlobalIntrinsic {
         } else {
             None
         };
+        // The leader's difficulty is bound into the certified output but no
+        // voter compares it with GLOBAL's: from the anchored issuance epoch
+        // GLOBAL prices issuance at its own anchored frame's difficulty.
+        let issuance = if anchored_issuance {
+            let difficulty = super::prover_shard_update::anchored_issuance_difficulty(
+                op,
+                self.anchor_difficulty(op)?,
+            );
+            let claimed = u64::from(op.difficulty);
+            if crate::pricing::pomw_generation(claimed)
+                != crate::pricing::pomw_generation(difficulty)
+            {
+                tracing::warn!(
+                    shard = %hex::encode(&op.address),
+                    shard_frame = op.frame_number,
+                    anchor = op.global_frame_number,
+                    frame = frame_number,
+                    claimed,
+                    priced = difficulty,
+                    "shard header claims a difficulty outside its GLOBAL anchor's issuance \
+                     generation: its leader's value is ignored and issuance priced at the \
+                     anchor's (a defect or tampering in that shard's leader)",
+                );
+            }
+            super::prover_shard_update::HeaderIssuance { difficulty, credit }
+        } else {
+            super::prover_shard_update::HeaderIssuance::claimed(op)
+        };
         let participants = participant_indices.len();
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
@@ -3534,6 +3602,7 @@ impl GlobalIntrinsic {
             committed_fees,
             session,
             storage.as_mut(),
+            issuance,
         )?;
         timing.mark("rewards/activity");
 

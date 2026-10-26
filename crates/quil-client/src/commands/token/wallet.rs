@@ -2462,6 +2462,8 @@ pub(super) async fn quoted_quil_fee(
 }
 
 /// [`quoted_quil_fee`] for an operation whose state growth is already known.
+/// The quote comes from the configured node, which also takes the submission,
+/// never from a `--read-rpc` node, and is bounded by `--max-fee`.
 #[cfg(feature = "native-proof")]
 pub(super) async fn quoted_quil_fee_for_cost(
     tc: &TokenCtx,
@@ -2475,9 +2477,21 @@ pub(super) async fn quoted_quil_fee_for_cost(
     let policy = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
         tc.node_config.p2p.network,
     );
-    let quote = tc.connect().await?.get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
-        application: quil_execution::domains::QUIL_TOKEN.to_vec(), max_payload_bytes: cost, global_venue,
-    }).await.map_err(|e| anyhow::anyhow!("fee estimate unavailable: {e}; provide an explicit --fee or use a node serving this execution venue"))?.into_inner();
+    let quote = tc
+        .connect_submit()
+        .await?
+        .get_token_fee_quote(quil_types::proto::node::GetTokenFeeQuoteRequest {
+            application: quil_execution::domains::QUIL_TOKEN.to_vec(),
+            max_payload_bytes: cost,
+            global_venue,
+        })
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "fee estimate unavailable from the configured node: {e}; provide an explicit --fee"
+            )
+        })?
+        .into_inner();
     anyhow::ensure!(
         !global_venue || quote.global_execution,
         "global venue fee quote was not priced for global execution"
@@ -2485,7 +2499,22 @@ pub(super) async fn quoted_quil_fee_for_cost(
     let charge = checked_quil_fee_quote(&quote, &policy.network, cost)?;
     let fee = with_fee_headroom(charge)?;
     println!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame);
+    check_automatic_fee("estimated fee", fee, tc.max_fee)?;
     Ok(fee)
+}
+
+/// Refuse a quoted amount above the automatic fee limit. A quote's pricing
+/// inputs are the serving node's word; the limit bounds what a wrong quote can
+/// take from the wallet without the operator's explicit approval.
+#[cfg(feature = "native-proof")]
+fn check_automatic_fee(what: &str, amount: u128, max_fee: u128) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        amount <= max_fee,
+        "the {what} of {amount} base units exceeds the automatic fee limit of {max_fee} \
+         base units; check the quote against a node you trust, then raise the limit with \
+         --max-fee or QUILIBRIUM_MAX_FEE"
+    );
+    Ok(())
 }
 
 /// Headroom an automatic fee carries over the quoted charge. The fee
@@ -2541,9 +2570,11 @@ fn checked_quil_fee_quote(
         num_bigint::BigInt::from(budget) == expected,
         "fee quote arithmetic does not match pricing inputs"
     );
+    // Every priced QUIL operation is charged at the global venue's vote of one;
+    // a quote with an application-shard vote prices something else.
     anyhow::ensure!(
-        !quote.global_execution || quote.fee_multiplier_vote == 1,
-        "global fee quote has an invalid vote"
+        quote.global_execution && quote.fee_multiplier_vote == 1,
+        "QUIL fee quote is not priced at the global venue's vote of one"
     );
     let cost = num_bigint::BigInt::from(cost);
     let required = quil_execution::pricing::fee_multiplier_for_cost(
@@ -3322,9 +3353,10 @@ pub(super) async fn run_prefund(
 ///
 /// Consumption is read from the configured node, which only answers for
 /// applications whose state it holds: a regular node serves the shards it
-/// covers, so read through an archive (`--read-rpc`) to see an application
-/// executed in the global venue. A settlement this node cannot speak for is
-/// listed as it stands, never dropped.
+/// covers, so read through an archive (`--read-rpc`, plaintext and so also
+/// `--insecure-read-rpc`) to see an application executed in the global venue.
+/// A settlement this node cannot speak for is listed as it stands, never
+/// dropped.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_prefunded(tc: &TokenCtx) -> anyhow::Result<()> {
     let entries = read_prefunded(tc);
@@ -3443,6 +3475,7 @@ pub(super) async fn pay_for_bundle(
     let context = bundle_context(rest)?;
     println!("This bundle needs {amount} base units for {cost} bytes of state growth on {} (snapshot frame {}).",
         hex::encode(destination), quote.observed_frame);
+    check_automatic_fee("bundle settlement", amount, tc.max_fee)?;
     let claimed_payment = match &payment {
         Some((payee, value)) => Some((
             quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())?,
@@ -4417,6 +4450,49 @@ mod tests {
         assert!(super::with_fee_headroom(u128::MAX).is_err());
     }
 
+    /// A/B reproducer: every priced QUIL operation is charged at the global
+    /// venue's vote of one, so a self-consistent quote priced at an
+    /// application-shard vote, or claiming shard execution, must not set or
+    /// refresh a QUIL fee.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn reproduces_quil_fee_quote_priced_at_a_shard_vote() {
+        let global = quil_types::proto::node::GetTokenFeeQuoteResponse {
+            application: quil_execution::domains::QUIL_TOKEN.to_vec(),
+            network: vec![0; 32],
+            observed_frame: 42,
+            global_execution: true,
+            difficulty: 50_000,
+            world_state_bytes: 0,
+            fee_multiplier_vote: 1,
+            max_payload_bytes: 64,
+            fee_budget: 127u128.to_be_bytes().to_vec(),
+        };
+        assert_eq!(
+            super::checked_quil_fee_quote(&global, &[0; 32], 64).unwrap(),
+            64
+        );
+        for (global_execution, vote) in [(false, 1_000_000), (false, 1), (true, 3)] {
+            let shard = quil_types::proto::node::GetTokenFeeQuoteResponse {
+                global_execution,
+                fee_multiplier_vote: vote,
+                fee_budget: (127u128 * u128::from(vote)).to_be_bytes().to_vec(),
+                ..global.clone()
+            };
+            if let Ok(charge) = super::checked_quil_fee_quote(&shard, &[0; 32], 64) {
+                panic!(
+                    "QUIL fee quote with global_execution={global_execution} and vote {vote} \
+                     was accepted: {charge} base units for 64 bytes (64 at the global vote)"
+                );
+            }
+            assert!(
+                super::check_submission_fee_quote(&shard, &[0; 32], 64, 1 << 20).is_err(),
+                "QUIL fee refresh with global_execution={global_execution} and vote {vote} \
+                 was accepted"
+            );
+        }
+    }
+
     #[cfg(feature = "native-proof")]
     #[test]
     fn quoted_quil_fee_checks_context_amount_and_recomputes_budget() {
@@ -4439,18 +4515,6 @@ mod tests {
         );
         assert!(super::check_submission_fee_quote(&quote, &[0; 32], 64, 64).is_ok());
         assert!(super::check_submission_fee_quote(&quote, &[0; 32], 64, 63).is_err());
-        let higher = quil_types::proto::node::GetTokenFeeQuoteResponse {
-            global_execution: false,
-            fee_multiplier_vote: 3,
-            fee_budget: 381u128.to_be_bytes().to_vec(),
-            ..quote.clone()
-        };
-        assert_eq!(
-            super::checked_quil_fee_quote(&higher, &[0; 32], 64).unwrap(),
-            192
-        );
-        assert!(super::check_submission_fee_quote(&higher, &[0; 32], 64, 64).is_err());
-        assert!(super::check_submission_fee_quote(&higher, &[0; 32], 64, 192).is_ok());
         for case in 0..7 {
             let mut bad = quote.clone();
             match case {
@@ -4489,6 +4553,20 @@ mod tests {
         );
         // A malformed network identifier cannot be priced.
         assert!(super::checked_quil_fee_quote(&quote, &[7; 32], 64).is_err());
+    }
+
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn automatic_fees_above_the_limit_are_refused() {
+        assert!(super::check_automatic_fee("estimated fee", 0, 0).is_ok());
+        assert!(super::check_automatic_fee("estimated fee", 500, 500).is_ok());
+        let error = super::check_automatic_fee("bundle settlement", 501, 500)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bundle settlement of 501") && error.contains("--max-fee"),
+            "{error}"
+        );
     }
 
     use super::*;

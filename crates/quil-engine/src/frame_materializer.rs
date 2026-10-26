@@ -36,7 +36,9 @@ mod execution_checkpoint;
 pub use execution_checkpoint::{GlobalExecutionCheckpoint, UnfinishedExecution};
 #[path = "frame_materializer_selected_parent.rs"]
 mod selected_parent;
-pub use selected_parent::{GlobalFinalizationAttempt, GlobalParentExecutor, GlobalParentLimits};
+pub use selected_parent::{
+    GlobalFinalizationAttempt, GlobalParentExecutor, GlobalParentLimits, MAX_GLOBAL_FRAME_BYTES,
+};
 
 /// Concrete prover registry handle exposing the `evict_inactive_provers`
 /// helper that the trait can't carry (the trait has no `HypergraphState`

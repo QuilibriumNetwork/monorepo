@@ -70,6 +70,13 @@ impl LeafNode {
         self.commitment = h.finalize().to_vec();
     }
 
+    /// Whether this leaf's commitment binds its `value`. A leaf carrying a
+    /// `hash_target` commits that target instead, so its `value` is not
+    /// authenticated by any commitment over the tree.
+    pub fn value_is_bound(&self) -> bool {
+        self.hash_target.is_empty()
+    }
+
     /// Commit this leaf, recomputing if needed.
     pub fn commit(&mut self, recalculate: bool) -> &[u8] {
         if recalculate || self.commitment.is_empty() {
@@ -226,6 +233,19 @@ impl VectorCommitmentNode {
                 }
                 None
             }
+        }
+    }
+
+    /// Whether any leaf in this sub-tree carries a value its commitment does
+    /// not bind (see [`LeafNode::value_is_bound`]).
+    pub fn has_unbound_value(&self) -> bool {
+        match self {
+            VectorCommitmentNode::Leaf(leaf) => !leaf.value_is_bound(),
+            VectorCommitmentNode::Branch(branch) => branch
+                .children
+                .iter()
+                .flatten()
+                .any(|child| child.has_unbound_value()),
         }
     }
 

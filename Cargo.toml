@@ -100,8 +100,11 @@ libp2p-tls = { path = "crates/libp2p-tls" }
 # works on our custom protocol id (`Version::V1_2`), is sent for a message's
 # first copy only, and is sent with priority. The message cache has a byte
 # budget (`mcache_max_bytes`): past it, the oldest messages are evicted,
-# validated ones first. Wire format and validation are unchanged. Local
-# changes are marked `QUILIBRIUM:`.
+# validated ones first. An inbound RPC is checked before it is decoded: one
+# carrying more entries of a kind than an RPC may, or malformed, is dropped,
+# its stream closed and its sender penalised. The wire format is unchanged.
+# Local changes are marked `QUILIBRIUM:`; see
+# crates/libp2p-gossipsub/PATCHES.md.
 libp2p-gossipsub = { path = "crates/libp2p-gossipsub" }
 
 [profile.release]

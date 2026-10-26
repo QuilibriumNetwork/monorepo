@@ -98,6 +98,14 @@ impl StorageHistory {
         let tree = quil_tries::VectorCommitmentTree {
             root: quil_tries::deserialize_go_tree(&proof.vertex_blob)?,
         };
+        // The fields below are read from a peer's blob. Registrations never
+        // carry a `hash_target` leaf, whose value the verified commitment
+        // would not authenticate.
+        if tree.has_unbound_values() {
+            return Err(QuilError::InvalidArgument(
+                "historical storage registration carries an unbound field".into(),
+            ));
+        }
         let cls = "leafroot:LeafRootRegistration";
         let read = |name| global_schema::read_field(&tree, cls, name);
         let valid_type = tree
@@ -296,6 +304,62 @@ pub(crate) mod tests {
         let root = archive.commit(&tree, 4);
         assert!(StorageHistory::default()
             .insert(root, &member, &leaf, 3, &archive.proof(root))
+            .is_err());
+    }
+
+    /// Rewrite the leaf at `key` to carry `value`, committing its original
+    /// value as `hash_target` and trimming the stored (recomputed)
+    /// commitment so the blob keeps its length.
+    fn with_unbound_value(blob: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let mut root = quil_tries::deserialize_go_tree(blob).unwrap().unwrap();
+        assert!(rewrite(&mut root, key, value));
+        quil_tries::serialize_go_tree(Some(&root)).unwrap()
+    }
+
+    /// A peer's blob whose field leaf commits the registered value as its
+    /// `hash_target` passes the proof check while carrying another value; the
+    /// registration is refused.
+    #[test]
+    fn registration_with_an_unbound_field_is_refused() {
+        let member = [7; 32];
+        let filter = [8; 32];
+        let leaf = leaf_id_bytes(&filter, &[]);
+        let archive = Archive::new(&member, &leaf);
+        let tree =
+            materialize::create_leaf_root_vertex_tree(&member, &filter, &[], 3, &[11; 74], 2, 10)
+                .unwrap();
+        let root = archive.commit(&tree, 10);
+        let bytes = archive.proof(root);
+        assert_eq!(
+            StorageHistory::default()
+                .insert(root, &member, &leaf, 3, &bytes)
+                .unwrap(),
+            Some((vec![11; 74], 2, 3))
+        );
+        let key = global_schema::field_key("leafroot:LeafRootRegistration", "NumBlocks").unwrap();
+        let mut proof = quil_forest::MembershipProof::from_bytes(&bytes).unwrap();
+        let blob = &proof.inputs[0].vertex_blob;
+        proof.inputs[0].vertex_blob = with_unbound_value(blob, &key, &9u64.to_be_bytes());
+        let forged = proof.to_bytes();
+        assert!(verify_global_vertex_proof(&root, &archive.address, &forged).is_ok());
+        assert!(StorageHistory::default()
+            .insert(root, &member, &leaf, 3, &forged)
             .is_err());
     }
 }

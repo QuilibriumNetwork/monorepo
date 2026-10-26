@@ -183,9 +183,43 @@ pub fn grpc_multiaddr_to_host_port(ma: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Whether a gRPC multiaddr dials this host: a loopback or unspecified IP
+/// address, or `localhost`. Plaintext h2 stays on the machine only then.
+pub fn is_local_multiaddr(ma: &str) -> anyhow::Result<bool> {
+    let host_port = grpc_multiaddr_to_host_port(ma)?;
+    let (host, _) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("could not extract host from multiaddr: {ma}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_multiaddrs_are_loopback_unspecified_or_localhost() {
+        for (ma, local) in [
+            ("/ip4/127.0.0.1/tcp/8337", true),
+            ("/ip4/127.8.9.10/tcp/8337", true),
+            ("/ip4/0.0.0.0/tcp/8337", true),
+            ("/ip6/::1/tcp/8337", true),
+            ("/ip6/::/tcp/8337", true),
+            ("/dns/localhost/tcp/8337", true),
+            ("/ip4/10.0.0.2/tcp/8337", false),
+            ("/ip4/192.0.2.7/tcp/8337", false),
+            ("/ip6/2001:db8::7/tcp/8337", false),
+            ("/dns4/rpc.quilibrium.com/tcp/8337", false),
+            ("/dns4/localhost.example.com/tcp/8337", false),
+        ] {
+            assert_eq!(is_local_multiaddr(ma).unwrap(), local, "{ma}");
+        }
+        assert!(is_local_multiaddr("127.0.0.1:8337").is_err());
+    }
 
     #[test]
     fn parses_ip4_tcp_multiaddr() {

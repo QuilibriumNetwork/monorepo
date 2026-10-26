@@ -844,6 +844,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
         "batch shields and shield source coverage"
     );
+    let committed_credit_from =
+        quil_execution::token_intrinsic::settlement_record::init_committed_credit_frame(
+            args.network,
+        );
+    info!(
+        committed_credit_frame = %if committed_credit_from == u64::MAX { "never".to_string() } else { committed_credit_from.to_string() },
+        "settlement records and mint-claim fees credited only with committed spends"
+    );
     if let Some(frame) =
         quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(
             args.network,

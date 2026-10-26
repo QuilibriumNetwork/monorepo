@@ -1406,6 +1406,9 @@ pub fn verify_relay(
 /// Commit every entry a certified header relays, in relay order, returning
 /// the fees of the operations that committed (credited to the relaying
 /// shard's provers). Re-carried entries are already decided and add nothing.
+/// From [`settlement_record::committed_credit_frame`] a mint claim's fee is
+/// not among them: the reward mint it claims paid it, and GLOBAL credited it
+/// there.
 pub fn materialize_relay(
     state: &HypergraphState,
     frame: u64,
@@ -1413,6 +1416,7 @@ pub fn materialize_relay(
     header_frame: u64,
     relay: &[u8],
 ) -> Result<u128> {
+    use crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
     if relay.is_empty() {
         return Ok(0);
     }
@@ -1426,13 +1430,16 @@ pub fn materialize_relay(
         Some((_, bits)) => quil_types::execution::ShardPath::from_bits(&bits),
         None => return Err(invalid("header filter names no shard")),
     };
+    let mint_fee_paid = frame >= settlement_record::committed_credit_frame();
     let mut fees = 0u128;
     let (mut committed, mut rejected) = (0usize, 0usize);
     for (_, entries) in verify_relay(frame, header_frame, relay)? {
         for entry in entries {
             match commit_entry(state, frame, &application, &entry, source_shard)? {
                 Outcome::Committed { fee, .. } => {
-                    fees = fees.saturating_add(fee);
+                    if !(mint_fee_paid && entry.kind == TYPE_LATTICE_MINT_CLAIM) {
+                        fees = fees.saturating_add(fee);
+                    }
                     committed += 1;
                 }
                 Outcome::Rejected(reason) => {
@@ -1441,6 +1448,7 @@ pub fn materialize_relay(
                         frame,
                         application = %hex::encode(&application[..8]),
                         tx = %hex::encode(&entry.tx_id[..8]),
+                        settles = entry.settlement.is_some(),
                         reason,
                         "spend rejected by the global commit",
                     );
@@ -2067,6 +2075,32 @@ mod tests {
         ));
     }
 
+    /// A committed mint claim's fee was paid with its reward mint: from the
+    /// committed-credit frame the relay credits it no second time, while the
+    /// claim still commits.
+    #[test]
+    fn a_mint_claim_fee_is_credited_once_from_the_activation_frame() {
+        use crate::token_intrinsic::settlement_record::set_committed_credit_frame_for_thread;
+        let mut claim = entry(2, &[30], &[]);
+        claim.kind = crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
+        claim.fee = 9;
+        let relayed = vec![
+            entry(1, &[20], &[]).encode().unwrap(),
+            claim.encode().unwrap(),
+        ];
+        let relay = crate::token_intrinsic::spend_relay::encode_relay(&[(40, relayed)]).unwrap();
+        set_committed_credit_frame_for_thread(Some(101));
+        assert_eq!(
+            materialize_relay(&mem_state(), 100, &APP, 41, &relay).unwrap(),
+            14
+        );
+        set_committed_credit_frame_for_thread(Some(100));
+        let state = mem_state();
+        assert_eq!(materialize_relay(&state, 100, &APP, 41, &relay).unwrap(), 5);
+        assert!(is_consumed(&state, &APP, &[30; 32]).unwrap());
+        set_committed_credit_frame_for_thread(None);
+    }
+
     #[test]
     fn a_settlement_record_is_written_only_when_its_spend_commits() {
         let state = mem_state();
@@ -2301,5 +2335,33 @@ mod tests {
             Outcome::Committed { .. }
         ));
         set_batch_shield_frame_for_thread(None);
+    }
+
+    /// A mint claim's fee is paid, and credited, with the reward mint it
+    /// claims: when the claim commits, the relay credits it no second time.
+    /// Runs at the committed-credit frame, set the way a test network sets
+    /// it; a build without that rule ignores the setting.
+    #[test]
+    fn reproduces_double_credited_mint_claim_fee() {
+        const FRAME: u64 = 1 << 40;
+        std::env::set_var("QUIL_COMMITTED_CREDIT_FRAME", FRAME.to_string());
+        let mut claim = entry(2, &[30], &[]);
+        claim.kind = crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
+        claim.fee = 9;
+        let relayed = vec![
+            entry(1, &[20], &[]).encode().unwrap(),
+            claim.encode().unwrap(),
+        ];
+        let relay = crate::token_intrinsic::spend_relay::encode_relay(&[(40, relayed)]).unwrap();
+        let state = mem_state();
+        let credited = materialize_relay(&state, FRAME, &APP, 41, &relay).unwrap();
+        assert!(
+            is_consumed(&state, &APP, &[30; 32]).unwrap(),
+            "the mint claim commits"
+        );
+        assert_eq!(
+            credited, 5,
+            "a committed mint claim's fee is credited a second time"
+        );
     }
 }

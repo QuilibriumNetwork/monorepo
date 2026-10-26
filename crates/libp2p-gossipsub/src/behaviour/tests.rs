@@ -31,7 +31,7 @@ use rand::Rng;
 use super::*;
 use crate::{
     config::{ConfigBuilder, TopicMeshConfig},
-    protocol::GossipsubCodec,
+    protocol::{GossipsubCodec, RpcEntry, RpcRejection},
     rpc::Receiver,
     subscription_filter::WhitelistSubscriptionFilter,
     types::Rpc,
@@ -6917,5 +6917,42 @@ fn test_quilibrium_caches_only_subscribed_messages_and_keeps_their_data() {
             sequence_number: gs.mcache.get(&published_id).unwrap().sequence_number,
             topic: topic_hashes[0].clone(),
         }),
+    );
+}
+
+/// QUILIBRIUM: an RPC the codec dropped before decoding penalises its sender below the node's
+/// graylist threshold (-400), leaves other peers alone, and is counted for the node's log.
+#[test]
+fn rejected_rpc_penalises_its_sender() {
+    let (mut gs, peers, _receivers, _topics) = inject_nodes1()
+        .peer_no(2)
+        .scoring(Some((
+            PeerScoreParams::default(),
+            PeerScoreThresholds::default(),
+        )))
+        .create_network();
+    let rejection = RpcRejection::TooMany {
+        entry: RpcEntry::Publish,
+        limit: 128,
+    };
+
+    gs.on_connection_handler_event(
+        peers[0],
+        ConnectionId::new_unchecked(0),
+        HandlerEvent::RpcRejected {
+            rejection,
+            frame_len: 4096,
+        },
+    );
+
+    assert!(gs.peer_score(&peers[0]).unwrap() < -400.0);
+    assert_eq!(gs.peer_score(&peers[1]), Some(0.0));
+    assert_eq!(
+        gs.rejected_rpc_stats(),
+        RejectedRpcStats {
+            rejected: 1,
+            bytes: 4096,
+            last: Some((peers[0], rejection)),
+        }
     );
 }

@@ -149,10 +149,9 @@ pub(crate) struct GrpcArgs {
     pub app_frame_misses: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// Receive side of the direct global-consensus transport: peers'
-    /// `SubmitGlobalConsensus` RPCs inject `(bitmask, data)` here, the
-    /// same channel BlossomSub self-loopback uses, so the existing
-    /// GLOBAL_FRAME / GLOBAL_CONSENSUS message-loop arms process them.
-    pub consensus_loopback_tx: tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
+    /// `SubmitGlobalConsensus` RPCs are admitted here, within size limits and
+    /// budgets, into the message loop's remote consensus queues.
+    pub consensus_intake: Arc<super::consensus_intake::ConsensusIntake>,
 }
 
 /// Serves forest-sync JMT nodes/values from the local CRDT's forest — the
@@ -1273,7 +1272,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         archive_pool,
         app_frame_misses,
         spawner,
-        consensus_loopback_tx,
+        consensus_intake,
     } = args;
 
     // Prover authorizer (mirrors Go `authenticateProverFromContext`, used by
@@ -1443,19 +1442,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         },
     );
     // Direct global-consensus delivery handler. Peer archives call
-    // `SubmitGlobalConsensus(bitmask, data)`; we inject it into the same
-    // loopback channel the message loop reads, tagged with the original
-    // topic, so the existing GLOBAL_FRAME / GLOBAL_CONSENSUS arms process
-    // it exactly as they did for gossip. This is the receive half of
-    // moving global consensus off gossip (app consensus is unaffected).
+    // `SubmitGlobalConsensus(bitmask, data)`; the intake checks each message
+    // against its kind's size limit and the callers' budgets, and queues it
+    // for the message loop, tagged with the original topic, so the existing
+    // GLOBAL_FRAME / GLOBAL_CONSENSUS arms and the commonware router process
+    // it exactly as they did for gossip. This is the receive half of moving
+    // global consensus off gossip (app consensus is unaffected).
     let consensus_delivery: quil_rpc::global_service::ConsensusDeliveryHandler = {
-        let tx = consensus_loopback_tx.clone();
-        // Per-peer rate limit on direct :8340 consensus injection. Any Ed448-authed
-        // peer (not just the committee) can call this; without a cap one peer can
-        // force sustained downstream cert/signature verification. Generous vs the
-        // real consensus cadence (a few vote/cert/block msgs per view).
-        let cw_rate: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, (u64, u32)>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let intake = consensus_intake.clone();
         Arc::new(
             move |request: tonic::Request<
                 quil_types::proto::global::SubmitGlobalConsensusRequest,
@@ -1467,77 +1461,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 let Some(auth) = auth else {
                     return Err("unauthenticated peer — global consensus delivery requires a valid Ed448 client cert".into());
                 };
-                {
-                    const MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER: u32 = 256;
-                    let now_s = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if let Ok(mut map) = cw_rate.lock() {
-                        if map.len() > 4096 {
-                            map.clear();
-                        }
-                        let e = map.entry(auth.peer_id.to_bytes()).or_insert((now_s, 0));
-                        if e.0 == now_s {
-                            e.1 = e.1.saturating_add(1);
-                        } else {
-                            *e = (now_s, 1);
-                        }
-                        if e.1 > MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER {
-                            return Err("global consensus delivery rate limited".into());
-                        }
-                    }
-                }
                 let req = request.into_inner();
-                // Accept the two legacy global-consensus topics AND the
-                // commonware-simplex CW channels (vote/cert/resolver/block), which
-                // are also delivered point-to-point over this RPC.
-                let is_cw = quil_engine::bitmasks::global_cw_channel_of(&req.bitmask).is_some();
-                if !is_cw
-                    && req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_FRAME
-                    && req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_CONSENSUS
-                {
-                    return Err(format!(
-                        "unexpected consensus bitmask 0x{}",
-                        hex::encode(&req.bitmask)
-                    ));
-                }
-                // DIAGNOSTIC: log every inbound consensus message at the RPC
-                // boundary — peer, bitmask, size, and the peeked consensus type
-                // — to pin why peer PROPOSALS never reach the vote path while
-                // peer timeouts do. Remove once resolved.
-                {
-                    let tp = quil_engine::consensus_wire::peek_consensus_type(&req.data);
-                    let tp_name = match tp {
-                        Some(quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE) => "proposal",
-                        Some(quil_engine::consensus_wire::PROPOSAL_VOTE_TYPE) => "vote",
-                        Some(quil_engine::consensus_wire::TIMEOUT_STATE_TYPE) => "timeout",
-                        Some(_) => "other",
-                        None => "unknown",
-                    };
-                    tracing::info!(
-                        peer = %auth.peer_id,
-                        bitmask = %hex::encode(&req.bitmask),
-                        bytes = req.data.len(),
-                        kind = tp_name,
-                        "inbound SubmitGlobalConsensus",
-                    );
-                }
-                let received = quil_p2p::node::ReceivedMessage {
-                    bitmask: req.bitmask,
-                    data: req.data,
-                    from: auth.peer_id.to_bytes(),
-                    direct: false,
-                };
-                match tx.try_send(received) {
-                    Ok(()) => Ok(()),
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        Err("consensus receive queue full".into())
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        Err("consensus receive queue closed".into())
-                    }
-                }
+                tracing::debug!(
+                    peer = %auth.peer_id,
+                    bitmask = %hex::encode(&req.bitmask),
+                    bytes = req.data.len(),
+                    "inbound SubmitGlobalConsensus",
+                );
+                intake.admit(auth.peer_id.to_bytes(), req.bitmask, req.data)
             },
         )
     };

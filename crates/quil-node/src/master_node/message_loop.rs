@@ -23,6 +23,9 @@ pub(crate) struct MessageLoopArgs {
     pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
     pub msg_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
     pub consensus_loopback_rx: tokio::sync::mpsc::Receiver<quil_p2p::node::ReceivedMessage>,
+    /// Peers' `SubmitGlobalConsensus` deliveries: committee members' and
+    /// other callers' queues.
+    pub remote_consensus: super::consensus_intake::RemoteConsensusQueues,
     pub global_msg_tx:
         tokio::sync::broadcast::Sender<quil_types::proto::global::StreamGlobalMessagesResponse>,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
@@ -180,6 +183,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         exec_manager: exec_mgr_for_recv,
         mut msg_rx,
         mut consensus_loopback_rx,
+        remote_consensus:
+            super::consensus_intake::RemoteConsensusQueues {
+                members: mut remote_members_rx,
+                others: mut remote_others_rx,
+            },
         global_msg_tx: gmtx_for_recv,
         archive_pool: pool_for_recv,
         mtls_seed: _mtls_seed_for_recv,
@@ -748,17 +756,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     }
                 }
                 msg = async {
-                    // Merge the network receive channel and the
-                    // self-loopback channel — both produce
-                    // `ReceivedMessage`s that go through the same
-                    // dispatch logic. This is how the proposer's own
-                    // proposal reaches its own `vote_aggregator` and
-                    // event_loop without relying on BlossomSub
-                    // self-echo (which doesn't happen).
+                    // Merge the network receive channel, the
+                    // self-loopback channel and peers' direct consensus
+                    // deliveries — all produce `ReceivedMessage`s that go
+                    // through the same dispatch logic. This is how the
+                    // proposer's own proposal reaches its own
+                    // `vote_aggregator` and event_loop without relying on
+                    // BlossomSub self-echo (which doesn't happen). The
+                    // node's own messages come first, then committee
+                    // members' deliveries, then gossip; other callers'
+                    // deliveries wait until none of those does.
                     tokio::select! {
                         biased;
                         m = consensus_loopback_rx.recv() => m,
+                        Some(m) = remote_members_rx.recv() => Some(m.into_message()),
                         m = msg_rx.recv() => m,
+                        Some(m) = remote_others_rx.recv() => Some(m.into_message()),
                     }
                 } => {
                     match msg {

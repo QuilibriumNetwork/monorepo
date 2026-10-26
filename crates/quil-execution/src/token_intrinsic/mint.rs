@@ -60,11 +60,12 @@ fn check_authorization(
         {
             return Err(invalid("invalid claimant authorization"));
         }
-        super::reward_witness::verify_reward_membership(
+        super::reward_witness::verify_reward_membership_with(
             &claim.owner,
             claim.value,
             trusted_root,
             &claim.forest_proof,
+            quil_types::consensus::vertex_value_binding_active(finalized_global_frame),
         )
         .map_err(|_| invalid("invalid reward membership"))?;
     }

@@ -35,6 +35,20 @@ pub fn network_selector(identifier: &[u8]) -> Option<u8> {
     (identifier.len() == 32 && prefix.iter().all(|b| *b == 0)).then_some(last[0])
 }
 
+/// The generation [`pomw_basis`] prices `difficulty` at: the number of
+/// 10_000-factor reductions from `difficulty` to below 10_000. Issuance
+/// depends on difficulty only through it.
+pub fn pomw_generation(difficulty: u64) -> u32 {
+    // Count generations: loop `difflog /= 10000` until < 10000.
+    let mut difflog = difficulty;
+    let mut generation: u32 = 0;
+    while difflog >= 10_000 {
+        difflog /= 10_000;
+        generation += 1;
+    }
+    generation
+}
+
 /// Compute the PoMW basis: `(POMW_NUMERATOR / world_state_bytes) ^
 /// (1/2^generation)` x `units`, where `generation` is the number of
 /// 10_000-factor reductions from `difficulty` to 0.
@@ -45,13 +59,7 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
         return BigInt::zero();
     }
 
-    // Count generations: loop `difflog /= 10000` until < 10000.
-    let mut difflog = difficulty;
-    let mut generation: u32 = 0;
-    while difflog >= 10_000 {
-        difflog /= 10_000;
-        generation += 1;
-    }
+    let generation = pomw_generation(difficulty);
 
     // Scaled normalized value: POMW_NUMERATOR / world_state_bytes,
     // multiplied by 2^(2^generation * POMW_SCALE_BITS) so the

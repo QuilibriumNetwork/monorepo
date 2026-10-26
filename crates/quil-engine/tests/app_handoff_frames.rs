@@ -221,6 +221,22 @@ impl RewardIssuance for ZeroRewards {
     }
 }
 
+/// Pays nothing, recording the difficulty each calculation was priced at.
+#[derive(Default)]
+struct DifficultyProbe(std::sync::Mutex<Vec<u64>>);
+impl RewardIssuance for DifficultyProbe {
+    fn calculate(
+        &self,
+        difficulty: u64,
+        _: u64,
+        _: u64,
+        provers: &[HashMap<String, ProverAllocation>],
+    ) -> Result<Vec<BigInt>> {
+        self.0.lock().unwrap().push(difficulty);
+        Ok(vec![BigInt::from(0); provers.len()])
+    }
+}
+
 struct Fixture {
     _db: quil_store::RocksDb,
     store: Arc<quil_store::RocksHypergraphStore>,
@@ -287,6 +303,10 @@ impl Fixture {
     }
 
     fn intrinsic(&self) -> GlobalIntrinsic {
+        self.intrinsic_with(Arc::new(ZeroRewards))
+    }
+
+    fn intrinsic_with(&self, issuance: Arc<dyn RewardIssuance>) -> GlobalIntrinsic {
         GlobalIntrinsic::new_with_stores(
             Arc::new(quil_execution::testing::NoopKeyManager),
             Some(self.prover.clone()),
@@ -299,7 +319,7 @@ impl Fixture {
             self.state.crdt().clone(),
             self.inclusion.clone(),
         )
-        .with_frame_header_deps(self.registry.clone(), Arc::new(ZeroRewards))
+        .with_frame_header_deps(self.registry.clone(), issuance)
     }
 
     fn archive(&self) -> ArchiveAppShardIngest {
@@ -563,6 +583,11 @@ fn anchored_first_frame(
 
 /// Store GLOBAL frame `number` with `output`, without executing it.
 fn store_global_frame(fixture: &Fixture, number: u64, output: &[u8]) {
+    store_global_frame_at(fixture, number, output, 0);
+}
+
+/// [`store_global_frame`] at `difficulty`.
+fn store_global_frame_at(fixture: &Fixture, number: u64, output: &[u8], difficulty: u32) {
     use quil_types::store::ClockStore as _;
     let txn = fixture.clock.new_transaction(false).unwrap();
     fixture
@@ -572,6 +597,7 @@ fn store_global_frame(fixture: &Fixture, number: u64, output: &[u8]) {
                 header: Some(quil_types::proto::global::GlobalFrameHeader {
                     frame_number: number,
                     output: output.to_vec(),
+                    difficulty,
                     ..Default::default()
                 }),
                 requests: Vec::new(),
@@ -745,6 +771,56 @@ async fn a_forged_frame_waiting_for_execution_does_not_hold_back_global_executio
         drain(&mut prefetch_rx),
         vec![3],
         "asked for as any missing frame"
+    );
+}
+
+/// A shard leader's header difficulty is bound into the certified output, but
+/// no voter compares it with GLOBAL's: one below 10,000 prices issuance with
+/// no square root, about 32 times as much at a 1 TiB world. And GLOBAL
+/// executes a certified header again whenever a GLOBAL frame includes it.
+/// From the anchored issuance epoch GLOBAL prices the header at the
+/// difficulty of the GLOBAL frame it anchors to and credits each frame of a
+/// session once; before it, both stay as they were.
+#[test]
+fn global_prices_a_header_at_its_anchor_and_credits_each_frame_once() {
+    let keys = keys();
+    let source = session(&keys, vec![0x67; 32]);
+    let anchor_output = vec![0x45; 32];
+    // The leader wrote difficulty 1 into the header; its GLOBAL anchor,
+    // frame 2, has 160,000.
+    let frame = anchored_first_frame(&source, &keys, 2, &anchor_output);
+    let mut op = canonical(&frame);
+    op.global_frame_number = 2;
+    assert_eq!(op.difficulty, 1);
+    let wire = op.to_canonical_bytes().unwrap();
+    // GLOBAL frames 3 and 4 both include the header.
+    let priced = |epoch: u64| {
+        quil_types::consensus::set_anchored_issuance_epoch_for_thread(Some(epoch));
+        let fixture = Fixture::new(&source);
+        handoff::initialize(&fixture.state, 2, &source).unwrap();
+        commit(&fixture.state, 2);
+        store_global_frame_at(&fixture, 2, &anchor_output, 160_000);
+        let probe = Arc::new(DifficultyProbe::default());
+        let intrinsic = fixture.intrinsic_with(probe.clone());
+        for number in [3, 4] {
+            intrinsic
+                .invoke_step(number, &wire, &fixture.state)
+                .unwrap();
+            commit(&fixture.state, number);
+        }
+        quil_types::consensus::set_anchored_issuance_epoch_for_thread(None);
+        let difficulties = probe.0.lock().unwrap().clone();
+        difficulties
+    };
+    assert_eq!(
+        priced(u64::MAX),
+        vec![1, 1],
+        "before the epoch: the leader's difficulty, credited in every GLOBAL frame"
+    );
+    assert_eq!(
+        priced(0),
+        vec![160_000],
+        "from the epoch: the anchor's difficulty, credited once"
     );
 }
 

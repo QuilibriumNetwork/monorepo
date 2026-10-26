@@ -31,13 +31,69 @@ pub struct TokenCommonArgs {
     /// Path to the node config directory.
     #[arg(long = "config", global = true, default_value = "")]
     pub config: String,
-    /// Read wallet state (coins, escrows, witnesses, fee quotes) from this
-    /// node's gRPC multiaddr instead of the configured node. Submissions still
-    /// go to the configured node, whose peer key authenticates them. Use when
-    /// the configured node does not hold the application's state (a regular
-    /// node's master process does not serve its workers' shard state).
+    /// Read wallet state (coins, escrows, witnesses) and other applications'
+    /// fee quotes from this node's gRPC multiaddr instead of the configured
+    /// node. QUIL fee quotes and submissions still go to the configured node,
+    /// whose peer key authenticates them. Use when the configured node does
+    /// not hold the application's state (a regular node's master process does
+    /// not serve its workers' shard state). The connection is plaintext: a
+    /// host other than this one also needs --insecure-read-rpc.
     #[arg(long = "read-rpc", global = true)]
     pub read_rpc: Option<String>,
+    /// Allow --read-rpc to name another host over plaintext gRPC, which
+    /// anyone on the network path can read and alter.
+    #[arg(long = "insecure-read-rpc", global = true, default_value_t = false)]
+    pub insecure_read_rpc: bool,
+    /// Largest fee in base units paid from a node's quote, and largest QUIL
+    /// settlement paid for another application's bundle (default: 0.1 QUIL).
+    /// A larger quote is refused; an explicit --fee is not limited.
+    #[arg(
+        long = "max-fee",
+        global = true,
+        env = "QUILIBRIUM_MAX_FEE",
+        default_value_t = DEFAULT_MAX_AUTOMATIC_FEE
+    )]
+    pub max_fee: u128,
+}
+
+/// Default limit on an automatic fee or bundle settlement: 0.1 QUIL. A QUIL
+/// operation's quoted fee is orders of magnitude lower; a settlement reaches it
+/// only for a bundle near the 1 MiB quote bound at several times the default
+/// application fee vote.
+pub const DEFAULT_MAX_AUTOMATIC_FEE: u128 = 800_000_000;
+
+/// Environment variable behind `--max-fee`, also read by paid deploy and
+/// hypergraph writes, which have no fee flags of their own.
+#[cfg(feature = "native-proof")]
+const MAX_FEE_ENV: &str = "QUILIBRIUM_MAX_FEE";
+
+/// The automatic fee limit for a paid write outside `qclient token`.
+#[cfg(feature = "native-proof")]
+fn max_fee_from_env() -> anyhow::Result<u128> {
+    match std::env::var(MAX_FEE_ENV) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{MAX_FEE_ENV} {value:?}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_AUTOMATIC_FEE),
+        Err(e) => Err(anyhow::anyhow!("{MAX_FEE_ENV}: {e}")),
+    }
+}
+
+/// Connection options for `--read-rpc`. The read connection is plaintext h2,
+/// so a host other than this one is dialed only with `--insecure-read-rpc`.
+fn read_rpc_opts(multiaddr: &str, insecure: bool) -> anyhow::Result<ConnectOpts> {
+    anyhow::ensure!(
+        insecure || crate::rpc::is_local_multiaddr(multiaddr)?,
+        "--read-rpc {multiaddr} is not on this host, and its gRPC connection is plaintext: \
+         anyone on the network path can read and alter the wallet state it returns; \
+         read through a node on this host, or pass --insecure-read-rpc to accept that"
+    );
+    Ok(ConnectOpts {
+        public_rpc: false,
+        custom_rpc: String::new(),
+        listen_grpc_multiaddr: multiaddr.to_string(),
+    })
 }
 
 #[derive(Debug, Args)]
@@ -274,6 +330,9 @@ pub struct TokenCtx {
     /// `config.p2p.peer_priv_key`. EMPTY on a Falcon-only node, which carries
     /// no pre-migration Ed448 key.
     pub peer_id_bytes: Vec<u8>,
+    /// Largest automatic fee or bundle settlement, in base units, paid from a
+    /// node's quote (`--max-fee`).
+    pub max_fee: u128,
 }
 
 impl TokenCtx {
@@ -339,11 +398,7 @@ impl TokenCtx {
         }
         let submit_opts = ctx.connect_opts(&node_config, common.public_rpc);
         let connect_opts = match &common.read_rpc {
-            Some(multiaddr) => ConnectOpts {
-                public_rpc: false,
-                custom_rpc: String::new(),
-                listen_grpc_multiaddr: multiaddr.clone(),
-            },
+            Some(multiaddr) => read_rpc_opts(multiaddr, common.insecure_read_rpc)?,
             None => submit_opts.clone(),
         };
 
@@ -356,6 +411,7 @@ impl TokenCtx {
             peer_id_bytes: identity
                 .map(|identity| identity.peer_id_bytes)
                 .unwrap_or_default(),
+            max_fee: common.max_fee,
         })
     }
 }
@@ -405,6 +461,8 @@ pub(crate) async fn pay_for_bundle(
         public_rpc: false,
         config: String::new(),
         read_rpc: None,
+        insecure_read_rpc: false,
+        max_fee: max_fee_from_env()?,
     };
     let tc = TokenCtx::load(global, &common)?;
     wallet::pay_for_bundle(&tc, destination, rest, None, wait).await
@@ -855,6 +913,51 @@ mod tests {
                 TokenCli::try_parse_from(["token", "mint", "--claim", "authorization.bin"]).is_ok()
             );
         }
+    }
+
+    #[test]
+    fn token_cli_takes_the_fee_limit_and_the_insecure_read_switch() {
+        let parsed = TokenCli::try_parse_from(["token", "balance"]).unwrap();
+        assert!(!parsed.token.common.insecure_read_rpc);
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "--read-rpc",
+            "/ip4/192.0.2.7/tcp/8337",
+            "balance",
+            "--insecure-read-rpc",
+            "--max-fee",
+            "5000",
+        ])
+        .unwrap();
+        assert!(parsed.token.common.insecure_read_rpc);
+        assert_eq!(parsed.token.common.max_fee, 5000);
+    }
+
+    #[test]
+    fn read_rpc_to_another_host_needs_the_insecure_switch() {
+        for local in [
+            "/ip4/127.0.0.1/tcp/8337",
+            "/ip4/0.0.0.0/tcp/8337",
+            "/ip6/::1/tcp/8337",
+            "/dns/localhost/tcp/8337",
+        ] {
+            let opts = read_rpc_opts(local, false).unwrap();
+            assert_eq!(opts.listen_grpc_multiaddr, local);
+            assert!(!opts.is_light_node());
+        }
+        for remote in [
+            "/ip4/192.0.2.7/tcp/8337",
+            "/ip6/2001:db8::7/tcp/8337",
+            "/dns4/rpc.example.com/tcp/8337",
+        ] {
+            let error = read_rpc_opts(remote, false).unwrap_err().to_string();
+            assert!(error.contains("--insecure-read-rpc"), "{error}");
+            assert_eq!(
+                read_rpc_opts(remote, true).unwrap().listen_grpc_multiaddr,
+                remote
+            );
+        }
+        assert!(read_rpc_opts("not-a-multiaddr", false).is_err());
     }
 
     #[test]

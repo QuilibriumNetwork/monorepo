@@ -19,7 +19,7 @@ mod worker;
 
 pub use clock::{CandidatePrune, RocksClockStore, StagedFrameCleanup};
 pub use clock_overlay::OverlayClockStore;
-pub use dispatch::RocksInboxStore;
+pub use dispatch::{InboxUsage, RocksInboxStore, INBOX_MESSAGE_KEY_LEN};
 pub use hypergraph::{
     OverlayHypergraphStore, RocksHypergraphSnapshot, RocksHypergraphStore, VertexWrite,
     FOREST_NAMESPACE,

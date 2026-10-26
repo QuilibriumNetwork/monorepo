@@ -4,36 +4,50 @@
 //! shared release download+verify ([`crate::release`]) and service management
 //! ([`super::service`]). Install/symlink paths require root.
 
+use std::path::Path;
+
 use crate::{release, system};
 
 /// `node install [version]` — download+verify+install the node binary, then
-/// install the system service.
-pub async fn install(version: Option<&str>) -> anyhow::Result<()> {
+/// install the system service. An older version than the linked one needs
+/// `allow_downgrade`.
+pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
     let version = resolve_version(version).await?;
     println!("Installing Quilibrium node {version}...");
-    let bin_path = release::download_and_install(
+    let installed = release::download_and_install(
         system::RELEASE_TYPE_NODE,
         &version,
         &system::default_node_symlink_path(),
+        allow_downgrade,
     )
     .await?;
-    println!("Installed node to {}", bin_path.display());
+    println!("Installed node to {}", installed.path.display());
     super::service::run("install")?;
     Ok(())
 }
 
-/// `node update [version] [--restart]` — install a newer node version and
-/// optionally restart the service.
-pub async fn update(version: Option<&str>, restart: bool) -> anyhow::Result<()> {
+/// `node update [version] [--restart] [--allow-downgrade]` — install a newer
+/// node version and optionally restart the service. An older version than
+/// the linked one needs `allow_downgrade`.
+pub async fn update(
+    version: Option<&str>,
+    restart: bool,
+    allow_downgrade: bool,
+) -> anyhow::Result<()> {
     let version = resolve_version(version).await?;
     println!("Updating Quilibrium node to {version}...");
-    let bin_path = release::download_and_install(
+    let installed = release::download_and_install(
         system::RELEASE_TYPE_NODE,
         &version,
         &system::default_node_symlink_path(),
+        allow_downgrade,
     )
     .await?;
-    println!("Updated node to {}", bin_path.display());
+    if !installed.fresh {
+        println!("Node {version} is already installed; nothing to update");
+        return Ok(());
+    }
+    println!("Updated node to {}", installed.path.display());
     if restart {
         super::service::run("restart")?;
     }
@@ -41,7 +55,8 @@ pub async fn update(version: Option<&str>, restart: bool) -> anyhow::Result<()> 
 }
 
 /// `node link [version]` — point `/usr/local/bin/quilibrium-node` at an
-/// installed version (latest if unspecified).
+/// installed version (latest if unspecified) whose release signatures
+/// verify.
 pub fn link(version: Option<&str>) -> anyhow::Result<()> {
     let version = match version {
         Some(v) if !v.is_empty() && v != "latest" => v.to_string(),
@@ -52,11 +67,15 @@ pub fn link(version: Option<&str>) -> anyhow::Result<()> {
     if !bin_path.exists() {
         anyhow::bail!("node binary not found: {}", bin_path.display());
     }
+    release::verify_installed(&bin_path).map_err(|e| {
+        anyhow::anyhow!(
+            "{} does not verify against its release signatures: {e}; reinstall it with \
+             'qclient node install {version}'",
+            bin_path.display()
+        )
+    })?;
     let link = system::default_node_symlink_path();
-    let _ = std::fs::remove_file(&link);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&bin_path, &link)
-        .map_err(|e| anyhow::anyhow!("symlink {}: {e} (root required)", link.display()))?;
+    release::switch_symlink(&bin_path, &link)?;
     println!("Linked {} → {}", link.display(), bin_path.display());
     Ok(())
 }
@@ -111,25 +130,85 @@ fn write_crontab(contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The cron entry. It runs `/usr/local/bin/qclient`, which `qclient update`
+/// points at a verified release, never the file this qclient was started
+/// from: the job runs as root.
 fn cron_line() -> anyhow::Result<String> {
-    let exe = std::env::current_exe()?;
-    Ok(format!(
+    let qclient = system::default_qclient_symlink_path();
+    let target = std::fs::canonicalize(&qclient).map_err(|e| {
+        anyhow::anyhow!(
+            "resolve {}: {e}; install qclient with 'sudo qclient update' first",
+            qclient.display()
+        )
+    })?;
+    let install_root = system::client_data_path();
+    let install_root = std::fs::canonicalize(&install_root)
+        .map_err(|e| anyhow::anyhow!("resolve {}: {e}", install_root.display()))?;
+    check_cron_target(&target, &install_root)?;
+    Ok(cron_entry(&qclient))
+}
+
+fn cron_entry(qclient: &Path) -> String {
+    format!(
         "{} {} node update --restart {CRON_MARKER}",
         system::DEFAULT_AUTO_UPDATE_INTERVAL,
-        exe.display()
-    ))
+        qclient.display()
+    )
+}
+
+/// Root runs the auto-update job, so its executable (`target`, resolved)
+/// must be an installed qclient release under `install_root`, and it and
+/// every directory above it must be owned by root and writable by no one
+/// else.
+#[cfg(unix)]
+fn check_cron_target(target: &Path, install_root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !target.starts_with(install_root) {
+        anyhow::bail!(
+            "{} is not an installed qclient release under {}; run 'sudo qclient update' to \
+             install one",
+            target.display(),
+            install_root.display()
+        );
+    }
+    for path in target.ancestors() {
+        let meta =
+            std::fs::metadata(path).map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?;
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            anyhow::bail!(
+                "{} must be owned by root and writable only by root: the auto-update job \
+                 runs as root",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_cron_target(_target: &Path, _install_root: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("auto-update requires cron, which this platform lacks")
 }
 
 fn cron_enable() -> anyhow::Result<()> {
     let current = current_crontab();
-    if current.contains(CRON_MARKER) {
+    let line = cron_line()?;
+    if current.lines().any(|l| l == line) {
         println!("Auto-update is already enabled");
         return Ok(());
     }
-    let mut lines: Vec<String> = current.lines().map(String::from).collect();
-    lines.push(cron_line()?);
+    // An entry from an earlier qclient may run another executable: replace it.
+    let mut lines: Vec<String> = current
+        .lines()
+        .filter(|l| !l.contains(CRON_MARKER))
+        .map(String::from)
+        .collect();
+    lines.push(line);
     write_crontab(&(lines.join("\n") + "\n"))?;
-    println!("Auto-update enabled (every 10 minutes)");
+    println!(
+        "Auto-update enabled (every 10 minutes, running {})",
+        system::default_qclient_symlink_path().display()
+    );
     Ok(())
 }
 
@@ -164,17 +243,67 @@ async fn resolve_version(version: Option<&str>) -> anyhow::Result<String> {
     }
 }
 
-/// The lexicographically-highest installed node version directory.
+/// The highest installed node version directory.
 fn latest_installed_node_version() -> anyhow::Result<String> {
-    let data = system::node_data_path();
-    let mut versions: Vec<String> = std::fs::read_dir(&data)
+    latest_version_in(&system::node_data_path())
+}
+
+/// The numerically highest release-version directory in `data`.
+fn latest_version_in(data: &Path) -> anyhow::Result<String> {
+    std::fs::read_dir(data)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", data.display()))?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    versions.sort();
-    versions
-        .pop()
+        .filter(|v| release::is_release_version(v))
+        .max_by(|a, b| release::compare_versions(a, b))
         .ok_or_else(|| anyhow::anyhow!("no installed node versions in {}", data.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cron_entry_runs_the_installed_qclient() {
+        assert_eq!(
+            cron_entry(&system::default_qclient_symlink_path()),
+            "*/10 * * * * /usr/local/bin/qclient node update --restart # quilibrium-auto-update"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cron_target_must_be_a_root_owned_installed_release() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("qclient");
+        let dir = root.join("2.1.0.25");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("qclient-2.1.0.25-linux-amd64");
+        std::fs::write(&target, b"bin").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let elsewhere = tmp.path().join("qclient-2.1.0.25-linux-amd64");
+        std::fs::write(&elsewhere, b"bin").unwrap();
+
+        let err = check_cron_target(&elsewhere, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("not an installed qclient release"),
+            "{err}"
+        );
+        // Writable by others (and, unless the tests run as root, owned by
+        // another user).
+        let err = check_cron_target(&target, &root).unwrap_err();
+        assert!(err.to_string().contains("owned by root"), "{err}");
+    }
+
+    #[test]
+    fn latest_installed_version_is_numeric() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for dir in ["2.1.0.9", "2.1.0.25", "2.1.0.100-x", ".tmp", "latest"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        std::fs::write(tmp.path().join("2.1.0.30"), b"not a directory").unwrap();
+        assert_eq!(latest_version_in(tmp.path()).unwrap(), "2.1.0.25");
+    }
 }
