@@ -542,9 +542,9 @@ pub fn set_seniority_succession_epoch_for_thread(epoch: Option<u64>) {
 /// `address ‖ Poseidon(output) ‖ rank`, not the frame number, so before this
 /// epoch two votes from different ranks, or one vote with a re-encoded
 /// output, pass for an equivocation. Consensus-affecting: every archive must
-/// run a build with it before then. `None` until scheduled;
+/// run a build with it before then. Mainnet epoch 1311 (frame 943,920);
 /// `QUIL_KICK_SIGNED_SLOT_EPOCH` elsewhere, never by default.
-pub const MAINNET_KICK_SIGNED_SLOT_EPOCH: Option<u64> = None;
+pub const MAINNET_KICK_SIGNED_SLOT_EPOCH: Option<u64> = Some(1311);
 
 static KICK_SIGNED_SLOT_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
