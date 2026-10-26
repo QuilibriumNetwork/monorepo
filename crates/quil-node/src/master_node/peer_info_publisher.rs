@@ -123,6 +123,14 @@ where
 /// needs a second server, so one settle window absorbs a burst of changes.
 const ANNOUNCE_CHANGE_SETTLE: Duration = Duration::from_secs(60);
 
+/// How long the first publish waits for an address when only AutoNAT can
+/// name one (no announce override, a wildcard listen address): its first
+/// probe runs 15 s after start and usually confirms at once. Publishing
+/// first would hand every peer a record without addresses, replacing the
+/// node's last one, until the confirmation publishes after the settle
+/// window.
+const FIRST_PUBLISH_ADDRESS_WAIT: Duration = Duration::from_secs(120);
+
 /// Minimum spacing of change-triggered publishes: a flapping NAT costs at most
 /// one extra PeerInfo per five minutes on top of the regular cadence.
 const ANNOUNCE_CHANGE_MIN_GAP: Duration = Duration::from_secs(5 * 60);
@@ -256,6 +264,26 @@ fn announce_reason(source: AnnounceSource, ext: &ConfirmedExternalAddrs) -> &'st
 /// watched value also carries AutoNAT's view, which changes with every
 /// failed probe; only a change of the selected address restarts the settle
 /// window.
+/// Wait until `select` names an address, at most `max_wait`; whether it
+/// does. An address that is already known returns at once.
+async fn wait_for_first_address(
+    rx: &mut watch::Receiver<ConfirmedExternalAddrs>,
+    select: impl Fn(&ConfirmedExternalAddrs) -> String,
+    max_wait: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        if !select(&*rx.borrow_and_update()).is_empty() {
+            return true;
+        }
+        match tokio::time::timeout_at(deadline, rx.changed()).await {
+            Ok(Ok(())) => {}
+            // Timed out, or the swarm is gone and nothing can change.
+            Err(_) | Ok(Err(_)) => return false,
+        }
+    }
+}
+
 async fn announce_change_due(
     rx: &mut watch::Receiver<ConfirmedExternalAddrs>,
     select: impl Fn(&ConfirmedExternalAddrs) -> String,
@@ -594,6 +622,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: PeerInfoPublisher
         // What that publish carried, for the change line.
         let mut published_carried: Option<String> = None;
         let mut last_change_publish: Option<tokio::time::Instant> = None;
+        let started = tokio::time::Instant::now();
+        if !wait_for_first_address(&mut addr_rx, select_addr, FIRST_PUBLISH_ADDRESS_WAIT).await {
+            info!(
+                waited_secs = started.elapsed().as_secs(),
+                "PeerInfo publishes without an address: AutoNAT has confirmed none yet and \
+                 no announce address is configured; it publishes the address once confirmed"
+            );
+        }
         loop {
             // Tick FIRST. `interval`'s opening tick completes immediately, so
             // this still publishes at startup without delay — but it stops the
@@ -954,6 +990,29 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_secs(1_000_000)).await;
             })
+        }
+
+        /// The first publish waits for AutoNAT's first confirmation rather
+        /// than announce no address; an address already known returns at
+        /// once, and the wait gives up at its bound.
+        #[tokio::test(start_paused = true)]
+        async fn the_first_publish_waits_for_the_first_confirmation() {
+            let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
+            let _driver = drive(tx, vec![(15, confirmed(&[TCP_A]))]);
+            let started = tokio::time::Instant::now();
+            assert!(wait_for_first_address(&mut rx, selected, FIRST_PUBLISH_ADDRESS_WAIT).await);
+            assert_eq!(started.elapsed(), Duration::from_secs(15));
+
+            let (_tx, mut rx) = watch::channel(confirmed(&[TCP_A]));
+            let started = tokio::time::Instant::now();
+            assert!(wait_for_first_address(&mut rx, selected, FIRST_PUBLISH_ADDRESS_WAIT).await);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+
+            let (tx, mut rx) = watch::channel(ConfirmedExternalAddrs::default());
+            let _late = drive(tx, vec![(500, confirmed(&[TCP_A]))]);
+            let started = tokio::time::Instant::now();
+            assert!(!wait_for_first_address(&mut rx, selected, FIRST_PUBLISH_ADDRESS_WAIT).await);
+            assert_eq!(started.elapsed(), FIRST_PUBLISH_ADDRESS_WAIT);
         }
 
         /// The first confirmation after startup publishes once it settles,
