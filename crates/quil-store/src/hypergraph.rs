@@ -119,6 +119,18 @@ fn prefix_range_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Read options of a sweep over a whole shard's vertex keyspace
+/// (`for_each_vertex_underlying`): the blocks it reads are not added to the
+/// block cache, where blocks already cached are still read. A sweep reads
+/// each block once (every epoch's storage confirmation, a prover scan, a
+/// worker seed), so caching them evicts the point-read working set and
+/// leaves each store's cache full of blocks no read uses again.
+fn sweep_read_options() -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    options.fill_cache(false);
+    options
+}
+
 impl RocksHypergraphStore {
     fn backing_store_identity_backend(&self) -> quil_types::store::BackingStoreIdentity {
         self.db.backing_store_identity()
@@ -440,10 +452,10 @@ impl RocksHypergraphStore {
         // Legacy (unversioned) fills any vertex not yet re-written v2.
         let prefix = hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
         let prefix_len = prefix.len();
-        for entry in self.db.iterator(rocksdb::IteratorMode::From(
-            &prefix,
-            rocksdb::Direction::Forward,
-        )) {
+        for entry in self.db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            sweep_read_options(),
+        ) {
             let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
             if !k.starts_with(&prefix) {
                 break;
@@ -1414,6 +1426,97 @@ mod tests {
     use super::*;
     use crate::rocksdb_store::RocksDb;
     use tempfile::TempDir;
+
+    /// Sweeps of whole shards read around the block cache: the vertex walk,
+    /// the general walk and the legacy keyspace add none of the blocks they
+    /// read, where a plain iterator over the same keys adds every one. Every
+    /// vertex is still yielded with its blob.
+    #[test]
+    fn shard_sweeps_do_not_fill_the_block_cache() {
+        const VERTICES: usize = 2048;
+        const BLOB: usize = 4096;
+        const MIB: u64 = 1 << 20;
+        let dir = TempDir::new().unwrap();
+        // The default 256 MiB block cache holds every block written here.
+        let db = RocksDb::open(dir.path()).unwrap();
+        let store = RocksHypergraphStore::new(db.inner());
+        // Keys of one length (the vertex walk, half of them legacy) and of
+        // two lengths (the general walk).
+        let uniform = ShardKey {
+            l1: [1, 2, 3],
+            l2: [0x11; 32],
+        };
+        let mixed = ShardKey {
+            l1: [4, 5, 6],
+            l2: [0x22; 32],
+        };
+        let vertex = |n: usize, len: usize| {
+            [(n as u64).to_be_bytes().to_vec(), vec![0xab; len - 8]].concat()
+        };
+        let blob = |vk: &[u8]| vec![vk[7]; BLOB];
+        for n in 0..VERTICES {
+            let vk = vertex(n, 64);
+            let key = if n % 2 == 0 {
+                crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &uniform, &vk, 1)
+            } else {
+                hypergraph_vertex_data_key("vertex", "adds", &uniform, &vk)
+            };
+            db.inner().put(key, blob(&vk)).unwrap();
+            let vk = vertex(n, 64 + n % 2);
+            let key =
+                crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &mixed, &vk, 1);
+            db.inner().put(key, blob(&vk)).unwrap();
+        }
+        // Reads now come from table files, through the block cache.
+        db.inner().flush().unwrap();
+        let cached = || db.memory_usage().block_cache;
+
+        let before = cached();
+        for shard in [&uniform, &mixed] {
+            let mut rows = Vec::new();
+            HypergraphStore::for_each_vertex_underlying(
+                &store,
+                "vertex",
+                "adds",
+                shard,
+                &mut |vk, data| rows.push((vk, data)),
+            )
+            .unwrap();
+            store
+                .for_each_vertex_underlying("vertex", "adds", shard, |vk, data| {
+                    rows.push((vk, data))
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 2 * VERTICES);
+            assert!(rows.iter().all(|(vk, data)| *data == blob(vk)));
+        }
+        let swept = cached().saturating_sub(before);
+        assert!(
+            swept < MIB,
+            "sweeping 16 MiB of blobs added {swept} bytes to the block cache"
+        );
+
+        // The measure sees a cache that fills: plain iterators over the same
+        // keys add every block they read.
+        for shard in [&uniform, &mixed] {
+            for prefix in [
+                crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", shard),
+                hypergraph_vertex_data_prefix("vertex", "adds", shard),
+            ] {
+                let mode = rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward);
+                for entry in db.inner().iterator(mode) {
+                    if !entry.unwrap().0.starts_with(&prefix) {
+                        break;
+                    }
+                }
+            }
+        }
+        let read = cached().saturating_sub(before);
+        assert!(
+            read > 8 * MIB,
+            "plain iterators over 16 MiB of blobs added only {read} bytes to the block cache"
+        );
+    }
 
     /// The vertex walk against the general walk over a shard whose vertices
     /// carry many versions, as frequently rewritten allocations do.
