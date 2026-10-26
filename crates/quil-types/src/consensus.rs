@@ -1201,6 +1201,77 @@ pub fn global_committee_epoch(frame: u64) -> u64 {
     u64::from(frame >= global_committee_succession_frame())
 }
 
+/// First mainnet GLOBAL frame from which a frame this node takes from an
+/// archive (the poller, record and hole backfill, the state jump, GLOBAL
+/// anchors) is authenticated by the GLOBAL committee alone: a signature in
+/// its header counts only as a commonware finalization certificate that
+/// verifies against the committee of its frame, never as a signature
+/// checked against a key the frame itself carries, and its request body
+/// must hash to its `requests_root` before it is stored or executed.
+///
+/// It changes what a node accepts from archives, not what consensus
+/// produces or votes for; frames below it keep the earlier checks. Unset on
+/// mainnet until a store scan confirms that no finalized frame from the
+/// proposed activation on carries a signature other than a committee
+/// certificate, since a syncing node refusing an honest frame would stop
+/// there. Suggested: [`MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`] (907,920),
+/// from which commonware simplex finalizes every frame with a certificate or
+/// no signature and voters bind its body before voting.
+/// `QUIL_GLOBAL_SYNC_AUTHENTICATION_FRAME` elsewhere, never by default.
+pub const MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME: Option<u64> = None;
+
+static GLOBAL_SYNC_AUTHENTICATION_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static GLOBAL_SYNC_AUTHENTICATION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn global_sync_authentication_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's GLOBAL sync authentication frame from its network, and
+/// return it. Called at startup before any frame is fetched; the first call
+/// decides.
+pub fn init_global_sync_authentication_frame(network: u8) -> u64 {
+    *GLOBAL_SYNC_AUTHENTICATION_FRAME.get_or_init(|| {
+        global_sync_authentication_frame_for(
+            network,
+            std::env::var("QUIL_GLOBAL_SYNC_AUTHENTICATION_FRAME")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_global_sync_authentication_frame`]; the mainnet
+/// frame in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX` when the network has none.
+pub fn global_sync_authentication_frame() -> u64 {
+    if let Some(frame) = GLOBAL_SYNC_AUTHENTICATION_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *GLOBAL_SYNC_AUTHENTICATION_FRAME.get_or_init(|| global_sync_authentication_frame_for(0, None))
+}
+
+/// Whether an archive-sourced GLOBAL frame `frame` must be authenticated by
+/// the committee alone (see [`MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME`]).
+pub fn global_sync_authenticated_at(frame: u64) -> bool {
+    frame >= global_sync_authentication_frame()
+}
+
+/// Set the GLOBAL sync authentication frame for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_global_sync_authentication_frame_for_thread(frame: Option<u64>) {
+    GLOBAL_SYNC_AUTHENTICATION_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 /// First GLOBAL frame whose included app frames record each signer's
 /// `LastSignedFrameNumber` on its allocation. One inactivity threshold later,
 /// when every member has had a full window to sign, the eviction stall census
@@ -2416,6 +2487,40 @@ mod global_committee_succession_tests {
         assert_eq!(global_committee_epoch(907_921), 1);
         set_global_committee_succession_frame(u64::MAX);
         assert_eq!(global_committee_epoch(907_920), 0);
+    }
+}
+
+#[cfg(test)]
+mod global_sync_authentication_tests {
+    #[test]
+    fn only_a_test_network_reads_the_global_sync_authentication_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::global_sync_authentication_frame_for(0, setting),
+                super::MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::global_sync_authentication_frame_for(1, Some("4")), 4);
+        assert_eq!(
+            super::global_sync_authentication_frame_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(
+            super::global_sync_authentication_frame_for(1, None),
+            u64::MAX
+        );
+    }
+
+    /// Inert on mainnet until scheduled; from its frame once set.
+    #[test]
+    fn archive_frames_are_authenticated_by_the_committee_from_the_set_frame() {
+        assert_eq!(super::MAINNET_GLOBAL_SYNC_AUTHENTICATION_FRAME, None);
+        super::set_global_sync_authentication_frame_for_thread(Some(10));
+        assert!(!super::global_sync_authenticated_at(9));
+        assert!(super::global_sync_authenticated_at(10));
+        super::set_global_sync_authentication_frame_for_thread(Some(u64::MAX));
+        assert!(!super::global_sync_authenticated_at(u64::MAX - 1));
+        super::set_global_sync_authentication_frame_for_thread(None);
     }
 }
 

@@ -748,6 +748,10 @@ pub(crate) async fn start(
         for raw in &config.engine.archive_endpoints {
             match crate::util::multiaddr::archive_multiaddr_to_host_port(raw, network) {
                 Some(endpoint) => {
+                    // An endpoint that names its peer must answer as that peer.
+                    if let Some(peer) = crate::util::multiaddr::archive_multiaddr_peer(raw) {
+                        quil_rpc::archive_client::pin_archive_peer(&endpoint, peer);
+                    }
                     archive_pool.add(endpoint.clone()).await;
                     tracing::debug!(
                         multiaddr = %raw,
@@ -768,6 +772,17 @@ pub(crate) async fn start(
         let static_ips = quil_engine::genesis::genesis_archive_static_ips();
         for (peer_id, ip) in static_ips {
             let endpoint = format!("{}:8340", ip);
+            // The genesis archive at this address presents this identity on
+            // `:8340` as on the mesh; a dial reaching anyone else fails.
+            match peer_id.parse::<quil_p2p::PeerId>() {
+                Ok(peer) => quil_rpc::archive_client::pin_archive_peer(&endpoint, peer),
+                Err(error) => tracing::warn!(
+                    peer = %peer_id,
+                    %endpoint,
+                    %error,
+                    "genesis archive endpoint has an unreadable peer id; dialed unpinned"
+                ),
+            }
             pool.add(endpoint.clone()).await;
             tracing::debug!(
                 peer = %peer_id,
