@@ -601,10 +601,11 @@ pub fn set_anchored_issuance_epoch_for_thread(epoch: Option<u64>) {
 /// records with an unsigned timestamp are accepted, because releases before
 /// this rule publish the former and forward the latter. Not
 /// consensus-affecting (frames and operations are unchanged), but it splits
-/// gossip from nodes on older releases: set it only once nearly every node
-/// runs a release that signs the KeyRegistry timestamp.
-/// `QUIL_STRICT_PEER_INFO_EPOCH` elsewhere, never by default.
-pub const MAINNET_STRICT_PEER_INFO_EPOCH: Option<u64> = None;
+/// gossip from nodes on older releases: mainnet epoch 1311 (frame 943,920),
+/// with the other rules of that epoch, leaves nodes that have not upgraded by
+/// then out of the mesh. `QUIL_STRICT_PEER_INFO_EPOCH` elsewhere, never by
+/// default.
+pub const MAINNET_STRICT_PEER_INFO_EPOCH: Option<u64> = Some(1311);
 
 static STRICT_PEER_INFO_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -2701,7 +2702,7 @@ mod strict_peer_info_epoch_tests {
         }
         assert_eq!(super::strict_peer_info_epoch_for(1, Some("4")), 4);
         assert_eq!(super::strict_peer_info_epoch_for(1, None), u64::MAX);
-        assert_eq!(super::MAINNET_STRICT_PEER_INFO_EPOCH, None);
+        assert_eq!(super::MAINNET_STRICT_PEER_INFO_EPOCH, Some(1311));
     }
 
     #[test]
