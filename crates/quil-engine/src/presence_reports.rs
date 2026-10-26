@@ -19,6 +19,13 @@
 //! not submit (offline, or unable to reach GLOBAL) loses its committee that
 //! epoch's report; the order changes every epoch.
 //!
+//! Nullify votes. From the presence exclusion frame a report also carries
+//! verified nullify votes ([`build_with_nullifies`]) of members its notarize
+//! votes leave out, and nullify voters count among the verified voters the
+//! submitter is drawn from. Stalled sessions' members often only nullify;
+//! a nullify protects its signer from exclusion for absence and earns no
+//! credit. Liveness keeps nullify signatures with the notarize ones.
+//!
 //! Traffic bound. Nothing is built before the presence report frame, in an
 //! epoch's last [`Pace::margin_frames`], or for a session whose tip advanced
 //! in the last [`Pace::stall_frames`]. A submitter sends at most
@@ -69,12 +76,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quil_cw_consensus::adapters::{Liveness, NotarizeKey, NotarizedProposal};
+use quil_cw_consensus::adapters::{Liveness, NotarizeKey, NotarizedProposal, NullifyKey};
 use quil_cw_consensus::handoff::{Seal, Session, SessionVotes};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;
 use quil_execution::global_intrinsic::handoff::{
     self,
-    presence::{NotarizeVote, PresenceProposal, PresenceReport, MAX_PRESENCE_PROPOSALS, MAX_PRESENCE_VOTES},
+    presence::{NotarizeVote, NullifyVote, PresenceProposal, PresenceReport, MAX_PRESENCE_PROPOSALS, MAX_PRESENCE_VOTES},
     Records,
 };
 use quil_types::consensus::epoch_length_frames;
@@ -181,6 +188,22 @@ impl Pace {
         epoch.saturating_mul(self.length).saturating_add(offset)
     }
 
+    /// The first GLOBAL frame of `epoch` a member `member` of session `id`
+    /// that the epoch's reports left out may report itself for: the epoch's
+    /// second half, after the designated submitter's turns, plus an offset
+    /// drawn from the session and member within a quarter epoch, so the
+    /// left-out members do not all report at once.
+    pub fn self_report_frame(&self, id: &[u8; 32], epoch: u64, member: u32) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"quil/presence-report/self-report");
+        hasher.update(id);
+        hasher.update(epoch.to_be_bytes());
+        hasher.update(member.to_be_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let offset = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes")) % self.spread_frames();
+        epoch.saturating_mul(self.length).saturating_add(self.length / 2).saturating_add(offset)
+    }
+
     /// Whether a report may land in GLOBAL frame `frame`: from `activation`
     /// on, and not in the last [`Self::margin_frames`] of its epoch.
     pub fn window_open(&self, frame: u64, activation: u64) -> bool {
@@ -211,6 +234,10 @@ pub trait VoteSource {
     fn notarize_votes(&self, wanted: &dyn Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)>;
     /// [`Liveness::notarized`].
     fn notarized(&self) -> Vec<NotarizedProposal>;
+    /// [`Liveness::nullify_votes`]; none unless the source keeps them.
+    fn nullify_votes(&self, _wanted: &dyn Fn(&NullifyKey) -> bool) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        Vec::new()
+    }
 }
 
 impl VoteSource for Liveness {
@@ -220,6 +247,10 @@ impl VoteSource for Liveness {
 
     fn notarized(&self) -> Vec<NotarizedProposal> {
         Liveness::notarized(self)
+    }
+
+    fn nullify_votes(&self, wanted: &dyn Fn(&NullifyKey) -> bool) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        Liveness::nullify_votes(self, wanted)
     }
 }
 
@@ -232,6 +263,8 @@ impl VoteSource for Liveness {
 pub struct VoteChecks {
     session: [u8; 32],
     results: BTreeMap<NotarizeKey, bool>,
+    /// Whether each nullify vote verifies ([`Self::refresh_nullifies`]).
+    nullify_results: BTreeMap<NullifyKey, bool>,
     /// Falcon verifications done.
     verifications: u64,
 }
@@ -244,6 +277,7 @@ impl VoteChecks {
         if self.session != id {
             self.session = id;
             self.results.clear();
+            self.nullify_results.clear();
         }
         let votes = {
             let results = &self.results;
@@ -262,6 +296,45 @@ impl VoteChecks {
             results.insert(key, valid);
         }
         self.results = results;
+    }
+
+    /// Check the nullify votes `source` holds of the session last
+    /// [`Self::refresh`]ed, as that checks notarize votes: each once, and
+    /// the results of votes no longer held dropped.
+    pub fn refresh_nullifies(&mut self, checker: &SessionVotes, source: &dyn VoteSource) {
+        let votes = {
+            let results = &self.nullify_results;
+            source.nullify_votes(&|key| !results.contains_key(key))
+        };
+        let mut results = BTreeMap::new();
+        for (key, signature) in votes {
+            let valid = match (self.nullify_results.get(&key), signature) {
+                (Some(valid), _) => *valid,
+                (None, Some(signature)) => {
+                    self.verifications += 1;
+                    checker.verify_nullify(key.epoch, key.view, key.signer, &signature)
+                }
+                (None, None) => continue,
+            };
+            results.insert(key, valid);
+        }
+        self.nullify_results = results;
+    }
+
+    /// Whether the nullify vote was checked and verifies.
+    pub fn valid_nullify(&self, key: &NullifyKey) -> bool {
+        self.nullify_results.get(key).copied().unwrap_or(false)
+    }
+
+    /// The members whose nullify votes of `session`'s generation verify.
+    pub fn nullify_voters(&self, session: &Session) -> BTreeSet<u32> {
+        self.nullify_results
+            .iter()
+            .filter(|(key, valid)| {
+                **valid && key.epoch == session.generation && (key.signer as usize) < session.members.len()
+            })
+            .map(|(key, _)| key.signer)
+            .collect()
     }
 
     /// Whether the vote was checked and verifies.
@@ -317,6 +390,25 @@ pub fn build(
     seen: &[NotarizedProposal],
     valid: impl Fn(&NotarizeKey) -> bool,
 ) -> Option<Built> {
+    build_with_nullifies(session, id, pace, inclusion, seen, valid, Vec::new())
+}
+
+/// [`build`], then the verified nullify votes `nullifies` (one per member,
+/// in ascending signer order) of the members its notarize votes left out,
+/// within [`MAX_PRESENCE_VOTES`]. A nullify protects its signer from
+/// exclusion for absence and earns nothing. With no notarize vote to carry,
+/// the report carries nullifies alone: a session whose members only
+/// nullify (no proposal reached them, or none they accept) still shows who
+/// follows it.
+pub fn build_with_nullifies(
+    session: &Session,
+    id: [u8; 32],
+    pace: Pace,
+    inclusion: u64,
+    seen: &[NotarizedProposal],
+    valid: impl Fn(&NotarizeKey) -> bool,
+    nullifies: Vec<NullifyVote>,
+) -> Option<Built> {
     // Latest first.
     let mut candidates: Vec<PresenceProposal> = eligible(session, pace, inclusion, seen)
         .map(|(seen, header)| PresenceProposal {
@@ -356,14 +448,36 @@ pub fn build(
         members.extend(proposal.votes.iter().map(|vote| vote.signer));
         chosen.push(proposal);
     }
-    if chosen.is_empty() {
+    chosen.sort_by_key(|proposal| proposal.view);
+    let room = MAX_PRESENCE_VOTES.saturating_sub(members.len());
+    let nullifies: Vec<NullifyVote> =
+        nullifies.into_iter().filter(|vote| !members.contains(&vote.signer)).take(room).collect();
+    members.extend(nullifies.iter().map(|vote| vote.signer));
+    if chosen.is_empty() && nullifies.is_empty() {
         return None;
     }
-    chosen.sort_by_key(|proposal| proposal.view);
     Some(Built {
-        report: PresenceReport { session: id, filter: session.filter.clone(), proposals: chosen },
+        report: PresenceReport { session: id, filter: session.filter.clone(), proposals: chosen, nullifies },
         members,
     })
+}
+
+/// Of the nullify votes `source` holds, the verified ones of `session`'s
+/// generation, the latest view of each member, in ascending signer order.
+/// Only views above `floor`, the highest GLOBAL recorded in earlier epochs
+/// ([`handoff::presence::nullify_floor`]), are taken: GLOBAL refuses the rest.
+fn verified_nullifies(session: &Session, checks: &VoteChecks, source: &dyn VoteSource, floor: u64) -> Vec<NullifyVote> {
+    let mut latest: BTreeMap<u32, NullifyVote> = BTreeMap::new();
+    for (key, signature) in source.nullify_votes(&|key| checks.valid_nullify(key)) {
+        let Some(signature) = signature else { continue };
+        if key.epoch != session.generation || key.view <= floor || (key.signer as usize) >= session.members.len() {
+            continue;
+        }
+        if latest.get(&key.signer).is_none_or(|kept| kept.view < key.view) {
+            latest.insert(key.signer, NullifyVote { view: key.view, signer: key.signer, signature });
+        }
+    }
+    latest.into_values().collect()
 }
 
 fn key(seen: &NotarizedProposal, signer: u32) -> NotarizeKey {
@@ -574,7 +688,9 @@ pub struct PresenceSchedule {
     first_refused: Option<u64>,
     /// The last submission's bytes digest and the members reported before
     /// it, to give its budget back if it was not published.
-    pending: Option<([u8; 32], BTreeSet<u32>)>,
+    pending: Option<([u8; 32], BTreeSet<u32>, bool)>,
+    /// The inclusion frame this member last reported itself for this epoch.
+    self_reported: Option<u64>,
 }
 
 impl PresenceSchedule {
@@ -615,20 +731,23 @@ impl PresenceSchedule {
 
     /// Record the bytes of the submission just counted, so that
     /// [`Self::reclaim`] can give it back.
-    fn pending(&mut self, bytes: &[u8], reported_before: BTreeSet<u32>) {
-        self.pending = Some((digest(bytes), reported_before));
+    fn pending(&mut self, bytes: &[u8], reported_before: BTreeSet<u32>, alone: bool) {
+        self.pending = Some((digest(bytes), reported_before, alone));
     }
 
     /// Give back the budget of the last submission if its publication
     /// failed ([`publication_failed`]): it no longer counts, nor do the
     /// members it carried. Its spacing still holds.
     fn reclaim(&mut self) {
-        if let Some((hash, before)) = self.pending.take() {
+        if let Some((hash, before, alone)) = self.pending.take() {
             if take_unpublished(&hash) {
                 self.submitted = self.submitted.saturating_sub(1);
                 self.reported = before;
+                if alone {
+                    self.self_reported = None;
+                }
             } else {
-                self.pending = Some((hash, before));
+                self.pending = Some((hash, before, alone));
             }
         }
     }
@@ -730,9 +849,31 @@ impl PresenceReporter {
         }
         let checker = SessionVotes::new(session).ok()?;
         self.checks.refresh(id, &checker, source);
-        let voters = self.checks.voters(session);
+        // From the presence exclusion frame nullify votes count too: they
+        // protect their signers from exclusion, and a session whose members
+        // only nullify has no notarize to report.
+        let nullifying = inclusion >= handoff::presence_exclusion_frame();
+        let mut voters = self.checks.voters(session);
+        if nullifying {
+            self.checks.refresh_nullifies(&checker, source);
+            voters.extend(self.checks.nullify_voters(session));
+        }
         let designated = designated_submitter(&id, epoch, &voters);
-        if designated != Some(me) {
+        // GLOBAL's records are kept by its own epoch of the inclusion frame.
+        let global_epoch = quil_types::consensus::epoch_for_frame(inclusion);
+        // One reporter's view must not decide who is absent: from its own
+        // frame of the epoch's second half, a member GLOBAL has not recorded
+        // present reports its own votes, again every resubmit spacing while
+        // GLOBAL still has no record of it (a report lost on the way, or
+        // dropped from a mempool), within the epoch's report budget, and at
+        // once again if its publication failed. GLOBAL's new-mark rule
+        // bounds what that costs.
+        let alone = designated != Some(me)
+            && nullifying
+            && inclusion >= pace.self_report_frame(&id, epoch, me)
+            && self.schedule.self_reported.is_none_or(|at| inclusion >= at.saturating_add(pace.resubmit_frames()))
+            && !handoff::presence::recorded(look.view, session, global_epoch, me).unwrap_or(true);
+        if designated != Some(me) && !alone {
             let outcome = Outcome::NotDesignated { designated, voters: voters.len() };
             // With no vote verified, this node cannot tell who submits.
             let cause = if designated.is_some() { "not designated" } else { "no verified vote" };
@@ -740,13 +881,25 @@ impl PresenceReporter {
         }
         let seen = source.notarized();
         let checks = &self.checks;
-        let valid = |key: &NotarizeKey| checks.valid(key);
-        let Some(built) = build(session, id, pace, inclusion, &seen, valid) else {
+        let valid = |key: &NotarizeKey| checks.valid(key) && (!alone || key.signer == me);
+        let nullifies = if nullifying {
+            let floor = handoff::presence::nullify_floor(look.view, session, global_epoch).unwrap_or(0);
+            let mut nullifies = verified_nullifies(session, &self.checks, source, floor);
+            if alone {
+                nullifies.retain(|vote| vote.signer == me);
+            }
+            nullifies
+        } else {
+            Vec::new()
+        };
+        let Some(built) = build_with_nullifies(session, id, pace, inclusion, &seen, valid, nullifies) else {
             let why = ineligible(session, pace, inclusion, &seen, &valid);
             return attempt(Outcome::NothingEligible(why), self.schedule.note("nothing eligible"));
         };
         let added = self.schedule.adds(&built.members);
-        if added == 0 {
+        // A member reporting itself again while GLOBAL has no record of it
+        // repeats its own vote: it adds nobody to this node's reports.
+        if added == 0 && !alone {
             self.schedule.idle(inclusion);
             return None;
         }
@@ -771,8 +924,11 @@ impl PresenceReporter {
         match checked {
             Ok(bytes) => {
                 let before = self.schedule.reported.clone();
+                if alone {
+                    self.schedule.self_reported = Some(inclusion);
+                }
                 self.schedule.submitted(inclusion, &built.members);
-                self.schedule.pending(&bytes, before);
+                self.schedule.pending(&bytes, before, alone);
                 attempt(Outcome::Submit { built, bytes, added, voters: voters.len() }, true)
             }
             Err(error) => {
@@ -966,6 +1122,20 @@ mod tests {
             NotarizedProposal { epoch: self.session.generation, view, parent: view - 1, payload, votes, body }
         }
 
+        /// Member `signer`'s nullify of `view` under the session's namespace,
+        /// as the session's liveness keeps it.
+        fn nullify(&self, view: u64, signer: usize) -> (NullifyKey, Vec<u8>) {
+            let participants: Set<_> =
+                self.keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+            let scheme: Generic<Namespace> =
+                Generic::signer(&self.session.namespace().unwrap(), participants, self.keys[signer].clone()).unwrap();
+            let round = Round::new(Epoch::new(self.session.generation), View::new(view));
+            let vote = scheme.sign::<SimplexFalconScheme, Digest>(Subject::Nullify { round }).unwrap();
+            assert_eq!(vote.signer.get() as usize, signer);
+            let key = NullifyKey { epoch: self.session.generation, view, signer: vote.signer.get() };
+            (key, vote.signature.get().unwrap().to_vec())
+        }
+
         /// A look by `member` at committed GLOBAL frame `frame`, the latest
         /// this node holds.
         fn look<'a, R: Records>(&'a self, view: &'a R, member: usize, frame: u64) -> Look<'a, R> {
@@ -1023,6 +1193,8 @@ mod tests {
     #[derive(Default)]
     struct Votes {
         proposals: Vec<NotarizedProposal>,
+        /// Kept nullify votes and their signatures.
+        nullifies: Vec<(NullifyKey, Vec<u8>)>,
         /// Lists of votes taken, signatures copied, and body reads.
         listed: Cell<u32>,
         copied: Cell<u32>,
@@ -1057,6 +1229,10 @@ mod tests {
         fn notarized(&self) -> Vec<NotarizedProposal> {
             self.bodies.set(self.bodies.get() + 1);
             self.proposals.clone()
+        }
+
+        fn nullify_votes(&self, wanted: &dyn Fn(&NullifyKey) -> bool) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+            self.nullifies.iter().map(|(key, signature)| (*key, wanted(key).then(|| signature.clone()))).collect()
         }
     }
 
@@ -1186,6 +1362,99 @@ mod tests {
         handoff::presence::verify(&view, inclusion, &report, anchors).unwrap();
         // It adds nobody later this epoch: nothing more is sent or logged.
         assert!(reporter.attempt(c.look(&view, me, inclusion - 1 + PACE.resubmit_frames()), &votes, anchors).is_none());
+    }
+
+    /// A session whose members only nullify (no proposal reaches quorum, or
+    /// none is made) reports their verified nullifies from the presence
+    /// exclusion frame, and GLOBAL accepts the report; a forged nullify is
+    /// left out. Before the frame its members verified no vote.
+    #[test]
+    fn a_session_that_only_nullifies_reports_its_nullifies_from_the_exclusion_frame() {
+        let _active = Active::new();
+        let c = committee(5);
+        let global = Global::new(&c.session);
+        let view = global.view();
+        let mut forged = c.nullify(1, 3);
+        forged.1[20] ^= 1;
+        let votes = Votes { nullifies: vec![c.nullify(1, 0), c.nullify(1, 1), c.nullify(2, 1), c.nullify(1, 2), forged], ..Votes::default() };
+        let frame = c.inclusion() - 1;
+        let me = c.designated(&[0, 1, 2]) as usize;
+        handoff::set_presence_exclusion_frame_for_thread(Some(u64::MAX));
+        let attempt = PresenceReporter::default().attempt(c.look(&view, me, frame), &votes, anchors).unwrap();
+        assert!(matches!(attempt.outcome, Outcome::NotDesignated { designated: None, voters: 0 }), "{attempt:?}");
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        let attempt = PresenceReporter::default().attempt(c.look(&view, me, frame), &votes, anchors).unwrap();
+        let (built, bytes, voters) = match attempt.outcome {
+            Outcome::Submit { built, bytes, voters, .. } => (built, bytes, voters),
+            other => panic!("{other:?}"),
+        };
+        handoff::set_presence_exclusion_frame_for_thread(None);
+        assert_eq!(voters, 3);
+        assert!(built.report.proposals.is_empty());
+        let carried: Vec<(u32, u64)> = built.report.nullifies.iter().map(|vote| (vote.signer, vote.view)).collect();
+        assert_eq!(carried, vec![(0, 1), (1, 2), (2, 1)], "each member's latest verified nullify");
+        assert_eq!(built.members, BTreeSet::from([0, 1, 2]));
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        handoff::presence::verify(&view, c.inclusion(), &PresenceReport::from_canonical_bytes(&bytes).unwrap(), anchors)
+            .unwrap();
+        handoff::set_presence_exclusion_frame_for_thread(None);
+    }
+
+    /// A member that is not the designated submitter, and that GLOBAL has
+    /// not recorded present, reports its own vote from its own frame of the
+    /// epoch's second half (spread by member), again every resubmit spacing
+    /// while GLOBAL still has no record of it, with its budget given back
+    /// when publication fails, and no more once GLOBAL records it.
+    #[test]
+    fn an_unrecorded_member_reports_itself_late_in_the_epoch_until_recorded() {
+        let _active = Active::new();
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        let c = committee(5);
+        let global = Global::new(&c.session);
+        let view = global.view();
+        let votes = Votes { nullifies: (0..5).map(|member| c.nullify(1, member)).collect(), ..Votes::default() };
+        let epoch = PACE.epoch(INCLUSION);
+        let designated = c.designated(&[0, 1, 2, 3, 4]);
+        let own = |member: u32| PACE.self_report_frame(&c.id, epoch, member);
+        let me = (0..5).filter(|member| *member != designated).min_by_key(|member| own(*member)).unwrap();
+        let frames: BTreeSet<u64> = (0..5).map(own).collect();
+        assert!(frames.len() > 1, "members are spread");
+        let start = epoch * PACE.length;
+        assert!(frames.iter().all(|frame| (start + PACE.length / 2..start + 3 * PACE.length / 4).contains(frame)));
+        let me_index = me as usize;
+        let mut reporter = PresenceReporter::default();
+        // Before its own frame it defers to the designated submitter.
+        let early = reporter.attempt(c.look(&view, me_index, own(me) - 3), &votes, anchors).unwrap();
+        assert!(matches!(early.outcome, Outcome::NotDesignated { .. }), "{early:?}");
+        let submitted = |attempt: Option<Attempt>| match attempt.map(|attempt| attempt.outcome) {
+            Some(Outcome::Submit { built, bytes, .. }) => (built, bytes),
+            other => panic!("{other:?}"),
+        };
+        let (built, bytes) = submitted(reporter.attempt(c.look(&view, me_index, own(me) - 1), &votes, anchors));
+        assert!(built.report.proposals.is_empty());
+        assert_eq!(built.members, BTreeSet::from([me]), "its own vote alone");
+        handoff::presence::verify(&view, own(me), &PresenceReport::from_canonical_bytes(&bytes).unwrap(), anchors).unwrap();
+        // Lost on the way (GLOBAL still has no record): reported again.
+        let retry = own(me) - 1 + PACE.resubmit_frames();
+        let (_, again) = submitted(reporter.attempt(c.look(&view, me_index, retry), &votes, anchors));
+        assert_eq!(reporter.schedule.submitted, 2);
+        // A failed publication gives its budget and its turn back.
+        publication_failed(&again);
+        assert!(reporter.attempt(c.look(&view, me_index, retry + 1), &votes, anchors).is_none());
+        assert_eq!((reporter.schedule.submitted, reporter.schedule.self_reported), (1, None));
+        // Once GLOBAL records it, it reports itself no more.
+        handoff::set_presence_credit_frame_for_thread(Some(0));
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.crdt.clone());
+        let recorded = retry + 2;
+        handoff::presence::apply(&state, recorded, &PresenceReport::from_canonical_bytes(&bytes).unwrap(), anchors).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global.crdt.commit_with_global_cursor(recorded, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        let view = global.view();
+        let after = reporter.attempt(c.look(&view, me_index, recorded + PACE.resubmit_frames()), &votes, anchors).unwrap();
+        assert!(matches!(after.outcome, Outcome::NotDesignated { .. }), "{after:?}");
+        handoff::set_presence_credit_frame_for_thread(None);
+        handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
     /// A vote that does not verify neither makes its signer the submitter

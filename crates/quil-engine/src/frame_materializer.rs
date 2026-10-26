@@ -781,7 +781,7 @@ impl FrameMaterializer {
                     })
                 })
                 .filter_map(|b| {
-                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok()
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(b, Some(frame_number)).ok()
                 })
                 .collect();
             if fh_bytes.len() >= 2 {
@@ -820,7 +820,7 @@ impl FrameMaterializer {
             let mut routed = Vec::new();
             for bundle in &frame.requests {
                 let address = self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
-                if let Ok(bytes) = crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+                if let Ok(bytes) = crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number)) {
                     routed.push((address, bytes));
                 }
             }
@@ -861,7 +861,9 @@ impl FrameMaterializer {
             // agree on the venue for every bundle.
             let route_addr = self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
             // Re-encode the proto bundle as canonical bytes.
-            let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes(bundle) {
+            // The frame's number decides which presence encodings its body
+            // may carry, on every node and after any restart alike.
+            let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number)) {
                 Ok(b) => b,
                 Err(e) => {
                     info!(

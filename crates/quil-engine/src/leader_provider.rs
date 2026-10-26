@@ -830,8 +830,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // own proposal fail its request-root check.
         let mut malformed = Vec::new();
         let collected: Vec<_> = collected.into_iter().filter(|raw| {
-            let round_trip = crate::consensus_wire::decode_message_bundle(raw)
-                .and_then(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle));
+            let round_trip = crate::consensus_wire::decode_message_bundle_at(raw, Some(frame_number))
+                .and_then(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(&bundle, Some(frame_number)));
             if round_trip.as_ref().is_ok_and(|canonical| canonical == raw) { true }
             else { malformed.push(raw.clone()); false }
         }).collect();
@@ -1224,7 +1224,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // bundle would also fail downstream.
         let proto_messages: Vec<quil_types::proto::global::MessageBundle> = messages
             .iter()
-            .filter_map(|raw| crate::consensus_wire::decode_message_bundle(raw).ok())
+            .filter_map(|raw| crate::consensus_wire::decode_message_bundle_at(raw, Some(frame_number)).ok())
             .collect();
         let state = GlobalState::new(
             frame_number,
