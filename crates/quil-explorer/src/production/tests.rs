@@ -523,6 +523,43 @@ fn memory_state(stored: u64, head: u64, grid: Arc<parking_lot::Mutex<Option<Hash
     .with_archive_grid(Arc::new(move || grid.lock().clone()))
 }
 
+#[test]
+fn an_indexer_restarted_with_its_history_file_reads_no_row_it_saved() {
+    let tmp = history::persist::TempPath::new("indexer");
+    let grid = Arc::new(parking_lot::Mutex::new(Some(cache_with_two_shards())));
+    let run = |indexer: &mut Indexer, state: &crate::ExplorerState| {
+        for _ in 0..200 {
+            indexer.tick(state, 3_000);
+            if indexer.backfill.as_ref().is_some_and(|plan| plan.is_done()) {
+                return;
+            }
+        }
+        panic!("the backfill did not complete");
+    };
+    // Rows 960 through 2940 backfilled, 3000 live.
+    let state = memory_state(3_000, 3_000, grid.clone()).with_history_file(tmp.0.clone(), 0);
+    let mut first = Indexer::default();
+    run(&mut first, &state);
+    assert_eq!((first.backfill.as_ref().unwrap().frames, state.production_history.read().len()), (2_941, 35));
+    assert!(tmp.0.exists(), "saved once the live row is recorded");
+    first.saver.save_at_shutdown(state.history_file.as_ref().unwrap(), &state.production_history);
+
+    // A restart over the same frames.
+    let restarted = memory_state(3_000, 3_000, grid).with_history_file(tmp.0.clone(), 0);
+    let source = StoreSource(restarted.clock_store.as_ref());
+    history::persist::restore(restarted.history_file.as_ref().unwrap(), &source, &restarted.production_history);
+    assert_eq!(restarted.production_history.read().len(), 35);
+    let mut second = Indexer::default();
+    run(&mut second, &restarted);
+    let plan = second.backfill.as_ref().unwrap();
+    assert_eq!((plan.frames, plan.rows), (0, 0), "every row below the live one restored");
+    let (before, after) = (state.production_history.read(), restarted.production_history.read());
+    assert_eq!(
+        before.final_rows().map(|r| r.frame).collect::<Vec<_>>(),
+        after.final_rows().map(|r| r.frame).collect::<Vec<_>>()
+    );
+}
+
 fn served(state: &crate::ExplorerState) -> Arc<Snapshot> {
     state.production_snapshot.read().clone().expect("a snapshot")
 }
@@ -562,6 +599,25 @@ fn an_indexer_tick_behind_the_head_keeps_classifying_flagged_stale() {
     assert_eq!((w.head_frame, w.as_of_frame, w.lag_frames, w.values_known, w.stale), (345, Some(300), Some(45), true, true));
     assert_eq!((s.live_shards, s.classes.producing, s.classes.below_quorum), (2, 1, 1));
     assert!(w.stale_reason.as_deref().unwrap().ends_with("serving the last known values, as of frame 300"));
+}
+
+#[test]
+fn an_indexer_tick_assesses_eviction_at_its_head() {
+    let grid = Arc::new(parking_lot::Mutex::new(Some(cache_with_two_shards())));
+    let state = memory_state(300, 300, grid);
+    let mut indexer = Indexer::default();
+    // The first tick builds the snapshot, which makes the assessment.
+    indexer.tick(&state, 300);
+    let first = state.eviction.read().clone().expect("an assessment");
+    assert_eq!(first.frame, 300);
+    // A tick at the same head keeps it.
+    indexer.tick(&state, 300);
+    assert!(Arc::ptr_eq(&first, state.eviction.read().as_ref().unwrap()));
+    // A new head, not stored yet: no snapshot build is due, and the tick
+    // still assesses it, so requests need not.
+    let tick = indexer.tick(&state, 301);
+    assert!(tick.build.is_none());
+    assert_eq!(state.eviction.read().as_ref().map(|e| e.frame), Some(301));
 }
 
 #[test]
@@ -809,6 +865,49 @@ fn a_regular_node_takes_its_grid_from_the_archive_cache() {
     assert_eq!((s.off_grid_inclusions_in_window, s.grid_shards, s.grid_digest.as_deref()), (Some(1), Some(2), Some("5936e534")));
     let json = serde_json::to_string(s).unwrap();
     assert!(json.ends_with(r#""grid_source":"archive_cache","grid_shards":2,"grid_digest":"5936e534","grid_unavailable":null}"#), "{json}");
+}
+
+/// GLOBAL's address in the registry (a prover's allocation) and in the
+/// shard sizes (a root row an archive's shards store holds) makes no live
+/// app shard, from either grid source; the grid and its digest stay the
+/// QUIL rows'.
+#[test]
+fn global_is_never_a_live_app_shard() {
+    let global = quil_execution::domains::GLOBAL.to_vec();
+    let (staffed, empty) = (quil_filter(&[0, 7, 8]), quil_filter(&[0, 7, 9]));
+    let registry = vec![staffed.clone(), global.clone()];
+    let sizes = HashMap::from([
+        (hex::encode(&staffed), (num_bigint::BigInt::from(5), 1)),
+        (hex::encode(&empty), (num_bigint::BigInt::from(0), 0)),
+        (hex::encode(&global), (num_bigint::BigInt::from(0), 0)),
+    ]);
+    let row = |key: Vec<u8>, prefix: Vec<u32>| quil_types::store::ShardInfo {
+        shard_key: key,
+        prefix,
+        size: Vec::new(),
+        data_shards: 0,
+        commitment: Vec::new(),
+    };
+    let quil_rows = vec![
+        row([vec![1, 2, 3], quil_execution::domains::QUIL_TOKEN.to_vec()].concat(), vec![0]),
+        row([vec![1, 2, 3], quil_execution::domains::QUIL_TOKEN.to_vec()].concat(), vec![1]),
+    ];
+    let rows = [quil_rows.clone(), vec![row([vec![4, 5, 6], global.clone()].concat(), Vec::new())]].concat();
+    let store = grid_from_store(&registry, &sizes, &rows);
+    assert_eq!(store.live, BTreeSet::from([staffed.clone()]), "the staffed shard; GLOBAL out");
+    let cache = HashMap::from([(staffed.clone(), (5, 1)), (empty.clone(), (0, 0)), (global.clone(), (7, 1))]);
+    assert_eq!(grid_from_cache(&registry, Some(cache)).live, BTreeSet::from([staffed.clone()]), "a sized GLOBAL entry too");
+
+    let mut idx = index(1);
+    empty_through(&mut idx, 240);
+    assert!(idx.window_complete());
+    let w = World { grid: store, active: HashMap::from([(staffed.clone(), 4)]), halted: BTreeSet::new(), committed: HashMap::new() };
+    let r = report(&idx, &w);
+    let s = &r.summary;
+    assert_eq!((s.live_shards, s.classes.below_quorum, s.classes.staffed_not_producing), (1, 0, 1));
+    assert!(r.shards.iter().all(|shard| shard.filter != hex::encode(&global)), "no GLOBAL row");
+    let grid = grid_filters(&quil_rows);
+    assert_eq!((s.grid_shards, s.grid_digest.clone()), (Some(grid.len() as u64), Some(grid_digest(&grid))), "the QUIL grid's");
 }
 
 #[test]

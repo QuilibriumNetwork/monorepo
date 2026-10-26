@@ -669,47 +669,35 @@ impl WorkerOnlyNode {
         // materialize-gated `maybe_sync_before_global_frame` path can't recover
         // it (it treats an empty local root as "matched" and skips), so a passive
         // worker would never re-sync — a deadlock. This loop pulls the latest
-        // prover tree from the master and refreshes the registry on a fixed
-        // cadence, so the registry becomes current and the engine's CW retry can
+        // prover tree from an archive and refreshes the registry every 10-12 s,
+        // so the registry becomes current and the engine's CW retry can
         // build the committee. Trust-the-peer sync (empty expected root).
-        if self.prover_tree_syncer.is_some() {
+        if let Some(syncer) = self.prover_tree_syncer.clone() {
             let this = self.clone();
-            let cancel = self.cancel.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
-                // A failing sync leaves the worker's GLOBAL view, and with it
-                // its committee sessions, behind; three failures in a row
-                // (30 s) make it an outage.
-                let mut outage = crate::outage::Outage::begin_after(3);
-                let core_id = this.config.core_id;
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tick.tick() => {
-                            if let Some(syncer) = this.prover_tree_syncer.as_ref() {
-                                // Anchor against the last-seen global frame header's
-                                // certified prover-tree roots. Empty
-                                // only before the first global frame arrives, in which
-                                // case we fall back to trust-the-peer for that window.
-                                let anchor = {
-                                    this.latest_prover_tree_anchor.lock().unwrap().clone()
-                                };
-                                let result = syncer.sync_prover_tree(&anchor).await;
-                                log_prover_tree_sync(&mut outage, core_id, std::time::Instant::now(),
-                                    result.as_ref().err().map(ToString::to_string));
-                                match result {
-                                    Ok(_) => {
-                                        if let Err(error) = this.refresh_registry() {
-                                            tracing::warn!(%error, "periodic prover registry refresh failed");
-                                        }
-                                    }
-                                    Err(e) => tracing::debug!(error = %e, "periodic prover-tree sync failed"),
-                                }
+            tokio::spawn(periodic_prover_tree_syncs(self.cancel.clone(), self.config.core_id, move || {
+                let (this, syncer) = (this.clone(), syncer.clone());
+                async move {
+                    // Anchor against the last-seen global frame header's
+                    // certified prover-tree roots. Empty
+                    // only before the first global frame arrives, in which
+                    // case we fall back to trust-the-peer for that window.
+                    let anchor = {
+                        this.latest_prover_tree_anchor.lock().unwrap().clone()
+                    };
+                    match syncer.sync_prover_tree(&anchor).await {
+                        Ok(_) => {
+                            if let Err(error) = this.refresh_registry() {
+                                tracing::warn!(%error, "periodic prover registry refresh failed");
                             }
+                            None
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "periodic prover-tree sync failed");
+                            Some(e.to_string())
                         }
                     }
                 }
-            });
+            }));
         }
 
         // Resolver traffic of this worker's shard, every 30 s.
@@ -914,7 +902,7 @@ impl WorkerOnlyNode {
                                                     biased;
                                                     _ = cancel.cancelled() => {},
                                                     _ = target.execution_record().recovering(&filter, crate::prover_tree_syncer::recover_shard_from_latest(
-                                                        syncer.as_ref(), &filter, local, &target, None, None,
+                                                        syncer.as_ref(), &filter, local, &target, &[], None,
                                                     )) => {}
                                                 }
                                             });
@@ -1321,7 +1309,7 @@ impl WorkerOnlyNode {
 
     /// Blocking prover-tree sync. Mirrors Go's
     /// `AppConsensusEngine.performBlockingGlobalHypersync`: calls the
-    /// syncer up to 3 times with 500ms delay, checks convergence,
+    /// syncer up to 3 times, after a jittered delay, checks convergence,
     /// refreshes the prover registry after each attempt. The 5-frame
     /// cooldown (`sync_cooldown_until`) prevents sync-storms.
     async fn perform_blocking_prover_sync(
@@ -1330,7 +1318,6 @@ impl WorkerOnlyNode {
         expected_roots: &[Vec<u8>],
     ) {
         const MAX_ATTEMPTS: usize = 3;
-        const RETRY_DELAY: Duration = Duration::from_millis(500);
         const COOLDOWN_FRAMES: u64 = 5;
 
         let cooldown = self.sync_cooldown_until.load(std::sync::atomic::Ordering::Relaxed);
@@ -1356,8 +1343,8 @@ impl WorkerOnlyNode {
         );
 
         for attempt in 0..MAX_ATTEMPTS {
+            tokio::time::sleep(blocking_prover_sync_delay(attempt)).await;
             if attempt > 0 {
-                tokio::time::sleep(RETRY_DELAY).await;
                 info!(
                     attempt = attempt + 1,
                     "retrying prover tree sync"
@@ -1925,8 +1912,11 @@ where
         return Some("an eviction is running");
     }
     let flag = evicting.clone();
+    // A rebind stops the engine the passes start for.
+    let engine = handle.cloned();
+    let serving: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || engine.as_ref().is_some_and(|h| h.is_running()));
     tokio::spawn(async move {
-        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage).await;
+        crate::worker_payload_eviction::run_passes(core_id, hex::encode(&bound), crdt, keep, storage, serving).await;
         flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
     None
@@ -1974,7 +1964,9 @@ impl quil_types::proto::node::data_ipc_service_server::DataIpcService
         };
         Ok(tonic::Response::new(quil_types::proto::node::GetWorkerExecutionResponse {
             filter,
-            execution,
+            // A store that refuses writes reads as blocked by it, to the
+            // master's lifecycle and health report alike.
+            execution: crate::worker_execution::with_store_state(self.worker.config.core_id, execution),
             now_unix_ms: crate::worker_execution::now_ms(),
         }))
     }
@@ -3088,6 +3080,66 @@ mod respawn_queue_tests {
     }
 }
 
+/// Pause between the end of a periodic prover-tree sync and the start of the
+/// next, before its jitter.
+const PROVER_TREE_SYNC_PERIOD: Duration = Duration::from_secs(10);
+
+/// Most random delay added to a periodic pause. Workers that started
+/// together, as after a release, would otherwise sync in lockstep; the
+/// added 0-2 s (1 s on average) only lengthens the period, so it adds no
+/// archive reads.
+const PROVER_TREE_SYNC_JITTER: Duration = Duration::from_secs(2);
+
+/// Most random delay before the first attempt of a blocking prover-tree
+/// sync. Every worker of every node receives a GLOBAL frame within moments
+/// of the others, and a root change sends all of them to the archives at
+/// once. GLOBAL frames come about 10 s apart and the sync holds this
+/// worker's GLOBAL stream for its own connection and diff anyway, so a
+/// second more still leaves the registry current well before the next frame.
+const BLOCKING_PROVER_SYNC_JITTER: Duration = Duration::from_secs(1);
+
+/// Pause before a blocking sync's retry, before its jitter of up to as much
+/// again: retries of workers that failed together then spread out too.
+const BLOCKING_PROVER_SYNC_RETRY: Duration = Duration::from_millis(500);
+
+/// The wait before the next periodic prover-tree sync.
+fn periodic_prover_tree_sync_pause() -> Duration {
+    PROVER_TREE_SYNC_PERIOD + crate::prover_tree_syncer::sync_jitter(PROVER_TREE_SYNC_JITTER)
+}
+
+/// The wait before attempt `attempt` (from 0) of a blocking prover-tree sync.
+fn blocking_prover_sync_delay(attempt: usize) -> Duration {
+    if attempt == 0 {
+        crate::prover_tree_syncer::sync_jitter(BLOCKING_PROVER_SYNC_JITTER)
+    } else {
+        BLOCKING_PROVER_SYNC_RETRY + crate::prover_tree_syncer::sync_jitter(BLOCKING_PROVER_SYNC_RETRY)
+    }
+}
+
+/// Run `sync` until `cancel`, each run a jittered pause after the previous
+/// one ended. A fixed-rate timer would instead fire the ticks a slow sync
+/// (an archive timing out) missed back to back, at the archive that is
+/// already slow. `sync` returns its error, if any.
+async fn periodic_prover_tree_syncs<F, Fut>(cancel: CancellationToken, core_id: u32, mut sync: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    // A failing sync leaves the worker's GLOBAL view, and with it its
+    // committee sessions, behind; three failures in a row (about 30 s) make
+    // it an outage.
+    let mut outage = crate::outage::Outage::begin_after(3);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(periodic_prover_tree_sync_pause()) => {
+                let error = sync().await;
+                log_prover_tree_sync(&mut outage, core_id, std::time::Instant::now(), error);
+            }
+        }
+    }
+}
+
 /// Log the outage transitions of a worker's periodic prover-tree sync;
 /// `error` is the attempt's failure, `None` when it succeeded.
 fn log_prover_tree_sync(
@@ -3136,5 +3188,55 @@ mod prover_tree_sync_log_tests {
         let recovered = logs.lines_with("prover-tree sync recovered");
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].contains("secs=40") && recovered[0].contains("failures=4"), "{}", recovered[0]);
+    }
+
+    /// A sync slowed by a timing-out archive is followed by a full pause, not
+    /// by the syncs its timer missed meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_periodic_prover_tree_sync_is_not_followed_by_catch_up_syncs() {
+        type Runs = Arc<std::sync::Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>>;
+        let runs: Runs = Default::default();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(periodic_prover_tree_syncs(cancel.clone(), 7, {
+            let runs = runs.clone();
+            move || {
+                let runs = runs.clone();
+                async move {
+                    let start = tokio::time::Instant::now();
+                    let first = runs.lock().unwrap().is_empty();
+                    if first {
+                        tokio::time::sleep(Duration::from_secs(35)).await;
+                    }
+                    runs.lock().unwrap().push((start, tokio::time::Instant::now()));
+                    None
+                }
+            }
+        }));
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        cancel.cancel();
+        task.await.unwrap();
+        let runs = runs.lock().unwrap();
+        assert!(runs.len() >= 5, "{} syncs", runs.len());
+        for pair in runs.windows(2) {
+            let pause = pair[1].0 - pair[0].1;
+            assert!((PROVER_TREE_SYNC_PERIOD..=PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER).contains(&pause),
+                "pause {pause:?} after a sync");
+        }
+    }
+
+    /// Periodic pauses and blocking-sync delays vary within their bounds, so
+    /// workers that start together drift apart.
+    #[test]
+    fn prover_tree_sync_delays_are_jittered_within_their_bounds() {
+        let distinct = |delays: Vec<Duration>, low: Duration, high: Duration| {
+            assert!(delays.iter().all(|delay| (low..=high).contains(delay)), "{delays:?}");
+            delays.into_iter().collect::<std::collections::HashSet<_>>().len()
+        };
+        let periodic = (0..64).map(|_| periodic_prover_tree_sync_pause()).collect();
+        assert!(distinct(periodic, PROVER_TREE_SYNC_PERIOD, PROVER_TREE_SYNC_PERIOD + PROVER_TREE_SYNC_JITTER) > 1);
+        let first = (0..64).map(|_| blocking_prover_sync_delay(0)).collect();
+        assert!(distinct(first, Duration::ZERO, BLOCKING_PROVER_SYNC_JITTER) > 1);
+        let retry = (0..64).map(|_| blocking_prover_sync_delay(1)).collect();
+        assert!(distinct(retry, BLOCKING_PROVER_SYNC_RETRY, BLOCKING_PROVER_SYNC_RETRY * 2) > 1);
     }
 }

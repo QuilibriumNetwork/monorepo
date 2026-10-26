@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use quil_types::thread_probe::{self as probe, Section as ProbeSection};
 use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
@@ -106,6 +107,100 @@ where
         Some(true)
     } else {
         Some(fallback().await)
+    }
+}
+
+/// Whether `registry` shows `prover` with an allocation on the GLOBAL (empty)
+/// confirmation filter, which makes it a GLOBAL prover.
+fn holds_global_allocation(registry: &dyn quil_types::consensus::ProverRegistry, prover: &[u8]) -> bool {
+    match registry.get_prover_info(prover) {
+        Ok(Some(info)) => info.allocations.iter().any(|a| a.confirmation_filter.is_empty()),
+        _ => false,
+    }
+}
+
+/// How long startup work waits for the prover registry's first load before
+/// warning, and how often it warns again while it waits.
+const REGISTRY_LOAD_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for the prover registry's first full load from the store; `false`
+/// when cancelled first. A node loads the registry in the background at
+/// startup and reads it empty until then, so startup work that acts once on
+/// what it reads waits here. `waiter` names that work in the log.
+pub(crate) async fn await_registry_load(
+    registry: &quil_execution::SharedProverRegistry,
+    cancel: &tokio_util::sync::CancellationToken,
+    waiter: &'static str,
+) -> bool {
+    if registry.initial_load_complete() {
+        return true;
+    }
+    let started = std::time::Instant::now();
+    info!(waiter, "waiting for the prover registry's first load from the store");
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return false,
+            _ = registry.initial_load() => break,
+            _ = tokio::time::sleep(REGISTRY_LOAD_WARN_INTERVAL) => warn!(
+                waiter,
+                waited_secs = started.elapsed().as_secs(),
+                "prover registry is still loading from the store, and startup work that reads it \
+                 keeps waiting (the load normally takes under a minute: check this node's disk and \
+                 the \"prover registry loaded (background)\" line)",
+            ),
+        }
+    }
+    info!(
+        waiter,
+        waited_ms = started.elapsed().as_millis() as u64,
+        provers = registry.read(|r| r.distinct_provers()),
+        "prover registry loaded; startup work resumes",
+    );
+    true
+}
+
+/// Whether this node is a GLOBAL prover, read once the prover registry has
+/// finished its first load from the store; `None` when cancelled first.
+///
+/// An archive decides once, here, whether to run GLOBAL consensus. Reading
+/// the registry before its load ends finds it empty, and the archive never
+/// runs GLOBAL consensus (two mainnet archives on 2026-10-24, after which
+/// GLOBAL halted).
+async fn global_prover_once_loaded(
+    registry: &quil_execution::SharedProverRegistry,
+    prover: &[u8],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<bool> {
+    if !await_registry_load(registry, cancel, "GLOBAL consensus activation").await {
+        return None;
+    }
+    Some(holds_global_allocation(registry, prover))
+}
+
+/// How often an archive that did not activate GLOBAL consensus at startup
+/// checks whether the prover registry has since given it a GLOBAL allocation.
+const GLOBAL_ALLOCATION_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often that archive repeats its warning once it holds one.
+const GLOBAL_ALLOCATION_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Completes with `true` once `registry` shows `prover` as a GLOBAL prover,
+/// checking every `recheck`; `false` when cancelled first.
+async fn await_global_allocation(
+    registry: &quil_execution::SharedProverRegistry,
+    prover: &[u8],
+    cancel: &tokio_util::sync::CancellationToken,
+    recheck: std::time::Duration,
+) -> bool {
+    loop {
+        if holds_global_allocation(registry, prover) {
+            return true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(recheck) => {}
+        }
     }
 }
 
@@ -1796,6 +1891,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 }) as quil_rpc::frame_sync::FrameCertified
             }),
             on_frame: Some(Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
+                let _callback = probe::section(ProbeSection::PollerFrameCallback);
                 let frame_num = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 let frame_difficulty = frame.header.as_ref().map(|h| h.difficulty).unwrap_or(0);
                 // Skip bogus frames (no header or frame_number=0):
@@ -1855,6 +1951,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // turn an archive's rejected join into local-only prover records.
                 if !signaled && !archive_mode_poller && (network == 99
                     || !quil_types::consensus::committee_handoff_active(frame_num)) {
+                let _execute = probe::section(ProbeSection::GlobalFrameExecution);
                 // Process frame messages through execution pipeline
                 match quil_engine::frame_processor::process_global_frame(
                     &exec_mgr_for_poller,
@@ -1913,7 +2010,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             if let Err(e) = exec_mgr_for_poller.commit_frame(frame_num) {
                                 warn!(error = %e, frame = frame_num, "hypergraph commit failed");
                             }
-                            if let Err(error) = pr_for_poller.refresh_from_store(hg_for_poller.as_ref()) {
+                            let refreshed = {
+                                let _refresh = probe::section(ProbeSection::ProverRegistryRefresh);
+                                pr_for_poller.refresh_from_store(hg_for_poller.as_ref())
+                            };
+                            if let Err(error) = refreshed {
                                 warn!(frame = frame_num, %error, "inline prover registry refresh failed");
                             }
                             // Keep the CRDT's per-app shard sets in sync with the
@@ -1941,7 +2042,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // versions.
                 cov_for_poller.check(frame_num);
                 if !archive_mode_poller {
-                    if let Err(e) = wa_for_poller.on_new_frame(frame_num) {
+                    let reconciled = {
+                        let _reconcile = probe::section(ProbeSection::AllocationReconcile);
+                        wa_for_poller.on_new_frame(frame_num)
+                    };
+                    if let Err(e) = reconciled {
                         tracing::warn!(error = %e, "worker allocation failed");
                     }
                 }
@@ -1978,6 +2083,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // on this task, between fetches (2026-10-04).
                 if !archive_mode_poller {
                     use std::collections::HashMap;
+                    let _sizes = probe::section(ProbeSection::ShardSizeRead);
                     let get_sizes = quil_engine::shard_info::local_app_shard_get_sizes(
                         crdt_for_poller.clone(),
                         shards_store_for_poller.clone(),
@@ -2055,12 +2161,16 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     }
                 }
                 if !archive_mode_poller && at_head {
-                    match pl_for_poller.evaluate(
-                        frame_num,
-                        frame_difficulty as u64,
-                        pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
-                        wm_for_poller.as_ref(),
-                    ) {
+                    let evaluated = {
+                        let _evaluate = probe::section(ProbeSection::LifecycleEvaluate);
+                        pl_for_poller.evaluate(
+                            frame_num,
+                            frame_difficulty as u64,
+                            pr_for_poller.as_ref() as &dyn quil_types::consensus::ProverRegistry,
+                            wm_for_poller.as_ref(),
+                        )
+                    };
+                    match evaluated {
                         Ok(actions) => {
                             for action in actions {
                                 tracing::info!(frame = frame_num, ?action, "prover lifecycle action");
@@ -2090,12 +2200,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
         {
             let pool = archive_pool.clone();
             let cs = clock_store.clone();
+            // A blocked poller fetches and executes no GLOBAL frame; the
+            // watchdog names where it is blocked.
+            let poller_probe = super::stall_watch::watch(
+                ProbeSection::ArchivePoller,
+                super::stall_watch::POLLER_IMPACT,
+                super::stall_watch::POLLER_STALL_AFTER,
+            );
             sup.run_until_cancelled("archive-poller", {
                 let seed = seed.clone();
-                move |cancel| async move {
+                move |cancel| probe::task_probed(poller_probe, async move {
                     quil_rpc::run_archive_poller(pool, cs, seed, poller_config, cancel).await;
                     Ok(())
-                }
+                })
             });
         }
         info!("archive frame poller spawned (with execution pipeline)");
@@ -2198,7 +2315,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                                 }
                             }
-                            for addr in sync_pool.get_all().await.iter() {
+                            let order = crate::prover_tree_syncer_prod::archive_pull_order(sync_pool.get_all().await);
+                            for addr in order.iter() {
                                 if sync_token.is_cancelled() { break 'rounds; }
                                 match crate::forest_sync::sync_single_shard_verified(
                                     addr, &seed[..], sync_crdt.clone(), &[0xffu8; 32], &[],
@@ -2211,6 +2329,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     Err(e) => warn!(peer = %addr, round, error = %e,
                                         "initial prover tree sync failed; trying the next archive"),
                                 }
+                                crate::prover_tree_syncer_prod::source_failed(addr);
                             }
                         }
                         warn!("initial prover tree sync failed on every archive; lifecycle gate stays held");
@@ -2314,6 +2433,15 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 // forward by consensus). Distinct from the record-only
                 // backfill, which fills clock-record holes `[H+1,N-1]`
                 // WITHOUT re-materializing.
+                // GLOBAL frames executed in place route each bundle and check
+                // frame headers by the canonical prover registry, and the
+                // shard rebalance proposes merges from it: read before its
+                // first load ends, it shows no prover on any shard.
+                if sync_archive_mode
+                    && !await_registry_load(&sync_pr, &sync_token, "GLOBAL frame materialization").await
+                {
+                    return Ok(());
+                }
                 if sync_archive_mode {
                     if let Some(m) = frame_materializer.clone() {
                         let cs = sync_cs.clone();
@@ -2395,6 +2523,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     "startup: re-materializing CRDT gap [cursor+1..=head] \
                                      (crash between clock-head and CRDT commit)"
                                 );
+                                let mut catch_up = quil_engine::global_catch_up::CatchUp::default();
                                 for n in (durable_cursor + 1)..=canonical_head {
                                     let frame = match cs.get_global_frame(n) {
                                         Ok(f) => f,
@@ -2435,6 +2564,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             break;
                                         }
                                     }
+                                    catch_up.observe_and_log(
+                                        std::time::Instant::now(),
+                                        n - 1,
+                                        canonical_head,
+                                        m.execution_counts(),
+                                    );
                                     // Mirror the live worker: refresh halt
                                     // durations before each materialize so the
                                     // eviction step is gated identically.
@@ -2444,13 +2579,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         use quil_engine::frame_materializer::{
                                             CanonicalAttempt,
                                         };
-                                        match canonical_atomic_attempts(&m, &frame) {
-                                            CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed => continue,
-                                            CanonicalAttempt::Unavailable(error) => info!(
+                                        match canonical_atomic_attempts(&m, &frame, catch_up.atomic_attempts()) {
+                                            Some(CanonicalAttempt::Published(_) | CanonicalAttempt::Replayed) => continue,
+                                            Some(CanonicalAttempt::Unavailable(error)) => info!(
                                                 frame = n,
                                                 %error,
                                                 "startup: canonical GLOBAL frame not executable atomically; executing in place"
                                             ),
+                                            None => {}
                                         }
                                     }
                                     if let Err(e) = m.materialize(&frame) {
@@ -2463,6 +2599,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         );
                                         break;
                                     }
+                                    catch_up.record_in_place();
                                 }
                                 info!(
                                     cursor = m.last_materialized_frame(),
@@ -2885,6 +3022,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                             // also retries on a timer without a new signal.
                             let mut target = 0u64;
                             let mut retry: Option<std::time::Duration> = None;
+                            let catch_up = std::sync::Arc::new(std::sync::Mutex::new(
+                                quil_engine::global_catch_up::CatchUp::default(),
+                            ));
                             loop {
                                 let signal = match retry.take() {
                                     Some(delay) => match tokio::time::timeout(delay, rx.recv()).await {
@@ -2915,7 +3055,19 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                 let sizes_for_merge = sizes_for_merge.clone();
                                 let shards_store_for_merge = shards_store_for_merge.clone();
                                 let registry_for_merge = registry_for_merge.clone();
+                                let catch_up = catch_up.clone();
                                 let outcome = tokio::task::spawn_blocking(move || {
+                                    let mut catch_up = catch_up.lock().unwrap_or_else(|p| p.into_inner());
+                                    // The freshest GLOBAL frame this node has evidence of.
+                                    // An inflated head only starts a catch-up early:
+                                    // frames then execute in place, as every frame
+                                    // did before atomic execution; none is skipped.
+                                    let head = || cf.effective().max(target);
+                                    // A consensus finalization the pipeline handed to
+                                    // the legacy path after its own attempts (or with
+                                    // none allowed): its canonical record executes in
+                                    // place directly, not after three more attempts.
+                                    let mut handed_over: Option<u64> = None;
                                     // Leader-gated shard-split rebalance trigger:
                                     // only the producer of THIS frame proposes,
                                     // matching Go's `frameProver` gate (exactly one
@@ -2974,6 +3126,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     // height and `target` does not bound the pass.
                                     loop {
                                         let next = m.last_materialized_frame() + 1;
+                                        catch_up.observe_and_log(
+                                            std::time::Instant::now(),
+                                            next - 1,
+                                            head(),
+                                            m.execution_counts(),
+                                        );
                                         if pipeline.is_none() && next > target {
                                             break Ok(None);
                                         }
@@ -3008,7 +3166,8 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                 // supplies; the branch captures it.
                                                 m.set_coverage_halt_durations(cov.check(next));
                                                 use quil_engine::global_finalization::FinalizationStep;
-                                                match pipeline.step(next) {
+                                                let attempts = catch_up.atomic_attempts();
+                                                match pipeline.step_within(next, attempts) {
                                                     FinalizationStep::Published { frame, result } => {
                                                         // Consumed bundles leave the mempool
                                                         // only after publication.
@@ -3024,7 +3183,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     }
                                                     // Now canonical; the legacy branch below
                                                     // materializes it on the next iteration.
-                                                    FinalizationStep::Legacy => continue,
+                                                    FinalizationStep::Legacy => {
+                                                        if attempts == 0 || pipeline.attempted(next) {
+                                                            handed_over = Some(next);
+                                                        }
+                                                        continue;
+                                                    }
                                                     FinalizationStep::Retry(delay) => break Ok(Some(delay)),
                                                     FinalizationStep::Idle => break Ok(None),
                                                 }
@@ -3034,7 +3198,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                         // The application frames this frame rewards
                                         // must be ingested first, on every path.
                                         if let Some(ingest) = ingest.as_ref() {
-                                            match ingest(&frame) {
+                                            let ready = ingest(&frame);
+                                            catch_up.note_ingest(std::time::Instant::now(), matches!(ready, Ok(true)));
+                                            match ready {
                                                 Ok(true) => {}
                                                 Ok(false) => break Ok(Some(std::time::Duration::from_secs(1))),
                                                 Err(error) => {
@@ -3056,8 +3222,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             use quil_engine::frame_materializer::{
                                                 CanonicalAttempt,
                                             };
-                                            match canonical_atomic_attempts(&m, &frame) {
-                                                CanonicalAttempt::Published(result) => {
+                                            let attempts = if handed_over == Some(frame_number) {
+                                                0
+                                            } else {
+                                                catch_up.atomic_attempts()
+                                            };
+                                            match canonical_atomic_attempts(&m, &frame, attempts) {
+                                                Some(CanonicalAttempt::Published(result)) => {
                                                     if !result.consumed_bundles.is_empty() {
                                                         mc.mark_finalized(&result.consumed_bundles);
                                                     }
@@ -3077,14 +3248,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     rebalance(&frame, frame_number);
                                                     continue;
                                                 }
-                                                CanonicalAttempt::Replayed => continue,
-                                                CanonicalAttempt::Unavailable(error) => {
+                                                Some(CanonicalAttempt::Replayed) => continue,
+                                                Some(CanonicalAttempt::Unavailable(error)) => {
                                                     tracing::info!(
                                                         frame = frame_number,
                                                         %error,
                                                         "canonical GLOBAL frame not executable atomically; executing in place"
                                                     );
                                                 }
+                                                // Trailing the head: counted by the
+                                                // catch-up progress line.
+                                                None => {}
                                             }
                                         }
                                         match m.materialize(&frame) {
@@ -3096,6 +3270,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                                     mc.mark_finalized(&result.finalized_bundles);
                                                 }
                                                 if m.last_materialized_frame() >= frame_number {
+                                                    catch_up.record_in_place();
                                                     if let Some(header) = frame.header.as_ref() {
                                                         if quil_types::consensus::global_committee_epoch(header.frame_number) == cf.rank_epoch() { mc.prune_after_finalization(header.rank); }
                                                     }
@@ -3188,16 +3363,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     // do not until ConfirmJoins flips their allocation
                     // to Active (at which point a future activation
                     // path can spin up the loop).
-                    let is_global_prover: bool = {
-                        use quil_types::consensus::ProverRegistry;
-                        match sync_pr.get_prover_info(&sync_pa) {
-                            Ok(Some(info)) => info
-                                .allocations
-                                .iter()
-                                .any(|a| a.confirmation_filter.is_empty()),
-                            _ => false,
-                        }
-                    };
+                    //
+                    // The decision is taken once, so it waits for the
+                    // prover registry's first load (see
+                    // `global_prover_once_loaded`).
+                    //
                     // Global consensus (HotStuff over the global frame
                     // chain) is archive-only. In Go this is gated on
                     // `isConsensusParticipant() = ArchiveMode || Network == 99`.
@@ -3211,6 +3381,14 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     // verification failures with genesis-shaped all-zero
                     // signatures.
                     let is_consensus_participant = sync_archive_mode || network == 99;
+                    let is_global_prover = if is_consensus_participant {
+                        match global_prover_once_loaded(&sync_pr, &sync_pa, &sync_token).await {
+                            Some(global) => global,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        false
+                    };
                     if !is_consensus_participant {
                         info!(
                             "non-archive, non-devnet — skipping global consensus event loop activation \
@@ -3219,6 +3397,37 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                     } else if !is_global_prover {
                         info!(
                             "archive/devnet but not a global prover — skipping global consensus activation",
+                        );
+                        // GLOBAL consensus starts only here, from the state
+                        // read at startup (anchor frame, journal marker,
+                        // committee epoch), so an allocation that appears
+                        // later takes a restart to act on.
+                        let recheck_pr = sync_pr.clone();
+                        let recheck_cancel = sync_token.clone();
+                        spawner.detach("global-allocation-recheck", async move {
+                            if !await_global_allocation(&recheck_pr, &sync_pa, &recheck_cancel, GLOBAL_ALLOCATION_RECHECK).await {
+                                return Ok(());
+                            }
+                            let since = std::time::Instant::now();
+                            loop {
+                                warn!(
+                                    prover = %hex::encode(sync_pa),
+                                    since_secs = since.elapsed().as_secs(),
+                                    "this node's prover now holds a GLOBAL allocation, but GLOBAL \
+                                     consensus was not activated at startup and does not start \
+                                     while the node runs: restart the node to activate it",
+                                );
+                                tokio::select! {
+                                    _ = recheck_cancel.cancelled() => return Ok(()),
+                                    _ = tokio::time::sleep(GLOBAL_ALLOCATION_WARN_INTERVAL) => {}
+                                }
+                            }
+                        });
+                    } else if let Err(error) = &genesis_frame_result {
+                        warn!(
+                            %error,
+                            "this node holds a GLOBAL allocation but has no GLOBAL frame to anchor \
+                             consensus on — GLOBAL consensus is not activated",
                         );
                     } else if genesis_frame_result.is_ok() {
                         if let Ok(genesis_frame) = genesis_frame_result {
@@ -3702,6 +3911,11 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             );
                                         }
                                     }
+                            } else {
+                                warn!(
+                                    "this node holds a GLOBAL allocation but has no Falcon512 prover \
+                                     key — GLOBAL consensus is not activated",
+                                );
                             }
                         }
                     }
@@ -3814,7 +4028,13 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     "prover registry reconcile pinned snapshot");
                             }
                             let expected_root = anchor.root.clone();
-                            let reconcile_peers = sync_pool.get_all().await;
+                            // From a random archive, recently failed ones
+                            // last: regular nodes pull together at an epoch
+                            // boundary, and in the pool's order they would all
+                            // ask the first archive, then all the next.
+                            let reconcile_peers = crate::prover_tree_syncer_prod::archive_pull_order(
+                                sync_pool.get_all().await,
+                            );
                             let mut reconcile_converged = false;
                             for addr in reconcile_peers.iter() {
                                 // Snapshot the local reward balance before the
@@ -3834,6 +4054,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     Ok(conv) => {
                                         if conv.is_none() {
                                             debug!(peer = %addr, "reconcile: peer not on finalized lineage — trying next");
+                                            crate::prover_tree_syncer_prod::source_failed(addr);
                                             continue;
                                         }
                                         info!(peer = %addr, match_ok = conv.is_some(), "incremental prover tree sync complete");
@@ -4011,6 +4232,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                     }
                                     Err(e) => {
                                         warn!(peer = %addr, error = %e, "incremental prover tree sync failed — trying next peer");
+                                        crate::prover_tree_syncer_prod::source_failed(addr);
                                     }
                                 }
                             }
@@ -4750,29 +4972,27 @@ mod validation_tests {
     }
 }
 
-/// Atomic GLOBAL finalization is on unless `QUIL_GLOBAL_ATOMIC_FINALIZATION`
-/// is `0`, `false` or `off`.
-/// Execute a canonical GLOBAL record atomically, retrying a failed attempt:
-/// most failures are commit conflicts with concurrent writers (application
-/// ingest, the poller), which were heavy during a live catch-up and sent every
-/// early frame to the in-place path. Matches the finalization pipeline's
-/// three attempts before its legacy fallback.
+/// Execute a canonical GLOBAL record atomically, retrying a failed attempt up
+/// to `attempts` times: most failures are commit conflicts with concurrent
+/// writers (application ingest, the poller). `attempts` comes from
+/// [`quil_engine::global_catch_up::CatchUp::atomic_attempts`]: three near
+/// the head, none during a catch-up, where those writers made nearly every
+/// attempt fail. `None`: none was made.
 fn canonical_atomic_attempts(
     m: &quil_engine::frame_materializer::FrameMaterializer,
     frame: &quil_types::proto::global::GlobalFrame,
-) -> quil_engine::frame_materializer::CanonicalAttempt {
-    use quil_engine::frame_materializer::{CanonicalAttempt, GlobalParentLimits};
-    let limits = GlobalParentLimits::default().branch.for_finalized_frame();
-    let mut attempt = m.materialize_canonical_atomically(frame, limits);
-    for _ in 1..3 {
-        if !matches!(attempt, CanonicalAttempt::Unavailable(_)) {
-            break;
-        }
-        attempt = m.materialize_canonical_atomically(frame, limits);
-    }
-    attempt
+    attempts: u32,
+) -> Option<quil_engine::frame_materializer::CanonicalAttempt> {
+    let limits = quil_engine::frame_materializer::GlobalParentLimits::default()
+        .branch
+        .for_finalized_frame();
+    quil_engine::global_catch_up::attempt_atomically(attempts, || {
+        m.materialize_canonical_atomically(frame, limits)
+    })
 }
 
+/// Atomic GLOBAL finalization is on unless `QUIL_GLOBAL_ATOMIC_FINALIZATION`
+/// is `0`, `false` or `off`.
 fn atomic_global_finalization_enabled() -> bool {
     !matches!(
         std::env::var("QUIL_GLOBAL_ATOMIC_FINALIZATION")
@@ -5183,4 +5403,117 @@ mod gap_backfill_tests {
         assert!(store.find_global_frame_record_gaps().is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod global_activation_tests {
+    use super::{await_global_allocation, global_prover_once_loaded};
+    use quil_execution::global_intrinsic::materialize::{
+        allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree,
+        prover_address_from_pubkey,
+    };
+    use quil_execution::prover_registry::vertex_tree_to_blob;
+    use quil_execution::SharedProverRegistry;
+    use quil_store::RocksHypergraphStore;
+    use quil_types::store::{HypergraphStore, ShardKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// A store holding one prover with one allocation on `filter`, and that
+    /// prover's address.
+    fn store_with_allocation(filter: &[u8]) -> (tempfile::TempDir, Arc<RocksHypergraphStore>, [u8; 32]) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = quil_store::RocksDb::open(tmp.path()).unwrap();
+        let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
+        let public_key = vec![0xA5u8; 585];
+        let prover = prover_address_from_pubkey(&public_key).unwrap();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let txn = <RocksHypergraphStore as HypergraphStore>::new_transaction(&store, false).unwrap();
+        for (address, tree) in [
+            (prover, create_prover_vertex_tree(&public_key, 0).unwrap()),
+            (
+                allocation_address(&public_key, filter).unwrap(),
+                create_allocation_vertex_tree(&prover, filter, 1).unwrap(),
+            ),
+        ] {
+            let mut key = quil_execution::domains::GLOBAL.to_vec();
+            key.extend_from_slice(&address);
+            <RocksHypergraphStore as HypergraphStore>::save_vertex_underlying(
+                &store, txn.as_ref(), "vertex", "adds", &shard, &key, &vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        (tmp, store, prover)
+    }
+
+    /// Fill `registry` from `store` after `delay`, as the startup load does
+    /// in the background.
+    fn load_later(
+        registry: &Arc<SharedProverRegistry>,
+        store: &Arc<RocksHypergraphStore>,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<quil_types::error::Result<()>> {
+        let (registry, store) = (registry.clone(), store.clone());
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(delay);
+            registry.refresh_from_store(store.as_ref())
+        })
+    }
+
+    /// Two mainnet archives decided before their registry had loaded,
+    /// found it empty and never ran GLOBAL consensus (2026-10-24).
+    #[tokio::test]
+    async fn activation_waits_for_a_registry_load_that_ends_after_the_check() {
+        let (_tmp, store, prover) = store_with_allocation(&[]);
+        let registry = Arc::new(SharedProverRegistry::new());
+        let loader = load_later(&registry, &store, Duration::from_millis(300));
+        let decided = tokio::time::timeout(
+            Duration::from_secs(30),
+            global_prover_once_loaded(&registry, &prover, &CancellationToken::new()),
+        )
+        .await
+        .expect("decides once the registry has loaded");
+        loader.await.unwrap().unwrap();
+        assert_eq!(decided, Some(true), "a GLOBAL prover activates GLOBAL consensus");
+    }
+
+    #[tokio::test]
+    async fn an_app_shard_prover_is_not_a_global_prover() {
+        let (_tmp, store, prover) = store_with_allocation(&[0xAB; 32]);
+        let registry = SharedProverRegistry::new();
+        registry.refresh_from_store(store.as_ref()).unwrap();
+        assert_eq!(
+            global_prover_once_loaded(&registry, &prover, &CancellationToken::new()).await,
+            Some(false),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_ends_the_wait_without_a_decision() {
+        let registry = SharedProverRegistry::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(global_prover_once_loaded(&registry, &[7; 32], &cancel).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_later_global_allocation_is_noticed() {
+        let (_tmp, store, prover) = store_with_allocation(&[]);
+        let registry = Arc::new(SharedProverRegistry::new());
+        let cancel = CancellationToken::new();
+        let loader = load_later(&registry, &store, Duration::from_millis(100));
+        let noticed = tokio::time::timeout(
+            Duration::from_secs(30),
+            await_global_allocation(&registry, &prover, &cancel, Duration::from_millis(20)),
+        )
+        .await
+        .expect("noticed within the timeout");
+        loader.await.unwrap().unwrap();
+        assert!(noticed);
+        cancel.cancel();
+        let other = SharedProverRegistry::new();
+        assert!(!await_global_allocation(&other, &prover, &cancel, Duration::from_millis(20)).await);
+    }
 }

@@ -160,6 +160,114 @@ pub fn file_exists<P: AsRef<Path>>(p: P) -> bool {
     p.as_ref().exists()
 }
 
+/// The node binary to run for this host: see [`resolve_node_binary`].
+pub fn node_binary() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let cwd_entries: Vec<PathBuf> = std::fs::read_dir(".")
+        .map(|dir| dir.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default();
+    resolve_node_binary(
+        find_on_path(NODE_SERVICE_NAME),
+        exe.as_deref(),
+        &|p| p.is_file(),
+        &cwd_entries,
+        os_type(),
+        arch(),
+    )
+}
+
+/// The first executable file `name` in a `$PATH` directory, as the shell
+/// would run it.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(p))
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Locate the node binary, in order: `on_path`, the `quilibrium-node` that
+/// `qclient node install`/`link` put on PATH; the release file beside the
+/// running qclient `exe`, its leading `qclient` replaced by `node`
+/// (`qclient-2.1.0.25-linux-amd64` runs `node-2.1.0.25-linux-amd64`); else
+/// the one `node-<version>-<os>-<arch>` file among `cwd_entries`, as a node
+/// run from its release files keeps it. Copies with a further suffix
+/// (`.bak-…`, `.candidate-…`, `.dgst`) never qualify, and of several
+/// versions none is picked.
+fn resolve_node_binary(
+    on_path: Option<PathBuf>,
+    exe: Option<&Path>,
+    is_file: &dyn Fn(&Path) -> bool,
+    cwd_entries: &[PathBuf],
+    os: &str,
+    arch: &str,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = on_path {
+        return Ok(path);
+    }
+    let beside = exe.and_then(|exe| {
+        let rest = exe.file_name()?.to_str()?.strip_prefix(RELEASE_TYPE_QCLIENT)?;
+        // Only a versioned name: a bare `qclient` would map to `node`,
+        // which on many hosts is Node.js.
+        rest.starts_with('-')
+            .then(|| exe.with_file_name(format!("{RELEASE_TYPE_NODE}{rest}")))
+    });
+    if let Some(path) = beside.filter(|p| is_file(p)) {
+        return Ok(path);
+    }
+    let suffix = format!("-{os}-{arch}");
+    let found: Vec<&PathBuf> = cwd_entries
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("node-"))
+                .and_then(|n| n.strip_suffix(suffix.as_str()))
+                .is_some_and(is_release_version)
+                && is_file(p)
+        })
+        .collect();
+    match found.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => anyhow::bail!(
+            "no node binary found: {NODE_SERVICE_NAME} is not on PATH, no node-… file \
+             matching this qclient's name sits beside it, and the current directory \
+             holds no node-<version>{suffix}; run 'qclient node link' to put an installed \
+             version on PATH, or run qclient from the node directory"
+        ),
+        several => {
+            let mut names: Vec<String> = several
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            anyhow::bail!(
+                "several node binaries in the current directory ({}) and none beside this \
+                 qclient matches its name; run the qclient-<version>{suffix} of the version \
+                 to use from this directory, or move the others away",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+/// A release version such as `2.1.0.25`: digits and dots.
+fn is_release_version(v: &str) -> bool {
+    v.starts_with(|c: char| c.is_ascii_digit())
+        && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +296,102 @@ mod tests {
             PathBuf::from("/usr/local/bin/quilibrium-node")
         );
         assert_eq!(node_env_path(), PathBuf::from("/var/quilibrium/quilibrium.env"));
+    }
+
+    /// `resolve_node_binary` over a fake file system: `files` are the
+    /// regular files, `cwd` the current directory's entries.
+    fn resolve(
+        on_path: Option<&str>,
+        exe: &str,
+        files: &[&str],
+        cwd: &[&str],
+    ) -> anyhow::Result<PathBuf> {
+        let cwd: Vec<PathBuf> = cwd.iter().map(PathBuf::from).collect();
+        resolve_node_binary(
+            on_path.map(PathBuf::from),
+            Some(Path::new(exe)),
+            &|p| files.iter().any(|f| Path::new(f) == p),
+            &cwd,
+            "linux",
+            "amd64",
+        )
+    }
+
+    #[test]
+    fn node_binary_on_path_comes_first() {
+        let node = "./node-2.1.0.25-linux-amd64";
+        let found = resolve(
+            Some("/usr/local/bin/quilibrium-node"),
+            "/opt/q/qclient-2.1.0.25-linux-amd64",
+            &["/opt/q/node-2.1.0.25-linux-amd64", node],
+            &[node],
+        )
+        .unwrap();
+        assert_eq!(found, PathBuf::from("/usr/local/bin/quilibrium-node"));
+    }
+
+    #[test]
+    fn node_binary_beside_qclient_matches_its_name() {
+        // The sibling wins over the current directory's other version.
+        let other = "./node-2.1.0.24-linux-amd64";
+        let found = resolve(
+            None,
+            "/opt/q/qclient-2.1.0.25-linux-amd64",
+            &["/opt/q/node-2.1.0.25-linux-amd64", other],
+            &[other],
+        )
+        .unwrap();
+        assert_eq!(found, PathBuf::from("/opt/q/node-2.1.0.25-linux-amd64"));
+    }
+
+    #[test]
+    fn node_binary_beside_bare_qclient_is_not_node_js() {
+        let node = "./node-2.1.0.25-linux-amd64";
+        let found = resolve(None, "/usr/bin/qclient", &["/usr/bin/node", node], &[node]).unwrap();
+        assert_eq!(found, PathBuf::from(node));
+    }
+
+    #[test]
+    fn node_binary_in_cwd_skips_copies_and_other_platforms() {
+        let node = "./node-2.1.0.25-linux-amd64";
+        let cwd = [
+            node,
+            "./node-2.1.0.24-linux-amd64.bak-20261020",
+            "./node-2.1.0.25-linux-amd64.candidate-abc",
+            "./node-2.1.0.25-linux-amd64.dgst",
+            "./node-2.1.0.25-linux-arm64",
+            "./node-2.1.0.25-darwin-amd64",
+            "./node-linux-amd64",
+            "./qclient-2.1.0.25-linux-amd64",
+        ];
+        // qclient was not started from here, so nothing sits beside it.
+        let exe = "/opt/other/qclient-2.1.0.25-linux-amd64";
+        let found = resolve(None, exe, &cwd, &cwd).unwrap();
+        assert_eq!(found, PathBuf::from(node));
+    }
+
+    #[test]
+    fn node_binary_in_cwd_must_be_a_regular_file() {
+        let node = "./node-2.1.0.25-linux-amd64";
+        let dir = "./node-2.1.0.24-linux-amd64";
+        let found = resolve(None, "/opt/q/qclient", &[node], &[dir, node]).unwrap();
+        assert_eq!(found, PathBuf::from(node));
+    }
+
+    #[test]
+    fn node_binary_of_several_versions_is_none() {
+        let cwd = ["./node-2.1.0.24-linux-amd64", "./node-2.1.0.25-linux-amd64"];
+        let err = resolve(None, "/opt/q/qclient", &cwd, &cwd).unwrap_err().to_string();
+        assert!(err.contains("several node binaries"), "{err}");
+        assert!(err.contains("node-2.1.0.24-linux-amd64, node-2.1.0.25-linux-amd64"), "{err}");
+    }
+
+    #[test]
+    fn node_binary_not_found_names_the_fixes() {
+        let err = resolve(None, "/opt/q/qclient", &[], &["./.config"]).unwrap_err().to_string();
+        assert!(err.contains("quilibrium-node is not on PATH"), "{err}");
+        assert!(err.contains("node-<version>-linux-amd64"), "{err}");
+        assert!(err.contains("qclient node link"), "{err}");
+        assert!(err.contains("from the node directory"), "{err}");
     }
 }

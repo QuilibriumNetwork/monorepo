@@ -72,6 +72,11 @@ pub(crate) fn init(
         let shards = shards_store.clone();
         worker_allocator.set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
     }
+    // Workers recover no shard state of a seat this node gives up, judged at
+    // the frame the allocator last reconciled at.
+    if !archive_mode {
+        worker_allocator.install_recovery_gate();
+    }
 
     // Compute the config-derived seniority estimate from the mainnet
     // compat table. Uses our local libp2p peer ID plus any peer IDs
@@ -134,28 +139,36 @@ pub(crate) fn init(
         let wa_for_init = worker_allocator.clone();
         let pr_for_init = prover_registry.clone();
         let lhf_for_init = last_global_head_frame.clone();
+        let clock_for_init = clock_store.clone();
         sup.spawn_startup_task("early-worker-reconcile", move |token_for_init| async move {
-            // The background refresh at startup is spawn_blocking and
-            // typically finishes in well under a second. Poll up to
-            // ~5s for `distinct_provers() > 0`; on a fresh node with
-            // an empty registry this just gives up silently and the
-            // archive-poller path picks it up later.
-            for _ in 0..50 {
-                if token_for_init.is_cancelled() { return Ok(()); }
-                let count = pr_for_init.read(|r| r.distinct_provers());
-                if count > 0 { break; }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The registry loads in the background at startup (18-29 s
+            // on a regular node's store, 2026-10-24); reconciling before
+            // that load ends would find none of our allocations. A fresh
+            // node's empty store loads at once.
+            if !super::archive_sync::await_registry_load(&pr_for_init, &token_for_init, "early worker reconcile").await {
+                return Ok(());
             }
             let frame = lhf_for_init.load(std::sync::atomic::Ordering::Relaxed);
             if frame > 0 {
-                if let Err(e) = wa_for_init.on_new_frame(frame) {
-                    warn!(
+                // Only a current stored head: a node back from downtime
+                // judges its seats at its first current frame instead.
+                let stamped = clock_for_init.get_latest_global_frame().ok()
+                    .and_then(|stored| stored.header.map(|header| u64::try_from(header.timestamp).unwrap_or(0)))
+                    .unwrap_or(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64);
+                match wa_for_init.startup_reconcile(frame, stamped, now) {
+                    Err(e) => warn!(
                         error = %e,
                         frame,
                         "early worker reconcile failed"
-                    );
-                } else {
-                    info!(frame, "early worker reconcile complete (off local registry)");
+                    ),
+                    Ok(true) => info!(frame, "early worker reconcile complete (off local registry)"),
+                    Ok(false) => info!(frame, stored_head_age_secs = now.saturating_sub(stamped) / 1000,
+                        scope = "this node",
+                        "early worker reconcile skipped: the stored GLOBAL head is over an epoch old, so this \
+                         node's seats are judged at its first current frame, after the startup state jump or \
+                         registry sync; its workers start then"),
                 }
             }
             Ok(())
@@ -258,17 +271,47 @@ pub(crate) fn init(
         // would execute it, before holding it. A verified frame then supersedes
         // its shard's lower ones, and no forged header can stand in for a real
         // one (decided 2026-10-15). One that cannot be verified now is held
-        // unverified for the leader to check (decided 2026-10-16).
+        // unverified for the leader to check (decided 2026-10-16), as is one
+        // whose session executed GLOBAL state has not authorized yet while it
+        // is anchored past it: while execution trails the head, a session a
+        // GLOBAL frame up to the anchor authorized is not in committed state.
+        let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
         message_collector.set_shard_frame_verifier({
             use quil_engine::message_collector::ShardFrameVerdict;
-            let (manager, current) = (exec_manager.clone(), current_frame.clone());
+            let (manager, current, global, deferrals) =
+                (exec_manager.clone(), current_frame.clone(), crdt.clone(), deferrals.clone());
             Arc::new(move |bundle: &[u8]| {
-                match manager.validate_message(current.effective().saturating_add(1), &[0xff; 32], bundle) {
+                let verified_for = current.effective().saturating_add(1);
+                match manager.validate_message(verified_for, &[0xff; 32], bundle) {
                     Ok(()) => ShardFrameVerdict::Valid,
                     Err(error) if error.is_execution_unavailable() => ShardFrameVerdict::Unavailable(error.to_string()),
-                    Err(error) => ShardFrameVerdict::Invalid(error.to_string()),
+                    Err(error) => {
+                        let executed = global
+                            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                            .ok();
+                        deferrals.verdict(&error, bundle, executed, verified_for, |filter| {
+                            quil_engine::execution_deferral::next_generation(&global, filter)
+                        })
+                    }
                 }
             })
+        });
+        // Forget held frames execution passed, and log the end of a wait,
+        // even when no submit arrives.
+        let global = crdt.clone();
+        sup.run_until_cancelled("collector-execution-deferrals", move |token| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            while !token.is_cancelled() {
+                tick.tick().await;
+                if deferrals.waiting() {
+                    if let Ok(executed) =
+                        global.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    {
+                        deferrals.executed(executed);
+                    }
+                }
+            }
+            Ok(())
         });
     } else {
         exec_manager.install_global_frame_prover(frame_prover.clone()).expect("failed to install global frame prover");

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing::{error, info};
 
@@ -71,30 +71,9 @@ pub(crate) fn handle_diagnostic_flags(
         } else {
             PathBuf::from(&config.db.path)
         };
-        // Read the latest committed frame number even when the running
-        // node holds the primary lock by opening as a read-only
-        // secondary. `try_catch_up_with_primary` pulls in everything
-        // the primary has flushed since it started so we don't return
-        // a stale-by-hours value.
-        let frame_number = if db_path.exists() {
-            let secondary_dir = std::env::temp_dir()
-                .join(format!("quil-node-info-secondary-{}", std::process::id()));
-            std::fs::create_dir_all(&secondary_dir).ok();
-            let result = quil_store::RocksDb::open_as_secondary(&db_path, &secondary_dir)
-                .ok()
-                .and_then(|d| {
-                    let _ = d.inner().try_catch_up_with_primary();
-                    let cs = quil_store::RocksClockStore::new(d.inner());
-                    cs.get_latest_global_frame()
-                        .ok()
-                        .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-                })
-                .unwrap_or(0);
-            // Cleanup the secondary scratch dir; ignore errors.
-            std::fs::remove_dir_all(&secondary_dir).ok();
-            result
-        } else {
-            0
+        let frame_number = match latest_global_frame_number(&db_path) {
+            Ok(number) => number.to_string(),
+            Err(reason) => format!("unavailable ({reason})"),
         };
 
         println!("Version: {}", quil_config::display_version());
@@ -148,6 +127,38 @@ pub(crate) fn handle_diagnostic_flags(
     }
 
     Ok(false)
+}
+
+/// The latest GLOBAL frame number committed to the store at `db_path`, or
+/// why it cannot be read. Opens the store as a read-only secondary, so a
+/// running node keeps its lock, and catches up with what it has written.
+/// Reads only the latest index and that frame's header: a secondary rejects
+/// snapshot reads, which the full-frame read takes for its requests.
+fn latest_global_frame_number(db_path: &Path) -> Result<u64, String> {
+    if !db_path.exists() {
+        return Err(format!("no store at {}", db_path.display()));
+    }
+    let secondary_dir = std::env::temp_dir()
+        .join(format!("quil-node-info-secondary-{}", std::process::id()));
+    std::fs::create_dir_all(&secondary_dir).ok();
+    let result = (|| {
+        let db = quil_store::RocksDb::open_as_secondary(db_path, &secondary_dir)
+            .map_err(|e| e.to_string())?;
+        db.inner()
+            .try_catch_up_with_primary()
+            .map_err(|e| format!("catch up with the running node: {e}"))?;
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        let latest = clock
+            .get_latest_frame_number()
+            .ok_or("no GLOBAL frames stored")?;
+        clock
+            .get_global_frame_header(latest)
+            .map(|h| h.frame_number)
+            .map_err(|e| e.to_string())
+    })();
+    // Cleanup the secondary scratch dir; ignore errors.
+    std::fs::remove_dir_all(&secondary_dir).ok();
+    result
 }
 
 /// `--metrics` (Go parity: `node -metrics` dialed the RUNNING node's gRPC
@@ -240,4 +251,33 @@ pub(crate) fn run_import(
         "import complete — start the node normally (without --import-db)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
+    use quil_types::store::ClockStore as _;
+
+    /// `--node-info` reads the GLOBAL head a running node committed: the
+    /// node keeps its store open, the frames still in its write-ahead log,
+    /// and they carry requests, as GLOBAL frames do.
+    #[test]
+    fn node_info_reads_a_running_nodes_global_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let clock = quil_store::RocksClockStore::new(db.inner());
+        assert_eq!(
+            super::latest_global_frame_number(dir.path()),
+            Err("no GLOBAL frames stored".to_string())
+        );
+        for number in 928_500..=928_502 {
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&GlobalFrame {
+                header: Some(GlobalFrameHeader { frame_number: number, ..Default::default() }),
+                requests: vec![MessageBundle::default()],
+            }, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(super::latest_global_frame_number(dir.path()), Ok(928_502));
+    }
 }

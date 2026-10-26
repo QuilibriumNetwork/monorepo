@@ -155,7 +155,7 @@ impl ExecutionViewAdmission {
     fn acquire(&self) -> Result<()> {
         let limit = self.max_views.load(Ordering::Acquire);
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|next| *next <= limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|next| *next <= limit))
             .map(|_| ())
             .map_err(|_| anyhow::anyhow!("execution view admission limit ({limit} held views)"))
     }
@@ -265,16 +265,28 @@ impl PinnedSnapshot {
     }
 
     /// Keep a healthy iterator for the next step. The caller still holds the
-    /// view, so a concurrent `release` cannot miss it.
+    /// view, so a concurrent `release` cannot miss it. When every slot is
+    /// taken, the iterator parked longest ago makes way: cursors bounded to
+    /// one key's range, such as a JMT value read, leave iterators no later
+    /// step retakes, and refusing the newest would leave a scan that starts
+    /// after them building one per step until the next capture's sweep.
     fn park(&self, mut iterator: ParkedIterator, _view: &HeldView<'_>) {
         if iterator.iterator.status().is_err() {
             return;
         }
         iterator.parked_at = Instant::now();
         let mut parked = self.iterators.lock().unwrap_or_else(|p| p.into_inner());
-        if parked.len() < MAX_PARKED_ITERATORS {
-            parked.push(iterator);
-        }
+        let evicted = if parked.len() >= MAX_PARKED_ITERATORS {
+            (0..parked.len()).min_by_key(|&i| parked[i].parked_at).map(|oldest| parked.swap_remove(oldest))
+        } else {
+            None
+        };
+        parked.push(iterator);
+        // Drop the evicted iterator outside the slot lock, so the idle sweep
+        // does not wait on its cleanup, but while `_view` is held: the
+        // snapshot it reads must outlive it.
+        drop(parked);
+        drop(evicted);
     }
 
     /// Dropping an iterator touches neither the snapshot nor another reader.
@@ -480,7 +492,7 @@ struct ForkPermit(Arc<ForkAdmission>);
 impl ForkAdmission {
     fn acquire(self: &Arc<Self>, limit: usize) -> Result<ForkPermit> {
         let limit = limit.min(self.limit);
-        self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        self.active.try_update(Ordering::AcqRel, Ordering::Acquire,
             |n| n.checked_add(1).filter(|next| *next <= limit))
             .map_err(|_| anyhow::anyhow!("overlay descendant branch limit"))?;
         Ok(ForkPermit(self.clone()))
@@ -921,6 +933,7 @@ impl ExecutionOverlay {
             lower: lower.to_vec(),
             upper: upper.to_vec(),
             row: None,
+            floor_guard: false,
         })
     }
 }
@@ -944,6 +957,24 @@ impl OverlayReadView {
 
     pub fn cursor(&self, lower: &[u8], upper: &[u8]) -> Result<OverlayCursor<'_>> {
         self.overlay.cursor_at(lower, upper, Some(&self.delta))
+    }
+
+    /// A cursor whose reverse steps never make the captured database's
+    /// iterator look below the lowest stored key in `[lower, upper)`. A
+    /// RocksDB reverse step that lands on a key reads on to the next key
+    /// below it, and checks the lower bound only after its merging iterator
+    /// has stepped back over every record a range tombstone deleted but an
+    /// older snapshot still pins, one at a time: a reverse step onto the
+    /// lowest stored key, or over a range holding none, walks all of them.
+    /// Each reverse positioning first reads the two lowest stored keys
+    /// forward from `lower`, which the iterator's upper bound stops, and
+    /// reaches the lowest by a forward seek; use it only for ranges holding a
+    /// few keys, such as one record's versions. Its iterators are not parked:
+    /// no later cursor retakes such bounds, and they would displace a scan's.
+    pub fn floor_guarded_cursor(&self, lower: &[u8], upper: &[u8]) -> Result<OverlayCursor<'_>> {
+        let mut cursor = self.cursor(lower, upper)?;
+        cursor.floor_guard = true;
+        Ok(cursor)
     }
 
     /// Reads of this view's watched keys read its database at the captured
@@ -975,6 +1006,8 @@ pub struct OverlayCursor<'a> {
     lower: Vec<u8>,
     upper: Vec<u8>,
     row: Option<(Vec<u8>, Vec<u8>)>,
+    /// See [`OverlayReadView::floor_guarded_cursor`].
+    floor_guard: bool,
 }
 
 impl Drop for OverlayCursor<'_> {
@@ -1089,39 +1122,51 @@ impl OverlayCursor<'_> {
         let view = base.view()?;
         let mut parked = base.take_iterator(&view, &self.lower, &self.upper)?;
         let it = &mut parked.iterator;
-        if it.key() != Some(key) {
-            if reverse {
-                it.seek_for_prev(key);
+        // A guarded reverse step needs the two lowest stored keys in bounds.
+        let floor = if reverse && self.floor_guard {
+            reads.operation(self.overlay.limits)?;
+            it.seek(&self.lower);
+            it.status()?;
+            let lowest = it.key().map(<[u8]>::to_vec);
+            let second = if lowest.is_some() {
+                reads.operation(self.overlay.limits)?;
+                it.next();
+                it.status()?;
+                it.key().map(<[u8]>::to_vec)
             } else {
+                None
+            };
+            Some((lowest, second))
+        } else {
+            None
+        };
+        let mut exhausted = false;
+        if reverse {
+            exhausted = !step_back(it, key, inclusive, &self.lower, floor.as_ref());
+        } else {
+            if it.key() != Some(key) {
                 it.seek(key);
             }
-        }
-        if !inclusive && it.key() == Some(key) {
-            reads.operation(self.overlay.limits)?;
-            if reverse {
-                it.prev();
-            } else {
+            if !inclusive && it.key() == Some(key) {
+                reads.operation(self.overlay.limits)?;
                 it.next();
             }
         }
         // Jump over deleted ranges rather than visiting all their base keys.
         // Only individual overridden points require individual steps.
-        while let Some(k) = it.key() {
+        while let Some(k) = it.key().filter(|_| !exhausted) {
             if let Some((start, end)) = self.delta.covering_range(k) {
                 reads.operation(self.overlay.limits)?;
                 if reverse {
-                    it.seek_for_prev(start);
-                    if it.key() == Some(start) {
-                        reads.operation(self.overlay.limits)?;
-                        it.prev();
-                    }
+                    exhausted = !step_back(it, start, false, &self.lower, floor.as_ref());
                 } else {
                     it.seek(end);
                 }
             } else if self.delta.points.contains_key(k) {
                 reads.operation(self.overlay.limits)?;
                 if reverse {
-                    it.prev();
+                    let k = k.to_vec();
+                    exhausted = !step_back(it, &k, false, &self.lower, floor.as_ref());
                 } else {
                     it.next();
                 }
@@ -1130,7 +1175,7 @@ impl OverlayCursor<'_> {
             }
         }
         it.status()?;
-        let stored = it.key().zip(it.value());
+        let stored = it.key().zip(it.value()).filter(|_| !exhausted);
         let chosen = match (point, stored) {
             (Some(a), Some(b)) => Some(if if reverse { a.0 > b.0 } else { a.0 < b.0 } {
                 a
@@ -1143,9 +1188,55 @@ impl OverlayCursor<'_> {
             reads.record(k, v, self.overlay.limits)?;
             self.row = Some((k.to_vec(), v.to_vec()));
         }
-        base.park(parked, &view);
+        if !self.floor_guard {
+            base.park(parked, &view);
+        }
         Ok(())
     }
+}
+
+/// Moves `it` to the largest stored key at or below `target` when
+/// `inclusive`, else below it; false when `[lower, target]` holds none.
+/// With `floor`, the two lowest stored keys in bounds (see
+/// [`OverlayReadView::floor_guarded_cursor`]), an answer below the second
+/// is reached by a forward seek, and a reverse step lands at or above the
+/// second, so the key it reads on to is the lowest at worst.
+fn step_back(
+    it: &mut rocksdb::DBRawIteratorWithThreadMode<'static, rocksdb::DB>,
+    target: &[u8],
+    inclusive: bool,
+    lower: &[u8],
+    floor: Option<&(Option<Vec<u8>>, Option<Vec<u8>>)>,
+) -> bool {
+    // Whether `key` lies above every key the step may land on.
+    let beyond = |key: &[u8]| if inclusive { key > target } else { key >= target };
+    if beyond(lower) {
+        return false;
+    }
+    if let Some((lowest, second)) = floor {
+        let Some(lowest) = lowest else { return false };
+        if beyond(lowest.as_slice()) {
+            return false;
+        }
+        if second.as_deref().map_or(true, beyond) {
+            if it.key() != Some(lowest.as_slice()) {
+                it.seek(lowest);
+            }
+            return it.valid();
+        }
+    }
+    if it.key() == Some(target) {
+        if inclusive {
+            return true;
+        }
+        it.prev();
+    } else {
+        it.seek_for_prev(target);
+        if !inclusive && it.key() == Some(target) {
+            it.prev();
+        }
+    }
+    it.valid()
 }
 
 // The forest uses the same encodings on both backends. A separate batch type
@@ -1524,6 +1615,50 @@ mod tests {
         assert_eq!(db.property_int_value("rocksdb.num-snapshots").unwrap(), Some(0));
     }
 
+    /// Cursors bounded to one key's range, as JMT value reads are, park
+    /// iterators no later step retakes. A scan that starts once they fill
+    /// every slot still parks its own iterator and reuses it at each step.
+    #[test]
+    fn a_scan_parks_its_iterator_after_point_reads_fill_the_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        for i in 0u16..64 {
+            db.put(i.to_be_bytes(), [1u8; 8]).unwrap();
+        }
+        db.flush().unwrap();
+        let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+        for i in 0..MAX_PARKED_ITERATORS as u16 {
+            let key = i.to_be_bytes();
+            let mut cursor = overlay.cursor(&key, &[key.as_slice(), &[0]].concat()).unwrap();
+            cursor.seek(&key).unwrap();
+            assert_eq!(cursor.key(), Some(key.as_slice()));
+        }
+        let base = overlay.lock_inner().unwrap().base.clone().unwrap();
+        assert_eq!(base.iterators.lock().unwrap().len(), MAX_PARKED_ITERATORS);
+        let created = base.iterators_created.load(Ordering::Relaxed);
+        let mut seen = Vec::new();
+        let mut from: Option<Vec<u8>> = None;
+        loop {
+            let mut cursor = overlay.cursor(&[0, 0], &[0xff, 0xff]).unwrap();
+            match &from {
+                None => cursor.seek(&[0, 0]).unwrap(),
+                Some(key) => {
+                    cursor.seek(key).unwrap();
+                    cursor.next().unwrap();
+                }
+            }
+            let Some(key) = cursor.key().map(<[u8]>::to_vec) else { break };
+            seen.push(key.clone());
+            from = Some(key);
+        }
+        assert_eq!(seen.len(), 64);
+        assert_eq!(base.iterators_created.load(Ordering::Relaxed), created + 1,
+            "the scan builds one iterator, not one per step");
+        assert_eq!(base.iterators.lock().unwrap().len(), MAX_PARKED_ITERATORS);
+        drop(base);
+        overlay.close();
+    }
+
     /// A branch keeps its capture point, and its views their scan point, until
     /// a tentative write covers a watched key; a database that watches nothing
     /// has neither.
@@ -1599,6 +1734,33 @@ mod tests {
         assert_eq!(plain.capture_point(), None);
     }
 
+    /// A floor-guarded cursor reads a few keys in reverse down to the
+    /// lowest, and parks no iterator a scan's could make way for.
+    #[test]
+    fn a_floor_guarded_cursor_stops_at_its_lowest_key_and_parks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path());
+        for i in 0u16..4 {
+            db.put(i.to_be_bytes(), [1u8; 8]).unwrap();
+        }
+        db.flush().unwrap();
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
+        let view = overlay.read_view().unwrap();
+        let mut cursor = view.floor_guarded_cursor(&[0, 1], &[0, 3]).unwrap();
+        cursor.seek_for_prev(&[0, 3]).unwrap();
+        assert_eq!(cursor.key(), Some(&[0u8, 2][..]));
+        cursor.prev().unwrap();
+        assert_eq!(cursor.key(), Some(&[0u8, 1][..]));
+        cursor.prev().unwrap();
+        assert_eq!(cursor.key(), None);
+        let base = overlay.lock_inner().unwrap().base.clone().unwrap();
+        assert!(base.iterators.lock().unwrap().is_empty());
+        drop(base);
+        drop(cursor);
+        drop(view);
+        overlay.close();
+    }
+
     #[test]
     fn mixed_writes_and_bidirectional_scans_match_independent_map() {
         let dir = tempfile::tempdir().unwrap();
@@ -1610,7 +1772,7 @@ mod tests {
             db.put(&key, &value).unwrap();
             expected.insert(key, value);
         }
-        let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), limits()).unwrap());
         let mut seed = 0x73656c6563746564u64;
         for i in 0..1500 {
             seed ^= seed << 13;
@@ -1656,8 +1818,23 @@ mod tests {
                 cursor.seek_for_prev(&k).unwrap();
                 assert_eq!(
                     cursor.key(),
-                    expected.range(..=k).next_back().map(|(k, _)| k.as_slice())
+                    expected.range(..=k.clone()).next_back().map(|(k, _)| k.as_slice())
                 );
+                drop(cursor);
+                // A floor-guarded cursor over a few keys reads the same in
+                // reverse, whatever its delta deleted below them.
+                let view = overlay.read_view().unwrap();
+                let upper = (u16::from_be_bytes([k[0], k[1]]) + 5).to_be_bytes().to_vec();
+                let mut guarded = view.floor_guarded_cursor(&k, &upper).unwrap();
+                guarded.seek_for_prev(&upper).unwrap();
+                let mut seen = Vec::new();
+                while let Some(key) = guarded.key() {
+                    seen.push(key.to_vec());
+                    guarded.prev().unwrap();
+                }
+                seen.reverse();
+                let window: Vec<_> = expected.range(k.clone()..upper.clone()).map(|(k, _)| k.clone()).collect();
+                assert_eq!(seen, window);
             }
         }
         assert_eq!(collect(&overlay, false), expected);

@@ -775,21 +775,67 @@ impl BlsAppFrameValidator {
         if header.frame_number == 0 || quil_cw_consensus::app_cert::unverified_finalization_epoch(cert) != Some(0) {
             return Ok(());
         }
+        // A certificate no committee could decide (a generation-0 wrapper
+        // on a managed shard, or past the flag day) is refused as it is.
+        if !self.legacy_committee_applies(header) {
+            return Ok(());
+        }
         let anchor = legacy_committee_frame(header);
         if self.historical_committees.get(&header.address, anchor).is_some() {
             return Ok(());
+        }
+        // A reconstruction of this anchor failed a short while ago: in-actor
+        // callers (sync anchors, engine start) get that answer at once.
+        if let Some(ago) = self.historical_committees.failed_ago(&header.address, anchor) {
+            return Err(QuilError::ExecutionUnavailable(format!(
+                "the historical committee of GLOBAL frame {anchor} could not be rebuilt {}s ago; tried again after {}s",
+                ago.as_secs(), crate::historical_committee::FAILED_KEPT_FOR.as_secs())));
         }
         let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
         let live = self.live_legacy_committee(header)?;
         if quil_cw_consensus::app_cert::verify_finalization_details(cert, &live, &legacy_namespace(header), digest).is_some() {
             return Ok(());
         }
-        let candidates = tokio::time::timeout(
-            crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
-            source(header.address.clone(), anchor),
-        )
+        let _rebuilding = match self.historical_committees.begin(&header.address, anchor) {
+            crate::historical_committee::Begun::Rebuild(rebuilding) => rebuilding,
+            // Another frame or copy is rebuilding them: wait on it, as on a
+            // reconstruction of one's own, and take what it found.
+            crate::historical_committee::Begun::Wait(mut done) => {
+                let _ = tokio::time::timeout(crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT, done.changed()).await;
+                return match self.historical_committees.get(&header.address, anchor) {
+                    Some(_) => Ok(()),
+                    None => Err(QuilError::ExecutionUnavailable(format!(
+                        "the historical committee of GLOBAL frame {anchor} could not be rebuilt"))),
+                };
+            }
+        };
+        // Rebuilt by another just before this one began.
+        if self.historical_committees.get(&header.address, anchor).is_some() {
+            return Ok(());
+        }
+        // At most a few reconstructions node-wide at a time, the wait for one
+        // within the reconstruction's own time.
+        let rebuilt = tokio::time::timeout(crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT, async {
+            let _permit = crate::historical_committee::REBUILDS.acquire().await
+                .map_err(|_| QuilError::Internal("historical committee rebuilds closed".into()))?;
+            source(header.address.clone(), anchor).await
+        })
         .await
-        .map_err(|_| QuilError::ExecutionUnavailable("historical committee reconstruction timed out".into()))??;
+        .map_err(|_| QuilError::ExecutionUnavailable("historical committee reconstruction timed out".into()))
+        .and_then(|candidates| candidates)
+        .and_then(|candidates| match candidates.is_empty() {
+            // Nothing found is no answer, kept as a failure.
+            true => Err(QuilError::ExecutionUnavailable(format!(
+                "no historical committee of GLOBAL frame {anchor} could be rebuilt"))),
+            false => Ok(candidates),
+        });
+        let candidates = match rebuilt {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.historical_committees.failed(header.address.clone(), anchor);
+                return Err(error);
+            }
+        };
         tracing::info!(
             filter = %hex::encode(&header.address),
             frame = header.frame_number,
@@ -799,6 +845,48 @@ impl BlsAppFrameValidator {
         );
         self.historical_committees.put(header.address.clone(), anchor, candidates);
         Ok(())
+    }
+
+    /// Whether a historical committee could decide `header`'s certificate:
+    /// a legacy (generation-0) commonware certificate of a frame after
+    /// genesis, before the committee-handoff flag day, that GLOBAL's
+    /// committed view leaves to the legacy verifier (legacy history, or a
+    /// shard no session manages). The refusal of any other certificate
+    /// stands whatever committee could be had: a generation-0 wrapper on a
+    /// managed shard ("generation has no authorization"), or one past the
+    /// flag day.
+    pub fn legacy_committee_applies(&self, header: &quil_types::proto::global::FrameHeader) -> bool {
+        let Some(cert) = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+        else {
+            return false;
+        };
+        if header.frame_number == 0
+            || quil_cw_consensus::app_cert::unverified_finalization_epoch(cert) != Some(0)
+            || self.refuse_legacy_after_flag_day(header).is_err()
+        {
+            return false;
+        }
+        let view = match &self.handoff_authority {
+            Some(crdt) => match crate::app_handoff::committed_view(crdt) {
+                Ok(view) => view,
+                Err(_) => return false,
+            },
+            None => None,
+        };
+        let Some(view) = view else { return true };
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        use quil_execution::global_intrinsic::handoff::frames;
+        let claim = frames::FrameClaim {
+            filter: &header.address,
+            frame: header.frame_number,
+            view: header.rank,
+            parent: &header.parent_selector,
+            digest,
+        };
+        matches!(frames::verify_history(&view, &claim, cert), Ok(None))
     }
 
     /// No legacy certificate is accepted from the committee-handoff flag day
@@ -1481,6 +1569,29 @@ impl BlsAppFrameValidator {
             other => other,
         }
     }
+}
+
+/// Whether `root` commits to no requests: all zeros, at the forest (32-byte)
+/// or legacy (64-byte) width.
+pub(crate) fn commits_no_requests(root: &[u8]) -> bool {
+    matches!(root.len(), 32 | 64) && root.iter().all(|&byte| byte == 0)
+}
+
+/// Whether `frame` carried no requests and comes without the storage
+/// attestation its body would carry: an empty frame rebuilt from the
+/// certified header a GLOBAL frame carries, which is all archives hold of
+/// some frames (`prover_tree_syncer::rebuild_from_carried_header`), when
+/// that header holds no attestation either (the member that submitted it
+/// held none; one rebuilt with the attestation is validated in full). Its
+/// possession proof cannot be verified here, and need not be: the quorum
+/// verified it when it certified the frame. The certificate binds the
+/// output and the output binds the empty requests root, so such a frame is
+/// validated by [`BlsAppFrameValidator::validate_certified_without_storage`];
+/// a frame with requests, or without a certificate, gets no exception.
+pub(crate) fn empty_without_attestation(frame: &AppShardFrame) -> bool {
+    frame.storage_attestation.is_none()
+        && frame.requests.is_empty()
+        && frame.header.as_ref().is_some_and(|header| commits_no_requests(&header.requests_root))
 }
 
 impl AppFrameValidator for BlsAppFrameValidator {

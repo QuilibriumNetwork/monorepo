@@ -10,4 +10,4 @@ pub mod proof;
 pub type Version = u64; // Height - also used for MVCC in StateDB
 
 /// The version before the genesis state. This version should always be empty.
-pub const PRE_GENESIS_VERSION: Version = u64::max_value();
+pub const PRE_GENESIS_VERSION: Version = u64::MAX;

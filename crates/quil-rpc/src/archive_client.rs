@@ -168,6 +168,43 @@ fn log_connect_outage(addr: &str, event: Option<quil_engine::outage::OutageEvent
     }
 }
 
+/// The runtime that dials archives for callers on a current-thread runtime
+/// and runs their channels' I/O. An in-process worker runs one: a
+/// synchronous call on its thread stalls every task there, and a PQNoise
+/// handshake stalled past the archive's 10 s deadline is dropped (the
+/// worker sees "pqnoise: io: unexpected end of file"), as is a channel
+/// that leaves the archive's keepalive pings unanswered past its timeout.
+/// Started at the first such dial; it lives as long as the process.
+fn archive_io() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("archive-io")
+            .enable_all()
+            .build()
+            .expect("failed to create the archive I/O runtime")
+    })
+}
+
+/// Whether a dial from here runs on [`archive_io`]: unless the caller's
+/// runtime has threads of its own to run it.
+fn dials_off_this_thread() -> bool {
+    !matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
+/// A dial on [`archive_io`] ends with the caller that awaits it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl ArchiveClient {
     /// Connect to an archive node at the given `host:port` over plaintext gRPC.
     /// Useful for local testing only — production archive nodes require mTLS.
@@ -233,6 +270,16 @@ impl ArchiveClient {
     }
 
     async fn connect_pq(addr: &str, connector: QuilPqNoiseConnector) -> Result<Self, ArchiveClientError> {
+        Self::dial_pq(addr, connector, dials_off_this_thread()).await
+    }
+
+    /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
+    /// the caller's runtime.
+    async fn dial_pq(
+        addr: &str,
+        connector: QuilPqNoiseConnector,
+        off_thread: bool,
+    ) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
         // our own PQNoise connector (no rustls/TLS on :8340 anymore).
@@ -260,7 +307,22 @@ impl ArchiveClient {
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (PQNoise)");
-        let channel = match endpoint.connect_with_connector(connector).await {
+        let dialed = if off_thread {
+            // The channel's connection and buffer tasks run where they are
+            // spawned: the dial spawns them, and the buffer task those of a
+            // reconnect, all on `archive_io`.
+            let mut dial = AbortOnDrop(archive_io().spawn(async move { endpoint.connect_with_connector(connector).await }));
+            match (&mut dial.0).await {
+                Ok(dialed) => dialed,
+                Err(error) => match error.try_into_panic() {
+                    Ok(panic) => std::panic::resume_unwind(panic),
+                    Err(error) => return Err(ArchiveClientError::TlsInit(format!("archive dial ended: {error}"))),
+                },
+            }
+        } else {
+            endpoint.connect_with_connector(connector).await
+        };
+        let channel = match dialed {
             Ok(ch) => ch,
             Err(e) => {
                 // Walk the std::error::Error source chain so the actual
@@ -683,7 +745,43 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: false, if_newer_than: 0 })
+            .await?
+            .into_inner();
+        resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// GLOBAL frame `frame_number` as its header alone, for a caller that
+    /// checks headers and their links and never reads the request bundles,
+    /// which can make a frame megabytes long. A server that predates the
+    /// `header_only` flag sends the whole frame; its bundles are dropped
+    /// here, so the answer is the same either way.
+    pub async fn get_global_frame_header_only(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false, header_only: true, if_newer_than: 0 })
+            .await?
+            .into_inner();
+        let mut frame = resp.frame.ok_or(ArchiveClientError::MissingField("frame"))?;
+        frame.requests.clear();
+        Ok(frame)
+    }
+
+    /// The latest GLOBAL frame for a poller that holds frames up to
+    /// `newer_than`: whole when the archive's head is newer, else its header
+    /// alone, which gives the archive's height without the request bundles
+    /// the poller already holds. A server that predates `if_newer_than`
+    /// sends the whole head either way; `0` asks for it whole.
+    pub async fn get_global_head(
+        &mut self,
+        newer_than: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number: 0, if_newer_than: newer_than, ..Default::default() })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
@@ -700,7 +798,7 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true, header_only: false, if_newer_than: 0 })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
@@ -1278,5 +1376,228 @@ mod pinned_master_tests {
         )));
         assert!(ArchiveClientError::Rpc(closed).is_transport_failure());
         assert!(!ArchiveClientError::Rpc(tonic::Status::not_found("frame 7 not found")).is_transport_failure());
+    }
+}
+
+#[cfg(test)]
+mod off_thread_dial_tests {
+    use super::*;
+    use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+    use quil_types::proto::global::FrameHeader;
+    use std::time::Instant;
+
+    /// An archive's deadline for a client's PQNoise handshake, scaled down
+    /// from its 10 s.
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    /// Serves frames whose header output has a fixed size.
+    struct Frames(usize);
+
+    #[tonic::async_trait]
+    impl crate::stub_services::AppShardFrameProvider for Frames {
+        async fn get_app_shard_frame(
+            &self,
+            _filter: Vec<u8>,
+            frame_number: u64,
+        ) -> Result<Option<AppShardFrame>, tonic::Status> {
+            let header = FrameHeader { frame_number, output: vec![0x5a; self.0], ..Default::default() };
+            Ok(Some(AppShardFrame { header: Some(header), ..Default::default() }))
+        }
+    }
+
+    /// An archive's peer listener: a PQNoise handshake within `deadline`,
+    /// then `AppShardService` over the stream, with h2 keepalive pings at
+    /// `keepalive` (interval, timeout) when given.
+    struct Archive {
+        runtime: Option<tokio::runtime::Runtime>,
+        address: String,
+        /// Each handshake's outcome: completed, failed or timed out.
+        handshakes: std::sync::mpsc::Receiver<&'static str>,
+    }
+
+    impl Archive {
+        fn serve(threads: usize, deadline: Duration, keepalive: Option<(Duration, Duration)>, frame_bytes: usize) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build().unwrap();
+            let server_key = quil_p2p::generate_falcon_signing_key();
+            let listener = runtime.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let (handshakes_tx, handshakes) = std::sync::mpsc::channel();
+            let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+            runtime.spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let (key, handshakes_tx, streams_tx) = (server_key.clone(), handshakes_tx.clone(), streams_tx.clone());
+                    tokio::spawn(async move {
+                        // As an archive does: a handshake past the deadline is dropped.
+                        let outcome = tokio::time::timeout(deadline, crate::pqnoise_channel::pq_server_handshake(tcp, &key)).await;
+                        let _ = handshakes_tx.send(match outcome {
+                            Ok(Ok(stream)) => {
+                                let _ = streams_tx.send(Ok::<_, std::io::Error>(stream));
+                                "completed"
+                            }
+                            Ok(Err(_)) => "failed",
+                            Err(_) => "timed out",
+                        });
+                    });
+                }
+            });
+            let frames = crate::stub_services::AppShardRpcServer::with_provider(Arc::new(Frames(frame_bytes)));
+            runtime.spawn(
+                tonic::transport::Server::builder()
+                    .http2_keepalive_interval(keepalive.map(|(interval, _)| interval))
+                    .http2_keepalive_timeout(keepalive.map(|(_, timeout)| timeout))
+                    .add_service(AppShardServiceServer::new(frames))
+                    .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(streams)),
+            );
+            Archive { runtime: Some(runtime), address, handshakes }
+        }
+    }
+
+    impl Drop for Archive {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// A dial from a current-thread runtime completes, and its channel
+    /// answers, although that runtime's only thread is blocked past the
+    /// archive's handshake deadline: an in-process worker whose thread a
+    /// synchronous call stalls keeps its archive connections.
+    #[test]
+    fn a_dial_completes_while_its_calling_thread_is_blocked_past_the_handshake_deadline() {
+        let archive = Archive::serve(2, DEADLINE, None, 16);
+        let worker = current_thread();
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let address = archive.address.clone();
+        let dialed = worker.block_on(async move {
+            let dial = tokio::spawn(async move { ArchiveClient::connect_mtls(&address, &client_key).await });
+            // The dial takes its first step before this task resumes...
+            tokio::task::yield_now().await;
+            // ...then a synchronous call blocks this runtime's only thread
+            // for twice the archive's deadline.
+            std::thread::sleep(DEADLINE * 2);
+            dial.await.unwrap()
+        });
+        assert_eq!(archive.handshakes.recv_timeout(Duration::from_secs(5)), Ok("completed"));
+        let mut client = dialed.expect("the dial completes");
+        let answered = worker.block_on(client.get_app_shard_frame(vec![0x21; 32], 1));
+        assert_eq!(answered.expect("the channel answers").and_then(|frame| frame.header).map(|h| h.frame_number), Some(1));
+    }
+
+    /// An established channel answers the archive's keepalive pings while
+    /// the thread that dialed it is blocked for longer than the archive
+    /// waits for an answer (scaled down from its 20 s interval and 10 s
+    /// timeout): the archive keeps the connection, and the next call needs
+    /// no new handshake.
+    #[test]
+    fn an_established_channel_survives_its_calling_thread_blocked_past_the_archive_keepalive() {
+        let (interval, timeout) = (Duration::from_millis(500), Duration::from_secs(1));
+        let archive = Archive::serve(2, DEADLINE, Some((interval, timeout)), 16);
+        let worker = current_thread();
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let mut client = worker.block_on(ArchiveClient::connect_mtls(&archive.address, &client_key)).expect("the dial completes");
+        assert!(worker.block_on(client.get_app_shard_frame(vec![0x21; 32], 1)).is_ok());
+        assert_eq!(archive.handshakes.try_iter().collect::<Vec<_>>(), vec!["completed"]);
+        // A synchronous call blocks the worker thread for twice as long as
+        // an unanswered ping keeps the connection.
+        worker.block_on(async { std::thread::sleep((interval + timeout) * 2) });
+        let answered = worker.block_on(client.get_app_shard_frame(vec![0x21; 32], 2));
+        assert_eq!(answered.expect("the channel answers").and_then(|frame| frame.header).map(|h| h.frame_number), Some(2));
+        assert_eq!(archive.handshakes.try_iter().collect::<Vec<_>>(), Vec::<&str>::new(), "the channel reconnected");
+    }
+
+    fn env_or(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+    }
+
+    fn secs(duration: Duration) -> String {
+        format!("{:.2}", duration.as_secs_f64())
+    }
+
+    /// Download throughput of many channels, each dialed from its own
+    /// current-thread runtime as in-process workers do, through the PQNoise
+    /// stack: dialed on [`archive_io`], whose two threads then carry every
+    /// channel's I/O, and dialed on each caller's runtime. Prints, per mode,
+    /// the aggregate MiB/s and the per-channel dial and download times.
+    ///
+    /// `ARCHIVE_IO_BENCH_CHANNELS` (48) channels each download
+    /// `ARCHIVE_IO_BENCH_MIB` (4) frames of 1 MiB; the archive runs
+    /// `ARCHIVE_IO_BENCH_SERVER_THREADS` (8) threads and drops handshakes
+    /// after its 10 s deadline. In the project image:
+    /// `cargo test --release --locked -p quil-rpc --lib archive_io_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a throughput measurement, run by hand"]
+    fn archive_io_throughput() {
+        let channels = env_or("ARCHIVE_IO_BENCH_CHANNELS", 48);
+        let frames = env_or("ARCHIVE_IO_BENCH_MIB", 4) as u64;
+        // The archive's own handshake deadline.
+        let deadline = Duration::from_secs(10);
+        let archive = Archive::serve(env_or("ARCHIVE_IO_BENCH_SERVER_THREADS", 8), deadline, None, 1 << 20);
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let host_threads = std::thread::available_parallelism().map_or(0, |n| n.get());
+        println!("archive I/O throughput: {channels} channels x {frames} MiB, {host_threads} host threads");
+        for (mode, off_thread) in [("dialed on archive-io", true), ("dialed on each caller's runtime", false)] {
+            let ready = Arc::new(std::sync::Barrier::new(channels + 1));
+            let workers: Vec<_> = (0..channels)
+                .map(|_| {
+                    let (address, key, ready) = (archive.address.clone(), client_key.clone(), ready.clone());
+                    std::thread::spawn(move || {
+                        let worker = current_thread();
+                        let started = Instant::now();
+                        let dialed = worker.block_on(ArchiveClient::dial_pq(&address, QuilPqNoiseConnector::new(key), off_thread));
+                        let dial = started.elapsed();
+                        ready.wait();
+                        let mut client = match dialed {
+                            Ok(client) => client,
+                            Err(error) => return (dial, Err(format!("dial: {error}"))),
+                        };
+                        let started = Instant::now();
+                        let downloaded = worker.block_on(async {
+                            let mut bytes = 0;
+                            for frame_number in 1..=frames {
+                                let frame = client.get_app_shard_frame(vec![0x21; 32], frame_number).await;
+                                bytes += frame
+                                    .map_err(|error| format!("frame {frame_number}: {error}"))?
+                                    .and_then(|frame| frame.header)
+                                    .map_or(0, |header| header.output.len());
+                            }
+                            Ok::<_, String>(bytes)
+                        });
+                        (dial, downloaded.map(|bytes| (bytes, started.elapsed())))
+                    })
+                })
+                .collect();
+            ready.wait();
+            let started = Instant::now();
+            let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+            let wall = started.elapsed();
+            let mut dials: Vec<_> = results.iter().map(|(dial, _)| *dial).collect();
+            let mut done: Vec<_> = results.iter().filter_map(|(_, outcome)| outcome.as_ref().ok().map(|(_, at)| *at)).collect();
+            let bytes: usize = results.iter().filter_map(|(_, outcome)| outcome.as_ref().ok().map(|(bytes, _)| *bytes)).sum();
+            let failures: Vec<_> = results.iter().filter_map(|(_, outcome)| outcome.as_ref().err()).collect();
+            dials.sort();
+            done.sort();
+            let spread = |times: &[Duration]| match times {
+                [] => "none".to_string(),
+                _ => format!("min {} median {} max {} s", secs(times[0]), secs(times[times.len() / 2]), secs(times[times.len() - 1])),
+            };
+            println!("{mode}: {:.1} MiB/s aggregate, {} MiB in {} s; {} failed{}",
+                bytes as f64 / (1 << 20) as f64 / wall.as_secs_f64(), bytes >> 20, secs(wall), failures.len(),
+                failures.first().map_or(String::new(), |error| format!(" (first: {error})")));
+            println!("  dial: {}", spread(&dials));
+            println!("  download: {}", spread(&done));
+            println!("  per-channel download completion (s, sorted): {}",
+                done.iter().map(|at| secs(*at)).collect::<Vec<_>>().join(" "));
+            let handshakes: Vec<_> = archive.handshakes.try_iter().collect();
+            let count = |outcome: &str| handshakes.iter().filter(|seen| **seen == outcome).count();
+            println!("  archive handshakes: {} completed, {} timed out ({} s deadline), {} failed",
+                count("completed"), count("timed out"), deadline.as_secs(), count("failed"));
+        }
     }
 }

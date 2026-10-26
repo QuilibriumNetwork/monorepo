@@ -109,6 +109,13 @@ lto   = true
 debug = false
 # panic = 'abort'
 
+# The profile of the devnet smoke test (scripts/devnet-smoke.sh): release
+# optimization without fat LTO, so the node links in a fraction of the time
+# and its artifacts stay small enough to cache.
+[profile.devnet]
+inherits = "release"
+lto = false
+
 # Test profile overrides.
 #
 # Cryptography tests are 10-100x slower in unoptimized builds because the

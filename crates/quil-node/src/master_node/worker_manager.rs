@@ -346,6 +346,10 @@ pub(crate) struct WorkerAppState {
     pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     pub db: Arc<quil_store::RocksDb>,
     pub hg_store: Arc<dyn quil_types::store::HypergraphStore>,
+    /// The worker's coin witness index, started on first use. It lives
+    /// with these stores, so releasing them also lets the index go.
+    #[cfg(feature = "confidential-tokens")]
+    pub witness_index: Arc<std::sync::OnceLock<Arc<crate::witness_index::NodeWitnessIndex>>>,
 }
 
 /// Each thread worker's stores, by core (filled as workers start).
@@ -355,6 +359,72 @@ pub(crate) type WorkerStoresByCore = Arc<parking_lot::RwLock<std::collections::H
 /// activation from the per-core stores the worker builder registers.
 pub(crate) type WorkerAppStates =
     Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, WorkerAppState>>>;
+
+/// How the recovery of a thread worker's stopped store stops and restarts
+/// the worker ([`crate::storage_watch::WorkerControl`]).
+struct ThreadWorkerStores {
+    manager: Arc<quil_engine::thread_worker::ThreadWorkerManager>,
+    by_core: Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>>,
+    by_filter: WorkerAppStates,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl crate::storage_watch::WorkerControl for ThreadWorkerStores {
+    fn stop(&self, core: u32) -> bool {
+        self.manager.stop_worker(core, crate::storage_watch::STOP_DEADLINE)
+    }
+
+    /// The master's handles on the worker's store, its coin witness index
+    /// included; the worker builder registers a reopened store again.
+    fn release(&self, core: u32) {
+        let Some(stores) = self.by_core.write().remove(&core) else { return };
+        self.by_filter.write().retain(|_, state| !Arc::ptr_eq(&state.db, &stores.db));
+    }
+
+    /// Never while the node shuts down: a store opened then is open at exit.
+    fn restart(&self, core: u32) -> anyhow::Result<()> {
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("the node is shutting down");
+        }
+        self.manager.restart_worker(core).map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    /// The builder registered the worker's stores again and, for a worker
+    /// running consensus on a shard, its activation mapped the shard to
+    /// them; until then a confirm would fall back to the master's stores.
+    fn ready(&self, core: u32) -> bool {
+        use quil_engine::worker::WorkerManager as _;
+        let stores = self.by_core.read().get(&core).cloned();
+        let workers = self.manager.range_workers();
+        worker_stores_ready(core, stores.as_ref(), workers, &self.by_filter.read())
+    }
+
+    fn shutting_down(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
+    fn running(&self, core: u32) -> bool {
+        self.manager.worker_running(core)
+    }
+}
+
+/// Whether thread worker `core`'s reopened `stores` serve its shard: the
+/// builder registered them, and a worker running consensus on a shard has
+/// it mapped to them by its activation. Unknown workers (`workers` failed)
+/// are not ready: their seat stays left out rather than read the master's.
+fn worker_stores_ready(
+    core: u32,
+    stores: Option<&WorkerAppState>,
+    workers: quil_types::error::Result<Vec<quil_engine::worker::WorkerInfo>>,
+    by_filter: &std::collections::HashMap<Vec<u8>, WorkerAppState>,
+) -> bool {
+    let (Some(stores), Ok(workers)) = (stores, workers) else { return false };
+    workers.into_iter().find(|worker| worker.core_id == core).is_none_or(|worker| {
+        worker.filter.is_empty()
+            || !worker.allocated
+            || by_filter.get(&worker.filter).is_some_and(|state| Arc::ptr_eq(&state.db, &stores.db))
+    })
+}
 
 pub(crate) struct WorkerManagerArgs {
     /// Rebuilds legacy committees from GLOBAL state; set once the archive
@@ -701,6 +771,7 @@ pub(crate) fn init(
                     format!("worker {} open db {}: {e}", core_id, path.display())
                 })?;
                 let db_arc = Arc::new(db);
+                db_arc.inner().register_store(quil_forest::StoreRole::Worker(core_id));
                 let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
                     quil_store::RocksClockStore::new(db_arc.inner()),
                 );
@@ -804,6 +875,8 @@ pub(crate) fn init(
                     crdt: crdt.clone(),
                     db: db_arc.clone(),
                     hg_store: hg_store_concrete.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                    #[cfg(feature = "confidential-tokens")]
+                    witness_index: Default::default(),
                 });
                 // Outputs committed to this worker's shard were often executed
                 // on another: their bytes live in that shard's certified frame,
@@ -843,6 +916,8 @@ pub(crate) fn init(
                 })
             });
 
+            // A blocked worker thread is reported in that worker's log.
+            quil_engine::worker_stall::route_logs_with(crate::logging::route_thread_to_core);
             thread_mgr.set_consensus_deps(quil_engine::thread_worker::WorkerConsensusDeps {
                 prover_registry: prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
                 frame_prover: frame_prover.clone(),
@@ -887,6 +962,18 @@ pub(crate) fn init(
             info!(
                 worker_cores = thread_mgr.num_worker_cores(),
                 "thread worker manager ready (local mode)"
+            );
+            // A worker whose own store stopped writing (a failed write, or
+            // free space below the floor) is stopped and restarted, reopening
+            // the store, once its disk has room again.
+            crate::storage_watch::spawn_worker_recovery(
+                Arc::new(ThreadWorkerStores {
+                    manager: thread_mgr.clone(),
+                    by_core: worker_stores_by_core.clone(),
+                    by_filter: worker_app_states.clone(),
+                    shutdown: spawner.token(),
+                }),
+                spawner.token(),
             );
             // Drain `WorkerToMaster` events from in-process worker
             // threads and forward to the master's BlossomSub publish
@@ -1375,6 +1462,82 @@ mod tests {
     use quil_engine::test_support::TestWorkerManager;
     use quil_engine::worker::WorkerManager as _;
 
+
+    /// Releasing a stopped thread worker's stores drops the master's last
+    /// handles on them, a started coin witness index included, so the store
+    /// closes and can be reopened.
+    #[cfg(feature = "confidential-tokens")]
+    #[tokio::test]
+    async fn released_worker_stores_close_with_their_witness_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = 8_401;
+        let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
+        assert!(db.inner().register_store(quil_forest::StoreRole::Worker(core)));
+        let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+        let state = WorkerAppState {
+            crdt: crdt.clone(),
+            db: db.clone(),
+            hg_store: Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            witness_index: Default::default(),
+        };
+        let supervisor = quil_lifecycle::Supervisor::<anyhow::Error>::new();
+        let index = state.witness_index.get_or_init(|| crate::witness_index::NodeWitnessIndex::start(
+            state.db.clone() as Arc<dyn quil_types::store::KvDb>, state.crdt.clone(), 1, supervisor.detached_spawner()));
+        assert!(Arc::strong_count(index) >= 1);
+        let stores = ThreadWorkerStores {
+            manager: Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new_with_count(1)),
+            by_core: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(core, state.clone())]))),
+            by_filter: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([(vec![7; 32], state)]))),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+        drop((db, crdt));
+        assert!(quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(core)));
+        crate::storage_watch::WorkerControl::release(&stores, core);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(core))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!quil_forest::storage_health::store_open(quil_forest::StoreRole::Worker(core)),
+            "the released store closes, its witness index with it");
+        drop(reopen(dir.path()));
+        drop(supervisor);
+    }
+
+    /// A reopened worker store serves its shard only once the builder
+    /// registered it and, for a worker running consensus, its activation
+    /// mapped the shard to it, not to the stores it had before.
+    #[cfg(feature = "confidential-tokens")]
+    #[tokio::test]
+    async fn reopened_worker_stores_are_ready_once_mapped_to_their_shard() {
+        let state = || {
+            let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+            let crdt = build_thread_worker_hypergraph(&db, Arc::new(quil_tries::ShaInclusionProver), false);
+            WorkerAppState {
+                crdt,
+                hg_store: Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+                db,
+                witness_index: Default::default(),
+            }
+        };
+        let (old, new) = (state(), state());
+        let worker = |filter: &[u8], allocated: bool| quil_engine::worker::WorkerInfo {
+            core_id: 3, filter: filter.to_vec(), available_storage: 0, total_storage: 0, manually_managed: false,
+            pending_filter_frame: 0, allocated,
+        };
+        let serving = || Ok(vec![worker(&[7; 32], true)]);
+        let mapped = |state: &WorkerAppState| std::collections::HashMap::from([(vec![7; 32], state.clone())]);
+        let none = std::collections::HashMap::new();
+        assert!(!worker_stores_ready(3, None, serving(), &mapped(&new)), "not registered by the builder yet");
+        assert!(!worker_stores_ready(3, Some(&new), serving(), &none), "its shard is not mapped yet");
+        assert!(!worker_stores_ready(3, Some(&new), serving(), &mapped(&old)), "mapped to its old stores");
+        assert!(worker_stores_ready(3, Some(&new), serving(), &mapped(&new)));
+        assert!(worker_stores_ready(3, Some(&new), Ok(vec![worker(&[7; 32], false)]), &none), "pinned, no engine");
+        assert!(worker_stores_ready(3, Some(&new), Ok(vec![worker(&[], false)]), &none), "idle");
+        let failed = Err(quil_types::error::QuilError::Internal("worker table poisoned".into()));
+        assert!(!worker_stores_ready(3, Some(&new), failed, &mapped(&new)), "unknown workers are not ready");
+    }
 
     /// Reopen a worker store a test just dropped. The one-shot staged-frame
     /// cleanup the builder starts holds its own handle until it finishes, so

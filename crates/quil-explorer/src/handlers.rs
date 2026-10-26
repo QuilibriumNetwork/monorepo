@@ -34,22 +34,38 @@ const CACHE_LONG: &str = "public, max-age=31536000, immutable";
 const CACHE_180: &str = "public, max-age=180";
 const CACHE_60: &str = "public, max-age=60";
 const PROVER_CACHE_TTL: Duration = Duration::from_secs(180);
+/// Bodies the response cache holds at most. Its keys come from request
+/// paths and queries, so it is bounded: once full of live entries, further
+/// bodies are served uncached until entries expire.
+pub(crate) const CACHE_MAX_ENTRIES: usize = 1024;
+/// How long a client is asked to wait while a full token scan runs.
+const TOKEN_SCAN_RETRY_SECS: u64 = 5;
 /// Longest a prover snapshot serves requests at its frame (one GLOBAL
 /// frame is about 9 s).
 const PROVER_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
+/// Longest an eviction assessment serves requests, whatever frame it was
+/// made at. The indexer makes one at each new head, a tick
+/// (`production::TICK`) after it arrives, and at least every
+/// `PROVER_SNAPSHOT_MAX_AGE`; an older one means the indexer has not made
+/// one yet or runs a long tick, and a request makes one.
+const EVICTION_SERVE_MAX_AGE: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Response helpers
 // ---------------------------------------------------------------------------
 
-fn build_response(status: StatusCode, body: Vec<u8>, cache: Option<&str>) -> Response {
+fn build_response(
+    status: StatusCode,
+    body: impl Into<axum::body::Body>,
+    cache: Option<&str>,
+) -> Response {
     let mut builder = Response::builder()
         .status(status)
         .header("Content-Type", "application/json");
     if let Some(c) = cache {
         builder = builder.header("Cache-Control", c);
     }
-    builder.body(axum::body::Body::from(body)).unwrap()
+    builder.body(body.into()).unwrap()
 }
 
 /// JSON body in Go `encoding/json` style: serialized value + trailing `\n`.
@@ -75,6 +91,17 @@ fn error(status: StatusCode, message: &str) -> Response {
     let mut map = BTreeMap::new();
     map.insert("error", message);
     build_response(status, json_value(&map), None)
+}
+
+/// 503 with `Retry-After`, for work the explorer limits instead of queueing.
+pub(crate) fn busy(message: &str, retry_after_secs: u64) -> Response {
+    let mut resp = error(StatusCode::SERVICE_UNAVAILABLE, message);
+    resp.headers_mut().insert("Retry-After", HeaderValue::from(retry_after_secs));
+    resp
+}
+
+fn token_scan_busy() -> Response {
+    busy("a full token scan is already running; retry shortly", TOKEN_SCAN_RETRY_SECS)
 }
 
 fn method_not_allowed() -> Response {
@@ -129,14 +156,6 @@ pub async fn handle_frames(
         Err(e) => return store_error(&e),
     };
     let fnum = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
-    // Serialize the frame, then merge per-bundle MATERIALIZATION outcomes so the
-    // UI can show whether each request actually applied (a frame carries every
-    // structurally-valid bundle, but some are rejected/failed at materialize).
-    // `requestOutcomes[i]` aligns to `requests[i]`.
-    let bytes = match protojson::to_protojson(protojson::GLOBAL_FRAME, &frame) {
-        Ok(b) => b,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-    };
     let outcomes = state
         .clock_store
         .get_global_clock_frame_outcomes(fnum)
@@ -144,24 +163,36 @@ pub async fn handle_frames(
     // Don't cache a frame immutably until its outcomes exist (materialization
     // runs a beat after finalization); an empty-request frame needs none.
     let cacheable = cacheable && (frame.requests.is_empty() || !outcomes.is_empty());
-    let out_json: Vec<serde_json::Value> = outcomes
-        .iter()
-        .map(|o| serde_json::json!({ "status": o.status.name(), "error": o.error }))
-        .collect();
-    let mut v: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
-            "requestOutcomes".to_string(),
-            serde_json::Value::Array(out_json),
-        );
+    match frame_body(&frame, &outcomes) {
+        Ok(body) => build_response(
+            StatusCode::OK,
+            body,
+            if cacheable { Some(CACHE_LONG) } else { None },
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
-    let merged = serde_json::to_vec(&v).unwrap_or(bytes);
-    build_response(
-        StatusCode::OK,
-        merged,
-        if cacheable { Some(CACHE_LONG) } else { None },
-    )
+}
+
+/// The `/frames` body: the frame's protojson plus `requestOutcomes`, each
+/// bundle's MATERIALIZATION outcome, so the UI can show whether each request
+/// actually applied (a frame carries every structurally-valid bundle, but
+/// some are rejected/failed at materialize). `requestOutcomes[i]` aligns to
+/// `requests[i]`. Built as one JSON value, whose objects sort their keys as
+/// the body always has, instead of writing the protojson, parsing it back
+/// and writing it again.
+fn frame_body(
+    frame: &quil_types::proto::global::GlobalFrame,
+    outcomes: &[quil_types::store::RequestOutcome],
+) -> Result<Vec<u8>, QuilError> {
+    let mut body = protojson::to_protojson_value(protojson::GLOBAL_FRAME, frame)?;
+    if let Some(object) = body.as_object_mut() {
+        let outcomes = outcomes
+            .iter()
+            .map(|o| serde_json::json!({ "status": o.status.name(), "error": o.error }))
+            .collect();
+        object.insert("requestOutcomes".to_string(), serde_json::Value::Array(outcomes));
+    }
+    serde_json::to_vec(&body).map_err(|e| QuilError::Serialization(e.to_string()))
 }
 
 pub async fn handle_certified(
@@ -190,15 +221,61 @@ pub async fn handle_certified(
 // /messages
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct MessageJson {
-    timestamp: String,
-    from: String,
-    bitmask: String,
-    seqno: String,
-    signature: String,
-    key: String,
-    data: String,
+/// A `/messages` body younger than this is served again although messages
+/// arrived since (bounded staleness: under steady gossip every request
+/// would otherwise re-serialize megabytes of payloads).
+const MESSAGES_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Append `bytes` as lowercase hex.
+fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)]);
+        out.push(DIGITS[usize::from(b & 0xf)]);
+    }
+}
+
+/// The `/messages` JSON, written straight into one buffer: an array of
+/// objects with hex fields, then a newline (as `json_value` would produce).
+fn render_messages(records: &[crate::RecentMessage]) -> axum::body::Bytes {
+    let size: usize = records
+        .iter()
+        .map(|r| {
+            2 * (r.from.len() + r.bitmask.len() + r.seqno.len() + r.signature.len() + r.key.len() + r.data.len())
+                + 140
+        })
+        .sum();
+    let mut out = Vec::with_capacity(size + 3);
+    out.push(b'[');
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"{\"timestamp\":\"");
+        out.extend_from_slice(r.timestamp().as_bytes());
+        for (name, value) in [
+            ("from", &r.from),
+            ("bitmask", &r.bitmask),
+            ("seqno", &r.seqno),
+            ("signature", &r.signature),
+            ("key", &r.key),
+            ("data", &r.data),
+        ] {
+            out.extend_from_slice(b"\",\"");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b"\":\"");
+            push_hex(&mut out, value);
+        }
+        out.extend_from_slice(b"\"}");
+    }
+    out.extend_from_slice(b"]\n");
+    out.into()
+}
+
+/// The `/messages` body for `limit` at `now`, reusing the ring's cached one.
+fn messages_body(ring: &crate::RecentMessageRing, limit: usize, now: Instant) -> axum::body::Bytes {
+    ring.cached_body(limit, now, MESSAGES_CACHE_MAX_AGE, render_messages)
 }
 
 pub async fn handle_messages(
@@ -217,20 +294,7 @@ pub async fn handle_messages(
             }
         }
     }
-    let records = state.messages.snapshot(limit);
-    let response: Vec<MessageJson> = records
-        .into_iter()
-        .map(|r| MessageJson {
-            timestamp: r.timestamp,
-            from: hex::encode(&r.from),
-            bitmask: hex::encode(&r.bitmask),
-            seqno: hex::encode(&r.seqno),
-            signature: hex::encode(&r.signature),
-            key: hex::encode(&r.key),
-            data: hex::encode(&r.data),
-        })
-        .collect();
-    json_ok(&response, None)
+    build_response(StatusCode::OK, messages_body(&state.messages, limit, Instant::now()), None)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,70 +332,88 @@ struct PeerInfoJson {
     reachability: Option<Vec<PeerReachabilityJson>>,
 }
 
+/// The fields `/peers` reports of a peer, copied out of the node's shared
+/// peer-info map: its read lock is held for the copies, not for the
+/// encoding (base58, base64, hex) and serialization of every peer.
+fn peer_fields(info: &quil_p2p::CanonicalPeerInfo) -> quil_p2p::CanonicalPeerInfo {
+    quil_p2p::CanonicalPeerInfo {
+        peer_id: info.peer_id.clone(),
+        reachability: info.reachability.clone(),
+        timestamp: info.timestamp,
+        version: info.version.clone(),
+        patch_number: info.patch_number.clone(),
+        capabilities: info.capabilities.clone(),
+        // Not reported.
+        public_key: Vec::new(),
+        signature: Vec::new(),
+        last_received_frame: info.last_received_frame,
+        last_global_head_frame: info.last_global_head_frame,
+    }
+}
+
+fn peer_json(info: &quil_p2p::CanonicalPeerInfo) -> PeerInfoJson {
+    let std = base64::engine::general_purpose::STANDARD;
+    let capabilities = if info.capabilities.is_empty() {
+        None
+    } else {
+        Some(
+            info.capabilities
+                .iter()
+                .map(|c| PeerCapabilityJson {
+                    protocol_identifier: c.protocol_identifier,
+                    additional_metadata: std.encode(&c.additional_metadata),
+                })
+                .collect(),
+        )
+    };
+    let reachability = if info.reachability.is_empty() {
+        None
+    } else {
+        Some(
+            info.reachability
+                .iter()
+                .map(|reach| PeerReachabilityJson {
+                    filter: hex::encode(&reach.filter),
+                    pubsub_multiaddrs: if reach.pubsub_multiaddrs.is_empty() {
+                        None
+                    } else {
+                        Some(reach.pubsub_multiaddrs.clone())
+                    },
+                    stream_multiaddrs: if reach.stream_multiaddrs.is_empty() {
+                        None
+                    } else {
+                        Some(reach.stream_multiaddrs.clone())
+                    },
+                })
+                .collect(),
+        )
+    };
+    PeerInfoJson {
+        peer_id: bs58::encode(&info.peer_id).into_string(),
+        version: String::from_utf8_lossy(&info.version).into_owned(),
+        patch_number: hex::encode(&info.patch_number),
+        // The Rust `CanonicalPeerInfo` carries no core count; the
+        // Go explorer reported a `cores` field, so emit 0 for
+        // shape compatibility.
+        cores: 0,
+        last_seen: info.timestamp,
+        last_received_frame: info.last_received_frame,
+        last_global_head_frame: info.last_global_head_frame,
+        release: info.release(),
+        subpatch: info.release_subpatch(),
+        build_fingerprint: info.build_fingerprint().map(hex::encode),
+        capabilities,
+        reachability,
+    }
+}
+
 pub async fn handle_peers(method: Method, State(state): State<ExplorerState>) -> Response {
     if !is_get(&method) {
         return method_not_allowed();
     }
-    let std = base64::engine::general_purpose::STANDARD;
-    let mut response: Vec<PeerInfoJson> = {
-        let map = state.peer_info_cache.read();
-        map.values()
-            .map(|info| {
-                let capabilities = if info.capabilities.is_empty() {
-                    None
-                } else {
-                    Some(
-                        info.capabilities
-                            .iter()
-                            .map(|c| PeerCapabilityJson {
-                                protocol_identifier: c.protocol_identifier,
-                                additional_metadata: std.encode(&c.additional_metadata),
-                            })
-                            .collect(),
-                    )
-                };
-                let reachability = if info.reachability.is_empty() {
-                    None
-                } else {
-                    Some(
-                        info.reachability
-                            .iter()
-                            .map(|reach| PeerReachabilityJson {
-                                filter: hex::encode(&reach.filter),
-                                pubsub_multiaddrs: if reach.pubsub_multiaddrs.is_empty() {
-                                    None
-                                } else {
-                                    Some(reach.pubsub_multiaddrs.clone())
-                                },
-                                stream_multiaddrs: if reach.stream_multiaddrs.is_empty() {
-                                    None
-                                } else {
-                                    Some(reach.stream_multiaddrs.clone())
-                                },
-                            })
-                            .collect(),
-                    )
-                };
-                PeerInfoJson {
-                    peer_id: bs58::encode(&info.peer_id).into_string(),
-                    version: String::from_utf8_lossy(&info.version).into_owned(),
-                    patch_number: hex::encode(&info.patch_number),
-                    // The Rust `CanonicalPeerInfo` carries no core count; the
-                    // Go explorer reported a `cores` field, so emit 0 for
-                    // shape compatibility.
-                    cores: 0,
-                    last_seen: info.timestamp,
-                    last_received_frame: info.last_received_frame,
-                    last_global_head_frame: info.last_global_head_frame,
-                    release: info.release(),
-                    subpatch: info.release_subpatch(),
-                    build_fingerprint: info.build_fingerprint().map(hex::encode),
-                    capabilities,
-                    reachability,
-                }
-            })
-            .collect()
-    };
+    let peers: Vec<quil_p2p::CanonicalPeerInfo> =
+        state.peer_info_cache.read().values().map(peer_fields).collect();
+    let mut response: Vec<PeerInfoJson> = peers.iter().map(peer_json).collect();
     // Sort by last_seen desc, tie-break peer_id asc (Go's slices.SortFunc).
     response.sort_by(|a, b| {
         b.last_seen
@@ -631,7 +713,8 @@ fn cache_put(state: &ExplorerState, key: String, body: Vec<u8>) {
 /// Insert `body` under `key`, first dropping expired entries: `cache_get`
 /// only skips them, so every distinct key (each `/provers` filter and
 /// status combination, each shard detail) would otherwise keep its body
-/// for the node's lifetime.
+/// for the node's lifetime. A new key finding [`CACHE_MAX_ENTRIES`] live
+/// entries is not cached.
 fn cache_insert(
     cache: &mut HashMap<String, (Instant, Vec<u8>)>,
     now: Instant,
@@ -639,6 +722,9 @@ fn cache_insert(
     body: Vec<u8>,
 ) {
     cache.retain(|_, (expiry, _)| *expiry > now);
+    if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+        return;
+    }
     cache.insert(key, (now + PROVER_CACHE_TTL, body));
 }
 
@@ -780,7 +866,8 @@ pub async fn handle_prover_shards(method: Method, State(state): State<ExplorerSt
 /// `fetchShardSizes` does, but in-process: enumerate the shards store and
 /// resolve each shard's `(size, data_shards)` via the same provider the
 /// gRPC `GetAppShards` uses. The filter key is `L2 (last 32 bytes of the
-/// shard key) ++ each prefix element as a byte`.
+/// shard key) ++ each prefix element as a byte`. Rows under GLOBAL's address
+/// are left out: they are no app shards (see `production::is_app_shard`).
 fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> {
     let mut result = HashMap::new();
     let shards = match state.shards_store.range_app_shards() {
@@ -791,6 +878,10 @@ fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> 
         if shard.shard_key.len() < 32 {
             continue;
         }
+        let l2 = &shard.shard_key[shard.shard_key.len() - 32..];
+        if !production::is_app_shard(l2) {
+            continue;
+        }
         let (size_be, data_shards) = match &state.app_shards_provider {
             Some(p) => match p(&shard.shard_key, &shard.prefix) {
                 Some((sz, ds, _)) => (sz, ds),
@@ -798,7 +889,6 @@ fn compute_shard_sizes(state: &ExplorerState) -> HashMap<String, (BigInt, u64)> 
             },
             None => (shard.size.clone(), shard.data_shards),
         };
-        let l2 = &shard.shard_key[shard.shard_key.len() - 32..];
         let filter = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
         let size = BigInt::from_bytes_be(Sign::Plus, &size_be);
         result.insert(hex::encode(&filter), (size, data_shards));
@@ -909,7 +999,7 @@ pub async fn handle_hyperedge(
     };
     // Go `hyperedge.GetSize()` == the extrinsic tree's leaf count, which is
     // the number of extrinsic atom ids.
-    let size = state.crdt.get_hyperedge_extrinsic_ids(&location).len();
+    let size = extrinsic_count(&value);
     let std = base64::engine::general_purpose::STANDARD;
     let response = AtomJson {
         id: hex::encode(id),
@@ -919,6 +1009,19 @@ pub async fn handle_hyperedge(
         size: size.to_string(),
     };
     json_ok(&response, None)
+}
+
+/// The extrinsic atom ids (64-byte leaf keys) of a hyperedge's serialized
+/// tree, as `get_hyperedge_extrinsic_ids` lists them, counted in the blob
+/// already read: no second read of the hyperedge and no copies of its
+/// leaves. 0 for an unreadable tree.
+fn extrinsic_count(blob: &[u8]) -> usize {
+    let Ok(Some(root)) = quil_tries::deserialize_go_tree(blob) else {
+        return 0;
+    };
+    let mut leaves = Vec::new();
+    root.collect_leaves(&mut leaves);
+    leaves.iter().filter(|leaf| leaf.key.len() == 64).count()
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,10 +1302,12 @@ struct EvictionRiskEntry {
     shard_progressing: bool,
 }
 
-/// Which eviction-risk entries a request asks for: one prover's
-/// (`address`), one shard's (`filter`), at most `limit` of them. The hex
-/// values are lowercase, as the entries carry them.
+/// Which eviction-risk entries a request asks for: those at least
+/// `min_ratio` at risk, one prover's (`address`), one shard's (`filter`),
+/// at most `limit` of them. The hex values are lowercase, as the entries
+/// carry them.
 struct EvictionRiskSelection {
+    min_ratio: f64,
     address: Option<String>,
     filter: Option<String>,
     limit: Option<usize>,
@@ -1212,12 +1317,15 @@ struct EvictionRiskSelection {
 /// and their count before `limit`. Applied after `eviction_pending` is set
 /// over every allocation, so the selection never changes which
 /// allocations are pending.
-fn select_eviction_risk(
-    entries: Vec<EvictionRiskEntry>,
+fn select_eviction_risk<'a>(
+    entries: &'a [EvictionRiskEntry],
     selection: &EvictionRiskSelection,
-) -> (Vec<EvictionRiskEntry>, usize) {
-    let mut selected: Vec<EvictionRiskEntry> = entries
-        .into_iter()
+) -> (Vec<&'a EvictionRiskEntry>, usize) {
+    let mut selected: Vec<&EvictionRiskEntry> = entries
+        .iter()
+        // Only a ratio below `min_ratio` is left out: a NaN `min_ratio`
+        // keeps every entry.
+        .filter(|e| e.risk_ratio.partial_cmp(&selection.min_ratio) != Some(std::cmp::Ordering::Less))
         .filter(|e| selection.address.as_deref().is_none_or(|a| e.address == a))
         .filter(|e| selection.filter.as_deref().is_none_or(|f| e.filter == f))
         .collect();
@@ -1234,7 +1342,8 @@ fn select_eviction_risk(
 /// (one shard's hex confirmation filter) and `limit` (the most at risk
 /// entries). `eviction_pending` is computed over every allocation,
 /// whatever the selection. The `X-Total-Count` header carries the number
-/// of entries selected before `limit`.
+/// of entries selected before `limit`. Serves the latest [`Eviction`]
+/// assessment, whose frame the entries' `current_frame` names.
 pub async fn handle_eviction_risk(
     method: Method,
     State(state): State<ExplorerState>,
@@ -1243,10 +1352,6 @@ pub async fn handle_eviction_risk(
     if !is_get(&method) {
         return method_not_allowed();
     }
-    let min_ratio: f64 = params
-        .get("min_ratio")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
     // Optional hex parameter, normalized to the entries' lowercase hex.
     let hex_param = |name: &str| -> Result<Option<String>, ()> {
         match params.get(name).map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1261,23 +1366,73 @@ pub async fn handle_eviction_risk(
         return error(StatusCode::BAD_REQUEST, "invalid filter");
     };
     let selection = EvictionRiskSelection {
+        min_ratio: params
+            .get("min_ratio")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0),
         address,
         filter,
         limit: params.get("limit").and_then(|s| s.parse().ok()),
     };
 
     let frame = state.current_frame.load(Ordering::Relaxed);
-    let halts = current_halts(&state, frame);
-    let threshold = crate::EVICTION_THRESHOLD_FRAMES;
-
-    let Some((_, provers)) = all_provers(&state, frame) else {
+    let eviction = served_eviction(&state, frame, Instant::now());
+    if eviction.provers_as_of_frame.is_none() {
         return provers_unavailable();
+    }
+    let (selected, total) = select_eviction_risk(&eviction.entries, &selection);
+    let mut response = json_ok(&selected, None);
+    response
+        .headers_mut()
+        .insert("X-Total-Count", HeaderValue::from(total));
+    response
+}
+
+/// Every active allocation's eviction runway at one frame, with the
+/// prover counts of `/stats`: what `/stats` and `/provers/eviction-risk`
+/// serve. The production indexer makes one at each new head (see
+/// [`eviction_at`]), so a request selects and serializes instead of
+/// scanning the shards store for halts and assessing every allocation.
+pub(crate) struct Eviction {
+    /// The frame assessed: the head when it was made.
+    pub(crate) frame: u64,
+    built_at: Instant,
+    /// The frame of the prover snapshot assessed; `None` while the registry
+    /// has not been read, the counts then being placeholders.
+    provers_as_of_frame: Option<u64>,
+    total_provers: u64,
+    by_status: BTreeMap<String, i64>,
+    total_seniority: u64,
+    /// Provers with an allocation past the threshold, and past half of it.
+    eviction_pending: u64,
+    at_risk: u64,
+    /// Shards in a full coverage halt.
+    halted: BTreeSet<Vec<u8>>,
+    /// One entry per active allocation accruing inactivity, most at risk
+    /// first, `eviction_pending` set over all of them.
+    entries: Vec<EvictionRiskEntry>,
+}
+
+/// Assess every allocation of `provers` (a snapshot with the frame it was
+/// read at; `None` before the registry was read) at `frame`, with the
+/// coverage halts `halts`, as the evictor would.
+fn assess_eviction(
+    frame: u64,
+    built_at: Instant,
+    provers: Option<(u64, &[ProverInfo])>,
+    halts: &HashMap<Vec<u8>, u64>,
+) -> Eviction {
+    let threshold = crate::EVICTION_THRESHOLD_FRAMES;
+    let provers_as_of_frame = provers.map(|(built, _)| built);
+    let provers: &[ProverInfo] = match provers {
+        Some((_, provers)) => provers,
+        None => &[],
     };
-    let active_by_filter = active_allocations_by_filter(&provers, frame);
+    let active_by_filter = active_allocations_by_filter(provers, frame);
     let fresh_by_filter = fresh_allocations_by_filter(
-        &provers,
+        provers,
         frame,
-        &halts,
+        halts,
         threshold,
         quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
     );
@@ -1288,19 +1443,28 @@ pub async fn handle_eviction_risk(
         )
     };
 
+    let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
+    let mut total_seniority: u64 = 0;
+    let mut eviction_pending: u64 = 0;
+    let mut at_risk: u64 = 0;
     let mut entries: Vec<EvictionRiskEntry> = Vec::new();
     // Every allocation past the threshold on a progressing shard, before the
-    // shard floor and regardless of `min_ratio`, so `eviction_pending`
-    // matches the evictor's selection.
+    // shard floor, so `eviction_pending` matches the evictor's selection.
     let mut stale: Vec<EvictionCandidate> = Vec::new();
-    for prover in provers.iter() {
+    for prover in provers {
+        *by_status
+            .entry(prover_status_to_string(prover.status))
+            .or_insert(0) += 1;
+        total_seniority = total_seniority.saturating_add(prover.seniority);
         if prover.status != ProverStatus::Active {
             continue;
         }
+        let mut worst = 0u64;
         for alloc in &prover.allocations {
-            let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) else {
+            let Some(a) = assess_allocation(alloc, frame, halts, &active_by_filter) else {
                 continue;
             };
+            worst = worst.max(a.effective_inactive);
             let on_progressing_shard = progressing(&alloc.confirmation_filter);
             if a.effective_inactive > threshold && on_progressing_shard {
                 stale.push(EvictionCandidate {
@@ -1309,10 +1473,6 @@ pub async fn handle_eviction_risk(
                     vertex_address: alloc.vertex_address.clone(),
                     effective_inactive: a.effective_inactive,
                 });
-            }
-            let risk_ratio = a.effective_inactive as f64 / threshold as f64;
-            if risk_ratio < min_ratio {
-                continue;
             }
             entries.push(EvictionRiskEntry {
                 address: hex::encode(&prover.address),
@@ -1325,12 +1485,18 @@ pub async fn handle_eviction_risk(
                 effective_inactive: a.effective_inactive,
                 eviction_threshold: threshold,
                 frames_until_eviction: threshold.saturating_sub(a.effective_inactive),
-                risk_ratio,
+                risk_ratio: a.effective_inactive as f64 / threshold as f64,
                 // Set below: past the threshold on a progressing shard AND
                 // within the shard floor.
                 eviction_pending: false,
                 shard_progressing: on_progressing_shard,
             });
+        }
+        if worst > threshold {
+            eviction_pending += 1;
+        }
+        if worst > threshold / 2 {
+            at_risk += 1;
         }
     }
     // The evictor keeps every shard at MIN_SHARD_CONSENSUS_PROVERS active
@@ -1350,12 +1516,68 @@ pub async fn handle_eviction_risk(
             .cmp(&b.frames_until_eviction)
             .then_with(|| b.effective_inactive.cmp(&a.effective_inactive))
     });
-    let (selected, total) = select_eviction_risk(entries, &selection);
-    let mut response = json_ok(&selected, None);
-    response
-        .headers_mut()
-        .insert("X-Total-Count", HeaderValue::from(total));
-    response
+    Eviction {
+        frame,
+        built_at,
+        provers_as_of_frame,
+        total_provers: provers.len() as u64,
+        by_status,
+        total_seniority,
+        eviction_pending,
+        at_risk,
+        halted: halts
+            .iter()
+            .filter(|(_, halt)| **halt == u64::MAX)
+            .map(|(filter, _)| filter.clone())
+            .collect(),
+        entries,
+    }
+}
+
+/// The eviction assessment at `frame`: the latest one when it was made at
+/// `frame` less than `PROVER_SNAPSHOT_MAX_AGE` before `now`, else a new one,
+/// which replaces it. One is made at a time: a caller needing one while
+/// another is made waits for it rather than making a second. Blocking:
+/// halts (a shards-store scan) and the prover snapshot.
+pub(crate) fn eviction_at(state: &ExplorerState, frame: u64, now: Instant) -> Arc<Eviction> {
+    let current = || {
+        state.eviction.read().clone().filter(|e| {
+            e.frame == frame && now.saturating_duration_since(e.built_at) < PROVER_SNAPSHOT_MAX_AGE
+        })
+    };
+    if let Some(eviction) = current() {
+        return eviction;
+    }
+    let _making = state.eviction_making.lock();
+    if let Some(eviction) = current() {
+        return eviction;
+    }
+    let halts = current_halts(state, frame);
+    let provers = all_provers(state, frame);
+    let eviction = Arc::new(assess_eviction(
+        frame,
+        now,
+        provers.as_ref().map(|(built, provers)| (*built, provers.as_slice())),
+        &halts,
+    ));
+    *state.eviction.write() = Some(Arc::clone(&eviction));
+    eviction
+}
+
+/// The eviction assessment a request serves: the latest one when made less
+/// than [`EVICTION_SERVE_MAX_AGE`] before `now` (the indexer's, normally a
+/// tick behind the head at most), else one made now at `frame` (see
+/// [`eviction_at`]).
+fn served_eviction(state: &ExplorerState, frame: u64, now: Instant) -> Arc<Eviction> {
+    let latest = state.eviction.read().clone();
+    match latest {
+        Some(eviction)
+            if now.saturating_duration_since(eviction.built_at) < EVICTION_SERVE_MAX_AGE =>
+        {
+            eviction
+        }
+        _ => eviction_at(state, frame, now),
+    }
 }
 
 /// One prover's seniority rank. The prover's public key is left out:
@@ -1442,6 +1664,9 @@ pub async fn handle_kicked(method: Method, State(state): State<ExplorerState>) -
 
 #[derive(Serialize)]
 struct StatsResponse {
+    /// The frame the counts below were assessed at (see [`Eviction`]): the
+    /// head, or an earlier one until the indexer assesses a new head,
+    /// normally within a tick and at most `EVICTION_SERVE_MAX_AGE` later.
     current_frame: u64,
     eviction_threshold: u64,
     total_provers: u64,
@@ -1476,55 +1701,23 @@ pub async fn handle_stats(method: Method, State(state): State<ExplorerState>) ->
         return method_not_allowed();
     }
     let frame = state.current_frame.load(Ordering::Relaxed);
-    let halts = current_halts(&state, frame);
-    let threshold = crate::EVICTION_THRESHOLD_FRAMES;
-
-    let (provers_as_of_frame, provers) = match all_provers(&state, frame) {
-        Some((built, provers)) => (Some(built), provers),
-        None => (None, Arc::new(Vec::new())),
-    };
-    let active_by_filter = active_allocations_by_filter(&provers, frame);
-    let mut by_status: BTreeMap<String, i64> = BTreeMap::new();
-    let mut total_seniority: u64 = 0;
-    let mut eviction_pending: u64 = 0;
-    let mut at_risk: u64 = 0;
-    for prover in provers.iter() {
-        *by_status
-            .entry(prover_status_to_string(prover.status))
-            .or_insert(0) += 1;
-        total_seniority = total_seniority.saturating_add(prover.seniority);
-        if prover.status == ProverStatus::Active {
-            let mut worst = 0u64;
-            for alloc in &prover.allocations {
-                if let Some(a) = assess_allocation(alloc, frame, &halts, &active_by_filter) {
-                    worst = worst.max(a.effective_inactive);
-                }
-            }
-            if worst > threshold {
-                eviction_pending += 1;
-            }
-            if worst > threshold / 2 {
-                at_risk += 1;
-            }
-        }
-    }
-    let halted_shards = halts.values().filter(|&&v| v == u64::MAX).count() as u64;
+    let eviction = served_eviction(&state, frame, Instant::now());
     let app_shards = state.production_snapshot.read().as_ref().map(|s| s.report.stats());
     let app_shard_history = state.production_history.read().stats();
 
     let response = StatsResponse {
-        current_frame: frame,
-        eviction_threshold: threshold,
-        total_provers: provers.len() as u64,
-        by_status,
-        total_seniority,
-        eviction_pending,
-        at_risk,
-        halted_shards,
+        current_frame: eviction.frame,
+        eviction_threshold: crate::EVICTION_THRESHOLD_FRAMES,
+        total_provers: eviction.total_provers,
+        by_status: eviction.by_status.clone(),
+        total_seniority: eviction.total_seniority,
+        eviction_pending: eviction.eviction_pending,
+        at_risk: eviction.at_risk,
+        halted_shards: eviction.halted.len() as u64,
         app_shards,
         app_shard_history,
-        provers_as_of_frame,
-        provers_stale: provers_as_of_frame != Some(frame),
+        provers_as_of_frame: eviction.provers_as_of_frame,
+        provers_stale: eviction.provers_as_of_frame != Some(eviction.frame),
     };
     json_ok(&response, None)
 }
@@ -1656,11 +1849,10 @@ pub(crate) fn build_production_report(
     let shard_sets = lap();
     let active = all_provers(state, head).map(|(frame, provers)| (frame, active_allocations_by_filter(&provers, head)));
     let census = lap();
-    let halted: BTreeSet<Vec<u8>> = current_halts(state, head)
-        .into_iter()
-        .filter(|(_, halt)| *halt == u64::MAX)
-        .map(|(filter, _)| filter)
-        .collect();
+    // Halts from the eviction assessment at this head, made here unless one
+    // was: one shards-store scan per head serves the report, `/stats` and
+    // `/provers/eviction-risk`.
+    let eviction = eviction_at(state, head, Instant::now());
     let halts = lap();
     let committed = committed_heads(state, &sets.grid.live);
     let committed_time = lap();
@@ -1670,7 +1862,7 @@ pub(crate) fn build_production_report(
             head_frame: head,
             grid: &sets.grid,
             active: active.as_ref().map(|(frame, active)| (*frame, active)),
-            halted: &halted,
+            halted: &eviction.halted,
             committed: &committed,
             quil: quil_str,
         },
@@ -1962,6 +2154,18 @@ pub async fn handle_token_supply(
             return build_response(StatusCode::OK, body, Some(CACHE_60));
         }
     }
+    let _scanning = if want_scan {
+        let Ok(permit) = state.token_scan.try_acquire() else {
+            return token_scan_busy();
+        };
+        // A scan that ended while this request waited for the cache read.
+        if let Some(body) = cache_get(&state, "token_supply_scan") {
+            return build_response(StatusCode::OK, body, Some(CACHE_60));
+        }
+        Some(permit)
+    } else {
+        None
+    };
 
     // Audited baseline: the migration receipt (count, Σ). Read via the canonical
     // reader so it matches how the intrinsic wrote it.
@@ -2117,6 +2321,12 @@ pub async fn handle_token_coins(
         Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
     };
     let cache_key = format!("token_coins:{}", hex::encode(owner));
+    if let Some(body) = cache_get(&state, &cache_key) {
+        return build_response(StatusCode::OK, body, Some(CACHE_60));
+    }
+    let Ok(_scanning) = state.token_scan.try_acquire() else {
+        return token_scan_busy();
+    };
     if let Some(body) = cache_get(&state, &cache_key) {
         return build_response(StatusCode::OK, body, Some(CACHE_60));
     }
@@ -2677,6 +2887,130 @@ mod tests {
     }
 
     #[test]
+    fn cache_holds_at_most_its_bound_of_live_entries() {
+        let mut cache = HashMap::new();
+        let t0 = Instant::now();
+        for n in 0..CACHE_MAX_ENTRIES + 10 {
+            cache_insert(&mut cache, t0, format!("k{n}"), vec![1]);
+        }
+        assert_eq!(cache.len(), CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key(&format!("k{}", CACHE_MAX_ENTRIES)), "a new key past the bound is not cached");
+        cache_insert(&mut cache, t0, "k0".into(), vec![2]);
+        assert_eq!(cache.get("k0").map(|(_, body)| body.clone()), Some(vec![2]), "a held key is refreshed");
+        let later = t0 + PROVER_CACHE_TTL + Duration::from_secs(1);
+        cache_insert(&mut cache, later, "fresh".into(), vec![3]);
+        assert_eq!(cache.len(), 1, "expired entries make room");
+    }
+
+    #[tokio::test]
+    async fn token_scans_run_one_at_a_time() {
+        let state = empty_state();
+        let held = state.token_scan.clone().try_acquire_owned().unwrap();
+        let owner = "11".repeat(32);
+        let coins = || handle_token_coins(Method::GET, State(state.clone()), Path(owner.clone()), Query(HashMap::new()));
+        let busy = coins().await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()["Retry-After"], TOKEN_SCAN_RETRY_SECS.to_string().as_str());
+        let scan = HashMap::from([("scan".to_string(), "1".to_string())]);
+        let supply = handle_token_supply(Method::GET, State(state.clone()), Query(scan.clone())).await;
+        assert_eq!(supply.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let plain = handle_token_supply(Method::GET, State(state.clone()), Query(HashMap::new())).await;
+        assert_eq!(plain.status(), StatusCode::OK, "the supply without a scan is not held back");
+        drop(held);
+        assert_eq!(coins().await.status(), StatusCode::OK);
+        assert_eq!(handle_token_supply(Method::GET, State(state.clone()), Query(scan)).await.status(), StatusCode::OK);
+        assert_eq!(state.token_scan.available_permits(), 1, "a finished scan returns its permit");
+    }
+
+    /// An explorer over an empty in-memory store.
+    fn empty_state() -> ExplorerState {
+        state_with_shards(&[], None)
+    }
+
+    /// An explorer over an in-memory store holding only the shard rows
+    /// `rows`, sized by `sizes` (an archive's provider).
+    fn state_with_shards(rows: &[quil_types::store::ShardInfo], sizes: Option<crate::AppShardsProvider>) -> ExplorerState {
+        use quil_types::store::{KvDb as _, ShardsStore as _};
+        let db = quil_store::RocksDb::open_in_memory().expect("an in-memory store");
+        let raw = db.inner();
+        let txn = db.new_batch(false).unwrap();
+        for row in rows {
+            quil_store::RocksShardsStore::new(raw.clone()).put_app_shard(txn.as_ref(), row).unwrap();
+        }
+        txn.commit().unwrap();
+        let hg = Arc::new(quil_store::RocksHypergraphStore::new(raw.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            hg as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(quil_tries::ShaInclusionProver),
+        ));
+        ExplorerState::new(
+            Arc::new(quil_store::RocksClockStore::new(raw.clone())),
+            crdt,
+            Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
+            Arc::new(quil_store::RocksKeyStore::new(raw.clone())),
+            Arc::new(quil_store::RocksShardsStore::new(raw)),
+            sizes,
+            None,
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(crate::RecentMessageRing::new(16)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    fn recent(time: std::time::SystemTime, from: &[u8], data: &[u8]) -> crate::RecentMessage {
+        crate::RecentMessage {
+            time,
+            from: from.to_vec().into(),
+            bitmask: vec![0xBB].into(),
+            seqno: Default::default(),
+            signature: vec![0x51, 0x47].into(),
+            key: Default::default(),
+            data: data.to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn messages_json_keeps_its_shape() {
+        let at = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 5);
+        let ring = crate::RecentMessageRing::new(4);
+        ring.record(recent(at, &[0x01, 0xAB], &[0x00, 0xFF]));
+        ring.record(recent(at, &[0x02], &[]));
+        let body = messages_body(&ring, 50, Instant::now());
+        // Newest first; hex lowercase; every field present; trailing newline.
+        let expected = concat!(
+            r#"[{"timestamp":"2023-11-14T22:13:20.000000005Z","from":"02","bitmask":"bb","seqno":"","signature":"5147","key":"","data":""},"#,
+            r#"{"timestamp":"2023-11-14T22:13:20.000000005Z","from":"01ab","bitmask":"bb","seqno":"","signature":"5147","key":"","data":"00ff"}]"#,
+            "\n"
+        );
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+        // The same bytes serde would produce for the old shape.
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value[1]["data"], "00ff");
+        // Empty ring: an empty array, as before.
+        let empty = crate::RecentMessageRing::new(4);
+        assert_eq!(&messages_body(&empty, 50, Instant::now())[..], b"[]\n");
+    }
+
+    #[test]
+    fn messages_body_is_cached_per_version_and_limit() {
+        let ring = crate::RecentMessageRing::new(8);
+        ring.push_received(&[1], &[2], &[3]);
+        let t0 = Instant::now();
+        let first = messages_body(&ring, 50, t0);
+        assert_eq!(first.as_ptr(), messages_body(&ring, 50, t0 + Duration::from_secs(30)).as_ptr());
+        // A push within the window is not shown yet; beyond it, it is.
+        ring.push_received(&[4], &[2], &[3]);
+        let soon = messages_body(&ring, 50, t0 + MESSAGES_CACHE_MAX_AGE / 2);
+        assert_eq!(first.as_ptr(), soon.as_ptr());
+        let later = messages_body(&ring, 50, t0 + MESSAGES_CACHE_MAX_AGE * 2);
+        assert_ne!(first, later);
+        assert_eq!(later.iter().filter(|b| **b == b'{').count(), 2);
+        // Another limit is not served the cached body.
+        let one = messages_body(&ring, 1, t0 + MESSAGES_CACHE_MAX_AGE * 2);
+        assert_eq!(one.iter().filter(|b| **b == b'{').count(), 1);
+    }
+
+    #[test]
     fn parse_hex_id_validation() {
         assert!(parse_hex_id("zz").is_err()); // not hex
         assert_eq!(parse_hex_id(&"ab".repeat(10)).unwrap_err(), "identifier must be 64 bytes");
@@ -2945,19 +3279,22 @@ mod tests {
                 entry("cc", "02", 200, false),
             ]
         };
-        let pick = |address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
+        let pick_at = |min_ratio: f64, address: Option<&str>, filter: Option<&str>, limit: Option<usize>| {
             let selection = EvictionRiskSelection {
+                min_ratio,
                 address: address.map(String::from),
                 filter: filter.map(String::from),
                 limit,
             };
-            let (selected, total) = select_eviction_risk(entries(), &selection);
+            let entries = entries();
+            let (selected, total) = select_eviction_risk(&entries, &selection);
             let selected = selected
                 .into_iter()
-                .map(|e| (e.address, e.filter, e.eviction_pending))
+                .map(|e| (e.address.clone(), e.filter.clone(), e.eviction_pending))
                 .collect::<Vec<_>>();
             (selected, total)
         };
+        let pick = |address: Option<&str>, filter: Option<&str>, limit: Option<usize>| pick_at(0.0, address, filter, limit);
         let rows = |r: &[(&str, &str, bool)]| {
             r.iter()
                 .map(|&(a, f, p)| (a.to_string(), f.to_string(), p))
@@ -2983,6 +3320,218 @@ mod tests {
         let (none, total) = pick(None, Some("01"), Some(0));
         assert!(none.is_empty());
         assert_eq!(total, 2);
+        // `min_ratio` leaves out lower ratios before the count; NaN none.
+        assert_eq!(
+            pick_at(0.5, None, None, Some(1)),
+            (rows(&[("aa", "01", true)]), 3)
+        );
+        assert_eq!(pick_at(f64::NAN, None, None, None).1, 4);
+    }
+
+    /// An active prover at `address` with one allocation on `filter`.
+    fn prover_on(address: u8, filter: u8, last_active: u64) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![],
+            address: vec![address],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![active_alloc(vec![filter], last_active)],
+            available_storage: 0,
+            seniority: 1,
+            delegate_address: vec![],
+        }
+    }
+
+    /// Shard 0xaa at `frame`: four members active 10 frames ago (a0..a3),
+    /// one past half the threshold (a4), one past it (a5); and a kicked
+    /// prover (b0).
+    fn assessed_provers(frame: u64) -> Vec<ProverInfo> {
+        let start = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME;
+        let mut provers: Vec<ProverInfo> = (0..4).map(|i| prover_on(0xA0 + i, 0xAA, frame - 10)).collect();
+        provers.push(prover_on(0xA4, 0xAA, frame - 200));
+        provers.push(prover_on(0xA5, 0xAA, start + 100));
+        let mut kicked = prover_on(0xB0, 0xAA, 0);
+        kicked.status = ProverStatus::Kicked;
+        kicked.allocations.clear();
+        provers.push(kicked);
+        provers
+    }
+
+    #[test]
+    fn eviction_assessment_counts_provers_and_orders_entries() {
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 5000;
+        let provers = assessed_provers(frame);
+        let halts = HashMap::from([(vec![0xBB], u64::MAX), (vec![0xCC], 50)]);
+        let e = assess_eviction(frame, Instant::now(), Some((frame - 1, provers.as_slice())), &halts);
+        assert_eq!((e.frame, e.provers_as_of_frame, e.total_provers, e.total_seniority), (frame, Some(frame - 1), 7, 7));
+        assert_eq!(e.by_status, BTreeMap::from([("active".to_string(), 6), ("kicked".to_string(), 1)]));
+        // Provers past the threshold, and past half of it.
+        assert_eq!((e.eviction_pending, e.at_risk), (1, 2));
+        assert_eq!(e.halted, BTreeSet::from([vec![0xBB]]));
+        // Most at risk first, ties in registry order; only a5 is pending:
+        // the shard keeps its floor after evicting it.
+        let order: Vec<(&str, u64, bool)> = e
+            .entries
+            .iter()
+            .map(|x| (x.address.as_str(), x.frames_until_eviction, x.eviction_pending))
+            .collect();
+        assert_eq!(
+            order,
+            [("a5", 0, true), ("a4", 160, false), ("a0", 350, false), ("a1", 350, false), ("a2", 350, false), ("a3", 350, false)]
+        );
+        assert!(e.entries.iter().all(|x| x.current_frame == frame && x.shard_progressing));
+        // Before the registry is read: placeholders, halts still counted.
+        let unread = assess_eviction(frame, Instant::now(), None, &halts);
+        assert_eq!((unread.provers_as_of_frame, unread.total_provers, unread.entries.len(), unread.halted.len()), (None, 0, 0, 1));
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stats_and_eviction_risk_serve_the_latest_assessment() {
+        let state = empty_state();
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 5000;
+        // The head moved on and the registry is empty: a request assessing
+        // for itself would read frame + 1 and no prover.
+        state.current_frame.store(frame + 1, Ordering::Relaxed);
+        let provers = assessed_provers(frame);
+        let halts = HashMap::from([(vec![0xBB], u64::MAX)]);
+        *state.eviction.write() = Some(Arc::new(assess_eviction(frame, Instant::now(), Some((frame, provers.as_slice())), &halts)));
+
+        let stats = body_json(handle_stats(Method::GET, State(state.clone())).await).await;
+        let count = |key: &str| stats[key].as_u64();
+        assert_eq!(
+            (count("current_frame"), count("total_provers"), count("eviction_pending"), count("at_risk"), count("halted_shards")),
+            (Some(frame), Some(7), Some(1), Some(2), Some(1))
+        );
+        assert_eq!((count("provers_as_of_frame"), stats["provers_stale"].as_bool()), (Some(frame), Some(false)));
+
+        let query = HashMap::from([("min_ratio".to_string(), "0.5".to_string()), ("limit".to_string(), "1".to_string())]);
+        let risk = handle_eviction_risk(Method::GET, State(state.clone()), Query(query)).await;
+        assert_eq!(risk.status(), StatusCode::OK);
+        assert_eq!(risk.headers()["X-Total-Count"], "2");
+        let risk = body_json(risk).await;
+        assert_eq!(risk.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            (risk[0]["address"].as_str(), risk[0]["eviction_pending"].as_bool(), risk[0]["current_frame"].as_u64()),
+            (Some("a5"), Some(true), Some(frame))
+        );
+
+        // An assessment made before the registry was read: 503, as before.
+        *state.eviction.write() = Some(Arc::new(assess_eviction(frame, Instant::now(), None, &halts)));
+        let unread = handle_eviction_risk(Method::GET, State(state.clone()), Query(HashMap::new())).await;
+        assert_eq!(unread.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A root row under GLOBAL's address, as an archive's shards store holds
+    /// one, is no app shard: `/provers/shards` leaves it out, sized or not.
+    #[tokio::test]
+    async fn provers_shards_leave_out_a_global_row() {
+        let row = |l2: [u8; 32], prefix: Vec<u32>| {
+            let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(&l2, 256, 3).to_vec();
+            shard_key.extend_from_slice(&l2);
+            quil_types::store::ShardInfo { shard_key, prefix, size: vec![], data_shards: 0, commitment: vec![] }
+        };
+        let quil = quil_execution::domains::QUIL_TOKEN;
+        let (global, other) = (quil_execution::domains::GLOBAL, [0xaa; 32]);
+        let rows = [row(quil, vec![0]), row(global, vec![]), row(other, vec![])];
+        let sized: crate::AppShardsProvider = Arc::new(|_: &[u8], _: &[u32]| Some((vec![1], 1, Default::default())));
+        let state = state_with_shards(&rows, Some(sized));
+        let sizes = compute_shard_sizes(&state);
+        let app = |l2: [u8; 32], prefix: &[u32]| hex::encode(quil_forest::shard_prefix_to_filter(&l2, prefix));
+        let mut keys: Vec<&String> = sizes.keys().collect();
+        keys.sort();
+        let mut expected = vec![app(quil, &[0]), app(other, &[])];
+        expected.sort();
+        assert_eq!(keys, expected.iter().collect::<Vec<_>>(), "QUIL and another app; GLOBAL out");
+        let listed = body_json(handle_prover_shards(Method::GET, State(state)).await).await;
+        let filters: Vec<&str> = listed.as_array().unwrap().iter().filter_map(|s| s["filter"].as_str()).collect();
+        assert_eq!(filters, expected.iter().map(String::as_str).collect::<Vec<_>>(), "every sized app shard, not GLOBAL");
+    }
+
+    #[test]
+    fn an_assessment_serves_until_its_age_bound_then_is_made_at_the_head() {
+        let state = empty_state();
+        let t0 = Instant::now();
+        let latest = Arc::new(assess_eviction(10, t0, None, &HashMap::new()));
+        *state.eviction.write() = Some(Arc::clone(&latest));
+        // Within the bound the latest serves, whatever the head.
+        assert!(Arc::ptr_eq(&served_eviction(&state, 12, t0 + EVICTION_SERVE_MAX_AGE / 2), &latest));
+        // Past it, one is made at the head, kept and shared at that head.
+        let later = t0 + EVICTION_SERVE_MAX_AGE;
+        let made = served_eviction(&state, 12, later);
+        assert_eq!(made.frame, 12);
+        assert!(Arc::ptr_eq(&made, &eviction_at(&state, 12, later + PROVER_SNAPSHOT_MAX_AGE / 2)));
+        assert!(Arc::ptr_eq(&made, state.eviction.read().as_ref().unwrap()));
+        // A new head is assessed anew.
+        assert_eq!(eviction_at(&state, 13, later).frame, 13);
+    }
+
+    #[test]
+    fn frame_body_is_the_round_trip_body() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
+        use quil_types::store::{RequestOutcome, RequestStatus};
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 42,
+                timestamp: 651_000,
+                output: vec![1, 2, 3],
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle::default(), MessageBundle::default()],
+        };
+        let outcomes = [
+            RequestOutcome { status: RequestStatus::Succeeded, error: String::new() },
+            RequestOutcome { status: RequestStatus::Failed, error: "no".into() },
+        ];
+        // The body as the handler built it before: protojson, parsed into a
+        // value, `requestOutcomes` added, written again.
+        let bytes = protojson::to_protojson(protojson::GLOBAL_FRAME, &frame).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "requestOutcomes".into(),
+            serde_json::json!([
+                { "status": RequestStatus::Succeeded.name(), "error": "" },
+                { "status": RequestStatus::Failed.name(), "error": "no" },
+            ]),
+        );
+        assert_eq!(frame_body(&frame, &outcomes).unwrap(), serde_json::to_vec(&v).unwrap());
+        let without = frame_body(&frame, &[]).unwrap();
+        assert!(without.windows(20).any(|w| w == b"\"requestOutcomes\":[]"));
+    }
+
+    #[test]
+    fn hyperedge_size_counts_extrinsic_ids_in_the_blob_read() {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        for key in [vec![1u8; 64], vec![2; 64], vec![3; 64], vec![4; 32]] {
+            tree.insert(&key, &[9], &[], &BigInt::from(1)).unwrap();
+        }
+        let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        // As `get_hyperedge_extrinsic_ids` lists them: the 64-byte keys.
+        let listed = tree.leaves().into_iter().filter(|(key, _)| key.len() == 64).count();
+        assert_eq!((extrinsic_count(&blob), listed), (3, 3));
+        let empty = quil_tries::serialize_go_tree(None).unwrap();
+        assert_eq!(extrinsic_count(&empty), 0);
+    }
+
+    #[test]
+    fn peer_fields_keep_what_peers_reports() {
+        let mut info = peer(Some(92), 7, true, 500, 1234);
+        info.peer_id = vec![0, 1, 2, 3];
+        info.last_received_frame = 499;
+        info.public_key = vec![5; 57];
+        info.signature = vec![6; 114];
+        info.reachability = vec![quil_p2p::CanonicalReachability {
+            filter: vec![0xAB],
+            pubsub_multiaddrs: vec!["/ip4/192.0.2.1/tcp/1".into()],
+            stream_multiaddrs: Vec::new(),
+        }];
+        let copied = peer_fields(&info);
+        assert!(copied.public_key.is_empty() && copied.signature.is_empty());
+        assert_eq!(to_str(&peer_json(&copied)), to_str(&peer_json(&info)));
     }
 
     #[test]

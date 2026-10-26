@@ -52,14 +52,9 @@ pub const BLOSSOMSUB_PROTOCOL_V2_1: &str = "/blossomsub/2.1.0";
 pub mod params {
     use std::time::Duration;
 
-    pub const D: usize = 8;
     pub const D_LO: usize = 6;
-    pub const D_HI: usize = 12;
-    pub const D_SCORE: usize = 4;
-    pub const D_OUT: usize = 2;
     pub const D_SAME: usize = 3;
     pub const D_SAME_LO: usize = 2;
-    pub const D_LAZY: usize = 6;
     // Bumped from 9/6 for WAN testnets: a peer that briefly drops
     // (NAT mapping churn, jitter, packet loss) needs the gossip
     // window long enough to discover missing messages via IHAVE
@@ -113,12 +108,7 @@ pub mod params {
 /// from the `params::*` constants.
 #[derive(Debug, Clone)]
 pub struct BlossomsubParams {
-    pub d: usize,
     pub d_lo: usize,
-    pub d_hi: usize,
-    pub d_score: usize,
-    pub d_out: usize,
-    pub d_lazy: usize,
     pub history_length: usize,
     pub history_gossip: usize,
     pub gossip_factor: f64,
@@ -129,11 +119,6 @@ pub struct BlossomsubParams {
     pub unsubscribe_backoff: std::time::Duration,
     pub iwant_followup_time: std::time::Duration,
     pub idont_want_message_threshold: usize,
-    /// Per-peer cap on cached IDONTWANT message IDs. Used to bound
-    /// the per-peer LRU that tracks which messages a remote peer has
-    /// asked us not to send. A malicious peer could otherwise
-    /// enumerate IDs and balloon our memory.
-    pub max_idont_want_messages: usize,
     /// Cap on mesh peers per IPv4 /24 (or IPv6 /48) per bitmask.
     /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
     /// `0` disables the check.
@@ -147,12 +132,7 @@ pub struct BlossomsubParams {
 impl Default for BlossomsubParams {
     fn default() -> Self {
         Self {
-            d: params::D,
             d_lo: params::D_LO,
-            d_hi: params::D_HI,
-            d_score: params::D_SCORE,
-            d_out: params::D_OUT,
-            d_lazy: params::D_LAZY,
             history_length: params::HISTORY_LENGTH,
             history_gossip: params::HISTORY_GOSSIP,
             gossip_factor: params::GOSSIP_FACTOR,
@@ -163,7 +143,6 @@ impl Default for BlossomsubParams {
             unsubscribe_backoff: params::UNSUBSCRIBE_BACKOFF,
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
-            max_idont_want_messages: 5000,
             mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
         }
@@ -188,12 +167,7 @@ impl BlossomsubParams {
             }
         };
         Self {
-            d: pos(cfg.d, d.d),
             d_lo: pos(cfg.d_lo, d.d_lo),
-            d_hi: pos(cfg.d_hi, d.d_hi),
-            d_score: pos(cfg.d_score, d.d_score),
-            d_out: pos(cfg.d_out, d.d_out),
-            d_lazy: pos(cfg.d_lazy, d.d_lazy),
             history_length: pos(cfg.history_length, d.history_length),
             history_gossip: pos(cfg.history_gossip, d.history_gossip),
             gossip_factor: if cfg.gossip_factor > 0.0 {
@@ -214,11 +188,6 @@ impl BlossomsubParams {
                 cfg.idont_want_message_threshold as usize
             } else {
                 d.idont_want_message_threshold
-            },
-            max_idont_want_messages: if cfg.max_idont_want_messages > 0 {
-                cfg.max_idont_want_messages as usize
-            } else {
-                d.max_idont_want_messages
             },
             // No P2PConfig field yet — operators tune via `set_params`
             // post-build if they need to. Default protects against

@@ -733,6 +733,7 @@ pub struct CommittedView {
 
 impl CommittedView {
     pub fn capture(crdt: &Arc<quil_hypergraph::HypergraphCrdt>) -> Result<Self> {
+        let _probe = quil_types::thread_probe::section(quil_types::thread_probe::Section::GlobalViewCapture);
         HypergraphState::new(crdt.clone())
             .require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
         let snapshot = crdt.capture_committed_snapshot()?;

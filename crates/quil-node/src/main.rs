@@ -64,6 +64,7 @@ mod master_node;
 mod clock_retention;
 
 mod mem_stats;
+mod storage_watch;
 
 mod metrics_tui;
 mod rpc_metrics;
@@ -397,7 +398,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
 
     // Load configuration first so logger paths / filters come from it.
-    let config = quil_config::load_config(&args.config)?;
+    let (config, config_notices) = quil_config::load_config_with_notices(&args.config)?;
     // Token proof worker settings fail fast, before any store opens.
     config
         .proof_worker
@@ -489,11 +490,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         let ed_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
         let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed_pub);
         // Ensure the BLS prover key (auto-created if missing), read full pubkey.
-        let keys_path = if cfg.key.key_store_file.path.is_empty() {
-            args.config.join("keys.yml")
-        } else {
-            PathBuf::from(&cfg.key.key_store_file.path)
-        };
+        let keys_path = quil_keys::resolve_keystore_path(&cfg.key.key_store_file, &args.config)?;
         let proving_key_id = if cfg.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {
@@ -537,11 +534,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // or starting the node. Used to bootstrap a node's consensus identity for a
     // committee list.
     if args.generate_keys {
-        let keys_path = if config.key.key_store_file.path.is_empty() {
-            args.config.join("keys.yml")
-        } else {
-            PathBuf::from(&config.key.key_store_file.path)
-        };
+        let keys_path =
+            quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)?;
         let proving_key_id = if config.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {
@@ -738,6 +732,22 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     );
 
     info!(config_dir = %args.config.display(), "loaded configuration");
+    // The master reports, once, config keys the node does not know, the
+    // settings of earlier releases and, on mainnet, a configured bootstrap
+    // list that the built-in one replaced.
+    if args.core == 0 {
+        if let Some(line) = config_notices.unknown_keys_line() {
+            warn!("{line}");
+        }
+        if let Some(line) = config_notices.retired_keys_line() {
+            info!("{line}");
+        }
+        if args.network == 0 {
+            if let Some(line) = config_notices.bootstrap_peers_line() {
+                info!("{line}");
+            }
+        }
+    }
 
     // Before any shard engine runs: shard frames anchored below this frame
     // relay nothing, as the mainnet build that made them did.

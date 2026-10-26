@@ -116,6 +116,15 @@ impl ProbeFailure {
         matches!(self, ProbeFailure::DialError | ProbeFailure::Timeout)
     }
 
+    /// What the failure tells the address tracker.
+    pub(crate) fn miss(self) -> crate::external_addr::ProbeMiss {
+        if self.unreachable_class() {
+            crate::external_addr::ProbeMiss::Unreachable
+        } else {
+            crate::external_addr::ProbeMiss::Inconclusive
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ProbeFailure::NoServer => "no_server",
@@ -246,8 +255,8 @@ impl Run {
                 "a server could not dial this node back; waiting for servers on other IPs"
             }
             ProbeFailure::DialRefused => {
-                "servers refused to dial back (their rate limits, or they see this node at a \
-                 non-public address); report this line if it persists"
+                "servers declined to dial back, usually at their own connection or rate limits; \
+                 expected now and then, no action needed"
             }
             ProbeFailure::DialFailure => {
                 "the chosen servers could not be dialed; check this node's outbound connectivity \
@@ -441,6 +450,12 @@ impl AutonatHealth {
         notice
     }
 
+    /// The failure counts of the probes since the last dial-back
+    /// (`dial_error=6`), `none` when the latest probe brought one.
+    pub(crate) fn run_failures(&self) -> String {
+        self.run.as_ref().map_or_else(|| "none".to_string(), |run| run.failures.to_string())
+    }
+
     /// AutoNAT's view for the PeerInfo publisher.
     pub(crate) fn summary(&self, nat: &NatStatus) -> AutonatSummary {
         AutonatSummary {
@@ -465,6 +480,13 @@ pub(crate) struct ProbeContext {
     /// Addresses in the latest probe request.
     pub(crate) addresses_sent: usize,
     pub(crate) confidence: usize,
+}
+
+/// Whether a failing-probes line is a warning: a repeat, unless servers
+/// mostly declined to dial back, which they do at their own connection
+/// limits and which tells nothing about this node.
+fn failing_is_warning(repeat: bool, dominant: ProbeFailure) -> bool {
+    repeat && dominant != ProbeFailure::DialRefused
 }
 
 /// Log `notice`. These lines concern this node's own reachability.
@@ -502,8 +524,10 @@ pub(crate) fn log(notice: &AutonatNotice, ctx: &ProbeContext) {
                     )
                 };
             }
-            if *repeat {
+            if failing_is_warning(*repeat, *dominant) {
                 failing!(warn, "AutoNAT probes of this node are still failing")
+            } else if *repeat {
+                failing!(info, "AutoNAT probes of this node are still failing")
             } else {
                 failing!(info, "AutoNAT probes of this node are failing")
             }
@@ -692,6 +716,24 @@ mod tests {
         }
     }
 
+    /// Declined dial-backs are routine: never a warning, and no request to
+    /// report them.
+    #[test]
+    fn declined_dial_backs_are_not_a_warning() {
+        assert!(!failing_is_warning(false, DialRefused));
+        assert!(!failing_is_warning(true, DialRefused));
+        assert!(failing_is_warning(true, Timeout));
+        assert!(!failing_is_warning(false, Timeout));
+        let mut health = AutonatHealth::new(Instant::now());
+        let notice = (0..3).find_map(|_| health.on_failure(DialRefused, ip("192.0.2.1"), Instant::now()));
+        match notice {
+            Some(AutonatNotice::Failing { hint, .. }) => {
+                assert!(hint.contains("no action needed") && !hint.contains("report"), "{hint}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// `no_server` and `no_addresses` abort before a request: they are no
     /// probes, and open a run only when no request goes out at all.
     #[test]
@@ -794,5 +836,33 @@ mod tests {
             health.on_status_changed(&NatStatus::Private, at(2_100)),
             Some(AutonatNotice::StatusChanged { old: "public", new: "private", suppressed_flips: 0, .. })
         ));
+    }
+
+    /// The hold lines carry the failures since the last dial-back.
+    #[test]
+    fn run_failures_count_the_probes_since_the_last_dial_back() {
+        let t0 = Instant::now();
+        let mut health = AutonatHealth::new(t0);
+        assert_eq!(health.run_failures(), "none");
+        health.on_failure(DialError, ip("192.0.2.1"), t0);
+        health.on_failure(DialError, ip("192.0.2.2"), t0);
+        health.on_failure(Timeout, ip("192.0.2.3"), t0);
+        assert_eq!(health.run_failures(), "dial_error=2 timeout=1");
+        health.on_success(t0);
+        assert_eq!(health.run_failures(), "none");
+    }
+
+    /// Only a server's failed or timed-out dial-back counts against an
+    /// address.
+    #[test]
+    fn only_failed_dial_backs_count_against_an_address() {
+        use crate::external_addr::ProbeMiss;
+        for class in CLASSES {
+            let expected = match class {
+                DialError | Timeout => ProbeMiss::Unreachable,
+                _ => ProbeMiss::Inconclusive,
+            };
+            assert_eq!(class.miss(), expected, "{class:?}");
+        }
     }
 }

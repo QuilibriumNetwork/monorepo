@@ -530,6 +530,8 @@ message GlobalAlert {
 message GetGlobalFrameRequest {
   uint64 frame_number = 1;
   bool historical_anchor = 2; // a worker asks its own master for a historical header, from an archive if not held
+  bool header_only = 3; // the header alone, without request bundles; a server predating this field sends the whole frame
+  uint64 if_newer_than = 4; // with frame_number 0: the header alone while the latest frame is numbered at or below this; a server predating this field sends the whole frame
 }
 
 message GlobalFrameResponse {

@@ -26,7 +26,6 @@ target/
 **/target/
 node/build/
 crates/quil-client/build/
-node/.vscode/
 .git
 .gitignore
 
@@ -35,7 +34,6 @@ node/.vscode/
 **/.config*
 vdf/generated/
 bls48581/generated/
-ferret/generated/
 sidecar/generated/
 verenc/generated/
 

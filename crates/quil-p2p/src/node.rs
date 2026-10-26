@@ -18,6 +18,10 @@ use quil_types::error::QuilError;
 
 use crate::blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent};
 
+/// How often the swarm logs what it did with other nodes' AutoNAT dial-back
+/// requests, when it did anything.
+const AUTONAT_SERVER_SUMMARY_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// A received message from the network.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
@@ -609,6 +613,7 @@ impl P2PNode {
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
+            let mut autonat_server_summary_at = std::time::Instant::now();
             // Throttle NeedPeers-driven Kademlia discovery. BlossomSub
             // can fire `NeedPeers` repeatedly when the mesh is short
             // of peers (bootstrap, partition, sustained churn); each
@@ -631,6 +636,28 @@ impl P2PNode {
                         break;
                     }
                     _ = discovery_timer.tick() => {
+                        // Other nodes' AutoNAT dial-back requests: one line
+                        // per hour, only when there were any.
+                        let summary_secs = autonat_server_summary_at.elapsed();
+                        if summary_secs >= AUTONAT_SERVER_SUMMARY_EVERY {
+                            autonat_server_summary_at = std::time::Instant::now();
+                            let stats = swarm.behaviour_mut().autonat.take_server_stats();
+                            if !stats.is_empty() {
+                                tracing::info!(
+                                    interval_secs = summary_secs.as_secs(),
+                                    served = stats.served,
+                                    failed = stats.failed,
+                                    refused = stats.refused.values().sum::<u32>(),
+                                    refused_by_reason = %stats.refused_by_reason(),
+                                    request_failures = stats.request_failures,
+                                    "AutoNAT dial-back requests of other nodes this node handled: served \
+                                     reached the requester, failed reached none of its addresses, refused \
+                                     were declined by this node (denied: this node's connection limits, \
+                                     usually two connections already held to the requester; throttled: \
+                                     rate limits); background work for the network, no action needed"
+                                );
+                            }
+                        }
                         // Keep operator-configured direct peers (e.g. the
                         // genesis global archives) connected at all times.
                         // Unlike bootstrap re-dial, this is gated only on
@@ -818,6 +845,7 @@ impl P2PNode {
                                 let applied = external_tracker.apply(
                                     crate::external_addr::ExternalAddrEvent::Expired(&address),
                                     &swarm.behaviour().autonat.nat_status(),
+                                    std::time::Instant::now(),
                                 );
                                 debug!(%address, ?applied, "external address expired");
                                 publish_external(
@@ -985,22 +1013,23 @@ impl P2PNode {
                                                 ip: probe_servers.ip_of_server(peer),
                                             };
                                             (
-                                                Some(ExternalAddrEvent::Probe(Some((address, server)))),
+                                                Some(ExternalAddrEvent::Confirmed(address, server)),
                                                 autonat_health.on_success(now),
                                             )
                                         }
                                         OutboundProbeEvent::Error { peer, error, .. } => {
                                             let server_ip = peer.as_ref().and_then(|p| probe_servers.ip_of_server(p));
+                                            let failure = ProbeFailure::of(error);
                                             (
-                                                Some(ExternalAddrEvent::Probe(None)),
-                                                autonat_health.on_failure(ProbeFailure::of(error), server_ip, now),
+                                                Some(ExternalAddrEvent::Failed(failure.miss())),
+                                                autonat_health.on_failure(failure, server_ip, now),
                                             )
                                         }
                                     };
                                     if let Some(event) = event {
                                         // The status already reflects this probe.
                                         let nat = swarm.behaviour().autonat.nat_status();
-                                        let applied = external_tracker.apply(event, &nat);
+                                        let applied = external_tracker.apply(event, &nat, now);
                                         debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
                                         publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
                                         let owed = autonat_health.flush_status(&nat, now);
@@ -1015,8 +1044,11 @@ impl P2PNode {
                                 NodeBehaviourEvent::Autonat(
                                     libp2p::autonat::Event::StatusChanged { old, new }
                                 ) => {
-                                    let applied = external_tracker
-                                        .apply(crate::external_addr::ExternalAddrEvent::StatusChanged, &new);
+                                    let applied = external_tracker.apply(
+                                        crate::external_addr::ExternalAddrEvent::StatusChanged,
+                                        &new,
+                                        std::time::Instant::now(),
+                                    );
                                     debug!(?old, ?new, ?applied, "AutoNAT status changed");
                                     if let Some(notice) =
                                         autonat_health.on_status_changed(&new, std::time::Instant::now())
@@ -1781,16 +1813,27 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
-/// Publish the confirmed addresses with AutoNAT's current view, when either
-/// changed, and log the tracker's pending-move lines.
+/// Drop the addresses no dial-back confirmed for too long, publish the
+/// confirmed addresses with AutoNAT's current view when either changed, and
+/// log the tracker's pending-move and hold lines. Runs after every AutoNAT
+/// event, so an address goes at the first probe past its window.
 fn publish_external(
     tx: &tokio::sync::watch::Sender<ConfirmedExternalAddrs>,
     tracker: &mut ExternalAddrTracker,
     health: &AutonatHealth,
     nat: &libp2p::autonat::NatStatus,
 ) {
-    for notice in tracker.pending_notices(std::time::Instant::now()) {
+    let now = std::time::Instant::now();
+    tracker.expire_unconfirmed(now);
+    for notice in tracker.pending_notices(now) {
         crate::external_addr::log_pending(&notice);
+    }
+    for notice in tracker.hold_notices() {
+        crate::external_addr::log_hold(
+            &notice,
+            crate::autonat_health::status_str(nat),
+            &health.run_failures(),
+        );
     }
     let next = ConfirmedExternalAddrs { autonat: health.summary(nat), ..tracker.snapshot() };
     tx.send_if_modified(|current| {

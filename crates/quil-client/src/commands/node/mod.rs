@@ -46,6 +46,13 @@ pub enum NodeCommand {
         command: log::LogCommand,
     },
     /// Print node info (runs the node binary's `--node-info`).
+    ///
+    /// The node binary is `quilibrium-node` on PATH, as `qclient node link`
+    /// sets it up; else the release file beside this qclient, named like it
+    /// (`qclient-2.1.0.25-linux-amd64` runs `node-2.1.0.25-linux-amd64`);
+    /// else the one `node-<version>-<os>-<arch>` file in the current
+    /// directory. Run it from the node directory when the node runs from
+    /// there.
     Info {
         /// Config name (defaults to the resolved default config).
         config: Option<String>,
@@ -147,12 +154,13 @@ fn info(global: GlobalArgs, config: Option<&str>) -> anyhow::Result<()> {
         Some(name) if name != "default" => crate::system::node_config_home_dir()?.join(name),
         _ => crate::nodeconfig::default_node_config_dir(network)?,
     };
-    let output = std::process::Command::new(crate::system::NODE_SERVICE_NAME)
+    let node = crate::system::node_binary()?;
+    let output = std::process::Command::new(&node)
         .arg("--node-info")
         .arg("--config")
         .arg(&dir)
         .output()
-        .map_err(|e| anyhow::anyhow!("run {}: {e}", crate::system::NODE_SERVICE_NAME))?;
+        .map_err(|e| anyhow::anyhow!("run {}: {e}", node.display()))?;
     std::io::Write::write_all(&mut std::io::stdout(), &output.stdout)?;
     if !output.status.success() {
         std::io::Write::write_all(&mut std::io::stderr(), &output.stderr)?;

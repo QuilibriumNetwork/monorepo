@@ -127,7 +127,19 @@ impl OverlayDbSnapshot {
             row: None,
             failure: None,
             bounds: None,
+            fixed_bounds: false,
         }
+    }
+
+    /// A cursor whose every seek stays within `[lower, upper)`, rather than
+    /// widening to the whole schema tag of the sought key, and whose reverse
+    /// steps never look below the lowest stored key in it (see
+    /// [`OverlayReadView::floor_guarded_cursor`]).
+    pub(crate) fn raw_iterator_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> OverlayRawCursor {
+        let mut cursor = self.raw_iterator();
+        cursor.bounds = Some((lower, upper));
+        cursor.fixed_bounds = true;
+        cursor
     }
 }
 
@@ -139,6 +151,9 @@ pub(crate) struct OverlayRawCursor {
     row: Option<(Vec<u8>, Vec<u8>)>,
     failure: Option<String>,
     bounds: Option<(Vec<u8>, Vec<u8>)>,
+    /// Seeks keep `bounds` instead of taking the sought key's schema tag, and
+    /// read through a floor-guarded cursor.
+    fixed_bounds: bool,
 }
 
 impl OverlayRawCursor {
@@ -177,7 +192,7 @@ impl OverlayRawCursor {
     fn position(&mut self, key: &[u8], reverse: bool, inclusive: bool, new_bounds: bool) {
         self.row = None;
         self.failure = None;
-        if new_bounds {
+        if new_bounds && !self.fixed_bounds {
             match key.first().copied() {
                 Some(tag) if tag < 0xff => self.bounds = Some((vec![tag], vec![tag + 1])),
                 _ => {
@@ -194,7 +209,12 @@ impl OverlayRawCursor {
                 .bounds
                 .as_ref()
                 .ok_or_else(|| error("missing tentative scan bounds"))?;
-            let mut cursor = view.cursor(lower, upper).map_err(error)?;
+            let mut cursor = if self.fixed_bounds {
+                view.floor_guarded_cursor(lower, upper)
+            } else {
+                view.cursor(lower, upper)
+            }
+            .map_err(error)?;
             if reverse {
                 cursor.seek_for_prev(key).map_err(error)?;
             } else {
@@ -463,6 +483,108 @@ impl PageSnapshot for OverlayDbSnapshot {
     fn raw_cursor(&self) -> Self::Cursor<'_> {
         self.raw_iterator()
     }
+}
+
+/// Source of cursors bounded to one key range on either backend. RocksDB
+/// applies `iterate_upper_bound` inside each table file's iterator, so a
+/// forward seek stops at `upper` however many deleted records in table
+/// files follow it; a memtable iterator checks no bound. A reverse step
+/// does not stop at `iterate_lower_bound`: having landed on a key, it reads
+/// on to the next key below, and its merging iterator steps back over each
+/// record a range tombstone deleted but an older snapshot still pins, one
+/// at a time, before the lower bound is checked. Landing on the lowest
+/// visible key in range, or finding none, walks every such record below.
+/// See [`newest_version_within`].
+pub(crate) trait BoundedCursorSource {
+    /// Whether a reverse seek never looks below the lowest key in the
+    /// cursor's range: true of an execution overlay's floor-guarded
+    /// cursors, false of RocksDB's.
+    const REVERSE_SEEK_BOUNDED: bool;
+    type Cursor<'a>: PageCursor
+    where
+        Self: 'a;
+    fn cursor_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> Self::Cursor<'_>;
+}
+
+fn bounded_read_options(lower: Vec<u8>, upper: Vec<u8>) -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    options.set_iterate_lower_bound(lower);
+    options.set_iterate_upper_bound(upper);
+    options
+}
+
+impl BoundedCursorSource for quil_forest::CoordinatedDb {
+    const REVERSE_SEEK_BOUNDED: bool = false;
+    type Cursor<'a>
+        = rocksdb::DBRawIterator<'a>
+    where
+        Self: 'a;
+    fn cursor_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> Self::Cursor<'_> {
+        self.raw_iterator_opt(bounded_read_options(lower, upper))
+    }
+}
+impl BoundedCursorSource for rocksdb::SnapshotWithThreadMode<'_, rocksdb::DB> {
+    const REVERSE_SEEK_BOUNDED: bool = false;
+    type Cursor<'a>
+        = rocksdb::DBRawIterator<'a>
+    where
+        Self: 'a;
+    fn cursor_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> Self::Cursor<'_> {
+        self.raw_iterator_opt(bounded_read_options(lower, upper))
+    }
+}
+impl BoundedCursorSource for OverlayDb {
+    const REVERSE_SEEK_BOUNDED: bool = true;
+    type Cursor<'a>
+        = OverlayRawCursor
+    where
+        Self: 'a;
+    fn cursor_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> Self::Cursor<'_> {
+        self.snapshot().raw_iterator_within(lower, upper)
+    }
+}
+impl BoundedCursorSource for OverlayDbSnapshot {
+    const REVERSE_SEEK_BOUNDED: bool = true;
+    type Cursor<'a>
+        = OverlayRawCursor
+    where
+        Self: 'a;
+    fn cursor_within(&self, lower: Vec<u8>, upper: Vec<u8>) -> Self::Cursor<'_> {
+        self.raw_iterator_within(lower, upper)
+    }
+}
+
+/// The largest key in `[lower, last]` and its value. On RocksDB, forward
+/// steps find it unless the range holds two or more keys, and only then a
+/// reverse seek, which lands at or above the second key, so the key below
+/// that it reads on to is the vertex's own. An execution overlay's
+/// floor-guarded cursor makes that distinction on its captured database
+/// itself, so it reverse-seeks at once and its read budget records only
+/// the newest version.
+pub(crate) fn newest_version_within<S: BoundedCursorSource>(
+    source: &S,
+    lower: &[u8],
+    last: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    fn row(cursor: &impl PageCursor) -> Option<(Vec<u8>, Vec<u8>)> {
+        cursor.key().zip(cursor.value()).map(|(k, v)| (k.to_vec(), v.to_vec()))
+    }
+    let mut upper = last.to_vec();
+    upper.push(0);
+    let mut cursor = source.cursor_within(lower.to_vec(), upper);
+    if !S::REVERSE_SEEK_BOUNDED {
+        cursor.seek(lower);
+        cursor.status()?;
+        let Some(first) = row(&cursor) else { return Ok(None) };
+        cursor.next();
+        cursor.status()?;
+        if !cursor.valid() {
+            return Ok(Some(first));
+        }
+    }
+    cursor.seek_for_prev(last);
+    cursor.status()?;
+    Ok(row(&cursor))
 }
 
 impl PageCursor for rocksdb::DBRawIterator<'_> {

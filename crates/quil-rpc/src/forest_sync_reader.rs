@@ -41,7 +41,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<T, ArchiveClientError>>,
 {
-    retry_forest_read_within(BUSY_RETRY_FOR, request).await
+    retry_forest_read_within(BUSY_RETRY_FOR, TIMEOUT_RETRIES, request).await
 }
 
 /// [`ArchiveClient::get_forest_head`], retrying while the archive is busy.
@@ -73,6 +73,7 @@ pub async fn resolve_forest_root(
 
 async fn retry_forest_read_within<T, F, Fut>(
     busy_for: Duration,
+    timeout_retries: usize,
     mut request: F,
 ) -> std::result::Result<T, ArchiveClientError>
 where
@@ -89,7 +90,7 @@ where
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
-            Err(e) if e.is_timeout() && timeouts < TIMEOUT_RETRIES => {
+            Err(e) if e.is_timeout() && timeouts < timeout_retries => {
                 timeouts += 1;
                 tracing::debug!(timeouts, error = %e, "archive read outran its deadline; sending it again");
                 tokio::time::sleep(backoff).await;
@@ -105,6 +106,12 @@ where
 
 /// Fetch `keys` with `fetch` in batches of `REMOTE_BATCH_KEYS`, several in
 /// flight, each batch re-requested from where a partial answer stopped.
+///
+/// A request that outruns its deadline is sent again with half as many keys,
+/// down to one, and the batches of this fetch keep the smaller size: a link
+/// too slow for a full batch's answer (up to the archive's byte cap) within
+/// the client deadline otherwise fails every attempt the same way. Only a
+/// single-key request is sent again at the same size.
 pub async fn fetch_in_batches<K, V, F, Fut>(keys: Vec<K>, fetch: F) -> std::result::Result<Vec<V>, ArchiveClientError>
 where
     K: Clone + Send,
@@ -112,15 +119,27 @@ where
     Fut: Future<Output = std::result::Result<Vec<V>, ArchiveClientError>>,
 {
     let chunks: Vec<Vec<K>> = keys.chunks(REMOTE_BATCH_KEYS).map(<[K]>::to_vec).collect();
+    let batch_keys = std::sync::atomic::AtomicUsize::new(REMOTE_BATCH_KEYS);
+    let batch_keys = &batch_keys;
     let answers: Vec<Vec<V>> = stream::iter(chunks)
         .map(|chunk| {
             let fetch = fetch.clone();
             async move {
                 let mut answered = Vec::with_capacity(chunk.len());
                 while answered.len() < chunk.len() {
-                    let rest = chunk[answered.len()..].to_vec();
-                    let part = retry_forest_read(|| fetch(rest.clone())).await?;
-                    if part.is_empty() || part.len() > rest.len() {
+                    let rest = &chunk[answered.len()..];
+                    let size = batch_keys.load(std::sync::atomic::Ordering::Relaxed).min(rest.len());
+                    let ask = rest[..size].to_vec();
+                    let retries = if size == 1 { TIMEOUT_RETRIES } else { 0 };
+                    let part = match retry_forest_read_within(BUSY_RETRY_FOR, retries, || fetch(ask.clone())).await {
+                        Err(e) if e.is_timeout() && size > 1 => {
+                            batch_keys.fetch_min(size / 2, std::sync::atomic::Ordering::Relaxed);
+                            tracing::debug!(keys = size / 2, error = %e, "batched archive read outran its deadline; asking for fewer keys");
+                            continue;
+                        }
+                        other => other?,
+                    };
+                    if part.is_empty() || part.len() > ask.len() {
                         return Err(ArchiveClientError::MissingField("batched forest read answered nothing"));
                     }
                     answered.extend(part);
@@ -442,11 +461,48 @@ mod tests {
         assert!(refused.unwrap_err().is_unimplemented());
     }
 
+    /// A link too slow for a full batch within the deadline still completes:
+    /// requests shrink after a timeout, later batches keep the smaller size,
+    /// and answers come back in request order.
+    #[tokio::test]
+    async fn timed_out_batches_are_asked_again_with_fewer_keys() {
+        let timeout = || ArchiveClientError::Rpc(tonic::Status::cancelled("Timeout expired"));
+        let largest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let timeouts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let keys: Vec<u32> = (0..(REMOTE_BATCH_KEYS as u32 * 6 + 5)).collect();
+        let fetch = {
+            let (largest, timeouts) = (largest.clone(), timeouts.clone());
+            move |chunk: Vec<u32>| {
+                let (largest, timeouts) = (largest.clone(), timeouts.clone());
+                async move {
+                    // The link answers at most 40 keys within the deadline.
+                    if chunk.len() > 40 {
+                        timeouts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Err(timeout());
+                    }
+                    largest.fetch_max(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                    Ok(chunk.into_iter().map(|k| k * 2).collect::<Vec<_>>())
+                }
+            }
+        };
+        let answers = fetch_in_batches(keys.clone(), fetch).await.unwrap();
+        assert_eq!(answers, keys.iter().map(|k| k * 2).collect::<Vec<_>>());
+        assert_eq!(largest.load(std::sync::atomic::Ordering::SeqCst), REMOTE_BATCH_KEYS / 8);
+        // 256 → 128 → 64 → 32: three halvings, a few more from the batches
+        // already in flight, not one per batch.
+        assert!(timeouts.load(std::sync::atomic::Ordering::SeqCst) <= 3 * REMOTE_BATCHES_IN_FLIGHT);
+
+        let stuck: std::result::Result<Vec<u32>, _> = fetch_in_batches(vec![1u32, 2], move |_chunk: Vec<u32>| async move {
+            Err::<Vec<u32>, _>(timeout())
+        }).await;
+        assert!(stuck.unwrap_err().is_timeout(), "a link that answers not even one key gives up");
+    }
+
     /// An archive that stays busy is given up on after a while, so the sync
     /// can move to another archive.
     #[tokio::test]
     async fn a_persistently_busy_archive_is_given_up_on() {
-        let result = retry_forest_read_within(Duration::from_millis(300), || async { Err::<(), _>(busy()) }).await;
+        let result = retry_forest_read_within(Duration::from_millis(300), TIMEOUT_RETRIES, || async { Err::<(), _>(busy()) }).await;
         assert!(result.unwrap_err().is_busy());
     }
 }

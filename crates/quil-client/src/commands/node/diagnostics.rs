@@ -93,7 +93,10 @@ pub enum DiagnosticsCommand {
     /// exceeds its maxBundleBytes. A target that writes no log files, or
     /// runs an older release, leaves it to its operator, who reviews a
     /// redacted preview first. With --filter only lines mentioning those
-    /// shard filters are exported, plus every warn and error line.
+    /// shard filters are exported, plus every warn and error line. The
+    /// answer states how many of the target's requestsPerDay are left to
+    /// this requester in the last 24 h and, once none are, when the next
+    /// request is possible; a target of an earlier release states neither.
     ///
     /// The target sees the IP address you connect from; use a network you
     /// are willing to reveal. With --identity <file> (from `qclient
@@ -531,6 +534,10 @@ fn row(worker: &WorkerHealth, now: u64) -> [String; 11] {
     ]
 }
 
+/// The report's line for a master store that refuses writes.
+const MASTER_STORE_WRITE_FAILED: &str = "Master store stopped writing (a failed write, or free space below the \
+    floor): this node cannot follow GLOBAL until the store is reopened.";
+
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
@@ -547,6 +554,9 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
         report.global_head_frame,
         report.workers.len()
     );
+    if report.master_store_write_failed {
+        let _ = writeln!(out, "{MASTER_STORE_WRITE_FAILED}");
+    }
     if report.workers.is_empty() {
         let _ = writeln!(out, "No data workers reported.");
         return out;
@@ -625,6 +635,7 @@ mod tests {
             generated_unix_ms: NOW,
             workers,
             omitted_workers,
+            master_store_write_failed: false,
         }
     }
 
@@ -729,6 +740,16 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let text = render_report("this node", &report(vec![seat], 0));
         assert!(text.lines().nth(2).unwrap().starts_with("  12  yes    wait   awaiting a committee seat (by frame 919440)  "),
             "{text}");
+    }
+
+    #[test]
+    fn a_master_store_refusing_writes_is_named() {
+        let mut latched = report(Vec::new(), 0);
+        latched.master_store_write_failed = true;
+        let text = render_report("this node", &latched);
+        assert_eq!(text.lines().nth(1), Some(MASTER_STORE_WRITE_FAILED), "{text}");
+        assert!(MASTER_STORE_WRITE_FAILED.contains("free space below the floor"), "{MASTER_STORE_WRITE_FAILED}");
+        assert!(!render_report("this node", &report(Vec::new(), 0)).contains("Master store"));
     }
 
     #[test]

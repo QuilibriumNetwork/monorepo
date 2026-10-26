@@ -994,6 +994,14 @@ pub trait ProverRegistry: Send + Sync {
     /// isolated execution context. Custom registries must opt in explicitly.
     fn as_any(&self) -> Option<&dyn std::any::Any> { None }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>>;
+    /// Whether the registry holds the store's contents yet. A node loads its
+    /// canonical registry in the background at startup and reads it empty
+    /// until then; a reader whose decision outlasts the read (releasing
+    /// workers, say) checks this first. Registries filled when built are
+    /// loaded from the start.
+    fn initial_load_complete(&self) -> bool {
+        true
+    }
     /// Capture the inputs used by lifecycle planning. Concurrent production
     /// registries must override this to capture all fields under one read lock.
     /// The compatibility implementation retains sequential getter semantics

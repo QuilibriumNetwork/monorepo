@@ -423,7 +423,199 @@ fn rows_are_bounded_and_small() {
     }
     assert_eq!((rows.len(), rows.stats().first_row_frame), (HISTORY_ROWS, Some(6 * 60)), "the oldest are dropped");
     assert!(std::mem::size_of::<Row>() <= 256, "{} bytes", std::mem::size_of::<Row>());
-    assert!(rows.holds_all(6 * 60, 100 * 60) && !rows.holds_all(60, 100 * 60) && rows.holds_all(120, 60));
+    assert_eq!(
+        (rows.missing_run(6 * 60, 100 * 60), rows.missing_run(60, 100 * 60), rows.missing_run(120, 60)),
+        (None, Some((60, 300)), None)
+    );
+}
+
+#[test]
+fn the_backfill_plans_only_runs_of_rows_not_held() {
+    let mut rows = Rows::default();
+    for frame in [120, 180, 360, 420] {
+        rows.insert(row(frame, 1, true, None));
+    }
+    assert_eq!(rows.missing_run(60, 480), Some((480, 480)));
+    assert_eq!(rows.missing_run(60, 420), Some((240, 300)), "the newest run below the held rows");
+    assert_eq!(rows.missing_run(60, 180), Some((60, 60)));
+    assert_eq!(rows.missing_run(120, 180), None);
+    assert_eq!(rows.missing_run(240, 300), Some((240, 300)));
+    assert_eq!((rows.count(60, 480), rows.count(480, 60)), (4, 0));
+    rows.forget_below(360);
+    assert_eq!((rows.len(), rows.stats().first_row_frame), (2, Some(360)));
+}
+
+/// Rows a complete backfill below `head` records over the test chain.
+fn backfilled(head: u64) -> RwLock<Rows> {
+    let chain = Chain::new(head);
+    let rows = RwLock::new(Rows::default());
+    let mut plan = Backfill::new(head, Some(1), None, DECODERS);
+    while !plan.is_done() {
+        plan.step(&chain, u64::MAX, &mut past_grace, &rows);
+    }
+    rows
+}
+
+/// Rows over the test chain's frames 2500 (never stored) and 2600 (without
+/// outcomes), stepped over past the grace, are not final.
+const NOT_FINAL: std::ops::RangeInclusive<u64> = 2_520..=3_540;
+
+#[test]
+fn a_row_is_final_once_no_stepped_over_frame_is_within_its_lead() {
+    let head = 4_200;
+    let chain = Chain::new(head);
+    let mut idx = ProductionIndex::new(1, DECODERS);
+    let mut provisional = Vec::new();
+    while idx.indexed_through() != Some(head) {
+        let target = advance_target(&idx, head);
+        idx.advance(&chain, target, u64::MAX, &mut past_grace);
+        if let Some(row) = row_of(&idx, &idx.view()) {
+            if !is_final(&idx, &row) {
+                provisional.push(row.frame);
+            }
+        }
+    }
+    assert_eq!(provisional, NOT_FINAL.step_by(60).collect::<Vec<_>>(), "up to ROW_LEAD above 2600");
+    let rows = backfilled(head);
+    let held = rows.read();
+    assert_eq!((held.len(), held.final_rows().count()), (53, 53 - 18), "the backfill records the same");
+    assert!(held.final_rows().all(|r| !NOT_FINAL.contains(&r.frame)));
+}
+
+#[test]
+fn final_rows_round_trip_through_the_history_file() {
+    let head = 4_200;
+    let rows = backfilled(head);
+    // A live row, with its census, at the stored frame's timestamp.
+    let mut live = row(head, 3, true, Some((9, 3)));
+    live.timestamp_ms = Some(head as i64 * 15_500);
+    rows.write().record(live.clone(), true);
+    let tmp = persist::TempPath::new("round-trip");
+    let mut saver = persist::Saver::default();
+    let first_save = Instant::now();
+    saver.save_due(&tmp.file(), &rows, first_save);
+    assert!(!rows.read().unsaved && tmp.0.exists());
+
+    // At most one save a minute while rows arrive.
+    rows.write().record(live.clone(), true);
+    saver.save_due(&tmp.file(), &rows, first_save);
+    assert!(rows.read().unsaved, "saved less than a minute ago");
+    saver.save_due(&tmp.file(), &rows, first_save + persist::SAVE_INTERVAL);
+    assert!(!rows.read().unsaved);
+
+    let chain = Chain::new(head);
+    let persist::Loaded::Rows(loaded) = tmp.file().load(&chain) else { panic!("rows expected") };
+    let held = rows.read();
+    assert_eq!(loaded.iter().collect::<Vec<_>>(), held.final_rows().collect::<Vec<_>>());
+    assert_eq!((loaded.len(), loaded.last()), (53 - 18 + 1, Some(&live)), "the census is kept");
+
+    let restored = RwLock::new(Rows::default());
+    persist::restore(&tmp.file(), &chain, &restored);
+    assert_eq!(restored.read().final_rows().collect::<Vec<_>>(), held.final_rows().collect::<Vec<_>>());
+    assert!(!restored.read().unsaved, "restored rows are not saved again");
+}
+
+#[test]
+fn a_history_file_of_another_format_or_parameters_is_ignored() {
+    let head = 1_200;
+    let chain = Chain::new(head);
+    let mut saved = row(head, 2, true, None);
+    saved.timestamp_ms = Some(head as i64 * 15_500);
+    let tmp = persist::TempPath::new("outdated");
+    let write = |format: u32, params: persist::Params| {
+        let body = serde_json::json!({ "format": format, "params": params, "rows": [&saved] });
+        tmp.file().write(&serde_json::to_vec(&body).unwrap()).unwrap();
+    };
+    let current = persist::Params::current(0);
+    write(persist::FORMAT, current);
+    assert_eq!(tmp.file().load(&chain), persist::Loaded::Rows(vec![saved.clone()]));
+    let other_network = persist::HistoryFile::new(tmp.0.clone(), 1).load(&chain);
+    assert!(matches!(other_network, persist::Loaded::Outdated(_)), "{other_network:?}");
+    for params in [persist::Params { row_frames: 120, ..current }, persist::Params { epoch_frames: 60, ..current }] {
+        write(persist::FORMAT, params);
+        assert!(matches!(tmp.file().load(&chain), persist::Loaded::Outdated(_)), "{params:?}");
+    }
+    write(persist::FORMAT + 1, current);
+    assert!(matches!(tmp.file().load(&chain), persist::Loaded::Outdated(_)));
+    let rows = RwLock::new(Rows::default());
+    persist::restore(&tmp.file(), &chain, &rows);
+    assert!(rows.read().is_empty(), "nothing restored: the backfill rebuilds every row");
+}
+
+#[test]
+fn a_corrupt_history_file_is_ignored() {
+    let head = 1_200;
+    let chain = Chain::new(head);
+    let tmp = persist::TempPath::new("corrupt");
+    let current = persist::Params::current(0);
+    let stored = |frame: u64| {
+        let mut r = row(frame, 2, true, None);
+        r.timestamp_ms = Some(frame as i64 * 15_500);
+        r
+    };
+    let file_of = |rows: &[Row]| {
+        serde_json::to_vec(&serde_json::json!({ "format": persist::FORMAT, "params": current, "rows": rows })).unwrap()
+    };
+    let bodies = [
+        b"\x00\xffnot json".to_vec(),
+        br#"{"format":1,"params":"#.to_vec(),
+        serde_json::to_vec(&serde_json::json!({ "format": persist::FORMAT, "params": current, "rows": [{ "frame": 60 }] }))
+            .unwrap(),
+        file_of(&[row(head, 2, true, None)]),
+        file_of(&[stored(head + 60)]),
+        file_of(&[stored(head), stored(head - 60)]),
+        file_of(&[stored(head - 1)]),
+    ];
+    for body in bodies {
+        tmp.file().write(&body).unwrap();
+        let loaded = tmp.file().load(&chain);
+        assert!(matches!(loaded, persist::Loaded::Invalid(_)), "{loaded:?}: {}", String::from_utf8_lossy(&body));
+        let rows = RwLock::new(Rows::default());
+        persist::restore(&tmp.file(), &chain, &rows);
+        assert!(rows.read().is_empty());
+    }
+    std::fs::remove_file(&tmp.0).unwrap();
+    assert_eq!(tmp.file().load(&chain), persist::Loaded::Absent);
+}
+
+#[test]
+fn a_restart_with_a_restored_file_backfills_only_the_rows_it_lacks() {
+    let head = 10_980;
+    let reference = continuous_rows(head);
+    // Saved before the restart: the rows through 6_000 but the ones not
+    // final.
+    let before = RwLock::new(Rows::default());
+    for (frame, row) in reference.range(..=6_000) {
+        before.write().record(row.clone(), !NOT_FINAL.contains(frame));
+    }
+    let tmp = persist::TempPath::new("restart");
+    persist::Saver::default().save_due(&tmp.file(), &before, Instant::now());
+
+    let chain = Chain::new(head);
+    let rows = RwLock::new(Rows::default());
+    persist::restore(&tmp.file(), &chain, &rows);
+    assert_eq!((rows.read().len(), chain.reads.get()), (84 - 18, 1), "one frame read checks the file's chain");
+    let mut plan = Backfill::new(head, Some(1), None, DECODERS);
+    let mut segments = Vec::new();
+    while !plan.is_done() {
+        let step = plan.step(&chain, MAX_FRAMES_PER_TICK, &mut past_grace, &rows);
+        assert_eq!((step.error.as_deref(), step.waiting), (None, None));
+        if let Some(s) = step.segment {
+            segments.push((s.lo, s.hi, s.rows, s.frames));
+        }
+    }
+    assert_eq!(
+        segments,
+        vec![(6_060, 10_920, 82, 5_821), (2_520, 3_540, 18, 1_981)],
+        "the rows after the file's last and the ones not saved, each with its lead"
+    );
+    assert_eq!(chain.reads.get(), 1 + 5_821 + 1_981, "from scratch: 11_762");
+    let held = rows.read();
+    assert_eq!(held.len(), 166);
+    for (frame, row) in &held.rows {
+        assert_eq!(row, &reference[frame], "row {frame}");
+    }
+    assert!(plan.state().complete);
 }
 
 #[test]

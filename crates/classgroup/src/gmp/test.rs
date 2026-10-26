@@ -22,7 +22,6 @@ mod mpz {
     use super::super::sign::Sign;
     use std::convert::{From, Into};
     use std::str::FromStr;
-    use std::{i64, u64};
 
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

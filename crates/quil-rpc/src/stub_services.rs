@@ -97,11 +97,21 @@ fn frame_outgoing(
     }))
 }
 
+/// Filter lengths of a shard ([`quil_execution::global_intrinsic::prover_ops::MAX_FILTER_LEN`]
+/// at most): an application address and its shard prefix.
+const REPORTED_FILTER_LENGTHS: std::ops::RangeInclusive<usize> =
+    32..=quil_execution::global_intrinsic::prover_ops::MAX_FILTER_LEN;
+
 /// Store-backed provider — reads the master/archive clock store directly. The
 /// archive variant: its local store IS authoritative (it materializes every
 /// finalized frame), so no worker routing is needed.
 struct ClockStoreAppShardFrameProvider {
     clock_store: Arc<dyn ClockStore>,
+    /// Bounds peers' frame reads, shared with `GlobalService`.
+    reads: &'static crate::global_service::FrameReadBound,
+    /// Where each numbered frame a peer asks for and the store lacks is
+    /// reported, without waiting ([`AppShardRpcServer::reporting_missing_frames`]).
+    missing: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
 }
 
 #[tonic::async_trait]
@@ -112,22 +122,44 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
         frame_number: u64,
     ) -> Result<Option<global::AppShardFrame>, Status> {
         let clock_store = self.clock_store.clone();
-        tokio::task::spawn_blocking(move || {
+        // Only a numbered frame of a filter of a shard's length is reported.
+        let report = self.missing.clone()
+            .filter(|_| frame_number != 0 && REPORTED_FILTER_LENGTHS.contains(&filter.len()))
+            .map(|missing| (missing, filter.clone()));
+        let reporting = report.is_some();
+        let read = move || {
             let result = if frame_number == 0 {
                 clock_store.get_latest_shard_clock_frame(&filter)
             } else {
                 clock_store.get_shard_clock_frame(&filter, frame_number, false)
             };
             match result {
-                Ok(frame) => Ok(Some(frame)),
-                Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
+                Ok(frame) => Ok((Some(frame), false)),
+                // A hole only below the latest frame stored for the filter:
+                // frames above it are routine reads of frames not made yet.
+                Err(quil_types::error::QuilError::NotFound(_)) => Ok((None, reporting && clock_store
+                    .get_latest_shard_clock_frame_number(&filter).ok().flatten()
+                    .is_some_and(|latest| frame_number < latest))),
                 Err(e) => Err(Status::internal(format!(
                     "app-shard frame store read failed: {e}"
                 ))),
             }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("app-shard frame read task failed: {e}")))?
+        };
+        // A numbered frame takes a frame read slot. The latest does not: a
+        // node that cannot read it starts an app's state sync without the
+        // roots to check it against.
+        let task = if frame_number == 0 {
+            tokio::task::spawn_blocking(read)
+        } else {
+            self.reads.spawn(read).await?
+        };
+        let (frame, hole) = task
+            .await
+            .map_err(|e| Status::internal(format!("app-shard frame read task failed: {e}")))??;
+        if let Some((missing, filter)) = report.filter(|_| hole) {
+            let _ = missing.try_send((filter, frame_number));
+        }
+        Ok(frame)
     }
 
     async fn get_shard_outgoing_history(
@@ -171,7 +203,28 @@ pub struct AppShardRpcServer {
 impl AppShardRpcServer {
     /// Construct the archive/store-backed variant (reads the local clock store).
     pub fn new(clock_store: Arc<dyn ClockStore>) -> Self {
-        Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider { clock_store }))
+        Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider {
+            clock_store,
+            reads: &crate::global_service::FRAME_READS,
+            missing: None,
+        }))
+    }
+
+    /// [`Self::new`] for an archive, reporting on `missing` each numbered
+    /// frame a peer asks for that the store lacks below the latest frame it
+    /// holds of that filter, so the archive's ingest can recover the body of
+    /// one below its cursor: a hole that every node replaying the shard from
+    /// archives otherwise stops at for good. A full queue drops the report;
+    /// the peer asks again.
+    pub fn reporting_missing_frames(
+        clock_store: Arc<dyn ClockStore>,
+        missing: tokio::sync::mpsc::Sender<(Vec<u8>, u64)>,
+    ) -> Self {
+        Self::with_provider(Arc::new(ClockStoreAppShardFrameProvider {
+            clock_store,
+            reads: &crate::global_service::FRAME_READS,
+            missing: Some(missing),
+        }))
     }
 
     /// Construct with an explicit provider — the worker-routing
@@ -552,5 +605,80 @@ mod outgoing_history_tests {
         assert!(server.get_shard_outgoing_history(request(4, 9)).await.unwrap().into_inner().frames.is_empty());
         assert!(server.get_shard_outgoing_history(request(0, 3)).await.is_err());
         assert!(server.get_shard_outgoing_history(request(3, 2)).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod frame_read_tests {
+    use super::*;
+    use crate::global_service::FrameReadBound;
+
+    /// While every frame read slot is busy, a numbered app-shard frame is
+    /// answered busy and served once a slot frees; the latest frame is never
+    /// refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn numbered_app_shard_frames_wait_for_a_frame_read_slot() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 1, std::time::Duration::from_millis(20));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let filter = vec![0x21; 32];
+        let frame = global::AppShardFrame {
+            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 3, ..Default::default() }),
+            ..Default::default()
+        };
+        let selector = [3u8; 32];
+        let txn = clock.new_transaction(false).unwrap();
+        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = clock.new_transaction(false).unwrap();
+        clock.commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        let provider = ClockStoreAppShardFrameProvider { clock_store: clock, reads: &READS, missing: None };
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = READS.spawn(move || { let _ = release_rx.recv(); }).await.unwrap();
+        assert_eq!(
+            provider.get_app_shard_frame(filter.clone(), 3).await.unwrap_err().code(),
+            tonic::Code::ResourceExhausted,
+        );
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 0).await.unwrap(), Some(frame.clone()));
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        assert_eq!(provider.get_app_shard_frame(filter, 3).await.unwrap(), Some(frame));
+    }
+
+    /// An archive reports each numbered frame a peer asks for and its store
+    /// lacks below the latest it holds, so its ingest can recover the body; a
+    /// stored frame, the latest frame, a frame above it and a filter of no
+    /// shard's length are not reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_numbered_frame_the_store_lacks_is_reported() {
+        static READS: FrameReadBound = FrameReadBound::new(1, 1, std::time::Duration::from_secs(5));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let filter = vec![0x21; 32];
+        let frame = global::AppShardFrame {
+            header: Some(global::FrameHeader { address: filter.clone(), frame_number: 3, ..Default::default() }),
+            ..Default::default()
+        };
+        let selector = [3u8; 32];
+        let txn = clock.new_transaction(false).unwrap();
+        clock.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).unwrap();
+        txn.commit().unwrap();
+        let txn = clock.new_transaction(false).unwrap();
+        clock.commit_shard_clock_frame(&filter, 3, &selector, txn.as_ref(), false).unwrap();
+        txn.commit().unwrap();
+        let (missing, mut reports) = tokio::sync::mpsc::channel(8);
+        let provider = ClockStoreAppShardFrameProvider { clock_store: clock, reads: &READS, missing: Some(missing) };
+
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 3).await.unwrap(), Some(frame.clone()));
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 0).await.unwrap(), Some(frame));
+        assert!(reports.try_recv().is_err(), "a stored frame is not reported");
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 4).await.unwrap(), None);
+        assert!(reports.try_recv().is_err(), "a frame above the latest is not made yet");
+        assert_eq!(provider.get_app_shard_frame(vec![0x21; 31], 2).await.unwrap(), None);
+        assert!(reports.try_recv().is_err(), "no shard's filter");
+        assert_eq!(provider.get_app_shard_frame(filter.clone(), 2).await.unwrap(), None);
+        assert_eq!(reports.try_recv().ok(), Some((filter, 2)));
     }
 }

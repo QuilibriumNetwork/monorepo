@@ -128,6 +128,9 @@ pub(crate) struct GrpcArgs {
         quil_types::proto::global::StreamGlobalMessagesResponse,
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
+    /// Archives: where the app-shard frame service reports each numbered
+    /// frame a peer asks for and the store lacks, for the ingest to recover.
+    pub app_frame_misses: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// Receive side of the direct global-consensus transport: peers'
     /// `SubmitGlobalConsensus` RPCs inject `(bitmask, data)` here, the
@@ -226,8 +229,6 @@ struct CrdtCoinWitness {
     /// witnesses for such an application read the worker's CRDT and index.
     worker_app_states: super::worker_manager::WorkerAppStates,
     #[cfg(feature = "confidential-tokens")]
-    worker_witness_indexes: parking_lot::Mutex<std::collections::HashMap<Vec<u8>, Arc<crate::witness_index::NodeWitnessIndex>>>,
-    #[cfg(feature = "confidential-tokens")]
     spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
     /// Scans in progress over an application held in SEVERAL local worker
     /// stores: the identity handed to the wallet → each store's own retained
@@ -253,6 +254,116 @@ struct CompositeScan {
 
 const COMPOSITE_SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(900);
 const MAX_COMPOSITE_SCANS: usize = 64;
+
+/// The peer listener's deadline for a PQNoise handshake.
+const PQ_HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// PQNoise handshakes the peer listener dropped at their deadline, logged
+/// at most once a minute with their count, and at most a minute after the
+/// first one not yet logged. The dialer is unknown until its handshake
+/// completes, so the line names none.
+#[derive(Default)]
+struct HandshakeTimeouts {
+    state: std::sync::Mutex<TimeoutCount>,
+}
+
+#[derive(Default)]
+struct TimeoutCount {
+    /// When the last line was logged.
+    logged_at: Option<std::time::Instant>,
+    /// Timeouts since.
+    pending: u64,
+    /// A flush of `pending` is scheduled.
+    flush_scheduled: bool,
+}
+
+/// What a counted timeout or a scheduled flush calls for.
+#[derive(Debug, PartialEq, Eq)]
+enum TimeoutsDue {
+    /// Log now: the timeouts since the previous line and how long ago that
+    /// line was.
+    Log(u64, Option<std::time::Duration>),
+    /// Flush the count after this long, when the next line is due.
+    FlushAfter(std::time::Duration),
+    /// Nothing to log: counted for a scheduled flush, or already logged.
+    Nothing,
+}
+
+impl HandshakeTimeouts {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Count a timeout at `now`.
+    fn record(&self, now: std::time::Instant) -> TimeoutsDue {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending += 1;
+        match state.logged_at.map(|at| now.saturating_duration_since(at)) {
+            Some(since) if since < Self::EVERY => {
+                if std::mem::replace(&mut state.flush_scheduled, true) {
+                    TimeoutsDue::Nothing
+                } else {
+                    TimeoutsDue::FlushAfter(Self::EVERY - since)
+                }
+            }
+            since => {
+                state.logged_at = Some(now);
+                TimeoutsDue::Log(std::mem::take(&mut state.pending), since)
+            }
+        }
+    }
+
+    /// The scheduled flush at `now`. A line logged since it was scheduled
+    /// defers the timeouts counted after it until the next line is due.
+    fn flush(&self, now: std::time::Instant) -> TimeoutsDue {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending == 0 {
+            state.flush_scheduled = false;
+            return TimeoutsDue::Nothing;
+        }
+        match state.logged_at.map(|at| now.saturating_duration_since(at)) {
+            Some(since) if since < Self::EVERY => TimeoutsDue::FlushAfter(Self::EVERY - since),
+            since => {
+                state.flush_scheduled = false;
+                state.logged_at = Some(now);
+                TimeoutsDue::Log(std::mem::take(&mut state.pending), since)
+            }
+        }
+    }
+}
+
+/// Count a handshake the peer listener dropped at its deadline. Called on
+/// the handshake runtime, which runs the scheduled flush.
+fn note_handshake_timeout() {
+    static TIMEOUTS: std::sync::OnceLock<HandshakeTimeouts> = std::sync::OnceLock::new();
+    let timeouts = TIMEOUTS.get_or_init(HandshakeTimeouts::default);
+    match timeouts.record(std::time::Instant::now()) {
+        TimeoutsDue::Log(count, since) => log_handshake_timeouts(count, since),
+        TimeoutsDue::FlushAfter(mut delay) => {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(delay).await;
+                    match timeouts.flush(std::time::Instant::now()) {
+                        TimeoutsDue::Log(count, since) => {
+                            log_handshake_timeouts(count, since);
+                            break;
+                        }
+                        TimeoutsDue::FlushAfter(again) => delay = again,
+                        TimeoutsDue::Nothing => break,
+                    }
+                }
+            });
+        }
+        TimeoutsDue::Nothing => {}
+    }
+}
+
+fn log_handshake_timeouts(timeouts: u64, since: Option<std::time::Duration>) {
+    info!(timeouts, since_previous_line_secs = %since.map_or_else(|| "none".to_string(), |d| d.as_secs().to_string()),
+        deadline_secs = PQ_HANDSHAKE_DEADLINE.as_secs(), scope = "inbound connections to this node's peer gRPC listener",
+        action = "connections that did not finish a PQNoise handshake in time were dropped; slow or stalled dialers \
+            and scanners that never speak both count, and the line names no dialer; a steady high count may mean \
+            this node's handshake runtime is overloaded: report it with this line",
+        "PQNoise handshakes timed out on the peer gRPC listener");
+}
 
 /// The shard path of a full filter, and the last address of its range.
 fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
@@ -432,7 +543,7 @@ impl CrdtCoinWitness {
             if owned.is_empty() {
                 continue;
             }
-            let index = self.worker_witness_indexes.lock().entry(filter).or_insert_with(|| {
+            let index = state.witness_index.get_or_init(|| {
                 crate::witness_index::NodeWitnessIndex::start(
                     state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone())
             }).clone();
@@ -465,9 +576,8 @@ impl CrdtCoinWitness {
     fn witness_index_for(&self, domain: &[u8; 32]) -> Arc<crate::witness_index::NodeWitnessIndex> {
         match self.worker_state(domain) {
             None => self.witness_index.clone(),
-            Some((filter, state)) => self.worker_witness_indexes.lock()
-                .entry(filter)
-                .or_insert_with(|| crate::witness_index::NodeWitnessIndex::start(
+            Some((_filter, state)) => state.witness_index
+                .get_or_init(|| crate::witness_index::NodeWitnessIndex::start(
                     state.db.clone(), state.crdt.clone(), self.network, self.spawner.clone(),
                 ))
                 .clone(),
@@ -720,6 +830,15 @@ impl quil_rpc::FrameLookup for ClockStoreFrameLookup {
             Err(e) => Err(e.to_string()),
         }
     }
+    /// Read without the request bundles; pruning keeps every header, so any
+    /// stored frame has one to give.
+    fn get_frame_header(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrameHeader, String> {
+        if n == 0 {
+            let latest = self.0.get_latest_global_frame().map_err(|e| e.to_string())?;
+            return latest.header.ok_or_else(|| "the latest frame has no header".to_string());
+        }
+        self.0.get_global_frame_header(n).map_err(|e| e.to_string())
+    }
 }
 // A frame whose request bodies were pruned is only a header here; never
 // hand it to a peer as if it were complete.
@@ -770,6 +889,7 @@ pub(crate) fn spawn_all(
         metrics_handle,
         global_msg_tx,
         archive_pool,
+        app_frame_misses,
         spawner,
         consensus_loopback_tx,
     } = args;
@@ -1446,8 +1566,6 @@ pub(crate) fn spawn_all(
                 }) as Arc<dyn Fn() -> Option<u64> + Send + Sync>
             },
             worker_app_states: worker_app_states.clone(),
-            #[cfg(feature = "confidential-tokens")]
-            worker_witness_indexes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             composite_scans: parking_lot::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "confidential-tokens")]
             spawner: spawner.clone(),
@@ -2267,9 +2385,11 @@ pub(crate) fn spawn_all(
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::app_shard_service_server::AppShardServiceServer::new({
-                let server = quil_rpc::stub_services::AppShardRpcServer::new(
-                    clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-                );
+                let store = clock_store.clone() as Arc<dyn quil_types::store::ClockStore>;
+                let server = match app_frame_misses {
+                    Some(missing) => quil_rpc::stub_services::AppShardRpcServer::reporting_missing_frames(store, missing),
+                    None => quil_rpc::stub_services::AppShardRpcServer::new(store),
+                };
                 // Answer peers asking about applications this node holds, so a
                 // node without coverage can serve its own wallet by asking one
                 // that has it.
@@ -2739,7 +2859,7 @@ pub(crate) fn spawn_all(
                     // only the task execution moves.
                     tls_handshake_rt.spawn(async move {
                         let pq = match tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
+                            PQ_HANDSHAKE_DEADLINE,
                             quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &pq_seed),
                         )
                         .await
@@ -2756,6 +2876,7 @@ pub(crate) fn spawn_all(
                             Err(_) => {
                                 crate::rpc_metrics::inc_tls_handshake("timeout");
                                 debug!("PQNoise handshake timed out");
+                                note_handshake_timeout();
                                 return;
                             }
                         };
@@ -2834,14 +2955,19 @@ pub(crate) const ONION_EXIT_METHODS: [&str; 4] = [
     "/quilibrium.node.global.pb.GlobalService/GetAppShards",
 ];
 
-/// The worker view: each worker with its engine's execution report.
+/// The worker view: each worker with its engine's execution report, and a
+/// worker whose own store refuses writes as blocked by it. Only this view
+/// shows the store: the lifecycle's renewal reads the engine's own report.
 fn worker_entries(wm: &dyn quil_engine::worker::WorkerManager) -> Vec<quil_rpc::WorkerEntry> {
     let execution = wm.worker_execution();
     quil_engine::worker::WorkerView::snapshot(wm)
         .all
         .into_iter()
         .map(|w| quil_rpc::WorkerEntry {
-            execution: execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
+            execution: quil_engine::worker_execution::with_store_state(
+                w.core_id,
+                execution.iter().find(|(id, filter, _)| *id == w.core_id && *filter == w.filter).map(|(_, _, s)| s.clone()),
+            ),
             core_id: w.core_id,
             filter: w.filter.clone(),
             available_storage: w.available_storage,
@@ -2883,7 +3009,14 @@ fn health_inputs(
             Default::default()
         }
     };
-    quil_rpc::diagnostics_service::HealthInputs { workers, committee_heads, global_head_frame, join_waits }
+    let master_store_write_failed = quil_forest::storage_health::store_latched(quil_forest::StoreRole::Master);
+    quil_rpc::diagnostics_service::HealthInputs {
+        workers,
+        committee_heads,
+        global_head_frame,
+        join_waits,
+        master_store_write_failed,
+    }
 }
 
 /// Keep shard diagnostics on a single durable GLOBAL snapshot, never the
@@ -2901,6 +3034,38 @@ fn committed_global_app_heads(crdt: &Arc<quil_hypergraph::HypergraphCrdt>, filte
             generation: session.generation,
         }))
     }).collect()
+}
+
+#[cfg(test)]
+mod handshake_timeout_tests {
+    use super::HandshakeTimeouts;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn handshake_timeouts_log_at_most_once_a_minute_and_flush_within_one() {
+        use super::TimeoutsDue::{FlushAfter, Log, Nothing};
+        let timeouts = HandshakeTimeouts::default();
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let secs = Duration::from_secs;
+        assert_eq!(timeouts.record(at(0)), Log(1, None));
+        assert_eq!(timeouts.record(at(1)), FlushAfter(secs(59)));
+        assert_eq!(timeouts.record(at(59)), Nothing);
+        // The scheduled flush logs the trailing count without a further timeout.
+        assert_eq!(timeouts.flush(at(60)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.record(at(200)), Log(1, Some(secs(140))));
+        assert_eq!(timeouts.record(at(201)), FlushAfter(secs(59)));
+        // A timeout once the line is due logs at once; the flush finds nothing.
+        assert_eq!(timeouts.record(at(260)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.flush(at(260)), Nothing);
+        assert_eq!(timeouts.record(at(261)), FlushAfter(secs(59)));
+        // Timeouts counted after such a line wait until the next one is due.
+        assert_eq!(timeouts.record(at(320)), Log(2, Some(secs(60))));
+        assert_eq!(timeouts.record(at(330)), Nothing);
+        assert_eq!(timeouts.flush(at(320)), FlushAfter(secs(60)));
+        assert_eq!(timeouts.flush(at(380)), Log(1, Some(secs(60))));
+        assert_eq!(timeouts.record(at(381)), FlushAfter(secs(59)));
+    }
 }
 
 #[cfg(test)]
@@ -3364,7 +3529,8 @@ mod anchor_lookup_tests {
 
     /// A frame whose request bodies were pruned is the node's own worker's
     /// anchor as its header while a peer is still refused it; a retained
-    /// frame is whole either way, and one never held is no anchor here.
+    /// frame is whole either way, and one never held is no anchor here. A
+    /// peer asking for headers alone gets the header of either.
     #[test]
     fn own_workers_read_pruned_headers_that_peers_are_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -3386,6 +3552,9 @@ mod anchor_lookup_tests {
         assert_eq!(lookup.get_frame(8).unwrap(), frame(8));
         assert_eq!(lookup.get_anchor_frame(8).unwrap(), Some(frame(8)));
         assert_eq!(lookup.get_anchor_frame(4).unwrap(), None);
+        assert_eq!(lookup.get_frame_header(5).unwrap(), frame(5).header.unwrap(), "a peer asking for headers alone");
+        assert_eq!(lookup.get_frame_header(8).unwrap(), frame(8).header.unwrap());
+        assert!(lookup.get_frame_header(4).is_err());
     }
 }
 

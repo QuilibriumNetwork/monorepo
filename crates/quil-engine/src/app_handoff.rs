@@ -174,9 +174,19 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
         Err(QuilError::ExecutionUnavailable(_)) => false,
         // A store or decoding failure says nothing about the session: do not
         // release a possibly closing member on it.
+        // Once a minute at most: the reconcile asks every frame, and the
+        // recovery gate on each recovery request.
         Err(error) => {
-            tracing::warn!(filter = hex::encode(filter), %error,
-                "committee authorization unreadable; retaining the worker");
+            static LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let last = LAST_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60
+                && LAST_WARN_SECS.compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed).is_ok()
+            {
+                tracing::warn!(filter = hex::encode(filter), %error,
+                    "committee authorization unreadable; retaining the worker (repeats at most once a minute)");
+            }
             true
         }
     }
@@ -566,6 +576,41 @@ pub fn canonical_header(frame: &quil_types::proto::global::AppShardFrame) -> Res
     .to_canonical_bytes()
 }
 
+/// A finalized app frame that carried no requests, rebuilt from the header
+/// a GLOBAL frame carries for it ([`canonical_header`], back as a proto
+/// `FrameHeader`): the frame its members stored. That header carries the
+/// committee's storage attestation, which the body holds beside its header
+/// and whose header field stays empty, and a commonware certificate there
+/// lacks the empty public key members store with it. The second value says
+/// why the frame comes without the attestation its header commits to (a
+/// member that held none submitted the header, or the bytes do not decode),
+/// so its possession proof cannot be verified; `None` when it carries the
+/// attestation or commits to none.
+pub fn frame_from_carried_header(
+    carried: &quil_types::proto::global::FrameHeader,
+) -> (quil_types::proto::global::AppShardFrame, Option<String>) {
+    use prost::Message;
+    let mut header = carried.clone();
+    let encoded = std::mem::take(&mut header.storage_attestation);
+    if let Some(signature) = header.public_key_signature_bls48581.as_mut().filter(|signature| {
+        signature.public_key.is_none()
+            && quil_cw_consensus::app_cert::unwrap_cert_from_header(&signature.signature).is_some()
+    }) {
+        signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    }
+    let (storage_attestation, missing) = if encoded.is_empty() {
+        let missing = (!header.storage_attestation_root.is_empty())
+            .then(|| "the carried header holds no storage attestation".to_string());
+        (None, missing)
+    } else {
+        match quil_types::proto::global::StorageAttestation::decode(encoded.as_slice()) {
+            Ok(attestation) => (Some(attestation), None),
+            Err(error) => (None, Some(format!("the carried storage attestation does not decode: {error}"))),
+        }
+    };
+    (quil_types::proto::global::AppShardFrame { header: Some(header), requests: Vec::new(), storage_attestation }, missing)
+}
+
 /// A finalized seal as submitted: the encoded submission, with the drain
 /// headers GLOBAL needs to accept it (#699).
 pub struct DrainedSeal {
@@ -765,6 +810,11 @@ const MAX_OWN_CHAIN_FRAMES: u64 = 4096;
 
 /// The prefix of [`fence_rewind`]'s refusal of the frames at a fence.
 const FENCE_FRAMES_DIFFER: &str = "local frames at the fence differ from the fenced frame";
+
+/// Why [`fence_rewind`] re-anchors a member whose frames past the fence
+/// name its session's genesis but contradict its chain
+/// ([`OwnChain::Broken`]).
+pub(crate) const OWN_CHAIN_BROKEN: &str = "local frames past the fence do not form this session's chain";
 
 /// What a member's frames past its session's fenced same-filter
 /// predecessor checkpoint are ([`own_session_chain`]).
@@ -1212,9 +1262,12 @@ pub fn successor_state_matches_held(
                 // (it never held the range, or holds another version). As a
                 // recoverable gap it requests the shard sync, which installs
                 // the state from an archive pinned to the sealed roots
-                // (`origin_anchors`); as a consensus error it retried the same
-                // comparison forever.
-                return Err(unavailable("local state differs from the predecessor's sealed checkpoint"));
+                // ([`sealed_state_mismatch`]); as a consensus error it retried
+                // the same comparison forever. The refusal names both roots.
+                return Err(unavailable(SealedStateMismatch {
+                    generation: source.generation, frame: checkpoint.frame,
+                    local_roots: local.roots, sealed_roots: checkpoint.state_roots,
+                }.to_string()));
             }
             // A shard that never materialized a frame has no cursor record; its
             // history is the chain's starting value, as the parent reader has it.
@@ -1230,6 +1283,76 @@ pub fn successor_state_matches_held(
         }
     }
     Ok(())
+}
+
+/// Why [`successor_state_matches`] refuses a member at its same-filter
+/// predecessor's sealed checkpoint that holds other state there.
+pub const SEALED_STATE_DIFFERS: &str = "local state differs from the predecessor's sealed checkpoint";
+
+/// A member whose committed cursor is at its same-filter predecessor's
+/// sealed checkpoint, with committed roots other than the sealed ones
+/// ([`sealed_state_mismatch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedStateMismatch {
+    /// The predecessor's generation.
+    pub generation: u64,
+    /// The frame its seal names, at which this member's cursor is.
+    pub frame: u64,
+    /// This member's committed roots.
+    pub local_roots: [[u8; 32]; 4],
+    pub sealed_roots: [[u8; 32]; 4],
+}
+
+impl SealedStateMismatch {
+    /// The first four bytes of each of `roots`, in hex.
+    pub fn prefixes(roots: &[[u8; 32]; 4]) -> String {
+        roots.iter().map(|root| hex::encode(&root[..4])).collect::<Vec<_>>().join(",")
+    }
+}
+
+impl std::fmt::Display for SealedStateMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{SEALED_STATE_DIFFERS} (generation {} sealed at frame {}: committed roots here {}, sealed roots {})",
+            self.generation, self.frame, Self::prefixes(&self.local_roots), Self::prefixes(&self.sealed_roots))
+    }
+}
+
+/// The [`SealedStateMismatch`] for which [`successor_state_matches`] refuses
+/// a member of `filter`'s current session, if any: its committed cursor is at
+/// a same-filter origin's sealed (not fenced) checkpoint, the origins taken
+/// as [`effective_origins`] gives them, and its committed roots are not the
+/// sealed ones. Such a member has no frame to replay: the shard sync installs
+/// the sealed state, pinned to its roots, instead.
+pub fn sealed_state_mismatch(
+    global: &Arc<HypergraphCrdt>,
+    shard: &Arc<HypergraphCrdt>,
+    filter: &[u8],
+) -> Result<Option<SealedStateMismatch>> {
+    let view = CommittedView::capture(global)?;
+    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
+    let origins = match effective_origins(&view, &session) {
+        Ok(effective) => effective.origins,
+        Err(QuilError::ExecutionUnavailable(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for (source, checkpoint) in origins {
+        if source.filter != filter || handoff::is_fenced(&view, &source.id()?)? {
+            continue;
+        }
+        let local = shard.capture_committed_shard(filter)?;
+        let cursor = local
+            .records
+            .read_record(&quil_store::encoding::consensus_materialized_cursor_key(filter))?
+            .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes))
+            .unwrap_or(0);
+        if cursor == checkpoint.frame && local.roots != checkpoint.state_roots {
+            return Ok(Some(SealedStateMismatch {
+                generation: source.generation, frame: checkpoint.frame,
+                local_roots: local.roots, sealed_roots: checkpoint.state_roots,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// A session's origins as the state it starts from: each same-filter origin
@@ -1354,9 +1477,13 @@ fn committed_frame_digest_in(
 /// recorded tip, else its base (nothing executed yet). `None` without a
 /// session.
 pub fn committed_tip(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Option<u64>> {
-    let view = CommittedView::capture(global)?;
-    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
-    Ok(Some(handoff::session_tip(&view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
+    committed_tip_in(&CommittedView::capture(global)?, filter)
+}
+
+/// [`committed_tip`] read from a captured `view`.
+pub fn committed_tip_in(view: &CommittedView, filter: &[u8]) -> Result<Option<u64>> {
+    let Some(session) = handoff::head(view, filter)? else { return Ok(None) };
+    Ok(Some(handoff::session_tip(view, &session.id()?)?.map_or(session.base_frame, |tip| tip.frame)))
 }
 
 /// [`committed_tip`] of each of `filters` that has a session, read from one
@@ -1482,7 +1609,8 @@ pub fn rewind_past_fence(
 /// frame the fence names. State, cursor and clock head move back to the
 /// fence; the discarded frames are deleted. A member without those frames or
 /// the fenced state is named as such ([`UnrewindableFence`]) and left as it
-/// is.
+/// is, as is one whose own frames past the fence contradict its session's
+/// chain ([`OWN_CHAIN_BROKEN`]): both owe a re-anchor.
 pub fn fence_rewind(
     global: &Arc<HypergraphCrdt>,
     shard: &Arc<HypergraphCrdt>,
@@ -1631,6 +1759,17 @@ pub fn fence_rewind_held(
         // executed tip differing from GLOBAL's is refused. Too few of its
         // frames to verify, behind the executed tip, are left for the
         // successor check, which asks the shard sync for them.
+        //
+        // Own frames that contradict the session's chain (a frame that does
+        // not extend the one before it) cannot all be the session's, and
+        // this node cannot tell which are: refused, the member stayed
+        // blocked for good (an operator's node: "local frame 5779 does not
+        // extend frame 5778" for 6.5 hours), as no start, sync or replay
+        // mends a stored frame below the head. The shard is re-anchored at
+        // the frame GLOBAL committed instead: its state is synced pinned to
+        // that frame's roots, and the session's later frames are replayed
+        // from archives, each linked to its parent. A head GLOBAL's
+        // executed tip vouches for returned untouched above.
         let behind = tip.is_some_and(|tip| tip > cursor);
         match own_session_chain_held(clock, session, &checkpoint, cursor, held)? {
             OwnChain::Held if at_tip != Some(false) => return Ok(FenceRewind::Untouched),
@@ -1638,7 +1777,10 @@ pub fn fence_rewind_held(
                 return Err(differ("this session's local frame at its executed tip is not the one GLOBAL executed".into()));
             }
             OwnChain::Unverified(_) if behind => return Ok(FenceRewind::Untouched),
-            OwnChain::Broken(reason) | OwnChain::Unverified(reason) => return Err(differ(reason)),
+            OwnChain::Broken(reason) => {
+                return Ok(unrewindable(OWN_CHAIN_BROKEN, Some(fence_refusal(OWN_CHAIN_BROKEN, &reason, session, cursor, tip))));
+            }
+            OwnChain::Unverified(reason) => return Err(differ(reason)),
             OwnChain::NotOwn => {}
         }
         if !crate::frame_validator::app_frame_links_to_child(&fenced, &header) {
@@ -1705,6 +1847,20 @@ impl ReanchorMarker {
 /// above the cursor: nothing GLOBAL committed names the state to sync.
 pub fn replay_mismatch_reanchor(generation: u64, cursor: u64, committed: Option<u64>) -> Option<ReanchorMarker> {
     committed.filter(|&tip| tip > cursor)
+        .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
+}
+
+/// The re-anchor a shard owes when a payload eviction dropped its subtree
+/// from this worker's store at materialized cursor `cursor`
+/// ([`dropped_lineage`]): as [`replay_mismatch_reanchor`], except that it
+/// anchors at the cursor itself when GLOBAL committed no frame above it, as
+/// on a shard whose committee stalled at this worker's head. The trees
+/// cannot match any frame there, so the shard would otherwise start on an
+/// empty subtree; the rebase replaces the local frame at an anchor that is
+/// the fence ([`rebase_for_reanchor`]). `None` without a committed frame at
+/// or above the cursor.
+pub fn evicted_lineage_reanchor(generation: u64, cursor: u64, committed: Option<u64>) -> Option<ReanchorMarker> {
+    committed.filter(|&tip| tip >= cursor)
         .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
 }
 
@@ -1855,6 +2011,36 @@ pub fn write_reanchor_marker(clock: &dyn ClockStore, filter: &[u8], marker: &Rea
 pub fn clear_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
     let txn = clock.new_transaction(false)?;
     if let Err(error) = txn.delete(&quil_store::encoding::app_reanchor_key(filter)) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+/// The materialized cursor at which a payload eviction dropped `filter`'s
+/// subtree from this worker's store while its frames and cursor stayed
+/// ([`quil_store::encoding::CONSENSUS_APP_LINEAGE_DROPPED`]), while that
+/// record still describes the shard: its cursor has not moved since. A
+/// record the cursor moved past (a sync or re-anchor installed the state
+/// again) is cleared, as is a malformed one.
+pub fn dropped_lineage(shard: &HypergraphCrdt, clock: &dyn ClockStore, filter: &[u8]) -> Result<Option<u64>> {
+    let txn = clock.new_transaction(false)?;
+    let value = txn.get(&quil_store::encoding::app_lineage_dropped_key(filter));
+    let _ = txn.abort();
+    let Some(bytes) = value? else { return Ok(None) };
+    let cursor = shard.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))?;
+    match <[u8; 8]>::try_from(bytes.as_slice()).map(u64::from_be_bytes) {
+        Ok(dropped) if dropped == cursor && cursor > 0 => Ok(Some(cursor)),
+        _ => {
+            clear_dropped_lineage(clock, filter)?;
+            Ok(None)
+        }
+    }
+}
+
+pub fn clear_dropped_lineage(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = txn.delete(&quil_store::encoding::app_lineage_dropped_key(filter)) {
         let _ = txn.abort();
         return Err(error);
     }
@@ -2091,6 +2277,7 @@ pub fn rebase_for_reanchor(
     }
     shard.checkpoint_frame_cursor(synced_to, &cursor_key)?;
     clear_reanchor_marker(clock, filter)?;
+    clear_dropped_lineage(clock, filter)?;
     Ok(Rebased { from, to: top })
 }
 
@@ -2175,6 +2362,75 @@ mod successor_tests {
             let page: Vec<_> = frames.iter().filter(|f| f.frame >= from && f.frame <= through).take(2).cloned().collect();
             Box::pin(async move { Ok(page) })
         })
+    }
+
+    /// A member whose cursor is at its predecessor's sealed checkpoint, with
+    /// other state there, is refused with the frame and both roots, and
+    /// [`sealed_state_mismatch`] names the same, also under a session sealed
+    /// at its base: the shard sync installs the sealed state from them. A
+    /// member holding the sealed state, or one behind the seal, has none
+    /// (…091f80 at frame 4693, 2026-10-23).
+    #[test]
+    fn a_member_at_a_sealed_checkpoint_with_other_state_is_named_with_both_roots() {
+        let (global, state) = global_state();
+        let clock = quil_store::RocksClockStore::new(quil_store::RocksDb::open_in_memory().unwrap().inner());
+        let filter = vec![0x0b; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
+        let at = |byte: u8| quil_hypergraph::Location { app_address: [0x0b; 32], data_address: [byte; 32] };
+        let member = crdt();
+        member.add_vertex(&at(7), &[7; 64]).unwrap();
+        let mut history = handoff::history::start(&source).unwrap();
+        for frame in 1..=3 {
+            member.commit_with_frame_cursor_and_records(frame, &cursor_key, &outflow_records(&filter, frame)).unwrap();
+            history = handoff::history::link(history, &outgoing(&filter, frame)).unwrap();
+        }
+        let sealed = member.capture_committed_shard(&filter).unwrap().roots;
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: [0x33; 32], state_roots: sealed, history_root: history },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 4);
+        let second = handoff::head(&state, &filter).unwrap().unwrap();
+        let close = handoff::schedule(&state, 5, vec![filter.clone()], vec![DesiredCommittee {
+            filter: filter.clone(), members: second.members.clone(),
+        }]).unwrap();
+        commit(&global, &state, 5);
+        let seal = Seal {
+            request: close.id().unwrap(), session: second.id().unwrap(), view: 9,
+            checkpoint: Checkpoint {
+                frame: 3, view: 0, digest: second.genesis, state_roots: [[0xb0; 32]; 4], history_root: [0xb1; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&second, &signers, &seal);
+        assert!(handoff::apply_submission(&state, 6, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 6);
+        let third = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!((third.generation, third.base_frame), (3, 3));
+
+        let other = crdt();
+        other.add_vertex(&at(9), &[9; 64]).unwrap();
+        other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&filter, 3)).unwrap();
+        let local = other.capture_committed_shard(&filter).unwrap().roots;
+        assert_ne!(local, sealed);
+        assert_eq!(sealed_state_mismatch(&global, &other, &filter).unwrap(),
+            Some(SealedStateMismatch { generation: 1, frame: 3, local_roots: local, sealed_roots: sealed }));
+        let error = successor_state_matches(&global, &other, &clock, &third).unwrap_err();
+        assert!(matches!(error, QuilError::ExecutionUnavailable(_)), "a recoverable gap: {error}");
+        assert_eq!(error.to_string(), format!(
+            "execution unavailable: app committee session: local state differs from the predecessor's sealed \
+            checkpoint (generation 1 sealed at frame 3: committed roots here {}, sealed roots {})",
+            SealedStateMismatch::prefixes(&local), SealedStateMismatch::prefixes(&sealed)));
+
+        assert_eq!(sealed_state_mismatch(&global, &member, &filter).unwrap(), None, "holds the sealed state");
+        successor_state_matches(&global, &member, &clock, &third).expect("holds the sealed state");
+        let behind = crdt();
+        behind.add_vertex(&at(9), &[9; 64]).unwrap();
+        behind.commit_with_frame_cursor_and_records(2, &cursor_key, &outflow_records(&filter, 2)).unwrap();
+        assert_eq!(sealed_state_mismatch(&global, &behind, &filter).unwrap(), None, "behind the seal: it replays");
     }
 
     /// A member that joined the predecessor through an archive-anchored jump
@@ -2407,6 +2663,55 @@ mod successor_tests {
         other.commit_with_frame_cursor_and_records(3, &cursor_key, &outflow_records(&ran, 3)).unwrap();
         let error = successor_state_matches(&global, &other, &clock, &third).unwrap_err();
         assert!(error.to_string().contains("sealed checkpoint"), "other state is still refused: {error}");
+    }
+
+    /// A session that ran and sealed at frame 3, then sessions based at the
+    /// seal that each sealed at their base: the sealed frame's digest, which
+    /// the head's direct origin does not name, still authenticates the
+    /// headers an outgoing-history or carry-window read starts from, and
+    /// only that frame's (…091f80: generation 12 sealed at frame 4693,
+    /// generations 13 to 23 sealed or fenced there, 2026-10-23).
+    #[test]
+    fn history_reads_take_a_sealed_frame_under_sessions_sealed_at_its_seal() {
+        let (global, state) = global_state();
+        let filter = vec![0x0a; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        let sealed = [0x3a; 32];
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: sealed, state_roots: [[4; 32]; 4], history_root: [5; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 4);
+        let mut head = handoff::head(&state, &filter).unwrap().unwrap();
+        let committed = |number| crate::app_history_recovery::committed_digest(Some(&global), &filter, number).unwrap();
+        assert_eq!(committed(3), Some(sealed), "the sealed checkpoint, a direct origin");
+        for frame in [5, 7] {
+            let close = handoff::schedule(&state, frame, vec![filter.clone()], vec![DesiredCommittee {
+                filter: filter.clone(), members: head.members.clone(),
+            }]).unwrap();
+            commit(&global, &state, frame);
+            let seal = Seal {
+                request: close.id().unwrap(), session: head.id().unwrap(), view: 9,
+                checkpoint: Checkpoint {
+                    frame: head.base_frame, view: 0, digest: head.genesis,
+                    state_roots: [[4; 32]; 4], history_root: [0xb1; 32],
+                },
+            };
+            let certificate = crate::test_support::certify_seal(&head, &signers, &seal);
+            assert!(handoff::apply_submission(&state, frame + 1, &CertificateSubmission { seal, certificate }).unwrap());
+            commit(&global, &state, frame + 1);
+            head = handoff::head(&state, &filter).unwrap().unwrap();
+        }
+        assert_eq!((head.generation, head.base_frame), (4, 3));
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), None, "direct origins name only a base");
+        assert_eq!(committed(3), Some(sealed), "looked through to the seal");
+        for number in [2, 4] {
+            assert_eq!(committed(number), None);
+        }
+        assert_eq!(crate::app_history_recovery::committed_digest(None, &filter, 3).unwrap(), None, "no GLOBAL state");
     }
 
     /// Committees that cannot produce keep sealing at their base, one session
@@ -2980,9 +3285,10 @@ mod successor_tests {
     // Frames past the fence that are not the session's own chain stay
     // refused: a frame after the fence naming neither the fenced frame nor
     // the session's genesis, own frames over a frame at the fence that is not
-    // the fenced one, own frames broken by a frame that does not extend the
-    // one before it, and own frames whose frame at GLOBAL's executed tip is
-    // not the one GLOBAL executed.
+    // the fenced one, and own frames whose frame at GLOBAL's executed tip is
+    // not the one GLOBAL executed. Own frames broken by a frame that does
+    // not extend the one before it are re-anchored instead
+    // (`own_frames_broken_past_the_fence_are_reanchored`).
     #[test]
     fn frames_past_a_fence_that_are_not_the_sessions_own_chain_stay_refused() {
         let refused = |past: &PastFence, case: &str| {
@@ -3007,17 +3313,80 @@ mod successor_tests {
         refused(&past, "another frame at the fence");
 
         let past = past_fence();
-        own_frames(&past, 6);
-        store_header(&past.clock, quil_types::proto::global::FrameHeader {
-            address: past.filter.clone(), frame_number: 5, rank: 5, output: vec![0x55; 32],
-            parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
-        });
-        refused(&past, "a frame that does not extend its parent");
-
-        let past = past_fence();
         own_frames(&past, 5);
         execute_successor_through(&past, 5, 0x66);
         refused(&past, "another frame at the executed tip");
+    }
+
+    // A member's own frames past the fence broken by a frame that does not
+    // extend the one before it owe a re-anchor at the frame GLOBAL
+    // committed, rather than a refusal for good (an operator's node: "local
+    // frame 5779 does not extend frame 5778" for 6.5 hours, nothing owed).
+    // Nothing is rewound locally; the rebase drops the frames past the
+    // fence, and the anchor's replay leaves a member the successor accepts.
+    // Behind GLOBAL's executed tip it is re-anchored at that tip; a head
+    // GLOBAL's executed tip vouches for stays untouched whatever lies below.
+    #[test]
+    fn own_frames_broken_past_the_fence_are_reanchored() {
+        use quil_types::store::ClockStore as _;
+        let broken = |through: u64| {
+            let past = past_fence();
+            own_frames(&past, through);
+            store_header(&past.clock, quil_types::proto::global::FrameHeader {
+                address: past.filter.clone(), frame_number: 5, rank: 5, output: vec![0x55; 32],
+                parent_selector: vec![0x99; 32], global_frame_number: past.due, ..Default::default()
+            });
+            past
+        };
+        let past = broken(6);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        let FenceRewind::Unrewindable { fence, error } = &outcome else { panic!("{outcome:?}") };
+        assert_eq!((fence.fence, fence.local_head, fence.session_tip, fence.reason), (3, 6, None, OWN_CHAIN_BROKEN));
+        let error = error.as_ref().expect("the broken link is named").to_string();
+        assert!(error.contains(&format!("{OWN_CHAIN_BROKEN}: local frame 5 does not extend frame 4")) && error.contains("local_head 6"), "{error}");
+        assert!(!error.contains(FENCE_FRAMES_DIFFER), "the fenced frame matched: {error}");
+        assert_eq!(past.cursor(), 6, "nothing is rewound locally");
+        let marker = outcome.reanchor().expect("a broken own chain owes a re-anchor");
+        assert_eq!(marker, ReanchorMarker { generation: past.successor.generation, fence: 3, from_cursor: 6, head: None });
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(3), "the anchor is the fence");
+        let marker = marker.with_head(&past.clock, &past.filter);
+        write_reanchor_marker(&past.clock, &past.filter, &marker).unwrap();
+        assert_eq!(gate_of(&past), ReanchorGate::Owed(marker));
+
+        // The shard sync installed frame 3's pre-state; the actor rebases.
+        let rebased = rebase_for_reanchor(&past.shard, &past.clock, &past.filter, &marker, 3,
+            Some(&header_frame(&past.filter, 2, 0x22)), |kept| { assert_eq!(kept, 2); Ok(()) }).unwrap();
+        assert_eq!(rebased, Rebased { from: 3, to: 6 });
+        assert_eq!(past.cursor(), 2);
+        for number in 4..=6 {
+            assert!(past.clock.get_shard_clock_frame(&past.filter, number, false).is_err(), "frame {number} is dropped");
+        }
+        assert_eq!(gate_of(&past), ReanchorGate::Absent);
+        // The anchor's replay: the fenced frame and the state after it.
+        past.shard.rewind_app_shard(&past.filter, &past.fenced_roots).unwrap();
+        store_header(&past.clock, quil_types::proto::global::FrameHeader {
+            address: past.filter.clone(), frame_number: 3, rank: 5, output: vec![0x33; 32], ..Default::default()
+        });
+        let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&past.filter);
+        past.shard.checkpoint_frame_cursor(3, &cursor_key).unwrap();
+        assert!(matches!(fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap(),
+            FenceRewind::Untouched));
+        successor_state_matches(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+
+        // Behind GLOBAL's executed tip: re-anchored at that tip.
+        let past = broken(6);
+        execute_successor_through(&past, 9, 0x59);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(&outcome, FenceRewind::Unrewindable { fence, error: Some(_) }
+            if fence.reason == OWN_CHAIN_BROKEN && fence.session_tip == Some(9)), "{outcome:?}");
+        assert_eq!(committed_tip(&past.global, &past.filter).unwrap(), Some(9));
+
+        // A head at GLOBAL's executed tip, its frame the one GLOBAL executed.
+        let past = broken(7);
+        execute_successor_through(&past, 7, 0x57);
+        let outcome = fence_rewind(&past.global, &past.shard, &past.clock, &past.successor).unwrap();
+        assert!(matches!(outcome, FenceRewind::Untouched), "{outcome:?}");
+        assert_eq!(past.cursor(), 7);
     }
 
     // The own-chain check names why frames past a fence are not the
@@ -3850,6 +4219,21 @@ mod successor_tests {
         assert_eq!(reanchor_gate(Some(unheaded), 6, Some([0x66; 32])), ReanchorGate::Owed(unheaded));
     }
 
+    /// An evicted lineage anchors at the frame GLOBAL committed, or at its
+    /// own head when that is the committed tip, as on a shard whose
+    /// committee stalled there; a replay mismatch needs a committed frame
+    /// above the head.
+    #[test]
+    fn an_evicted_lineage_anchors_at_its_head_when_the_shard_stalled_there() {
+        let at = |fence| Some(ReanchorMarker { generation: 3, fence, from_cursor: fence, head: None });
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(5)), at(5), "the stalled shard");
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(9)), at(5));
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(4)), None, "GLOBAL behind the head");
+        assert_eq!(evicted_lineage_reanchor(3, 5, None), None);
+        assert_eq!(replay_mismatch_reanchor(3, 5, Some(5)), None);
+        assert_eq!(at(5).unwrap().cause(), ReanchorCause::ReplayMismatch);
+    }
+
     // An operator's joining worker held a lineage from an earlier tenure
     // whose trees no longer matched it (2026-10-20): every archive frame
     // past its head failed to replay with a pre-state mismatch, for hours,
@@ -3912,6 +4296,12 @@ mod successor_tests {
         write_reanchor_marker(&clock, &filter, &marker).unwrap();
         let gate = || reanchor_gate_at(&shard, &clock, &filter, read_reanchor_marker(&clock, &filter).unwrap()).unwrap();
         assert_eq!(gate(), ReanchorGate::Owed(marker));
+        // A payload eviction's record of the dropped subtree at the cursor.
+        let dropped_key = quil_store::encoding::app_lineage_dropped_key(&filter);
+        let txn = clock.new_transaction(false).unwrap();
+        txn.set(&dropped_key, &4u64.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(dropped_lineage(&shard, &clock, &filter).unwrap(), Some(4));
         assert!(reanchor_applies(&global, &filter).unwrap());
         assert!(anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x99)).unwrap());
         assert!(!anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x98)).unwrap());
@@ -3930,6 +4320,9 @@ mod successor_tests {
         }
         assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap().header.unwrap().output, vec![0x88; 32]);
         assert_eq!(gate(), ReanchorGate::Absent, "the rebase committed");
+        let txn = clock.new_transaction(false).unwrap();
+        assert_eq!(txn.get(&dropped_key).unwrap(), None, "and cleared the dropped-lineage record");
+        let _ = txn.abort();
 
         // The anchor replays: the head is the frame GLOBAL executed.
         store_header(&clock, FrameHeader {

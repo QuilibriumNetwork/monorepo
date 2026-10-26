@@ -384,6 +384,8 @@ impl GlobalProposer for GlobalSeamProposer {
         if !self.persist_candidate(&frame) { return None; }
         prepared.check().ok()?;
         self.note_frame(digest, header.frame_number);
+        // One line per leader turn this node wins; the other members vote.
+        tracing::info!(view = context.view, frame = header.frame_number, "cw propose: proposed GLOBAL frame as leader");
         Some((digest, bytes))
     }
 
@@ -527,6 +529,8 @@ impl GlobalProposer for GlobalSeamProposer {
         if !self.persist_candidate(&frame) { return None; }
 
         self.block_meta.lock().unwrap().insert(digest, frame_number);
+        // One line per leader turn this node wins; the other members vote.
+        tracing::info!(view, frame = frame_number, "cw propose: proposed GLOBAL frame as leader");
         Some((digest, bytes))
     }
 

@@ -1432,16 +1432,15 @@ impl ProverLifecycle {
         }
         // A missed renewal or rejected leave needs bounded recovery before
         // cleanup, even if reconciliation has not restored the worker yet.
-        // Use the same grace as the allocator so releasing a worker cannot
-        // turn a recoverable registration into an orphan in the same cycle.
-        let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
-            .as_ref()
-            .map(|p| p.allocations.iter()
-                .filter(|a| self.allocator.renewal_recovering(a, frame_number))
-                .map(|a| a.confirmation_filter.clone()).collect())
-            .unwrap_or_default();
+        // Sweep only the seats the allocator gives up, by the rule it
+        // releases workers and withholds archive recovery by, so releasing a
+        // worker cannot turn a recoverable registration into an orphan in
+        // the same cycle, and no worker recovers a seat this sweep leaves.
         let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
-            .filter(|f| !recovery_filters.contains(*f)).cloned().collect();
+            .filter(|f| prover_info.as_ref()
+                .and_then(|p| self.allocator.given_up_among(&p.allocations, f, frame_number))
+                .is_some_and(|seat| seat.cause == crate::worker_allocator::GivenUp::Lapsed))
+            .cloned().collect();
 
         // Build separate descriptor views.
         //
@@ -1660,7 +1659,8 @@ impl ProverLifecycle {
             let lapsed: std::collections::HashSet<&[u8]> = prover.allocations.iter()
                 .filter(|a| a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch)
                 .map(|a| a.confirmation_filter.as_slice()).collect();
-            let executions = worker_manager.worker_execution();
+            // A worker stopped to reopen its store cannot host its seat.
+            let executions = crate::worker_execution::with_held_stores(worker_manager.worker_execution(), &bound);
             let unanswered = worker_manager.unanswered_workers();
             let now = crate::worker_execution::now_ms();
             let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
@@ -1723,7 +1723,11 @@ impl ProverLifecycle {
             hosting.held_back()
         };
         self.allocator.set_held_back(held_back.clone());
-        free_worker_ids.retain(|core_id| !held_back.contains(core_id));
+        // A worker whose store stopped writing cannot host a new seat either:
+        // a join for it would only expire, its confirm left out, and repeat.
+        free_worker_ids.retain(|core_id| {
+            !held_back.contains(core_id) && !crate::worker_execution::store_stopped(*core_id)
+        });
         let mut held_back_cores: Vec<u32> = held_back.iter().copied().collect();
         held_back_cores.sort_unstable();
         let unbound_held_count = all_our_filters
@@ -4704,6 +4708,30 @@ mod proposal_loop_tests {
         assert!(joins(&lc) > 0, "it votes");
     }
 
+    /// A free worker whose store stopped writing, held for its reopening,
+    /// takes no new seat: a join would expire with its confirm left out and
+    /// repeat for as long as the disk stays full. Once released, it joins.
+    #[test]
+    fn a_worker_whose_store_stopped_does_not_join() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_summaries((1..=4).map(|byte| shard_summary(filter_bytes(byte), 1)).collect());
+        reg.set_prover(prover(address.clone(), vec![]));
+        let joins = || {
+            let lc = make_lifecycle(address.clone(), wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>);
+            lc.set_prover_root_verified_frame(100);
+            count_proposed_joins(&lc.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap())
+        };
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(1));
+        let while_held = joins();
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(1));
+        assert_eq!(while_held, 0, "a worker held for its store takes no seat");
+        assert!(joins() > 0, "it joins once its store is back");
+    }
+
     /// Authenticated GLOBAL state in which each filter's committee session
     /// has the given members.
     fn session_authority(sessions: &[(&Vec<u8>, Vec<Vec<u8>>)]) -> Arc<quil_hypergraph::HypergraphCrdt> {
@@ -4976,6 +5004,64 @@ mod proposal_loop_tests {
         assert_eq!(count_proposed_leaves(&actions), 1, "{actions:?}");
         assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
             "cleanup must not race an opposite confirmation: {actions:?}");
+    }
+
+    /// An unbound seat still Active, registered only for the current epoch,
+    /// is not an unrecoverable orphan: the allocator can bind a worker to
+    /// it, so only the score and capacity ranking may shed it. The sweep
+    /// took it with the lapsed seats, which share its renewal bucket.
+    #[test]
+    fn an_unbound_current_seat_is_not_swept_as_an_unrecoverable_orphan() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![ProverAllocationInfo { epoch: 2, ..alloc(held.clone(), ProverStatus::Active, 10) }]));
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(count_proposed_leaves(&actions), 0, "{actions:?}");
+        assert_eq!(lc.allocator.given_up_seat(&held, 1440), None);
+    }
+
+    /// The planner leaves as unrecoverable orphans exactly the seats the
+    /// recovery gate withholds archive recovery from, by one rule
+    /// (`WorkerAllocator::gives_up`): no worker recovers a seat the planner
+    /// leaves, and every seat it keeps, in its recovery epoch or with its
+    /// renewal running, may still recover.
+    #[test]
+    fn the_planner_leaves_exactly_the_seats_the_recovery_gate_withholds() {
+        use crate::submission_attempts::OpKind;
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let lapsed = filter_bytes(0xA1);
+        let recovering = filter_bytes(0xA2);
+        let renewing = filter_bytes(0xA3);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let seat = |filter: &Vec<u8>, epoch: u64| ProverAllocationInfo { epoch, ..alloc(filter.clone(), ProverStatus::Active, 10) };
+        reg.set_prover(prover(address.clone(), vec![seat(&lapsed, 0), seat(&recovering, 1), seat(&renewing, 0)]));
+        reg.set_summaries(vec![
+            shard_summary(lapsed.clone(), 50), shard_summary(recovering.clone(), 50), shard_summary(renewing.clone(), 50),
+        ]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let renewal = lc.submission_attempts.begin(std::slice::from_ref(&renewing), 1440, OpKind::Confirm).unwrap();
+        lc.set_prover_root_verified_frame(1440);
+        let actions = lc.evaluate(1440, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+        let left = proposed_leave_filters(&actions);
+        assert_eq!(left, vec![lapsed.clone()], "{actions:?}");
+        // The gate gives up lapsed seats once a reconcile has found which ones
+        // a worker served at this start.
+        lc.allocator.on_new_frame(1440).unwrap();
+        for filter in [&lapsed, &recovering, &renewing] {
+            assert_eq!(lc.allocator.given_up_seat(filter, 1440).is_some(), left.contains(filter),
+                "{}", hex::encode(filter));
+        }
+        drop(renewal);
     }
 
     #[test]

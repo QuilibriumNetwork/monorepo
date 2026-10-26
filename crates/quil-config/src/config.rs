@@ -19,8 +19,6 @@ pub struct Config {
     pub logger: LogConfig,
     #[serde(default, alias = "listenGRPCMultiaddr")]
     pub listen_grpc_multiaddr: String,
-    #[serde(default, rename = "listenRESTMultiaddr")]
-    pub listen_rest_multiaddr: String,
     #[serde(default)]
     pub explorer: ExplorerConfig,
     /// Token proof verifier worker (operator-tunable resource
@@ -57,7 +55,6 @@ impl Default for Config {
             db: DbConfig::default(),
             logger: LogConfig::default(),
             listen_grpc_multiaddr: DEFAULT_LISTEN_GRPC_MULTIADDR.to_string(),
-            listen_rest_multiaddr: String::new(),
             explorer: ExplorerConfig::default(),
             proof_worker: ProofWorkerConfig::default(),
             diagnostics: DiagnosticsConfig::default(),

@@ -2,10 +2,13 @@
 
 use num_bigint::BigInt;
 
-/// The QUIL conversion factor `0x1DCD65000` = 8,000,000,000 base units
-/// per QUIL (`client/cmd/token/balance.go:94`).
+/// Base units per QUIL: `0x1DCD65000` = 8,000,000,000
+/// (`client/cmd/token/balance.go:94`).
+pub const UNITS_PER_QUIL: u64 = 0x1_DCD6_5000;
+
+/// [`UNITS_PER_QUIL`] as a [`BigInt`].
 pub fn conversion_factor() -> BigInt {
-    BigInt::from(0x1_DCD6_5000_u64)
+    BigInt::from(UNITS_PER_QUIL)
 }
 
 /// Parse a user-entered **decimal QUIL** amount (integer or fractional, e.g.

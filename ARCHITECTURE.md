@@ -3,11 +3,14 @@
 ## Overview
 
 Quilibrium is a distributed protocol that leverages advanced cryptographic
-techniques including multi-party computation (MPC) for privacy-preserving
-compute. The system operates on a sharded network architecture where the master
-process runs global consensus while data worker processes run app-level
-consensus for their assigned shards, each maintaining their own hypergraph
-state, storage, and networking stack.
+techniques including post-quantum signatures and key exchange for
+privacy-preserving compute. The system operates on a sharded network
+architecture where the master process runs global consensus while data workers
+run app-level consensus for their assigned shards, each maintaining their own
+hypergraph state and storage. Workers run as threads of the master process by
+default, or as standalone processes (see Worker Modes below).
+
+The node and client are a single Rust workspace (`Cargo.toml`, `crates/`).
 
 ## System Architecture
 
@@ -21,7 +24,7 @@ state, storage, and networking stack.
                                 │
 ┌───────────────────────────────┴─────────────────────────────────┐
 │                           RPC Layer                             │
-│              (gRPC/REST APIs, IPCP2P Communication)             │
+│            (gRPC services, explorer REST, DataIPC)              │
 └───────────────────────────────┬─────────────────────────────────┘
                                 │
 ┌───────────────────────────────┴─────────────────────────────────┐
@@ -32,21 +35,21 @@ state, storage, and networking stack.
 │   │   Engine     │  │   Engine    │  │                     │    │
 │   └──────────────┘  └─────────────┘  └─────────────────────┘    │
 │   ┌──────────────┐  ┌─────────────┐  ┌─────────────────────┐    │
-│   │   Storage    │  │    Rust     │  │  Global Hypergraph  │    │
-│   │  (PebbleDB)  │  │  Libraries  │  │       State         │    │
+│   │   Storage    │  │   Crypto    │  │  Global Hypergraph  │    │
+│   │  (RocksDB)   │  │   Crates    │  │       State         │    │
 │   └──────────────┘  └─────────────┘  └─────────────────────┘    │
 └───────────────────────────────┬─────────────────────────────────┘
-                                │ IPCP2P
+                                │ DataIPC (gRPC) or in-process channels
 ┌───────────────────────────────┴─────────────────────────────────┐
-│                  Data Worker Process (Core 1)                   │
+│                      Data Worker (Core 1+)                      │
 │   ┌──────────────┐  ┌─────────────┐  ┌─────────────────────┐    │
 │   │     App      │  │Token/Hyper- │  │    P2P Network      │    │
-│   │  Consensus   │  │graph/Compute│  │   (BlossomSub)      │    │
+│   │  Consensus   │  │graph/Compute│  │ (master or proxied) │    │
 │   │   Engine     │  │  Execution  │  │                     │    │
 │   └──────────────┘  └─────────────┘  └─────────────────────┘    │
 │   ┌──────────────┐  ┌─────────────┐  ┌─────────────────────┐    │
-│   │   Storage    │  │    Rust     │  │  Shard Hypergraph   │    │
-│   │  (PebbleDB)  │  │  Libraries  │  │       State         │    │
+│   │   Storage    │  │   Crypto    │  │  Shard Hypergraph   │    │
+│   │  (RocksDB)   │  │   Crates    │  │       State         │    │
 │   └──────────────┘  └─────────────┘  └─────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
                                 │
@@ -55,164 +58,197 @@ state, storage, and networking stack.
 
 ### Core Components
 
-#### 1. Node Module (`node/`)
+#### 1. Node (`crates/quil-node/`)
 
-The main entry point containing the core system implementation with a
-multi-process architecture where each process has its own complete stack.
+The main entry point (`src/main.rs`) containing the node binary. The master
+runs the global stack; each data worker owns its own consensus engine,
+execution engines and store.
 
 **Process Types:**
 
 ##### Master Process (Core 0)
-Runs the global consensus and coordination:
-- **Global Consensus Engine**: System-wide consensus and coordination
+Runs the global consensus and coordination (`src/master_node/`):
+- **Global Consensus**: System-wide consensus and coordination
 - **Global Execution Engine**: System-level operations
 - **P2P Networking**: Full BlossomSub stack for global communication
-- **Storage (PebbleDB)**: Persistent storage for global state
-- **Rust Library Bindings**: Access to cryptographic operations
+- **Storage (RocksDB)**: Persistent storage for global state
+- **Cryptography**: Access to the cryptographic crates
 - **Global Hypergraph State**: System-wide state management
 
-##### Data Worker Processes (Cores 1+)
+##### Data Workers (Cores 1+)
 Each worker manages specific shards:
 - **App Consensus Engine**: Shard-level consensus
 - **Execution Engines**: Token, Hypergraph, and Compute engines
-- **P2P Networking**: Full BlossomSub stack for shard communication
-- **Storage (PebbleDB)**: Persistent storage for shard state
-- **Rust Library Bindings**: Access to cryptographic operations
+- **P2P Networking**: The master's BlossomSub stack, shared in-process or
+  reached through the master's pubsub proxy; a standalone worker can also run
+  its own stack
+- **Storage (RocksDB)**: Persistent storage for shard state in the worker's
+  own store directory
+- **Cryptography**: Access to the cryptographic crates
 - **Shard Hypergraph State**: Shard-specific state management
 
-**Application Layer** (`app/`):
-- `Node`: Main node implementation (runs in master process)
-- `DataWorkerNode`: Worker node implementation (runs in worker processes)
+##### Worker Modes
+- **Thread mode (default)**: `ThreadWorkerManager`
+  (`crates/quil-engine/src/thread_worker.rs`) runs each worker as a core-pinned
+  thread of the master process with its own single-threaded runtime;
+  the master talks to it over in-process channels.
+- **Standalone mode**: when `engine.dataWorkerStreamMultiaddrs` is configured,
+  `RemoteWorkerManager` (`crates/quil-engine/src/remote_worker.rs`) assigns
+  shards by `Respawn(filter)` RPC to separate `quil-node --core=N` processes
+  (`crates/quil-node/src/worker_node.rs`,
+  `crates/quil-engine/src/worker_node.rs`), which may run on other machines.
+
+**Application Layer**:
+- `master_node` (`crates/quil-node/src/master_node/`): Main node
+  implementation (runs in master process)
+- `worker_node` (`crates/quil-node/src/worker_node.rs`): Standalone worker
+  implementation (runs in worker processes)
 
 **Key Subsystems:**
 
-##### Consensus Engines (`node/consensus/`)
+##### Consensus Engines (`crates/quil-engine/`, `crates/quil-cw-consensus/`, `crates/quil-consensus/`)
 
-Two distinct consensus implementations:
+Two distinct consensus levels run on commonware simplex with Falcon-512
+signatures (`quil-cw-consensus`), driven by seams in `quil-engine`. The
+generic `quil-consensus` crate keeps the shared models, leader-provider trait
+and bitmask helpers.
 
-**Global Consensus** (`node/global/`) - Master Process:
+**Global Consensus** (`cw_global_seams.rs`, `global_finalization.rs`) - Master
+Process:
 - System-wide coordination
 - Cross-shard transaction ordering
 - Global state transitions
 - Network-wide fork choice
 
-**App Consensus** (`node/app/`) - Worker Processes:
+**App Consensus** (`app_engine.rs`, `cw_app_seams.rs`) - Workers:
 - Shard-specific consensus
 - Local transaction ordering
 - Shard state transitions
 - Integration with global consensus
 
 **Shared Components**:
-- `DifficultyAdjuster`: Dynamic difficulty adjustment
-- `DynamicFeeManager`: Dynamic Fee Market management
-- `ProverRegistry`: Enrolled prover registry
-- `SignerRegistry`: Block signer registry
-- Time Reels: VDF-based time consensus
+- `DifficultyAdjuster` (`difficulty.rs`): Dynamic difficulty adjustment
+- `DynamicFeeManager` (`fees.rs`): Dynamic Fee Market management
+- `ProverRegistry` (`crates/quil-execution/src/prover_registry.rs`): Enrolled
+  prover registry
+- `SignerRegistry` (`crates/quil-p2p/src/signer_registry.rs`): Block signer
+  registry
+- Time Reels (`time_reel.rs`): VDF-based time consensus
 
-##### Execution Engines (`node/execution/`)
+##### Execution Engines (`crates/quil-execution/`)
 
-Distribution across processes:
+Created by `ExecutionEngineManager` (`src/manager.rs`). Distribution across
+processes:
 
-**Global Execution Engine** - Master Process:
+**Global Execution Engine** (`global_engine.rs`) - Master Process:
 - System-wide operations
 - Cross-shard coordination
 - Global state updates
 
-**App Execution Engines** - Worker Processes:
-- **Token Engine**: QUIL token operations within shards
-- **Hypergraph Engine**: CRDT-based state management for shards
-- **Compute Engine**: MPC-based privacy-preserving computation
+**App Execution Engines** - Workers:
+- **Token Engine** (`token_engine.rs`): QUIL token operations within shards
+- **Hypergraph Engine** (`hypergraph_engine.rs`): CRDT-based state management
+  for shards
+- **Compute Engine** (`compute_engine.rs`): Compute deployment and execution
+  operations; the circuit compiler it needs is not yet wired in the node (a
+  no-op stub is used)
 
-##### P2P Networking (`node/p2p/`)
+##### P2P Networking (`crates/quil-p2p/`, `crates/blossomsub/`)
 
-Each process (master and workers) has its own complete P2P stack:
-- **BlossomSub**: Custom pub/sub protocol
+- **BlossomSub**: Custom pub/sub protocol (`crates/blossomsub`, a fork of
+  libp2p-gossipsub, bridged by `quil-p2p/src/blossomsub_behaviour.rs`)
 - **Peer Management**: Discovery and connections
 - **Public Channels**: Point to point authenticated message routing
 - **Private Channels**: Onion-routing authenticated message channels
-- **DHT Integration**: Distributed peer discovery
+  (`quil-p2p/src/onion/`)
+- **DHT Integration**: Distributed peer discovery (`crates/libp2p-kad`,
+  `quil-node/src/dht_node.rs`)
 
 Master process handles global bitmask, workers handle shard-specific bitmasks.
 
-##### Storage Layer (`node/store/`)
+##### Storage Layer (`crates/quil-store/`)
 
-Each process maintains its own PebbleDB instance:
+Each store (the master's and each worker's) is a separate RocksDB instance:
 - **Clock Store**: Frame-based ordering
-- **Coin Store**: Locally managed token state
-- **Data Proof Store**: Cryptographic proofs
+- **Token Store**: Locally managed token state
+- **Key Store**: Key records
 - **Hypergraph Store**: Hypergraph state persistence
-- **Peer Store**: Network peer information
+- **Shards and Worker Stores**: Shard metadata and worker bindings
 
 Storage is partitioned by process responsibility (global vs shard).
 
-##### Hypergraph (`hypergraph/`)
+##### Hypergraph (`crates/quil-hypergraph/`, `crates/quil-forest/`)
 
 Distributed graph structure:
 - **Global Hypergraph**: Maintained by master process
 - **Shard Hypergraphs**: Maintained by respective workers
 - **CRDT Semantics**: Conflict-free updates
 - **Components**:
-  - `Hypergraph`: Core graph structure
-  - `Vertex`: Node with associated data
-  - `Hyperedge`: Multi-way relationships
+  - `HypergraphCrdt` (`quil-hypergraph/src/crdt.rs`): Core graph structure
+  - Vertex and hyperedge add/remove operations
+    (`quil-execution/src/hypergraph_intrinsic/types.rs`)
+  - `quil-forest`: Authenticated Merkle forest holding the committed state
 
-##### Cryptographic Layer (`types/crypto/`)
+##### Cryptographic Layer (`crates/quil-crypto/`, `crates/quil-tries/`)
 
-Shared across all processes via Rust bindings (`bls48581`):
-- **Proof Trees**: Verkle tree structures
-- **Channel Crypto**: Secure E2EE communication
+Shared across all processes:
+- **Crypto adapters**: `quil-crypto` wraps the cryptographic crates behind the
+  `quil-types` traits
+- **Proof Trees**: Vector commitment trees (`quil-tries`)
+- **Channel Crypto**: Secure E2EE communication (`crates/channel`)
 
-#### 2. Client Module (`client/`)
+#### 2. Client (`crates/quil-client/`)
 
-Command-line interface for user interactions:
+Command-line interface (`qclient`) for user interactions:
 - **Node Management**: Install, update, service control
 - **Token Operations**: Balance, transfer, mint operations
 - **Hypergraph Operations**: Deploy, store, update, query operations
 - **Compute Operations**: Deploy, execute, commit operations
-- **Cross-Mint**: Token bridging
+- **Prover Operations**: Join, merge, manage provers
 - **Configuration**: Network and RPC settings
 
 #### 3. Rust Crates (`crates/`)
 
-High-performance cryptographic libraries used by all processes:
+Libraries used by all processes:
 
 **Core Cryptography**:
 - **bls48581**: BLS signatures
-- **bulletproofs**: Transaction privacy via zero-knowledge proofs
+- **bulletproofs**: Bulletproofs over Ed448
 - **vdf**: Verifiable Delay Functions for time consensus
 - **verenc**: Verifiable encryption schemes
+- **quil-lattice-ct**: Lattice-based confidential token commitments and proofs
 
 **MPC Components**:
 - **ferret**: Oblivious transfer protocols
 - **channel**: Secure communication protocols
 - **rpm**: Randomized Permutation Matrices
+- **dkls23**: Threshold ECDSA
 
 **Supporting**:
 - **classgroup**: Class group VDF implementation
-- WASM bindings for various libraries
+- **quil-compiler**: QCL circuit compiler
+- WASM bindings for various libraries (`*-wasm`)
 
 #### 4. Supporting Libraries
 
 **MPC and Privacy**:
-- `bedlam`: Garbled circuit compiler/evaluator
-- `emp-ot`, `emp-tool`: Efficient MPC primitives
-- `nekryptology`: Additional cryptographic tools
+- `emp-ot`, `emp-tool`: Efficient MPC primitives (C++, built by
+  `install-emp.sh`)
 
 **Networking**:
-- `go-libp2p-blossomsub`: Custom gossip for sharding
-- `go-libp2p-kad-dht`: DHT implementation
-- `go-libp2p`: Core P2P functionality
+- `crates/blossomsub`: Custom gossip for sharding
+- `crates/libp2p-kad`: DHT implementation
+- `crates/libp2p-*`: Forked libp2p components
 
 **Storage**:
-- `node/pebble`: High-performance key-value store
-- `protobufs`: Protocol definitions
+- `rocksdb`: High-performance key-value store (`quil-store`)
+- `protobufs`: Protocol definitions (`.proto`, compiled by
+  `crates/quil-types/build.rs`)
 
-#### 5. Interfaces (`types/`)
+#### 5. Interfaces (`crates/quil-types/`)
 
 **Interfaces**:
-- `types/consensus/`: Consensus-oriented interfaces:
-  - **AppConsensusEngine**: The app shard level consensus engine
-  - **GlobalConsensusEngine**: The global level consensus engine
+- `src/consensus.rs`: Consensus-oriented interfaces:
   - **DifficultyAdjuster**: Manages the next difficulty following the prior
       frame
   - **EventDistributor**: The central nervous system to internal event control
@@ -227,9 +263,8 @@ High-performance cryptographic libraries used by all processes:
       messaging channel keys
   - **AppFrameValidator**: Validator path for app shard frames
   - **GlobalFrameValidator**: Validator path for global frames
-- `types/crypto/`:
-  - **BlsAggregateOutput**: Methods for handling aggregate signatures
-  - **BlsKeygenOutput**: Methods for handling BLS keygen outputs
+- `src/crypto.rs`:
+  - **BlsAggregateOutput**: Output of aggregate signature handling
   - **BulletproofProver**: Provides construction and verification of outputs
       related to bulletproofs
   - **FrameProver**: Methods for generating proofs on frames
@@ -239,69 +274,54 @@ High-performance cryptographic libraries used by all processes:
   - **DecafConstructor**: Methods for creating Decaf 448 keys
   - **DecafAgreement**: Methods specific to key agreement with Decaf 448 keys
   - **Signer**: Generic signer interface to unify all managed key types
-  - **Agreement**: Generic key agreement interface to unify all DH agreed keys
-  - **VerifiableEncryptor**: Methods for producing verifiable encryption proofs
-  - **VerEncProof**: Methods for handling the proof outputs
-  - **VerEnc**: Methods for handling the compressed proof outputs for storage
-- `types/execution/intrinsics/`: Intrinsics and intrinsic operation interfaces:
-  - **Intrinsic**: Methods for managing intrinsics
-  - **IntrinsicOperation**: Methods for performing operations of the intrinsics
-- `types/execution/state/`: State management related interfaces:
-  - **State**: Methods for initializing, modifying, and deleting state, and
-      retrieving state transition outputs
-- `types/execution/`: Execution engine encapsulation
+  - **KeyManager**: Key management interface
+- `src/execution.rs`: Execution engine encapsulation
   - **ShardExecutionEngine**: Shard-specific execution container methods
-- `types/hypergraph/`: Hypergraph-oriented interfaces
-- `types/keys/`: Key management interfaces
-- `types/p2p/`: PubSub related interfaces
-- `types/store/`: KVDB store related interfaces
+  - **CircuitCompiler**: Circuit compilation for compute deployments
+- `crates/quil-execution/src/intrinsics.rs`: Intrinsic interface
+  - **Intrinsic**: Methods for managing intrinsics
+- `src/p2p.rs`: PubSub related interfaces
+- `src/store.rs`: KVDB and store related interfaces (`ClockStore`,
+  `TokenStore`, `HypergraphStore`, ...)
 
-**Mock Implementations**:
-- **MockBlsConstructor**: BLS Key Constructor, used by key manager
-- **MockBLSSigner**: BLS Keypair, used in many places
-- **MockBulletproofProver**: Bulletproof prover, used by token intrinsic
-- **MockDecafConstructor**: Decaf 448 Key Constructor, used by key manager and
-    token intrinsic
-- **MockVertex, MockHyperedge, MockHypergraph**: Hypergraph components
-- **MockInclusionProver**: KZG prover
-- **MockMultiproof**: Multiproof output
-- **MockKeyManager**: Key manager, used everywhere
-- **MockPubSub**: PubSub-based message system, used by consensus engines
-- **MockVerifiableEncryptor, MockVerEncProof, MockVerEnc**: Verifiable
-    encryption, used in intrinsics, hypergraph storage
+**Test Doubles**:
+Stubs for tests live in `testing` modules next to the code they stand in for
+(e.g. `crates/quil-execution/src/testing.rs`,
+`crates/quil-hypergraph/src/testing.rs`, `crates/quil-store/src/testing.rs`).
 
 **Tries**:
-All trie related constructions are contained within types for easy WASM
-generation.
+All trie related constructions are contained within `quil-tries`.
 
 ### Architectural Patterns
 
-#### 1. Shared-Nothing Process Architecture
+#### 1. Shared-Nothing Worker Architecture
 
-Each process is self-contained with its own:
+Each worker is self-contained with its own:
 - Consensus engine (global or app)
 - Execution engine(s)
-- P2P networking stack
 - Storage layer
-- Cryptographic libraries
+
+and uses the cryptographic crates and (directly or via the master) the P2P
+stack. A worker runs as a thread by default or as a standalone process.
 
 Benefits:
-- Process independence
-- Failure isolation
+- Worker independence
+- Failure isolation (process-level when standalone)
 - Horizontal scalability
 
 #### 2. Sharded State Management
 
-State is partitioned across processes:
+State is partitioned across the master and its workers:
 - Master process: Global state and coordination
-- Worker processes: Shard-specific state
+- Workers: Shard-specific state
 - CRDT hypergraph for convergence
 
 #### 3. Multi-Party Computation (MPC)
 
-Privacy-preserving computation:
-- Garbled circuits via bedlam
-- Oblivious transfer for private inputs
+Privacy-preserving computation (the building blocks are in the workspace; the
+node does not yet execute MPC compute):
+- Circuit compilation via `quil-compiler`
+- Oblivious transfer via `ferret`
 - General-purpose privacy beyond just transactions
 
 #### 4. Layered Consensus
@@ -311,10 +331,11 @@ Two-tier consensus system:
 - App consensus for shard-level operations
 - Time Reel VDF for temporal ordering
 
-#### 5. IPC Communication
+#### 5. Master-Worker Communication
 
-Inter-process communication design:
-- Structured message passing
+Master-worker communication design:
+- Structured message passing (in-process channels, or the `DataIPCService`
+  gRPC service for standalone workers)
 - Minimal shared state
 
 ### Security Architecture
@@ -322,42 +343,37 @@ Inter-process communication design:
 #### 1. Privacy Layers
 
 **Transaction Privacy**:
-- Bulletproofs for confidential transactions
-- Zero-knowledge range proofs and sum checks
+- Lattice-based confidential token commitments and proofs (`quil-lattice-ct`)
 
 **Computation Privacy**:
-- MPC for general computations
-- Garbled circuits for function privacy
-- Oblivious transfer for input privacy
+- MPC building blocks (`quil-compiler`, `ferret`); not yet wired into the node
 
 **Data Privacy**:
-- Verifiable encryption for settled state
+- Post-quantum commit-and-encrypt for confidential hypergraph vertex fields
+  (`quil-execution/src/hypergraph_intrinsic/confidential.rs`)
 
 #### 2. Process Isolation
 
-- Independent process spaces
-- Limited IPC surface
-- Resource isolation per process
+- Separate store per worker
+- Standalone workers: independent process spaces and a limited gRPC surface
 
 #### 3. Network Security
 
-- Peer reputation scoring
-- Sybil resistance
-- Eclipse attack prevention
+- Peer reputation scoring (`crates/blossomsub/src/peer_score.rs`)
+- Post-quantum authenticated transports (`quil-p2p/src/pqnoise.rs`)
 - Shard-aware routing
 
 #### 4. Binary Verification
 
-- Multi-signature verification
-- Threshold signing schemes
-- Automated signature updates
+- Multi-signature verification of release digests against the signatories
+  (`quil-node/src/release_check.rs`, `signers/`)
 
 ### System Boundaries
 
 #### Process Boundaries
 - Master process: Global operations
-- Worker processes: Shard operations
-- Clear IPC interfaces between processes
+- Workers: Shard operations
+- Clear interfaces between master and workers
 
 #### Consensus Boundaries
 - Global consensus: Cross-shard coordination
@@ -366,25 +382,24 @@ Inter-process communication design:
 
 #### State Boundaries
 - Global state in master process
-- Shard state in worker processes
+- Shard state in workers
 - CRDT merge protocols for synchronization
 
 #### Network Boundaries
-- Each process has independent P2P stack
 - Topic-based message routing
 - Shard-aware peer connections
 
 ### Build and Deployment
 
 #### Build System
-- Hybrid Go/Rust via CGO
+- Rust workspace built with Cargo, linking the native GMP/FLINT/MPFR/EMP
+  libraries (`node/build.sh`, `Taskfile.yaml`, `docker/`)
 - Platform-specific optimizations
 - Static linking for distribution
 
 #### Configuration
 - Per-process configuration
-- Environment variable support
-- YAML configuration files
+- YAML configuration files (`quil-config`)
 
 #### Monitoring
 - Prometheus metrics per process
@@ -393,9 +408,9 @@ Inter-process communication design:
 
 ## Design Rationale
 
-### 1. Independent Process Stacks
-- **Decision**: Each process has full stack
-- **Rationale**: Maximum isolation, independent scaling, failure resilience
+### 1. Independent Worker Stacks
+- **Decision**: Each worker has its own engines and store
+- **Rationale**: Isolation, independent scaling, failure resilience
 
 ### 2. Two-Tier Consensus
 - **Decision**: Separate global and app consensus
@@ -410,74 +425,90 @@ Inter-process communication design:
 - **Decision**: CRDT-based state model
 - **Rationale**: Natural convergence in distributed sharded system
 
-### 5. Rust Cryptography
-- **Decision**: Rust for crypto operations
+### 5. Rust Throughout
+- **Decision**: Rust for the node, client and cryptography
 - **Rationale**: Performance and memory safety for critical operations
 
 ## Development Guidelines
 
 ### Architecture Principles
-- Maintain process independence
+- Maintain worker independence
 - Respect consensus boundaries
 - Minimize cross-shard communication
 - Preserve privacy guarantees
 
 ### Code Organization
-- Clear separation by process type
-- Shared interfaces and types
+- Clear separation by crate
+- Shared interfaces and types (`quil-types`)
 - Process-specific implementations
 
 ### Testing Strategy
 - Unit tests per component
-- Integration tests per process
-- Cross-process interaction tests
-- MPC protocol verification
+- Integration tests per crate (`crates/*/tests/`)
+- Docker-based network harness (`crates/devnet`)
+- CI runs `cargo nextest` (`.nextest.toml`)
 
 ## Frequently Asked Questions (FAQ) with Code References
 
 ### Getting Started
 
 **Q: Where is the main entry point?**
-- Main entry: `node/main.go`
+- Main entry: `crates/quil-node/src/main.rs`
 - The `main()` function handles initialization, and manages the lifecycle
 
 **Q: How does the multi-process architecture work?**
-- Process spawning: `node/worker/manager.go` (see `spawnDataWorkers` function)
-- Master process runs on core 0, creates and starts Global Consensus Engine with
-embedded Worker Manager
-- Upon start, Worker Manager spawns workers for cores 1+ using `exec.Command`
-- Each worker receives `--core` parameter to identify its role
+- Worker management: `crates/quil-node/src/master_node/worker_manager.rs`
+- Master process runs on core 0 and starts the global consensus stack with a
+  worker manager
+- By default `ThreadWorkerManager` starts a pinned worker thread per core
+  (`crates/quil-engine/src/thread_worker.rs`)
+- With `engine.dataWorkerStreamMultiaddrs` set, `RemoteWorkerManager`
+  (`crates/quil-engine/src/remote_worker.rs`) drives standalone
+  `quil-node --core=N --parent-process <master pid>` processes you start
+  yourself (`scripts/localnet.sh` shows a local setup)
+- Each worker receives the `--core` parameter to identify its role
 
 **Q: How do I run the node?**
-- Build: `./node/build.sh` (creates static binary)
-- Run: `./node/node` (starts master process which spawns workers)
-- Configuration: `config.yml` or environment variables
+- Build: `./node/build.sh` (builds `crates/quil-node`, statically linked)
+- Run: the built `node/build/<platform>/node` binary (starts the master
+  process, which starts its workers)
+- Configuration: `config.yml` in the config directory
 
 ### Architecture & Design
 
 **Q: How do processes communicate (IPC)?**
-- Uses IPC over private pubsub topics for structured message passing
-- Master process acts as coordinator, workers connect via IPC
+- Thread workers use in-process channels
+- Standalone workers use the `DataIPCService` gRPC service
+  (`protobufs/node.proto`) and the master's pubsub proxy
+  (`crates/quil-rpc/src/pubsub_proxy.rs`)
+- Master process acts as coordinator
 
 **Q: Where is consensus implemented?**
-- App Consensus (workers): `node/consensus/app/app_consensus_engine.go`
-- Factory: `node/consensus/app/factory.go`
-- Consensus interface: `node/consensus/consensus_engine.go`
+- App Consensus (workers): `crates/quil-engine/src/app_engine.rs`
+  (`AppConsensusEngine`), `cw_app_seams.rs`
+- Global Consensus (master): `crates/quil-engine/src/cw_global_seams.rs`,
+  `crates/quil-node/src/cw_consensus_bridge.rs`
+- Simplex backend: `crates/quil-cw-consensus/`
+- Consensus interfaces: `crates/quil-types/src/consensus.rs`,
+  `crates/quil-consensus/src/leader_provider.rs`
 
 **Q: Where is the hypergraph implementation?**
-- Main interface: `hypergraph/hypergraph.go`
+- Main structure: `crates/quil-hypergraph/src/crdt.rs` (`HypergraphCrdt`)
 - Core components:
-  - Vertex: `hypergraph/vertex.go`
-  - Hyperedge: `hypergraph/hyperedge.go`
-  - Atoms: `hypergraph/atom.go`
-  - Proofs: `hypergraph/proofs.go`
+  - Addressing: `crates/quil-hypergraph/src/addressing.rs`
+  - Snapshots: `crates/quil-hypergraph/src/snapshot.rs`
+  - Vertex and hyperedge operations:
+    `crates/quil-execution/src/hypergraph_intrinsic/types.rs`
+  - Persistence: `crates/quil-store/src/hypergraph.rs`
 
 ### Networking & P2P
 
 **Q: How is P2P networking initialized?**
-- BlossomSub: `node/p2p/blossomsub.go` (`NewBlossomSub`)
-- Worker P2P ports: Base port + worker index
-- Each process has independent P2P stack
+- BlossomSub: `crates/quil-p2p/src/blossomsub_behaviour.rs`, node setup in
+  `crates/quil-p2p/src/node.rs`
+- Worker P2P ports start at `engine.dataWorkerBaseP2PPort`
+- A standalone worker runs its own stack or, with `engine.enableMasterProxy`,
+  uses the master's
 
 **Q: How does cross-shard communication work?**
 - Through master process coordination via P2P
@@ -489,49 +520,57 @@ embedded Worker Manager
 ### Execution & State
 
 **Q: Where are execution engines created?**
-- Factory: `node/execution/engines/factory.go` (`CreateExecutionEngine`)
+- Factory: `crates/quil-execution/src/manager.rs`
+  (`ExecutionEngineManager::new`)
 - Engine types: Global, Compute, Token, Hypergraph
-- Batch creation: `CreateAllEngines`
+  (`crates/quil-execution/src/engines.rs`)
 
 **Q: How is state stored?**
-- PebbleDB wrapper: `node/store/pebble.go`
-- Clock store: `node/store/clock.go`
-- Localized Coin store: `node/store/coin.go`
-- Each process has its own DB instance
+- RocksDB wrapper: `crates/quil-store/src/rocksdb_store.rs`
+- Clock store: `crates/quil-store/src/clock.rs`
+- Localized token store: `crates/quil-store/src/token.rs`
+- The master and each worker have their own DB instance
 
 ### Cryptography & Privacy
 
 **Q: Where is MPC/garbled circuits used?**
-- Bedlam compiler: `bedlam/` directory
-- Compute intrinsic: `node/execution/intrinsics/compute/compute_deploy.go`
-- Client deployment initializes the garbler
+- Circuit compiler: `crates/quil-compiler/` (a port of the former `bedlam`
+  compiler); not yet wired into the node, which uses a no-op compiler
+- Compute intrinsic: `crates/quil-execution/src/compute_intrinsic/`
+- Oblivious transfer: `crates/ferret/`
 
 **Q: Where are the cryptographic libraries?**
 - Rust crates: `crates/` directory
   - BLS: `crates/bls48581/`
   - Bulletproofs: `crates/bulletproofs/`
   - VDF: `crates/vdf/`
-- Go bindings: Generated via CGO in each crate
+- Node-facing adapters: `crates/quil-crypto/`
 
 **Q: How are bulletproofs integrated?**
 - Rust implementation: `crates/bulletproofs/`
-- Used for transaction privacy (amount hiding)
-- Go bindings in `bulletproofs/` directory
+- Adapter: `crates/quil-crypto/src/bulletproof_adapter.rs`
+- The node's confidential token path is now lattice-based
+  (`crates/quil-lattice-ct/`); the decaf448 bulletproof providers are retired
+  from it
 
 ### Configuration & Operations
 
 **Q: How do I configure the node?**
-- Main config: `config/config.go` (`Config` struct)
-- Engine config: `config/engine.go`
+- Main config: `crates/quil-config/src/config.rs` (`Config` struct)
+- Engine config: `crates/quil-config/src/engine.rs`
 - Data worker config
-- Load with YAML file or environment variables
+- Load with a YAML file
 
 **Q: What are the RPC/API endpoints?**
-- Node RPC: `node/rpc/node_rpc_server.go`
+- Node RPC: `crates/quil-rpc/src/node_service.rs`
+- Global and diagnostics services: `crates/quil-rpc/src/global_service.rs`,
+  `crates/quil-rpc/src/diagnostics_service.rs`
 - gRPC definitions: `protobufs/node.proto`
+- Explorer REST API: `crates/quil-explorer/`
 
 **Q: How do I monitor the node?**
-- Prometheus metrics throughout codebase
+- Prometheus metrics throughout codebase (`crates/quil-node/src/rpc_metrics.rs`;
+  `quil-node --metrics` fetches them from a running node)
 - Grafana dashboards: `dashboards/grafana/`
 - Structured logging with configurable levels
 
@@ -539,18 +578,21 @@ embedded Worker Manager
 
 **Q: How is the project built?**
 - Node build: `node/build.sh` (static linking, platform detection)
-- Client build: `client/build.sh`
-- Rust integration: Various `generate.sh` scripts
-- Docker: Multiple Dockerfiles for different scenarios
+- Client build: `Taskfile.yaml` `build_qclient_*` tasks (`crates/quil-client`)
+- Docker: `docker/Dockerfile.source`, `docker/Dockerfile.sourceavx512`,
+  `docker/Dockerfile.release`
 
 **Q: What happens when a worker crashes?**
-- Master process monitors worker processes
-- Automatic restart logic in `spawnDataWorkers`
-- Process isolation prevents cascade failures
+- The master keeps a connection to each standalone worker and re-sends any
+  owed `Respawn` (`RemoteWorkerManager::reconcile_respawns`)
+- A standalone worker exits when its parent process is gone
+  (`monitor_parent_process`)
+- Process isolation prevents cascade failures between standalone workers
 
 **Q: How do I add a new execution engine?**
-- Implement the interface in `node/execution/`
-- Add to factory in `node/execution/engines/factory.go`
+- Implement `ShardExecutionEngine` (`crates/quil-types/src/execution.rs`) in
+  `crates/quil-execution/`
+- Add to `ExecutionEngineManager` in `crates/quil-execution/src/manager.rs`
 - Register intrinsics as needed
 
 ### Common Code Paths
@@ -574,4 +616,3 @@ embedded Worker Manager
 2. Topic routing to appropriate handler
 3. Shard-specific messages to workers
 4. Global messages to master process
-

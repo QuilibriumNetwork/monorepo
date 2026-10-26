@@ -249,7 +249,8 @@ impl HistoricalCommittees {
     /// prover, VDF and signature) and is certified (`anchor_accepted`), and
     /// stored. Never the latest frame alias or a frame at or above this
     /// node's head; at most [`ANCHOR_ARCHIVES`] archives, each within
-    /// [`ANCHOR_FETCH`].
+    /// [`ANCHOR_FETCH`]. Below this node's request-retention boundary only
+    /// the header is fetched, as that is all the store keeps there.
     pub(crate) async fn global_anchor(&self, number: u64) -> Result<GlobalFrame> {
         let _one = self.anchor_fetch.lock().await;
         match self.clock_store.get_global_frame(number) {
@@ -263,14 +264,23 @@ impl HistoricalCommittees {
                 "GLOBAL anchor {number} is not behind this node's head {head}"
             )));
         }
+        // The worker validates against the header alone, but a frame stored
+        // at or above the request-retention boundary counts as whole: the gap
+        // backfill skips it and peers are served it. Below the boundary the
+        // store keeps headers only and refuses them to peers, so a header is
+        // all the anchor needs, and it spares the archive reading and sending
+        // request bundles that can run to megabytes within `ANCHOR_FETCH`.
+        let header_only = self.clock_store.global_requests_retained_from().is_some_and(|from| number < from);
         let mut refusals = Vec::new();
         for addr in self.pool.get_all().await.into_iter().take(ANCHOR_ARCHIVES) {
             let fetched = tokio::time::timeout(ANCHOR_FETCH, async {
                 let mut client = (self.connect)(addr.clone()).await?;
-                let frame = client
-                    .get_global_frame(number)
-                    .await
-                    .map_err(|e| QuilError::ExecutionUnavailable(format!("archive read: {e}")))?;
+                let read = if header_only {
+                    client.get_global_frame_header_only(number).await
+                } else {
+                    client.get_global_frame(number).await
+                };
+                let frame = read.map_err(|e| QuilError::ExecutionUnavailable(format!("archive read: {e}")))?;
                 let accepted = self.anchor_accepted(number, &frame, &mut client).await;
                 Ok::<_, QuilError>((frame, accepted))
             })
@@ -310,6 +320,8 @@ impl HistoricalCommittees {
     /// sync; a valid frame from a nullified view is not. So it is accepted
     /// when frames from the same archive, each valid and the child of the
     /// one below, reach a certified frame at most [`ANCHOR_DESCENT`] above.
+    /// Those frames are only checked, never stored, so only their headers
+    /// are fetched.
     async fn anchor_accepted(
         &self,
         number: u64,
@@ -327,7 +339,7 @@ impl HistoricalCommittees {
             if super::archive_sync::frame_self_certified(&below, &self.verifier) {
                 return Ok(());
             }
-            let above = client.get_global_frame(above_number).await.map_err(|e| {
+            let above = client.get_global_frame_header_only(above_number).await.map_err(|e| {
                 format!("carries no certificate of its own, and frame {above_number} above it is unavailable: {e}")
             })?;
             let identity = below.header.as_ref().and_then(|h| quil_crypto::poseidon::hash_bytes_to_32(&h.output).ok());
@@ -758,5 +770,45 @@ mod tests {
         }
         assert_eq!(clock.get_global_frame(40).unwrap(), linked(40, false));
         assert_eq!(clock.get_latest_frame_number(), Some(100));
+    }
+
+    /// Serves [`UncertifiedArchive`]'s chain with a request bundle in every
+    /// frame, counting the frames read whole; a header is read alone.
+    struct BundledArchive(Arc<std::sync::atomic::AtomicUsize>);
+    impl quil_rpc::global_service::FrameLookup for BundledArchive {
+        fn get_latest_frame(&self) -> std::result::Result<GlobalFrame, String> {
+            UncertifiedArchive.get_latest_frame()
+        }
+        fn get_frame(&self, n: u64) -> std::result::Result<GlobalFrame, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut frame = UncertifiedArchive.get_frame(n)?;
+            frame.requests.push(quil_types::proto::global::MessageBundle { timestamp: n as i64, ..Default::default() });
+            Ok(frame)
+        }
+        fn get_frame_header(&self, n: u64) -> std::result::Result<GlobalFrameHeader, String> {
+            UncertifiedArchive.get_frame(n)?.header.ok_or_else(|| "no header".to_string())
+        }
+    }
+
+    /// Below this node's request-retention boundary an anchor is fetched as
+    /// its header alone, as are the frames above it fetched to find its
+    /// certificate, so the archive reads no request bundle. At or above the
+    /// boundary the stored anchor counts as whole and keeps its bundles.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anchors_below_the_retention_boundary_are_fetched_as_headers() {
+        let whole = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_whole = || whole.load(std::sync::atomic::Ordering::SeqCst);
+        let (service, clock, _stores) = anchor_service(BundledArchive(whole.clone())).await;
+        assert_eq!(clock.prune_global_frame_requests(70).unwrap().retained_from, Some(30));
+
+        assert_eq!(service.global_anchor(21).await.unwrap(), linked(21, false), "certified 8 frames above");
+        assert_eq!(read_whole(), 0, "the anchor and the 8 frames above it, as headers");
+        assert_eq!(clock.get_global_frame(21).unwrap(), linked(21, false));
+
+        let anchor = service.global_anchor(40).await.unwrap();
+        assert_eq!(anchor.requests.len(), 1, "a whole frame at the boundary or above");
+        assert_eq!(anchor.header, linked(40, false).header);
+        assert_eq!(read_whole(), 1, "its certified child, as a header");
+        assert_eq!(clock.get_global_frame(40).unwrap(), anchor);
     }
 }

@@ -241,6 +241,7 @@ pub struct TestWorkerManager {
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
     unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    shard_data: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
 }
 
 impl Default for TestWorkerManager {
@@ -257,7 +258,13 @@ impl TestWorkerManager {
             evictions: Mutex::new(Vec::new()),
             executions: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
+            shard_data: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The shards whose data `core_id`'s store holds, with their cursors.
+    pub fn set_shard_data(&self, core_id: u32, shards: Vec<(Vec<u8>, u64)>) {
+        self.shard_data.lock().unwrap().insert(core_id, shards);
     }
 
     /// Configure fewer workers than there are records, as after an operator
@@ -332,6 +339,10 @@ impl WorkerManager for TestWorkerManager {
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
         self.evictions.lock().unwrap().push((core_id, keep));
         Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.lock().unwrap().clone()
     }
 
     fn set_worker_filter(

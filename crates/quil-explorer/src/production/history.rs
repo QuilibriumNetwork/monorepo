@@ -10,24 +10,26 @@
 //! frame depends on no older frame (see `forget_before`), so the row is the
 //! same whether a live run, a restart or the backfill computed it.
 //!
-//! Rows are held in memory, at most [`HISTORY_ROWS`] of them, and rebuilt
-//! from stored GLOBAL frames and outcomes after a restart: the live index
-//! records rows from the newest row frame at or below the head on start,
-//! and a [`Backfill`] recomputes older ones, newest day first, with what the
-//! live index leaves of [`MAX_FRAMES_PER_TICK`] each tick, so the two
-//! together never read more frames per tick than the index did alone.
+//! Rows are held in memory, at most [`HISTORY_ROWS`] of them. When the node
+//! names a history file, the final ones (see [`is_final`]) are saved to it
+//! and restored at start ([`persist`]). After a restart the live index
+//! records rows from the newest row frame at or below the head, and a
+//! [`Backfill`] recomputes the older rows not held, from stored GLOBAL
+//! frames and outcomes, newest day first, with what the live index leaves
+//! of [`MAX_FRAMES_PER_TICK`] each tick, so the two together never read more
+//! frames per tick than the index did alone.
 //!
 //! The live-set census (live shards, grid, effectively active members) is
 //! current state, not kept per frame: only a row the live index recorded
-//! within [`ROW_FRAMES`] of the head carries it (`census`). Backfilled rows,
-//! and so every row older than the last restart, carry `census: null`; their
-//! `producing_shards` and counts are exact.
+//! within [`ROW_FRAMES`] of the head carries it (`census`), and keeps it
+//! through a restart when restored from the file. Backfilled rows carry
+//! `census: null`; their `producing_shards` and counts are exact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     classify, Class, ClassCounts, Decoders, FrameSource, IndexView, Kind, ProductionIndex, Summary,
@@ -49,6 +51,8 @@ pub const SEGMENT_ROWS: u64 = ROWS_PER_DAY;
 pub const MAX_SPAN_ROWS: u64 = 7 * ROWS_PER_DAY;
 /// Cache-Control of `/shards/production/history`: about one row.
 pub const CACHE_CONTROL: &str = "public, max-age=60";
+
+pub mod persist;
 
 /// The lowest row frame at or above `n`.
 pub fn row_frame_at_or_after(n: u64) -> u64 {
@@ -74,7 +78,7 @@ pub fn advance_target(index: &ProductionIndex, head: u64) -> u64 {
 
 /// The live-set census at the row: what `/stats` `app_shards` read when the
 /// live index recorded it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Census {
     /// The head the census was read at, less than [`ROW_FRAMES`] above the
     /// row.
@@ -98,7 +102,7 @@ impl Census {
 
 /// One history row: the window at `frame`, and the row's own frames
 /// `frame - ROW_FRAMES + 1 ..= frame`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub frame: u64,
     pub epoch: u64,
@@ -131,6 +135,22 @@ pub fn attach_census(row: &mut Row, summary: &Summary, head: u64) {
     if head < row.frame.saturating_add(ROW_FRAMES) {
         row.census = Some(Census::of(summary, head));
     }
+}
+
+/// Whether `row`, read off `index`, is final: the index stepped over no
+/// frame within [`ROW_LEAD`] below it (one never stored, or stored without
+/// outcomes, once materialization passed it by the grace). Any index then
+/// reads the same row from the store, now or after a restart; a row over a
+/// stepped-over frame could still change should the store gain that frame
+/// or its outcomes later. Only final rows are saved (see [`persist`]).
+pub fn is_final(index: &ProductionIndex, row: &Row) -> bool {
+    index.stepped_over.is_none_or(|n| n.saturating_add(ROW_LEAD) < row.frame)
+}
+
+/// The lowest row frame held with the live index's first row at
+/// `first_live_row`: [`HISTORY_ROWS`] rows down to it.
+pub fn depth_floor(first_live_row: u64) -> u64 {
+    first_live_row.saturating_sub((HISTORY_ROWS - 1) * ROW_FRAMES)
 }
 
 /// The row at `index`'s last frame, read off `view` (its unadjusted view),
@@ -212,6 +232,11 @@ pub struct BackfillState {
 #[derive(Default)]
 pub struct Rows {
     rows: BTreeMap<u64, Row>,
+    /// Frames of the held rows that are not final (see [`is_final`]): they
+    /// are never saved.
+    provisional: BTreeSet<u64>,
+    /// A final row was recorded since the last save.
+    unsaved: bool,
     backfill: BackfillState,
 }
 
@@ -225,17 +250,76 @@ pub struct HistoryStats {
 }
 
 impl Rows {
-    /// Hold `row`, dropping the oldest beyond [`HISTORY_ROWS`].
+    /// Hold `row` as final, dropping the oldest beyond [`HISTORY_ROWS`].
+    #[cfg(test)]
     pub fn insert(&mut self, row: Row) {
+        self.record(row, true);
+    }
+
+    /// Hold `row`, final or not (see [`is_final`]), dropping the oldest
+    /// beyond [`HISTORY_ROWS`].
+    pub fn record(&mut self, row: Row, is_final: bool) {
+        if is_final {
+            self.provisional.remove(&row.frame);
+            self.unsaved = true;
+        } else {
+            self.provisional.insert(row.frame);
+        }
         self.rows.insert(row.frame, row);
+        self.trim();
+    }
+
+    /// Hold `saved`, final rows read back from the history file.
+    pub fn restore(&mut self, saved: Vec<Row>) {
+        for row in saved {
+            self.provisional.remove(&row.frame);
+            self.rows.insert(row.frame, row);
+        }
+        self.trim();
+    }
+
+    fn trim(&mut self) {
         while self.rows.len() as u64 > HISTORY_ROWS {
-            self.rows.pop_first();
+            if let Some((frame, _)) = self.rows.pop_first() {
+                self.provisional.remove(&frame);
+            }
         }
     }
 
-    /// Whether every row frame in `lo..=hi` is held.
-    pub fn holds_all(&self, lo: u64, hi: u64) -> bool {
-        hi < lo || self.rows.range(lo..=hi).count() as u64 == (hi - lo) / ROW_FRAMES + 1
+    /// Drop the rows below `frame`: restored rows more than
+    /// [`HISTORY_ROWS`] below the live index's first row.
+    pub fn forget_below(&mut self, frame: u64) {
+        self.rows = self.rows.split_off(&frame);
+        self.provisional = self.provisional.split_off(&frame);
+    }
+
+    /// The final rows, ascending by frame.
+    pub fn final_rows(&self) -> impl Iterator<Item = &Row> {
+        self.rows.values().filter(|row| !self.provisional.contains(&row.frame))
+    }
+
+    /// The rows held in `lo..=hi`.
+    pub fn count(&self, lo: u64, hi: u64) -> u64 {
+        if hi < lo {
+            return 0;
+        }
+        self.rows.range(lo..=hi).count() as u64
+    }
+
+    /// The newest run of row frames in `lo..=hi` (both row frames) none of
+    /// which is held, as `(lowest, highest)`; `None` when all are held.
+    pub fn missing_run(&self, lo: u64, hi: u64) -> Option<(u64, u64)> {
+        if hi < lo {
+            return None;
+        }
+        let mut top = hi;
+        for &frame in self.rows.range(lo..=hi).rev().map(|(frame, _)| frame) {
+            if frame < top {
+                return Some((frame + ROW_FRAMES, top));
+            }
+            top = top.checked_sub(ROW_FRAMES).filter(|t| *t >= lo)?;
+        }
+        Some((lo, top))
     }
 
     pub fn len(&self) -> u64 {
@@ -458,7 +542,8 @@ struct Job {
     lo: u64,
     hi: u64,
     index: ProductionIndex,
-    rows: Vec<Row>,
+    /// Each with whether it is final.
+    rows: Vec<(Row, bool)>,
     frames: u64,
     missing: u64,
     outcome_less: u64,
@@ -491,8 +576,9 @@ pub struct Step {
     pub frame: Option<u64>,
 }
 
-/// Recomputes the rows below the live index's first row, newest segment
-/// first, down to the floor.
+/// Recomputes the rows below the live index's first row that are not held
+/// (restored from the history file, or kept across a task restart), newest
+/// segment first, down to the floor.
 pub struct Backfill {
     decoders: Decoders,
     floor_frame: u64,
@@ -511,7 +597,7 @@ impl Backfill {
     /// earliest GLOBAL frame (`None` when it holds none); `retained_from`
     /// the lowest frame whose request bodies it keeps (`None`: all).
     pub fn new(first_live_row: u64, earliest: Option<u64>, retained_from: Option<u64>, decoders: Decoders) -> Self {
-        let depth = first_live_row.saturating_sub((HISTORY_ROWS - 1) * ROW_FRAMES);
+        let depth = depth_floor(first_live_row);
         let (floor_frame, floor) = match earliest {
             None => (first_live_row, Floor::EarliestStoredFrame),
             Some(earliest) => {
@@ -570,14 +656,17 @@ impl Backfill {
         let mut out = Step::default();
         while out.indexed < budget && !self.done {
             if self.job.is_none() {
-                let Some(hi) = self.next_hi else { break };
-                let lo = self.floor_frame.max(hi.saturating_sub((SEGMENT_ROWS - 1) * ROW_FRAMES));
-                self.next_hi = lo.checked_sub(ROW_FRAMES).filter(|n| *n >= self.floor_frame);
-                if rows.read().holds_all(lo, hi) {
-                    self.done = self.next_hi.is_none();
-                    out.completed = self.done;
+                let Some(top) = self.next_hi else { break };
+                // A segment is the newest run of rows not held, at most a
+                // day of them: held rows are not read again.
+                let Some((run_lo, hi)) = rows.read().missing_run(self.floor_frame, top) else {
+                    self.next_hi = None;
+                    self.done = true;
+                    out.completed = true;
                     continue;
-                }
+                };
+                let lo = run_lo.max(hi.saturating_sub((SEGMENT_ROWS - 1) * ROW_FRAMES));
+                self.next_hi = lo.checked_sub(ROW_FRAMES).filter(|n| *n >= self.floor_frame);
                 self.job = Some(Job {
                     lo,
                     hi,
@@ -606,7 +695,8 @@ impl Backfill {
                 break;
             }
             if let Some(row) = row_of(&job.index, &job.index.view()) {
-                job.rows.push(row);
+                let settled = is_final(&job.index, &row);
+                job.rows.push((row, settled));
             }
             if target == job.hi {
                 let mut job = self.job.take().expect("a job");
@@ -622,9 +712,9 @@ impl Backfill {
                 };
                 {
                     let mut held = rows.write();
-                    for row in job.rows {
+                    for (row, settled) in job.rows {
                         if !held.rows.contains_key(&row.frame) {
-                            held.insert(row);
+                            held.record(row, settled);
                         }
                     }
                 }

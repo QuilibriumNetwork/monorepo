@@ -215,8 +215,28 @@ fn header_roots(header: &FrameHeader) -> Result<Roots> {
 }
 
 /// The digest GLOBAL committed for a frame of the shard being recovered
-/// ([`crate::app_handoff::committed_frame_digest`]).
+/// ([`committed_digest`]).
 type CommittedDigest<'a> = &'a (dyn Fn(u64) -> Result<Option<[u8; 32]>> + Sync);
+
+/// The digest GLOBAL committed for `filter`'s frame `number` as `global`
+/// holds it, `None` without GLOBAL state. Same-filter sessions that closed
+/// at their base are looked through
+/// ([`crate::app_handoff::committed_frame_digest_looked_through`]): when
+/// every session based at a seal closed there without a frame, only the
+/// sealed origin below them names the sealed frame, which has no
+/// certificate of its own. A member that joined at that frame could not
+/// read its predecessor's history or its carry window down from it
+/// (…091f80 at frame 4693 under generations 13 to 23, 2026-10-23).
+pub(crate) fn committed_digest(
+    global: Option<&Arc<quil_hypergraph::HypergraphCrdt>>,
+    filter: &[u8],
+    number: u64,
+) -> Result<Option<[u8; 32]>> {
+    match global {
+        Some(global) => crate::app_handoff::committed_frame_digest_looked_through(global, filter, number),
+        None => Ok(None),
+    }
+}
 
 /// Headers one batch keeps authenticated for the frames below them.
 const MAX_AUTHENTICATED: usize = 2 * MAX_REPLAY_DESCENDANTS + MAX_FRAMES;
@@ -701,10 +721,7 @@ pub async fn recover(
     source: Option<&DeliveryFrameSource>,
     expected_cursor: u64,
 ) -> Result<bool> {
-    let committed = |number: u64| match global {
-        Some(global) => crate::app_handoff::committed_frame_digest(global, &session.filter, number),
-        None => Ok(None),
-    };
+    let committed = |number: u64| committed_digest(global, &session.filter, number);
     let headers = Headers::new(
         &session.filter,
         Some(session.generation),
@@ -1004,10 +1021,7 @@ pub async fn recover_carry_window(
     source: Option<&DeliveryFrameSource>,
     cursor: u64,
 ) -> Result<(usize, Option<u64>)> {
-    let committed = |number: u64| match global {
-        Some(global) => crate::app_handoff::committed_frame_digest(global, filter, number),
-        None => Ok(None),
-    };
+    let committed = |number: u64| committed_digest(global, filter, number);
     let headers = Headers::new(filter, None, clock.as_ref(), validator.as_ref(), source, &committed);
     recover_carry_window_with_headers(filter, manager, clock.as_ref(), &headers, cursor).await
 }

@@ -8,8 +8,11 @@
 //! version never changes, so a hit is answered from memory without taking one
 //! of the storage read slots.
 //!
-//! Only found entries are kept, and a value only when its version is at or
-//! below the tree's head (a read above the head could change when that
+//! Vertex blobs of the GLOBAL prover tree, which every node fetches for the
+//! same changed leaves after each epoch, are kept on the same terms as values.
+//!
+//! Only found entries are kept, and a value or blob only when its version is
+//! at or below the tree's head (a read above the head could change when that
 //! version commits). Entries also expire, which bounds what a rebuilt tree
 //! (an orphaned head dropped and recommitted from version 0) could leave
 //! behind; a client authenticates every node and value against its parent
@@ -21,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-/// Bytes of cached nodes and values, unless `QUIL_FOREST_READ_CACHE_MB` sets
+/// Bytes of cached nodes, values and prover-tree blobs, unless `QUIL_FOREST_READ_CACHE_MB` sets
 /// them. At 128 MiB an archive answered 2% of reads from it.
 pub const FOREST_READ_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -40,6 +43,7 @@ const SHARDS: usize = 16;
 pub(crate) enum Kind {
     Node,
     Value,
+    Blob,
 }
 
 /// Which forest served an entry and in which tree generation: the same node
@@ -75,6 +79,14 @@ impl CacheKey {
         let mut key = version.to_be_bytes().to_vec();
         key.extend_from_slice(key_hash);
         Self { origin, kind: Kind::Value, shard_id: shard_id.to_vec(), phase, key }
+    }
+
+    /// A vertex blob `id` under the app ShardKey bytes `shard_key`, read as
+    /// of tree `version`.
+    pub(crate) fn blob(origin: Origin, shard_key: &[u8], phase: u32, version: u64, id: &[u8]) -> Self {
+        let mut key = version.to_be_bytes().to_vec();
+        key.extend_from_slice(id);
+        Self { origin, kind: Kind::Blob, shard_id: shard_key.to_vec(), phase, key }
     }
 
     fn size(&self) -> usize {
@@ -136,6 +148,26 @@ impl ForestReadCache {
     }
 
     pub(crate) fn get(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+        let found = self.lookup(key);
+        let counter = if found.is_some() { &self.hits } else { &self.misses };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// [`Self::get`] again for a key that missed when its request arrived,
+    /// just before its storage read: a read for another peer may have cached
+    /// it while this request waited for a slot. A hit now turns that miss
+    /// into a hit.
+    pub(crate) fn recheck(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+        let found = self.lookup(key);
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.misses.fetch_sub(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    fn lookup(&self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
         let mut shard = self.shards[key.shard()].lock();
         let found = match shard.entries.get(key) {
             Some(entry) if entry.stored.elapsed() < self.ttl => Some(entry.data.clone()),
@@ -147,8 +179,6 @@ impl ForestReadCache {
             }
             None => None,
         };
-        let counter = if found.is_some() { &self.hits } else { &self.misses };
-        counter.fetch_add(1, Ordering::Relaxed);
         found
     }
 

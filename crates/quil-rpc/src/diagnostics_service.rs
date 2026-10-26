@@ -64,7 +64,7 @@ const PHASES: [(&str, Phase); 11] = [
     ("joining", Phase::Joining),
 ];
 
-const BLOCKERS: [(&str, Blocker); 13] = [
+const BLOCKERS: [(&str, Blocker); 14] = [
     ("waiting for transport", Blocker::WaitingForTransport),
     ("restarting consensus host", Blocker::RestartingConsensusHost),
     ("engine exited", Blocker::EngineExited),
@@ -78,6 +78,7 @@ const BLOCKERS: [(&str, Blocker); 13] = [
     ("consensus startup unavailable", Blocker::ConsensusStartupUnavailable),
     ("session identity unavailable", Blocker::SessionIdentityUnavailable),
     ("session state unavailable", Blocker::SessionStateUnavailable),
+    ("storage writes stopped", Blocker::StorageWriteFailed),
 ];
 
 const RECOVERY_PHASES: [(&str, RecoveryPhase); 6] = [
@@ -259,6 +260,8 @@ pub struct HealthInputs {
     /// What this prover's joining or activating allocations wait for, by
     /// shard filter, in this node's prover registry.
     pub join_waits: HashMap<Vec<u8>, JoinWait>,
+    /// This node's master store refuses writes after a failed write.
+    pub master_store_write_failed: bool,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -272,6 +275,7 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         build_fingerprint: build_fingerprint.to_vec(),
         global_head_frame: inputs.global_head_frame,
         generated_unix_ms: now_ms,
+        master_store_write_failed: inputs.master_store_write_failed,
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -625,6 +629,7 @@ mod tests {
             committee_heads: HashMap::new(),
             global_head_frame: 9,
             join_waits: HashMap::new(),
+            ..Default::default()
         });
         DiagnosticsServer::new(Arc::new(admission), source, vec![0xab; 32])
     }
@@ -789,6 +794,24 @@ mod tests {
         }
     }
 
+    /// A worker whose own store refuses writes reads as blocked by it, and a
+    /// master store that does is reported.
+    #[test]
+    fn a_failed_store_write_is_reported() {
+        let latched = WorkerExecution {
+            state: "blocked".into(),
+            blocker: quil_engine::worker_execution::STORAGE_WRITE_FAILED.into(),
+            observed_unix_ms: 2_000,
+            ..Default::default()
+        };
+        let inputs = HealthInputs { workers: vec![entry(2, &[2; 32], Some(latched))], ..Default::default() };
+        let report = build_report(&inputs, &[], 3_000);
+        assert_eq!((report.workers[0].phase(), report.workers[0].blocker()), (Phase::Blocked, Blocker::StorageWriteFailed));
+        assert!(!report.master_store_write_failed);
+        let inputs = HealthInputs { master_store_write_failed: true, ..inputs };
+        assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
+    }
+
     fn noisy_execution() -> WorkerExecution {
         WorkerExecution {
             state: "blocked".into(),
@@ -841,6 +864,7 @@ mod tests {
             committee_heads: HashMap::from([(vec![5; 32], head)]),
             global_head_frame: 90_001,
             join_waits: HashMap::new(),
+            ..Default::default()
         };
         let encoded = build_report(&inputs, &[1; 32], 3_000).encode_to_vec();
         for secret in ["192.0.2", "/home", "operator", "refused", "replayed", "partial", "state unavailable"] {
@@ -897,6 +921,7 @@ mod tests {
             committee_heads: HashMap::from([(vec![2; 32], head(200)), (vec![3; 32], head(300)), (Vec::new(), head(9))]),
             global_head_frame: 5,
             join_waits: HashMap::new(),
+            ..Default::default()
         };
         let report = build_report(&inputs, &[], 0);
         let order: Vec<(u32, Option<u64>, Option<u64>)> =
@@ -913,6 +938,7 @@ mod tests {
                 GlobalAppFrameHead { frame: u64::MAX, global_frame: u64::MAX, generation: u64::MAX })).collect(),
             global_head_frame: u64::MAX,
             join_waits: HashMap::new(),
+            ..Default::default()
         };
         let light = build_report(&many(None), &[0xff; 32], u64::MAX);
         assert_eq!((light.workers.len(), light.omitted_workers), (MAX_WORKERS, 44));

@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use quil_store::RocksClockStore;
 use quil_types::proto::global::GlobalFrame;
+use quil_types::thread_probe::{self as probe, Section as ProbeSection};
 
 use crate::archive_client::{error_chain, ArchiveClient, ArchiveClientError};
 
@@ -326,12 +327,18 @@ fn store_chain(
         return Ok(timing);
     }
     let started = Instant::now();
-    let taken = config.store_hook.as_ref().is_some_and(|store| store(chain));
+    let taken = {
+        let _store = probe::section(ProbeSection::GlobalFrameStore);
+        config.store_hook.as_ref().is_some_and(|store| store(chain))
+    };
     timing.store += started.elapsed();
     for frame in chain {
         let started = Instant::now();
-        if !taken && !already_canonical(clock_store, frame) {
-            clock_store.put_global_frame(frame, None)?;
+        if !taken {
+            let _store = probe::section(ProbeSection::GlobalFrameStore);
+            if !already_canonical(clock_store, frame) {
+                clock_store.put_global_frame(frame, None)?;
+            }
         }
         timing.store += started.elapsed();
         if let Some(ref cb) = config.on_frame {
@@ -371,14 +378,30 @@ fn log_slow_processing(
     }
 }
 
-/// Fetch frame `number` (0: the head). An archive closes a connection its
-/// client leaves idle; a request that finds its connection gone goes once
-/// more on a fresh connection to the same archive instead of counting
-/// against it.
+/// Ask `client` for frame `number`, or for the head (`0`), whole only when
+/// it is newer than `newer_than`.
+async fn request_frame<S: PollerFrameSource>(
+    client: &mut S,
+    number: u64,
+    newer_than: u64,
+) -> Result<GlobalFrame, ArchiveClientError> {
+    if number == 0 {
+        client.get_global_head(newer_than).await
+    } else {
+        client.get_global_frame(number).await
+    }
+}
+
+/// Fetch frame `number` (0: the head, whole only when newer than
+/// `newer_than`, which a numbered frame ignores). An archive closes a
+/// connection its client leaves idle; a request that finds its connection
+/// gone goes once more on a fresh connection to the same archive instead of
+/// counting against it.
 async fn fetch_frame<S, F, C>(
     client: &mut S,
     addr: &str,
     number: u64,
+    newer_than: u64,
     connect: &C,
     call_timeout: Duration,
     connection: &mut ConnectionTraffic,
@@ -389,7 +412,7 @@ where
     F: std::future::Future<Output = Result<S, ArchiveClientError>>,
 {
     let started = Instant::now();
-    let mut result = tokio::time::timeout(call_timeout, client.get_global_frame(number)).await;
+    let mut result = tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
     if let Ok(Err(error)) = &result {
         if error.is_transport_failure() {
             info!(
@@ -400,13 +423,15 @@ where
                 fetched_on_connection = connection.frames,
                 "archive connection gone under the poller; reconnecting"
             );
+            probe::step(ProbeSection::PollerReconnect);
             let Ok(fresh) = connect(addr.to_owned()).await else {
                 return result;
             };
             *client = fresh;
             *connection = ConnectionTraffic::new();
+            probe::step(ProbeSection::PollerRefetch);
             let started = Instant::now();
-            result = tokio::time::timeout(call_timeout, client.get_global_frame(number)).await;
+            result = tokio::time::timeout(call_timeout, request_frame(client, number, newer_than)).await;
             if let Ok(Ok(frame)) = &result {
                 connection.fetched(addr, number, frame, started);
             }
@@ -664,7 +689,7 @@ fn forward_fill_due(last_frame: u64, has_genesis: bool, head: u64) -> bool {
 }
 
 /// The single fetch surface [`run_archive_poller`] needs from its remote
-/// source: `GetGlobalFrame(n)`, with `0` meaning "latest head". Extracted
+/// source: `GetGlobalFrame(n)`, and the head, whole only if newer. Extracted
 /// from [`ArchiveClient`] so tests can inject an in-process fake source and
 /// drive the poller loop deterministically (see the `forward_fill_tests`
 /// tests); production goes through the impl below over the real mTLS client.
@@ -673,6 +698,14 @@ pub(crate) trait PollerFrameSource: Send {
     async fn get_global_frame(
         &mut self,
         frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError>;
+
+    /// The latest frame: whole when it is numbered above `newer_than`, else
+    /// possibly its header alone (a server predating the request sends it
+    /// whole).
+    async fn get_global_head(
+        &mut self,
+        newer_than: u64,
     ) -> Result<GlobalFrame, ArchiveClientError>;
 }
 
@@ -683,6 +716,13 @@ impl PollerFrameSource for ArchiveClient {
         frame_number: u64,
     ) -> Result<GlobalFrame, ArchiveClientError> {
         ArchiveClient::get_global_frame(self, frame_number).await
+    }
+
+    async fn get_global_head(
+        &mut self,
+        newer_than: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        ArchiveClient::get_global_head(self, newer_than).await
     }
 }
 
@@ -720,6 +760,8 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
     F: std::future::Future<Output = Result<S, ArchiveClientError>>,
 {
     info!("archive frame poller started");
+    // No deadline on an endpoint or the state-jump barrier.
+    probe::idle();
     pool.wait_nonempty(&cancel).await;
     if cancel.is_cancelled() {
         return;
@@ -836,6 +878,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         .unwrap_or_else(tokio::time::Instant::now);
 
     loop {
+        // Each pass, and each catch-up frame, beats: the stall watchdog
+        // reports a pass that does not return.
+        probe::beat();
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {}
@@ -863,6 +908,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             let hard_due = last_actual_rpc.elapsed() >= HARD_RECONCILE_INTERVAL;
             let reconcile_needs_rpc = (reconcile_due && !current_per_peerinfo) || hard_due;
             if gf.fresh_within(GOSSIP_FRESH_WINDOW) && !reconcile_needs_rpc {
+                probe::step(ProbeSection::PollerGossipFollow);
                 // If we hit the reconcile point but PeerInfo already confirms
                 // we're current, treat it as reconciled: reset the timer so we
                 // don't re-check every tick, and stay paused with no RPC.
@@ -878,6 +924,9 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 // network round-trip.
                 let mut hole = false;
                 while last_frame < target {
+                    // Each executed frame is progress.
+                    probe::beat();
+                    probe::step(ProbeSection::PollerGossipFollow);
                     let next = last_frame + 1;
                     match clock_store.get_global_frame(next) {
                         Ok(frame) => {
@@ -919,6 +968,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
 
         // Acquire a working client.
         if current_client.is_none() {
+            probe::step(ProbeSection::PollerConnect);
             if let Some(addr) = pool.next().await {
                 match connect(addr.clone()).await {
                     Ok(c) => {
@@ -938,6 +988,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 }
             } else {
                 // Pool empty — wait for PeerInfo discovery to feed us.
+                probe::idle();
                 pool.wait_nonempty(&cancel).await;
                 continue;
             }
@@ -948,12 +999,16 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             continue;
         };
 
-        // 1. Fetch the latest frame.
+        // 1. Fetch the latest frame, whole only if it is newer than ours: an
+        // archive that is not ahead sends its header, and the no-progress
+        // path below reads nothing else.
+        probe::step(ProbeSection::PollerHeadFetch);
         let fetch_started = Instant::now();
         let head = match fetch_frame(
             client,
             &addr,
             0,
+            last_frame,
             &connect,
             config.call_timeout,
             &mut connection,
@@ -1063,7 +1118,11 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                     head = new_number,
                     "archive poller: far behind at runtime — attempting state-jump",
                 );
-                if let Some(n) = jump(new_number, cancel.clone()).await {
+                // A state jump takes as long as the snapshot does.
+                probe::idle();
+                let jumped = jump(new_number, cancel.clone()).await;
+                probe::beat();
+                if let Some(n) = jumped {
                     if n > last_frame {
                         last_frame = n;
                     }
@@ -1105,6 +1164,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
             // its own distinct-endpoint tally.
             let mut failed_validation = false;
             for fn_ in (last_frame + 1)..fill_end {
+                probe::beat();
                 if cancel.is_cancelled() {
                     return;
                 }
@@ -1121,6 +1181,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         continue;
                     }
                 }
+                probe::step(ProbeSection::PollerFillFetch);
                 let fetch_started = Instant::now();
                 let fetched = tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -1128,6 +1189,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         client,
                         &addr,
                         fn_,
+                        0,
                         &connect,
                         config.call_timeout,
                         &mut connection,
@@ -1135,6 +1197,7 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                 };
                 match fetched {
                     Ok(Ok(frame)) => {
+                        probe::step(ProbeSection::PollerFillFrame);
                         let processing = Instant::now();
                         // Gate BEFORE persist — genesis-prover allowlist +
                         // VDF/BLS, mirroring the gossip GLOBAL_FRAME handler.
@@ -1144,7 +1207,11 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
                         // honest archive may serve the real record at this
                         // height) rather than persisting forged data.
                         if let Some(ref validate) = config.frame_validator {
-                            if !validate(&frame) {
+                            let valid = {
+                                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                                validate(&frame)
+                            };
+                            if !valid {
                                 debug!(%addr, frame = fn_, "catchup frame failed validation — rotating endpoint");
                                 failed_frame = Some(fn_);
                                 failed_validation = true;
@@ -1285,9 +1352,14 @@ pub(crate) async fn run_archive_poller_with_connector<S, F, C>(
         // gossip GLOBAL_FRAME handler. A head frame failing validation is
         // dropped: don't store, don't fire on_frame, and don't advance
         // last_frame (the next tick re-polls the head).
+        probe::step(ProbeSection::PollerHeadFrame);
         let processing = Instant::now();
         if let Some(ref validate) = config.frame_validator {
-            if !validate(&head) {
+            let valid = {
+                let _validate = probe::section(ProbeSection::GlobalFrameValidation);
+                validate(&head)
+            };
+            if !valid {
                 debug!(%addr, frame = new_number, "head frame failed validation — dropping");
                 continue;
             }
@@ -1757,7 +1829,7 @@ mod admit_tests {
 #[cfg(test)]
 mod forward_fill_tests {
     use super::*;
-    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+    use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
     use std::collections::BTreeMap;
 
     /// Minimal frame that satisfies `RocksClockStore::put_global_frame`
@@ -1781,6 +1853,11 @@ mod forward_fill_tests {
         frames: Arc<std::sync::Mutex<BTreeMap<u64, GlobalFrame>>>,
         requests: Arc<std::sync::Mutex<Vec<u64>>>,
         block_at: Option<u64>,
+        /// Each head request's `newer_than`, and whether the head went whole.
+        head_answers: Arc<std::sync::Mutex<Vec<(u64, bool)>>>,
+        /// Answer every head request whole, as a server predating
+        /// `if_newer_than` does.
+        legacy: bool,
     }
 
     impl FakeArchive {
@@ -1790,6 +1867,8 @@ mod forward_fill_tests {
                 frames: Arc::new(std::sync::Mutex::new(frames)),
                 requests: Arc::new(std::sync::Mutex::new(Vec::new())),
                 block_at: None,
+                head_answers: Arc::new(std::sync::Mutex::new(Vec::new())),
+                legacy: false,
             }
         }
     }
@@ -1816,6 +1895,20 @@ mod forward_fill_tests {
                 )))
             })
         }
+
+        async fn get_global_head(
+            &mut self,
+            newer_than: u64,
+        ) -> Result<GlobalFrame, ArchiveClientError> {
+            let mut head = self.get_global_frame(0).await?;
+            let newer = head.header.as_ref().is_some_and(|h| h.frame_number > newer_than);
+            let whole = self.legacy || newer_than == 0 || newer;
+            if !whole {
+                head.requests.clear();
+            }
+            self.head_answers.lock().unwrap().push((newer_than, whole));
+            Ok(head)
+        }
     }
 
     #[tokio::test]
@@ -1832,6 +1925,9 @@ mod forward_fill_tests {
                     Ok(mk_frame(number))
                 }
             }
+            async fn get_global_head(&mut self, _newer_than: u64) -> Result<GlobalFrame, ArchiveClientError> {
+                self.get_global_frame(0).await
+            }
         }
         let reconnects = std::sync::atomic::AtomicUsize::new(0);
         let connect = |_| {
@@ -1840,7 +1936,7 @@ mod forward_fill_tests {
         };
         let mut source = BrokenSource(true);
         let mut traffic = ConnectionTraffic::new();
-        let frame = fetch_frame(&mut source, "archive:1", 7, &connect, Duration::from_secs(1), &mut traffic)
+        let frame = fetch_frame(&mut source, "archive:1", 7, 0, &connect, Duration::from_secs(1), &mut traffic)
             .await.unwrap().unwrap();
         assert_eq!(frame.header.unwrap().frame_number, 7);
         assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -1851,7 +1947,7 @@ mod forward_fill_tests {
             reconnects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async { Ok(FakeArchive::serving(1..=7)) }
         };
-        assert!(matches!(fetch_frame(&mut missing, "archive:1", 7, &connect, Duration::from_secs(1), &mut traffic)
+        assert!(matches!(fetch_frame(&mut missing, "archive:1", 7, 0, &connect, Duration::from_secs(1), &mut traffic)
             .await.unwrap(), Err(ArchiveClientError::Rpc(status)) if status.code() == tonic::Code::NotFound));
         assert_eq!(reconnects.load(std::sync::atomic::Ordering::Relaxed), 1,
             "an application status must not reconnect or bypass endpoint rotation");
@@ -1957,6 +2053,40 @@ mod forward_fill_tests {
         }
         rig.cancel.cancel();
         reached
+    }
+
+    /// The poller asks for the head whole only when it is newer than its own:
+    /// an archive that is not ahead answers with the header, which is all the
+    /// poller reads then, while a newer head still arrives whole and is
+    /// stored with its bundles. A server that ignores the request sends the
+    /// whole head each time, and the poller makes the same progress.
+    #[tokio::test]
+    async fn head_polls_ask_for_the_whole_head_only_when_it_is_newer() {
+        for legacy in [false, true] {
+            let mut fake = FakeArchive::serving(1..=5);
+            fake.legacy = legacy;
+            for (n, frame) in fake.frames.lock().unwrap().iter_mut() {
+                frame.requests.push(MessageBundle { timestamp: *n as i64, ..Default::default() });
+            }
+            let answers = fake.head_answers.clone();
+            let rig = spawn_poller(fake, &[0, 1, 2, 3, 4], None).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while answers.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the poller polls the head twice");
+            rig.cancel.cancel();
+            rig.poller.await.unwrap();
+            assert_eq!(
+                answers.lock().unwrap()[..2],
+                [(4, true), (5, legacy)],
+                "head 5 whole for a poller at 4, then whole again only from a legacy server ({legacy})",
+            );
+            assert_eq!(*rig.seen.lock().unwrap(), vec![5]);
+            assert_eq!(rig.store.get_global_frame(5).unwrap().requests.len(), 1, "the newer head is stored whole");
+        }
     }
 
     #[tokio::test]

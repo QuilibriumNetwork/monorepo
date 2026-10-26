@@ -42,7 +42,8 @@ pub const BUNDLE_LOG: &str = "node.log.gz";
 /// preview and the manifest.
 pub const REDACTION_NOTE: &str = "Redaction hides your network location (IP addresses, DNS names, \
 multiaddrs, peer IDs), host and user names, home paths and reward balances. It does not hide which \
-prover you are: your shard set and join/reward frames are on-chain and stay in the log.";
+prover you are: your shard set and join/reward frames are on-chain and stay in the log. The public \
+mainnet bootstrap archive endpoints (their IPs and peer IDs) are kept.";
 
 /// Rank of the level column of a node line (unknown levels rank as info).
 fn level_rank(level: &str) -> u8 {

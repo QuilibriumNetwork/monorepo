@@ -7,11 +7,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
 
-use quil_types::store::{BackingStoreIdentity, ScanPoint};
+use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
+use crate::storage_health::{StoreRole, StoreState};
 use rocksdb::{
     DBIterator, DBRawIterator, IteratorMode, ReadOptions, Snapshot, WriteBatch, WriteOptions, DB,
 };
@@ -34,75 +34,15 @@ pub enum DatabaseCommitError {
     Storage(#[from] rocksdb::Error),
 }
 
-struct DatabaseInner {
+pub(crate) struct DatabaseInner {
     db: DB,
     writes: Mutex<WriteLedger>,
-    failed_write: AtomicBool,
-    /// The first write error and the refusals since, for the operator log.
-    failure: Mutex<Option<WriteFailure>>,
+    /// The failed-write latch and the store's role in the operator log.
+    state: Arc<StoreState>,
     /// Process-unique, never reused: a scan of one instance never matches a
     /// later database, even one reopened at the same path.
     instance: u64,
     watched: Option<Vec<Vec<u8>>>,
-}
-
-/// How often the operator is reminded while writes keep being refused.
-const FAILED_WRITE_REPEAT: Duration = Duration::from_secs(600);
-
-/// What the first failed write was, and how many writes it has stopped since.
-/// RocksDB keeps refusing writes after an I/O error until the database is
-/// reopened, and callers only see one per-call error, so this names the cause
-/// and the operator action once, then repeats at a bounded interval.
-struct WriteFailure {
-    cause: String,
-    since: Instant,
-    refused: u64,
-    last_logged: Instant,
-}
-
-impl WriteFailure {
-    fn new(cause: String, now: Instant) -> Self {
-        Self {
-            cause,
-            since: now,
-            refused: 0,
-            last_logged: now,
-        }
-    }
-
-    /// Count one refused write; the repeat line when one is due.
-    fn refuse(&mut self, now: Instant) -> Option<String> {
-        self.refused += 1;
-        if now.duration_since(self.last_logged) < FAILED_WRITE_REPEAT {
-            return None;
-        }
-        self.last_logged = now;
-        Some(failed_write_message(
-            &self.cause,
-            self.refused,
-            now.duration_since(self.since),
-        ))
-    }
-}
-
-/// The operator-facing line: this node's store, what failed first, how long
-/// and how many writes ago, and what to do. A full disk is named as such.
-fn failed_write_message(cause: &str, refused: u64, elapsed: Duration) -> String {
-    let lowered = cause.to_ascii_lowercase();
-    let action = if lowered.contains("no space left") || lowered.contains("storage full") {
-        "the disk is full: free space, then restart the node"
-    } else {
-        "check the disk and the store files, then restart the node"
-    };
-    let since = if refused == 0 {
-        String::new()
-    } else {
-        format!(" (first failure {}s ago, {refused} writes refused since)", elapsed.as_secs())
-    };
-    format!(
-        "store write failed and the database refuses further writes until the node restarts: \
-         {cause}; {action}{since}"
-    )
 }
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -116,6 +56,57 @@ struct WriteLedger {
     disjoint: BTreeMap<[u8; 2], u64>,
     /// Sequence after the last write that may have written a watched key.
     watched: u64,
+    /// The watched keys those writes wrote, once a reader has asked for them
+    /// ([`CoordinatedDb::watched_writes_since`]); a database nobody asks
+    /// keeps no journal and lists no keys.
+    journal: Option<WatchedJournal>,
+}
+
+/// Distinct watched keys the journal keeps (those written since the reader's
+/// previous request) before it starts over; the reader then reads every row.
+const MAX_JOURNALED_KEYS: usize = 32_768;
+
+/// The watched keys written after `floor`, each with the sequence after its
+/// last write, so a cache of those rows can re-read only what changed. A
+/// write that cannot be listed (a range deletion reaching a watched key, a
+/// batch that does not parse, a write whose outcome is unknown) or a journal
+/// past its bound starts it over at that sequence.
+struct WatchedJournal {
+    floor: u64,
+    keys: BTreeMap<Vec<u8>, u64>,
+}
+
+impl WatchedJournal {
+    fn starting_at(sequence: u64) -> Self {
+        Self { floor: sequence, keys: BTreeMap::new() }
+    }
+
+    fn record(&mut self, sequence: u64, write: WatchedWrite) {
+        match write {
+            WatchedWrite::None => {}
+            WatchedWrite::Unlisted => *self = Self::starting_at(sequence),
+            WatchedWrite::Keys(keys) => {
+                for key in keys {
+                    self.keys.insert(key, sequence);
+                }
+                if self.keys.len() > MAX_JOURNALED_KEYS {
+                    *self = Self::starting_at(sequence);
+                }
+            }
+        }
+    }
+
+    /// Every watched key written after `sequence`; `None` when the journal
+    /// does not reach back that far. The reader's caches are at `sequence`
+    /// or later from now on, so what was written up to it is forgotten.
+    fn take_since(&mut self, sequence: u64) -> Option<Vec<Vec<u8>>> {
+        if self.floor > sequence {
+            return None;
+        }
+        self.keys.retain(|_, written| *written > sequence);
+        self.floor = sequence;
+        Some(self.keys.keys().cloned().collect())
+    }
 }
 
 /// Two-byte key prefixes a branch read, scanned or wrote. Marking is
@@ -275,6 +266,7 @@ impl CoordinatedDb {
 
     fn open(db: DB, watched: Option<Vec<Vec<u8>>>) -> Self {
         let general = db.latest_sequence_number();
+        let state = Arc::new(StoreState::new(db.path().to_path_buf()));
         Self(Arc::new(DatabaseInner {
             db,
             writes: Mutex::new(WriteLedger {
@@ -282,9 +274,9 @@ impl CoordinatedDb {
                 disjoint: BTreeMap::new(),
                 // Nothing written before the watch is known to be unwatched.
                 watched: general,
+                journal: None,
             }),
-            failed_write: AtomicBool::new(false),
-            failure: Mutex::new(None),
+            state,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             watched,
         }))
@@ -320,7 +312,7 @@ impl CoordinatedDb {
             .writes
             .lock()
             .map_err(|_| DatabaseCommitError::Poisoned)?;
-        if self.0.failed_write.load(Ordering::Acquire) {
+        if self.0.state.is_latched() {
             return Err(self.refuse_write());
         }
         Ok(DatabaseWriteGuard {
@@ -329,29 +321,40 @@ impl CoordinatedDb {
         })
     }
 
-    /// Count a write refused after an earlier failure and log the repeat line
-    /// when one is due. The failure state is leaf-locked: callers hold only
-    /// the write barrier.
+    /// Count a write refused after an earlier failure; the store repeats
+    /// its report at a bounded interval. Callers hold only the write barrier.
     fn refuse_write(&self) -> DatabaseCommitError {
-        let line = self
-            .0
-            .failure
-            .lock()
-            .ok()
-            .and_then(|mut failure| failure.as_mut()?.refuse(Instant::now()));
-        if let Some(line) = line {
-            tracing::error!(store = %self.0.db.path().display(), "{line}");
-        }
+        self.0.state.refuse();
         DatabaseCommitError::PriorWriteFailed
     }
 
-    /// Remember the first write error and log it once, with the action.
-    fn record_failed_write(&self, cause: String) {
-        let line = failed_write_message(&cause, 0, Duration::ZERO);
-        if let Ok(mut failure) = self.0.failure.lock() {
-            failure.get_or_insert_with(|| WriteFailure::new(cause.clone(), Instant::now()));
-        }
-        tracing::error!(store = %self.0.db.path().display(), first_error = %cause, "{line}");
+    /// Name this database as one of the node's stores, for the reports of a
+    /// failed write and of its disk headroom ([`crate::storage_health`]).
+    /// Returns false when it already has a role, which it keeps.
+    pub fn register_store(&self, role: StoreRole) -> bool {
+        crate::storage_health::register(&self.0.state, Arc::downgrade(&self.0), role)
+    }
+
+    /// Whether a write failed, so the database refuses every later write
+    /// until it is reopened.
+    pub fn write_failed(&self) -> bool {
+        self.0.state.is_latched()
+    }
+
+    /// Latch the database as if a write had failed with `cause`: report it
+    /// once and refuse every later write until it is reopened. For fault
+    /// injection in tests of what owns the store. Takes the write barrier,
+    /// so never call it while holding a [`DatabaseWriteGuard`].
+    #[doc(hidden)]
+    pub fn refuse_writes(&self, cause: impl Into<String>) {
+        let _barrier = self.0.writes.lock();
+        self.0.state.latch(cause.into());
+    }
+
+    /// Fail the next write with `error`, as if RocksDB had returned it.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&self, error: rocksdb::Error) {
+        self.0.state.arm_fault(error);
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<(), DatabaseCommitError> {
@@ -407,6 +410,48 @@ impl CoordinatedDb {
         let sequence = self.0.db.latest_sequence_number();
         let watched = self.0.watched.as_ref().map(|_| guard.ledger.watched);
         Ok((self.0.db.snapshot(), sequence, watched))
+    }
+
+    /// The capture point an execution capture taken now would record, without
+    /// taking a snapshot: `None` when this database watches no keys. Holds the
+    /// write barrier only to read the ledger, as a capture does.
+    pub fn current_capture_point(&self) -> Result<Option<CapturePoint>, DatabaseCommitError> {
+        let guard = self.lock_writes()?;
+        Ok(guard.watched_write_sequence().map(|watched| CapturePoint {
+            database: self.0.instance,
+            sequence: self.0.db.latest_sequence_number(),
+            watched,
+        }))
+    }
+
+    /// Start the journal now, at the last watched write, rather than at the
+    /// first [`Self::watched_writes_since`]. A no-op when no keys are watched
+    /// or the journal runs.
+    pub fn enable_watched_journal(&self) -> Result<(), DatabaseCommitError> {
+        let mut guard = self.lock_writes()?;
+        if self.0.watched.is_some() {
+            let last = guard.ledger.watched;
+            guard.ledger.journal.get_or_insert_with(|| WatchedJournal::starting_at(last));
+        }
+        Ok(())
+    }
+
+    /// The watched keys written after `sequence` (a [`ScanPoint`]'s `from`),
+    /// or `None` when they cannot all be listed or no keys are watched. The
+    /// first request starts the journal at the last watched write, which
+    /// lists exactly what follows it; one reader is assumed, whose caches
+    /// are at `sequence` or later from now on.
+    pub fn watched_writes_since(&self, sequence: u64) -> Result<Option<Vec<Vec<u8>>>, DatabaseCommitError> {
+        let mut guard = self.lock_writes()?;
+        if self.0.watched.is_none() {
+            return Ok(None);
+        }
+        let last = guard.ledger.watched;
+        Ok(guard
+            .ledger
+            .journal
+            .get_or_insert_with(|| WatchedJournal::starting_at(last))
+            .take_since(sequence))
     }
 
     pub fn snapshot(&self) -> Snapshot<'_> {
@@ -482,6 +527,9 @@ impl CoordinatedDb {
         let caught_up = self.0.db.try_catch_up_with_primary();
         let sequence = self.0.db.latest_sequence_number();
         guard.ledger.watched = sequence;
+        if let Some(journal) = guard.ledger.journal.as_mut() {
+            *journal = WatchedJournal::starting_at(sequence);
+        }
         caught_up?;
         guard.ledger.general = sequence;
         Ok(())
@@ -501,25 +549,33 @@ impl DatabaseWriteGuard<'_> {
         batch: WriteBatch,
         options: &WriteOptions,
     ) -> Result<(), DatabaseCommitError> {
-        if self.database.0.failed_write.load(Ordering::Acquire) {
+        if self.database.0.state.is_latched() {
             return Err(self.database.refuse_write());
         }
+        // Keys are listed only for a journal someone reads.
+        let list = self.ledger.journal.is_some();
         let watched = self
             .database
             .0
             .watched
             .as_ref()
-            .is_some_and(|prefixes| batch_may_write_under(batch.data(), prefixes));
-        let written = self.database.0.db.write_opt(batch, options);
-        if watched {
+            .map_or(WatchedWrite::None, |prefixes| watched_writes(batch.data(), prefixes, list));
+        let written = match self.database.0.state.take_fault() {
+            Some(fault) => Err(fault),
+            None => self.database.0.db.write_opt(batch, options),
+        };
+        if !matches!(watched, WatchedWrite::None) {
             // Recorded even for a failed write, whose durable effect is unknown.
-            self.ledger.watched = self.database.0.db.latest_sequence_number();
+            let sequence = self.database.0.db.latest_sequence_number();
+            self.ledger.watched = sequence;
+            if let Some(journal) = self.ledger.journal.as_mut() {
+                journal.record(sequence, if written.is_ok() { watched } else { WatchedWrite::Unlisted });
+            }
         }
         if let Err(error) = written {
             // An I/O/WAL-sync error is not proof that no durable bytes exist.
             // Never reuse execution metadata against an ambiguous write result.
-            self.database.0.failed_write.store(true, Ordering::Release);
-            self.database.record_failed_write(error.to_string());
+            self.database.0.state.latch(error.to_string());
             return Err(DatabaseCommitError::Storage(error));
         }
         Ok(())
@@ -570,6 +626,15 @@ impl DatabaseWriteGuard<'_> {
     }
 }
 
+/// Stop the database's writes, under its write barrier, as after a failed
+/// write with `cause`, without its own log line (the caller reports a group
+/// of stores at once). Whether it was open and not stopped before.
+pub(crate) fn stop_writes(database: &Weak<DatabaseInner>, cause: String) -> bool {
+    let Some(inner) = database.upgrade() else { return false };
+    let _barrier = inner.writes.lock();
+    inner.state.latch_quietly(cause)
+}
+
 pub(crate) fn key_under(prefixes: &[Vec<u8>], key: &[u8]) -> bool {
     prefixes.iter().any(|p| key.starts_with(p))
 }
@@ -592,11 +657,30 @@ pub(crate) fn range_meets(prefixes: &[Vec<u8>], begin: &[u8], end: &[u8]) -> boo
         })
 }
 
+/// What a write batch wrote under the watched prefixes.
+#[derive(Debug, PartialEq, Eq)]
+enum WatchedWrite {
+    /// Nothing under them.
+    None,
+    /// These keys (puts, merges and deletions); empty when not listed.
+    Keys(Vec<Vec<u8>>),
+    /// Something that cannot be listed key by key.
+    Unlisted,
+}
+
 /// Whether a RocksDB `WriteBatch` representation may write a key under one of
-/// `prefixes`. The encoding is a 12-byte header (sequence, record count) and
-/// tagged records of varint-length-prefixed slices. An unknown tag, a
-/// malformed record or a count mismatch counts as a write under every prefix.
+/// `prefixes`.
+#[cfg(test)]
 fn batch_may_write_under(batch: &[u8], prefixes: &[Vec<u8>]) -> bool {
+    watched_writes(batch, prefixes, false) != WatchedWrite::None
+}
+
+/// The keys a RocksDB `WriteBatch` representation writes under `prefixes`,
+/// collected only when `list`. The encoding is a 12-byte header (sequence, record count) and tagged
+/// records of varint-length-prefixed slices. An unknown tag, a malformed
+/// record or a count mismatch counts as an unlisted write under every prefix,
+/// as does a range deletion reaching one.
+fn watched_writes(batch: &[u8], prefixes: &[Vec<u8>], list: bool) -> WatchedWrite {
     fn varint(rest: &mut &[u8]) -> Option<usize> {
         let mut value = 0u32;
         for shift in (0..35).step_by(7) {
@@ -618,44 +702,53 @@ fn batch_may_write_under(batch: &[u8], prefixes: &[Vec<u8>]) -> bool {
         *rest = tail;
         Some(head)
     }
-    let key = |k: &[u8]| key_under(prefixes, k);
-    let range = |begin: &[u8], end: &[u8]| range_meets(prefixes, begin, end);
-    let parse = || -> Option<bool> {
+    let parse = || -> Option<WatchedWrite> {
         let count = u32::from_le_bytes(batch.get(8..12)?.try_into().ok()?);
         let mut rest = batch.get(12..)?;
         let mut records = 0u32;
+        let mut keys = Vec::new();
         let mut touched = false;
+        let mut unlisted = false;
+        let mut key = |k: &[u8]| {
+            if key_under(prefixes, k) {
+                touched = true;
+                if list {
+                    keys.push(k.to_vec());
+                }
+            }
+        };
+        let mut range = |begin: &[u8], end: &[u8]| unlisted |= range_meets(prefixes, begin, end);
         while let Some((&tag, tail)) = rest.split_first() {
             rest = tail;
             match tag {
                 // Deletion, single deletion.
-                0x0 | 0x7 => touched |= key(slice(&mut rest)?),
+                0x0 | 0x7 => key(slice(&mut rest)?),
                 // Value, merge.
                 0x1 | 0x2 => {
-                    touched |= key(slice(&mut rest)?);
+                    key(slice(&mut rest)?);
                     slice(&mut rest)?;
                 }
                 // Range deletion.
                 0xF => {
                     let begin = slice(&mut rest)?;
-                    touched |= range(begin, slice(&mut rest)?);
+                    range(begin, slice(&mut rest)?);
                 }
                 // Column-family deletion, single deletion.
                 0x4 | 0x8 => {
                     varint(&mut rest)?;
-                    touched |= key(slice(&mut rest)?);
+                    key(slice(&mut rest)?);
                 }
                 // Column-family value, merge.
                 0x5 | 0x6 => {
                     varint(&mut rest)?;
-                    touched |= key(slice(&mut rest)?);
+                    key(slice(&mut rest)?);
                     slice(&mut rest)?;
                 }
                 // Column-family range deletion.
                 0xE => {
                     varint(&mut rest)?;
                     let begin = slice(&mut rest)?;
-                    touched |= range(begin, slice(&mut rest)?);
+                    range(begin, slice(&mut rest)?);
                 }
                 // Log data: not a record and never applied.
                 0x3 => {
@@ -666,9 +759,13 @@ fn batch_may_write_under(batch: &[u8], prefixes: &[Vec<u8>]) -> bool {
             }
             records += 1;
         }
-        (records == count).then_some(touched)
+        (records == count).then(|| match (unlisted, touched) {
+            (true, _) => WatchedWrite::Unlisted,
+            (false, false) => WatchedWrite::None,
+            (false, true) => WatchedWrite::Keys(keys),
+        })
     };
-    parse().unwrap_or(true)
+    parse().unwrap_or(WatchedWrite::Unlisted)
 }
 
 #[cfg(test)]
@@ -747,11 +844,94 @@ mod watched_write_tests {
         assert_eq!(watched(&db), after);
         let (_snapshot, sequence, recorded) = db.execution_snapshot().unwrap();
         assert_eq!((sequence, recorded), (db.latest_sequence_number(), Some(after)));
+        // The point a capture would record, without capturing.
+        assert_eq!(
+            db.current_capture_point().unwrap(),
+            Some(CapturePoint { database: db.instance(), sequence, watched: after })
+        );
 
         let plain_dir = tempfile::tempdir().unwrap();
         let plain = CoordinatedDb::new(DB::open_default(plain_dir.path()).unwrap());
         assert_eq!(plain.lock_writes().unwrap().watched_write_sequence(), None);
+        assert_eq!(plain.current_capture_point().unwrap(), None);
         assert_ne!(plain.instance(), db.instance());
+    }
+
+    /// A reader of the watched rows can list exactly the keys written since
+    /// the sequence its cache is at; what it no longer needs is forgotten,
+    /// and a write that cannot be listed starts the journal over.
+    #[test]
+    fn the_journal_lists_watched_keys_written_after_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let listed = |since| db.watched_writes_since(since).unwrap();
+        // Nothing is journaled before a reader asks.
+        db.put([0x21, 0x01, 1], b"v").unwrap();
+        assert!(db.lock_writes().unwrap().ledger.journal.is_none());
+        let start = db.latest_sequence_number();
+        assert_eq!(listed(start - 1), None, "a write before the first request is not listed");
+        assert_eq!(listed(start), Some(Vec::new()));
+
+        db.put([0x21, 0x01, 3], b"v").unwrap();
+        db.put([0x05], b"v").unwrap();
+        let first = db.latest_sequence_number();
+        db.delete([0x20, 0x01, 0xff, 9]).unwrap();
+        db.put([0x21, 0x01, 3], b"w").unwrap();
+        assert_eq!(listed(start), Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]]));
+        assert_eq!(listed(first), Some(vec![vec![0x20, 0x01, 0xff, 9], vec![0x21, 0x01, 3]]),
+            "a key written again after the sequence is listed once");
+        let latest = db.latest_sequence_number();
+        assert_eq!(listed(latest), Some(Vec::new()));
+        assert_eq!(listed(first), None, "the reader's caches are past `first` now");
+
+        let mut range = WriteBatch::default();
+        range.delete_range(&[0x21, 0x01][..], &[0x21, 0x02][..]);
+        db.write(range).unwrap();
+        let reset = db.latest_sequence_number();
+        assert_eq!(listed(latest), None, "a range deletion cannot be listed key by key");
+        db.put([0x21, 0x01, 4], b"v").unwrap();
+        assert_eq!(listed(reset), Some(vec![vec![0x21, 0x01, 4]]));
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let plain = CoordinatedDb::new(DB::open_default(plain_dir.path()).unwrap());
+        assert_eq!(plain.watched_writes_since(0).unwrap(), None);
+    }
+
+    /// Versioned rows write a new key per version. The bound counts only keys
+    /// written since the reader's previous request, so a reader that asks
+    /// every frame never sees the journal start over; one batch past it does.
+    #[test]
+    fn the_journal_bound_counts_keys_since_the_last_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CoordinatedDb::with_watched_prefixes(DB::open_default(dir.path()).unwrap(), prefixes());
+        let versioned = |address: u8, version: u64| {
+            let mut key = vec![0x21, 0x01, address];
+            key.extend_from_slice(&version.to_be_bytes());
+            key
+        };
+        db.enable_watched_journal().unwrap();
+        let mut seen = db.latest_sequence_number();
+        // Three rounds would outgrow a journal that never forgets.
+        let third = (MAX_JOURNALED_KEYS / 3) as u64 + 1;
+        for round in 0..5u64 {
+            let mut batch = WriteBatch::default();
+            for version in round * third..(round + 1) * third {
+                batch.put(versioned((version % 7) as u8, version), b"v");
+            }
+            db.write(batch).unwrap();
+            let listed = db.watched_writes_since(seen).unwrap().expect("within the bound since the last request");
+            assert_eq!(listed.len() as u64, third, "every version is its own key");
+            seen = db.latest_sequence_number();
+        }
+
+        let mut batch = WriteBatch::default();
+        for version in 0..=MAX_JOURNALED_KEYS as u64 {
+            batch.put(versioned(9, version), b"v");
+        }
+        db.write(batch).unwrap();
+        assert_eq!(db.watched_writes_since(seen).unwrap(), None, "past its bound the journal starts over");
+        let after = db.latest_sequence_number();
+        assert_eq!(db.watched_writes_since(after).unwrap(), Some(Vec::new()));
     }
 
     #[test]
@@ -795,57 +975,5 @@ mod prefix_set_tests {
         let mut key = KeyPrefixSet::default();
         key.mark_key(&[0x12]);
         assert!(key.contains([0x12, 0x00]) && !key.contains([0x12, 0x01]));
-    }
-}
-
-#[cfg(test)]
-mod failed_write_report_tests {
-    use super::*;
-
-    #[test]
-    fn a_full_disk_is_named_with_its_cause_and_the_action() {
-        let line = failed_write_message(
-            "IO error: No space left on device: While appending to file: .config/store/1.log",
-            0,
-            Duration::ZERO,
-        );
-        assert!(line.contains("the disk is full: free space, then restart the node"));
-        assert!(line.contains("No space left on device"));
-        assert!(!line.contains("refused since"), "{line}");
-        let other = failed_write_message("Corruption: bad block", 3, Duration::from_secs(70));
-        assert!(!other.contains("disk is full"));
-        assert!(other.contains("Corruption: bad block"));
-        assert!(other.contains("70s ago, 3 writes refused"));
-    }
-
-    #[test]
-    fn refusals_repeat_the_report_at_most_once_per_interval() {
-        let t0 = Instant::now();
-        let mut failure = WriteFailure::new("IO error: No space left on device".into(), t0);
-        let step = FAILED_WRITE_REPEAT / 4;
-        for i in 1..4 {
-            assert!(failure.refuse(t0 + step * i).is_none());
-        }
-        let line = failure.refuse(t0 + FAILED_WRITE_REPEAT).expect("repeat due");
-        assert!(line.contains("4 writes refused"), "{line}");
-        assert!(failure.refuse(t0 + FAILED_WRITE_REPEAT + step).is_none());
-        assert!(failure.refuse(t0 + FAILED_WRITE_REPEAT * 2).is_some());
-    }
-
-    #[test]
-    fn the_first_error_is_kept_and_later_writes_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = CoordinatedDb::new(DB::open_default(dir.path()).unwrap());
-        db.0.failed_write.store(true, Ordering::Release);
-        db.record_failed_write("IO error: No space left on device".into());
-        db.record_failed_write("IO error: later".into());
-        assert!(matches!(
-            db.lock_writes(),
-            Err(DatabaseCommitError::PriorWriteFailed)
-        ));
-        let failure = db.0.failure.lock().unwrap();
-        let failure = failure.as_ref().unwrap();
-        assert!(failure.cause.contains("No space left"));
-        assert_eq!(failure.refused, 1);
     }
 }

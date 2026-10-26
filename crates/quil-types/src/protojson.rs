@@ -41,26 +41,42 @@ static POOL: Lazy<DescriptorPool> = Lazy::new(|| {
 /// `full_name` is the fully-qualified protobuf message name (e.g.
 /// [`GLOBAL_FRAME`]); it must name the same message type as `M`.
 pub fn to_protojson<M: Message>(full_name: &str, msg: &M) -> Result<Vec<u8>> {
+    let dynamic = to_dynamic(full_name, msg)?;
+    let mut buf = Vec::with_capacity(msg.encoded_len() * 2);
+    let mut ser = serde_json::Serializer::new(&mut buf);
+    dynamic
+        .serialize_with_options(&mut ser, &serialize_options())
+        .map_err(|e| QuilError::Serialization(format!("protojson: serialize {full_name}: {e}")))?;
+    Ok(buf)
+}
+
+/// [`to_protojson`] as a JSON value, for a caller that adds fields before
+/// writing it: no write and re-parse of the bytes. Like any
+/// `serde_json::Value` object (without serde_json's `preserve_order`), its
+/// objects sort their keys, where [`to_protojson`] keeps field order.
+pub fn to_protojson_value<M: Message>(full_name: &str, msg: &M) -> Result<serde_json::Value> {
+    to_dynamic(full_name, msg)?
+        .serialize_with_options(serde_json::value::Serializer, &serialize_options())
+        .map_err(|e| QuilError::Serialization(format!("protojson: serialize {full_name}: {e}")))
+}
+
+/// The prost message as a dynamic message under its descriptor (through
+/// its wire bytes).
+fn to_dynamic<M: Message>(full_name: &str, msg: &M) -> Result<DynamicMessage> {
     let descriptor = POOL.get_message_by_name(full_name).ok_or_else(|| {
         QuilError::Serialization(format!("protojson: unknown message type {full_name}"))
     })?;
-
-    // prost message -> wire bytes -> dynamic message under the descriptor.
     let wire = msg.encode_to_vec();
-    let dynamic = DynamicMessage::decode(descriptor, wire.as_slice()).map_err(|e| {
+    DynamicMessage::decode(descriptor, wire.as_slice()).map_err(|e| {
         QuilError::Serialization(format!("protojson: decode {full_name} into dynamic: {e}"))
-    })?;
+    })
+}
 
-    // skip_default_fields(false) == Go EmitUnpopulated: emit zero-valued
-    // fields too. The remaining protojson rules (camelCase json names,
-    // base64 bytes, string 64-bit ints, string enum names) are defaults.
-    let options = SerializeOptions::new().skip_default_fields(false);
-    let mut buf = Vec::with_capacity(wire.len() * 2);
-    let mut ser = serde_json::Serializer::new(&mut buf);
-    dynamic
-        .serialize_with_options(&mut ser, &options)
-        .map_err(|e| QuilError::Serialization(format!("protojson: serialize {full_name}: {e}")))?;
-    Ok(buf)
+/// skip_default_fields(false) == Go EmitUnpopulated: emit zero-valued
+/// fields too. The remaining protojson rules (camelCase json names,
+/// base64 bytes, string 64-bit ints, string enum names) are defaults.
+fn serialize_options() -> SerializeOptions {
+    SerializeOptions::new().skip_default_fields(false)
 }
 
 /// Deserialize protojson bytes into a prost message `M` — the inverse of
@@ -118,6 +134,31 @@ mod tests {
         let json2 = serde_json::to_vec(&v).unwrap();
         let back: GlobalFrame = from_protojson(GLOBAL_FRAME, &json2).unwrap();
         assert_eq!(back, frame, "protojson round-trip must reproduce the frame");
+    }
+
+    #[test]
+    fn the_value_is_the_parsed_bytes() {
+        use crate::proto::global::{message_request, MessageBundle, MessageRequest, ProverJoin};
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 699663,
+                rank: 3,
+                output: vec![9, 8, 7],
+                ..Default::default()
+            }),
+            requests: vec![MessageBundle {
+                requests: vec![MessageRequest {
+                    request: Some(message_request::Request::Join(ProverJoin::default())),
+                    timestamp: 12345,
+                }],
+                ..Default::default()
+            }],
+        };
+        let bytes = to_protojson(GLOBAL_FRAME, &frame).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let value = to_protojson_value(GLOBAL_FRAME, &frame).unwrap();
+        assert_eq!(value, parsed);
+        assert_eq!(serde_json::to_vec(&value).unwrap(), serde_json::to_vec(&parsed).unwrap());
     }
 
     #[test]

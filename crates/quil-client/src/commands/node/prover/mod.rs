@@ -15,6 +15,7 @@ use quil_types::proto::node::node_service_client::NodeServiceClient;
 use quil_types::proto::node::GetWorkerInfoRequest;
 
 use crate::context::GlobalArgs;
+use crate::util::UNITS_PER_QUIL;
 use crate::rpc::ConnectOpts;
 
 pub mod epoch;
@@ -279,7 +280,7 @@ const FRAMES_PER_DAY: u64 = 24 * 60 * 60 / 10; // 8640
 pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
     let raw = per_frame * BigInt::from(FRAMES_PER_DAY);
     if raw.sign() != Sign::Plus { return "0.0".to_string(); }
-    let tenths = (raw + BigInt::from(5_000_000u64)) / BigInt::from(10_000_000u64);
+    let tenths = (raw + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
     if tenths.sign() != Sign::Plus { return "<0.1".to_string(); }
     format!("{}.{}", &tenths / 10, &tenths % 10)
 }
@@ -287,7 +288,7 @@ pub(crate) fn format_quil_daily_round(per_frame: &BigInt) -> String {
 pub(crate) fn format_quil_daily_units(v: &BigInt) -> String {
     let negative = v.sign() == Sign::Minus;
     let magnitude = if negative { -v } else { v.clone() };
-    let tenths = (&magnitude + BigInt::from(5_000_000u64)) / BigInt::from(10_000_000u64);
+    let tenths = (&magnitude + BigInt::from(UNITS_PER_QUIL / 20)) / BigInt::from(UNITS_PER_QUIL / 10);
     let text = if magnitude > BigInt::from(0) && tenths == BigInt::from(0) { "<0.1".into() }
         else { format!("{}.{}", &tenths / 10, &tenths % 10) };
     format!("~{}{text}", if negative { "-" } else { "" })
@@ -325,15 +326,19 @@ mod tests {
         assert_eq!(format_quil_daily_round(&BigInt::from(0)), "0.0");
         assert_eq!(format_quil_daily_round(&BigInt::from(1u64)), "<0.1");
         // Values immediately around 0.5 QUIL/day share the same tenth.
-        let half = BigInt::from(50_000_000u64 / FRAMES_PER_DAY); // 5787 -> 0.4999…
+        let half = BigInt::from(UNITS_PER_QUIL / 2 / FRAMES_PER_DAY); // 462962 -> 0.4999…
         assert_eq!(format_quil_daily_round(&half), "0.5");
         assert_eq!(format_quil_daily_round(&(half + BigInt::from(1))), "0.5");
-        // The reported total: 269.91550080 QUIL/day.
-        assert_eq!(format_quil_daily_round(&BigInt::from(3_124_022u64)), "269.9");
+        // A reported total of 269.9 QUIL/day.
+        assert_eq!(format_quil_daily_round(&BigInt::from(249_921_760u64)), "269.9");
+        // 8e9 units (one QUIL) per day is 1.0, not 80x more.
+        assert_eq!(format_quil_daily_round(&BigInt::from(UNITS_PER_QUIL / FRAMES_PER_DAY)), "1.0");
+        assert_eq!(format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL)), "~1.0");
+        assert_eq!(format_quil_daily_units(&BigInt::from(UNITS_PER_QUIL / 20 - 1)), "~<0.1");
         // Per-shard rates observed on a live node collapse to a handful of
         // tiers, and the ~15x spread that drives a join decision survives.
-        assert_eq!(format_quil_daily_round(&BigInt::from(4_498u64)), "0.4");
-        assert_eq!(format_quil_daily_round(&BigInt::from(67_900u64)), "5.9");
-        assert_eq!(format_quil_daily_round(&BigInt::from(268_000u64)), "23.2");
+        assert_eq!(format_quil_daily_round(&BigInt::from(359_840u64)), "0.4");
+        assert_eq!(format_quil_daily_round(&BigInt::from(5_432_000u64)), "5.9");
+        assert_eq!(format_quil_daily_round(&BigInt::from(21_440_000u64)), "23.2");
     }
 }

@@ -19,6 +19,11 @@ pub trait WorkerManager: Send + Sync {
         Ok(())
     }
 
+    /// Install what its workers ask before they recover a shard from an
+    /// archive (`WorkerAllocator::install_recovery_gate`); managers whose
+    /// workers recover elsewhere ignore it.
+    fn set_recovery_gate(&self, _gate: crate::worker_allocator::RecoveryGate) {}
+
     /// Bind `core_id` to `filter` and (re)start the consensus engine.
     /// Equivalent to `set_worker_filter(core_id, filter, true)`.
     /// Kept as the default for callers that always want full
@@ -44,6 +49,14 @@ pub trait WorkerManager: Send + Sync {
     ) -> Result<()>;
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
+    /// The shards whose data each worker's own store holds, by core, with
+    /// their materialized cursors, as each worker last read its store
+    /// ([`crate::worker_payload_eviction::held_shards`]). Managers that
+    /// cannot tell (workers in separate processes) report none, and binding
+    /// keeps its order.
+    fn shard_data(&self) -> std::collections::HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        Default::default()
+    }
     fn check_workers_connected(&self) -> Result<Vec<u32>>;
     fn range_workers(&self) -> Result<Vec<WorkerInfo>>;
     /// Filter-bound local execution observations; unsupported managers return none.

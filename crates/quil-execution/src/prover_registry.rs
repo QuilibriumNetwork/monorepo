@@ -251,6 +251,7 @@ impl InMemoryProverRegistry {
     /// blob`. The commitment tree blob holds only topology + per-node
     /// commitments and is not consulted here.
     pub fn refresh(&mut self, hg_store: &dyn HypergraphStore) -> QuilResult<()> {
+        crate::test_hooks::registry_load_delay();
         self.refresh_with_limits(hg_store, RegistryLimits::UNBOUNDED)
     }
 
@@ -284,13 +285,13 @@ impl InMemoryProverRegistry {
         // every leaf there on every commit, and the RPC sync path
         // populates it too. One row per `(set, phase, shard, vk)` so
         // no dedup is required.
-        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut rows = RegistryRows::default();
         visit_registry_vertices(snapshot, "adds", &shard, limits.page(), |vk, data| {
             budget.input(vk.len(), data.len(), true)?;
             row(vk.len(), data.len());
             rows.add(vk[32..].try_into().expect("64-byte registry key"), &data);
-            leaves.push((vk, data));
+            // Rows retain the decoded data. Release serialized blobs with each
+            // page instead of holding another whole registry until publication.
             Ok(())
         })?;
         let from_rows = rows.has_adds();
@@ -301,7 +302,8 @@ impl InMemoryProverRegistry {
         // running before the first post-upgrade commit doesn't see an
         // empty cache. The next commit re-populates the per-vertex
         // range, after which this branch is a no-op.
-        if leaves.is_empty() {
+        let mut leaves: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if !from_rows {
             if let Some(blob) = snapshot.load_tree_blob("vertex", "adds", &shard)? {
                 budget.input(0, blob.len(), false)?;
                 if let Some(root) = quil_tries::deserialize_tree(&blob)
@@ -1416,6 +1418,16 @@ fn left_current(alloc: &ProverAllocationInfo) -> bool {
         || alloc.epoch >= quil_types::consensus::epoch_for_frame(alloc.leave_frame_number)
 }
 
+/// Does the leaving `alloc` still sit in its committee at `frame_number`,
+/// serving its notice? Before [`leaver_currency_frame`] every unexpired
+/// leaver does; from it, only one that was current when it left
+/// ([`left_current`]). The committee rule for leavers
+/// ([`committee_eligible`]), for callers that decide whether a leaver's
+/// worker still serves.
+pub fn leaver_seated(alloc: &ProverAllocationInfo, frame_number: u64) -> bool {
+    frame_number < leaver_currency_frame() || left_current(alloc)
+}
+
 /// Is `alloc` a member of the epoch-aligned consensus committee at
 /// `frame_number`? SHARED predicate behind both `get_active_provers`
 /// (quorum membership) and `get_ordered_provers` (leader rotation) — they
@@ -1452,7 +1464,7 @@ fn left_current(alloc: &ProverAllocationInfo) -> bool {
 fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: bool) -> bool {
     match alloc.effective_status(frame_number) {
         EffectiveStatus::Active => true,
-        EffectiveStatus::Leaving => frame_number < leaver_currency_frame() || left_current(alloc),
+        EffectiveStatus::Leaving => leaver_seated(alloc, frame_number),
         // Demoted-but-raw-Active: re-admitted only by the empty-committee floor.
         EffectiveStatus::Joining | EffectiveStatus::ExpiredEpoch => {
             lenient && alloc.status == ProverStatus::Active
@@ -1461,11 +1473,55 @@ fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: 
     }
 }
 
+/// How [`SharedProverRegistry::catch_up`] left the registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryCatchUp {
+    /// No registry row was written since its scan.
+    Current,
+    /// Re-read the rows of this many addresses.
+    Updated { rows: usize },
+    /// Read every row again.
+    Refreshed,
+    /// Not a canonical registry built from rows; left as it was.
+    Skipped,
+}
+
 /// no-op because the trait doesn't know which store to read from.
 #[derive(Clone)]
 pub struct SharedProverRegistry {
     inner: Arc<RwLock<InMemoryProverRegistry>>,
     execution_binding: Option<(quil_types::store::BackingStoreIdentity, RegistryLimits)>,
+    /// Set once a full refresh of the canonical cache from the store has
+    /// succeeded. A node starts with an empty cache and loads it in the
+    /// background, so a reader that decides something once at startup waits
+    /// for this rather than for the cache's lock.
+    initial_load: Arc<tokio::sync::watch::Sender<bool>>,
+    refresh: Arc<RefreshGate>,
+}
+
+fn initial_load_signal(loaded: bool) -> Arc<tokio::sync::watch::Sender<bool>> {
+    Arc::new(tokio::sync::watch::Sender::new(loaded))
+}
+
+/// Lets a full refresh read the store without holding the cache's lock.
+/// Refreshes of one cache run one at a time, so a slower read cannot
+/// replace a newer one; `edits` counts the other writes to the cache, so a
+/// refresh that one overlapped reads the store again under the lock.
+#[derive(Default)]
+struct RefreshGate {
+    serial: std::sync::Mutex<()>,
+    edits: std::sync::atomic::AtomicU64,
+}
+
+impl RefreshGate {
+    /// Call while holding the cache's write lock, before changing it.
+    fn note_edit(&self) {
+        self.edits.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn edits(&self) -> u64 {
+        self.edits.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 pub(crate) struct PreparedRegistryAdoption<'a> {
@@ -1507,6 +1563,7 @@ impl SharedProverRegistry {
         let patience = quil_types::lock_patience::Patience::new();
         let source = patience.write(&self.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "canonical registry is busy or poisoned".into()))?;
+        self.refresh.note_edit();
         let incoming = patience.write(&incoming.inner).ok_or_else(|| QuilError::ExecutionUnavailable(
             "private registry is busy or poisoned".into()))?;
         Ok(PreparedRegistryAdoption { source, incoming, adopted: false })
@@ -1516,10 +1573,30 @@ impl SharedProverRegistry {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Whether a full refresh from the store has filled the canonical cache.
+    /// Until then it may be empty: a node loads it in the background at
+    /// startup. An execution branch registry is filled when it is built.
+    pub fn initial_load_complete(&self) -> bool {
+        *self.initial_load.borrow()
+    }
+
+    /// Completes once [`Self::initial_load_complete`] holds.
+    pub async fn initial_load(&self) {
+        let mut loaded = self.initial_load.subscribe();
+        // `self` holds the sender, so the channel cannot close here.
+        let _ = loaded.wait_for(|loaded| *loaded).await;
+    }
+
+    fn note_initial_load(&self) {
+        self.initial_load.send_if_modified(|loaded| !std::mem::replace(loaded, true));
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InMemoryProverRegistry::new())),
             execution_binding: None,
+            initial_load: initial_load_signal(false),
+            refresh: Arc::default(),
         }
     }
 
@@ -1557,6 +1634,9 @@ impl SharedProverRegistry {
         let mut registry = Self {
             inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
             execution_binding: Some((identity.clone(), read_limits)),
+            // Read or copied whole before it is returned.
+            initial_load: initial_load_signal(true),
+            refresh: Arc::default(),
         };
         if read {
             registry.refresh_from_store(store)?;
@@ -1566,6 +1646,15 @@ impl SharedProverRegistry {
             registry.execution_binding = Some((identity, bound));
         }
         Ok(registry)
+    }
+
+    /// Whether [`Self::for_execution_capture`] of a view at `capture` would
+    /// copy this registry instead of reading every prover row again. A busy
+    /// registry is skipped there, so it does not seed here either.
+    pub fn seeds(&self, capture: &CapturePoint) -> bool {
+        self.inner
+            .try_read()
+            .is_ok_and(|source| source.reproduces(capture, RegistryLimits::UNBOUNDED))
     }
 
     /// `limits` as headroom above the committed registry this one comes
@@ -1615,6 +1704,9 @@ impl SharedProverRegistry {
         let registry = Self {
             inner: Arc::new(RwLock::new(seeded)),
             execution_binding: Some((identity, bound)),
+            // Read or copied whole before it is returned.
+            initial_load: initial_load_signal(true),
+            refresh: Arc::default(),
         };
         registry.update_written_rows(store, overlay)?;
         Ok(registry)
@@ -1627,8 +1719,11 @@ impl SharedProverRegistry {
         Ok(())
     }
 
-    /// Rebuild the cache from the given hypergraph store. Takes a
-    /// write lock for the duration of the refresh.
+    /// Rebuild the cache from the given hypergraph store. The canonical
+    /// registry reads the store without its lock and takes the write lock
+    /// only to install the result; readers (worker threads among them)
+    /// keep reading the previous cache meanwhile, so a reader that needs the
+    /// store's contents waits for [`Self::initial_load`] instead.
     ///
     /// Logs an `info!` whenever any field of the LOCAL prover (the one whose
     /// address matches `LOCAL_PROVER_ADDRESS`) or any of its allocations changes
@@ -1643,16 +1738,36 @@ impl SharedProverRegistry {
                 .refresh_with_limits(hg_store, *limits)
                 .map_err(|error| QuilError::ExecutionUnavailable(format!("execution registry refresh: {error}")));
         }
-        // Snapshot the local prover BEFORE taking the write lock for
-        // the refresh; it is snapshotted again after and diffed.
+        // Snapshot the local prover BEFORE the refresh; it is snapshotted
+        // again after and diffed.
         let before = self.snapshot_local_prover();
+        self.refresh_canonical(|| {
+            let mut fresh = InMemoryProverRegistry::new();
+            fresh.refresh(hg_store)?;
+            Ok(fresh)
+        })?;
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(())
+    }
+
+    /// Install the registry `read` builds from the store. Reading every
+    /// prover vertex takes 18-29 s on a regular node's store (2026-10-24);
+    /// under the write lock, every worker thread reading the registry
+    /// stopped for that long. When another write reached the cache during
+    /// the read, `read` runs again under the lock, as before. Readers see
+    /// the old cache until the install, so the initial load is reported
+    /// only once the read registry is installed.
+    fn refresh_canonical(&self, read: impl Fn() -> QuilResult<InMemoryProverRegistry>) -> QuilResult<()> {
+        let _serial = self.refresh.serial.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let edits = self.refresh.edits();
+        let fresh = read()?;
         {
             let mut guard = self.inner.write()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-            guard.refresh(hg_store)?;
+            *guard = if self.refresh.edits() == edits { fresh } else { read()? };
         }
-        let after = self.snapshot_local_prover();
-        log_local_prover_diff(before.as_ref(), after.as_ref());
+        self.note_initial_load();
         Ok(())
     }
 
@@ -1693,6 +1808,66 @@ impl SharedProverRegistry {
             }
         }
         self.refresh_from_store(store)
+    }
+
+    /// Bring this canonical registry up to the prover rows `store` holds now
+    /// by re-reading only the rows written since its last scan, as
+    /// `written_since(database, sequence)` lists them (see
+    /// [`quil_forest::CoordinatedDb::watched_writes_since`]); read every row
+    /// again when they cannot be listed or an update cannot reproduce a
+    /// refresh. The result is what [`Self::refresh_from_store`] would leave,
+    /// and its scan is current, so a capture now copies it.
+    ///
+    /// A cache edited directly (eviction) is read again in full. A registry
+    /// without a row scan (built from the legacy tree) or bound to an
+    /// execution branch is left as it is.
+    pub fn catch_up(
+        &self,
+        store: &dyn HypergraphStore,
+        written_since: impl FnOnce(u64, u64) -> Option<Vec<Vec<u8>>>,
+    ) -> QuilResult<RegistryCatchUp> {
+        if self.execution_binding.is_some() {
+            return Ok(RegistryCatchUp::Skipped);
+        }
+        let before = self.snapshot_local_prover();
+        let outcome = {
+            let mut guard = self.inner.write()
+                .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+            let Some(scan) = guard.scanned else {
+                return Ok(RegistryCatchUp::Skipped);
+            };
+            // Taken before listing: a write between the two is listed and
+            // re-read at this snapshot, and leaves the new scan stale.
+            let snapshot = store.capture_tree_snapshot()?.ok_or_else(|| {
+                QuilError::Store("prover registry requires a consistent store snapshot".into())
+            })?;
+            let point = snapshot.scan_point().filter(|point| point.database == scan.database);
+            let written = point
+                .and_then(|_| written_since(scan.database, scan.from))
+                .map(registry_rows::rows_of_keys);
+            // An edited cache may differ from its rows even where none changed.
+            let updated = match (point, &written) {
+                _ if guard.diverged || guard.rows.is_none() => None,
+                (Some(point), Some(written)) if written.is_empty() => Some((point, RegistryCatchUp::Current)),
+                (Some(point), Some(written)) => guard
+                    .update_rows(snapshot.as_ref(), written, RegistryLimits::UNBOUNDED)?
+                    .then_some((point, RegistryCatchUp::Updated { rows: written.len() })),
+                _ => None,
+            };
+            match updated {
+                Some((point, outcome)) => {
+                    guard.scanned = Some(point);
+                    outcome
+                }
+                None => {
+                    guard.refresh_from_snapshot(snapshot.as_ref())?;
+                    RegistryCatchUp::Refreshed
+                }
+            }
+        };
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(outcome)
     }
 
     /// Read the LOCAL prover's `ProverInfo` (if any), keyed by the
@@ -1912,6 +2087,7 @@ impl SharedProverRegistry {
                 .inner
                 .write()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+            self.refresh.note_edit();
             for candidate in &evicted {
                 if let Some(info) = guard.prover_cache.get_mut(&candidate.prover_address) {
                     for alloc in info.allocations.iter_mut() {
@@ -2131,6 +2307,10 @@ fn log_local_alloc_diff(prev: &ProverAllocationInfo, new: &ProverAllocationInfo)
 }
 
 impl ProverRegistryTrait for SharedProverRegistry {
+    fn initial_load_complete(&self) -> bool {
+        SharedProverRegistry::initial_load_complete(self)
+    }
+
     fn get_lifecycle_view(
         &self, address: &[u8], frame: u64,
     ) -> QuilResult<quil_types::consensus::ProverLifecycleView> {
@@ -2303,6 +2483,7 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .inner
             .write()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        self.refresh.note_edit();
         guard.update_prover_activity(address, filter, frame_number);
         Ok(())
     }
@@ -3264,6 +3445,74 @@ mod tests {
         // An epoch it never registered stays absent.
         assert!(reg.get_leaf_root(&member, &leaf_id, 39).is_none());
         assert!(reg.get_leaf_root(&member, &leaf_id, 43).is_none());
+    }
+
+    #[test]
+    fn refresh_reads_the_store_without_blocking_readers() {
+        let shared = SharedProverRegistry::new();
+        shared.refresh_canonical(|| {
+            // A worker thread reads the registry while the store is read.
+            let reader = shared.clone();
+            let free = std::thread::spawn(move || reader.inner.try_read().is_ok()).join().unwrap();
+            assert!(free, "a refresh's store read must not hold the registry lock");
+            assert!(!shared.initial_load_complete(), "nothing is loaded before the install");
+            let mut fresh = InMemoryProverRegistry::new();
+            fresh.largest_row = 7;
+            Ok(fresh)
+        }).unwrap();
+        assert_eq!(shared.read(|r| r.largest_row), 7, "the read registry is installed");
+        assert!(shared.initial_load_complete(), "the install completes the initial load");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_a_load() {
+        let shared = SharedProverRegistry::new();
+        assert!(shared.refresh_canonical(|| Err(QuilError::Store("unreadable".into()))).is_err());
+        assert!(!shared.initial_load_complete());
+    }
+
+    #[test]
+    fn refresh_overlapped_by_an_edit_reads_again_under_the_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let shared = SharedProverRegistry::new();
+        let reads = AtomicUsize::new(0);
+        shared.refresh_canonical(|| {
+            let read = reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if read == 1 {
+                // An edit lands while the store is read: its read may lack
+                // the edit's rows, so it must not be installed.
+                let editor = shared.clone();
+                let (done, edited) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    editor.update_prover_activity(&[1; 32], &[2; 32], 5).unwrap();
+                    let _ = done.send(());
+                });
+                let _ = edited.recv_timeout(std::time::Duration::from_secs(5));
+            }
+            let mut fresh = InMemoryProverRegistry::new();
+            fresh.largest_row = read;
+            Ok(fresh)
+        }).unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "the overlapped read is repeated");
+        assert_eq!(shared.read(|r| r.largest_row), 2, "the repeated read is installed");
+    }
+
+    #[test]
+    fn initial_load_is_reported_after_a_full_refresh() {
+        let shared = SharedProverRegistry::new();
+        let reader = shared.clone();
+        assert!(!reader.initial_load_complete(), "a new registry has not loaded");
+        shared.update_prover_activity(&[1; 32], &[2; 32], 5).unwrap();
+        assert!(!reader.initial_load_complete(), "an edit is not a load");
+        let (_tmp, store) = temp_store();
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert!(reader.initial_load_complete(), "clones share the signal");
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert!(reader.initial_load_complete(), "it stays set");
+        assert!(!SharedProverRegistry::new().initial_load_complete(),
+            "another registry has its own signal");
+        let branch = SharedProverRegistry::for_execution_store(store.as_ref(), RegistryLimits::UNBOUNDED).unwrap();
+        assert!(ProverRegistryTrait::initial_load_complete(&branch), "a branch registry is built loaded");
     }
 
     #[test]

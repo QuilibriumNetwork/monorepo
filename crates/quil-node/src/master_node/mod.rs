@@ -1,4 +1,5 @@
 mod frame_observations;
+mod peer_info_file;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -18,6 +19,7 @@ mod committee_peer_policy;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
 pub(crate) mod runtime_state;
+pub(crate) mod stall_watch;
 pub(crate) mod storage;
 pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;
@@ -63,6 +65,13 @@ pub(crate) async fn start(
     #[cfg(feature = "native-proof")]
     let proof_worker = crate::proof_worker::build_node_worker(config)?;
     let storage = storage::init(config, archive_mode)?;
+    // Thread workers register their stores with this process's watch too.
+    crate::storage_watch::start(&config.db);
+    // A master store that stopped writing is reopened by a restart of the
+    // process once its disk has room again.
+    sup.run_until_cancelled("store-reopen", |_token| {
+        crate::storage_watch::exit_when_store_reopenable(quil_forest::StoreRole::Master)
+    });
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
     let key_store = storage.key_store.clone();
@@ -313,7 +322,8 @@ pub(crate) async fn start(
             }
         }
     }
-    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path.
+    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path, and
+    // at startup from the verified records the last run saved.
     // Read by NodeService::get_peer_info so CLI tools can enumerate
     // the peers this node has observed on the network. Keyed by the
     // raw peer_id bytes; last-write-wins.
@@ -327,6 +337,19 @@ pub(crate) async fn start(
     let peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // Restored before any reader runs: regular nodes republish their
+    // PeerInfo every 30 minutes on mainnet, and until then a restarted
+    // node knew none of their endpoints. Saved every few minutes and at
+    // shutdown (peer_info_file.rs).
+    {
+        let path = config_dir.join(peer_info_file::FILE_NAME);
+        peer_info_file::restore_at_startup(&peer_info_cache, &path, network);
+        let cache = peer_info_cache.clone();
+        sup.spawn("peer-info-cache-saver", move |token| async move {
+            peer_info_file::save_until_cancelled(cache, path, network, token).await;
+            Ok(())
+        });
+    }
     // filter → AppEngineHandle registry. Populated by the worker→master
     // drain task on `WorkerToMaster::ShardActivated` and cleared on
     // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
@@ -1286,6 +1309,9 @@ pub(crate) async fn start(
     // frames need are fetched only while none of those wait.
     let (gap_tx, gap_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
     let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(512);
+    // Frames peers ask this archive for and its store lacks: a hole below the
+    // ingest's cursor gets its body recovered (`with_missing_frame_reports`).
+    let (frame_miss_tx, frame_miss_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(256);
     // The archive ingest's validator, once built below.
     let gap_validator: Arc<std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>> =
         Default::default();
@@ -1302,6 +1328,7 @@ pub(crate) async fn start(
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
         let gap_network = config.p2p.network;
+        let no_member_notice: Arc<peer_info_file::HourlyNotice> = Default::default();
         // One connection per endpoint, shared by every fetch: a frame each
         // second used to open a new connection to every endpoint it asked.
         let clients: Arc<parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>> =
@@ -1334,15 +1361,15 @@ pub(crate) async fn start(
                 // archives that restarted together (the usual way a gap opens)
                 // missed the same frame. A live run sat on such a gap for the
                 // whole session while every member of the shard had the frame.
-                let mut endpoints: Vec<String> = gap_peers.read().values()
-                    .flat_map(|info| info.reachability.iter()
-                        .filter(|reach| reach.filter == filter)
-                        .flat_map(|reach| reach.stream_multiaddrs.iter())
-                        .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, gap_network))
-                        .collect::<Vec<_>>())
-                    .collect();
-                endpoints.sort();
-                endpoints.dedup();
+                let (mut endpoints, peer_info_records) = {
+                    let peers = gap_peers.read();
+                    (peer_info_file::shard_member_endpoints(&peers, &filter, gap_network), peers.len())
+                };
+                if endpoints.is_empty() && no_member_notice.due(&filter) {
+                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, peer_info_records,
+                        "app-shard gap fetch knows no member endpoint for this shard, so it asks archives only; \
+                         it ends when a member's PeerInfo arrives (repeated hourly while it lasts)");
+                }
                 async move {
                     let Some(key) = key.as_ref() else { return };
                     // Every one of the shard's members, then every archive: an
@@ -1406,97 +1433,115 @@ pub(crate) async fn start(
                             endpoints.push(addr);
                         }
                     }
+                    // A frame that fails verification (a copy without its
+                    // storage attestation, say) does not end the round: the
+                    // next endpoint is asked, as when one lacks the frame,
+                    // unless the frame's registrations were unavailable.
                     let mut failures = Vec::new();
+                    let mut awaiting_execution = 0usize;
                     let mut recovered = None;
                     let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
                         let attempt = fetch_from(addr.clone(), frame_number);
                         async move { (addr, attempt.await) }
                     })).buffer_unordered(CONCURRENT);
-                    while let Some((addr, attempt)) = attempts.next().await {
-                        match attempt {
+                    while let Some((source, attempt)) = attempts.next().await {
+                        let frame = match attempt {
                             Ok(Ok(Some(frame))) if frame.header.as_ref().is_some_and(|h|
-                                h.address == filter && h.frame_number == frame_number) => {
-                                recovered = Some((addr, frame));
-                                break;
+                                h.address == filter && h.frame_number == frame_number) => frame,
+                            Ok(Ok(Some(_))) => { failures.push(format!("{source}: served another frame")); continue; }
+                            Ok(Ok(None)) => { failures.push(format!("{source}: does not have the frame")); continue; }
+                            Ok(Err(error)) => { failures.push(format!("{source}: {error}")); continue; }
+                            Err(_) => { failures.push(format!("{source}: timed out")); continue; }
+                        };
+                        // A frame anchored to a GLOBAL frame this archive has
+                        // not stored cannot validate: it is parked below,
+                        // unprepared, until that GLOBAL frame is stored.
+                        let anchored = ingest.as_ref()
+                            .is_none_or(|(_, verifier)| verifier.missing_anchor(&frame).is_none());
+                        // Validation needs the storage registrations the
+                        // frames' GLOBAL anchors name; an archive whose
+                        // execution is behind those anchors fetches them
+                        // here, off the ingest lock. A frame without a
+                        // certificate comes with the run up to its
+                        // certified descendant, the source asked first.
+                        let mut prepared_ok = true;
+                        let frames = match validator.as_ref() {
+                            Some(validator) if anchored => {
+                                let fetch = |number: u64| {
+                                    let order: Vec<String> = std::iter::once(source.clone())
+                                        .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
+                                        .collect();
+                                    let filter = filter.clone();
+                                    let fetch_from = &fetch_from;
+                                    async move {
+                                        for addr in order {
+                                            if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
+                                                if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
+                                                    return Some(frame);
+                                                }
+                                            }
+                                        }
+                                        None
+                                    }
+                                };
+                                let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
+                                if let Err(error) = prepared {
+                                    prepared_ok = false;
+                                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                        "app-shard gap fetch: historical storage registrations unavailable");
+                                }
+                                frames
                             }
-                            Ok(Ok(Some(_))) => failures.push(format!("{addr}: served another frame")),
-                            Ok(Ok(None)) => failures.push(format!("{addr}: does not have the frame")),
-                            Ok(Err(error)) => failures.push(format!("{addr}: {error}")),
-                            Err(_) => failures.push(format!("{addr}: timed out")),
+                            _ => vec![frame],
+                        };
+                        let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
+                        match ingest.clone() {
+                            // Checked on the blocking pool, concurrently with
+                            // other fetches; the ingest is held only to admit.
+                            Some((ingest, verifier)) => {
+                                let address = filter.clone();
+                                let admitted = tokio::task::spawn_blocking(move || {
+                                    quil_engine::archive_ingest::admit_fetched(&ingest, &verifier, &address, frames)
+                                }).await;
+                                use quil_engine::archive_ingest::FetchedFrames;
+                                match admitted {
+                                    Ok(FetchedFrames::Admitted) => {}
+                                    Ok(FetchedFrames::Refused) => {
+                                        failures.push(format!("{source}: served a frame that failed verification"));
+                                        if prepared_ok {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                    // Not recovered from this endpoint: a forged copy
+                                    // must not keep the others from being asked.
+                                    Ok(FetchedFrames::AwaitsExecution { anchor, executed }) => {
+                                        failures.push(format!("{source}: served a frame whose generation GLOBAL \
+                                            execution at {executed} has not authorized (anchor {anchor})"));
+                                        awaiting_execution += 1;
+                                        continue;
+                                    }
+                                    Err(error) => tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
+                                        "app-shard gap fetch: admitting the recovered frames failed"),
+                                }
+                            }
+                            None => for frame in frames {
+                                let data = prost::Message::encode_to_vec(&frame);
+                                let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
+                            },
                         }
+                        recovered = Some((source, through));
+                        break;
                     }
                     drop(attempts);
                     match recovered {
-                        Some((source, frame)) => {
-                            // A frame anchored to a GLOBAL frame this archive has
-                            // not stored cannot validate: it is parked below,
-                            // unprepared, until that GLOBAL frame is stored.
-                            let anchored = ingest.as_ref()
-                                .is_none_or(|(_, verifier)| verifier.missing_anchor(&frame).is_none());
-                            // Validation needs the storage registrations the
-                            // frames' GLOBAL anchors name; an archive whose
-                            // execution is behind those anchors fetches them
-                            // here, off the ingest lock. A frame without a
-                            // certificate comes with the run up to its
-                            // certified descendant, the source asked first.
-                            let frames = match validator.as_ref() {
-                                Some(validator) if anchored => {
-                                    let fetch = |number: u64| {
-                                        let order: Vec<String> = std::iter::once(source.clone())
-                                            .chain(endpoints.iter().filter(|addr| **addr != source).cloned())
-                                            .collect();
-                                        let filter = filter.clone();
-                                        let fetch_from = &fetch_from;
-                                        async move {
-                                            for addr in order {
-                                                if let Ok(Ok(Some(frame))) = fetch_from(addr, number).await {
-                                                    if frame.header.as_ref().is_some_and(|h| h.address == filter && h.frame_number == number) {
-                                                        return Some(frame);
-                                                    }
-                                                }
-                                            }
-                                            None
-                                        }
-                                    };
-                                    let (frames, prepared) = quil_engine::archive_ingest::prepare_gap_fetched(validator, frame, fetch).await;
-                                    if let Err(error) = prepared {
-                                        tracing::info!(filter = %hex::encode(&filter), frame = frame_number, %error,
-                                            "app-shard gap fetch: historical storage registrations unavailable");
-                                    }
-                                    frames
-                                }
-                                _ => vec![frame],
-                            };
-                            let through = frames.last().and_then(|frame| frame.header.as_ref()).map_or(frame_number, |h| h.frame_number);
-                            tracing::info!(filter = %hex::encode(&filter), frame = frame_number, through, %source,
-                                "app-shard gap fetch recovered a missing frame");
-                            match ingest {
-                                // Checked on the blocking pool, concurrently with
-                                // other fetches; the ingest is held only to admit.
-                                Some((ingest, verifier)) => {
-                                    let address = filter.clone();
-                                    let admitted = tokio::task::spawn_blocking(move || {
-                                        for frame in frames {
-                                            if let Some(anchor) = verifier.missing_anchor(&frame) {
-                                                let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
-                                                ingest.lock().unwrap_or_else(|p| p.into_inner())
-                                                    .await_anchor(&address, number, anchor);
-                                            } else if let Some(certified) = verifier.verify(&frame) {
-                                                ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
-                                            }
-                                        }
-                                    }).await;
-                                    if let Err(error) = admitted {
-                                        tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
-                                            "app-shard gap fetch: admitting the recovered frames failed");
-                                    }
-                                }
-                                None => for frame in frames {
-                                    let data = prost::Message::encode_to_vec(&frame);
-                                    let _ = loopback.send(message_loop::gap_fetched_frame_message(&filter, data)).await;
-                                },
-                            }
-                        }
+                        Some((source, through)) => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            through, %source, endpoints_failed = failures.len(),
+                            "app-shard gap fetch recovered a missing frame"),
+                        None if awaiting_execution > 0 => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            tried = endpoints.len(), awaiting_execution, ?failures,
+                            "app-shard gap fetch: endpoints served the frame, but its session generation is not authorized \
+                             in executed GLOBAL state yet; it is asked for again once execution reaches its anchor"),
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             tried = endpoints.len(), ?failures,
                             "app-shard gap fetch found no endpoint with the frame; ingest will retry"),
@@ -1520,7 +1565,7 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).sequenced();
+        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).with_missing_frame_reports(frame_miss_rx).sequenced();
         let ingest = match mtls_seed.map(|_| falcon_signing_key.clone()) {
             Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(archive_pool.clone(), key)),
             None => ingest,
@@ -1641,6 +1686,7 @@ pub(crate) async fn start(
         metrics_handle: metrics_handle.clone(),
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
+        app_frame_misses: archive_mode.then_some(frame_miss_tx),
         spawner: detached_spawner.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
     })?;
@@ -1703,6 +1749,9 @@ pub(crate) async fn start(
                 .with_archive_grid(Arc::new(move || lifecycle.remote_shard_metrics()))
                 .with_request_retention(Arc::new(move || clock.global_requests_retained_from()))
         };
+        // Final production-history rows survive a restart: it then
+        // backfills only the rows after the last saved one.
+        let state = state.with_history_file(config_dir.join("explorer-history.json"), network);
         let router = quil_explorer::router(state.clone());
         match tokio::net::TcpListener::bind(&listen_addr).await {
             Ok(listener) => {
@@ -1714,9 +1763,12 @@ pub(crate) async fn start(
                     .await
                     .map_err(anyhow::Error::from)
                 });
-                // App-shard production index for `/shards/production`.
-                sup.run_until_cancelled("explorer-production", move |_token| {
-                    quil_explorer::production::run_indexer(state)
+                // App-shard production index for `/shards/production`; it
+                // saves the history rows on cancellation.
+                sup.spawn("explorer-production", move |token| {
+                    quil_explorer::production::run_indexer(state, async move {
+                        token.cancelled().await;
+                    })
                 });
             }
             Err(e) => warn!(

@@ -355,6 +355,8 @@ pub const GLOBAL_INTRINSIC_ADDRESS: [u8; 32] = [0xFFu8; 32];
 /// they're already verified against live mainnet and avoid the
 /// sponge-hash cost on hot paths.
 pub fn compute_type_hash(class_name: &str) -> [u8; 32] {
+    #[cfg(test)]
+    tests::COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let mut msg = Vec::with_capacity(32 + class_name.len());
     msg.extend_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
     msg.extend_from_slice(class_name.as_bytes());
@@ -393,8 +395,27 @@ pub const TYPE_HASH_REWARD: [u8; 32] = [
 /// referenced by seniority merge spent-marker logic. Included for
 /// forward compatibility.
 pub fn type_hash_spent_merge() -> [u8; 32] {
-    compute_type_hash("merge:SpentMerge")
+    RUNTIME_TYPE_HASHES[0].0
 }
+
+/// The type hashes of the classes outside the Go schema, computed once.
+/// A prover registry refresh classifies every prover-shard row, and each row
+/// that is neither a prover, an allocation nor a reward (every leaf-root
+/// registration) hashed both class names again: Poseidon was at the top of a
+/// mainnet archive's 9.6 s registry reads (2026-10-25).
+static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 5]> =
+    std::sync::LazyLock::new(|| {
+        [
+            (compute_type_hash("merge:SpentMerge"), "merge:SpentMerge"),
+            (
+                compute_type_hash("leafroot:LeafRootRegistration"),
+                "leafroot:LeafRootRegistration",
+            ),
+            (compute_type_hash("storage:StorageSeat"), "storage:StorageSeat"),
+            (compute_type_hash("storage:StorageExpiry"), "storage:StorageExpiry"),
+            (compute_type_hash("storage:StorageSnapshot"), "storage:StorageSnapshot"),
+        ]
+    });
 
 /// The full `[type_hash; 32] → class_name` mapping for the global
 /// intrinsic schema. Does not include `merge:SpentMerge` because its
@@ -416,52 +437,36 @@ pub fn class_for_type_hash(hash: &[u8]) -> Option<&'static str> {
             return Some(*name);
         }
     }
-    // Fallback: check merge:SpentMerge (computed at runtime)
-    let spent_merge_hash = type_hash_spent_merge();
-    if hash == spent_merge_hash.as_slice() {
-        return Some("merge:SpentMerge");
-    }
-    // Fallback: leafroot:LeafRootRegistration (not in the Go schema, computed at runtime).
-    if hash == type_hash_leaf_root_registration().as_slice() {
-        return Some("leafroot:LeafRootRegistration");
-    }
-    if hash == type_hash_storage_seat().as_slice() {
-        return Some("storage:StorageSeat");
-    }
-    if hash == type_hash_storage_expiry().as_slice() {
-        return Some("storage:StorageExpiry");
-    }
-    if hash == type_hash_storage_snapshot().as_slice() {
-        return Some("storage:StorageSnapshot");
-    }
-    None
+    // Fallback: merge:SpentMerge, leafroot:LeafRootRegistration and the
+    // storage classes, which are not in the Go schema.
+    RUNTIME_TYPE_HASHES
+        .iter()
+        .find(|(known, _)| hash == known.as_slice())
+        .map(|(_, name)| *name)
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageSeat")`, computed
 /// once (this class is not in the Go schema).
 pub fn type_hash_storage_seat() -> [u8; 32] {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    *HASH.get_or_init(|| compute_type_hash("storage:StorageSeat"))
+    RUNTIME_TYPE_HASHES[2].0
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageExpiry")`, computed
 /// once (this class is not in the Go schema).
 pub fn type_hash_storage_expiry() -> [u8; 32] {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    *HASH.get_or_init(|| compute_type_hash("storage:StorageExpiry"))
+    RUNTIME_TYPE_HASHES[3].0
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageSnapshot")`, computed
 /// once (this class is not in the Go schema).
 pub fn type_hash_storage_snapshot() -> [u8; 32] {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    *HASH.get_or_init(|| compute_type_hash("storage:StorageSnapshot"))
+    RUNTIME_TYPE_HASHES[4].0
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "leafroot:LeafRootRegistration")`,
 /// computed at runtime (this class is not in the Go schema).
 pub fn type_hash_leaf_root_registration() -> [u8; 32] {
-    compute_type_hash("leafroot:LeafRootRegistration")
+    RUNTIME_TYPE_HASHES[1].0
 }
 
 // =====================================================================
@@ -631,6 +636,34 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// Type hashes [`compute_type_hash`] computed on this thread.
+        pub(super) static COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Classifying a row hashes no class name: the runtime type hashes are
+    /// computed once per process, not twice for every leaf-root row.
+    #[test]
+    fn classifying_rows_computes_no_type_hash() {
+        let leaf_root = compute_type_hash("leafroot:LeafRootRegistration");
+        let unknown = [0x5a; 32];
+        let before = COMPUTED.with(|computed| computed.get());
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            assert_eq!(class_for_type_hash(&leaf_root), Some("leafroot:LeafRootRegistration"));
+            assert_eq!(class_for_type_hash(&unknown), None);
+        }
+        let computed = COMPUTED.with(|computed| computed.get()) - before;
+        // At most the one-time computation, when this thread came first.
+        assert!(
+            computed <= RUNTIME_TYPE_HASHES.len(),
+            "{computed} type hashes computed classifying 2000 rows in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(type_hash_leaf_root_registration(), leaf_root);
+        assert_eq!(class_for_type_hash(&type_hash_spent_merge()), Some("merge:SpentMerge"));
+    }
+
     #[test]
     fn the_seal_fields_of_a_leaf_registration_share_no_other_class_key() {
         let cls = "leafroot:LeafRootRegistration";
@@ -674,10 +707,14 @@ mod tests {
             compute_type_hash("reward:ProverReward"),
             TYPE_HASH_REWARD
         );
-        // SpentMerge is runtime-computed, verify round-trip
+        // The runtime-computed hashes, verify round-trip
         assert_eq!(
             compute_type_hash("merge:SpentMerge"),
             type_hash_spent_merge()
+        );
+        assert_eq!(
+            compute_type_hash("leafroot:LeafRootRegistration"),
+            type_hash_leaf_root_registration()
         );
     }
 

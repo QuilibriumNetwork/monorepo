@@ -671,7 +671,7 @@ fn fmt_reward_change(v: &BigInt) -> String {
 
 /// Round to five decimals with integer arithmetic; preserve tiny positive amounts.
 fn fmt_claimable(value: u128) -> String {
-    const UNITS_PER_QUIL: u128 = 8_000_000_000;
+    const UNITS_PER_QUIL: u128 = crate::util::UNITS_PER_QUIL as u128;
     const UNITS_PER_DECIMAL: u128 = UNITS_PER_QUIL / 100_000;
     if value == 0 { return "0".into(); }
     if value < UNITS_PER_DECIMAL { return "<0.00001".into(); }
@@ -3682,8 +3682,8 @@ mod tests {
         assert_eq!(fmt_reward_change(&BigInt::from(0)), "0.0");
         assert_eq!(fmt_reward_change(&BigInt::from(1)), "+<0.1");
         assert_eq!(fmt_reward_change(&BigInt::from(-1)), "-<0.1");
-        assert_eq!(fmt_reward_change(&BigInt::from(3_124_022)), "+269.9");
-        assert_eq!(fmt_reward_change(&BigInt::from(-3_124_022)), "-269.9");
+        assert_eq!(fmt_reward_change(&BigInt::from(249_921_760)), "+269.9");
+        assert_eq!(fmt_reward_change(&BigInt::from(-249_921_760)), "-269.9");
     }
 
     #[test]
@@ -4482,7 +4482,7 @@ mod tests {
     #[test]
     fn reward_filters_use_daily_units_without_rounding_the_sort() {
         let mut m = Model::new(); m.reward_windows = 4;
-        m.available = vec![shard("low", 0, 10_000), shard("high", 0, 11_000)];
+        m.available = vec![shard("low", 0, 800_000), shard("high", 0, 880_000)];
         // Rounded display preserves tenths, but sorting retains the underlying precision.
         assert_eq!(fmt_reward(&m.available[0].estimated_reward), "0.9");
         assert_eq!(fmt_reward(&m.available[1].estimated_reward), "1.0");
@@ -4496,7 +4496,7 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].filter_key, "high");
         let mut allocation = joining_table().remove(0);
-        allocation.estimated_reward = BigInt::from(11_000);
+        allocation.estimated_reward = BigInt::from(880_000);
         assert!((alloc_row_numeric_val(&m, &allocation, 10) - 0.9504).abs() < 1e-10);
     }
 
@@ -4861,7 +4861,7 @@ mod compact_action_tests {
         let mut m = Model::new();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let mut a = super::tests::row("aabb", 100, 5, 7, "", "");
-        a.status = 2; a.epoch = m.current_epoch; a.estimated_reward = BigInt::from(100_000_000);
+        a.status = 2; a.epoch = m.current_epoch; a.estimated_reward = BigInt::from(8_000_000_000u64);
         let c = FrameCadence { last_observed_unix_seconds: now,
             hour: Some(FrameWindow { window_seconds: 3600, observed_seconds: 120, advanced_frames: 6 }),
             day: Some(FrameWindow { window_seconds: 86400, observed_seconds: 120, advanced_frames: 3 }) };
@@ -4909,7 +4909,7 @@ mod visibility_grid_tests {
     #[test]
     fn compact_headers_carry_units_and_the_forecast_marker_without_value_noise() {
         let mut m = Model::new(); m.reward_windows = 4;
-        let mut row = super::tests::row("01", 1, 1, 1, "", ""); row.status = 2; row.estimated_reward = BigInt::from(100_000_000);
+        let mut row = super::tests::row("01", 1, 1, 1, "", ""); row.status = 2; row.estimated_reward = BigInt::from(8_000_000_000u64);
         assert_eq!(alloc_header(&m, 16), "[s 60m/24h]");
         assert_eq!(alloc_header(&m, 10), "[~Q/d T]");
         m.compact_units = false; assert_eq!(alloc_header(&m, 10), "Reward [~Q/d theory]");
@@ -4919,7 +4919,7 @@ mod visibility_grid_tests {
         assert!(title.contains("[~Q/d T] 8640.0"), "{title}");
         assert!(!title.contains("~8640"));
         assert_eq!(fmt_forecast(&BigInt::from(1)), "<0.1");
-        assert_eq!(fmt_forecast(&BigInt::from(-100_000_000)), "-1.0");
+        assert_eq!(fmt_forecast(&BigInt::from(-8_000_000_000i64)), "-1.0");
     }
     #[test]
     fn interval_visibility_controls_global_and_shard_headers_cells_and_numeric_values() {

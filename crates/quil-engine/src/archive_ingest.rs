@@ -70,6 +70,13 @@ pub struct ArchiveAppShardIngest {
     awaiting_anchor: HashMap<Vec<u8>, BTreeMap<u64, u64>>,
     /// The GLOBAL frames [`Self::awaiting_anchor`] has logged waiting on.
     anchors_noted: std::collections::BTreeSet<u64>,
+    /// Frames received whose session generation executed GLOBAL state has not
+    /// authorized, anchored past it, per address: frame → (that anchor, since
+    /// when). Not asked for again until execution reaches the anchor
+    /// ([`Self::await_execution`]).
+    awaiting_execution: HashMap<Vec<u8>, BTreeMap<u64, (u64, Instant)>>,
+    /// The operator lines on [`Self::awaiting_execution`].
+    execution_deferrals: crate::execution_deferral::DeferralLog,
     /// Frames are materialized only through [`Self::materialize_through`], at
     /// the points the GLOBAL chain sequences, never on arrival.
     sequenced: bool,
@@ -86,6 +93,22 @@ pub struct ArchiveAppShardIngest {
     last_tip_scan: Option<Instant>,
     /// Shards whose committed GLOBAL tip this archive does not serve.
     missing_tips: HashMap<Vec<u8>, MissingTip>,
+    /// Frames at or below the cursor whose bodies this archive does not serve,
+    /// per address: those materialized from certified headers that carried
+    /// no verifiable storage attestation ([`Self::empty_frame_from_header`])
+    /// and those a peer asked for and found missing
+    /// ([`Self::with_missing_frame_reports`]). Each is asked for until its
+    /// certified body is stored, for at most [`OWED_BODY_ASKS`] asks and
+    /// [`OWED_BODY_TTL`] ([`Self::request_owed_bodies`]). Kept in memory
+    /// only: after a restart a frame is owed again once a peer asks for it.
+    owed_bodies: HashMap<Vec<u8>, BTreeMap<u64, OwedBody>>,
+    /// When [`Self::request_owed_bodies`] last warned about bodies still owed.
+    owed_warned: Option<Instant>,
+    /// Frames peers asked this archive for that it does not serve.
+    missing_frame_reports: Option<tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>>,
+    /// Reported frames found not to be owed, and since when: such a report
+    /// is not looked into again for [`NOT_OWED_TTL`]; at most [`MAX_NOT_OWED`].
+    not_owed: HashMap<(Vec<u8>, u64), Instant>,
     #[cfg(test)]
     skip_header_authentication: bool,
 }
@@ -111,6 +134,17 @@ const _: () = assert!(PREFETCH_DEPTH < MAX_BUFFERED_FRAMES_PER_SHARD as u64);
 /// links to them. Keyed by output identity, so a well-formed impostor cannot
 /// displace the real frame at the same height.
 const MAX_HELD_FRAMES_PER_SHARD: usize = 32;
+/// Frames of one shard that wait for GLOBAL execution to reach their anchor
+/// ([`ArchiveAppShardIngest::await_execution`]). Past it the farthest frame is
+/// forgotten: it is asked for again like any missing frame once a GLOBAL frame
+/// needs it, and verified then.
+const MAX_AWAITING_EXECUTION_PER_SHARD: usize = MAX_BUFFERED_FRAMES_PER_SHARD;
+/// Frames of all shards that wait for GLOBAL execution to reach their anchor.
+/// Past it a frame is not parked: it is asked for like any missing frame.
+const MAX_AWAITING_EXECUTION: usize = 4096;
+/// The longest a frame waits for GLOBAL execution to reach its anchor before
+/// it may be asked for, and verified, again.
+const AWAIT_EXECUTION_TTL: Duration = Duration::from_secs(30 * 60);
 /// How often an archive compares each shard's committed GLOBAL tip with the
 /// frame it serves ([`ArchiveAppShardIngest::request_committed_tips`]).
 const COMMITTED_TIP_SCAN: Duration = Duration::from_secs(60);
@@ -129,6 +163,57 @@ struct MissingTip {
     asked: Option<Instant>,
     asks: u32,
     warned: Option<Instant>,
+}
+
+/// Bodies owed at once, across shards. A frame found missing beyond this is
+/// owed once a peer asks for it again after others were stored or expired.
+const MAX_OWED_BODIES: usize = 1024;
+/// Owed bodies asked for per retry pass, each at most every
+/// [`COMMITTED_TIP_ASK`], on the prefetch queue, which the gap fetch serves
+/// only while no frame a waiting GLOBAL frame needs is asked for.
+const OWED_BODY_ASKS_PER_PASS: usize = 16;
+/// How often an owed body is asked for, at most, and for how long: one ask
+/// every [`COMMITTED_TIP_ASK`] for 24 hours. No member or archive serving it
+/// by then, it is forgotten until a peer asks for the frame again.
+const OWED_BODY_ASKS: u32 = 288;
+const OWED_BODY_TTL: Duration = Duration::from_secs(24 * 3600);
+const _: () = assert!(OWED_BODY_ASKS as u64 * COMMITTED_TIP_ASK.as_secs() == OWED_BODY_TTL.as_secs());
+/// How long a reported frame found not to be owed is not looked into again,
+/// and how many such frames are remembered.
+const NOT_OWED_TTL: Duration = Duration::from_secs(3600);
+const MAX_NOT_OWED: usize = 1024;
+/// Peer reports of frames this archive does not serve, checked per retry pass.
+const MISSING_FRAME_REPORTS_PER_PASS: usize = 64;
+
+/// The body of a frame this archive executed, or found missing below its
+/// cursor, without serving it: the digest of the output it must carry
+/// (`poseidon(output)`, the selector it is stored and linked under) and
+/// where that digest came from, since when it is owed, when it was last
+/// asked for, whether a copy without its certificate is served meanwhile,
+/// and how often a certified body with another output was warned about
+/// (once).
+struct OwedBody {
+    selector: [u8; 32],
+    origin: OwedOrigin,
+    since: Instant,
+    asked: Option<Instant>,
+    asks: u32,
+    uncertified_served: bool,
+    mismatch_warns: u32,
+}
+
+/// Where an owed body's output digest came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwedOrigin {
+    /// The certified header GLOBAL carried, which this archive executed: the
+    /// body carries a certificate of its own.
+    Executed,
+    /// The digest GLOBAL committed at that height: final as it is, with or
+    /// without a certificate of its own (a sealed session's last frame).
+    Committed,
+    /// The parent the stored frame after it names: that frame authenticates
+    /// the body, with or without a certificate of its own.
+    Successor,
 }
 
 /// How long GLOBAL execution waits for the body of a frame whose certified
@@ -157,6 +242,10 @@ impl ArchiveAppShardIngest {
             prover_registry: prover_registry.clone(),
             last_tip_scan: None,
             missing_tips: HashMap::new(),
+            owed_bodies: HashMap::new(),
+            owed_warned: None,
+            missing_frame_reports: None,
+            not_owed: HashMap::new(),
             validator: Arc::new(
                 BlsAppFrameValidator::new(prover_registry, bls_constructor, frame_prover)
                     .with_clock_store(clock_store.clone())
@@ -174,6 +263,8 @@ impl ArchiveAppShardIngest {
             requested: HashMap::new(),
             awaiting_anchor: HashMap::new(),
             anchors_noted: std::collections::BTreeSet::new(),
+            awaiting_execution: HashMap::new(),
+            execution_deferrals: crate::execution_deferral::DeferralLog::new("archive ingest"),
             sequenced: false,
             missing_since: HashMap::new(),
             empty_body_grace: EMPTY_FRAME_BODY_GRACE,
@@ -195,6 +286,16 @@ impl ArchiveAppShardIngest {
         self
     }
 
+    /// For tests elsewhere in the crate: `address` materialized through
+    /// `height`, and a frame rebuilt from its header without waiting for its
+    /// body ([`Self::empty_frame_from_header`]).
+    #[cfg(test)]
+    pub(crate) fn rebuilding_at_once_from(mut self, address: &[u8], height: u64) -> Self {
+        self.empty_body_grace = Duration::ZERO;
+        self.last_materialized.insert(address.to_vec(), height);
+        self
+    }
+
     /// Ask `requests` for any app-shard frame this archive is missing.
     ///
     /// Without it a single missed frame — one produced while this node was
@@ -206,6 +307,17 @@ impl ArchiveAppShardIngest {
     /// read an archive.
     pub fn with_gap_fetch(mut self, requests: tokio::sync::mpsc::Sender<(Vec<u8>, u64)>) -> Self {
         self.gap_requests = Some(requests);
+        self
+    }
+
+    /// Where this archive's frame service reports each numbered frame a peer
+    /// asked for and the store lacks. One below the cursor is a hole: GLOBAL
+    /// executed it, from its body or its certified header, but the body was
+    /// never stored, so every node replaying the shard from archives stops
+    /// there. Such a frame is owed and asked for ([`Self::request_owed_bodies`])
+    /// when the stored frame after it names its output.
+    pub fn with_missing_frame_reports(mut self, reports: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>) -> Self {
+        self.missing_frame_reports = Some(reports);
         self
     }
 
@@ -248,6 +360,7 @@ impl ArchiveAppShardIngest {
             inclusion_prover: self.inclusion_prover.clone(),
             has_forest: self.hypergraph.has_forest(),
             clock_store: self.clock_store.clone(),
+            hypergraph: self.hypergraph.clone(),
         }
     }
 
@@ -267,6 +380,66 @@ impl ArchiveAppShardIngest {
             info!(anchor, frame = number, address = %hex::encode(address),
                 "archive app-shard frames wait for a GLOBAL frame this archive has not stored; \
                  they are asked for again once it is");
+        }
+    }
+
+    /// Park frame `number` of `address` until GLOBAL execution, at `executed`,
+    /// reaches `anchor`, the GLOBAL frame it is anchored to: executed state
+    /// holds no session for the generation its certificate names, which is the
+    /// shard's next ([`FrameCheck::AwaitExecution`]). It is asked for again
+    /// then, at once when a GLOBAL frame waits for it, or after
+    /// [`AWAIT_EXECUTION_TTL`], and verified again; one still unauthorized is
+    /// refused then. Only shards this archive holds frames of are parked, at
+    /// most [`MAX_AWAITING_EXECUTION_PER_SHARD`] frames each and
+    /// [`MAX_AWAITING_EXECUTION`] in all; the first anchor and time stand, so
+    /// a copy received again does not extend the wait. Returns whether the
+    /// frame waits; one that does not is dropped and asked for as any missing
+    /// frame.
+    ///
+    /// Refused instead, such frames were fetched again and again: an archive
+    /// 510 frames behind refused 9870 of them on 83 shards in 24 minutes, and
+    /// its gap fetch recovered 3677 (2026-10-25).
+    pub fn await_execution(&mut self, address: &[u8], number: u64, anchor: u64, executed: u64) -> bool {
+        match self.materialized_height(address) {
+            Ok(height) if height > 0 && number > height => {}
+            _ => return false,
+        }
+        let parked: usize = self.awaiting_execution.values().map(BTreeMap::len).sum();
+        let waiting = self.awaiting_execution.entry(address.to_vec()).or_default();
+        if waiting.contains_key(&number) {
+            return true;
+        }
+        if parked >= MAX_AWAITING_EXECUTION {
+            if waiting.is_empty() {
+                self.awaiting_execution.remove(address);
+            }
+            return false;
+        }
+        waiting.insert(number, (anchor, Instant::now()));
+        while waiting.len() > MAX_AWAITING_EXECUTION_PER_SHARD {
+            waiting.pop_last();
+        }
+        if !waiting.contains_key(&number) {
+            return false;
+        }
+        let shards = self.awaiting_execution.len();
+        self.execution_deferrals.deferred(address, number, anchor, executed, Some(shards));
+        true
+    }
+
+    /// The GLOBAL frame executed state is at; `None` when unreadable.
+    fn executed_global_frame(&self) -> Option<u64> {
+        self.hypergraph
+            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+            .ok()
+    }
+
+    /// Log the end of a wait for execution once it reached every anchor.
+    fn note_execution(&self) {
+        if self.execution_deferrals.waiting() {
+            if let Some(executed) = self.executed_global_frame() {
+                self.execution_deferrals.executed(executed);
+            }
         }
     }
 
@@ -300,6 +473,12 @@ impl ArchiveAppShardIngest {
             let awaiting = &self.awaiting_anchor;
             self.anchors_noted.retain(|anchor| awaiting.values().any(|waiting| waiting.values().any(|a| a == anchor)));
         }
+        if let Some(waiting) = self.awaiting_execution.get_mut(address) {
+            *waiting = waiting.split_off(&(frame + 1));
+            if waiting.is_empty() {
+                self.awaiting_execution.remove(address);
+            }
+        }
         self.missing_since.remove(address);
     }
 
@@ -324,6 +503,7 @@ impl ArchiveAppShardIngest {
         self.buffered.clear();
         self.held.clear();
         self.requested.clear();
+        self.owed_bodies.clear();
         crate::app_engine::forget_legacy_relay_boundaries();
         tracing::info!(global_frame, "committee-handoff flag day: archive discarded its legacy app frame history");
         Ok(true)
@@ -335,6 +515,9 @@ impl ArchiveAppShardIngest {
             self.serve_committed_held(&address);
         }
         self.request_committed_tips();
+        self.take_missing_frame_reports();
+        self.request_owed_bodies();
+        self.note_execution();
         if self.sequenced {
             return;
         }
@@ -376,8 +559,17 @@ impl ArchiveAppShardIngest {
             address = %hex::encode(&address),
             "archive ingest: received a full app-shard frame"
         );
-        // Already materialized (or older) — ignore.
+        // Already materialized (or older): ignore, unless this archive owes
+        // the frame's body, which is then checked and served, never executed.
         if frame_number <= held {
+            if self.wants_owed_body(&address, &frame) {
+                let verifier = self.verifier();
+                if verifier.missing_anchor(&frame).is_none() {
+                    if let Some(certified) = verifier.verify(&frame) {
+                        self.store_owed_body(&address, &frame, certified, "gossip");
+                    }
+                }
+            }
             return;
         }
 
@@ -386,7 +578,14 @@ impl ArchiveAppShardIngest {
             self.await_anchor(&address, frame_number, anchor);
             return;
         }
-        let Some(certified) = verifier.verify(&frame) else { return };
+        let certified = match verifier.check(&frame) {
+            FrameCheck::Admit { certified } => certified,
+            FrameCheck::AwaitExecution { anchor, executed } => {
+                self.await_execution(&address, frame_number, anchor, executed);
+                return;
+            }
+            FrameCheck::Refused => return,
+        };
         self.admit(&address, frame, certified);
         if !self.sequenced {
             self.try_materialize(&address);
@@ -405,7 +604,10 @@ impl ArchiveAppShardIngest {
         };
         match self.materialized_height(&address) {
             Ok(held) if frame_number > held => {}
-            Ok(_) => return,
+            Ok(_) => {
+                self.store_owed_body(&address, &frame, certified, "gap fetch");
+                return;
+            }
             Err(error) => {
                 warn!(error = %error, "archive ingest deferred: materialized cursor unavailable");
                 return;
@@ -569,24 +771,295 @@ impl ArchiveAppShardIngest {
     /// The receive loop used to store every gossiped frame before this check,
     /// so one forged far-future frame could pin the head an archive serves;
     /// and frames recovered through the gap fetch were never stored at all.
-    fn store_for_serving(&self, frame: &AppShardFrame) {
-        let Some(header) = frame.header.as_ref() else { return };
-        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return };
-        // Two transactions: the commit reads the staged copy from the store.
-        let stored = self.clock_store.new_transaction(false)
-            .and_then(|txn| {
-                self.clock_store.stage_shard_clock_frame(&selector, frame, txn.as_ref())?;
-                txn.commit()
-            })
-            .and_then(|()| {
-                let txn = self.clock_store.new_transaction(false)?;
-                self.clock_store.commit_shard_clock_frame(&header.address, header.frame_number, &selector, txn.as_ref(), false)?;
-                txn.commit()
-            });
-        if let Err(error) = stored {
+    /// The header's own `storage_attestation` field, which only the header a
+    /// GLOBAL frame carries fills and no certificate binds, is stored empty.
+    /// Returns whether the frame was stored.
+    fn store_for_serving(&self, frame: &AppShardFrame) -> bool {
+        if frame.header.as_ref().is_some_and(|header| !header.storage_attestation.is_empty()) {
+            let mut cleared = frame.clone();
+            if let Some(header) = cleared.header.as_mut() {
+                header.storage_attestation.clear();
+            }
+            return self.store_for_serving(&cleared);
+        }
+        let Some(header) = frame.header.as_ref() else { return false };
+        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return false };
+        // Outside every GLOBAL execution footprint, so it does not make a
+        // concurrent atomic execution stale.
+        if let Err(error) = self.clock_store.store_shard_clock_frame_for_serving(&selector, frame) {
             warn!(frame = header.frame_number, %error,
                 address = %hex::encode(&header.address),
                 "archive ingest: storing a verified shard frame for serving failed");
+            return false;
+        }
+        true
+    }
+
+    /// Whether this archive owes the body of frame `number` of `address`.
+    pub(crate) fn owes_body(&self, address: &[u8], number: u64) -> bool {
+        self.owed_bodies.get(address).is_some_and(|owed| owed.contains_key(&number))
+    }
+
+    /// Whether `frame` has the output of a body this archive owes and could
+    /// take its place: checked before the frame is verified, which only such
+    /// a frame is. A copy without its own certificate cannot replace the one
+    /// already served.
+    fn wants_owed_body(&self, address: &[u8], frame: &AppShardFrame) -> bool {
+        let Some(header) = frame.header.as_ref() else { return false };
+        let Some(owed) = self.owed_bodies.get(address).and_then(|owed| owed.get(&header.frame_number)) else {
+            return false;
+        };
+        (has_certificate(frame) || !owed.uncertified_served)
+            && quil_crypto::poseidon::hash_bytes_to_32(&header.output).is_ok_and(|selector| selector == owed.selector)
+    }
+
+    /// Owe the body of frame `number` of `address`, whose output hashes to
+    /// `selector` by `origin`, so [`Self::request_owed_bodies`] asks for it
+    /// until it is stored. Returns whether it was newly owed.
+    fn owe_body(&mut self, address: &[u8], number: u64, selector: [u8; 32], origin: OwedOrigin) -> bool {
+        let owed: usize = self.owed_bodies.values().map(BTreeMap::len).sum();
+        if owed >= MAX_OWED_BODIES || self.owes_body(address, number) {
+            return false;
+        }
+        self.owed_bodies.entry(address.to_vec()).or_default().insert(number, OwedBody {
+            selector, origin, since: Instant::now(), asked: None, asks: 0, uncertified_served: false, mismatch_warns: 0,
+        });
+        true
+    }
+
+    /// Whether the report of frame `number` of `address` was found not to be
+    /// owed within [`NOT_OWED_TTL`].
+    fn not_owed(&self, address: &[u8], number: u64) -> bool {
+        self.not_owed.get(&(address.to_vec(), number)).is_some_and(|at| at.elapsed() < NOT_OWED_TTL)
+    }
+
+    /// Remember that frame `number` of `address` is not owed, within
+    /// [`MAX_NOT_OWED`].
+    fn note_not_owed(&mut self, address: &[u8], number: u64) {
+        self.not_owed.retain(|_, at| at.elapsed() < NOT_OWED_TTL);
+        if self.not_owed.len() >= MAX_NOT_OWED {
+            if let Some(oldest) = self.not_owed.iter().min_by_key(|(_, at)| **at).map(|(key, _)| key.clone()) {
+                self.not_owed.remove(&oldest);
+            }
+        }
+        self.not_owed.insert((address.to_vec(), number), Instant::now());
+    }
+
+    fn forget_owed_body(&mut self, address: &[u8], number: u64) {
+        let Some(owed) = self.owed_bodies.get_mut(address) else { return };
+        owed.remove(&number);
+        if owed.is_empty() {
+            self.owed_bodies.remove(address);
+        }
+    }
+
+    /// Store the verified body of an owed frame at or below the cursor for
+    /// serving when its output is the one executed there, the digest
+    /// [`OwedBody::selector`] holds; any other body at that height is refused.
+    /// It is neither buffered nor executed again: GLOBAL executed the frame.
+    /// A copy without its own certificate is final when the digest is the one
+    /// GLOBAL committed or the stored frame after it names
+    /// ([`OwedOrigin`]); a frame executed from its certified header is served
+    /// so only until a certified copy replaces it.
+    ///
+    /// Every archive used to drop a body arriving after GLOBAL executed its
+    /// frame from the certified header, and nothing asked for it again, so
+    /// a 90 s miss became a hole every archive served for good: nodes
+    /// replaying …d9000a1b40 stopped at frame 5577 ("archive replay is
+    /// missing shard frame 5577"), while its members held the body
+    /// (2026-10-23).
+    fn store_owed_body(&mut self, address: &[u8], frame: &AppShardFrame, certified: bool, via: &'static str) {
+        let Some(header) = frame.header.as_ref() else { return };
+        let number = header.frame_number;
+        let Some(owed) = self.owed_bodies.get_mut(address).and_then(|owed| owed.get_mut(&number)) else { return };
+        let Ok(selector) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return };
+        if selector != owed.selector {
+            let (origin, expected) = (owed.origin, owed.selector);
+            if !certified {
+                debug!(filter = %hex::encode(address), frame = number, via,
+                    "archive refused a shard frame body whose output differs from the frame executed at that height");
+            } else if origin == OwedOrigin::Successor {
+                // A certified frame the stored frame after it does not name:
+                // that frame opens a session GLOBAL holds no record of here,
+                // and names its genesis. The digest owed is no frame's.
+                self.forget_owed_body(address, number);
+                self.note_not_owed(address, number);
+                warn!(filter = %hex::encode(address), frame = number, via,
+                    body = %hex::encode(&selector[..4]), named = %hex::encode(&expected[..4]),
+                    "archive stopped asking for the body of a shard frame below its cursor: a certified body has \
+                     another output than the stored frame after it names, which then opens a session; nodes \
+                     replaying the shard need the frame GLOBAL committed there");
+            } else if owed.mismatch_warns == 0 {
+                owed.mismatch_warns += 1;
+                warn!(filter = %hex::encode(address), frame = number, via,
+                    body = %hex::encode(&selector[..4]), executed = %hex::encode(&expected[..4]),
+                    "archive refused a certified shard frame body whose output differs from the frame executed at \
+                     that height: two certified frames at one height is a defect to report with this line");
+            }
+            return;
+        }
+        if !certified && owed.uncertified_served {
+            return;
+        }
+        let (since, asks) = (owed.since, owed.asks);
+        let complete = certified || owed.origin != OwedOrigin::Executed;
+        if !self.store_for_serving(frame) {
+            return;
+        }
+        if !complete {
+            if let Some(owed) = self.owed_bodies.get_mut(address).and_then(|owed| owed.get_mut(&number)) {
+                owed.uncertified_served = true;
+            }
+            info!(filter = %hex::encode(address), frame = number, via, asks, owed_secs = since.elapsed().as_secs(),
+                "archive stored the late body of a shard frame below its cursor without its own certificate; nodes \
+                 replaying the shard can fetch it with the certified frame after it, and the archive still asks \
+                 for a certified copy");
+            return;
+        }
+        self.forget_owed_body(address, number);
+        info!(filter = %hex::encode(address), frame = number, via, asks, owed_secs = since.elapsed().as_secs(),
+            "archive stored the late body of a shard frame below its cursor; nodes replaying the shard from \
+             archives can fetch it now");
+    }
+
+    /// Whether frame `number + 1` of `address` opens a committee session:
+    /// it then names the session's genesis as its parent, not frame
+    /// `number`'s output. `Err` when GLOBAL's records cannot be read.
+    fn opens_session_after(&self, address: &[u8], number: u64) -> quil_types::error::Result<bool> {
+        use quil_execution::global_intrinsic::handoff;
+        let Some(view) = crate::app_handoff::committed_view(&self.hypergraph)? else { return Ok(false) };
+        let Some(head) = handoff::head(&view, address)? else { return Ok(false) };
+        // A successor's base is its predecessor's closing checkpoint, never
+        // below that predecessor's base (`app_engine::session_based_at`).
+        for generation in (1..=head.generation).rev() {
+            match handoff::session_at_generation(&view, address, generation)? {
+                Some(session) if session.base_frame == number => return Ok(true),
+                Some(session) if session.base_frame < number => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Owe the body of each frame below the cursor that a peer asked for and
+    /// this archive does not serve, under the output GLOBAL committed at that
+    /// height (a session's last frame), else the one the stored frame after
+    /// it names (`parent_selector`), unless that frame opens a session and
+    /// names its genesis instead. A hole left before archives kept asking for
+    /// such bodies, or forgotten across a restart, is so recovered the first
+    /// time a node replaying the shard asks for it. Only a hole whose next
+    /// frame is stored gets that far: of consecutive holes, all but the last
+    /// are owed only under a digest GLOBAL committed. A report found not to be
+    /// owed is not looked into again for [`NOT_OWED_TTL`]. At most
+    /// [`MISSING_FRAME_REPORTS_PER_PASS`] reports a pass; the rest wait.
+    fn take_missing_frame_reports(&mut self) {
+        let mut reports = Vec::new();
+        if let Some(receiver) = self.missing_frame_reports.as_mut() {
+            while reports.len() < MISSING_FRAME_REPORTS_PER_PASS {
+                let Ok(report) = receiver.try_recv() else { break };
+                reports.push(report);
+            }
+        }
+        for (address, number) in reports {
+            if number == 0 || self.owes_body(&address, number) || self.not_owed(&address, number)
+                || self.clock_store.get_shard_clock_frame(&address, number, false).is_ok()
+            {
+                continue;
+            }
+            // Read before the cursor, which is cached per address: only a
+            // shard this archive stores frames of gets that far.
+            let Some(child) = self.clock_store.get_shard_clock_frame(&address, number + 1, false).ok()
+                .and_then(|child| child.header)
+            else {
+                continue;
+            };
+            if !self.materialized_height(&address).is_ok_and(|height| number <= height) {
+                continue;
+            }
+            let committed = crate::app_handoff::committed_frame_digest_looked_through(&self.hypergraph, &address, number)
+                .ok().flatten();
+            let (selector, origin) = match committed {
+                Some(digest) => (digest, OwedOrigin::Committed),
+                // Records unreadable now: the next report looks again.
+                None => match self.opens_session_after(&address, number) {
+                    Err(_) => continue,
+                    Ok(true) => {
+                        self.note_not_owed(&address, number);
+                        continue;
+                    }
+                    Ok(false) => match <[u8; 32]>::try_from(child.parent_selector.as_slice()) {
+                        Ok(selector) => (selector, OwedOrigin::Successor),
+                        Err(_) => continue,
+                    },
+                },
+            };
+            if self.owe_body(&address, number, selector, origin) {
+                info!(filter = %hex::encode(&address), frame = number,
+                    "archive does not serve a shard frame below its cursor that a peer asked for; asking the \
+                     shard's members and archives for its body");
+            }
+        }
+    }
+
+    /// Ask for each owed body on the prefetch queue, at most every
+    /// [`COMMITTED_TIP_ASK`] and [`OWED_BODY_ASKS_PER_PASS`] a pass; forget
+    /// one stored with its certificate meanwhile, and one asked for
+    /// [`OWED_BODY_ASKS`] times or owed for [`OWED_BODY_TTL`] (warned about
+    /// once a pass). While one has been owed for [`COMMITTED_TIP_WARN`],
+    /// warn once per that interval.
+    fn request_owed_bodies(&mut self) {
+        let mut expired: Vec<(Vec<u8>, u64, u32)> = Vec::new();
+        for (address, owed) in self.owed_bodies.iter_mut() {
+            owed.retain(|&number, body| {
+                let keep = body.asks < OWED_BODY_ASKS && body.since.elapsed() < OWED_BODY_TTL;
+                if !keep {
+                    expired.push((address.clone(), number, body.asks));
+                }
+                keep
+            });
+        }
+        self.owed_bodies.retain(|_, owed| !owed.is_empty());
+        if let Some((address, number, asks)) = expired.first() {
+            warn!(expired = expired.len(), filter = %hex::encode(address), frame = number, asks,
+                ttl_secs = OWED_BODY_TTL.as_secs(),
+                "archive stopped asking for the bodies of shard frames below its cursor: no member or archive \
+                 served one (the gap fetch's line for each frame names each answer); nodes replaying such a \
+                 shard from archives stop at the frame, which is owed again once one asks for it");
+        }
+        let Some(sender) = self.prefetch_requests.clone() else { return };
+        let due: Vec<(Vec<u8>, u64)> = self.owed_bodies.iter()
+            .flat_map(|(address, owed)| owed.iter()
+                .filter(|(_, body)| body.asked.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_ASK))
+                .map(move |(&number, _)| (address.clone(), number)))
+            .take(OWED_BODY_ASKS_PER_PASS)
+            .collect();
+        for (address, number) in due {
+            if self.clock_store.get_shard_clock_frame(&address, number, false).is_ok_and(|stored| has_certificate(&stored)) {
+                self.forget_owed_body(&address, number);
+                continue;
+            }
+            if sender.try_send((address.clone(), number)).is_err() {
+                break;
+            }
+            if let Some(body) = self.owed_bodies.get_mut(&address).and_then(|owed| owed.get_mut(&number)) {
+                body.asked = Some(Instant::now());
+                body.asks += 1;
+            }
+        }
+        let oldest = self.owed_bodies.iter()
+            .flat_map(|(address, owed)| owed.iter().map(move |(&number, body)| (body.since, address, number)))
+            .min_by_key(|(since, _, _)| *since)
+            .map(|(since, address, number)| (since, hex::encode(address), number));
+        let Some((since, filter, frame)) = oldest else { return };
+        if since.elapsed() >= COMMITTED_TIP_WARN && self.owed_warned.is_none_or(|at| at.elapsed() >= COMMITTED_TIP_WARN) {
+            self.owed_warned = Some(Instant::now());
+            let owed: usize = self.owed_bodies.values().map(BTreeMap::len).sum();
+            warn!(owed, shards = self.owed_bodies.len(), oldest_filter = %filter, oldest_frame = frame,
+                oldest_owed_secs = since.elapsed().as_secs(),
+                "archive still lacks the bodies of shard frames below its cursor: it asks the shards' members \
+                 and archives for each at most every 5 minutes, behind the frames GLOBAL execution waits on, for \
+                 up to 24 hours (the gap fetch's line for a frame names each answer); nodes replaying a shard \
+                 from archives stop at such a frame until one serves it");
         }
     }
 
@@ -635,10 +1108,11 @@ impl ArchiveAppShardIngest {
                 break true;
             }
             let Some(next) = last.checked_add(1) else { break true };
-            let frame = match self.buffered.get(address).and_then(|m| m.get(&next)) {
-                Some(f) => f.clone(),
+            // `rebuilt`: rebuilt from its header, and whether whole.
+            let (frame, rebuilt) = match self.buffered.get(address).and_then(|m| m.get(&next)) {
+                Some(f) => (f.clone(), None),
                 None => match self.empty_frame_from_header(address, next, vouched) {
-                    Some(frame) => frame,
+                    Some((frame, whole)) => (frame, Some(whole)),
                     None => break false, // gap — wait for the missing frame (or sync)
                 },
             };
@@ -668,6 +1142,21 @@ impl ArchiveAppShardIngest {
             self.set_materialized_height(address, next);
             if let Some(m) = self.buffered.get_mut(address) {
                 m.remove(&next);
+            }
+            // A frame rebuilt whole is its body, served; one executed
+            // without it owes its body, still sought, to serve.
+            match rebuilt {
+                Some(true) => {
+                    self.store_for_serving(&frame);
+                }
+                Some(false) => {
+                    let selector = frame.header.as_ref()
+                        .and_then(|header| quil_crypto::poseidon::hash_bytes_to_32(&header.output).ok());
+                    if let Some(selector) = selector {
+                        self.owe_body(address, next, selector, OwedOrigin::Executed);
+                    }
+                }
+                None => {}
             }
             // Info, not debug: an archive holding app-shard state is a
             // duty, and its only positive evidence. At debug a WORKING
@@ -705,7 +1194,7 @@ impl ArchiveAppShardIngest {
             } else {
                 (wanted, GAP_RETRY_INTERVAL)
             };
-            let requested = self.request_frames(address, wanted..=upto, true, interval);
+            let requested = self.request_frames(address, wanted..=upto, true, waiting, interval);
             if requested > 0 {
                 warn!(
                     address = %hex::encode(address),
@@ -748,18 +1237,28 @@ impl ArchiveAppShardIngest {
         if last == 0 || upto <= last {
             return Ok(0);
         }
-        Ok(self.request_frames(address, last + 1..=upto, false, GAP_RETRY_INTERVAL))
+        Ok(self.request_frames(address, last + 1..=upto, false, false, GAP_RETRY_INTERVAL))
     }
 
     /// Ask for each frame of `frames` neither buffered nor held, unless it was
     /// asked for within `interval` (at this priority or above). `urgent` asks
     /// on `gap_requests`, otherwise on `prefetch_requests`. A full queue
     /// leaves the rest for the next pass.
-    fn request_frames(&mut self, address: &[u8], frames: RangeInclusive<u64>, urgent: bool, interval: Duration) -> usize {
+    /// `global_waits`: a GLOBAL frame waits for these frames, so one parked
+    /// until execution reaches its anchor is asked for at once.
+    fn request_frames(
+        &mut self,
+        address: &[u8],
+        frames: RangeInclusive<u64>,
+        urgent: bool,
+        global_waits: bool,
+        interval: Duration,
+    ) -> usize {
         let sender = if urgent { self.gap_requests.clone() } else { self.prefetch_requests.clone() };
         let Some(sender) = sender else { return 0 };
         let mut sent = 0;
         let mut stored: HashMap<u64, bool> = HashMap::new();
+        let mut executed: Option<Option<u64>> = None;
         for number in frames {
             if self.buffered.get(address).is_some_and(|buffered| buffered.contains_key(&number))
                 || self.is_held(address, number)
@@ -783,6 +1282,30 @@ impl ArchiveAppShardIngest {
                     requested.remove(&number);
                 }
             }
+            if let Some((anchor, since)) = self.awaiting_execution.get(address).and_then(|waiting| waiting.get(&number)).copied() {
+                // A GLOBAL frame waiting for this one sequences only a frame
+                // anchored at or below the executed frame, so the parked copy
+                // is not it: ask at once. A gap alone does not (unsequenced
+                // ingest asks for the first missing frame urgently too).
+                // Unreadable, the cursor holds nothing back: verification then
+                // refuses as before.
+                let reached = global_waits || executed
+                    .get_or_insert_with(|| self.executed_global_frame())
+                    .is_none_or(|executed| executed >= anchor);
+                if !reached && since.elapsed() < AWAIT_EXECUTION_TTL {
+                    continue;
+                }
+                // Execution reached the anchor: verify the frame again, so ask at once.
+                if let Some(waiting) = self.awaiting_execution.get_mut(address) {
+                    waiting.remove(&number);
+                    if waiting.is_empty() {
+                        self.awaiting_execution.remove(address);
+                    }
+                }
+                if let Some(requested) = self.requested.get_mut(address) {
+                    requested.remove(&number);
+                }
+            }
             let due = self.requested.get(address).and_then(|requested| requested.get(&number))
                 .is_none_or(|&(at, was_urgent)| (urgent && !was_urgent) || at.elapsed() >= interval);
             if !due {
@@ -793,6 +1316,9 @@ impl ArchiveAppShardIngest {
             }
             self.requested.entry(address.to_vec()).or_default().insert(number, (Instant::now(), urgent));
             sent += 1;
+        }
+        if let Some(Some(executed)) = executed {
+            self.execution_deferrals.executed(executed);
         }
         sent
     }
@@ -806,12 +1332,18 @@ impl ArchiveAppShardIngest {
     /// The frame `number` of `address`, rebuilt from the certified header the
     /// executing GLOBAL frame carries, when no endpoint has served its body for
     /// [`EMPTY_FRAME_BODY_GRACE`] and the header proves the frame carried no
-    /// requests (an all-zero `requests_root`, which the frame's output binds).
+    /// requests (an all-zero `requests_root`, which the frame's output binds),
+    /// with whether it is whole.
     ///
     /// Materializing a frame reads only its requests and header fields, so
     /// such a frame leaves exactly the state its body would, on every archive,
-    /// whether or not it holds the body. The rebuilt frame lacks the storage
-    /// attestation, so it is never stored for serving. A frame that carried
+    /// whether or not it holds the body. The header carries the committee's
+    /// storage attestation ([`crate::app_handoff::frame_from_carried_header`]):
+    /// rebuilt with it, the frame is its body, and once it passes full
+    /// validation it is stored for serving. Rebuilt without it (the header
+    /// holds none, or it does not verify), the frame is executed on its
+    /// certificate and output and not served: its body is owed and asked for
+    /// until it arrives ([`Self::store_owed_body`]). A frame that carried
     /// requests cannot be rebuilt and keeps waiting for its body.
     ///
     /// GLOBAL 903,302 rewarded frame 2063 of a shard whose body no member or
@@ -822,7 +1354,7 @@ impl ArchiveAppShardIngest {
         address: &[u8],
         number: u64,
         vouched: &HashMap<u64, quil_types::proto::global::FrameHeader>,
-    ) -> Option<AppShardFrame> {
+    ) -> Option<(AppShardFrame, bool)> {
         let header = vouched.get(&number)
             .filter(|header| header.address == address && header.frame_number == number)?;
         if !requests_root_is_empty(&header.requests_root) {
@@ -838,18 +1370,49 @@ impl ArchiveAppShardIngest {
         if since.elapsed() < self.empty_body_grace {
             return None;
         }
-        let frame = AppShardFrame { header: Some(header.clone()), requests: Vec::new(), storage_attestation: None };
-        if let Err(reason) = self.authenticate_header(&frame) {
+        let (frame, missing) = crate::app_handoff::frame_from_carried_header(header);
+        let whole = match missing {
+            Some(reason) => Err(reason),
+            None => self.authenticate_body(&frame),
+        };
+        let reason = match whole {
+            Ok(()) => {
+                info!(frame = number, address = %hex::encode(address), waited_secs = since.elapsed().as_secs(),
+                    attested = frame.storage_attestation.is_some(),
+                    "archive materialized an empty shard frame from the certified header GLOBAL carried, with its \
+                     committee's storage attestation: no endpoint served its body, and this archive serves the \
+                     rebuilt one");
+                return Some((frame, true));
+            }
+            Err(reason) => reason,
+        };
+        let frame = AppShardFrame { storage_attestation: None, ..frame };
+        if let Err(refused) = self.authenticate_header(&frame) {
             if let Some(entry) = self.missing_since.get_mut(address).filter(|entry| !entry.2) {
                 entry.2 = true;
-                warn!(frame = number, address = %hex::encode(address), %reason,
+                warn!(frame = number, address = %hex::encode(address), reason = %refused,
                     "archive cannot materialize an empty shard frame from its header: the header does not authenticate");
             }
             return None;
         }
-        warn!(frame = number, address = %hex::encode(address), waited_secs = since.elapsed().as_secs(),
-            "archive materialized an empty shard frame from its certified header: no endpoint served its body");
-        Some(frame)
+        warn!(frame = number, address = %hex::encode(address), waited_secs = since.elapsed().as_secs(), %reason,
+            "archive materialized an empty shard frame from its certified header without its storage attestation: \
+             no endpoint served its body, which this archive asks for to serve");
+        Some((frame, false))
+    }
+
+    /// Full validation of a frame rebuilt with its storage attestation:
+    /// certificate, deterministic output and possession.
+    fn authenticate_body(&self, frame: &AppShardFrame) -> Result<(), String> {
+        #[cfg(test)]
+        if self.skip_header_authentication {
+            return Ok(());
+        }
+        match self.validator.validate(frame) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("certificate refused".into()),
+            Err(error) => Err(format!("full validation failed: {error}")),
+        }
     }
 
     /// Certificate and deterministic output (which binds `requests_root`),
@@ -876,6 +1439,24 @@ pub struct ArchiveFrameVerifier {
     inclusion_prover: Arc<dyn InclusionProver>,
     has_forest: bool,
     clock_store: Arc<dyn quil_types::store::ClockStore>,
+    /// GLOBAL state frames verify against, whose executed frame tells a frame
+    /// that waits for execution from one that is refused.
+    hypergraph: Arc<quil_hypergraph::HypergraphCrdt>,
+}
+
+/// What [`ArchiveFrameVerifier::check`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameCheck {
+    /// It may be admitted; `certified` says whether it carries its own
+    /// certificate.
+    Admit { certified: bool },
+    /// GLOBAL state executed through `executed` holds no session for its
+    /// generation, and it is anchored past it, at `anchor`: it waits for
+    /// execution to reach the anchor
+    /// ([`ArchiveAppShardIngest::await_execution`]).
+    AwaitExecution { anchor: u64, executed: u64 },
+    /// Refused (logged).
+    Refused,
 }
 
 impl ArchiveFrameVerifier {
@@ -888,9 +1469,21 @@ impl ArchiveFrameVerifier {
     }
 
     /// `Some(certified)` when `frame` may be admitted, `certified` saying
-    /// whether it carries its own certificate; `None` (logged) when refused.
+    /// whether it carries its own certificate; `None` when refused or when it
+    /// waits for execution ([`Self::check`]).
     pub fn verify(&self, frame: &AppShardFrame) -> Option<bool> {
-        let header = frame.header.as_ref().filter(|header| !header.address.is_empty())?;
+        match self.check(frame) {
+            FrameCheck::Admit { certified } => Some(certified),
+            FrameCheck::AwaitExecution { .. } | FrameCheck::Refused => None,
+        }
+    }
+
+    /// Whether `frame` may be admitted, waits for GLOBAL execution to reach
+    /// its anchor, or is refused (logged).
+    pub fn check(&self, frame: &AppShardFrame) -> FrameCheck {
+        let Some(header) = frame.header.as_ref().filter(|header| !header.address.is_empty()) else {
+            return FrameCheck::Refused;
+        };
         let (address, frame_number, requests_root) = (&header.address, header.frame_number, &header.requests_root);
         // 1. Quorum BLS cert + VDF against the shard committee. A frame with
         // no certificate of its own is one a certified descendant finalized
@@ -906,9 +1499,28 @@ impl ArchiveFrameVerifier {
                     address = %hex::encode(address),
                     "archive ingest: shard frame REJECTED — quorum cert / signature validation returned false"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
             Err(e) => {
+                let anchor = header.global_frame_number;
+                let executed = self
+                    .hypergraph
+                    .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    .ok()
+                    .filter(|&executed| crate::execution_deferral::awaits_execution(&e, anchor, executed))
+                    // Only the shard's next generation can be authorized by
+                    // GLOBAL frames not yet executed; any other is refused, so a
+                    // header naming an arbitrary generation is not parked.
+                    .filter(|_| {
+                        let claimed = header.public_key_signature_bls48581.as_ref()
+                            .and_then(|s| crate::execution_deferral::claimed_generation(&s.signature));
+                        claimed.is_some() && claimed == crate::execution_deferral::next_generation(&self.hypergraph, address)
+                    });
+                if let Some(executed) = executed {
+                    debug!(frame = frame_number, address = %hex::encode(address), anchor, executed, error = %e,
+                        "archive ingest: shard frame waits for GLOBAL execution to reach its anchor");
+                    return FrameCheck::AwaitExecution { anchor, executed };
+                }
                 // Elevated from debug: this is the primary "why wasn't my shard
                 // frame accepted" signal. A common cause is the anchored GLOBAL
                 // frame being absent from the local clock store (ρ_N unavailable,
@@ -921,7 +1533,7 @@ impl ArchiveFrameVerifier {
                     error = %e,
                     "archive ingest: shard frame validation FAILED — rejecting"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
         }
 
@@ -941,7 +1553,7 @@ impl ArchiveFrameVerifier {
                 frame.requests.len().saturating_sub(canonical.len()),
                 frame.requests.len(),
             );
-            return None;
+            return FrameCheck::Refused;
         }
         let recomputed = match compute_requests_root(
             &canonical,
@@ -959,16 +1571,62 @@ impl ArchiveFrameVerifier {
                     error = %e,
                     "archive ingest: requests_root recompute errored — rejecting frame"
                 );
-                return None;
+                return FrameCheck::Refused;
             }
         };
         if recomputed != *requests_root {
             warn!(frame = frame_number, address = %hex::encode(address), "archive ingest: requests_root mismatch — rejecting");
-            return None;
+            return FrameCheck::Refused;
         }
 
-        Some(certified)
+        FrameCheck::Admit { certified }
     }
+}
+
+/// What [`admit_fetched`] made of the frames one endpoint served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchedFrames {
+    /// The frame asked for was admitted, or waits for its GLOBAL anchor to
+    /// be stored.
+    Admitted,
+    /// The frame asked for failed verification.
+    Refused,
+    /// The frame asked for waits for GLOBAL execution to reach `anchor`
+    /// ([`FrameCheck::AwaitExecution`]). Not recovered from this endpoint:
+    /// another may serve a copy that verifies now.
+    AwaitsExecution { anchor: u64, executed: u64 },
+}
+
+/// Check the frames a gap fetch recovered from one endpoint (the frame asked
+/// for first, then the run up to its certified descendant) and admit them to
+/// `ingest`, which is held only to admit.
+pub fn admit_fetched(
+    ingest: &std::sync::Mutex<ArchiveAppShardIngest>,
+    verifier: &ArchiveFrameVerifier,
+    address: &[u8],
+    frames: Vec<AppShardFrame>,
+) -> FetchedFrames {
+    let lock = || ingest.lock().unwrap_or_else(|p| p.into_inner());
+    let mut outcome = FetchedFrames::Admitted;
+    for (index, frame) in frames.into_iter().enumerate() {
+        let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+        if let Some(anchor) = verifier.missing_anchor(&frame) {
+            lock().await_anchor(address, number, anchor);
+            continue;
+        }
+        match verifier.check(&frame) {
+            FrameCheck::Admit { certified } => lock().admit_verified(frame, certified),
+            FrameCheck::AwaitExecution { anchor, executed } => {
+                lock().await_execution(address, number, anchor, executed);
+                if index == 0 {
+                    outcome = FetchedFrames::AwaitsExecution { anchor, executed };
+                }
+            }
+            FrameCheck::Refused if index == 0 => return FetchedFrames::Refused,
+            FrameCheck::Refused => {}
+        }
+    }
+    outcome
 }
 
 /// The `requests_root` of a frame with no requests: zero bytes, 32 on the
@@ -1544,6 +2202,90 @@ mod tests {
             "frames at or below the cursor no longer wait");
     }
 
+    /// A frame that waits for GLOBAL execution to reach its anchor is not asked
+    /// for again until execution does, or at once when a GLOBAL frame waits
+    /// for it: that frame sequences only one anchored at or below the
+    /// executed frame, so the parked copy is not it. A copy received again
+    /// keeps the first wait. Only shards this archive holds frames of are
+    /// parked, within the per-shard and overall caps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_awaiting_execution_is_asked_for_once_execution_reaches_its_anchor() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let execute = |number: u64| {
+            global.commit_with_global_cursor(number, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        execute(907_000);
+        let filter = vec![0x5c; 32];
+        let (urgent_tx, mut urgent_rx) = tokio::sync::mpsc::channel(256);
+        let (prefetch_tx, mut prefetch_rx) = tokio::sync::mpsc::channel(256);
+        let mut ingest = fixture_over(global.clone(), None)
+            .with_gap_fetch(urgent_tx)
+            .with_prefetch(prefetch_tx)
+            .sequenced();
+        ingest.last_materialized.insert(filter.clone(), 1);
+        // `urgent` asks on the gap fetch, `waits` for a waiting GLOBAL frame.
+        let mut ask_for = |ingest: &mut ArchiveAppShardIngest, urgent: bool, waits: bool| {
+            for request in ingest.requested.values_mut().flat_map(|requested| requested.values_mut()) {
+                request.0 = Instant::now() - GAP_RETRY_INTERVAL;
+            }
+            ingest.request_frames(&filter, 2..=4, urgent, waits, GLOBAL_WAIT_RETRY_INTERVAL);
+            let rx = if urgent { &mut urgent_rx } else { &mut prefetch_rx };
+            let mut frames = Vec::new();
+            while let Ok((_, number)) = rx.try_recv() {
+                frames.push(number);
+            }
+            frames
+        };
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4]);
+        assert!(ingest.await_execution(&filter, 3, 907_473, 907_000));
+        assert!(!ingest.await_execution(&filter, 1, 907_473, 907_000), "at or below the cursor");
+        assert!(!ingest.await_execution(&[0x5d; 32], 3, 907_473, 907_000), "a shard this archive holds no frames of");
+        assert!(ingest.execution_deferrals.waiting());
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4], "frame 3 waits for execution");
+        let first = ingest.awaiting_execution[&filter][&3];
+        assert!(ingest.await_execution(&filter, 3, 907_480, 907_000));
+        assert_eq!(ingest.awaiting_execution[&filter][&3], first, "a copy received again keeps the first wait");
+        execute(907_472);
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
+        execute(907_473);
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 3, 4], "asked for again once execution reached its anchor");
+        assert!(ingest.awaiting_execution.is_empty());
+        assert!(!ingest.execution_deferrals.waiting(), "the wait's end is logged");
+
+        // A forged copy anchored far ahead cannot hold back a GLOBAL frame
+        // that waits for the real one.
+        assert!(ingest.await_execution(&filter, 3, 908_000, 907_473));
+        assert_eq!(ask_for(&mut ingest, false, false), vec![2, 4]);
+        assert_eq!(ask_for(&mut ingest, true, false), vec![2, 4], "a gap alone does not release it");
+        assert_eq!(ask_for(&mut ingest, true, true), vec![2, 3, 4], "asked for at once for a waiting GLOBAL frame");
+        assert!(ingest.awaiting_execution.is_empty());
+
+        let cap = MAX_AWAITING_EXECUTION_PER_SHARD as u64;
+        for number in 2..=cap + 6 {
+            ingest.await_execution(&filter, number, 908_000, 907_473);
+        }
+        let waiting = &ingest.awaiting_execution[&filter];
+        assert_eq!(waiting.len(), MAX_AWAITING_EXECUTION_PER_SHARD);
+        assert_eq!(waiting.keys().next_back().copied(), Some(cap + 1), "the farthest frames are forgotten");
+        let shards = MAX_AWAITING_EXECUTION / MAX_AWAITING_EXECUTION_PER_SHARD;
+        for shard in 1..shards {
+            let address = vec![shard as u8; 32];
+            ingest.last_materialized.insert(address.clone(), 1);
+            for number in 2..=cap + 1 {
+                assert!(ingest.await_execution(&address, number, 908_000, 907_473));
+            }
+        }
+        let address = vec![0xfe; 32];
+        ingest.last_materialized.insert(address.clone(), 1);
+        assert!(!ingest.await_execution(&address, 2, 908_000, 907_473), "the overall cap");
+        assert!(!ingest.awaiting_execution.contains_key(&address));
+    }
+
     /// A frame no endpoint serves is materialized from the certified header the
     /// GLOBAL frame carries only when that header proves it had no requests,
     /// and only after the body has been sought for the grace period. A frame
@@ -1583,6 +2325,243 @@ mod tests {
         assert!(!ingest.materialize_through_vouched(&filter, 3, &elsewhere).unwrap(), "another shard's header");
         assert!(ingest.materialize_through_vouched(&filter, 3, &legacy_empty).unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 3);
+    }
+
+    /// A frame materialized from a certified header that carried no storage
+    /// attestation owes its body: it is asked for on the prefetch queue,
+    /// behind the frames GLOBAL execution waits on, until one arrives. A body
+    /// whose output is the one executed is then stored for serving, neither
+    /// buffered nor executed again; a body with another output is refused,
+    /// and one without its certificate is served only until a certified one
+    /// replaces it. A frame its header rebuilds whole (here, one committing to
+    /// no attestation) is served at once and owes nothing. Archives used to
+    /// drop such a body below their cursor, so every one served a hole at
+    /// that frame for good (…d9000a1b40, frame 5577, 2026-10-23).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_executed_from_its_header_has_its_late_body_stored_for_serving() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 3);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (gap, mut gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).sequenced();
+        ingest.skip_header_authentication = true;
+        ingest.empty_body_grace = Duration::ZERO;
+        let served = |number| clock.get_shard_clock_frame(&filter, number, false).ok();
+        ingest.admit(&filter, frames[0].clone(), true);
+        let mut body = frames[1].clone();
+        let header = body.header.as_mut().unwrap();
+        header.requests_root = vec![0; 32];
+        header.storage_attestation_root = vec![1; 32];
+        let vouched = HashMap::from([(2, body.header.clone().unwrap())]);
+        assert!(!ingest.materialize_through_vouched(&filter, 2, &vouched).unwrap(), "the body is sought first");
+        assert!(ingest.materialize_through_vouched(&filter, 2, &vouched).unwrap());
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
+        assert_eq!(served(2), None, "a frame rebuilt without its attestation is not served");
+        while gaps.try_recv().is_ok() {}
+        while rx.try_recv().is_ok() {}
+
+        ingest.retry_pending();
+        assert_eq!(rx.try_recv().ok(), Some((filter.clone(), 2)), "the body is asked for again");
+        assert!(gaps.try_recv().is_err(), "not ahead of the frames GLOBAL execution waits on");
+        ingest.retry_pending();
+        assert!(rx.try_recv().is_err(), "at most once per interval");
+
+        let mut impostor = body.clone();
+        impostor.header.as_mut().unwrap().output = vec![0xee; 32];
+        ingest.admit_verified(impostor, true);
+        assert_eq!(served(2), None, "a body with another output is refused");
+
+        ingest.admit_verified(body.clone(), false);
+        assert_eq!(served(2), Some(body.clone()), "a copy without its certificate is served meanwhile");
+        assert!(ingest.owes_body(&filter, 2), "a certified one is still asked for");
+        let mut certified = body.clone();
+        let header = certified.header.as_mut().unwrap();
+        header.public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature { signature: vec![1], ..Default::default() });
+        header.storage_attestation = vec![0xaa; 8];
+        ingest.admit_verified(certified.clone(), true);
+        certified.header.as_mut().unwrap().storage_attestation.clear();
+        assert_eq!(served(2), Some(certified), "replaced, without the header's uncertified attestation field");
+        assert_eq!(ingest.materialized_height(&filter).unwrap(), 2);
+        assert!(ingest.buffered.get(&filter).is_none_or(|buffered| !buffered.contains_key(&2)), "never buffered");
+        assert!(ingest.owed_bodies.is_empty());
+        ingest.retry_pending();
+        assert!(rx.try_recv().is_err(), "a stored body is not asked for");
+
+        let mut whole = frames[2].clone();
+        whole.header.as_mut().unwrap().requests_root = vec![0; 32];
+        let vouched = HashMap::from([(3, whole.header.clone().unwrap())]);
+        assert!(!ingest.materialize_through_vouched(&filter, 3, &vouched).unwrap());
+        assert!(ingest.materialize_through_vouched(&filter, 3, &vouched).unwrap());
+        assert_eq!(served(3), Some(whole), "rebuilt whole, it is served at once");
+        assert!(ingest.owed_bodies.is_empty());
+    }
+
+    /// A frame below the cursor that a peer asks for and this archive does
+    /// not serve, a hole left before archives kept asking for such bodies,
+    /// is owed once reported, when the stored frame after it names its
+    /// output: it is asked for, and its body is stored for serving, final
+    /// without a certificate of its own, as that frame authenticates it. A
+    /// report of a stored frame, of one above the cursor or of one without a
+    /// stored successor is ignored. An owed body asked for its whole
+    /// allowance is forgotten.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_frame_a_peer_asks_for_is_recovered_for_serving() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (gap, _gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        for index in [0, 2, 3] {
+            ingest.admit(&filter, frames[index].clone(), true);
+        }
+        // Executed through frame 4, frame 2 from its header before this fix.
+        ingest.last_materialized.insert(filter.clone(), 4);
+        for number in [2, 2, 3, 5] {
+            report.try_send((filter.clone(), number)).unwrap();
+        }
+        report.try_send((vec![9; 32], 2)).unwrap();
+        ingest.retry_pending();
+        let mut asked = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            asked.push(request);
+        }
+        assert_eq!(asked, vec![(filter.clone(), 2)]);
+
+        ingest.admit_verified(frames[1].clone(), false);
+        assert_eq!(clock.get_shard_clock_frame(&filter, 2, false).ok(), Some(frames[1].clone()));
+        assert!(ingest.owed_bodies.is_empty());
+
+        assert!(ingest.owe_body(&filter, 7, [7; 32], OwedOrigin::Successor));
+        ingest.owed_bodies.get_mut(&filter).unwrap().get_mut(&7).unwrap().asks = OWED_BODY_ASKS;
+        ingest.retry_pending();
+        assert!(ingest.owed_bodies.is_empty(), "asked for its whole allowance");
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A certified body with another output than the stored frame after it
+    /// names shows that frame opens a session GLOBAL holds no record of: the
+    /// hole is no longer owed, and its reports are not looked into again for
+    /// a while. Another output for a frame this archive executed is warned
+    /// about once. A copy without its own certificate is not verified while
+    /// one is served: it could not replace it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owed_body_contradicted_or_already_served_is_not_asked_for_again() {
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (gap, _gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        for index in [0, 2, 3] {
+            ingest.admit(&filter, frames[index].clone(), true);
+        }
+        ingest.last_materialized.insert(filter.clone(), 4);
+        report.try_send((filter.clone(), 2)).unwrap();
+        ingest.retry_pending();
+        assert_eq!(rx.try_recv().ok(), Some((filter.clone(), 2)));
+        let mut other = frames[1].clone();
+        other.header.as_mut().unwrap().output = vec![0xee; 32];
+        ingest.admit_verified(other.clone(), true);
+        assert!(!ingest.owes_body(&filter, 2), "the digest owed is no frame's");
+        report.try_send((filter.clone(), 2)).unwrap();
+        ingest.retry_pending();
+        assert!(!ingest.owes_body(&filter, 2) && rx.try_recv().is_err(), "nor owed again for a while");
+
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&frames[1].header.as_ref().unwrap().output).unwrap();
+        assert!(ingest.owe_body(&filter, 2, selector, OwedOrigin::Executed));
+        let warns = |ingest: &ArchiveAppShardIngest| ingest.owed_bodies[&filter][&2].mismatch_warns;
+        ingest.admit_verified(other.clone(), false);
+        assert_eq!(warns(&ingest), 0, "another output without a certificate is no defect");
+        ingest.admit_verified(other.clone(), true);
+        ingest.admit_verified(other, true);
+        assert_eq!(warns(&ingest), 1, "two certified frames at one height: warned once, and still owed");
+
+        let mut certified = frames[1].clone();
+        certified.header.as_mut().unwrap().public_key_signature_bls48581 =
+            Some(quil_types::proto::keys::Bls48581AggregateSignature { signature: vec![1], ..Default::default() });
+        assert!(ingest.wants_owed_body(&filter, &frames[1]));
+        ingest.admit_verified(frames[1].clone(), false);
+        assert!(!ingest.wants_owed_body(&filter, &frames[1]), "one copy without its certificate is served");
+        assert!(ingest.wants_owed_body(&filter, &certified));
+    }
+
+    /// While GLOBAL's records cannot be read (a committee-handoff policy is
+    /// installed and this archive holds no GLOBAL cursor yet), whether the
+    /// frame after a reported hole opens a session cannot be told: the hole
+    /// is not owed, nor remembered as not owed, so the next report looks
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_report_whose_session_cannot_be_told_is_looked_into_again() {
+        use quil_types::consensus::{CommitteeHandoffPolicy, LegacyHistory};
+        struct RestorePolicy(Option<CommitteeHandoffPolicy>);
+        impl Drop for RestorePolicy {
+            fn drop(&mut self) { quil_types::consensus::set_committee_handoff_policy(self.0); }
+        }
+        let _restore = RestorePolicy(quil_types::consensus::committee_handoff_policy());
+        quil_types::consensus::set_committee_handoff_policy(Some(CommitteeHandoffPolicy {
+            activation_frame: 0, chain_id: [1; 32], legacy_history: LegacyHistory::Discard,
+            membership_boundary_frame: u64::MAX, first_session_boundary_frame: u64::MAX,
+        }));
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (ingest, _) = fixture_with_clock(Some(clock.clone()));
+        let (gap, _gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let mut ingest = ingest.with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        for index in [0, 2, 3] {
+            ingest.admit(&filter, frames[index].clone(), true);
+        }
+        ingest.last_materialized.insert(filter.clone(), 4);
+        assert!(ingest.opens_session_after(&filter, 2).is_err(), "GLOBAL's records cannot be read");
+        report.try_send((filter.clone(), 2)).unwrap();
+        ingest.retry_pending();
+        assert!(!ingest.owes_body(&filter, 2) && rx.try_recv().is_err(), "not owed");
+        assert!(!ingest.not_owed(&filter, 2), "nor remembered as not owed");
+    }
+
+    /// A session's first frame names the session's genesis as its parent,
+    /// not the frame before it: a hole at a sealed session's last frame is
+    /// owed under the digest GLOBAL committed for it, so its genuine body,
+    /// final through the seal without a certificate of its own, is served.
+    /// Owed under the next frame's parent, it was refused for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hole_at_a_sealed_sessions_last_frame_is_owed_under_the_committed_digest() {
+        use quil_types::store::ClockStore as _;
+        let filter = quil_execution::domains::QUIL_TOKEN.to_vec();
+        let frames = chain(&filter, 4);
+        let sealed = quil_crypto::poseidon::hash_bytes_to_32(&frames[2].header.as_ref().unwrap().output).unwrap();
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (gap, _gaps) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (report, reports) = tokio::sync::mpsc::channel(8);
+        let mut ingest = fixture_over(sealed_global(&filter, 3, sealed), Some(clock.clone()))
+            .with_gap_fetch(gap).with_prefetch(tx).with_missing_frame_reports(reports).sequenced();
+        assert!(ingest.opens_session_after(&filter, 3).unwrap());
+        assert!(!ingest.opens_session_after(&filter, 2).unwrap());
+        let mut opening = frames[3].clone();
+        opening.header.as_mut().unwrap().parent_selector = vec![0x77; 32];
+        for frame in [&frames[0], &frames[1], &opening] {
+            ingest.admit(&filter, frame.clone(), true);
+        }
+        ingest.last_materialized.insert(filter.clone(), 4);
+        report.try_send((filter.clone(), 3)).unwrap();
+        ingest.retry_pending();
+        assert_eq!(rx.try_recv().ok(), Some((filter.clone(), 3)));
+        ingest.admit_verified(frames[2].clone(), false);
+        assert_eq!(clock.get_shard_clock_frame(&filter, 3, false).ok(), Some(frames[2].clone()));
+        assert!(ingest.owed_bodies.is_empty(), "final through the seal, it owes nothing more");
     }
 
     #[tokio::test(flavor = "multi_thread")]

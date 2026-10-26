@@ -215,6 +215,9 @@ enum LeftOutCause {
     OverLimit,
     /// Its committed allocation no longer accepts the confirm (`confirm_refusal`).
     Refused,
+    /// Its thread worker is stopped while the node reopens the worker's
+    /// store (`stopped_store_filters`); the master's stores lack the shard.
+    StoreStopped,
 }
 
 impl LeftOutCause {
@@ -227,6 +230,7 @@ impl LeftOutCause {
             Self::MergeTarget => "merge target",
             Self::OverLimit => "over decode limit",
             Self::Refused => "refused",
+            Self::StoreStopped => "worker store stopped",
         }
     }
 }
@@ -267,6 +271,44 @@ impl PreparedConfirm {
         attempt.fence_for_epoch(&filters(|cause| cause == LeftOutCause::OverLimit), frame);
         attempt.fence(&filters(|cause| cause == LeftOutCause::Refused), frame);
         attempt.release(&filters(|cause| !matches!(cause, LeftOutCause::OverLimit | LeftOutCause::Refused)));
+    }
+}
+
+/// The filters of thread workers whose own stores stopped writing, latched
+/// or held stopped for their reopening (`worker_execution::store_stopped`).
+/// Neither such a store, which refuses the confirm's replica writes, nor the
+/// master's stores, which lack the shard, can prepare the seat, and an error
+/// preparing one seat would abort the confirm of every seat.
+fn stopped_store_filters(workers: &[crate::worker::WorkerInfo]) -> std::collections::HashSet<Vec<u8>> {
+    workers
+        .iter()
+        .filter(|w| !w.filter.is_empty())
+        .filter(|w| crate::worker_execution::store_stopped(w.core_id))
+        .map(|w| w.filter.clone())
+        .collect()
+}
+
+/// A seat among `stopped` is left out of the confirm and retried next cycle.
+fn stopped_seat(stopped: &std::collections::HashSet<Vec<u8>>, filter: &[u8]) -> Option<Prepared> {
+    stopped.contains(filter).then(|| Prepared::Unanswered(
+        LeftOutCause::StoreStopped,
+        QuilError::ExecutionUnavailable("its thread worker is stopped while its store is reopened".into()),
+    ))
+}
+
+/// A seat whose preparation failed because its thread worker's store stopped
+/// writing during the encode (its own replica writes can push the disk
+/// below the floor) is left out like a stopped seat; any other error stays
+/// an error, aborting the confirm.
+fn stopped_mid_encode(
+    workers: &[crate::worker::WorkerInfo],
+    filter: &[u8],
+    error: QuilError,
+) -> Result<Prepared> {
+    if workers.iter().any(|w| w.filter == filter && crate::worker_execution::store_stopped(w.core_id)) {
+        Ok(Prepared::Unanswered(LeftOutCause::StoreStopped, error))
+    } else {
+        Err(error)
     }
 }
 
@@ -1568,6 +1610,10 @@ impl ProverPipeline {
             Some(pending) if frame_number >= quil_execution::global_intrinsic::leaf_root_registration::pre_registration_frame() => pending(),
             _ => Vec::new(),
         };
+        // A shard whose thread worker is stopped to reopen its store is left
+        // out: neither the worker nor the master's stores can prepare it.
+        let workers = self.worker_manager.range_workers().unwrap_or_default();
+        let stopped = stopped_store_filters(&workers);
         // The thread worker holding each shard, if any. A shard none holds is
         // prepared by the standalone worker running it, else by the master.
         let local: HashMap<_, _> = filters
@@ -1601,7 +1647,7 @@ impl ProverPipeline {
             Some(remote) => {
                 let mut requests: Vec<(Vec<u8>, Vec<Vec<u8>>)> = confirm_encoding_plan(filters, &changes, epoch)
                     .into_iter()
-                    .filter(|(filter, _)| matches!(local.get(filter), Some(None)))
+                    .filter(|(filter, _)| matches!(local.get(filter), Some(None)) && !stopped.contains(filter))
                     .collect();
                 late_seats().ask_last(&mut requests);
                 let answers = query_remote_workers(
@@ -1619,6 +1665,9 @@ impl ProverPipeline {
             None => HashMap::new(),
         };
         prepare_confirm(filters, &changes, epoch, |filter, targets| {
+            if let Some(left_out) = stopped_seat(&stopped, filter) {
+                return Ok(left_out);
+            }
             if let Some(prepared) = answers.remove(filter).and_then(|answer| remote_answer(filter, targets, answer)) {
                 return Ok(prepared);
             }
@@ -1628,7 +1677,7 @@ impl ProverPipeline {
                 None => (crdt, replica_store),
             };
             let (encoded, snapshots) = sources(filter, targets);
-            Ok(Prepared::Roots(crate::app_shard_metadata::compute_storage_confirm(
+            match crate::app_shard_metadata::compute_storage_confirm(
                 filter_crdt,
                 filter_replicas,
                 &encoded,
@@ -1638,7 +1687,11 @@ impl ProverPipeline {
                 &quil_crypto::sdr::SdrParams::default(),
                 frame_number,
                 &snapshots,
-            )?))
+            ) {
+                Ok(roots) => Ok(Prepared::Roots(roots)),
+                Err(error) if worker.is_some() => stopped_mid_encode(&workers, filter, error),
+                Err(error) => Err(error),
+            }
         }, |filter| confirm_refusal(crdt, &self.bls_pubkey, filter, frame_number))
     }
 
@@ -2017,6 +2070,56 @@ mod tests {
         attempt.published(FRAME);
         assert!(attempts.begin(&[vec![1]], FRAME + 1, OpKind::Confirm).is_none(), "only the submitted seat is fenced as published");
         assert!(attempts.begin(&[vec![2]], FRAME + 1, OpKind::Confirm).is_some());
+    }
+
+    /// A seat whose thread worker is held stopped for its store is left out
+    /// and retried next cycle, never prepared from the master's stores.
+    #[test]
+    fn a_seat_whose_worker_store_is_stopped_is_left_out() {
+        use std::sync::Arc;
+        let worker = |core_id: u32, filter: Vec<u8>| crate::worker::WorkerInfo {
+            core_id, filter, available_storage: 0, total_storage: 0, manually_managed: false,
+            pending_filter_frame: 0, allocated: true,
+        };
+        let workers = [worker(9_501, vec![1]), worker(9_502, vec![2]), worker(9_503, Vec::new()), worker(9_504, vec![3])];
+        assert!(super::stopped_store_filters(&workers).is_empty());
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(9_502));
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(9_503));
+        // A worker whose store failed a write and is not stopped yet, or whose
+        // restarts ran out: its store refuses the confirm's replica writes.
+        let latched = quil_store::RocksDb::open_in_memory().unwrap();
+        assert!(latched.inner().register_store(quil_forest::StoreRole::Worker(9_504)));
+        latched.inner().refuse_writes("IO error: Input/output error");
+        let stopped = super::stopped_store_filters(&workers);
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(9_502));
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(9_503));
+        assert_eq!(stopped, std::collections::HashSet::from([vec![2], vec![3]]));
+        let attempts = Arc::new(crate::submission_attempts::SubmissionAttempts::default());
+        let filters = vec![vec![1], vec![2], vec![3]];
+        let mut attempt = attempts.begin(&filters, FRAME, OpKind::Confirm).unwrap();
+        let prepared = super::prepare_confirm(&filters, &[], 2, |filter, _| {
+            if let Some(left_out) = super::stopped_seat(&stopped, filter) {
+                return Ok(left_out);
+            }
+            // Preparing a seat over a stopped store fails, which would abort
+            // every seat's confirm.
+            match filter {
+                [2] | [3] => Err(quil_types::error::QuilError::Store("store refuses writes".into())),
+                _ => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
+            }
+        }, |_| None)
+        .expect("one worker's stopped store does not abort the other seats' confirm");
+        assert_eq!((prepared.filters.clone(), left_out_filters(&prepared)), (vec![vec![1]], vec![vec![2], vec![3]]));
+        assert_eq!(prepared.left_out[0].cause, super::LeftOutCause::StoreStopped);
+        prepared.settle_left_out(&mut attempt, FRAME);
+        assert!(attempts.begin(&[vec![2]], FRAME, OpKind::Confirm).is_some(), "retried on the next cycle");
+
+        // A store that stops during the encode: its seat is left out; an
+        // error of a seat whose store still writes aborts as before.
+        let failed = || quil_types::error::QuilError::Store("store refuses writes".into());
+        assert!(matches!(super::stopped_mid_encode(&workers, &[3], failed()),
+            Ok(super::Prepared::Unanswered(super::LeftOutCause::StoreStopped, _))));
+        assert!(super::stopped_mid_encode(&workers, &[1], failed()).is_err());
     }
 
     #[test]

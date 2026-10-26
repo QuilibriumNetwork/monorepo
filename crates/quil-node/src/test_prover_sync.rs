@@ -11,7 +11,7 @@
 //! if it were serving its live head the root would MISMATCH (the old off-by-one).
 //! Read-only against the archive; needs the node's keystore for the mTLS identity.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use quil_keys::KeyManager as _;
@@ -28,27 +28,23 @@ pub async fn run_test_prover_sync(
     // 1. Load the Falcon signing key (the :8340 mTLS identity), mirroring the
     //    node's `keys::init` — self-contained so this offline tool has no other
     //    boot deps.
-    let keys_path = if config.key.key_store_file.path.is_empty() {
-        config_dir.join("keys.yml")
-    } else {
-        PathBuf::from(&config.key.key_store_file.path)
-    };
+    let keys_path =
+        quil_keys::resolve_existing_keystore_path(&config.key.key_store_file, config_dir)?;
     let proving_key_id = if config.engine.proving_key_id.is_empty() {
         "default-proving-key".to_string()
     } else {
         config.engine.proving_key_id.clone()
     };
     let file_key_manager = quil_keys::FileKeyManager::new(
-        keys_path,
+        keys_path.clone(),
         &config.key.key_store_file.encryption_key,
         proving_key_id,
         Box::new(quil_crypto::FalconKeyConstructor),
     )?;
     file_key_manager.set_peer_priv_key_hex(&config.p2p.peer_priv_key);
-    file_key_manager.ensure_standard_keys()?;
     let falcon_key = file_key_manager
         .get_private_key(quil_types::crypto::KeyType::Falcon512)
-        .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?;
+        .map_err(|e| crate::query_shards::falcon_key_unavailable(&keys_path, e))?;
 
     // 2. Resolve archive endpoint(s): explicit `ip:port` arg, else config's
     //    `engine.archiveEndpoints`, else (network 0) the embedded genesis archives.

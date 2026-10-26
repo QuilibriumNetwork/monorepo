@@ -21,13 +21,13 @@
 //! way. Windows are counted in GLOBAL frames;
 //! seconds follow from the median frame interval. Every
 //! [`history::ROW_FRAMES`] frames the task also records a history row
-//! (see [`history`]).
+//! (see [`history`]), saved to the node's history file when it names one.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS;
@@ -238,6 +238,10 @@ pub struct ProductionIndex {
     start: u64,
     first_indexed: Option<u64>,
     indexed_through: Option<u64>,
+    /// The last frame stepped over as never stored or without outcomes
+    /// (see [`OUTCOME_GRACE`]): rows near it are not final (see
+    /// [`history::is_final`]).
+    stepped_over: Option<u64>,
     window: VecDeque<FrameEntry>,
     shards: HashMap<Arc<[u8]>, ShardAgg>,
 }
@@ -289,6 +293,7 @@ impl ProductionIndex {
             start,
             first_indexed: None,
             indexed_through: None,
+            stepped_over: None,
             window: VecDeque::new(),
             shards: HashMap::new(),
         }
@@ -339,6 +344,7 @@ impl ProductionIndex {
                         break;
                     }
                     self.apply_missing(n);
+                    self.stepped_over = Some(n);
                     out.missing.push(n);
                 }
                 Some(frame) => {
@@ -350,6 +356,7 @@ impl ProductionIndex {
                             break;
                         }
                         self.apply(&frame, None);
+                        self.stepped_over = Some(n);
                         out.outcome_less.push(n);
                     } else {
                         self.apply(&frame, Some(outcomes.as_slice()));
@@ -415,10 +422,12 @@ impl ProductionIndex {
             Some(t) if n - t > WINDOW_FRAMES => {
                 self.window.clear();
                 self.first_indexed = Some(n);
+                self.stepped_over = Some(n - 1);
             }
             Some(t) => {
                 for gap in t + 1..n {
                     self.window.push_back(FrameEntry::missing(gap));
+                    self.stepped_over = Some(gap);
                 }
             }
             None => self.first_indexed = Some(n),
@@ -781,7 +790,7 @@ pub struct WindowInfo {
     pub built_at_ms: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassCounts {
     pub no_data: u64,
     pub producing: u64,
@@ -939,9 +948,18 @@ impl ProductionReport {
     }
 }
 
+/// Whether `filter` can be an application shard's: a filter under GLOBAL's
+/// address ([`quil_execution::domains::GLOBAL`]) names the GLOBAL
+/// intrinsic, never an app shard, although a prover's allocation and a
+/// shards-store row can carry it.
+pub fn is_app_shard(filter: &[u8]) -> bool {
+    !filter.starts_with(&quil_execution::domains::GLOBAL)
+}
+
 /// The live (`/provers/shards`) set: registry filters on the current grid,
-/// plus grid shards holding data without provers. `sizes` is keyed by
-/// lowercase hex filter, as `compute_shard_sizes` builds it.
+/// plus grid shards holding data without provers; app shards only (see
+/// [`is_app_shard`]). `sizes` is keyed by lowercase hex filter, as
+/// `compute_shard_sizes` builds it.
 pub fn live_filters<'a>(
     registry: impl IntoIterator<Item = &'a [u8]>,
     sizes: &HashMap<String, (num_bigint::BigInt, u64)>,
@@ -958,6 +976,7 @@ pub fn live_filters<'a>(
             }
         }
     }
+    live.retain(|f| is_app_shard(f));
     live
 }
 
@@ -1118,6 +1137,9 @@ pub struct BuildTimings {
     pub shard_sets: Duration,
     /// Registry provers and the effectively active census.
     pub census: Duration,
+    /// Coverage halts, with the eviction assessment they come in (see
+    /// `handlers::eviction_at`); zero when one was made at this head
+    /// already.
     pub halts: Duration,
     /// Committed snapshot capture and the head session reads.
     pub committed: Duration,
@@ -1240,6 +1262,7 @@ struct Indexer {
     last_build: Option<Instant>,
     /// Created on the first tick after the rebuild.
     backfill: Option<history::Backfill>,
+    saver: history::persist::Saver,
 }
 
 /// The backfill's plan, logged once.
@@ -1247,6 +1270,9 @@ struct BackfillPlan {
     floor_frame: u64,
     floor: history::Floor,
     top: Option<u64>,
+    /// Rows from the floor to `top` already held: restored from the history
+    /// file, so not recomputed.
+    held: u64,
 }
 
 /// The backfill's totals once it completes.
@@ -1308,8 +1334,12 @@ impl Indexer {
             self.last_build = Some(Instant::now());
             build = Some((timings, live));
         }
+        // `/stats` and `/provers/eviction-risk` serve the eviction assessment
+        // at this head: made by the build above when it was due, else here.
+        crate::handlers::eviction_at(state, head, Instant::now());
         if let Some(row) = row {
-            state.production_history.write().insert(row);
+            let is_final = history::is_final(index, &row);
+            state.production_history.write().record(row, is_final);
         }
         let (mut planned, mut backfill, mut backfill_done) = (None, None, None);
         if !rebuild {
@@ -1322,11 +1352,16 @@ impl Indexer {
                 match earliest {
                     Ok(earliest) => {
                         let retained = state.requests_retained_from.as_ref().and_then(|f| f());
-                        let plan =
-                            history::Backfill::new(history::first_exact_row(index), earliest, retained, Decoders::default());
+                        let first_live = history::first_exact_row(index);
+                        let plan = history::Backfill::new(first_live, earliest, retained, Decoders::default());
                         let (floor_frame, floor) = plan.floor();
-                        planned = Some(BackfillPlan { floor_frame, floor, top: plan.top() });
-                        state.production_history.write().set_backfill(plan.state());
+                        let held = {
+                            let mut rows = state.production_history.write();
+                            rows.forget_below(history::depth_floor(first_live));
+                            rows.set_backfill(plan.state());
+                            plan.top().map_or(0, |top| rows.count(floor_frame, top))
+                        };
+                        planned = Some(BackfillPlan { floor_frame, floor, top: plan.top(), held });
                         self.backfill = Some(plan);
                     }
                     Err(e) => {
@@ -1355,6 +1390,9 @@ impl Indexer {
                     backfill = Some(step);
                 }
             }
+        }
+        if let Some(file) = &state.history_file {
+            self.saver.save_due(file, &state.production_history, Instant::now());
         }
         Tick {
             rebuild,
@@ -1439,10 +1477,11 @@ fn log_backfill(tick: &Tick, blocked: &mut Option<String>) {
             first_row = plan.floor_frame,
             last_row = ?plan.top,
             rows,
+            held = plan.held,
             floor = ?plan.floor,
-            "explorer production history backfill planned: rows below the live index's first row are \
-             recomputed from stored GLOBAL frames and outcomes, newest day first, within the index's \
-             per-tick frame budget",
+            "explorer production history backfill planned: rows below the live index's first row that \
+             are not held (restored from the history file) are recomputed from stored GLOBAL frames and \
+             outcomes, newest day first, within the index's per-tick frame budget",
         );
     }
     let Some(step) = &tick.backfill else { return };
@@ -1622,12 +1661,30 @@ fn log_tick(
 }
 
 /// Index new GLOBAL frames every [`TICK`] after rebuilding from
-/// [`history::live_start`], rebuild the snapshot the handlers serve, record
-/// history rows and backfill older ones (see [`history`]). Store
+/// [`history::live_start`], rebuild the snapshot the handlers serve, assess
+/// eviction risk at each new head for `/stats` and `/provers/eviction-risk`
+/// (see `handlers::eviction_at`), record history rows and backfill older
+/// ones (see [`history`]). Store
 /// reads and the snapshot build run on blocking workers, so a failed read or
-/// a panic there is logged and retried. Never returns: the caller drops it
-/// on shutdown.
-pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
+/// a panic there is logged and retried. With a history file, restores its
+/// rows before the first tick and saves them as they complete. Returns once
+/// `shutdown` resolves (seen between ticks), after saving the rows not
+/// saved yet.
+pub async fn run_indexer<E>(
+    state: crate::ExplorerState,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), E> {
+    if let Some(file) = state.history_file.clone() {
+        let st = state.clone();
+        let restored = tokio::task::spawn_blocking(move || {
+            history::persist::restore(&file, &StoreSource(st.clock_store.as_ref()), &st.production_history)
+        })
+        .await;
+        if let Err(e) = restored {
+            tracing::warn!(error = %e, "explorer production history restore failed; rows are rebuilt from stored GLOBAL frames");
+        }
+    }
+    let mut shutdown = std::pin::pin!(shutdown);
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut indexer: Option<Indexer> = None;
@@ -1637,7 +1694,11 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
     let mut builds =
         BuildLog { since: Instant::now(), count: 0, total: Duration::ZERO, max: Duration::ZERO, last_slow: None };
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {}
+        }
         let head = state.current_frame.load(std::sync::atomic::Ordering::Relaxed);
         if head == 0 {
             continue;
@@ -1658,6 +1719,15 @@ pub async fn run_indexer<E>(state: crate::ExplorerState) -> Result<(), E> {
             Err(e) => tracing::warn!(error = %e, "explorer production index task failed; rebuilding"),
         }
     }
+    if let Some(file) = state.history_file.clone() {
+        let mut saver = indexer.map(|working| working.saver).unwrap_or_default();
+        let rows = state.production_history.clone();
+        let saved = tokio::task::spawn_blocking(move || saver.save_at_shutdown(&file, &rows)).await;
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, "explorer production history save at shutdown failed");
+        }
+    }
+    Ok(())
 }
 
 pub mod history;

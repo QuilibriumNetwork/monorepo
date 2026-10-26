@@ -35,6 +35,12 @@ pub fn set_worker_core_id(core_id: u32) {
     WORKER_CORE_ID.with(|cell| cell.set(Some(core_id)));
 }
 
+/// Tag this thread's next lines as `core_id`'s (`None`: the master's), so a
+/// watchdog thread can write a worker's lines to that worker's log.
+pub fn route_thread_to_core(core_id: Option<u32>) {
+    WORKER_CORE_ID.with(|cell| cell.set(core_id));
+}
+
 pub fn current_worker_core_id() -> Option<u32> {
     WORKER_CORE_ID.with(|cell| cell.get())
 }
@@ -382,8 +388,8 @@ pub fn log_filename_for_core(core_id: u32) -> String {
 /// or above `cfg.stderr_level` (default `warn`); `path: none` logs every
 /// level to stderr only.
 ///
-/// Rotation (`cfg.rotation()`; the default directory gets 50 MB, 10, 14 days,
-/// compressed):
+/// Rotation (`cfg.rotation()`; the default directory defaults to 50 MB, 10,
+/// 14 days, compressed):
 /// * `max_size` MB — rotation trigger (0 → daily).
 /// * `max_backups` — rotated files retained (0 → 1024 cap).
 /// * `max_age` days — reaper deletes older rotations.

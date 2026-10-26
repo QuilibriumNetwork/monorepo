@@ -54,6 +54,10 @@ enum Blocker {
   BLOCKER_CONSENSUS_STARTUP_UNAVAILABLE = 12;
   BLOCKER_SESSION_IDENTITY_UNAVAILABLE = 13;
   BLOCKER_SESSION_STATE_UNAVAILABLE = 14;
+  // The worker's own store stopped writing until it is reopened: after a
+  // failed write (a full disk, an I/O error), or below the node's
+  // free-space floor.
+  BLOCKER_STORAGE_WRITE_FAILED = 15;
 }
 
 // The phase of a worker's archive recovery (`ShardRecovery.phase`).
@@ -155,6 +159,9 @@ message HealthReport {
   repeated WorkerHealth workers = 8;
   // Workers left out by those bounds.
   uint32 omitted_workers = 9;
+  // The master's store refuses writes after a failed write (a full disk,
+  // an I/O error) until it is reopened.
+  bool master_store_write_failed = 10;
 }
 
 message GetHealthReportRequest {}
@@ -232,7 +239,8 @@ enum LogRequestRefusal {
   LOG_REQUEST_REFUSAL_QUEUE_FULL = 8;
   // A filter is not a full shard filter (32 to 64 bytes).
   LOG_REQUEST_REFUSAL_FILTER_LENGTH = 9;
-  // This requester's requests hold half of `maxPending` already.
+  // This requester's requests awaiting a decision or a fetch hold half of
+  // `maxPending` already.
   LOG_REQUEST_REFUSAL_TOO_MANY_PENDING = 10;
 }
 
@@ -245,6 +253,14 @@ message SubmitLogRequestResponse {
   // The target's node approves the request itself rather than waiting for
   // its operator.
   bool automatic = 5;
+  // The requester's budget of `requestsPerDay` in the last 24 h, after
+  // this submission: the requests it may still make, and the budget. A
+  // node of an earlier release sets neither.
+  optional uint32 requests_remaining = 6;
+  optional uint32 requests_per_day = 7;
+  // When the oldest request counted in the last 24 h ages out, freeing one
+  // request; unset while none is counted.
+  optional uint64 next_request_unix_ms = 8;
 }
 
 message GetLogRequestStatusRequest {

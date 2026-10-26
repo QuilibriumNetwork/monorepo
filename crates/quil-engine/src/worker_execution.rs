@@ -20,7 +20,7 @@ pub const STATES: [&str; 9] =
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
-pub const BLOCKERS: [&str; 13] = [
+pub const BLOCKERS: [&str; 14] = [
     "waiting for transport",
     "restarting consensus host",
     "engine exited",
@@ -34,7 +34,12 @@ pub const BLOCKERS: [&str; 13] = [
     "consensus startup unavailable",
     "session identity unavailable",
     "session state unavailable",
+    STORAGE_WRITE_FAILED,
 ];
+
+/// The blocker of a worker whose own store stopped writing: after a failed
+/// write, or below the free-space floor ([`with_store_state`]).
+pub const STORAGE_WRITE_FAILED: &str = "storage writes stopped";
 
 /// Every archive recovery phase (`ShardRecovery.phase`).
 pub const RECOVERY_PHASES: [&str; 6] = [
@@ -49,6 +54,62 @@ pub const RECOVERY_PHASES: [&str; 6] = [
 /// Every class [`failure_class`] gives a failed recovery attempt.
 pub const FAILURE_CLASSES: [&str; 6] =
     [NO_ARCHIVE, "connect", "archive_request", "archive_state", "replay_mismatch", "other"];
+
+/// A worker's execution report with its store's state: a worker whose own
+/// store refuses writes after a failed write reads as blocked by it, also
+/// while it runs no engine, since it cannot progress until the store is
+/// reopened, and as stopped by it while the node holds it stopped to reopen
+/// the store. `execution` is what its engine reports, if it runs one.
+pub fn with_store_state(core_id: u32, execution: Option<WorkerExecution>) -> Option<WorkerExecution> {
+    let role = quil_forest::StoreRole::Worker(core_id);
+    let state = if quil_forest::storage_health::store_held(role) {
+        "stopped"
+    } else if quil_forest::storage_health::store_latched(role) {
+        "blocked"
+    } else {
+        return execution;
+    };
+    let mut execution = execution.unwrap_or_default();
+    execution.state = state.into();
+    execution.blocker = STORAGE_WRITE_FAILED.into();
+    execution.observed_unix_ms = now_ms();
+    Some(execution)
+}
+
+/// Whether worker `core_id`'s own store has stopped writing: latched after
+/// a failed write or below the free-space floor, or held stopped while the
+/// node reopens it. Its shard cannot be prepared and it hosts no new seat.
+pub fn store_stopped(core_id: u32) -> bool {
+    let role = quil_forest::StoreRole::Worker(core_id);
+    quil_forest::storage_health::store_held(role) || quil_forest::storage_health::store_latched(role)
+}
+
+/// The report of a worker the node holds stopped to reopen its store, for
+/// the lifecycle: it cannot host its seat's session, so a long stop lets
+/// the seat lapse instead of renewing it for a worker that does not vote.
+pub fn held_store_execution(core_id: u32) -> Option<WorkerExecution> {
+    quil_forest::storage_health::store_held(quil_forest::StoreRole::Worker(core_id))
+        .then(|| with_store_state(core_id, None))
+        .flatten()
+}
+
+/// `executions` with a report for each bound worker `(core, filter)` the
+/// node holds stopped to reopen its store and that reports nothing itself,
+/// for the lifecycle's seat renewal ([`held_store_execution`]).
+pub fn with_held_stores(
+    mut executions: Vec<(u32, Vec<u8>, WorkerExecution)>,
+    bound: &[(u32, Vec<u8>)],
+) -> Vec<(u32, Vec<u8>, WorkerExecution)> {
+    for (core_id, filter) in bound {
+        if executions.iter().any(|(id, reported, _)| id == core_id && reported == filter) {
+            continue;
+        }
+        if let Some(held) = held_store_execution(*core_id) {
+            executions.push((*core_id, filter.clone(), held));
+        }
+    }
+    executions
+}
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -71,6 +132,12 @@ pub struct SharedWorkerExecution {
     reanchor_yield: Arc<AtomicBool>,
     /// The archive recovery turn this worker's recovery holds.
     turn: Arc<Mutex<TurnHold>>,
+    /// This worker is a voting member of its shard's running committee
+    /// session whose materialized frame trails the session's committed tip.
+    lagging_voter: Arc<AtomicBool>,
+    /// The queue place of this worker's last replay, kept while it ended
+    /// behind its target: `(filter, ticket)`.
+    replay_ticket: Arc<Mutex<Option<(Vec<u8>, u64)>>>,
 }
 
 /// An archive recovery turn as its holder's recovery sees it
@@ -142,6 +209,31 @@ impl SharedWorkerExecution {
     /// not looked since.
     pub(crate) fn reanchor_yield_pending(&self) -> bool {
         self.reanchor_yield.load(Ordering::Relaxed)
+    }
+
+    /// Whether this worker votes in its shard's running committee session
+    /// while its materialized frame trails the session's committed tip. Its
+    /// replays take the next recovery turn before others, and keep it for
+    /// further batches, as a blocked successor's do.
+    pub fn set_lagging_voter(&self, lagging: bool) {
+        self.lagging_voter.store(lagging, Ordering::Relaxed);
+    }
+
+    /// The flag behind [`Self::set_lagging_voter`], read by the recovery
+    /// turn queue each time it grants a turn.
+    pub(crate) fn lagging_voter_flag(&self) -> Arc<AtomicBool> { self.lagging_voter.clone() }
+
+    /// A replay of `filter` ended its turn behind its target: its next
+    /// recovery of the shard queues again at `ticket`, its place, rather
+    /// than behind every waiter.
+    pub(crate) fn keep_replay_ticket(&self, filter: &[u8], ticket: u64) {
+        *self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((filter.to_vec(), ticket));
+    }
+
+    /// The place [`Self::keep_replay_ticket`] kept for `filter`; clears it.
+    pub(crate) fn take_replay_ticket(&self, filter: &[u8]) -> Option<u64> {
+        self.replay_ticket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+            .filter(|(kept, _)| kept == filter).map(|(_, ticket)| ticket)
     }
 
     /// This worker's recovery holds a turn from `since`, to do `kind`.
@@ -648,6 +740,41 @@ pub fn recovery_leaves(tree_phase: u32, installed: u64, planned: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker whose store latched reads as blocked by it, with or without
+    /// an engine; others keep their engine's report.
+    #[test]
+    fn a_worker_whose_store_refuses_writes_reads_as_blocked_by_it() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let core = 9_401;
+        assert!(db.inner().register_store(quil_forest::StoreRole::Worker(core)));
+        let serving = WorkerExecution { state: "serving".into(), observed_unix_ms: 1, ..Default::default() };
+        assert_eq!(with_store_state(core, Some(serving.clone())), Some(serving.clone()));
+        assert_eq!(with_store_state(core, None), None);
+        assert!(!store_stopped(core));
+        db.inner().refuse_writes("IO error: No space left on device");
+        assert!(store_stopped(core), "a latched store has stopped writing");
+        for execution in [Some(serving.clone()), None] {
+            let reported = with_store_state(core, execution).expect("a latched store is reported");
+            assert_eq!((reported.state.as_str(), reported.blocker.as_str()), ("blocked", STORAGE_WRITE_FAILED));
+            assert!(reported.observed_unix_ms > 1);
+        }
+        assert_eq!(with_store_state(core + 1, Some(serving.clone())), Some(serving.clone()));
+        assert_eq!(held_store_execution(core + 1), None);
+        quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(core + 1));
+        let held = with_store_state(core + 1, Some(serving)).expect("a held store is reported");
+        assert_eq!((held.state.as_str(), held.blocker.as_str()), ("stopped", STORAGE_WRITE_FAILED));
+        let for_lifecycle = held_store_execution(core + 1).expect("the lifecycle sees it too");
+        assert_eq!(for_lifecycle.state, "stopped");
+        let bound = [(core, vec![1]), (core + 1, vec![2])];
+        let running = vec![(core, vec![1], WorkerExecution { state: "serving".into(), ..Default::default() })];
+        let seen = with_held_stores(running.clone(), &bound);
+        assert_eq!(seen.len(), 2, "the held worker reads as unable to host: {seen:?}");
+        assert_eq!((seen[1].0, seen[1].1.clone(), seen[1].2.state.as_str()), (core + 1, vec![2], "stopped"));
+        assert_eq!(with_held_stores(running.clone(), &bound[..1]), running, "an unbound worker adds nothing");
+        quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(core + 1));
+    }
+
     #[test]
     fn restoration_rewind_and_state_are_independent() {
         let s = SharedWorkerExecution::default();
@@ -971,6 +1098,8 @@ mod tests").unwrap()];
         let chained = literals(chain, "{ ", '}');
         assert_eq!(chained.len(), 4, "{chain}");
         written.extend(chained.into_iter().map(|blocker| vec!["blocked", blocker[0]]));
+        // A store's state, which no engine writes (`with_store_state`).
+        written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
         let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();
         let blockers: BTreeSet<&str> = written.iter().filter_map(|args| args.get(1).copied()).filter(|b| !b.is_empty()).collect();
         assert_eq!(states, STATES.into_iter().collect::<BTreeSet<_>>());

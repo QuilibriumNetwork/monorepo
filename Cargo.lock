@@ -6486,6 +6486,7 @@ dependencies = [
  "criterion 0.5.1",
  "hex 0.4.3",
  "jmt",
+ "libc",
  "num-bigint 0.4.6",
  "quil-tries",
  "quil-types",
@@ -6494,6 +6495,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.12",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

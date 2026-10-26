@@ -3,10 +3,13 @@
 //! read slots; a few recover at a time rather than all failing busy
 //! together. Turns go in arrival order, except that a worker replaying frames
 //! onto those it holds goes before checkpoint installs, and a worker whose
-//! successor session cannot start until its recovery lands, or whose shard
-//! owes a re-anchor, goes first: both reorder the queue and add no concurrent
-//! recovery. A blocked successor also keeps its turn for further replay
-//! batches, for at most [`BLOCKED_TURN_BUDGET`]. No recovery keeps a turn
+//! successor session cannot start until its recovery lands, whose shard
+//! owes a re-anchor, or that votes in its running session while it trails
+//! the session's committed tip (a lagging voter), goes first: these reorder
+//! the queue and add no concurrent recovery. A blocked successor or lagging
+//! voter also keeps its turn for further replay batches, for at most
+//! [`BLOCKED_TURN_BUDGET`]. A replay whose turn ends behind its target
+//! queues again in its first place. No recovery keeps a turn
 //! much past [`MAX_TURN_HOLD`]: a tree install hands it back at its next
 //! chunk boundary and queues again in its first place, resuming from the
 //! leaves it installed, and the engine's own installation of a checkpoint
@@ -59,11 +62,11 @@ const SATURATION_TICK: Duration = Duration::from_secs(60);
 
 pub(crate) static SHARD_RECOVERY_TURNS: RecoveryTurns = RecoveryTurns::new(RECOVERY_TURNS);
 
-/// Whether a turn held for `held` replays another batch: only while the
-/// holder's successor-blocked flag (`None`: a recovery holding no turn) is
-/// set, and within [`BLOCKED_TURN_BUDGET`].
-pub(crate) fn holds_turn(blocked: Option<&AtomicBool>, held: Duration) -> bool {
-    held < BLOCKED_TURN_BUDGET && blocked.is_some_and(|blocked| blocked.load(Ordering::Relaxed))
+/// Whether a turn held for `held` replays another batch: only while one of
+/// the holder's `flags` is set (its successor-blocked or lagging-voter flag;
+/// none for a recovery holding no turn), and within [`BLOCKED_TURN_BUDGET`].
+pub(crate) fn holds_turn(flags: &[&AtomicBool], held: Duration) -> bool {
+    held < BLOCKED_TURN_BUDGET && flags.iter().any(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// What a recovery does with its turn.
@@ -115,6 +118,10 @@ struct Priority {
     /// Its shard owes a re-anchor whose requested attempt this recovery
     /// makes (`SharedWorkerExecution::set_reanchor_armed`).
     reanchor: Arc<AtomicBool>,
+    /// It votes in its running session while it trails the session's
+    /// committed tip (`SharedWorkerExecution::set_lagging_voter`): it goes
+    /// as a blocked successor does.
+    lagging: Arc<AtomicBool>,
     /// It holds frames of its shard, so its turn replays at most a few
     /// batches onto them (or re-anchors at a fence) rather than installing a
     /// checkpoint, about half an hour per million leaves.
@@ -138,13 +145,14 @@ struct Waiter<T> {
 
 impl<T> Waiter<T> {
     /// Turn order past the longest waiter, lowest first: an owed re-anchor
-    /// or a blocked successor's replay, a replay, a blocked successor's
-    /// install, an install.
+    /// or a blocked successor's or lagging voter's replay, a replay, a
+    /// blocked successor's or lagging voter's install, an install.
     fn rank(&self) -> u8 {
         if self.priority.reanchor.load(Ordering::Relaxed) {
             return 0;
         }
-        match (self.priority.replay, self.priority.blocked.load(Ordering::Relaxed)) {
+        let first = self.priority.blocked.load(Ordering::Relaxed) || self.priority.lagging.load(Ordering::Relaxed);
+        match (self.priority.replay, first) {
             (true, true) => 0,
             (true, false) => 1,
             (false, true) => 2,
@@ -486,13 +494,20 @@ impl RecoveryTurns {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Workers waiting for a turn.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.lock().queue.waiters.len()
+    }
+
     /// Wait for a turn. Replays go before checkpoint installs, and a worker
-    /// whose successor-blocked or re-anchor flag is set when a turn frees up
-    /// before others of its kind ([`Waiter::rank`]).
+    /// whose successor-blocked, re-anchor or lagging-voter flag is set when
+    /// a turn frees up before others of its kind ([`Waiter::rank`]).
     pub(crate) async fn acquire(&self, claim: Claim) -> Turn<'_> {
         let priority = Priority {
             blocked: claim.execution.successor_blocked_flag(),
             reanchor: claim.execution.reanchor_armed_flag(),
+            lagging: claim.execution.lagging_voter_flag(),
             replay: claim.kind == RecoveryKind::Replay,
         };
         let (grant, granted) = oneshot::channel();
@@ -561,10 +576,10 @@ impl RecoveryTurns {
                 holders = %holders.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
                 scope = "this node",
                 action = "this node recovers at most this many shards from archives at once to bound their load; \
-                    workers wait their turn, frame replays before checkpoint installs and owed re-anchors and blocked \
-                    successor sessions first, and no recovery holds a turn much past 10 minutes; holders names what \
-                    the turns do now; with 'archive recovery failing' warnings check those first, otherwise it ends \
-                    as the queue drains",
+                    workers wait their turn, frame replays before checkpoint installs and owed re-anchors, blocked \
+                    successor sessions and voting members trailing their committee first, and no recovery holds a \
+                    turn much past 10 minutes; holders names what the turns do now; with 'archive recovery \
+                    failing' warnings check those first, otherwise it ends as the queue drains",
                 "archive recovery turns saturated"),
             Some((SaturationLog::Cleared { duration }, _, _)) => tracing::info!(
                 permits = self.turns, saturated_secs = duration.as_secs(),
@@ -581,13 +596,50 @@ mod tests {
     const MINUTE: Duration = Duration::from_secs(60);
 
     fn waiter(blocked: bool, replay: bool) -> Priority {
-        Priority { blocked: Arc::new(AtomicBool::new(blocked)), reanchor: Arc::default(), replay }
+        Priority { blocked: Arc::new(AtomicBool::new(blocked)), reanchor: Arc::default(), lagging: Arc::default(), replay }
+    }
+
+    /// A lagging voter's replay.
+    fn lagging() -> Priority {
+        Priority { lagging: Arc::new(AtomicBool::new(true)), ..waiter(false, true) }
     }
 
     fn claim(core: u32, blocked: bool) -> Claim {
         let execution = SharedWorkerExecution::default();
         execution.set_successor_blocked(blocked);
         Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Install, execution, ticket: None }
+    }
+
+    /// A worker's replay claim; `lagging` sets its lagging-voter flag.
+    fn replay_claim(core: u32, lagging: bool) -> Claim {
+        let execution = SharedWorkerExecution::default();
+        execution.set_lagging_voter(lagging);
+        Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Replay, execution, ticket: None }
+    }
+
+    /// A worker's lagging-voter flag, read when a turn frees up, takes it
+    /// the next turn before a replay that queued earlier.
+    #[tokio::test]
+    async fn turns_go_to_lagging_voters_first() {
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let held = turns.acquire(claim(1, false)).await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let run = |name: &'static str, core: u32, lagging: bool| {
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _turn = turns.acquire(replay_claim(core, lagging)).await;
+                order.lock().unwrap().push(name);
+            })
+        };
+        let replay = run("replay", 2, false);
+        tokio::task::yield_now().await;
+        let voter = run("lagging voter", 3, true);
+        tokio::task::yield_now().await;
+        assert_eq!(turns.lock().queue.waiters.len(), 2);
+        drop(held);
+        replay.await.unwrap();
+        voter.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["lagging voter", "replay"]);
     }
 
     /// Free turns are taken in arrival order; a blocked successor takes the
@@ -697,12 +749,70 @@ mod tests {
     #[test]
     fn only_a_blocked_successor_holds_its_turn_and_only_within_the_budget() {
         let blocked = Arc::new(AtomicBool::new(true));
-        assert!(holds_turn(Some(&*blocked), Duration::ZERO));
-        assert!(holds_turn(Some(&*blocked), BLOCKED_TURN_BUDGET - Duration::from_millis(1)));
-        assert!(!holds_turn(Some(&*blocked), BLOCKED_TURN_BUDGET));
+        assert!(holds_turn(&[&*blocked], Duration::ZERO));
+        assert!(holds_turn(&[&*blocked], BLOCKED_TURN_BUDGET - Duration::from_millis(1)));
+        assert!(!holds_turn(&[&*blocked], BLOCKED_TURN_BUDGET));
         blocked.store(false, Ordering::Relaxed);
-        assert!(!holds_turn(Some(&*blocked), Duration::ZERO));
-        assert!(!holds_turn(None, Duration::ZERO));
+        assert!(!holds_turn(&[&*blocked], Duration::ZERO));
+        assert!(!holds_turn(&[], Duration::ZERO));
+    }
+
+    /// A seated voter trailing its committee's committed tip goes first, as
+    /// a blocked successor's replay does: before replays and installs that
+    /// queued earlier (an operator's node: such a member waited up to 5
+    /// hours per turn at replay rank, behind everyone each time).
+    #[test]
+    fn a_lagging_voter_goes_before_replays_and_installs() {
+        let now = Instant::now();
+        let mut queue = TurnQueue::new(0);
+        queue.take_or_queue(waiter(false, false), 1, now, "install").unwrap_err();
+        queue.take_or_queue(waiter(false, true), 2, now, "replay").unwrap_err();
+        queue.take_or_queue(waiter(true, false), 3, now, "blocked install").unwrap_err();
+        queue.take_or_queue(lagging(), 4, now, "lagging voter").unwrap_err();
+        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        assert_eq!(order, ["lagging voter", "replay", "install", "blocked install"]);
+        // Once it caught up it is a replay like any other.
+        let mut queue = TurnQueue::new(0);
+        let caught_up = lagging();
+        caught_up.lagging.store(false, Ordering::Relaxed);
+        queue.take_or_queue(waiter(false, true), 5, now, "replay 2").unwrap_err();
+        queue.take_or_queue(caught_up, 6, now, "caught up").unwrap_err();
+        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        assert_eq!(order, ["replay 2", "caught up"]);
+    }
+
+    /// Lagging voters take at most [`PRIORITY_RUN`] turns in a row past the
+    /// longest waiter, a replay queued before them.
+    #[test]
+    fn lagging_voters_do_not_starve_the_longest_waiter() {
+        let now = Instant::now();
+        let mut queue = TurnQueue::new(0);
+        queue.take_or_queue(waiter(false, true), 1, now, "replay").unwrap_err();
+        for (core, name) in [(2, "l1"), (3, "l2"), (4, "l3"), (5, "l4")] {
+            queue.take_or_queue(lagging(), core, now, name).unwrap_err();
+        }
+        let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
+        assert_eq!(order, ["l1", "l2", "replay", "l3", "l4"]);
+    }
+
+    /// Two lagging voters queued again in their first places take at most
+    /// every other turn while others wait, so they do not hold both turns.
+    #[test]
+    fn resumed_lagging_voters_take_every_other_turn() {
+        let now = Instant::now();
+        let mut queue = TurnQueue::new(2);
+        let (l1, _) = queue.take_or_requeue(lagging(), 1, None, now, "l1");
+        let (l2, _) = queue.take_or_requeue(lagging(), 2, None, now, "l2");
+        for (core, name) in [(3, "s1"), (4, "s2")] {
+            queue.take_or_queue(waiter(false, false), core, now, name).unwrap_err();
+        }
+        queue.take_or_requeue(lagging(), 1, Some(l1), now, "l1 again").1.unwrap_err();
+        queue.take_or_requeue(lagging(), 2, Some(l2), now, "l2 again").1.unwrap_err();
+        assert_eq!(queue.next(), Some("l1 again"));
+        assert_eq!(queue.next(), Some("s1"), "after a resumed recovery's turn another waiter's");
+        assert_eq!(queue.next(), Some("l2 again"));
+        assert_eq!(queue.next(), Some("s2"));
+        assert_eq!(queue.next(), None);
     }
 
     #[test]
