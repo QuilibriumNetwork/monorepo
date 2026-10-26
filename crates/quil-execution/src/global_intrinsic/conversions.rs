@@ -493,6 +493,7 @@ pub fn prover_update_from_proto(pb: &pb::ProverUpdate) -> ProverUpdate {
             .public_key_signature_bls48581
             .as_ref()
             .map(addressed_sig_from_proto),
+        frame_number: ProverUpdate::signed_frame(pb.frame_number),
     }
 }
 
@@ -503,6 +504,7 @@ pub fn prover_update_to_proto(u: &ProverUpdate) -> pb::ProverUpdate {
             .public_key_signature_bls48581
             .as_ref()
             .map(addressed_sig_to_proto),
+        frame_number: u.frame_number,
     }
 }
 
@@ -680,6 +682,7 @@ mod tests {
         let pb = pb::ProverUpdate {
             delegate_address: vec![0xAAu8; 32],
             public_key_signature_bls48581: Some(sample_pb_addr_sig()),
+            frame_number: 0,
         };
         let u = prover_update_from_proto(&pb);
         let back = prover_update_to_proto(&u);

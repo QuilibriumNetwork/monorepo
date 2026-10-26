@@ -90,6 +90,9 @@ message ReleaseInfo {
 message ProverUpdate {
   bytes delegate_address = 1;
   quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 2;
+  // The GLOBAL frame the update was signed at, bound into its signature from
+  // the prover operation replay guard epoch; zero (absent) before it.
+  uint64 frame_number = 3;
 }
 
 message ProverKick {

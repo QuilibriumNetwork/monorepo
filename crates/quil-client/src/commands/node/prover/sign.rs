@@ -19,7 +19,8 @@ use quil_types::proto::keys::Bls48581AddressedSignature;
 use quil_execution::global_intrinsic::prover_update_materialize::prover_update_domain;
 use quil_execution::global_intrinsic::prover_verify::{
     multi_filter_signing_message, prover_confirm_domain, prover_leave_domain, prover_pause_domain,
-    prover_reject_domain, prover_resume_domain, single_filter_signing_message,
+    prover_reject_domain, prover_resume_domain, prover_update_signing_message,
+    single_filter_signing_message,
 };
 
 /// Build the `Bls48581AddressedSignature` for a prover op: sign `message`
@@ -148,14 +149,17 @@ pub fn reject_sig(
     addressed_sig(km, &msg, &domain)
 }
 
-/// ProverUpdate (delegate) signature. The signed message is just the
-/// 32-byte delegate address.
+/// ProverUpdate (delegate) signature over the 32-byte delegate address, then
+/// `frame` (the frame the update carries from the prover operation replay
+/// guard epoch); a `frame` of 0 signs the delegate address alone.
 pub fn update_sig(
     km: &FileKeyManager,
     delegate_address: &[u8],
+    frame: u64,
 ) -> anyhow::Result<Bls48581AddressedSignature> {
     let domain = prover_update_domain().map_err(|e| anyhow::anyhow!("update domain: {e}"))?;
-    addressed_sig(km, delegate_address, &domain)
+    let msg = prover_update_signing_message(delegate_address, frame);
+    addressed_sig(km, &msg, &domain)
 }
 
 #[cfg(test)]
@@ -337,12 +341,22 @@ mod tests {
             .unwrap());
 
         let delegate = vec![0x11u8; 32];
-        let us = update_sig(&km, &delegate).unwrap();
+        let us = update_sig(&km, &delegate, 0).unwrap();
         assert!(km
             .validate_signature(
                 KeyType::Falcon512,
                 &pubkey,
                 &delegate,
+                &us.signature,
+                &prover_update_domain().unwrap()
+            )
+            .unwrap());
+        let us = update_sig(&km, &delegate, frame).unwrap();
+        assert!(km
+            .validate_signature(
+                KeyType::Falcon512,
+                &pubkey,
+                &prover_update_signing_message(&delegate, frame),
                 &us.signature,
                 &prover_update_domain().unwrap()
             )

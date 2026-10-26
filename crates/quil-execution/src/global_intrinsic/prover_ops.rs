@@ -334,15 +334,36 @@ pub const TYPE_PROVER_UPDATE: u32 = 0x0308;
 pub struct ProverUpdate {
     pub delegate_address: Vec<u8>,
     pub public_key_signature_bls48581: Option<AddressedSignature>,
+    /// The GLOBAL frame the update was signed at, appended after the
+    /// signature and bound into it
+    /// ([`super::prover_verify::prover_update_signing_message`]). Carried only
+    /// from the prover operation replay guard epoch ([`Self::signed_frame`]);
+    /// zero serializes byte-identically to the legacy format, and a decoder
+    /// that predates it ignores the bytes.
+    pub frame_number: u64,
 }
 
 impl ProverUpdate {
+    /// The signed frame an update carries for `frame`: `frame` from the
+    /// prover operation replay guard epoch, else zero, so that before the
+    /// epoch an update re-encodes as a build without the field encodes it.
+    pub fn signed_frame(frame: u64) -> u64 {
+        if quil_types::consensus::prover_op_replay_guard_active(frame) {
+            frame
+        } else {
+            0
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         put_u32(&mut out, TYPE_PROVER_UPDATE);
         put_u32(&mut out, self.delegate_address.len() as u32);
         out.extend_from_slice(&self.delegate_address);
         write_opt_addr_sig(&mut out, self.public_key_signature_bls48581.as_ref())?;
+        if self.frame_number != 0 {
+            put_u64(&mut out, self.frame_number);
+        }
         Ok(out)
     }
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
@@ -362,9 +383,17 @@ impl ProverUpdate {
         }
         let delegate_address = read_bytes(data, &mut c, dl as usize)?;
         let sig = read_opt_addr_sig(data, &mut c)?;
+        // Like a decoder that predates it, never refuse an update for its
+        // tail: a short tail carries no frame, and bytes after it are ignored.
+        let frame_number = if data.len().saturating_sub(c) >= 8 {
+            Self::signed_frame(read_u64(data, &mut c)?)
+        } else {
+            0
+        };
         Ok(Self {
             delegate_address,
             public_key_signature_bls48581: sig,
+            frame_number,
         })
     }
 }
@@ -963,10 +992,44 @@ mod tests {
         let u = ProverUpdate {
             delegate_address: vec![0xDDu8; 32],
             public_key_signature_bls48581: Some(addr_sig()),
+            frame_number: 0,
         };
         let b = u.to_canonical_bytes().unwrap();
         assert_eq!(&b[..4], &TYPE_PROVER_UPDATE.to_be_bytes());
         assert_eq!(ProverUpdate::from_canonical_bytes(&b).unwrap(), u);
+    }
+
+    /// From the replay guard epoch an update carries its signed frame after
+    /// the legacy bytes; before it the frame is read as absent, so the update
+    /// re-encodes exactly as a build without the field re-encodes it.
+    #[test]
+    fn an_update_carries_its_frame_only_from_the_replay_guard_epoch() {
+        let legacy = ProverUpdate {
+            delegate_address: vec![0xDDu8; 32],
+            public_key_signature_bls48581: Some(addr_sig()),
+            frame_number: 0,
+        };
+        let legacy_bytes = legacy.to_canonical_bytes().unwrap();
+        let epoch = quil_types::consensus::epoch_length_frames();
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(2));
+        let fresh = ProverUpdate {
+            frame_number: 2 * epoch + 5,
+            ..legacy.clone()
+        };
+        let bytes = fresh.to_canonical_bytes().unwrap();
+        assert_eq!(&bytes[..legacy_bytes.len()], &legacy_bytes[..]);
+        assert_eq!(&bytes[legacy_bytes.len()..], &(2 * epoch + 5).to_be_bytes());
+        assert_eq!(ProverUpdate::from_canonical_bytes(&bytes).unwrap(), fresh);
+
+        let early = ProverUpdate {
+            frame_number: 2 * epoch - 1,
+            ..legacy.clone()
+        };
+        let decoded =
+            ProverUpdate::from_canonical_bytes(&early.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, legacy, "a frame before the epoch is not carried");
+        assert_eq!(decoded.to_canonical_bytes().unwrap(), legacy_bytes);
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
     }
     #[test]
     fn update_minimal() {

@@ -198,12 +198,28 @@ pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
     }
 
     let mut client = pc.connect().await?;
-    // The delegate signature covers only the delegate address (no frame),
-    // but Go still fetches node info first; we skip that as it's unused.
-    let sig = sign::update_sig(&pc.key_manager, &delegate_address)?;
+    let info = client
+        .get_node_info(tonic::Request::new(
+            quil_types::proto::node::GetNodeInfoRequest::default(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
+        .into_inner();
+    if info.epoch_length_frames > 0 {
+        quil_types::consensus::set_epoch_length_frames(info.epoch_length_frames);
+    }
+    quil_types::consensus::init_prover_op_replay_guard_epoch(pc.node_config.p2p.network);
+    // From the prover operation replay guard epoch the update signs the head
+    // frame, so it cannot be submitted again later; before it the signature
+    // covers the delegate address alone (frame 0).
+    let frame = quil_execution::global_intrinsic::prover_ops::ProverUpdate::signed_frame(
+        info.last_global_head_frame,
+    );
+    let sig = sign::update_sig(&pc.key_manager, &delegate_address, frame)?;
     let op = ProverUpdate {
         delegate_address: delegate_address.clone(),
         public_key_signature_bls48581: Some(sig),
+        frame_number: frame,
     };
     pc.send_global(&mut client, wrap(Request::Update(op)))
         .await?;

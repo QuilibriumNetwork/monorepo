@@ -145,6 +145,20 @@ pub fn prover_join_signing_message(filters: &[Vec<u8>], frame_number: u64) -> Ve
     multi_filter_signing_message(filters, frame_number)
 }
 
+/// Build the signing message for ProverUpdate: the delegate address, then
+/// the frame the update was signed at (u64 BE) when it carries one, which it
+/// does from the prover operation replay guard epoch
+/// ([`super::prover_ops::ProverUpdate::signed_frame`]). Without a frame it
+/// is the legacy message, the delegate address alone.
+pub fn prover_update_signing_message(delegate_address: &[u8], frame_number: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(delegate_address.len() + 8);
+    msg.extend_from_slice(delegate_address);
+    if frame_number != 0 {
+        msg.extend_from_slice(&frame_number.to_be_bytes());
+    }
+    msg
+}
+
 /// Build the signing message for ProverLeave.
 ///
 /// Unlike Confirm/Reject/Join (which sign the raw concatenation of the
@@ -269,6 +283,15 @@ mod tests {
         let msg = single_filter_signing_message(&[], 0);
         assert_eq!(msg.len(), 8);
         assert_eq!(&msg[..], &0u64.to_be_bytes());
+    }
+
+    #[test]
+    fn update_signing_message_appends_only_a_carried_frame() {
+        let delegate = vec![0x12u8; 32];
+        assert_eq!(prover_update_signing_message(&delegate, 0), delegate);
+        let msg = prover_update_signing_message(&delegate, 7);
+        assert_eq!(&msg[..32], &delegate[..]);
+        assert_eq!(&msg[32..], &7u64.to_be_bytes());
     }
 
     #[test]

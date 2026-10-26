@@ -237,6 +237,67 @@ pub const PROOF_CHUNK_SIZE: usize = 516;
 pub const MIN_FILTER_LEN: usize = 32;
 /// Maximum frames a join request can be older than current frame.
 pub const JOIN_FRESHNESS_WINDOW: u64 = 10;
+/// Maximum frames a signed pause, resume, leave, reject or update can be
+/// older than the GLOBAL frame including it, from the prover operation replay
+/// guard epoch ([`validate_prover_op_frame`]): the join's window, which the
+/// mempool's retention of ten finalized frames already bounds.
+pub const PROVER_OP_FRESHNESS_WINDOW: u64 = JOIN_FRESHNESS_WINDOW;
+
+/// From the prover operation replay guard epoch
+/// ([`quil_types::consensus::prover_op_replay_guard_active`]), a signed pause,
+/// resume, leave, reject or update must be signed in the epoch of the GLOBAL
+/// frame `inclusion_frame` that includes it, at most
+/// [`PROVER_OP_FRESHNESS_WINDOW`] frames before it and not after it, so a
+/// captured operation cannot be submitted again later. Undoing a leave or a
+/// reject takes an epoch boundary (a leave is rejected in the epoch after
+/// it), so the same-epoch rule keeps either from being replayed after the
+/// state it changed has changed back; a pause or resume is also bound to the
+/// allocation's last resume or pause ([`validate_signed_after`]). Before the
+/// epoch nothing is checked.
+pub fn validate_prover_op_frame(op: &str, signed_frame: u64, inclusion_frame: u64) -> Result<()> {
+    if !quil_types::consensus::prover_op_replay_guard_active(inclusion_frame) {
+        return Ok(());
+    }
+    if signed_frame > inclusion_frame
+        || inclusion_frame - signed_frame > PROVER_OP_FRESHNESS_WINDOW
+        || quil_types::consensus::epoch_for_frame(signed_frame)
+            != quil_types::consensus::epoch_for_frame(inclusion_frame)
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: signed frame {signed_frame} is not within {PROVER_OP_FRESHNESS_WINDOW} frames \
+             before frame {inclusion_frame} in its epoch"
+        )));
+    }
+    Ok(())
+}
+
+/// From the prover operation replay guard epoch, a pause must be signed no
+/// earlier than the allocation's last resume and a resume no earlier than its
+/// last pause (`field`, `ResumeFrameNumber` or `PauseFrameNumber`), so a pause
+/// or resume cannot be replayed after the allocation was resumed or paused
+/// again within [`PROVER_OP_FRESHNESS_WINDOW`]. Before the epoch, or without
+/// the allocation, nothing is checked.
+pub fn validate_signed_after(
+    op: &str,
+    signed_frame: u64,
+    inclusion_frame: u64,
+    allocation_tree: Option<&quil_tries::VectorCommitmentTree>,
+    field: &str,
+) -> Result<()> {
+    if !quil_types::consensus::prover_op_replay_guard_active(inclusion_frame) {
+        return Ok(());
+    }
+    let last = allocation_tree
+        .and_then(|tree| read_field(tree, "allocation:ProverAllocation", field))
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        .map_or(0, u64::from_be_bytes);
+    if signed_frame < last {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: signed at frame {signed_frame}, before the allocation's {field} {last}"
+        )));
+    }
+    Ok(())
+}
 
 /// Structural validation for ProverJoin — checks everything that
 /// doesn't require external dependencies (frame store, VDF prover).
@@ -677,6 +738,7 @@ where
 pub fn verify_prover_update(
     op: &super::prover_ops::ProverUpdate,
     prover_tree: &quil_tries::VectorCommitmentTree,
+    frame_number: u64,
     key_manager: &dyn KeyManager,
 ) -> Result<bool> {
     let vertex_type = read_type(prover_tree)
@@ -711,16 +773,26 @@ pub fn verify_prover_update(
         return Ok(false);
     }
 
-    // ProverUpdate signing message is just the delegate_address.
+    // From the replay guard epoch the update signs its frame, which must be
+    // fresh in GLOBAL frame `frame_number`; before it the signing message is
+    // the delegate_address alone and an update carries no frame.
+    if quil_types::consensus::prover_op_replay_guard_active(frame_number) {
+        validate_prover_op_frame("verify prover update", op.frame_number, frame_number)?;
+    } else if op.frame_number != 0 {
+        return Err(QuilError::InvalidArgument(
+            "verify prover update: signed frame before the replay guard epoch".into(),
+        ));
+    }
     // Domain matches Go's `global_prover_update.go:378` —
     // `poseidon(GLOBAL_INTRINSIC_ADDRESS || "PROVER_UPDATE")`.
-    let message = &op.delegate_address;
+    let message =
+        prover_verify::prover_update_signing_message(&op.delegate_address, op.frame_number);
     let domain = super::prover_update_materialize::prover_update_domain()?;
 
     key_manager.validate_signature(
         KeyType::Falcon512,
         &pubkey,
-        message,
+        &message,
         &sig.signature,
         &domain,
     )
@@ -2087,8 +2159,9 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: prover_addr(),
             }),
+            frame_number: 0,
         };
-        assert!(verify_prover_update(&op, &prover_tree, &AcceptKeyManager).unwrap());
+        assert!(verify_prover_update(&op, &prover_tree, 1, &AcceptKeyManager).unwrap());
     }
 
     #[test]
@@ -2100,9 +2173,10 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: vec![0xEEu8; 32], // != poseidon(pubkey)
             }),
+            frame_number: 0,
         };
         // Address binding fails → Ok(false), not Err.
-        assert!(!verify_prover_update(&op, &prover_tree, &AcceptKeyManager).unwrap());
+        assert!(!verify_prover_update(&op, &prover_tree, 1, &AcceptKeyManager).unwrap());
     }
 
     #[test]
@@ -2114,8 +2188,115 @@ mod tests {
                 signature: vec![0xBBu8; 74],
                 address: vec![0xCCu8; 16], // != 32
             }),
+            frame_number: 0,
         };
-        assert!(verify_prover_update(&op, &prover_tree, &AcceptKeyManager).is_err());
+        assert!(verify_prover_update(&op, &prover_tree, 1, &AcceptKeyManager).is_err());
+    }
+
+    /// Accepts exactly one signing message.
+    struct AcceptsMessage(Vec<u8>);
+    impl KeyManager for AcceptsMessage {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            message: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
+            Ok(message == self.0.as_slice())
+        }
+    }
+
+    /// From the replay guard epoch an update signs its frame, which must be
+    /// fresh: a captured update cannot restore an earlier delegate address
+    /// later, and one without a frame is refused. Before the epoch the
+    /// legacy message is checked and an update carrying a frame is refused.
+    #[test]
+    fn an_update_signs_a_fresh_frame_from_the_replay_guard_epoch() {
+        let prover_tree = make_prover_tree();
+        let delegate = vec![0x12u8; 32];
+        let update = |frame_number| ProverUpdate {
+            delegate_address: delegate.clone(),
+            public_key_signature_bls48581: Some(AddressedSignature {
+                signature: vec![0xBBu8; 74],
+                address: prover_addr(),
+            }),
+            frame_number,
+        };
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 20;
+        let signed_at = |frame: u64| {
+            let mut message = delegate.clone();
+            message.extend_from_slice(&frame.to_be_bytes());
+            AcceptsMessage(message)
+        };
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        let legacy = AcceptsMessage(delegate.clone());
+        assert!(verify_prover_update(&update(0), &prover_tree, at, &legacy).unwrap());
+        assert!(verify_prover_update(&update(at - 1), &prover_tree, at, &legacy).is_err());
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        let fresh = at - PROVER_OP_FRESHNESS_WINDOW;
+        assert!(verify_prover_update(&update(fresh), &prover_tree, at, &signed_at(fresh)).unwrap());
+        assert!(!verify_prover_update(&update(fresh), &prover_tree, at, &legacy).unwrap());
+        let replayed = fresh - 1;
+        assert!(
+            verify_prover_update(&update(replayed), &prover_tree, at, &signed_at(replayed))
+                .is_err(),
+            "an update signed {} frames earlier is refused",
+            PROVER_OP_FRESHNESS_WINDOW + 1
+        );
+        assert!(verify_prover_update(&update(0), &prover_tree, at, &legacy).is_err());
+        assert!(
+            verify_prover_update(&update(at + 1), &prover_tree, at, &signed_at(at + 1)).is_err()
+        );
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+    }
+
+    #[test]
+    fn prover_ops_must_be_signed_fresh_in_their_epoch_from_the_replay_guard_epoch() {
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 5;
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        assert!(
+            validate_prover_op_frame("leave", 1, at).is_ok(),
+            "inert before"
+        );
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        assert!(validate_prover_op_frame("leave", at, at).is_ok());
+        assert!(validate_prover_op_frame("leave", 3 * epoch, at).is_ok());
+        assert!(
+            validate_prover_op_frame("leave", at + 1, at).is_err(),
+            "future"
+        );
+        assert!(
+            validate_prover_op_frame("leave", 3 * epoch - 1, at).is_err(),
+            "previous epoch"
+        );
+        let late = 3 * epoch + 5 + PROVER_OP_FRESHNESS_WINDOW + 1;
+        assert!(
+            validate_prover_op_frame("leave", at, late).is_err(),
+            "stale"
+        );
+        assert!(validate_prover_op_frame("leave", at + 1, late).is_ok());
+
+        let mut paused = make_allocation_tree(2);
+        crate::global_schema::write_field(
+            &mut paused,
+            "allocation:ProverAllocation",
+            "PauseFrameNumber",
+            &(at - 2).to_be_bytes(),
+        )
+        .unwrap();
+        let field = "PauseFrameNumber";
+        assert!(validate_signed_after("resume", at - 3, at, Some(&paused), field).is_err());
+        assert!(validate_signed_after("resume", at - 2, at, Some(&paused), field).is_ok());
+        assert!(validate_signed_after("resume", at - 3, at, None, field).is_ok());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        assert!(validate_signed_after("resume", at - 3, at, Some(&paused), field).is_ok());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
     }
 
     fn sample_split() -> ShardSplit {
