@@ -8,8 +8,9 @@
 //!
 //! Every saved record is verified on load exactly as a gossiped one, and is
 //! dropped once older than [`MAX_AGE_MS`]. Gossip still replaces a restored
-//! record: it inserts unconditionally, and only a record no older than a
-//! minute passes its mesh validator.
+//! record with a newer one (`peer_info_bounds.rs`, which also bounds and
+//! expires the cache in memory), and only a record no older than a minute
+//! passes its mesh validator.
 use std::{
     collections::HashMap,
     io::{BufReader, BufWriter, Read, Write},
@@ -46,20 +47,13 @@ pub(super) fn unix_millis() -> i64 {
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
-/// The checks a PeerInfo passes before it is cached: Falcon key and
-/// signature lengths (897 / 666), the peer ID bound to the signing key
-/// (without it an attacker signs with their own key but names a genesis
-/// archive's peer ID), and the Falcon signature over the record with an
-/// empty signature field and an empty domain (as `Signer::sign` signs).
+/// The checks a PeerInfo passes before it is cached
+/// ([`quil_p2p::verify_peer_info`], which the mesh validator runs too):
+/// Falcon key and signature lengths (897 / 666), the peer ID bound to the
+/// signing key (without it an attacker signs with their own key but names a
+/// genesis archive's peer ID), and the Falcon signature over the record.
 pub(crate) fn verified(info: &quil_p2p::CanonicalPeerInfo) -> bool {
-    if info.peer_id.is_empty() || info.public_key.len() != 897 || info.signature.len() != 666 {
-        return false;
-    }
-    if info.peer_id != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key) {
-        return false;
-    }
-    let signing_payload = quil_p2p::encode_canonical_peer_info(info, &info.public_key, &[]);
-    quil_crypto::falcon_verify(&info.public_key, &info.signature, &signing_payload, &[])
+    quil_p2p::verify_peer_info(info)
 }
 
 fn within_age(info: &quil_p2p::CanonicalPeerInfo, now_ms: i64) -> bool {

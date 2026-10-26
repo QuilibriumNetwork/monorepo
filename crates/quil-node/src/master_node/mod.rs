@@ -1,5 +1,6 @@
 mod activation_wait;
 mod frame_observations;
+mod peer_info_bounds;
 mod peer_info_file;
 use std::sync::Arc;
 

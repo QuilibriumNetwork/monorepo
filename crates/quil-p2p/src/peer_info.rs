@@ -522,7 +522,8 @@ const BLS48581_SIGNATURE_TYPE: u32 = 0x0119;
 ///
 /// Required inputs:
 /// - `ed448_pubkey`: 57-byte Ed448 public key (identity key)
-/// - `bls_pubkey`: BLS48-581 G2 public key (prover key, 585 bytes)
+/// - `bls_pubkey`: the prover key: a Falcon-512 key (897 bytes) since the
+///   Falcon cutover, a BLS48-581 G2 key (585 bytes) before it
 /// - `identity_to_prover_sig`: Ed448 signature of "KEY_REGISTRY" || bls_pubkey
 /// - `prover_to_identity_sig`: BLS signature of ed448_pubkey with domain "KEY_REGISTRY"
 pub fn encode_key_registry(
@@ -550,8 +551,10 @@ pub fn encode_key_registry(
     }
 
     // prover_key: BLS48581G2PublicKey canonical bytes
-    // Go format: [u32 type=0x0117][585 bytes key] (NO length prefix, fixed 585)
-    if bls_pubkey.len() == 585 {
+    // Go format: [u32 type=0x0117][585 bytes key] (NO length prefix, fixed 585).
+    // The Falcon prover key (897 bytes) rides the same wrapper; dropping it
+    // published every binding with an empty prover key, which no node accepts.
+    if bls_pubkey.len() == 585 || bls_pubkey.len() == 897 {
         let mut pk = Vec::new();
         pk.extend_from_slice(&BLS48581_G2_PUBLIC_KEY_TYPE.to_be_bytes()); // 4 bytes
         pk.extend_from_slice(bls_pubkey); // 585 bytes
@@ -617,6 +620,11 @@ pub struct CanonicalKeyRegistry {
     /// `KeyRegistry.KeysByPurpose`.
     pub keys_by_purpose: Vec<KeysByPurposeEntry>,
     pub last_updated_ms: u64,
+    /// The prover (Falcon) key's signature over the binding and
+    /// `last_updated_ms` ([`key_registry_timestamp_message`]), carried after
+    /// `last_updated`. Empty in records from releases that do not sign the
+    /// timestamp: their timestamp can be restamped by anyone.
+    pub timestamp_signature: Vec<u8>,
 }
 
 /// One purpose-key pair from a `KeyRegistry` broadcast. The `purpose`
@@ -717,7 +725,241 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
     // last_updated: u64 big-endian.
     out.last_updated_ms = r.read_u64()?;
 
+    // Optional trailer: the timestamp signature, length-prefixed, and nothing
+    // after it. Decoders before it ignore trailing bytes.
+    if r.remaining() > 0 {
+        out.timestamp_signature = r.read_bytes()?;
+        if out.timestamp_signature.is_empty() || r.remaining() != 0 {
+            return Err(QuilError::P2p(
+                "KeyRegistry: malformed timestamp signature trailer".into(),
+            ));
+        }
+    }
+
     Ok(out)
+}
+
+/// Domain of the KeyRegistry timestamp signature.
+pub const KEY_REGISTRY_TIMESTAMP_DOMAIN: &[u8] = b"KEY_REGISTRY_TIMESTAMP";
+
+/// What the prover key signs to date a KeyRegistry binding: the identity
+/// key, the prover key and `last_updated_ms` (big-endian).
+pub fn key_registry_timestamp_message(
+    ed448_pubkey: &[u8],
+    prover_pubkey: &[u8],
+    last_updated_ms: u64,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(ed448_pubkey.len() + prover_pubkey.len() + 8);
+    message.extend_from_slice(ed448_pubkey);
+    message.extend_from_slice(prover_pubkey);
+    message.extend_from_slice(&last_updated_ms.to_be_bytes());
+    message
+}
+
+/// Whether `reg` carries a valid signature of its prover key over its
+/// timestamp. False when it carries none.
+pub fn verify_key_registry_timestamp(reg: &CanonicalKeyRegistry) -> bool {
+    !reg.timestamp_signature.is_empty()
+        && quil_crypto::falcon_verify(
+            &reg.bls_pubkey,
+            &reg.timestamp_signature,
+            &key_registry_timestamp_message(
+                &reg.ed448_pubkey,
+                &reg.bls_pubkey,
+                reg.last_updated_ms,
+            ),
+            KEY_REGISTRY_TIMESTAMP_DOMAIN,
+        )
+}
+
+/// [`encode_key_registry`] followed by the timestamp signature trailer
+/// (`timestamp_signature` signs [`key_registry_timestamp_message`] under
+/// [`KEY_REGISTRY_TIMESTAMP_DOMAIN`] with the prover key).
+pub fn encode_signed_key_registry(
+    ed448_pubkey: &[u8],
+    bls_pubkey: &[u8],
+    identity_to_prover_sig: &[u8],
+    prover_to_identity_sig: &[u8],
+    last_updated_ms: u64,
+    timestamp_signature: &[u8],
+) -> Vec<u8> {
+    let mut w = Writer {
+        buf: encode_key_registry(
+            ed448_pubkey,
+            bls_pubkey,
+            identity_to_prover_sig,
+            prover_to_identity_sig,
+            last_updated_ms,
+        ),
+    };
+    w.write_bytes(timestamp_signature);
+    w.buf
+}
+
+/// The checks a PeerInfo passes before it is trusted: Falcon key and
+/// signature lengths (897 / 666), the peer ID bound to the signing key
+/// (without it an attacker signs with their own key but names another
+/// peer's ID), and the Falcon signature over the record with an empty
+/// signature field and an empty domain (as `Signer::sign` signs).
+pub fn verify_peer_info(info: &CanonicalPeerInfo) -> bool {
+    if info.peer_id.is_empty() || info.public_key.len() != 897 || info.signature.len() != 666 {
+        return false;
+    }
+    if info.peer_id != crate::falcon_identity::peer_id_from_falcon_pubkey(&info.public_key) {
+        return false;
+    }
+    let signing_payload = encode_canonical_peer_info(info, &info.public_key, &[]);
+    quil_crypto::falcon_verify(&info.public_key, &info.signature, &signing_payload, &[])
+}
+
+/// Largest GLOBAL_PEER_INFO PeerInfo the mesh forwards. A published one
+/// carries one reachability entry (under 300 bytes) per allocated worker,
+/// so this admits several thousand workers per node.
+pub const MAX_PEER_INFO_BYTES: usize = 1 << 20;
+/// Largest KeyRegistry the mesh forwards; one is about 2.3 KB as published.
+pub const MAX_KEY_REGISTRY_BYTES: usize = 64 * 1024;
+/// A PeerInfo or KeyRegistry older than this is dropped without penalty: it
+/// can age in transit through an honest relay.
+const STALE_IGNORE_PAST_MS: i64 = 60_000;
+/// Older than this, it is rejected: no honest relay forwards it.
+const STALE_REJECT_PAST_MS: i64 = 300_000;
+
+static STRICT_PEER_INFO_VALIDATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Switch strict GLOBAL_PEER_INFO validation (the node sets it from its
+/// GLOBAL head and `quil_types::consensus::strict_peer_info_active`).
+/// Returns the previous setting.
+pub fn set_strict_peer_info_validation(active: bool) -> bool {
+    STRICT_PEER_INFO_VALIDATION.swap(active, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether strict GLOBAL_PEER_INFO validation is on.
+pub fn strict_peer_info_validation() -> bool {
+    STRICT_PEER_INFO_VALIDATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the mesh makes of a GLOBAL_PEER_INFO message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerInfoVerdict {
+    /// Deliver and forward.
+    Accept,
+    /// Aged in transit, or dated ahead of this node's clock.
+    Late,
+    /// Older than any honest relay forwards.
+    Stale,
+    /// No release accepts it: too short, an unknown type, oversized,
+    /// malformed, or a signature or key binding that fails.
+    Invalid,
+    /// A KeyRegistry whose timestamp is not signed, as releases before the
+    /// timestamp signature publish it.
+    UnsignedTimestamp,
+}
+
+fn freshness(timestamp: i64, now_ms: i64, max_ahead_ms: i64) -> Option<PeerInfoVerdict> {
+    if timestamp < now_ms - STALE_REJECT_PAST_MS {
+        Some(PeerInfoVerdict::Stale)
+    } else if timestamp < now_ms - STALE_IGNORE_PAST_MS || timestamp > now_ms + max_ahead_ms {
+        Some(PeerInfoVerdict::Late)
+    } else {
+        None
+    }
+}
+
+/// The mesh-level checks of a GLOBAL_PEER_INFO message: the timestamp
+/// first (a byte peek), then size, the full decode and the Falcon
+/// signatures (PeerInfo; the prover half and the timestamp of a
+/// KeyRegistry). The Ed448 half of a KeyRegistry binding is left to the
+/// receive loop.
+pub fn peer_info_gossip_verdict(data: &[u8], now_ms: i64) -> PeerInfoVerdict {
+    if data.len() < 4 {
+        return PeerInfoVerdict::Invalid;
+    }
+    match u32::from_be_bytes([data[0], data[1], data[2], data[3]]) {
+        PEER_INFO_TYPE => {
+            let Some(timestamp) = peek_peer_info_timestamp(data) else {
+                return PeerInfoVerdict::Invalid;
+            };
+            if let Some(verdict) = freshness(timestamp, now_ms, 300_000) {
+                return verdict;
+            }
+            if data.len() > MAX_PEER_INFO_BYTES {
+                return PeerInfoVerdict::Invalid;
+            }
+            match decode_canonical_peer_info(data) {
+                Ok(info) if verify_peer_info(&info) => PeerInfoVerdict::Accept,
+                _ => PeerInfoVerdict::Invalid,
+            }
+        }
+        KEY_REGISTRY_TYPE => {
+            let Some(timestamp) = peek_key_registry_timestamp(data) else {
+                return PeerInfoVerdict::Invalid;
+            };
+            if let Some(verdict) = freshness(timestamp as i64, now_ms, 5_000) {
+                return verdict;
+            }
+            if data.len() > MAX_KEY_REGISTRY_BYTES {
+                return PeerInfoVerdict::Invalid;
+            }
+            let Ok(reg) = decode_canonical_key_registry(data) else {
+                return PeerInfoVerdict::Invalid;
+            };
+            if !quil_crypto::falcon_verify(
+                &reg.bls_pubkey,
+                &reg.prover_to_identity_sig,
+                &reg.ed448_pubkey,
+                crate::signer_registry::KEY_REGISTRY_DOMAIN,
+            ) {
+                return PeerInfoVerdict::Invalid;
+            }
+            if reg.timestamp_signature.is_empty() {
+                PeerInfoVerdict::UnsignedTimestamp
+            } else if verify_key_registry_timestamp(&reg) {
+                PeerInfoVerdict::Accept
+            } else {
+                PeerInfoVerdict::Invalid
+            }
+        }
+        _ => PeerInfoVerdict::Invalid,
+    }
+}
+
+/// The gossip outcome of `verdict`. A message no release accepts is
+/// dropped without penalty until strict validation, since releases before
+/// these checks forward it: penalising them for it would cut them off the
+/// mesh. Strict validation also refuses unsigned KeyRegistry timestamps.
+pub fn peer_info_gossip_result(verdict: PeerInfoVerdict, strict: bool) -> crate::ValidationResult {
+    use crate::ValidationResult::{Accept, Ignore, Reject};
+    match verdict {
+        PeerInfoVerdict::Accept => Accept,
+        PeerInfoVerdict::Late => Ignore,
+        PeerInfoVerdict::Stale => Reject,
+        PeerInfoVerdict::Invalid if strict => Reject,
+        PeerInfoVerdict::Invalid => Ignore,
+        PeerInfoVerdict::UnsignedTimestamp if strict => Reject,
+        PeerInfoVerdict::UnsignedTimestamp => Accept,
+    }
+}
+
+/// Largest GLOBAL_ALERT the mesh forwards: a verifiable one is at most
+/// 1,126 bytes.
+pub const MAX_GLOBAL_ALERT_BYTES: usize = 4096;
+
+/// Whether `data` is a GLOBAL_ALERT the receive loop can verify:
+/// `[u32 type][u32 msg_len][msg][u32 sig_len][sig]` with a message of at
+/// most 1,000 bytes and a 114-byte Ed448 signature, within
+/// [`MAX_GLOBAL_ALERT_BYTES`] (the receive loop ignores trailing bytes).
+pub fn global_alert_well_formed(data: &[u8]) -> bool {
+    if data.len() < 12 || data.len() > MAX_GLOBAL_ALERT_BYTES {
+        return false;
+    }
+    let msg_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    if msg_len > 1000 || 12 + msg_len > data.len() {
+        return false;
+    }
+    let at = 8 + msg_len;
+    let sig_len = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+    sig_len == 114 && data.len() >= at + 4 + sig_len
 }
 
 fn decode_wrapped_signature(blob: &[u8], expect_type: u32, name: &str) -> Result<Vec<u8>> {
@@ -1424,5 +1666,210 @@ mod tests {
         let full = decode_canonical_key_registry(&encoded).expect("decode");
         assert_eq!(peeked, 1_725_000_000_000u64);
         assert_eq!(peeked, full.last_updated_ms);
+    }
+
+    // =====================================================================
+    // Mesh-level checks and the KeyRegistry timestamp signature
+    // =====================================================================
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    /// A PeerInfo signed as a node publishes it.
+    fn signed_peer_info(timestamp: i64) -> Vec<u8> {
+        use quil_types::crypto::Signer as _;
+        let signer = quil_crypto::FalconSigner::generate();
+        let public_key = signer.public_key().to_vec();
+        let mut info = fixture_peer_info(timestamp, 7);
+        info.peer_id = crate::falcon_identity::peer_id_from_falcon_pubkey(&public_key);
+        let payload = encode_canonical_peer_info(&info, &public_key, &[]);
+        let signature = signer.sign(&payload).unwrap();
+        encode_canonical_peer_info(&info, &public_key, &signature)
+    }
+
+    /// A KeyRegistry with valid cross-signatures over a Falcon prover key,
+    /// with its timestamp signed or not.
+    fn key_registry(last_updated_ms: u64, sign_timestamp: bool) -> Vec<u8> {
+        use quil_types::crypto::{BlsConstructor as _, Signer as _};
+        quil_crypto::init();
+        let seed = [0x31; 57];
+        let identity = quil_crypto::Ed448Signer::from_bytes(
+            &seed,
+            &quil_crypto::Ed448Signer::derive_public(&seed).unwrap(),
+        )
+        .unwrap();
+        let ed448 = identity.public_key().to_vec();
+        let (prover, prover_key) = quil_crypto::FalconKeyConstructor.new_key().unwrap();
+        let domain = crate::signer_registry::KEY_REGISTRY_DOMAIN;
+        let mut identity_msg = domain.to_vec();
+        identity_msg.extend_from_slice(&prover_key);
+        let i2p = identity.sign(&identity_msg).unwrap();
+        let p2i = prover.sign_with_domain(&ed448, domain).unwrap();
+        if !sign_timestamp {
+            return encode_key_registry(&ed448, &prover_key, &i2p, &p2i, last_updated_ms);
+        }
+        let message = key_registry_timestamp_message(&ed448, &prover_key, last_updated_ms);
+        let stamp = prover
+            .sign_with_domain(&message, KEY_REGISTRY_TIMESTAMP_DOMAIN)
+            .unwrap();
+        encode_signed_key_registry(&ed448, &prover_key, &i2p, &p2i, last_updated_ms, &stamp)
+    }
+
+    /// Re-date a KeyRegistry without re-signing: the last eight bytes before
+    /// an optional 670-byte timestamp signature trailer.
+    fn restamp(wire: &[u8], last_updated_ms: u64, signed: bool) -> Vec<u8> {
+        let mut out = wire.to_vec();
+        let end = if signed {
+            out.len() - 4 - 666
+        } else {
+            out.len()
+        };
+        out[end - 8..end].copy_from_slice(&last_updated_ms.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn a_falcon_prover_key_is_published_in_the_key_registry() {
+        let wire = key_registry(NOW as u64, false);
+        let reg = decode_canonical_key_registry(&wire).unwrap();
+        assert_eq!(reg.bls_pubkey.len(), 897, "the prover key is carried");
+        assert!(reg.timestamp_signature.is_empty());
+    }
+
+    #[test]
+    fn the_key_registry_timestamp_signature_round_trips_and_covers_the_timestamp() {
+        let wire = key_registry(NOW as u64, true);
+        // Decoders without the trailer read the same record.
+        assert_eq!(peek_key_registry_timestamp(&wire), Some(NOW as u64));
+        let reg = decode_canonical_key_registry(&wire).unwrap();
+        assert_eq!(reg.timestamp_signature.len(), 666);
+        assert!(verify_key_registry_timestamp(&reg));
+        let restamped =
+            decode_canonical_key_registry(&restamp(&wire, NOW as u64 + 1, true)).unwrap();
+        assert_eq!(restamped.last_updated_ms, NOW as u64 + 1);
+        assert!(
+            !verify_key_registry_timestamp(&restamped),
+            "a restamped record fails"
+        );
+        // A trailer with anything after it, or an empty one, is malformed.
+        let mut junk = wire.clone();
+        junk.push(0);
+        assert!(decode_canonical_key_registry(&junk).is_err());
+        let mut empty = key_registry(NOW as u64, false);
+        empty.extend_from_slice(&0u32.to_be_bytes());
+        assert!(decode_canonical_key_registry(&empty).is_err());
+    }
+
+    #[test]
+    fn the_mesh_drops_peer_info_no_release_accepts_and_penalises_it_only_when_strict() {
+        use crate::ValidationResult::{Accept, Ignore, Reject};
+        let good = signed_peer_info(NOW - 1_000);
+        assert_eq!(
+            peer_info_gossip_verdict(&good, NOW),
+            PeerInfoVerdict::Accept
+        );
+        // Aged and stale records keep their outcomes.
+        let aged = signed_peer_info(NOW - 2 * 60_000);
+        assert_eq!(peer_info_gossip_verdict(&aged, NOW), PeerInfoVerdict::Late);
+        let stale = signed_peer_info(NOW - 10 * 60_000);
+        assert_eq!(
+            peer_info_gossip_verdict(&stale, NOW),
+            PeerInfoVerdict::Stale
+        );
+        // A flipped signature byte, a peer ID of another key, junk, an
+        // unknown type and a short message are invalid.
+        let mut bad_signature = good.clone();
+        let at = bad_signature.len() - 16 - 10;
+        bad_signature[at] ^= 1;
+        let mut info = decode_canonical_peer_info(&good).unwrap();
+        info.peer_id = vec![0x11; 38];
+        let unbound = encode_canonical_peer_info(&info, &info.public_key, &info.signature);
+        let mut unknown = good.clone();
+        unknown[..4].copy_from_slice(&0x0999u32.to_be_bytes());
+        let mut padded = fixture_peer_info(NOW, 0);
+        padded.reachability = vec![CanonicalReachability::default(); MAX_PEER_INFO_BYTES / 12];
+        let padded = encode_canonical_peer_info(&padded, &[0; 897], &[0; 666]);
+        for invalid in [
+            &bad_signature,
+            &unbound,
+            &unknown,
+            &padded,
+            &good[..good.len() / 2].to_vec(),
+            &vec![0u8; 3],
+        ] {
+            let verdict = peer_info_gossip_verdict(invalid, NOW);
+            assert_eq!(verdict, PeerInfoVerdict::Invalid);
+            assert_eq!(peer_info_gossip_result(verdict, false), Ignore);
+            assert_eq!(peer_info_gossip_result(verdict, true), Reject);
+        }
+        assert_eq!(
+            peer_info_gossip_result(PeerInfoVerdict::Accept, true),
+            Accept
+        );
+        assert_eq!(peer_info_gossip_result(PeerInfoVerdict::Late, true), Ignore);
+        assert_eq!(
+            peer_info_gossip_result(PeerInfoVerdict::Stale, false),
+            Reject
+        );
+    }
+
+    #[test]
+    fn the_mesh_refuses_unsigned_key_registry_timestamps_only_when_strict() {
+        use crate::ValidationResult::{Accept, Reject};
+        let ts = (NOW - 1_000) as u64;
+        let signed = key_registry(ts, true);
+        assert_eq!(
+            peer_info_gossip_verdict(&signed, NOW),
+            PeerInfoVerdict::Accept
+        );
+        let legacy = key_registry(ts, false);
+        let verdict = peer_info_gossip_verdict(&legacy, NOW);
+        assert_eq!(verdict, PeerInfoVerdict::UnsignedTimestamp);
+        assert_eq!(peer_info_gossip_result(verdict, false), Accept);
+        assert_eq!(peer_info_gossip_result(verdict, true), Reject);
+        // Restamping a signed record is caught at the mesh.
+        assert_eq!(
+            peer_info_gossip_verdict(&restamp(&signed, ts + 1, true), NOW),
+            PeerInfoVerdict::Invalid
+        );
+        // A binding whose prover half fails, as current releases published
+        // it without the prover key, is invalid.
+        let mut no_prover_key = decode_canonical_key_registry(&legacy).unwrap();
+        no_prover_key.bls_pubkey.clear();
+        let no_prover_key = encode_key_registry(
+            &no_prover_key.ed448_pubkey,
+            &no_prover_key.bls_pubkey,
+            &no_prover_key.identity_to_prover_sig,
+            &no_prover_key.prover_to_identity_sig,
+            ts,
+        );
+        assert_eq!(
+            peer_info_gossip_verdict(&no_prover_key, NOW),
+            PeerInfoVerdict::Invalid
+        );
+    }
+
+    #[test]
+    fn only_a_verifiable_global_alert_shape_is_well_formed() {
+        let alert = |msg: &[u8], sig_len: usize| {
+            let mut out = 0x0911u32.to_be_bytes().to_vec();
+            out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+            out.extend_from_slice(msg);
+            out.extend_from_slice(&(sig_len as u32).to_be_bytes());
+            out.extend_from_slice(&vec![7u8; sig_len]);
+            out
+        };
+        assert!(global_alert_well_formed(&alert(b"halt", 114)));
+        assert!(!global_alert_well_formed(&alert(b"halt", 113)));
+        assert!(!global_alert_well_formed(&alert(&[1; 1001], 114)));
+        // The receive loop ignores trailing bytes; a padded flood is cut.
+        let mut trailing = alert(b"halt", 114);
+        trailing.push(0);
+        assert!(global_alert_well_formed(&trailing));
+        trailing.resize(MAX_GLOBAL_ALERT_BYTES + 1, 0);
+        assert!(!global_alert_well_formed(&trailing));
+        assert!(!global_alert_well_formed(&[0; 11]));
+        let mut overrun = alert(b"halt", 114);
+        overrun[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(!global_alert_well_formed(&overrun));
     }
 }

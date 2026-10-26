@@ -1404,66 +1404,62 @@ impl P2PHandle {
             .map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
     }
 
-    /// Register a blossomsub-level validator on `bitmask` that filters stale
-    /// PeerInfo / KeyRegistry BEFORE the mesh forwards them, so stale gossip is
-    /// never re-broadcast (self-amplifying the flood) and only reaches the app
-    /// router's `*_ts_too_old` reject as a fallback. This is a CHEAP peek (no
-    /// canonical decode / signature verify); fresh messages `Accept` and still
-    /// get full app-level validation.
+    /// Register a blossomsub-level validator on `bitmask` (GLOBAL_PEER_INFO)
+    /// that checks PeerInfo / KeyRegistry BEFORE the mesh forwards them
+    /// ([`crate::peer_info::peer_info_gossip_verdict`]): the timestamp peek,
+    /// then size, full decode and the Falcon signatures. The Ed448 half of a
+    /// KeyRegistry binding is still verified by the receive loop.
     ///
     /// The response is GRADUATED by how stale the timestamp is:
-    /// - within `STALE_IGNORE_PAST_MS` of now (plus the small future skew
-    ///   allowance) → `Accept`;
-    /// - moderately stale (past `STALE_IGNORE_PAST_MS` but within
-    ///   `STALE_REJECT_PAST_MS`), or future-skewed → `Ignore` (drop, NO peer
+    /// - fresh → `Accept`;
+    /// - moderately stale, or future-skewed → `Ignore` (drop, NO peer
     ///   penalty) — a message can legitimately age in transit through an honest
     ///   relayer, who must not be punished for it;
-    /// - grossly stale (older than `STALE_REJECT_PAST_MS` ≈ 5 min) → `Reject`,
-    ///   which feeds gossipsub's P₄ invalid-message peer score. An honest,
+    /// - grossly stale (older than about 5 min) → `Reject`, which feeds
+    ///   gossipsub's P₄ invalid-message peer score. An honest,
     ///   roughly-NTP-synced relayer never forwards a 5-minute-old PeerInfo (it
     ///   would `Ignore` it too), so reaching us with one means the sender is
     ///   replaying / grossly clock-skewed / flooding — a sustained stream of
     ///   these graylists the peer (see the topic-score params in
     ///   `set_signing_identity`).
+    ///
+    /// A message no release accepts (malformed, oversized, unknown type, bad
+    /// signature) is dropped without penalty until strict validation
+    /// ([`crate::peer_info::strict_peer_info_validation`]) and rejected after:
+    /// releases before these checks forward such messages, and penalising
+    /// them for it would cut them off the mesh.
     pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
-        // Fresh window (Accept below this age). Past this but within the reject
-        // bound → Ignore (possible honest transit aging).
-        const STALE_IGNORE_PAST_MS: i64 = 60_000;
-        // Beyond this age → Reject + penalize; no honest relayer forwards
-        // something this old.
-        const STALE_REJECT_PAST_MS: i64 = 300_000; // 5 min
         let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
             Box::new(|_peer, data| {
-                use crate::ValidationResult;
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                if data.len() >= 4 {
-                    let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
-                    if tp == crate::peer_info::PEER_INFO_TYPE {
-                        if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
-                            if ts < now_ms - STALE_REJECT_PAST_MS {
-                                return ValidationResult::Reject;
-                            }
-                            if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
-                                return ValidationResult::Ignore;
-                            }
-                        }
-                    } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
-                        if let Some(ts) =
-                            crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
-                        {
-                            if ts < now_ms - STALE_REJECT_PAST_MS {
-                                return ValidationResult::Reject;
-                            }
-                            if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
-                                return ValidationResult::Ignore;
-                            }
-                        }
-                    }
+                crate::peer_info::peer_info_gossip_result(
+                    crate::peer_info::peer_info_gossip_verdict(data, now_ms),
+                    crate::peer_info::strict_peer_info_validation(),
+                )
+            });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
+    /// Mesh-level gate for GLOBAL_ALERT: only an alert the receive loop can
+    /// verify is forwarded ([`crate::peer_info::global_alert_well_formed`];
+    /// the Ed448 signature itself is verified there). Anything else is
+    /// dropped without penalty until strict validation, rejected after.
+    pub async fn register_global_alert_validator(&self, bitmask: Vec<u8>) {
+        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
+            Box::new(|_peer, data| {
+                if crate::peer_info::global_alert_well_formed(data) {
+                    crate::ValidationResult::Accept
+                } else if crate::peer_info::strict_peer_info_validation() {
+                    crate::ValidationResult::Reject
+                } else {
+                    crate::ValidationResult::Ignore
                 }
-                ValidationResult::Accept
             });
         let _ = self
             .cmd_tx

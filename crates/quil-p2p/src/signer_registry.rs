@@ -9,7 +9,7 @@
 //! `node/consensus/registration/cached_signer_registry.go` that the
 //! runtime actually queries from consensus/materializer paths.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 use quil_types::crypto::BlsConstructor;
@@ -96,15 +96,18 @@ fn verify_key_registry_bindings(reg: &CanonicalKeyRegistry) -> bool {
     true
 }
 
-/// Hard cap on the number of distinct identities the registry will
-/// retain. Each entry is ~850 bytes (57-byte Ed448 + 585-byte BLS +
-/// two signatures + metadata), so 65536 × 850 ≈ 56 MB worst case.
-/// On real networks the live signer set is far smaller; this bound
-/// only kicks in under sustained Sybil / replay pressure where a
-/// malicious peer broadcasts KeyRegistry messages with fabricated
-/// identities. Without it, `update` is strictly append-on-newer and
-/// the maps grow linearly forever.
+/// Hard cap on the bindings of registered provers the registry retains
+/// (only a registered prover's binding authorizes anything). Each entry is
+/// about 2 KB (57-byte Ed448 key, 897-byte Falcon key, two signatures and
+/// indexes), so 65536 entries are about 130 MB at worst; the live signer
+/// set is far smaller.
 pub const MAX_SIGNER_ENTRIES: usize = 65_536;
+
+/// Hard cap on the bindings of identities that are not registered provers
+/// (a prover announcing itself before its join lands). Anyone can create
+/// such bindings, so they have their own quota and never evict a
+/// registered prover's binding.
+pub const MAX_UNREGISTERED_SIGNER_ENTRIES: usize = 4_096;
 
 /// One entry per registered identity.
 #[derive(Debug, Clone, Default)]
@@ -116,15 +119,32 @@ pub struct SignerEntry {
     pub last_updated_ms: u64,
 }
 
+impl SignerEntry {
+    /// Whether `reg` carries this entry's binding, signatures included: an
+    /// already verified binding, whatever its timestamp.
+    fn same_binding(&self, reg: &CanonicalKeyRegistry) -> bool {
+        self.bls_pubkey == reg.bls_pubkey
+            && self.identity_to_prover_sig == reg.identity_to_prover_sig
+            && self.prover_to_identity_sig == reg.prover_to_identity_sig
+    }
+}
+
+struct Held {
+    entry: SignerEntry,
+    /// Whether the prover key was a registered prover's when stored.
+    registered: bool,
+    /// Position in `Inner::order`.
+    seq: u64,
+}
+
 /// Joint state behind a single `RwLock`. Held together so eviction
-/// stays atomic across the two indexes; otherwise an evicted entry
+/// stays atomic across the indexes; otherwise an evicted entry
 /// could linger in one map after disappearing from the other.
 #[derive(Default)]
 struct Inner {
-    by_identity: HashMap<Vec<u8>, SignerEntry>,
-    /// Reverse index BLS pubkey → Ed448 identity. We store only the
-    /// identity key (not the full entry) to halve the per-entry
-    /// footprint; full entries are reachable via `by_identity`.
+    by_identity: HashMap<Vec<u8>, Held>,
+    /// Reverse index prover pubkey → Ed448 identity. A prover key is bound
+    /// to one identity: its newest binding.
     by_prover: HashMap<Vec<u8>, Vec<u8>>,
     /// Index libp2p `PeerId::to_bytes()` → prover (consensus/Falcon) pubkey.
     /// Derived from the Falcon prover pubkey (`peer_id_from_falcon_pubkey`, the
@@ -134,16 +154,42 @@ struct Inner {
     /// its prover so submit auth can require an ACTIVE prover (Go
     /// `authenticateProverFromContext`).
     by_peer_id: HashMap<Vec<u8>, Vec<u8>>,
-    /// Insertion / update order of Ed448 identities. Used to evict
-    /// the oldest-touched entry when `by_identity.len()` exceeds
-    /// `MAX_SIGNER_ENTRIES`.
-    order: VecDeque<Vec<u8>>,
+    /// Update order of the identities, per tier (`[unregistered,
+    /// registered]`): sequence number → identity, least recently updated
+    /// first. Evicts within a tier when it is full.
+    order: [BTreeMap<u64, Vec<u8>>; 2],
+    next_seq: u64,
+}
+
+impl Inner {
+    /// Whether `identity` holds a binding dated `ms` or later.
+    fn holds_since(&self, identity: &[u8], ms: u64) -> bool {
+        self.by_identity
+            .get(identity)
+            .is_some_and(|held| held.entry.last_updated_ms >= ms)
+    }
+
+    /// Remove `identity`'s entry from every index.
+    fn remove_identity(&mut self, identity: &[u8]) -> Option<SignerEntry> {
+        let held = self.by_identity.remove(identity)?;
+        self.order[usize::from(held.registered)].remove(&held.seq);
+        let prover = &held.entry.bls_pubkey;
+        if self.by_prover.get(prover).is_some_and(|id| id == identity) {
+            self.by_prover.remove(prover);
+        }
+        let peer = crate::falcon_identity::peer_id_from_falcon_pubkey(prover);
+        if self.by_peer_id.get(&peer) == Some(prover) {
+            self.by_peer_id.remove(&peer);
+        }
+        Some(held.entry)
+    }
 }
 
 /// Thread-safe in-memory store. Indexes by 57-byte Ed448 pubkey and
-/// 585-byte BLS G2 pubkey. `update` is last-write-wins scoped by
-/// `last_updated_ms` and capped at [`MAX_SIGNER_ENTRIES`] total
-/// entries (FIFO eviction by most recent write).
+/// prover pubkey. `update` is last-write-wins scoped by `last_updated_ms`
+/// and capped per tier ([`MAX_SIGNER_ENTRIES`] registered provers,
+/// [`MAX_UNREGISTERED_SIGNER_ENTRIES`] others), evicting the least
+/// recently updated binding of the tier.
 #[derive(Default)]
 pub struct SignerRegistry {
     inner: RwLock<Inner>,
@@ -154,96 +200,136 @@ impl SignerRegistry {
         Self::default()
     }
 
+    /// [`update_with`](Self::update_with) for a binding that is not a
+    /// registered prover's, accepting an unsigned timestamp.
+    pub fn update(&self, reg: CanonicalKeyRegistry) -> bool {
+        self.update_with(reg, false, |_| false)
+    }
+
     /// Accept a decoded KeyRegistry record. The identity↔prover
     /// cross-signatures are verified at this boundary (Finding B) so an
     /// unverified binding never lands in the registry — a peer cannot
-    /// inject an arbitrary Ed448→BLS pairing. Records with empty keys,
-    /// missing/invalid cross-signatures, or an older timestamp than an
-    /// existing binding are rejected. When the registry is at capacity,
-    /// the least-recently-updated identity is evicted to make room.
+    /// inject an arbitrary Ed448→BLS pairing. A record that repeats a
+    /// stored binding with a newer timestamp only refreshes it, without
+    /// verifying the cross-signatures again. A timestamp signature, when
+    /// present, must verify; `require_signed_timestamp` refuses records
+    /// without one. `is_registered` tells whether a prover key is a
+    /// registered prover's, which picks the binding's quota.
     ///
     /// Returns `true` if the record was accepted (inserted or updated),
     /// `false` if it was rejected for any reason.
-    pub fn update(&self, reg: CanonicalKeyRegistry) -> bool {
+    pub fn update_with(
+        &self,
+        reg: CanonicalKeyRegistry,
+        require_signed_timestamp: bool,
+        is_registered: impl FnOnce(&[u8]) -> bool,
+    ) -> bool {
         if reg.ed448_pubkey.is_empty() || reg.bls_pubkey.is_empty() {
             return false;
         }
-        // Finding B: reject bindings whose cross-signatures don't verify
-        // BEFORE they reach the in-memory maps.
-        if !verify_key_registry_bindings(&reg) {
+        if reg.timestamp_signature.is_empty() {
+            if require_signed_timestamp {
+                return false;
+            }
+        } else if !crate::peer_info::verify_key_registry_timestamp(&reg) {
             return false;
         }
-        self.insert_verified(reg)
+        let known = {
+            let inner = self.inner.read().unwrap();
+            match inner.by_identity.get(&reg.ed448_pubkey) {
+                Some(held) if held.entry.last_updated_ms >= reg.last_updated_ms => return false,
+                Some(held) if held.entry.same_binding(&reg) => Some(held.registered),
+                _ => None,
+            }
+        };
+        let registered = match known {
+            Some(true) => true,
+            Some(false) => is_registered(&reg.bls_pubkey),
+            None => {
+                // Finding B: reject bindings whose cross-signatures don't
+                // verify BEFORE they reach the in-memory maps.
+                if !verify_key_registry_bindings(&reg) {
+                    return false;
+                }
+                is_registered(&reg.bls_pubkey)
+            }
+        };
+        self.insert_verified_in(reg, registered)
+    }
+
+    /// [`insert_verified_in`](Self::insert_verified_in) as a registered
+    /// prover's binding.
+    #[cfg(test)]
+    fn insert_verified(&self, reg: CanonicalKeyRegistry) -> bool {
+        self.insert_verified_in(reg, true)
     }
 
     /// Insert an already-verified KeyRegistry record into the in-memory
-    /// indexes. Enforces timestamp-monotonicity (older replays ignored)
-    /// and capacity eviction. Returns `true` if the record was stored,
-    /// `false` if skipped as a stale replay.
+    /// indexes. Enforces timestamp-monotonicity (older replays ignored),
+    /// one identity per prover key and the tier's capacity. Returns `true`
+    /// if the record was stored, `false` if skipped as a stale replay.
     ///
-    /// Callers other than tests MUST go through [`update`], which gates
-    /// on cross-signature verification first.
-    fn insert_verified(&self, reg: CanonicalKeyRegistry) -> bool {
-        let entry = SignerEntry {
-            ed448_pubkey: reg.ed448_pubkey.clone(),
-            bls_pubkey: reg.bls_pubkey.clone(),
-            identity_to_prover_sig: reg.identity_to_prover_sig,
-            prover_to_identity_sig: reg.prover_to_identity_sig,
-            last_updated_ms: reg.last_updated_ms,
-        };
+    /// Callers other than tests MUST go through
+    /// [`update_with`](Self::update_with), which
+    /// gates on cross-signature verification first.
+    fn insert_verified_in(&self, reg: CanonicalKeyRegistry, registered: bool) -> bool {
         let mut inner = self.inner.write().unwrap();
-        // Capture only the bits we need from the existing entry so
-        // the immutable borrow ends before we mutate other fields.
-        enum Slot {
-            Skip,
-            Replace { stale_bls: Option<Vec<u8>> },
-            Insert,
+        if inner.holds_since(&reg.ed448_pubkey, reg.last_updated_ms) {
+            return false;
         }
-        let slot = match inner.by_identity.get(&reg.ed448_pubkey) {
-            Some(existing) if existing.last_updated_ms >= entry.last_updated_ms => Slot::Skip,
-            Some(existing) => {
-                let stale_bls = if existing.bls_pubkey != entry.bls_pubkey {
-                    Some(existing.bls_pubkey.clone())
-                } else {
-                    None
-                };
-                Slot::Replace { stale_bls }
+        // The prover key's holder signed both bindings; the newer stands.
+        let other = inner
+            .by_prover
+            .get(&reg.bls_pubkey)
+            .filter(|identity| **identity != reg.ed448_pubkey)
+            .cloned();
+        if let Some(other) = other {
+            if inner.holds_since(&other, reg.last_updated_ms) {
+                return false;
             }
-            None => Slot::Insert,
+            inner.remove_identity(&other);
+        }
+        // Replacing drops the old prover key's indexes, its peer ID too.
+        inner.remove_identity(&reg.ed448_pubkey);
+        let tier = usize::from(registered);
+        let cap = if registered {
+            MAX_SIGNER_ENTRIES
+        } else {
+            MAX_UNREGISTERED_SIGNER_ENTRIES
         };
-        match slot {
-            Slot::Skip => return false,
-            Slot::Replace { stale_bls } => {
-                if let Some(b) = stale_bls {
-                    inner.by_prover.remove(&b);
-                }
-                inner.order.retain(|id| id != &reg.ed448_pubkey);
-                inner.order.push_back(reg.ed448_pubkey.clone());
-            }
-            Slot::Insert => {
-                if inner.order.len() >= MAX_SIGNER_ENTRIES {
-                    if let Some(victim_id) = inner.order.pop_front() {
-                        if let Some(victim) = inner.by_identity.remove(&victim_id) {
-                            inner.by_prover.remove(&victim.bls_pubkey);
-                            let victim_peer = crate::falcon_identity::peer_id_from_falcon_pubkey(
-                                &victim.bls_pubkey,
-                            );
-                            inner.by_peer_id.remove(&victim_peer);
-                        }
-                    }
-                }
-                inner.order.push_back(reg.ed448_pubkey.clone());
-            }
+        while inner.order[tier].len() >= cap {
+            let Some((_, victim)) = inner.order[tier].pop_first() else {
+                break;
+            };
+            inner.remove_identity(&victim);
         }
-        let id_key = reg.ed448_pubkey.clone();
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.order[tier].insert(seq, reg.ed448_pubkey.clone());
         // peer_id (libp2p multihash of the FALCON prover key — the network
         // identity) → prover pubkey. The Ed448 pubkey remains the KeyRegistry
         // index (`by_identity`) + seniority root, but the live connection
         // identity is the Falcon prover key, so `by_peer_id` keys on it.
         let peer_id = crate::falcon_identity::peer_id_from_falcon_pubkey(&reg.bls_pubkey);
         inner.by_peer_id.insert(peer_id, reg.bls_pubkey.clone());
-        inner.by_prover.insert(reg.bls_pubkey, id_key.clone());
-        inner.by_identity.insert(id_key, entry);
+        inner
+            .by_prover
+            .insert(reg.bls_pubkey.clone(), reg.ed448_pubkey.clone());
+        let entry = SignerEntry {
+            ed448_pubkey: reg.ed448_pubkey.clone(),
+            bls_pubkey: reg.bls_pubkey,
+            identity_to_prover_sig: reg.identity_to_prover_sig,
+            prover_to_identity_sig: reg.prover_to_identity_sig,
+            last_updated_ms: reg.last_updated_ms,
+        };
+        inner.by_identity.insert(
+            reg.ed448_pubkey,
+            Held {
+                entry,
+                registered,
+                seq,
+            },
+        );
         true
     }
 
@@ -262,7 +348,7 @@ impl SignerRegistry {
         inner
             .by_identity
             .get(ed448_pubkey)
-            .map(|e| e.bls_pubkey.clone())
+            .map(|held| held.entry.bls_pubkey.clone())
     }
 
     /// Look up the Ed448 identity for a given BLS G2 prover pubkey.
@@ -274,7 +360,10 @@ impl SignerRegistry {
     /// Full entry by identity.
     pub fn get_by_identity(&self, ed448_pubkey: &[u8]) -> Option<SignerEntry> {
         let inner = self.inner.read().unwrap();
-        inner.by_identity.get(ed448_pubkey).cloned()
+        inner
+            .by_identity
+            .get(ed448_pubkey)
+            .map(|held| held.entry.clone())
     }
 
     /// Current entry count (identity-keyed).
@@ -301,6 +390,7 @@ mod tests {
             prover_to_identity_sig: vec![0x44; 74],
             keys_by_purpose: Vec::new(),
             last_updated_ms: 1,
+            timestamp_signature: Vec::new(),
         };
         reg.insert_verified(entry);
         let pk = reg.bls_pubkey_for_identity(&[0x11; 57]).unwrap();
@@ -520,6 +610,7 @@ mod tests {
             prover_to_identity_sig,
             keys_by_purpose: Vec::new(),
             last_updated_ms,
+            timestamp_signature: Vec::new(),
         };
         (reg, ed448_pubkey, bls_pubkey)
     }
@@ -576,6 +667,7 @@ mod tests {
             prover_to_identity_sig: attacker.prover_to_identity_sig.clone(),
             keys_by_purpose: Vec::new(),
             last_updated_ms: 2,
+            timestamp_signature: Vec::new(),
         };
         assert!(!reg.update(forged), "rebound prover key must be rejected");
         assert!(reg.identity_for_prover(&attacker_bls).is_none());
@@ -588,5 +680,134 @@ mod tests {
         rec.identity_to_prover_sig = Vec::new();
         assert!(!reg.update(rec), "missing identity sig must be rejected");
         assert_eq!(reg.len(), 0);
+    }
+
+    /// `valid_key_registry` with the prover's signature over its timestamp.
+    fn timestamped_key_registry(seed_byte: u8, last_updated_ms: u64) -> CanonicalKeyRegistry {
+        use quil_types::crypto::BlsConstructor as _;
+        let (mut rec, _, _) = valid_key_registry(seed_byte, last_updated_ms);
+        // Re-key the prover: valid_key_registry does not return its signer.
+        let (prover, prover_key) = quil_crypto::FalconKeyConstructor.new_key().unwrap();
+        let seed = [seed_byte; 57];
+        let identity = quil_crypto::Ed448Signer::from_bytes(
+            &seed,
+            &quil_crypto::Ed448Signer::derive_public(&seed).unwrap(),
+        )
+        .unwrap();
+        use quil_types::crypto::Signer as _;
+        let mut id_msg = KEY_REGISTRY_DOMAIN.to_vec();
+        id_msg.extend_from_slice(&prover_key);
+        rec.identity_to_prover_sig = identity.sign(&id_msg).unwrap();
+        rec.prover_to_identity_sig = prover
+            .sign_with_domain(&rec.ed448_pubkey, KEY_REGISTRY_DOMAIN)
+            .unwrap();
+        rec.bls_pubkey = prover_key.clone();
+        let message = crate::peer_info::key_registry_timestamp_message(
+            &rec.ed448_pubkey,
+            &prover_key,
+            last_updated_ms,
+        );
+        rec.timestamp_signature = prover
+            .sign_with_domain(&message, crate::peer_info::KEY_REGISTRY_TIMESTAMP_DOMAIN)
+            .unwrap();
+        rec
+    }
+
+    #[test]
+    fn a_strict_registry_takes_only_bindings_whose_timestamp_is_signed() {
+        let reg = SignerRegistry::new();
+        let (legacy, _, _) = valid_key_registry(0x21, 1);
+        assert!(!reg.update_with(legacy.clone(), true, |_| true));
+        assert!(
+            reg.update_with(legacy, false, |_| true),
+            "accepted before strict"
+        );
+        let signed = timestamped_key_registry(0x22, 5);
+        assert!(reg.update_with(signed.clone(), true, |_| true));
+        // Restamped: the timestamp signature no longer verifies.
+        let mut restamped = signed;
+        restamped.last_updated_ms = 6;
+        assert!(!reg.update_with(restamped.clone(), false, |_| true));
+        assert!(!reg.update_with(restamped, true, |_| true));
+    }
+
+    #[test]
+    fn a_repeated_binding_is_refreshed_and_a_forged_variant_is_not() {
+        let reg = SignerRegistry::new();
+        let (rec, ed448_pubkey, _) = valid_key_registry(0x23, 1);
+        assert!(reg.update(rec.clone()));
+        // Only an already verified binding can skip verification: a forged
+        // signature in an otherwise identical record is not the same binding.
+        let mut forged = rec.clone();
+        forged.identity_to_prover_sig = vec![0xAB; 114];
+        forged.last_updated_ms = 2;
+        assert!(!reg.update(forged));
+        let mut repeated = rec;
+        repeated.last_updated_ms = 3;
+        assert!(reg.update(repeated));
+        assert_eq!(
+            reg.get_by_identity(&ed448_pubkey).unwrap().last_updated_ms,
+            3
+        );
+    }
+
+    #[test]
+    fn rebinding_an_identity_drops_its_old_peer_id() {
+        let reg = SignerRegistry::new();
+        let (first, _, first_key) = valid_key_registry(0x24, 1);
+        let (second, _, second_key) = valid_key_registry(0x24, 2);
+        assert!(reg.update(first));
+        assert!(reg.update(second));
+        let old_peer = crate::falcon_identity::peer_id_from_falcon_pubkey(&first_key);
+        let new_peer = crate::falcon_identity::peer_id_from_falcon_pubkey(&second_key);
+        assert_eq!(reg.prover_key_for_peer_id(&old_peer), None);
+        assert_eq!(reg.prover_key_for_peer_id(&new_peer), Some(second_key));
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn a_prover_key_keeps_one_identity() {
+        let reg = SignerRegistry::new();
+        for i in 0..10u32 {
+            reg.insert_verified(CanonicalKeyRegistry {
+                ed448_pubkey: ed448_key(i),
+                bls_pubkey: bls_key(0),
+                last_updated_ms: 100 + i as u64,
+                ..Default::default()
+            });
+        }
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.identity_for_prover(&bls_key(0)), Some(ed448_key(9)));
+    }
+
+    #[test]
+    fn unregistered_bindings_cannot_evict_registered_ones() {
+        let reg = SignerRegistry::new();
+        reg.insert_verified_in(
+            CanonicalKeyRegistry {
+                ed448_pubkey: ed448_key(0),
+                bls_pubkey: bls_key(0),
+                last_updated_ms: 1,
+                ..Default::default()
+            },
+            true,
+        );
+        let total = MAX_UNREGISTERED_SIGNER_ENTRIES as u32 + 10;
+        for i in 1..=total {
+            reg.insert_verified_in(
+                CanonicalKeyRegistry {
+                    ed448_pubkey: ed448_key(i),
+                    bls_pubkey: bls_key(i),
+                    last_updated_ms: 100 + i as u64,
+                    ..Default::default()
+                },
+                false,
+            );
+        }
+        assert_eq!(reg.len(), MAX_UNREGISTERED_SIGNER_ENTRIES + 1);
+        assert_eq!(reg.bls_pubkey_for_identity(&ed448_key(0)), Some(bls_key(0)));
+        let first_peer = crate::falcon_identity::peer_id_from_falcon_pubkey(&bls_key(1));
+        assert_eq!(reg.prover_key_for_peer_id(&first_peer), None, "evicted");
+        assert!(reg.identity_for_prover(&bls_key(total)).is_some());
     }
 }

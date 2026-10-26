@@ -11,6 +11,12 @@ use quil_lifecycle::Supervisor;
 pub(crate) static SHARD_FRAME_VERIFY_TASKS: quil_engine::spawn_gate::SpawnGate =
     quil_engine::spawn_gate::SpawnGate::new("shard-frame-verify", 128);
 
+/// "verified peer build identity" lines per status interval for peers that
+/// are neither registered provers nor genesis archives (those are always
+/// logged): anyone can mint such peers. Peers republish every 30 minutes,
+/// so a mainnet node of about 100 peers logs about two per interval.
+const OTHER_BUILD_LINES_PER_STATUS: u32 = 32;
+
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
@@ -285,6 +291,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         // Peers whose build identity this run has logged.
         let mut peer_builds_logged: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut other_build_lines_left = OTHER_BUILD_LINES_PER_STATUS;
+        // Bounds of the PeerInfo cache; the records restored from the last
+        // run are indexed first.
+        let mut peer_info_bounds = super::peer_info_bounds::PeerInfoBounds::default();
+        peer_info_bounds.adopt(&mut pic_for_recv.write(), |info| {
+            super::peer_info_bounds::preferred(info, &genesis_archive_peer_ids_for_recv, &*pr_for_recv)
+        });
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         // When the loop started: archives announce themselves about every
         // thirty minutes, so the first one is verified up to that long after it.
@@ -548,6 +561,18 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
                         .unwrap_or(0);
                     global_execution.observe(std::time::Instant::now(), cf_for_recv.materialized(), cf_for_recv.effective());
+                    // Strict GLOBAL_PEER_INFO validation follows the GLOBAL head.
+                    let strict_peer_info = quil_types::consensus::strict_peer_info_active(latest_frame);
+                    if quil_p2p::set_strict_peer_info_validation(strict_peer_info) != strict_peer_info {
+                        info!(
+                            frame = latest_frame,
+                            epoch = quil_types::consensus::strict_peer_info_epoch(),
+                            strict = strict_peer_info,
+                            "GLOBAL_PEER_INFO validation changed: when strict, peers forwarding invalid PeerInfo, KeyRegistry or alerts are penalised and KeyRegistry records with an unsigned timestamp are refused"
+                        );
+                    }
+                    peer_info_bounds.expire(&mut pic_for_recv.write(), super::peer_info_file::unix_millis());
+                    other_build_lines_left = OTHER_BUILD_LINES_PER_STATUS;
                     let (active, pending, total_allocs) = {
                         use quil_types::consensus::{EffectiveStatus, ProverRegistry};
                         let info = {
@@ -685,6 +710,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         host_swap_total_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_total_bytes)),
                         host_swap_used_mb = host_mem.map(|h| crate::mem_stats::fmt_mb(h.swap_used_bytes)),
                         peer_info_cache = sizes.peer_info_cache,
+                        // Its bounds (peer_info_bounds.rs): memory held, and
+                        // records evicted, expired and refused since start.
+                        peer_info_cache_mb = %crate::mem_stats::fmt_mb(peer_info_bounds.bytes() as u64),
+                        peer_info_evicted = peer_info_bounds.evicted,
+                        peer_info_expired = peer_info_bounds.expired,
+                        peer_info_refused = peer_info_bounds.refused,
                         shard_engines = sizes.shard_engines,
                         signer_registry = sizes.signer_registry,
                         archive_peers_seen = sizes.archive_peers_seen,
@@ -815,15 +846,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             //
                             // The only bitmask workers still need from
                             // the master stream is GLOBAL_PEER_INFO
-                            // (peer discovery for their own mesh).
-                            if received.bitmask.as_slice() == GLOBAL_PEER_INFO {
-                                let _ = gmtx_for_recv.send(
-                                    quil_types::proto::global::StreamGlobalMessagesResponse {
-                                        data: received.data.clone(),
-                                        bitmask: received.bitmask.clone(),
-                                    },
-                                );
-                            }
+                            // (peer discovery for their own mesh): a PeerInfo
+                            // is forwarded below once verified.
 
                             // Per-topic validator gate. Malformed bytes are
                             // dropped before they reach a queue.
@@ -930,6 +954,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         if !super::peer_info_file::verified(&info) {
                                             continue;
                                         }
+                                        // Workers learn committee keys from it.
+                                        let _ = gmtx_for_recv.send(
+                                            quil_types::proto::global::StreamGlobalMessagesResponse {
+                                                data: received.data.clone(),
+                                                bitmask: received.bitmask.clone(),
+                                            },
+                                        );
                                         // Dedup: hash PeerInfo with timestamp zeroed
                                         // (mirrors Go's hashPeerInfo). Skip if seen.
                                         let mut dedup_info = info.clone();
@@ -948,21 +979,31 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                             peer_info_digest_cache.clear();
                                         }
                                         if !info.peer_id.is_empty() {
+                                            let preferred = super::peer_info_bounds::preferred(
+                                                &info,
+                                                &genesis_archive_peer_ids_for_recv,
+                                                &*pr_for_recv,
+                                            );
                                             let mut cache = pic_for_recv.write();
                                             let fingerprint = info.build_fingerprint();
                                             // Logged at each peer's first PeerInfo of
                                             // this run too, also when a record restored
                                             // from the last run already names its build.
-                                            let first_this_run = peer_builds_logged.insert(info.peer_id.clone());
-                                            if peer_builds_logged.len() > 10_000 {
-                                                peer_builds_logged.clear();
-                                            }
-                                            let build_changed = first_this_run || cache.get(&info.peer_id).map(|old| {
+                                            let build_changed = !peer_builds_logged.contains(&info.peer_id) || cache.get(&info.peer_id).map(|old| {
                                                 old.build_fingerprint() != fingerprint
                                                     || old.version != info.version
                                                     || old.patch_number != info.patch_number
                                             }).unwrap_or(true);
-                                            if build_changed {
+                                            let admitted = peer_info_bounds.admit(&mut cache, info.clone(), preferred).admitted();
+                                            drop(cache);
+                                            if admitted && build_changed && (preferred || other_build_lines_left > 0) {
+                                                if !preferred {
+                                                    other_build_lines_left -= 1;
+                                                }
+                                                peer_builds_logged.insert(info.peer_id.clone());
+                                                if peer_builds_logged.len() > 10_000 {
+                                                    peer_builds_logged.clear();
+                                                }
                                                 info!(
                                                     peer = %bs58::encode(&info.peer_id).into_string(),
                                                     version = %quil_config::format_version(&info.version),
@@ -971,11 +1012,6 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     local_build_fingerprint = env!("QUIL_BUILD_FINGERPRINT"),
                                                     "verified peer build identity"
                                                 );
-                                            }
-                                            // A delayed copy of an older record never
-                                            // replaces a newer one.
-                                            if super::peer_info_file::supersedes(cache.get(&info.peer_id), &info) {
-                                                cache.insert(info.peer_id.clone(), info.clone());
                                             }
                                         }
                                         // Only ARCHIVE-capable peers go into the
@@ -1168,7 +1204,12 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                 // whose sigs don't validate, so a peer
                                                 // can't inject an arbitrary Ed448→BLS
                                                 // pairing.
-                                                if sr_for_recv.update(reg) {
+                                                // Strict validation refuses a KeyRegistry
+                                                // whose timestamp is not signed.
+                                                let strict = quil_p2p::strict_peer_info_validation();
+                                                if sr_for_recv.update_with(reg, strict, |prover_key| {
+                                                    super::peer_info_bounds::registered_prover(prover_key, &*pr_for_recv)
+                                                }) {
                                                     debug!(
                                                         identity_len,
                                                         prover_len,
@@ -1179,7 +1220,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                                     debug!(
                                                         identity_len,
                                                         prover_len,
-                                                        "rejected KeyRegistry: invalid cross-signature, empty key, or stale replay"
+                                                        "rejected KeyRegistry: invalid cross-signature or timestamp signature, unsigned timestamp under strict validation, empty key, or stale replay"
                                                     );
                                                 }
                                             }
