@@ -42,7 +42,7 @@ pub fn verify_from_clock(
     if root != claim.global_root {
         return Err(invalid("global root mismatch"));
     }
-    mint_authorization::verify_membership(
+    mint_authorization::verify_membership_with(
         network,
         application,
         &claim.receipt,
@@ -50,6 +50,7 @@ pub fn verify_from_clock(
         claim.fee,
         &root,
         &claim.forest_proof,
+        quil_types::consensus::vertex_value_binding_active(bound),
     )?;
     Ok(VerifiedMintClaim { claim })
 }

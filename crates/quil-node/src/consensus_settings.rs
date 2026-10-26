@@ -23,6 +23,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_HASH_STORAGE_PROOF_EPOCH override active (localnet only)"
         );
     }
+    let binding_epoch = quil_types::consensus::init_vertex_value_binding_epoch(network);
+    if network != 0 && binding_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = binding_epoch,
+            "QUIL_VERTEX_VALUE_BINDING_EPOCH override active (localnet only)"
+        );
+    }
     let succession_epoch = quil_types::consensus::init_seniority_succession_epoch(network);
     if network != 0 && succession_epoch != u64::MAX {
         tracing::warn!(

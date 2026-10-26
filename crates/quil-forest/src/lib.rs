@@ -63,7 +63,8 @@ pub use database::{
 pub use jmt::storage::TreeReader;
 pub use jmt::KeyHash;
 pub use membership_proof::{
-    verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
+    verify_vertex_membership, verify_vertex_membership_with, MembershipProof, ShardAggregation,
+    VertexMembershipProof,
 };
 pub use overlay::{
     ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits, OverlayMutation,

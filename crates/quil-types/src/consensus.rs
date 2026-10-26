@@ -692,6 +692,74 @@ pub fn set_hash_storage_proof_epoch_for_thread(epoch: Option<u64>) {
     HASH_STORAGE_PROOF_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a vertex membership proof authenticates a field only
+/// when the field's leaf commitment binds its value. A leaf carrying a
+/// `hash_target` commits that target instead of its value, so its value is
+/// not authenticated by the vertex commitment. From this epoch mint claims,
+/// settlement claims, deliveries, reward mints and prover kicks reject a
+/// proof whose bound field sits in such a leaf; the records they prove
+/// never carry one. Consensus-affecting: every archive and prover must run a
+/// build with it before then. `None` on mainnet until it is decided;
+/// `QUIL_VERTEX_VALUE_BINDING_EPOCH` elsewhere, never by default.
+pub const MAINNET_VERTEX_VALUE_BINDING_EPOCH: Option<u64> = Some(0);
+
+static VERTEX_VALUE_BINDING_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static VERTEX_VALUE_BINDING_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn vertex_value_binding_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_VERTEX_VALUE_BINDING_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's vertex value binding epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_vertex_value_binding_epoch(network: u8) -> u64 {
+    *VERTEX_VALUE_BINDING_EPOCH.get_or_init(|| {
+        vertex_value_binding_epoch_for(
+            network,
+            std::env::var("QUIL_VERTEX_VALUE_BINDING_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_vertex_value_binding_epoch`]; the mainnet epoch
+/// in a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX`: never.
+pub fn vertex_value_binding_epoch() -> u64 {
+    if let Some(epoch) = VERTEX_VALUE_BINDING_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *VERTEX_VALUE_BINDING_EPOCH.get_or_init(|| vertex_value_binding_epoch_for(0, None))
+}
+
+/// Whether a membership proof checked at GLOBAL frame `frame` (or in an app
+/// frame anchored at it) must bind every proven field's value.
+pub fn vertex_value_binding_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= vertex_value_binding_epoch()
+}
+
+/// Whether this network has an activation epoch for the binding at all.
+/// Node-local checks of synced state, which carry no frame, follow it.
+pub fn vertex_value_binding_scheduled() -> bool {
+    vertex_value_binding_epoch() != u64::MAX
+}
+
+/// Set the vertex value binding epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_vertex_value_binding_epoch_for_thread(epoch: Option<u64>) {
+    VERTEX_VALUE_BINDING_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The effective state of an allocation at a given frame, with the
 /// 720-frame grace window applied. Prefer this over reading
 /// `alloc.status` directly anywhere the protocol's implicit
@@ -2166,6 +2234,42 @@ mod seniority_succession_epoch_tests {
         assert_eq!(
             super::seniority_succession_quiet_frames(),
             2 * super::epoch_length_frames()
+        );
+    }
+}
+
+#[cfg(test)]
+mod vertex_value_binding_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_vertex_value_binding_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::vertex_value_binding_epoch_for(0, setting),
+                super::MAINNET_VERTEX_VALUE_BINDING_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::vertex_value_binding_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::vertex_value_binding_epoch_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::vertex_value_binding_epoch_for(1, None), u64::MAX);
+    }
+
+    #[test]
+    fn binding_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_vertex_value_binding_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::vertex_value_binding_active(u64::MAX - 1));
+        assert!(!super::vertex_value_binding_scheduled());
+        super::set_vertex_value_binding_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::vertex_value_binding_active(first - 1));
+        assert!(super::vertex_value_binding_active(first));
+        assert!(super::vertex_value_binding_scheduled());
+        super::set_vertex_value_binding_epoch_for_thread(None);
+        assert_eq!(
+            super::vertex_value_binding_epoch(),
+            super::MAINNET_VERTEX_VALUE_BINDING_EPOCH.unwrap_or(u64::MAX)
         );
     }
 }

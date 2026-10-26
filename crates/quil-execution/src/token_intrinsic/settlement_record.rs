@@ -360,6 +360,19 @@ pub fn verify_membership(
     root: &[u8; 32],
     proof: &[u8],
 ) -> Result<()> {
+    verify_membership_with(network, entry, root, proof, true)
+}
+
+#[cfg(feature = "confidential-tokens")]
+/// [`verify_membership`] under the consensus rule of the claim's anchor:
+/// `bind_values` from `quil_types::consensus::vertex_value_binding_active`.
+pub fn verify_membership_with(
+    network: &[u8; 32],
+    entry: &SettlementEntry,
+    root: &[u8; 32],
+    proof: &[u8],
+    bind_values: bool,
+) -> Result<()> {
     if entry.parameter_context != parameter_context(network, &crate::domains::QUIL_TOKEN) {
         return Err(invalid("settlement belongs to another network"));
     }
@@ -373,8 +386,13 @@ pub fn verify_membership(
     if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != address {
         return Err(invalid("proof does not address the receipt"));
     }
-    quil_forest::verify_vertex_membership(root, &membership.inputs[0], &fields(entry)?)
-        .map_err(|_| invalid("record not proven at the cited root"))
+    quil_forest::verify_vertex_membership_with(
+        root,
+        &membership.inputs[0],
+        &fields(entry)?,
+        bind_values,
+    )
+    .map_err(|_| invalid("record not proven at the cited root"))
 }
 
 #[cfg(test)]

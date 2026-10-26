@@ -41,7 +41,21 @@ impl VectorCommitmentTree {
 
     /// Get a value by key.
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.get_leaf(key).map(|leaf| leaf.value.as_slice())
+    }
+
+    /// Get the leaf stored at `key`, so a caller authenticating a value can
+    /// check that the leaf's commitment binds it
+    /// ([`LeafNode::value_is_bound`]).
+    pub fn get_leaf(&self, key: &[u8]) -> Option<&LeafNode> {
         get_recursive(self.root.as_ref(), key, 0)
+    }
+
+    /// Whether any leaf carries a value its commitment does not bind.
+    pub fn has_unbound_values(&self) -> bool {
+        self.root
+            .as_ref()
+            .is_some_and(VectorCommitmentNode::has_unbound_value)
     }
 
     /// Delete a key from the tree.
@@ -419,11 +433,11 @@ fn get_recursive<'a>(
     node: Option<&'a VectorCommitmentNode>,
     key: &[u8],
     depth: usize,
-) -> Option<&'a [u8]> {
+) -> Option<&'a LeafNode> {
     match node? {
         VectorCommitmentNode::Leaf(leaf) => {
             if leaf.key == key {
-                Some(&leaf.value)
+                Some(leaf)
             } else {
                 None
             }

@@ -182,6 +182,18 @@ pub fn sync_blob_matches(phase_idx: usize, leaf: &[u8], blob: &[u8]) -> Result<b
     Ok(quil_tries::vertex_leaf_value(blob)? == leaf)
 }
 
+/// Whether a synced vertex blob carries a field value its commitment does not
+/// bind (a leaf with a `hash_target`). GLOBAL records never do, apart from the
+/// domain's metadata vertex, so with the vertex value binding scheduled a sync
+/// refuses such a GLOBAL blob: the authenticated leaf would not cover the
+/// field values the node later reads from it.
+pub fn sync_blob_has_unbound_values(blob: &[u8]) -> bool {
+    quil_tries::deserialize_go_tree(blob)
+        .ok()
+        .flatten()
+        .is_some_and(|root| root.has_unbound_value())
+}
+
 /// Marks an application phase whose confinement commit still needs its
 /// records outside the kept shards swept (see `confine_forest`).
 fn confinement_sweep_key(app: &[u8; 32], phase_idx: usize) -> Vec<u8> {
@@ -3397,7 +3409,10 @@ impl HypergraphCrdt {
             ));
         }
         let leaves = &plan.remaining()[..blobs.len()];
-        for ((_, leaf), blob) in leaves.iter().zip(blobs) {
+        let bind_values = plan.phase_idx == 0
+            && plan.shard_id.starts_with(&[0xff; 32])
+            && quil_types::consensus::vertex_value_binding_scheduled();
+        for ((key, leaf), blob) in leaves.iter().zip(blobs) {
             let matches = match leaf {
                 Some(leaf) => sync_blob_matches(plan.phase_idx, leaf, blob)?,
                 None => blob.is_empty(),
@@ -3405,6 +3420,11 @@ impl HypergraphCrdt {
             if !matches {
                 return Err(QuilError::InvalidArgument(
                     "synced blob does not match its authenticated leaf".into(),
+                ));
+            }
+            if bind_values && *key != [0xff; 32] && sync_blob_has_unbound_values(blob) {
+                return Err(QuilError::InvalidArgument(
+                    "synced GLOBAL vertex carries a field its commitment does not bind".into(),
                 ));
             }
         }
@@ -5947,5 +5967,72 @@ mod size_index_tests {
             "forest vs scan must agree under removes (spent, double-remove, \
              never-added, removed hyperedge)\nforest={forest:?}\nscan={scan:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_value_binding_tests {
+    use super::*;
+    use crate::testing::{CrdtTreeReader, MemStore, StubProver};
+
+    fn crdt() -> Arc<HypergraphCrdt> {
+        let crdt = HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver));
+        Arc::new(crdt)
+    }
+
+    fn blob(key: &[u8], value: &[u8], hash_target: &[u8]) -> Vec<u8> {
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0xff; 32], &[7; 32], &[], &BigInt::from(32))
+            .unwrap();
+        tree.insert(key, value, hash_target, &BigInt::from(value.len()))
+            .unwrap();
+        quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()
+    }
+
+    /// Install `blob` as the one GLOBAL vertex at `data_address` on a fresh
+    /// node, by a sync from a node that holds it.
+    fn sync_one(data_address: [u8; 32], blob: &[u8]) -> Result<()> {
+        let address = [0xff; 32];
+        let archive = crdt();
+        let location = Location {
+            app_address: address,
+            data_address,
+        };
+        archive.add_vertex(&location, blob).unwrap();
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = CrdtTreeReader {
+            source: archive,
+            shard_id: address.to_vec(),
+            phase: 0,
+        };
+        let target = crdt();
+        let mut plan = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &address,
+                0,
+                &[],
+                Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
+        target.apply_sync_chunk(&mut plan, &[blob.to_vec()])
+    }
+
+    /// GLOBAL records carry no `hash_target` leaf. Once the binding is
+    /// scheduled, a synced GLOBAL vertex whose field the authenticated leaf
+    /// does not bind is refused; the metadata vertex may seal sub-trees.
+    #[test]
+    fn a_scheduled_binding_refuses_a_global_vertex_with_an_unbound_field() {
+        let bound = blob(&[4], &[0xaa; 8], &[]);
+        let unbound = blob(&[4], &[0xaa; 8], &[0xbb; 8]);
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(u64::MAX));
+        assert!(sync_one([1; 32], &unbound).is_ok(), "inert until scheduled");
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(Some(10));
+        assert!(sync_one([1; 32], &bound).is_ok());
+        assert!(sync_one([1; 32], &unbound).is_err());
+        assert!(sync_one([0xff; 32], &unbound).is_ok());
+        quil_types::consensus::set_vertex_value_binding_epoch_for_thread(None);
     }
 }

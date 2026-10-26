@@ -338,12 +338,14 @@ pub fn verify_prover_kick_full(
                 "prover kick: forest proof vertex address != kicked prover's vertex".into(),
             ));
         }
-        quil_forest::verify_vertex_membership(&root32, vertex, &expected).map_err(|e| {
-            QuilError::InvalidArgument(format!(
-                "prover kick: forest membership failed (prover not present/active): {}",
-                e
-            ))
-        })?;
+        let bind_values = quil_types::consensus::vertex_value_binding_active(frame_number);
+        quil_forest::verify_vertex_membership_with(&root32, vertex, &expected, bind_values)
+            .map_err(|e| {
+                QuilError::InvalidArgument(format!(
+                    "prover kick: forest membership failed (prover not present/active): {}",
+                    e
+                ))
+            })?;
     }
 
     // Double-tap: ensure the kicked prover vertex actually exists in
