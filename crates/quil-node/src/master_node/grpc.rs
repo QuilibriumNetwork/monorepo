@@ -398,6 +398,239 @@ fn log_handshake_timeouts(timeouts: u64, since: Option<std::time::Duration>) {
         "PQNoise handshakes timed out on the peer gRPC listener");
 }
 
+/// Whether `peer` (a `PeerId::to_bytes()`) resolves, through its verified
+/// KeyRegistry binding, to a prover that is active or holds an active
+/// allocation.
+pub(crate) fn peer_is_active_prover(
+    signer_registry: &quil_p2p::SignerRegistry,
+    prover_registry: &dyn quil_types::consensus::ProverRegistry,
+    peer: &[u8],
+) -> bool {
+    let Some(prover_key) = signer_registry.prover_key_for_peer_id(peer) else {
+        return false;
+    };
+    let Ok(addr) =
+        quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&prover_key)
+    else {
+        return false;
+    };
+    matches!(
+        prover_registry.get_prover_info(&addr),
+        Ok(Some(info))
+            if info.status == quil_types::consensus::ProverStatus::Active
+                || info
+                    .allocations
+                    .iter()
+                    .any(|a| a.status == quil_types::consensus::ProverStatus::Active)
+    )
+}
+
+/// Where NodeService is served, for the address `listenGrpcMultiaddr` names.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeServiceBind {
+    /// A loopback address, as configured.
+    Loopback(String),
+    /// A non-loopback address, as configured and allowed by
+    /// `listenGrpcAllowRemote`.
+    Remote(String),
+    /// The loopback address on the configured port: the configured
+    /// non-loopback address was not allowed.
+    Refused { bind: String, configured: String },
+}
+
+/// NodeService authenticates no caller, so it is served on a non-loopback
+/// address only when `allow_remote` (`listenGrpcAllowRemote`) is set. An
+/// address that does not parse is left for the server to refuse.
+fn node_service_bind(configured: String, allow_remote: bool) -> NodeServiceBind {
+    match configured.parse::<std::net::SocketAddr>() {
+        Ok(addr) if !addr.ip().is_loopback() && !allow_remote => NodeServiceBind::Refused {
+            bind: std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())).to_string(),
+            configured,
+        },
+        Ok(addr) if !addr.ip().is_loopback() => NodeServiceBind::Remote(configured),
+        _ => NodeServiceBind::Loopback(configured),
+    }
+}
+
+/// How often refused peer submits are summarized in the log.
+const SUBMIT_REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The message collector's refusal reasons, as the summary names them.
+const SUBMIT_REFUSAL_NAMES: [&str; 5] = [
+    "prover_only",
+    "unknown_shard",
+    "rank_full",
+    "invalid_shard_frame",
+    "awaiting_execution",
+];
+
+fn submit_refusal_slot(refusal: quil_engine::message_collector::Refusal) -> usize {
+    use quil_engine::message_collector::Refusal;
+    match refusal {
+        Refusal::ProverOnly => 0,
+        Refusal::UnknownShard => 1,
+        Refusal::RankFull => 2,
+        Refusal::InvalidShardFrame => 3,
+        Refusal::AwaitingExecution => 4,
+    }
+}
+
+/// Peer submits the message collector refused since the last line: the
+/// first is logged at once, the rest at most once per
+/// [`SUBMIT_REFUSAL_REPORT_INTERVAL`], with the next refusal after it.
+struct SubmitRefusals {
+    counts: [u64; 5],
+    latest_peer: String,
+    latest_reason: &'static str,
+    logged_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubmitRefusalSummary {
+    counts: [u64; 5],
+    latest_peer: String,
+    latest_reason: &'static str,
+    since_previous: Option<std::time::Duration>,
+}
+
+impl SubmitRefusals {
+    const fn new() -> Self {
+        Self {
+            counts: [0; 5],
+            latest_peer: String::new(),
+            latest_reason: "",
+            logged_at: None,
+        }
+    }
+
+    fn record(
+        &mut self,
+        refusal: quil_engine::message_collector::Refusal,
+        peer: String,
+        now: std::time::Instant,
+    ) -> Option<SubmitRefusalSummary> {
+        self.counts[submit_refusal_slot(refusal)] += 1;
+        self.latest_peer = peer;
+        self.latest_reason = refusal.reason();
+        let since_previous = self.logged_at.map(|at| now.saturating_duration_since(at));
+        if since_previous.is_some_and(|elapsed| elapsed < SUBMIT_REFUSAL_REPORT_INTERVAL) {
+            return None;
+        }
+        self.logged_at = Some(now);
+        Some(SubmitRefusalSummary {
+            counts: std::mem::take(&mut self.counts),
+            latest_peer: std::mem::take(&mut self.latest_peer),
+            latest_reason: self.latest_reason,
+            since_previous,
+        })
+    }
+}
+
+/// Count a refused peer submit, and log the refusals at most once a minute.
+fn note_submit_refusal(
+    refusal: quil_engine::message_collector::Refusal,
+    peer: String,
+    executed: u64,
+    head: u64,
+) {
+    static REFUSALS: std::sync::Mutex<SubmitRefusals> =
+        std::sync::Mutex::new(SubmitRefusals::new());
+    let summary = REFUSALS.lock().unwrap_or_else(|e| e.into_inner()).record(
+        refusal,
+        peer,
+        std::time::Instant::now(),
+    );
+    if let Some(summary) = summary {
+        log_submit_refusals(&summary, executed, head);
+    }
+}
+
+fn log_submit_refusals(summary: &SubmitRefusalSummary, executed: u64, head: u64) {
+    let counts = SUBMIT_REFUSAL_NAMES
+        .iter()
+        .zip(summary.counts)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let window = match summary.since_previous {
+        Some(elapsed) => format!("the last {}s", elapsed.as_secs()),
+        None => "startup".to_string(),
+    };
+    let (latest_peer, latest_reason) = (&summary.latest_peer, summary.latest_reason);
+    if summary.counts[submit_refusal_slot(quil_engine::message_collector::Refusal::RankFull)] > 0 {
+        warn!(
+            executed,
+            head,
+            %latest_peer,
+            latest_reason,
+            "gRPC submits refused by the message collector since {window}: {counts}; rank_full \
+             means this node's mempool is at its cap, which a node whose GLOBAL execution trails \
+             its head reaches first; submitters are told why and retry"
+        );
+    } else {
+        info!(
+            executed,
+            head,
+            %latest_peer,
+            latest_reason,
+            "gRPC submits refused by the message collector since {window}: {counts}; submitters \
+             are told why and retry awaiting_execution ones; unknown_shard and \
+             invalid_shard_frame are the senders' unless this node's execution trails its head"
+        );
+    }
+}
+
+/// The open file limit of this process, as raised at startup.
+fn open_file_limit() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the limit into `lim`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            return u64::from(lim.rlim_cur);
+        }
+    }
+    1024
+}
+
+/// Requests one peer connection may carry at once. A compliant client queues
+/// past it rather than failing.
+const PEER_MAX_STREAMS_PER_CONNECTION: u32 = 256;
+
+/// How long a peer request may take until its response starts (a streaming
+/// response's stream then runs on). It bounds a request whose body arrives
+/// slowly as well as a slow handler; every handler answers well within it, and
+/// peers give up sooner.
+const PEER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn log_connection_refusals(
+    limiter: &quil_rpc::connection_limits::ConnectionLimiter,
+    report: &quil_rpc::connection_limits::RefusalReport,
+) {
+    warn!(
+        per_source = report.per_source,
+        total = report.total,
+        reserve = report.reserve,
+        open = report.open,
+        max_connections = limiter.total(),
+        max_per_source = limiter.per_source(),
+        latest_source = %report
+            .latest_source
+            .map_or_else(|| "none".to_string(), |ip| ip.to_string()),
+        since_previous_line_secs = %report
+            .since_previous
+            .map_or_else(|| "none".to_string(), |d| d.as_secs().to_string()),
+        "peer gRPC listener refused connections: per_source counts a source address at its cap \
+         (p2p.streamMaxConnectionsPerSource), total the listener at its cap \
+         (p2p.streamMaxConnections), reserve a connection kept for active provers and the GLOBAL \
+         committee whose peer was neither; one source at its cap is a peer opening too many \
+         connections, a steady total count a node that needs a higher cap or open file limit"
+    );
+}
+
 /// The shard path of a full filter, and the last address of its range.
 fn shard_range(filter: &[u8]) -> Option<(quil_types::execution::ShardPath, [u8; 32])> {
     let (_, bits) = quil_forest::decode_shard_filter_or_root(filter, 32)?;
@@ -1297,25 +1530,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 return true; // (a) the node's own workers/pipeline.
             }
             // (b) resolve peer_id → Falcon prover key → address → ACTIVE.
-            let Some(prover_key) = sr.prover_key_for_peer_id(&caller) else {
-                return false;
-            };
-            let Ok(addr) =
-                quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(
-                    &prover_key,
-                )
-            else {
-                return false;
-            };
-            matches!(
-                pr.get_prover_info(&addr),
-                Ok(Some(info))
-                    if info.status == quil_types::consensus::ProverStatus::Active
-                        || info
-                            .allocations
-                            .iter()
-                            .any(|a| a.status == quil_types::consensus::ProverStatus::Active)
-            )
+            peer_is_active_prover(&sr, pr.as_ref(), &caller)
         })
     };
 
@@ -1337,14 +1552,40 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             "127.0.0.1:8337".to_string()
         }
     };
+    let grpc_addr = match node_service_bind(grpc_addr, config.listen_grpc_allow_remote) {
+        NodeServiceBind::Loopback(addr) => addr,
+        NodeServiceBind::Remote(addr) => {
+            warn!(
+                %addr,
+                "NodeService is served on a non-loopback address (listenGrpcAllowRemote): it \
+                 authenticates no caller, so anyone who reaches this port can join, leave and \
+                 manage this node's provers and read its state; restrict the port to trusted \
+                 hosts with a firewall"
+            );
+            addr
+        }
+        NodeServiceBind::Refused { bind, configured } => {
+            warn!(
+                %configured,
+                %bind,
+                "NodeService is served on loopback only, not on the configured non-loopback \
+                 address: it authenticates no caller, so anyone who reached it could join, leave \
+                 and manage this node's provers and read its state; to serve it remotely anyway, \
+                 set listenGrpcAllowRemote: true and restrict the port to trusted hosts"
+            );
+            bind
+        }
+    };
 
     // Submit handler
     let submit_mc = message_collector.clone();
     let submit_cf = current_frame.clone();
+    let submit_prover = prover_authorizer.clone();
     let submit_handler: quil_rpc::SubmitHandler = Arc::new(
         move |request: tonic::Request<quil_types::proto::global::SubmitGlobalMessageRequest>| {
             let submit_mc = submit_mc.clone();
             let submit_cf = submit_cf.clone();
+            let submit_prover = submit_prover.clone();
             Box::pin(async move {
                 use quil_rpc::SubmitRefusal;
                 let auth = request
@@ -1387,9 +1628,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         ));
                     };
                     let collector = submit_mc.clone();
+                    let sender = auth.clone();
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        collector.add_message_outcome(rank, data)
+                        // Only this node and active provers may have a frame
+                        // held before it can be verified.
+                        let provenance = if submit_prover(&sender) {
+                            quil_engine::message_collector::Provenance::Prover
+                        } else {
+                            quil_engine::message_collector::Provenance::Other
+                        };
+                        collector.add_message_outcome_from(rank, data, provenance)
                     })
                     .await
                     .map_err(|error| {
@@ -1421,14 +1670,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         // addresses and ranks by its own state. A full mempool
                         // asks for a retry.
                         let (executed, head) = (submit_cf.materialized(), submit_cf.effective());
-                        tracing::warn!(
-                            peer = %auth.peer_id,
-                            rank,
-                            reason = refusal.reason(),
-                            executed,
-                            head,
-                            "gRPC submit REJECTED by message collector"
-                        );
+                        note_submit_refusal(refusal, auth.peer_id.to_string(), executed, head);
                         Err(SubmitRefusal {
                         reason: format!(
                             "message collector rejected: {} (rank {rank}, executed {executed}, head {head})",
@@ -1823,7 +2065,12 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             }
             // Consensus rank, not frame number (see peer submit handler).
             let rank = node_submit_cf.effective_rank();
-            match node_submit_mc.add_message_outcome(rank, data) {
+            // NodeService authenticates no caller.
+            match node_submit_mc.add_message_outcome_from(
+                rank,
+                data,
+                quil_engine::message_collector::Provenance::Other,
+            ) {
                 // Duplicate = already delivered → success (not a drop).
                 quil_engine::message_collector::SubmitOutcome::Accepted
                 | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
@@ -3454,6 +3701,41 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         let seed = mtls_seed.ok_or_else(|| anyhow::anyhow!(
             "peer gRPC requires an Ed448 identity — set `p2p.peerPrivKey` to a 57-byte hex seed (or 114-byte seed+pubkey). Without it no peer can authenticate against this node.",
         ))?;
+        // Connection caps (see `quil_rpc::connection_limits`): per public
+        // source address and in all, the total derived from the open file
+        // limit unless configured, with a reserve for privileged peers.
+        let fd_limit = open_file_limit();
+        let limiter = quil_rpc::connection_limits::ConnectionLimiter::new(
+            match config.p2p.stream_max_connections_per_source {
+                0 => quil_rpc::connection_limits::DEFAULT_MAX_CONNECTIONS_PER_SOURCE,
+                n => n,
+            },
+            match config.p2p.stream_max_connections {
+                0 => quil_rpc::connection_limits::default_max_connections(fd_limit),
+                n => n,
+            },
+        );
+        info!(
+            max_connections = limiter.total(),
+            max_per_source = limiter.per_source(),
+            open_file_limit = fd_limit,
+            "peer gRPC listener connection caps"
+        );
+        // This node's identity, the configured GLOBAL committee (the
+        // archives) and active provers.
+        let privileged_peer: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = {
+            let self_peer = peer_id.to_bytes();
+            let committee = super::consensus_intake::committee_members(
+                &config.engine.consensus_committee_peer_ids,
+                Default::default(),
+            );
+            let (sr, pr) = (signer_registry.clone(), prover_registry.clone());
+            Arc::new(move |peer: &[u8]| {
+                peer == self_peer.as_slice()
+                    || committee(peer)
+                    || peer_is_active_prover(&sr, pr.as_ref(), peer)
+            })
+        };
         sup.spawn("peer-grpc-server", move |peer_grpc_token| async move {
             // The peer-facing gRPC server (:8340) runs on its OWN dedicated
             // multi-threaded runtime. The main runtime carries consensus,
@@ -3527,7 +3809,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
             let accept_token = peer_grpc_token.clone();
             tokio::spawn(async move {
                 loop {
-                    let (tcp, _peer) = tokio::select! {
+                    let (tcp, source) = tokio::select! {
                         r = listener.accept() => match r {
                             Ok(v) => v,
                             Err(e) => {
@@ -3540,8 +3822,20 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                         },
                         _ = accept_token.cancelled() => return,
                     };
+                    // Refused before any handshake work; the dropped socket
+                    // closes the connection.
+                    let slot = match limiter.try_acquire(source.ip()) {
+                        Ok(slot) => slot,
+                        Err(_) => {
+                            if let Some(report) = limiter.report_due(std::time::Instant::now()) {
+                                log_connection_refusals(&limiter, &report);
+                            }
+                            continue;
+                        }
+                    };
                     let tx = conn_tx.clone();
                     let pq_seed = pq_seed.clone();
+                    let (limiter, privileged_peer) = (limiter.clone(), privileged_peer.clone());
                     crate::rpc_metrics::inc_connection_accepted();
                     // Handshake runs on the dedicated tls-handshake runtime
                     // (see `tls_handshake_rt`), NOT on the peer-gRPC workers —
@@ -3573,6 +3867,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                                 return;
                             }
                         };
+                        // A connection in the reserve is kept only for a
+                        // privileged peer.
+                        let peer = pq.peer_id().to_bytes();
+                        if slot.in_reserve() && !privileged_peer(peer.as_slice()) {
+                            slot.refuse();
+                            if let Some(report) = limiter.report_due(std::time::Instant::now()) {
+                                log_connection_refusals(&limiter, &report);
+                            }
+                            return;
+                        }
+                        let pq = pq.with_slot(slot);
                         // Hand off to tonic. The backlog is unbounded, so this
                         // never blocks and never sheds a completed handshake;
                         // `send` only errors if the receiver (tonic serve loop)
@@ -3596,6 +3901,9 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 // regardless of how high the ulimit is.
                 .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
                 .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                // Bound what one connection and one request may hold.
+                .max_concurrent_streams(PEER_MAX_STREAMS_PER_CONNECTION)
+                .timeout(PEER_REQUEST_TIMEOUT)
                 // Count every inbound RPC by method path
                 // (`rpc_requests_total{path=...}`) — cheap counter bump, no
                 // request buffering.
@@ -4655,5 +4963,90 @@ mod committed_app_head_tests {
         );
         crdt.set_covered_prefix(&[63; 43]).unwrap();
         assert!(committed_global_app_heads(&crdt, &[filter]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rpc_bound_tests {
+    use super::{
+        node_service_bind, NodeServiceBind, SubmitRefusalSummary, SubmitRefusals,
+        SUBMIT_REFUSAL_REPORT_INTERVAL,
+    };
+    use quil_engine::message_collector::Refusal;
+    use std::time::{Duration, Instant};
+
+    /// NodeService authenticates no caller: a non-loopback address is served
+    /// only with `listenGrpcAllowRemote`, otherwise loopback on its port.
+    #[test]
+    fn node_service_is_served_on_loopback_unless_remote_access_is_allowed() {
+        let bind = |configured: &str, allow| node_service_bind(configured.to_string(), allow);
+        assert_eq!(
+            bind("127.0.0.1:8337", false),
+            NodeServiceBind::Loopback("127.0.0.1:8337".into())
+        );
+        assert_eq!(
+            bind("0.0.0.0:8337", false),
+            NodeServiceBind::Refused {
+                bind: "127.0.0.1:8337".into(),
+                configured: "0.0.0.0:8337".into()
+            }
+        );
+        assert_eq!(
+            bind("192.0.2.4:9000", false),
+            NodeServiceBind::Refused {
+                bind: "127.0.0.1:9000".into(),
+                configured: "192.0.2.4:9000".into()
+            }
+        );
+        assert_eq!(
+            bind("0.0.0.0:8337", true),
+            NodeServiceBind::Remote("0.0.0.0:8337".into())
+        );
+        assert_eq!(
+            bind("127.0.0.1:8337", true),
+            NodeServiceBind::Loopback("127.0.0.1:8337".into())
+        );
+        assert_eq!(
+            bind("not an address", false),
+            NodeServiceBind::Loopback("not an address".into()),
+            "left for the server to refuse"
+        );
+    }
+
+    /// The first refused submit is logged at once, the rest summarized with
+    /// the first refusal at least a minute after the previous line.
+    #[test]
+    fn refused_submits_are_logged_at_most_once_a_minute() {
+        let mut refusals = SubmitRefusals::new();
+        let start = Instant::now();
+        assert_eq!(
+            refusals.record(Refusal::InvalidShardFrame, "a".into(), start),
+            Some(SubmitRefusalSummary {
+                counts: [0, 0, 0, 1, 0],
+                latest_peer: "a".into(),
+                latest_reason: Refusal::InvalidShardFrame.reason(),
+                since_previous: None,
+            })
+        );
+        for n in 1..100u64 {
+            let at = start + Duration::from_secs(n % 59);
+            assert_eq!(
+                refusals.record(Refusal::UnknownShard, format!("p{n}"), at),
+                None
+            );
+        }
+        assert_eq!(
+            refusals.record(
+                Refusal::RankFull,
+                "b".into(),
+                start + SUBMIT_REFUSAL_REPORT_INTERVAL
+            ),
+            Some(SubmitRefusalSummary {
+                counts: [0, 99, 1, 0, 0],
+                latest_peer: "b".into(),
+                latest_reason: Refusal::RankFull.reason(),
+                since_previous: Some(SUBMIT_REFUSAL_REPORT_INTERVAL),
+            })
+        );
     }
 }

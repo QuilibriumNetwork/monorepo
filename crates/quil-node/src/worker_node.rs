@@ -269,22 +269,27 @@ pub(crate) async fn start(
     // Worker-channel mTLS materials: derived deterministically from the node's
     // Falcon key (the master derives the identical cert), so the DataIpc server
     // requires a client cert from a master holding the node's key — closing the
-    // previously plaintext/unauthenticated control channel.
-    let (channel_tls_ca_pem, channel_tls_leaf_pem, channel_tls_key_pem) = match file_key_manager
+    // previously plaintext/unauthenticated control channel. Without them the
+    // worker does not start: it would serve DataIpc as unauthenticated
+    // plaintext on its listen address.
+    let channel_tls = file_key_manager
         .get_private_key(quil_types::crypto::KeyType::Falcon512)
-        .ok()
-        .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
-    {
-        Some(t) => (
-            Some(t.ca_cert_pem),
-            Some(t.leaf_cert_pem),
-            Some(t.leaf_key_pem),
-        ),
-        None => {
-            warn!("could not build worker-channel mTLS cert — DataIpc server will be UNAUTHENTICATED plaintext");
-            (None, None, None)
-        }
-    };
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|sk| {
+            quil_rpc::quil_tls::build_worker_channel_cert(&sk).map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "worker not started: could not build the worker-channel mTLS certificate from \
+                 the node's Falcon key ({e}); without it the worker would serve DataIpc \
+                 unauthenticated. Check that the worker reads the node's keys file"
+            )
+        })?;
+    let (channel_tls_ca_pem, channel_tls_leaf_pem, channel_tls_key_pem) = (
+        Some(channel_tls.ca_cert_pem),
+        Some(channel_tls.leaf_cert_pem),
+        Some(channel_tls.leaf_key_pem),
+    );
 
     let worker_config = quil_engine::worker_node::WorkerNodeConfig {
         core_id,

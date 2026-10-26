@@ -20,6 +20,12 @@ pub struct Config {
     pub logger: LogConfig,
     #[serde(default, alias = "listenGRPCMultiaddr")]
     pub listen_grpc_multiaddr: String,
+    /// Serve NodeService on a `listenGrpcMultiaddr` that is not a loopback
+    /// address. NodeService authenticates no caller and lets any of them
+    /// steer the node's provers (joins, leaves, manual management) and read
+    /// its state, so without this the node serves it on loopback only.
+    #[serde(default)]
+    pub listen_grpc_allow_remote: bool,
     #[serde(default)]
     pub explorer: ExplorerConfig,
     /// Token proof verifier worker (operator-tunable resource
@@ -56,6 +62,7 @@ impl Default for Config {
             db: DbConfig::default(),
             logger: LogConfig::default(),
             listen_grpc_multiaddr: DEFAULT_LISTEN_GRPC_MULTIADDR.to_string(),
+            listen_grpc_allow_remote: false,
             explorer: ExplorerConfig::default(),
             proof_worker: ProofWorkerConfig::default(),
             diagnostics: DiagnosticsConfig::default(),

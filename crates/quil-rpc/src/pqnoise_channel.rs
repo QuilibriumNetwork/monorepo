@@ -45,11 +45,19 @@ pub struct PqConnectInfo {
 pub struct PqServerStream {
     inner: PqTokioStream,
     peer_id: PeerId,
+    /// The connection's place under the listener's caps, released with it.
+    _slot: Option<crate::connection_limits::ConnectionSlot>,
 }
 
 impl PqServerStream {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Hold `slot` for as long as the connection lives.
+    pub fn with_slot(mut self, slot: crate::connection_limits::ConnectionSlot) -> Self {
+        self._slot = Some(slot);
+        self
     }
 }
 
@@ -133,6 +141,7 @@ pub async fn pq_server_handshake(
     Ok(PqServerStream {
         inner: pq.compat(),
         peer_id,
+        _slot: None,
     })
 }
 

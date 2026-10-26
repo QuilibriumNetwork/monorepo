@@ -1,5 +1,6 @@
 pub mod archive_client;
 pub mod archive_shard_list;
+pub mod connection_limits;
 pub mod diagnostics_logs;
 pub mod diagnostics_service;
 pub mod dispatch_service;

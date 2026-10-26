@@ -271,6 +271,23 @@ const FRAME_READ_REPORT_INTERVAL: std::time::Duration = std::time::Duration::fro
 pub(crate) static FRAME_READS: FrameReadBound =
     FrameReadBound::new(FRAME_READ_SLOTS, MAX_FRAME_READ_WAITERS, FRAME_READ_WAIT);
 
+/// Peer reads of the latest GLOBAL or app-shard frame, or of a GLOBAL
+/// header, running at once. They take no frame read slot, since a poller
+/// whose head read fails passes over the archive, but unbounded any peer
+/// could start them by the thousand on the blocking pool, each holding a copy
+/// of a frame of up to several MB. Each takes milliseconds, so these slots
+/// serve thousands of reads a second, far above every node polling the head.
+const HEAD_READ_SLOTS: usize = 32;
+/// Head reads waiting for a slot beyond which further ones are refused.
+const MAX_HEAD_READ_WAITERS: usize = 1024;
+/// How long a head read waits for a slot before the server answers busy.
+const HEAD_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on peers' head and header reads, shared by every peer-facing
+/// service. This node's own workers do not take it.
+pub(crate) static HEAD_READS: FrameReadBound =
+    FrameReadBound::new(HEAD_READ_SLOTS, MAX_HEAD_READ_WAITERS, HEAD_READ_WAIT);
+
 /// Slots for blocking frame reads and a bounded queue for them. A read keeps
 /// its slot until its storage work and copy finish, even when its caller has
 /// gone.
@@ -1259,7 +1276,13 @@ impl GlobalService for GlobalRpcServer {
         // enough for its short deadline.
         if req.header_only {
             let frames = self.frames.clone();
-            let header = tokio::task::spawn_blocking(move || frames.get_frame_header(frame_number))
+            let read = move || frames.get_frame_header(frame_number);
+            let task = if own {
+                tokio::task::spawn_blocking(read)
+            } else {
+                HEAD_READS.spawn(read).await?
+            };
+            let header = task
                 .await
                 .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
                 .map_err(|e| {
@@ -1279,7 +1302,13 @@ impl GlobalService for GlobalRpcServer {
         // without the request bundles it already holds.
         if frame_number == 0 && req.if_newer_than > 0 {
             let frames = self.frames.clone();
-            let header = tokio::task::spawn_blocking(move || frames.get_frame_header(0))
+            let read = move || frames.get_frame_header(0);
+            let task = if own {
+                tokio::task::spawn_blocking(read)
+            } else {
+                HEAD_READS.spawn(read).await?
+            };
+            let header = task
                 .await
                 .map_err(|e| Status::internal(format!("get_global_frame task panicked: {e}")))?
                 .map_err(|e| Status::not_found(format!("no frames: {e}")))?;
@@ -1314,14 +1343,16 @@ impl GlobalService for GlobalRpcServer {
                     .map_err(|e| format!("frame {} not found: {}", frame_number, e))
             }
         };
-        // A peer's numbered frame takes a frame read slot. The head does not:
-        // it is one cached frame, and a poller whose head read fails passes
-        // over the archive for a minute. Nor do this node's own workers,
-        // which must not wait behind peers.
-        let task = if frame_number != 0 && !own {
+        // A peer's numbered frame takes a frame read slot. The head takes a
+        // head read slot instead: it is one cached frame, and a poller whose
+        // head read fails passes over the archive for a minute. This node's
+        // own workers take neither: they must not wait behind peers.
+        let task = if own {
+            tokio::task::spawn_blocking(read)
+        } else if frame_number != 0 {
             self.frame_reads.spawn(read).await?
         } else {
-            tokio::task::spawn_blocking(read)
+            HEAD_READS.spawn(read).await?
         };
         let frame = task
             .await

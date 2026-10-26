@@ -278,16 +278,19 @@ pub(crate) fn init(
         // whose session executed GLOBAL state has not authorized yet while it
         // is anchored past it: while execution trails the head, a session a
         // GLOBAL frame up to the anchor authorized is not in committed state.
+        // Only this node and active provers may have such a frame held: its
+        // certificate cannot be checked yet, and a held frame can take
+        // another's place.
         let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
-        message_collector.set_shard_frame_verifier({
-            use quil_engine::message_collector::ShardFrameVerdict;
+        message_collector.set_shard_frame_verifier_with_provenance({
+            use quil_engine::message_collector::{Provenance, ShardFrameVerdict};
             let (manager, current, global, deferrals) = (
                 exec_manager.clone(),
                 current_frame.clone(),
                 crdt.clone(),
                 deferrals.clone(),
             );
-            Arc::new(move |bundle: &[u8]| {
+            Arc::new(move |bundle: &[u8], provenance: Provenance| {
                 let verified_for = current.effective().saturating_add(1);
                 match manager.validate_message(verified_for, &[0xff; 32], bundle) {
                     Ok(()) => ShardFrameVerdict::Valid,
@@ -300,9 +303,16 @@ pub(crate) fn init(
                                 &quil_store::encoding::global_materialized_cursor_key(),
                             )
                             .ok();
-                        deferrals.verdict(&error, bundle, executed, verified_for, |filter| {
-                            quil_engine::execution_deferral::next_generation(&global, filter)
-                        })
+                        deferrals.verdict_from(
+                            &error,
+                            bundle,
+                            executed,
+                            verified_for,
+                            provenance,
+                            |filter| {
+                                quil_engine::execution_deferral::next_generation(&global, filter)
+                            },
+                        )
                     }
                 }
             })
