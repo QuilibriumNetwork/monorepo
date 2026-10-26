@@ -386,19 +386,21 @@ impl FileKeyManager {
         let contents = serde_yaml::to_string(&*keys)
             .map_err(|e| QuilError::Crypto(format!("failed to serialize keystore: {}", e)))?;
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists (owner-only when created here)
         if let Some(parent) = self.keys_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            quil_config::create_private_dir_all(parent).map_err(|e| {
                 QuilError::Crypto(format!("failed to create keystore directory: {}", e))
             })?;
         }
 
-        // Atomic write: temp file + rename
+        // Atomic write: temp file + rename. The temp file is created
+        // readable by its owner only, so the keystore never is by others.
         let tmp_path = self.keys_path.with_extension("tmp");
-        std::fs::write(&tmp_path, &contents)
+        quil_config::write_private_file(&tmp_path, contents.as_bytes())
             .map_err(|e| QuilError::Crypto(format!("failed to write keystore: {}", e)))?;
         std::fs::rename(&tmp_path, &self.keys_path)
             .map_err(|e| QuilError::Crypto(format!("failed to rename keystore: {}", e)))?;
+        quil_config::sync_parent_dir(&self.keys_path);
 
         Ok(())
     }
@@ -1561,6 +1563,28 @@ pub(crate) mod tests {
         cleanup(&dir);
     }
 
+    /// A keystore directory created by a save is accessible by its owner
+    /// only.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_keystore_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir("private_keystore_dir");
+        let keys_path = dir.join("node").join("keys.yml");
+        let m = FileKeyManager::new(
+            keys_path.clone(),
+            TEST_KEY_HEX,
+            "test-key-id".into(),
+            bls_constructor(),
+        )
+        .unwrap();
+        m.ensure_standard_keys().unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("node")), 0o700);
+        assert_eq!(mode(&keys_path), 0o600);
+        cleanup(&dir);
+    }
+
     #[test]
     fn create_bls_key_produces_valid_signatures_cross_verified() {
         let (m, dir) = make_manager("cross_verify");
@@ -2059,6 +2083,37 @@ q-view-key:
             .expect("the replaced prover key is preserved under a free legacy id");
         assert_eq!(preserved.private_key, undecodable.private_key);
         assert_ne!(keys["q-prover-key"].private_key, undecodable.private_key);
+        cleanup(&dir);
+    }
+
+    /// The keystore holds every private key of the node: it is written
+    /// readable by its owner only, also over a temporary file an
+    /// interrupted save left behind.
+    #[cfg(unix)]
+    #[test]
+    fn reproduces_world_readable_keystore() {
+        use std::os::unix::fs::PermissionsExt;
+        let check = |path: &Path| {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                let whom = if mode & 0o004 != 0 {
+                    "world-readable"
+                } else {
+                    "group-readable"
+                };
+                panic!("keys.yml written with mode {mode:04o} ({whom})");
+            }
+        };
+        let (m, dir) = make_manager("private_keystore");
+        m.ensure_standard_keys().unwrap();
+        check(&m.keys_path);
+
+        let tmp_path = m.keys_path.with_extension("tmp");
+        std::fs::write(&tmp_path, "").unwrap();
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        m.create_falcon_key("another-key").unwrap();
+        assert!(!tmp_path.exists());
+        check(&m.keys_path);
         cleanup(&dir);
     }
 }

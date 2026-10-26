@@ -101,6 +101,10 @@ pub(crate) async fn start(
     // The 4096→64 migration is long done; the coordinated prover resets own the
     // clean baseline now. The grid tracks splits via `apply_due_shard_changes`.
 
+    // Earlier releases left the config and keystore readable by other
+    // accounts; restrict them before anything writes new keys into them.
+    keys::restrict_key_files(config, config_dir);
+
     // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
     // empty. Generate + persist the Ed448 identity HERE, before anything
     // reads it — `keys::init` derives `prover_address` from this key, and

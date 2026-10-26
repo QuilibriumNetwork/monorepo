@@ -96,7 +96,7 @@ fn create(name: Option<&str>, _set_default: bool) -> anyhow::Result<()> {
     // placeholder so the config dir is recognized as valid (`has_node_config_files`).
     let keys_path = config_dir.join("keys.yml");
     if !keys_path.exists() {
-        std::fs::write(&keys_path, "null:\n")
+        quil_config::write_private_file(&keys_path, b"null:\n")
             .map_err(|e| anyhow::anyhow!("write keys.yml placeholder: {e}"))?;
     }
 
@@ -132,7 +132,7 @@ fn import(name: &str, source_dir: &str, set_default: bool) -> anyhow::Result<()>
     }
     let configs_dir = system::node_config_home_dir()?;
     let target = configs_dir.join(name);
-    std::fs::create_dir_all(&target)?;
+    quil_config::create_private_dir_all(&target)?;
     copy_dir(source, &target)?;
 
     if set_default {
@@ -150,9 +150,10 @@ fn import(name: &str, source_dir: &str, set_default: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Recursively copy a directory tree.
+/// Recursively copy a directory tree. It holds private keys: directories
+/// this creates are accessible by their owner only.
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(to)?;
+    quil_config::create_private_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let src = entry.path();
@@ -310,7 +311,9 @@ fn clean_config_file(path: &Path, dry_run: bool) -> anyhow::Result<(PathBuf, Cle
     if dry_run {
         return Ok((path, CleanOutcome::DryRun(cleaned.keys)));
     }
-    let permissions = std::fs::metadata(&path)?.permissions();
+    // The config holds private keys: the backup and the replacement are
+    // readable by its owner only, also when the original was not.
+    let permissions = owner_only(std::fs::metadata(&path)?.permissions());
     let backup = write_backup(&path, &original, &permissions)?;
     replace_file(&path, &cleaned.contents, &permissions)?;
     let removed: Vec<String> = cleaned.keys.iter().map(|key| key.path.clone()).collect();
@@ -334,8 +337,18 @@ fn clean_config_file(path: &Path, dry_run: bool) -> anyhow::Result<(PathBuf, Cle
     ))
 }
 
+/// `permissions` without any access for group and others.
+fn owner_only(permissions: std::fs::Permissions) -> std::fs::Permissions {
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(permissions.mode() & 0o700)
+    };
+    permissions
+}
+
 /// Write `contents` to the first free of `<file>.bak`, `<file>.bak.1`, …
-/// beside `path`, with the original's permissions.
+/// beside `path`, with the given permissions.
 fn write_backup(
     path: &Path,
     contents: &str,
@@ -422,7 +435,8 @@ mod tests {
     }
 
     /// A run backs up the original, comments out the retired settings
-    /// keeping the file's permissions, and a second run finds nothing.
+    /// keeping the file's owner permissions but none for group and others,
+    /// and a second run finds nothing.
     #[test]
     fn clean_backs_up_and_comments_out_retired_settings() {
         let dir = tempfile::tempdir().unwrap();
@@ -451,11 +465,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
                 std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777,
-                0o640
+                0o600
             );
             assert_eq!(
                 std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
-                0o640
+                0o600
             );
         }
         assert_eq!(
