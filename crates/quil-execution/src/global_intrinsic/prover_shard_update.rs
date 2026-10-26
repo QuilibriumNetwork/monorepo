@@ -51,6 +51,32 @@ use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
 
+/// A frame anchored in a hash-proof epoch (decided 2026-10-21): GLOBAL holds
+/// each participant's issuance share in its storage seat
+/// (`storage_seat`) until its epoch proof settles it, and chains the
+/// proposer's openings root there.
+#[derive(Debug, Clone, Default)]
+pub struct StorageFrame {
+    /// The epoch the frame is anchored in.
+    pub epoch: u64,
+    /// The proposer's commitment, when it made one GLOBAL chains.
+    pub commitment: Option<StorageCommitment>,
+    /// Members whose seat closed an epoch with committed roots it never
+    /// proved: the caller kicks them.
+    pub kicks: Vec<Vec<u8>>,
+}
+
+/// A frame's openings root as GLOBAL chains it
+/// (`storage_seat::decode_commitment`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageCommitment {
+    pub root: [u8; 32],
+    /// The GLOBAL frame whose beacon chose the openings.
+    pub beacon: u64,
+    /// That frame's storage beacon.
+    pub rho_n: Vec<u8>,
+}
+
 /// Hypergraph metadata for the shard under `FrameHeader.address`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ShardMetadata {
@@ -805,7 +831,7 @@ pub fn materialize_prover_shard_update(
 ) -> Result<()> {
     materialize_prover_shard_update_with_fees(
         frame_header, current_frame_number, state, prover_registry, frame_prover, reward_issuance,
-        world_state_size, active_provers, participant_bitmask, shard_metadata, 0, None,
+        world_state_size, active_provers, participant_bitmask, shard_metadata, 0, None, None,
     )
 }
 
@@ -819,6 +845,10 @@ pub fn materialize_prover_shard_update(
 /// members are rewarded at the session's recorded rings
 /// ([`session_member_rings`]) and no allocation's ring is rewritten. A legacy
 /// committee (`None`) keeps the per-allocation rings.
+///
+/// `storage` marks a frame anchored in a hash-proof epoch: each participant's
+/// issuance share is held in its storage seat instead of paid
+/// ([`hold_storage_shares`]); fees are still paid at once.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_prover_shard_update_with_fees(
     frame_header: &FrameHeader,
@@ -833,6 +863,7 @@ pub fn materialize_prover_shard_update_with_fees(
     shard_metadata: ShardMetadata,
     committed_fees: u128,
     session: Option<[u8; 32]>,
+    storage: Option<&mut StorageFrame>,
 ) -> Result<()> {
     let session_rings = match &session {
         Some(session) => Some(session_member_rings(
@@ -926,6 +957,14 @@ pub fn materialize_prover_shard_update_with_fees(
         None
     };
 
+    // Hash-proof epochs: issuance shares are held per seat, fees paid below.
+    let held = match storage {
+        Some(storage) => Some(hold_storage_shares(
+            frame_header, current_frame_number, state, &ctx, &rewards_per_ring, storage,
+        )?),
+        None => None,
+    };
+
     // Apply per-participant rewards + activity updates.
     let mut credited_provers = 0usize;
     let mut total_reward = BigInt::from(0);
@@ -934,7 +973,10 @@ pub fn materialize_prover_shard_update_with_fees(
         for &idx in participants {
             let prover = &ctx.active_provers[idx];
 
-            let mut amount = share.cloned().unwrap_or_else(|| BigInt::from(0));
+            let mut amount = match &held {
+                Some(_) => BigInt::from(0),
+                None => share.cloned().unwrap_or_else(|| BigInt::from(0)),
+            };
             amount += &fee_share;
             if remainder_receiver == Some(idx) {
                 amount += &fee_remainder;
@@ -967,6 +1009,7 @@ pub fn materialize_prover_shard_update_with_fees(
     // visible per frame instead of silent. `participants` is the committee size
     // that was eligible, so `credited < participants` flags a partial payout.
     let participants: usize = ctx.participants_by_ring.values().map(|p| p.len()).sum();
+    let (held_provers, held_total) = held.unwrap_or_default();
     tracing::info!(
         shard = %hex::encode(&frame_header.address),
         frame = current_frame_number,
@@ -974,9 +1017,110 @@ pub fn materialize_prover_shard_update_with_fees(
         participants,
         total_reward = %total_reward,
         fee_total = %fee_total,
+        held_provers,
+        held_total = %held_total,
         "shard reward distribution",
     );
 
+    Ok(())
+}
+
+/// Hash-proof epochs (decided 2026-10-21): chain the proposer's openings root
+/// into its seat, then hold each participant's issuance share in its seat and
+/// count the frame toward the proposals expected of it. Only a member with a
+/// sealed registration for the shard and epoch earns a share; settlement pays
+/// it in proportion to the expected proposals it published with a root
+/// (`storage_seat::SeatSlot::release`). A seat's first root of an epoch
+/// queues it for the epoch's expiry sweep. Each seat touched first closes an
+/// epoch whose settlement window ended; one that closes with committed roots
+/// never proved kicks its member (`storage.kicks`). Returns how many
+/// participants had shares held, and their total.
+fn hold_storage_shares(
+    frame_header: &FrameHeader,
+    current_frame_number: u64,
+    state: &HypergraphState,
+    ctx: &ShardUpdateContext,
+    rewards_per_ring: &HashMap<u8, BigInt>,
+    storage: &mut StorageFrame,
+) -> Result<(usize, BigInt)> {
+    use super::storage_seat;
+    let filter = &frame_header.address;
+    let epoch = storage.epoch;
+    let touch = |address: &[u8], storage: &mut StorageFrame,
+                     f: &mut dyn FnMut(&mut storage_seat::Seat) -> bool| -> Result<bool> {
+        let Ok(member) = <[u8; 32]>::try_from(address) else { return Ok(false) };
+        let Some(mut seat) = storage_seat::read(state, &member, filter)? else { return Ok(false) };
+        let before = seat.clone();
+        if seat.expire(current_frame_number) && !storage.kicks.iter().any(|k| k == address) {
+            storage.kicks.push(address.to_vec());
+        }
+        let changed = f(&mut seat);
+        if seat != before {
+            storage_seat::write(state, current_frame_number, &seat)?;
+        }
+        Ok(changed)
+    };
+
+    // The proposer's commitment. Every root GLOBAL executes is chained,
+    // drained ones too (`commit_drained_storage`), with the GLOBAL frame
+    // executing it; settlement counts those within the response window of
+    // their beacons (`storage_seat::SeatSlot::response_times`).
+    if let Some(commitment) = storage.commitment.clone() {
+        let first = touch(&frame_header.prover, storage, &mut |seat| {
+            seat.commit(epoch, frame_header.frame_number, commitment.beacon, current_frame_number,
+                &commitment.rho_n, &commitment.root)
+                && seat.first_commitment(epoch)
+        })?;
+        if first {
+            let seat = storage_seat::seat_address(&frame_header.prover, filter)?;
+            storage_seat::enqueue_expiry(state, current_frame_number, epoch, &seat)?;
+        }
+    }
+
+    let committee = ctx.active_provers.len();
+    let mut held = 0usize;
+    let mut total = BigInt::from(0);
+    let none = BigInt::from(0);
+    for (ring, participants) in &ctx.participants_by_ring {
+        let share = rewards_per_ring.get(ring).unwrap_or(&none);
+        for &idx in participants {
+            let prover = &ctx.active_provers[idx];
+            if touch(&prover.address, storage, &mut |seat| {
+                seat.hold(epoch, current_frame_number, frame_header.frame_number, share, committee)
+            })? {
+                held += 1;
+                total += share;
+            }
+        }
+    }
+    Ok((held, total))
+}
+
+/// Pay a storage seat's held rewards to `member` when its epoch proof
+/// settles them (`storage_epoch_proof`). The seat's outcome, written in the
+/// same frame, keeps it to once.
+pub fn credit_storage_settlement(
+    state: &HypergraphState,
+    frame_number: u64,
+    member: &[u8; 32],
+    amount: &BigInt,
+) -> Result<()> {
+    if amount.sign() != num_bigint::Sign::Plus {
+        return Ok(());
+    }
+    let reward_addr = reward_address(member)?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let va_disc = vertex_adds_discriminator()?;
+    let mut reward_tree = match state.get(domain, &reward_addr, &va_disc)? {
+        Some(blob) if !blob.is_empty() => rebuild_vertex_tree_from_blob(&blob),
+        _ => quil_tries::VectorCommitmentTree::new(),
+    };
+    add_to_reward_balance(&mut reward_tree, amount)?;
+    state.set(domain, &reward_addr, &va_disc, frame_number, vertex_tree_to_blob(&reward_tree))?;
+    if LOCAL_PROVER_ADDRESS.get().is_some_and(|local| local.as_slice() == member) {
+        tracing::info!(frame = frame_number, prover = %hex::encode(member), delta = %amount,
+            "storage rewards released to local prover");
+    }
     Ok(())
 }
 
@@ -2047,6 +2191,76 @@ mod tests {
         assert_eq!(reward_balance(&state, &provers[2]), BigInt::from(1_333 + 1_000 + 2));
     }
 
+    /// Hash-proof epochs (decided 2026-10-21): a participant's issuance share
+    /// is held in its storage seat, and only with a sealed registration; each
+    /// frame counts toward the proposals expected of it, and a proposer's
+    /// root is chained into its seat; fees are paid at once.
+    #[test]
+    fn a_hash_epoch_frame_holds_issuance_in_sealed_seats_and_pays_fees() {
+        use super::super::storage_seat::{self, Seat};
+        let state = make_state();
+        let filter = vec![0xAAu8; 32];
+        let provers: Vec<ProverInfo> = (1u8..=3).map(|s| fake_prover(s, s as u64, 0, &filter)).collect();
+        for p in &provers {
+            seed_alloc_blob(&state, p, &filter);
+        }
+        let epoch = 7;
+        let member = |p: &ProverInfo| <[u8; 32]>::try_from(p.address.as_slice()).unwrap();
+        // The first two hold sealed registrations, the third none.
+        for p in &provers[..2] {
+            let mut seat = Seat::new(member(p), filter.clone());
+            seat.register(epoch, &[vec![]], 10);
+            assert!(seat.seal(epoch, 11));
+            storage_seat::write(&state, 11, &seat).unwrap();
+        }
+        let reward_issuance: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8_000)));
+        let rho_n = vec![5u8; 32];
+        let distribute = |header: &FrameHeader, frame: u64| {
+            let commitment = storage_seat::decode_commitment(&header.storage_attestation_root)
+                .map(|(root, beacon)| StorageCommitment { root, beacon, rho_n: rho_n.clone() });
+            let mut storage = StorageFrame { epoch, commitment, kicks: Vec::new() };
+            materialize_prover_shard_update_with_fees(
+                header, frame, &state, &noop_registry(), &noop_frame_prover(), &reward_issuance, 4096,
+                provers.clone(), &[0, 1, 2], ShardMetadata { state_size: 1024, shard_count: 1 }, 0, None,
+                Some(&mut storage),
+            )
+            .unwrap();
+            storage.kicks
+        };
+        let pending = |p: &ProverInfo| storage_seat::read(&state, &member(p), &filter).unwrap()
+            .map(|seat| seat.slot(epoch).unwrap().pending_amount());
+
+        let mut header = fake_header(filter.clone(), 10);
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(300);
+        header.prover = provers[1].address.clone();
+        assert!(distribute(&header, 100).is_empty());
+        for p in &provers {
+            assert_eq!(reward_balance(&state, p), BigInt::from(100), "fees only, at once");
+        }
+        assert_eq!(pending(&provers[0]), Some(BigInt::from(1_000)));
+        assert_eq!(pending(&provers[1]), Some(BigInt::from(1_000)));
+        assert_eq!(pending(&provers[2]), None, "no sealed registration, no share");
+        let slot = |p: &ProverInfo| storage_seat::read(&state, &member(p), &filter).unwrap().unwrap()
+            .slot(epoch).cloned().unwrap();
+        assert_eq!((slot(&provers[1]).frames, slot(&provers[1]).expected), (0, storage_seat::PROPOSAL / 3),
+            "its own frame committed no root: a proposal expected, none published");
+
+        let mut header = fake_header(filter.clone(), 11);
+        header.prover = provers[1].address.clone();
+        header.storage_attestation_root = storage_seat::encode_commitment(&[0x11; 32], 98);
+        distribute(&header, 101);
+        assert_eq!(pending(&provers[0]), Some(BigInt::from(2_000)));
+        assert_eq!(pending(&provers[1]), Some(BigInt::from(2_000)));
+        let committed = slot(&provers[1]);
+        assert_eq!((committed.frames, committed.accumulator, committed.chained.clone()),
+            (1, storage_seat::chain([(11, rho_n.as_slice(), &[0x11u8; 32])]),
+                vec![storage_seat::Chained { frame: 11, beacon: 98, executed: 101 }]));
+        assert_eq!(committed.expected, 2 * (storage_seat::PROPOSAL / 3));
+        distribute(&header, 101);
+        assert_eq!(pending(&provers[1]), Some(BigInt::from(2_000)), "the same frame applied again");
+        assert_eq!(slot(&provers[1]), committed);
+    }
+
     /// Global-venue fees go to the global frame's prover under the global
     /// filter, independent of a shard credit at the same frame.
     #[test]
@@ -2681,7 +2895,7 @@ mod tests {
             materialize_prover_shard_update_with_fees(
                 &fake_header(filter.clone(), header_frame), header_frame + 1, &state,
                 &noop_registry(), &noop_frame_prover(), &issuance, 4096,
-                members, &everyone, md, 0, session,
+                members, &everyone, md, 0, session, None,
             )
         };
 

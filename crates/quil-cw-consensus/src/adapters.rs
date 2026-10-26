@@ -52,6 +52,9 @@ pub struct ProposalContext {
     pub view: u64,
     pub parent_view: u64,
     pub parent: Digest,
+    /// The view's leader as a prover address (Poseidon of its Falcon key);
+    /// `None` for a context not made by Simplex.
+    pub leader: Option<[u8; 32]>,
 }
 
 impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
@@ -61,8 +64,28 @@ impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
             view: context.view().get(),
             parent_view: context.parent.0.get(),
             parent: context.parent.1,
+            leader: prover_address(&context.leader),
         }
     }
+}
+
+/// A committee member's prover address, `poseidon(public key)`, remembered:
+/// every proposal and vote asks for its leader's.
+fn prover_address(key: &FalconPublicKey) -> Option<[u8; 32]> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static REMEMBERED: LazyLock<Mutex<HashMap<FalconPublicKey, [u8; 32]>>> = LazyLock::new(Default::default);
+    if let Some(address) = REMEMBERED.lock().ok().and_then(|cache| cache.get(key).copied()) {
+        return Some(address);
+    }
+    let address = quil_crypto::poseidon::hash_bytes_to_32(key.as_ref()).ok()?;
+    if let Ok(mut cache) = REMEMBERED.lock() {
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key.clone(), address);
+    }
+    Some(address)
 }
 
 /// Re-exported so seam implementors (quil-engine) needn't depend on commonware-p2p.
@@ -526,6 +549,8 @@ pub struct Liveness {
     /// ([`Liveness::notarized`]); bound by the host's reporter, and not kept
     /// alive by it.
     blocks: std::sync::OnceLock<WeakBlockStore>,
+    /// Set once [`Liveness::notarized`] has warned that no store is bound.
+    unbound_warned: std::sync::atomic::AtomicBool,
     /// Whether notarize votes keep their signatures ([`Liveness::keep_votes`]).
     keep_votes: std::sync::atomic::AtomicBool,
 }
@@ -789,7 +814,18 @@ impl Liveness {
     /// ascending view order, each with its votes and the body this node
     /// built or verified; a proposal without such a body is left out.
     pub fn notarized(&self) -> Vec<NotarizedProposal> {
-        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else { return Vec::new() };
+        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else {
+            // A host that failed part-way through activation never bound its
+            // store; a bound store that is gone is an ordinary shutdown.
+            if self.blocks.get().is_none() && !self.unbound_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "consensus liveness has no block store bound, so notarized proposals are reported without \
+                     bodies; this node's consensus activation did not finish (defect to report with the \
+                     preceding activation errors)",
+                );
+            }
+            return Vec::new();
+        };
         let recent: Vec<NotarizedProposal> = {
             let Ok(state) = self.inner.lock() else { return Vec::new() };
             state.views.iter().flat_map(|(view, votes)| {
@@ -1151,6 +1187,7 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.evidence(7, 3, 6, [1; 32], 2, vec![0xa2]);
         assert!(liveness.notarized().is_empty(), "no block store bound");
+        assert!(liveness.unbound_warned.load(std::sync::atomic::Ordering::Relaxed), "an unbound store warns once");
         let store = BlockStore::new();
         liveness.bind_blocks(&store);
         liveness.evidence(7, 3, 6, [1; 32], 0, vec![0xa0]);

@@ -112,7 +112,9 @@ impl FrameMaterializer {
             number,
             crate::stage_clock::SLOW_EXECUTION,
         );
-        let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate, &mut timing)?;
+        let result = self.materialize_atomically_inner(frame, limits, write_clock, authenticate, &mut timing);
+        self.execution_counters.attempted(&result);
+        let result = result?;
         if let Some(published) = &result {
             published.prover_ops.log(number);
         }
@@ -144,10 +146,13 @@ impl FrameMaterializer {
         let frame_guard = patience
             .lock(&self.frame_execution)
             .ok_or_else(|| unavailable("canonical materializer is busy or poisoned"))?;
-        let (mut branch, mut publication) = self.capture_execution_branch_with(limits, |registry| {
+        let capture_started = std::time::Instant::now();
+        let captured = self.capture_execution_branch_with(limits, |registry| {
             self.execution_manager
                 .capture_execution_branch_guarded_seeded(limits.execution, registry)
-        })?;
+        });
+        self.execution_counters.captured(capture_started.elapsed());
+        let (mut branch, mut publication) = captured?;
         timing.mark("capture branch");
         // Node-local coverage and diagnostic writers must not be overwritten by
         // metadata captured before their update. Keep their locks through adoption.

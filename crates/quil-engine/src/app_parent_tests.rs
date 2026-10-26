@@ -272,7 +272,7 @@ fn the_seam_leader_waits_before_a_private_parent_and_voters_use_it_at_once() {
         if private { proposer.with_private_parents(parents.clone(), true) } else { proposer }
     };
     let leader_seam = seam(true);
-    let context = ProposalContext { epoch: 0, view: RANK + 1, parent_view: RANK, parent: digest };
+    let context = ProposalContext { epoch: 0, view: RANK + 1, parent_view: RANK, parent: digest, leader: None };
     // A plain host keeps waiting for the canonical parent before executing it.
     for _ in 0..12 {
         assert!(leader_seam.propose_with_context(context).is_none());
@@ -368,7 +368,7 @@ fn a_member_missing_the_parent_body_votes_once_the_body_arrives() {
     let child = child_of(&holder, &holder_parents.prepare(digest, RANK).unwrap(), digest);
     let child_digest = app_frame_digest(&child).unwrap();
     let bytes = prost::Message::encode_to_vec(&child);
-    let context = ProposalContext { epoch: 0, view: RANK + 1, parent_view: RANK, parent: digest };
+    let context = ProposalContext { epoch: 0, view: RANK + 1, parent_view: RANK, parent: digest, leader: None };
 
     let member = rig();
     let led = leader(&member, member.clock.clone());
@@ -398,7 +398,7 @@ fn a_leader_after_a_nullified_view_resends_the_unfinalized_chain() {
     let sent = Arc::new(Sent::default());
     let proposer = seam(&rig, led, parents, sent.clone());
     proposer.note_frame(second_digest, 2);
-    let next = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK + 1, parent: second_digest };
+    let next = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK + 1, parent: second_digest, leader: None };
     assert!(proposer.propose_with_context(next).is_some(), "the leader proposes over the private parent");
     assert!(sent.0.lock().unwrap().is_empty(), "nothing re-sent right after the parent's view");
     let later = ProposalContext { view: RANK + 4, ..next };
@@ -424,7 +424,7 @@ fn a_declined_turn_resends_nothing() {
     let sent = Arc::new(Sent::default());
     let proposer = seam(&rig, led, parents.clone(), sent.clone());
     proposer.note_frame(digest, 1);
-    let context = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK, parent: digest };
+    let context = ProposalContext { epoch: 0, view: RANK + 2, parent_view: RANK, parent: digest, leader: None };
     // This rig has no active provers: each turn is declined after the parent
     // executed privately.
     for _ in 0..3 {
@@ -676,12 +676,13 @@ fn a_private_session_parent_reads_as_the_committed_checkpoint_it_will_become() {
     commit(2);
     let source = crate::app_handoff::ParentSource::new(
         session.clone(), global, rig.manager.crdt(), rig.clock.clone(), Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(true)),
     )
     .unwrap();
     let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (frame, digest) = parent(&rig, 0);
     offer(&rig, &frame);
-    let context = ProposalContext { epoch: 1, view: RANK + 1, parent_view: RANK, parent: digest };
+    let context = ProposalContext { epoch: 1, view: RANK + 1, parent_view: RANK, parent: digest, leader: None };
     let committed = source.reader();
     assert!(committed(context).is_err(), "the parent is not materialized yet");
     let prepared = executor.prepare(digest, RANK).unwrap();

@@ -1,0 +1,148 @@
+name: devnet-smoke
+
+# Restarts every archive of a localhost devnet and checks that GLOBAL
+# consensus resumes (scripts/devnet-smoke.sh). It is not a required check,
+# so it does not run in the merge queue; rust-ci's checks are unchanged.
+
+on:
+  push:
+    branches: [develop, 'develop-*', 'v[0-9]*']
+    # Every crate the devnet node build compiles (quil-node and
+    # quil-amount-proof-worker), their build inputs outside crates/, the
+    # scripts and this workflow. Keep in step with quil-node's dependencies.
+    paths: &devnet-paths
+      - 'crates/bls48581/**'
+      - 'crates/bulletproofs/**'
+      - 'crates/channel/**'
+      - 'crates/classgroup/**'
+      - 'crates/commonware-consensus/**'
+      - 'crates/ed448-rust/**'
+      - 'crates/jmt/**'
+      - 'crates/libp2p-autonat/**'
+      - 'crates/libp2p-gossipsub/**'
+      - 'crates/libp2p-identity/**'
+      - 'crates/libp2p-tls/**'
+      - 'crates/quil-config/**'
+      - 'crates/quil-consensus/**'
+      - 'crates/quil-crypto/**'
+      - 'crates/quil-cw-consensus/**'
+      - 'crates/quil-engine/**'
+      - 'crates/quil-execution/**'
+      - 'crates/quil-explorer/**'
+      - 'crates/quil-forest/**'
+      - 'crates/quil-forest-migrate/**'
+      - 'crates/quil-hypergraph/**'
+      - 'crates/quil-keys/**'
+      - 'crates/quil-lattice-ct/**'
+      - 'crates/quil-lattice-proof-sys/**'
+      - 'crates/quil-lifecycle/**'
+      - 'crates/quil-node/**'
+      - 'crates/quil-p2p/**'
+      - 'crates/quil-rpc/**'
+      - 'crates/quil-store/**'
+      - 'crates/quil-tries/**'
+      - 'crates/quil-types/**'
+      - 'crates/vdf/**'
+      - 'crates/verenc/**'
+      - 'node/execution/intrinsics/global/compat/**'
+      - 'protobufs/**'
+      - 'subpatch'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/actions/setup-native-deps/**'
+      - '.github/workflows/devnet-smoke.yml'
+      - 'scripts/localnet.sh'
+      - 'scripts/devnet-smoke.sh'
+  pull_request:
+    paths: *devnet-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devnet-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+
+jobs:
+  smoke:
+    name: devnet-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - id: native-deps
+        uses: ./.github/actions/setup-native-deps
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # Don't let the action set RUSTFLAGS
+          rustflags: ""
+          # The explicit cache below owns restore/save for this job.
+          cache: false
+
+      # Every run restores the cache; only pushes to the default branch save
+      # it, so this job adds one entry per lockfile or toolchain change to
+      # the repository's 10 GB and pull requests never add their own.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ steps.native-deps.outputs.cache-key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+          shared-key: rust-devnet
+          cache-on-failure: true
+          save-if: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # The `devnet` profile is release optimization without fat LTO. One
+      # invocation builds only the two binaries the devnet runs, so their
+      # dependencies resolve one feature set. The test-hooks feature lets
+      # the script delay the registry load.
+      - name: build the devnet node
+        run: |
+          cargo build --locked --profile devnet -p quil-node -p quil-lattice-ct \
+            --features quil-node/test-hooks,quil-lattice-ct/native-proof \
+            --bin quil-node --bin quil-amount-proof-worker
+
+      # A node stops its store writes below 2 GiB free (FLOOR_FREE_BYTES)
+      # and reopens them only at twice that. Free preinstalled toolchains
+      # this job does not use when the build left less than 8 GiB.
+      - name: disk space
+        run: |
+          need=$((8 << 30))
+          df -h .
+          if [ "$(df -B1 --output=avail . | tail -1)" -lt "$need" ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h .
+          fi
+          avail=$(df -B1 --output=avail . | tail -1)
+          if [ "$avail" -lt "$need" ]; then
+            echo "::error::$((avail >> 20)) MiB free; the devnet needs $((need >> 20)) MiB"
+            exit 1
+          fi
+
+      - name: archive restart smoke test
+        timeout-minutes: 30
+        run: scripts/devnet-smoke.sh
+
+      - name: upload devnet logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-smoke-logs
+          path: |
+            .devnet-smoke/results
+            .devnet-smoke/archive*.log
+            .devnet-smoke/reg1*.log
+            .devnet-smoke/archive*/.log
+            .devnet-smoke/reg1/.log
+          include-hidden-files: true
+          retention-days: 7

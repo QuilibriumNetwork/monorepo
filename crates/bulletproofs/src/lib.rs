@@ -11,7 +11,6 @@ mod util;
 mod notes {
     mod inner_product_proof {}
     mod range_proof {}
-    mod r1cs_proof {}
 }
 
 mod errors;
@@ -32,9 +31,6 @@ pub mod range_proof_mpc {
     pub use crate::range_proof::messages;
     pub use crate::range_proof::party;
 }
-
-#[cfg(feature = "yoloproofs")]
-pub mod r1cs;
 
 pub mod uniffi_bulletproofs;
 

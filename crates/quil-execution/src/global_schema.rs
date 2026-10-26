@@ -65,16 +65,17 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // multi-shard prover (one call per allocation) or a re-materialized
             // frame accrues `SENIORITY_PER_ACTIVE_FRAME` at most once per frame.
             FieldTag { name: "LastSeniorityFrameNumber", order: 5, size: 8, rdf_type: RdfType::Uint },
-            // order 20 — not in the Go schema: the retro seniority this prover
+            // order 32 — not in the Go schema: the retro seniority this prover
             // holds from the seniority succession epoch, per part of
             // `seniority_compat::retro_components` (4 retro epochs, then the
             // mainnet snapshot), 5 × u64 BE. A key's retro counts once: a merge,
-            // join or succession credits only what raises a part. Order 20, key
-            // 0x50: no other class has an order-20 field.
-            FieldTag { name: "RetroCredited", order: 20, size: 40, rdf_type: RdfType::ByteArray },
-            // order 21 — not in the Go schema: the retro successions moved out
-            // of this prover, per part, 5 × u64 BE. Key 0x54, unique.
-            FieldTag { name: "RetroMoved", order: 21, size: 40, rdf_type: RdfType::ByteArray },
+            // join or succession credits only what raises a part. Order 32, key
+            // 0x80, above the storage classes' 20–31: no other class has an
+            // order-32 field.
+            FieldTag { name: "RetroCredited", order: 32, size: 40, rdf_type: RdfType::ByteArray },
+            // order 33 — not in the Go schema: the retro successions moved out
+            // of this prover, per part, 5 × u64 BE. Key 0x84, unique.
+            FieldTag { name: "RetroMoved", order: 33, size: 40, rdf_type: RdfType::ByteArray },
         ],
     },
     ClassDef {
@@ -224,16 +225,86 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "PrevLeafRoot",  order: 11, size: 128, rdf_type: RdfType::ByteArray },
             // order 12 — prev-epoch slot: leaf block count.
             FieldTag { name: "PrevNumBlocks", order: 12, size: 8,   rdf_type: RdfType::Uint },
+            // Hash storage proofs (`quil_crypto::storage_proof`): per slot,
+            // the GLOBAL frame that recorded the registration (the frame after
+            // it gives the seal's challenges) and the frame its seal proof was
+            // accepted. Written only for slots of a hash-proof epoch, so KZG
+            // registrations stay byte-identical; for those slots `LeafRoot` is
+            // `comm_D ‖ comm_C ‖ comm_R` and `NumBlocks` the node count.
+            // Orders 20–25, above every other class's, so no key here is one a
+            // reader probes on another class's tree (orders 18 and 19 must
+            // stay unique to the allocation).
+            // order 20 — current slot: frame registered.
+            FieldTag { name: "RegisteredAt",     order: 20, size: 8, rdf_type: RdfType::Uint },
+            // order 21 — current slot: frame sealed.
+            FieldTag { name: "SealedAt",         order: 21, size: 8, rdf_type: RdfType::Uint },
+            // order 22 — next slot: frame registered.
+            FieldTag { name: "NextRegisteredAt", order: 22, size: 8, rdf_type: RdfType::Uint },
+            // order 23 — next slot: frame sealed.
+            FieldTag { name: "NextSealedAt",     order: 23, size: 8, rdf_type: RdfType::Uint },
+            // order 24 — prev slot: frame registered.
+            FieldTag { name: "PrevRegisteredAt", order: 24, size: 8, rdf_type: RdfType::Uint },
+            // order 25 — prev slot: frame sealed.
+            FieldTag { name: "PrevSealedAt",     order: 25, size: 8, rdf_type: RdfType::Uint },
+        ],
+    },
+    // Not in the Go GLOBAL_RDF_SCHEMA. A member's storage seat on one shard
+    // (hash storage proofs, `storage_seat`): per epoch, the leaves it
+    // registered, whether its epoch proof sealed them, the chain of openings
+    // roots its proposals committed and the storage rewards held until its
+    // epoch proof settles them. Keyed by address
+    // poseidon("STORAGE_SEAT" || member || filter). Written only in hash-proof
+    // epochs. Orders 26–28, above every other class's, so no key here is one
+    // a reader probes on another class's tree.
+    ClassDef {
+        name: "storage:StorageSeat",
+        fields: &[
+            // order 26 — the member's 32-byte prover address.
+            FieldTag { name: "Member",      order: 26, size: 32,   rdf_type: RdfType::ByteArray },
+            // order 27 — the shard's confirmation filter (≤64 bytes).
+            FieldTag { name: "ShardFilter", order: 27, size: 64,   rdf_type: RdfType::ByteArray },
+            // order 28 — the epoch slots, `storage_seat::encode_slots`.
+            FieldTag { name: "Slots",       order: 28, size: 4096, rdf_type: RdfType::ByteArray },
+        ],
+    },
+    // Not in the Go GLOBAL_RDF_SCHEMA. One bucket of an epoch's storage
+    // expiry queue (`storage_seat::enqueue_expiry`): the seats that committed
+    // a root in the epoch, swept when its settlement window closes so a
+    // member that never proves is kicked even if it never returns. Keyed by
+    // address poseidon("STORAGE_EXPIRY" || epoch mod 4 || bucket), reused
+    // (never removed); the field starts with the epoch it holds. Order 29,
+    // above every other class's.
+    ClassDef {
+        name: "storage:StorageExpiry",
+        fields: &[
+            // order 29 — the epoch (8 bytes), then the queued seat addresses,
+            // 32 bytes each.
+            FieldTag { name: "Seats", order: 29, size: 1 << 20, rdf_type: RdfType::ByteArray },
+        ],
+    },
+    // Not in the Go GLOBAL_RDF_SCHEMA. The certified state a shard's storage
+    // registrations for an epoch commit to (`storage_snapshot`): the state
+    // roots of the first header of the shard GLOBAL executes at or after the
+    // epoch's snapshot frame. Keyed by address
+    // poseidon("STORAGE_SNAPSHOT" || epoch mod 4 || filter), reused (never
+    // removed). Orders 30–31, above every other class's.
+    ClassDef {
+        name: "storage:StorageSnapshot",
+        fields: &[
+            // order 30 — the shard's confirmation filter (≤64 bytes).
+            FieldTag { name: "ShardFilter", order: 30, size: 64,  rdf_type: RdfType::ByteArray },
+            // order 31 — epoch, app frame, anchor (8 bytes each), 4 × 32-byte roots.
+            FieldTag { name: "Snapshot",    order: 31, size: 152, rdf_type: RdfType::ByteArray },
         ],
     },
 ];
 
-/// The schema's max `order` across all classes — now 19 (allocation's
-/// `Release`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 33 (a prover's
+/// `RetroMoved`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 21;
+pub const GLOBAL_MAX_ORDER: u16 = 33;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -295,6 +366,8 @@ pub const GLOBAL_INTRINSIC_ADDRESS: [u8; 32] = [0xFFu8; 32];
 /// they're already verified against live mainnet and avoid the
 /// sponge-hash cost on hot paths.
 pub fn compute_type_hash(class_name: &str) -> [u8; 32] {
+    #[cfg(test)]
+    tests::COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let mut msg = Vec::with_capacity(32 + class_name.len());
     msg.extend_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
     msg.extend_from_slice(class_name.as_bytes());
@@ -333,8 +406,27 @@ pub const TYPE_HASH_REWARD: [u8; 32] = [
 /// referenced by seniority merge spent-marker logic. Included for
 /// forward compatibility.
 pub fn type_hash_spent_merge() -> [u8; 32] {
-    compute_type_hash("merge:SpentMerge")
+    RUNTIME_TYPE_HASHES[0].0
 }
+
+/// The type hashes of the classes outside the Go schema, computed once.
+/// A prover registry refresh classifies every prover-shard row, and each row
+/// that is neither a prover, an allocation nor a reward (every leaf-root
+/// registration) hashed both class names again: Poseidon was at the top of a
+/// mainnet archive's 9.6 s registry reads (2026-10-25).
+static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 5]> =
+    std::sync::LazyLock::new(|| {
+        [
+            (compute_type_hash("merge:SpentMerge"), "merge:SpentMerge"),
+            (
+                compute_type_hash("leafroot:LeafRootRegistration"),
+                "leafroot:LeafRootRegistration",
+            ),
+            (compute_type_hash("storage:StorageSeat"), "storage:StorageSeat"),
+            (compute_type_hash("storage:StorageExpiry"), "storage:StorageExpiry"),
+            (compute_type_hash("storage:StorageSnapshot"), "storage:StorageSnapshot"),
+        ]
+    });
 
 /// The full `[type_hash; 32] → class_name` mapping for the global
 /// intrinsic schema. Does not include `merge:SpentMerge` because its
@@ -356,22 +448,36 @@ pub fn class_for_type_hash(hash: &[u8]) -> Option<&'static str> {
             return Some(*name);
         }
     }
-    // Fallback: check merge:SpentMerge (computed at runtime)
-    let spent_merge_hash = type_hash_spent_merge();
-    if hash == spent_merge_hash.as_slice() {
-        return Some("merge:SpentMerge");
-    }
-    // Fallback: leafroot:LeafRootRegistration (not in the Go schema, computed at runtime).
-    if hash == type_hash_leaf_root_registration().as_slice() {
-        return Some("leafroot:LeafRootRegistration");
-    }
-    None
+    // Fallback: merge:SpentMerge, leafroot:LeafRootRegistration and the
+    // storage classes, which are not in the Go schema.
+    RUNTIME_TYPE_HASHES
+        .iter()
+        .find(|(known, _)| hash == known.as_slice())
+        .map(|(_, name)| *name)
+}
+
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageSeat")`, computed
+/// once (this class is not in the Go schema).
+pub fn type_hash_storage_seat() -> [u8; 32] {
+    RUNTIME_TYPE_HASHES[2].0
+}
+
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageExpiry")`, computed
+/// once (this class is not in the Go schema).
+pub fn type_hash_storage_expiry() -> [u8; 32] {
+    RUNTIME_TYPE_HASHES[3].0
+}
+
+/// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "storage:StorageSnapshot")`, computed
+/// once (this class is not in the Go schema).
+pub fn type_hash_storage_snapshot() -> [u8; 32] {
+    RUNTIME_TYPE_HASHES[4].0
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "leafroot:LeafRootRegistration")`,
 /// computed at runtime (this class is not in the Go schema).
 pub fn type_hash_leaf_root_registration() -> [u8; 32] {
-    compute_type_hash("leafroot:LeafRootRegistration")
+    RUNTIME_TYPE_HASHES[1].0
 }
 
 // =====================================================================
@@ -514,10 +620,10 @@ mod tests {
 
     #[test]
     fn retro_ledger_keys_are_unique_across_classes() {
-        // Orders 20 and 21 → 0x50 and 0x54, single byte: no existing key
+        // Orders 32 and 33 → 0x80 and 0x84, single byte: no existing key
         // changes width, and no other field of any class shares them (readers
         // probe keys across classes).
-        for (name, key) in [("RetroCredited", 0x50u8), ("RetroMoved", 0x54)] {
+        for (name, key) in [("RetroCredited", 0x80u8), ("RetroMoved", 0x84)] {
             assert_eq!(field_key("prover:Prover", name), Some(vec![key]));
             for class in GLOBAL_CLASSES {
                 for field in class.fields {
@@ -536,7 +642,7 @@ mod tests {
         // changes width, and no other field of any class shares it.
         let cls = "allocation:ProverAllocation";
         assert_eq!(field_key(cls, "Release"), Some(vec![0x4C]));
-        assert_eq!(GLOBAL_MAX_ORDER, 21, "RetroMoved (order 21) is the highest");
+        assert_eq!(GLOBAL_MAX_ORDER, 33, "RetroMoved (order 33) is the highest");
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(
             GLOBAL_CLASSES.iter().flat_map(|c| c.fields.iter()).map(|f| f.order).max(),
@@ -555,6 +661,50 @@ mod tests {
                     class.name,
                     field.name
                 );
+            }
+        }
+    }
+
+    thread_local! {
+        /// Type hashes [`compute_type_hash`] computed on this thread.
+        pub(super) static COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Classifying a row hashes no class name: the runtime type hashes are
+    /// computed once per process, not twice for every leaf-root row.
+    #[test]
+    fn classifying_rows_computes_no_type_hash() {
+        let leaf_root = compute_type_hash("leafroot:LeafRootRegistration");
+        let unknown = [0x5a; 32];
+        let before = COMPUTED.with(|computed| computed.get());
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            assert_eq!(class_for_type_hash(&leaf_root), Some("leafroot:LeafRootRegistration"));
+            assert_eq!(class_for_type_hash(&unknown), None);
+        }
+        let computed = COMPUTED.with(|computed| computed.get()) - before;
+        // At most the one-time computation, when this thread came first.
+        assert!(
+            computed <= RUNTIME_TYPE_HASHES.len(),
+            "{computed} type hashes computed classifying 2000 rows in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(type_hash_leaf_root_registration(), leaf_root);
+        assert_eq!(class_for_type_hash(&type_hash_spent_merge()), Some("merge:SpentMerge"));
+    }
+
+    #[test]
+    fn the_seal_fields_of_a_leaf_registration_share_no_other_class_key() {
+        let cls = "leafroot:LeafRootRegistration";
+        let ours = ["RegisteredAt", "SealedAt", "NextRegisteredAt", "NextSealedAt", "PrevRegisteredAt", "PrevSealedAt"];
+        let keys: Vec<Vec<u8>> = ours.iter().map(|name| field_key(cls, name).unwrap()).collect();
+        for class in GLOBAL_CLASSES {
+            for field in class.fields {
+                if class.name == cls && ours.contains(&field.name) {
+                    continue;
+                }
+                assert!(!keys.contains(&order_to_key(field.order, GLOBAL_MAX_ORDER)),
+                    "{}.{} shares a leaf registration's seal key", class.name, field.name);
             }
         }
     }
@@ -586,10 +736,14 @@ mod tests {
             compute_type_hash("reward:ProverReward"),
             TYPE_HASH_REWARD
         );
-        // SpentMerge is runtime-computed, verify round-trip
+        // The runtime-computed hashes, verify round-trip
         assert_eq!(
             compute_type_hash("merge:SpentMerge"),
             type_hash_spent_merge()
+        );
+        assert_eq!(
+            compute_type_hash("leafroot:LeafRootRegistration"),
+            type_hash_leaf_root_registration()
         );
     }
 

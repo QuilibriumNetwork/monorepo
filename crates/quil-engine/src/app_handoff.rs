@@ -169,6 +169,9 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
     };
     match check() {
         Ok(retain) => retain,
+        // A GLOBAL state sync between chunks withholds the view for a while;
+        // it says nothing about the session, so keep a possibly hosting member.
+        Err(error) if handoff::global_sync_in_progress(&error) => true,
         // No authenticated GLOBAL state yet: this node cannot be running a
         // session host (startup needs the same snapshot), so nothing is closing.
         Err(QuilError::ExecutionUnavailable(_)) => false,
@@ -225,8 +228,15 @@ pub struct ParentSource {
     history: Mutex<Option<HistoryTip>>,
     /// Unix seconds of the last operator-visible "parent unavailable" line.
     last_reported: std::sync::atomic::AtomicU64,
-    /// The engine's staged-data flag ([`Self::require_staged_data`]).
-    data_ready: std::sync::OnceLock<Arc<AtomicBool>>,
+    /// The engine's staged-data flag: no parent, and so no seal, while false.
+    /// At its base a session's checkpoint is this member's committed shard
+    /// roots, and a seal checks only that members agree on them: members that
+    /// had not staged the shard's data agreed on their partial roots and
+    /// certified them, and every same-filter successor then required those
+    /// roots. Data frames are gated on the same flag
+    /// (`AppSeamProposer::data_ready`). Required at construction, so an
+    /// unbound flag cannot read as staged.
+    data_ready: Arc<AtomicBool>,
 }
 
 impl ParentSource {
@@ -236,6 +246,7 @@ impl ParentSource {
         shard: Arc<HypergraphCrdt>,
         clock: Arc<dyn ClockStore>,
         closing: Arc<AtomicBool>,
+        staged: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
         let session_id = session.id()?;
         Ok(Arc::new(Self {
@@ -247,24 +258,15 @@ impl ParentSource {
             closing,
             history: Mutex::new(None),
             last_reported: std::sync::atomic::AtomicU64::new(0),
-            data_ready: std::sync::OnceLock::new(),
+            data_ready: staged,
         }))
     }
 
-    /// No parent, and so no seal, while `staged` is false. At its base a
-    /// session's checkpoint is this member's committed shard roots, and a seal
-    /// checks only that members agree on them: members that had not staged the
-    /// shard's data agreed on their partial roots and certified them, and
-    /// every same-filter successor then required those roots. Data frames are
-    /// gated on the same flag (`AppSeamProposer::data_ready`).
-    pub fn require_staged_data(&self, staged: Arc<AtomicBool>) {
-        let _ = self.data_ready.set(staged);
-    }
-
     fn check_staged(&self) -> Result<()> {
-        match self.data_ready.get() {
-            Some(staged) if !staged.load(Ordering::Acquire) => Err(unavailable("covered shard data is not staged")),
-            _ => Ok(()),
+        if self.data_ready.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(unavailable("covered shard data is not staged"))
         }
     }
 
@@ -1850,6 +1852,20 @@ pub fn replay_mismatch_reanchor(generation: u64, cursor: u64, committed: Option<
         .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
 }
 
+/// The re-anchor a shard owes when a payload eviction dropped its subtree
+/// from this worker's store at materialized cursor `cursor`
+/// ([`dropped_lineage`]): as [`replay_mismatch_reanchor`], except that it
+/// anchors at the cursor itself when GLOBAL committed no frame above it, as
+/// on a shard whose committee stalled at this worker's head. The trees
+/// cannot match any frame there, so the shard would otherwise start on an
+/// empty subtree; the rebase replaces the local frame at an anchor that is
+/// the fence ([`rebase_for_reanchor`]). `None` without a committed frame at
+/// or above the cursor.
+pub fn evicted_lineage_reanchor(generation: u64, cursor: u64, committed: Option<u64>) -> Option<ReanchorMarker> {
+    committed.filter(|&tip| tip >= cursor)
+        .map(|_| ReanchorMarker { generation, fence: cursor, from_cursor: cursor, head: None })
+}
+
 /// Why a shard owes a re-anchor, read from its marker: a head past its
 /// session fence records the fence below that head ([`fence_rewind`]), a
 /// persistent replay mismatch records the cursor itself
@@ -1997,6 +2013,36 @@ pub fn write_reanchor_marker(clock: &dyn ClockStore, filter: &[u8], marker: &Rea
 pub fn clear_reanchor_marker(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
     let txn = clock.new_transaction(false)?;
     if let Err(error) = txn.delete(&quil_store::encoding::app_reanchor_key(filter)) {
+        let _ = txn.abort();
+        return Err(error);
+    }
+    txn.commit()
+}
+
+/// The materialized cursor at which a payload eviction dropped `filter`'s
+/// subtree from this worker's store while its frames and cursor stayed
+/// ([`quil_store::encoding::CONSENSUS_APP_LINEAGE_DROPPED`]), while that
+/// record still describes the shard: its cursor has not moved since. A
+/// record the cursor moved past (a sync or re-anchor installed the state
+/// again) is cleared, as is a malformed one.
+pub fn dropped_lineage(shard: &HypergraphCrdt, clock: &dyn ClockStore, filter: &[u8]) -> Result<Option<u64>> {
+    let txn = clock.new_transaction(false)?;
+    let value = txn.get(&quil_store::encoding::app_lineage_dropped_key(filter));
+    let _ = txn.abort();
+    let Some(bytes) = value? else { return Ok(None) };
+    let cursor = shard.read_frame_cursor(&quil_store::encoding::consensus_materialized_cursor_key(filter))?;
+    match <[u8; 8]>::try_from(bytes.as_slice()).map(u64::from_be_bytes) {
+        Ok(dropped) if dropped == cursor && cursor > 0 => Ok(Some(cursor)),
+        _ => {
+            clear_dropped_lineage(clock, filter)?;
+            Ok(None)
+        }
+    }
+}
+
+pub fn clear_dropped_lineage(clock: &dyn ClockStore, filter: &[u8]) -> Result<()> {
+    let txn = clock.new_transaction(false)?;
+    if let Err(error) = txn.delete(&quil_store::encoding::app_lineage_dropped_key(filter)) {
         let _ = txn.abort();
         return Err(error);
     }
@@ -2233,6 +2279,7 @@ pub fn rebase_for_reanchor(
     }
     shard.checkpoint_frame_cursor(synced_to, &cursor_key)?;
     clear_reanchor_marker(clock, filter)?;
+    clear_dropped_lineage(clock, filter)?;
     Ok(Rebased { from, to: top })
 }
 
@@ -2317,6 +2364,51 @@ mod successor_tests {
             let page: Vec<_> = frames.iter().filter(|f| f.frame >= from && f.frame <= through).take(2).cloned().collect();
             Box::pin(async move { Ok(page) })
         })
+    }
+
+    /// While an archive state sync of GLOBAL installs its chunks, the
+    /// committed view is withheld, and a member of the head session keeps
+    /// its worker: the wait says nothing about the session, unlike a node
+    /// with no GLOBAL state yet. Once the sync is in, the view shows the
+    /// archive's state (here without the session).
+    #[test]
+    fn a_global_sync_between_chunks_withholds_the_view_but_keeps_the_worker() {
+        use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
+        let (global, state) = global_state();
+        let filter = vec![0x0c; 32];
+        let (source, _, _) = closing_session(&global, &state, &filter);
+        let member = source.members[0].clone();
+        assert!(retains_worker(&global, &filter, &member));
+
+        let address = [0xff; 32];
+        let archive = Arc::new(HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        for byte in 1..=3u8 {
+            let location = quil_hypergraph::Location { app_address: address, data_address: [byte; 32] };
+            archive.add_vertex(&location, &[byte; 48]).unwrap();
+        }
+        archive.commit(1).unwrap();
+        let (version, root) = archive.serve_forest_head(&address, 0).unwrap();
+        let reader = quil_hypergraph::testing::CrdtTreeReader { source: archive, shard_id: address.to_vec(), phase: 0 };
+        let mut plan = global.prepare_phase_sync(&reader, version, &address, 0, &[],
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        // The archive's records replace the local ones, which it lacks.
+        let blob = |(key, leaf): &([u8; 32], Option<Vec<u8>>)| if leaf.is_some() { vec![key[0]; 48] } else { Vec::new() };
+        let first = vec![blob(&plan.remaining()[0])];
+        global.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(!plan.remaining().is_empty());
+        let error = CommittedView::capture(&global).err().expect("no committed view between a sync's chunks");
+        assert!(global_sync_in_progress(&error), "{error}");
+        assert!(retains_worker(&global, &filter, &member), "the member keeps its worker while the sync installs");
+
+        let rest: Vec<_> = plan.remaining().iter().map(blob).collect();
+        global.apply_sync_chunk(&mut plan, &rest).unwrap();
+        assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
+        let view = CommittedView::capture(&global).unwrap();
+        assert!(handoff::head(&view, &filter).unwrap().is_none());
+        assert!(!retains_worker(&global, &filter, &member));
     }
 
     /// A member whose cursor is at its predecessor's sealed checkpoint, with
@@ -4174,6 +4266,21 @@ mod successor_tests {
         assert_eq!(reanchor_gate(Some(unheaded), 6, Some([0x66; 32])), ReanchorGate::Owed(unheaded));
     }
 
+    /// An evicted lineage anchors at the frame GLOBAL committed, or at its
+    /// own head when that is the committed tip, as on a shard whose
+    /// committee stalled there; a replay mismatch needs a committed frame
+    /// above the head.
+    #[test]
+    fn an_evicted_lineage_anchors_at_its_head_when_the_shard_stalled_there() {
+        let at = |fence| Some(ReanchorMarker { generation: 3, fence, from_cursor: fence, head: None });
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(5)), at(5), "the stalled shard");
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(9)), at(5));
+        assert_eq!(evicted_lineage_reanchor(3, 5, Some(4)), None, "GLOBAL behind the head");
+        assert_eq!(evicted_lineage_reanchor(3, 5, None), None);
+        assert_eq!(replay_mismatch_reanchor(3, 5, Some(5)), None);
+        assert_eq!(at(5).unwrap().cause(), ReanchorCause::ReplayMismatch);
+    }
+
     // An operator's joining worker held a lineage from an earlier tenure
     // whose trees no longer matched it (2026-10-20): every archive frame
     // past its head failed to replay with a pre-state mismatch, for hours,
@@ -4236,6 +4343,12 @@ mod successor_tests {
         write_reanchor_marker(&clock, &filter, &marker).unwrap();
         let gate = || reanchor_gate_at(&shard, &clock, &filter, read_reanchor_marker(&clock, &filter).unwrap()).unwrap();
         assert_eq!(gate(), ReanchorGate::Owed(marker));
+        // A payload eviction's record of the dropped subtree at the cursor.
+        let dropped_key = quil_store::encoding::app_lineage_dropped_key(&filter);
+        let txn = clock.new_transaction(false).unwrap();
+        txn.set(&dropped_key, &4u64.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(dropped_lineage(&shard, &clock, &filter).unwrap(), Some(4));
         assert!(reanchor_applies(&global, &filter).unwrap());
         assert!(anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x99)).unwrap());
         assert!(!anchor_is_committed(&global, &filter, &header_frame(&filter, 9, 0x98)).unwrap());
@@ -4254,6 +4367,9 @@ mod successor_tests {
         }
         assert_eq!(clock.get_latest_shard_clock_frame(&filter).unwrap().header.unwrap().output, vec![0x88; 32]);
         assert_eq!(gate(), ReanchorGate::Absent, "the rebase committed");
+        let txn = clock.new_transaction(false).unwrap();
+        assert_eq!(txn.get(&dropped_key).unwrap(), None, "and cleared the dropped-lineage record");
+        let _ = txn.abort();
 
         // The anchor replays: the head is the frame GLOBAL executed.
         store_header(&clock, FrameHeader {
@@ -4480,7 +4596,7 @@ mod successor_tests {
         });
         let source = ParentSource::new(
             session.clone(), global.clone(), crdt(), anchors.clone() as Arc<dyn ClockStore>,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)),
         ).unwrap();
         use crate::global_view_refresh::{Reason, ViewRefresh};
         let refresh = Arc::new(ViewRefresh::default());
@@ -4595,16 +4711,16 @@ mod successor_tests {
         let request = schedule::closing_request(&CommittedView::capture(&global).unwrap(), &zero).unwrap().unwrap();
 
         let closing = Arc::new(AtomicBool::new(false));
-        let source = ParentSource::new(
-            zero.clone(), global.clone(), shard.clone(), clock.clone() as Arc<dyn ClockStore>, closing.clone(),
-        ).unwrap();
-        let context = |view: u64, parent_view: u64, parent: [u8; 32]| ProposalContext {
-            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent),
-        };
         // A member that has not staged the shard's data reads no parent, so it
         // can neither propose nor verify a seal of its partial roots.
         let staged = Arc::new(AtomicBool::new(false));
-        source.require_staged_data(staged.clone());
+        let source = ParentSource::new(
+            zero.clone(), global.clone(), shard.clone(), clock.clone() as Arc<dyn ClockStore>, closing.clone(),
+            staged.clone(),
+        ).unwrap();
+        let context = |view: u64, parent_view: u64, parent: [u8; 32]| ProposalContext {
+            epoch: 0, view, parent_view, parent: quil_cw_consensus::adapters::digest_from_identity(parent), leader: None,
+        };
         let unstaged = source.read(context(18, 17, tip_digest)).unwrap_err();
         assert!(unstaged.to_string().contains("not staged"), "{unstaged}");
         staged.store(true, Ordering::Release);
@@ -4636,7 +4752,7 @@ mod successor_tests {
         }
         let drained_source = ParentSource::new(
             zero.clone(), global.clone(), drained_shard, drained_clock as Arc<dyn ClockStore>,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(true)),
         ).unwrap();
         assert_eq!(drained_source.read(context(18, 17, tip_digest)).unwrap().closing_request, None);
 

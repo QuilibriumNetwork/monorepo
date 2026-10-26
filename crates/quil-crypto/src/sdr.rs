@@ -44,7 +44,7 @@ impl Default for SdrParams {
     }
 }
 
-const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
+pub(crate) const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
 const DST_GRAPH: &[u8] = b"quil/porep/sdr-graph/v1";
 
 /// Two 64-bit values deterministically derived for a graph edge. `kind` = 0 for
@@ -69,7 +69,7 @@ fn graph_rng(v: u64, kind: u8, edge_idx: u32) -> (u64, u64) {
 ///
 /// AUDIT: this is the distribution to validate against the reference. The bucket
 /// `j ∈ [1, ⌊log2 v⌋+1]`, then a node uniformly in `[2^(j-1), min(v, 2^j))`.
-fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
+pub(crate) fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
     out.clear();
     if v == 0 {
         return;
@@ -89,7 +89,7 @@ fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
 
 /// Expander parents of node `v` in the PRIOR layer: `expander_degree` uniformly
 /// random nodes in `[0, n)`.
-fn expander_parents(v: u64, expander_degree: usize, n: u64, out: &mut Vec<u64>) {
+pub(crate) fn expander_parents(v: u64, expander_degree: usize, n: u64, out: &mut Vec<u64>) {
     out.clear();
     if n == 0 {
         return;
@@ -111,7 +111,7 @@ fn node<'a>(buf: &'a [u8], idx: u64, nb: usize) -> &'a [u8] {
 /// parents). The graph is key-independent and the same in every layer, so it
 /// is derived once per leaf, in parallel, rather than once per layer; it costs
 /// `4·width` bytes per node. `None` when node indices do not fit in `u32`.
-fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize)> {
+pub(crate) fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize)> {
     use rayon::prelude::*;
     if u32::try_from(n).is_err() {
         return None;
@@ -140,8 +140,21 @@ fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize
 /// Two layers resident at a time, plus the parent table of [`graph_parents`].
 /// Labelling stays sequential: every label depends on its predecessor.
 fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
+    label_layers(n, key, params, &mut |_, _| {})
+}
+
+/// [`final_layer_labels`], handing every finished layer to `on_layer` (its
+/// index and labels) before the next one is computed. The hash-based storage
+/// proofs fold each layer into the column commitment and keep the labels of
+/// the nodes a seal proof opens; the labels themselves are unchanged.
+pub(crate) fn label_layers(
+    n: usize,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[u8]),
+) -> Vec<u8> {
     let Some((parents, drg, width)) = graph_parents(n, params) else {
-        return final_layer_labels_uncached(n, key, params);
+        return label_layers_uncached(n, key, params, on_layer);
     };
     let nb = params.node_bytes;
     let mut prev = vec![0u8; n * nb]; // layer -1: no expander parents on layer 0
@@ -169,6 +182,7 @@ fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
             let lbl = h.finalize();
             cur[v * nb..v * nb + nb].copy_from_slice(&lbl[..nb]);
         }
+        on_layer(layer, &cur);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev // after the final swap, `prev` holds layer L-1
@@ -176,7 +190,18 @@ fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
 
 /// [`final_layer_labels`] deriving parents on every layer, for leaves whose
 /// node indices exceed `u32` and as the reference the cached path must match.
+#[cfg(test)]
 fn final_layer_labels_uncached(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
+    label_layers_uncached(n, key, params, &mut |_, _| {})
+}
+
+/// [`label_layers`] deriving parents on every layer.
+fn label_layers_uncached(
+    n: usize,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[u8]),
+) -> Vec<u8> {
     let nb = params.node_bytes;
     let mut prev = vec![0u8; n * nb]; // layer -1: no expander parents on layer 0
     let mut cur = vec![0u8; n * nb];
@@ -206,6 +231,7 @@ fn final_layer_labels_uncached(n: usize, key: &[u8], params: &SdrParams) -> Vec<
             let lbl = h.finalize();
             cur[v as usize * nb..v as usize * nb + nb].copy_from_slice(&lbl[..nb]);
         }
+        on_layer(layer, &cur);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev // after the final swap, `prev` holds layer L-1

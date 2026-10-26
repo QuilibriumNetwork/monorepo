@@ -19,7 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt,
     fmt::Debug,
 };
@@ -38,6 +38,26 @@ pub(crate) struct CacheEntry {
     topic: TopicHash,
 }
 
+/// QUILIBRIUM: occupancy and byte-budget evictions of the message cache.
+///
+/// The eviction counters are cumulative since the cache was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageCacheStats {
+    /// Bytes currently accounted to cached messages: payload, signature, key, topic and id.
+    pub bytes: usize,
+    /// The configured budget ([`crate::Config::mcache_max_bytes`]).
+    pub max_bytes: usize,
+    /// Messages currently cached.
+    pub messages: usize,
+    /// Messages evicted to keep the cache within its budget.
+    pub evicted_messages: u64,
+    /// Bytes of the evicted messages.
+    pub evicted_bytes: u64,
+    /// Evicted messages that the application had not validated yet. Such a
+    /// message still reaches the application, but is not forwarded.
+    pub evicted_unvalidated: u64,
+}
+
 /// MessageCache struct holding history of messages.
 #[derive(Clone)]
 pub(crate) struct MessageCache {
@@ -49,6 +69,27 @@ pub(crate) struct MessageCache {
     /// won't get gossiped anymore when shift got called `gossip` many times after inserting the
     /// message in the cache.
     gossip: usize,
+    /// QUILIBRIUM: byte budget. The history windows bound the cache by heartbeats, not by bytes:
+    /// under a flood of large messages, or while heartbeats run late, the windows hold whatever
+    /// arrives. When a new message would take the cache over `max_bytes`, the oldest messages
+    /// are evicted, validated ones first, down to [`MessageCache::low_watermark`].
+    max_bytes: usize,
+    /// Bytes accounted to the messages in `msgs` (see [`cached_bytes`]).
+    bytes: usize,
+    evicted_messages: u64,
+    evicted_bytes: u64,
+    evicted_unvalidated: u64,
+}
+
+/// QUILIBRIUM: the bytes a cached message is accounted for: its payload, signature, key and
+/// topic, plus its id, which is held twice (map key and history entry). Fixed-size fields and
+/// allocator overhead are not counted.
+fn cached_bytes(message_id: &MessageId, msg: &RawMessage) -> usize {
+    msg.data.len()
+        + msg.signature.as_ref().map_or(0, Vec::len)
+        + msg.key.as_ref().map_or(0, Vec::len)
+        + msg.topic.as_str().len()
+        + 2 * message_id.0.len()
 }
 
 impl fmt::Debug for MessageCache {
@@ -57,18 +98,92 @@ impl fmt::Debug for MessageCache {
             .field("msgs", &self.msgs)
             .field("history", &self.history)
             .field("gossip", &self.gossip)
+            .field("bytes", &self.bytes)
+            .field("max_bytes", &self.max_bytes)
             .finish()
     }
 }
 
 /// Implementation of the MessageCache.
 impl MessageCache {
-    pub(crate) fn new(gossip: usize, history_capacity: usize) -> Self {
+    pub(crate) fn new(gossip: usize, history_capacity: usize, max_bytes: usize) -> Self {
         MessageCache {
             gossip,
             msgs: HashMap::default(),
             iwant_counts: HashMap::default(),
             history: vec![Vec::new(); history_capacity],
+            max_bytes,
+            bytes: 0,
+            evicted_messages: 0,
+            evicted_bytes: 0,
+            evicted_unvalidated: 0,
+        }
+    }
+
+    /// QUILIBRIUM: occupancy and eviction counters.
+    pub(crate) fn stats(&self) -> MessageCacheStats {
+        MessageCacheStats {
+            bytes: self.bytes,
+            max_bytes: self.max_bytes,
+            messages: self.msgs.len(),
+            evicted_messages: self.evicted_messages,
+            evicted_bytes: self.evicted_bytes,
+            evicted_unvalidated: self.evicted_unvalidated,
+        }
+    }
+
+    /// QUILIBRIUM: the level an eviction pass brings the cache down to, 7/8 of the budget, so
+    /// that one pass over the history makes room for many further messages.
+    fn low_watermark(&self) -> usize {
+        self.max_bytes - self.max_bytes / 8
+    }
+
+    /// QUILIBRIUM: evicts messages, oldest first, until at most `target` bytes remain. Validated
+    /// messages go first: they have been forwarded already and only serve IWANT requests. Only
+    /// if that is not enough, unvalidated ones follow; those still reach the application but are
+    /// no longer forwarded. Evicted entries leave the history too, so they are not advertised.
+    fn evict(&mut self, target: usize) {
+        let MessageCache {
+            msgs,
+            iwant_counts,
+            history,
+            bytes,
+            evicted_messages,
+            evicted_bytes,
+            evicted_unvalidated,
+            ..
+        } = self;
+        for validated_only in [true, false] {
+            // `history[0]` is the newest window; within a window, entries are in arrival order.
+            for window in history.iter_mut().rev() {
+                if *bytes <= target {
+                    return;
+                }
+                window.retain(|entry| {
+                    if *bytes <= target {
+                        return true;
+                    }
+                    let validated = match msgs.get(&entry.mid) {
+                        // Left behind by `remove`; drop it while we are here.
+                        None => return false,
+                        Some((msg, _)) => msg.validated,
+                    };
+                    if validated_only && !validated {
+                        return true;
+                    }
+                    if let Some((msg, _)) = msgs.remove(&entry.mid) {
+                        let size = cached_bytes(&entry.mid, &msg);
+                        *bytes = bytes.saturating_sub(size);
+                        *evicted_messages += 1;
+                        *evicted_bytes += size as u64;
+                        if !validated {
+                            *evicted_unvalidated += 1;
+                        }
+                    }
+                    iwant_counts.remove(&entry.mid);
+                    false
+                });
+            }
         }
     }
 
@@ -79,23 +194,28 @@ impl MessageCache {
         if self.history.is_empty() {
             return true;
         }
-        match self.msgs.entry(message_id.clone()) {
-            Entry::Occupied(_) => {
-                // Don't add duplicate entries to the cache.
-                false
-            }
-            Entry::Vacant(entry) => {
-                let cache_entry = CacheEntry {
-                    mid: message_id.clone(),
-                    topic: msg.topic.clone(),
-                };
-                entry.insert((msg, HashSet::default()));
-                self.history[0].push(cache_entry);
-
-                tracing::trace!(message=?message_id, "Put message in mcache");
-                true
-            }
+        // Don't add duplicate entries to the cache.
+        if self.msgs.contains_key(message_id) {
+            return false;
         }
+        // QUILIBRIUM: make room within the byte budget before admitting the message. The new
+        // message itself is always cached, as before, so a message larger than the whole budget
+        // is cached alone.
+        let size = cached_bytes(message_id, &msg);
+        if self.bytes.saturating_add(size) > self.max_bytes {
+            self.evict(self.low_watermark().saturating_sub(size));
+        }
+        let cache_entry = CacheEntry {
+            mid: message_id.clone(),
+            topic: msg.topic.clone(),
+        };
+        self.bytes += size;
+        self.msgs
+            .insert(message_id.clone(), (msg, HashSet::default()));
+        self.history[0].push(cache_entry);
+
+        tracing::trace!(message=?message_id, "Put message in mcache");
+        true
     }
 
     /// Keeps track of peers we know have received the message to prevent forwarding to said peers.
@@ -196,6 +316,7 @@ impl MessageCache {
 
         for entry in self.history.pop().expect("history is always > 1") {
             if let Some((msg, _)) = self.msgs.remove(&entry.mid) {
+                self.bytes = self.bytes.saturating_sub(cached_bytes(&entry.mid, &msg));
                 if !msg.validated {
                     // If GossipsubConfig::validate_messages is true, the implementing
                     // application has to ensure that Gossipsub::validate_message gets called for
@@ -224,7 +345,11 @@ impl MessageCache {
         // history vector. Zhe id in the history vector will simply be ignored on popping.
 
         self.iwant_counts.remove(message_id);
-        self.msgs.remove(message_id)
+        let removed = self.msgs.remove(message_id);
+        if let Some((msg, _)) = &removed {
+            self.bytes = self.bytes.saturating_sub(cached_bytes(message_id, msg));
+        }
+        removed
     }
 }
 
@@ -260,7 +385,21 @@ mod tests {
     }
 
     fn new_cache(gossip_size: usize, history: usize) -> MessageCache {
-        MessageCache::new(gossip_size, history)
+        MessageCache::new(gossip_size, history, usize::MAX)
+    }
+
+    /// A message with a `len`-byte payload and a 4-byte id.
+    fn sized_message(x: u32, len: usize, topic: TopicHash) -> (MessageId, RawMessage) {
+        let m = RawMessage {
+            source: None,
+            data: vec![0; len],
+            sequence_number: None,
+            topic,
+            signature: None,
+            key: None,
+            validated: false,
+        };
+        (MessageId::new(&x.to_be_bytes()), m)
     }
 
     #[test]
@@ -391,5 +530,134 @@ mod tests {
         assert_eq!(mc.history[mc.history.len() - 1].len(), 0);
         assert_eq!(mc.history[0].len(), 0);
         assert_eq!(mc.msgs.len(), 0);
+    }
+
+    #[test]
+    /// QUILIBRIUM: the byte budget bounds the cache however many messages one history window
+    /// receives, evicting the oldest, validated ones first.
+    fn test_byte_budget_bounds_the_cache() {
+        let topic = Topic::new("t").hash();
+        let (id, m) = sized_message(0, 1000, topic.clone());
+        let entry = cached_bytes(&id, &m);
+        let budget = 10 * entry;
+        let mut mc = MessageCache::new(3, 5, budget);
+
+        // An unvalidated message first: it outlives validated ones that arrive after it.
+        let (pending, m) = sized_message(0, 1000, topic.clone());
+        mc.put(&pending, m);
+        for i in 1..100 {
+            let (id, m) = sized_message(i, 1000, topic.clone());
+            mc.put(&id, m);
+            let _ = mc.validate(&id);
+            assert!(
+                mc.stats().bytes <= budget,
+                "{:?} after {} puts",
+                mc.stats(),
+                i + 1
+            );
+        }
+
+        let stats = mc.stats();
+        assert_eq!(stats.bytes, stats.messages * entry);
+        assert!(stats.messages >= 8, "{stats:?}");
+        assert!(stats.evicted_messages > 0);
+        assert_eq!(stats.evicted_unvalidated, 0);
+        assert!(
+            mc.get(&pending).is_some(),
+            "the unvalidated message was evicted first"
+        );
+        assert!(mc.get(&MessageId::new(&99u32.to_be_bytes())).is_some());
+        assert!(mc.get(&MessageId::new(&1u32.to_be_bytes())).is_none());
+        // Evicted messages are no longer advertised.
+        let advertised = mc.get_gossip_message_ids(&topic);
+        assert_eq!(advertised.len(), stats.messages - 1);
+
+        // Unvalidated messages go only when nothing else is left.
+        let mut mc = MessageCache::new(3, 5, budget);
+        for i in 0..20 {
+            let (id, m) = sized_message(i, 1000, topic.clone());
+            mc.put(&id, m);
+            assert!(mc.stats().bytes <= budget);
+        }
+        assert!(mc.stats().evicted_unvalidated > 0);
+    }
+
+    #[test]
+    /// QUILIBRIUM: under the budget the cache behaves as before, and removals and history
+    /// shifts release their bytes.
+    fn test_byte_accounting_follows_removal_and_shift() {
+        let topic = Topic::new("t").hash();
+        let mut mc = MessageCache::new(1, 2, 1 << 20);
+        let (a, m) = sized_message(1, 100, topic.clone());
+        let size = cached_bytes(&a, &m);
+        assert!(mc.put(&a, m.clone()));
+        assert!(
+            !mc.put(&a, m),
+            "a duplicate is not cached or accounted twice"
+        );
+        assert_eq!(mc.stats().bytes, size);
+        let (b, m) = sized_message(2, 200, topic.clone());
+        mc.put(&b, m);
+        assert!(mc.remove(&a).is_some());
+        assert_eq!(mc.stats().bytes, cached_bytes(&b, mc.get(&b).unwrap()));
+        mc.shift();
+        mc.shift();
+        assert_eq!(mc.stats().bytes, 0);
+        assert_eq!(mc.stats().messages, 0);
+        assert_eq!(mc.stats().evicted_messages, 0);
+
+        // A message larger than the whole budget is still cached, alone.
+        let mut mc = MessageCache::new(1, 2, 1000);
+        let (small, m) = sized_message(3, 10, topic.clone());
+        mc.put(&small, m);
+        let (big, m) = sized_message(4, 5000, topic);
+        mc.put(&big, m);
+        assert!(mc.get(&big).is_some());
+        assert!(mc.get(&small).is_none());
+        assert_eq!(mc.stats().messages, 1);
+    }
+
+    #[test]
+    /// QUILIBRIUM: under pressure an evicted message is neither advertised (IHAVE) nor served
+    /// (IWANT) and leaves no request counters behind, while the survivors stay available.
+    fn test_iwant_and_ihave_under_byte_pressure() {
+        let topic = Topic::new("t").hash();
+        let peer = PeerId::random();
+        let (id, m) = sized_message(0, 1000, topic.clone());
+        let entry = cached_bytes(&id, &m);
+        let mut mc = MessageCache::new(3, 5, 4 * entry);
+
+        let ids: Vec<MessageId> = (0..4)
+            .map(|i| {
+                let (id, m) = sized_message(i, 1000, topic.clone());
+                mc.put(&id, m);
+                let _ = mc.validate(&id);
+                assert!(mc.get_with_iwant_counts(&id, &peer).is_some());
+                id
+            })
+            .collect();
+        assert_eq!(mc.stats().evicted_messages, 0);
+        assert_eq!(mc.get_gossip_message_ids(&topic).len(), 4);
+
+        // One more message pushes the cache over its budget: the oldest go.
+        let (newest, m) = sized_message(4, 1000, topic.clone());
+        mc.put(&newest, m);
+        let _ = mc.validate(&newest);
+        assert!(mc.stats().evicted_messages > 0);
+        assert!(mc.stats().bytes <= 4 * entry);
+        assert!(
+            mc.get_with_iwant_counts(&ids[0], &peer).is_none(),
+            "evicted: IWANT fails"
+        );
+        assert!(!mc.iwant_counts.contains_key(&ids[0]));
+        assert!(!mc.get_gossip_message_ids(&topic).contains(&ids[0]));
+        assert!(mc.get_with_iwant_counts(&newest, &peer).is_some());
+        assert!(mc.get_gossip_message_ids(&topic).contains(&newest));
+        assert_eq!(mc.get_gossip_message_ids(&topic).len(), mc.stats().messages);
+
+        // An unvalidated message is not served over IWANT, evicted or not.
+        let (pending, m) = sized_message(5, 1000, topic);
+        mc.put(&pending, m);
+        assert!(mc.get_with_iwant_counts(&pending, &peer).is_none());
     }
 }

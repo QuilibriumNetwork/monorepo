@@ -201,6 +201,11 @@ message MessageRequest {
     // Canonical notarize votes of an app-shard session, the evidence of
     // which members vote. GLOBAL validates them against committed state.
     bytes presence_report = 32;
+    // Canonical storage epoch proof (type 0x0324): one member's STARK for
+    // one storage seat, sealing its next registration and proving the
+    // openings it committed the epoch before. Replaced the plain storage
+    // seal (0x0323), which never reached mainnet.
+    bytes storage_epoch_proof = 33;
   }
   int64 timestamp = 99;
 }
@@ -1033,6 +1038,8 @@ message ShardCoin {
   uint64 position = 6;
 }
 
+// Same contract as node.pb ListCoinsResponse, including its empty
+// root_record answer for an application without a coin root.
 message ListShardCoinsResponse {
   bytes network = 1;
   bytes snapshot_id = 2;

@@ -289,6 +289,15 @@ pub fn apply_config_worker_filters(
         };
 
         let core_id = (i as u32) + 1;
+        if worker_manager.is_draining(core_id) {
+            stats.skipped_missing_core += 1;
+            warn!(
+                index = i,
+                core_id,
+                "data_worker_filters: the worker is above the configured worker count and drains; skipping"
+            );
+            continue;
+        }
         let Some(existing) = current.get(&core_id) else {
             stats.skipped_missing_core += 1;
             warn!(
@@ -378,6 +387,22 @@ pub const MAX_DEFERRED_REPLACEMENTS_PER_REVIEW: usize = 4;
 /// Roughly ten minutes of frames — often enough that a fresh log window
 /// always shows the current state, rare enough not to bury the log.
 pub const REBIND_TELEMETRY_REPEAT_FRAMES: u64 = 75;
+
+/// How often the orphan warning repeats while the same allocations stay
+/// without a worker, about ten minutes of frames. A change of the orphan
+/// set is logged at once.
+pub const ORPHAN_WARNING_REPEAT_FRAMES: u64 = 75;
+
+/// The allocations without a worker as of the last reconcile that found
+/// some, for the bounded orphan warning ([`WorkerAllocator::watch_orphans`]).
+struct OrphanWatch {
+    /// Frame at which the current episode began.
+    since_frame: u64,
+    /// Frame of the last line logged for it.
+    logged_frame: u64,
+    /// The orphans as sorted `filter:Status` strings.
+    set: Vec<String>,
+}
 
 /// Hysteresis for a priority rebind within the same tier: the unbound
 /// allocation must score at least this percent of the bound one before
@@ -524,6 +549,44 @@ impl RebindOutcome {
     }
 }
 
+/// How far a worker's held shard may trail the frame GLOBAL committed for
+/// it and still be bound to that worker: an epoch's worth of frames. A
+/// lineage further behind replays that many frames from archives, a cost
+/// that outgrows the install a worker without it makes.
+fn shard_data_trail() -> u64 {
+    quil_types::consensus::epoch_length_frames()
+}
+
+/// For each of `filters` in turn, the worker among `eligible` whose store
+/// holds that shard's data (`holders`, [`WorkerManager::shard_data`]): the
+/// one with the highest materialized cursor, then the lowest core, among
+/// those within [`shard_data_trail`] of the shard's committed tip (`tip`;
+/// any holder when it is unknown). Each worker is chosen once; a filter no
+/// eligible worker holds is absent.
+fn data_holders<'a>(
+    filters: impl Iterator<Item = &'a [u8]>,
+    eligible: &[u32],
+    holders: &HashMap<u32, Vec<(Vec<u8>, u64)>>,
+    tip: impl Fn(&[u8]) -> Option<u64>,
+) -> HashMap<Vec<u8>, u32> {
+    let mut chosen: HashMap<Vec<u8>, u32> = HashMap::new();
+    for filter in filters {
+        let tip = tip(filter);
+        let best = eligible.iter()
+            .filter(|core| !chosen.values().any(|taken| taken == *core))
+            .filter_map(|core| {
+                let (_, cursor) = holders.get(core)?.iter().find(|(held, _)| held.as_slice() == filter)?;
+                Some((*cursor, *core))
+            })
+            .filter(|(cursor, _)| tip.is_none_or(|tip| cursor.saturating_add(shard_data_trail()) >= tip))
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        if let Some((_, core)) = best {
+            chosen.entry(filter.to_vec()).or_insert(core);
+        }
+    }
+    chosen
+}
+
 /// Snapshot of the current allocation state across the network.
 #[derive(Debug, Clone)]
 pub struct AllocationSnapshot {
@@ -631,6 +694,8 @@ pub struct WorkerAllocator {
     /// means unknown: no eviction is requested.
     pending_shard_changes: RwLock<Option<PendingShardChanges>>,
     payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
+    /// The running orphan episode, `None` while every seat has a worker.
+    orphan_watch: std::sync::Mutex<Option<OrphanWatch>>,
 }
 
 impl WorkerAllocator {
@@ -816,14 +881,50 @@ impl WorkerAllocator {
         Ok(())
     }
 
-    /// Free a worker, unless its committee session is still closing.
+    /// Free a worker, unless its committee session is still closing or its
+    /// seat still owes a storage epoch proof.
     fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
         if retained {
             debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
-                "committee session still counts this member; worker stays bound until its seal is recorded");
+                "committee session or storage settlement still needs this member; worker stays bound");
             return Ok(());
         }
         self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
+    /// for roots it committed: a sealed, open slot of the previous or current
+    /// epoch with committed roots, whose settlement window has not closed.
+    /// Only the shard's engine proves a seat, and GLOBAL kicks a member that
+    /// committed roots and never proved them, so the worker stays bound (and
+    /// its engine running) until the epoch settles or its window closes.
+    fn owes_storage_settlement(&self, filter: &[u8], frame_number: u64) -> bool {
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at};
+        let current = epoch_for_frame(frame_number);
+        [current.saturating_sub(1), current].into_iter().any(|epoch| {
+            hash_storage_proofs_at(epoch)
+                && self.prover_registry.get_storage_seat_slot(&self.local_prover_address, filter, epoch).ok().flatten()
+                    .is_some_and(|slot| {
+                        slot.sealed_at.is_some() && slot.open && slot.frames > 0
+                            && frame_number < quil_execution::global_intrinsic::storage_seat::settlement_window(epoch).1
+                    })
+        })
+    }
+
+    /// The frame GLOBAL committed for each of `filters` that has one
+    /// ([`crate::app_handoff::committed_tips`]); none without authenticated
+    /// GLOBAL state or when it is unreadable.
+    fn committed_tips(&self, filters: &[Vec<u8>]) -> HashMap<Vec<u8>, u64> {
+        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return HashMap::new();
+        };
+        match crate::app_handoff::committed_tips(&global, filters) {
+            Ok(tips) => tips.into_iter().collect(),
+            Err(error) => {
+                debug!(%error, "committed shard tips unreadable; binding prefers any holder of a shard's data");
+                HashMap::new()
+            }
+        }
     }
 
     pub fn set_session_authority(&self, global: Arc<quil_hypergraph::HypergraphCrdt>) {
@@ -831,18 +932,25 @@ impl WorkerAllocator {
     }
 
     /// Of `filters`, those whose current committee session counts `member`
-    /// ([`crate::app_handoff::member_sessions`]). None without authenticated
+    /// ([`crate::app_handoff::member_sessions`]). Empty without authenticated
     /// GLOBAL state or when it is unreadable: no seat is then held to
-    /// hosting a session.
-    pub(crate) fn session_member_filters(&self, filters: &[Vec<u8>], member: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    /// hosting a session. `None` while a GLOBAL state sync withholds the
+    /// committed view: membership is then unknown, not empty.
+    pub(crate) fn session_member_filters(
+        &self, filters: &[Vec<u8>], member: &[u8],
+    ) -> Option<std::collections::HashSet<Vec<u8>>> {
         let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
-            return Default::default();
+            return Some(Default::default());
         };
         match crate::app_handoff::member_sessions(&global, filters, member) {
-            Ok(members) => members,
+            Ok(members) => Some(members),
+            Err(error) if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) => {
+                debug!(%error, "committee sessions withheld by a GLOBAL state sync; seat hosting is not observed");
+                None
+            }
             Err(error) => {
                 debug!(%error, "committee sessions unreadable; no seat is held to hosting");
-                Default::default()
+                Some(Default::default())
             }
         }
     }
@@ -880,7 +988,83 @@ impl WorkerAllocator {
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
+            orphan_watch: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Log the allocations left without a worker, once per episode and
+    /// change of its set, then every `ORPHAN_WARNING_REPEAT_FRAMES` while it
+    /// lasts, and its end when the set empties. A node under a lowered worker
+    /// count reconciles every frame with the same orphans, so a line per
+    /// pass would repeat one fact about a hundred times an hour. Returns the
+    /// event logged, if any.
+    fn watch_orphans(
+        &self,
+        frame_number: u64,
+        orphans: &[(Vec<u8>, ProverStatus)],
+        draining: usize,
+    ) -> Option<&'static str> {
+        let mut watch = self.orphan_watch.lock().unwrap_or_else(|e| e.into_inner());
+        let capacity = self.worker_manager.allocation_capacity().unwrap_or_default();
+        let bound = self
+            .worker_manager
+            .range_workers()
+            .map(|ws| ws.iter().filter(|w| !w.filter.is_empty()).count())
+            .unwrap_or_default();
+        if orphans.is_empty() {
+            if let Some(ended) = watch.take() {
+                info!(
+                    frame_number,
+                    since_frame = ended.since_frame,
+                    orphaned_frames = frame_number.saturating_sub(ended.since_frame),
+                    bound_workers = bound,
+                    configured_workers = capacity,
+                    "every allocation has a worker again; the allocations without one have left or been bound"
+                );
+                return Some("ended");
+            }
+            return None;
+        }
+        let mut set: Vec<String> = orphans
+            .iter()
+            .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+            .collect();
+        set.sort();
+        let (event, since_frame) = match watch.as_ref() {
+            None => ("started", frame_number),
+            Some(w) if w.set != set => ("changed", w.since_frame),
+            Some(w) if frame_number.abs_diff(w.logged_frame) >= ORPHAN_WARNING_REPEAT_FRAMES => {
+                ("continues", w.since_frame)
+            }
+            Some(_) => return None,
+        };
+        *watch = Some(OrphanWatch { since_frame, logged_frame: frame_number, set });
+        let count_of = |status: ProverStatus| orphans.iter().filter(|(_, s)| *s == status).count();
+        let sample: Vec<String> = orphans
+            .iter()
+            .take(8)
+            .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+            .collect();
+        warn!(
+            event,
+            orphan_count = orphans.len(),
+            joining = count_of(ProverStatus::Joining),
+            active = count_of(ProverStatus::Active),
+            leaving = count_of(ProverStatus::Leaving),
+            bound_workers = bound,
+            configured_workers = capacity,
+            draining_workers = draining,
+            frame_number,
+            since_frame,
+            orphaned_frames = frame_number.saturating_sub(since_frame),
+            ?sample,
+            "allocations without a worker: this node holds more seats than it has workers \
+             (a lowered dataWorkerCount, lost workers or overlapping joins). An expected wait: \
+             an unconfirmed Joining seat expires after its confirm epoch, a Leaving seat departs \
+             at its confirmed boundary or expiry, an Active seat leaves through the surplus \
+             leave or lapses when its reconfirm is missed. Report it only if it outlasts these"
+        );
+        Some(event)
     }
 
     /// The workers held back from new seats for sending no vote in their
@@ -1406,7 +1590,7 @@ impl WorkerAllocator {
                 (Some(global), Some(member)) if !worker.filter.is_empty() =>
                     crate::app_handoff::retains_worker(global, &worker.filter, member),
                 _ => false,
-            };
+            } || (!worker.filter.is_empty() && self.owes_storage_settlement(&worker.filter, frame_number));
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -1675,11 +1859,14 @@ impl WorkerAllocator {
             .map(|w| w.filter.clone())
             .collect();
 
+        // A worker above the configured count drains: it takes no new seat,
+        // so neither idle list offers it (`WorkerManager::is_draining`).
+        let draining = self.worker_manager.draining_workers();
         let mut idle_workers: Vec<u32> = self
             .worker_manager
             .range_workers()?
             .iter()
-            .filter(|w| w.filter.is_empty() && !w.manually_managed)
+            .filter(|w| w.filter.is_empty() && !w.manually_managed && !draining.contains(&w.core_id))
             .map(|w| w.core_id)
             .collect();
         // Sorted DESCENDING so `pop()` yields the LOWEST core id first.
@@ -1715,7 +1902,7 @@ impl WorkerAllocator {
             .worker_manager
             .range_workers()?
             .iter()
-            .filter(|w| w.filter.is_empty() && w.manually_managed)
+            .filter(|w| w.filter.is_empty() && w.manually_managed && !draining.contains(&w.core_id))
             .map(|w| w.core_id)
             .collect();
         manual_pending.sort();
@@ -1790,10 +1977,16 @@ impl WorkerAllocator {
         // join merely because the latter scores higher; nor may a confirmed
         // join, a committee member from the next boundary whatever this node
         // does, lose the worker to a join that may never be confirmed.
+        // A leave not yet confirmed comes after the seats the node keeps:
+        // when workers are short (a lowered count, or a restart that binds
+        // anew), it stays unbound, and its confirm then goes through as an
+        // orphan's instead of being rejected for its score. A confirmed
+        // leave serves its notice and keeps its place.
         bind_candidates.sort_by(|a, b| {
             use quil_types::consensus::AllocationPhase;
             let pending = |a: &quil_types::consensus::ProverAllocationInfo| match a.phase(frame_number) {
-                Some(AllocationPhase::Joining) => 2u8,
+                Some(AllocationPhase::Joining) => 3u8,
+                Some(AllocationPhase::Leaving) => 2,
                 Some(AllocationPhase::Activating) => 1,
                 _ => 0,
             };
@@ -1810,14 +2003,51 @@ impl WorkerAllocator {
             })
         });
 
+        // The candidates the idle pool serves go first to the idle worker
+        // whose own store holds their shard's data. A restart or release
+        // that frees several workers at once rebinds them here, and a shard
+        // given to a worker without its data installs all of it from an
+        // archive (minutes and about a gigabyte for a large shard, through
+        // the node's two archive recovery turns) while the worker holding it
+        // installs another. Which candidates get a worker, and the manual
+        // pool's precedence, stay as they were; a worker held back or whose
+        // store stopped keeps its place at the end.
+        let served = bind_candidates.len().min(manual_pending.len() + idle_workers.len());
+        let eligible: Vec<u32> = idle_workers.iter().copied()
+            .filter(|core| !held_back.contains(core) && !crate::worker_execution::store_stopped(*core))
+            .collect();
+        let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served].iter()
+            .map(|a| a.confirmation_filter.clone())
+            .collect();
+        let holders = self.worker_manager.shard_data();
+        let tips = if holders.values().any(|held| !held.is_empty()) {
+            self.committed_tips(&from_idle)
+        } else {
+            HashMap::new()
+        };
+        let mut on_data = data_holders(
+            from_idle.iter().map(Vec::as_slice),
+            &eligible,
+            &holders,
+            |filter| tips.get(filter).copied(),
+        );
+        idle_workers.retain(|core| !on_data.values().any(|held| held == core));
+        let mut bound_on_data: Vec<String> = Vec::new();
+
         // Unconfirmed joins bound in this pass, by the epoch their confirm is
         // due in: (count, first join frame, last join frame).
         let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> = Default::default();
         for alloc in bind_candidates {
             // Prefer a manually-pending (user-picked) worker before
             // falling back to the auto-managed idle pool.
-            let pick = manual_pending.pop().or_else(|| idle_workers.pop());
+            let holds_data = manual_pending.is_empty() && on_data.contains_key(&alloc.confirmation_filter);
+            let pick = manual_pending.pop()
+                .or_else(|| on_data.remove(&alloc.confirmation_filter))
+                .or_else(|| idle_workers.pop());
             if let Some(core_id) = pick {
+                if holds_data {
+                    bound_on_data.push(format!("{core_id}:{}", hex::encode(&alloc.confirmation_filter)));
+                }
                 if let Some(quil_types::consensus::JoinWait::Confirmation { epoch }) = alloc.join_wait(frame_number) {
                     let join = alloc.join_frame_number;
                     let entry = landed_joins.entry(epoch).or_insert((0, join, join));
@@ -1844,6 +2074,7 @@ impl WorkerAllocator {
                     status = ?alloc.status,
                     start_consensus,
                     manual,
+                    holds_data,
                     "assigning shard to worker"
                 );
                 self.worker_manager.set_worker_filter(
@@ -1854,16 +2085,22 @@ impl WorkerAllocator {
             } else {
                 // No idle worker available — the alloc is on-chain
                 // but has no local worker bound. This is a
-                // worker-budget overflow, almost always caused by
-                // overlapping ProposeJoin cycles materializing more
-                // distinct filters than we have worker slots for.
-                // The lifecycle's per-filter Join cooldown prevents
-                // the upstream cause; this branch logs the symptom
-                // so the operator (or a future regression) can spot
-                // it. Collected and logged in aggregate below so a
-                // batch of 9 orphans produces one log line, not 9.
+                // worker-budget overflow: a lowered worker count, lost
+                // workers, or overlapping ProposeJoin cycles
+                // materializing more distinct filters than we have
+                // worker slots for (the lifecycle's per-filter Join
+                // cooldown prevents the last). Collected and logged in
+                // aggregate by `watch_orphans` below, so a batch of 9
+                // orphans produces one line, not 9, and a steady state
+                // one line per `ORPHAN_WARNING_REPEAT_FRAMES`.
                 orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
+        }
+
+        if !bound_on_data.is_empty() {
+            info!(frame = frame_number, bound = bound_on_data.len(),
+                workers = ?bound_on_data.iter().take(8).collect::<Vec<_>>(),
+                "bound shards to the idle workers whose stores hold their data");
         }
 
         self.log_idled_manual_workers(frame_number, &manual_seats, &alloc_by_filter)?;
@@ -1873,26 +2110,9 @@ impl WorkerAllocator {
             prover_info.as_ref().map(|p| p.allocations.as_slice()).unwrap_or(&[]),
         )?;
 
-        if !orphan_filters.is_empty() {
-            let count = orphan_filters.len();
-            let sample: Vec<String> = orphan_filters
-                .iter()
-                .take(8)
-                .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
-                .collect();
-            warn!(
-                orphan_count = count,
-                frame_number,
-                ?sample,
-                "allocations with no worker bound — idle pool exhausted; \
-                 likely overlapping ProposeJoin cycles produced more \
-                 distinct Joining filters than worker slots. The orphan \
-                 alloc stays in the registry until its 720-frame grace \
-                 expires (Joining) or until the network confirms/rejects \
-                 it. Lifecycle's `JOIN_FILTER_COOLDOWN_FRAMES` is the \
-                 upstream guard against this."
-            );
+        let _ = self.watch_orphans(frame_number, &orphan_filters, draining.len());
 
+        if !orphan_filters.is_empty() {
             // Orphans are not necessarily the least valuable
             // allocations: workers lost to an incident (crashed data
             // worker, reduced core count, an operator shrinking the
@@ -2629,6 +2849,191 @@ mod tests {
         assert_eq!(bound_cores(&wm), vec![2], "the worker with a working store takes the seat");
     }
 
+    fn bound_to(wm: &MockWorkerManager) -> Vec<(u32, Vec<u8>)> {
+        wm.range_workers().unwrap().into_iter()
+            .filter(|w| !w.filter.is_empty())
+            .map(|w| (w.core_id, w.filter))
+            .collect()
+    }
+
+    /// Workers a restart released together (an early reconcile against an
+    /// unloaded registry clears every binding) are bound back to the shards
+    /// their own stores hold, whatever order the shards are bound in: the
+    /// worker with the highest cursor of a shard wins, and no worker is
+    /// given to two shards.
+    #[test]
+    fn a_restart_rebinds_each_shard_to_the_worker_holding_its_data() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for (core, filter) in [(1, f(2)), (2, f(3)), (3, f(1)), (4, Vec::new())] {
+            wm.add_with_filter(core, filter);
+            wm.deallocate_worker(core).unwrap();
+        }
+        wm.set_shard_data(1, vec![(f(2), 70)]);
+        wm.set_shard_data(2, vec![(f(3), 80), (f(1), 12)]);
+        wm.set_shard_data(3, vec![(f(1), 90)]);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        let logged = reconcile_logged(&alloc, 101);
+        assert_eq!(bound_to(&wm), vec![(1, f(2)), (2, f(3)), (3, f(1))], "each shard back on its data");
+        assert!(logged.contains("bound shards to the idle workers whose stores hold their data")
+            && logged.contains("bound=3"), "{logged}");
+    }
+
+    /// A holder trailing the shard's committed tip by more than an epoch's
+    /// worth of frames is not preferred; one within it, or any holder of a
+    /// shard whose tip is unknown, is, the highest cursor first.
+    #[test]
+    fn a_holder_far_behind_the_committed_tip_is_not_preferred() {
+        let f = |byte: u8| vec![byte; 32];
+        let trail = shard_data_trail();
+        let holders = HashMap::from([
+            (1, vec![(f(1), 10), (f(2), 10)]),
+            (2, vec![(f(1), 5000 - trail)]),
+        ]);
+        let tips = HashMap::from([(f(1), 5000u64), (f(2), 5000)]);
+        let pick = |filters: &[Vec<u8>], tips: &HashMap<Vec<u8>, u64>| {
+            let mut chosen: Vec<_> = data_holders(filters.iter().map(Vec::as_slice), &[1, 2], &holders,
+                |filter| tips.get(filter).copied()).into_iter().collect();
+            chosen.sort();
+            chosen
+        };
+        assert_eq!(pick(&[f(1), f(2)], &tips), vec![(f(1), 2)], "core 1's lineages trail too far");
+        assert_eq!(pick(&[f(2)], &HashMap::new()), vec![(f(2), 1)], "an unknown tip bounds nothing");
+    }
+
+    /// A shard no idle worker's store holds takes the lowest free core as
+    /// before, and a worker held back from new seats is not preferred for
+    /// the shard its store holds: it is still bound last.
+    #[test]
+    fn binding_by_shard_data_keeps_the_free_order_otherwise() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=4u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        wm.set_shard_data(1, vec![(f(1), 50)]);
+        wm.set_shard_data(4, vec![(f(3), 40)]);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.set_held_back(std::collections::HashSet::from([1]));
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_to(&wm), vec![(2, f(1)), (3, f(2)), (4, f(3))]);
+    }
+
+    /// A worker above the configured count drains: an unbound allocation is
+    /// bound to an idle worker within the count, or to none, but never to a
+    /// draining one, manual or not.
+    #[test]
+    fn a_draining_worker_is_never_bound_to_a_seat() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=4u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        wm.set_manually_managed(4, true).unwrap();
+        wm.set_configured_count(2);
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+        assert_eq!(bound_cores(&wm), vec![1, 2], "cores 3 and 4 drain; the third seat stays unbound");
+    }
+
+    /// With fewer idle workers than seats, a leave not yet confirmed waits
+    /// behind the seats the node keeps, so it stays unbound; a confirmed
+    /// leave serving its notice keeps its precedence.
+    #[test]
+    fn an_unconfirmed_leave_is_bound_after_the_seats_the_node_keeps() {
+        let f = |byte: u8| vec![byte; 32];
+        let e = epoch_length_frames();
+        let wm = Arc::new(MockWorkerManager::new());
+        for core in 1..=3u32 {
+            wm.allocate_worker(core, &[]).unwrap();
+        }
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let mut leaving = current(f(1));
+        leaving.status = ProverStatus::Leaving;
+        leaving.leave_frame_number = e + 10;
+        let mut departing = current(f(2));
+        departing.status = ProverStatus::Leaving;
+        departing.leave_frame_number = 10;
+        departing.leave_confirm_frame_number = e + 5;
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            leaving, departing, current(f(3)), current(f(4)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(e + 101).unwrap();
+        let mut bound: Vec<Vec<u8>> = bound_to(&wm).into_iter().map(|(_, filter)| filter).collect();
+        bound.sort();
+        assert_eq!(bound, vec![f(2), f(3), f(4)], "the unconfirmed leave waits for a spare worker");
+    }
+
+    /// Allocations without a worker are logged once per episode and change
+    /// of their set, repeated once per interval while they last, and their
+    /// end is logged: not a line per pass.
+    #[test]
+    fn orphan_warning_is_bounded_by_the_interval_and_the_set() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            current(f(1)), current(f(2)), current(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        let two = vec![(f(2), ProverStatus::Active), (f(3), ProverStatus::Active)];
+        let swapped = vec![(f(2), ProverStatus::Active), (f(3), ProverStatus::Leaving)];
+        let base = 1_000u64;
+        assert_eq!(alloc.watch_orphans(base, &two, 0), Some("started"));
+        for pass in 1..ORPHAN_WARNING_REPEAT_FRAMES {
+            assert_eq!(alloc.watch_orphans(base + pass, &two, 0), None, "frame +{pass} is inside the interval");
+        }
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES, &two, 0),
+            Some("continues"),
+            "the interval has elapsed"
+        );
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 1, &two, 0), None);
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 2, &swapped, 0),
+            Some("changed"),
+            "a changed status is logged at once"
+        );
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 3, &swapped[..1], 0), Some("changed"));
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 4, &swapped[..1], 0), None);
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 5, &[], 0), Some("ended"));
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 6, &[], 0), None, "the end is logged once");
+        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 7, &two, 0), Some("started"));
+    }
+
+    /// The reconcile feeds the episode: two seats beyond the one worker are
+    /// an episode that ends when a seat is gone.
+    #[test]
+    fn orphan_episode_follows_the_reconcile() {
+        let f = |byte: u8| vec![byte; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &[]).unwrap();
+        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            current(f(1)), current(f(2)), current(f(3)),
+        ])));
+        let alloc = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAAu8; 32]);
+        alloc.on_new_frame(101).unwrap();
+        let since = alloc.orphan_watch.lock().unwrap().as_ref().map(|w| (w.since_frame, w.set.len()));
+        assert_eq!(since, Some((101, 2)));
+        alloc.on_new_frame(102).unwrap();
+        assert_eq!(alloc.orphan_watch.lock().unwrap().as_ref().map(|w| w.logged_frame), Some(101));
+        reg.set_prover(prover_with(vec![current(f(1))]));
+        alloc.on_new_frame(103).unwrap();
+        assert!(alloc.orphan_watch.lock().unwrap().is_none(), "the episode ended with its orphans");
+    }
+
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {
         ProverInfo {
             public_key: vec![0xBB; 585],
@@ -2759,6 +3164,48 @@ mod tests {
                 assert!(!worker.allocated);
             }
         }
+    }
+
+    /// A departing member whose seat committed roots in its last epoch keeps
+    /// its worker, engine running, until that epoch settles or its settlement
+    /// window closes: only the engine proves the seat, and GLOBAL kicks a
+    /// member that committed roots and never proved them.
+    #[test]
+    fn a_departing_worker_stays_bound_while_its_seat_owes_a_settlement() {
+        let e = EPOCH_LENGTH_FRAMES;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        for open in [true, false] {
+            let wm = Arc::new(MockWorkerManager::new());
+            let filter = vec![0x02; 32];
+            wm.allocate_worker(1, &filter).unwrap();
+            wm.set_allocated(1, true).unwrap();
+            let mut leaving = make_alloc(filter.clone());
+            leaving.status = ProverStatus::Leaving;
+            leaving.leave_frame_number = e + 1;
+            leaving.leave_confirm_frame_number = 2 * e + 10;
+            let prover = ProverInfo {
+                public_key: vec![0xBB; 585], address: vec![0xAA; 32],
+                status: ProverStatus::Active, kick_frame_number: 0,
+                allocations: vec![leaving], available_storage: 0,
+                seniority: 100, delegate_address: vec![],
+            };
+            let registry = TestProverRegistry::with_prover(prover);
+            // The last epoch it served (2) committed roots; settling it is
+            // owed until the end of epoch 3.
+            registry.set_storage_seat_slot(&[0xAA; 32], &filter, quil_types::consensus::StorageSeatSlot {
+                epoch: 2, leaves: vec![vec![0]], registered_at: e + 20, sealed_at: Some(e + 30), frames: 3,
+                accumulator: [0; 32], chained: Vec::new(), open,
+            });
+            let allocator = WorkerAllocator::new(wm.clone(), Arc::new(registry), vec![0xAA; 32]);
+            allocator.on_new_frame(3 * e).unwrap();
+            let worker = wm.range_workers().unwrap().remove(0);
+            assert_eq!(worker.filter.is_empty(), !open, "open={open}: bound only while the settlement is owed");
+            assert_eq!(worker.allocated, open, "open={open}: the owed seat's engine keeps running");
+            allocator.on_new_frame(4 * e).unwrap();
+            let worker = wm.range_workers().unwrap().remove(0);
+            assert!(worker.filter.is_empty(), "open={open}: departs once the settlement window closes");
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     #[test]

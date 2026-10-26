@@ -9,6 +9,8 @@ mod key_manager;
 pub mod poseidon;
 pub mod porep;
 pub mod sdr;
+pub mod storage_hash;
+pub mod storage_proof;
 pub mod seal;
 mod secp256k1;
 pub mod sntrup761;

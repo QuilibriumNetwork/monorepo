@@ -11,7 +11,11 @@
 //! [`ViewRefresh`] lets the sync task pull early: when the GLOBAL head has
 //! passed an epoch boundary the committed view has not, when a seal arrives
 //! whose closing request the view lacks, and (at most every
-//! [`SUCCESSOR_INTERVAL`]) while a sealed session awaits its successor. Early
+//! [`SUCCESSOR_INTERVAL`]) while a sealed session awaits its successor, and
+//! while a hash storage proof record this node waits for is not in its view:
+//! its shard's snapshot, which a renewal encodes, its own registration, which
+//! it seals, or a seal or settlement it sent (its proposals commit roots only
+//! once it sees its seal). Early
 //! pulls are capped per epoch, with sub-caps for seals and successors; they
 //! start [`MIN_GAP`] after the previous pull ended, except once for each frame
 //! a waiting seal needs.
@@ -42,6 +46,12 @@ pub const SEAL_PER_EPOCH: u32 = 8;
 /// successors (they ask on every start retry).
 pub const SUCCESSOR_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Of [`MAX_PER_EPOCH`], the pulls hash storage proof records may use: a
+/// shard's snapshot, this node's registration, and the seals and settlements
+/// it sent, each recorded once per epoch. A request names the frame the view
+/// must reach; requests add up, and [`MIN_GAP`] spaces the pulls.
+pub const STORAGE_PER_EPOCH: u32 = 12;
+
 /// How often the sync task checks whether an early pull is due.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -50,6 +60,7 @@ pub enum Reason {
     EpochBoundary,
     SealBeforeClosingRequest,
     SealedSessionAwaitsSuccessor,
+    StorageRecordAwaited,
 }
 
 impl Reason {
@@ -58,6 +69,7 @@ impl Reason {
             Self::EpochBoundary => "epoch boundary",
             Self::SealBeforeClosingRequest => "seal before its closing request",
             Self::SealedSessionAwaitsSuccessor => "sealed session awaits its successor",
+            Self::StorageRecordAwaited => "storage snapshot, seal or settlement not in the view yet",
         }
     }
 }
@@ -87,6 +99,7 @@ struct State {
     seal: Option<u64>,
     successor: Option<u64>,
     successor_asked: Option<Instant>,
+    storage: Option<u64>,
     /// The frame the pull in progress reaches.
     running: Option<u64>,
     last_end: Option<Instant>,
@@ -94,11 +107,12 @@ struct State {
     used: u32,
     successor_used: u32,
     seal_used: u32,
+    storage_used: u32,
     /// The highest seal frame a pull already skipped the gap for.
     seal_skipped: Option<u64>,
     /// Spent budgets reported this epoch: all early pulls, the successors',
-    /// the seals'.
-    reported: [bool; 3],
+    /// the seals', the storage records'.
+    reported: [bool; 4],
 }
 
 /// The sync task's early-pull state, shared with the sessions that ask.
@@ -157,6 +171,7 @@ impl ViewRefresh {
                 state.successor_asked = Some(now);
                 &mut state.successor
             }
+            Reason::StorageRecordAwaited => &mut state.storage,
         };
         let wanted = slot.map_or(through, |frame| frame.max(through));
         *slot = Some(wanted);
@@ -169,6 +184,7 @@ impl ViewRefresh {
         }
         let gap_over = state.last_end.map_or(true, |end| now.saturating_duration_since(end) >= MIN_GAP);
         state.used < MAX_PER_EPOCH
+            && (reason != Reason::StorageRecordAwaited || state.storage_used < STORAGE_PER_EPOCH)
             && (reason != Reason::SealBeforeClosingRequest
                 || (state.seal_used < SEAL_PER_EPOCH
                     && (gap_over || state.seal_skipped.map_or(true, |skipped| wanted > skipped))))
@@ -181,6 +197,7 @@ impl ViewRefresh {
             Reason::EpochBoundary => None,
             Reason::SealBeforeClosingRequest => state.seal,
             Reason::SealedSessionAwaitsSuccessor => state.successor,
+            Reason::StorageRecordAwaited => state.storage,
         }
     }
 
@@ -188,7 +205,7 @@ impl ViewRefresh {
     pub fn settle(&self, view: u64) {
         let mut guard = self.lock();
         let state = &mut *guard;
-        for slot in [&mut state.seal, &mut state.successor] {
+        for slot in [&mut state.seal, &mut state.successor, &mut state.storage] {
             if slot.is_some_and(|through| through <= view) {
                 *slot = None;
             }
@@ -233,7 +250,8 @@ impl ViewRefresh {
             state.used = 0;
             state.successor_used = 0;
             state.seal_used = 0;
-            state.reported = [false; 3];
+            state.storage_used = 0;
+            state.reported = [false; 4];
         }
         let boundary = epoch * length;
         let pending = |slot: Option<u64>| slot.filter(|through| *through > view && *through <= reach);
@@ -243,6 +261,8 @@ impl ViewRefresh {
             EarlyPull { reason: Reason::SealBeforeClosingRequest, through }
         } else if let Some(through) = pending(state.successor) {
             EarlyPull { reason: Reason::SealedSessionAwaitsSuccessor, through }
+        } else if let Some(through) = pending(state.storage) {
+            EarlyPull { reason: Reason::StorageRecordAwaited, through }
         } else {
             return Decision::Idle;
         };
@@ -257,6 +277,7 @@ impl ViewRefresh {
         }
         let successor = wanted.reason == Reason::SealedSessionAwaitsSuccessor;
         let seal = wanted.reason == Reason::SealBeforeClosingRequest;
+        let storage = wanted.reason == Reason::StorageRecordAwaited;
         // A sub-budget that is spent drops its request, so it does not wait
         // ahead of the epoch's other handoffs.
         let spent = if state.used >= MAX_PER_EPOCH {
@@ -267,6 +288,9 @@ impl ViewRefresh {
         } else if seal && state.seal_used >= SEAL_PER_EPOCH {
             state.seal = None;
             Some((2, SEAL_PER_EPOCH))
+        } else if storage && state.storage_used >= STORAGE_PER_EPOCH {
+            state.storage = None;
+            Some((3, STORAGE_PER_EPOCH))
         } else {
             None
         };
@@ -282,6 +306,9 @@ impl ViewRefresh {
         }
         if seal {
             state.seal_used += 1;
+        }
+        if storage {
+            state.storage_used += 1;
         }
         if !gap_over {
             state.seal_skipped = seal_skip;
@@ -320,6 +347,66 @@ mod tests {
         refresh.end(now);
         // Once the view holds the boundary, the head moving on is periodic work.
         assert_eq!(refresh.decide(Some(922320), Some(922330), now + MIN_GAP * 2), Decision::Idle);
+    }
+
+    /// A storage record this node waits for (a renewal's snapshot, its
+    /// registration, a seal it sent) pulls early once the view can reach the
+    /// frame asked for, [`MIN_GAP`] after the last pull and at most
+    /// [`STORAGE_PER_EPOCH`] times an epoch; a view holding that frame drops
+    /// the request.
+    #[test]
+    fn an_awaited_storage_record_pulls_early_within_its_budget() {
+        const SNAPSHOT: Reason = Reason::StorageRecordAwaited;
+        let refresh = enabled();
+        let mut now = Instant::now();
+        let view = 922330;
+        assert!(refresh.request(SNAPSHOT, 922340, now));
+        assert!(refresh.request(SNAPSHOT, 922338, now), "requests add up");
+        assert_eq!(refresh.requested(SNAPSHOT), Some(922340));
+        assert_eq!(refresh.decide(Some(view), Some(922340), now), Decision::Idle, "not bindable yet");
+        assert_eq!(refresh.decide(Some(view), Some(922341), now), pull(SNAPSHOT, 922340));
+        refresh.begin(922340);
+        refresh.end(now);
+        refresh.settle(922340);
+        assert_eq!(refresh.requested(SNAPSHOT), None, "the view reached it");
+        assert!(refresh.request(SNAPSHOT, 922341, now));
+        assert_eq!(refresh.decide(Some(922340), Some(922342), now), Decision::Idle, "a pull just ended");
+        assert_eq!(refresh.decide(Some(922340), Some(922342), now + MIN_GAP), pull(SNAPSHOT, 922341));
+        for pulls in 2..STORAGE_PER_EPOCH {
+            now += MIN_GAP;
+            let through = 922340 + u64::from(pulls);
+            assert!(refresh.request(SNAPSHOT, through, now));
+            assert_eq!(refresh.decide(Some(view), Some(through + 1), now + MIN_GAP), pull(SNAPSHOT, through));
+        }
+        now += MIN_GAP;
+        assert!(!refresh.request(SNAPSHOT, 922360, now), "the epoch's storage pulls are spent");
+        assert!(matches!(refresh.decide(Some(view), Some(922361), now + MIN_GAP), Decision::Exhausted { max: STORAGE_PER_EPOCH, .. }));
+        assert_eq!(refresh.requested(SNAPSHOT), None, "a spent budget drops its request");
+    }
+
+    /// A record awaited on every frame (a renewal waiting for its snapshot)
+    /// asks for the frame before the head each time: a pull reaches it, so
+    /// pulls repeat [`MIN_GAP`] apart, where asking for the head itself
+    /// stayed one frame out of reach.
+    #[test]
+    fn a_record_awaited_every_frame_pulls_every_gap() {
+        const STORAGE: Reason = Reason::StorageRecordAwaited;
+        let refresh = enabled();
+        let mut now = Instant::now();
+        let (mut view, mut pulls) = (922330u64, 0);
+        for head in 922331..922350u64 {
+            refresh.request(STORAGE, head - 1, now);
+            if let Decision::Pull(EarlyPull { through, .. }) = refresh.decide(Some(view), Some(head), now) {
+                assert_eq!(through, head - 1);
+                pulls += 1;
+                refresh.begin(head - 1);
+                refresh.end(now);
+                view = head - 1;
+                refresh.settle(view);
+            }
+            now += MIN_GAP / 2;
+        }
+        assert_eq!(pulls, 9, "one pull per gap (every other frame here) while the record is awaited");
     }
 
     #[test]

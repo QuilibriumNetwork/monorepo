@@ -11,6 +11,7 @@ pub mod app_shard_metadata;
 pub mod app_types;
 pub mod multi_proof_cache;
 pub mod outage;
+mod delivery_sources;
 pub mod committee;
 pub mod consensus_metrics;
 pub mod consensus_types;
@@ -34,12 +35,15 @@ pub mod frame_materializer;
 pub mod frame_maintenance;
 pub mod frame_processor;
 pub mod genesis;
+pub mod global_catch_up;
 pub mod global_finalization;
 pub mod global_view_refresh;
 pub mod frame_replay;
 pub mod frame_validator;
 pub mod halt_state;
 pub mod message_collector;
+pub mod spawn_gate;
+pub mod execution_deferral;
 pub mod message_router;
 pub mod leader_provider;
 pub mod prover_op_tally;
@@ -54,6 +58,8 @@ pub mod prover_message_transport;
 pub mod prover_pipeline;
 pub mod own_prover_ops;
 pub mod presence_reports;
+pub mod storage_epoch_batch;
+pub mod storage_snapshot;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;
@@ -423,6 +429,30 @@ pub mod bitmasks {
             assert_eq!(shard_cw_addressee(&legacy), None);
             assert_eq!(shard_cw_admit(&filter, &legacy, &bob_tag), Some((2, request.as_slice())));
             assert_eq!(shard_cw_addressee(&[0x82, 0xAD, 1, 2]), None, "truncated");
+        }
+
+        /// The node's gossip traffic classes follow this module's layouts.
+        #[test]
+        fn gossip_traffic_classes_match_the_bitmask_layouts() {
+            use quil_p2p::GossipClass;
+            let address = [0x5au8; 32];
+            let cw = shard_cw_bitmask(&address);
+            let class = GossipClass::of_bitmask;
+            assert_eq!(class(&cw, &shard_cw_frame_payload(0, b"vote")), GossipClass::Votes);
+            assert_eq!(class(&cw, &shard_cw_frame_for(0, b"vote", &[vec![1u8; 8]])), GossipClass::Votes);
+            for channel in 1..=3 {
+                assert_eq!(class(&cw, &shard_cw_frame_payload(channel, b"cw")), GossipClass::ShardConsensus);
+                assert_eq!(class(&cw, &shard_cw_frame_for(channel, b"cw", &[vec![1u8; 8]])), GossipClass::ShardConsensus);
+            }
+            assert_eq!(class(&shard_frame_bitmask(&address), b"frame"), GossipClass::ShardFrames);
+            assert_eq!(class(&shard_consensus_bitmask(&address), b"vote"), GossipClass::Votes);
+            assert_eq!(class(&shard_prover_bitmask(&address), b"op"), GossipClass::Other);
+            assert_eq!(class(&shard_dispatch_bitmask(&address), b"op"), GossipClass::Other);
+            for global in [GLOBAL_CONSENSUS, GLOBAL_FRAME, GLOBAL_PROVER, GLOBAL_ALERT,
+                GLOBAL_CW_VOTE, GLOBAL_CW_CERT, GLOBAL_CW_RESOLVER, GLOBAL_CW_BLOCK] {
+                assert_eq!(class(global, b"x"), GossipClass::Global, "{}", hex::encode(global));
+            }
+            assert_eq!(class(GLOBAL_PEER_INFO, b"x"), GossipClass::PeerInfo);
         }
 
         /// A wallet addresses an application, not a shard. Every sub-shard of a

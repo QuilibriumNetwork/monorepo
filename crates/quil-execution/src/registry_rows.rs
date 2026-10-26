@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 const VK_LEN: usize = 64;
 
 type LeafRootKey = (Vec<u8>, Vec<u8>, u64);
+type SeatKey = (Vec<u8>, Vec<u8>);
+type SeatSlots = Vec<quil_types::consensus::StorageSeatSlot>;
+type SnapshotKey = (Vec<u8>, u8);
 
 /// An absent ring is an unassigned allocation, not decoded ring zero.
 #[derive(Clone, Copy)]
@@ -43,7 +46,13 @@ enum FirstPass {
     /// synthesized for its allocations.
     Prover { info: Option<ProverInfo>, retired_key: Vec<u8> },
     Reward,
-    LeafRoot(Vec<(LeafRootKey, LeafRootRecord)>),
+    LeafRoot {
+        records: Vec<(LeafRootKey, LeafRootRecord)>,
+    },
+    /// A storage seat (`None`: it does not decode).
+    Seat(Option<(SeatKey, SeatSlots)>),
+    /// A storage snapshot record (`None`: it does not decode).
+    Snapshot(Option<(SnapshotKey, quil_types::consensus::StorageSnapshotRoots)>),
 }
 
 /// Decode one `adds` row as both passes of `decode_vertices` read it.
@@ -64,7 +73,11 @@ fn decode_row(vk: &[u8], data: &[u8]) -> DecodedRow {
             },
         },
         Some("reward:ProverReward") => FirstPass::Reward,
-        Some("leafroot:LeafRootRegistration") => FirstPass::LeafRoot(decode_leaf_root(&root)),
+        Some("leafroot:LeafRootRegistration") => FirstPass::LeafRoot {
+            records: decode_leaf_root(&root),
+        },
+        Some("storage:StorageSeat") => FirstPass::Seat(decode_seat(&root)),
+        Some("storage:StorageSnapshot") => FirstPass::Snapshot(decode_snapshot(&root)),
         Some("allocation:ProverAllocation") => FirstPass::Nothing,
         _ => FirstPass::Unknown,
     };
@@ -109,6 +122,10 @@ pub(super) struct RegistryRows {
     owned: HashMap<Vec<u8>, BTreeSet<[u8; 32]>>,
     /// Effective rows naming each leaf-root key; a refresh keeps the highest.
     leaf_sources: HashMap<LeafRootKey, BTreeSet<[u8; 32]>>,
+    /// The same for each storage seat key.
+    seat_sources: HashMap<SeatKey, BTreeSet<[u8; 32]>>,
+    /// And for each storage snapshot key.
+    snapshot_sources: HashMap<SnapshotKey, BTreeSet<[u8; 32]>>,
 }
 
 impl RegistryRows {
@@ -171,10 +188,16 @@ impl RegistryRows {
         if let Some(Some((owner, _))) = &row.allocation {
             self.owned.entry(owner.clone()).or_default().insert(*address);
         }
-        if let FirstPass::LeafRoot(records) = &row.first {
+        if let FirstPass::LeafRoot { records } = &row.first {
             for (key, _) in records {
                 self.leaf_sources.entry(key.clone()).or_default().insert(*address);
             }
+        }
+        if let FirstPass::Seat(Some((key, _))) = &row.first {
+            self.seat_sources.entry(key.clone()).or_default().insert(*address);
+        }
+        if let FirstPass::Snapshot(Some((key, _))) = &row.first {
+            self.snapshot_sources.entry(key.clone()).or_default().insert(*address);
         }
     }
 
@@ -187,13 +210,29 @@ impl RegistryRows {
                 }
             }
         }
-        if let FirstPass::LeafRoot(records) = &row.first {
+        if let FirstPass::LeafRoot { records } = &row.first {
             for (key, _) in records {
                 if let Some(rows) = self.leaf_sources.get_mut(key) {
                     rows.remove(address);
                     if rows.is_empty() {
                         self.leaf_sources.remove(key);
                     }
+                }
+            }
+        }
+        if let FirstPass::Seat(Some((key, _))) = &row.first {
+            if let Some(rows) = self.seat_sources.get_mut(key) {
+                rows.remove(address);
+                if rows.is_empty() {
+                    self.seat_sources.remove(key);
+                }
+            }
+        }
+        if let FirstPass::Snapshot(Some((key, _))) = &row.first {
+            if let Some(rows) = self.snapshot_sources.get_mut(key) {
+                rows.remove(address);
+                if rows.is_empty() {
+                    self.snapshot_sources.remove(key);
                 }
             }
         }
@@ -230,7 +269,7 @@ fn contribution(
     if let (Some((_, decoded)), None) = (adds, removes) {
         match &decoded.first {
             FirstPass::Prover { info: Some(info), .. } => usage = usage.plus(RegistryBudget::prover_charge(info)),
-            FirstPass::LeafRoot(records) => {
+            FirstPass::LeafRoot { records, .. } => {
                 for (key, record) in records {
                     usage = usage.plus(RegistryBudget::leaf_root_charge(key, record));
                 }
@@ -283,10 +322,15 @@ pub(super) struct Written {
 /// The registry rows `overlay` wrote, by address; `None` when a range
 /// deletion reaches them, so they cannot be listed.
 pub(super) fn written_rows(overlay: &quil_forest::ExecutionOverlay) -> Option<BTreeMap<[u8; 32], Written>> {
+    let all = quil_store::encoding::prover_registry_key_prefixes();
+    Some(rows_of_keys(overlay.written_keys_under(&all)?))
+}
+
+/// The registry rows, by address and phase, that writes of `keys` changed.
+pub(super) fn rows_of_keys(keys: impl IntoIterator<Item = Vec<u8>>) -> BTreeMap<[u8; 32], Written> {
     let prefixes = quil_store::encoding::prover_registry_row_prefixes();
-    let all: Vec<Vec<u8>> = prefixes.iter().map(|(_, prefix)| prefix.clone()).collect();
     let mut written: BTreeMap<[u8; 32], Written> = BTreeMap::new();
-    for key in overlay.written_keys_under(&all)? {
+    for key in keys {
         for (phase, prefix) in &prefixes {
             let Some(address) = key.get(prefix.len()..prefix.len() + 32).filter(|_| key.starts_with(prefix)) else {
                 continue;
@@ -299,7 +343,7 @@ pub(super) fn written_rows(overlay: &quil_forest::ExecutionOverlay) -> Option<BT
             }
         }
     }
-    Some(written)
+    written
 }
 
 /// One address's rows after the update: `Some` for a phase it re-read.
@@ -313,7 +357,7 @@ impl InMemoryProverRegistry {
     /// Build every cache from `rows` as `decode_vertices` builds them from
     /// the same effective rows in address order, indexing as it goes.
     pub(super) fn compose_from_rows(&mut self, rows: &mut RegistryRows, budget: &mut RegistryBudget) -> QuilResult<()> {
-        let RegistryRows { adds, removes, owned, leaf_sources, .. } = rows;
+        let RegistryRows { adds, removes, owned, leaf_sources, seat_sources, snapshot_sources, .. } = rows;
         let effective = || adds.iter().filter(|(address, _)| !removes.contains_key(*address));
         let mut retired_keys: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         for (address, row) in effective() {
@@ -334,13 +378,23 @@ impl InMemoryProverRegistry {
                     }
                 }
                 FirstPass::Reward => self.reward_vertex_count += 1,
-                FirstPass::LeafRoot(records) => {
+                FirstPass::LeafRoot { records } => {
                     self.leaf_root_vertex_count += 1;
                     for (key, record) in records {
                         budget.leaf_root(key, record)?;
                         self.leaf_root_cache.insert(key.clone(), record.clone());
                         leaf_sources.entry(key.clone()).or_default().insert(*address);
                     }
+                }
+                FirstPass::Seat(None) => {}
+                FirstPass::Seat(Some((key, slots))) => {
+                    self.seat_cache.insert(key.clone(), slots.clone());
+                    seat_sources.entry(key.clone()).or_default().insert(*address);
+                }
+                FirstPass::Snapshot(None) => {}
+                FirstPass::Snapshot(Some((key, snapshot))) => {
+                    self.snapshot_cache.insert(key.clone(), snapshot.clone());
+                    snapshot_sources.entry(key.clone()).or_default().insert(*address);
                 }
             }
         }
@@ -419,6 +473,8 @@ impl InMemoryProverRegistry {
         // after, and each such prover's allocation filters before.
         let mut provers: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut leaf_keys: HashSet<LeafRootKey> = HashSet::new();
+        let mut seat_keys: HashSet<SeatKey> = HashSet::new();
+        let mut snapshot_keys: HashSet<SnapshotKey> = HashSet::new();
         for change in &changes {
             let new = match &change.adds {
                 Some(new) => new.as_ref().map(|(_, decoded)| decoded),
@@ -432,8 +488,14 @@ impl InMemoryProverRegistry {
                 if let Some(Some((owner, _))) = &row.allocation {
                     provers.insert(owner.clone());
                 }
-                if let FirstPass::LeafRoot(records) = &row.first {
+                if let FirstPass::LeafRoot { records } = &row.first {
                     leaf_keys.extend(records.iter().map(|(key, _)| key.clone()));
+                }
+                if let FirstPass::Seat(Some((key, _))) = &row.first {
+                    seat_keys.insert(key.clone());
+                }
+                if let FirstPass::Snapshot(Some((key, _))) = &row.first {
+                    snapshot_keys.insert(key.clone());
                 }
             }
         }
@@ -478,7 +540,7 @@ impl InMemoryProverRegistry {
             let record = rows.leaf_sources.get(&key).and_then(|sources| sources.last()).and_then(|address| {
                 match &rows.effective(address)?.first {
                     // A row naming a key twice keeps its last record, as a refresh inserts in order.
-                    FirstPass::LeafRoot(records) => records.iter().rev().find(|(k, _)| *k == key).map(|(_, r)| r.clone()),
+                    FirstPass::LeafRoot { records, .. } => records.iter().rev().find(|(k, _)| *k == key).map(|(_, r)| r.clone()),
                     _ => None,
                 }
             });
@@ -488,6 +550,39 @@ impl InMemoryProverRegistry {
                 }
                 None => {
                     self.leaf_root_cache.remove(&key);
+                }
+            }
+        }
+        for key in seat_keys {
+            // A refresh inserts in address order: the last row naming a key wins.
+            let slots = rows.seat_sources.get(&key).and_then(|sources| sources.last()).and_then(|address| {
+                match &rows.effective(address)?.first {
+                    FirstPass::Seat(Some((_, slots))) => Some(slots.clone()),
+                    _ => None,
+                }
+            });
+            match slots {
+                Some(slots) => {
+                    self.seat_cache.insert(key, slots);
+                }
+                None => {
+                    self.seat_cache.remove(&key);
+                }
+            }
+        }
+        for key in snapshot_keys {
+            let snapshot = rows.snapshot_sources.get(&key).and_then(|sources| sources.last()).and_then(|address| {
+                match &rows.effective(address)?.first {
+                    FirstPass::Snapshot(Some((_, snapshot))) => Some(snapshot.clone()),
+                    _ => None,
+                }
+            });
+            match snapshot {
+                Some(snapshot) => {
+                    self.snapshot_cache.insert(key, snapshot);
+                }
+                None => {
+                    self.snapshot_cache.remove(&key);
                 }
             }
         }
@@ -509,7 +604,8 @@ impl InMemoryProverRegistry {
             FirstPass::Unknown => step(&mut self.unknown_vertex_count),
             FirstPass::Prover { .. } => step(&mut self.prover_vertex_count),
             FirstPass::Reward => step(&mut self.reward_vertex_count),
-            FirstPass::LeafRoot(_) => step(&mut self.leaf_root_vertex_count),
+            FirstPass::LeafRoot { .. } => step(&mut self.leaf_root_vertex_count),
+            FirstPass::Seat(_) | FirstPass::Snapshot(_) => {}
         }
         if row.allocation.is_some() {
             step(&mut self.allocation_vertex_count);

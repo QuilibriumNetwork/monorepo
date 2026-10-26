@@ -50,4 +50,17 @@ pub trait LeaderProvider<S: Unique>: Send + Sync {
     fn local_world_state_size(&self, _frame_number: u64) -> Option<u64> {
         None
     }
+
+    /// Why `requests`, carried by a proposal of frame `frame_number`, register
+    /// storage this node's own snapshot contradicts (hash storage proofs: a
+    /// data commitment other than the one it recorded) or that it cannot
+    /// judge yet (it has not recorded that snapshot), or `None`. The vote seam
+    /// nullifies such a proposal. Default `None` = no such records.
+    fn storage_registration_conflict(
+        &self,
+        _frame_number: u64,
+        _requests: &[quil_types::proto::global::MessageBundle],
+    ) -> Option<String> {
+        None
+    }
 }

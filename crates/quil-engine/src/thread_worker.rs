@@ -256,6 +256,9 @@ pub struct WorkerOwnedDeps {
 /// How long a stopping worker's engine gets to tear down before its thread
 /// is cancelled ([`ThreadWorkerManager::stop_worker`]).
 const ENGINE_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a retired worker's thread may take to end (closing its own
+/// stores) before the node says it has not.
+const RETIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether worker `core_id` recovers nothing of `filter` from an archive:
 /// the seat on it is one this node gives up (`WorkerAllocator::gives_up`).
@@ -300,6 +303,57 @@ pub struct ThreadWorkerManager {
     /// flushed so it survives restarts. Mirrors Go's
     /// `engine.workerStore` plumbing.
     worker_store: Mutex<Option<Arc<dyn quil_types::store::WorkerStore>>>,
+    /// The shards whose data each worker's own store holds
+    /// ([`WorkerManager::shard_data`]), read by the worker when its store
+    /// opens, at each change of its binding and after each eviction.
+    shard_data: Arc<ShardData>,
+}
+
+/// The shards whose data each worker's store holds, by core, and when a
+/// failed read of each was last warned about.
+#[derive(Default)]
+struct ShardData {
+    held: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    warned: Mutex<HashMap<u32, std::time::Instant>>,
+}
+
+/// How often a worker's failed shard-data read is warned about again.
+const SHARD_DATA_WARN_REPEAT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+impl ShardData {
+    /// Record the shards whose data worker `core_id`'s store holds
+    /// ([`crate::worker_payload_eviction::held_shards`]), for binding. A
+    /// failed read leaves none recorded for it, and is warned about at
+    /// once, then every [`SHARD_DATA_WARN_REPEAT`].
+    fn publish(&self, core_id: u32, crdt: &quil_hypergraph::HypergraphCrdt) {
+        match crate::worker_payload_eviction::held_shards(crdt) {
+            Ok(held) => {
+                self.held.lock().unwrap().insert(core_id, held);
+            }
+            Err(error) => {
+                self.forget(core_id);
+                let now = std::time::Instant::now();
+                let mut warned = self.warned.lock().unwrap();
+                if warned.get(&core_id).is_none_or(|at| now.saturating_duration_since(*at) >= SHARD_DATA_WARN_REPEAT) {
+                    warned.insert(core_id, now);
+                    warn!(core_id, error = %quil_forest::storage_health::redact_paths(&error.to_string()),
+                        scope = "this node",
+                        action = "binding gives this worker no preference for the shards its store holds; check the \
+                            worker's store if it persists",
+                        "this worker's shard data could not be read");
+                }
+            }
+        }
+    }
+
+    /// Record none for worker `core_id`, while its store may lose shards.
+    fn forget(&self, core_id: u32) {
+        self.held.lock().unwrap().remove(&core_id);
+    }
+
+    fn snapshot(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.held.lock().unwrap().clone()
+    }
 }
 
 impl ThreadWorkerManager {
@@ -350,6 +404,7 @@ impl ThreadWorkerManager {
             consensus_deps: Mutex::new(None),
             recovery_gate: Arc::default(),
             worker_store: Mutex::new(None),
+            shard_data: Default::default(),
         }
     }
 
@@ -518,6 +573,7 @@ impl ThreadWorkerManager {
         let recovery_gate = self.recovery_gate.clone();
         let execution_handle = Arc::new(Mutex::new(None::<crate::app_engine::AppEngineHandle>));
         let execution_slot = execution_handle.clone();
+        let shard_data = self.shard_data.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("worker-{}", core_id))
@@ -580,6 +636,10 @@ impl ThreadWorkerManager {
                          run on the master's stores: restart the node"
                     );
                     return;
+                }
+
+                if let Some(owned) = worker_owned.as_ref() {
+                    shard_data.publish(core_id, &owned.hypergraph);
                 }
 
                 // Create per-thread tokio runtime
@@ -655,6 +715,10 @@ impl ThreadWorkerManager {
                                             cancel.cancel();
                                             // Give the engine a moment to clean up
                                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        }
+                                        // The shard it leaves holds data here.
+                                        if let Some(owned) = worker_owned.as_ref() {
+                                            shard_data.publish(core_id, &owned.hypergraph);
                                         }
 
                                         if filter.is_empty() {
@@ -1065,8 +1129,18 @@ impl ThreadWorkerManager {
                                             crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base,
                                                 move |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
                                                     crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey)))));
+                                        // Still serving the binding the passes start for: a
+                                        // rebind retires the engine first.
+                                        let (slot, binding) = (execution_slot.clone(), current_filter.clone());
+                                        let bound: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move ||
+                                            slot.lock().unwrap().as_ref().is_some_and(|h| h.filter == binding && h.is_running()));
+                                        // The store is not read as holding the shards the
+                                        // passes may drop until they end.
+                                        let shard_data = shard_data.clone();
+                                        shard_data.forget(core_id);
                                         tokio::spawn(probed(ProbeSection::PayloadEviction, async move {
-                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt, keep, storage).await;
+                                            crate::worker_payload_eviction::run_passes(core_id, filter, crdt.clone(), keep, storage, bound).await;
+                                            shard_data.publish(core_id, &crdt);
                                             flag.store(false, std::sync::atomic::Ordering::SeqCst);
                                         }));
                                     }
@@ -1218,6 +1292,71 @@ impl WorkerManager for ThreadWorkerManager {
             });
         });
         Ok(())
+    }
+
+    /// Cores above the configured count drain: the count is the capacity,
+    /// and a record left from a larger configuration keeps serving only
+    /// until its seat departs.
+    fn is_draining(&self, core_id: u32) -> bool {
+        core_id > self.num_cores
+    }
+
+    /// Remove an idle draining worker from the pool and its persisted record,
+    /// cancel its thread and join it off the caller's thread, so a lifecycle
+    /// tick does not wait for the worker's stores to close. Logs once, when
+    /// the thread has ended (or has not within [`RETIRE_DEADLINE`]).
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(QuilError::InvalidArgument(format!(
+                "worker {core_id} is within the configured count of {}", self.num_cores)));
+        }
+        let (state, running) = {
+            let mut workers = self.workers.lock().unwrap();
+            match workers.get(&core_id) {
+                None => return Ok(()),
+                Some(w) if !w.filter.is_empty() || w.pending_filter_frame != 0 => {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "worker {core_id} still holds a seat or a pending join")));
+                }
+                Some(_) => {}
+            }
+            let state = workers.remove(&core_id).expect("checked above");
+            (state, workers.len())
+        };
+        state.cancel.cancel();
+        self.shard_data.forget(core_id);
+        let deleted = match self.worker_store.lock().unwrap().as_ref() {
+            Some(store) => store.delete_worker(core_id).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        if let Err(error) = &deleted {
+            warn!(core_id, %error, scope = "this node",
+                action = "none needed: an idle record above the configured count is not restored at startup",
+                "retired draining worker's persisted record could not be deleted");
+        }
+        let configured = self.num_cores;
+        let join = move || {
+            let started = std::time::Instant::now();
+            let ended = state.handle.is_none_or(|handle| join_within(vec![(core_id, handle)], RETIRE_DEADLINE).is_empty());
+            if ended {
+                info!(core_id, configured, running, waited_ms = started.elapsed().as_millis() as u64,
+                    scope = "this node",
+                    "draining worker retired: it was above the configured worker count and held no seat or \
+                     join, so its thread stopped and its record was removed; its store stays on disk");
+            } else {
+                warn!(core_id, configured, running, waited_secs = RETIRE_DEADLINE.as_secs(), scope = "this node",
+                    action = "it ends when its stores close; report it if the worker still runs after a restart",
+                    "draining worker removed from the pool, but its thread has not ended");
+            }
+        };
+        if let Err(error) = std::thread::Builder::new().name(format!("retire-worker-{core_id}")).spawn(join) {
+            warn!(core_id, %error, scope = "this node", "could not start the thread that waits for a retired worker");
+        }
+        Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.snapshot()
     }
 
     fn check_workers_connected(&self) -> Result<Vec<u32>> {
@@ -1782,6 +1921,37 @@ mod tests {
         assert_eq!(lp.filter, b"shard-filter");
     }
 
+    /// A worker above the configured count drains; once it holds no seat and
+    /// no join it is retired: dropped from the pool with its persisted
+    /// record. Workers within the count, or holding a seat or join, are not.
+    #[tokio::test]
+    async fn an_idle_draining_worker_is_retired_with_its_record() {
+        let mgr = ThreadWorkerManager::new_with_count(1);
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+        mgr.set_worker_filter(1, &[], false).unwrap();
+        mgr.set_worker_filter(2, &[], false).unwrap();
+        mgr.set_worker_filter(3, b"seat", false).unwrap();
+        mgr.set_worker_filter(4, &[], false).unwrap();
+        mgr.set_pending_filter_frame(4, 90).unwrap();
+        assert_eq!(mgr.draining_workers(), std::collections::HashSet::from([2, 3, 4]));
+        assert!(!mgr.is_draining(1) && mgr.is_draining(5));
+
+        assert!(mgr.retire_worker(1).is_err(), "within the configured count");
+        assert!(mgr.retire_worker(3).is_err(), "still holds a seat");
+        assert!(mgr.retire_worker(4).is_err(), "still holds a join");
+        mgr.retire_worker(2).unwrap();
+        let cores: Vec<u32> = { let mut c: Vec<u32> = mgr.range_workers().unwrap().iter().map(|w| w.core_id).collect(); c.sort(); c };
+        assert_eq!(cores, vec![1, 3, 4]);
+        assert!(store.get_worker(2).unwrap().is_none(), "its record is deleted");
+        assert!(store.get_worker(3).unwrap().is_some());
+        mgr.retire_worker(2).unwrap();
+        let mgr = Arc::new(mgr);
+        let done = mgr.clone();
+        tokio::task::spawn_blocking(move || done.shutdown_workers(std::time::Duration::from_secs(5))).await.unwrap();
+    }
+
     /// Toggling manual-management mode flushes through to the store while
     /// preserving the filter — operator pins survive a restart.
     #[tokio::test]
@@ -1841,6 +2011,25 @@ mod tests {
             },
             |m, sig| quil_crypto::falcon_verify(key.public_key(), sig, m, FALCON_SELF_TEST_DOMAIN),
         )
+    }
+
+    /// A worker's shard data is withdrawn while an eviction pass may drop
+    /// shards from its store, and read again after it.
+    #[test]
+    fn shard_data_is_withdrawn_during_an_eviction_and_read_again_after() {
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = quil_hypergraph::HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let filter = vec![0x21; 32];
+        db.inner().put(quil_store::encoding::consensus_materialized_cursor_key(&filter), 9u64.to_be_bytes()).unwrap();
+        let table = ShardData::default();
+        table.publish(3, &crdt);
+        assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter.clone(), 9)])]));
+        table.forget(3);
+        assert!(table.snapshot().is_empty(), "withdrawn while the passes run");
+        table.publish(3, &crdt);
+        assert_eq!(table.snapshot(), HashMap::from([(3, vec![(filter, 9)])]));
     }
 
     #[test]

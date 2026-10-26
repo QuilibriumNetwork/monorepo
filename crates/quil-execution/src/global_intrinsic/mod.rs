@@ -48,6 +48,10 @@ pub mod reassignment;
 pub mod seniority_merge;
 pub mod seniority_succession;
 pub mod sig_with_pop;
+pub mod storage_epoch_proof;
+pub mod storage_binding;
+pub mod storage_seat;
+pub mod storage_snapshot;
 pub mod verify;
 
 pub use addressed_signature::{

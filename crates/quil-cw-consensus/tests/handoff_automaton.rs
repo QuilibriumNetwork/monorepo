@@ -75,6 +75,7 @@ fn context(session: &Session, parent: &AuthorizedParent, view: u64) -> ProposalC
         view,
         parent_view: parent.checkpoint.view,
         parent: Digest(parent.checkpoint.digest),
+        leader: None,
     }
 }
 

@@ -14,6 +14,10 @@ native-proof = ["confidential-tokens", "quil-lattice-ct/native-proof"]
 # Downstream crates that need to build a manager in their own tests
 # pull this feature in as a dev-dependency.
 testing-stubs = []
+# Fault-injection hooks for the devnet smoke test (scripts/devnet-smoke.sh).
+# Off by default and never enabled by a release build: each hook is an
+# env-driven delay or failure that a node must not carry in production.
+test-hooks = []
 
 [dependencies]
 rayon = "1"
@@ -21,6 +25,8 @@ memchr = "2"
 quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-crypto = { path = "../quil-crypto" }
+# Epoch storage proofs (Plonky3; Rust 1.93 or later).
+quil-storage-stark = { path = "../quil-storage-stark" }
 # Commonware-simplex finalization-cert verify (reward attribution for CW-finalized
 # app-shard frames). Acyclic: quil-cw-consensus doesn't depend on us.
 quil-cw-consensus = { path = "../quil-cw-consensus" }

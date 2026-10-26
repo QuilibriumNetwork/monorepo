@@ -6,7 +6,7 @@ pub mod retention;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing;
 
-pub use crdt::{ForestConfinement, HypergraphCrdt, Mutation, ShardMetadata, ExecutionCapture, ExecutionFork, ExecutionForkLimits, ExecutionMetadataUsage, ForestWriteGuard, PreparedCrdtAdoption};
+pub use crdt::{ForestConfinement, HypergraphCrdt, LineageRecord, Mutation, ShardMetadata, ExecutionCapture, ExecutionFork, ExecutionForkLimits, ExecutionMetadataUsage, ForestWriteGuard, PreparedCrdtAdoption};
 pub use snapshot::{SnapshotManager, GenerationHandle, MAX_GENERATIONS as SNAPSHOT_MAX_GENERATIONS};
 pub use addressing::{Location, shard_key_for_location};
 pub use retention::{snapshot_pin_limit_from_env, spawn_retention_pruner, RetentionPass, RetentionPolicy};

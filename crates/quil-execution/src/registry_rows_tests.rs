@@ -37,6 +37,25 @@ fn random_row(rng: &mut Rng) -> Vec<u8> {
                 field_leaf(cls, "LastActiveFrameNumber", rng.below(100).to_be_bytes().to_vec()),
             ])
         }
+        5 if rng.below(2) == 0 => {
+            // A hash registration (epochs 1 and 2 in these tests), sealed or
+            // still awaiting its seal.
+            use crate::global_intrinsic::materialize::{mark_registration_sealed, upsert_leaf_root_registration};
+            let epoch = 1 + rng.below(2);
+            let tree = upsert_leaf_root_registration(
+                None,
+                &[rng.below(2) as u8 + 1; 32],
+                &filters[rng.below(2) as usize],
+                &[rng.below(2) as u32],
+                epoch,
+                &vec![rng.below(250) as u8; 96],
+                rng.below(9),
+                100,
+            )
+            .unwrap();
+            let tree = if rng.below(2) == 0 { mark_registration_sealed(&tree, epoch, 101).unwrap().unwrap() } else { tree };
+            vertex_tree_to_blob(&tree)
+        }
         5 => {
             let tree = crate::global_intrinsic::materialize::create_leaf_root_vertex_tree(
                 &[rng.below(2) as u8 + 1; 32],
@@ -57,6 +76,25 @@ fn random_row(rng: &mut Rng) -> Vec<u8> {
                 crate::global_schema::write_field(&mut tree, cls, "PrevLeafRoot", &[0x5A; 74]).unwrap();
             }
             vertex_tree_to_blob(&tree)
+        }
+        6 if rng.below(2) == 0 => {
+            // A storage seat; two members on two shards, so keys repeat.
+            let mut seat = crate::global_intrinsic::storage_seat::Seat::new(
+                [rng.below(2) as u8 + 1; 32], filters[rng.below(2) as usize].clone(),
+            );
+            seat.register(1 + rng.below(2), &[vec![rng.below(3) as u32]], 100);
+            if rng.below(2) == 0 {
+                seat.seal(1, 101);
+            }
+            vertex_tree_to_blob(&seat.to_tree().unwrap())
+        }
+        6 if rng.below(2) == 0 => {
+            // A storage snapshot record; two shards, epochs sharing a ring slot.
+            let snapshot = quil_types::consensus::StorageSnapshotRoots {
+                epoch: 2 + 4 * rng.below(2), frame: 40 + rng.below(5), anchor: 7, roots: [[rng.below(3) as u8; 32]; 4],
+            };
+            let filter = filters[rng.below(2) as usize].clone();
+            vertex_tree_to_blob(&crate::global_intrinsic::storage_snapshot::to_tree(&filter, &snapshot).unwrap())
         }
         6 => build_sub_tree(vec![type_hash_leaf("reward:ProverReward")]),
         _ if rng.below(2) == 0 => vec![0xEE; 1 + rng.below(40) as usize],
@@ -88,6 +126,7 @@ fn refreshed(store: &RocksHypergraphStore, limits: RegistryLimits) -> InMemoryPr
 // rescan. The update must leave exactly what a rescan leaves.
 #[test]
 fn row_updates_leave_what_a_full_refresh_leaves() {
+    quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(1));
     let (_tmp, store) = temp_store();
     let limits = RegistryLimits::UNBOUNDED;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -134,6 +173,60 @@ fn row_updates_leave_what_a_full_refresh_leaves() {
         }
     }
     assert!(updates > 250, "updates applied: {updates}");
+    quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+}
+
+// Members find their storage seats — what to seal, what they committed —
+// through the registry, which live nodes build from rows; the rows path once
+// left the registrations awaiting a seal out, so no member ever proved one.
+#[test]
+fn rows_carry_storage_seats() {
+    use crate::global_intrinsic::storage_seat::Seat;
+    let (_tmp, store) = temp_store();
+    let limits = RegistryLimits::UNBOUNDED;
+    let (member, filter) = ([0x31u8; 32], vec![0xA1u8; 32]);
+    let mut seat = Seat::new(member, filter.clone());
+    seat.register(4, &[vec![2], vec![1]], 201);
+    let address = row_address(3);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&seat.to_tree().unwrap())));
+    let mut registry = refreshed(&store, limits);
+    assert!(registry.from_rows);
+    let slot = registry.get_storage_seat_slot(&member, &filter, 4).unwrap();
+    assert_eq!((slot.leaves.clone(), slot.registered_at, slot.sealed_at), (vec![vec![1], vec![2]], 201, None));
+    assert!(registry.get_storage_seat_slot(&member, &filter, 5).is_none());
+
+    seat.seal(4, 205);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&seat.to_tree().unwrap())));
+    let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
+    let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+    assert!(registry.update_rows(snapshot.as_ref(), &written, limits).unwrap());
+    assert_eq!(registry.get_storage_seat_slot(&member, &filter, 4).unwrap().sealed_at, Some(205));
+    assert_eq!(registry.content(), refreshed(&store, limits).content());
+}
+
+#[test]
+fn rows_carry_storage_snapshots() {
+    use crate::global_intrinsic::storage_snapshot;
+    use quil_types::consensus::StorageSnapshotRoots;
+    let (_tmp, store) = temp_store();
+    let limits = RegistryLimits::UNBOUNDED;
+    let filter = vec![0xA2u8; 33];
+    let snapshot = |epoch: u64, seed: u8| StorageSnapshotRoots { epoch, frame: 50, anchor: 9, roots: [[seed; 32]; 4] };
+    let address = row_address(4);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot(5, 1)).unwrap())));
+    let mut registry = refreshed(&store, limits);
+    assert!(registry.from_rows);
+    assert_eq!(registry.get_storage_snapshot(&filter, 5), Some(&snapshot(5, 1)));
+    assert_eq!(registry.get_storage_snapshot(&filter, 9), None, "the ring slot holds epoch 5");
+
+    // The record reused for epoch 9.
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot(9, 2)).unwrap())));
+    let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
+    let captured = store.capture_tree_snapshot().unwrap().unwrap();
+    assert!(registry.update_rows(captured.as_ref(), &written, limits).unwrap());
+    assert_eq!(registry.get_storage_snapshot(&filter, 9), Some(&snapshot(9, 2)));
+    assert_eq!(registry.get_storage_snapshot(&filter, 5), None);
+    assert_eq!(registry.content(), refreshed(&store, limits).content());
 }
 
 // An update a refresh would refuse fails the same way and changes nothing.

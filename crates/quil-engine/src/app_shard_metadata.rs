@@ -232,6 +232,30 @@ pub fn leaf_data_for(
     Ok(out)
 }
 
+/// [`leaf_data_for`] over committed state as `snapshot` captured it
+/// (`HypergraphCrdt::capture_committed_snapshot`): the leaf data a storage
+/// registration binds at an epoch's snapshot, read after the state moved on.
+/// Byte-identical to [`leaf_data_for`] at the captured commit.
+pub fn leaf_data_at(
+    snapshot: &dyn quil_types::store::SnapshotReadable,
+    filter: &[u8],
+    shard_key: &ShardKey,
+    relative_prefix: &[u32],
+) -> quil_types::error::Result<Vec<u8>> {
+    const VERSION: u8 = 0x01;
+    let mut out: Vec<u8> = Vec::new();
+    out.push(VERSION);
+    out.extend_from_slice(&(filter.len() as u16).to_be_bytes());
+    out.extend_from_slice(filter);
+    out.extend_from_slice(&(relative_prefix.len() as u16).to_be_bytes());
+    for &p in relative_prefix {
+        out.extend_from_slice(&p.to_be_bytes());
+    }
+    let full_path = build_app_shard_full_prefix(&shard_key.l2, relative_prefix);
+    out.extend_from_slice(&HypergraphCrdt::serialize_phase_subtrees_at(snapshot, shard_key, &full_path)?);
+    Ok(out)
+}
+
 /// Seed a worker's own committed data for its full coverage filter. Unified
 /// workers reject unrelated addresses before retaining blobs and do not write
 /// unchanged vertices again. Legacy trees retain whole-app seed semantics.
@@ -400,18 +424,25 @@ pub fn retire_unchallengeable_replicas(
 /// Reads committed CRDT state — call at a commit boundary. Leaf data is fetched
 /// fallibly up front (so a store error aborts rather than silently encoding an
 /// empty leaf), then encoded through the pure `compute_confirm_leaf_roots`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn compute_storage_confirm(
-    crdt: &HypergraphCrdt,
+    crdt: &std::sync::Arc<HypergraphCrdt>,
     replica_store: &quil_store::replica_store::ReplicaStore,
     filters: &[Vec<u8>],
     member: &[u8],
     epoch: u64,
     block_poly_size: u64,
     params: &quil_crypto::sdr::SdrParams,
+    frame_number: u64,
+    snapshots: &[(Vec<u8>, Vec<quil_execution::global_intrinsic::storage_snapshot::Source>)],
 ) -> quil_types::error::Result<
     Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
 > {
     use quil_execution::global_intrinsic::leaf_id_bytes;
+    if quil_types::consensus::hash_storage_proofs_at(epoch) {
+        return snapshot_storage_confirm(crdt, replica_store, filters, member, epoch, frame_number, snapshots);
+    }
     let mut all = Vec::with_capacity(filters.len());
     for filter in filters {
         // 35-byte shard key over the 32-byte APP (a split-app sub-shard filter is
@@ -460,6 +491,73 @@ pub fn compute_storage_confirm(
     Ok(all)
 }
 
+/// GLOBAL frames after an epoch's snapshot frame within which a renewal waits
+/// for the member's snapshot of it to be encoded; past them a member without
+/// one renews without a registration (its seat stays, its frames that epoch
+/// are unattested). A third of an epoch, 240 frames on mainnet. Decided
+/// 2026-10-20.
+pub fn storage_snapshot_grace() -> u64 {
+    quil_types::consensus::epoch_length_frames() / 3
+}
+
+/// A hash-proof epoch's registrations: the leaves the member's snapshot for
+/// `epoch` encoded (`crate::storage_snapshot`), never the live data, which has
+/// moved on from the state archives commit to. A snapshot not encoded yet is
+/// taken now from its `snapshots` sources, and the renewal waits for it until
+/// the grace.
+fn snapshot_storage_confirm(
+    crdt: &std::sync::Arc<HypergraphCrdt>,
+    replica_store: &quil_store::replica_store::ReplicaStore,
+    filters: &[Vec<u8>],
+    member: &[u8],
+    epoch: u64,
+    frame_number: u64,
+    snapshots: &[(Vec<u8>, Vec<quil_execution::global_intrinsic::storage_snapshot::Source>)],
+) -> quil_types::error::Result<
+    Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>,
+> {
+    use quil_execution::global_intrinsic::leaf_id_bytes;
+    use quil_execution::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+    let unavailable = |what: String| quil_types::error::QuilError::ExecutionUnavailable(what);
+    let mut all = Vec::with_capacity(filters.len());
+    for (index, filter) in filters.iter().enumerate() {
+        let Some(prefixes) = replica_store.get_partition(epoch, filter)? else {
+            // The bound shard (first) waits for its snapshot; a shard a
+            // recorded change creates from it waits only while its sources are
+            // known, rather than hold the renewal up for one never recorded.
+            let sources = snapshots.iter().find(|(shard, _)| shard == filter).map(|(_, sources)| sources);
+            if let Some(sources) = sources {
+                crate::storage_snapshot::request_member(
+                    crdt.clone(), replica_store.clone(), member.to_vec(), filter.clone(), epoch, sources.clone(),
+                );
+            }
+            if (index == 0 || sources.is_some())
+                && frame_number < quil_types::consensus::storage_snapshot_frame(epoch) + storage_snapshot_grace()
+            {
+                return Err(unavailable(format!(
+                    "leaf snapshot of {} for epoch {epoch} not encoded yet", hex::encode(filter)
+                )));
+            }
+            tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
+                "no leaf snapshot for the epoch: renewing without a storage registration; this seat's frames carry \
+                 no storage attestation that epoch");
+            all.push(ConfirmLeafRoots { filter: filter.clone(), entries: Vec::new() });
+            continue;
+        };
+        let mut entries = Vec::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            let lid = leaf_id_bytes(filter, &prefix);
+            let stored = replica_store.get_hash(epoch, &lid)?.ok_or_else(|| unavailable(format!(
+                "leaf {} of the epoch {epoch} snapshot has no replica", hex::encode(&lid)
+            )))?;
+            let nodes = (stored.replica.len() / quil_crypto::storage_proof::NODE_BYTES) as u64;
+            entries.push(LeafRootEntry { prefix, leaf_root: stored.registration_root, num_blocks: nodes });
+        }
+        all.push(ConfirmLeafRoots { filter: filter.clone(), entries });
+    }
+    Ok(all)
+}
+
 /// Per-frame producer (PoRep wiring E, part A): build ONE member's possession
 /// openings for a frame, from the replicas it persisted at confirm time. For
 /// each covered `(filter, prefixes)` it loads the leaf's replica from
@@ -485,9 +583,20 @@ pub fn build_member_frame_openings(
 ) -> quil_types::error::Result<Vec<quil_crypto::porep::StorageOpening>> {
     use quil_execution::global_intrinsic::leaf_id_bytes;
     let mut openings = Vec::new();
+    let hash = quil_types::consensus::hash_storage_proofs_at(epoch);
     for (filter, prefixes) in covered {
         for prefix in prefixes {
             let lid = leaf_id_bytes(filter, prefix);
+            if hash {
+                let Some(stored) = replica_store.get_hash(epoch, &lid)? else { continue };
+                let Some(cap) = quil_crypto::storage_proof::MerkleCap::from_bytes(&stored.cap) else { continue };
+                openings.extend((0..queries).filter_map(|q| {
+                    quil_crypto::storage_proof::build_opening(
+                        &stored.replica, &cap, &stored.registration_root, &lid, epoch, member, q, rho_n,
+                    )
+                }));
+                continue;
+            }
             let Some(replica) = replica_store.get(epoch, &lid)? else {
                 continue;
             };
@@ -525,12 +634,17 @@ pub fn build_vote_openings(
     // this split, a 33-byte QUIL sub-shard filter yields a 36-byte shard-key that
     // `shard_key_from_bytes` rejects → the shard is silently skipped and NOTHING
     // is ever attested (breaks storage rewards for every split app).
-    let (app, sub_prefix) = split_coverage_filter(filter);
-    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
-    let mut shard_key = Vec::with_capacity(3 + app.len());
-    shard_key.extend_from_slice(&l1);
-    shard_key.extend_from_slice(app);
-    let prefixes = partition_shard_leaves(crdt, &shard_key, &sub_prefix);
+    let prefixes = if quil_types::consensus::hash_storage_proofs_at(epoch) {
+        // The leaves registered are the snapshot's, not the live data's.
+        replica_store.get_partition(epoch, filter)?.unwrap_or_default()
+    } else {
+        let (app, sub_prefix) = split_coverage_filter(filter);
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+        let mut shard_key = Vec::with_capacity(3 + app.len());
+        shard_key.extend_from_slice(&l1);
+        shard_key.extend_from_slice(app);
+        partition_shard_leaves(crdt, &shard_key, &sub_prefix)
+    };
     if prefixes.is_empty() {
         return Ok(Vec::new());
     }
@@ -643,6 +757,54 @@ mod tests {
         crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
         crdt.set_unified_tree(unified);
         (db, crdt)
+    }
+
+    /// The snapshot reader gives the live reader's bytes at the captured
+    /// commit, for the whole shard and for a sub-prefix, and keeps giving them
+    /// after the state has moved on.
+    #[test]
+    fn leaf_data_at_a_snapshot_is_the_live_data_of_that_commit() {
+        let (_db, crdt) = seed_test_crdt(true);
+        let app = [0x5Bu8; 32];
+        let filter = app.to_vec();
+        let mut shard_key = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        shard_key.extend_from_slice(&app);
+        let typed = shard_key_from_bytes(&shard_key).unwrap();
+        let addresses: Vec<[u8; 32]> = [0x00u8, 0x13, 0x80, 0x81, 0xF7].iter().map(|&b| {
+            let mut a = [b; 32];
+            a[31] = b.wrapping_add(1);
+            a
+        }).collect();
+        for (i, address) in addresses.iter().enumerate() {
+            crdt.add_vertex(&Location { app_address: app, data_address: *address }, &vec![i as u8 + 1; 300]).unwrap();
+        }
+        crdt.commit(1).unwrap();
+        crdt.remove_vertex(&Location { app_address: app, data_address: addresses[2] }).unwrap();
+        crdt.commit(2).unwrap();
+        let snapshot = crdt.capture_committed_snapshot().unwrap();
+        // The whole shard, and the sub-prefixes of each address's first six bits.
+        let mut prefixes: Vec<Vec<u32>> = vec![vec![]];
+        let app_path_len = quil_tries::get_full_path(&app).len();
+        for address in &addresses {
+            let full = build_app_shard_full_prefix(&app, &[]);
+            assert_eq!(full.len(), app_path_len);
+            let id = [app.as_slice(), address].concat();
+            let nibble = |level: usize| -> u32 {
+                (0..6).fold(0u32, |acc, j| {
+                    let b = level * 6 + j;
+                    (acc << 1) | ((id[b / 8] >> (7 - (b % 8))) & 1) as u32
+                })
+            };
+            prefixes.push(vec![nibble(app_path_len)]);
+        }
+        let live: Vec<Vec<u8>> = prefixes.iter().map(|p| leaf_data_for(&crdt, &filter, &typed, p).unwrap()).collect();
+        for (prefix, expected) in prefixes.iter().zip(&live) {
+            assert_eq!(&leaf_data_at(snapshot.as_ref(), &filter, &typed, prefix).unwrap(), expected, "prefix {prefix:?}");
+        }
+        crdt.add_vertex(&Location { app_address: app, data_address: [0x13; 32] }, &vec![0xEE; 64]).unwrap();
+        crdt.commit(3).unwrap();
+        assert_ne!(leaf_data_for(&crdt, &filter, &typed, &[]).unwrap(), live[0], "the live state moved on");
+        assert_eq!(leaf_data_at(snapshot.as_ref(), &filter, &typed, &[]).unwrap(), live[0], "the snapshot did not");
     }
 
     #[test]
@@ -1041,6 +1203,8 @@ mod tests {
             epoch,
             poly_size,
             &params,
+            0,
+            &[],
         )
         .expect("compute_storage_confirm");
 
@@ -1067,6 +1231,79 @@ mod tests {
             );
             assert_eq!(leaf.block_commitments().len() as u64, e.num_blocks);
         }
+    }
+
+    /// In a hash-proof epoch the confirm registers `comm_D ‖ comm_C ‖ comm_R`
+    /// and keeps the replica with its cap, the member's openings verify
+    /// against those registrations without BLS, and the registered data
+    /// commitment is the leaf data's.
+    #[test]
+    fn hash_epoch_confirm_and_openings_verify_without_kzg() {
+        use std::collections::HashMap;
+        use quil_execution::global_intrinsic::leaf_id_bytes;
+        use quil_hypergraph::Location;
+        let (_db, crdt) = seed_test_crdt(true);
+        let app = 0x55u8;
+        let filter = vec![app; 32];
+        for d in 0u8..3 {
+            crdt.add_vertex(&Location { app_address: [app; 32], data_address: [d; 32] }, &vec![d.wrapping_add(9); 256])
+                .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let replica_store = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        let member = vec![0xC2u8; 32];
+        let epoch = 7u64;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+        let params = quil_crypto::sdr::SdrParams::default();
+        let confirm_frame = quil_types::consensus::storage_snapshot_frame(epoch) + 30;
+        let confirm = |frame| compute_storage_confirm(&crdt, &replica_store, std::slice::from_ref(&filter), &member,
+            epoch, 64, &params, frame, &[]);
+        assert!(confirm(confirm_frame).unwrap_err().is_execution_unavailable(), "waits for the snapshot");
+        assert!(confirm(confirm_frame + storage_snapshot_grace()).unwrap()[0].entries.is_empty(),
+            "past the grace it renews without a registration");
+        let source = crate::storage_snapshot::current_source(&crdt, &filter, epoch);
+        let captured = crate::storage_snapshot::capture_at(&crdt, &filter, epoch, std::slice::from_ref(&source)).unwrap();
+        crate::storage_snapshot::encode_member(&captured, &member, &replica_store).unwrap();
+        let roots = confirm(confirm_frame).unwrap();
+        // A shard a recorded change creates whose sources are not recorded
+        // registers nothing, and does not hold up the bound shard's renewal.
+        let child = [filter.as_slice(), &[0x01]].concat();
+        let with_child = compute_storage_confirm(&crdt, &replica_store, &[filter.clone(), child.clone()], &member,
+            epoch, 64, &params, confirm_frame, &[]).unwrap();
+        assert_eq!(with_child[0], roots[0]);
+        assert_eq!((with_child[1].filter.clone(), with_child[1].entries.len()), (child, 0));
+        let mut registry: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        for entry in &roots[0].entries {
+            let registered = quil_crypto::storage_proof::parse_registration_root(&entry.leaf_root)
+                .expect("a hash registration root");
+            let data = captured.leaf_data(&entry.prefix).unwrap();
+            let nodes = quil_crypto::storage_proof::data_nodes(&data);
+            assert_eq!(registered.comm_d,
+                quil_crypto::storage_proof::MerkleTree::from_nodes(&nodes).unwrap().commitment(quil_crypto::storage_proof::Tree::Data),
+                "the data commitment is the leaf data's");
+            assert_eq!(entry.num_blocks as usize, nodes.len() / quil_crypto::storage_proof::NODE_BYTES);
+            let lid = leaf_id_bytes(&filter, &entry.prefix);
+            registry.insert((member.clone(), lid), (entry.leaf_root.clone(), entry.num_blocks, epoch));
+        }
+        let covered = vec![(filter.clone(), roots[0].entries.iter().map(|e| e.prefix.clone()).collect())];
+        let rho_n = [0x3Cu8; 32];
+        let openings = build_member_frame_openings(&replica_store, &covered, &member, epoch, &rho_n, 64, 2).unwrap();
+        assert_eq!(openings.len(), 2 * roots[0].entries.len());
+        assert!(openings.iter().all(|o| o.proof.is_empty() && o.commitment.is_empty()), "no KZG fields");
+        let attestation = quil_types::proto::global::StorageAttestation {
+            openings: openings.iter().map(quil_crypto::porep::StorageOpening::to_proto).collect(),
+        };
+        let root = quil_crypto::porep::compute_storage_attestation_root(&openings, 9, &rho_n, &[], 64);
+        assert_eq!(root.len(), 32);
+        let lookup = |m: &[u8], l: &[u8], _: u64| registry.get(&(m.to_vec(), l.to_vec())).cloned();
+        assert_eq!(quil_crypto::porep::explain_frame_storage_attestation_registered(
+            &root, &attestation, 9, &rho_n, &[], 64, epoch, lookup), Ok(()));
+        let failed = quil_crypto::porep::audit_frame_storage_attestations(&openings, &rho_n, 64, epoch, u64::MAX,
+            |m: &[u8], l: &[u8]| registry.get(&(m.to_vec(), l.to_vec())).cloned());
+        assert!(failed.is_empty(), "{failed:?}");
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     /// Each boundary evicts once, keeps the previous epoch, and a later
@@ -1136,6 +1373,8 @@ mod tests {
             epoch,
             poly_size,
             &params,
+            0,
+            &[],
         )
         .unwrap();
 
@@ -1201,7 +1440,7 @@ mod tests {
 
         // Confirm: persist replicas + register roots (production constants).
         let roots = compute_storage_confirm(
-            &crdt, &replica_store, std::slice::from_ref(&filter), &member, epoch, poly_size, &params,
+            &crdt, &replica_store, std::slice::from_ref(&filter), &member, epoch, poly_size, &params, 0, &[],
         )
         .unwrap();
         let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();

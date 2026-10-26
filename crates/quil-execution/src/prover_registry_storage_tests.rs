@@ -915,3 +915,84 @@ fn a_branch_fork_seeds_its_registry_from_the_view_beneath_the_branch_writes() {
     assert!(full.0[41].is_some());
     assert_eq!(reads, full_reads);
 }
+
+/// A canonical registry catches up with the prover rows written since its
+/// scan by re-reading only those, leaving what a full refresh would, with a
+/// scan a capture copies. Writes it cannot list are read again in full.
+#[test]
+fn a_canonical_registry_catches_up_with_rows_written_since_its_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = quil_store::RocksDb::open(dir.path()).unwrap();
+    let store = RocksHypergraphStore::new(db.inner());
+    let shard = quil_store::encoding::prover_registry_shard();
+    let put = |n: u8, status: u8| {
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(n), &registry_prover_blob(status))
+            .unwrap();
+    };
+    let journal = |database: u64, sequence: u64| {
+        (db.inner().instance() == database)
+            .then(|| db.inner().watched_writes_since(sequence).unwrap())
+            .flatten()
+    };
+    let view = |registry: &SharedProverRegistry| {
+        registry.read(|r| {
+            (r.distinct_provers(), r.resource_usage(),
+             [1u8, 2].map(|n| r.get_prover_info(&[n; 32]).map(|p| p.status)))
+        })
+    };
+    let refreshed = || {
+        let full = SharedProverRegistry::new();
+        full.refresh_from_store(&store).unwrap();
+        view(&full)
+    };
+    let seeds = |registry: &SharedProverRegistry| {
+        let overlay = quil_forest::ExecutionOverlay::capture(db.inner(), registry_overlay_limits()).unwrap();
+        registry.seeds(&overlay.capture_point().unwrap())
+    };
+
+    put(1, 1);
+    let registry = SharedProverRegistry::new();
+    assert_eq!(registry.catch_up(&store, journal).unwrap(), RegistryCatchUp::Skipped, "never scanned");
+    registry.refresh_from_store(&store).unwrap();
+    assert_eq!(registry.catch_up(&store, journal).unwrap(), RegistryCatchUp::Current);
+    db.inner().put(b"unrelated", b"value").unwrap();
+    assert_eq!(registry.catch_up(&store, journal).unwrap(), RegistryCatchUp::Current);
+
+    put(2, 1);
+    put(1, 0);
+    assert_ne!(view(&registry), refreshed(), "the rows changed under the registry");
+    assert!(!seeds(&registry));
+    assert_eq!(registry.catch_up(&store, journal).unwrap(), RegistryCatchUp::Updated { rows: 2 });
+    assert_eq!(view(&registry), refreshed());
+    assert!(seeds(&registry), "a capture now copies the registry");
+
+    put(2, 0);
+    assert_eq!(registry.catch_up(&store, |_, _| None).unwrap(), RegistryCatchUp::Refreshed);
+    assert_eq!(view(&registry), refreshed());
+    assert!(seeds(&registry));
+
+    // A write landing between the snapshot and the listing is listed and
+    // read at the snapshot, which does not hold it yet: the registry matches
+    // its snapshot and stays stale until the next catch-up.
+    let status = |registry: &SharedProverRegistry| registry.read(|r| r.get_prover_info(&[1; 32]).map(|p| p.status));
+    let before = status(&registry);
+    let racing = |database: u64, sequence: u64| {
+        put(1, 1);
+        journal(database, sequence)
+    };
+    assert_eq!(registry.catch_up(&store, racing).unwrap(), RegistryCatchUp::Updated { rows: 1 });
+    assert_eq!(status(&registry), before, "the value at the snapshot");
+    assert_ne!(view(&registry), refreshed());
+    assert!(!seeds(&registry), "the racing write leaves the scan stale");
+    assert_eq!(registry.catch_up(&store, journal).unwrap(), RegistryCatchUp::Updated { rows: 1 });
+    assert_eq!(view(&registry), refreshed());
+    assert!(seeds(&registry));
+
+    // A branch registry is not caught up here; its publication updates it.
+    let overlay = Arc::new(quil_forest::ExecutionOverlay::capture(db.inner(), registry_overlay_limits()).unwrap());
+    let branch_store = quil_store::OverlayHypergraphStore::new(overlay.clone());
+    let branch = SharedProverRegistry::for_execution_capture(
+        &branch_store, RegistryLimits::UNBOUNDED, None, overlay.capture_point()).unwrap();
+    assert_eq!(branch.catch_up(&branch_store, journal).unwrap(), RegistryCatchUp::Skipped);
+}

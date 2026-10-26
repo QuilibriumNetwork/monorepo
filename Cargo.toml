@@ -35,6 +35,7 @@ members = [
     "crates/quil-config",
     "crates/quil-lifecycle",
     "crates/quil-crypto",
+    "crates/quil-storage-stark",
     "crates/quil-tries",
     "crates/quil-tries-ffi",
     "crates/quil-forest",
@@ -97,8 +98,10 @@ libp2p-tls = { path = "crates/libp2p-tls" }
 # the history window rolled over); signature verification encodes the signed
 # bytes from borrowed fields instead of cloning the message twice. IDONTWANT
 # works on our custom protocol id (`Version::V1_2`), is sent for a message's
-# first copy only, and is sent with priority. Wire format and validation are
-# unchanged. Local changes are marked `QUILIBRIUM:`.
+# first copy only, and is sent with priority. The message cache has a byte
+# budget (`mcache_max_bytes`): past it, the oldest messages are evicted,
+# validated ones first. Wire format and validation are unchanged. Local
+# changes are marked `QUILIBRIUM:`.
 libp2p-gossipsub = { path = "crates/libp2p-gossipsub" }
 
 [profile.release]
@@ -107,6 +110,13 @@ rpath = false
 lto   = true
 debug = false
 # panic = 'abort'
+
+# The profile of the devnet smoke test (scripts/devnet-smoke.sh): release
+# optimization without fat LTO, so the node links in a fraction of the time
+# and its artifacts stay small enough to cache.
+[profile.devnet]
+inherits = "release"
+lto = false
 
 # Test profile overrides.
 #
@@ -136,6 +146,8 @@ opt-level = 3
 
 # Workspace crates whose own code is the hot path in tests.
 [profile.test.package.bls48581]
+opt-level = 3
+[profile.test.package.quil-storage-stark]
 opt-level = 3
 [profile.test.package.dkls23]
 opt-level = 3

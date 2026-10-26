@@ -26,6 +26,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     net::IpAddr,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -57,12 +58,13 @@ use crate::{
     config::{Config, ValidationMode},
     gossip_promises::GossipPromises,
     handler::{Handler, HandlerEvent, HandlerIn},
-    mcache::MessageCache,
+    mcache::{MessageCache, MessageCacheStats},
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
     rpc::Sender,
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
     time_cache::DuplicateCache,
     topic::{Hasher, Topic, TopicHash},
+    traffic::{TrafficKind, TrafficObserver},
     transform::{DataTransform, IdentityTransform},
     types::{
         ControlAction, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance, MessageId,
@@ -340,6 +342,9 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     #[cfg(feature = "metrics")]
     metrics: Option<Metrics>,
 
+    /// QUILIBRIUM: told of every message copy received, sent and published.
+    traffic: Option<Arc<dyn TrafficObserver>>,
+
     /// Tracks the numbers of failed messages per peer-id.
     failed_messages: HashMap<PeerId, FailedMessages>,
 
@@ -430,6 +435,7 @@ where
         Ok(Behaviour {
             #[cfg(feature = "metrics")]
             metrics: None,
+            traffic: None,
             events: VecDeque::new(),
             publish_config: privacy.into(),
             duplicate_cache: DuplicateCache::new(config.duplicate_cache_time()),
@@ -443,7 +449,11 @@ where
                 config.heartbeat_interval(),
                 config.backoff_slack(),
             ),
-            mcache: MessageCache::new(config.history_gossip(), config.history_length()),
+            mcache: MessageCache::new(
+                config.history_gossip(),
+                config.history_length(),
+                config.mcache_max_bytes(),
+            ),
             heartbeat: Delay::new(config.heartbeat_interval() + config.heartbeat_initial_delay()),
             heartbeat_ticks: 0,
             px_peers: HashSet::new(),
@@ -471,6 +481,13 @@ where
         self.metrics = Some(Metrics::new(metrics_registry, metrics_config));
         self
     }
+
+    /// QUILIBRIUM: report every message copy to `observer` (see
+    /// [`TrafficObserver`]), independent of the metrics feature.
+    pub fn with_traffic_observer(mut self, observer: Arc<dyn TrafficObserver>) -> Self {
+        self.traffic = Some(observer);
+        self
+    }
 }
 
 impl<D, F> Behaviour<D, F>
@@ -481,6 +498,11 @@ where
     /// Lists the hashes of the topics we are currently subscribed to.
     pub fn topics(&self) -> impl Iterator<Item = &TopicHash> {
         self.mesh.keys()
+    }
+
+    /// QUILIBRIUM: occupancy of the message cache and its byte-budget evictions.
+    pub fn message_cache_stats(&self) -> MessageCacheStats {
+        self.mcache.stats()
     }
 
     /// Lists all mesh peers for a certain topic hash.
@@ -796,6 +818,13 @@ where
                 },
             ) {
                 publish_failed = false
+            }
+        }
+        // QUILIBRIUM: counted once the message is queued for a peer, before
+        // the memcache takes it (the checks below fail the publish otherwise).
+        if !publish_failed {
+            if let Some(traffic) = &self.traffic {
+                traffic.observe(TrafficKind::Published, &raw_message.topic, &raw_message.data, raw_protobuf_len);
             }
         }
         self.mcache.put(&msg_id, raw_message);
@@ -1800,6 +1829,9 @@ where
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.msg_recvd_unfiltered(&raw_message.topic, raw_protobuf_len);
         }
+        if let Some(traffic) = &self.traffic {
+            traffic.observe(TrafficKind::Received, &raw_message.topic, &raw_message.data, raw_protobuf_len);
+        }
 
         // Try and perform the data transform to the message. If it fails, consider it invalid.
         // QUILIBRIUM: an identity transform takes the data instead of a copy
@@ -1886,6 +1918,9 @@ where
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.msg_recvd(&message.topic);
+        }
+        if let Some(traffic) = &self.traffic {
+            traffic.observe(TrafficKind::FirstReceived, &message.topic, &message.data, raw_protobuf_len);
         }
 
         // Tells score that message arrived (but is maybe not fully validated yet).
@@ -2939,11 +2974,23 @@ where
     /// sending the message failed due to the channel to the connection handler being
     /// full (which indicates a slow peer).
     fn send_message(&mut self, peer_id: PeerId, rpc: RpcOut) -> bool {
-        #[cfg(feature = "metrics")]
-        if let Some(m) = self.metrics.as_mut() {
-            if let RpcOut::Publish { ref message, .. } | RpcOut::Forward { ref message, .. } = rpc {
-                // register bytes sent on the internal metrics.
-                m.msg_sent(&message.topic, message.raw_protobuf_len());
+        // QUILIBRIUM: the size is computed once, for the metrics and the
+        // traffic observer.
+        if let RpcOut::Publish { ref message, .. } | RpcOut::Forward { ref message, .. } = rpc {
+            #[cfg(feature = "metrics")]
+            let measured = self.metrics.is_some();
+            #[cfg(not(feature = "metrics"))]
+            let measured = false;
+            if measured || self.traffic.is_some() {
+                let bytes = message.raw_protobuf_len();
+                #[cfg(feature = "metrics")]
+                if let Some(m) = self.metrics.as_mut() {
+                    // register bytes sent on the internal metrics.
+                    m.msg_sent(&message.topic, bytes);
+                }
+                if let Some(traffic) = &self.traffic {
+                    traffic.observe(TrafficKind::Sent, &message.topic, &message.data, bytes);
+                }
             }
         }
 

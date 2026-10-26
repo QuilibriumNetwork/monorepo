@@ -432,7 +432,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         let checkpoint = self.state.as_ref().map_or(0, |state| state.changeset_len());
         let invoke = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
             if (inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
-                || inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT)
+                || inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT
+                || inner_tp == crate::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF)
                 && (self.intrinsic.is_none() || self.state.is_none())
             {
                 return Err(QuilError::ExecutionUnavailable("handoff execution requires authenticated global state".into()));
@@ -494,7 +495,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             | Some(MessageRequestInner::Shard(_))
             | Some(MessageRequestInner::SeniorityMerge(_))
             | Some(MessageRequestInner::CommitteeHandoff(_))
-            | Some(MessageRequestInner::PresenceReport(_)) => true,
+            | Some(MessageRequestInner::PresenceReport(_))
+            | Some(MessageRequestInner::StorageEpochProof(_)) => true,
             _ => false,
         }, "global")
     }

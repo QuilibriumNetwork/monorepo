@@ -49,6 +49,39 @@ pub trait WorkerManager: Send + Sync {
     ) -> Result<()>;
 
     fn deallocate_worker(&self, core_id: u32) -> Result<()>;
+
+    /// Whether `core_id` is above the configured worker count, so it drains:
+    /// it takes no new seat or join, its seats leave only through the surplus
+    /// leave, and once it holds none it is retired ([`Self::retire_worker`]).
+    /// Only a manager whose configured count is its capacity drains workers.
+    fn is_draining(&self, core_id: u32) -> bool {
+        let _ = core_id;
+        false
+    }
+
+    /// The listed workers that are draining ([`Self::is_draining`]).
+    fn draining_workers(&self) -> HashSet<u32> {
+        self.range_workers()
+            .map(|workers| workers.into_iter().map(|w| w.core_id).filter(|core_id| self.is_draining(*core_id)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Stop draining worker `core_id`, which holds no seat and no pending
+    /// join: end its thread, drop it from the pool and delete its persisted
+    /// record. Its store stays on disk. Managers that drain no workers refuse.
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        Err(quil_types::error::QuilError::ExecutionUnavailable(format!(
+            "worker {core_id}: this worker manager does not retire workers"
+        )))
+    }
+    /// The shards whose data each worker's own store holds, by core, with
+    /// their materialized cursors, as each worker last read its store
+    /// ([`crate::worker_payload_eviction::held_shards`]). Managers that
+    /// cannot tell (workers in separate processes) report none, and binding
+    /// keeps its order.
+    fn shard_data(&self) -> std::collections::HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        Default::default()
+    }
     fn check_workers_connected(&self) -> Result<Vec<u32>>;
     fn range_workers(&self) -> Result<Vec<WorkerInfo>>;
     /// Filter-bound local execution observations; unsupported managers return none.

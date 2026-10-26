@@ -741,6 +741,49 @@ fn committed_view_requires_a_valid_cursor_and_supported_snapshot_store() {
     assert!(CommittedView::capture(&memory).is_err());
 }
 
+/// Archive state sync installs a GLOBAL tree in chunks, each its own
+/// commit; a view between them mixed the state before the sync with part of
+/// the archive's (a head whose session record was not in yet). The view is
+/// withheld from the first chunk until the last one is in.
+#[test]
+fn committed_view_is_withheld_while_a_global_sync_installs_its_chunks() {
+    use quil_types::store::KvDb as _;
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let batch = db.new_batch(false).unwrap();
+    batch.set(&quil_store::encoding::global_materialized_cursor_key(), &7u64.to_be_bytes()).unwrap();
+    batch.commit().unwrap();
+    let crdt = state.crdt();
+    assert_eq!(CommittedView::capture(crdt).unwrap().frame(), 7);
+
+    let archive = Arc::new(HypergraphCrdt::new(
+        Arc::new(quil_hypergraph::testing::MemStore::new()),
+        Arc::new(StubProver),
+    ));
+    for byte in 1..=3u8 {
+        let location = quil_hypergraph::Location { app_address: GLOBAL_INTRINSIC_ADDRESS, data_address: [byte; 32] };
+        archive.add_vertex(&location, &[byte; 48]).unwrap();
+    }
+    archive.commit(1).unwrap();
+    let (version, root) = archive.serve_forest_head(&GLOBAL_INTRINSIC_ADDRESS, 0).unwrap();
+    let reader = quil_hypergraph::testing::CrdtTreeReader {
+        source: archive, shard_id: GLOBAL_INTRINSIC_ADDRESS.to_vec(), phase: 0,
+    };
+    let mut plan = crdt.prepare_phase_sync(&reader, version, &GLOBAL_INTRINSIC_ADDRESS, 0, &[],
+        Some(quil_forest::SubtreeSyncAnchor::AppRoot(root))).unwrap();
+    assert_eq!(plan.remaining().len(), 3);
+    while plan.remaining().len() > 1 {
+        let byte = plan.remaining()[0].0[0];
+        crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+        let error = CommittedView::capture(crdt).err().expect("no committed view between a sync's chunks");
+        assert!(global_sync_in_progress(&error), "{error}");
+    }
+    let byte = plan.remaining()[0].0[0];
+    crdt.apply_sync_chunk(&mut plan, &[vec![byte; 48]]).unwrap();
+    assert_eq!(crdt.finish_phase_sync(&plan).unwrap(), root);
+    assert_eq!(CommittedView::capture(crdt).unwrap().frame(), 7, "the view returns once the last chunk is in");
+}
+
 #[test]
 fn canonical_global_dispatch_validates_real_certificate_and_rejects_stateless_admission() {
     use crate::{

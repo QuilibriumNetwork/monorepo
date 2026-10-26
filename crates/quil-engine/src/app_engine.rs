@@ -917,6 +917,37 @@ fn cw_session_parent(
 }
 
 impl AppLeaderProvider {
+    /// The openings root this member commits in app frame `frame_number`,
+    /// anchored in hash-proof epoch `epoch` with beacon `rho_n`, from its
+    /// sealed registration's replicas; `None` without one (the frame then
+    /// counts as a proposal the member missed when its epoch settles).
+    fn storage_commitment(&self, epoch: u64, frame_number: u64, rho_n: &[u8]) -> Option<[u8; 32]> {
+        let kv = self.kv_db.as_ref()?;
+        let slot = match self.prover_registry.get_storage_seat_slot(&self.local_prover_address, &self.filter, epoch) {
+            Ok(Some(slot)) if slot.sealed_at.is_some() && slot.open && !slot.leaves.is_empty() => slot,
+            _ => {
+                info!(frame = frame_number, epoch,
+                    "app-shard proof: no sealed storage registration for the epoch — frame commits no openings root");
+                return None;
+            }
+        };
+        let replicas = quil_store::replica_store::ReplicaStore::new(kv.clone());
+        match crate::storage_snapshot::commitment(
+            &replicas, &self.local_prover_address, &self.filter, &slot, frame_number, rho_n,
+        ) {
+            Ok(root) => {
+                info!(frame = frame_number, epoch, leaves = slot.leaves.len(),
+                    "app-shard proof: storage openings root committed");
+                Some(root)
+            }
+            Err(error) => {
+                warn!(frame = frame_number, epoch, %error,
+                    "app-shard proof: storage openings root not computed — frame commits none");
+                None
+            }
+        }
+    }
+
     /// A leader over a private selected-parent branch: its frame chain, state,
     /// execution manager and outflows, the parent as the materialized height,
     /// and a copy of the pending messages (collection would prune the public
@@ -1647,7 +1678,25 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             &storage_attestation_root,
             anchor_gfn,
         )?;
-        if storage_active {
+        let storage_epoch = quil_types::consensus::epoch_for_frame(anchor_gfn);
+        if storage_active && quil_types::consensus::hash_storage_proofs_at(storage_epoch) {
+            // Hash storage proofs (decided 2026-10-21): the frame commits one
+            // root over the replica nodes a beacon chose, which this member's
+            // epoch proof proves later; no openings ride the frame. The beacon
+            // is this node's freshest GLOBAL frame's, not the anchor's: the
+            // root counts only if GLOBAL executes it within the response
+            // window of that frame (`storage_seat::RESPONSE_WINDOW_MS`).
+            let (beacon_frame, beacon_output) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                .and_then(|frame| frame.header)
+                .map(|header| (header.frame_number, header.output))
+                .filter(|(number, _)| *number >= anchor_gfn)
+                .unwrap_or((anchor_gfn, anchor_output.clone()));
+            let beacon = quil_crypto::porep::derive_storage_beacon(beacon_frame, &beacon_output);
+            if let Some(root) = self.storage_commitment(storage_epoch, frame_number, &beacon) {
+                header.storage_attestation_root =
+                    quil_execution::global_intrinsic::storage_seat::encode_commitment(&root, beacon_frame);
+            }
+        } else if storage_active {
             // PROPOSER SELF-ATTESTATION (CW PoRep port). Legacy Jolteon assembled
             // the committee `StorageAttestation` from every member's per-vote
             // openings at QC time. Simplex votes carry no payload, so under CW the
@@ -1682,7 +1731,12 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     &rho_n,
                 )
                 .unwrap_or_default();
-                if opening_blob.is_empty() && !self.private_parent {
+                // A hash-proof epoch attests only replicas its snapshot encoded
+                // and its renewal registered (`storage_snapshot`); encoding the
+                // live data here would replace them with unregistered ones.
+                if opening_blob.is_empty() && !self.private_parent
+                    && !quil_types::consensus::hash_storage_proofs_at(epoch)
+                {
                     // (1) worker-side shard-data sync into its OWN store.
                     if let Some(source) = self.storage_source_hypergraph.as_ref() {
                         match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
@@ -1714,6 +1768,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                         epoch,
                         quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                         &quil_crypto::sdr::SdrParams::default(),
+                        frame_number,
+                        &[],
                     ) {
                         warn!(frame = frame_number, error = %e, "storage self-seal failed");
                     }
@@ -2184,6 +2240,8 @@ pub struct AppConsensusEngine {
     /// Fetches certified frames of shards this node does not hold, so their
     /// committed outputs can be delivered here.
     delivery_frame_source: Option<DeliveryFrameSource>,
+    /// Those fetches, run off the select loop ([`crate::delivery_sources`]).
+    delivery_sources: crate::delivery_sources::DeliverySources,
     // NOTE: `global_anchor_store` (added below near `clock_store`) resolves the
     // GLOBAL frame anchor; `clock_store` serves this shard's own chain.
     /// CPU core this engine runs on.
@@ -2537,6 +2595,7 @@ impl AppConsensusEngine {
             storage_source_hypergraph: deps.storage_source_hypergraph,
             shard_drain: deps.topology.map(|topology| Arc::new(crate::shard_drain::ShardDrain::new(filter.clone(), topology))),
             delivery_frame_source: deps.delivery_frame_source,
+            delivery_sources: Default::default(),
             unified_cutover_hook: deps.unified_cutover_hook,
             execution_engine: deps.execution_engine,
             inclusion_prover: deps.inclusion_prover,
@@ -2662,6 +2721,183 @@ impl AppConsensusEngine {
             &frame.to_be_bytes())
     }
 
+    /// Hash storage proofs (decided 2026-10-21): this member's epoch proof
+    /// for its seat on the shard, during the epoch after the one it settles.
+    /// It seals the registration for the epoch after next once GLOBAL has
+    /// recorded it and the frame after it exists, and proves the roots
+    /// committed the epoch before once their settlement window is open. Both
+    /// go in one proof; settling alone waits until a registration can no
+    /// longer land. Proving runs in the background, and a proof GLOBAL does
+    /// not record is proven and sent again later.
+    fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
+        use quil_types::consensus::{epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame};
+        let current = epoch_for_frame(global_frame_number);
+        let (epoch, seal_epoch) = (current.saturating_sub(1), current + 1);
+        if !hash_storage_proofs_at(epoch) && !hash_storage_proofs_at(seal_epoch) {
+            return;
+        }
+        let (Some(kv), Some(publish)) = (self.kv_db.clone(), self.coverage_publish.clone()) else { return };
+        let Ok(member) = <[u8; 32]>::try_from(self.local_prover_address.as_slice()) else { return };
+        let slot = |e: u64| self.prover_registry.get_storage_seat_slot(&member, &self.filter, e).ok().flatten();
+        let next = slot(seal_epoch).filter(|slot| {
+            hash_storage_proofs_at(seal_epoch) && slot.sealed_at.is_none() && !slot.leaves.is_empty()
+        });
+        let seal = next.clone().filter(|slot| slot.registered_at + 1 < global_frame_number);
+        let (from, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        let registration_closed = global_frame_number
+            >= storage_snapshot_frame(seal_epoch) + crate::app_shard_metadata::storage_snapshot_grace()
+                + crate::storage_snapshot::seal_retry_frames();
+        // Settling shares a proof with the seal when one can still come: a
+        // registration GLOBAL recorded whose beacon frame is not here yet, or
+        // one that may still land.
+        let awaiting_seal = seal.is_none()
+            && hash_storage_proofs_at(seal_epoch)
+            && (next.is_some() || (slot(seal_epoch).is_none() && !registration_closed));
+        let settle = slot(epoch).filter(|slot| {
+            hash_storage_proofs_at(epoch) && slot.sealed_at.is_some() && slot.open && slot.frames > 0
+                && (from..until).contains(&global_frame_number) && !awaiting_seal
+        });
+        if seal.is_none() && settle.is_none() {
+            crate::storage_epoch_batch::forget_prepared(&member, &self.filter, epoch);
+            return;
+        }
+        // GLOBAL frames this proof reads that this worker does not hold (a
+        // standalone worker stores them only from its start) come from its
+        // own master in the background; the job runs again next frame.
+        let recover = |numbers: Vec<u64>| {
+            let (Some(source), Ok(runtime)) = (self.global_anchor_source.clone(), tokio::runtime::Handle::try_current())
+            else {
+                return;
+            };
+            let store = self.global_anchor_store.clone();
+            runtime.spawn(async move {
+                for number in numbers {
+                    if let Err(error) = crate::global_anchor::ensure_global_anchor(store.as_ref(), &source, number).await {
+                        debug!(frame = number, %error, "GLOBAL frame for a storage epoch proof not recovered yet");
+                    }
+                }
+            });
+        };
+        let missing = |number: u64| self.global_anchor_store.get_global_clock_frame(number).is_err();
+        let beacon_output = match &seal {
+            Some(slot) => match self.global_anchor_store.get_global_clock_frame(slot.registered_at + 1).ok()
+                .and_then(|frame| frame.header.map(|header| header.output))
+            {
+                Some(output) => output,
+                None => {
+                    recover(vec![slot.registered_at + 1]);
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        let beacons = match &settle {
+            Some(slot) => match crate::storage_snapshot::chained_beacons(self.global_anchor_store.as_ref(), slot) {
+                Some(beacons) => beacons,
+                None => {
+                    let absent: Vec<u64> = slot.chained.iter().map(|&(_, anchor)| anchor).filter(|&n| missing(n)).collect();
+                    warn!(epoch, frames = ?absent,
+                        "storage epoch proof: GLOBAL frames chained frames anchor to are not stored here; recovering them");
+                    recover(absent);
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        // A part sent before is owed still in this node's view, which may
+        // trail GLOBAL by a registry pull (minutes): ask for an early one, so
+        // the view learns the seal (proposals commit roots only for a seal
+        // they see) and a part GLOBAL applied is not sent again.
+        if let Some(sent) = crate::storage_snapshot::epoch_proof_sent_at(&member, &self.filter, epoch) {
+            crate::global_view_refresh::shared().request(
+                crate::global_view_refresh::Reason::StorageRecordAwaited, sent + 4, std::time::Instant::now(),
+            );
+        }
+        let Some(attempt) = crate::storage_snapshot::claim_epoch_proof(&member, &self.filter, epoch, global_frame_number)
+        else {
+            return;
+        };
+        let (filter, replicas) = (self.filter.clone(), quil_store::replica_store::ReplicaStore::new(kv));
+        let crdt = self.hypergraph.clone();
+        // This seat's part of the member's epoch proof goes to the node, which
+        // proves it with the member's other seats (`storage_epoch_batch`),
+        // waiting for the parts announced to it; a part sent again is proved
+        // alone.
+        let announce = |seals: bool, settles: bool| {
+            use crate::storage_epoch_batch::{SeatKey, SeatMessage};
+            if attempt == 1 {
+                let key = SeatKey { filter: self.filter.clone(), seals, settles };
+                publish(SeatMessage::Announce(member, key).to_bytes());
+            }
+        };
+        match (seal.is_some(), settle.is_some()) {
+            (true, true) if attempt > 1 => {}
+            (seals, settles) => announce(seals, settles),
+        }
+        // What each half of the part is prepared from: a retry reuses a half
+        // prepared from the same inputs.
+        let seal_inputs = seal.as_ref().map(|slot| crate::storage_epoch_batch::PartInputs::Seal {
+            registered_at: slot.registered_at, leaves: slot.leaves.clone(), beacon_output: beacon_output.clone(),
+        });
+        let settle_inputs = settle.as_ref().map(|slot| crate::storage_epoch_batch::PartInputs::Settle {
+            frames: slot.frames, accumulator: slot.accumulator,
+        });
+        crate::storage_snapshot::spawn("epoch proof part", move || {
+            let prove = |seals: bool, settles: bool| -> quil_types::error::Result<()> {
+                let withdraw = |error: quil_types::error::QuilError| {
+                    use crate::storage_epoch_batch::{SeatKey, SeatMessage};
+                    publish(SeatMessage::Withdraw(member, SeatKey { filter: filter.clone(), seals, settles }).to_bytes());
+                    error
+                };
+                let started = std::time::Instant::now();
+                let (mut seat, reused) = crate::storage_epoch_batch::prepare_reusing(
+                    &member, &filter, epoch,
+                    seal_inputs.clone().filter(|_| seals),
+                    settle_inputs.clone().filter(|_| settles),
+                    |seals, settles| {
+                        // The sealed registration's bindings read the
+                        // snapshot its data was taken from.
+                        let captured = match (seal.as_ref().filter(|_| seals), crdt.as_ref()) {
+                            (Some(_), Some(crdt)) => Some(crate::storage_snapshot::captured_for(crdt, &replicas, &filter, epoch + 2)?),
+                            (Some(_), None) => return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                                "no shard store to read the sealed snapshot from".into(),
+                            )),
+                            _ => None,
+                        };
+                        crate::storage_snapshot::prepare_member_seat(
+                            &replicas, &member, &filter, epoch,
+                            seal.as_ref().filter(|_| seals).zip(captured.as_deref())
+                                .map(|(slot, captured)| (slot, beacon_output.as_slice(), captured)),
+                            settle.as_ref().filter(|_| settles).map(|slot| (slot, beacons.as_slice())),
+                        )
+                    },
+                )
+                .map_err(withdraw)?;
+                seat.solo = attempt > 1;
+                let bytes = seat.to_bytes();
+                info!(epoch, seals, settles, attempt, reused, frames = settle.as_ref().filter(|_| settles).map_or(0, |slot| slot.frames),
+                    bytes = bytes.len(), seconds = started.elapsed().as_secs_f64(), filter = %hex::encode(&filter),
+                    "storage epoch proof part prepared for the node");
+                publish(bytes);
+                Ok(())
+            };
+            match (seal.is_some(), settle.is_some()) {
+                // A seal that fails here, or one GLOBAL refused once, must not
+                // keep the settlement out: the held rewards and the seat ride
+                // on it. Send the parts apart.
+                (true, true) if attempt > 1 => {
+                    let settled = prove(false, true);
+                    prove(true, false).and(settled)
+                }
+                (true, true) => prove(true, true).or_else(|error| {
+                    warn!(epoch, %error, "storage epoch proof with the seal failed; settling alone");
+                    prove(false, true)
+                }),
+                (seals, settles) => prove(seals, settles),
+            }
+        });
+    }
+
     /// Run a frame's `requests` through the execution engines on the
     /// blocking thread pool, off the engine's `tokio::select!` task.
     /// Materialization is CPU- and DB-bound; running it inline on the
@@ -2685,6 +2921,7 @@ impl AppConsensusEngine {
             Some(e) => e,
             None => return Ok((0, 0)),
         };
+        self.prove_storage_epoch_if_due(global_frame_number);
         let collector = self.message_collector.clone();
         // Price from the network size certified by global consensus on the
         // anchored global frame — identical on every member — never from this
@@ -2810,6 +3047,9 @@ impl AppConsensusEngine {
         let Some(shard) = self.execution_engine.as_ref().map(|m| m.crdt()) else {
             return Ok(false);
         };
+        // A shard whose subtree a payload eviction dropped owes a re-anchor
+        // before any replay onto the missing state.
+        self.check_evicted_lineage(std::time::Instant::now());
         // A recorded re-anchor is honored or cleared before anything else.
         let gate = self.reanchor_gate(&shard)?;
         let applies = match gate {
@@ -2994,9 +3234,10 @@ impl AppConsensusEngine {
                 "shard re-anchor no longer applies: the shard's current session does not continue this shard's chain",
         };
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
-            cause = marker.cause().as_str(), fence = marker.fence, local_head = marker.from_cursor, lineage,
+            cause = self.reanchor_cause_label(marker), fence = marker.fence, local_head = marker.from_cursor, lineage,
             head_generation = %head_generation, head_origins = %head_origins, owed_secs = %owed, scope = "this node",
             action = action, "{line}");
+        self.fence_reanchor.evicted = false;
         let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested { filter: self.filter.clone() });
         Ok(())
     }
@@ -3006,6 +3247,8 @@ impl AppConsensusEngine {
     /// trees are the archive's (or the shard's own), and catch-up goes on.
     fn clear_stale_reanchor(&mut self, marker: &crate::app_handoff::ReanchorMarker) -> Result<()> {
         crate::app_handoff::clear_reanchor_marker(self.clock_store.as_ref(), &self.filter)?;
+        crate::app_handoff::clear_dropped_lineage(self.clock_store.as_ref(), &self.filter)?;
+        self.fence_reanchor.evicted = false;
         let owed = self.finish_reanchor(std::time::Instant::now())
             .map_or_else(|| "unknown".to_string(), |owed| owed.as_secs().to_string());
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
@@ -3018,22 +3261,106 @@ impl AppConsensusEngine {
     /// trees: its pre-state roots differ at `phase`. A mismatch of the same
     /// frame that persists ([`ReplayMismatch::failed`]) while this shard
     /// runs no consensus owes a re-anchor at the frame GLOBAL committed
-    /// ([`Self::reanchor_after_replay_mismatch`]).
-    fn note_replay_mismatch(&mut self, frame: u64, phase: usize, now: std::time::Instant) {
-        let Some(streak) = self.replay_mismatch.failed(frame, now) else { return };
-        let inputs = match self.global_hypergraph.as_ref()
-            .filter(|_| quil_types::consensus::committee_handoff_policy().is_some())
-        {
-            Some(global) => crate::app_handoff::replay_mismatch_inputs(global, &self.filter).map(Some),
-            None => Ok(None),
-        };
+    /// ([`Self::reanchor_after_replay_mismatch`]); so does the first one
+    /// onto an empty local subtree where the certified state holds data
+    /// (`empty_local`): a payload eviction dropped it, and no replay can
+    /// bring it back.
+    fn note_replay_mismatch(&mut self, frame: u64, phase: usize, now: std::time::Instant, empty_local: bool) {
+        let Some(streak) = self.replay_mismatch.failed(frame, now, empty_local) else { return };
+        let cause = if empty_local { MismatchCause::EmptyLocal } else { MismatchCause::Persistent };
         let running = self.cw_handle.is_some();
-        let result = inputs.and_then(|global| self.reanchor_after_replay_mismatch(&streak, phase, global, running, now));
+        let result = self.replay_mismatch_global()
+            .and_then(|global| self.reanchor_after_replay_mismatch(&streak, phase, global, running, now, cause));
         if let Err(error) = result {
             warn!(core_id = self.core_id, filter = hex::encode(&self.filter), frame, %error, scope = "this node",
                 action = "the archive recovery keeps retrying; report it with this line and the archive recovery lines",
                 "could not record a re-anchor after a persistent archive replay mismatch");
         }
+    }
+
+    /// What a replay mismatch re-anchor needs of GLOBAL
+    /// ([`crate::app_handoff::replay_mismatch_inputs`]); `None` without a
+    /// GLOBAL view under the committee-handoff policy.
+    fn replay_mismatch_global(&self) -> Result<Option<(Option<u64>, u64, bool)>> {
+        match self.global_hypergraph.as_ref()
+            .filter(|_| quil_types::consensus::committee_handoff_policy().is_some())
+        {
+            Some(global) => crate::app_handoff::replay_mismatch_inputs(global, &self.filter).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Record the re-anchor an evicted lineage owes
+    /// ([`Self::evicted_lineage`]), warning at a bounded rate when the check
+    /// fails. The record is read under the shard's forest write barrier,
+    /// under which the eviction passes ask whether their binding still
+    /// stands before each write: a confinement that began before this
+    /// worker was rebound has committed by then, with its record, and a
+    /// later one finds the binding changed and stops.
+    fn check_evicted_lineage(&mut self, now: std::time::Instant) {
+        let cursor = {
+            let shard = self.execution_engine.as_ref().map(|manager| manager.crdt());
+            let _barrier = shard.as_ref().map(|shard| shard.lock_forest_writes());
+            self.evicted_lineage()
+        };
+        let evicted = cursor.and_then(|cursor| match cursor {
+            Some(cursor) => self.replay_mismatch_global()
+                .and_then(|global| self.reanchor_evicted_lineage(cursor, global, now)),
+            None => {
+                self.fence_reanchor.evicted_waiting = false;
+                Ok(false)
+            }
+        });
+        if let Err(error) = evicted {
+            if repeat_due(&mut self.fence_reanchor.evicted_check_warned, now) {
+                warn!(core_id = self.core_id, filter = hex::encode(&self.filter), %error, scope = "this node",
+                    action = "the first failing archive replay re-anchors the shard instead; report it with this line \
+                        if it persists",
+                    "could not check whether this worker evicted the shard's data");
+            }
+        }
+    }
+
+    /// The owed re-anchor's cause as its log lines name it: one recorded
+    /// for an evicted lineage is named so, though its marker reads as a
+    /// replay mismatch.
+    fn reanchor_cause_label(&self, marker: &crate::app_handoff::ReanchorMarker) -> &'static str {
+        match marker.cause() {
+            crate::app_handoff::ReanchorCause::ReplayMismatch if self.fence_reanchor.evicted => EVICTED_REANCHOR_CAUSE,
+            cause => cause.as_str(),
+        }
+    }
+
+    /// The stored cursor of this shard's lineage when a payload eviction
+    /// dropped its subtree from this worker's store and no re-anchor is
+    /// owed yet ([`crate::app_handoff::dropped_lineage`]). A re-anchor owed
+    /// at the cursor the record names is the record's (after a restart).
+    fn evicted_lineage(&mut self) -> Result<Option<u64>> {
+        let Some(shard) = self.execution_engine.as_ref().map(|manager| manager.crdt()) else { return Ok(None) };
+        if let Some(marker) = self.recorded_reanchor()? {
+            if !self.fence_reanchor.evicted && marker.cause() == crate::app_handoff::ReanchorCause::ReplayMismatch {
+                self.fence_reanchor.evicted = crate::app_handoff::dropped_lineage(&shard, self.clock_store.as_ref(),
+                    &self.filter)? == Some(marker.from_cursor);
+            }
+            return Ok(None);
+        }
+        crate::app_handoff::dropped_lineage(&shard, self.clock_store.as_ref(), &self.filter)
+    }
+
+    /// Record the re-anchor a shard owes at once when this worker's store
+    /// dropped its subtree at `cursor` ([`Self::evicted_lineage`]): every
+    /// replay onto it would fail its pre-state check, for half an hour
+    /// before a persistent mismatch re-anchors it. True when recorded.
+    /// `global` is [`crate::app_handoff::replay_mismatch_inputs`]'s answer.
+    fn reanchor_evicted_lineage(
+        &mut self,
+        cursor: u64,
+        global: Option<(Option<u64>, u64, bool)>,
+        now: std::time::Instant,
+    ) -> Result<bool> {
+        let streak = MismatchStreak { frame: cursor + 1, failures: 0, duration: Duration::ZERO };
+        let running = self.cw_handle.is_some();
+        self.reanchor_after_replay_mismatch(&streak, 0, global, running, now, MismatchCause::Evicted)
     }
 
     /// Record a re-anchor at the frame GLOBAL committed once
@@ -3050,6 +3377,9 @@ impl AppConsensusEngine {
     /// once, or without a GLOBAL view under the committee-handoff policy
     /// (`global` is `None`). The last three are warned about at each check.
     /// `global` is [`crate::app_handoff::replay_mismatch_inputs`]'s answer.
+    /// `cause` names why it is owed now; a dropped lineage that cannot
+    /// re-anchor yet waits silently for its first failing replay, which
+    /// says why.
     ///
     /// The attempt is armed, not requested: the shard sync whose replays
     /// failed still runs and would drop the request. The next sync takes
@@ -3061,6 +3391,7 @@ impl AppConsensusEngine {
         global: Option<(Option<u64>, u64, bool)>,
         running: bool,
         now: std::time::Instant,
+        cause: MismatchCause,
     ) -> Result<bool> {
         let (committed, generation, applies) = global.unwrap_or((None, 0, false));
         if running || self.recorded_reanchor()?.is_some() {
@@ -3073,8 +3404,32 @@ impl AppConsensusEngine {
                 "replay mismatch not at the frame after the stored cursor; no re-anchor");
             return Ok(false);
         }
-        let marker = crate::app_handoff::replay_mismatch_reanchor(generation, cursor, committed).filter(|_| applies);
+        let marker = match cause {
+            MismatchCause::Evicted => crate::app_handoff::evicted_lineage_reanchor(generation, cursor, committed),
+            MismatchCause::Persistent | MismatchCause::EmptyLocal =>
+                crate::app_handoff::replay_mismatch_reanchor(generation, cursor, committed),
+        }.filter(|_| applies);
         let Some(marker) = marker else {
+            if cause == MismatchCause::Evicted {
+                self.fence_reanchor.evicted_waiting = true;
+                if repeat_due(&mut self.fence_reanchor.evicted_wait_logged, now) {
+                    let reason = if global.is_none() {
+                        "this worker holds no GLOBAL view under the committee-handoff policy"
+                    } else if !applies {
+                        "the shard's current session does not continue this shard's chain"
+                    } else {
+                        "GLOBAL committed no frame of the shard at or above the local head"
+                    };
+                    let committed = committed.map_or_else(|| "unknown".to_string(), |frame| frame.to_string());
+                    info!(core_id = self.core_id, filter = hex::encode(&self.filter), local_head = cursor,
+                        committed_tip = %committed, reason, scope = "this node",
+                        action = "the engine starts on its local lineage; the first archive replay onto the evicted \
+                            subtree re-anchors the shard at once; checked again each minute while consensus is not \
+                            running, and at each start",
+                        "evicted shard cannot re-anchor yet");
+                }
+                return Ok(false);
+            }
             let (reason, action) = if global.is_none() {
                 ("this worker holds no GLOBAL view under the committee-handoff policy",
                     "a re-anchor needs the frame GLOBAL committed, which this worker cannot read; it checks again \
@@ -3101,14 +3456,32 @@ impl AppConsensusEngine {
         self.fence_reanchor.marker = Some(Some(marker));
         self.fence_reanchor.arm(now);
         self.publish_reanchor_armed();
-        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation, local_head = cursor,
-            frame = streak.frame, phase, failures = streak.failures, failing_secs = streak.duration.as_secs(),
-            anchor_frame = committed.unwrap_or_default(), scope = "this node",
-            action = "this worker's shard trees differ from the state its frames claim; it keeps its frames through \
-                the local head and syncs the shard from an archive pinned to the frame GLOBAL committed, retried \
-                after 5 minutes and then at doubling intervals up to hourly; the start waits for it; the re-anchor \
-                lines follow",
-            "archive replay keeps failing on this worker's shard state; re-anchoring the shard at the frame GLOBAL committed");
+        if cause == MismatchCause::Evicted {
+            self.fence_reanchor.evicted = true;
+            self.fence_reanchor.evicted_waiting = false;
+        }
+        let anchor_frame = committed.unwrap_or_default();
+        match cause {
+            MismatchCause::Persistent => warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation,
+                local_head = cursor, frame = streak.frame, phase, failures = streak.failures,
+                failing_secs = streak.duration.as_secs(), anchor_frame, scope = "this node",
+                action = "this worker's shard trees differ from the state its frames claim; it keeps its frames through \
+                    the local head and syncs the shard from an archive pinned to the frame GLOBAL committed, retried \
+                    after 5 minutes and then at doubling intervals up to hourly; the start waits for it; the re-anchor \
+                    lines follow",
+                "archive replay keeps failing on this worker's shard state; re-anchoring the shard at the frame GLOBAL committed"),
+            MismatchCause::EmptyLocal => warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation,
+                local_head = cursor, frame = streak.frame, phase, anchor_frame, scope = "this node",
+                action = "this worker's store holds no data in the shard's subtree, which a payload eviction drops when \
+                    the worker serves another shard; it keeps its frames through the local head and syncs the shard \
+                    from an archive pinned to the frame GLOBAL committed; the re-anchor lines follow",
+                "re-anchoring at once: this worker's shard subtree is empty where the certified state holds data"),
+            MismatchCause::Evicted => info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation,
+                local_head = cursor, anchor_frame,
+                action = "it keeps its frames through the local head and syncs the shard from an archive pinned to the \
+                    frame GLOBAL committed; the re-anchor lines follow",
+                "re-anchoring at once: this worker evicted the shard's data while it served another shard"),
+        }
         Ok(true)
     }
 
@@ -3143,7 +3516,7 @@ impl AppConsensusEngine {
         let (wait, scope, action) = reanchor_wait(reason, refusal.as_ref().map(|(error, _)| error.as_str()));
         let refusal_age = refusal.as_ref().map_or_else(|| "none".to_string(), |(_, age)| age.as_secs().to_string());
         warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
-            cause = marker.cause().as_str(), fence = marker.fence, local_head = marker.from_cursor,
+            cause = self.reanchor_cause_label(&marker), fence = marker.fence, local_head = marker.from_cursor,
             anchor_frame = %anchor, reason = %reason,
             last_refusal = %refusal.as_ref().map_or("none", |(error, _)| error.as_str()),
             last_refusal_age_secs = %refusal_age, waited_secs = waited.as_secs(),
@@ -3186,7 +3559,7 @@ impl AppConsensusEngine {
                 replays next",
         };
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
-            cause = marker.cause().as_str(), fence = marker.fence, from = rebased.from, to = rebased.to,
+            cause = self.reanchor_cause_label(marker), fence = marker.fence, from = rebased.from, to = rebased.to,
             anchor_frame = anchor, "{line}");
         let synced_to = anchor - 1;
         self.set_materialized_frame(synced_to);
@@ -3655,7 +4028,11 @@ impl AppConsensusEngine {
             } else { hg.compute_shard_root(set, phase, &shard) };
             if root.is_empty() { root = vec![0; if hg.has_forest() { 32 } else { 64 }]; }
             if root != header.state_roots[i] {
-                self.note_replay_mismatch(number, i, std::time::Instant::now());
+                // A lineage replaying onto an empty subtree where the
+                // certified state holds data can never catch up.
+                let empty_local = i == 0 && self.last_materialized_frame > 0
+                    && !empty_subtree_root(&header.state_roots[i]) && local_subtree_empty(hg, &self.filter);
+                self.note_replay_mismatch(number, i, std::time::Instant::now(), empty_local);
                 return Err(QuilError::ExecutionUnavailable(format!("archive replay pre-state mismatch at phase {i}")));
             }
         }
@@ -4289,12 +4666,15 @@ impl AppConsensusEngine {
                 .unwrap_or_else(|| "unknown".to_string());
             let line = match marker.cause() {
                 crate::app_handoff::ReanchorCause::PastFence => "re-anchored shard at the session fence from an archive",
+                crate::app_handoff::ReanchorCause::ReplayMismatch if self.fence_reanchor.evicted =>
+                    "re-anchored shard at the frame GLOBAL committed from an archive after this worker evicted its data",
                 crate::app_handoff::ReanchorCause::ReplayMismatch =>
                     "re-anchored shard at the frame GLOBAL committed from an archive after a persistent replay mismatch",
             };
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = marker.generation,
-                cause = marker.cause().as_str(), fence = marker.fence, old_head = marker.from_cursor,
+                cause = self.reanchor_cause_label(&marker), fence = marker.fence, old_head = marker.from_cursor,
                 anchor_frame = anchor_n, elapsed_secs = elapsed.as_secs(), archive = %archive, "{line}");
+            self.fence_reanchor.evicted = false;
             self.end_unrewindable_fence("re-anchored at the fence from an archive", now);
         }
         true
@@ -4381,52 +4761,28 @@ impl AppConsensusEngine {
         });
     }
 
-    async fn fetch_delivery_sources(&self) {
-        let (Some(manager), Some(fetch)) = (self.execution_engine.as_ref(), self.delivery_frame_source.as_ref()) else {
+    /// Start a sweep for the frames this shard's pending deliveries read
+    /// their bytes from and this node lacks. Waits for neither the store nor
+    /// the network: the sweep's reads and fetches run beside the select loop
+    /// ([`crate::delivery_sources`]).
+    fn fetch_delivery_sources(&mut self) {
+        let (Some(manager), Some(fetch)) = (self.execution_engine.clone(), self.delivery_frame_source.clone()) else {
             return;
         };
-        let global = match self.storage_source_hypergraph.as_ref().or(self.hypergraph.as_ref()) {
-            Some(crdt) => crdt.clone(),
-            None => return,
+        let Some(global) = self.storage_source_hypergraph.as_ref().or(self.hypergraph.as_ref()).cloned() else {
+            return;
         };
-        let sources = match manager.pending_delivery_sources(global, &self.filter) {
-            Ok(sources) => sources,
-            Err(error) => {
-                debug!(filter = hex::encode(&self.filter), %error, "delivery sources unavailable");
-                return;
-            }
-        };
-        for (filter, frame_number) in sources {
+        let (filter, clock_store) = (self.filter.clone(), self.clock_store.clone());
+        let collect: crate::delivery_sources::Collect = Box::new(move || {
+            let sources = manager.pending_delivery_sources(global, &filter).map_err(|error| error.to_string())?;
             // Already here: this shard's own frames, and anything fetched
             // earlier. Nothing is refetched.
-            if self.clock_store.get_shard_clock_frame(&filter, frame_number, false).is_ok() {
-                continue;
-            }
-            let Some(frame) = fetch(filter.clone(), frame_number).await else {
-                debug!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame not available yet");
-                continue;
-            };
-            let Some(header) = frame.header.as_ref() else { continue };
-            if header.address != filter || header.frame_number != frame_number {
-                warn!(filter = hex::encode(&filter), frame = frame_number, "delivery source frame is not the one requested");
-                continue;
-            }
-            let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                .map(|hash| hash.to_vec())
-                .unwrap_or_default();
-            let stored = self.clock_store.new_transaction(false).ok().and_then(|txn| {
-                self.clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()).ok()?;
-                txn.commit().ok()?;
-                let txn = self.clock_store.new_transaction(false).ok()?;
-                self.clock_store.commit_shard_clock_frame(&filter, frame_number, &selector, txn.as_ref(), true).ok()?;
-                txn.commit().ok()
-            });
-            if stored.is_some() {
-                info!(filter = hex::encode(&filter), frame = frame_number, "fetched a delivery's source frame");
-            } else {
-                warn!(filter = hex::encode(&filter), frame = frame_number, "storing a delivery's source frame failed");
-            }
-        }
+            Ok(sources
+                .into_iter()
+                .filter(|(source, frame_number)| clock_store.get_shard_clock_frame(source, *frame_number, false).is_err())
+                .collect())
+        });
+        self.delivery_sources.sweep(&self.filter, collect, fetch, self.clock_store.clone());
     }
 
     pub async fn run(
@@ -4873,6 +5229,9 @@ impl AppConsensusEngine {
                 // Periodic cleanup
                 _ = cleanup_timer.tick() => {
                     probe::step(probe::Section::EngineCleanupTimer);
+                    if self.fence_reanchor.evicted_waiting && self.cw_handle.is_none() {
+                        self.check_evicted_lineage(std::time::Instant::now());
+                    }
                     self.retry_certified_parent_seals().await;
                     if self.pending_follower_clock.is_some() {
                         self.try_materialize_follower_frames().await;
@@ -4885,7 +5244,7 @@ impl AppConsensusEngine {
                 // in this node's registry). No-op once running.
                 _ = delivery_source_timer.tick() => {
                     probe::step(probe::Section::EngineDeliveryTimer);
-                    self.fetch_delivery_sources().await;
+                    self.fetch_delivery_sources();
                     self.request_data_bootstrap_if_unstaged();
                 }
 
@@ -4899,6 +5258,17 @@ impl AppConsensusEngine {
                     self.heal_disagreeing_pre_state();
                     if let Err(error) = self.discard_legacy_history_if_due().await {
                         warn!(core_id = self.core_id, %error, "legacy app history could not be discarded; will retry");
+                    }
+                    // The epoch proof job also runs from here, not only when a
+                    // frame materializes: a joiner materializes nothing before
+                    // consensus starts, and a stalled committee nothing at all,
+                    // yet a seal or a settlement left undone kicks the member
+                    // (an in-process engine receives no GLOBAL frame messages).
+                    // `claim_epoch_proof` paces the attempts.
+                    if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
+                        .and_then(|frame| frame.header).map(|header| header.frame_number)
+                    {
+                        self.prove_storage_epoch_if_due(head);
                     }
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
@@ -5540,7 +5910,11 @@ impl AppConsensusEngine {
         let now = std::time::Instant::now();
         let filter = hex::encode(&self.filter);
         let error = status.as_ref().err().map(ToString::to_string).unwrap_or_default();
-        match self.session_status_outage.observe(now, status.is_ok()) {
+        // A GLOBAL state sync between chunks withholds the view: an expected
+        // wait the master logs, during which the session keeps running.
+        let syncing = status.as_ref()
+            .is_err_and(|error| quil_execution::global_intrinsic::handoff::global_sync_in_progress(error));
+        match (!syncing).then(|| self.session_status_outage.observe(now, status.is_ok())).flatten() {
             Some(OutageEvent::Began) => warn!(core_id = self.core_id, filter = %filter,
                 generation = session.generation, error = %error, scope = "local", action = "report",
                 "committee session status unavailable; the session keeps running until it can be read"),
@@ -6068,7 +6442,11 @@ impl AppConsensusEngine {
                 // the missing frames from an archive when it has a lineage, the
                 // archive's certified tip otherwise. Nothing else requests it,
                 // and the retry loop would otherwise ask this question forever.
-                if matches!(error, QuilError::ExecutionUnavailable(_)) {
+                // A GLOBAL view withheld while its sync installs is no missing
+                // shard state: the retry finds it once the sync is in.
+                if matches!(error, QuilError::ExecutionUnavailable(_))
+                    && !quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error)
+                {
                     let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested {
                         filter: self.filter.clone(),
                     });
@@ -6486,8 +6864,8 @@ impl AppConsensusEngine {
                 };
                 let source = crate::app_handoff::ParentSource::new(
                     session.clone(), global, shard, self.clock_store.clone(), self.session_closing.clone(),
+                    self.data_ready.clone(),
                 )?;
-                source.require_staged_data(self.data_ready.clone());
                 let msg_tx = self.self_msg_tx.clone();
                 let read_private_parent = self.private_parents.clone().map(|parents| {
                     let source = source.clone();
@@ -7235,6 +7613,14 @@ impl AppConsensusEngine {
             );
             self.shard_frame_number = expected_shard_frame;
         }
+
+        // Run the epoch proof job from GLOBAL frames too (and from the retry
+        // timer, for an in-process engine, which receives no GLOBAL frame
+        // messages), not only when a frame materializes: a joiner's first
+        // registration must be sealed before consensus starts, and a member
+        // whose committee stalls in the settlement window must still settle
+        // what it committed, or it is kicked.
+        self.prove_storage_epoch_if_due(global_frame_number);
 
         // Update difficulty from global frame header
         self.current_difficulty.store(
@@ -9679,10 +10065,6 @@ pub(crate) fn refusal_of(number: u64, error: QuilError) -> QuilError {
     }
 }
 
-/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
-/// validating untrusted frame or storage-proof bytes is a validation failure
-/// rather than unwinding the receive task. Mirrors the global frame
-/// path's `catch_unwind` (`message_loop.rs`).
 /// Fetch the historical storage registrations a certified frame's attestation
 /// names. False when they cannot be had: the frame is then validated on its
 /// certificate alone ([`validate_certified_frame`]).
@@ -9693,11 +10075,24 @@ async fn storage_history_retained(
     storage_history_unavailable(validator, frame).await.is_none()
 }
 
-/// [`storage_history_retained`], with why the history is not.
-async fn storage_history_unavailable(
+/// [`storage_history_retained`], with why the history is not. A frame
+/// without a certificate of its own (final through its certified child, or
+/// the frame GLOBAL committed) is validated without possession, so only its
+/// GLOBAL anchor is prepared: asked for as a certified frame's, its history
+/// was refused for the certificate it never had ("missing BLS signature"),
+/// warned as a certified frame's, and named as the anchor's history error
+/// of a sync whose predecessor its child authenticated (…091200 at frame
+/// 28439, 2026-10-24).
+pub(crate) async fn storage_history_unavailable(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
 ) -> Option<QuilError> {
+    let certified = frame.header.as_ref()
+        .and_then(|header| header.public_key_signature_bls48581.as_ref())
+        .is_some_and(|signature| !signature.signature.is_empty());
+    if !certified {
+        return validator.prepare_global_anchor(frame).await.err();
+    }
     prepare_certified_frame(validator, frame).await.history
 }
 
@@ -10321,6 +10716,10 @@ fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRef
             its head lay past its session fence or its archive replays kept failing; attempted every 5 minutes, \
             backing off to hourly after a replay mismatch; it starts once the re-anchor installs; the re-anchor \
             warnings name an attempt that fails or has no outcome", true)
+    } else if quil_execution::global_intrinsic::handoff::global_sync_in_progress(error) {
+        (ExpectedWait, "this node is installing a GLOBAL state sync from an archive, and committed GLOBAL state is \
+            withheld until its last chunk is in (the 'sync phase: installing' lines show its progress); it retries \
+            every 10 s", true)
     } else if text.contains("authenticated GLOBAL state") {
         (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
             check the master if it persists", true)
@@ -10698,6 +11097,10 @@ pub(crate) fn validate_certified_frame(
     }
 }
 
+/// Run a [`BlsAppFrameValidator`] with panic containment. A panic while
+/// validating untrusted frame or storage-proof bytes is a validation failure
+/// rather than unwinding the receive task. Mirrors the global frame
+/// path's `catch_unwind` (`message_loop.rs`).
 pub(crate) fn validate_app_frame_panic_safe(
     validator: &BlsAppFrameValidator,
     frame: &quil_types::proto::global::AppShardFrame,
@@ -11128,18 +11531,60 @@ struct MismatchStreak {
     duration: Duration,
 }
 
+/// The cause the log lines of an evicted lineage's re-anchor name.
+const EVICTED_REANCHOR_CAUSE: &str = "shard data evicted";
+
+/// Why a replay mismatch owes a re-anchor
+/// ([`AppConsensusEngine::reanchor_after_replay_mismatch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchCause {
+    /// The same frame kept failing ([`ReplayMismatch::failed`]).
+    Persistent,
+    /// The local subtree holds no leaf where the certified pre-state does.
+    EmptyLocal,
+    /// A payload eviction dropped the subtree
+    /// ([`crate::app_handoff::dropped_lineage`]).
+    Evicted,
+}
+
+/// Whether `root` commits to an empty subtree: the all-zero placeholder a
+/// missing subtree reads as, or the tree's own empty-root placeholder.
+fn empty_subtree_root(root: &[u8]) -> bool {
+    root.iter().all(|byte| *byte == 0) || root == b"SPARSE_MERKLE_PLACEHOLDER_HASH__"
+}
+
+/// Whether `filter`'s vertex-adds subtree in `hg` holds no leaf, as after a
+/// payload eviction dropped it. No opinion (false) without unified trees or
+/// when the count cannot be read.
+fn local_subtree_empty(hg: &quil_hypergraph::HypergraphCrdt, filter: &[u8]) -> bool {
+    filter.len() >= 32 && hg.canonical_bits_for_filter(filter)
+        .is_some_and(|bits| hg.unified_subtree_leaf_count_checked("vertex", "adds", &filter[..32], &bits) == Some(0))
+}
+
+/// Whether a condition paced by `last` is due at `now`: at once, then every
+/// [`FENCE_REANCHOR_WAIT_REPEAT`]; if so, `last` becomes `now`.
+fn repeat_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    if last.is_some_and(|at| now.saturating_duration_since(at) < FENCE_REANCHOR_WAIT_REPEAT) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 impl ReplayMismatch {
     /// Frame `frame` failed to replay at `now`: the streak, once it has
     /// lasted [`REPLAY_MISMATCH_FAILURES`] attempts and
-    /// [`REPLAY_MISMATCH_PERSISTS`], and then every
-    /// [`REPLAY_MISMATCH_RECHECK`]; otherwise `None`.
-    fn failed(&mut self, frame: u64, now: std::time::Instant) -> Option<MismatchStreak> {
+    /// [`REPLAY_MISMATCH_PERSISTS`], or at once when the failure can never
+    /// pass (`at_once`), and then every [`REPLAY_MISMATCH_RECHECK`];
+    /// otherwise `None`.
+    fn failed(&mut self, frame: u64, now: std::time::Instant, at_once: bool) -> Option<MismatchStreak> {
         if self.frame != frame || self.since.is_none() {
             *self = ReplayMismatch { frame, since: Some(now), ..ReplayMismatch::default() };
         }
         self.failures += 1;
         let duration = now.saturating_duration_since(self.since.unwrap_or(now));
-        if self.failures < REPLAY_MISMATCH_FAILURES || duration < REPLAY_MISMATCH_PERSISTS
+        let persists = self.failures >= REPLAY_MISMATCH_FAILURES && duration >= REPLAY_MISMATCH_PERSISTS;
+        if !(persists || at_once)
             || self.considered.is_some_and(|at| now.saturating_duration_since(at) < REPLAY_MISMATCH_RECHECK)
         {
             return None;
@@ -11199,6 +11644,16 @@ struct FenceReanchor {
     refusal: Option<(std::time::Instant, String)>,
     /// When a failure to tell whether it still applies was last warned about.
     applies_warned: Option<std::time::Instant>,
+    /// When a failure to check for an evicted lineage was last warned about.
+    evicted_check_warned: Option<std::time::Instant>,
+    /// When an evicted lineage that cannot re-anchor yet was last logged.
+    evicted_wait_logged: Option<std::time::Instant>,
+    /// An evicted lineage could not re-anchor yet: checked again each
+    /// minute while consensus is not running.
+    evicted_waiting: bool,
+    /// The owed re-anchor is an evicted lineage's
+    /// ([`AppConsensusEngine::reanchor_cause_label`]).
+    evicted: bool,
     /// Attempts that ended without installing.
     failures: u32,
 }
@@ -11554,19 +12009,19 @@ mod fence_reanchor_tests {
         let at = |seconds: u64| start + Duration::from_secs(seconds);
         let mut mismatch = ReplayMismatch::default();
         for tick in 0..180u64 {
-            assert_eq!(mismatch.failed(131, at(10 * tick)), None, "tick {tick}");
+            assert_eq!(mismatch.failed(131, at(10 * tick), false), None, "tick {tick}");
         }
-        assert_eq!(mismatch.failed(131, at(1800)),
+        assert_eq!(mismatch.failed(131, at(1800), false),
             Some(MismatchStreak { frame: 131, failures: 181, duration: MINUTE * 30 }));
-        assert_eq!(mismatch.failed(131, at(1810)), None, "considered");
-        assert_eq!(mismatch.failed(131, at(3600)).map(|streak| streak.failures), Some(183), "reconsidered");
-        assert_eq!(mismatch.failed(132, at(3700)), None, "another frame starts over");
-        assert_eq!(mismatch.failed(132, at(3700 + 1800)), None, "two failures in half an hour are not ten");
+        assert_eq!(mismatch.failed(131, at(1810), false), None, "considered");
+        assert_eq!(mismatch.failed(131, at(3600), false).map(|streak| streak.failures), Some(183), "reconsidered");
+        assert_eq!(mismatch.failed(132, at(3700), false), None, "another frame starts over");
+        assert_eq!(mismatch.failed(132, at(3700 + 1800), false), None, "two failures in half an hour are not ten");
         let mut sparse = ReplayMismatch::default();
         for n in 0..9u64 {
-            assert_eq!(sparse.failed(131, at(n * 600)), None);
+            assert_eq!(sparse.failed(131, at(n * 600), false), None);
         }
-        assert_eq!(sparse.failed(131, at(9 * 600)).map(|streak| streak.failures), Some(10));
+        assert_eq!(sparse.failed(131, at(9 * 600), false).map(|streak| streak.failures), Some(10));
     }
 
     /// An engine with shard state and an execution engine, as archive
@@ -11661,12 +12116,15 @@ mod fence_reanchor_tests {
             (2, Some(9), true, true), (2, None, true, false), (2, Some(1), true, false),
             (2, Some(9), false, false), (8, Some(9), true, false),
         ] {
-            assert!(!engine.reanchor_after_replay_mismatch(&streak(frame), 0, Some((committed, 3, applies)), running, now).unwrap());
+            assert!(!engine.reanchor_after_replay_mismatch(&streak(frame), 0, Some((committed, 3, applies)), running, now,
+                MismatchCause::Persistent).unwrap());
             assert_eq!(recorded(&engine), None, "{frame} {committed:?} {applies} {running}");
         }
-        assert!(!engine.reanchor_after_replay_mismatch(&streak(2), 0, None, false, now).unwrap(), "no GLOBAL view");
+        assert!(!engine.reanchor_after_replay_mismatch(&streak(2), 0, None, false, now, MismatchCause::Persistent).unwrap(),
+            "no GLOBAL view");
         assert_eq!(recorded(&engine), None);
-        assert!(engine.reanchor_after_replay_mismatch(&streak(2), 0, Some((Some(9), 3, true)), false, now).unwrap());
+        assert!(engine.reanchor_after_replay_mismatch(&streak(2), 0, Some((Some(9), 3, true)), false, now,
+            MismatchCause::Persistent).unwrap());
         let head = quil_crypto::poseidon::hash_bytes_to_32(&[1; 32]).unwrap();
         let marker = crate::app_handoff::ReanchorMarker { generation: 3, fence: 1, from_cursor: 1, head: Some(head) };
         assert_eq!(recorded(&engine), Some(marker));
@@ -11676,9 +12134,115 @@ mod fence_reanchor_tests {
         let refused = engine.rewind_past_fence().unwrap_err();
         assert!(refused.to_string().contains(REANCHOR_IN_PROGRESS), "{refused}");
         assert!(matches!(events.try_recv(), Ok(AppEngineEvent::ShardDataBootstrapRequested { .. })));
-        assert!(!engine.reanchor_after_replay_mismatch(&streak(2), 0, Some((Some(10), 3, true)), false, now).unwrap(),
-            "already owed");
+        assert!(!engine.reanchor_after_replay_mismatch(&streak(2), 0, Some((Some(10), 3, true)), false, now,
+            MismatchCause::Persistent).unwrap(), "already owed");
         assert_eq!(recorded(&engine), Some(marker));
+    }
+
+    /// A mismatch that can never pass is a re-anchor's cause at its first
+    /// failure, then reconsidered every half hour like any other.
+    #[test]
+    fn a_replay_mismatch_that_cannot_pass_counts_at_once() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut mismatch = ReplayMismatch::default();
+        assert_eq!(mismatch.failed(131, at(0), true),
+            Some(MismatchStreak { frame: 131, failures: 1, duration: Duration::ZERO }));
+        assert_eq!(mismatch.failed(131, at(10), true), None, "considered");
+        assert_eq!(mismatch.failed(131, at(1800), true).map(|streak| streak.failures), Some(3), "reconsidered");
+    }
+
+    /// A shard engine with unified trees at local head 5, and frame 6
+    /// linked to that head, whose certified pre-state roots hold data.
+    fn engine_at_head_five(
+    ) -> (AppConsensusEngine, Arc<quil_hypergraph::HypergraphCrdt>, quil_types::proto::global::AppShardFrame) {
+        let (mut engine, _events, crdt) = shard_engine();
+        crdt.set_unified_tree(true);
+        let filter = engine.filter.clone();
+        let frame = |number: u64, output: u8, parent: Vec<u8>| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address: filter.clone(), frame_number: number, output: vec![output; 32], parent_selector: parent,
+                state_roots: vec![vec![0x5a; 32]; 4], ..Default::default()
+            }),
+            ..Default::default()
+        };
+        engine.commit_shard_clock_head(&frame(5, 0x41, vec![0x40; 32]), 5).unwrap();
+        engine.set_materialized_frame(5);
+        let next = frame(6, 0x42, quil_crypto::poseidon::hash_bytes_to_32(&[0x41; 32]).unwrap().to_vec());
+        (engine, crdt, next)
+    }
+
+    /// The first replay onto an empty local subtree, where the certified
+    /// pre-state holds data, considers a re-anchor at once. A local subtree
+    /// that holds data, its root changing between failures, never does
+    /// before the mismatch persists.
+    #[tokio::test]
+    async fn only_an_empty_local_subtree_reanchors_at_the_first_replay_mismatch() {
+        let (mut empty, _, frame) = engine_at_head_five();
+        let error = empty.replay_archive_frame_with(frame, None, |_| Ok(true)).await.unwrap_err();
+        assert!(error.to_string().contains("pre-state mismatch at phase 0"), "{error}");
+        assert_eq!(empty.replay_mismatch.failures, 1);
+        assert!(empty.replay_mismatch.considered.is_some(), "considered at the first failure");
+
+        let (mut held, crdt, frame) = engine_at_head_five();
+        let app = quil_execution::domains::QUIL_TOKEN;
+        for key in 1..=3u8 {
+            let location = quil_hypergraph::Location { app_address: app, data_address: [key; 32] };
+            crdt.add_vertex(&location, &vec![key; 48]).unwrap();
+            crdt.commit(key as u64).unwrap();
+            let error = held.replay_archive_frame_with(frame.clone(), None, |_| Ok(true)).await.unwrap_err();
+            assert!(error.to_string().contains("pre-state mismatch at phase 0"), "{error}");
+            assert_eq!(held.replay_mismatch.failures, key as u64);
+            assert!(held.replay_mismatch.considered.is_none(), "failure {key}: a subtree holding data waits");
+        }
+    }
+
+    fn write_dropped_lineage(engine: &AppConsensusEngine, cursor: u64) {
+        let txn = engine.clock_store.new_transaction(false).unwrap();
+        txn.set(&quil_store::encoding::app_lineage_dropped_key(&engine.filter), &cursor.to_be_bytes()).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn dropped_lineage_record(engine: &AppConsensusEngine) -> Option<Vec<u8>> {
+        let txn = engine.clock_store.new_transaction(false).unwrap();
+        let value = txn.get(&quil_store::encoding::app_lineage_dropped_key(&engine.filter)).unwrap();
+        let _ = txn.abort();
+        value
+    }
+
+    /// A shard whose subtree this worker's payload eviction dropped at the
+    /// stored cursor owes a re-anchor once its engine starts, recorded at
+    /// once, at the head itself when GLOBAL committed no frame above it, and
+    /// requested by the start check. A record the cursor moved past is
+    /// cleared and owes nothing.
+    #[tokio::test]
+    async fn an_evicted_lineage_reanchors_when_its_engine_starts() {
+        let (mut engine, mut events, crdt) = shard_engine();
+        let frame = first_frame(&engine, &crdt).await;
+        assert_eq!(engine.replay_archive_frame_with(frame, None, |_| Ok(true)).await.unwrap(), 1);
+        assert_eq!(engine.evicted_lineage().unwrap(), None, "nothing recorded");
+        write_dropped_lineage(&engine, 4);
+        assert_eq!(engine.evicted_lineage().unwrap(), None, "the cursor is not the dropped one");
+        assert_eq!(dropped_lineage_record(&engine), None, "the stale record is cleared");
+
+        write_dropped_lineage(&engine, 1);
+        assert_eq!(engine.evicted_lineage().unwrap(), Some(1));
+        let now = std::time::Instant::now();
+        assert!(!engine.reanchor_evicted_lineage(1, Some((None, 3, true)), now).unwrap(), "no committed frame");
+        assert!(!engine.reanchor_evicted_lineage(1, None, now).unwrap(), "no GLOBAL view");
+        assert!(!engine.reanchor_evicted_lineage(1, Some((Some(1), 3, false)), now).unwrap(), "another chain");
+        // A stalled shard, GLOBAL's tip at the local head, re-anchors at it.
+        assert!(engine.reanchor_evicted_lineage(1, Some((Some(1), 3, true)), now).unwrap());
+        let head = quil_crypto::poseidon::hash_bytes_to_32(&[1; 32]).unwrap();
+        let marker = crate::app_handoff::ReanchorMarker { generation: 3, fence: 1, from_cursor: 1, head: Some(head) };
+        assert_eq!(crate::app_handoff::load_reanchor_marker(engine.clock_store.as_ref(), &engine.filter).unwrap().0,
+            Some(marker));
+        assert_eq!(marker.cause(), crate::app_handoff::ReanchorCause::ReplayMismatch);
+        assert_eq!(engine.evicted_lineage().unwrap(), None, "owed now");
+        let refused = engine.rewind_past_fence().unwrap_err();
+        assert!(refused.to_string().contains(REANCHOR_IN_PROGRESS), "{refused}");
+        assert!(matches!(events.try_recv(), Ok(AppEngineEvent::ShardDataBootstrapRequested { .. })),
+            "the start requests the attempt");
     }
 
     /// After a persistent replay mismatch, attempts start five minutes apart
@@ -12092,6 +12656,37 @@ mod tests {
         };
         let (engine, handle) = AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
         (engine, handle, received)
+    }
+
+    /// A member whose committee runs consensus but materializes nothing (a
+    /// stalled committee) still settles its storage epoch, from GLOBAL frames:
+    /// GLOBAL kicks a member that committed roots and never proved them.
+    #[tokio::test]
+    async fn a_stalled_member_settles_its_storage_epoch_from_global_frames() {
+        use crate::storage_epoch_batch::SeatMessage;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
+        let epoch = 5;
+        let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+        registry.set_storage_seat_slot(&[1; 32], &engine.filter, quil_types::consensus::StorageSeatSlot {
+            epoch, leaves: vec![vec![0]], registered_at: 1, sealed_at: Some(2), frames: 1,
+            accumulator: [0; 32], chained: Vec::new(), open: true,
+        });
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader { frame_number: until - 1, ..Default::default() }),
+            ..Default::default()
+        };
+        engine.handle_global_frame_message(&crate::consensus_wire::encode_global_frame(&frame).unwrap());
+        let announced = published.lock().unwrap().iter()
+            .any(|bytes| matches!(SeatMessage::from_bytes(bytes), Ok(SeatMessage::Announce(..))));
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+        assert!(announced, "a settlement due on a running, stalled committee is prepared from a GLOBAL frame");
     }
 
     /// This node's prover (`test_engine`'s), allocated to the engine's shard

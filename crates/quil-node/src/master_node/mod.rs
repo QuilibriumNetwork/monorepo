@@ -1,4 +1,6 @@
+mod activation_wait;
 mod frame_observations;
+mod peer_info_file;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -321,7 +323,8 @@ pub(crate) async fn start(
             }
         }
     }
-    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path.
+    // PeerInfo cache populated by the GLOBAL_PEER_INFO recv path, and
+    // at startup from the verified records the last run saved.
     // Read by NodeService::get_peer_info so CLI tools can enumerate
     // the peers this node has observed on the network. Keyed by the
     // raw peer_id bytes; last-write-wins.
@@ -335,6 +338,19 @@ pub(crate) async fn start(
     let peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // Restored before any reader runs: regular nodes republish their
+    // PeerInfo every 30 minutes on mainnet, and until then a restarted
+    // node knew none of their endpoints. Saved every few minutes and at
+    // shutdown (peer_info_file.rs).
+    {
+        let path = config_dir.join(peer_info_file::FILE_NAME);
+        peer_info_file::restore_at_startup(&peer_info_cache, &path, network);
+        let cache = peer_info_cache.clone();
+        sup.spawn("peer-info-cache-saver", move |token| async move {
+            peer_info_file::save_until_cancelled(cache, path, network, token).await;
+            Ok(())
+        });
+    }
     // filter → AppEngineHandle registry. Populated by the worker→master
     // drain task on `WorkerToMaster::ShardActivated` and cleared on
     // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
@@ -346,6 +362,10 @@ pub(crate) async fn start(
     // filter → covering thread worker's own stores, for wallet reads of
     // application state the master's stores do not hold.
     let worker_app_states: worker_manager::WorkerAppStates =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    // core → thread worker's stores, from its start (a worker pinned to a
+    // shard it is joining holds the shard's registrations before it runs it).
+    let worker_stores_by_core: worker_manager::WorkerStoresByCore =
         Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // SignerRegistry — populated from inbound KeyRegistry broadcasts
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
@@ -609,6 +629,7 @@ pub(crate) async fn start(
             prover_address,
             bls_pubkey: bls_pubkey.clone(),
             worker_app_states: worker_app_states.clone(),
+            worker_stores_by_core: worker_stores_by_core.clone(),
             shard_engines: shard_engines.clone(),
             remote_worker_manager_for_halt: remote_worker_manager_for_halt.clone(),
             pi_worker_manager: pi_worker_manager.clone(),
@@ -926,12 +947,18 @@ pub(crate) async fn start(
         // hypergraph and replica store, the ones it attests from.
         storage_for_filter: Some({
             let states = worker_app_states.clone();
+            let by_core = worker_stores_by_core.clone();
+            let workers = worker_manager.clone();
             Arc::new(move |filter: &[u8]| {
-                states.read().get(filter).map(|state| (
+                // The worker running the shard; before it runs it (a join
+                // not yet active), the worker pinned to it, which will.
+                let state = states.read().get(filter).cloned().or_else(|| {
+                    let core = workers.range_workers().ok()?.into_iter().find(|w| w.filter == filter)?.core_id;
+                    by_core.read().get(&core).cloned()
+                })?;
+                Some((
                     state.crdt.clone(),
-                    quil_store::replica_store::ReplicaStore::new(
-                        state.db.clone() as Arc<dyn quil_types::store::KvDb>,
-                    ),
+                    quil_store::replica_store::ReplicaStore::new(state.db.clone() as Arc<dyn quil_types::store::KvDb>),
                 ))
             })
         }),
@@ -940,19 +967,26 @@ pub(crate) async fn start(
         remote_storage_confirm: Some({
             let cell = remote_worker_manager_for_halt.clone();
             let runtime = tokio::runtime::Handle::current();
-            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration| {
+            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration,
+                           snapshots: &[quil_engine::prover_pipeline::SnapshotSources]| {
                 let Some(manager) = cell.get().cloned() else {
                     return Ok(None);
                 };
-                if !manager.serves_filter(filter) {
+                if !manager.prepares_storage_confirm(filter, snapshots) {
                     return Ok(None);
                 }
-                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout))
+                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout, snapshots))
             })
         }),
         pending_shard_changes: Some({
             let shards_store = shards_store.clone();
             Arc::new(move || shards_store.all_pending_shard_changes().unwrap_or_default())
+        }),
+        storage_snapshot: Some({
+            let registry = prover_registry.clone();
+            Arc::new(move |filter: &[u8], epoch: u64| {
+                quil_types::consensus::ProverRegistry::get_storage_snapshot(registry.as_ref(), filter, epoch).ok().flatten()
+            })
         }),
         // Loopback deps so a frame PRODUCER (which runs the coverage orchestrator)
         // includes its OWN ShardSplit/ShardMerge ops even when the remote publish
@@ -1155,6 +1189,13 @@ pub(crate) async fn start(
             )
         };
 
+    // `cw_router` and `global_finalization` stay unset until activation; report
+    // when readers start and stop falling back. Only an archive with a committee
+    // ever sets them.
+    let activation_waits = Arc::new(activation_wait::ActivationWaits::new(
+        archive_mode && !consensus_committee.is_empty(),
+    ));
+
     // Bind the fixed global committee (genesis archives' Falcon pubkeys) into the
     // receive-path frame validator so CW-finalized global frames arriving over
     // GLOBAL_FRAME gossip are verified via their carried finalization cert (CWCT).
@@ -1247,6 +1288,7 @@ pub(crate) async fn start(
         consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
         cw_router: cw_router.clone(),
         global_finalization: global_finalization.clone(),
+        activation_waits: activation_waits.clone(),
         app_ingest: app_ingest.clone(),
         // A STABLE subdir of the node's data dir for the simplex journal, so
         // consensus resumes across restarts instead of replaying from the
@@ -1295,6 +1337,7 @@ pub(crate) async fn start(
         let key = mtls_seed.map(|_| falcon_signing_key.clone());
         let gap_peers = peer_info_cache.clone();
         let gap_network = config.p2p.network;
+        let no_member_notice: Arc<peer_info_file::HourlyNotice> = Default::default();
         // One connection per endpoint, shared by every fetch: a frame each
         // second used to open a new connection to every endpoint it asked.
         let clients: Arc<parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>> =
@@ -1327,15 +1370,15 @@ pub(crate) async fn start(
                 // archives that restarted together (the usual way a gap opens)
                 // missed the same frame. A live run sat on such a gap for the
                 // whole session while every member of the shard had the frame.
-                let mut endpoints: Vec<String> = gap_peers.read().values()
-                    .flat_map(|info| info.reachability.iter()
-                        .filter(|reach| reach.filter == filter)
-                        .flat_map(|reach| reach.stream_multiaddrs.iter())
-                        .filter_map(|ma| crate::util::multiaddr::archive_multiaddr_to_host_port(ma, gap_network))
-                        .collect::<Vec<_>>())
-                    .collect();
-                endpoints.sort();
-                endpoints.dedup();
+                let (mut endpoints, peer_info_records) = {
+                    let peers = gap_peers.read();
+                    (peer_info_file::shard_member_endpoints(&peers, &filter, gap_network), peers.len())
+                };
+                if endpoints.is_empty() && no_member_notice.due(&filter) {
+                    tracing::info!(filter = %hex::encode(&filter), frame = frame_number, peer_info_records,
+                        "app-shard gap fetch knows no member endpoint for this shard, so it asks archives only; \
+                         it ends when a member's PeerInfo arrives (repeated hourly while it lasts)");
+                }
                 async move {
                     let Some(key) = key.as_ref() else { return };
                     // Every one of the shard's members, then every archive: an
@@ -1404,6 +1447,7 @@ pub(crate) async fn start(
                     // next endpoint is asked, as when one lacks the frame,
                     // unless the frame's registrations were unavailable.
                     let mut failures = Vec::new();
+                    let mut awaiting_execution = 0usize;
                     let mut recovered = None;
                     let mut attempts = futures::stream::iter(endpoints.iter().cloned().map(|addr| {
                         let attempt = fetch_from(addr.clone(), frame_number);
@@ -1466,28 +1510,25 @@ pub(crate) async fn start(
                             Some((ingest, verifier)) => {
                                 let address = filter.clone();
                                 let admitted = tokio::task::spawn_blocking(move || {
-                                    for (index, frame) in frames.into_iter().enumerate() {
-                                        if let Some(anchor) = verifier.missing_anchor(&frame) {
-                                            let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
-                                            ingest.lock().unwrap_or_else(|p| p.into_inner())
-                                                .await_anchor(&address, number, anchor);
-                                        } else if let Some(certified) = verifier.verify(&frame) {
-                                            ingest.lock().unwrap_or_else(|p| p.into_inner()).admit_verified(frame, certified);
-                                        } else if index == 0 {
-                                            // The frame asked for failed verification.
-                                            return false;
-                                        }
-                                    }
-                                    true
+                                    quil_engine::archive_ingest::admit_fetched(&ingest, &verifier, &address, frames)
                                 }).await;
+                                use quil_engine::archive_ingest::FetchedFrames;
                                 match admitted {
-                                    Ok(true) => {}
-                                    Ok(false) => {
+                                    Ok(FetchedFrames::Admitted) => {}
+                                    Ok(FetchedFrames::Refused) => {
                                         failures.push(format!("{source}: served a frame that failed verification"));
                                         if prepared_ok {
                                             continue;
                                         }
                                         break;
+                                    }
+                                    // Not recovered from this endpoint: a forged copy
+                                    // must not keep the others from being asked.
+                                    Ok(FetchedFrames::AwaitsExecution { anchor, executed }) => {
+                                        failures.push(format!("{source}: served a frame whose generation GLOBAL \
+                                            execution at {executed} has not authorized (anchor {anchor})"));
+                                        awaiting_execution += 1;
+                                        continue;
                                     }
                                     Err(error) => tracing::warn!(filter = %hex::encode(&filter), frame = frame_number, %error,
                                         "app-shard gap fetch: admitting the recovered frames failed"),
@@ -1506,6 +1547,10 @@ pub(crate) async fn start(
                         Some((source, through)) => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             through, %source, endpoints_failed = failures.len(),
                             "app-shard gap fetch recovered a missing frame"),
+                        None if awaiting_execution > 0 => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
+                            tried = endpoints.len(), awaiting_execution, ?failures,
+                            "app-shard gap fetch: endpoints served the frame, but its session generation is not authorized \
+                             in executed GLOBAL state yet; it is asked for again once execution reaches its anchor"),
                         None => tracing::info!(filter = %hex::encode(&filter), frame = frame_number,
                             tried = endpoints.len(), ?failures,
                             "app-shard gap fetch found no endpoint with the frame; ingest will retry"),
@@ -1586,6 +1631,7 @@ pub(crate) async fn start(
         current_frame: current_frame.clone(),
         cw_router: cw_router.clone(),
         global_finalization: global_finalization.clone(),
+        activation_waits: activation_waits.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
         gossip_freshness: gossip_freshness.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),

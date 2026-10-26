@@ -312,6 +312,19 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
     let linked_calls = calls.load(Ordering::SeqCst);
     let linked = validator().with_storage_history_source(source.clone());
     assert!(linked.prepare_storage_history(&unsigned).await.is_err());
+    // A sync anchor check prepares such a frame as the linked frame it is:
+    // no "missing BLS signature" refusal reported as its storage history,
+    // and no registration read before its child authenticates it.
+    assert!(crate::app_engine::storage_history_unavailable(&linked, &unsigned).await.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), linked_calls, "nothing fetched for an unauthenticated frame");
+    // Controls: a certified frame still prepares its registrations, and one
+    // whose registration no archive retains still reports why.
+    let certified = validator().with_storage_history_source(source.clone());
+    assert!(crate::app_engine::storage_history_unavailable(&certified, &frame).await.is_none());
+    assert!(calls.load(Ordering::SeqCst) > linked_calls, "the certified frame's registrations were fetched");
+    assert!(matches!(crate::app_engine::storage_history_unavailable(&unavailable, &frame).await,
+        Some(QuilError::ExecutionUnavailable(_))));
+    let linked_calls = calls.load(Ordering::SeqCst);
     linked.prepare_storage_history_of_linked(&unsigned).await.unwrap();
     assert!(calls.load(Ordering::SeqCst) > linked_calls, "the registrations were fetched");
     assert!(unavailable.validate_linked_without_storage(&unsigned).unwrap());

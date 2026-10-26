@@ -838,6 +838,8 @@ impl AppShardHarness {
                     epoch,
                     quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                     &quil_crypto::sdr::SdrParams::default(),
+                    gfn,
+                    &[],
                 )
                 .expect("seed worker storage confirm");
                 (Some(sh.crdt.clone()), Some(kv))
@@ -1504,6 +1506,7 @@ pub fn build_tier2_archive_rig_with_key_manager(
         storage_for_filter: None,
         remote_storage_confirm: None,
         pending_shard_changes: None,
+        storage_snapshot: None,
         local_message_collector: None,
         current_frame: None,
     });
@@ -1616,6 +1619,7 @@ pub fn build_test_pipeline_with_registry(
         storage_for_filter: None,
         remote_storage_confirm: None,
         pending_shard_changes: None,
+        storage_snapshot: None,
         local_message_collector: None,
         current_frame: None,
     });

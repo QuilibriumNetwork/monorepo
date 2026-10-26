@@ -57,6 +57,45 @@ fn restore_and_fill_worker_pool(
     Ok((restored, created))
 }
 
+/// Restore the local worker pool from `persisted` and fill it to
+/// `expected_worker_count`, then say how many run against the count and
+/// which workers drain. An archive restores none: it runs no app-shard
+/// workers, and the records stay in the store for a return to a regular
+/// node. Returns `(restored, created)`, or `None` on an archive.
+fn restore_local_workers(
+    worker_manager: &dyn quil_engine::worker::WorkerManager,
+    persisted: &[quil_types::store::PersistedWorkerInfo],
+    expected_worker_count: u32,
+    archive_mode: bool,
+) -> quil_types::error::Result<Option<(usize, usize)>> {
+    if archive_mode {
+        if !persisted.is_empty() {
+            info!("archive mode: skipping persisted worker restore");
+        }
+        return Ok(None);
+    }
+    let (restored, created) = restore_and_fill_worker_pool(worker_manager, persisted, expected_worker_count)?;
+    let workers = worker_manager.range_workers()?;
+    info!(configured = expected_worker_count, running = workers.len(), restored, created,
+        "restored and filled local worker pool");
+    let draining: Vec<String> = workers.iter()
+        .filter(|w| worker_manager.is_draining(w.core_id))
+        .map(|w| match (w.filter.is_empty(), w.pending_filter_frame) {
+            (false, _) => format!("core {} {}", w.core_id, hex::encode(&w.filter)),
+            (true, 0) => format!("core {} idle", w.core_id),
+            (true, frame) => format!("core {} join proposed at frame {frame}", w.core_id),
+        })
+        .collect();
+    if !draining.is_empty() {
+        info!(configured = expected_worker_count, running = workers.len(), draining = draining.len(),
+            cores = ?draining, scope = "this node",
+            "running more workers than configured: the workers above the configured count drain; they take no \
+             new seat, their seats leave through the surplus leave, and each stops once it holds no seat or join \
+             (summary once per epoch)");
+    }
+    Ok(Some((restored, created)))
+}
+
 /// `NoPeersSubscribedToTopic` is transient during gossip mesh startup; other
 /// publish errors require a different recovery path and must not be retried by
 /// the CW outbox.
@@ -352,6 +391,9 @@ pub(crate) struct WorkerAppState {
     pub witness_index: Arc<std::sync::OnceLock<Arc<crate::witness_index::NodeWitnessIndex>>>,
 }
 
+/// Each thread worker's stores, by core (filled as workers start).
+pub(crate) type WorkerStoresByCore = Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>>;
+
 /// Shard filter → stores of the thread worker covering it. Filled on shard
 /// activation from the per-core stores the worker builder registers.
 pub(crate) type WorkerAppStates =
@@ -448,6 +490,8 @@ pub(crate) struct WorkerManagerArgs {
     pub bls_pubkey: Vec<u8>,
     /// Filter → covering thread worker's stores (see [`WorkerAppState`]).
     pub worker_app_states: WorkerAppStates,
+    /// Core → thread worker's stores, from the worker's start.
+    pub worker_stores_by_core: WorkerStoresByCore,
     pub shard_engines: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
     >>,
@@ -504,6 +548,7 @@ pub(crate) fn init(
         bls_pubkey,
         shard_engines,
         worker_app_states,
+        worker_stores_by_core,
         remote_worker_manager_for_halt,
         pi_worker_manager,
         prover_message_transport,
@@ -691,6 +736,22 @@ pub(crate) fn init(
                         Err(e) => failed("bundle encode failed", &e),
                     }
                 });
+            // A worker's storage seat part is proved here with the member's
+            // other seats, and the proof goes out the same way
+            // (`storage_epoch_batch`).
+            let coverage_publish: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
+                let publish = coverage_publish.clone();
+                Arc::new(move |bytes: Vec<u8>| {
+                    use quil_engine::storage_epoch_batch::{deliver, is_seat_message, SeatMessage};
+                    if !is_seat_message(&bytes) {
+                        return publish(bytes);
+                    }
+                    match SeatMessage::from_bytes(&bytes) {
+                        Ok(message) => deliver(message, publish.clone()),
+                        Err(error) => warn!(%error, "a worker's storage seat message does not decode"),
+                    }
+                })
+            };
             // Per-worker state builder: each thread-mode worker opens
             // its own RocksDB (resolved from db.worker_paths /
             // worker_path_prefix / fallback) and builds its own
@@ -710,13 +771,14 @@ pub(crate) fn init(
             let proof_worker_for_builder = proof_worker.clone();
             let network_for_builder = config.p2p.network;
             // Per-core stores, mapped to shard filters on activation.
-            let worker_stores_by_core: Arc<parking_lot::RwLock<std::collections::HashMap<u32, WorkerAppState>>> =
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
             let worker_stores_for_builder = worker_stores_by_core.clone();
             // Global frames live in the master's store; a worker's own store
             // holds only its app-shard chain.
             let master_clock_for_builder: Arc<dyn quil_types::store::ClockStore> =
                 clock_store.clone();
+            // Workers are built on their own threads, outside any runtime;
+            // the snapshot sync below runs on this one.
+            let runtime_for_builder = tokio::runtime::Handle::try_current().ok();
             let worker_state_builder: Arc<
                 dyn Fn(u32) -> std::result::Result<
                     quil_engine::thread_worker::WorkerOwnedDeps,
@@ -813,7 +875,7 @@ pub(crate) fn init(
                 let shard_syncer: Option<
                     Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>,
                 > = falcon_sk_for_builder.clone().map(|sk| {
-                    Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
+                    let syncer = Arc::new(crate::prover_tree_syncer_prod::ProdProverTreeSyncer {
                         // No fixed source: with no archive in the pool the attempt
                         // fails as "no archive known yet" and retries next gap.
                         master_stream_addr: String::new(),
@@ -822,8 +884,15 @@ pub(crate) fn init(
                         crdt: crdt.clone(),
                         archive_pool: Some(archive_pool_for_builder.clone()),
                         discover_archives_from_master: false,
-                    })
-                        as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
+                    });
+                    // Storage snapshot sources this process does not hold are
+                    // synced through the first worker's syncer (one per process).
+                    if let Some(runtime) = runtime_for_builder.clone().or_else(|| tokio::runtime::Handle::try_current().ok()) {
+                        quil_engine::storage_snapshot::install_remote(
+                            syncer.storage_snapshot_remote(crate::prover_tree_syncer_prod::snapshot_scratch_dir(&path), runtime),
+                        );
+                    }
+                    syncer as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
                 });
                 // (B) Unified-cutover consolidation hook bound to THIS worker's
                 // store: fold the covered app's pre-cutover per-sub-shard trees
@@ -1313,26 +1382,12 @@ pub(crate) fn init(
             // run app-shard workers. A subsequent return to non-archive
             // will pick
             // them up again because we don't delete them here.
-            let persisted = if archive_mode {
-                if !thread_mgr.load_all_persisted().is_empty() {
-                    info!("archive mode: skipping persisted worker restore");
-                }
-                Vec::new()
-            } else {
-                thread_mgr.load_all_persisted()
-            };
-            if !archive_mode {
-                // The manager's count is also its allocation capacity.
-                let worker_count = thread_mgr.num_worker_cores();
-                match restore_and_fill_worker_pool(thread_mgr.as_ref(), &persisted, worker_count) {
-                    Ok((restored, created)) => info!(
-                        workers = worker_count,
-                        restored,
-                        created,
-                        "restored and filled local worker pool"
-                    ),
-                    Err(e) => warn!(error = %e, "failed to restore and fill local worker pool"),
-                }
+            // The manager's count is also its allocation capacity.
+            let persisted = thread_mgr.load_all_persisted();
+            if let Err(e) = restore_local_workers(
+                thread_mgr.as_ref(), &persisted, thread_mgr.num_worker_cores(), archive_mode)
+            {
+                warn!(error = %e, "failed to restore and fill local worker pool");
             }
             thread_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         };
@@ -1642,6 +1697,35 @@ mod tests {
         let workers = manager.range_workers().unwrap();
         assert_eq!(workers.iter().map(|w| w.core_id).collect::<Vec<_>>(), vec![1, 2, 4, 5]);
         assert_eq!(workers[3].pending_filter_frame, 100);
+    }
+
+    /// A count lowered below seated records keeps those running, draining;
+    /// raised again, the cores fill and none drains. An archive restores
+    /// nothing, the records staying in the store.
+    #[test]
+    fn restore_drains_records_above_the_count_and_archives_restore_none() {
+        let record = |core_id, filter: Vec<u8>| quil_types::store::PersistedWorkerInfo {
+            core_id, filter, manually_managed: false, allocated: true, pending_filter_frame: 0,
+        };
+        let persisted = vec![record(1, vec![0xaa]), record(4, vec![0xbb]), record(5, Vec::new())];
+
+        let archive = TestWorkerManager::new();
+        archive.set_configured_count(2);
+        assert_eq!(restore_local_workers(&archive, &persisted, 2, true).unwrap(), None);
+        assert!(archive.range_workers().unwrap().is_empty());
+
+        let lowered = TestWorkerManager::new();
+        lowered.set_configured_count(2);
+        assert_eq!(restore_local_workers(&lowered, &persisted, 2, false).unwrap(), Some((2, 1)));
+        let cores: Vec<u32> = lowered.range_workers().unwrap().iter().map(|w| w.core_id).collect();
+        assert_eq!(cores, vec![1, 2, 4]);
+        assert_eq!(lowered.draining_workers(), HashSet::from([4]));
+
+        let raised = TestWorkerManager::new();
+        raised.set_configured_count(5);
+        assert_eq!(restore_local_workers(&raised, &persisted, 5, false).unwrap(), Some((3, 2)));
+        assert_eq!(raised.range_workers().unwrap().len(), 5);
+        assert!(raised.draining_workers().is_empty());
     }
 
     /// #595 regression: a fresh thread worker must install a PERSISTENT (Rocks)

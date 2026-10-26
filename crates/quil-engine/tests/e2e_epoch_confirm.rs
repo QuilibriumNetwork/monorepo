@@ -1513,7 +1513,7 @@ async fn a_seat_over_a_decode_limit_does_not_hold_up_its_message() {
     let asked: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     let (asked_by, over) = (asked.clone(), bad.clone());
     let remote: quil_engine::prover_pipeline::RemoteStorageConfirm =
-        Arc::new(move |filter: &[u8], _: &[Vec<u8>], _: u64, _: std::time::Duration| -> QResult<Option<Vec<ConfirmLeafRoots>>> {
+        Arc::new(move |filter: &[u8], _: &[Vec<u8>], _: u64, _: std::time::Duration, _: &[quil_engine::prover_pipeline::SnapshotSources]| -> QResult<Option<Vec<ConfirmLeafRoots>>> {
             *asked_by.lock().entry(filter.to_vec()).or_default() += 1;
             let entries = if filter == over.as_slice() { 257 } else { 1 };
             Ok(Some(vec![ConfirmLeafRoots { filter: filter.to_vec(), entries: vec![LeafRootEntry::default(); entries] }]))

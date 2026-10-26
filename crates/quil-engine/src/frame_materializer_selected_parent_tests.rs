@@ -193,6 +193,7 @@ impl Rig {
             view: 73,
             parent_view: parent.header.as_ref().unwrap().rank,
             parent: id(parent),
+            leader: None,
         }
     }
     fn put(&self, frame: &GlobalFrame) {

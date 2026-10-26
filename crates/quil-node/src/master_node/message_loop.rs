@@ -5,6 +5,12 @@ use tracing::{debug, info, warn};
 
 use quil_lifecycle::Supervisor;
 
+/// Gossiped or submitted prover messages being verified on the blocking pool.
+/// The collector runs 4 verifications at once; the rest only queue. The cap
+/// leaves 32 queued per running verification, so it binds only on a flood.
+pub(crate) static SHARD_FRAME_VERIFY_TASKS: quil_engine::spawn_gate::SpawnGate =
+    quil_engine::spawn_gate::SpawnGate::new("shard-frame-verify", 128);
+
 pub(crate) struct MessageLoopArgs {
     /// Standalone workers, when this node runs them: direct shard consensus
     /// messages for their shards are handed to them.
@@ -39,6 +45,8 @@ pub(crate) struct MessageLoopArgs {
         Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>>,
     /// Atomic GLOBAL finalization pipeline (archives with CW GLOBAL consensus).
     pub global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>>,
+    /// Reports when readers of the two cells above start and stop falling back.
+    pub activation_waits: Arc<super::activation_wait::ActivationWaits>,
     pub peer_info_cache: Arc<parking_lot::RwLock<
         std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
     >>,
@@ -196,6 +204,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         recent_messages: recent_messages_for_recv,
         cw_router: cw_router_for_recv,
         global_finalization: global_finalization_for_recv,
+        activation_waits: activation_waits_for_recv,
     } = args;
     let archive_ingest_for_recv = archive_app_shard_ingest;
 
@@ -255,6 +264,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut frames_received: u64 = 0;
         let mut peer_infos_received: u64 = 0;
         let mut peer_info_digest_cache: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        // Peers whose build identity this run has logged.
+        let mut peer_builds_logged: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut archive_peers_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         // When the loop started: archives announce themselves about every
         // thirty minutes, so the first one is verified up to that long after it.
@@ -437,6 +448,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             // this node and members without PeerInfo report no head.
                             let (mut builds, mut releases, mut heads) = (Vec::new(), Vec::new(), Vec::new());
                             {
+                                // A head reported over an hour ago is not current:
+                                // a live member republishes every 30 minutes.
+                                let now_ms = super::peer_info_file::unix_millis();
                                 let infos = pic_for_recv.read();
                                 for key in &session.members {
                                     if quil_engine::bitmasks::shard_cw_addressee_tag(key) == local_cw_tag {
@@ -447,7 +461,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         let info = infos.get(&quil_p2p::peer_id_from_falcon_pubkey(key));
                                         builds.push(super::committee_builds::Build::of(info.map(|info| info.build_fingerprint())));
                                         releases.push(super::committee_builds::Release::of(info.map(|info| info.release())));
-                                        heads.push(info.map(|info| info.last_global_head_frame));
+                                        heads.push(info.filter(|info| super::peer_info_file::head_is_current(info, now_ms))
+                                            .map(|info| info.last_global_head_frame));
                                     }
                                 }
                             }
@@ -852,7 +867,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                             // one of its channel bitmasks is fed to the engine and
                             // the legacy dispatch below is skipped. Off by default
                             // (router unset) → zero overhead.
-                            if let Some(router) = cw_router_for_recv.get() {
+                            let router = cw_router_for_recv.get();
+                            activation_waits_for_recv.cw_router.observe(router.is_some(), None);
+                            if let Some(router) = router {
                                 if router.route(
                                     &received.bitmask,
                                     &received.from,
@@ -885,28 +902,8 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         //      the admission gate.
                                         //   3. Falcon verify (empty domain, matching
                                         //      `Signer::sign` = sign_with_domain(m,&[])).
-                                        if info.peer_id.is_empty()
-                                            || info.public_key.len() != 897
-                                            || info.signature.len() != 666
-                                        {
-                                            continue;
-                                        }
-                                        if info.peer_id
-                                            != quil_p2p::peer_id_from_falcon_pubkey(&info.public_key)
-                                        {
-                                            continue;
-                                        }
-                                        let signing_payload = quil_p2p::encode_canonical_peer_info(
-                                            &info,
-                                            &info.public_key,
-                                            &[],
-                                        );
-                                        if !quil_crypto::falcon_verify(
-                                            &info.public_key,
-                                            &info.signature,
-                                            &signing_payload,
-                                            &[],
-                                        ) {
+                                        // Records restored at startup pass the same checks.
+                                        if !super::peer_info_file::verified(&info) {
                                             continue;
                                         }
                                         // Dedup: hash PeerInfo with timestamp zeroed
@@ -929,7 +926,14 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         if !info.peer_id.is_empty() {
                                             let mut cache = pic_for_recv.write();
                                             let fingerprint = info.build_fingerprint();
-                                            let build_changed = cache.get(&info.peer_id).map(|old| {
+                                            // Logged at each peer's first PeerInfo of
+                                            // this run too, also when a record restored
+                                            // from the last run already names its build.
+                                            let first_this_run = peer_builds_logged.insert(info.peer_id.clone());
+                                            if peer_builds_logged.len() > 10_000 {
+                                                peer_builds_logged.clear();
+                                            }
+                                            let build_changed = first_this_run || cache.get(&info.peer_id).map(|old| {
                                                 old.build_fingerprint() != fingerprint
                                                     || old.version != info.version
                                                     || old.patch_number != info.patch_number
@@ -1348,9 +1352,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                         // with the execution state.
                                         let stored = {
                                             let _store = probe::section(ProbeSection::GlobalFrameStore);
-                                            if global_finalization_for_recv
-                                                .get()
-                                                .is_some_and(|pipeline| pipeline.offer_synced(&frame))
+                                            let pipeline = global_finalization_for_recv.get();
+                                            activation_waits_for_recv.global_finalization.observe(pipeline.is_some(), Some(frame_num));
+                                            if pipeline.is_some_and(|pipeline| pipeline.offer_synced(&frame))
                                             {
                                                 Ok(())
                                             } else {
@@ -1636,8 +1640,15 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                 // Shard frames are verified before they are
                                 // held: off this loop.
                                 if mc_for_recv.requires_verification(&received.data) {
-                                    let (collector, data) = (mc_for_recv.clone(), received.data.clone());
-                                    tokio::task::spawn_blocking(move || collector.add_message(current_rank, data));
+                                    // At most SHARD_FRAME_VERIFY_TASKS wait on the
+                                    // blocking pool; the sender's relays cover a drop.
+                                    if let Some(permit) = SHARD_FRAME_VERIFY_TASKS.try_enter() {
+                                        let (collector, data) = (mc_for_recv.clone(), received.data.clone());
+                                        tokio::task::spawn_blocking(move || {
+                                            let _permit = permit;
+                                            collector.add_message(current_rank, data)
+                                        });
+                                    }
                                 } else {
                                     mc_for_recv.add_message(current_rank, received.data.clone());
                                 }

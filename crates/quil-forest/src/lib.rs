@@ -42,6 +42,7 @@ mod store;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
 mod sync;
+pub mod subtree_proof;
 
 pub use forest::{
     node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,

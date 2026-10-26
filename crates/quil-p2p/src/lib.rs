@@ -8,6 +8,7 @@ pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod external_addr;
+pub mod gossip_traffic;
 pub mod handler;
 pub mod metrics;
 pub mod node;
@@ -32,6 +33,7 @@ pub use falcon_identity::{
 };
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
 pub use direct::{DirectOutcome, DirectStatsSnapshot};
+pub use gossip_traffic::{ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind};
 pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
@@ -189,12 +191,11 @@ impl BlossomsubParams {
             } else {
                 d.idont_want_message_threshold
             },
-            // No P2PConfig field yet — operators tune via `set_params`
-            // post-build if they need to. Default protects against
+            // No P2PConfig field yet. Default protects against
             // single-/24 eclipse on every node.
             mesh_peers_per_subnet: d.mesh_peers_per_subnet,
-            // No P2PConfig field yet — defaults to a 512 MiB ceiling,
-            // tunable via `set_params` post-build.
+            // No P2PConfig field yet: a 512 MiB ceiling, enforced by
+            // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,
         }
     }

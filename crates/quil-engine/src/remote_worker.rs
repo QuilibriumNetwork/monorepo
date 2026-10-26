@@ -843,6 +843,24 @@ impl RemoteWorkerManager {
         !filter.is_empty() && worker.wants_consensus && worker.filter.as_slice() == filter
     }
 
+    /// Whether a standalone worker prepares `filter`'s storage confirm: the
+    /// one running it, or, when `snapshots` names the shard's recorded
+    /// snapshot (hash storage proofs), the one assigned it before it runs it
+    /// (a joining seat). That worker encodes from the snapshot, synced from an
+    /// archive, so the replicas it later proves land in its own store.
+    pub fn prepares_storage_confirm(&self, filter: &[u8], snapshots: &[crate::prover_pipeline::SnapshotSources]) -> bool {
+        self.workers
+            .lock()
+            .map(|workers| workers.values().any(|w| Self::prepares(w, filter, snapshots)))
+            .unwrap_or(false)
+    }
+
+    fn prepares(worker: &RemoteWorkerState, filter: &[u8], snapshots: &[crate::prover_pipeline::SnapshotSources]) -> bool {
+        Self::runs(worker, filter)
+            || (!filter.is_empty() && worker.filter.as_slice() == filter
+                && snapshots.iter().any(|(shard, _)| shard.as_slice() == filter))
+    }
+
     /// Filters a standalone worker is running consensus for.
     pub fn served_filters(&self) -> Vec<Vec<u8>> {
         self.workers
@@ -896,10 +914,13 @@ impl RemoteWorkerManager {
         targets: &[Vec<u8>],
         frame_number: u64,
         timeout: std::time::Duration,
+        snapshots: &[crate::prover_pipeline::SnapshotSources],
     ) -> Result<Option<Vec<quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots>>> {
         let channel = {
             let workers = self.workers.lock().map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
-            let Some(worker) = workers.values().find(|w| Self::runs(w, filter)) else {
+            let Some(worker) = workers.values().find(|w| Self::runs(w, filter))
+                .or_else(|| workers.values().find(|w| Self::prepares(w, filter, snapshots)))
+            else {
                 return Ok(None);
             };
             worker.channel.clone().ok_or_else(|| {
@@ -914,6 +935,7 @@ impl RemoteWorkerManager {
                 filter: filter.to_vec(),
                 frame_number,
                 targets: targets.to_vec(),
+                snapshot_sources: quil_execution::global_intrinsic::storage_snapshot::encode_plan(snapshots),
             }),
         )
         .await
@@ -1467,6 +1489,25 @@ mod tests {
         assert!(!mgr.range_workers().unwrap()[0].allocated);
     }
 
+    /// A joining seat's storage confirm goes to the worker assigned it once
+    /// the shard's recorded snapshot is named (hash storage proofs): its
+    /// replicas must land in that worker's store. Without one, only the
+    /// worker running the shard prepares it.
+    #[test]
+    fn a_joining_seat_is_prepared_by_its_worker_from_the_recorded_snapshot() {
+        let mgr = RemoteWorkerManager::new(vec![(1, "http://10.0.0.1:32501".into())], String::new(), None);
+        let (joining, other) = (vec![0xBB; 32], vec![0xCC; 32]);
+        mgr.set_worker_filter(1, &joining, false).unwrap();
+        let snapshot = |shard: &[u8]| -> Vec<crate::prover_pipeline::SnapshotSources> { vec![(shard.to_vec(), Vec::new())] };
+        assert!(!mgr.serves_filter(&joining));
+        assert!(!mgr.prepares_storage_confirm(&joining, &[]), "no snapshot: not before it runs the shard");
+        assert!(mgr.prepares_storage_confirm(&joining, &snapshot(&joining)));
+        assert!(!mgr.prepares_storage_confirm(&other, &snapshot(&other)), "a shard it was not assigned");
+        assert!(!mgr.prepares_storage_confirm(&joining, &snapshot(&other)), "another shard's snapshot");
+        mgr.set_worker_filter(1, &joining, true).unwrap();
+        assert!(mgr.prepares_storage_confirm(&joining, &[]), "the worker running it");
+    }
+
     /// A mode toggle on a remote worker is logged on change, as the local
     /// manager logs it, and says it is not persisted.
     #[test]
@@ -1831,7 +1872,7 @@ mod fee_relay_tests {
         manager.set_worker_filter(1, &[7; 32], true).unwrap();
         let targets = vec![vec![10; 32], vec![11; 32]];
         let roots = manager
-            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10))
+            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10), &[])
             .await
             .unwrap()
             .expect("the worker runs the shard");
@@ -1842,7 +1883,7 @@ mod fee_relay_tests {
         );
         mode.store(9, Ordering::SeqCst);
         assert!(manager
-            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10))
+            .prepare_storage_confirm(&[7; 32], &targets, 720, std::time::Duration::from_secs(10), &[])
             .await
             .unwrap_err()
             .is_execution_unavailable(), "a group for a shard it was not asked for");

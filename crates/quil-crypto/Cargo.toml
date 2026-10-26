@@ -39,6 +39,11 @@ hex = "0.4"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 tracing = "0.1"
+# Poseidon2 over KoalaBear: the hash of the hash storage proofs, which a STARK
+# recomputes (`storage_hash`). Plonky3 needs Rust 1.93 or later.
+p3-field = "=0.8.0"
+p3-koala-bear = "=0.8.0"
+p3-symmetric = "=0.8.0"
 
 [dev-dependencies]
 criterion = "0.5"

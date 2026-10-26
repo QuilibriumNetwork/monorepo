@@ -556,6 +556,19 @@ pub fn prove_raw(
   }
 }
 
+/// A G1 point from untrusted bytes; `None` when they are shorter than
+/// `ECP::frombytes` reads (73 bytes after a compressed tag, 146 after `0x04`),
+/// which it indexes without a length check and would panic on. Bytes long
+/// enough decode exactly as before, so only a crash becomes a rejection.
+fn g1_from_untrusted(b: &[u8]) -> Option<ecp::ECP> {
+  let mb = big::MODBYTES;
+  let needed = match b.first()? {
+    0x04 => 2 * mb + 1,
+    _ => mb + 1,
+  };
+  (b.len() >= needed).then(|| ecp::ECP::frombytes(b))
+}
+
 pub fn verify_raw(
   data: &[u8],
   commit: &[u8],
@@ -563,16 +576,18 @@ pub fn verify_raw(
   proof: &[u8],
   poly_size: u64,
 ) -> bool {
-  let z = bls::singleton().RootsOfUnityBLS48581[&poly_size][index as usize];
+  let Some(&z) = bls::singleton().RootsOfUnityBLS48581.get(&poly_size).and_then(|roots| roots.get(index as usize)) else {
+    return false;
+  };
 
   let y = big::BIG::frombytes(data);
 
-  let c = ecp::ECP::frombytes(commit);
+  let Some(c) = g1_from_untrusted(commit) else { return false };
   if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
     return false;
   }
 
-  let p = ecp::ECP::frombytes(proof);
+  let Some(p) = g1_from_untrusted(proof) else { return false };
   if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
     return false;
   }
@@ -632,11 +647,11 @@ pub fn aggregate_verify_openings(
   let mut zs: Vec<big::BIG> = Vec::with_capacity(k);
   let mut ys: Vec<big::BIG> = Vec::with_capacity(k);
   for i in 0..k {
-    let c = ecp::ECP::frombytes(&commits[i]);
+    let Some(c) = g1_from_untrusted(&commits[i]) else { return false };
     if c.is_infinity() || c.equals(&ecp::ECP::generator()) {
       return false;
     }
-    let p = ecp::ECP::frombytes(&proofs[i]);
+    let Some(p) = g1_from_untrusted(&proofs[i]) else { return false };
     if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
       return false;
     }
@@ -718,7 +733,7 @@ pub fn aggregate_proof_point(proofs: &[Vec<u8>], gamma: &[u8]) -> Option<Vec<u8>
   let order = big::BIG::new_ints(&rom::CURVE_ORDER);
   let mut pts: Vec<ecp::ECP> = Vec::with_capacity(k);
   for pb in proofs {
-    let p = ecp::ECP::frombytes(pb);
+    let p = g1_from_untrusted(pb)?;
     if p.is_infinity() || p.equals(&ecp::ECP::generator()) {
       return None;
     }
@@ -1602,18 +1617,20 @@ pub fn verify_multiple(
     c_q_bytes: &Vec<u8>,    // D
     proof_bytes: &Vec<u8>,  // π
 ) -> bool {
-    assert_eq!(commits.len(), indices.len());
-    assert_eq!(commits.len(), y_bytes.len());
+    if commits.len() != indices.len() || commits.len() != y_bytes.len() {
+        return false;
+    }
     let m = commits.len();
 
     // 0. Decode input
-    let c_q = ecp::ECP::frombytes(c_q_bytes.as_slice()); // D
-    let proof = ecp::ECP::frombytes(proof_bytes); // π
+    let Some(c_q) = g1_from_untrusted(c_q_bytes.as_slice()) else { return false }; // D
+    let Some(proof) = g1_from_untrusted(proof_bytes) else { return false }; // π
 
     let mut c_points: Vec<ecp::ECP> = Vec::with_capacity(m); // Cᵢ
     let mut y_scalars: Vec<big::BIG> = Vec::with_capacity(m); // yᵢ
     for (c_bytes, y_b) in commits.iter().zip(y_bytes) {
-        c_points.push(ecp::ECP::frombytes(&c_bytes));
+        let Some(c) = g1_from_untrusted(c_bytes) else { return false };
+        c_points.push(c);
         y_scalars.push(big::BIG::frombytes(&y_b));
     }
 

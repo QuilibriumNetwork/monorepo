@@ -722,6 +722,16 @@ impl Records for HypergraphState {
     }
 }
 
+/// Why [`CommittedView::capture`] refuses while an archive state sync of the
+/// GLOBAL shard has installed some of its chunks but not the last.
+pub const GLOBAL_SYNC_IN_PROGRESS: &str = "global state sync in progress";
+
+/// Whether `error` is [`CommittedView::capture`]'s wait for a GLOBAL state
+/// sync to install its last chunk: an expected wait, not a read failure.
+pub fn global_sync_in_progress(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(m) if m.contains(GLOBAL_SYNC_IN_PROGRESS))
+}
+
 /// A short-lived view of one durably materialized/synchronized global state.
 /// The cursor and all authorization records come from the SAME DB snapshot.
 /// Capturing this view does not validate an external sync's certificate or
@@ -750,6 +760,13 @@ impl CommittedView {
                 .try_into()
                 .map_err(|_| QuilError::Store("corrupt global handoff snapshot cursor".into()))?,
         );
+        // Archive state sync installs the GLOBAL tree in bounded chunks, each
+        // its own commit. Until the last one lands, the records mix the old
+        // state with part of the new: a head whose session is not in yet, or
+        // an old head whose status already closed.
+        if quil_hypergraph::crdt::snapshot_sync_incomplete(snapshot.as_ref(), &GLOBAL_INTRINSIC_ADDRESS)? {
+            return Err(QuilError::ExecutionUnavailable(GLOBAL_SYNC_IN_PROGRESS.into()));
+        }
         Ok(Self { snapshot, frame })
     }
 

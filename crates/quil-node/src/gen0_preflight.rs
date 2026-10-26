@@ -959,6 +959,7 @@ fn request_kind(request: &quil_types::proto::global::message_request::Request) -
         Request::TokenOperation(_) => "token_operation",
         Request::CommitteeHandoff(_) => "committee_handoff",
         Request::PresenceReport(_) => "presence_report",
+        Request::StorageEpochProof(_) => "storage_epoch_proof",
     }
 }
 

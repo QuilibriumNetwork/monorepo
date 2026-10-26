@@ -22,7 +22,7 @@ look) label indicates that the branch is ready for code review.
 
 ## Labels
 
-Labels starting with `T-` are for labeling topics (`T-api`, `T-r1cs`, etc).
+Labels starting with `T-` are for labeling topics (`T-api`, etc).
 
 The `T-research` label indicates unsolved open problems.
 

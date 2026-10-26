@@ -352,6 +352,13 @@ impl GlobalFinalizationPipeline {
         self.announcer.announce(frame);
     }
 
+    /// Whether the pipeline made failed atomic attempts at `number` that its
+    /// legacy hand-over has not yet completed: the worker then executes the
+    /// canonical record in place rather than attempt it again.
+    pub fn attempted(&self, number: u64) -> bool {
+        matches!(self.lock().attempts, Some((height, _)) if height == number)
+    }
+
     /// The legacy materializer completed `frame`. True when it is the queued
     /// consensus finalization at that height, which the caller then announces.
     pub fn finish_legacy(&self, frame: &GlobalFrame) -> bool {
@@ -380,6 +387,14 @@ impl GlobalFinalizationPipeline {
     /// Try to publish the certified frame at `next` (the executed cursor + 1).
     /// The caller has already found no canonical clock record at `next`.
     pub fn step(&self, next: u64) -> FinalizationStep {
+        self.step_within(next, self.limits.max_attempts)
+    }
+
+    /// [`Self::step`] with at most `max_attempts` atomic attempts at `next`
+    /// (see [`crate::global_catch_up::atomic_attempts`]). With none, an
+    /// authentic frame goes straight to the legacy materializer.
+    pub fn step_within(&self, next: u64, max_attempts: u32) -> FinalizationStep {
+        let max_attempts = max_attempts.min(self.limits.max_attempts);
         let queued = self.lock().queued.get(&next).cloned();
         let (frame, implied) = match queued.or_else(|| self.load_durable(next)) {
             Some(frame) => (frame, None),
@@ -396,6 +411,13 @@ impl GlobalFinalizationPipeline {
         }
         if !self.ingest_before(&frame) {
             return FinalizationStep::Retry(self.limits.retry);
+        }
+        if max_attempts == 0 {
+            let implied = implied.as_ref().map(|(chain, descendant)| (chain.as_slice(), descendant));
+            return match self.executor.authenticate_for_legacy(&frame, implied, &self.verifier) {
+                Ok(()) => self.legacy_quietly(next, &frame),
+                Err(error) => self.reject(next, frame, error),
+            };
         }
         let attempt = match implied.as_ref() {
             None => self.executor.attempt_finalization(&frame, &self.verifier),
@@ -427,18 +449,7 @@ impl GlobalFinalizationPipeline {
                 FinalizationStep::Idle
             }
             GlobalFinalizationAttempt::Busy => FinalizationStep::Retry(self.limits.retry / 2),
-            GlobalFinalizationAttempt::Rejected(error) => {
-                tracing::error!(
-                    frame = next,
-                    %error,
-                    "finalized GLOBAL frame failed authentication; not publishing it"
-                );
-                let output = frame.header.map(|h| h.output).unwrap_or_default();
-                let mut state = self.lock();
-                state.queued.remove(&next);
-                state.rejected.insert((next, output));
-                FinalizationStep::Idle
-            }
+            GlobalFinalizationAttempt::Rejected(error) => self.reject(next, frame, error),
             GlobalFinalizationAttempt::Unavailable {
                 error,
                 retryable: false,
@@ -456,7 +467,7 @@ impl GlobalFinalizationPipeline {
                     state.attempts = Some((next, attempts));
                     attempts
                 };
-                if attempts >= self.limits.max_attempts {
+                if attempts >= max_attempts {
                     return self.legacy(next, &frame, &error.to_string());
                 }
                 tracing::debug!(
@@ -470,21 +481,49 @@ impl GlobalFinalizationPipeline {
         }
     }
 
+    fn reject(&self, next: u64, frame: GlobalFrame, error: quil_types::error::QuilError) -> FinalizationStep {
+        tracing::error!(
+            frame = next,
+            %error,
+            "finalized GLOBAL frame failed authentication; not publishing it"
+        );
+        let output = frame.header.map(|h| h.output).unwrap_or_default();
+        let mut state = self.lock();
+        state.queued.remove(&next);
+        state.rejected.insert((next, output));
+        FinalizationStep::Idle
+    }
+
     fn legacy(&self, next: u64, frame: &GlobalFrame, reason: &str) -> FinalizationStep {
+        let step = self.write_canonical(next, frame);
+        if matches!(step, FinalizationStep::Legacy) {
+            tracing::warn!(
+                frame = next,
+                reason,
+                "publishing finalized GLOBAL frame through the legacy materializer"
+            );
+        }
+        step
+    }
+
+    /// [`Self::legacy`] for a frame not attempted while execution catches up:
+    /// expected for every such frame, counted by the catch-up progress line.
+    fn legacy_quietly(&self, next: u64, frame: &GlobalFrame) -> FinalizationStep {
+        let step = self.write_canonical(next, frame);
+        if matches!(step, FinalizationStep::Legacy) {
+            tracing::debug!(frame = next, "GLOBAL execution trails the head; finalized frame executes in place");
+        }
+        step
+    }
+
+    fn write_canonical(&self, next: u64, frame: &GlobalFrame) -> FinalizationStep {
         let write = || -> Result<()> {
             let txn = self.clock.new_transaction(false)?;
             self.clock.put_global_clock_frame(frame, txn.as_ref())?;
             txn.commit()
         };
         match write() {
-            Ok(()) => {
-                tracing::warn!(
-                    frame = next,
-                    reason,
-                    "publishing finalized GLOBAL frame through the legacy materializer"
-                );
-                FinalizationStep::Legacy
-            }
+            Ok(()) => FinalizationStep::Legacy,
             Err(error) => {
                 tracing::warn!(frame = next, %error, "canonical GLOBAL frame write failed");
                 FinalizationStep::Retry(self.limits.retry)

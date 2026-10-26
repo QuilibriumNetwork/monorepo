@@ -288,6 +288,54 @@ mod tests {
         assert_eq!(reopened.page(&[9; 32], None, 16).unwrap().unwrap(), (Vec::new(), false));
     }
 
+    /// Mainnet's legacy coins were written by the migration into the
+    /// UNVERSIONED keyspace, not through a CRDT commit; the sweep must find
+    /// them there, across page boundaries, interleaved with versioned rows.
+    #[test]
+    fn the_index_finds_coins_in_the_unversioned_keyspace_the_migration_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(dir.path()).unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = quil_hypergraph::HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let th = transparent_type_hash(&APP).unwrap();
+        let shard = quil_execution::token_intrinsic::legacy_migration::coin_domain_shard(&APP);
+        let owners = [[1u8; 32], [2u8; 32]];
+        let mut expected: Vec<Vec<[u8; 32]>> = vec![Vec::new(); owners.len()];
+        for i in 0u32..9_000 {
+            let o = (i % 2) as usize;
+            let mut origin = [0u8; 32];
+            origin[..4].copy_from_slice(&i.to_be_bytes());
+            let tree = create_transparent_coin_tree(&TransparentCoin { owner_address: owners[o], amount: u128::from(i) + 1 }, &th, &origin).unwrap();
+            let address = quil_execution::token_intrinsic::materialize::coin_content_address(&tree).unwrap();
+            let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+            let mut vertex_key = APP.to_vec();
+            vertex_key.extend_from_slice(&address);
+            store.migrate_put_vertex_underlying("vertex", "adds", &shard, &vertex_key, &blob).unwrap();
+            expected[o].push(address);
+        }
+        // Versioned rows (live commits after the migration) interleave.
+        for d in 0u8..20 {
+            crdt.add_vertex(&quil_hypergraph::Location { app_address: APP, data_address: [d * 12; 32] }, &[d; 300]).unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let kv: Arc<dyn KvDb> = Arc::new(db);
+        let index = LegacyOwnerIndex::new(kv, store, APP).unwrap();
+        index.build(std::time::Duration::ZERO).unwrap();
+        for (o, owner) in owners.iter().enumerate() {
+            let mut got = Vec::new();
+            let mut after = None;
+            loop {
+                let (coins, more) = index.page(owner, after.as_ref(), 500).unwrap().unwrap();
+                after = coins.last().map(|(address, _, _)| *address).or(after);
+                got.extend(coins.into_iter().map(|(address, _, _)| address));
+                if !more { break; }
+            }
+            expected[o].sort();
+            assert_eq!(got, expected[o], "owner {o}");
+        }
+    }
+
     #[test]
     fn a_build_resumes_from_its_recorded_progress() {
         let owners = [[4u8; 32]];

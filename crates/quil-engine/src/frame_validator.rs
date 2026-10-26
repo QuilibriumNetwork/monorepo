@@ -1413,7 +1413,29 @@ impl BlsAppFrameValidator {
         // member's registered leaf root for the active epoch. Skipped when the
         // header carries no storage attestation (pre-fork frames) or no clock
         // store is attached (the beacon source).
-        if verify_storage && !header.storage_attestation_root.is_empty() {
+        // Hash storage proofs (decided 2026-10-21): a frame commits one root
+        // its proposer's epoch proof proves later and carries no openings;
+        // nothing here can check the root without the proposer's replica.
+        // The commitment names its beacon frame, at or after the anchor
+        // (`storage_seat::encode_commitment`).
+        let hash_epoch = header.global_frame_number > 0
+            && quil_types::consensus::hash_storage_proofs_at(
+                quil_types::consensus::epoch_for_frame(header.global_frame_number),
+            );
+        if hash_epoch {
+            let canonical = quil_execution::global_intrinsic::storage_seat::commitment_acceptable(
+                &header.storage_attestation_root, header.global_frame_number,
+            );
+            let carries_openings = frame.storage_attestation.as_ref().is_some_and(|a| !a.openings.is_empty());
+            if !canonical || carries_openings {
+                return Err(QuilError::Crypto(
+                    "app shard frame storage attestation rejected: a hash-proof epoch's frame commits one \
+                     canonical openings root with its beacon frame, at or after its anchor, and carries no \
+                     openings".into(),
+                ));
+            }
+        }
+        if verify_storage && !hash_epoch && !header.storage_attestation_root.is_empty() {
             if let Some(clock_store) = self.clock_store.as_ref() {
             let global = clock_store
                 .get_global_clock_frame(header.global_frame_number)

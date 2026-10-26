@@ -41,6 +41,10 @@ pub struct TestProverRegistry {
     /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
     #[allow(clippy::type_complexity)]
     leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
+    /// Storage seat slots, keyed by `(member, filter, epoch)`
+    /// ([`Self::set_storage_seat_slot`] / [`ProverRegistry::get_storage_seat_slot`]).
+    #[allow(clippy::type_complexity)]
+    seat_slots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), quil_types::consensus::StorageSeatSlot>>,
 }
 
 impl Default for TestProverRegistry {
@@ -56,7 +60,13 @@ impl TestProverRegistry {
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
             leaf_roots: Mutex::new(std::collections::HashMap::new()),
+            seat_slots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record `member`'s storage seat slot on `filter` for `slot.epoch`.
+    pub fn set_storage_seat_slot(&self, member: &[u8], filter: &[u8], slot: quil_types::consensus::StorageSeatSlot) {
+        self.seat_slots.lock().unwrap().insert((member.to_vec(), filter.to_vec(), slot.epoch), slot);
     }
 
     /// Register a member's storage leaf root so `get_leaf_root` returns it (the
@@ -109,6 +119,14 @@ impl TestProverRegistry {
 }
 
 impl ProverRegistry for TestProverRegistry {
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Result<Option<quil_types::consensus::StorageSeatSlot>> {
+        Ok(self.seat_slots.lock().unwrap().get(&(member.to_vec(), filter.to_vec(), epoch)).cloned())
+    }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
         Ok(self
             .provers
@@ -223,6 +241,12 @@ pub struct TestWorkerManager {
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
     unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    shard_data: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    /// Workers above this count drain, as a thread manager's above its
+    /// configured count; `None` drains none.
+    drain_above: Mutex<Option<u32>>,
+    retired: Mutex<Vec<u32>>,
+    refuse_retirement: Mutex<bool>,
 }
 
 impl Default for TestWorkerManager {
@@ -239,7 +263,33 @@ impl TestWorkerManager {
             evictions: Mutex::new(Vec::new()),
             executions: Mutex::new(HashMap::new()),
             unanswered: Mutex::new(HashMap::new()),
+            shard_data: Mutex::new(HashMap::new()),
+            drain_above: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            refuse_retirement: Mutex::new(false),
         }
+    }
+
+    /// Configure `count` workers, so those above it drain, as after an
+    /// operator lowers a thread manager's worker count.
+    pub fn set_configured_count(&self, count: u32) {
+        self.set_allocation_capacity(count as usize);
+        *self.drain_above.lock().unwrap() = Some(count);
+    }
+
+    /// Fail every retirement, as when a worker cannot be stopped.
+    pub fn refuse_retirement(&self) {
+        *self.refuse_retirement.lock().unwrap() = true;
+    }
+
+    /// Workers retired so far, in order.
+    pub fn retired(&self) -> Vec<u32> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// The shards whose data `core_id`'s store holds, with their cursors.
+    pub fn set_shard_data(&self, core_id: u32, shards: Vec<(Vec<u8>, u64)>) {
+        self.shard_data.lock().unwrap().insert(core_id, shards);
     }
 
     /// Configure fewer workers than there are records, as after an operator
@@ -293,6 +343,28 @@ impl WorkerManager for TestWorkerManager {
         Ok(configured.unwrap_or_else(|| self.workers.lock().unwrap().len()))
     }
 
+    fn is_draining(&self, core_id: u32) -> bool {
+        self.drain_above.lock().unwrap().is_some_and(|count| core_id > count)
+    }
+
+    /// Like the thread manager: only an idle draining worker is retired.
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!("worker {core_id} is not draining")));
+        }
+        if *self.refuse_retirement.lock().unwrap() {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(format!("worker {core_id} cannot stop")));
+        }
+        let mut workers = self.workers.lock().unwrap();
+        if workers.get(&core_id).is_some_and(|w| !w.filter.is_empty() || w.pending_filter_frame != 0) {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!("worker {core_id} holds a seat")));
+        }
+        if workers.remove(&core_id).is_some() {
+            self.retired.lock().unwrap().push(core_id);
+        }
+        Ok(())
+    }
+
     /// Reports set with `set_execution`, for workers still bound to their filter.
     fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
         let workers = self.workers.lock().unwrap();
@@ -314,6 +386,10 @@ impl WorkerManager for TestWorkerManager {
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
         self.evictions.lock().unwrap().push((core_id, keep));
         Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.lock().unwrap().clone()
     }
 
     fn set_worker_filter(

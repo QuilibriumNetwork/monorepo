@@ -271,17 +271,47 @@ pub(crate) fn init(
         // would execute it, before holding it. A verified frame then supersedes
         // its shard's lower ones, and no forged header can stand in for a real
         // one (decided 2026-10-15). One that cannot be verified now is held
-        // unverified for the leader to check (decided 2026-10-16).
+        // unverified for the leader to check (decided 2026-10-16), as is one
+        // whose session executed GLOBAL state has not authorized yet while it
+        // is anchored past it: while execution trails the head, a session a
+        // GLOBAL frame up to the anchor authorized is not in committed state.
+        let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
         message_collector.set_shard_frame_verifier({
             use quil_engine::message_collector::ShardFrameVerdict;
-            let (manager, current) = (exec_manager.clone(), current_frame.clone());
+            let (manager, current, global, deferrals) =
+                (exec_manager.clone(), current_frame.clone(), crdt.clone(), deferrals.clone());
             Arc::new(move |bundle: &[u8]| {
-                match manager.validate_message(current.effective().saturating_add(1), &[0xff; 32], bundle) {
+                let verified_for = current.effective().saturating_add(1);
+                match manager.validate_message(verified_for, &[0xff; 32], bundle) {
                     Ok(()) => ShardFrameVerdict::Valid,
                     Err(error) if error.is_execution_unavailable() => ShardFrameVerdict::Unavailable(error.to_string()),
-                    Err(error) => ShardFrameVerdict::Invalid(error.to_string()),
+                    Err(error) => {
+                        let executed = global
+                            .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                            .ok();
+                        deferrals.verdict(&error, bundle, executed, verified_for, |filter| {
+                            quil_engine::execution_deferral::next_generation(&global, filter)
+                        })
+                    }
                 }
             })
+        });
+        // Forget held frames execution passed, and log the end of a wait,
+        // even when no submit arrives.
+        let global = crdt.clone();
+        sup.run_until_cancelled("collector-execution-deferrals", move |token| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            while !token.is_cancelled() {
+                tick.tick().await;
+                if deferrals.waiting() {
+                    if let Ok(executed) =
+                        global.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    {
+                        deferrals.executed(executed);
+                    }
+                }
+            }
+            Ok(())
         });
     } else {
         exec_manager.install_global_frame_prover(frame_prover.clone()).expect("failed to install global frame prover");

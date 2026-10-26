@@ -711,6 +711,26 @@ pub fn verify_prover_update(
 /// Verify a `ProverConfirm` operation. Same BLS signature check as
 /// the filter ops, but uses multi-filter signing message and the
 /// PROVER_CONFIRM domain.
+/// A confirm in GLOBAL frame `frame_number` registers leaves for the next
+/// epoch; for a hash-proof epoch each must be `comm_D ‖ comm_C ‖ comm_R` over
+/// at least one node (`quil_crypto::storage_proof`). Checked before the
+/// confirm changes anything.
+pub fn validate_confirm_leaf_roots(op: &super::prover_ops::ProverConfirm, frame_number: u64) -> Result<()> {
+    let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
+    if !quil_types::consensus::hash_storage_proofs_at(epoch) {
+        return Ok(());
+    }
+    let malformed = op.leaf_roots.iter().flat_map(|group| &group.entries).any(|entry| {
+        quil_crypto::storage_proof::parse_registration_root(&entry.leaf_root).is_none() || entry.num_blocks == 0
+    });
+    if malformed {
+        return Err(QuilError::InvalidArgument(format!(
+            "prover confirm: epoch {epoch} registers hash storage commitments"
+        )));
+    }
+    Ok(())
+}
+
 pub fn verify_prover_confirm(
     op: &ProverConfirm,
     prover_tree: &quil_tries::VectorCommitmentTree,
