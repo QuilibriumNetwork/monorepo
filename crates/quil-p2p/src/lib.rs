@@ -8,6 +8,7 @@ pub mod ed448_noise_transport;
 pub mod ed448_peer;
 pub mod external_addr;
 pub mod falcon_identity;
+pub mod global_frame_gate;
 pub mod gossip_traffic;
 pub mod handler;
 pub mod metrics;
@@ -30,6 +31,7 @@ pub use falcon_identity::{
     falcon_identity_self_check, generate_falcon_signing_key, peer_id_base58_from_falcon_pubkey,
     peer_id_from_falcon_pubkey,
 };
+pub use global_frame_gate::{FrameStatus, GlobalFrameGate};
 pub use gossip_traffic::{
     ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind,
 };

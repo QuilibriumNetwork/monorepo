@@ -1205,6 +1205,12 @@ impl P2PNode {
                                     .blossomsub
                                     .register_validator(bitmask, validator);
                             }
+                            Some(P2PCommand::RegisterAuthoredValidator { bitmask, validator }) => {
+                                swarm
+                                    .behaviour_mut()
+                                    .blossomsub
+                                    .register_authored_validator(bitmask, validator);
+                            }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
                                 if let Err(ref e) = result {
@@ -1318,6 +1324,7 @@ impl P2PNode {
                 metrics_registry,
                 direct_stats,
                 gossip_traffic,
+                global_frame_gate: Default::default(),
             },
             msg_rx,
         ))
@@ -1339,9 +1346,18 @@ pub struct P2PHandle {
     direct_stats: std::sync::Arc<crate::direct::DirectStats>,
     /// This process's gossip traffic by class, counted by the swarm.
     gossip_traffic: std::sync::Arc<crate::gossip_traffic::GossipTraffic>,
+    /// GLOBAL_FRAME admission state, shared by the gossip validator and the
+    /// receive loop that verifies frames.
+    global_frame_gate: std::sync::Arc<crate::global_frame_gate::GlobalFrameGate>,
 }
 
 impl P2PHandle {
+    /// The GLOBAL_FRAME admission state: the receive loop records verified
+    /// headers and accepted frames in it, and the node sets the committee.
+    pub fn global_frame_gate(&self) -> std::sync::Arc<crate::global_frame_gate::GlobalFrameGate> {
+        self.global_frame_gate.clone()
+    }
+
     pub async fn subscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
     }
@@ -1471,67 +1487,33 @@ impl P2PHandle {
             .await;
     }
 
-    /// Mesh-level gate for the GLOBAL_FRAME topic. Runs in the gossip poll
-    /// thread BEFORE a message is delivered to the app recv loop or forwarded to
-    /// the mesh, so it must stay O(1): it does NOT decode the frame (frames can
-    /// be up to ~15 MiB) or verify the committee cert (that would move the
-    /// expensive work an attacker is trying to trigger into the swarm thread).
-    ///
-    /// It enforces two cheap invariants and reports `Reject` (which penalises the
-    /// sender's gossip score and stops propagation) when they fail:
-    ///   1. the message carries the canonical GLOBAL_FRAME type prefix, and
-    ///   2. no single peer exceeds `MAX_FRAMES_PER_SEC` frames in a 1s window.
-    ///
-    /// (1) sheds garbage floods; (2) caps a peer that floods unique (dedup-
-    /// evading) frames — the CPU-DoS vector where each frame otherwise forces a
-    /// VDF verify downstream. Legitimate gossip is head-only (~1 frame / 10s per
-    /// source), so the bound has ~80x headroom and never trips in normal flow.
+    /// Mesh-level gate for the GLOBAL_FRAME topic, see
+    /// [`GlobalFrameAdmission`](crate::global_frame_gate::GlobalFrameAdmission).
+    /// It runs in the gossip poll thread BEFORE a message is delivered to the
+    /// app recv loop or forwarded to the mesh, so it stays O(1): it does not
+    /// decode the frame (up to ~15 MiB) or verify the committee cert. It
+    /// rejects a wrong type prefix, ignores copies of frames the recv loop
+    /// already accepted (or stale ones), and rate-limits the rest per committee
+    /// author or, for frames the committee did not sign, per forwarding peer.
     /// The authoritative checks (genesis prover, committee finalization cert,
-    /// VDF) still run in the recv loop; this only bounds what reaches them.
+    /// VDF, requests root) still run in the recv loop.
     pub async fn register_global_frame_validator(&self, bitmask: Vec<u8>, frame_type: u32) {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        // Per-source fixed-window counter. Bounded: the mesh has at most a few
-        // dozen peers; if it somehow grows past the cap we clear it wholesale
-        // (a coarse but O(1) reset that can only *reprieve* a flooder briefly).
-        const MAX_FRAMES_PER_SEC: u32 = 8;
-        const MAP_CAP: usize = 4096;
-        let counters: std::sync::Arc<Mutex<HashMap<PeerId, (u64, u32)>>> =
-            std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
-            Box::new(move |peer, data| {
-                use crate::ValidationResult;
-                // (1) cheap shape/type check — legit frames are canonical-wire with
-                // the 4-byte type prefix; anything else on this topic is bogus.
-                if data.len() < 4
-                    || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
-                {
-                    return ValidationResult::Reject;
-                }
-                // (2) per-peer rate limit.
-                let now_s = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                if let Ok(mut map) = counters.lock() {
-                    if map.len() > MAP_CAP {
-                        map.clear();
-                    }
-                    let entry = map.entry(*peer).or_insert((now_s, 0));
-                    if entry.0 == now_s {
-                        entry.1 = entry.1.saturating_add(1);
-                    } else {
-                        *entry = (now_s, 1);
-                    }
-                    if entry.1 > MAX_FRAMES_PER_SEC {
-                        return ValidationResult::Reject;
-                    }
-                }
-                ValidationResult::Accept
-            });
+        let admission = crate::global_frame_gate::GlobalFrameAdmission::new(
+            frame_type,
+            self.global_frame_gate.clone(),
+        );
+        let validator: Box<
+            dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> crate::ValidationResult + Send + Sync,
+        > = Box::new(move |peer, author, data| {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            admission.admit(peer, author, data, now_secs)
+        });
         let _ = self
             .cmd_tx
-            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .send(P2PCommand::RegisterAuthoredValidator { bitmask, validator })
             .await;
     }
 
@@ -1791,6 +1773,7 @@ impl P2PHandle {
             )),
             direct_stats: Default::default(),
             gossip_traffic: Default::default(),
+            global_frame_gate: Default::default(),
         }
     }
 }
@@ -1820,6 +1803,13 @@ enum P2PCommand {
     RegisterValidator {
         bitmask: Vec<u8>,
         validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
+    },
+    /// Register a validator that also sees the message's signed author
+    /// (`None` for an unsigned message); see `RegisterValidator`.
+    RegisterAuthoredValidator {
+        bitmask: Vec<u8>,
+        validator:
+            Box<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> crate::ValidationResult + Send + Sync>,
     },
     Publish {
         bitmask: Vec<u8>,

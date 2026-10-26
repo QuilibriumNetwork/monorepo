@@ -1243,6 +1243,13 @@ pub(crate) async fn start(
                 config.engine.consensus_committee_peer_ids.clone(),
             )
         };
+    // The committee authors GLOBAL frames: the gossip gate rate-limits the
+    // frames they sign per author rather than per forwarding peer.
+    p2p_handle.global_frame_gate().set_committee(
+        consensus_committee_peer_ids
+            .iter()
+            .filter_map(|peer_id| peer_id.parse::<quil_p2p::PeerId>().ok()),
+    );
 
     // `cw_router` and `global_finalization` stay unset until activation; report
     // when readers start and stop falling back. Only an archive with a committee

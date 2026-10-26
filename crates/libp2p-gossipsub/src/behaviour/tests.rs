@@ -3751,6 +3751,7 @@ fn test_scoring_p4_invalid_signature() {
     };
     peer_score_params.topics.insert(topic_hash, topic_params);
     peer_score_params.app_specific_weight = 1.0;
+    let behaviour_penalty_weight = peer_score_params.behaviour_penalty_weight;
     let peer_score_thresholds = PeerScoreThresholds::default();
 
     // build mesh with one peer
@@ -3782,10 +3783,58 @@ fn test_scoring_p4_invalid_signature() {
         },
     );
 
+    // QUILIBRIUM: plus one behaviour penalty for the invalid signature.
     assert_eq!(
         gs.as_peer_score_mut().score_report(&peers[0]).score,
-        -2.0 * 0.7
+        -2.0 * 0.7 + behaviour_penalty_weight
     );
+}
+
+/// QUILIBRIUM: an invalid signature is penalised on a topic without score
+/// parameters too, and only an invalid signature is.
+#[test]
+fn test_scoring_p7_invalid_signature_on_unscored_topic() {
+    let config = ConfigBuilder::default()
+        .validate_messages()
+        .build()
+        .unwrap();
+    let peer_score_params = PeerScoreParams::default();
+    let behaviour_penalty_weight = peer_score_params.behaviour_penalty_weight;
+    let (mut gs, peers, _, topics) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec!["test".into()])
+        .to_subscribe(true)
+        .gs_config(config)
+        .explicit(0)
+        .outbound(0)
+        .scoring(Some((peer_score_params, PeerScoreThresholds::default())))
+        .create_network();
+
+    let mut seq = 0;
+    for (peer, error) in [
+        (peers[0], ValidationError::InvalidSignature),
+        (peers[1], ValidationError::InvalidSequenceNumber),
+    ] {
+        let m = random_message(&mut seq, &topics);
+        gs.on_connection_handler_event(
+            peer,
+            ConnectionId::new_unchecked(0),
+            HandlerEvent::Message {
+                rpc: Rpc {
+                    messages: vec![],
+                    subscriptions: vec![],
+                    control_msgs: vec![],
+                },
+                invalid_messages: vec![(m, error)],
+            },
+        );
+    }
+
+    assert_eq!(
+        gs.as_peer_score_mut().score_report(&peers[0]).score,
+        behaviour_penalty_weight
+    );
+    assert_eq!(gs.as_peer_score_mut().score_report(&peers[1]).score, 0.0);
 }
 
 #[test]
