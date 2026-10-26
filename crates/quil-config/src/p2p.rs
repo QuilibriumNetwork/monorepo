@@ -71,6 +71,16 @@ pub struct P2PConfig {
     /// `OnionService` transport is still served either way.
     #[serde(default, alias = "disableOnionRouting")]
     pub disable_onion_routing: bool,
+    /// Most connections the peer gRPC listener (`streamListenMultiaddr`)
+    /// holds at once; 0 (the default) derives it from the process's open
+    /// file limit, leaving room for the stores.
+    #[serde(default)]
+    pub stream_max_connections: usize,
+    /// Most connections the peer gRPC listener holds from one public source
+    /// address (an IPv6 /64); 0 (the default) is 512. Loopback and private
+    /// sources are not capped per address.
+    #[serde(default)]
+    pub stream_max_connections_per_source: usize,
 }
 
 fn default_stream_listen() -> String {

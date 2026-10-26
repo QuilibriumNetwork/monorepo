@@ -13,8 +13,13 @@
 //!
 //! The refusal comes before any signature check, so a forged header can claim
 //! it. A frame waits only when it names the shard's next generation (the only
-//! one GLOBAL frames not yet executed can authorize) and within per-shard and
-//! overall caps; anything else is refused as before.
+//! one GLOBAL frames not yet executed can authorize), within per-shard and
+//! overall caps, and only when this node or a peer it knows as an active
+//! prover delivered it: past the per-shard cap a higher frame takes the
+//! lowest one's place, so a forged header from any sender could otherwise
+//! push the shard's real frames out. A frame from any other sender is refused
+//! retryably; the members' own submissions carry it. Anything else is refused
+//! as before.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -23,7 +28,7 @@ use std::time::{Duration, Instant};
 use quil_types::error::QuilError;
 use tracing::info;
 
-use crate::message_collector::ShardFrameVerdict;
+use crate::message_collector::{Provenance, ShardFrameVerdict};
 
 /// Whether a shard frame anchored to GLOBAL frame `anchor`, refused with
 /// `error` by verification against GLOBAL state executed through `executed`,
@@ -118,20 +123,42 @@ impl Default for CollectorDeferrals {
 }
 
 impl CollectorDeferrals {
-    /// The verdict on a bundle whose verification, for a GLOBAL frame no
-    /// later than `verified_for`, against GLOBAL state executed through
-    /// `executed`, failed with `error`. [`ShardFrameVerdict::Unavailable`]
-    /// (held unverified) when every frame it carries is anchored past
-    /// `executed` and at most at `verified_for`, names its shard's
-    /// `next_generation` and was refused as unauthorized
-    /// ([`awaits_execution`]); [`ShardFrameVerdict::Full`] (refused,
-    /// retryably) when such a frame does not fit the caps; otherwise invalid.
+    /// [`Self::verdict_from`] for a bundle from a sender this node does not
+    /// know as a prover ([`Provenance::Other`]).
     pub fn verdict(
         &self,
         error: &QuilError,
         bundle: &[u8],
         executed: Option<u64>,
         verified_for: u64,
+        next_generation: impl Fn(&[u8]) -> Option<u64>,
+    ) -> ShardFrameVerdict {
+        self.verdict_from(
+            error,
+            bundle,
+            executed,
+            verified_for,
+            Provenance::Other,
+            next_generation,
+        )
+    }
+
+    /// The verdict on a bundle `provenance` delivered, whose verification,
+    /// for a GLOBAL frame no later than `verified_for`, against GLOBAL state
+    /// executed through `executed`, failed with `error`.
+    /// [`ShardFrameVerdict::Unavailable`] (held unverified) when every frame
+    /// it carries is anchored past `executed` and at most at `verified_for`,
+    /// names its shard's `next_generation` and was refused as unauthorized
+    /// ([`awaits_execution`]), and a [`Provenance::Prover`] delivered it;
+    /// [`ShardFrameVerdict::Full`] (refused, retryably) when such a frame came
+    /// from any other sender or does not fit the caps; otherwise invalid.
+    pub fn verdict_from(
+        &self,
+        error: &QuilError,
+        bundle: &[u8],
+        executed: Option<u64>,
+        verified_for: u64,
+        provenance: Provenance,
         next_generation: impl Fn(&[u8]) -> Option<u64>,
     ) -> ShardFrameVerdict {
         let invalid = || ShardFrameVerdict::Invalid(error.to_string());
@@ -148,6 +175,13 @@ impl CollectorDeferrals {
             });
         if !waits {
             return invalid();
+        }
+        // Its certificate cannot be checked before execution reaches its
+        // anchor, and past the cap it would take a held frame's place.
+        if provenance != Provenance::Prover {
+            return ShardFrameVerdict::Full(format!(
+                "{error}; frames waiting for GLOBAL execution are held only from active provers"
+            ));
         }
         let shards = {
             let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
@@ -494,10 +528,10 @@ mod tests {
         let authorized = Arc::new(AtomicBool::new(false));
         let deferrals = Arc::new(CollectorDeferrals::default());
         let collector = MessageCollector::new();
-        collector.set_shard_frame_verifier({
+        collector.set_shard_frame_verifier_with_provenance({
             let (executed, authorized, deferrals) =
                 (executed.clone(), authorized.clone(), deferrals.clone());
-            Arc::new(move |data: &[u8]| {
+            Arc::new(move |data: &[u8], provenance: Provenance| {
                 let address = crate::message_collector::extract_shard_frame_keys(data)[0]
                     .0
                     .clone();
@@ -505,11 +539,12 @@ mod tests {
                     return ShardFrameVerdict::Valid;
                 }
                 // Every shard's head session is generation 1.
-                deferrals.verdict(
+                deferrals.verdict_from(
                     &unauthorized(),
                     data,
                     Some(executed.load(Ordering::SeqCst)),
                     100,
+                    provenance,
                     |_| Some(2),
                 )
             })
@@ -568,6 +603,25 @@ mod tests {
         let full = collector.add_message_outcome(1, bundle(0x44, 6, 99, 2, 0));
         assert_eq!(full, SubmitOutcome::Filtered(Refusal::AwaitingExecution));
         assert!(Refusal::AwaitingExecution.retryable());
+        // A sender not known as a prover holds nothing, and so displaces
+        // nothing, however high its frame.
+        assert_eq!(
+            collector.add_message_outcome_from(1, bundle(0x44, 1_000, 99, 2, 0), Provenance::Other),
+            SubmitOutcome::Filtered(Refusal::AwaitingExecution)
+        );
+        assert_eq!(
+            collector.add_message_outcome_from(1, bundle(0x55, 3, 99, 2, 0), Provenance::Other),
+            SubmitOutcome::Filtered(Refusal::AwaitingExecution)
+        );
+        assert_eq!(
+            deferrals.held.lock().unwrap()[&vec![0x44; 32]]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            (8..=15).collect::<Vec<_>>(),
+            "an unknown sender's frame displaced a held one"
+        );
+        assert!(!deferrals.held.lock().unwrap().contains_key(&vec![0x55; 32]));
 
         // GLOBAL frame 99 executes and authorizes the first shard's session.
         executed.store(99, Ordering::SeqCst);
@@ -633,5 +687,35 @@ mod tests {
         );
         assert_eq!(log.executed_at(end, 105), None);
         assert!(!log.waiting());
+    }
+
+    /// A frame waiting for GLOBAL execution is held before its certificate
+    /// can be checked, and past the per-shard cap a higher frame takes the
+    /// lowest one's place: a sender that is not a known prover must not be
+    /// able to push a shard's frames out with forged higher ones.
+    #[test]
+    fn reproduces_forged_waiting_frames_displacing_held_ones() {
+        let deferrals = CollectorDeferrals::default();
+        let verdict = |frame: u64| {
+            deferrals.verdict(
+                &unauthorized(),
+                &bundle(0x66, frame, 99, 2, 0),
+                Some(98),
+                100,
+                |_| Some(2),
+            )
+        };
+        for frame in 5..5 + MAX_HELD_PER_SHARD as u64 {
+            let _ = verdict(frame);
+        }
+        let forged = 1u64 << 40;
+        for frame in forged..forged + MAX_HELD_PER_SHARD as u64 {
+            let outcome = verdict(frame);
+            assert!(
+                !matches!(outcome, ShardFrameVerdict::Unavailable(_)),
+                "forged frame {frame} from a sender not known as a prover was held unverified, \
+                 displacing a held frame of its shard: {outcome:?}"
+            );
+        }
     }
 }

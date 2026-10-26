@@ -331,8 +331,9 @@ pub enum Refusal {
     RankFull,
     /// A shard frame failed verification against committed state.
     InvalidShardFrame,
-    /// A shard frame waits for GLOBAL execution to reach its anchor, and the
-    /// frames this node holds for its shard while they wait are at their cap.
+    /// A shard frame waits for GLOBAL execution to reach its anchor, and this
+    /// node holds no more of it: its shard's waiting frames are at their cap,
+    /// or it came from neither this node nor a known active prover.
     AwaitingExecution,
 }
 
@@ -343,7 +344,7 @@ impl Refusal {
             Self::UnknownShard => "shard frame address not in this node's committed shard set",
             Self::RankFull => "rank buffer full",
             Self::InvalidShardFrame => "shard frame failed verification",
-            Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, and its shard's waiting frames are at their cap",
+            Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, which holds such frames only from active provers and up to a cap per shard",
         }
     }
 
@@ -367,8 +368,27 @@ pub enum ShardFrameVerdict {
     Full(String),
 }
 
+/// Who delivered a message to the collector, as far as the receiving node
+/// can tell. Only a [`Provenance::Prover`] delivery may hold a shard frame
+/// unverified while it waits for GLOBAL execution: its certificate cannot be
+/// checked then, so any other sender could fill its shard's places with
+/// forged headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// This node itself, or a peer whose identity resolves to an active
+    /// prover.
+    Prover,
+    /// Any other sender.
+    Other,
+}
+
 /// Verifies the shard frames of a bundle ([`MessageCollector::set_shard_frame_verifier`]).
 pub type ShardFrameVerifier = std::sync::Arc<dyn Fn(&[u8]) -> ShardFrameVerdict + Send + Sync>;
+
+/// A [`ShardFrameVerifier`] that is also told who delivered the bundle
+/// ([`MessageCollector::set_shard_frame_verifier_with_provenance`]).
+pub type ProvenanceShardFrameVerifier =
+    std::sync::Arc<dyn Fn(&[u8], Provenance) -> ShardFrameVerdict + Send + Sync>;
 
 /// Shard-frame verifications run at once; past it, frames are held
 /// unverified.
@@ -462,7 +482,7 @@ pub struct MessageCollector {
     /// lower frames: a stall then holds one proof per shard instead of every
     /// member's copy of every frame, and no forged header can stand in for a
     /// real one.
-    shard_frame_verifier: RwLock<Option<ShardFrameVerifier>>,
+    shard_frame_verifier: RwLock<Option<ProvenanceShardFrameVerifier>>,
     verifications: std::sync::atomic::AtomicUsize,
     /// Highest VERIFIED frame admitted per shard address. Only verified
     /// frames move it: an unverified height would let an invalid candidate
@@ -510,6 +530,14 @@ impl MessageCollector {
     /// Install the admission check of shard frames. Archives, whose collector
     /// feeds GLOBAL proposals, verify against committed state.
     pub fn set_shard_frame_verifier(&self, verifier: ShardFrameVerifier) {
+        self.set_shard_frame_verifier_with_provenance(std::sync::Arc::new(
+            move |data: &[u8], _: Provenance| verifier(data),
+        ));
+    }
+
+    /// [`Self::set_shard_frame_verifier`] with a verifier that also judges by
+    /// who delivered the bundle.
+    pub fn set_shard_frame_verifier_with_provenance(&self, verifier: ProvenanceShardFrameVerifier) {
         *self.shard_frame_verifier.write().unwrap() = Some(verifier);
     }
 
@@ -708,10 +736,21 @@ impl MessageCollector {
         )
     }
 
+    /// [`Self::add_message`] for a message `provenance` delivered.
+    pub fn add_message_from(&self, rank: u64, data: Vec<u8>, provenance: Provenance) -> bool {
+        matches!(
+            self.add_message_outcome_from(rank, data, provenance),
+            SubmitOutcome::Accepted
+        )
+    }
+
     /// Add a message the collector it was copied from held as verified (a
     /// private proposal copy, which has no verifier of its own).
     pub fn add_verified_message(&self, rank: u64, data: Vec<u8>) -> bool {
-        matches!(self.admit(rank, data, true), SubmitOutcome::Accepted)
+        matches!(
+            self.admit(rank, data, true, Provenance::Prover),
+            SubmitOutcome::Accepted
+        )
     }
 
     /// Add a message, distinguishing "newly accepted" from "we already
@@ -725,11 +764,30 @@ impl MessageCollector {
     ///
     /// With a shard-frame verifier installed this verifies shard frames,
     /// which can take milliseconds: see [`Self::requires_verification`].
+    ///
+    /// For this node's own messages: a peer's go through
+    /// [`Self::add_message_outcome_from`].
     pub fn add_message_outcome(&self, rank: u64, data: Vec<u8>) -> SubmitOutcome {
-        self.admit(rank, data, false)
+        self.admit(rank, data, false, Provenance::Prover)
     }
 
-    fn admit(&self, rank: u64, data: Vec<u8>, verified: bool) -> SubmitOutcome {
+    /// [`Self::add_message_outcome`] for a message `provenance` delivered.
+    pub fn add_message_outcome_from(
+        &self,
+        rank: u64,
+        data: Vec<u8>,
+        provenance: Provenance,
+    ) -> SubmitOutcome {
+        self.admit(rank, data, false, provenance)
+    }
+
+    fn admit(
+        &self,
+        rank: u64,
+        data: Vec<u8>,
+        verified: bool,
+        provenance: Provenance,
+    ) -> SubmitOutcome {
         // Prover-only mode filtering: check if the message is a
         // prover-protocol op (type prefix 0x0301-0x031A). If not,
         // reject it during degraded coverage.
@@ -870,7 +928,7 @@ impl MessageCollector {
                     slot.0.fetch_add(1, Ordering::AcqRel) < MAX_CONCURRENT_VERIFICATIONS
                 });
                 if let Some(slot) = slot {
-                    let verdict = verify(&message.data);
+                    let verdict = verify(&message.data, provenance);
                     drop(slot);
                     match verdict {
                         ShardFrameVerdict::Valid => message.verified = true,

@@ -1757,9 +1757,22 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     // blocking pool; the sender's relays cover a drop.
                                     if let Some(permit) = SHARD_FRAME_VERIFY_TASKS.try_enter() {
                                         let (collector, data) = (mc_for_recv.clone(), received.data.clone());
+                                        // Only an active prover's message may have a
+                                        // frame held before it can be verified.
+                                        let (signers, provers, from) =
+                                            (sr_for_recv.clone(), pr_for_recv.clone(), received.from.clone());
                                         tokio::task::spawn_blocking(move || {
                                             let _permit = permit;
-                                            collector.add_message(current_rank, data)
+                                            let provenance = if super::grpc::peer_is_active_prover(
+                                                &signers,
+                                                provers.as_ref(),
+                                                &from,
+                                            ) {
+                                                quil_engine::message_collector::Provenance::Prover
+                                            } else {
+                                                quil_engine::message_collector::Provenance::Other
+                                            };
+                                            collector.add_message_from(current_rank, data, provenance)
                                         });
                                     }
                                 } else {

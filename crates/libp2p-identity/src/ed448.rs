@@ -80,6 +80,11 @@ impl PublicKey {
         // so a panic here is a remote DoS. Use the fallible `TryFrom` instead.
         let inner = ed448_rust::PublicKey::try_from(&arr[..])
             .map_err(|_| DecodingError::missing_feature("ed448"))?;
+        // Signatures nobody made verify under a key of small order, so anyone
+        // could speak as its peer ID.
+        if inner.has_small_order() {
+            return Err(DecodingError::missing_feature("ed448"));
+        }
         Ok(Self { inner, bytes: arr })
     }
 
@@ -123,5 +128,32 @@ impl std::fmt::Debug for Keypair {
 impl std::fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Ed448PublicKey(57 bytes)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The neutral element as an identity key: under the cofactored check
+    /// `R = O`, `S = 0` verifies every message, so anyone could sign as its
+    /// peer ID.
+    #[test]
+    fn reproduces_small_order_identity_key_signed_by_anyone() {
+        let mut neutral = [0u8; 57];
+        neutral[0] = 1;
+        let mut forged = [0u8; 114];
+        forged[0] = 1;
+        let decoded = PublicKey::from_bytes(&neutral);
+        let forged_verifies = decoded
+            .as_ref()
+            .is_ok_and(|key| key.verify(b"any message", &forged));
+        assert!(
+            decoded.is_err() && !forged_verifies,
+            "a small-order Ed448 identity key was accepted; a signature nobody made verifies \
+             under it: {forged_verifies}"
+        );
+        let keypair = Keypair::generate();
+        assert!(PublicKey::from_bytes(&keypair.public().to_bytes()).is_ok());
     }
 }

@@ -152,11 +152,11 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
                 ))),
             }
         };
-        // A numbered frame takes a frame read slot. The latest does not: a
-        // node that cannot read it starts an app's state sync without the
-        // roots to check it against.
+        // A numbered frame takes a frame read slot. The latest takes a head
+        // read slot, of which there are many more: a node that cannot read it
+        // starts an app's state sync without the roots to check it against.
         let task = if frame_number == 0 {
-            tokio::task::spawn_blocking(read)
+            crate::global_service::HEAD_READS.spawn(read).await?
         } else {
             self.reads.spawn(read).await?
         };
@@ -176,24 +176,31 @@ impl AppShardFrameProvider for ClockStoreAppShardFrameProvider {
         through: u64,
     ) -> Result<Vec<global::ShardFrameOutgoing>, Status> {
         let clock_store = self.clock_store.clone();
-        tokio::task::spawn_blocking(move || {
-            let last = through.min(from.saturating_add(MAX_OUTGOING_HISTORY_FRAMES - 1));
-            let mut frames = Vec::new();
-            let mut bytes = 0usize;
-            for frame_number in from..=last {
-                let outgoing = frame_outgoing(clock_store.as_ref(), &filter, frame_number)
-                    .map_err(|e| Status::internal(format!("outgoing history read failed: {e}")))?;
-                let Some(outgoing) = outgoing else { break };
-                bytes += prost::Message::encoded_len(&outgoing);
-                if !frames.is_empty() && bytes > MAX_OUTGOING_HISTORY_BYTES {
-                    break;
+        // Up to MAX_OUTGOING_HISTORY_BYTES of frames read: a frame read slot,
+        // like any numbered frame. A busy archive answers busy and the
+        // successor asks the others.
+        self.reads
+            .spawn(move || {
+                let last = through.min(from.saturating_add(MAX_OUTGOING_HISTORY_FRAMES - 1));
+                let mut frames = Vec::new();
+                let mut bytes = 0usize;
+                for frame_number in from..=last {
+                    let outgoing = frame_outgoing(clock_store.as_ref(), &filter, frame_number)
+                        .map_err(|e| {
+                            Status::internal(format!("outgoing history read failed: {e}"))
+                        })?;
+                    let Some(outgoing) = outgoing else { break };
+                    bytes += prost::Message::encoded_len(&outgoing);
+                    if !frames.is_empty() && bytes > MAX_OUTGOING_HISTORY_BYTES {
+                        break;
+                    }
+                    frames.push(outgoing);
                 }
-                frames.push(outgoing);
-            }
-            Ok(frames)
-        })
-        .await
-        .map_err(|e| Status::internal(format!("outgoing history read task failed: {e}")))?
+                Ok(frames)
+            })
+            .await?
+            .await
+            .map_err(|e| Status::internal(format!("outgoing history read task failed: {e}")))?
     }
 }
 
@@ -881,5 +888,38 @@ mod frame_read_tests {
             None
         );
         assert_eq!(reports.try_recv().ok(), Some((filter, 2)));
+    }
+
+    /// A peer's outgoing history read (up to 256 frames) runs on the blocking
+    /// pool: with every frame read slot taken it must be answered busy, not
+    /// started beside them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reproduces_outgoing_history_reads_bypassing_the_frame_read_bound() {
+        static READS: FrameReadBound =
+            FrameReadBound::new(1, 0, std::time::Duration::from_millis(20));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let provider = ClockStoreAppShardFrameProvider {
+            clock_store: Arc::new(quil_store::RocksClockStore::new(db.inner())),
+            reads: &READS,
+            missing: None,
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = READS
+            .spawn(move || {
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        let outcome = provider
+            .get_shard_outgoing_history(vec![0x21; 32], 1, 256)
+            .await;
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        assert_eq!(
+            outcome.as_ref().map_err(|status| status.code()).err(),
+            Some(tonic::Code::ResourceExhausted),
+            "an outgoing history read ran with every frame read slot taken, outside the \
+             frame read bound: {outcome:?}"
+        );
     }
 }

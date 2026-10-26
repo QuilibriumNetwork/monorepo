@@ -61,3 +61,5 @@ db:
   terminatePercentage: 0
 logger: null
 listenGrpcMultiaddr: /ip4/0.0.0.0/tcp/8337
+# Devnet containers reach each other's NodeService.
+listenGrpcAllowRemote: true

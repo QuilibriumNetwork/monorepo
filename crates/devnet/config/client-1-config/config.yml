@@ -78,3 +78,5 @@ logger:
   compress: false
   logFilters: {}
 listenGrpcMultiaddr: /ip4/0.0.0.0/tcp/8337
+# Devnet containers reach each other's NodeService.
+listenGrpcAllowRemote: true

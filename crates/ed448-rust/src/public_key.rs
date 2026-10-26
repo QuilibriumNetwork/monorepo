@@ -40,6 +40,15 @@ impl PublicKey {
         self.0.encode()
     }
 
+    /// Whether the key is a point of small order: the neutral element or a
+    /// torsion point, which `[4]A` sends to the neutral element. Under the
+    /// cofactored check of [`Self::verify`] such a key verifies signatures
+    /// nobody made, so an identity must not use one; `[s]B` never is one.
+    #[must_use]
+    pub fn has_small_order(&self) -> bool {
+        self.0.clone().double().double() == Point::new_stdbase()
+    }
+
     /// Verify signature with public key.
     ///
     /// # Example
@@ -103,8 +112,9 @@ impl PublicKey {
         ctx: Option<&[u8]>,
         pre_hash: PreHash,
     ) -> crate::Result<()> {
-        // Sanity-check sizes.
-        if sign.len() < SIG_LENGTH {
+        // Sanity-check sizes. Exactly: bytes past `SIG_LENGTH` would be read
+        // into S, so a padded copy of a signature would verify too.
+        if sign.len() != SIG_LENGTH {
             return Err(Ed448Error::WrongSignatureLength);
         }
 
@@ -239,6 +249,28 @@ mod tests {
             pubkey.verify(b"message", &sig, None).unwrap_err(),
             Ed448Error::WrongSignatureLength
         );
+        let sig = [0x01; SIG_LENGTH + 1];
+        assert_eq!(
+            pubkey.verify(b"message", &sig, None).unwrap_err(),
+            Ed448Error::WrongSignatureLength
+        );
+    }
+
+    /// The neutral element and the points of order 2 and 4 have small order;
+    /// a key made from a secret does not.
+    #[test]
+    fn small_order_keys_are_reported() {
+        let mut neutral = [0u8; KEY_LENGTH];
+        neutral[0] = 1;
+        let order_four = [0u8; KEY_LENGTH];
+        let mut order_four_odd = [0u8; KEY_LENGTH];
+        order_four_odd[KEY_LENGTH - 1] = 0x80;
+        for key in [neutral, order_four, order_four_odd] {
+            assert!(PublicKey::try_from(&key[..]).unwrap().has_small_order());
+        }
+        for _ in 0..4 {
+            assert!(!PublicKey::from(&PrivateKey::new(&mut OsRng)).has_small_order());
+        }
     }
 
     #[test]
@@ -288,6 +320,22 @@ mod tests {
         assert_eq!(
             public.verify(msg, &sig, None).unwrap_err(),
             Ed448Error::InvalidSignature
+        );
+    }
+
+    /// A signature with bytes appended must not verify: they would be read
+    /// into S, so every signature had other encodings that verified too.
+    #[test]
+    fn reproduces_padded_signature_verifying() {
+        let secret = PrivateKey::new(&mut OsRng);
+        let public = PublicKey::from(&secret);
+        let msg = b"Lorem ipsum dolor sit amet";
+        let mut padded = secret.sign(msg, None).unwrap().to_vec();
+        padded.extend_from_slice(&[0, 0]);
+        assert!(
+            public.verify(msg, &padded, None).is_err(),
+            "a signature padded to {} bytes verified",
+            padded.len()
         );
     }
 }
