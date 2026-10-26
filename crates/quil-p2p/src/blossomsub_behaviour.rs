@@ -134,6 +134,8 @@ pub struct BlossomSubBehaviour {
     last_need_peers_check: std::time::Instant,
     /// Operator log state for the message cache's byte budget.
     cache_pressure: CachePressure,
+    /// Operator log state for gossip RPCs dropped before decoding.
+    rejected_rpcs: RejectedRpcLog,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -182,6 +184,7 @@ impl BlossomSubBehaviour {
             pending_events: VecDeque::new(),
             last_need_peers_check: std::time::Instant::now(),
             cache_pressure: CachePressure::default(),
+            rejected_rpcs: RejectedRpcLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
@@ -229,8 +232,9 @@ impl BlossomSubBehaviour {
             .with_traffic_observer(self.traffic.clone())
         };
         self.inner = inner;
-        // The new inner behaviour's cache counters start from zero.
+        // The new inner behaviour's cache and rejection counters start from zero.
         self.cache_pressure = CachePressure::default();
+        self.rejected_rpcs = RejectedRpcLog::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -449,9 +453,12 @@ impl BlossomSubBehaviour {
             return;
         }
         self.last_need_peers_check = now;
-        // The message cache's byte-budget signal shares this cadence.
+        // The message cache's byte-budget signal shares this cadence, and so does the
+        // count of RPCs dropped before decoding.
         self.cache_pressure
             .observe(self.inner.message_cache_stats(), now);
+        self.rejected_rpcs
+            .observe(self.inner.rejected_rpc_stats(), now);
         if self.subscriptions.is_empty() {
             return;
         }
@@ -594,6 +601,116 @@ impl CachePressure {
             }
         }
         Some(log)
+    }
+}
+
+/// While gossip RPCs are dropped before decoding, the warning repeats at this interval; this
+/// long without one ends the episode.
+const REJECTED_RPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator log of the gossip RPCs the pubsub codec dropped before decoding them, because they
+/// carried more entries than an RPC may or were malformed: a warning when they start, one per
+/// [`REJECTED_RPC_LOG_INTERVAL`] while they continue, and an info line when they stop.
+#[derive(Debug, Default)]
+struct RejectedRpcLog {
+    /// Counters at the previous check.
+    seen: gossipsub::RejectedRpcStats,
+    episode: Option<RejectedRpcEpisode>,
+}
+
+#[derive(Debug)]
+struct RejectedRpcEpisode {
+    /// Counters before the episode's first rejection.
+    base: gossipsub::RejectedRpcStats,
+    /// Counters at the episode's previous line.
+    logged: gossipsub::RejectedRpcStats,
+    started: std::time::Instant,
+    last_rejection: std::time::Instant,
+    last_log: std::time::Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedRpcLogLine {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl RejectedRpcLog {
+    fn observe(
+        &mut self,
+        stats: gossipsub::RejectedRpcStats,
+        now: std::time::Instant,
+    ) -> Option<RejectedRpcLogLine> {
+        let rejecting = stats.rejected > self.seen.rejected;
+        let before = std::mem::replace(&mut self.seen, stats);
+        let line = match self.episode.as_mut() {
+            None if rejecting => RejectedRpcLogLine::Started,
+            None => return None,
+            Some(episode) if rejecting => {
+                episode.last_rejection = now;
+                if now.duration_since(episode.last_log) < REJECTED_RPC_LOG_INTERVAL {
+                    return None;
+                }
+                RejectedRpcLogLine::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_rejection) < REJECTED_RPC_LOG_INTERVAL {
+                    return None;
+                }
+                RejectedRpcLogLine::Ended
+            }
+        };
+        if line == RejectedRpcLogLine::Started {
+            self.episode = Some(RejectedRpcEpisode {
+                base: before,
+                logged: before,
+                started: now,
+                last_rejection: now,
+                last_log: now,
+            });
+        }
+        let episode = self.episode.as_mut()?;
+        let rejected = stats.rejected.saturating_sub(episode.logged.rejected);
+        let bytes = stats.bytes.saturating_sub(episode.logged.bytes);
+        let total = stats.rejected.saturating_sub(episode.base.rejected);
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        let (last_peer, last_reason) = stats
+            .last
+            .map(|(peer, rejection)| (peer.to_string(), rejection.to_string()))
+            .unwrap_or_default();
+        episode.logged = stats;
+        episode.last_log = now;
+        match line {
+            RejectedRpcLogLine::Started => tracing::warn!(
+                rejected,
+                bytes,
+                %last_peer,
+                %last_reason,
+                "dropping gossip RPCs from remote peers before decoding them: they carry more \
+                 entries than an RPC may, or are malformed. Each sender is penalised and its \
+                 gossip stream closed. No action is needed on this node; report it with these \
+                 fields if it persists"
+            ),
+            RejectedRpcLogLine::Continuing => tracing::warn!(
+                rejected,
+                bytes,
+                total,
+                %last_peer,
+                %last_reason,
+                duration_secs,
+                "still dropping gossip RPCs from remote peers before decoding them"
+            ),
+            RejectedRpcLogLine::Ended => {
+                tracing::info!(
+                    total,
+                    duration_secs,
+                    "no gossip RPC dropped before decoding for a minute; the episode ended"
+                );
+                self.episode = None;
+            }
+        }
+        Some(line)
     }
 }
 
@@ -852,8 +969,12 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
-        // Per-message size cap. 16 MiB matches the RPC frame cap in
-        // `protocol.rs`.
+        // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
+        // `protocol.rs` and is the smallest that carries the largest message
+        // the node gossips: a GLOBAL frame of up to 15 MiB
+        // (`MAX_GOSSIP_GLOBAL_FRAME`) plus its signature and header. The
+        // codec bounds each RPC's entries before decoding it, so decoding
+        // stays proportional to the frame.
         .max_transmit_size(crate::protocol::MAX_MESSAGE_SIZE)
         // Keep de-duplicated message IDs at least as long as the peer-score
         // delivery-record window (WAN margin); cost is holding 33-byte ids a bit
@@ -924,6 +1045,38 @@ mod propagation_tests {
         assert_eq!(
             pressure.observe(stats(13), at(201)),
             Some(CachePressureLog::Started)
+        );
+    }
+
+    #[test]
+    fn rejected_rpc_logs_start_bounded_repeats_and_end() {
+        let stats = |rejected| gossipsub::RejectedRpcStats {
+            rejected,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = RejectedRpcLog::default();
+        assert_eq!(log.observe(stats(0), at(0)), None);
+        assert_eq!(
+            log.observe(stats(1), at(1)),
+            Some(RejectedRpcLogLine::Started)
+        );
+        assert_eq!(log.observe(stats(40), at(2)), None);
+        assert_eq!(log.observe(stats(40), at(30)), None);
+        assert_eq!(
+            log.observe(stats(41), at(61)),
+            Some(RejectedRpcLogLine::Continuing)
+        );
+        assert_eq!(log.observe(stats(41), at(100)), None);
+        assert_eq!(
+            log.observe(stats(41), at(121)),
+            Some(RejectedRpcLogLine::Ended)
+        );
+        assert_eq!(log.observe(stats(41), at(200)), None);
+        assert_eq!(
+            log.observe(stats(42), at(201)),
+            Some(RejectedRpcLogLine::Started)
         );
     }
 

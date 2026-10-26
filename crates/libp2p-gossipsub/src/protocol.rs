@@ -18,16 +18,16 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use std::{collections::HashMap, convert::Infallible, pin::Pin};
+use std::{collections::HashMap, convert::Infallible, fmt, io, pin::Pin};
 
 use asynchronous_codec::{Decoder, Encoder, Framed};
 use byteorder::{BigEndian, ByteOrder};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use futures::prelude::*;
 use libp2p_core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use libp2p_identity::{PeerId, PublicKey};
 use libp2p_swarm::StreamProtocol;
-use quick_protobuf::{MessageWrite, Writer};
+use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
 
 use crate::{
     config::ValidationMode,
@@ -207,6 +207,9 @@ pub struct GossipsubCodec {
     validation_mode: ValidationMode,
     /// The codec to handle common encoding/decoding of protobuf messages
     codec: quick_protobuf_codec::Codec<proto::RPC>,
+    /// QUILIBRIUM: the largest inbound frame, in bytes. Inbound frames are read here (see
+    /// `decode`), the codec only encodes.
+    max_length: usize,
     /// Maximum transmit sizes per topic, with a default if not specified.
     max_transmit_sizes: HashMap<TopicHash, usize>,
 }
@@ -221,6 +224,7 @@ impl GossipsubCodec {
         GossipsubCodec {
             validation_mode,
             codec,
+            max_length,
             max_transmit_sizes,
         }
     }
@@ -295,9 +299,36 @@ impl Decoder for GossipsubCodec {
     type Error = quick_protobuf_codec::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let Some(rpc) = self.codec.decode(src)? else {
+        // QUILIBRIUM: the frame is read here rather than by `quick_protobuf_codec`, so that
+        // its entries are counted before any of them is decoded (`scan_rpc`). A frame over
+        // the limits is consumed undecoded and reported, and the handler closes the stream.
+        let Some((prefix_len, frame_len)) = frame_header(src.as_ref())? else {
             return Ok(None);
         };
+        if frame_len > self.max_length {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "message with {frame_len}b exceeds maximum of {}b",
+                    self.max_length
+                ),
+            )
+            .into());
+        }
+        if src.len() < prefix_len + frame_len {
+            return Ok(None);
+        }
+        src.advance(prefix_len);
+        let frame = src.split_to(frame_len);
+        if let Err(rejection) = scan_rpc(&frame) {
+            return Ok(Some(HandlerEvent::RpcRejected {
+                rejection,
+                frame_len,
+            }));
+        }
+        let mut reader = BytesReader::from_bytes(&frame);
+        let rpc = proto::RPC::from_reader(&mut reader, &frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Store valid messages.
         let mut messages = Vec::with_capacity(rpc.publish.len());
         // Store any invalid messages.
@@ -610,6 +641,291 @@ impl Decoder for GossipsubCodec {
     }
 }
 
+/// QUILIBRIUM: the most publish entries one inbound RPC may carry. This crate sends one
+/// message per RPC (`RpcOut`).
+const MAX_RPC_PUBLISH: usize = 128;
+/// QUILIBRIUM: the most subscription changes one inbound RPC may carry; sent one per RPC.
+const MAX_RPC_SUBSCRIPTIONS: usize = 1024;
+/// QUILIBRIUM: the most control messages (IHAVE, IWANT, GRAFT, PRUNE, IDONTWANT) one inbound
+/// RPC may carry; sent one per RPC.
+const MAX_RPC_CONTROL_MESSAGES: usize = 1024;
+/// QUILIBRIUM: the most message ids across one inbound RPC's control messages: twice the
+/// default `max_ihave_length` (5000), the most ids an IHAVE or IWANT carries.
+const MAX_RPC_MESSAGE_IDS: usize = 10_000;
+/// QUILIBRIUM: the most peer-exchange records across one inbound RPC's PRUNEs; a PRUNE
+/// carries at most `prune_peers` (0 by default, 16 upstream).
+const MAX_RPC_PRUNE_PEERS: usize = 1024;
+/// The longest varint, of a 64-bit value.
+const MAX_VARINT_LEN: usize = 10;
+
+/// QUILIBRIUM: a kind of entry counted in an inbound RPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcEntry {
+    /// A published message.
+    Publish,
+    /// A subscription change.
+    Subscription,
+    /// A control message.
+    ControlMessage,
+    /// A message id in IHAVE, IWANT or IDONTWANT.
+    MessageId,
+    /// A peer-exchange record in PRUNE.
+    PrunePeer,
+}
+
+impl RpcEntry {
+    /// The most entries of this kind one RPC may carry.
+    fn limit(self) -> usize {
+        match self {
+            RpcEntry::Publish => MAX_RPC_PUBLISH,
+            RpcEntry::Subscription => MAX_RPC_SUBSCRIPTIONS,
+            RpcEntry::ControlMessage => MAX_RPC_CONTROL_MESSAGES,
+            RpcEntry::MessageId => MAX_RPC_MESSAGE_IDS,
+            RpcEntry::PrunePeer => MAX_RPC_PRUNE_PEERS,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RpcEntry::Publish => "published messages",
+            RpcEntry::Subscription => "subscription changes",
+            RpcEntry::ControlMessage => "control messages",
+            RpcEntry::MessageId => "message ids",
+            RpcEntry::PrunePeer => "peer-exchange records",
+        }
+    }
+}
+
+/// QUILIBRIUM: why an inbound RPC was dropped before it was decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RpcRejection {
+    /// It carried more entries of one kind than an RPC may.
+    TooMany {
+        /// The kind of entry.
+        entry: RpcEntry,
+        /// The most entries of that kind an RPC may carry.
+        limit: usize,
+    },
+    /// It was not well-formed protobuf, which the decoder could read differently from the
+    /// count.
+    Malformed,
+}
+
+impl fmt::Display for RpcRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RpcRejection::TooMany { entry, limit } => {
+                write!(f, "more than {limit} {}", entry.name())
+            }
+            RpcRejection::Malformed => f.write_str("malformed protobuf"),
+        }
+    }
+}
+
+/// QUILIBRIUM: inbound RPCs dropped before decoding, counted since the behaviour was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RejectedRpcStats {
+    /// RPCs dropped.
+    pub rejected: u64,
+    /// Bytes of their frames.
+    pub bytes: u64,
+    /// The sender of the latest and why it was dropped.
+    pub last: Option<(PeerId, RpcRejection)>,
+}
+
+/// QUILIBRIUM: the unsigned-varint length prefix of the frame at the start of `src`, as its
+/// own length and the frame's, or `None` until the prefix is complete.
+fn frame_header(src: &[u8]) -> io::Result<Option<(usize, usize)>> {
+    let mut frame_len: u64 = 0;
+    for (i, byte) in src.iter().take(MAX_VARINT_LEN).enumerate() {
+        frame_len |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            let frame_len = usize::try_from(frame_len)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            return Ok(Some((i + 1, frame_len)));
+        }
+    }
+    if src.len() >= MAX_VARINT_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame length prefix longer than a varint",
+        ));
+    }
+    Ok(None)
+}
+
+/// QUILIBRIUM: counts of one inbound RPC's entries.
+#[derive(Default)]
+struct RpcEntryCounts {
+    publish: usize,
+    subscriptions: usize,
+    control_messages: usize,
+    message_ids: usize,
+    prune_peers: usize,
+}
+
+impl RpcEntryCounts {
+    fn add(&mut self, entry: RpcEntry) -> Result<(), RpcRejection> {
+        let count = match entry {
+            RpcEntry::Publish => &mut self.publish,
+            RpcEntry::Subscription => &mut self.subscriptions,
+            RpcEntry::ControlMessage => &mut self.control_messages,
+            RpcEntry::MessageId => &mut self.message_ids,
+            RpcEntry::PrunePeer => &mut self.prune_peers,
+        };
+        *count += 1;
+        let limit = entry.limit();
+        if *count > limit {
+            return Err(RpcRejection::TooMany { entry, limit });
+        }
+        Ok(())
+    }
+}
+
+/// QUILIBRIUM: a strict reader of protobuf wire format, which never allocates.
+struct WireReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> WireReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn varint(&mut self) -> Result<u64, RpcRejection> {
+        let bytes = self.bytes;
+        let mut value: u64 = 0;
+        for (i, byte) in bytes.iter().take(MAX_VARINT_LEN).enumerate() {
+            value |= u64::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                self.bytes = &bytes[i + 1..];
+                return Ok(value);
+            }
+        }
+        Err(RpcRejection::Malformed)
+    }
+
+    /// A tag or a length. The decoder reads those as 32-bit varints and drops higher bits,
+    /// so a larger value is refused rather than read as another field or length.
+    fn varint32(&mut self) -> Result<u32, RpcRejection> {
+        u32::try_from(self.varint()?).map_err(|_| RpcRejection::Malformed)
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], RpcRejection> {
+        let bytes = self.bytes;
+        if len > bytes.len() {
+            return Err(RpcRejection::Malformed);
+        }
+        let (taken, rest) = bytes.split_at(len);
+        self.bytes = rest;
+        Ok(taken)
+    }
+
+    /// The contents of a length-delimited field.
+    fn len_delimited(&mut self) -> Result<&'a [u8], RpcRejection> {
+        let len = self.varint32()? as usize;
+        self.take(len)
+    }
+
+    /// Skips the value of a field with `tag`, by its wire type.
+    fn skip(&mut self, tag: u32) -> Result<(), RpcRejection> {
+        match tag & 0x7 {
+            0 => {
+                self.varint()?;
+            }
+            1 => {
+                self.take(8)?;
+            }
+            2 => {
+                self.len_delimited()?;
+            }
+            5 => {
+                self.take(4)?;
+            }
+            // Groups (3, 4), which the decoder refuses too, and undefined wire types.
+            _ => return Err(RpcRejection::Malformed),
+        }
+        Ok(())
+    }
+}
+
+/// QUILIBRIUM: checks that `frame` is well-formed protobuf and counts the entries of the RPC
+/// it encodes, without allocating, so that an RPC over the limits is dropped before it is
+/// decoded and decoding stays proportional to the frame. Every nested message is walked to
+/// its end, and a frame the decoder could read differently from this walk is refused.
+fn scan_rpc(frame: &[u8]) -> Result<(), RpcRejection> {
+    let mut counts = RpcEntryCounts::default();
+    let mut rpc = WireReader::new(frame);
+    while !rpc.is_empty() {
+        match rpc.varint32()? {
+            // `subscriptions` (1).
+            10 => {
+                counts.add(RpcEntry::Subscription)?;
+                check_fields(rpc.len_delimited()?)?;
+            }
+            // `publish` (2).
+            18 => {
+                counts.add(RpcEntry::Publish)?;
+                check_fields(rpc.len_delimited()?)?;
+            }
+            // `control` (3).
+            26 => scan_control(rpc.len_delimited()?, &mut counts)?,
+            tag => rpc.skip(tag)?,
+        }
+    }
+    Ok(())
+}
+
+/// QUILIBRIUM: counts the entries of a `ControlMessage`.
+fn scan_control(control: &[u8], counts: &mut RpcEntryCounts) -> Result<(), RpcRejection> {
+    let mut control = WireReader::new(control);
+    while !control.is_empty() {
+        let tag = control.varint32()?;
+        // The repeated field of each control message: IHAVE (1), IWANT (2) and
+        // IDONTWANT (5) list message ids, PRUNE (4) peer-exchange records, GRAFT (3) none.
+        let list = match tag {
+            10 => Some((18, RpcEntry::MessageId)),
+            18 | 42 => Some((10, RpcEntry::MessageId)),
+            34 => Some((18, RpcEntry::PrunePeer)),
+            26 => None,
+            _ => {
+                control.skip(tag)?;
+                continue;
+            }
+        };
+        counts.add(RpcEntry::ControlMessage)?;
+        let mut message = WireReader::new(control.len_delimited()?);
+        while !message.is_empty() {
+            let tag = message.varint32()?;
+            match list {
+                Some((list_tag, entry)) if tag == list_tag => {
+                    counts.add(entry)?;
+                    let item = message.len_delimited()?;
+                    if entry == RpcEntry::PrunePeer {
+                        check_fields(item)?;
+                    }
+                }
+                _ => message.skip(tag)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// QUILIBRIUM: checks a message without repeated or nested message fields.
+fn check_fields(message: &[u8]) -> Result<(), RpcRejection> {
+    let mut message = WireReader::new(message);
+    while !message.is_empty() {
+        let tag = message.varint32()?;
+        message.skip(tag)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use libp2p_identity::Keypair;
@@ -758,6 +1074,174 @@ mod tests {
         }
 
         QuickCheck::new().quickcheck(prop as fn(_, _, _, _) -> _)
+    }
+
+    /// QUILIBRIUM: the frame limit of the node's gossip (`MAX_MESSAGE_SIZE` in quil-p2p).
+    const FRAME_LIMIT: usize = 16 * 1024 * 1024;
+
+    /// QUILIBRIUM: `rpc` framed as on the wire.
+    fn frame(rpc: proto::RPC) -> BytesMut {
+        let mut codec =
+            GossipsubCodec::new(u32::MAX as usize, ValidationMode::Strict, HashMap::new());
+        let mut buf = BytesMut::new();
+        codec.encode(rpc, &mut buf).unwrap();
+        buf
+    }
+
+    /// QUILIBRIUM: decodes one whole frame, under the node's frame limit.
+    fn decode_frame(mut buf: BytesMut) -> HandlerEvent {
+        let mut codec = GossipsubCodec::new(FRAME_LIMIT, ValidationMode::Strict, HashMap::new());
+        let event = codec.decode(&mut buf).unwrap().expect("a whole frame");
+        assert!(buf.is_empty(), "the frame is consumed");
+        event
+    }
+
+    /// QUILIBRIUM: an RPC with `count` entries of `entry`, each as small as it gets.
+    fn rpc_with(entry: RpcEntry, count: usize) -> proto::RPC {
+        let topic_id = Some("00".to_string());
+        let mut rpc = proto::RPC::default();
+        match entry {
+            RpcEntry::Publish => rpc.publish = vec![proto::Message::default(); count],
+            RpcEntry::Subscription => {
+                rpc.subscriptions = vec![
+                    proto::SubOpts {
+                        subscribe: Some(true),
+                        topic_id,
+                    };
+                    count
+                ]
+            }
+            RpcEntry::ControlMessage => {
+                rpc.control = Some(proto::ControlMessage {
+                    graft: vec![proto::ControlGraft { topic_id }; count],
+                    ..Default::default()
+                })
+            }
+            RpcEntry::MessageId => {
+                rpc.control = Some(proto::ControlMessage {
+                    ihave: vec![proto::ControlIHave {
+                        topic_id,
+                        message_ids: vec![Vec::new(); count],
+                    }],
+                    ..Default::default()
+                })
+            }
+            RpcEntry::PrunePeer => {
+                rpc.control = Some(proto::ControlMessage {
+                    prune: vec![proto::ControlPrune {
+                        topic_id,
+                        peers: vec![proto::PeerInfo::default(); count],
+                        backoff: Some(60),
+                    }],
+                    ..Default::default()
+                })
+            }
+        }
+        rpc
+    }
+
+    /// QUILIBRIUM: an RPC with one entry more than its limit is dropped and consumed without
+    /// being decoded; one at the limit is decoded.
+    #[test]
+    fn rpc_over_an_entry_limit_is_dropped_before_decoding() {
+        let entries = [
+            RpcEntry::Publish,
+            RpcEntry::Subscription,
+            RpcEntry::ControlMessage,
+            RpcEntry::MessageId,
+            RpcEntry::PrunePeer,
+        ];
+        for entry in entries {
+            let limit = entry.limit();
+            match decode_frame(frame(rpc_with(entry, limit + 1))) {
+                HandlerEvent::RpcRejected { rejection, .. } => {
+                    assert_eq!(rejection, RpcRejection::TooMany { entry, limit });
+                }
+                _ => panic!("{} {entry:?} entries were decoded", limit + 1),
+            }
+            assert!(
+                matches!(
+                    decode_frame(frame(rpc_with(entry, limit))),
+                    HandlerEvent::Message { .. }
+                ),
+                "{limit} {entry:?} entries must be decoded"
+            );
+        }
+    }
+
+    /// QUILIBRIUM: frames the decoder could read differently from the count are dropped too.
+    #[test]
+    fn malformed_rpc_is_dropped_before_decoding() {
+        let frames: [&[u8]; 4] = [
+            // A publish entry whose topic runs past the entry's end.
+            &[0x12, 0x02, 0x22, 0x05, 0x00, 0x00, 0x00],
+            // A publish entry running past the frame's end.
+            &[0x12, 0x05, 0x00],
+            // A group.
+            &[0x13, 0x00],
+            // A tag beyond 32 bits.
+            &[0x92, 0x80, 0x80, 0x80, 0x10, 0x00],
+        ];
+        for bytes in frames {
+            let mut buf = BytesMut::from(&[bytes.len() as u8][..]);
+            buf.extend_from_slice(bytes);
+            assert!(
+                matches!(
+                    decode_frame(buf),
+                    HandlerEvent::RpcRejected {
+                        rejection: RpcRejection::Malformed,
+                        ..
+                    }
+                ),
+                "{bytes:02x?} must be dropped as malformed"
+            );
+        }
+    }
+
+    /// QUILIBRIUM: the largest legitimate RPCs are still decoded: a signed 15 MiB message (the
+    /// node gossips GLOBAL frames up to that size) under the 16 MiB frame limit, and an IHAVE
+    /// with `max_ihave_length` ids of the node's 33-byte message id.
+    #[test]
+    fn largest_legitimate_rpcs_are_decoded() {
+        let config = Config::default();
+        let max_ihave_length = config.max_ihave_length();
+        let mut gs: Behaviour = Behaviour::new(
+            MessageAuthenticity::Signed(Keypair::generate_ed25519()),
+            config,
+        )
+        .unwrap();
+        let topic: TopicHash = Topic::new("0000").into();
+        let message = gs
+            .build_raw_message(topic.clone(), vec![0xab; 15 * 1024 * 1024])
+            .unwrap();
+        let publish = Rpc {
+            messages: vec![message],
+            subscriptions: vec![],
+            control_msgs: vec![],
+        };
+        match decode_frame(frame(publish.into_protobuf())) {
+            HandlerEvent::Message {
+                rpc,
+                invalid_messages,
+            } => {
+                assert!(invalid_messages.is_empty());
+                assert_eq!(rpc.messages.len(), 1);
+            }
+            _ => panic!("the largest message must be decoded"),
+        }
+
+        let ihave = Rpc {
+            messages: vec![],
+            subscriptions: vec![],
+            control_msgs: vec![ControlAction::IHave(IHave {
+                topic_hash: topic,
+                message_ids: vec![MessageId::from(vec![0x01; 33]); max_ihave_length],
+            })],
+        };
+        assert!(matches!(
+            decode_frame(frame(ihave.into_protobuf())),
+            HandlerEvent::Message { .. }
+        ));
     }
 
     #[test]
