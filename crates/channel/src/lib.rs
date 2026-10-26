@@ -1,16 +1,23 @@
-use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use base64::prelude::*;
 use ed448_rust::Ed448Error;
+use hex;
 use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
-use sha2::Sha512;
 use serde::{Deserialize, Serialize};
+use sha2::Sha512;
 use std::{collections::HashMap, error::Error};
-use hex;
 
-use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, elliptic_curve::Group, CompressedEdwardsY, EdwardsPoint, Scalar};
-use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};
+use ed448_goldilocks_plus::{
+    elliptic_curve::group::GroupEncoding, elliptic_curve::Group, CompressedEdwardsY, EdwardsPoint,
+    Scalar,
+};
+use protocols::{
+    doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope},
+    tripleratchet::{PeerInfo, TripleRatchetParticipant},
+    x3dh,
+};
 
 pub(crate) mod protocols;
 
@@ -139,17 +146,21 @@ fn encrypt_aead(plaintext: &[u8], key: &[u8]) -> Result<MessageCiphertext, Strin
     let mut iv = [0u8; 12];
     OsRng.fill_bytes(&mut iv);
 
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Invalid key: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("Invalid key: {}", e))?;
     let nonce = Nonce::from_slice(&iv);
 
     let mut aad = [0u8; 32];
     OsRng.fill_bytes(&mut aad);
 
-    let ciphertext = cipher.encrypt(nonce, Payload {
-        msg: plaintext,
-        aad: &aad,
-    }).map_err(|e| format!("Encryption failed: {}", e))?;
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| format!("Encryption failed: {}", e))?;
 
     Ok(MessageCiphertext {
         ciphertext: BASE64_STANDARD.encode(ciphertext),
@@ -163,26 +174,33 @@ fn decrypt_aead(ciphertext: &MessageCiphertext, key: &[u8]) -> Result<Vec<u8>, S
     if key.len() != 32 {
         return Err("Invalid key length".to_string());
     }
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Invalid key: {}", e))?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("Invalid key: {}", e))?;
 
-    let iv = BASE64_STANDARD.decode(&ciphertext.initialization_vector)
+    let iv = BASE64_STANDARD
+        .decode(&ciphertext.initialization_vector)
         .map_err(|e| format!("Invalid IV: {}", e))?;
     let nonce = Nonce::from_slice(&iv);
 
     let associated_data = match &ciphertext.associated_data {
-        Some(aad) => BASE64_STANDARD.decode(aad)
+        Some(aad) => BASE64_STANDARD
+            .decode(aad)
             .map_err(|e| format!("Invalid AAD: {}", e))?,
         None => Vec::new(),
     };
 
-    let ct = BASE64_STANDARD.decode(&ciphertext.ciphertext)
+    let ct = BASE64_STANDARD
+        .decode(&ciphertext.ciphertext)
         .map_err(|e| format!("Invalid ciphertext: {}", e))?;
 
-    cipher.decrypt(nonce, Payload {
-        msg: &ct,
-        aad: &associated_data,
-    }).map_err(|e| format!("Decryption failed: {}", e))
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct,
+                aad: &associated_data,
+            },
+        )
+        .map_err(|e| format!("Decryption failed: {}", e))
 }
 
 // ============ Key Generation ============
@@ -230,7 +248,10 @@ pub fn get_pubkey_x448(key: String) -> String {
     let priv_key = Scalar::from_bytes(&priv_key_bytes);
     let pub_key = EdwardsPoint::generator() * priv_key;
 
-    format!("\"{}\"", BASE64_STANDARD.encode(pub_key.compress().to_bytes().to_vec()))
+    format!(
+        "\"{}\"",
+        BASE64_STANDARD.encode(pub_key.compress().to_bytes().to_vec())
+    )
 }
 
 pub fn get_pubkey_ed448(key: String) -> String {
@@ -328,7 +349,8 @@ pub fn verify_ed448(public_key: String, message: String, signature: String) -> S
 // ============ Inbox Message Encryption ============
 
 pub fn encrypt_inbox_message(input: String) -> String {
-    let json: Result<SealedInboxMessageEncryptRequest, serde_json::Error> = serde_json::from_str(&input);
+    let json: Result<SealedInboxMessageEncryptRequest, serde_json::Error> =
+        serde_json::from_str(&input);
     match json {
         Ok(params) => {
             let key = params.ephemeral_private_key;
@@ -353,7 +375,10 @@ pub fn encrypt_inbox_message(input: String) -> String {
             let dh_output = priv_key * maybe_pub_key.unwrap();
             let hkdf = Hkdf::<Sha512>::new(None, &dh_output.compress().to_bytes());
             let mut derived = [0u8; 32];
-            if hkdf.expand(b"quilibrium-sealed-sender", &mut derived).is_err() {
+            if hkdf
+                .expand(b"quilibrium-sealed-sender", &mut derived)
+                .is_err()
+            {
                 return "invalid length".to_string();
             }
 
@@ -367,7 +392,8 @@ pub fn encrypt_inbox_message(input: String) -> String {
 }
 
 pub fn decrypt_inbox_message(input: String) -> String {
-    let json: Result<SealedInboxMessageDecryptRequest, serde_json::Error> = serde_json::from_str(&input);
+    let json: Result<SealedInboxMessageDecryptRequest, serde_json::Error> =
+        serde_json::from_str(&input);
     match json {
         Ok(params) => {
             let ephemeral_key = params.ephemeral_public_key;
@@ -392,7 +418,10 @@ pub fn decrypt_inbox_message(input: String) -> String {
             let dh_output = priv_key * maybe_eph_key.unwrap();
             let hkdf = Hkdf::<Sha512>::new(None, &dh_output.compress().to_bytes());
             let mut derived = [0u8; 32];
-            if hkdf.expand(b"quilibrium-sealed-sender", &mut derived).is_err() {
+            if hkdf
+                .expand(b"quilibrium-sealed-sender", &mut derived)
+                .is_err()
+            {
                 return "invalid length".to_string();
             }
 
@@ -419,87 +448,122 @@ pub fn decrypt_inbox_message(input: String) -> String {
 
 // ============ X3DH Key Agreement ============
 
-pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_signed_pre_key: &Vec<u8>, session_key_length: u64) -> String {
-  if sending_identity_private_key.len() != 56 {
-    return "invalid sending identity private key length".to_string();
-  }
-
-  if sending_ephemeral_private_key.len() != 56 {
-    return "invalid sending ephemeral private key length".to_string();
-  }
-
-  if receiving_identity_key.len() != 57 {
-    return "invalid receiving identity public key length".to_string();
-  }
-
-  if receiving_signed_pre_key.len() != 57 {
-    return "invalid receiving signed public key length".to_string();
-  }
-
-  let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
-  let sepk = Scalar::from_bytes(sending_ephemeral_private_key.as_slice().try_into().unwrap());
-  let ridk = CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
-  let rspk = CompressedEdwardsY(receiving_signed_pre_key.as_slice().try_into().unwrap()).decompress();
-
-  if ridk.is_none().into() {
-    return "invalid receiving identity public key".to_string();
-  }
-
-  if rspk.is_none().into() {
-    return "invalid receiving signed public key".to_string();
-  }
-
-  match x3dh::sender_x3dh(&sidk, &sepk, &ridk.unwrap(), &rspk.unwrap(), session_key_length) {
-    Some(result) => {
-      return format!("\"{}\"", BASE64_STANDARD.encode(result));
+pub fn sender_x3dh(
+    sending_identity_private_key: &Vec<u8>,
+    sending_ephemeral_private_key: &Vec<u8>,
+    receiving_identity_key: &Vec<u8>,
+    receiving_signed_pre_key: &Vec<u8>,
+    session_key_length: u64,
+) -> String {
+    if sending_identity_private_key.len() != 56 {
+        return "invalid sending identity private key length".to_string();
     }
-    None => {
-      return "could not perform key agreement".to_string();
+
+    if sending_ephemeral_private_key.len() != 56 {
+        return "invalid sending ephemeral private key length".to_string();
     }
-  }
+
+    if receiving_identity_key.len() != 57 {
+        return "invalid receiving identity public key length".to_string();
+    }
+
+    if receiving_signed_pre_key.len() != 57 {
+        return "invalid receiving signed public key length".to_string();
+    }
+
+    let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
+    let sepk = Scalar::from_bytes(sending_ephemeral_private_key.as_slice().try_into().unwrap());
+    let ridk =
+        CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
+    let rspk =
+        CompressedEdwardsY(receiving_signed_pre_key.as_slice().try_into().unwrap()).decompress();
+
+    if ridk.is_none().into() {
+        return "invalid receiving identity public key".to_string();
+    }
+
+    if rspk.is_none().into() {
+        return "invalid receiving signed public key".to_string();
+    }
+
+    match x3dh::sender_x3dh(
+        &sidk,
+        &sepk,
+        &ridk.unwrap(),
+        &rspk.unwrap(),
+        session_key_length,
+    ) {
+        Some(result) => {
+            return format!("\"{}\"", BASE64_STANDARD.encode(result));
+        }
+        None => {
+            return "could not perform key agreement".to_string();
+        }
+    }
 }
 
-pub fn receiver_x3dh(sending_identity_private_key: &Vec<u8>, sending_signed_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>, session_key_length: u64) -> String {
-  if sending_identity_private_key.len() != 56 {
-    return "invalid sending identity private key length".to_string();
-  }
-
-  if sending_signed_private_key.len() != 56 {
-    return "invalid sending signed private key length".to_string();
-  }
-
-  if receiving_identity_key.len() != 57 {
-    return "invalid receiving identity public key length".to_string();
-  }
-
-  if receiving_ephemeral_key.len() != 57 {
-    return "invalid receiving ephemeral public key length".to_string();
-  }
-
-  let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
-  let sspk = Scalar::from_bytes(sending_signed_private_key.as_slice().try_into().unwrap());
-  let ridk = CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
-  let repk = CompressedEdwardsY(receiving_ephemeral_key.as_slice().try_into().unwrap()).decompress();
-
-  if ridk.is_none().into() {
-    return "invalid receiving identity public key".to_string();
-  }
-
-  if repk.is_none().into() {
-    return "invalid receiving signed public key".to_string();
-  }
-
-  match x3dh::receiver_x3dh(&sidk, &sspk, &ridk.unwrap(), &repk.unwrap(), session_key_length) {
-    Some(result) => {
-      return format!("\"{}\"", BASE64_STANDARD.encode(result));
+pub fn receiver_x3dh(
+    sending_identity_private_key: &Vec<u8>,
+    sending_signed_private_key: &Vec<u8>,
+    receiving_identity_key: &Vec<u8>,
+    receiving_ephemeral_key: &Vec<u8>,
+    session_key_length: u64,
+) -> String {
+    if sending_identity_private_key.len() != 56 {
+        return "invalid sending identity private key length".to_string();
     }
-    None => {
-      return "could not perform key agreement".to_string();
+
+    if sending_signed_private_key.len() != 56 {
+        return "invalid sending signed private key length".to_string();
     }
-  }
+
+    if receiving_identity_key.len() != 57 {
+        return "invalid receiving identity public key length".to_string();
+    }
+
+    if receiving_ephemeral_key.len() != 57 {
+        return "invalid receiving ephemeral public key length".to_string();
+    }
+
+    let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
+    let sspk = Scalar::from_bytes(sending_signed_private_key.as_slice().try_into().unwrap());
+    let ridk =
+        CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
+    let repk =
+        CompressedEdwardsY(receiving_ephemeral_key.as_slice().try_into().unwrap()).decompress();
+
+    if ridk.is_none().into() {
+        return "invalid receiving identity public key".to_string();
+    }
+
+    if repk.is_none().into() {
+        return "invalid receiving signed public key".to_string();
+    }
+
+    match x3dh::receiver_x3dh(
+        &sidk,
+        &sspk,
+        &ridk.unwrap(),
+        &repk.unwrap(),
+        session_key_length,
+    ) {
+        Some(result) => {
+            return format!("\"{}\"", BASE64_STANDARD.encode(result));
+        }
+        None => {
+            return "could not perform key agreement".to_string();
+        }
+    }
 }
 
-pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, next_receiving_header_key: &Vec<u8>, is_sender: bool, sending_ephemeral_private_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>) -> String {
+pub fn new_double_ratchet(
+    session_key: &Vec<u8>,
+    sending_header_key: &Vec<u8>,
+    next_receiving_header_key: &Vec<u8>,
+    is_sender: bool,
+    sending_ephemeral_private_key: &Vec<u8>,
+    receiving_ephemeral_key: &Vec<u8>,
+) -> String {
     if sending_ephemeral_private_key.len() != 56 {
         return "invalid private key length".to_string();
     }
@@ -515,7 +579,8 @@ pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, n
     receiving_ephemeral_key_bytes.copy_from_slice(&receiving_ephemeral_key);
 
     let sending_key = Scalar::from_bytes(&sending_ephemeral_private_key_bytes.into());
-    let receiving_key = EdwardsPoint::from_bytes(&receiving_ephemeral_key_bytes.into()).into_option();
+    let receiving_key =
+        EdwardsPoint::from_bytes(&receiving_ephemeral_key_bytes.into()).into_option();
     if receiving_key.is_none() {
         return "invalid receiving key".to_string();
     }
@@ -541,28 +606,35 @@ pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, n
     return json.unwrap();
 }
 
-pub fn double_ratchet_encrypt(ratchet_state_and_message: DoubleRatchetStateAndMessage) -> Result<DoubleRatchetStateAndEnvelope, CryptoError> {
+pub fn double_ratchet_encrypt(
+    ratchet_state_and_message: DoubleRatchetStateAndMessage,
+) -> Result<DoubleRatchetStateAndEnvelope, CryptoError> {
     let ratchet_state = ratchet_state_and_message.ratchet_state.clone();
     let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone())
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
     let mut dr = participant;
-    let envelope = dr.ratchet_encrypt(&ratchet_state_and_message.message)
+    let envelope = dr
+        .ratchet_encrypt(&ratchet_state_and_message.message)
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
-    let participant_json = dr.to_json()
+    let participant_json = dr
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    let envelope_json = envelope.to_json()
+    let envelope_json = envelope
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(DoubleRatchetStateAndEnvelope{
+    Ok(DoubleRatchetStateAndEnvelope {
         ratchet_state: participant_json,
         envelope: envelope_json,
     })
 }
 
-pub fn double_ratchet_decrypt(ratchet_state_and_envelope: DoubleRatchetStateAndEnvelope) -> Result<DoubleRatchetStateAndMessage, CryptoError> {
+pub fn double_ratchet_decrypt(
+    ratchet_state_and_envelope: DoubleRatchetStateAndEnvelope,
+) -> Result<DoubleRatchetStateAndMessage, CryptoError> {
     let ratchet_state = ratchet_state_and_envelope.ratchet_state.clone();
     let participant = DoubleRatchetParticipant::from_json(ratchet_state.clone())
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -570,49 +642,58 @@ pub fn double_ratchet_decrypt(ratchet_state_and_envelope: DoubleRatchetStateAndE
         .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
 
     let mut dr = participant;
-    let message = dr.ratchet_decrypt(&envelope)
+    let message = dr
+        .ratchet_decrypt(&envelope)
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
-    let participant_json = dr.to_json()
+    let participant_json = dr
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(DoubleRatchetStateAndMessage{
+    Ok(DoubleRatchetStateAndMessage {
         ratchet_state: participant_json,
         message: message,
     })
 }
 
-pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key: &Vec<u8>, signed_pre_key: &Vec<u8>, threshold: u64, async_dkg_ratchet: bool) -> TripleRatchetStateAndMetadata {
+pub fn new_triple_ratchet(
+    peers: &Vec<Vec<u8>>,
+    peer_key: &Vec<u8>,
+    identity_key: &Vec<u8>,
+    signed_pre_key: &Vec<u8>,
+    threshold: u64,
+    async_dkg_ratchet: bool,
+) -> TripleRatchetStateAndMetadata {
     if peer_key.len() != 56 {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: "invalid peerkey".to_string(),
             metadata: HashMap::new(),
         };
     }
 
     if identity_key.len() != 56 {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: "invalid identity key".to_string(),
             metadata: HashMap::new(),
         };
     }
 
     if signed_pre_key.len() != 56 {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: "invalid signed pre key".to_string(),
             metadata: HashMap::new(),
         };
     }
 
     if peers.len() < 3 {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: "invalid peer count".to_string(),
             metadata: HashMap::new(),
         };
     }
 
     if threshold > peers.len() as u64 {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: "invalid threshold".to_string(),
             metadata: HashMap::new(),
         };
@@ -633,13 +714,13 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     let mut peerinfos = Vec::<PeerInfo>::new();
     for pk in peers.iter() {
         if pk.len() != 171 {
-            return TripleRatchetStateAndMetadata{
+            return TripleRatchetStateAndMetadata {
                 ratchet_state: "invalid peer key size".to_string(),
                 metadata: HashMap::new(),
             };
         }
 
-        peerinfos.push(PeerInfo{
+        peerinfos.push(PeerInfo {
             public_key: pk[..57].into(),
             identity_public_key: pk[57..114].into(),
             signed_pre_public_key: pk[114..].into(),
@@ -647,16 +728,16 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     }
 
     let participant = TripleRatchetParticipant::new(
-      &peerinfos,
-      peer_key_scalar,
-      identity_key_scalar,
-      signed_pre_key_scalar,
-      threshold as usize,
-      async_dkg_ratchet,
+        &peerinfos,
+        peer_key_scalar,
+        identity_key_scalar,
+        signed_pre_key_scalar,
+        threshold as usize,
+        async_dkg_ratchet,
     );
 
     if participant.is_err() {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: participant.err().unwrap().to_string(),
             metadata: HashMap::new(),
         };
@@ -667,7 +748,7 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     let participant_json = tr.to_json();
 
     if participant_json.is_err() {
-        return TripleRatchetStateAndMetadata{
+        return TripleRatchetStateAndMetadata {
             ratchet_state: participant_json.err().unwrap().to_string(),
             metadata: HashMap::new(),
         };
@@ -678,18 +759,21 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
         Err(value) => return value,
     };
 
-    return TripleRatchetStateAndMetadata{
+    return TripleRatchetStateAndMetadata {
         ratchet_state: participant_json.unwrap(),
         metadata: metadata_json,
     };
 }
 
-fn metadata_to_json(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
+fn metadata_to_json(
+    _ratchet_state: &String,
+    metadata: HashMap<Vec<u8>, P2PChannelEnvelope>,
+) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
     let mut metadata_json = HashMap::<String, String>::new();
-    for (k,v) in metadata {
+    for (k, v) in metadata {
         let env = v.to_json();
         if env.is_err() {
-            return Err(TripleRatchetStateAndMetadata{
+            return Err(TripleRatchetStateAndMetadata {
                 ratchet_state: env.err().unwrap().to_string(),
                 metadata: HashMap::new(),
             });
@@ -703,52 +787,65 @@ fn metadata_to_json(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChann
 // Inverse of `metadata_to_json`, kept so the JSON state format stays
 // round-trippable; only the serializing half has a caller today.
 #[allow(dead_code)]
-fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, _ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
-  let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
-  for (k,v) in ratchet_state_and_metadata.metadata {
-      let env = P2PChannelEnvelope::from_json(v);
-      let kb = BASE64_STANDARD.decode(k);
-      if env.is_err() {
-          return Err(TripleRatchetStateAndMetadata{
-              ratchet_state: env.err().unwrap().to_string(),
-              metadata: HashMap::new(),
-          });
-      }
-      if kb.is_err() {
-          return Err(TripleRatchetStateAndMetadata{
-              ratchet_state: kb.err().unwrap().to_string(),
-              metadata: HashMap::new(),
-          });
-      }
+fn json_to_metadata(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+    _ratchet_state: &String,
+) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
+    let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
+    for (k, v) in ratchet_state_and_metadata.metadata {
+        let env = P2PChannelEnvelope::from_json(v);
+        let kb = BASE64_STANDARD.decode(k);
+        if env.is_err() {
+            return Err(TripleRatchetStateAndMetadata {
+                ratchet_state: env.err().unwrap().to_string(),
+                metadata: HashMap::new(),
+            });
+        }
+        if kb.is_err() {
+            return Err(TripleRatchetStateAndMetadata {
+                ratchet_state: kb.err().unwrap().to_string(),
+                metadata: HashMap::new(),
+            });
+        }
 
-      metadata.insert(kb.unwrap(), env.unwrap());
-  }
-  Ok(metadata)
+        metadata.insert(kb.unwrap(), env.unwrap());
+    }
+    Ok(metadata)
 }
 
-fn json_to_metadata_result(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, _ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, CryptoError> {
-  let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
-  for (k,v) in ratchet_state_and_metadata.metadata {
-      let env = P2PChannelEnvelope::from_json(v)
-          .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
-      let kb = BASE64_STANDARD.decode(k)
-          .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
-      metadata.insert(kb, env);
-  }
-  Ok(metadata)
+fn json_to_metadata_result(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+    _ratchet_state: &String,
+) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, CryptoError> {
+    let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
+    for (k, v) in ratchet_state_and_metadata.metadata {
+        let env = P2PChannelEnvelope::from_json(v)
+            .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
+        let kb = BASE64_STANDARD
+            .decode(k)
+            .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
+        metadata.insert(kb, env);
+    }
+    Ok(metadata)
 }
 
-fn metadata_to_json_result(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, CryptoError> {
+fn metadata_to_json_result(
+    _ratchet_state: &String,
+    metadata: HashMap<Vec<u8>, P2PChannelEnvelope>,
+) -> Result<HashMap<String, String>, CryptoError> {
     let mut metadata_json = HashMap::<String, String>::new();
-    for (k,v) in metadata {
-        let env = v.to_json()
+    for (k, v) in metadata {
+        let env = v
+            .to_json()
             .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
         metadata_json.insert(BASE64_STANDARD.encode(k), env);
     }
     Ok(metadata_json)
 }
 
-pub fn triple_ratchet_init_round_1(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+pub fn triple_ratchet_init_round_1(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -756,21 +853,25 @@ pub fn triple_ratchet_init_round_1(ratchet_state_and_metadata: TripleRatchetStat
     let metadata = json_to_metadata_result(ratchet_state_and_metadata, &ratchet_state)?;
 
     let mut trp = tr;
-    let result = trp.initialize(&metadata)
+    let result = trp
+        .initialize(&metadata)
         .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
 
     let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndMetadata{
+    Ok(TripleRatchetStateAndMetadata {
         ratchet_state: json,
         metadata: metadata_json,
     })
 }
 
-pub fn triple_ratchet_init_round_2(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+pub fn triple_ratchet_init_round_2(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -780,7 +881,8 @@ pub fn triple_ratchet_init_round_2(ratchet_state_and_metadata: TripleRatchetStat
     let mut trp = tr;
     let mut result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
     for (k, v) in metadata {
-        let r = trp.receive_poly_frag(&k, &v)
+        let r = trp
+            .receive_poly_frag(&k, &v)
             .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
 
         if let Some(out) = r {
@@ -790,16 +892,19 @@ pub fn triple_ratchet_init_round_2(ratchet_state_and_metadata: TripleRatchetStat
 
     let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndMetadata{
+    Ok(TripleRatchetStateAndMetadata {
         ratchet_state: json,
         metadata: metadata_json,
     })
 }
 
-pub fn triple_ratchet_init_round_3(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+pub fn triple_ratchet_init_round_3(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -809,7 +914,8 @@ pub fn triple_ratchet_init_round_3(ratchet_state_and_metadata: TripleRatchetStat
     let mut trp = tr;
     let mut result = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
     for (k, v) in metadata {
-        let r = trp.receive_commitment(&k, &v)
+        let r = trp
+            .receive_commitment(&k, &v)
             .map_err(|e| CryptoError::InvalidInput(e.to_string()))?;
 
         if let Some(out) = r {
@@ -819,16 +925,19 @@ pub fn triple_ratchet_init_round_3(ratchet_state_and_metadata: TripleRatchetStat
 
     let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndMetadata{
+    Ok(TripleRatchetStateAndMetadata {
         ratchet_state: json,
         metadata: metadata_json,
     })
 }
 
-pub fn triple_ratchet_init_round_4(ratchet_state_and_metadata: TripleRatchetStateAndMetadata) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
+pub fn triple_ratchet_init_round_4(
+    ratchet_state_and_metadata: TripleRatchetStateAndMetadata,
+) -> Result<TripleRatchetStateAndMetadata, CryptoError> {
     let ratchet_state = ratchet_state_and_metadata.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -844,37 +953,45 @@ pub fn triple_ratchet_init_round_4(ratchet_state_and_metadata: TripleRatchetStat
 
     let metadata_json = metadata_to_json_result(&ratchet_state, result)?;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndMetadata{
+    Ok(TripleRatchetStateAndMetadata {
         ratchet_state: json,
         metadata: metadata_json,
     })
 }
 
-pub fn triple_ratchet_encrypt(ratchet_state_and_message: TripleRatchetStateAndMessage) -> Result<TripleRatchetStateAndEnvelope, CryptoError> {
+pub fn triple_ratchet_encrypt(
+    ratchet_state_and_message: TripleRatchetStateAndMessage,
+) -> Result<TripleRatchetStateAndEnvelope, CryptoError> {
     let ratchet_state = ratchet_state_and_message.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
 
     let mut trp = tr;
-    let envelope = trp.ratchet_encrypt(&ratchet_state_and_message.message)
+    let envelope = trp
+        .ratchet_encrypt(&ratchet_state_and_message.message)
         .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
 
-    let envelope_json = envelope.to_json()
+    let envelope_json = envelope
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndEnvelope{
+    Ok(TripleRatchetStateAndEnvelope {
         ratchet_state: json,
         envelope: envelope_json,
     })
 }
 
-pub fn triple_ratchet_decrypt(ratchet_state_and_envelope: TripleRatchetStateAndEnvelope) -> Result<TripleRatchetStateAndMessage, CryptoError> {
+pub fn triple_ratchet_decrypt(
+    ratchet_state_and_envelope: TripleRatchetStateAndEnvelope,
+) -> Result<TripleRatchetStateAndMessage, CryptoError> {
     let ratchet_state = ratchet_state_and_envelope.ratchet_state.clone();
     let tr = TripleRatchetParticipant::from_json(&ratchet_state)
         .map_err(|e| CryptoError::InvalidState(e.to_string()))?;
@@ -883,21 +1000,28 @@ pub fn triple_ratchet_decrypt(ratchet_state_and_envelope: TripleRatchetStateAndE
     let env = P2PChannelEnvelope::from_json(ratchet_state_and_envelope.envelope)
         .map_err(|e| CryptoError::InvalidEnvelope(e.to_string()))?;
 
-    let result = trp.ratchet_decrypt(&env)
+    let result = trp
+        .ratchet_decrypt(&env)
         .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
 
     let message = result.0;
 
-    let json = trp.to_json()
+    let json = trp
+        .to_json()
         .map_err(|e| CryptoError::SerializationFailed(e.to_string()))?;
 
-    Ok(TripleRatchetStateAndMessage{
+    Ok(TripleRatchetStateAndMessage {
         ratchet_state: json,
         message: message,
     })
 }
 
-pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: u64, total: u64) -> Vec<Vec<u8>> {
+pub fn triple_ratchet_resize(
+    ratchet_state: String,
+    other: String,
+    id: u64,
+    total: u64,
+) -> Vec<Vec<u8>> {
     let tr = TripleRatchetParticipant::from_json(&ratchet_state);
     if tr.is_err() {
         return vec![vec![1]];
@@ -908,7 +1032,9 @@ pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: u64, tota
         return vec![other_bytes.unwrap_err().to_string().as_bytes().to_vec()];
     }
 
-    let result = tr.unwrap().ratchet_resize(other_bytes.unwrap(), id as usize, total as usize);
+    let result = tr
+        .unwrap()
+        .ratchet_resize(other_bytes.unwrap(), id as usize, total as usize);
     if result.is_err() {
         return vec![result.unwrap_err().to_string().as_bytes().to_vec()];
     }
@@ -916,7 +1042,11 @@ pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: u64, tota
     return result.unwrap();
 }
 
-pub fn triple_ratchet_verify_point(ratchet_state: String, point: String, id: usize) -> Result<bool, Box<dyn Error>> {
+pub fn triple_ratchet_verify_point(
+    ratchet_state: String,
+    point: String,
+    id: usize,
+) -> Result<bool, Box<dyn Error>> {
     let tr = TripleRatchetParticipant::from_json(&ratchet_state);
     if tr.is_err() {
         return Err(tr.unwrap_err());
@@ -940,24 +1070,47 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use ed448_goldilocks_plus::{Scalar, elliptic_curve::Group, EdwardsPoint};
-    use protocols::{doubleratchet::P2PChannelEnvelope, tripleratchet::{PeerInfo, TripleRatchetParticipant}};
+    use ed448_goldilocks_plus::{elliptic_curve::Group, EdwardsPoint, Scalar};
+    use protocols::{
+        doubleratchet::P2PChannelEnvelope,
+        tripleratchet::{PeerInfo, TripleRatchetParticipant},
+    };
 
     #[test]
-    fn test_four_party_triple_ratchet_communication() {    
+    fn test_four_party_triple_ratchet_communication() {
         let mut rng = rand::thread_rng();
         let mut keys: Vec<(Scalar, Scalar, Scalar)> = (0..4)
-            .map(|_| (Scalar::random(&mut rng), Scalar::random(&mut rng), Scalar::random(&mut rng)))
+            .map(|_| {
+                (
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                )
+            })
             .collect();
 
-        keys.sort_by(|a, b| (a.0 * EdwardsPoint::generator()).compress().to_bytes().cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes()));
+        keys.sort_by(|a, b| {
+            (a.0 * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes())
+        });
 
         let mut peer_infos: Vec<PeerInfo> = keys
             .iter()
             .map(|(peer_key, identity_key, signed_pre_key)| PeerInfo {
-                public_key: (peer_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                identity_public_key: (identity_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
+                public_key: (peer_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                identity_public_key: (identity_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
             })
             .collect();
 
@@ -965,10 +1118,14 @@ mod tests {
         peer_infos.sort_by(|a, b| a.public_key.cmp(&b.public_key));
 
         let mut participants: Vec<TripleRatchetParticipant> = Vec::new();
-        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
+        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
 
         for i in 0..4 {
             init_messages.insert(peer_infos[i].public_key.clone(), HashMap::new());
@@ -978,7 +1135,9 @@ mod tests {
         }
 
         for i in 0..4 {
-            let other_peers: Vec<PeerInfo> = peer_infos.iter().enumerate()
+            let other_peers: Vec<PeerInfo> = peer_infos
+                .iter()
+                .enumerate()
                 .filter(|&(j, _)| j != i)
                 .map(|(_, peer)| peer.clone())
                 .collect();
@@ -990,20 +1149,29 @@ mod tests {
                 keys[i].2.clone(),
                 3,
                 false,
-            ).unwrap();
-            
+            )
+            .unwrap();
+
             participants.push(participant);
 
             for (j, env) in init_msg.iter() {
-                init_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                init_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
         }
-    
+
         // Exchange initial messages and get frags:
         for i in 0..4 {
-            let result = participants[i].initialize(&init_messages[&peer_infos[i].public_key.clone()]).unwrap();
+            let result = participants[i]
+                .initialize(&init_messages[&peer_infos[i].public_key.clone()])
+                .unwrap();
             for (j, env) in result.iter() {
-                frag_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                frag_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
         }
 
@@ -1012,7 +1180,10 @@ mod tests {
             for (p, envelope) in frag_messages[&peer_infos[i].public_key.clone()].iter() {
                 if let Some(out) = participants[i].receive_poly_frag(&p, envelope).unwrap() {
                     for (j, env) in out.iter() {
-                        commitment_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        commitment_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
@@ -1021,14 +1192,18 @@ mod tests {
         // Exchange commitments and produce reveals:
         for i in 0..4 {
             for (p, envelope) in commitment_messages[&peer_infos[i].public_key.clone()].iter() {
-                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap() {
+                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap()
+                {
                     for (j, env) in reveal_msg.iter() {
-                        reveal_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        reveal_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
         }
-    
+
         // Collect reveals and confirm zkpoks are valid, produce group key:
         for i in 0..4 {
             for (j, env) in reveal_messages[&peer_infos[i].public_key.clone()].iter() {
@@ -1043,13 +1218,18 @@ mod tests {
             "you are a bold one",
             "*mechanical laughter*",
         ];
-    
+
         for (i, message) in test_messages.iter().enumerate() {
             let encrypted = participants[i].ratchet_encrypt(message.as_bytes()).unwrap();
             for j in 0..4 {
                 if i != j {
                     let decrypted = participants[j].ratchet_decrypt(&encrypted).unwrap();
-                    assert_eq!(message.as_bytes(), decrypted.0.as_slice(), "Message decryption failed for Participant {}", j);
+                    assert_eq!(
+                        message.as_bytes(),
+                        decrypted.0.as_slice(),
+                        "Message decryption failed for Participant {}",
+                        j
+                    );
                 }
             }
         }
@@ -1058,37 +1238,70 @@ mod tests {
             for i in 0..4 {
                 let message1 = format!("test 1 {}", i + 1);
                 let message2 = format!("test 2 {}", i + 1);
-                let encrypted1 = participants[i].ratchet_encrypt(message1.as_bytes()).unwrap();
-                let encrypted2 = participants[i].ratchet_encrypt(message2.as_bytes()).unwrap();
+                let encrypted1 = participants[i]
+                    .ratchet_encrypt(message1.as_bytes())
+                    .unwrap();
+                let encrypted2 = participants[i]
+                    .ratchet_encrypt(message2.as_bytes())
+                    .unwrap();
 
                 for j in 0..4 {
                     if i != j {
-                      let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
-                      assert_eq!(message1.as_bytes(), decrypted1.0.as_slice(), "Round message decryption failed for Participant {}", j);
-                      let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
-                      assert_eq!(message2.as_bytes(), decrypted2.0.as_slice(), "Round message decryption failed for Participant {}", j);
+                        let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
+                        assert_eq!(
+                            message1.as_bytes(),
+                            decrypted1.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
+                        let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
+                        assert_eq!(
+                            message2.as_bytes(),
+                            decrypted2.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
                     }
                 }
             }
         }
     }
 
-
     #[test]
     fn test_four_party_triple_ratchet_communication_with_serialization_each_step() {
         let mut rng = rand::thread_rng();
         let mut keys: Vec<(Scalar, Scalar, Scalar)> = (0..4)
-            .map(|_| (Scalar::random(&mut rng), Scalar::random(&mut rng), Scalar::random(&mut rng)))
+            .map(|_| {
+                (
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                )
+            })
             .collect();
 
-        keys.sort_by(|a, b| (a.0 * EdwardsPoint::generator()).compress().to_bytes().cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes()));
+        keys.sort_by(|a, b| {
+            (a.0 * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes())
+        });
 
         let mut peer_infos: Vec<PeerInfo> = keys
             .iter()
             .map(|(peer_key, identity_key, signed_pre_key)| PeerInfo {
-                public_key: (peer_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                identity_public_key: (identity_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
+                public_key: (peer_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                identity_public_key: (identity_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
             })
             .collect();
 
@@ -1096,10 +1309,14 @@ mod tests {
         peer_infos.sort_by(|a, b| a.public_key.cmp(&b.public_key));
 
         let mut participants: Vec<TripleRatchetParticipant> = Vec::new();
-        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
+        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
 
         for i in 0..4 {
             init_messages.insert(peer_infos[i].public_key.clone(), HashMap::new());
@@ -1109,7 +1326,9 @@ mod tests {
         }
 
         for i in 0..4 {
-            let other_peers: Vec<PeerInfo> = peer_infos.iter().enumerate()
+            let other_peers: Vec<PeerInfo> = peer_infos
+                .iter()
+                .enumerate()
                 .filter(|&(j, _)| j != i)
                 .map(|(_, peer)| peer.clone())
                 .collect();
@@ -1121,28 +1340,39 @@ mod tests {
                 keys[i].2.clone(),
                 3,
                 false,
-            ).unwrap();
+            )
+            .unwrap();
 
             for (j, env) in init_msg.iter() {
-                init_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                init_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
 
             let participant_json = participant.to_json();
             if participant_json.is_err() {
                 panic!("bad json");
             }
-            participants.push(TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap());
+            participants
+                .push(TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap());
         }
-    
+
         // Exchange initial messages and get frags:
         for i in 0..4 {
-            let result = participants[i].initialize(&init_messages[&peer_infos[i].public_key.clone()]).unwrap();
+            let result = participants[i]
+                .initialize(&init_messages[&peer_infos[i].public_key.clone()])
+                .unwrap();
             for (j, env) in result.iter() {
-                frag_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                frag_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
 
             let participant_json = participants[i].to_json();
-            participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+            participants[i] =
+                TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
         }
 
         // Exchange frags and receive commitments once all frags have been distributed:
@@ -1150,27 +1380,36 @@ mod tests {
             for (p, envelope) in frag_messages[&peer_infos[i].public_key.clone()].iter() {
                 if let Some(out) = participants[i].receive_poly_frag(&p, envelope).unwrap() {
                     for (j, env) in out.iter() {
-                        commitment_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        commitment_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
 
             let participant_json = participants[i].to_json();
-            participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+            participants[i] =
+                TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
         }
 
         // Exchange commitments and produce reveals:
         for i in 0..4 {
             for (p, envelope) in commitment_messages[&peer_infos[i].public_key.clone()].iter() {
-                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap() {
+                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap()
+                {
                     for (j, env) in reveal_msg.iter() {
-                        reveal_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        reveal_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
 
             let participant_json = participants[i].to_json();
-            participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+            participants[i] =
+                TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
         }
 
         // Collect reveals and confirm zkpoks are valid, produce group key:
@@ -1179,7 +1418,8 @@ mod tests {
                 participants[i].recombine(j, &env.clone()).unwrap();
 
                 let participant_json = participants[i].to_json();
-                participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+                participants[i] =
+                    TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
             }
         }
 
@@ -1196,32 +1436,53 @@ mod tests {
             for j in 0..4 {
                 if i != j {
                     let decrypted = participants[j].ratchet_decrypt(&encrypted).unwrap();
-                    assert_eq!(message.as_bytes(), decrypted.0.as_slice(), "Message decryption failed for Participant {}", j);
+                    assert_eq!(
+                        message.as_bytes(),
+                        decrypted.0.as_slice(),
+                        "Message decryption failed for Participant {}",
+                        j
+                    );
                 }
             }
 
             let participant_json = participants[i].to_json();
-            participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+            participants[i] =
+                TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
         }
 
         for _ in 0..5 {
             for i in 0..4 {
                 let message1 = format!("test 1 {}", i + 1);
                 let message2 = format!("test 2 {}", i + 1);
-                let encrypted1 = participants[i].ratchet_encrypt(message1.as_bytes()).unwrap();
-                let encrypted2 = participants[i].ratchet_encrypt(message2.as_bytes()).unwrap();
+                let encrypted1 = participants[i]
+                    .ratchet_encrypt(message1.as_bytes())
+                    .unwrap();
+                let encrypted2 = participants[i]
+                    .ratchet_encrypt(message2.as_bytes())
+                    .unwrap();
 
                 for j in 0..4 {
                     if i != j {
-                      let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
-                      assert_eq!(message1.as_bytes(), decrypted1.0.as_slice(), "Round message decryption failed for Participant {}", j);
-                      let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
-                      assert_eq!(message2.as_bytes(), decrypted2.0.as_slice(), "Round message decryption failed for Participant {}", j);
+                        let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
+                        assert_eq!(
+                            message1.as_bytes(),
+                            decrypted1.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
+                        let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
+                        assert_eq!(
+                            message2.as_bytes(),
+                            decrypted2.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
                     }
                 }
 
                 let participant_json = participants[i].to_json();
-                participants[i] = TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
+                participants[i] =
+                    TripleRatchetParticipant::from_json(&participant_json.unwrap()).unwrap();
             }
         }
     }
@@ -1230,17 +1491,37 @@ mod tests {
     fn test_four_party_async_triple_ratchet_communication() {
         let mut rng = rand::thread_rng();
         let mut keys: Vec<(Scalar, Scalar, Scalar)> = (0..4)
-            .map(|_| (Scalar::random(&mut rng), Scalar::random(&mut rng), Scalar::random(&mut rng)))
+            .map(|_| {
+                (
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                    Scalar::random(&mut rng),
+                )
+            })
             .collect();
 
-        keys.sort_by(|a, b| (a.0 * EdwardsPoint::generator()).compress().to_bytes().cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes()));
+        keys.sort_by(|a, b| {
+            (a.0 * EdwardsPoint::generator())
+                .compress()
+                .to_bytes()
+                .cmp(&(b.0 * EdwardsPoint::generator()).compress().to_bytes())
+        });
 
         let mut peer_infos: Vec<PeerInfo> = keys
             .iter()
             .map(|(peer_key, identity_key, signed_pre_key)| PeerInfo {
-                public_key: (peer_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                identity_public_key: (identity_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
-                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator()).compress().to_bytes().to_vec(),
+                public_key: (peer_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                identity_public_key: (identity_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
+                signed_pre_public_key: (signed_pre_key * EdwardsPoint::generator())
+                    .compress()
+                    .to_bytes()
+                    .to_vec(),
             })
             .collect();
 
@@ -1248,10 +1529,14 @@ mod tests {
         peer_infos.sort_by(|a, b| a.public_key.cmp(&b.public_key));
 
         let mut participants: Vec<TripleRatchetParticipant> = Vec::new();
-        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
-        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> = HashMap::new();
+        let mut init_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut frag_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut commitment_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
+        let mut reveal_messages: HashMap<Vec<u8>, HashMap<Vec<u8>, P2PChannelEnvelope>> =
+            HashMap::new();
 
         for i in 0..4 {
             init_messages.insert(peer_infos[i].public_key.clone(), HashMap::new());
@@ -1261,7 +1546,9 @@ mod tests {
         }
 
         for i in 0..4 {
-            let other_peers: Vec<PeerInfo> = peer_infos.iter().enumerate()
+            let other_peers: Vec<PeerInfo> = peer_infos
+                .iter()
+                .enumerate()
                 .filter(|&(j, _)| j != i)
                 .map(|(_, peer)| peer.clone())
                 .collect();
@@ -1273,20 +1560,29 @@ mod tests {
                 keys[i].2.clone(),
                 2,
                 true,
-            ).unwrap();
-            
+            )
+            .unwrap();
+
             participants.push(participant);
 
             for (j, env) in init_msg.iter() {
-                init_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                init_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
         }
 
         // Exchange initial messages and get frags:
         for i in 0..4 {
-            let result = participants[i].initialize(&init_messages[&peer_infos[i].public_key.clone()]).unwrap();
+            let result = participants[i]
+                .initialize(&init_messages[&peer_infos[i].public_key.clone()])
+                .unwrap();
             for (j, env) in result.iter() {
-                frag_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                frag_messages
+                    .get_mut(j)
+                    .unwrap()
+                    .insert(peer_infos[i].public_key.clone(), env.clone());
             }
         }
 
@@ -1295,7 +1591,10 @@ mod tests {
             for (p, envelope) in frag_messages[&peer_infos[i].public_key.clone()].iter() {
                 if let Some(out) = participants[i].receive_poly_frag(&p, envelope).unwrap() {
                     for (j, env) in out.iter() {
-                        commitment_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        commitment_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
@@ -1304,9 +1603,13 @@ mod tests {
         // Exchange commitments and produce reveals:
         for i in 0..4 {
             for (p, envelope) in commitment_messages[&peer_infos[i].public_key.clone()].iter() {
-                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap() {
+                if let Some(reveal_msg) = participants[i].receive_commitment(&p, envelope).unwrap()
+                {
                     for (j, env) in reveal_msg.iter() {
-                        reveal_messages.get_mut(j).unwrap().insert(peer_infos[i].public_key.clone(), env.clone());
+                        reveal_messages
+                            .get_mut(j)
+                            .unwrap()
+                            .insert(peer_infos[i].public_key.clone(), env.clone());
                     }
                 }
             }
@@ -1332,7 +1635,12 @@ mod tests {
             for j in 0..4 {
                 if i != j {
                     let decrypted = participants[j].ratchet_decrypt(&encrypted).unwrap();
-                    assert_eq!(message.as_bytes(), decrypted.0.as_slice(), "Message decryption failed for Participant {}", j);
+                    assert_eq!(
+                        message.as_bytes(),
+                        decrypted.0.as_slice(),
+                        "Message decryption failed for Participant {}",
+                        j
+                    );
                 }
             }
         }
@@ -1341,15 +1649,29 @@ mod tests {
             for i in 0..4 {
                 let message1 = format!("test 1 {}", i + 1);
                 let message2 = format!("test 2 {}", i + 1);
-                let encrypted1 = participants[i].ratchet_encrypt(message1.as_bytes()).unwrap();
-                let encrypted2 = participants[i].ratchet_encrypt(message2.as_bytes()).unwrap();
+                let encrypted1 = participants[i]
+                    .ratchet_encrypt(message1.as_bytes())
+                    .unwrap();
+                let encrypted2 = participants[i]
+                    .ratchet_encrypt(message2.as_bytes())
+                    .unwrap();
 
                 for j in 0..4 {
                     if i != j {
-                      let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
-                      assert_eq!(message1.as_bytes(), decrypted1.0.as_slice(), "Round message decryption failed for Participant {}", j);
-                      let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
-                      assert_eq!(message2.as_bytes(), decrypted2.0.as_slice(), "Round message decryption failed for Participant {}", j);
+                        let decrypted1 = participants[j].ratchet_decrypt(&encrypted1).unwrap();
+                        assert_eq!(
+                            message1.as_bytes(),
+                            decrypted1.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
+                        let decrypted2 = participants[j].ratchet_decrypt(&encrypted2).unwrap();
+                        assert_eq!(
+                            message2.as_bytes(),
+                            decrypted2.0.as_slice(),
+                            "Round message decryption failed for Participant {}",
+                            j
+                        );
                     }
                 }
             }

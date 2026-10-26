@@ -34,7 +34,7 @@ pub const TYPE_BLS48581_ADDRESSED_SIGNATURE: u32 = 0x011B;
 pub const MAX_ADDRESSED_SIG_LEN: usize = 4 + 4 + (666 + 516) + 4 + 32; // 1226
 
 // Re-export from the crate-wide canonical cursor module.
-pub(crate) use crate::canonical_cursor::{put_u32, read_u32, read_bytes};
+pub(crate) use crate::canonical_cursor::{put_u32, read_bytes, read_u32};
 
 // =====================================================================
 // AddressedSignature
@@ -130,7 +130,10 @@ mod tests {
         let sig = sample_single_sig();
         let bytes = sig.to_canonical_bytes().unwrap();
         // 4 type + 4 sig_len + 666 sig + 4 addr_len + 32 addr = 710
-        assert_eq!(bytes.len(), 4 + 4 + AddressedSignature::SIG_LEN_SINGLE + 4 + 32);
+        assert_eq!(
+            bytes.len(),
+            4 + 4 + AddressedSignature::SIG_LEN_SINGLE + 4 + 32
+        );
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x01, 0x1B]);
         let restored = AddressedSignature::from_canonical_bytes(&bytes).unwrap();
         assert_eq!(restored, sig);

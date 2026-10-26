@@ -11,8 +11,7 @@ use super::prover_ops::ProverKick;
 // Re-use the authoritative type-prefix constants from `frame_header`
 // (Go `canonical_types.go:49-50`).
 use super::frame_header::{
-    TYPE_FRAME_HEADER as FRAME_HEADER_TYPE,
-    TYPE_GLOBAL_FRAME_HEADER as GLOBAL_FRAME_HEADER_TYPE,
+    TYPE_FRAME_HEADER as FRAME_HEADER_TYPE, TYPE_GLOBAL_FRAME_HEADER as GLOBAL_FRAME_HEADER_TYPE,
 };
 
 /// Verify that a ProverKick's conflicting frames constitute a valid
@@ -58,16 +57,10 @@ pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
     // Parse both frames and extract frame numbers + outputs
     match tp1 {
         GLOBAL_FRAME_HEADER_TYPE => {
-            verify_global_frame_equivocation(
-                &kick.conflicting_frame_1,
-                &kick.conflicting_frame_2,
-            )
+            verify_global_frame_equivocation(&kick.conflicting_frame_1, &kick.conflicting_frame_2)
         }
         FRAME_HEADER_TYPE => {
-            verify_app_frame_equivocation(
-                &kick.conflicting_frame_1,
-                &kick.conflicting_frame_2,
-            )
+            verify_app_frame_equivocation(&kick.conflicting_frame_1, &kick.conflicting_frame_2)
         }
         _ => Ok(false),
     }
@@ -134,21 +127,25 @@ pub fn verify_prover_kick_full(
         Err(e) => {
             let candidates = clock_store
                 .range_global_clock_frame_candidates(frame_number - 1, frame_number - 1, 1)
-                .map_err(|range_e| QuilError::InvalidArgument(format!(
-                    "prover kick: previous frame {} not certified ({e}) and \
+                .map_err(|range_e| {
+                    QuilError::InvalidArgument(format!(
+                        "prover kick: previous frame {} not certified ({e}) and \
                      candidate fallback failed: {range_e}",
-                    frame_number - 1,
-                )))?;
-            candidates.into_iter().next().ok_or_else(|| QuilError::InvalidArgument(format!(
-                "prover kick: previous frame {} not certified ({e}) and \
+                        frame_number - 1,
+                    ))
+                })?;
+            candidates.into_iter().next().ok_or_else(|| {
+                QuilError::InvalidArgument(format!(
+                    "prover kick: previous frame {} not certified ({e}) and \
                  no candidates available",
-                frame_number - 1,
-            )))?
+                    frame_number - 1,
+                ))
+            })?
         }
     };
-    let prev_header = prev_frame.header.ok_or_else(|| QuilError::InvalidArgument(
-        "prover kick: previous frame has no header".into(),
-    ))?;
+    let prev_header = prev_frame.header.ok_or_else(|| {
+        QuilError::InvalidArgument("prover kick: previous frame has no header".into())
+    })?;
     let reward_root = prev_header.prover_tree_commitment;
     if reward_root.is_empty() {
         return Err(QuilError::InvalidArgument(
@@ -167,9 +164,7 @@ pub fn verify_prover_kick_full(
     if !use_forest {
         // Parse the kick's traversal proof bytes via the same Go-format
         // decoder used by mint PoMW.
-        let traversal = crate::traversal_proof::parse_traversal_proof(
-            &kick.traversal_proof,
-        )?;
+        let traversal = crate::traversal_proof::parse_traversal_proof(&kick.traversal_proof)?;
         let traversal_ok = crate::traversal_proof::verify_traversal_proof(
             inclusion_prover,
             &reward_root,
@@ -183,22 +178,21 @@ pub fn verify_prover_kick_full(
 
         // Multiproof verify: the kicked prover's PublicKey + Status=1 must
         // verify against the kick's commitment + proof.
-        let evals: Vec<Vec<u8>> = vec![
-            kick.kicked_prover_public_key.clone(),
-            vec![1u8],
-        ];
+        let evals: Vec<Vec<u8>> = vec![kick.kicked_prover_public_key.clone(), vec![1u8]];
         let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
         let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
         // Schema-driven field-order lookup keeps indices in lockstep with the
         // source-of-truth schema (a reorder must not silently diverge nodes).
-        let pk_tag = crate::global_schema::field_tag("prover:Prover", "PublicKey")
-            .ok_or_else(|| QuilError::Internal(
-                "ProverKick: prover:Prover.PublicKey missing from schema".into(),
-            ))?;
-        let status_tag = crate::global_schema::field_tag("prover:Prover", "Status")
-            .ok_or_else(|| QuilError::Internal(
-                "ProverKick: prover:Prover.Status missing from schema".into(),
-            ))?;
+        let pk_tag =
+            crate::global_schema::field_tag("prover:Prover", "PublicKey").ok_or_else(|| {
+                QuilError::Internal(
+                    "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+                )
+            })?;
+        let status_tag =
+            crate::global_schema::field_tag("prover:Prover", "Status").ok_or_else(|| {
+                QuilError::Internal("ProverKick: prover:Prover.Status missing from schema".into())
+            })?;
         let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
         if !inclusion_prover.verify_multiple(
             &commit_refs,
@@ -222,31 +216,33 @@ pub fn verify_prover_kick_full(
                 "prover kick: prover_tree_commitment is not a 32-byte forest root".into(),
             )
         })?;
-        let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
-            &kick.kicked_prover_public_key,
-        )?;
+        let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
         let mut vertex_id = [0u8; 64];
         vertex_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
         vertex_id[32..].copy_from_slice(&prover_addr);
-        let pk_key = crate::global_schema::field_key("prover:Prover", "PublicKey")
-            .ok_or_else(|| QuilError::Internal(
-                "ProverKick: prover:Prover.PublicKey missing from schema".into(),
-            ))?;
-        let status_key = crate::global_schema::field_key("prover:Prover", "Status")
-            .ok_or_else(|| QuilError::Internal(
-                "ProverKick: prover:Prover.Status missing from schema".into(),
-            ))?;
+        let pk_key =
+            crate::global_schema::field_key("prover:Prover", "PublicKey").ok_or_else(|| {
+                QuilError::Internal(
+                    "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+                )
+            })?;
+        let status_key =
+            crate::global_schema::field_key("prover:Prover", "Status").ok_or_else(|| {
+                QuilError::Internal("ProverKick: prover:Prover.Status missing from schema".into())
+            })?;
         let expected = vec![
             (pk_key, kick.kicked_prover_public_key.clone()),
             (status_key, vec![1u8]),
         ];
-        let mp = quil_forest::MembershipProof::from_bytes(&kick.traversal_proof)
-            .map_err(|e| QuilError::InvalidArgument(format!(
-                "prover kick: decode forest membership proof: {}", e
-            )))?;
-        let vertex = mp.inputs.first().ok_or_else(|| QuilError::InvalidArgument(
-            "prover kick: forest membership proof has no vertex".into(),
-        ))?;
+        let mp = quil_forest::MembershipProof::from_bytes(&kick.traversal_proof).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "prover kick: decode forest membership proof: {}",
+                e
+            ))
+        })?;
+        let vertex = mp.inputs.first().ok_or_else(|| {
+            QuilError::InvalidArgument("prover kick: forest membership proof has no vertex".into())
+        })?;
         if vertex.vertex_address != vertex_id {
             return Err(QuilError::InvalidArgument(
                 "prover kick: forest proof vertex address != kicked prover's vertex".into(),
@@ -254,7 +250,8 @@ pub fn verify_prover_kick_full(
         }
         quil_forest::verify_vertex_membership(&root32, vertex, &expected).map_err(|e| {
             QuilError::InvalidArgument(format!(
-                "prover kick: forest membership failed (prover not present/active): {}", e
+                "prover kick: forest membership failed (prover not present/active): {}",
+                e
             ))
         })?;
     }
@@ -274,9 +271,8 @@ pub fn verify_prover_kick_full(
     // validated before any changeset would be applied, so going
     // through HypergraphState's changeset layer adds no value and
     // the CRDT doesn't impl Clone needed for Arc-wrapping).
-    let prover_addr_bytes = quil_crypto::poseidon::hash_bytes_to_32(
-        &kick.kicked_prover_public_key,
-    )?;
+    let prover_addr_bytes =
+        quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
     let mut prover_loc_id = [0u8; 64];
     prover_loc_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
     prover_loc_id[32..].copy_from_slice(&prover_addr_bytes);
@@ -293,7 +289,8 @@ pub fn verify_prover_kick_full(
                         return Err(QuilError::InvalidArgument(
                             "ProverKick: kicked prover already has Status=4 — \
                              refusing to double-kick (avoids consensus split on \
-                             whether the materialize was a no-op)".into(),
+                             whether the materialize was a no-op)"
+                                .into(),
                         ));
                     }
                 }
@@ -312,9 +309,11 @@ pub fn verify_prover_kick_full(
     //      `global_prover_kick.go:597-643`).
     // Without (1), anyone could sign two conflicting frames with their own
     // key, set the victim's bit, and evict an honest prover.
-    let pr = prover_registry.ok_or_else(|| QuilError::InvalidArgument(
-        "ProverKick: prover registry unavailable — cannot bind signers to the committee".into(),
-    ))?;
+    let pr = prover_registry.ok_or_else(|| {
+        QuilError::InvalidArgument(
+            "ProverKick: prover registry unavailable — cannot bind signers to the committee".into(),
+        )
+    })?;
     let (filter1, bitmask1) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_1)?;
     let (filter2, bitmask2) = extract_kick_frame_filter_and_bitmask(&kick.conflicting_frame_2)?;
     if filter1 != filter2 {
@@ -343,9 +342,11 @@ pub fn verify_kick_frame_signers(
     let (_, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
     let mut keys: Vec<&[u8]> = Vec::new();
     for index in quil_consensus::bitmask::set_bit_indices(&agg.bitmask) {
-        let prover = active.get(index).ok_or_else(|| QuilError::InvalidArgument(
-            "ProverKick: conflicting frame bitmask names a non-committee index".into(),
-        ))?;
+        let prover = active.get(index).ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "ProverKick: conflicting frame bitmask names a non-committee index".into(),
+            )
+        })?;
         keys.push(prover.public_key.as_slice());
     }
     if keys.is_empty() {
@@ -356,7 +357,11 @@ pub fn verify_kick_frame_signers(
     let expected = bls.aggregate_public_keys(&keys).map_err(|e| {
         QuilError::InvalidArgument(format!("ProverKick: committee key aggregation failed: {e}"))
     })?;
-    let declared = agg.public_key.as_ref().map(|k| k.key_value.as_slice()).unwrap_or(&[]);
+    let declared = agg
+        .public_key
+        .as_ref()
+        .map(|k| k.key_value.as_slice())
+        .unwrap_or(&[]);
     if expected.as_slice() != declared {
         return Err(QuilError::InvalidArgument(
             "ProverKick: conflicting frame's declared signer keys are not the committee members its bitmask names".into(),
@@ -390,20 +395,21 @@ pub fn verify_kick_bitmask_overlap(
     prover_registry: &dyn quil_types::consensus::ProverRegistry,
     frame_number: u64,
 ) -> Result<()> {
-    let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
-        &kick.kicked_prover_public_key,
-    )?;
+    let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(&kick.kicked_prover_public_key)?;
     let active = prover_registry
         .get_active_provers(prover_filter, frame_number)
-        .map_err(|e| QuilError::InvalidArgument(format!(
-            "ProverKick: get_active_provers failed: {e}"
-        )))?;
+        .map_err(|e| {
+            QuilError::InvalidArgument(format!("ProverKick: get_active_provers failed: {e}"))
+        })?;
     let index = active
         .iter()
         .position(|p| p.address.as_slice() == prover_addr.as_slice())
-        .ok_or_else(|| QuilError::InvalidArgument(
-            "ProverKick: kicked prover not in active set for the conflicting frames' filter".into(),
-        ))?;
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "ProverKick: kicked prover not in active set for the conflicting frames' filter"
+                    .into(),
+            )
+        })?;
     let byte_index = index / 8;
     let bit_index = index % 8;
     let b = 1u8 << bit_index;
@@ -425,9 +431,7 @@ pub fn verify_kick_bitmask_overlap(
 /// `TYPE_GLOBAL_FRAME_HEADER` the "filter" is the empty address (global
 /// frames are not per-shard). For `TYPE_FRAME_HEADER` (app shard) it's
 /// the header's `address` field.
-pub fn extract_kick_frame_filter_and_bitmask(
-    frame_bytes: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn extract_kick_frame_filter_and_bitmask(frame_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let (filter, agg) = kick_frame_filter_and_aggregate(frame_bytes)?;
     Ok((filter, agg.bitmask))
 }
@@ -435,7 +439,10 @@ pub fn extract_kick_frame_filter_and_bitmask(
 /// `(filter_or_address, aggregate signature)` of one conflicting frame.
 fn kick_frame_filter_and_aggregate(
     frame_bytes: &[u8],
-) -> Result<(Vec<u8>, crate::hypergraph_intrinsic::canonical::AggregateSignature)> {
+) -> Result<(
+    Vec<u8>,
+    crate::hypergraph_intrinsic::canonical::AggregateSignature,
+)> {
     if frame_bytes.len() < 4 {
         return Err(QuilError::InvalidArgument(
             "ProverKick: conflicting frame too short".into(),
@@ -458,7 +465,8 @@ fn kick_frame_filter_and_aggregate(
         Ok((header.address, agg))
     } else {
         Err(QuilError::InvalidArgument(format!(
-            "ProverKick: conflicting frame has unknown type prefix 0x{:08x}", tp
+            "ProverKick: conflicting frame has unknown type prefix 0x{:08x}",
+            tp
         )))
     }
 }
@@ -490,7 +498,8 @@ fn verify_conflicting_frame_bls(
         }
     } else {
         return Err(QuilError::InvalidArgument(format!(
-            "prover kick: unrecognized frame type 0x{:08x}", frame_type
+            "prover kick: unrecognized frame type 0x{:08x}",
+            frame_type
         )));
     }
     Ok(())
@@ -504,17 +513,16 @@ fn decode_aggregate_signature_to_proto(
     if nested_bytes.is_empty() {
         return Ok(None);
     }
-    let local =
-        crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
-            nested_bytes,
-        )?;
+    let local = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
+        nested_bytes,
+    )?;
     Ok(Some(quil_types::proto::keys::Bls48581AggregateSignature {
         signature: local.signature,
-        public_key: local.public_key.map(|pk| {
-            quil_types::proto::keys::Bls48581g2PublicKey {
+        public_key: local
+            .public_key
+            .map(|pk| quil_types::proto::keys::Bls48581g2PublicKey {
                 key_value: pk.key_value,
-            }
-        }),
+            }),
         bitmask: local.bitmask,
     }))
 }
@@ -599,9 +607,7 @@ fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool
     }
 
     // Both must have BLS signatures
-    if h1.public_key_signature_bls48581.is_none()
-        || h2.public_key_signature_bls48581.is_none()
-    {
+    if h1.public_key_signature_bls48581.is_none() || h2.public_key_signature_bls48581.is_none() {
         return Ok(false);
     }
 
@@ -610,7 +616,6 @@ fn verify_global_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool
 
 /// Verify equivocation between two FrameHeaders (app shard frames).
 fn verify_app_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
-
     let h1 = match decode_app_header_from_canonical(frame1) {
         Some(h) => h,
         None => return Ok(false),
@@ -636,9 +641,7 @@ fn verify_app_frame_equivocation(frame1: &[u8], frame2: &[u8]) -> Result<bool> {
     }
 
     // Both must have BLS signatures
-    if h1.public_key_signature_bls48581.is_none()
-        || h2.public_key_signature_bls48581.is_none()
-    {
+    if h1.public_key_signature_bls48581.is_none() || h2.public_key_signature_bls48581.is_none() {
         return Ok(false);
     }
 
@@ -654,7 +657,9 @@ fn decode_global_header_from_canonical(
 ) -> Option<quil_types::proto::global::GlobalFrameHeader> {
     // Use the existing canonical-bytes decoder from the global_engine module
     // For now, try protobuf decode after skipping the 4-byte type prefix
-    if data.len() < 12 { return None; }
+    if data.len() < 12 {
+        return None;
+    }
 
     // The canonical format stores fields as big-endian length-prefixed.
     // For structural equivocation check, we need frame_number and output.
@@ -662,47 +667,67 @@ fn decode_global_header_from_canonical(
     let mut cursor = 4usize; // skip type prefix
 
     // frame_number: u64
-    if cursor + 8 > data.len() { return None; }
-    let frame_number = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let frame_number = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // rank: u64
-    if cursor + 8 > data.len() { return None; }
-    let rank = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let rank = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // timestamp: i64
-    if cursor + 8 > data.len() { return None; }
-    let timestamp = i64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let timestamp = i64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // difficulty: u32
-    if cursor + 4 > data.len() { return None; }
-    let difficulty = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?);
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let difficulty = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?);
     cursor += 4;
 
     // output: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let output_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let output_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + output_len > data.len() { return None; }
-    let output = data[cursor..cursor+output_len].to_vec();
+    if cursor + output_len > data.len() {
+        return None;
+    }
+    let output = data[cursor..cursor + output_len].to_vec();
     cursor += output_len;
 
     // parent_selector: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let ps_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let ps_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + ps_len > data.len() { return None; }
-    let parent_selector = data[cursor..cursor+ps_len].to_vec();
+    if cursor + ps_len > data.len() {
+        return None;
+    }
+    let parent_selector = data[cursor..cursor + ps_len].to_vec();
     cursor += ps_len;
 
     // prover: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let prover_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let prover_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + prover_len > data.len() { return None; }
-    let prover = data[cursor..cursor+prover_len].to_vec();
+    if cursor + prover_len > data.len() {
+        return None;
+    }
+    let prover = data[cursor..cursor + prover_len].to_vec();
     cursor += prover_len;
 
     // For signature presence check, we need to scan further but at minimum
@@ -727,32 +752,42 @@ fn decode_global_header_from_canonical(
 }
 
 /// Try to decode a FrameHeader from canonical bytes.
-fn decode_app_header_from_canonical(
-    data: &[u8],
-) -> Option<quil_types::proto::global::FrameHeader> {
-    if data.len() < 12 { return None; }
+fn decode_app_header_from_canonical(data: &[u8]) -> Option<quil_types::proto::global::FrameHeader> {
+    if data.len() < 12 {
+        return None;
+    }
 
     let mut cursor = 4usize; // skip type prefix
 
     // frame_number: u64
-    if cursor + 8 > data.len() { return None; }
-    let frame_number = u64::from_be_bytes(data[cursor..cursor+8].try_into().ok()?);
+    if cursor + 8 > data.len() {
+        return None;
+    }
+    let frame_number = u64::from_be_bytes(data[cursor..cursor + 8].try_into().ok()?);
     cursor += 8;
 
     // address: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let addr_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let addr_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + addr_len > data.len() { return None; }
-    let address = data[cursor..cursor+addr_len].to_vec();
+    if cursor + addr_len > data.len() {
+        return None;
+    }
+    let address = data[cursor..cursor + addr_len].to_vec();
     cursor += addr_len;
 
     // output: length-prefixed
-    if cursor + 4 > data.len() { return None; }
-    let output_len = u32::from_be_bytes(data[cursor..cursor+4].try_into().ok()?) as usize;
+    if cursor + 4 > data.len() {
+        return None;
+    }
+    let output_len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().ok()?) as usize;
     cursor += 4;
-    if cursor + output_len > data.len() { return None; }
-    let output = data[cursor..cursor+output_len].to_vec();
+    if cursor + output_len > data.len() {
+        return None;
+    }
+    let output = data[cursor..cursor + output_len].to_vec();
     cursor += output_len;
 
     let has_signature = cursor < data.len();
@@ -875,8 +910,8 @@ mod tests {
     // extract_kick_frame_filter_and_bitmask
     // -----------------------------------------------------------------
 
-    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
     use crate::global_intrinsic::frame_header::FrameHeader;
+    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
 
     fn agg_sig_bytes(bitmask: &[u8]) -> Vec<u8> {
         AggregateSignature {
@@ -922,22 +957,36 @@ mod tests {
     }
 
     fn committee(seeds: &[u8]) -> Vec<ProverInfo> {
-        seeds.iter().map(|&seed| {
-            let key = committee_key(seed);
-            let mut info = fake_prover_info(quil_crypto::poseidon::hash_bytes_to_32(&key).unwrap());
-            info.public_key = key;
-            info
-        }).collect()
+        seeds
+            .iter()
+            .map(|&seed| {
+                let key = committee_key(seed);
+                let mut info =
+                    fake_prover_info(quil_crypto::poseidon::hash_bytes_to_32(&key).unwrap());
+                info.public_key = key;
+                info
+            })
+            .collect()
     }
 
     fn app_frame_with_declared_keys(bitmask: &[u8], declared: Option<Vec<u8>>) -> Vec<u8> {
         let mut bytes = app_frame_bytes(&[0x22u8; 32], bitmask);
         let mut header = FrameHeader::from_canonical_bytes(&bytes).unwrap();
         header.public_key_signature_bls48581 = AggregateSignature {
-            signature: vec![0xABu8; 666 * bitmask.iter().map(|b| b.count_ones() as usize).sum::<usize>()],
-            public_key: declared.map(|key_value| crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey { key_value }),
+            signature: vec![
+                0xABu8;
+                666 * bitmask
+                    .iter()
+                    .map(|b| b.count_ones() as usize)
+                    .sum::<usize>()
+            ],
+            public_key: declared.map(|key_value| {
+                crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey { key_value }
+            }),
             bitmask: bitmask.to_vec(),
-        }.to_canonical_bytes().unwrap();
+        }
+        .to_canonical_bytes()
+        .unwrap();
         bytes = header.to_canonical_bytes().unwrap();
         bytes
     }
@@ -957,18 +1006,28 @@ mod tests {
     fn kick_signers_reject_a_foreign_key_behind_a_committee_bit() {
         let active = committee(&[1, 2, 3]);
         let frame = app_frame_with_declared_keys(&[0b0000_0010], Some(committee_key(0x99)));
-        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
         // Right keys in the wrong order are rejected too.
         let swapped = [committee_key(3), committee_key(1)].concat();
         let frame = app_frame_with_declared_keys(&[0b0000_0101], Some(swapped));
-        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
         // Missing declared key, empty bitmask, and out-of-committee indices.
         let frame = app_frame_with_declared_keys(&[0b0000_0001], None);
-        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
         let frame = app_frame_with_declared_keys(&[0], Some(committee_key(1)));
-        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
         let frame = app_frame_with_declared_keys(&[0b0000_1000], Some(committee_key(4)));
-        assert!(verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err());
+        assert!(
+            verify_kick_frame_signers(&frame, &active, &quil_crypto::FalconKeyConstructor).is_err()
+        );
     }
 
     #[test]
@@ -997,9 +1056,7 @@ mod tests {
     // verify_kick_bitmask_overlap
     // -----------------------------------------------------------------
 
-    use quil_types::consensus::{
-        ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
-    };
+    use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
 
     struct FixedRegistry {
         active: Vec<ProverInfo>,
@@ -1019,14 +1076,24 @@ mod tests {
     }
 
     impl ProverRegistry for FixedRegistry {
-        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
         fn get_active_provers(&self, _: &[u8], _: u64) -> Result<Vec<ProverInfo>> {
             Ok(self.active.clone())
         }
-        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(self.active.len()) }
-        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(self.active.clone()) }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> {
+            Ok(self.active.len())
+        }
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> {
+            Ok(self.active.clone())
+        }
         fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> {
             Ok(vec![])
         }
@@ -1052,7 +1119,9 @@ mod tests {
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
         // Put the kicked prover at index 0.
-        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
         // bit 0 set in both bitmasks.
         let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
@@ -1063,7 +1132,9 @@ mod tests {
     fn bitmask_overlap_rejects_when_one_frame_misses_signer() {
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
-        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
         // frame 1 has bit 0; frame 2 does not.
         let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b0], &reg, 0);
@@ -1075,7 +1146,9 @@ mod tests {
         let pubkey = vec![0x55u8; 585];
         // Active set contains a DIFFERENT prover.
         let other_addr = [0x99u8; 32];
-        let reg = FixedRegistry { active: vec![fake_prover_info(other_addr)] };
+        let reg = FixedRegistry {
+            active: vec![fake_prover_info(other_addr)],
+        };
         let kick = kick_for_pubkey(pubkey);
         let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
         assert!(r.is_err());
@@ -1086,8 +1159,7 @@ mod tests {
         // Place the kicked prover at index 9 → byte 1, bit 1.
         let pubkey = vec![0x55u8; 585];
         let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
-        let mut active: Vec<ProverInfo> =
-            (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
+        let mut active: Vec<ProverInfo> = (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
         active.push(fake_prover_info(addr)); // index 9
         let reg = FixedRegistry { active };
         let kick = kick_for_pubkey(pubkey);

@@ -15,7 +15,6 @@
 //! versa, modulo the listen-multiaddr fields which we don't track
 //! (they're empty strings in the encoding — same on-disk shape).
 
-
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{PersistedWorkerInfo, WorkerStore};
 
@@ -182,15 +181,27 @@ impl WorkerStore for RocksWorkerStore {
 
     fn range_workers(&self) -> Result<Vec<PersistedWorkerInfo>> {
         let lower = [WORKER, WORKER_BY_CORE, 0x00, 0, 0, 0, 0, 0, 0, 0];
-        let upper = [WORKER, WORKER_BY_CORE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let upper = [
+            WORKER,
+            WORKER_BY_CORE,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+        ];
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_iterate_lower_bound(lower.to_vec());
         read_opts.set_iterate_upper_bound(upper.to_vec());
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         let mut out = Vec::new();
         for item in iter {
-            let (_k, v) = item
-                .map_err(|e| QuilError::Store(format!("range_workers: {}", e)))?;
+            let (_k, v) = item.map_err(|e| QuilError::Store(format!("range_workers: {}", e)))?;
             out.push(decode(&v)?);
         }
         out.sort_by_key(|w| w.core_id);

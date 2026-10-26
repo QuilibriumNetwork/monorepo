@@ -44,7 +44,11 @@ impl RewardIssuance for PomwIssuance {
                     .values()
                     .map(|a| {
                         crate::pricing::allocation_ring_reward(
-                            &basis, &BigInt::from(a.state_size), &world, a.ring, a.shards,
+                            &basis,
+                            &BigInt::from(a.state_size),
+                            &world,
+                            a.ring,
+                            a.shards,
                         )
                     })
                     .sum::<BigInt>()
@@ -63,7 +67,10 @@ fn seat(header: usize, member: usize) -> Seat {
     public_key[0] = header as u8;
     public_key[1] = member as u8;
     let address = materialize::prover_address_from_pubkey(&public_key).unwrap();
-    Seat { public_key, address }
+    Seat {
+        public_key,
+        address,
+    }
 }
 
 fn shard_filter(header: usize) -> Vec<u8> {
@@ -78,13 +85,19 @@ fn open_state(db: &quil_store::RocksDb) -> HypergraphState {
         store,
         Arc::new(quil_tries::ShaInclusionProver),
     ));
-    crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+    crdt.set_forest(quil_forest::Forest::with_namespace(
+        db.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
     HypergraphState::new(crdt)
 }
 
 fn vertex(state: &HypergraphState, address: &[u8]) -> quil_tries::VectorCommitmentTree {
     let va_disc = vertex_adds_discriminator().unwrap();
-    let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc).unwrap().unwrap();
+    let blob = state
+        .get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)
+        .unwrap()
+        .unwrap();
     rebuild_vertex_tree_from_blob(&blob)
 }
 
@@ -111,7 +124,9 @@ fn prover_info(seat: &Seat, filter: &[u8], ring: u8) -> ProverInfo {
             last_signed_frame_number: 0,
             epoch: 0,
             ring,
-            vertex_address: materialize::allocation_address(&seat.public_key, filter).unwrap().to_vec(),
+            vertex_address: materialize::allocation_address(&seat.public_key, filter)
+                .unwrap()
+                .to_vec(),
         }],
         available_storage: 0,
         seniority: 0,
@@ -144,8 +159,9 @@ fn measure_global_frame_header_cost() {
         .map(|i| if i % 32 == 31 { (i / 32) as u8 } else { 0 })
         .collect();
     let leaf = quil_crypto::sdr::commit_leaf(&replica, poly_size);
-    let seats: Vec<Vec<Seat>> =
-        (0..HEADERS).map(|h| (0..PARTICIPANTS).map(|m| seat(h, m)).collect()).collect();
+    let seats: Vec<Vec<Seat>> = (0..HEADERS)
+        .map(|h| (0..PARTICIPANTS).map(|m| seat(h, m)).collect())
+        .collect();
 
     let directory = tempfile::tempdir().unwrap();
     let db = quil_store::RocksDb::open(directory.path()).unwrap();
@@ -153,10 +169,22 @@ fn measure_global_frame_header_cost() {
     for (h, members) in seats.iter().enumerate() {
         let filter = shard_filter(h);
         for seat in members {
-            let join = materialize::materialize_prover_join(&seat.public_key, &[filter.clone()], 1, 1_000).unwrap();
-            state.set(domain, &join.prover_address, &va_disc, 1, vertex_tree_to_blob(&join.prover_tree)).unwrap();
+            let join =
+                materialize::materialize_prover_join(&seat.public_key, &[filter.clone()], 1, 1_000)
+                    .unwrap();
+            state
+                .set(
+                    domain,
+                    &join.prover_address,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&join.prover_tree),
+                )
+                .unwrap();
             for (address, tree) in &join.allocations {
-                state.set(domain, address, &va_disc, 1, vertex_tree_to_blob(tree)).unwrap();
+                state
+                    .set(domain, address, &va_disc, 1, vertex_tree_to_blob(tree))
+                    .unwrap();
             }
             let registration = materialize::materialize_leaf_root_registration(
                 &seat.address,
@@ -171,7 +199,15 @@ fn measure_global_frame_header_cost() {
                 },
             )
             .unwrap();
-            state.set(domain, &registration.address, &va_disc, 1, vertex_tree_to_blob(&registration.tree)).unwrap();
+            state
+                .set(
+                    domain,
+                    &registration.address,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&registration.tree),
+                )
+                .unwrap();
         }
     }
     state.commit().unwrap();
@@ -184,7 +220,10 @@ fn measure_global_frame_header_cost() {
         Arc::new(quil_crypto::WesolowskiFrameProver::new(2048));
     let issuance: Arc<dyn RewardIssuance> = Arc::new(PomwIssuance);
     let participants: Vec<usize> = (0..PARTICIPANTS).collect();
-    let shard = || ShardMetadata { state_size: SHARD_SIZE, shard_count: 1 };
+    let shard = || ShardMetadata {
+        state_size: SHARD_SIZE,
+        shard_count: 1,
+    };
     let header = |h: usize, attestation: Vec<u8>| FrameHeader {
         address: shard_filter(h),
         frame_number: 5,
@@ -198,10 +237,24 @@ fn measure_global_frame_header_cost() {
     // The prior frame: every participant has been rewarded and active, and
     // its ring is recorded, as on a running network.
     for h in 0..HEADERS {
-        let provers = seats[h].iter().map(|s| prover_info(s, &shard_filter(h), 0)).collect();
+        let provers = seats[h]
+            .iter()
+            .map(|s| prover_info(s, &shard_filter(h), 0))
+            .collect();
         materialize_prover_shard_update_with_fees(
-            &header(h, Vec::new()), prior_frame, &state, &registry, &frame_prover, &issuance,
-            WORLD_SIZE, provers, &participants, shard(), 0, None, None,
+            &header(h, Vec::new()),
+            prior_frame,
+            &state,
+            &registry,
+            &frame_prover,
+            &issuance,
+            WORLD_SIZE,
+            provers,
+            &participants,
+            shard(),
+            0,
+            None,
+            None,
         )
         .unwrap();
         state.commit().unwrap();
@@ -214,7 +267,10 @@ fn measure_global_frame_header_cost() {
             seats[h]
                 .iter()
                 .map(|s| {
-                    let allocation = vertex(&state, &materialize::allocation_address(&s.public_key, &filter).unwrap());
+                    let allocation = vertex(
+                        &state,
+                        &materialize::allocation_address(&s.public_key, &filter).unwrap(),
+                    );
                     let ring = read_field(&allocation, "allocation:ProverAllocation", "Ring")
                         .and_then(|bytes| bytes.first().copied())
                         .unwrap_or(0);
@@ -258,12 +314,24 @@ fn measure_global_frame_header_cost() {
         for (h, op) in ops.iter().enumerate() {
             let started = Instant::now();
             materialize_prover_shard_update_with_fees(
-                op, frame, &state, &registry, &frame_prover, &issuance,
-                WORLD_SIZE, provers[h].clone(), &participants, shard(), 0, None, None,
+                op,
+                frame,
+                &state,
+                &registry,
+                &frame_prover,
+                &issuance,
+                WORLD_SIZE,
+                provers[h].clone(),
+                &participants,
+                shard(),
+                0,
+                None,
+                None,
             )
             .unwrap();
             let credited = Instant::now();
-            gi.audit_storage_attestation(frame, op, &[], &state, &va_disc).unwrap();
+            gi.audit_storage_attestation(frame, op, &[], &state, &va_disc)
+                .unwrap();
             audit += credited.elapsed();
             rewards += credited - started;
             state.commit().unwrap();
@@ -281,7 +349,11 @@ fn measure_global_frame_header_cost() {
         for members in &seats {
             for s in members {
                 let status = read_field(&vertex(&state, &s.address), "prover:Prover", "Status");
-                assert_ne!(status.as_deref(), Some(&[4u8][..]), "an honest member was evicted");
+                assert_ne!(
+                    status.as_deref(),
+                    Some(&[4u8][..]),
+                    "an honest member was evicted"
+                );
             }
         }
     }

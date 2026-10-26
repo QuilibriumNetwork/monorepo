@@ -100,8 +100,12 @@ impl DirectStats {
     ) {
         let counter = match result {
             Ok(()) => &self.gossip_received,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => &self.gossip_received_queue_full,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => &self.gossip_received_queue_closed,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                &self.gossip_received_queue_full
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                &self.gossip_received_queue_closed
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -145,7 +149,10 @@ async fn read_prefixed<T: AsyncRead + Unpin + Send>(io: &mut T, max: usize) -> i
     io.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len > max {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "direct message field too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "direct message field too large",
+        ));
     }
     let mut buf = vec![0u8; len];
     io.read_exact(&mut buf).await?;
@@ -153,8 +160,12 @@ async fn read_prefixed<T: AsyncRead + Unpin + Send>(io: &mut T, max: usize) -> i
 }
 
 async fn write_prefixed<T: AsyncWrite + Unpin + Send>(io: &mut T, bytes: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "direct message field too large"))?;
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "direct message field too large",
+        )
+    })?;
     io.write_all(&len.to_be_bytes()).await?;
     io.write_all(bytes).await
 }
@@ -183,19 +194,32 @@ impl libp2p::request_response::Codec for DirectCodec {
         Ok(accepted[0] == 1)
     }
 
-    async fn write_request<T>(&mut self, _: &StreamProtocol, io: &mut T, req: DirectRequest) -> io::Result<()>
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        req: DirectRequest,
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
         if req.bitmask.len() > MAX_DIRECT_BITMASK || req.data.len() > MAX_DIRECT_DATA {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "direct message too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct message too large",
+            ));
         }
         write_prefixed(io, &req.bitmask).await?;
         write_prefixed(io, &req.data).await?;
         io.flush().await
     }
 
-    async fn write_response<T>(&mut self, _: &StreamProtocol, io: &mut T, accepted: bool) -> io::Result<()>
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        accepted: bool,
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
@@ -213,26 +237,59 @@ mod tests {
     fn requests_and_responses_round_trip_and_oversized_fields_are_refused() {
         futures::executor::block_on(async {
             let protocol = direct_protocol(0);
-            let request = DirectRequest { bitmask: vec![1, 2, 3], data: vec![9; 1000] };
+            let request = DirectRequest {
+                bitmask: vec![1, 2, 3],
+                data: vec![9; 1000],
+            };
             let mut wire = futures::io::Cursor::new(Vec::new());
-            DirectCodec.write_request(&protocol, &mut wire, request.clone()).await.unwrap();
+            DirectCodec
+                .write_request(&protocol, &mut wire, request.clone())
+                .await
+                .unwrap();
             let mut read = futures::io::Cursor::new(wire.into_inner());
-            assert_eq!(DirectCodec.read_request(&protocol, &mut read).await.unwrap(), request);
+            assert_eq!(
+                DirectCodec
+                    .read_request(&protocol, &mut read)
+                    .await
+                    .unwrap(),
+                request
+            );
 
             for accepted in [true, false] {
                 let mut wire = futures::io::Cursor::new(Vec::new());
-                DirectCodec.write_response(&protocol, &mut wire, accepted).await.unwrap();
+                DirectCodec
+                    .write_response(&protocol, &mut wire, accepted)
+                    .await
+                    .unwrap();
                 let mut read = futures::io::Cursor::new(wire.into_inner());
-                assert_eq!(DirectCodec.read_response(&protocol, &mut read).await.unwrap(), accepted);
+                assert_eq!(
+                    DirectCodec
+                        .read_response(&protocol, &mut read)
+                        .await
+                        .unwrap(),
+                    accepted
+                );
             }
 
             let mut forged = (u32::MAX).to_be_bytes().to_vec();
             forged.extend_from_slice(&[0; 8]);
             let mut read = futures::io::Cursor::new(forged);
-            assert!(DirectCodec.read_request(&protocol, &mut read).await.is_err(), "a huge length is refused before allocating");
-            let oversized = DirectRequest { bitmask: vec![0; MAX_DIRECT_BITMASK + 1], data: Vec::new() };
+            assert!(
+                DirectCodec
+                    .read_request(&protocol, &mut read)
+                    .await
+                    .is_err(),
+                "a huge length is refused before allocating"
+            );
+            let oversized = DirectRequest {
+                bitmask: vec![0; MAX_DIRECT_BITMASK + 1],
+                data: Vec::new(),
+            };
             let mut wire = futures::io::Cursor::new(Vec::new());
-            assert!(DirectCodec.write_request(&protocol, &mut wire, oversized).await.is_err());
+            assert!(DirectCodec
+                .write_request(&protocol, &mut wire, oversized)
+                .await
+                .is_err());
         });
     }
 
@@ -243,7 +300,10 @@ mod tests {
         stats.note(DirectOutcome::Delivered);
         stats.note(DirectOutcome::Unsupported);
         let snapshot = stats.snapshot();
-        assert_eq!((snapshot.delivered, snapshot.unsupported, snapshot.failed), (2, 1, 0));
+        assert_eq!(
+            (snapshot.delivered, snapshot.unsupported, snapshot.failed),
+            (2, 1, 0)
+        );
     }
 
     #[test]
@@ -259,7 +319,10 @@ mod tests {
         stats.note_gossip_receive(&tx.try_send(message(10)));
         let full = tx.try_send(message(20));
         stats.note_gossip_receive(&full);
-        assert!(matches!(full, Err(tokio::sync::mpsc::error::TrySendError::Full(_))));
+        assert!(matches!(
+            full,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
         let admitted = rx.try_recv().unwrap();
         assert_eq!(admitted.bitmask, vec![1, 2]);
         assert_eq!(admitted.data, vec![10]);
@@ -270,13 +333,19 @@ mod tests {
         drop(rx);
         let closed = tx.try_send(message(40));
         stats.note_gossip_receive(&closed);
-        assert!(matches!(closed, Err(tokio::sync::mpsc::error::TrySendError::Closed(_))));
-        assert_eq!(stats.snapshot(), DirectStatsSnapshot {
-            gossip_received: 2,
-            gossip_received_queue_full: 1,
-            gossip_received_queue_closed: 1,
-            ..Default::default()
-        });
+        assert!(matches!(
+            closed,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+        ));
+        assert_eq!(
+            stats.snapshot(),
+            DirectStatsSnapshot {
+                gossip_received: 2,
+                gossip_received_queue_full: 1,
+                gossip_received_queue_closed: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -286,12 +355,15 @@ mod tests {
         stats.note(DirectOutcome::Refused);
         stats.received.fetch_add(1, Ordering::Relaxed);
         stats.received_refused.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(stats.snapshot(), DirectStatsSnapshot {
-            delivered: 1,
-            refused: 1,
-            received: 1,
-            received_refused: 1,
-            ..Default::default()
-        });
+        assert_eq!(
+            stats.snapshot(),
+            DirectStatsSnapshot {
+                delivered: 1,
+                refused: 1,
+                received: 1,
+                received_refused: 1,
+                ..Default::default()
+            }
+        );
     }
 }

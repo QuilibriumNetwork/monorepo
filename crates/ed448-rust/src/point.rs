@@ -457,6 +457,9 @@ mod point_encode_round_trip {
         let bytes_a = pk.as_byte();
         let pk2 = PublicKey::try_from(&bytes_a[..]).unwrap();
         let bytes_b = pk2.as_byte();
-        assert_eq!(bytes_a, bytes_b, "encode → decode → encode must be idempotent");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "encode → decode → encode must be idempotent"
+        );
     }
 }

@@ -20,8 +20,8 @@ use std::time::SystemTime;
 use bytes::Buf as _;
 use commonware_actor::{Feedback, Unreliable};
 use commonware_cryptography::PublicKey;
-use commonware_p2p::{CheckedSender, LimitedSender, Receiver, Recipients};
 pub use commonware_p2p::Message;
+use commonware_p2p::{CheckedSender, LimitedSender, Receiver, Recipients};
 use commonware_runtime::{IoBuf, IoBufs};
 use tokio::sync::mpsc;
 
@@ -155,7 +155,12 @@ pub fn build_channel<P: PublicKey>(
 ) -> P2pChannel<P> {
     let (inbound_tx, rx) = mpsc::unbounded_channel();
     P2pChannel {
-        sender: ChannelSender { channel, peers, out, echo: None },
+        sender: ChannelSender {
+            channel,
+            peers,
+            out,
+            echo: None,
+        },
         receiver: ChannelReceiver { rx },
         inbound_tx,
     }
@@ -213,9 +218,9 @@ mod tests {
     use crate::falcon_base::{FalconPrivateKey, FalconPublicKey};
     // Only the tests call `ChannelSender::send` through the trait; the module
     // itself implements it, so the import belongs here rather than at the top.
-    use commonware_p2p::Sender as _;
     use commonware_cryptography::Signer as _;
     use commonware_math::algebra::Random;
+    use commonware_p2p::Sender as _;
 
     fn pk() -> FalconPublicKey {
         FalconPrivateKey::random(commonware_utils::test_rng()).public_key()
@@ -266,7 +271,10 @@ mod tests {
 
         let _ = ch.sender.send(Recipients::All, b"nullify".to_vec(), true);
 
-        assert_eq!(out_rx.try_recv().expect("still sent to peers").bytes, b"nullify");
+        assert_eq!(
+            out_rx.try_recv().expect("still sent to peers").bytes,
+            b"nullify"
+        );
         let (from, buf) = futures::executor::block_on(ch.receiver.recv()).expect("recv");
         assert_eq!(from, me);
         assert_eq!(buf.as_ref(), b"nullify");

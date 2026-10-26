@@ -11,7 +11,11 @@ use quil_types::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) fn certify(frame: &mut AppShardFrame, signer: &quil_crypto::FalconSigner, global_output: &[u8]) {
+pub(crate) fn certify(
+    frame: &mut AppShardFrame,
+    signer: &quil_crypto::FalconSigner,
+    global_output: &[u8],
+) {
     use quil_cw_consensus::{
         _consensus::{
             simplex::{
@@ -171,12 +175,22 @@ fn aged_out_registration_attested(requests_root: Vec<u8>, bitmask: &[u8]) -> Age
             status: ProverStatus::Active,
             kick_frame_number: 0,
             allocations: vec![quil_types::consensus::ProverAllocationInfo {
-                status: ProverStatus::Active, confirmation_filter: filter.to_vec(),
-                rejection_filter: vec![], join_frame_number: 1, leave_frame_number: 0,
-                pause_frame_number: 0, resume_frame_number: 0, kick_frame_number: 0,
-                join_confirm_frame_number: 0, join_reject_frame_number: 0,
-                leave_confirm_frame_number: 0, leave_reject_frame_number: 0,
-                last_active_frame_number: global_frame, epoch, ring: 0, vertex_address: vec![],
+                status: ProverStatus::Active,
+                confirmation_filter: filter.to_vec(),
+                rejection_filter: vec![],
+                join_frame_number: 1,
+                leave_frame_number: 0,
+                pause_frame_number: 0,
+                resume_frame_number: 0,
+                kick_frame_number: 0,
+                join_confirm_frame_number: 0,
+                join_reject_frame_number: 0,
+                leave_confirm_frame_number: 0,
+                leave_reject_frame_number: 0,
+                last_active_frame_number: global_frame,
+                epoch,
+                ring: 0,
+                vertex_address: vec![],
                 last_signed_frame_number: 0,
             }],
             available_storage: 0,
@@ -201,11 +215,29 @@ fn aged_out_registration_attested(requests_root: Vec<u8>, bitmask: &[u8]) -> Age
         storage_attestation: Some(attestation),
     };
     certify(&mut frame, &signer, &output);
-    AgedOutRegistration { member, leaf_id, global_frame, epoch, archive, root, proof, clock, registry, frame, signer, output }
+    AgedOutRegistration {
+        member,
+        leaf_id,
+        global_frame,
+        epoch,
+        archive,
+        root,
+        proof,
+        clock,
+        registry,
+        frame,
+        signer,
+        output,
+    }
 }
 
 /// A proof source serving `proof` for `root`'s record, counting requests.
-fn serving(root: [u8; 32], address: [u8; 32], proof: Vec<u8>, calls: Arc<AtomicUsize>) -> GlobalVertexProofSource {
+fn serving(
+    root: [u8; 32],
+    address: [u8; 32],
+    proof: Vec<u8>,
+    calls: Arc<AtomicUsize>,
+) -> GlobalVertexProofSource {
     Arc::new(move |requested_root, requested_address| {
         assert_eq!(requested_root, root);
         assert_eq!(requested_address, address);
@@ -217,8 +249,19 @@ fn serving(root: [u8; 32], address: [u8; 32], proof: Vec<u8>, calls: Arc<AtomicU
 
 #[tokio::test]
 async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipping_possession() {
-    let AgedOutRegistration { member, leaf_id, global_frame, epoch, archive, root, proof, clock, registry, frame, .. } =
-        aged_out_registration(Vec::new());
+    let AgedOutRegistration {
+        member,
+        leaf_id,
+        global_frame,
+        epoch,
+        archive,
+        root,
+        proof,
+        clock,
+        registry,
+        frame,
+        ..
+    } = aged_out_registration(Vec::new());
     let validator = || {
         BlsAppFrameValidator::new(
             registry.clone(),
@@ -270,7 +313,10 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
         remote.validate(&corrupt).is_err(),
         "a valid registry proof cannot replace possession"
     );
-    assert!(remote.validate_notarized_parent(&corrupt).is_err(), "a failed possession proof is not excused");
+    assert!(
+        remote.validate_notarized_parent(&corrupt).is_err(),
+        "a failed possession proof is not excused"
+    );
     let mut wrong_epoch = frame.clone();
     wrong_epoch.storage_attestation.as_mut().unwrap().openings[0].epoch += 1;
     assert!(remote.validate(&wrong_epoch).is_err());
@@ -291,19 +337,29 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
     // No archive retains the registration any longer: the certified frame is
     // accepted on its quorum certificate alone (sync anchors, certified
     // replays and a member's own head), and an uncertified copy is not.
-    assert!(unavailable.validate_certified_without_storage(&frame).unwrap());
+    assert!(unavailable
+        .validate_certified_without_storage(&frame)
+        .unwrap());
     // Without a committee-handoff policy a node may hold no GLOBAL cursor (a
     // regular, or one upgraded from the mainnet build). Nothing is managed
     // then, so the certificate verifies in the legacy namespace.
     assert!(quil_types::consensus::committee_handoff_policy().is_none());
     let uncursored_db = quil_store::RocksDb::open_in_memory().unwrap();
     let uncursored = validator().with_handoff_authority(Archive::open_crdt(&uncursored_db));
-    assert!(uncursored.validate_certified_without_storage(&frame).unwrap());
-    assert!(!unavailable.validate_certified_without_storage(&unsigned).unwrap_or(false));
+    assert!(uncursored
+        .validate_certified_without_storage(&frame)
+        .unwrap());
+    assert!(!unavailable
+        .validate_certified_without_storage(&unsigned)
+        .unwrap_or(false));
     let mut altered = frame.clone();
     altered.header.as_mut().unwrap().state_roots[0][0] ^= 1;
-    assert!(!unavailable.validate_certified_without_storage(&altered).unwrap_or(false),
-        "the certificate still binds the header");
+    assert!(
+        !unavailable
+            .validate_certified_without_storage(&altered)
+            .unwrap_or(false),
+        "the certificate still binds the header"
+    );
     // A frame final only through its certified child has no certificate of
     // its own: its registrations are fetched once the caller has
     // authenticated it through the child. (This fixture's openings are bound
@@ -315,22 +371,53 @@ async fn certified_storage_frame_recovers_an_aged_out_registration_without_skipp
     // A sync anchor check prepares such a frame as the linked frame it is:
     // no "missing BLS signature" refusal reported as its storage history,
     // and no registration read before its child authenticates it.
-    assert!(crate::app_engine::storage_history_unavailable(&linked, &unsigned).await.is_none());
-    assert_eq!(calls.load(Ordering::SeqCst), linked_calls, "nothing fetched for an unauthenticated frame");
+    assert!(
+        crate::app_engine::storage_history_unavailable(&linked, &unsigned)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        linked_calls,
+        "nothing fetched for an unauthenticated frame"
+    );
     // Controls: a certified frame still prepares its registrations, and one
     // whose registration no archive retains still reports why.
     let certified = validator().with_storage_history_source(source.clone());
-    assert!(crate::app_engine::storage_history_unavailable(&certified, &frame).await.is_none());
-    assert!(calls.load(Ordering::SeqCst) > linked_calls, "the certified frame's registrations were fetched");
-    assert!(matches!(crate::app_engine::storage_history_unavailable(&unavailable, &frame).await,
-        Some(QuilError::ExecutionUnavailable(_))));
+    assert!(
+        crate::app_engine::storage_history_unavailable(&certified, &frame)
+            .await
+            .is_none()
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > linked_calls,
+        "the certified frame's registrations were fetched"
+    );
+    assert!(matches!(
+        crate::app_engine::storage_history_unavailable(&unavailable, &frame).await,
+        Some(QuilError::ExecutionUnavailable(_))
+    ));
     let linked_calls = calls.load(Ordering::SeqCst);
-    linked.prepare_storage_history_of_linked(&unsigned).await.unwrap();
-    assert!(calls.load(Ordering::SeqCst) > linked_calls, "the registrations were fetched");
-    assert!(unavailable.validate_linked_without_storage(&unsigned).unwrap());
+    linked
+        .prepare_storage_history_of_linked(&unsigned)
+        .await
+        .unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) > linked_calls,
+        "the registrations were fetched"
+    );
+    assert!(unavailable
+        .validate_linked_without_storage(&unsigned)
+        .unwrap());
     let mut malformed = unsigned.clone();
     malformed.header.as_mut().unwrap().state_roots.pop();
-    assert!(linked.prepare_storage_history_of_linked(&malformed).await.is_err(), "structure is checked before any read");
+    assert!(
+        linked
+            .prepare_storage_history_of_linked(&malformed)
+            .await
+            .is_err(),
+        "structure is checked before any read"
+    );
     let untrusted = validator()
         .with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(Some(vec![0; 8])) })));
     assert!(untrusted.prepare_storage_history(&frame).await.is_err());
@@ -382,15 +469,28 @@ async fn an_archive_behind_a_frames_anchor_fetches_its_registration_and_ingests_
     use quil_types::store::ClockStore as _;
     let store = Arc::new(quil_hypergraph::testing::MemStore::new());
     let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
-    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        store,
+        inclusion.clone(),
+    ));
     let crypto = quil_execution::testing::NoopExecutionCrypto::new();
     let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-        inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
-        crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+        inclusion.clone(),
+        crypto.key_manager,
+        crdt.clone(),
+        crypto.circuit_compiler,
+        crypto.clock_store.clone(),
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+        false,
     ));
     let filter = [8; 32];
     let requests_root = crate::app_engine::compute_requests_root(
-        &[], &filter, 95, Some(manager.as_ref()), Some(inclusion.as_ref()), crdt.has_forest(),
+        &[],
+        &filter,
+        95,
+        Some(manager.as_ref()),
+        Some(inclusion.as_ref()),
+        crdt.has_forest(),
     )
     .unwrap();
     let aged = aged_out_registration(requests_root);
@@ -404,15 +504,32 @@ async fn an_archive_behind_a_frames_anchor_fetches_its_registration_and_ingests_
         crdt,
         aged.clock.clone(),
     )
-    .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), calls.clone()))
+    .with_storage_history_source(serving(
+        aged.root,
+        aged.archive.address,
+        aged.proof.clone(),
+        calls.clone(),
+    ))
     .sequenced();
     let bytes = prost::Message::encode_to_vec(&aged.frame);
     let served = || aged.clock.get_shard_clock_frame(&filter, 95, false).ok();
 
     ingest.ingest(&bytes);
-    assert_eq!(served(), None, "refused before its registration is prepared");
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "ingest itself never waits on a peer");
-    ingest.validator().prepare_storage_history(&aged.frame).await.unwrap();
+    assert_eq!(
+        served(),
+        None,
+        "refused before its registration is prepared"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "ingest itself never waits on a peer"
+    );
+    ingest
+        .validator()
+        .prepare_storage_history(&aged.frame)
+        .await
+        .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     ingest.ingest(&bytes);
     assert_eq!(served(), Some(aged.frame.clone()));
@@ -430,17 +547,32 @@ async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child
     use quil_types::store::ClockStore as _;
     let store = Arc::new(quil_hypergraph::testing::MemStore::new());
     let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
-    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+    let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+        store,
+        inclusion.clone(),
+    ));
     let crypto = quil_execution::testing::NoopExecutionCrypto::new();
     let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-        inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
-        crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+        inclusion.clone(),
+        crypto.key_manager,
+        crdt.clone(),
+        crypto.circuit_compiler,
+        crypto.clock_store.clone(),
+        Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+        false,
     ));
     let filter = [8; 32];
-    let requests_root = |number| crate::app_engine::compute_requests_root(
-        &[], &filter, number, Some(manager.as_ref()), Some(inclusion.as_ref()), crdt.has_forest(),
-    )
-    .unwrap();
+    let requests_root = |number| {
+        crate::app_engine::compute_requests_root(
+            &[],
+            &filter,
+            number,
+            Some(manager.as_ref()),
+            Some(inclusion.as_ref()),
+            crdt.has_forest(),
+        )
+        .unwrap()
+    };
     let aged = aged_out_registration_attested(requests_root(95), &[]);
     let mut frame = aged.frame.clone();
     frame.header.as_mut().unwrap().public_key_signature_bls48581 = None;
@@ -454,7 +586,11 @@ async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child
                 timestamp: 2,
                 state_roots: vec![vec![0; 32]; 4],
                 prover: aged.member.to_vec(),
-                parent_selector: quil_crypto::poseidon::hash_bytes_to_32(&parent.header.as_ref().unwrap().output).unwrap().to_vec(),
+                parent_selector: quil_crypto::poseidon::hash_bytes_to_32(
+                    &parent.header.as_ref().unwrap().output,
+                )
+                .unwrap()
+                .to_vec(),
                 requests_root: requests_root(96),
                 ..Default::default()
             }),
@@ -475,37 +611,70 @@ async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child
         crdt.clone(),
         aged.clock.clone(),
     )
-    .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), calls.clone()))
+    .with_storage_history_source(serving(
+        aged.root,
+        aged.archive.address,
+        aged.proof.clone(),
+        calls.clone(),
+    ))
     .sequenced();
     let validator = ingest.validator();
-    let served = |number| aged.clock.get_shard_clock_frame(&filter, number, false).ok();
-    let fetched = |offered: Option<AppShardFrame>| move |number: u64| {
-        let offered = offered.clone().filter(|frame| frame.header.as_ref().is_some_and(|h| h.frame_number == number));
-        async move { offered }
+    let served = |number| {
+        aged.clock
+            .get_shard_clock_frame(&filter, number, false)
+            .ok()
+    };
+    let fetched = |offered: Option<AppShardFrame>| {
+        move |number: u64| {
+            let offered = offered.clone().filter(|frame| {
+                frame
+                    .header
+                    .as_ref()
+                    .is_some_and(|h| h.frame_number == number)
+            });
+            async move { offered }
+        }
     };
 
     ingest.ingest(&prost::Message::encode_to_vec(&frame));
-    assert_eq!(served(95), None, "refused before its registration is prepared");
+    assert_eq!(
+        served(95),
+        None,
+        "refused before its registration is prepared"
+    );
 
     // No child, a child that does not link, one without a certificate and
     // one certified by a stranger authenticate nothing: no peer is asked.
     let mut stranger_parent = frame.clone();
     stranger_parent.header.as_mut().unwrap().output[0] ^= 1;
     let mut uncertified = child.clone();
-    uncertified.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    uncertified
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     for offered in [
         None,
         Some(child_signed_by(&aged.signer, &stranger_parent)),
         Some(uncertified),
-        Some(child_signed_by(&quil_crypto::FalconSigner::generate(), &frame)),
+        Some(child_signed_by(
+            &quil_crypto::FalconSigner::generate(),
+            &frame,
+        )),
     ] {
-        let (frames, prepared) = prepare_gap_fetched(&validator, frame.clone(), fetched(offered)).await;
+        let (frames, prepared) =
+            prepare_gap_fetched(&validator, frame.clone(), fetched(offered)).await;
         assert!(prepared.is_err());
         assert_eq!(frames[0], frame);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "authenticate before remote reads");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "authenticate before remote reads"
+        );
     }
 
-    let (frames, prepared) = prepare_gap_fetched(&validator, frame.clone(), fetched(Some(child.clone()))).await;
+    let (frames, prepared) =
+        prepare_gap_fetched(&validator, frame.clone(), fetched(Some(child.clone()))).await;
     prepared.unwrap();
     assert_eq!(frames, vec![frame.clone(), child.clone()]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -530,18 +699,32 @@ async fn an_archive_gap_fetch_prepares_a_frame_final_through_its_certified_child
 /// its body is owed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_archive_serves_an_empty_frame_it_rebuilt_whole_from_its_carried_header() {
-    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    use quil_execution::global_intrinsic::{
+        conversions::frame_header_to_proto, FrameHeader as CarriedHeader,
+    };
     use quil_types::store::ClockStore as _;
     let aged = aged_out_registration_attested(vec![0; 32], &[]);
     // As a member stores a commonware-finalized frame.
     let mut body = aged.frame.clone();
-    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
-    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    let signature = body
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581
+        .as_mut()
+        .unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey {
+        key_value: Vec::new(),
+    });
     signature.bitmask = Vec::new();
     let carried = frame_header_to_proto(
-        &CarriedHeader::from_canonical_bytes(&crate::app_handoff::canonical_header(&body).unwrap()).unwrap(),
+        &CarriedHeader::from_canonical_bytes(&crate::app_handoff::canonical_header(&body).unwrap())
+            .unwrap(),
     );
-    assert!(!carried.storage_attestation.is_empty(), "GLOBAL carries the attestation");
+    assert!(
+        !carried.storage_attestation.is_empty(),
+        "GLOBAL carries the attestation"
+    );
     let filter = [8; 32];
     for attested in [true, false] {
         let mut header = carried.clone();
@@ -549,14 +732,26 @@ async fn an_archive_serves_an_empty_frame_it_rebuilt_whole_from_its_carried_head
             header.storage_attestation.clear();
         }
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
-        clock.seed_frame(aged.clock.get_global_clock_frame(aged.global_frame).unwrap());
+        clock.seed_frame(
+            aged.clock
+                .get_global_clock_frame(aged.global_frame)
+                .unwrap(),
+        );
         let store = Arc::new(quil_hypergraph::testing::MemStore::new());
         let inclusion = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store, inclusion.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store,
+            inclusion.clone(),
+        ));
         let crypto = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-            inclusion.clone(), crypto.key_manager, crdt.clone(), crypto.circuit_compiler,
-            crypto.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), false,
+            inclusion.clone(),
+            crypto.key_manager,
+            crdt.clone(),
+            crypto.circuit_compiler,
+            crypto.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            false,
         ));
         let mut ingest = crate::archive_ingest::ArchiveAppShardIngest::new(
             aged.registry.clone(),
@@ -567,17 +762,37 @@ async fn an_archive_serves_an_empty_frame_it_rebuilt_whole_from_its_carried_head
             crdt,
             clock.clone(),
         )
-        .with_storage_history_source(serving(aged.root, aged.archive.address, aged.proof.clone(), Arc::default()))
+        .with_storage_history_source(serving(
+            aged.root,
+            aged.archive.address,
+            aged.proof.clone(),
+            Arc::default(),
+        ))
         .sequenced()
         .rebuilding_at_once_from(&filter, 94);
-        ingest.validator().prepare_storage_history(&body).await.unwrap();
+        ingest
+            .validator()
+            .prepare_storage_history(&body)
+            .await
+            .unwrap();
         let vouched = std::collections::HashMap::from([(95, header)]);
-        assert!(!ingest.materialize_through_vouched(&filter, 95, &vouched).unwrap(), "the body is sought first");
-        assert!(ingest.materialize_through_vouched(&filter, 95, &vouched).unwrap());
+        assert!(
+            !ingest
+                .materialize_through_vouched(&filter, 95, &vouched)
+                .unwrap(),
+            "the body is sought first"
+        );
+        assert!(ingest
+            .materialize_through_vouched(&filter, 95, &vouched)
+            .unwrap());
         assert_eq!(ingest.materialized_height(&filter).unwrap(), 95);
         let served = clock.get_shard_clock_frame(&filter, 95, false).ok();
         if attested {
-            assert_eq!(served, Some(body.clone()), "the rebuilt body is the stored one");
+            assert_eq!(
+                served,
+                Some(body.clone()),
+                "the rebuilt body is the stored one"
+            );
             assert!(!ingest.owes_body(&filter, 95));
         } else {
             assert_eq!(served, None);
@@ -598,7 +813,11 @@ async fn a_legacy_certificate_verifies_under_its_rebuilt_historical_committee() 
     let output = vec![9; 516];
     let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
     clock.seed_frame(GlobalFrame {
-        header: Some(GlobalFrameHeader { frame_number: global_frame, output: output.clone(), ..Default::default() }),
+        header: Some(GlobalFrameHeader {
+            frame_number: global_frame,
+            output: output.clone(),
+            ..Default::default()
+        }),
         requests: vec![],
     });
     let prover = |signer: &quil_crypto::FalconSigner, address: u8| ProverInfo {
@@ -614,7 +833,9 @@ async fn a_legacy_certificate_verifies_under_its_rebuilt_historical_committee() 
     let then = quil_crypto::FalconSigner::generate();
     let now = quil_crypto::FalconSigner::generate();
     // Today's registry: only a prover that joined later.
-    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(prover(&now, 2)));
+    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(
+        prover(&now, 2),
+    ));
     let mut frame = AppShardFrame {
         header: Some(FrameHeader {
             address: filter.to_vec(),
@@ -644,28 +865,39 @@ async fn a_legacy_certificate_verifies_under_its_rebuilt_historical_committee() 
     };
     let plain = validator(None);
     plain.prepare_historical_committee(&frame).await.unwrap();
-    assert!(plain.validate(&frame).is_err(), "today's registry cannot reproduce the committee");
+    assert!(
+        plain.validate(&frame).is_err(),
+        "today's registry cannot reproduce the committee"
+    );
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let source_for = |members: Vec<Vec<u8>>| -> crate::historical_committee::HistoricalCommitteeSource {
-        let calls = calls.clone();
-        Arc::new(move |requested_filter, anchor| {
-            assert_eq!(requested_filter, filter.to_vec());
-            assert_eq!(anchor, global_frame);
-            calls.fetch_add(1, Ordering::SeqCst);
-            let members = members.clone();
-            Box::pin(async move { Ok(vec![members]) })
-        })
-    };
+    let source_for =
+        |members: Vec<Vec<u8>>| -> crate::historical_committee::HistoricalCommitteeSource {
+            let calls = calls.clone();
+            Arc::new(move |requested_filter, anchor| {
+                assert_eq!(requested_filter, filter.to_vec());
+                assert_eq!(anchor, global_frame);
+                calls.fetch_add(1, Ordering::SeqCst);
+                let members = members.clone();
+                Box::pin(async move { Ok(vec![members]) })
+            })
+        };
     let wrong = validator(Some(source_for(vec![now.public_key().to_vec()])));
     wrong.prepare_historical_committee(&frame).await.unwrap();
-    assert!(wrong.validate(&frame).is_err(), "a committee that did not sign does not verify it");
+    assert!(
+        wrong.validate(&frame).is_err(),
+        "a committee that did not sign does not verify it"
+    );
 
     let rebuilt = validator(Some(source_for(vec![then.public_key().to_vec()])));
     rebuilt.prepare_historical_committee(&frame).await.unwrap();
     rebuilt.prepare_historical_committee(&frame).await.unwrap();
     assert!(rebuilt.validate(&frame).unwrap());
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "once per validator and anchor");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "once per validator and anchor"
+    );
 }
 
 /// An empty frame rebuilt from the certified header GLOBAL carried, which
@@ -685,21 +917,36 @@ fn archive_replay_validates_a_certified_empty_frame_without_its_attestation() {
     };
     let validate = crate::app_engine::validate_certified_frame;
     let empty = aged_out_registration(vec![0; 32]);
-    let rebuilt = AppShardFrame { storage_attestation: None, ..empty.frame.clone() };
+    let rebuilt = AppShardFrame {
+        storage_attestation: None,
+        ..empty.frame.clone()
+    };
     assert!(validate(&validator(&empty), &rebuilt, true).unwrap());
-    assert!(validate(&validator(&empty), &empty.frame, true).is_err(),
-        "the body's proof is verified: this registration aged out of the live registry");
+    assert!(
+        validate(&validator(&empty), &empty.frame, true).is_err(),
+        "the body's proof is verified: this registration aged out of the live registry"
+    );
     let mut unsigned = rebuilt.clone();
-    unsigned.header.as_mut().unwrap().public_key_signature_bls48581 = None;
+    unsigned
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581 = None;
     assert!(!validate(&validator(&empty), &unsigned, true).unwrap_or(false));
     let mut altered = rebuilt.clone();
     altered.header.as_mut().unwrap().state_roots[0][0] ^= 1;
-    assert!(!validate(&validator(&empty), &altered, true).unwrap_or(false), "the certificate binds the header");
+    assert!(
+        !validate(&validator(&empty), &altered, true).unwrap_or(false),
+        "the certificate binds the header"
+    );
     let mut bundled = rebuilt.clone();
     bundled.requests.push(Default::default());
     assert!(validate(&validator(&empty), &bundled, true).is_err());
     let with_requests = aged_out_registration(vec![7; 32]);
-    let stripped = AppShardFrame { storage_attestation: None, ..with_requests.frame.clone() };
+    let stripped = AppShardFrame {
+        storage_attestation: None,
+        ..with_requests.frame.clone()
+    };
     assert!(validate(&validator(&with_requests), &stripped, true).is_err());
 }
 
@@ -713,12 +960,22 @@ fn archive_replay_validates_a_certified_empty_frame_without_its_attestation() {
 #[test]
 fn an_empty_frame_rebuilt_from_its_carried_header_is_its_stored_body() {
     use crate::app_handoff::{canonical_header, frame_from_carried_header};
-    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    use quil_execution::global_intrinsic::{
+        conversions::frame_header_to_proto, FrameHeader as CarriedHeader,
+    };
     let fixture = aged_out_registration_attested(vec![0; 32], &[]);
     // As a member stores a commonware-finalized frame.
     let mut body = fixture.frame.clone();
-    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
-    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    let signature = body
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581
+        .as_mut()
+        .unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey {
+        key_value: Vec::new(),
+    });
     signature.bitmask = Vec::new();
     let validator = || {
         BlsAppFrameValidator::new(
@@ -729,17 +986,30 @@ fn an_empty_frame_rebuilt_from_its_carried_header_is_its_stored_body() {
         .with_clock_store(fixture.clock.clone())
         .with_handoff_authority(fixture.archive.crdt.clone())
     };
-    let replayed = |frame: &AppShardFrame| crate::app_engine::validate_certified_frame(&validator(), frame, true);
-    let carried = |body: &AppShardFrame| {
-        frame_header_to_proto(&CarriedHeader::from_canonical_bytes(&canonical_header(body).unwrap()).unwrap())
+    let replayed = |frame: &AppShardFrame| {
+        crate::app_engine::validate_certified_frame(&validator(), frame, true)
     };
-    assert!(validator().validate(&body).unwrap(), "the stored body validates");
+    let carried = |body: &AppShardFrame| {
+        frame_header_to_proto(
+            &CarriedHeader::from_canonical_bytes(&canonical_header(body).unwrap()).unwrap(),
+        )
+    };
+    assert!(
+        validator().validate(&body).unwrap(),
+        "the stored body validates"
+    );
     let header = carried(&body);
-    assert!(!header.storage_attestation.is_empty(), "GLOBAL carries the attestation");
+    assert!(
+        !header.storage_attestation.is_empty(),
+        "GLOBAL carries the attestation"
+    );
     let (rebuilt, missing) = frame_from_carried_header(&header);
     assert_eq!(missing, None);
     assert_eq!(rebuilt, body);
-    assert!(validator().validate(&rebuilt).unwrap(), "possession is verified");
+    assert!(
+        validator().validate(&rebuilt).unwrap(),
+        "possession is verified"
+    );
     assert!(replayed(&rebuilt).unwrap());
 
     let mut corrupt = body.clone();
@@ -747,14 +1017,20 @@ fn an_empty_frame_rebuilt_from_its_carried_header_is_its_stored_body() {
     let (tampered, missing) = frame_from_carried_header(&carried(&corrupt));
     assert_eq!(missing, None);
     assert!(validator().validate(&tampered).is_err());
-    assert!(replayed(&tampered).is_err(), "a carried attestation is verified");
+    assert!(
+        replayed(&tampered).is_err(),
+        "a carried attestation is verified"
+    );
 
     let mut bare = header.clone();
     bare.storage_attestation.clear();
     let (stripped, missing) = frame_from_carried_header(&bare);
     assert!(missing.unwrap().contains("holds no storage attestation"));
     assert_eq!(stripped.storage_attestation, None);
-    assert!(validator().validate(&stripped).is_err(), "no possession proof");
+    assert!(
+        validator().validate(&stripped).is_err(),
+        "no possession proof"
+    );
     assert!(replayed(&stripped).unwrap(), "its certificate and output");
 
     let mut junk = header;
@@ -775,15 +1051,30 @@ fn an_empty_frame_rebuilt_from_its_carried_header_is_its_stored_body() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_carried_copy_is_checked_as_replay_checks_it_and_a_missing_anchor_is_a_wait() {
     use crate::prover_tree_syncer::{refuses_frame, verify_carried_copy, CopyVerdict};
-    use quil_execution::global_intrinsic::{conversions::frame_header_to_proto, FrameHeader as CarriedHeader};
+    use quil_execution::global_intrinsic::{
+        conversions::frame_header_to_proto, FrameHeader as CarriedHeader,
+    };
     let fixture = aged_out_registration_attested(vec![0; 32], &[]);
     let mut body = fixture.frame.clone();
-    let signature = body.header.as_mut().unwrap().public_key_signature_bls48581.as_mut().unwrap();
-    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey { key_value: Vec::new() });
+    let signature = body
+        .header
+        .as_mut()
+        .unwrap()
+        .public_key_signature_bls48581
+        .as_mut()
+        .unwrap();
+    signature.public_key = Some(quil_types::proto::keys::Bls48581g2PublicKey {
+        key_value: Vec::new(),
+    });
     signature.bitmask = Vec::new();
-    let carried = |body: &AppShardFrame| frame_header_to_proto(
-        &CarriedHeader::from_canonical_bytes(&crate::app_handoff::canonical_header(body).unwrap()).unwrap(),
-    );
+    let carried = |body: &AppShardFrame| {
+        frame_header_to_proto(
+            &CarriedHeader::from_canonical_bytes(
+                &crate::app_handoff::canonical_header(body).unwrap(),
+            )
+            .unwrap(),
+        )
+    };
     let header = carried(&body);
     let validator = |clock: Arc<quil_store::testing::InMemoryClockStore>| {
         Arc::new(
@@ -796,19 +1087,36 @@ async fn a_carried_copy_is_checked_as_replay_checks_it_and_a_missing_anchor_is_a
             .with_handoff_authority(fixture.archive.crdt.clone()),
         )
     };
-    let verify = |header: &quil_types::proto::global::FrameHeader| verify_carried_copy(validator(fixture.clock.clone()), header.clone());
-    assert_eq!(verify(&header).await, CopyVerdict::Certified, "possession included");
-    let cleared = quil_types::proto::global::FrameHeader { storage_attestation: Vec::new(), ..header.clone() };
+    let verify = |header: &quil_types::proto::global::FrameHeader| {
+        verify_carried_copy(validator(fixture.clock.clone()), header.clone())
+    };
+    assert_eq!(
+        verify(&header).await,
+        CopyVerdict::Certified,
+        "possession included"
+    );
+    let cleared = quil_types::proto::global::FrameHeader {
+        storage_attestation: Vec::new(),
+        ..header.clone()
+    };
     assert_eq!(verify(&cleared).await, CopyVerdict::Certified);
     let mut forged = header.clone();
     forged.output[0] ^= 1;
     assert_eq!(verify(&forged).await, CopyVerdict::Refused);
     let mut junk = header.clone();
     junk.storage_attestation = vec![0xff; 3];
-    assert_eq!(verify(&junk).await, CopyVerdict::AttestationRefused, "does not decode");
+    assert_eq!(
+        verify(&junk).await,
+        CopyVerdict::AttestationRefused,
+        "does not decode"
+    );
     let mut corrupt = body.clone();
     corrupt.storage_attestation.as_mut().unwrap().openings[0].proof[0] ^= 1;
-    assert_eq!(verify(&carried(&corrupt)).await, CopyVerdict::AttestationRefused, "fails possession");
+    assert_eq!(
+        verify(&carried(&corrupt)).await,
+        CopyVerdict::AttestationRefused,
+        "fails possession"
+    );
     let unavailable = Arc::new(
         BlsAppFrameValidator::new(
             fixture.registry.clone(),
@@ -818,20 +1126,31 @@ async fn a_carried_copy_is_checked_as_replay_checks_it_and_a_missing_anchor_is_a
         .with_clock_store(fixture.clock.clone())
         .with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(None) }))),
     );
-    assert_eq!(verify_carried_copy(unavailable, header.clone()).await, CopyVerdict::AttestationUnavailable,
-        "registrations unavailable");
+    assert_eq!(
+        verify_carried_copy(unavailable, header.clone()).await,
+        CopyVerdict::AttestationUnavailable,
+        "registrations unavailable"
+    );
 
     let lacking = Arc::new(quil_store::testing::InMemoryClockStore::new());
     let (frame, _) = crate::app_handoff::frame_from_carried_header(&cleared);
     // The validator's other callers keep refusing a frame whose anchor this
     // node lacks; archive replay and its copies wait for it.
-    let error = validator(lacking.clone()).validate_certified_without_storage(&frame).unwrap_err();
+    let error = validator(lacking.clone())
+        .validate_certified_without_storage(&frame)
+        .unwrap_err();
     assert!(matches!(error, QuilError::Crypto(_)), "{error}");
     assert!(!refuses_frame(&error));
     let full = validator(lacking.clone()).validate(&body).unwrap_err();
     assert!(!refuses_frame(&full), "{full}");
-    assert!(matches!(crate::app_engine::refusal_of(40, full), QuilError::ExecutionUnavailable(_)));
-    assert_eq!(verify_carried_copy(validator(lacking), header).await, CopyVerdict::Unavailable);
+    assert!(matches!(
+        crate::app_engine::refusal_of(40, full),
+        QuilError::ExecutionUnavailable(_)
+    ));
+    assert_eq!(
+        verify_carried_copy(validator(lacking), header).await,
+        CopyVerdict::Unavailable
+    );
 }
 
 /// A certified frame refused while the committee that may have signed it
@@ -860,12 +1179,18 @@ async fn a_refused_certificate_waits_only_when_possession_holds() {
             false => validator,
         };
         match source {
-            true => validator.with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(None) }))),
+            true => {
+                validator.with_storage_history_source(Arc::new(|_, _| Box::pin(async { Ok(None) })))
+            }
             false => validator,
         }
     };
     let unavailable = || QuilError::ExecutionUnavailable("no archive answered".into());
-    let refused = || Err(QuilError::InvalidSignature("app shard frame certificate rejected".into()));
+    let refused = || {
+        Err(QuilError::InvalidSignature(
+            "app shard frame certificate rejected".into(),
+        ))
+    };
     let judged = |validator: &BlsAppFrameValidator, prepared: &Prepared, frame: &AppShardFrame| {
         match prepared.judge(validator, frame, refused()) {
             Err(QuilError::ExecutionUnavailable(_)) => "waits",
@@ -873,21 +1198,44 @@ async fn a_refused_certificate_waits_only_when_possession_holds() {
             other => panic!("{other:?}"),
         }
     };
-    let with_history = Prepared { committee: Some(unavailable()), ..Default::default() };
+    let with_history = Prepared {
+        committee: Some(unavailable()),
+        ..Default::default()
+    };
     let full = validator(true, false);
     assert_eq!(judged(&full, &with_history, &body), "waits");
-    assert_eq!(judged(&full, &with_history, &corrupt), "refused", "possession is checked with its own history");
+    assert_eq!(
+        judged(&full, &with_history, &corrupt),
+        "refused",
+        "possession is checked with its own history"
+    );
     for (frame, expected) in [(&body, "waits"), (&corrupt, "refused")] {
-        let mut prepared = Prepared { committee: Some(unavailable()), history: Some(unavailable()), ..Default::default() };
+        let mut prepared = Prepared {
+            committee: Some(unavailable()),
+            history: Some(unavailable()),
+            ..Default::default()
+        };
         prepared.prepare_without_certificate(&full, frame).await;
         assert!(prepared.possession);
-        assert_eq!(judged(&full, &prepared, frame), expected, "and with the history had without its certificate");
+        assert_eq!(
+            judged(&full, &prepared, frame),
+            expected,
+            "and with the history had without its certificate"
+        );
     }
     let lacking = validator(false, true);
-    let mut prepared = Prepared { committee: Some(unavailable()), history: Some(unavailable()), ..Default::default() };
+    let mut prepared = Prepared {
+        committee: Some(unavailable()),
+        history: Some(unavailable()),
+        ..Default::default()
+    };
     prepared.prepare_without_certificate(&lacking, &body).await;
     assert!(!prepared.possession);
-    assert_eq!(judged(&lacking, &prepared, &body), "waits", "no history at all: checked without possession");
+    assert_eq!(
+        judged(&lacking, &prepared, &body),
+        "waits",
+        "no history at all: checked without possession"
+    );
 }
 
 /// A shard GLOBAL manages through a session of generation 1, as GLOBAL's
@@ -898,18 +1246,30 @@ fn managed_shard(filter: &[u8]) -> Arc<quil_hypergraph::HypergraphCrdt> {
         Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
         Arc::new(quil_hypergraph::testing::StubProver),
     ));
-    global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+    global.set_forest(quil_forest::Forest::with_namespace(
+        db.inner(),
+        quil_store::FOREST_NAMESPACE,
+    ));
     let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
     let commit = |frame: u64| {
         state.commit().unwrap();
         state.abort();
-        global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        global
+            .commit_with_global_cursor(
+                frame,
+                &quil_store::encoding::global_materialized_cursor_key(),
+            )
+            .unwrap();
     };
     let signer = quil_crypto::FalconSigner::generate();
     let session = quil_cw_consensus::handoff::Session {
-        chain_id: [7; 32], filter: filter.to_vec(), generation: 1,
+        chain_id: [7; 32],
+        filter: filter.to_vec(),
+        generation: 1,
         genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
-        base_frame: 0, authorization: [0; 32], members: vec![signer.public_key().to_vec()],
+        base_frame: 0,
+        authorization: [0; 32],
+        members: vec![signer.public_key().to_vec()],
     };
     commit(1);
     quil_execution::global_intrinsic::handoff::initialize(&state, 2, &session).unwrap();
@@ -943,18 +1303,40 @@ async fn a_legacy_wrapper_on_a_managed_shard_is_refused_not_a_wait() {
     // A generation-0 certificate today's committee does not verify (another
     // frame's), wrapped around the genuine header.
     let mut header = fixture.frame.header.clone().unwrap();
-    header.public_key_signature_bls48581 = legacy_committee_frame().frame.header.unwrap().public_key_signature_bls48581;
+    header.public_key_signature_bls48581 = legacy_committee_frame()
+        .frame
+        .header
+        .unwrap()
+        .public_key_signature_bls48581;
     assert!(!validator.legacy_committee_applies(&header));
     let within = std::time::Duration::from_secs(30);
-    let verdict = tokio::time::timeout(within, verify_carried_copy(validator.clone(), header.clone()))
-        .await
-        .expect("no historical committee is waited on");
+    let verdict = tokio::time::timeout(
+        within,
+        verify_carried_copy(validator.clone(), header.clone()),
+    )
+    .await
+    .expect("no historical committee is waited on");
     assert_eq!(verdict, CopyVerdict::CertificateRefused);
-    let frame = AppShardFrame { header: Some(header), ..fixture.frame.clone() };
-    let prepared = tokio::time::timeout(within, prepare_replayed_frame(&validator, &frame)).await.unwrap();
+    let frame = AppShardFrame {
+        header: Some(header),
+        ..fixture.frame.clone()
+    };
+    let prepared = tokio::time::timeout(within, prepare_replayed_frame(&validator, &frame))
+        .await
+        .unwrap();
     assert!(prepared.committee.is_none(), "{:?}", prepared.committee);
-    let judged = prepared.judge(&validator, &frame, validate_certified_frame(&validator, &frame, prepared.retained()));
-    assert!(match &judged { Ok(valid) => !valid, Err(error) => refuses_frame(error) }, "{judged:?}");
+    let judged = prepared.judge(
+        &validator,
+        &frame,
+        validate_certified_frame(&validator, &frame, prepared.retained()),
+    );
+    assert!(
+        match &judged {
+            Ok(valid) => !valid,
+            Err(error) => refuses_frame(error),
+        },
+        "{judged:?}"
+    );
 }
 
 /// Archive replay, in the engine, waits on a legacy certificate's
@@ -973,11 +1355,23 @@ async fn replay_waits_briefly_on_a_committee_being_rebuilt() {
     });
     let validator = (legacy.validator)(never);
     let first = prepare_replayed_frame(&validator, &legacy.frame).await;
-    assert!(first.committee.as_ref().is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
-        "{:?}", first.committee);
+    assert!(
+        first
+            .committee
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
+        "{:?}",
+        first.committee
+    );
     let second = prepare_replayed_frame(&validator, &legacy.frame).await;
-    assert!(second.committee.as_ref().is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
-        "it waits on the reconstruction under way: {:?}", second.committee);
+    assert!(
+        second
+            .committee
+            .as_ref()
+            .is_some_and(|error| error.to_string().contains("not rebuilt within 20s")),
+        "it waits on the reconstruction under way: {:?}",
+        second.committee
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1, "one reconstruction");
 }
 
@@ -1004,7 +1398,12 @@ async fn frames_needing_one_committee_share_its_reconstruction() {
         prepare_certified_frame(&validator, &legacy.frame),
         prepare_certified_frame(&validator, &legacy.frame),
     );
-    assert!(first.committee.is_none() && second.committee.is_none(), "{:?} {:?}", first.committee, second.committee);
+    assert!(
+        first.committee.is_none() && second.committee.is_none(),
+        "{:?} {:?}",
+        first.committee,
+        second.committee
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -1018,7 +1417,11 @@ async fn a_copy_anchored_elsewhere_is_refused_before_any_committee_is_rebuilt() 
     use crate::prover_tree_syncer::{verify_carried_copy, CopyVerdict};
     let legacy = legacy_committee_frame();
     legacy.clock.seed_frame(GlobalFrame {
-        header: Some(GlobalFrameHeader { frame_number: 4_001, output: vec![3; 516], ..Default::default() }),
+        header: Some(GlobalFrameHeader {
+            frame_number: 4_001,
+            output: vec![3; 516],
+            ..Default::default()
+        }),
         requests: vec![],
     });
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1031,8 +1434,14 @@ async fn a_copy_anchored_elsewhere_is_refused_before_any_committee_is_rebuilt() 
     let validator = (legacy.validator)(source);
     let mut header = legacy.frame.header.clone().unwrap();
     header.global_frame_number = 4_001;
-    assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Refused);
-    let frame = AppShardFrame { header: Some(header), ..legacy.frame.clone() };
+    assert_eq!(
+        verify_carried_copy(validator.clone(), header.clone()).await,
+        CopyVerdict::Refused
+    );
+    let frame = AppShardFrame {
+        header: Some(header),
+        ..legacy.frame.clone()
+    };
     let prepared = prepare_replayed_frame(&validator, &frame).await;
     assert!(prepared.committee.is_none(), "{:?}", prepared.committee);
     assert_eq!(calls.load(Ordering::SeqCst), 0, "no committee rebuilt");
@@ -1045,7 +1454,9 @@ struct LegacyCommitteeFrame {
     frame: AppShardFrame,
     members: Vec<Vec<u8>>,
     clock: Arc<quil_store::testing::InMemoryClockStore>,
-    validator: Box<dyn Fn(crate::historical_committee::HistoricalCommitteeSource) -> Arc<BlsAppFrameValidator>>,
+    validator: Box<
+        dyn Fn(crate::historical_committee::HistoricalCommitteeSource) -> Arc<BlsAppFrameValidator>,
+    >,
 }
 
 fn legacy_committee_frame() -> LegacyCommitteeFrame {
@@ -1055,7 +1466,11 @@ fn legacy_committee_frame() -> LegacyCommitteeFrame {
     let output = vec![9; 516];
     let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
     clock.seed_frame(GlobalFrame {
-        header: Some(GlobalFrameHeader { frame_number: global_frame, output: output.clone(), ..Default::default() }),
+        header: Some(GlobalFrameHeader {
+            frame_number: global_frame,
+            output: output.clone(),
+            ..Default::default()
+        }),
         requests: vec![],
     });
     let prover = |signer: &quil_crypto::FalconSigner, address: u8| ProverInfo {
@@ -1070,7 +1485,9 @@ fn legacy_committee_frame() -> LegacyCommitteeFrame {
     };
     let then = quil_crypto::FalconSigner::generate();
     let now = quil_crypto::FalconSigner::generate();
-    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(prover(&now, 2)));
+    let registry = Arc::new(crate::test_support::TestProverRegistry::with_prover(
+        prover(&now, 2),
+    ));
     let mut frame = AppShardFrame {
         header: Some(FrameHeader {
             address: filter.to_vec(),
@@ -1106,11 +1523,20 @@ fn legacy_committee_frame() -> LegacyCommitteeFrame {
 }
 
 /// Historical committee sources answering `members`, and failing.
-fn committee_sources(members: Vec<Vec<u8>>) -> [crate::historical_committee::HistoricalCommitteeSource; 2] {
-    let rebuilt: crate::historical_committee::HistoricalCommitteeSource =
-        Arc::new(move |_, _| { let members = members.clone(); Box::pin(async move { Ok(vec![members]) }) });
-    let failing: crate::historical_committee::HistoricalCommitteeSource =
-        Arc::new(|_, _| Box::pin(async { Err(QuilError::ExecutionUnavailable("no archive answered".into())) }));
+fn committee_sources(
+    members: Vec<Vec<u8>>,
+) -> [crate::historical_committee::HistoricalCommitteeSource; 2] {
+    let rebuilt: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        let members = members.clone();
+        Box::pin(async move { Ok(vec![members]) })
+    });
+    let failing: crate::historical_committee::HistoricalCommitteeSource = Arc::new(|_, _| {
+        Box::pin(async {
+            Err(QuilError::ExecutionUnavailable(
+                "no archive answered".into(),
+            ))
+        })
+    });
     [rebuilt, failing]
 }
 
@@ -1127,19 +1553,33 @@ async fn a_carried_copy_whose_committee_needs_history_is_certified() {
     let legacy = legacy_committee_frame();
     let header = legacy.frame.header.clone().unwrap();
     let [rebuilt, failing] = committee_sources(legacy.members.clone());
-    assert_eq!(verify_carried_copy((legacy.validator)(rebuilt), header.clone()).await, CopyVerdict::Certified);
-    assert_eq!(verify_carried_copy((legacy.validator)(failing), header.clone()).await, CopyVerdict::Unavailable,
-        "a committee that cannot be had says nothing of the copy");
+    assert_eq!(
+        verify_carried_copy((legacy.validator)(rebuilt), header.clone()).await,
+        CopyVerdict::Certified
+    );
+    assert_eq!(
+        verify_carried_copy((legacy.validator)(failing), header.clone()).await,
+        CopyVerdict::Unavailable,
+        "a committee that cannot be had says nothing of the copy"
+    );
     let [_, failing] = committee_sources(legacy.members.clone());
     let mut forged = header.clone();
     forged.output[0] ^= 1;
-    assert_eq!(verify_carried_copy((legacy.validator)(failing), forged).await, CopyVerdict::Refused,
-        "a forged output is refused whatever the committee");
+    assert_eq!(
+        verify_carried_copy((legacy.validator)(failing), forged).await,
+        CopyVerdict::Refused,
+        "a forged output is refused whatever the committee"
+    );
     // A committee rebuilt that does not verify it: refused for now.
     let other = vec![quil_crypto::FalconSigner::generate().public_key().to_vec()];
-    let wrong: crate::historical_committee::HistoricalCommitteeSource =
-        Arc::new(move |_, _| { let other = other.clone(); Box::pin(async move { Ok(vec![other]) }) });
-    assert_eq!(verify_carried_copy((legacy.validator)(wrong), header.clone()).await, CopyVerdict::CertificateRefused);
+    let wrong: crate::historical_committee::HistoricalCommitteeSource = Arc::new(move |_, _| {
+        let other = other.clone();
+        Box::pin(async move { Ok(vec![other]) })
+    });
+    assert_eq!(
+        verify_carried_copy((legacy.validator)(wrong), header.clone()).await,
+        CopyVerdict::CertificateRefused
+    );
     // None rebuilt is no answer: no committee kept, a wait, answered as a
     // failure for a while (in-actor callers do not repeat it at once), then
     // asked again.
@@ -1151,12 +1591,25 @@ async fn a_carried_copy_whose_committee_needs_history_is_certified() {
     });
     let validator = (legacy.validator)(none);
     for _ in 0..2 {
-        assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Unavailable);
+        assert_eq!(
+            verify_carried_copy(validator.clone(), header.clone()).await,
+            CopyVerdict::Unavailable
+        );
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "the failure answers for a while");
-    assert!(validator.historical_committees.get(&header.address, legacy_committee_frame_of(&header)).is_none());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the failure answers for a while"
+    );
+    assert!(validator
+        .historical_committees
+        .get(&header.address, legacy_committee_frame_of(&header))
+        .is_none());
     validator.historical_committees.expire();
-    assert_eq!(verify_carried_copy(validator.clone(), header.clone()).await, CopyVerdict::Unavailable);
+    assert_eq!(
+        verify_carried_copy(validator.clone(), header.clone()).await,
+        CopyVerdict::Unavailable
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2, "asked again after it");
 }
 
@@ -1188,7 +1641,10 @@ async fn historical_reconstructions_run_two_at_a_time() {
         validator.prepare_historical_committee(&b),
         validator.prepare_historical_committee(&c),
     );
-    assert!(ra.is_ok() && rb.is_ok() && rc.is_ok(), "{ra:?} {rb:?} {rc:?}");
+    assert!(
+        ra.is_ok() && rb.is_ok() && rc.is_ok(),
+        "{ra:?} {rb:?} {rc:?}"
+    );
     assert_eq!(most.load(Ordering::SeqCst), 2);
 }
 
@@ -1211,12 +1667,19 @@ async fn replay_waits_on_a_frame_whose_committee_cannot_be_had() {
         let frame = legacy.frame.clone();
         async move {
             let prepared = prepare_certified_frame(&validator, &frame).await;
-            prepared.judge(&validator, &frame, validate_certified_frame(&validator, &frame, prepared.retained()))
+            prepared.judge(
+                &validator,
+                &frame,
+                validate_certified_frame(&validator, &frame, prepared.retained()),
+            )
         }
     };
     assert!(replayed((legacy.validator)(rebuilt)).await.unwrap());
     let waits = replayed((legacy.validator)(failing)).await.unwrap_err();
-    assert!(matches!(waits, QuilError::ExecutionUnavailable(_)) && !refuses_frame(&waits), "{waits}");
+    assert!(
+        matches!(waits, QuilError::ExecutionUnavailable(_)) && !refuses_frame(&waits),
+        "{waits}"
+    );
 
     // Only a refused certificate waits on the committee: a frame whose
     // output is forged is refused while it cannot be had too.
@@ -1225,6 +1688,16 @@ async fn replay_waits_on_a_frame_whose_committee_cannot_be_had() {
     let mut forged = legacy.frame.clone();
     forged.header.as_mut().unwrap().output[0] ^= 1;
     let prepared = prepare_certified_frame(&validator, &forged).await;
-    let refused = prepared.judge(&validator, &forged, validate_certified_frame(&validator, &forged, prepared.retained()));
-    assert!(match &refused { Ok(valid) => !valid, Err(error) => refuses_frame(error) }, "{refused:?}");
+    let refused = prepared.judge(
+        &validator,
+        &forged,
+        validate_certified_frame(&validator, &forged, prepared.retained()),
+    );
+    assert!(
+        match &refused {
+            Ok(valid) => !valid,
+            Err(error) => refuses_frame(error),
+        },
+        "{refused:?}"
+    );
 }

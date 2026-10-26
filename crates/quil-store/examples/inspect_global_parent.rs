@@ -19,9 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.inner().try_catch_up_with_primary()?;
     let mut records = Vec::new();
     for (kind, key) in [
-        ("prior", encoding::clock_global_frame_key(height.saturating_sub(1))),
+        (
+            "prior",
+            encoding::clock_global_frame_key(height.saturating_sub(1)),
+        ),
         ("canonical", encoding::clock_global_frame_key(height)),
-        ("candidate", encoding::clock_global_frame_candidate_key(height, &selector)),
+        (
+            "candidate",
+            encoding::clock_global_frame_candidate_key(height, &selector),
+        ),
     ] {
         let raw = db.inner().get(&key)?;
         let header = match raw {
@@ -37,6 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         records.push(json!({"kind":kind,"header":header}));
     }
-    println!("{}",serde_json::to_string_pretty(&json!({"store":args[0],"records":records}))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"store":args[0],"records":records}))?
+    );
     Ok(())
 }

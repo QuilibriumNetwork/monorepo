@@ -20,9 +20,9 @@
 //! engines (token, compute, hypergraph)
 
 use num_bigint::BigInt;
+use num_traits::Zero;
 #[cfg(all(test, feature = "confidential-tokens"))]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
-use num_traits::Zero;
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global::message_request::Request as MessageRequestInner;
 use quil_types::proto::global::{MessageBundle, MessageRequest};
@@ -97,7 +97,6 @@ pub fn default_fee_market() -> Policy {
 pub fn collect_bundle_fees(bundle: &MessageBundle, policy: &Policy) -> Vec<BigInt> {
     let mut queue = Vec::new();
 
-
     for op in &bundle.requests {
         match &op.request {
             Some(MessageRequestInner::TokenOperation(op)) => {
@@ -116,10 +115,7 @@ pub fn collect_bundle_fees(bundle: &MessageBundle, policy: &Policy) -> Vec<BigIn
 /// domain. The fee is read through the typed codec, so a malformed carrier
 /// produces nothing rather than a guessed amount.
 #[cfg(feature = "confidential-tokens")]
-fn token_fee(
-    op: &quil_types::proto::token::TokenOperation,
-    policy: &Policy,
-) -> Option<BigInt> {
+fn token_fee(op: &quil_types::proto::token::TokenOperation, policy: &Policy) -> Option<BigInt> {
     let bytes = &op.canonical_bytes;
     let domain = crate::token_intrinsic::wire::domain(bytes).ok()?;
     if domain.as_slice() != policy.producer_domain.as_slice() {
@@ -135,21 +131,19 @@ fn token_fee(
 }
 
 #[cfg(not(feature = "confidential-tokens"))]
-fn token_fee(
-    _op: &quil_types::proto::token::TokenOperation,
-    _policy: &Policy,
-) -> Option<BigInt> {
+fn token_fee(_op: &quil_types::proto::token::TokenOperation, _policy: &Policy) -> Option<BigInt> {
     None
 }
 
 /// QCT3 operations consume like their legacy counterparts: transfers
 /// and shields as transactions, escrow funding/claims as pending transactions,
 /// mints per the mint toggle. A mint claim spends an already-paid authorization.
-fn token_consumes(
-    op: &quil_types::proto::token::TokenOperation,
-    policy: &Policy,
-) -> bool {
-    match op.canonical_bytes.get(..4).map(|prefix| u32::from_be_bytes(prefix.try_into().unwrap())) {
+fn token_consumes(op: &quil_types::proto::token::TokenOperation, policy: &Policy) -> bool {
+    match op
+        .canonical_bytes
+        .get(..4)
+        .map(|prefix| u32::from_be_bytes(prefix.try_into().unwrap()))
+    {
         Some(0x0512) | Some(0x0516) => policy.consume_tx,
         Some(0x0514) | Some(0x0515) => policy.consume_pending_tx,
         Some(0x0513) => policy.consume_mint_tx,
@@ -232,11 +226,6 @@ mod tests {
         domains::QUIL_TOKEN.to_vec()
     }
 
-
-
-
-
-
     fn vertex_add_request() -> MessageRequest {
         MessageRequest {
             timestamp: 0,
@@ -296,11 +285,6 @@ mod tests {
     // collect_bundle_fees
     // -----------------------------------------------------------------
 
-
-
-
-
-
     #[test]
     fn collect_fees_from_hypergraph_op_is_nothing() {
         let p = default_fee_market();
@@ -317,7 +301,6 @@ mod tests {
     // -----------------------------------------------------------------
     // count_fee_consumers
     // -----------------------------------------------------------------
-
 
     #[test]
     fn count_consumers_empty_bundle() {
@@ -366,8 +349,6 @@ mod tests {
         assert!(needs_one_fee(&vertex_add_request(), &default_fee_market()));
     }
 
-
-
     // -----------------------------------------------------------------
     // pop_fee
     // -----------------------------------------------------------------
@@ -394,7 +375,9 @@ mod tests {
         MessageRequest {
             timestamp: 0,
             request: Some(MessageRequestInner::TokenOperation(
-                quil_types::proto::token::TokenOperation { canonical_bytes: bytes },
+                quil_types::proto::token::TokenOperation {
+                    canonical_bytes: bytes,
+                },
             )),
         }
     }
@@ -436,17 +419,31 @@ mod tests {
         let transfer = |application: [u8; 32], fee: u128| {
             let context = parameter_context(&network, &application);
             let output = Output {
-                commitment: CommitmentKey::derive(&context).commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
+                commitment: CommitmentKey::derive(&context)
+                    .commit(10, &AmountOpening::from_seed(&context, &[2; 32])),
                 owner: [3; IDENTITY_BYTES],
                 memo: [4; MEMO_BYTES],
             };
-            token_request(Transfer { statement: TransferStatement { network, application, depth: 1,
-                root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(), images: vec![[5; IDENTITY_BYTES]], fee, outputs: vec![output] },
-                proof: proof.clone() }.encode().unwrap())
+            token_request(
+                Transfer {
+                    statement: TransferStatement {
+                        network,
+                        application,
+                        depth: 1,
+                        root: Node::from_bytes(&[0; NODE_BYTES]).unwrap(),
+                        images: vec![[5; IDENTITY_BYTES]],
+                        fee,
+                        outputs: vec![output],
+                    },
+                    proof: proof.clone(),
+                }
+                .encode()
+                .unwrap(),
+            )
         };
         let b = bundle(vec![
             transfer(domains::QUIL_TOKEN, 7),
-            transfer([9; 32], 0),           // custom-token transfer: no QUIL fee
+            transfer([9; 32], 0), // custom-token transfer: no QUIL fee
             transfer(domains::QUIL_TOKEN, 0), // zero fee produces nothing
             vertex_add_request(),
         ]);
@@ -458,27 +455,43 @@ mod tests {
         // A structurally valid claim carries its earlier fee for receipt
         // authentication, but cannot finance itself or another operation.
         let output = match &transfer(domains::QUIL_TOKEN, 7).request {
-            Some(MessageRequestInner::TokenOperation(op)) =>
-                Transfer::decode(&op.canonical_bytes, &network, &domains::QUIL_TOKEN).unwrap().statement.outputs[0].clone(),
+            Some(MessageRequestInner::TokenOperation(op)) => {
+                Transfer::decode(&op.canonical_bytes, &network, &domains::QUIL_TOKEN)
+                    .unwrap()
+                    .statement
+                    .outputs[0]
+                    .clone()
+            }
             _ => unreachable!(),
         };
         let claim = quil_lattice_ct::confidential::mint_claim::MintClaim {
-            network, application: domains::QUIL_TOKEN, cited_global_frame: 1,
-            global_root: [6; 32], receipt: [7; 32], fee: 123,
-            outputs: vec![output], forest_proof: vec![1],
+            network,
+            application: domains::QUIL_TOKEN,
+            cited_global_frame: 1,
+            global_root: [6; 32],
+            receipt: [7; 32],
+            fee: 123,
+            outputs: vec![output],
+            forest_proof: vec![1],
         };
         let claim = token_request(claim.encode().unwrap());
         let claim_only = bundle(vec![claim.clone()]);
         assert!(collect_bundle_fees(&claim_only, &p).is_empty());
         assert_eq!(count_fee_consumers(&claim_only, &p), 0);
         let with_consumer = bundle(vec![claim.clone(), vertex_add_request()]);
-        assert!(sanity_check(&collect_bundle_fees(&with_consumer, &p), count_fee_consumers(&with_consumer, &p)).is_err());
+        assert!(sanity_check(
+            &collect_bundle_fees(&with_consumer, &p),
+            count_fee_consumers(&with_consumer, &p)
+        )
+        .is_err());
         let with_new_payment = bundle(vec![claim, transfer(domains::QUIL_TOKEN, 7)]);
-        assert_eq!(collect_bundle_fees(&with_new_payment, &p), vec![BigInt::from(7)]);
+        assert_eq!(
+            collect_bundle_fees(&with_new_payment, &p),
+            vec![BigInt::from(7)]
+        );
     }
 
     // -----------------------------------------------------------------
     // End-to-end: produce, count, sanity check, pop-each-consumer loop
     // -----------------------------------------------------------------
-
 }

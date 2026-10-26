@@ -1,7 +1,16 @@
 //! Caller-owned configuration for an isolated amount-proof verifier.
 //! Clones share a single worker slot; busy/error outcomes are local unavailability.
-use super::{worker_process::{run_worker, run_worker_capped, WorkerError, READINESS_REQUEST}, worker_request::{WorkerRequest, RequestError}};
-use std::{collections::HashMap, path::PathBuf, process::Command, sync::{Arc, Condvar, Mutex}, time::{Duration, Instant}};
+use super::{
+    worker_process::{run_worker, run_worker_capped, WorkerError, READINESS_REQUEST},
+    worker_request::{RequestError, WorkerRequest},
+};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -43,8 +52,11 @@ struct SlotState {
 
 impl SlotState {
     fn next_admitted(&self) -> Option<u64> {
-        self.waiting.iter()
-            .min_by_key(|(ticket, lane)| (self.last_admitted.get(lane).copied().unwrap_or(0), *ticket))
+        self.waiting
+            .iter()
+            .min_by_key(|(ticket, lane)| {
+                (self.last_admitted.get(lane).copied().unwrap_or(0), *ticket)
+            })
             .map(|(ticket, _)| *ticket)
     }
 
@@ -57,7 +69,11 @@ impl SlotState {
 
 impl Slots {
     fn new(max: usize) -> Self {
-        Self { max, state: Mutex::new(SlotState::default()), freed: Condvar::new() }
+        Self {
+            max,
+            state: Mutex::new(SlotState::default()),
+            freed: Condvar::new(),
+        }
     }
 }
 
@@ -103,7 +119,9 @@ struct SharedAdmission {
 
 impl SharedAdmission {
     fn slot_path(path: &std::path::Path, slot: usize) -> PathBuf {
-        if slot == 0 { path.to_path_buf() } else {
+        if slot == 0 {
+            path.to_path_buf()
+        } else {
             let mut name = path.as_os_str().to_os_string();
             name.push(format!(".{slot}"));
             PathBuf::from(name)
@@ -111,17 +129,29 @@ impl SharedAdmission {
     }
 
     fn open(path: PathBuf, slots: usize) -> Result<Self, ClientError> {
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::OpenOptionsExt;
             let mut files = Vec::with_capacity(slots);
             for slot in 0..slots {
-                files.push(std::fs::OpenOptions::new().read(true).write(true).create(true)
-                    .truncate(false).mode(0o600).open(Self::slot_path(&path, slot))
-                    .map_err(|e| ClientError::Process(WorkerError::Io(e)))?);
+                files.push(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .mode(0o600)
+                        .open(Self::slot_path(&path, slot))
+                        .map_err(|e| ClientError::Process(WorkerError::Io(e)))?,
+                );
             }
             Ok(Self { path, files })
         }
-        #[cfg(not(unix))] { let _ = (path, slots); Err(ClientError::Configuration) }
+        #[cfg(not(unix))]
+        {
+            let _ = (path, slots);
+            Err(ClientError::Configuration)
+        }
     }
 }
 
@@ -129,14 +159,31 @@ impl WorkerVerifier {
     /// The executable must be chosen by trusted local configuration. This
     /// requires an absolute path but does not attest or pin the binary's bytes.
     /// CPU and wall limits do not cap native workspace memory.
-    pub fn new(executable: PathBuf, cpu_seconds: u64, wall_timeout: Duration) -> Result<Self, ClientError> {
-        if !executable.is_absolute() || !(1..=3600).contains(&cpu_seconds)
-            || wall_timeout.is_zero() || wall_timeout > Duration::from_secs(3600) {
+    pub fn new(
+        executable: PathBuf,
+        cpu_seconds: u64,
+        wall_timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        if !executable.is_absolute()
+            || !(1..=3600).contains(&cpu_seconds)
+            || wall_timeout.is_zero()
+            || wall_timeout > Duration::from_secs(3600)
+        {
             return Err(ClientError::Configuration);
         }
-        Ok(Self { executable, cpu_seconds, wall_timeout, address_space_bytes: None, native_threads: None,
-            slots: Arc::new(Slots::new(1)), shared_admission: None,
-            lane: 0, admission_wait: Duration::ZERO, max_resident_bytes: None, worker_mode_arg: None })
+        Ok(Self {
+            executable,
+            cpu_seconds,
+            wall_timeout,
+            address_space_bytes: None,
+            native_threads: None,
+            slots: Arc::new(Slots::new(1)),
+            shared_admission: None,
+            lane: 0,
+            admission_wait: Duration::ZERO,
+            max_resident_bytes: None,
+            worker_mode_arg: None,
+        })
     }
 
     /// Start the executable with `arg` first, selecting its worker mode.
@@ -150,10 +197,13 @@ impl WorkerVerifier {
     /// file gets the same number of byte-range slots. Memory scales with the
     /// number of concurrent children (≈1 GB each at depth 32).
     pub fn with_concurrency(mut self, max: usize) -> Result<Self, ClientError> {
-        if !(1..=64).contains(&max) { return Err(ClientError::Configuration); }
+        if !(1..=64).contains(&max) {
+            return Err(ClientError::Configuration);
+        }
         self.slots = Arc::new(Slots::new(max));
         if let Some(shared) = self.shared_admission.take() {
-            self.shared_admission = Some(Arc::new(SharedAdmission::open(shared.path.clone(), max)?));
+            self.shared_admission =
+                Some(Arc::new(SharedAdmission::open(shared.path.clone(), max)?));
         }
         Ok(self)
     }
@@ -161,7 +211,9 @@ impl WorkerVerifier {
     /// Cap the native aggregation threads of each child (1..=8). With N
     /// concurrent children, N × threads should not exceed the machine's cores.
     pub fn with_native_threads(mut self, threads: u8) -> Result<Self, ClientError> {
-        if !(1..=8).contains(&threads) { return Err(ClientError::Configuration); }
+        if !(1..=8).contains(&threads) {
+            return Err(ClientError::Configuration);
+        }
         self.native_threads = Some(threads);
         Ok(self)
     }
@@ -184,7 +236,9 @@ impl WorkerVerifier {
     /// their number is bounded; past that bound, and at the deadline, the
     /// outcome is still `Busy` (local unavailability).
     pub fn with_admission_wait(mut self, wait: Duration) -> Result<Self, ClientError> {
-        if wait > Duration::from_secs(60) { return Err(ClientError::Configuration); }
+        if wait > Duration::from_secs(60) {
+            return Err(ClientError::Configuration);
+        }
         self.admission_wait = wait;
         Ok(self)
     }
@@ -239,7 +293,9 @@ impl WorkerVerifier {
     /// files in place while any node process runs; replacing/unlinking one
     /// creates a different lock. OS process exit releases held locks.
     pub fn with_shared_admission(mut self, path: PathBuf) -> Result<Self, ClientError> {
-        if !path.is_absolute() { return Err(ClientError::Configuration); }
+        if !path.is_absolute() {
+            return Err(ClientError::Configuration);
+        }
         self.shared_admission = Some(Arc::new(SharedAdmission::open(path, self.slots.max)?));
         Ok(self)
     }
@@ -251,8 +307,14 @@ impl WorkerVerifier {
     /// platforms can raise the deadline without editing fixtures. This is a
     /// test convenience, not a node configuration path.
     pub fn from_test_env(executable: PathBuf) -> Result<Self, ClientError> {
-        let wall = test_limit_secs(std::env::var("QUIL_TEST_WORKER_WALL_SECS").ok().as_deref(), 600);
-        let cpu = test_limit_secs(std::env::var("QUIL_TEST_WORKER_CPU_SECS").ok().as_deref(), wall);
+        let wall = test_limit_secs(
+            std::env::var("QUIL_TEST_WORKER_WALL_SECS").ok().as_deref(),
+            600,
+        );
+        let cpu = test_limit_secs(
+            std::env::var("QUIL_TEST_WORKER_CPU_SECS").ok().as_deref(),
+            wall,
+        );
         Self::new(executable, cpu, Duration::from_secs(wall))
     }
 
@@ -270,8 +332,13 @@ impl WorkerVerifier {
     /// five seconds. This does not attest the binary or prove native correctness.
     pub fn check_ready(&self) -> Result<(), ClientError> {
         let _permit = self.acquire_local(Instant::now())?;
-        match run_worker(self.command(), READINESS_REQUEST,
-            self.wall_timeout.min(Duration::from_secs(5))).map_err(ClientError::Process)? {
+        match run_worker(
+            self.command(),
+            READINESS_REQUEST,
+            self.wall_timeout.min(Duration::from_secs(5)),
+        )
+        .map_err(ClientError::Process)?
+        {
             true => Ok(()),
             false => Err(ClientError::Configuration),
         }
@@ -281,8 +348,13 @@ impl WorkerVerifier {
         let mut command = Command::new(&self.executable);
         command.args(self.worker_mode_arg);
         // The worker otherwise reads a node running as PID 1 as init.
-        command.env(super::worker_limits::PARENT_PID_ENV, std::process::id().to_string());
-        command.arg("--cpu-seconds").arg(self.cpu_seconds.to_string());
+        command.env(
+            super::worker_limits::PARENT_PID_ENV,
+            std::process::id().to_string(),
+        );
+        command
+            .arg("--cpu-seconds")
+            .arg(self.cpu_seconds.to_string());
         if let Some(bytes) = self.address_space_bytes {
             command.arg("--address-space-bytes").arg(bytes.to_string());
         }
@@ -298,11 +370,19 @@ impl WorkerVerifier {
     pub fn verify(&self, request: &WorkerRequest<'_>) -> Result<bool, ClientError> {
         let deadline = Instant::now() + self.admission_wait;
         let _permit = self.acquire_local(deadline)?;
-        let _shared = self.shared_admission.as_deref()
-            .map(|shared| acquire_shared_until(shared, deadline)).transpose()?;
+        let _shared = self
+            .shared_admission
+            .as_deref()
+            .map(|shared| acquire_shared_until(shared, deadline))
+            .transpose()?;
         let bytes = request.encode().map_err(ClientError::Request)?;
-        run_worker_capped(self.command(), &bytes, self.wall_timeout, self.max_resident_bytes)
-            .map_err(ClientError::Process)
+        run_worker_capped(
+            self.command(),
+            &bytes,
+            self.wall_timeout,
+            self.max_resident_bytes,
+        )
+        .map_err(ClientError::Process)
     }
 }
 
@@ -311,7 +391,10 @@ struct SharedPermit<'a>(&'a std::fs::File);
 
 /// Other node processes hold these locks too, and `flock` has no fair queue;
 /// poll until the caller's admission deadline rather than refusing at once.
-fn acquire_shared_until(shared: &SharedAdmission, deadline: Instant) -> Result<SharedPermit<'_>, ClientError> {
+fn acquire_shared_until(
+    shared: &SharedAdmission,
+    deadline: Instant,
+) -> Result<SharedPermit<'_>, ClientError> {
     loop {
         match acquire_shared(shared) {
             Err(ClientError::Busy) if Instant::now() < deadline => {
@@ -323,7 +406,8 @@ fn acquire_shared_until(shared: &SharedAdmission, deadline: Instant) -> Result<S
 }
 
 fn acquire_shared(shared: &SharedAdmission) -> Result<SharedPermit<'_>, ClientError> {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::fd::AsRawFd;
         // Nonblocking: busy is local unavailability, never proof rejection.
         for file in &shared.files {
@@ -337,13 +421,20 @@ fn acquire_shared(shared: &SharedAdmission) -> Result<SharedPermit<'_>, ClientEr
         }
         Err(ClientError::Busy)
     }
-    #[cfg(not(unix))] { let _ = shared; Err(ClientError::Configuration) }
+    #[cfg(not(unix))]
+    {
+        let _ = shared;
+        Err(ClientError::Configuration)
+    }
 }
 impl Drop for SharedPermit<'_> {
     fn drop(&mut self) {
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::fd::AsRawFd;
-            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); }
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }
@@ -366,10 +457,13 @@ mod tests {
     fn the_worker_command_names_this_process_as_its_parent() {
         use super::super::worker_limits::PARENT_PID_ENV;
         use std::ffi::OsStr;
-        let verifier = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap();
+        let verifier =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap();
         let pid = std::process::id().to_string();
-        assert!(verifier.command().get_envs()
-            .any(|(key, value)| key == OsStr::new(PARENT_PID_ENV) && value == Some(OsStr::new(&pid))));
+        assert!(verifier.command().get_envs().any(|(key, value)| key
+            == OsStr::new(PARENT_PID_ENV)
+            && value == Some(OsStr::new(&pid))));
     }
 
     #[cfg(unix)]
@@ -377,8 +471,11 @@ mod tests {
     #[ignore = "subprocess fixture invoked by shared_admission_coordinates_processes"]
     fn shared_admission_child() {
         let path = PathBuf::from(std::env::var_os("QUIL_TEST_ADMISSION_FILE").unwrap());
-        let verifier = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
-            .unwrap().with_shared_admission(path).unwrap();
+        let verifier =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_shared_admission(path)
+                .unwrap();
         let result = acquire_shared(verifier.shared_admission.as_deref().unwrap());
         if std::env::var("QUIL_TEST_ADMISSION_BUSY").unwrap() == "1" {
             assert!(matches!(result, Err(ClientError::Busy)));
@@ -391,13 +488,20 @@ mod tests {
 
     #[test]
     fn waiting_admission_is_fair_across_lanes_bounded_and_times_out() {
-        let base = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap();
-        assert!(base.clone().with_admission_wait(Duration::from_secs(61)).is_err());
+        let base = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+            .unwrap();
+        assert!(base
+            .clone()
+            .with_admission_wait(Duration::from_secs(61))
+            .is_err());
         let base = base.with_admission_wait(Duration::from_secs(20)).unwrap();
         let (busy, quiet) = (base.for_lane(1), base.for_lane(2));
         let held = busy.acquire_local(Instant::now()).unwrap();
         // A zero deadline still refuses at once, as before.
-        assert!(matches!(quiet.acquire_local(Instant::now()), Err(ClientError::Busy)));
+        assert!(matches!(
+            quiet.acquire_local(Instant::now()),
+            Err(ClientError::Busy)
+        ));
 
         // Lane 1 queues three more requests BEFORE lane 2 asks once.
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -405,13 +509,17 @@ mod tests {
         let spawn = |verifier: WorkerVerifier, lane: u32| {
             let (order, release) = (order.clone(), release.clone());
             std::thread::spawn(move || {
-                let permit = verifier.acquire_local(Instant::now() + Duration::from_secs(20)).unwrap();
+                let permit = verifier
+                    .acquire_local(Instant::now() + Duration::from_secs(20))
+                    .unwrap();
                 order.lock().unwrap().push(lane);
                 // Hold the slot until the test releases this admission.
                 let (count, signal) = &*release;
                 let mut released = count.lock().unwrap();
                 let position = order.lock().unwrap().len();
-                while *released < position { released = signal.wait(released).unwrap(); }
+                while *released < position {
+                    released = signal.wait(released).unwrap();
+                }
                 drop(permit);
             })
         };
@@ -423,26 +531,37 @@ mod tests {
             }
         };
         let mut threads = Vec::new();
-        for n in 1..=3 { threads.push(spawn(busy.clone(), 1)); waiting(n); }
+        for n in 1..=3 {
+            threads.push(spawn(busy.clone(), 1));
+            waiting(n);
+        }
         threads.push(spawn(quiet.clone(), 2));
         waiting(4);
         // The queue is bounded (4 per slot): a fifth waiter is refused outright.
         let start = Instant::now();
-        assert!(matches!(quiet.acquire_local(Instant::now() + Duration::from_secs(20)), Err(ClientError::Busy)));
+        assert!(matches!(
+            quiet.acquire_local(Instant::now() + Duration::from_secs(20)),
+            Err(ClientError::Busy)
+        ));
         assert!(start.elapsed() < Duration::from_secs(5));
 
         drop(held);
         for admitted in 1..=4 {
             let deadline = Instant::now() + Duration::from_secs(10);
             while order.lock().unwrap().len() < admitted {
-                assert!(Instant::now() < deadline, "admission {admitted} never happened");
+                assert!(
+                    Instant::now() < deadline,
+                    "admission {admitted} never happened"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
             let (count, signal) = &*release;
             *count.lock().unwrap() = admitted;
             signal.notify_all();
         }
-        for thread in threads { thread.join().unwrap(); }
+        for thread in threads {
+            thread.join().unwrap();
+        }
         // Lane 1 was admitted last, so lane 2's single request overtakes all
         // three of lane 1's earlier ones; within lane 1 the order is arrival.
         assert_eq!(*order.lock().unwrap(), vec![2, 1, 1, 1]);
@@ -450,7 +569,10 @@ mod tests {
         // A waiter that reaches its deadline leaves the queue and reports Busy.
         let held = busy.acquire_local(Instant::now()).unwrap();
         let start = Instant::now();
-        assert!(matches!(quiet.acquire_local(Instant::now() + Duration::from_millis(150)), Err(ClientError::Busy)));
+        assert!(matches!(
+            quiet.acquire_local(Instant::now() + Duration::from_millis(150)),
+            Err(ClientError::Busy)
+        ));
         assert!(start.elapsed() >= Duration::from_millis(150));
         assert!(base.slots.state.lock().unwrap().waiting.is_empty());
         drop(held);
@@ -463,71 +585,131 @@ mod tests {
         use rand::RngCore;
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let directory = std::env::temp_dir().join(format!("quil-admission-{}-{:x?}", std::process::id(), nonce));
+        let directory = std::env::temp_dir().join(format!(
+            "quil-admission-{}-{:x?}",
+            std::process::id(),
+            nonce
+        ));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("slot");
-        let make = || WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
-            .unwrap().with_shared_admission(path.clone()).unwrap();
-        let first = make(); let second = make();
+        let make = || {
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_shared_admission(path.clone())
+                .unwrap()
+        };
+        let first = make();
+        let second = make();
         let child = |busy| {
             assert!(Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "confidential::relation::backend::worker_client::tests::shared_admission_child", "--ignored", "--nocapture"])
-                .env("QUIL_TEST_ADMISSION_FILE", &path).env("QUIL_TEST_ADMISSION_BUSY", if busy { "1" } else { "0" })
-                .status().unwrap().success());
+                .args([
+                    "--exact",
+                    "confidential::relation::backend::worker_client::tests::shared_admission_child",
+                    "--ignored",
+                    "--nocapture"
+                ])
+                .env("QUIL_TEST_ADMISSION_FILE", &path)
+                .env("QUIL_TEST_ADMISSION_BUSY", if busy { "1" } else { "0" })
+                .status()
+                .unwrap()
+                .success());
         };
         let held = acquire_shared(first.shared_admission.as_deref().unwrap()).unwrap();
-        let request = WorkerRequest { network: [1; 32], application: [2; 32],
-            limits: CompileLimits { max_inputs: 2, max_outputs: 2, max_depth: 32 },
-            submission_bytes: 0, transaction: &[] };
+        let request = WorkerRequest {
+            network: [1; 32],
+            application: [2; 32],
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            },
+            submission_bytes: 0,
+            transaction: &[],
+        };
         assert!(matches!(second.verify(&request), Err(ClientError::Busy)));
         child(true);
         drop(held);
         child(false);
         // Encode failure also releases the shared slot before returning.
-        assert!(matches!(second.verify(&request), Err(ClientError::Request(_))));
+        assert!(matches!(
+            second.verify(&request),
+            Err(ClientError::Request(_))
+        ));
         let held = acquire_shared(first.shared_admission.as_deref().unwrap()).unwrap();
-        drop(held); drop(first); drop(second);
+        drop(held);
+        drop(first);
+        drop(second);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn concurrency_slots_admit_n_in_flight_locally_and_across_descriptors() {
-        let directory = std::env::temp_dir().join(format!("quil-admission-slots-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("quil-admission-slots-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let verifier = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap();
+        let verifier =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap();
         assert!(verifier.clone().with_concurrency(0).is_err());
         assert!(verifier.clone().with_concurrency(65).is_err());
         assert!(verifier.clone().with_native_threads(0).is_err());
         assert!(verifier.clone().with_native_threads(9).is_err());
         let verifier = verifier
-            .with_shared_admission(directory.join("slots")).unwrap()
-            .with_concurrency(2).unwrap()
-            .with_native_threads(2).unwrap();
+            .with_shared_admission(directory.join("slots"))
+            .unwrap()
+            .with_concurrency(2)
+            .unwrap()
+            .with_native_threads(2)
+            .unwrap();
         assert_eq!(verifier.concurrency(), 2);
         assert_eq!(verifier.shared_admission.as_ref().unwrap().files.len(), 2);
         let clone = verifier.clone();
         let first = verifier.acquire_local(Instant::now()).unwrap();
         let second = clone.acquire_local(Instant::now()).unwrap();
-        assert!(matches!(verifier.acquire_local(Instant::now()), Err(ClientError::Busy)));
+        assert!(matches!(
+            verifier.acquire_local(Instant::now()),
+            Err(ClientError::Busy)
+        ));
         drop(first);
         assert!(verifier.acquire_local(Instant::now()).is_ok());
         drop(second);
         // An independent client on the same file competes for the same two slots.
-        let other = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap()
-            .with_shared_admission(directory.join("slots")).unwrap().with_concurrency(2).unwrap();
-        let third = WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1)).unwrap()
-            .with_shared_admission(directory.join("slots")).unwrap().with_concurrency(2).unwrap();
+        let other =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_shared_admission(directory.join("slots"))
+                .unwrap()
+                .with_concurrency(2)
+                .unwrap();
+        let third =
+            WorkerVerifier::new(std::env::current_exe().unwrap(), 1, Duration::from_secs(1))
+                .unwrap()
+                .with_shared_admission(directory.join("slots"))
+                .unwrap()
+                .with_concurrency(2)
+                .unwrap();
         let a = acquire_shared(verifier.shared_admission.as_deref().unwrap()).unwrap();
         let b = acquire_shared(other.shared_admission.as_deref().unwrap()).unwrap();
         // Both slot files are held by other descriptors: a third client is busy.
-        assert!(matches!(acquire_shared(third.shared_admission.as_deref().unwrap()), Err(ClientError::Busy)));
+        assert!(matches!(
+            acquire_shared(third.shared_admission.as_deref().unwrap()),
+            Err(ClientError::Busy)
+        ));
         drop(a);
         let c = acquire_shared(third.shared_admission.as_deref().unwrap()).unwrap();
         drop(b);
         drop(c);
         let command = verifier.command();
-        let envs: Vec<_> = command.get_envs().map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect();
-        assert!(envs.iter().any(|(k, v)| k == "QUIL_NATIVE_AGGREGATION_THREADS" && v.as_deref() == Some(std::ffi::OsStr::new("2"))), "{envs:?}");
+        let envs: Vec<_> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "QUIL_NATIVE_AGGREGATION_THREADS"
+                    && v.as_deref() == Some(std::ffi::OsStr::new("2"))),
+            "{envs:?}"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -554,13 +736,24 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         assert!(verifier.clone().with_address_space_limit(1 << 30).is_err());
         let clone = verifier.clone();
-        let request = WorkerRequest { network: [1; 32], application: [2; 32],
-            limits: CompileLimits { max_inputs: 2, max_outputs: 2, max_depth: 32 },
-            submission_bytes: 0, transaction: &[0; 4] };
+        let request = WorkerRequest {
+            network: [1; 32],
+            application: [2; 32],
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            },
+            submission_bytes: 0,
+            transaction: &[0; 4],
+        };
         let permit = verifier.acquire_local(Instant::now()).unwrap();
         assert!(matches!(clone.verify(&request), Err(ClientError::Busy)));
         drop(permit);
-        let bad = WorkerRequest { transaction: &[], ..request };
+        let bad = WorkerRequest {
+            transaction: &[],
+            ..request
+        };
         assert!(matches!(clone.verify(&bad), Err(ClientError::Request(_))));
         assert!(verifier.acquire_local(Instant::now()).is_ok());
     }
@@ -572,24 +765,50 @@ mod tests {
         let path = PathBuf::from(std::env::var("QUIL_AMOUNT_WORKER_PATH").expect("worker path"));
         let fixture = std::env::var("QUIL_AMOUNT_WORKER_FIXTURE").expect("public fixture path");
         let mut transaction = Vec::new();
-        std::fs::File::open(fixture).unwrap().take(1 << 20).read_to_end(&mut transaction).unwrap();
+        std::fs::File::open(fixture)
+            .unwrap()
+            .take(1 << 20)
+            .read_to_end(&mut transaction)
+            .unwrap();
         // Independently specified context for the saved mint fixture.
         let hex = "11558584af7017a9bfd1ff1864302d643fbe58c62dcf90cbcd8fde74a26794d9";
         let mut app = [0; 32];
-        for (i, value) in app.iter_mut().enumerate() { *value = u8::from_str_radix(&hex[i*2..i*2+2], 16).unwrap(); }
+        for (i, value) in app.iter_mut().enumerate() {
+            *value = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
         let verifier = WorkerVerifier::from_test_env(path).unwrap();
         // Explicit test allowance, not a node default or a measured RSS bound.
         #[cfg(target_os = "linux")]
         let verifier = verifier.with_address_space_limit(8 << 30).unwrap();
-        let request = WorkerRequest { network: [1; 32], application: app,
-            limits: CompileLimits { max_inputs: 2, max_outputs: 2, max_depth: 32 },
-            submission_bytes: 1 << 30, transaction: &transaction };
+        let request = WorkerRequest {
+            network: [1; 32],
+            application: app,
+            limits: CompileLimits {
+                max_inputs: 2,
+                max_outputs: 2,
+                max_depth: 32,
+            },
+            submission_bytes: 1 << 30,
+            transaction: &transaction,
+        };
         assert!(verifier.verify(&request).unwrap());
-        let wrong = WorkerRequest { network: [2; 32], ..request };
+        let wrong = WorkerRequest {
+            network: [2; 32],
+            ..request
+        };
         assert!(!verifier.verify(&wrong).unwrap());
-        let unavailable = WorkerRequest { submission_bytes: 0, ..request };
-        assert!(matches!(verifier.verify(&unavailable), Err(ClientError::Process(WorkerError::UnexpectedExit(Some(82))))));
+        let unavailable = WorkerRequest {
+            submission_bytes: 0,
+            ..request
+        };
+        assert!(matches!(
+            verifier.verify(&unavailable),
+            Err(ClientError::Process(WorkerError::UnexpectedExit(Some(82))))
+        ));
         assert!(verifier.acquire_local(Instant::now()).is_ok());
-        println!("worker_client_native_mint=true context_rejected=true budget_unavailable=true bytes={}", transaction.len());
+        println!(
+            "worker_client_native_mint=true context_rejected=true budget_unavailable=true bytes={}",
+            transaction.len()
+        );
     }
 }

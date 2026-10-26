@@ -25,7 +25,7 @@
 
 use quil_types::error::{QuilError, Result};
 
-use crate::canonical_cursor::{put_u32, read_u32, read_bytes, read_lp, expect_tp};
+use crate::canonical_cursor::{expect_tp, put_u32, read_bytes, read_lp, read_u32};
 
 /// `MessageRequestType = 0x0311` from canonical_types.go.
 pub const TYPE_MESSAGE_REQUEST: u32 = 0x0311;
@@ -67,7 +67,11 @@ impl CanonicalMessageRequest {
     /// and tags it with the inner type prefix.
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
         let mut c = 0;
-        expect_tp(read_u32(data, &mut c)?, TYPE_MESSAGE_REQUEST, "MessageRequest")?;
+        expect_tp(
+            read_u32(data, &mut c)?,
+            TYPE_MESSAGE_REQUEST,
+            "MessageRequest",
+        )?;
 
         let inner_bytes = read_lp(data, &mut c)?;
         if inner_bytes.is_empty() {
@@ -145,7 +149,11 @@ impl CanonicalMessageBundle {
 
     pub fn from_canonical_bytes(data: &[u8]) -> Result<Self> {
         let mut c = 0;
-        expect_tp(read_u32(data, &mut c)?, TYPE_MESSAGE_BUNDLE, "MessageBundle")?;
+        expect_tp(
+            read_u32(data, &mut c)?,
+            TYPE_MESSAGE_BUNDLE,
+            "MessageBundle",
+        )?;
 
         let num_requests = read_u32(data, &mut c)? as usize;
         // Cap pre-allocation against the remaining buffer: every
@@ -202,9 +210,7 @@ pub fn proto_message_request_to_canonical_inner_bytes(
     use quil_types::proto::global::message_request::Request as Inner;
 
     let inner = pb.request.as_ref().ok_or_else(|| {
-        quil_types::error::QuilError::InvalidArgument(
-            "MessageRequest: missing oneof".into(),
-        )
+        quil_types::error::QuilError::InvalidArgument("MessageRequest: missing oneof".into())
     })?;
 
     match inner {
@@ -218,49 +224,42 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             Ok(bytes.clone())
         }
         Inner::StorageEpochProof(bytes) => {
-            crate::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(bytes)?;
+            crate::global_intrinsic::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(
+                bytes,
+            )?;
             Ok(bytes.clone())
         }
         Inner::Join(p) => {
-            crate::global_intrinsic::conversions::prover_join_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_join_from_proto(p).to_canonical_bytes()
         }
         Inner::Leave(p) => {
-            crate::global_intrinsic::conversions::prover_leave_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_leave_from_proto(p).to_canonical_bytes()
         }
         Inner::Pause(p) => {
-            crate::global_intrinsic::conversions::prover_pause_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_pause_from_proto(p).to_canonical_bytes()
         }
         Inner::Resume(p) => {
-            crate::global_intrinsic::conversions::prover_resume_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_resume_from_proto(p).to_canonical_bytes()
         }
         Inner::Confirm(p) => {
-            crate::global_intrinsic::conversions::prover_confirm_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_confirm_from_proto(p).to_canonical_bytes()
         }
         Inner::Reject(p) => {
-            crate::global_intrinsic::conversions::prover_reject_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_reject_from_proto(p).to_canonical_bytes()
         }
         Inner::Update(p) => {
-            crate::global_intrinsic::conversions::prover_update_from_proto(p)
-                .to_canonical_bytes()
+            crate::global_intrinsic::conversions::prover_update_from_proto(p).to_canonical_bytes()
         }
-        Inner::AltShardUpdate(p) => {
-            crate::global_intrinsic::consensus_types::AltShardUpdate {
-                public_key: p.public_key.clone(),
-                frame_number: p.frame_number,
-                vertex_adds_root: p.vertex_adds_root.clone(),
-                vertex_removes_root: p.vertex_removes_root.clone(),
-                hyperedge_adds_root: p.hyperedge_adds_root.clone(),
-                hyperedge_removes_root: p.hyperedge_removes_root.clone(),
-                signature: p.signature.clone(),
-            }
-            .to_canonical_bytes()
+        Inner::AltShardUpdate(p) => crate::global_intrinsic::consensus_types::AltShardUpdate {
+            public_key: p.public_key.clone(),
+            frame_number: p.frame_number,
+            vertex_adds_root: p.vertex_adds_root.clone(),
+            vertex_removes_root: p.vertex_removes_root.clone(),
+            hyperedge_adds_root: p.hyperedge_adds_root.clone(),
+            hyperedge_removes_root: p.hyperedge_removes_root.clone(),
+            signature: p.signature.clone(),
         }
+        .to_canonical_bytes(),
 
         // Hypergraph ops (mirror `hypergraph_engine::request_to_payload`).
         Inner::VertexAdd(p) => {
@@ -276,10 +275,12 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             crate::hypergraph_intrinsic::types::HyperedgeRemove::from_proto(p).to_canonical_bytes()
         }
         Inner::HypergraphDeploy(p) => {
-            crate::hypergraph_intrinsic::types::HypergraphDeploy::from_proto(p)?.to_canonical_bytes()
+            crate::hypergraph_intrinsic::types::HypergraphDeploy::from_proto(p)?
+                .to_canonical_bytes()
         }
         Inner::HypergraphUpdate(p) => {
-            crate::hypergraph_intrinsic::types::HypergraphUpdate::from_proto(p)?.to_canonical_bytes()
+            crate::hypergraph_intrinsic::types::HypergraphUpdate::from_proto(p)?
+                .to_canonical_bytes()
         }
 
         // Token deploy / update (the confidential Transaction path is a
@@ -297,13 +298,16 @@ pub fn proto_message_request_to_canonical_inner_bytes(
 
         // Compute deploy / update / code.
         Inner::ComputeDeploy(p) => {
-            crate::compute_intrinsic::conversions::compute_deploy_from_proto(p)?.to_canonical_bytes()
+            crate::compute_intrinsic::conversions::compute_deploy_from_proto(p)?
+                .to_canonical_bytes()
         }
         Inner::ComputeUpdate(p) => {
-            crate::compute_intrinsic::conversions::compute_update_from_proto(p)?.to_canonical_bytes()
+            crate::compute_intrinsic::conversions::compute_update_from_proto(p)?
+                .to_canonical_bytes()
         }
         Inner::CodeDeploy(p) => {
-            crate::compute_intrinsic::conversions::code_deployment_from_proto(p).to_canonical_bytes()
+            crate::compute_intrinsic::conversions::code_deployment_from_proto(p)
+                .to_canonical_bytes()
         }
         Inner::CodeExecute(p) => {
             crate::compute_intrinsic::conversions::code_execute_from_proto(p)?.to_canonical_bytes()
@@ -312,13 +316,11 @@ pub fn proto_message_request_to_canonical_inner_bytes(
         // Consensus-internal variants not submitted via the client.
         Inner::SeniorityMerge(_)
         | Inner::Kick(_)
-
         | Inner::CodeFinalize(_)
         | Inner::Shard(_)
         | Inner::ShardSplit(_)
         | Inner::ShardMerge(_) => Err(quil_types::error::QuilError::Internal(
-            "proto_message_request_to_canonical_inner_bytes: variant not yet supported"
-                .into(),
+            "proto_message_request_to_canonical_inner_bytes: variant not yet supported".into(),
         )),
     }
 }
@@ -398,8 +400,10 @@ mod tests {
         assert_eq!(decoded.timestamp, 1_700_000_000_000);
 
         let req = decoded.requests[0].as_ref().expect("request present");
-        let leave_decoded = crate::global_intrinsic::prover_filter_ops::ProverLeave
-            ::from_canonical_bytes(&req.inner_bytes)
+        let leave_decoded =
+            crate::global_intrinsic::prover_filter_ops::ProverLeave::from_canonical_bytes(
+                &req.inner_bytes,
+            )
             .unwrap();
         assert_eq!(leave_decoded.filters, leave_pb.filters);
         assert_eq!(leave_decoded.frame_number, leave_pb.frame_number);
@@ -413,9 +417,9 @@ mod tests {
     #[test]
     #[allow(deprecated)] // the fixture sets the deprecated `filter` explicitly
     fn proto_to_canonical_confirm_matches_handcrafted() {
+        use crate::global_intrinsic::prover_ops::ProverConfirm;
         use quil_types::proto::global as pb;
         use quil_types::proto::keys as keys_pb;
-        use crate::global_intrinsic::prover_ops::ProverConfirm;
 
         let confirm_pb = pb::ProverConfirm {
             filter: vec![],
@@ -436,8 +440,7 @@ mod tests {
             timestamp: 42,
         };
 
-        let canonical_via_dispatch =
-            proto_message_bundle_to_canonical_bytes(&bundle_pb).unwrap();
+        let canonical_via_dispatch = proto_message_bundle_to_canonical_bytes(&bundle_pb).unwrap();
 
         let confirm_handcrafted = ProverConfirm {
             filter: vec![],
@@ -484,8 +487,7 @@ mod tests {
         let decoded = CanonicalMessageRequest::from_canonical_bytes(&encoded).unwrap();
 
         // The inner bytes should be the ProverPause canonical form
-        let restored_pause =
-            ProverPause::from_canonical_bytes(&decoded.inner_bytes).unwrap();
+        let restored_pause = ProverPause::from_canonical_bytes(&decoded.inner_bytes).unwrap();
         assert_eq!(restored_pause.filter, vec![0xAAu8; 32]);
         assert_eq!(restored_pause.frame_number, 42);
     }

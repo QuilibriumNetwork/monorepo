@@ -9,25 +9,25 @@ use quil_lifecycle::{ShutdownReason, Supervisor};
 
 pub(crate) mod allocator_and_lifecycle;
 pub(crate) mod archive_sync;
+mod committee_builds;
+mod committee_peer_policy;
+pub(crate) mod direct_delivery;
 pub(crate) mod engines;
 pub(crate) mod frame_pipeline;
+pub(crate) mod global_execution;
 pub(crate) mod grpc;
+pub(crate) mod historical_committees;
 pub(crate) mod keys;
-mod committee_builds;
 pub(crate) mod message_loop;
-mod shard_sender;
-mod committee_peer_policy;
 pub(crate) mod networking;
 pub(crate) mod peer_info_publisher;
+pub(crate) mod remote_reads;
+pub(crate) mod reward_proofs;
 pub(crate) mod runtime_state;
+mod shard_sender;
 pub(crate) mod stall_watch;
 pub(crate) mod storage;
-pub(crate) mod remote_reads;
 pub(crate) mod worker_manager;
-pub(crate) mod direct_delivery;
-pub(crate) mod reward_proofs;
-pub(crate) mod historical_committees;
-pub(crate) mod global_execution;
 
 /// How long shutdown waits for the worker threads to stop before the
 /// process arms its forced-exit watchdog.
@@ -84,7 +84,10 @@ pub(crate) async fn start(
     // so its stored grid stays the genesis grid and would invite a false
     // comparison.
     if archive_mode {
-        quil_execution::global_intrinsic::intrinsic::log_local_shard_grid(shards_store.as_ref(), None);
+        quil_execution::global_intrinsic::intrinsic::log_local_shard_grid(
+            shards_store.as_ref(),
+            None,
+        );
     }
 
     // NOTE: the boot-time `normalize_quil_token_grid` (force QUIL to 64-way) was
@@ -116,7 +119,9 @@ pub(crate) async fn start(
         c.p2p.peer_priv_key = key_hex;
         match quil_config::save_config(config_dir, &c) {
             Ok(()) => info!("generated and persisted new Ed448 peer key (stable identity)"),
-            Err(e) => warn!(error = %e, "failed to persist generated peer key to config (continuing with in-memory key)"),
+            Err(e) => {
+                warn!(error = %e, "failed to persist generated peer key to config (continuing with in-memory key)")
+            }
         }
         owned_config = c;
         &owned_config
@@ -152,8 +157,9 @@ pub(crate) async fn start(
     let inclusion_prover = engines.inclusion_prover.clone();
     // Rebuilds legacy app committees from authenticated GLOBAL state; built by
     // the archive sync (which holds the frame verifier), used by every engine.
-    let historical_committees: Arc<std::sync::OnceLock<Arc<historical_committees::HistoricalCommittees>>> =
-        Default::default();
+    let historical_committees: Arc<
+        std::sync::OnceLock<Arc<historical_committees::HistoricalCommittees>>,
+    > = Default::default();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
     engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
@@ -259,7 +265,6 @@ pub(crate) async fn start(
         }
     }
 
-
     let frame_pipeline::FramePipeline {
         frame_prover,
         frame_validator,
@@ -273,7 +278,15 @@ pub(crate) async fn start(
         consensus_loopback_tx,
         consensus_loopback_rx,
         listen_addr,
-    } = networking::init(&mut sup, config, config_dir, network, archive_mode, &falcon_signing_key).await?;
+    } = networking::init(
+        &mut sup,
+        config,
+        config_dir,
+        network,
+        archive_mode,
+        &falcon_signing_key,
+    )
+    .await?;
 
     // Bridge the p2p prometheus registry (blossomsub_* mesh/graft/prune/
     // message families + libp2p_* connection families) into every metrics
@@ -312,7 +325,12 @@ pub(crate) async fn start(
                 .filter(|p| p.legacy_history == quil_types::consensus::LegacyHistory::Discard)
             {
                 if h.frame_number >= policy.activation_frame
-                    && matches!(quil_types::store::ClockStore::app_frame_history_discarded(clock_store.as_ref()), Ok(None))
+                    && matches!(
+                        quil_types::store::ClockStore::app_frame_history_discarded(
+                            clock_store.as_ref()
+                        ),
+                        Ok(None)
+                    )
                 {
                     match quil_types::store::ClockStore::discard_app_frame_history(clock_store.as_ref(), h.frame_number) {
                         Ok(()) => info!(global_frame = h.frame_number,
@@ -335,9 +353,9 @@ pub(crate) async fn start(
     // an async-fix — parking_lot's lock is still blocking from
     // tokio's view. Switch to `tokio::sync::RwLock` if reads need
     // to yield instead of block.
-    let peer_info_cache: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>,
-    >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let peer_info_cache: Arc<
+        parking_lot::RwLock<std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // Restored before any reader runs: regular nodes republish their
     // PeerInfo every 30 minutes on mainnet, and until then a restarted
     // node knew none of their endpoints. Saved every few minutes and at
@@ -356,9 +374,11 @@ pub(crate) async fn start(
     // `ShardDeactivated`. Read by the inbound BlossomSub recv loop to
     // route per-shard frame / consensus / prover / dispatch messages
     // to the right engine in multi-prover deployments.
-    let shard_engines: Arc<parking_lot::RwLock<
-        std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
-    >> = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     // filter → covering thread worker's own stores, for wallet reads of
     // application state the master's stores do not hold.
     let worker_app_states: worker_manager::WorkerAppStates =
@@ -371,8 +391,7 @@ pub(crate) async fn start(
     // on GLOBAL_PEER_INFO. Consumed by consensus message verification
     // (BLS signatures from peers whose identity↔prover binding we've
     // observed).
-    let signer_registry: Arc<quil_p2p::SignerRegistry> =
-        Arc::new(quil_p2p::SignerRegistry::new());
+    let signer_registry: Arc<quil_p2p::SignerRegistry> = Arc::new(quil_p2p::SignerRegistry::new());
     // Seed from the local clock store so PeerInfo broadcasts our
     // real head on the first publish. Without this, restart leaves
     // the atomic at 0 until a new frame arrives over the network —
@@ -406,31 +425,33 @@ pub(crate) async fn start(
     // PeerInfo tick picks it up. First tick (immediate at startup)
     // may publish without per-worker entries; subsequent ticks
     // include them.
-    let pi_worker_manager: Arc<std::sync::OnceLock<
-        Arc<dyn quil_engine::worker::WorkerManager>,
-    >> = Arc::new(std::sync::OnceLock::new());
-    peer_info_publisher::spawn(&mut sup, peer_info_publisher::PeerInfoPublisherArgs {
-        p2p_handle: p2p_handle.clone(),
-        peer_id,
-        peer_priv_key_hex: config.p2p.peer_priv_key.clone(),
-        announce_listen_multiaddr: config.p2p.announce_listen_multiaddr.clone(),
-        announce_stream_listen_multiaddr: config.p2p.announce_stream_listen_multiaddr.clone(),
-        stream_listen_multiaddr: config.p2p.stream_listen_multiaddr.clone(),
-        listen_fallback: listen_addr.clone(),
-        current_frame: current_frame.clone(),
-        last_global_head_frame: last_global_head_frame.clone(),
-        worker_p2p_multiaddrs: config.engine.data_worker_p2p_multiaddrs.clone(),
-        worker_stream_multiaddrs: config.engine.data_worker_stream_multiaddrs.clone(),
-        worker_announce_p2p: config.engine.data_worker_announce_p2p_multiaddrs.clone(),
-        worker_announce_stream: config.engine.data_worker_announce_stream_multiaddrs.clone(),
-        worker_manager_cell: pi_worker_manager.clone(),
-        bls_pubkey: bls_pubkey.clone(),
-        key_manager: file_key_manager.clone(),
-        exec_manager: exec_manager.clone(),
-        archive_mode,
-        network,
-        onion_routing_enabled: !config.p2p.disable_onion_routing,
-    });
+    let pi_worker_manager: Arc<std::sync::OnceLock<Arc<dyn quil_engine::worker::WorkerManager>>> =
+        Arc::new(std::sync::OnceLock::new());
+    peer_info_publisher::spawn(
+        &mut sup,
+        peer_info_publisher::PeerInfoPublisherArgs {
+            p2p_handle: p2p_handle.clone(),
+            peer_id,
+            peer_priv_key_hex: config.p2p.peer_priv_key.clone(),
+            announce_listen_multiaddr: config.p2p.announce_listen_multiaddr.clone(),
+            announce_stream_listen_multiaddr: config.p2p.announce_stream_listen_multiaddr.clone(),
+            stream_listen_multiaddr: config.p2p.stream_listen_multiaddr.clone(),
+            listen_fallback: listen_addr.clone(),
+            current_frame: current_frame.clone(),
+            last_global_head_frame: last_global_head_frame.clone(),
+            worker_p2p_multiaddrs: config.engine.data_worker_p2p_multiaddrs.clone(),
+            worker_stream_multiaddrs: config.engine.data_worker_stream_multiaddrs.clone(),
+            worker_announce_p2p: config.engine.data_worker_announce_p2p_multiaddrs.clone(),
+            worker_announce_stream: config.engine.data_worker_announce_stream_multiaddrs.clone(),
+            worker_manager_cell: pi_worker_manager.clone(),
+            bls_pubkey: bls_pubkey.clone(),
+            key_manager: file_key_manager.clone(),
+            exec_manager: exec_manager.clone(),
+            archive_mode,
+            network,
+            onion_routing_enabled: !config.p2p.disable_onion_routing,
+        },
+    );
 
     let runtime_state::RuntimeState {
         message_collector,
@@ -483,8 +504,8 @@ pub(crate) async fn start(
         // A small test network can keep enough workers on both children to exceed
         // the same threshold again. Limit its proposals to the root when a
         // single split is requested; mainnet never enables this test control.
-        let split_roots_only = network != 0
-            && std::env::var("QUIL_SPLIT_ROOT_ONLY").is_ok_and(|v| v == "1");
+        let split_roots_only =
+            network != 0 && std::env::var("QUIL_SPLIT_ROOT_ONLY").is_ok_and(|v| v == "1");
         coverage_monitor.set_split_proposer(std::sync::Arc::new(
             move |filter: &[u8]| -> Option<Vec<Vec<u8>>> {
                 if !crdt_pr.unified_tree() || filter.len() < 32 {
@@ -495,14 +516,14 @@ pub(crate) async fn start(
                 // Parent shard bit-path: a deep (sentinel) shard's filter is
                 // already a bit-path filter (`app ‖ bit_len ‖ packed`); a legacy
                 // filter is `app ‖ byte-suffix` → derive via canonical bits.
-                let parent_bits =
-                    if let Some((_, bits)) = quil_forest::decode_shard_bit_path(filter, 32) {
-                        bits
-                    } else {
-                        let parent_prefix: Vec<u32> =
-                            filter[32..].iter().map(|b| *b as u32).collect();
-                        crdt_pr.canonical_bits_for_prefix(&app, &parent_prefix)
-                    };
+                let parent_bits = if let Some((_, bits)) =
+                    quil_forest::decode_shard_bit_path(filter, 32)
+                {
+                    bits
+                } else {
+                    let parent_prefix: Vec<u32> = filter[32..].iter().map(|b| *b as u32).collect();
+                    crdt_pr.canonical_bits_for_prefix(&app, &parent_prefix)
+                };
                 if split_roots_only && !parent_bits.is_empty() {
                     return None;
                 }
@@ -563,12 +584,13 @@ pub(crate) async fn start(
     // counting an empty shard's committed deliveries reads every block it
     // owns, and the coverage check, the poller, the merge trigger and the
     // shard RPCs each counted all of them per frame.
-    let committed_shard_sizes = std::sync::Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
+    let committed_shard_sizes =
+        std::sync::Arc::new(quil_engine::shard_info::CommittedShardSizes::default());
     {
         let crdt_inv = crdt.clone();
         let shards_inv = shards_store.clone();
-        let reg_inv = prover_registry.clone()
-            as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
+        let reg_inv =
+            prover_registry.clone() as std::sync::Arc<dyn quil_types::consensus::ProverRegistry>;
         let sizes_inv = committed_shard_sizes.clone();
         coverage_monitor.set_shard_inventory_provider(std::sync::Arc::new(move |frame: u64| {
             quil_engine::coverage::build_shard_inventory(
@@ -587,9 +609,7 @@ pub(crate) async fn start(
     // needs a stable handle now to wire up its publish paths.
     // `set()` is called once the real transport is built.
     let prover_message_transport_cell: Arc<
-        std::sync::OnceLock<
-            Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>,
-        >,
+        std::sync::OnceLock<Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport>>,
     > = Arc::new(std::sync::OnceLock::new());
 
     // Archive endpoint pool — created HERE (before worker_manager) and shared as
@@ -604,8 +624,7 @@ pub(crate) async fn start(
         ),
         n => std::time::Duration::from_secs(n as u64),
     };
-    let archive_pool =
-        std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
+    let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
 
     let worker_manager: Arc<dyn quil_engine::worker::WorkerManager> = worker_manager::init(
         &mut sup,
@@ -645,32 +664,37 @@ pub(crate) async fn start(
         worker_allocator,
         prover_lifecycle,
         frame_materializer,
-    } = allocator_and_lifecycle::init(&mut sup, allocator_and_lifecycle::LifecycleInitArgs {
-        config: config.clone(),
-        db: db_arc.clone(),
-        network,
-        archive_mode,
-        worker_manager: worker_manager.clone(),
-        prover_registry: prover_registry.clone(),
-        prover_address,
-        halt_state: halt_state.clone(),
-        current_frame: current_frame.clone(),
-        last_global_head_frame: last_global_head_frame.clone(),
-        shards_store: shards_store.clone(),
-        exec_manager: exec_manager.clone(),
-        frame_prover: frame_prover.clone(),
-        inclusion_prover: inclusion_prover.clone(),
-        clock_store: clock_store.clone(),
-        crdt: crdt.clone(),
-        hg_store: hg_store.clone(),
-        message_collector: message_collector.clone(),
-    })?;
+    } = allocator_and_lifecycle::init(
+        &mut sup,
+        allocator_and_lifecycle::LifecycleInitArgs {
+            config: config.clone(),
+            db: db_arc.clone(),
+            network,
+            archive_mode,
+            worker_manager: worker_manager.clone(),
+            prover_registry: prover_registry.clone(),
+            prover_address,
+            halt_state: halt_state.clone(),
+            current_frame: current_frame.clone(),
+            last_global_head_frame: last_global_head_frame.clone(),
+            shards_store: shards_store.clone(),
+            exec_manager: exec_manager.clone(),
+            frame_prover: frame_prover.clone(),
+            inclusion_prover: inclusion_prover.clone(),
+            clock_store: clock_store.clone(),
+            crdt: crdt.clone(),
+            hg_store: hg_store.clone(),
+            message_collector: message_collector.clone(),
+        },
+    )?;
 
     // ---------------------------------------------------------------
     // 6. Message receive loop
     // ---------------------------------------------------------------
-    info!(archive = archive_mode, "master node initialized — waiting for frames");
-
+    info!(
+        archive = archive_mode,
+        "master node initialized — waiting for frames"
+    );
 
     // Resolve our Ed448 seed (57 bytes) for the mTLS cert. The peer key in
     // config is either 57 bytes (raw seed) or 114 bytes (seed + pubkey).
@@ -907,8 +931,10 @@ pub(crate) async fn start(
     // also publish on BlossomSub for maximum dissemination; non-archive
     // nodes skip the gossip publish (they don't subscribe to
     // GLOBAL_PROVER so publishing into it is wasteful and unreliable).
-    let prover_message_transport: Arc<dyn quil_engine::prover_message_transport::ProverMessageTransport> =
-        Arc::new(crate::prover_message_transport_prod::ProdProverMessageTransport {
+    let prover_message_transport: Arc<
+        dyn quil_engine::prover_message_transport::ProverMessageTransport,
+    > = Arc::new(
+        crate::prover_message_transport_prod::ProdProverMessageTransport {
             archive_pool: archive_pool.clone(),
             clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
             p2p_handle: p2p_handle.clone(),
@@ -917,7 +943,8 @@ pub(crate) async fn start(
             falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
             retry_queue: Default::default(),
-        });
+        },
+    );
 
     // Hand the freshly-built transport to the worker_manager so its
     // coverage_publish closure can route
@@ -941,7 +968,7 @@ pub(crate) async fn start(
         // inert until the storage fork.
         hypergraph: Some(crdt.clone()),
         replica_store: Some(quil_store::replica_store::ReplicaStore::new(
-            db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
+            db_arc.clone() as Arc<dyn quil_types::store::KvDb>
         )),
         // Shards a thread worker holds are confirmed from that worker's own
         // hypergraph and replica store, the ones it attests from.
@@ -953,12 +980,19 @@ pub(crate) async fn start(
                 // The worker running the shard; before it runs it (a join
                 // not yet active), the worker pinned to it, which will.
                 let state = states.read().get(filter).cloned().or_else(|| {
-                    let core = workers.range_workers().ok()?.into_iter().find(|w| w.filter == filter)?.core_id;
+                    let core = workers
+                        .range_workers()
+                        .ok()?
+                        .into_iter()
+                        .find(|w| w.filter == filter)?
+                        .core_id;
                     by_core.read().get(&core).cloned()
                 })?;
                 Some((
                     state.crdt.clone(),
-                    quil_store::replica_store::ReplicaStore::new(state.db.clone() as Arc<dyn quil_types::store::KvDb>),
+                    quil_store::replica_store::ReplicaStore::new(
+                        state.db.clone() as Arc<dyn quil_types::store::KvDb>
+                    ),
                 ))
             })
         }),
@@ -967,16 +1001,27 @@ pub(crate) async fn start(
         remote_storage_confirm: Some({
             let cell = remote_worker_manager_for_halt.clone();
             let runtime = tokio::runtime::Handle::current();
-            Arc::new(move |filter: &[u8], targets: &[Vec<u8>], frame_number: u64, timeout: std::time::Duration,
-                           snapshots: &[quil_engine::prover_pipeline::SnapshotSources]| {
-                let Some(manager) = cell.get().cloned() else {
-                    return Ok(None);
-                };
-                if !manager.prepares_storage_confirm(filter, snapshots) {
-                    return Ok(None);
-                }
-                runtime.block_on(manager.prepare_storage_confirm(filter, targets, frame_number, timeout, snapshots))
-            })
+            Arc::new(
+                move |filter: &[u8],
+                      targets: &[Vec<u8>],
+                      frame_number: u64,
+                      timeout: std::time::Duration,
+                      snapshots: &[quil_engine::prover_pipeline::SnapshotSources]| {
+                    let Some(manager) = cell.get().cloned() else {
+                        return Ok(None);
+                    };
+                    if !manager.prepares_storage_confirm(filter, snapshots) {
+                        return Ok(None);
+                    }
+                    runtime.block_on(manager.prepare_storage_confirm(
+                        filter,
+                        targets,
+                        frame_number,
+                        timeout,
+                        snapshots,
+                    ))
+                },
+            )
         }),
         pending_shard_changes: Some({
             let shards_store = shards_store.clone();
@@ -985,7 +1030,13 @@ pub(crate) async fn start(
         storage_snapshot: Some({
             let registry = prover_registry.clone();
             Arc::new(move |filter: &[u8], epoch: u64| {
-                quil_types::consensus::ProverRegistry::get_storage_snapshot(registry.as_ref(), filter, epoch).ok().flatten()
+                quil_types::consensus::ProverRegistry::get_storage_snapshot(
+                    registry.as_ref(),
+                    filter,
+                    epoch,
+                )
+                .ok()
+                .flatten()
             })
         }),
         // Loopback deps so a frame PRODUCER (which runs the coverage orchestrator)
@@ -1139,14 +1190,14 @@ pub(crate) async fn start(
     // Commonware-simplex inbound router. Shared, set post-spawn at
     // the archive-sync activation site when the committee is configured; unset
     // (the default) leaves the simplex path off.
-    let cw_router: Arc<
-        std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>,
-    > = Arc::new(std::sync::OnceLock::new());
+    let cw_router: Arc<std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>> =
+        Arc::new(std::sync::OnceLock::new());
     // Atomic GLOBAL finalization pipeline, set at the same activation site.
     // Archives route authenticated frames from peers (poller and gossip)
     // through it instead of writing the canonical clock first.
-    let global_finalization: Arc<std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>> =
-        Arc::new(std::sync::OnceLock::new());
+    let global_finalization: Arc<
+        std::sync::OnceLock<Arc<quil_engine::global_finalization::GlobalFinalizationPipeline>>,
+    > = Arc::new(std::sync::OnceLock::new());
     // Archive app-frame ingest, built below (it needs the gap fetcher). GLOBAL
     // execution materializes it at the points the chain sequences.
     let app_ingest: archive_sync::AppIngestCell = Arc::new(std::sync::OnceLock::new());
@@ -1174,7 +1225,10 @@ pub(crate) async fn start(
                         pids.push(peer_id);
                         hexes.push(hex::encode(&pubkey));
                     }
-                    info!(committee = hexes.len(), "CW committee loaded from genesis data");
+                    info!(
+                        committee = hexes.len(),
+                        "CW committee loaded from genesis data"
+                    );
                     (hexes, pids)
                 }
                 Err(e) => {
@@ -1205,9 +1259,14 @@ pub(crate) async fn start(
     // follow the chain over gossip. The poller's own verifier is already
     // committee-bound (see archive_sync); this gives the gossip path parity.
     let frame_validator = {
-        let decode = |keys: &[String]| -> Vec<Vec<u8>> { keys.iter().filter_map(|s| hex::decode(s).ok()).collect() };
-        let (successor, _) =
-            archive_sync::global_committee_successor(network, &consensus_committee, &consensus_committee_peer_ids);
+        let decode = |keys: &[String]| -> Vec<Vec<u8>> {
+            keys.iter().filter_map(|s| hex::decode(s).ok()).collect()
+        };
+        let (successor, _) = archive_sync::global_committee_successor(
+            network,
+            &consensus_committee,
+            &consensus_committee_peer_ids,
+        );
         frame_validator
             .with_global_committee(decode(&consensus_committee))
             .with_global_committee_successor(decode(&successor))
@@ -1249,62 +1308,64 @@ pub(crate) async fn start(
         }))
     };
 
-    archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
-        historical_committees: historical_committees.clone(),
-        inclusion_prover: inclusion_prover.clone(),
-        committed_shard_sizes: committed_shard_sizes.clone(),
-        mtls_seed,
-        network,
-        genesis_seed: config.engine.genesis_seed.clone(),
-        archive_mode,
-        archive_pool: archive_pool.clone(),
-        clock_store: clock_store.clone(),
-        hg_store: hg_store.clone(),
-        crdt: crdt.clone(),
-        shards_store: shards_store.clone(),
-        exec_manager: exec_manager.clone(),
-        worker_allocator: worker_allocator.clone(),
-        prover_lifecycle: prover_lifecycle.clone(),
-        prover_registry: prover_registry.clone(),
-        worker_manager: worker_manager.clone(),
-        coverage_monitor: coverage_monitor.clone(),
-        current_frame: current_frame.clone(),
-        last_global_head_frame: last_global_head_frame.clone(),
-        gossip_freshness: gossip_freshness.clone(),
-        prover_pipeline: prover_pipeline.clone(),
-        file_key_manager: file_key_manager.clone(),
-        frame_prover: frame_prover.clone(),
-        message_collector: message_collector.clone(),
-        bls_pubkey: bls_pubkey.clone(),
-        prover_address,
-        genesis_prover_addrs: genesis_prover_addrs.clone(),
-        frame_materializer: frame_materializer.clone(),
-        consensus_loopback_tx: consensus_loopback_tx.clone(),
-        global_frame_publisher,
-        peer_id,
-        spawner: detached_spawner.clone(),
-        consensus_committee,
-        consensus_committee_peer_ids,
-        consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
-        cw_router: cw_router.clone(),
-        global_finalization: global_finalization.clone(),
-        activation_waits: activation_waits.clone(),
-        app_ingest: app_ingest.clone(),
-        // A STABLE subdir of the node's data dir for the simplex journal, so
-        // consensus resumes across restarts instead of replaying from the
-        // migration head (the CW runtime otherwise defaults to a random temp
-        // dir). Mirrors `storage::init`'s db-path default.
-        cw_storage_dir: {
-            let base = if config.db.path.is_empty() {
-                std::path::PathBuf::from(".config/store")
-            } else {
-                std::path::PathBuf::from(&config.db.path)
-            };
-            base.join("cw-global-consensus")
+    archive_sync::spawn_all(
+        &mut sup,
+        archive_sync::ArchiveSyncArgs {
+            historical_committees: historical_committees.clone(),
+            inclusion_prover: inclusion_prover.clone(),
+            committed_shard_sizes: committed_shard_sizes.clone(),
+            mtls_seed,
+            network,
+            genesis_seed: config.engine.genesis_seed.clone(),
+            archive_mode,
+            archive_pool: archive_pool.clone(),
+            clock_store: clock_store.clone(),
+            hg_store: hg_store.clone(),
+            crdt: crdt.clone(),
+            shards_store: shards_store.clone(),
+            exec_manager: exec_manager.clone(),
+            worker_allocator: worker_allocator.clone(),
+            prover_lifecycle: prover_lifecycle.clone(),
+            prover_registry: prover_registry.clone(),
+            worker_manager: worker_manager.clone(),
+            coverage_monitor: coverage_monitor.clone(),
+            current_frame: current_frame.clone(),
+            last_global_head_frame: last_global_head_frame.clone(),
+            gossip_freshness: gossip_freshness.clone(),
+            prover_pipeline: prover_pipeline.clone(),
+            file_key_manager: file_key_manager.clone(),
+            frame_prover: frame_prover.clone(),
+            message_collector: message_collector.clone(),
+            bls_pubkey: bls_pubkey.clone(),
+            prover_address,
+            genesis_prover_addrs: genesis_prover_addrs.clone(),
+            frame_materializer: frame_materializer.clone(),
+            consensus_loopback_tx: consensus_loopback_tx.clone(),
+            global_frame_publisher,
+            peer_id,
+            spawner: detached_spawner.clone(),
+            consensus_committee,
+            consensus_committee_peer_ids,
+            consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
+            cw_router: cw_router.clone(),
+            global_finalization: global_finalization.clone(),
+            activation_waits: activation_waits.clone(),
+            app_ingest: app_ingest.clone(),
+            // A STABLE subdir of the node's data dir for the simplex journal, so
+            // consensus resumes across restarts instead of replaying from the
+            // migration head (the CW runtime otherwise defaults to a random temp
+            // dir). Mirrors `storage::init`'s db-path default.
+            cw_storage_dir: {
+                let base = if config.db.path.is_empty() {
+                    std::path::PathBuf::from(".config/store")
+                } else {
+                    std::path::PathBuf::from(&config.db.path)
+                };
+                base.join("cw-global-consensus")
+            },
+            global_msg_tx: global_msg_tx.clone(),
         },
-        global_msg_tx: global_msg_tx.clone(),
-    });
-
+    );
 
     // Archive-only: recover an app-shard frame this archive missed. Gossip
     // carries a frame once, so a frame produced while this node was restarting
@@ -1322,13 +1383,16 @@ pub(crate) async fn start(
     // ingest's cursor gets its body recovered (`with_missing_frame_reports`).
     let (frame_miss_tx, frame_miss_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, u64)>(256);
     // The archive ingest's validator, once built below.
-    let gap_validator: Arc<std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>> =
-        Default::default();
+    let gap_validator: Arc<
+        std::sync::OnceLock<Arc<quil_engine::frame_validator::BlsAppFrameValidator>>,
+    > = Default::default();
     // The archive ingest and its checks, once built below.
-    let gap_ingest: Arc<std::sync::OnceLock<(
-        Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>,
-        quil_engine::archive_ingest::ArchiveFrameVerifier,
-    )>> = Default::default();
+    let gap_ingest: Arc<
+        std::sync::OnceLock<(
+            Arc<std::sync::Mutex<quil_engine::archive_ingest::ArchiveAppShardIngest>>,
+            quil_engine::archive_ingest::ArchiveFrameVerifier,
+        )>,
+    > = Default::default();
     if archive_mode {
         let pool = archive_pool.clone();
         let loopback = consensus_loopback_tx.clone();
@@ -1340,8 +1404,9 @@ pub(crate) async fn start(
         let no_member_notice: Arc<peer_info_file::HourlyNotice> = Default::default();
         // One connection per endpoint, shared by every fetch: a frame each
         // second used to open a new connection to every endpoint it asked.
-        let clients: Arc<parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>> =
-            Default::default();
+        let clients: Arc<
+            parking_lot::Mutex<std::collections::HashMap<String, quil_rpc::ArchiveClient>>,
+        > = Default::default();
         detached_spawner.detach("archive-shard-gap-fetch", async move {
             use futures::StreamExt;
             // Fetches at once, across shards. Four, each of one frame asked for
@@ -1561,7 +1626,6 @@ pub(crate) async fn start(
         });
     }
 
-
     // Archive-only: ingest full app-shard frames into the archive's CRDT
     // so it holds (and can serve via HyperSync) every shard's state.
     let archive_app_shard_ingest = if archive_mode {
@@ -1574,9 +1638,16 @@ pub(crate) async fn start(
             inclusion_prover.clone(),
             crdt.clone(),
             clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
-        ).with_gap_fetch(gap_tx).with_prefetch(prefetch_tx).with_missing_frame_reports(frame_miss_rx).sequenced();
+        )
+        .with_gap_fetch(gap_tx)
+        .with_prefetch(prefetch_tx)
+        .with_missing_frame_reports(frame_miss_rx)
+        .sequenced();
         let ingest = match mtls_seed.map(|_| falcon_signing_key.clone()) {
-            Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(archive_pool.clone(), key)),
+            Some(key) => ingest.with_storage_history_source(crate::storage_history::from_pool(
+                archive_pool.clone(),
+                key,
+            )),
             None => ingest,
         };
         let _ = gap_validator.set(ingest.validator());
@@ -1604,102 +1675,115 @@ pub(crate) async fn start(
         None
     };
 
-    message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
-        remote_workers: remote_worker_manager_for_halt.clone(),
-        local_cw_tag: quil_engine::bitmasks::shard_cw_addressee_tag(&bls_pubkey),
-        clock_store: clock_store.clone(),
-        exec_manager: exec_manager.clone(),
-        crdt: crdt.clone(),
-        genesis_seed: config.engine.genesis_seed.clone(),
-        msg_rx,
-        consensus_loopback_rx,
-        global_msg_tx: global_msg_tx.clone(),
-        archive_pool: archive_pool.clone(),
-        mtls_seed,
-        // Falcon network identity for the prover-tree bootstrap :8340 dial
-        // (present iff we have a transport identity, gated by mtls_seed).
-        prover_falcon_key: mtls_seed.map(|_| falcon_signing_key.clone()),
-        hg_store: hg_store.clone(),
-        frame_validator,
-        message_collector: message_collector.clone(),
-        coverage_monitor: coverage_monitor.clone(),
-        worker_allocator: worker_allocator.clone(),
-        prover_pipeline: prover_pipeline.clone(),
-        peer_info_cache: peer_info_cache.clone(),
-        shard_engines: shard_engines.clone(),
-        signer_registry: signer_registry.clone(),
-        current_frame: current_frame.clone(),
-        cw_router: cw_router.clone(),
-        global_finalization: global_finalization.clone(),
-        activation_waits: activation_waits.clone(),
-        last_global_head_frame: last_global_head_frame.clone(),
-        gossip_freshness: gossip_freshness.clone(),
-        genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
-        genesis_prover_addrs: genesis_prover_addrs.clone(),
-        alert_pubkey: hex::decode(&config.engine.alert_key).unwrap_or_default(),
-        network,
-        archive_mode,
-        prover_lifecycle: prover_lifecycle.clone(),
-        prover_registry: prover_registry.clone(),
-        worker_manager: worker_manager.clone(),
-        prover_address,
-        p2p_handle: p2p_handle.clone(),
-        time_reel: if !archive_mode {
-            Some(Arc::new(quil_engine::time_reel::GlobalTimeReel::new(network)))
-        } else {
-            None
+    message_loop::spawn(
+        &mut sup,
+        message_loop::MessageLoopArgs {
+            remote_workers: remote_worker_manager_for_halt.clone(),
+            local_cw_tag: quil_engine::bitmasks::shard_cw_addressee_tag(&bls_pubkey),
+            clock_store: clock_store.clone(),
+            exec_manager: exec_manager.clone(),
+            crdt: crdt.clone(),
+            genesis_seed: config.engine.genesis_seed.clone(),
+            msg_rx,
+            consensus_loopback_rx,
+            global_msg_tx: global_msg_tx.clone(),
+            archive_pool: archive_pool.clone(),
+            mtls_seed,
+            // Falcon network identity for the prover-tree bootstrap :8340 dial
+            // (present iff we have a transport identity, gated by mtls_seed).
+            prover_falcon_key: mtls_seed.map(|_| falcon_signing_key.clone()),
+            hg_store: hg_store.clone(),
+            frame_validator,
+            message_collector: message_collector.clone(),
+            coverage_monitor: coverage_monitor.clone(),
+            worker_allocator: worker_allocator.clone(),
+            prover_pipeline: prover_pipeline.clone(),
+            peer_info_cache: peer_info_cache.clone(),
+            shard_engines: shard_engines.clone(),
+            signer_registry: signer_registry.clone(),
+            current_frame: current_frame.clone(),
+            cw_router: cw_router.clone(),
+            global_finalization: global_finalization.clone(),
+            activation_waits: activation_waits.clone(),
+            last_global_head_frame: last_global_head_frame.clone(),
+            gossip_freshness: gossip_freshness.clone(),
+            genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
+            genesis_prover_addrs: genesis_prover_addrs.clone(),
+            alert_pubkey: hex::decode(&config.engine.alert_key).unwrap_or_default(),
+            network,
+            archive_mode,
+            prover_lifecycle: prover_lifecycle.clone(),
+            prover_registry: prover_registry.clone(),
+            worker_manager: worker_manager.clone(),
+            prover_address,
+            p2p_handle: p2p_handle.clone(),
+            time_reel: if !archive_mode {
+                Some(Arc::new(quil_engine::time_reel::GlobalTimeReel::new(
+                    network,
+                )))
+            } else {
+                None
+            },
+            spawner: detached_spawner.clone(),
+            archive_app_shard_ingest,
+            recent_messages: recent_messages.clone(),
         },
-        spawner: detached_spawner.clone(),
-        archive_app_shard_ingest,
-        recent_messages: recent_messages.clone(),
-    });
+    );
 
     // ---------------------------------------------------------------
     // 7. gRPC service
     // ---------------------------------------------------------------
-    grpc::spawn_all(&mut sup, grpc::GrpcArgs {
-        frame_observations_path: std::path::Path::new(config_dir).join("frame-observations.bin"),
-        diagnostics_spool: std::path::Path::new(config_dir).join(".diagnostics").join("log-bundles"),
-        diagnostics_auto: config.logger.log_dir(config_dir).map(|log_dir| quil_rpc::diagnostics_logs::AutoApproval {
-            log_dir,
-            token_maps: config_dir.join(".diagnostics").join("token-maps"),
-        }),
-        historical_committees: historical_committees.clone(),
-        halt_state: halt_state.clone(),
-        committed_shard_sizes: committed_shard_sizes.clone(),
-        worker_app_states: worker_app_states.clone(),
-        shard_engines: shard_engines.clone(),
-        remote_fee_workers: remote_worker_manager_for_halt.clone(),
-        exec_manager: exec_manager.clone(),
-        config: config.clone(),
-        network,
-        archive_mode,
-        db_arc: db_arc.clone(),
-        clock_store: clock_store.clone(),
-        hg_store: hg_store.clone(),
-        message_collector: message_collector.clone(),
-        current_frame: current_frame.clone(),
-        last_global_head_frame: last_global_head_frame.clone(),
-        prover_address,
-        prover_registry: prover_registry.clone(),
-        signer_registry: signer_registry.clone(),
-        prover_pipeline: prover_pipeline.clone(),
-        worker_manager: worker_manager.clone(),
-        inclusion_prover: inclusion_prover.clone(),
-        peer_id,
-        p2p_handle: p2p_handle.clone(),
-        file_key_manager: file_key_manager.clone(),
-        mtls_seed,
-        crdt: crdt.clone(),
-        peer_info_cache: peer_info_cache.clone(),
-        key_store: key_store.clone(),
-        metrics_handle: metrics_handle.clone(),
-        global_msg_tx: global_msg_tx.clone(),
-        archive_pool: archive_pool.clone(),
-        app_frame_misses: archive_mode.then_some(frame_miss_tx),
-        spawner: detached_spawner.clone(),
-        consensus_loopback_tx: consensus_loopback_tx.clone(),
-    })?;
+    grpc::spawn_all(
+        &mut sup,
+        grpc::GrpcArgs {
+            frame_observations_path: std::path::Path::new(config_dir)
+                .join("frame-observations.bin"),
+            diagnostics_spool: std::path::Path::new(config_dir)
+                .join(".diagnostics")
+                .join("log-bundles"),
+            diagnostics_auto: config.logger.log_dir(config_dir).map(|log_dir| {
+                quil_rpc::diagnostics_logs::AutoApproval {
+                    log_dir,
+                    token_maps: config_dir.join(".diagnostics").join("token-maps"),
+                }
+            }),
+            historical_committees: historical_committees.clone(),
+            halt_state: halt_state.clone(),
+            committed_shard_sizes: committed_shard_sizes.clone(),
+            worker_app_states: worker_app_states.clone(),
+            shard_engines: shard_engines.clone(),
+            remote_fee_workers: remote_worker_manager_for_halt.clone(),
+            exec_manager: exec_manager.clone(),
+            config: config.clone(),
+            network,
+            archive_mode,
+            db_arc: db_arc.clone(),
+            clock_store: clock_store.clone(),
+            hg_store: hg_store.clone(),
+            message_collector: message_collector.clone(),
+            current_frame: current_frame.clone(),
+            last_global_head_frame: last_global_head_frame.clone(),
+            prover_address,
+            prover_registry: prover_registry.clone(),
+            signer_registry: signer_registry.clone(),
+            prover_pipeline: prover_pipeline.clone(),
+            worker_manager: worker_manager.clone(),
+            inclusion_prover: inclusion_prover.clone(),
+            peer_id,
+            p2p_handle: p2p_handle.clone(),
+            file_key_manager: file_key_manager.clone(),
+            mtls_seed,
+            crdt: crdt.clone(),
+            peer_info_cache: peer_info_cache.clone(),
+            key_store: key_store.clone(),
+            metrics_handle: metrics_handle.clone(),
+            global_msg_tx: global_msg_tx.clone(),
+            archive_pool: archive_pool.clone(),
+            app_frame_misses: archive_mode.then_some(frame_miss_tx),
+            spawner: detached_spawner.clone(),
+            consensus_loopback_tx: consensus_loopback_tx.clone(),
+        },
+    )?;
 
     // ---------------------------------------------------------------
     // 7b. Explorer REST API (archive-only, config-gated)
@@ -1720,10 +1804,8 @@ pub(crate) async fn start(
                     data_shards: 0,
                     commitment: Vec::new(),
                 };
-                let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(
-                    crdt.as_ref(),
-                    &info,
-                )?;
+                let meta =
+                    quil_engine::app_shard_metadata::get_app_shard_metadata(crdt.as_ref(), &info)?;
                 Some((meta.size, meta.data_shards, meta.commitments))
             })
         };
@@ -1800,8 +1882,11 @@ pub(crate) async fn start(
     let stopping = worker_manager.clone();
     match tokio::task::spawn_blocking(move || stopping.shutdown(WORKER_SHUTDOWN_GRACE)).await {
         Ok(running) if running.is_empty() => info!("worker threads stopped"),
-        Ok(running) => warn!(?running, grace_secs = WORKER_SHUTDOWN_GRACE.as_secs(),
-            "worker threads still running at the shutdown deadline"),
+        Ok(running) => warn!(
+            ?running,
+            grace_secs = WORKER_SHUTDOWN_GRACE.as_secs(),
+            "worker threads still running at the shutdown deadline"
+        ),
         Err(error) => warn!(%error, "worker shutdown task failed"),
     }
 
@@ -1816,7 +1901,6 @@ pub(crate) async fn start(
     Ok(reason)
 }
 
-
 #[cfg(test)]
 mod grid_clobber_repro {
     //! Reproduces a grid re-divergence: the removed boot-time
@@ -1830,7 +1914,11 @@ mod grid_clobber_repro {
 
     /// Build `valid_shard_addresses` exactly as archive_sync does: for each QUIL
     /// grid row, `shard_prefix_to_filter(shard_key[3..35], prefix)`.
-    fn valid_shard_set(store: &dyn ShardsStore, _quil: &[u8], gk: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    fn valid_shard_set(
+        store: &dyn ShardsStore,
+        _quil: &[u8],
+        gk: &[u8],
+    ) -> std::collections::HashSet<Vec<u8>> {
         store
             .range_app_shards()
             .unwrap()
@@ -1860,10 +1948,32 @@ mod grid_clobber_repro {
             quil_forest::bit_path_to_prefix(&[false, false, false, false, false, false, true]); // 0000001
         let txn = clock.new_transaction(false).unwrap();
         for i in 1u32..64 {
-            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            shards
+                .put_app_shard(
+                    txn.as_ref(),
+                    &ShardInfo {
+                        shard_key: gk.clone(),
+                        prefix: vec![i],
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
         }
         for p in [&child0, &child1] {
-            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: p.clone(), size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            shards
+                .put_app_shard(
+                    txn.as_ref(),
+                    &ShardInfo {
+                        shard_key: gk.clone(),
+                        prefix: p.clone(),
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
         }
         txn.commit().unwrap();
 
@@ -1874,16 +1984,37 @@ mod grid_clobber_repro {
         // PRE-clobber (split grid = post-FIX): valid-set INCLUDES the depth-7 shard
         // → the collector's `!valid.contains(address)` is false → proof ACCEPTED.
         let valid_split = valid_shard_set(&shards, &quil, &gk);
-        assert!(valid_split.contains(&deep_filter), "split grid's valid-set contains the depth-7 shard the prover is on");
+        assert!(
+            valid_split.contains(&deep_filter),
+            "split grid's valid-set contains the depth-7 shard the prover is on"
+        );
 
         // CLOBBER — exactly what the removed `normalize_quil_token_grid` did on every
         // mainnet restart: delete all QUIL rows, force 64-way genesis.
         let txn = clock.new_transaction(false).unwrap();
-        for s in shards.range_app_shards().unwrap().into_iter().filter(|s| s.shard_key == gk) {
-            shards.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix).unwrap();
+        for s in shards
+            .range_app_shards()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.shard_key == gk)
+        {
+            shards
+                .delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)
+                .unwrap();
         }
         for i in 0..64u32 {
-            shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            shards
+                .put_app_shard(
+                    txn.as_ref(),
+                    &ShardInfo {
+                        shard_key: gk.clone(),
+                        prefix: vec![i],
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
         }
         txn.commit().unwrap();
 

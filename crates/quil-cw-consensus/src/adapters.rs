@@ -74,8 +74,13 @@ impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
 fn prover_address(key: &FalconPublicKey) -> Option<[u8; 32]> {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
-    static REMEMBERED: LazyLock<Mutex<HashMap<FalconPublicKey, [u8; 32]>>> = LazyLock::new(Default::default);
-    if let Some(address) = REMEMBERED.lock().ok().and_then(|cache| cache.get(key).copied()) {
+    static REMEMBERED: LazyLock<Mutex<HashMap<FalconPublicKey, [u8; 32]>>> =
+        LazyLock::new(Default::default);
+    if let Some(address) = REMEMBERED
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).copied())
+    {
         return Some(address);
     }
     let address = quil_crypto::poseidon::hash_bytes_to_32(key.as_ref()).ok()?;
@@ -134,7 +139,9 @@ struct StoredBlock {
 
 impl BlockStore {
     pub fn downgrade(&self) -> WeakBlockStore {
-        WeakBlockStore { inner: Arc::downgrade(&self.inner) }
+        WeakBlockStore {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn new() -> Self {
@@ -161,12 +168,17 @@ impl BlockStore {
         }
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        self.inner.lock().get(digest).map(|stored| stored.bytes.clone())
+        self.inner
+            .lock()
+            .get(digest)
+            .map(|stored| stored.bytes.clone())
     }
 
     /// Refuse oversized recovery input before copying peer-controlled bytes.
     pub fn get_bounded(&self, digest: &Digest, max_bytes: usize) -> Option<Vec<u8>> {
-        self.inner.lock().get(digest)
+        self.inner
+            .lock()
+            .get(digest)
             .filter(|stored| stored.bytes.len() <= max_bytes)
             .map(|stored| stored.bytes.clone())
     }
@@ -176,7 +188,11 @@ impl BlockStore {
     /// cannot substitute different bytes for it.
     pub fn seal(&self, digest: Digest, bytes: Vec<u8>) {
         let mut inner = self.inner.lock();
-        if inner.get(&digest).map(|stored| stored.verified).unwrap_or(false) {
+        if inner
+            .get(&digest)
+            .map(|stored| stored.verified)
+            .unwrap_or(false)
+        {
             return;
         }
         inner.insert(
@@ -228,7 +244,13 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// `bytes` is the frame body
     /// if already delivered (via `FrameSink`), else `None` (not yet arrived →
     /// return `false` so the view nullifies rather than votes blind).
-    fn verify(&self, view: u64, parent_digest: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
+    fn verify(
+        &self,
+        view: u64,
+        parent_digest: Digest,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool;
 
     /// After `propose` declined: how long until asking again for the same view
     /// can succeed, or `None` to give the view up. A leader that is only pacing
@@ -267,7 +289,11 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// it needs is on its way to this node (its GLOBAL anchor, just ahead of
     /// this node's latest); `None` checks it now. Wrapping proposers forward
     /// it to the one that knows.
-    fn verify_delay(&self, _context: ProposalContext, _bytes: &[u8]) -> Option<std::time::Duration> {
+    fn verify_delay(
+        &self,
+        _context: ProposalContext,
+        _bytes: &[u8],
+    ) -> Option<std::time::Duration> {
         None
     }
 
@@ -282,7 +308,10 @@ pub trait GlobalProposer: Send + Sync + 'static {
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> Result<bool, std::time::Duration> {
-        if let Some(delay) = bytes.as_deref().and_then(|bytes| self.verify_delay(context, bytes)) {
+        if let Some(delay) = bytes
+            .as_deref()
+            .and_then(|bytes| self.verify_delay(context, bytes))
+        {
             return Err(delay);
         }
         Ok(self.verify_with_context(context, digest, bytes))
@@ -354,7 +383,12 @@ impl<E: Spawner + Clock, Pr: GlobalProposer> Clone for FalconAutomaton<E, Pr> {
 
 impl<E: Spawner + Clock, Pr: GlobalProposer> FalconAutomaton<E, Pr> {
     pub fn new(context: E, proposer: Arc<Pr>, store: BlockStore) -> Self {
-        Self { context, proposer, store, liveness: None }
+        Self {
+            context,
+            proposer,
+            store,
+            liveness: None,
+        }
     }
 
     /// Also count, in `liveness`, how each proposal and vote of this member
@@ -365,9 +399,7 @@ impl<E: Spawner + Clock, Pr: GlobalProposer> FalconAutomaton<E, Pr> {
     }
 }
 
-impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
-    for FalconAutomaton<E, Pr>
-{
+impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for FalconAutomaton<E, Pr> {
     type Digest = Digest;
     type Context = Context<Digest, FalconPublicKey>;
 
@@ -377,8 +409,10 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         let liveness = self.liveness.clone();
-        let settle = move |proposed: bool| if let Some(liveness) = liveness.as_ref() {
-            liveness.settle(Step::Propose, proposal_context.view, proposed);
+        let settle = move |proposed: bool| {
+            if let Some(liveness) = liveness.as_ref() {
+                liveness.settle(Step::Propose, proposal_context.view, proposed);
+            }
         };
         self.context.child("propose").spawn(move |ctx| async move {
             if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
@@ -493,7 +527,10 @@ pub struct FalconRelay<Sk: FrameSink> {
 
 impl<Sk: FrameSink> Clone for FalconRelay<Sk> {
     fn clone(&self) -> Self {
-        Self { sink: self.sink.clone(), store: self.store.clone() }
+        Self {
+            sink: self.sink.clone(),
+            store: self.store.clone(),
+        }
     }
 }
 
@@ -624,7 +661,12 @@ impl ViewVotes {
     fn tally(&self, view: u64) -> ViewTally {
         ViewTally {
             view,
-            notarize: self.notarize.values().map(|signers| signers.len()).max().unwrap_or(0),
+            notarize: self
+                .notarize
+                .values()
+                .map(|signers| signers.len())
+                .max()
+                .unwrap_or(0),
             proposals: self.notarize.len(),
             nullify: self.nullify.len(),
             finalize: self.finalize.len(),
@@ -632,7 +674,12 @@ impl ViewVotes {
     }
 
     fn signers(&self) -> impl Iterator<Item = u32> + '_ {
-        self.notarize.values().flatten().chain(&self.nullify).chain(&self.finalize).copied()
+        self.notarize
+            .values()
+            .flatten()
+            .chain(&self.nullify)
+            .chain(&self.finalize)
+            .copied()
     }
 }
 
@@ -720,12 +767,18 @@ pub struct Decisions {
 
 impl Liveness {
     fn vote(&self, view: u64, count: impl FnOnce(&mut LivenessSnapshot, &mut ViewVotes)) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         let state = &mut *state;
         state.snapshot.view = state.snapshot.view.max(view);
         let floor = state.snapshot.view.saturating_sub(LIVENESS_VIEWS);
         let mut ignored = ViewVotes::default();
-        let votes = if view > floor { state.views.entry(view).or_default() } else { &mut ignored };
+        let votes = if view > floor {
+            state.views.entry(view).or_default()
+        } else {
+            &mut ignored
+        };
         count(&mut state.snapshot, votes);
         state.views.retain(|recent, _| *recent > floor);
     }
@@ -737,7 +790,13 @@ impl Liveness {
 
     /// Count a notarize vote and, with `evidence` (round epoch, parent view
     /// and signature), keep it; a signer's first vote of a proposal stays.
-    fn notarize_vote(&self, view: u64, signer: u32, payload: [u8; 32], evidence: Option<(u64, u64, Vec<u8>)>) {
+    fn notarize_vote(
+        &self,
+        view: u64,
+        signer: u32,
+        payload: [u8; 32],
+        evidence: Option<(u64, u64, Vec<u8>)>,
+    ) {
         self.vote(view, |s, votes| {
             s.notarize_votes += 1;
             votes.notarize.entry(payload).or_default().insert(signer);
@@ -745,7 +804,10 @@ impl Liveness {
                 votes
                     .evidence
                     .entry((parent, payload))
-                    .or_insert_with(|| Evidence { epoch, signatures: Default::default() })
+                    .or_insert_with(|| Evidence {
+                        epoch,
+                        signatures: Default::default(),
+                    })
                     .signatures
                     .entry(signer)
                     .or_insert(signature);
@@ -754,7 +816,15 @@ impl Liveness {
     }
 
     #[cfg(test)]
-    fn evidence(&self, view: u64, epoch: u64, parent: u64, payload: [u8; 32], signer: u32, signature: Vec<u8>) {
+    fn evidence(
+        &self,
+        view: u64,
+        epoch: u64,
+        parent: u64,
+        payload: [u8; 32],
+        signer: u32,
+        signature: Vec<u8>,
+    ) {
         self.notarize_vote(view, signer, payload, Some((epoch, parent, signature)))
     }
 
@@ -783,20 +853,32 @@ impl Liveness {
     }
 
     fn certificate(&self, view: u64, record: impl FnOnce(&mut LivenessSnapshot)) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         record(&mut state.snapshot);
         state.snapshot.view = state.snapshot.view.max(view);
     }
 
     pub fn snapshot(&self) -> LivenessSnapshot {
-        let Ok(state) = self.inner.lock() else { return LivenessSnapshot::default() };
+        let Ok(state) = self.inner.lock() else {
+            return LivenessSnapshot::default();
+        };
         let mut snapshot = state.snapshot;
-        snapshot.voters = state.views.values().flat_map(ViewVotes::signers)
-            .collect::<std::collections::BTreeSet<_>>().len();
+        snapshot.voters = state
+            .views
+            .values()
+            .flat_map(ViewVotes::signers)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         let tallies = || state.views.iter().map(|(view, votes)| votes.tally(*view));
         snapshot.current = tallies().last().unwrap_or_default();
-        snapshot.best = tallies().max_by_key(|tally| (tally.notarize, tally.view)).unwrap_or_default();
-        snapshot.most_nullified = tallies().max_by_key(|tally| (tally.nullify, tally.view)).unwrap_or_default();
+        snapshot.best = tallies()
+            .max_by_key(|tally| (tally.notarize, tally.view))
+            .unwrap_or_default();
+        snapshot.most_nullified = tallies()
+            .max_by_key(|tally| (tally.nullify, tally.view))
+            .unwrap_or_default();
         snapshot.blocked_peers = state.blocked.len();
         snapshot
     }
@@ -804,11 +886,18 @@ impl Liveness {
     /// Who voted in `view` while it is one of the last [`LIVENESS_VIEWS`]
     /// views; `None` for a view without votes or one that left them.
     pub fn view_signers(&self, view: u64) -> Option<ViewSigners> {
-        let Ok(state) = self.inner.lock() else { return None };
+        let Ok(state) = self.inner.lock() else {
+            return None;
+        };
         let votes = state.views.get(&view)?;
         Some(ViewSigners {
             view,
-            notarize: votes.notarize.values().max_by_key(|signers| signers.len()).cloned().unwrap_or_default(),
+            notarize: votes
+                .notarize
+                .values()
+                .max_by_key(|signers| signers.len())
+                .cloned()
+                .unwrap_or_default(),
             nullify: votes.nullify.clone(),
             finalize: votes.finalize.clone(),
         })
@@ -825,7 +914,8 @@ impl Liveness {
     /// [`Self::nullify_votes`] (presence reports).
     /// Off by default: then no signature is decoded, copied or stored.
     pub fn keep_votes(&self, keep: bool) {
-        self.keep_votes.store(keep, std::sync::atomic::Ordering::Relaxed);
+        self.keep_votes
+            .store(keep, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether notarize votes keep their signatures ([`Self::keep_votes`]).
@@ -840,7 +930,11 @@ impl Liveness {
         let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else {
             // A host that failed part-way through activation never bound its
             // store; a bound store that is gone is an ordinary shutdown.
-            if self.blocks.get().is_none() && !self.unbound_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if self.blocks.get().is_none()
+                && !self
+                    .unbound_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
                 tracing::warn!(
                     "consensus liveness has no block store bound, so notarized proposals are reported without \
                      bodies; this node's consensus activation did not finish (defect to report with the \
@@ -850,33 +944,55 @@ impl Liveness {
             return Vec::new();
         };
         let recent: Vec<NotarizedProposal> = {
-            let Ok(state) = self.inner.lock() else { return Vec::new() };
-            state.views.iter().flat_map(|(view, votes)| {
-                votes.evidence.iter().map(move |((parent, payload), evidence)| NotarizedProposal {
-                    epoch: evidence.epoch,
-                    view: *view,
-                    parent: *parent,
-                    payload: *payload,
-                    votes: evidence.signatures.iter().map(|(signer, signature)| (*signer, signature.clone())).collect(),
-                    body: Vec::new(),
+            let Ok(state) = self.inner.lock() else {
+                return Vec::new();
+            };
+            state
+                .views
+                .iter()
+                .flat_map(|(view, votes)| {
+                    votes
+                        .evidence
+                        .iter()
+                        .map(move |((parent, payload), evidence)| NotarizedProposal {
+                            epoch: evidence.epoch,
+                            view: *view,
+                            parent: *parent,
+                            payload: *payload,
+                            votes: evidence
+                                .signatures
+                                .iter()
+                                .map(|(signer, signature)| (*signer, signature.clone()))
+                                .collect(),
+                            body: Vec::new(),
+                        })
                 })
-            }).collect()
+                .collect()
         };
-        recent.into_iter().filter_map(|mut proposal| {
-            let (body, verified) = blocks.get_with_verification(&digest_from_identity(proposal.payload))?;
-            verified.then(|| {
-                proposal.body = body;
-                proposal
+        recent
+            .into_iter()
+            .filter_map(|mut proposal| {
+                let (body, verified) =
+                    blocks.get_with_verification(&digest_from_identity(proposal.payload))?;
+                verified.then(|| {
+                    proposal.body = body;
+                    proposal
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Every notarize vote of the recent views, in ascending view order,
     /// with its signature bytes where `wanted` asks for them and `None`
     /// elsewhere, so a caller that keeps the result of checking a vote
     /// copies only the votes it has not checked yet. No body is read.
-    pub fn notarize_votes(&self, wanted: impl Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
-        let Ok(state) = self.inner.lock() else { return Vec::new() };
+    pub fn notarize_votes(
+        &self,
+        wanted: impl Fn(&NotarizeKey) -> bool,
+    ) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut votes = Vec::new();
         for (view, recent) in &state.views {
             for ((parent, payload), evidence) in &recent.evidence {
@@ -899,12 +1015,21 @@ impl Liveness {
     /// Every kept nullify vote of the recent views, in ascending view and
     /// signer order, with its signature bytes where `wanted` asks for them
     /// and `None` elsewhere ([`Self::notarize_votes`]).
-    pub fn nullify_votes(&self, wanted: impl Fn(&NullifyKey) -> bool) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
-        let Ok(state) = self.inner.lock() else { return Vec::new() };
+    pub fn nullify_votes(
+        &self,
+        wanted: impl Fn(&NullifyKey) -> bool,
+    ) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut votes = Vec::new();
         for (view, recent) in &state.views {
             for (signer, (epoch, signature)) in &recent.nullify_evidence {
-                let key = NullifyKey { epoch: *epoch, view: *view, signer: *signer };
+                let key = NullifyKey {
+                    epoch: *epoch,
+                    view: *view,
+                    signer: *signer,
+                };
                 let signature = wanted(&key).then(|| signature.clone());
                 votes.push((key, signature));
             }
@@ -913,13 +1038,18 @@ impl Liveness {
     }
 
     pub fn decisions(&self) -> Decisions {
-        self.inner.lock().map(|state| state.decisions.clone()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|state| state.decisions.clone())
+            .unwrap_or_default()
     }
 
     /// Why `step` of `view` has not succeeded (so far): the reason its outcome
     /// is counted under if it ends without success. A later note replaces it.
     pub fn note(&self, step: Step, view: u64, reason: &'static str, detail: impl Into<String>) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         let floor = state.snapshot.view.saturating_sub(NOTE_VIEWS);
         state.notes.retain(|(_, noted), _| *noted > floor);
         state.notes.insert((step, view), (reason, detail.into()));
@@ -927,23 +1057,42 @@ impl Liveness {
 
     /// `step` of `view` ended, successfully or under its last note.
     pub fn settle(&self, step: Step, view: u64, succeeded: bool) {
-        let Ok(mut state) = self.inner.lock() else { return };
-        let (reason, detail) = state.notes.remove(&(step, view)).unwrap_or(("unexplained", String::new()));
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        let (reason, detail) = state
+            .notes
+            .remove(&(step, view))
+            .unwrap_or(("unexplained", String::new()));
         let decisions = &mut state.decisions;
         let (done, failed, last) = match step {
-            Step::Propose => (&mut decisions.proposed, &mut decisions.declined, &mut decisions.last_declined),
-            Step::Verify => (&mut decisions.accepted, &mut decisions.refused, &mut decisions.last_refused),
+            Step::Propose => (
+                &mut decisions.proposed,
+                &mut decisions.declined,
+                &mut decisions.last_declined,
+            ),
+            Step::Verify => (
+                &mut decisions.accepted,
+                &mut decisions.refused,
+                &mut decisions.last_refused,
+            ),
         };
         if succeeded {
             *done += 1;
         } else {
             *failed.entry(reason).or_default() += 1;
-            *last = Some(Outcome { view, reason, detail });
+            *last = Some(Outcome {
+                view,
+                reason,
+                detail,
+            });
         }
     }
 
     fn blocked(&self, peer: FalconPublicKey) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         state.snapshot.blocked += 1;
         if state.blocked.len() < BLOCKED_PEERS {
             state.blocked.insert(peer);
@@ -958,16 +1107,28 @@ impl Liveness {
             Activity::Notarize(vote) => {
                 let evidence = if self.keep_votes.load(std::sync::atomic::Ordering::Relaxed) {
                     vote.attestation.signature.get().map(|signature| {
-                        (vote.proposal.round.epoch().get(), vote.proposal.parent.get(), signature.to_vec())
+                        (
+                            vote.proposal.round.epoch().get(),
+                            vote.proposal.parent.get(),
+                            signature.to_vec(),
+                        )
                     })
                 } else {
                     None
                 };
-                self.notarize_vote(vote.view().get(), signer(vote.signer()), vote.proposal.payload.0, evidence);
+                self.notarize_vote(
+                    vote.view().get(),
+                    signer(vote.signer()),
+                    vote.proposal.payload.0,
+                    evidence,
+                );
             }
             Activity::Nullify(vote) => {
                 let evidence = if self.keep_votes.load(std::sync::atomic::Ordering::Relaxed) {
-                    vote.attestation.signature.get().map(|signature| (vote.round.epoch().get(), signature.to_vec()))
+                    vote.attestation
+                        .signature
+                        .get()
+                        .map(|signature| (vote.round.epoch().get(), signature.to_vec()))
                 } else {
                     None
                 };
@@ -1006,7 +1167,9 @@ impl CountingBlocker {
 
 impl Clone for CountingBlocker {
     fn clone(&self) -> Self {
-        Self { liveness: self.liveness.clone() }
+        Self {
+            liveness: self.liveness.clone(),
+        }
     }
 }
 
@@ -1030,13 +1193,21 @@ pub struct FalconReporter<Fin: FrameFinalizer> {
 
 impl<Fin: FrameFinalizer> Clone for FalconReporter<Fin> {
     fn clone(&self) -> Self {
-        Self { finalizer: self.finalizer.clone(), store: self.store.clone(), liveness: self.liveness.clone() }
+        Self {
+            finalizer: self.finalizer.clone(),
+            store: self.store.clone(),
+            liveness: self.liveness.clone(),
+        }
     }
 }
 
 impl<Fin: FrameFinalizer> FalconReporter<Fin> {
     pub fn new(finalizer: Arc<Fin>, store: BlockStore) -> Self {
-        Self { finalizer, store, liveness: None }
+        Self {
+            finalizer,
+            store,
+            liveness: None,
+        }
     }
 
     /// Also record every vote and certificate in `liveness`, which reads the
@@ -1165,8 +1336,26 @@ mod liveness_tests {
         }
         liveness.finalize(7, 1);
         let seen = liveness.snapshot();
-        assert_eq!(seen.best, ViewTally { view: 7, notarize: 5, proposals: 2, nullify: 0, finalize: 1 });
-        assert_eq!(seen.current, ViewTally { view: 8, notarize: 0, proposals: 0, nullify: 3, finalize: 0 });
+        assert_eq!(
+            seen.best,
+            ViewTally {
+                view: 7,
+                notarize: 5,
+                proposals: 2,
+                nullify: 0,
+                finalize: 1
+            }
+        );
+        assert_eq!(
+            seen.current,
+            ViewTally {
+                view: 8,
+                notarize: 0,
+                proposals: 0,
+                nullify: 3,
+                finalize: 0
+            }
+        );
         assert_eq!(seen.most_nullified, seen.current);
         assert_eq!(seen.voters, 8);
         assert_eq!(seen.notarize_votes, 9);
@@ -1191,10 +1380,20 @@ mod liveness_tests {
         liveness.nullify(7, 4);
         liveness.nullify(7, 5);
         liveness.finalize(7, 0);
-        let set = |signers: &[u32]| signers.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let set = |signers: &[u32]| {
+            signers
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
         assert_eq!(
             liveness.view_signers(7),
-            Some(ViewSigners { view: 7, notarize: set(&[0, 2, 3]), nullify: set(&[4, 5]), finalize: set(&[0]) }),
+            Some(ViewSigners {
+                view: 7,
+                notarize: set(&[0, 2, 3]),
+                nullify: set(&[4, 5]),
+                finalize: set(&[0])
+            }),
         );
         liveness.nullify(7 + LIVENESS_VIEWS, 1);
         assert_eq!(liveness.view_signers(7), None, "left the recent views");
@@ -1206,18 +1405,34 @@ mod liveness_tests {
     fn outcomes_are_counted_once_per_view_under_their_last_reason() {
         let liveness = Liveness::default();
         liveness.note(Step::Propose, 3, "parent unavailable", "not yet");
-        liveness.note(Step::Propose, 3, "leader not ready to build on the parent", "frame 0");
+        liveness.note(
+            Step::Propose,
+            3,
+            "leader not ready to build on the parent",
+            "frame 0",
+        );
         liveness.settle(Step::Propose, 3, false);
         liveness.note(Step::Propose, 4, "parent unavailable", "not yet");
         liveness.settle(Step::Propose, 4, true);
-        liveness.note(Step::Verify, 4, "pre-state root differs", "phase vertex adds");
+        liveness.note(
+            Step::Verify,
+            4,
+            "pre-state root differs",
+            "phase vertex adds",
+        );
         liveness.settle(Step::Verify, 4, false);
         liveness.settle(Step::Verify, 5, false);
         liveness.settle(Step::Verify, 6, true);
         let decided = liveness.decisions();
         assert_eq!(decided.proposed, 1);
-        assert_eq!(decided.declined.into_iter().collect::<Vec<_>>(), vec![("leader not ready to build on the parent", 1)]);
-        assert_eq!(decided.last_declined.map(|o| (o.view, o.detail)), Some((3, "frame 0".to_string())));
+        assert_eq!(
+            decided.declined.into_iter().collect::<Vec<_>>(),
+            vec![("leader not ready to build on the parent", 1)]
+        );
+        assert_eq!(
+            decided.last_declined.map(|o| (o.view, o.detail)),
+            Some((3, "frame 0".to_string()))
+        );
         assert_eq!(decided.accepted, 1);
         assert_eq!(
             decided.refused.into_iter().collect::<Vec<_>>(),
@@ -1233,7 +1448,12 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.evidence(7, 3, 6, [1; 32], 2, vec![0xa2]);
         assert!(liveness.notarized().is_empty(), "no block store bound");
-        assert!(liveness.unbound_warned.load(std::sync::atomic::Ordering::Relaxed), "an unbound store warns once");
+        assert!(
+            liveness
+                .unbound_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "an unbound store warns once"
+        );
         let store = BlockStore::new();
         liveness.bind_blocks(&store);
         liveness.evidence(7, 3, 6, [1; 32], 0, vec![0xa0]);
@@ -1245,12 +1465,22 @@ mod liveness_tests {
         assert_eq!(
             liveness.notarized(),
             vec![NotarizedProposal {
-                epoch: 3, view: 7, parent: 6, payload: [1; 32],
-                votes: vec![(0, vec![0xa0]), (2, vec![0xa2])], body: b"body".to_vec(),
+                epoch: 3,
+                view: 7,
+                parent: 6,
+                payload: [1; 32],
+                votes: vec![(0, vec![0xa0]), (2, vec![0xa2])],
+                body: b"body".to_vec(),
             }],
             "a signer's first vote stays",
         );
-        let key = |view, parent, payload, signer| NotarizeKey { epoch: 3, view, parent, payload, signer };
+        let key = |view, parent, payload, signer| NotarizeKey {
+            epoch: 3,
+            view,
+            parent,
+            payload,
+            signer,
+        };
         assert_eq!(
             liveness.notarize_votes(|key| key.signer == 2),
             vec![
@@ -1280,13 +1510,26 @@ mod liveness_tests {
         let mut keys: Vec<_> = (0..2)
             .map(|_| {
                 let key = quil_crypto::FalconSigner::generate();
-                crate::falcon_base::FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+                crate::falcon_base::FalconPrivateKey::from_bytes(
+                    key.private_key(),
+                    key.public_key(),
+                )
+                .unwrap()
             })
             .collect();
         keys.sort_by_key(|key| key.public_key().as_ref().to_vec());
-        let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+        let participants: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
         let scheme = SimplexFalconScheme::signer(b"test", participants, keys[1].clone()).unwrap();
-        let proposal = Proposal::new(Round::new(Epoch::new(3), View::new(9)), View::new(5), digest_from_identity([4; 32]));
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(3), View::new(9)),
+            View::new(5),
+            digest_from_identity([4; 32]),
+        );
         let vote = Notarize::sign(&scheme, proposal).unwrap();
         (scheme, vote)
     }
@@ -1303,14 +1546,29 @@ mod liveness_tests {
         liveness.keep_votes(true);
         liveness.observe(&Activity::Notarize(vote.clone()));
         let votes = liveness.notarize_votes(|_| true);
-        let key = NotarizeKey { epoch: 3, view: 9, parent: 5, payload: [4; 32], signer: 1 };
-        assert_eq!(votes, vec![(key, Some(vote.attestation.signature.get().unwrap().to_vec()))]);
+        let key = NotarizeKey {
+            epoch: 3,
+            view: 9,
+            parent: 5,
+            payload: [4; 32],
+            signer: 1,
+        };
+        assert_eq!(
+            votes,
+            vec![(
+                key,
+                Some(vote.attestation.signature.get().unwrap().to_vec())
+            )]
+        );
         let listed = Proposal::new(
             Round::new(Epoch::new(key.epoch), View::new(key.view)),
             View::new(key.parent),
             digest_from_identity(key.payload),
         );
-        assert!(scheme.verify_notarize(&listed, &vote.attestation), "the listed vote verifies as consensus checks it");
+        assert!(
+            scheme.verify_notarize(&listed, &vote.attestation),
+            "the listed vote verifies as consensus checks it"
+        );
     }
 
     /// A nullify vote consensus reports keeps its round and signature when
@@ -1321,18 +1579,32 @@ mod liveness_tests {
         use commonware_consensus::simplex::types::Nullify;
         use commonware_consensus::types::{Epoch, Round, View};
         let (scheme, _) = signed_notarize();
-        let vote = Nullify::sign::<Digest>(&scheme, Round::new(Epoch::new(3), View::new(11))).unwrap();
+        let vote =
+            Nullify::sign::<Digest>(&scheme, Round::new(Epoch::new(3), View::new(11))).unwrap();
         let liveness = Liveness::default();
         liveness.observe(&Activity::Nullify(vote.clone()));
         assert_eq!(liveness.snapshot().nullify_votes, 1, "the vote is counted");
-        assert!(liveness.nullify_votes(|_| true).is_empty(), "and its signature not kept");
+        assert!(
+            liveness.nullify_votes(|_| true).is_empty(),
+            "and its signature not kept"
+        );
         liveness.keep_votes(true);
         liveness.observe(&Activity::Nullify(vote.clone()));
-        let key = NullifyKey { epoch: 3, view: 11, signer: 1 };
+        let key = NullifyKey {
+            epoch: 3,
+            view: 11,
+            signer: 1,
+        };
         let signature = vote.attestation.signature.get().unwrap().to_vec();
-        assert_eq!(liveness.nullify_votes(|_| true), vec![(key, Some(signature))]);
+        assert_eq!(
+            liveness.nullify_votes(|_| true),
+            vec![(key, Some(signature))]
+        );
         assert_eq!(liveness.nullify_votes(|_| false), vec![(key, None)]);
-        assert!(scheme.verify_nullify(&vote), "the listed vote verifies as consensus checks it");
+        assert!(
+            scheme.verify_nullify(&vote),
+            "the listed vote verifies as consensus checks it"
+        );
     }
 
     /// Unless presence reports ask for them, notarize votes are only
@@ -1343,8 +1615,17 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.observe(&Activity::Notarize(vote.clone()));
         assert_eq!(liveness.snapshot().notarize_votes, 1, "the vote is counted");
-        assert!(liveness.notarize_votes(|_| true).is_empty(), "and its signature not kept");
-        assert!(liveness.inner.lock().unwrap().views.values().all(|votes| votes.evidence.is_empty()));
+        assert!(
+            liveness.notarize_votes(|_| true).is_empty(),
+            "and its signature not kept"
+        );
+        assert!(liveness
+            .inner
+            .lock()
+            .unwrap()
+            .views
+            .values()
+            .all(|votes| votes.evidence.is_empty()));
         liveness.keep_votes(true);
         liveness.observe(&Activity::Notarize(vote));
         assert_eq!(liveness.notarize_votes(|_| true).len(), 1);
@@ -1361,7 +1642,10 @@ mod liveness_tests {
         store.seal(digest_from_identity([1; 32]), b"body".to_vec());
         assert_eq!(liveness.notarized().len(), 1);
         drop(store);
-        assert!(liveness.notarized().is_empty(), "the bodies went with their store");
+        assert!(
+            liveness.notarized().is_empty(),
+            "the bodies went with their store"
+        );
     }
 
     #[test]
@@ -1372,7 +1656,10 @@ mod liveness_tests {
         let liveness = Arc::new(Liveness::default());
         let mut blocker = CountingBlocker::new(Some(liveness.clone()));
         let peers: Vec<_> = (0..2)
-            .map(|_| crate::falcon_base::FalconPrivateKey::random(commonware_utils::test_rng()).public_key())
+            .map(|_| {
+                crate::falcon_base::FalconPrivateKey::random(commonware_utils::test_rng())
+                    .public_key()
+            })
             .collect();
         for peer in [&peers[0], &peers[0], &peers[1]] {
             blocker.block((*peer).clone());

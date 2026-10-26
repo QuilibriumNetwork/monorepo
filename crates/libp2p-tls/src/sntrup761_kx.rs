@@ -24,9 +24,7 @@
 //! (pk 1158 B / ct 1039 B / shared secret 32 B), via `pqcrypto-ntruprime`.
 
 use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{
-    Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _,
-};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
 use rustls::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
 use rustls::{Error, NamedGroup, PeerMisbehaved};
 

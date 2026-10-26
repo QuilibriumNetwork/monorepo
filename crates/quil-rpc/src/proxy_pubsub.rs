@@ -14,9 +14,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, ClientTlsConfig};
 
-use quil_types::proto::proxy::{
-    self as pb, pub_sub_proxy_client::PubSubProxyClient,
-};
+use quil_types::proto::proxy::{self as pb, pub_sub_proxy_client::PubSubProxyClient};
 
 /// Received message forwarded from the master. Mirrors
 /// `ReceivedMessage` from `quil_p2p` so worker handlers can treat
@@ -213,4 +211,3 @@ impl ProxyPubSub {
         &self.channel
     }
 }
-

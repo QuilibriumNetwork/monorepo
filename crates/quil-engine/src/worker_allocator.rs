@@ -19,7 +19,8 @@ use crate::worker::{WorkerInfo, WorkerManager};
 
 /// A binding must stay unchanged this long before its worker evicts payload
 /// outside it: the previous engine's background tasks have finished by then.
-pub(crate) const PAYLOAD_EVICTION_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub(crate) const PAYLOAD_EVICTION_SETTLE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
 /// Repeat interval for a settled binding. Requests are idempotent; repeats
 /// retry refusals (pending mutations, an unfinished sync) and are cheap once
 /// nothing remains outside the protected scopes.
@@ -61,7 +62,9 @@ fn manual_release_reason(
         return ("join_never_landed", false);
     };
     match alloc.effective_status(frame_number) {
-        EffectiveStatus::Kicked if alloc.leave_confirm_frame_number > 0 => ("leave_confirmed", true),
+        EffectiveStatus::Kicked if alloc.leave_confirm_frame_number > 0 => {
+            ("leave_confirmed", true)
+        }
         EffectiveStatus::ExpiredLeaving => ("leave_departed", true),
         EffectiveStatus::Kicked => ("kicked", false),
         EffectiveStatus::Rejected => ("join_rejected", false),
@@ -115,9 +118,13 @@ pub enum GivenUp {
 impl GivenUp {
     pub fn reason(self) -> &'static str {
         match self {
-            Self::Lapsed => "its storage registration lapsed past its recovery epoch and no renewal of it runs",
-            Self::LeftLapsed => "it is being left after its storage registration lapsed past its recovery epoch, \
-                and its committee no longer seats it",
+            Self::Lapsed => {
+                "its storage registration lapsed past its recovery epoch and no renewal of it runs"
+            }
+            Self::LeftLapsed => {
+                "it is being left after its storage registration lapsed past its recovery epoch, \
+                and its committee no longer seats it"
+            }
         }
     }
 
@@ -161,11 +168,14 @@ fn lapsed_seat(
 ) -> Option<GivenUp> {
     use quil_types::consensus::{epoch_for_frame, EffectiveStatus};
     match allocation.effective_status(frame) {
-        EffectiveStatus::ExpiredEpoch if !epoch_renewal_recovery_pending(allocation, frame) => Some(GivenUp::Lapsed),
+        EffectiveStatus::ExpiredEpoch if !epoch_renewal_recovery_pending(allocation, frame) => {
+            Some(GivenUp::Lapsed)
+        }
         EffectiveStatus::Leaving
             if !allocation.confirmation_filter.is_empty()
                 && allocation.leave_frame_number > 0
-                && allocation.epoch.saturating_add(1) < epoch_for_frame(allocation.leave_frame_number)
+                && allocation.epoch.saturating_add(1)
+                    < epoch_for_frame(allocation.leave_frame_number)
                 && !quil_execution::prover_registry::leaver_seated(allocation, frame) =>
         {
             Some(GivenUp::LeftLapsed)
@@ -505,7 +515,10 @@ enum PriorityState {
     /// evaluation with shard-info loaded since this node started.
     Missing,
     /// A ranking exists but predates `PRIORITY_SNAPSHOT_MAX_AGE_FRAMES`.
-    Stale { published_at: u64, age: u64 },
+    Stale {
+        published_at: u64,
+        age: u64,
+    },
     Fresh(HashMap<Vec<u8>, AllocationPriorityEntry>),
 }
 
@@ -572,13 +585,19 @@ fn data_holders<'a>(
     let mut chosen: HashMap<Vec<u8>, u32> = HashMap::new();
     for filter in filters {
         let tip = tip(filter);
-        let best = eligible.iter()
+        let best = eligible
+            .iter()
             .filter(|core| !chosen.values().any(|taken| taken == *core))
             .filter_map(|core| {
-                let (_, cursor) = holders.get(core)?.iter().find(|(held, _)| held.as_slice() == filter)?;
+                let (_, cursor) = holders
+                    .get(core)?
+                    .iter()
+                    .find(|(held, _)| held.as_slice() == filter)?;
                 Some((*cursor, *core))
             })
-            .filter(|(cursor, _)| tip.is_none_or(|tip| cursor.saturating_add(shard_data_trail()) >= tip))
+            .filter(|(cursor, _)| {
+                tip.is_none_or(|tip| cursor.saturating_add(shard_data_trail()) >= tip)
+            })
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
         if let Some((_, core)) = best {
             chosen.entry(filter.to_vec()).or_insert(core);
@@ -712,8 +731,11 @@ impl WorkerAllocator {
         frame: u64,
     ) -> bool {
         epoch_renewal_recovery_pending(allocation, frame)
-            || (allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                && self.submission_attempts.confirming(&allocation.confirmation_filter, frame))
+            || (allocation.effective_status(frame)
+                == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                && self
+                    .submission_attempts
+                    .confirming(&allocation.confirmation_filter, frame))
     }
 
     /// Whether a lapsed seat keeps its worker until the lifecycle first
@@ -729,9 +751,15 @@ impl WorkerAllocator {
         allocation: &quil_types::consensus::ProverAllocationInfo,
         frame: u64,
     ) -> bool {
-        !self.renewals_offered.load(std::sync::atomic::Ordering::Acquire)
-            && allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-            && self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner())
+        !self
+            .renewals_offered
+            .load(std::sync::atomic::Ordering::Acquire)
+            && allocation.effective_status(frame)
+                == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+            && self
+                .interrupted_seats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .is_some_and(|seats| seats.contains(&allocation.confirmation_filter))
     }
@@ -739,7 +767,8 @@ impl WorkerAllocator {
     /// The lifecycle has decided which seats renew; see
     /// [`Self::awaits_renewal_offer`].
     pub(crate) fn note_renewals_offered(&self) {
-        self.renewals_offered.store(true, std::sync::atomic::Ordering::Release);
+        self.renewals_offered
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether this node gives up `allocation` at GLOBAL `frame`, and why: a
@@ -760,7 +789,8 @@ impl WorkerAllocator {
     ) -> Option<GivenUp> {
         match lapsed_seat(allocation, frame)? {
             GivenUp::Lapsed
-                if self.renewal_recovering(allocation, frame) || self.awaits_renewal_offer(allocation, frame) =>
+                if self.renewal_recovering(allocation, frame)
+                    || self.awaits_renewal_offer(allocation, frame) =>
             {
                 None
             }
@@ -779,9 +809,17 @@ impl WorkerAllocator {
     /// for once is not lost. And a worker its committee session retains
     /// still serves that session.
     pub fn given_up_seat(&self, filter: &[u8], frame: u64) -> Option<GivenUpSeat> {
-        let prover = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()?;
+        let prover = self
+            .prover_registry
+            .get_prover_info(&self.local_prover_address)
+            .ok()
+            .flatten()?;
         let seat = self.given_up_among(&prover.allocations, filter, frame)?;
-        let reconciled = self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let reconciled = self
+            .interrupted_seats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
         if seat.cause == GivenUp::Lapsed && !reconciled {
             return None;
         }
@@ -796,7 +834,11 @@ impl WorkerAllocator {
     /// (`app_handoff::retains_worker`).
     fn session_retains(&self, filter: &[u8], member: &[u8]) -> bool {
         !filter.is_empty()
-            && self.session_authority.read().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && self
+                .session_authority
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
                 .is_some_and(|global| crate::app_handoff::retains_worker(global, filter, member))
     }
 
@@ -811,7 +853,10 @@ impl WorkerAllocator {
         frame: u64,
     ) -> Option<GivenUpSeat> {
         let mut given_up = None;
-        for allocation in allocations.iter().filter(|a| a.confirmation_filter == filter) {
+        for allocation in allocations
+            .iter()
+            .filter(|a| a.confirmation_filter == filter)
+        {
             match self.gives_up(allocation, frame) {
                 Some(cause) => {
                     given_up.get_or_insert(GivenUpSeat {
@@ -837,11 +882,16 @@ impl WorkerAllocator {
     /// nothing up.
     pub fn install_recovery_gate(self: &Arc<Self>) {
         let allocator = Arc::downgrade(self);
-        self.worker_manager.set_recovery_gate(Arc::new(move |filter: &[u8]| {
-            let Some(allocator) = allocator.upgrade() else { return (0, None) };
-            let frame = allocator.reconciled_frame.load(std::sync::atomic::Ordering::Relaxed);
-            (frame, allocator.given_up_seat(filter, frame))
-        }));
+        self.worker_manager
+            .set_recovery_gate(Arc::new(move |filter: &[u8]| {
+                let Some(allocator) = allocator.upgrade() else {
+                    return (0, None);
+                };
+                let frame = allocator
+                    .reconciled_frame
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                (frame, allocator.given_up_seat(filter, frame))
+            }));
     }
 
     /// Tell the operator about each manual worker this pass released and
@@ -864,10 +914,14 @@ impl WorkerAllocator {
         }
         let workers = self.worker_manager.range_workers()?;
         for (core_id, filter) in manual_seats {
-            if !workers.iter().any(|w| w.core_id == *core_id && w.manually_managed && w.filter.is_empty()) {
+            if !workers
+                .iter()
+                .any(|w| w.core_id == *core_id && w.manually_managed && w.filter.is_empty())
+            {
                 continue;
             }
-            let (reason, left) = manual_release_reason(alloc_by_filter.get(filter).copied(), frame_number);
+            let (reason, left) =
+                manual_release_reason(alloc_by_filter.get(filter).copied(), frame_number);
             if left {
                 info!(core_id, filter = %hex::encode(filter), frame = frame_number, reason,
                     "manual worker idle after leaving its shard; the lifecycle does not join manual \
@@ -915,7 +969,12 @@ impl WorkerAllocator {
     /// ([`crate::app_handoff::committed_tips`]); none without authenticated
     /// GLOBAL state or when it is unreadable.
     fn committed_tips(&self, filters: &[Vec<u8>]) -> HashMap<Vec<u8>, u64> {
-        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+        let Some(global) = self
+            .session_authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             return HashMap::new();
         };
         match crate::app_handoff::committed_tips(&global, filters) {
@@ -928,7 +987,10 @@ impl WorkerAllocator {
     }
 
     pub fn set_session_authority(&self, global: Arc<quil_hypergraph::HypergraphCrdt>) {
-        *self.session_authority.write().unwrap_or_else(|e| e.into_inner()) = Some(global);
+        *self
+            .session_authority
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(global);
     }
 
     /// Of `filters`, those whose current committee session counts `member`
@@ -937,14 +999,23 @@ impl WorkerAllocator {
     /// hosting a session. `None` while a GLOBAL state sync withholds the
     /// committed view: membership is then unknown, not empty.
     pub(crate) fn session_member_filters(
-        &self, filters: &[Vec<u8>], member: &[u8],
+        &self,
+        filters: &[Vec<u8>],
+        member: &[u8],
     ) -> Option<std::collections::HashSet<Vec<u8>>> {
-        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+        let Some(global) = self
+            .session_authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             return Some(Default::default());
         };
         match crate::app_handoff::member_sessions(&global, filters, member) {
             Ok(members) => Some(members),
-            Err(error) if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) => {
+            Err(error)
+                if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) =>
+            {
                 debug!(%error, "committee sessions withheld by a GLOBAL state sync; seat hosting is not observed");
                 None
             }
@@ -1005,7 +1076,10 @@ impl WorkerAllocator {
         draining: usize,
     ) -> Option<&'static str> {
         let mut watch = self.orphan_watch.lock().unwrap_or_else(|e| e.into_inner());
-        let capacity = self.worker_manager.allocation_capacity().unwrap_or_default();
+        let capacity = self
+            .worker_manager
+            .allocation_capacity()
+            .unwrap_or_default();
         let bound = self
             .worker_manager
             .range_workers()
@@ -1038,7 +1112,11 @@ impl WorkerAllocator {
             }
             Some(_) => return None,
         };
-        *watch = Some(OrphanWatch { since_frame, logged_frame: frame_number, set });
+        *watch = Some(OrphanWatch {
+            since_frame,
+            logged_frame: frame_number,
+            set,
+        });
         let count_of = |status: ProverStatus| orphans.iter().filter(|(_, s)| *s == status).count();
         let sample: Vec<String> = orphans
             .iter()
@@ -1075,7 +1153,10 @@ impl WorkerAllocator {
     }
 
     pub fn set_pending_shard_changes(&self, changes: PendingShardChanges) {
-        *self.pending_shard_changes.write().unwrap_or_else(|e| e.into_inner()) = Some(changes);
+        *self
+            .pending_shard_changes
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(changes);
     }
 
     /// Ask each settled, serving worker to drop payload its store keeps from
@@ -1083,12 +1164,23 @@ impl WorkerAllocator {
     /// keeps it bound) and staged split/merge filters of the bound
     /// application.
     pub(crate) fn schedule_payload_eviction(&self, now: std::time::Instant) -> Result<()> {
-        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(changes) = self.pending_shard_changes.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+        let _reconcile = self
+            .reconcile_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(changes) = self
+            .pending_shard_changes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             return Ok(());
         };
         let workers = self.worker_manager.range_workers()?;
-        let mut tracks = self.payload_eviction.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tracks = self
+            .payload_eviction
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         tracks.retain(|core, _| workers.iter().any(|w| w.core_id == *core));
         let mut due = Vec::new();
         for worker in &workers {
@@ -1096,16 +1188,24 @@ impl WorkerAllocator {
                 tracks.remove(&worker.core_id);
                 continue;
             }
-            let track = tracks.entry(worker.core_id).or_insert_with(|| EvictionTrack {
-                filter: worker.filter.clone(),
-                since: now,
-                requested: None,
-            });
+            let track = tracks
+                .entry(worker.core_id)
+                .or_insert_with(|| EvictionTrack {
+                    filter: worker.filter.clone(),
+                    since: now,
+                    requested: None,
+                });
             if track.filter != worker.filter {
-                *track = EvictionTrack { filter: worker.filter.clone(), since: now, requested: None };
+                *track = EvictionTrack {
+                    filter: worker.filter.clone(),
+                    since: now,
+                    requested: None,
+                };
             }
             let settled = now.saturating_duration_since(track.since) >= PAYLOAD_EVICTION_SETTLE;
-            let repeat = track.requested.is_none_or(|at| now.saturating_duration_since(at) >= PAYLOAD_EVICTION_INTERVAL);
+            let repeat = track
+                .requested
+                .is_none_or(|at| now.saturating_duration_since(at) >= PAYLOAD_EVICTION_INTERVAL);
             if settled && repeat {
                 due.push(worker.core_id);
             }
@@ -1120,24 +1220,38 @@ impl WorkerAllocator {
         let held: std::collections::HashSet<Vec<u8>> = if staged.is_empty() {
             Default::default()
         } else {
-            self.prover_registry.get_all_active_app_shard_provers()?
+            self.prover_registry
+                .get_all_active_app_shard_provers()?
                 .into_iter()
                 .flat_map(|p| p.allocations)
-                .filter(|a| matches!(a.status, ProverStatus::Joining | ProverStatus::Active
-                    | ProverStatus::Paused | ProverStatus::Leaving))
+                .filter(|a| {
+                    matches!(
+                        a.status,
+                        ProverStatus::Joining
+                            | ProverStatus::Active
+                            | ProverStatus::Paused
+                            | ProverStatus::Leaving
+                    )
+                })
                 .map(|a| a.confirmation_filter)
                 .chain(workers.iter().map(|w| w.filter.clone()))
                 .filter(|f| !f.is_empty())
                 .collect()
         };
-        let staged: Vec<_> = staged.into_iter()
-            .filter(|c| std::iter::once(&c.parent).chain(c.children.iter()).any(|f| held.contains(f)))
+        let staged: Vec<_> = staged
+            .into_iter()
+            .filter(|c| {
+                std::iter::once(&c.parent)
+                    .chain(c.children.iter())
+                    .any(|f| held.contains(f))
+            })
             .collect();
         for worker in workers.iter().filter(|w| due.contains(&w.core_id)) {
             let application = &worker.filter[..worker.filter.len().min(32)];
             let mut keep = vec![worker.filter.clone()];
             keep.extend(
-                staged.iter()
+                staged
+                    .iter()
                     .flat_map(|c| std::iter::once(&c.parent).chain(c.children.iter()))
                     .filter(|f| f.len() >= 32 && f[..32] == *application)
                     .cloned(),
@@ -1145,10 +1259,14 @@ impl WorkerAllocator {
             keep.sort();
             keep.dedup();
             match self.worker_manager.evict_payload(worker.core_id, keep) {
-                Ok(()) => if let Some(track) = tracks.get_mut(&worker.core_id) {
-                    track.requested = Some(now);
-                },
-                Err(error) => warn!(core_id = worker.core_id, %error, "worker payload eviction request failed"),
+                Ok(()) => {
+                    if let Some(track) = tracks.get_mut(&worker.core_id) {
+                        track.requested = Some(now);
+                    }
+                }
+                Err(error) => {
+                    warn!(core_id = worker.core_id, %error, "worker payload eviction request failed")
+                }
             }
         }
         Ok(())
@@ -1161,7 +1279,11 @@ impl WorkerAllocator {
         let v = self
             .config_seniority_estimate
             .load(std::sync::atomic::Ordering::Relaxed);
-        if v == u64::MAX { 0 } else { v }
+        if v == u64::MAX {
+            0
+        } else {
+            v
+        }
     }
 
     /// Record the config-derived seniority estimate at startup.
@@ -1181,8 +1303,7 @@ impl WorkerAllocator {
     /// `fetch_max` so out-of-order callers can't accidentally
     /// regress the cooldown clock.
     pub fn record_attempt(&self, kind: Cooldown, frame_number: u64) {
-        self.cooldowns[kind as usize]
-            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+        self.cooldowns[kind as usize].fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ---------------------------------------------------------------
@@ -1205,7 +1326,9 @@ impl WorkerAllocator {
     }
     pub fn seniority_merge_held(&self, frame_number: u64) -> bool {
         quil_types::consensus::epoch_for_frame(frame_number)
-            < self.seniority_merge_resume_epoch.load(std::sync::atomic::Ordering::Relaxed)
+            < self
+                .seniority_merge_resume_epoch
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn last_reject_attempt(&self) -> u64 {
         self.last_attempt(Cooldown::Reject)
@@ -1231,7 +1354,8 @@ impl WorkerAllocator {
     /// Freed earlier, the worker is proposed for a second shard while the
     /// first join is still on its way.
     pub fn hold_pending_joins_for_registry_sync(&self) {
-        self.pending_joins_await_sync.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.pending_joins_await_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A prover-tree sync numbered `sync` began at `frame_number`.
@@ -1243,9 +1367,12 @@ impl WorkerAllocator {
 
     /// The registry now reflects the prover-tree sync numbered `sync`.
     pub fn note_registry_synced(&self, sync: u64) {
-        let Ok(mut running) = self.registry_syncs_running.lock() else { return };
+        let Ok(mut running) = self.registry_syncs_running.lock() else {
+            return;
+        };
         if let Some(frame) = running.remove(&sync) {
-            self.registry_synced_from_frame.fetch_max(frame, std::sync::atomic::Ordering::SeqCst);
+            self.registry_synced_from_frame
+                .fetch_max(frame, std::sync::atomic::Ordering::SeqCst);
         }
         running.retain(|later, _| *later > sync);
     }
@@ -1255,9 +1382,14 @@ impl WorkerAllocator {
     /// at the frame before its begin frame.
     fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
         pending_frame > 0
-            && self.pending_joins_await_sync.load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .pending_joins_await_sync
+                .load(std::sync::atomic::Ordering::SeqCst)
             && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
-            && self.registry_synced_from_frame.load(std::sync::atomic::Ordering::SeqCst) <= pending_frame + 1
+            && self
+                .registry_synced_from_frame
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= pending_frame + 1
     }
 
     /// Clear the pending-join marker of a worker still idle after the bind
@@ -1317,7 +1449,9 @@ impl WorkerAllocator {
                      — archive likely dropped the bundle silently"
                 ),
             }
-            let _ = self.worker_manager.set_pending_filter_frame(worker.core_id, 0);
+            let _ = self
+                .worker_manager
+                .set_pending_filter_frame(worker.core_id, 0);
         }
         Ok(())
     }
@@ -1343,12 +1477,25 @@ impl WorkerAllocator {
         entries: Vec<(Vec<u8>, bool, BigInt)>,
         mut evidence: HashMap<Vec<u8>, AllocationPriorityEvidence>,
     ) {
-        let entries = entries.into_iter().map(|(filter, halt_risk, score)| {
-            let evidence = evidence.remove(&filter);
-            (filter, AllocationPriorityEntry { halt_risk, score, evidence })
-        }).collect();
+        let entries = entries
+            .into_iter()
+            .map(|(filter, halt_risk, score)| {
+                let evidence = evidence.remove(&filter);
+                (
+                    filter,
+                    AllocationPriorityEntry {
+                        halt_risk,
+                        score,
+                        evidence,
+                    },
+                )
+            })
+            .collect();
         if let Ok(mut guard) = self.allocation_priority.write() {
-            *guard = Some(AllocationPriority { frame_number, entries });
+            *guard = Some(AllocationPriority {
+                frame_number,
+                entries,
+            });
         }
     }
 
@@ -1397,8 +1544,8 @@ impl WorkerAllocator {
         let last_code = self.last_rebind_outcome.load(Ordering::Relaxed);
         let last_frame = self.last_rebind_outcome_frame.load(Ordering::Relaxed);
         let changed = last_code != code;
-        let due = last_frame == 0
-            || frame_number.abs_diff(last_frame) >= REBIND_TELEMETRY_REPEAT_FRAMES;
+        let due =
+            last_frame == 0 || frame_number.abs_diff(last_frame) >= REBIND_TELEMETRY_REPEAT_FRAMES;
         if !changed && !due {
             return;
         }
@@ -1432,7 +1579,12 @@ impl WorkerAllocator {
     /// startup state jump, the registry sync's at its authenticated cursor,
     /// or an executed frame's. Workers restored from the store start no
     /// engine before a reconcile. Returns whether it reconciled.
-    pub fn startup_reconcile(&self, head: u64, head_unix_ms: u64, now_unix_ms: u64) -> Result<bool> {
+    pub fn startup_reconcile(
+        &self,
+        head: u64,
+        head_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<bool> {
         if !stored_head_current(head_unix_ms, now_unix_ms) {
             return Ok(false);
         }
@@ -1449,8 +1601,12 @@ impl WorkerAllocator {
     }
 
     fn reconcile(&self, frame_number: u64) -> Result<()> {
-        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.reconciled_frame.fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
+        let _reconcile = self
+            .reconcile_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.reconciled_frame
+            .fetch_max(frame_number, std::sync::atomic::Ordering::Relaxed);
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
         // the deep filter that survived the v2 tree wipe in the local worker store
@@ -1527,13 +1683,21 @@ impl WorkerAllocator {
         // The seats the first reconcile finds bound although lapsed past
         // recovery; see `awaits_renewal_offer`.
         if prover_info.is_some() {
-            let mut seats = self.interrupted_seats.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seats = self
+                .interrupted_seats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if seats.is_none() {
-                let found: std::collections::HashSet<Vec<u8>> = workers.iter()
+                let found: std::collections::HashSet<Vec<u8>> = workers
+                    .iter()
                     .filter(|w| !w.filter.is_empty())
-                    .filter(|w| alloc_by_filter.get(&w.filter).is_some_and(|a|
-                        a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                            && !self.renewal_recovering(a, frame_number)))
+                    .filter(|w| {
+                        alloc_by_filter.get(&w.filter).is_some_and(|a| {
+                            a.effective_status(frame_number)
+                                == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                                && !self.renewal_recovering(a, frame_number)
+                        })
+                    })
                     .map(|w| w.filter.clone())
                     .collect();
                 if !found.is_empty() {
@@ -1569,28 +1733,34 @@ impl WorkerAllocator {
             .unwrap_or(&[])
             .iter()
             .any(|a| {
-                a.status == ProverStatus::Active
-                    && !bound_filters.contains(&a.confirmation_filter)
+                a.status == ProverStatus::Active && !bound_filters.contains(&a.confirmation_filter)
             });
 
         // Seats of manual workers at the start of this pass; see
         // `log_idled_manual_workers`.
-        let manual_seats: Vec<(u32, Vec<u8>)> = workers.iter()
+        let manual_seats: Vec<(u32, Vec<u8>)> = workers
+            .iter()
             .filter(|w| w.manually_managed && !w.filter.is_empty())
             .map(|w| (w.core_id, w.filter.clone()))
             .collect();
 
-        let session_authority = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let session_authority = self
+            .session_authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let local_public_key = prover_info.as_ref().map(|p| p.public_key.clone());
         for worker in &workers {
             // Retention only withholds a RELEASE below. Everything else in this
             // pass (notably starting the engine once the allocation is Active)
             // must still run for a retained worker.
             let retained = match (session_authority.as_ref(), local_public_key.as_ref()) {
-                (Some(global), Some(member)) if !worker.filter.is_empty() =>
-                    crate::app_handoff::retains_worker(global, &worker.filter, member),
+                (Some(global), Some(member)) if !worker.filter.is_empty() => {
+                    crate::app_handoff::retains_worker(global, &worker.filter, member)
+                }
                 _ => false,
-            } || (!worker.filter.is_empty() && self.owes_storage_settlement(&worker.filter, frame_number));
+            } || (!worker.filter.is_empty()
+                && self.owes_storage_settlement(&worker.filter, frame_number));
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -1618,10 +1788,10 @@ impl WorkerAllocator {
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
                 // elapsed) so we don't cancel a legitimately pending bind.
-                let pending_in_flight = self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
+                let pending_in_flight = self
+                    .join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                     || worker.pending_filter_frame > 0
-                    && frame_number
-                        <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
+                        && frame_number <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
                 // A retained worker is not stranded: its closing session still
                 // counts its vote, and the pass below restarts its engine.
                 if !f_resolvable && !pending_in_flight && !retained {
@@ -1681,19 +1851,24 @@ impl WorkerAllocator {
                     // A retained worker runs consensus whatever its allocation
                     // says: after a restart its engine must start again even
                     // though the allocation is Leaving or terminal.
-                    let mut desired_allocated = retained || matches!(
-                        alloc.status,
-                        ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
-                    );
+                    let mut desired_allocated = retained
+                        || matches!(
+                            alloc.status,
+                            ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
+                        );
 
                     // The join has landed once its allocation is confirmed. The
                     // pending marker would otherwise exclude the worker from
                     // priority replacement for as long as it stays bound.
-                    if worker.pending_filter_frame > 0 && matches!(
-                        alloc.status,
-                        ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
-                    ) {
-                        let _ = self.worker_manager.set_pending_filter_frame(worker.core_id, 0);
+                    if worker.pending_filter_frame > 0
+                        && matches!(
+                            alloc.status,
+                            ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
+                        )
+                    {
+                        let _ = self
+                            .worker_manager
+                            .set_pending_filter_frame(worker.core_id, 0);
                     }
 
                     match alloc.status {
@@ -1718,9 +1893,7 @@ impl WorkerAllocator {
                                 self.release_worker(worker, retained)?;
                             }
                         }
-                        ProverStatus::Rejected
-                        | ProverStatus::Kicked
-                        | ProverStatus::Historic => {
+                        ProverStatus::Rejected | ProverStatus::Kicked | ProverStatus::Historic => {
                             // Allocation no longer lives on this filter — clear
                             // immediately so the worker returns to the free pool.
                             // `Rejected` = join was rejected; `Kicked` =
@@ -1825,7 +1998,8 @@ impl WorkerAllocator {
                     }
                     if worker.pending_filter_frame > 0
                         && frame_number > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
-                        && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
+                        && !self
+                            .join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1866,7 +2040,9 @@ impl WorkerAllocator {
             .worker_manager
             .range_workers()?
             .iter()
-            .filter(|w| w.filter.is_empty() && !w.manually_managed && !draining.contains(&w.core_id))
+            .filter(|w| {
+                w.filter.is_empty() && !w.manually_managed && !draining.contains(&w.core_id)
+            })
             .map(|w| w.core_id)
             .collect();
         // Sorted DESCENDING so `pop()` yields the LOWEST core id first.
@@ -1883,7 +2059,11 @@ impl WorkerAllocator {
         // A worker held back for sending no vote in its last seat is bound
         // last, so a healthy idle worker takes an unbound seat first
         // (`provers::session_hosting`).
-        let held_back = self.held_back.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let held_back = self
+            .held_back
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // So is a worker whose store stopped writing: it cannot serve a seat
         // until its store is reopened (`worker_execution::store_stopped`).
         idle_workers.sort_by_key(|core_id| {
@@ -1932,8 +2112,7 @@ impl WorkerAllocator {
             _ => None,
         };
 
-        let mut bind_candidates: Vec<&quil_types::consensus::ProverAllocationInfo> =
-            Vec::new();
+        let mut bind_candidates: Vec<&quil_types::consensus::ProverAllocationInfo> = Vec::new();
         for alloc in prover_info
             .as_ref()
             .map(|p| p.allocations.as_slice())
@@ -1952,11 +2131,8 @@ impl WorkerAllocator {
             // covers both via `effective_status`.
             use quil_types::consensus::EffectiveStatus;
             match alloc.effective_status(frame_number) {
-                EffectiveStatus::Active
-                | EffectiveStatus::Paused
-                | EffectiveStatus::Joining => {}
-                EffectiveStatus::ExpiredEpoch
-                    if self.renewal_recovering(alloc, frame_number) => {}
+                EffectiveStatus::Active | EffectiveStatus::Paused | EffectiveStatus::Joining => {}
+                EffectiveStatus::ExpiredEpoch if self.renewal_recovering(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
                 // the worker or change the frozen committee mid-epoch. A seat
@@ -1984,12 +2160,13 @@ impl WorkerAllocator {
         // leave serves its notice and keeps its place.
         bind_candidates.sort_by(|a, b| {
             use quil_types::consensus::AllocationPhase;
-            let pending = |a: &quil_types::consensus::ProverAllocationInfo| match a.phase(frame_number) {
-                Some(AllocationPhase::Joining) => 3u8,
-                Some(AllocationPhase::Leaving) => 2,
-                Some(AllocationPhase::Activating) => 1,
-                _ => 0,
-            };
+            let pending =
+                |a: &quil_types::consensus::ProverAllocationInfo| match a.phase(frame_number) {
+                    Some(AllocationPhase::Joining) => 3u8,
+                    Some(AllocationPhase::Leaving) => 2,
+                    Some(AllocationPhase::Activating) => 1,
+                    _ => 0,
+                };
             pending(a).cmp(&pending(b)).then_with(|| {
                 if let Some(priority) = priority.as_ref() {
                     let ka = priority_key(priority, &a.confirmation_filter);
@@ -2012,11 +2189,18 @@ impl WorkerAllocator {
         // installs another. Which candidates get a worker, and the manual
         // pool's precedence, stay as they were; a worker held back or whose
         // store stopped keeps its place at the end.
-        let served = bind_candidates.len().min(manual_pending.len() + idle_workers.len());
-        let eligible: Vec<u32> = idle_workers.iter().copied()
-            .filter(|core| !held_back.contains(core) && !crate::worker_execution::store_stopped(*core))
+        let served = bind_candidates
+            .len()
+            .min(manual_pending.len() + idle_workers.len());
+        let eligible: Vec<u32> = idle_workers
+            .iter()
+            .copied()
+            .filter(|core| {
+                !held_back.contains(core) && !crate::worker_execution::store_stopped(*core)
+            })
             .collect();
-        let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served].iter()
+        let from_idle: Vec<Vec<u8>> = bind_candidates[manual_pending.len().min(served)..served]
+            .iter()
             .map(|a| a.confirmation_filter.clone())
             .collect();
         let holders = self.worker_manager.shard_data();
@@ -2036,19 +2220,27 @@ impl WorkerAllocator {
 
         // Unconfirmed joins bound in this pass, by the epoch their confirm is
         // due in: (count, first join frame, last join frame).
-        let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> = Default::default();
+        let mut landed_joins: std::collections::BTreeMap<u64, (usize, u64, u64)> =
+            Default::default();
         for alloc in bind_candidates {
             // Prefer a manually-pending (user-picked) worker before
             // falling back to the auto-managed idle pool.
-            let holds_data = manual_pending.is_empty() && on_data.contains_key(&alloc.confirmation_filter);
-            let pick = manual_pending.pop()
+            let holds_data =
+                manual_pending.is_empty() && on_data.contains_key(&alloc.confirmation_filter);
+            let pick = manual_pending
+                .pop()
                 .or_else(|| on_data.remove(&alloc.confirmation_filter))
                 .or_else(|| idle_workers.pop());
             if let Some(core_id) = pick {
                 if holds_data {
-                    bound_on_data.push(format!("{core_id}:{}", hex::encode(&alloc.confirmation_filter)));
+                    bound_on_data.push(format!(
+                        "{core_id}:{}",
+                        hex::encode(&alloc.confirmation_filter)
+                    ));
                 }
-                if let Some(quil_types::consensus::JoinWait::Confirmation { epoch }) = alloc.join_wait(frame_number) {
+                if let Some(quil_types::consensus::JoinWait::Confirmation { epoch }) =
+                    alloc.join_wait(frame_number)
+                {
                     let join = alloc.join_frame_number;
                     let entry = landed_joins.entry(epoch).or_insert((0, join, join));
                     *entry = (entry.0 + 1, entry.1.min(join), entry.2.max(join));
@@ -2107,7 +2299,10 @@ impl WorkerAllocator {
 
         self.expire_unlanded_join_markers(
             frame_number,
-            prover_info.as_ref().map(|p| p.allocations.as_slice()).unwrap_or(&[]),
+            prover_info
+                .as_ref()
+                .map(|p| p.allocations.as_slice())
+                .unwrap_or(&[]),
         )?;
 
         let _ = self.watch_orphans(frame_number, &orphan_filters, draining.len());
@@ -2149,7 +2344,8 @@ impl WorkerAllocator {
 
         for (epoch, (count, first_join, last_join)) in landed_joins {
             let window_start = quil_types::consensus::epoch_start_frame(epoch);
-            let activation = quil_types::consensus::JoinWait::Confirmation { epoch }.activation_frame();
+            let activation =
+                quil_types::consensus::JoinWait::Confirmation { epoch }.activation_frame();
             let join_frames = if first_join == last_join {
                 first_join.to_string()
             } else {
@@ -2222,7 +2418,9 @@ impl WorkerAllocator {
             })
             .collect();
         challengers.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2))
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
         });
         if challengers.is_empty() {
             self.log_rebind_outcome(
@@ -2253,7 +2451,9 @@ impl WorkerAllocator {
             })
             .collect();
         holders.sort_by(|a, b| {
-            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.3.cmp(&b.3))
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.3.cmp(&b.3))
         });
         if holders.is_empty() {
             self.log_rebind_outcome(
@@ -2278,10 +2478,15 @@ impl WorkerAllocator {
         let candidate_inputs: Vec<_> = challengers.iter().filter(|_| include_inputs).map(|(tier, score, filter)|
             serde_json::json!({"filter": hex::encode(filter), "tier": tier,
                 "score": score.to_string(), "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
-        let holder_inputs: Vec<_> = holders.iter().filter(|_| include_inputs).map(|(tier, score, core_id, filter)|
-            serde_json::json!({"filter": hex::encode(filter), "worker": core_id,
+        let holder_inputs: Vec<_> = holders
+            .iter()
+            .filter(|_| include_inputs)
+            .map(|(tier, score, core_id, filter)| {
+                serde_json::json!({"filter": hex::encode(filter), "worker": core_id,
                 "tier": tier, "score": score.to_string(),
-                "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})).collect();
+                "ranking": priority.get(filter).and_then(|p| p.evidence.as_ref())})
+            })
+            .collect();
         let mut deferred = 0usize;
         for ((c_tier, c_score, c_filter), (h_tier, h_score, core_id, h_filter)) in
             challengers.into_iter().zip(holders.into_iter())
@@ -2322,7 +2527,8 @@ impl WorkerAllocator {
         }
 
         if deferred > 0 {
-            self.last_priority_review_frame.store(frame_number, Ordering::Relaxed);
+            self.last_priority_review_frame
+                .store(frame_number, Ordering::Relaxed);
             self.log_rebind_outcome(
                 frame_number,
                 RebindOutcome::ServiceRetained,
@@ -2366,8 +2572,7 @@ impl WorkerAllocator {
             .allocations
             .iter()
             .filter(|a| {
-                a.effective_status(frame_number)
-                    == quil_types::consensus::EffectiveStatus::Joining
+                a.effective_status(frame_number) == quil_types::consensus::EffectiveStatus::Joining
             })
             .map(|a| a.confirmation_filter.clone())
             .collect())
@@ -2413,9 +2618,7 @@ impl WorkerAllocator {
         let idle = workers.len() - active;
         info!(
             total_workers = workers.len(),
-            active,
-            idle,
-            "worker allocation status"
+            active, idle, "worker allocation status"
         );
         Ok(())
     }
@@ -2456,7 +2659,9 @@ mod tests {
     #[test]
     fn closing_session_retains_only_the_release_of_its_worker() {
         use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
-        use quil_execution::global_intrinsic::handoff::{self, CertificateSubmission, DesiredCommittee};
+        use quil_execution::global_intrinsic::handoff::{
+            self, CertificateSubmission, DesiredCommittee,
+        };
         use quil_execution::hypergraph_state::HypergraphState;
         use quil_types::crypto::Signer as _;
 
@@ -2465,22 +2670,36 @@ mod tests {
             Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
             Arc::new(quil_hypergraph::testing::StubProver),
         ));
-        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        global.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         let state = HypergraphState::new(global.clone());
         let commit = |frame: u64| {
             state.commit().unwrap();
             state.abort();
-            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            global
+                .commit_with_global_cursor(
+                    frame,
+                    &quil_store::encoding::global_materialized_cursor_key(),
+                )
+                .unwrap();
         };
-        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
         let local_key = signers[0].public_key().to_vec();
         let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
         members.sort();
         let filter = vec![0x01; 32];
         let session = Session {
-            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            chain_id: [7; 32],
+            filter: filter.clone(),
+            generation: 1,
             genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
-            base_frame: 0, authorization: [0; 32], members: members.clone(),
+            base_frame: 0,
+            authorization: [0; 32],
+            members: members.clone(),
         };
 
         let wm = Arc::new(MockWorkerManager::new());
@@ -2488,18 +2707,31 @@ mod tests {
         let mut kicked = make_alloc(filter.clone());
         kicked.status = ProverStatus::Kicked;
         let prover = |allocation: ProverAllocationInfo| ProverInfo {
-            public_key: local_key.clone(), address: vec![0xAA; 32], status: ProverStatus::Active,
-            kick_frame_number: 0, allocations: vec![allocation], available_storage: 0,
-            seniority: 100, delegate_address: vec![],
+            public_key: local_key.clone(),
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![allocation],
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
         };
         let bound = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.clone();
 
         // No authenticated GLOBAL state at all: nothing can be closing here.
         let alloc = WorkerAllocator::new(
-            wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![prover(kicked.clone())])), vec![0xAA; 32]);
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_provers(vec![prover(
+                kicked.clone(),
+            )])),
+            vec![0xAA; 32],
+        );
         alloc.set_session_authority(global.clone());
         alloc.on_new_frame(100).unwrap();
-        assert!(bound(&wm).is_empty(), "an unreadable cursor must not pin workers forever");
+        assert!(
+            bound(&wm).is_empty(),
+            "an unreadable cursor must not pin workers forever"
+        );
 
         // The session, not the registry, says who runs consensus: a member of
         // an ACTIVE session keeps its worker through a terminal allocation.
@@ -2511,8 +2743,16 @@ mod tests {
         assert_eq!(bound(&wm), filter);
 
         // Closing: still bound…
-        let request = handoff::schedule(&state, 3, vec![filter.clone()],
-            vec![DesiredCommittee { filter: filter.clone(), members: vec![signers[1].public_key().to_vec()] }]).unwrap();
+        let request = handoff::schedule(
+            &state,
+            3,
+            vec![filter.clone()],
+            vec![DesiredCommittee {
+                filter: filter.clone(),
+                members: vec![signers[1].public_key().to_vec()],
+            }],
+        )
+        .unwrap();
         commit(3);
         wm.set_worker_filter(1, &filter, true).unwrap();
         alloc.on_new_frame(102).unwrap();
@@ -2520,28 +2760,49 @@ mod tests {
         // …and a retained worker still gets the rest of the pass: a fresh
         // allocator that sees the allocation Active marks it allocated.
         let active = WorkerAllocator::new(
-            wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(filter.clone()))])), vec![0xAA; 32]);
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(
+                filter.clone(),
+            ))])),
+            vec![0xAA; 32],
+        );
         active.set_session_authority(global.clone());
         let _ = wm.set_allocated(1, false);
         active.on_new_frame(102).unwrap();
-        assert!(wm.range_workers().unwrap()[0].allocated, "retention must not skip the Active transition");
+        assert!(
+            wm.range_workers().unwrap()[0].allocated,
+            "retention must not skip the Active transition"
+        );
         // …nor the engine restart of a member whose allocation already ended,
         // while another allocation waits for a worker.
-        let restarted = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
-            allocations: vec![kicked.clone(), make_alloc(vec![0x02; 32])], ..prover(kicked.clone())
-        }])), vec![0xAA; 32]);
+        let restarted = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+                allocations: vec![kicked.clone(), make_alloc(vec![0x02; 32])],
+                ..prover(kicked.clone())
+            }])),
+            vec![0xAA; 32],
+        );
         restarted.set_session_authority(global.clone());
         wm.set_worker_filter(1, &filter, false).unwrap();
         restarted.on_new_frame(102).unwrap();
         let worker = wm.range_workers().unwrap()[0].clone();
         assert_eq!(worker.filter, filter);
-        assert!(worker.allocated, "a closing member must restart its engine while another allocation waits");
+        assert!(
+            worker.allocated,
+            "a closing member must restart its engine while another allocation waits"
+        );
         // Nor does the recovery gate give up a lapsed seat the session
         // retains, whose worker the reconcile keeps.
         let e = epoch_length_frames();
         let lapsed_gate = || {
-            let gate = WorkerAllocator::new(Arc::new(MockWorkerManager::new()),
-                Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(filter.clone()))])), vec![0xAA; 32]);
+            let gate = WorkerAllocator::new(
+                Arc::new(MockWorkerManager::new()),
+                Arc::new(TestProverRegistry::with_provers(vec![prover(make_alloc(
+                    filter.clone(),
+                ))])),
+                vec![0xAA; 32],
+            );
             gate.set_session_authority(global.clone());
             gate.on_new_frame(3 * e).unwrap();
             gate.note_renewals_offered();
@@ -2551,16 +2812,31 @@ mod tests {
 
         // Once GLOBAL state records the seal, the worker is released.
         let seal = Seal {
-            request: request.id().unwrap(), session: session.id().unwrap(), view: 3,
-            checkpoint: Checkpoint { frame: 0, view: 0, digest: session.genesis, state_roots: [[0; 32]; 4], history_root: [9; 32] },
+            request: request.id().unwrap(),
+            session: session.id().unwrap(),
+            view: 3,
+            checkpoint: Checkpoint {
+                frame: 0,
+                view: 0,
+                digest: session.genesis,
+                state_roots: [[0; 32]; 4],
+                history_root: [9; 32],
+            },
         };
         let certificate = crate::test_support::certify_seal(&session, &signers, &seal);
         handoff::record_session_tip(&state, 4, &seal.session, &seal.checkpoint).unwrap();
-        assert!(handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate }).unwrap());
+        assert!(
+            handoff::apply_submission(&state, 4, &CertificateSubmission { seal, certificate })
+                .unwrap()
+        );
         commit(4);
         alloc.on_new_frame(103).unwrap();
         assert!(bound(&wm).is_empty());
-        assert_eq!(lapsed_gate(), Some(GivenUp::Lapsed), "the seal recorded, nothing retains it");
+        assert_eq!(
+            lapsed_gate(),
+            Some(GivenUp::Lapsed),
+            "the seal recorded, nothing retains it"
+        );
     }
 
     #[test]
@@ -2625,13 +2901,21 @@ mod tests {
             pending_filter_frame: 100,
             allocated: false,
         });
-        let alloc = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::new()), vec![0xAAu8; 32]);
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::new()),
+            vec![0xAAu8; 32],
+        );
         alloc.hold_pending_joins_for_registry_sync();
         let pending = |frame: u64| {
             alloc.on_new_frame(frame).unwrap();
             wm.range_workers().unwrap()[0].pending_filter_frame
         };
-        assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES), 100, "no sync has refreshed the registry since");
+        assert_eq!(
+            pending(100 + PROPOSAL_SYNC_CEILING_FRAMES),
+            100,
+            "no sync has refreshed the registry since"
+        );
         assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
     }
 
@@ -2655,12 +2939,21 @@ mod tests {
         let alloc = WorkerAllocator::new(wm.clone(), registry.clone(), vec![0xAAu8; 32]);
         let frame = PENDING_FILTER_GRACE_FRAMES + 100;
         alloc.on_new_frame(frame).unwrap();
-        assert_eq!(wm.range_workers().unwrap()[0].filter, filter, "nothing is released before the load");
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            filter,
+            "nothing is released before the load"
+        );
         // Loaded and still without the allocation, the worker is orphaned.
         let db = quil_store::RocksDb::open_in_memory().unwrap();
-        registry.refresh_from_store(&quil_store::RocksHypergraphStore::new(db.inner())).unwrap();
+        registry
+            .refresh_from_store(&quil_store::RocksHypergraphStore::new(db.inner()))
+            .unwrap();
         alloc.on_new_frame(frame + 1).unwrap();
-        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "the loaded registry decides");
+        assert!(
+            wm.range_workers().unwrap()[0].filter.is_empty(),
+            "the loaded registry decides"
+        );
     }
 
     #[test]
@@ -2677,11 +2970,20 @@ mod tests {
             allocated: true,
         });
         let alloc = WorkerAllocator::new(
-            wm.clone(), Arc::new(TestProverRegistry::with_prover(prover_with_active(&[filter.clone()], 200))), vec![0xAAu8; 32]);
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover_with_active(
+                &[filter.clone()],
+                200,
+            ))),
+            vec![0xAAu8; 32],
+        );
         alloc.on_new_frame(200).unwrap();
         let workers = wm.range_workers().unwrap();
         assert_eq!(workers[0].filter, filter);
-        assert_eq!(workers[0].pending_filter_frame, 0, "a landed join must not stay pending");
+        assert_eq!(
+            workers[0].pending_filter_frame, 0,
+            "a landed join must not stay pending"
+        );
     }
 
     /// Runs one reconcile and returns what it logged.
@@ -2689,12 +2991,19 @@ mod tests {
         #[derive(Clone, Default)]
         struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Lines {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let lines = Lines::default();
         let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, || alloc.on_new_frame(frame).unwrap());
         let bytes = lines.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
@@ -2734,14 +3043,19 @@ mod tests {
         wm.add(idle_worker(1, 100));
         let alloc = WorkerAllocator::new(
             wm.clone(),
-            Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining_alloc(filter.clone(), 102)]))),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                joining_alloc(filter.clone(), 102),
+            ]))),
             vec![0xAAu8; 32],
         );
         let logged = reconcile_logged(&alloc, 129);
         assert!(!logged.contains(DROPPED), "{logged}");
         let worker = &wm.range_workers().unwrap()[0];
         assert_eq!(worker.filter, filter);
-        assert_eq!(worker.pending_filter_frame, 100, "the landed join stays pending until confirmed");
+        assert_eq!(
+            worker.pending_filter_frame, 100,
+            "the landed join stays pending until confirmed"
+        );
     }
 
     /// A join that landed on another worker releases this worker's
@@ -2755,13 +3069,21 @@ mod tests {
         wm.add(idle_worker(2, 100));
         let alloc = WorkerAllocator::new(
             wm.clone(),
-            Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining_alloc(filter.clone(), 102)]))),
+            Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                joining_alloc(filter.clone(), 102),
+            ]))),
             vec![0xAAu8; 32],
         );
         let logged = reconcile_logged(&alloc, 129);
-        assert!(!logged.contains(DROPPED) && logged.contains("not on this worker"), "{logged}");
+        assert!(
+            !logged.contains(DROPPED) && logged.contains("not on this worker"),
+            "{logged}"
+        );
         let workers = wm.range_workers().unwrap();
-        assert_eq!((workers[0].filter.clone(), workers[1].pending_filter_frame), (filter, 0));
+        assert_eq!(
+            (workers[0].filter.clone(), workers[1].pending_filter_frame),
+            (filter, 0)
+        );
 
         let wm = Arc::new(MockWorkerManager::new());
         wm.add(idle_worker(1, 100));
@@ -2790,10 +3112,7 @@ mod tests {
             address: vec![0xAA; 32],
             status: ProverStatus::Active,
             kick_frame_number: 0,
-            allocations: vec![
-                make_alloc(vec![0x01; 32]),
-                make_alloc(vec![0x02; 32]),
-            ],
+            allocations: vec![make_alloc(vec![0x01; 32]), make_alloc(vec![0x02; 32])],
             available_storage: 0,
             seniority: 100,
             delegate_address: vec![],
@@ -2818,19 +3137,31 @@ mod tests {
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
         wm.allocate_worker(2, &[]).unwrap();
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(vec![0x01; 32]),
+        ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.set_held_back(std::collections::HashSet::from([1]));
         alloc.on_new_frame(101).unwrap();
-        assert_eq!(bound_cores(&wm), vec![2], "the healthy idle worker takes the seat");
+        assert_eq!(
+            bound_cores(&wm),
+            vec![2],
+            "the healthy idle worker takes the seat"
+        );
 
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(vec![0x01; 32]),
+        ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.set_held_back(std::collections::HashSet::from([1]));
         alloc.on_new_frame(101).unwrap();
-        assert_eq!(bound_cores(&wm), vec![1], "with no other idle worker it is bound");
+        assert_eq!(
+            bound_cores(&wm),
+            vec![1],
+            "with no other idle worker it is bound"
+        );
     }
 
     /// A worker whose store stopped writing is bound to an unbound seat only
@@ -2840,17 +3171,25 @@ mod tests {
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
         wm.allocate_worker(2, &[]).unwrap();
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![make_alloc(vec![0x01; 32])])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            make_alloc(vec![0x01; 32]),
+        ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         quil_forest::storage_health::hold_store(quil_forest::StoreRole::Worker(1));
         let result = alloc.on_new_frame(101);
         quil_forest::storage_health::release_store(quil_forest::StoreRole::Worker(1));
         result.unwrap();
-        assert_eq!(bound_cores(&wm), vec![2], "the worker with a working store takes the seat");
+        assert_eq!(
+            bound_cores(&wm),
+            vec![2],
+            "the worker with a working store takes the seat"
+        );
     }
 
     fn bound_to(wm: &MockWorkerManager) -> Vec<(u32, Vec<u8>)> {
-        wm.range_workers().unwrap().into_iter()
+        wm.range_workers()
+            .unwrap()
+            .into_iter()
             .filter(|w| !w.filter.is_empty())
             .map(|w| (w.core_id, w.filter))
             .collect()
@@ -2873,13 +3212,22 @@ mod tests {
         wm.set_shard_data(2, vec![(f(3), 80), (f(1), 12)]);
         wm.set_shard_data(3, vec![(f(1), 90)]);
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+            make_alloc(f(1)),
+            make_alloc(f(2)),
+            make_alloc(f(3)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         let logged = reconcile_logged(&alloc, 101);
-        assert_eq!(bound_to(&wm), vec![(1, f(2)), (2, f(3)), (3, f(1))], "each shard back on its data");
-        assert!(logged.contains("bound shards to the idle workers whose stores hold their data")
-            && logged.contains("bound=3"), "{logged}");
+        assert_eq!(
+            bound_to(&wm),
+            vec![(1, f(2)), (2, f(3)), (3, f(1))],
+            "each shard back on its data"
+        );
+        assert!(
+            logged.contains("bound shards to the idle workers whose stores hold their data")
+                && logged.contains("bound=3"),
+            "{logged}"
+        );
     }
 
     /// A holder trailing the shard's committed tip by more than an epoch's
@@ -2895,13 +3243,27 @@ mod tests {
         ]);
         let tips = HashMap::from([(f(1), 5000u64), (f(2), 5000)]);
         let pick = |filters: &[Vec<u8>], tips: &HashMap<Vec<u8>, u64>| {
-            let mut chosen: Vec<_> = data_holders(filters.iter().map(Vec::as_slice), &[1, 2], &holders,
-                |filter| tips.get(filter).copied()).into_iter().collect();
+            let mut chosen: Vec<_> = data_holders(
+                filters.iter().map(Vec::as_slice),
+                &[1, 2],
+                &holders,
+                |filter| tips.get(filter).copied(),
+            )
+            .into_iter()
+            .collect();
             chosen.sort();
             chosen
         };
-        assert_eq!(pick(&[f(1), f(2)], &tips), vec![(f(1), 2)], "core 1's lineages trail too far");
-        assert_eq!(pick(&[f(2)], &HashMap::new()), vec![(f(2), 1)], "an unknown tip bounds nothing");
+        assert_eq!(
+            pick(&[f(1), f(2)], &tips),
+            vec![(f(1), 2)],
+            "core 1's lineages trail too far"
+        );
+        assert_eq!(
+            pick(&[f(2)], &HashMap::new()),
+            vec![(f(2), 1)],
+            "an unknown tip bounds nothing"
+        );
     }
 
     /// A shard no idle worker's store holds takes the lowest free core as
@@ -2917,7 +3279,9 @@ mod tests {
         wm.set_shard_data(1, vec![(f(1), 50)]);
         wm.set_shard_data(4, vec![(f(3), 40)]);
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+            make_alloc(f(1)),
+            make_alloc(f(2)),
+            make_alloc(f(3)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.set_held_back(std::collections::HashSet::from([1]));
@@ -2938,11 +3302,17 @@ mod tests {
         wm.set_manually_managed(4, true).unwrap();
         wm.set_configured_count(2);
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            make_alloc(f(1)), make_alloc(f(2)), make_alloc(f(3)),
+            make_alloc(f(1)),
+            make_alloc(f(2)),
+            make_alloc(f(3)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(101).unwrap();
-        assert_eq!(bound_cores(&wm), vec![1, 2], "cores 3 and 4 drain; the third seat stays unbound");
+        assert_eq!(
+            bound_cores(&wm),
+            vec![1, 2],
+            "cores 3 and 4 drain; the third seat stays unbound"
+        );
     }
 
     /// With fewer idle workers than seats, a leave not yet confirmed waits
@@ -2956,7 +3326,10 @@ mod tests {
         for core in 1..=3u32 {
             wm.allocate_worker(core, &[]).unwrap();
         }
-        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let current = |filter: Vec<u8>| ProverAllocationInfo {
+            epoch: u64::MAX,
+            ..make_alloc(filter)
+        };
         let mut leaving = current(f(1));
         leaving.status = ProverStatus::Leaving;
         leaving.leave_frame_number = e + 10;
@@ -2965,13 +3338,23 @@ mod tests {
         departing.leave_frame_number = 10;
         departing.leave_confirm_frame_number = e + 5;
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            leaving, departing, current(f(3)), current(f(4)),
+            leaving,
+            departing,
+            current(f(3)),
+            current(f(4)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(e + 101).unwrap();
-        let mut bound: Vec<Vec<u8>> = bound_to(&wm).into_iter().map(|(_, filter)| filter).collect();
+        let mut bound: Vec<Vec<u8>> = bound_to(&wm)
+            .into_iter()
+            .map(|(_, filter)| filter)
+            .collect();
         bound.sort();
-        assert_eq!(bound, vec![f(2), f(3), f(4)], "the unconfirmed leave waits for a spare worker");
+        assert_eq!(
+            bound,
+            vec![f(2), f(3), f(4)],
+            "the unconfirmed leave waits for a spare worker"
+        );
     }
 
     /// Allocations without a worker are logged once per episode and change
@@ -2982,9 +3365,14 @@ mod tests {
         let f = |byte: u8| vec![byte; 32];
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
-        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let current = |filter: Vec<u8>| ProverAllocationInfo {
+            epoch: u64::MAX,
+            ..make_alloc(filter)
+        };
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            current(f(1)), current(f(2)), current(f(3)),
+            current(f(1)),
+            current(f(2)),
+            current(f(3)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         let two = vec![(f(2), ProverStatus::Active), (f(3), ProverStatus::Active)];
@@ -2992,24 +3380,47 @@ mod tests {
         let base = 1_000u64;
         assert_eq!(alloc.watch_orphans(base, &two, 0), Some("started"));
         for pass in 1..ORPHAN_WARNING_REPEAT_FRAMES {
-            assert_eq!(alloc.watch_orphans(base + pass, &two, 0), None, "frame +{pass} is inside the interval");
+            assert_eq!(
+                alloc.watch_orphans(base + pass, &two, 0),
+                None,
+                "frame +{pass} is inside the interval"
+            );
         }
         assert_eq!(
             alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES, &two, 0),
             Some("continues"),
             "the interval has elapsed"
         );
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 1, &two, 0), None);
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 1, &two, 0),
+            None
+        );
         assert_eq!(
             alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 2, &swapped, 0),
             Some("changed"),
             "a changed status is logged at once"
         );
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 3, &swapped[..1], 0), Some("changed"));
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 4, &swapped[..1], 0), None);
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 5, &[], 0), Some("ended"));
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 6, &[], 0), None, "the end is logged once");
-        assert_eq!(alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 7, &two, 0), Some("started"));
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 3, &swapped[..1], 0),
+            Some("changed")
+        );
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 4, &swapped[..1], 0),
+            None
+        );
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 5, &[], 0),
+            Some("ended")
+        );
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 6, &[], 0),
+            None,
+            "the end is logged once"
+        );
+        assert_eq!(
+            alloc.watch_orphans(base + ORPHAN_WARNING_REPEAT_FRAMES + 7, &two, 0),
+            Some("started")
+        );
     }
 
     /// The reconcile feeds the episode: two seats beyond the one worker are
@@ -3019,19 +3430,40 @@ mod tests {
         let f = |byte: u8| vec![byte; 32];
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
-        let current = |filter: Vec<u8>| ProverAllocationInfo { epoch: u64::MAX, ..make_alloc(filter) };
+        let current = |filter: Vec<u8>| ProverAllocationInfo {
+            epoch: u64::MAX,
+            ..make_alloc(filter)
+        };
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            current(f(1)), current(f(2)), current(f(3)),
+            current(f(1)),
+            current(f(2)),
+            current(f(3)),
         ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAAu8; 32]);
         alloc.on_new_frame(101).unwrap();
-        let since = alloc.orphan_watch.lock().unwrap().as_ref().map(|w| (w.since_frame, w.set.len()));
+        let since = alloc
+            .orphan_watch
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|w| (w.since_frame, w.set.len()));
         assert_eq!(since, Some((101, 2)));
         alloc.on_new_frame(102).unwrap();
-        assert_eq!(alloc.orphan_watch.lock().unwrap().as_ref().map(|w| w.logged_frame), Some(101));
+        assert_eq!(
+            alloc
+                .orphan_watch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|w| w.logged_frame),
+            Some(101)
+        );
         reg.set_prover(prover_with(vec![current(f(1))]));
         alloc.on_new_frame(103).unwrap();
-        assert!(alloc.orphan_watch.lock().unwrap().is_none(), "the episode ended with its orphans");
+        assert!(
+            alloc.orphan_watch.lock().unwrap().is_none(),
+            "the episode ended with its orphans"
+        );
     }
 
     fn prover_with(allocs: Vec<ProverAllocationInfo>) -> ProverInfo {
@@ -3136,7 +3568,8 @@ mod tests {
             for recovered in [false, true] {
                 let wm = Arc::new(MockWorkerManager::new());
                 let filter = vec![0x02; 32];
-                wm.allocate_worker(1, if recovered { &[] } else { &filter }).unwrap();
+                wm.allocate_worker(1, if recovered { &[] } else { &filter })
+                    .unwrap();
                 if !recovered {
                     wm.set_allocated(1, true).unwrap();
                 }
@@ -3145,17 +3578,27 @@ mod tests {
                 leaving.leave_frame_number = e + 1;
                 leaving.leave_confirm_frame_number = if confirmed { 2 * e + 10 } else { 0 };
                 let prover = ProverInfo {
-                    public_key: vec![0xBB; 585], address: vec![0xAA; 32],
-                    status: ProverStatus::Active, kick_frame_number: 0,
-                    allocations: vec![leaving], available_storage: 0,
-                    seniority: 100, delegate_address: vec![],
+                    public_key: vec![0xBB; 585],
+                    address: vec![0xAA; 32],
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![leaving],
+                    available_storage: 0,
+                    seniority: 100,
+                    delegate_address: vec![],
                 };
-                let allocator = WorkerAllocator::new(wm.clone(),
-                    Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAA; 32]);
+                let allocator = WorkerAllocator::new(
+                    wm.clone(),
+                    Arc::new(TestProverRegistry::with_prover(prover)),
+                    vec![0xAA; 32],
+                );
                 for frame in [2 * e + 20, 3 * e - 1] {
                     allocator.on_new_frame(frame).unwrap();
                     let worker = wm.range_workers().unwrap().remove(0);
-                    assert_eq!(worker.filter, filter, "confirmed={confirmed}, recovered={recovered}, frame={frame}");
+                    assert_eq!(
+                        worker.filter, filter,
+                        "confirmed={confirmed}, recovered={recovered}, frame={frame}"
+                    );
                     assert!(worker.allocated, "notice-period worker must run consensus");
                 }
                 allocator.on_new_frame(3 * e).unwrap();
@@ -3184,26 +3627,50 @@ mod tests {
             leaving.leave_frame_number = e + 1;
             leaving.leave_confirm_frame_number = 2 * e + 10;
             let prover = ProverInfo {
-                public_key: vec![0xBB; 585], address: vec![0xAA; 32],
-                status: ProverStatus::Active, kick_frame_number: 0,
-                allocations: vec![leaving], available_storage: 0,
-                seniority: 100, delegate_address: vec![],
+                public_key: vec![0xBB; 585],
+                address: vec![0xAA; 32],
+                status: ProverStatus::Active,
+                kick_frame_number: 0,
+                allocations: vec![leaving],
+                available_storage: 0,
+                seniority: 100,
+                delegate_address: vec![],
             };
             let registry = TestProverRegistry::with_prover(prover);
             // The last epoch it served (2) committed roots; settling it is
             // owed until the end of epoch 3.
-            registry.set_storage_seat_slot(&[0xAA; 32], &filter, quil_types::consensus::StorageSeatSlot {
-                epoch: 2, leaves: vec![vec![0]], registered_at: e + 20, sealed_at: Some(e + 30), frames: 3,
-                accumulator: [0; 32], chained: Vec::new(), open,
-            });
+            registry.set_storage_seat_slot(
+                &[0xAA; 32],
+                &filter,
+                quil_types::consensus::StorageSeatSlot {
+                    epoch: 2,
+                    leaves: vec![vec![0]],
+                    registered_at: e + 20,
+                    sealed_at: Some(e + 30),
+                    frames: 3,
+                    accumulator: [0; 32],
+                    chained: Vec::new(),
+                    open,
+                },
+            );
             let allocator = WorkerAllocator::new(wm.clone(), Arc::new(registry), vec![0xAA; 32]);
             allocator.on_new_frame(3 * e).unwrap();
             let worker = wm.range_workers().unwrap().remove(0);
-            assert_eq!(worker.filter.is_empty(), !open, "open={open}: bound only while the settlement is owed");
-            assert_eq!(worker.allocated, open, "open={open}: the owed seat's engine keeps running");
+            assert_eq!(
+                worker.filter.is_empty(),
+                !open,
+                "open={open}: bound only while the settlement is owed"
+            );
+            assert_eq!(
+                worker.allocated, open,
+                "open={open}: the owed seat's engine keeps running"
+            );
             allocator.on_new_frame(4 * e).unwrap();
             let worker = wm.range_workers().unwrap().remove(0);
-            assert!(worker.filter.is_empty(), "open={open}: departs once the settlement window closes");
+            assert!(
+                worker.filter.is_empty(),
+                "open={open}: departs once the settlement window closes"
+            );
         }
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
@@ -3221,13 +3688,20 @@ mod tests {
         leaving.leave_frame_number = e + 1;
         leaving.leave_confirm_frame_number = 2 * e + 10;
         let prover = ProverInfo {
-            public_key: vec![0xBB; 585], address: vec![0xAA; 32],
-            status: ProverStatus::Active, kick_frame_number: 0,
-            allocations: vec![joining, leaving.clone()], available_storage: 0,
-            seniority: 100, delegate_address: vec![],
+            public_key: vec![0xBB; 585],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![joining, leaving.clone()],
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
         };
-        let allocator = WorkerAllocator::new(wm.clone(),
-            Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAA; 32]);
+        let allocator = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)),
+            vec![0xAA; 32],
+        );
         allocator.on_new_frame(2 * e + 20).unwrap();
         let worker = wm.range_workers().unwrap().remove(0);
         assert_eq!(worker.filter, leaving.confirmation_filter);
@@ -3256,18 +3730,29 @@ mod tests {
             let wm = Arc::new(MockWorkerManager::new());
             wm.allocate_worker(1, &[]).unwrap();
             let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-                pending.clone(), activating.clone(),
+                pending.clone(),
+                activating.clone(),
             ])));
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
             if ranked {
-                allocator.publish_allocation_priority(frame, vec![
-                    (pending.confirmation_filter.clone(), true, BigInt::from(10)),
-                    (activating.confirmation_filter.clone(), false, BigInt::from(9_000)),
-                ]);
+                allocator.publish_allocation_priority(
+                    frame,
+                    vec![
+                        (pending.confirmation_filter.clone(), true, BigInt::from(10)),
+                        (
+                            activating.confirmation_filter.clone(),
+                            false,
+                            BigInt::from(9_000),
+                        ),
+                    ],
+                );
             }
             allocator.on_new_frame(frame).unwrap();
-            assert_eq!(bound_filters(&wm), vec![activating.confirmation_filter.clone()],
-                "ranked={ranked}");
+            assert_eq!(
+                bound_filters(&wm),
+                vec![activating.confirmation_filter.clone()],
+                "ranked={ranked}"
+            );
         }
     }
 
@@ -3278,23 +3763,40 @@ mod tests {
     }
 
     impl WorkerManager for CountingThreadWorkers {
-        fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
+        fn set_worker_filter(
+            &self,
+            core_id: u32,
+            filter: &[u8],
+            start_consensus: bool,
+        ) -> Result<()> {
             if start_consensus && !filter.is_empty() {
-                self.starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            self.inner.set_worker_filter(core_id, filter, start_consensus)
+            self.inner
+                .set_worker_filter(core_id, filter, start_consensus)
         }
-        fn deallocate_worker(&self, core_id: u32) -> Result<()> { self.inner.deallocate_worker(core_id) }
-        fn check_workers_connected(&self) -> Result<Vec<u32>> { self.inner.check_workers_connected() }
-        fn range_workers(&self) -> Result<Vec<crate::worker::WorkerInfo>> { self.inner.range_workers() }
-        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> { self.inner.respawn_worker(core_id, filter) }
+        fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+            self.inner.deallocate_worker(core_id)
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            self.inner.check_workers_connected()
+        }
+        fn range_workers(&self) -> Result<Vec<crate::worker::WorkerInfo>> {
+            self.inner.range_workers()
+        }
+        fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+            self.inner.respawn_worker(core_id, filter)
+        }
         fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
             self.inner.set_pending_filter_frame(core_id, frame)
         }
         fn set_manually_managed(&self, core_id: u32, manual: bool) -> Result<()> {
             self.inner.set_manually_managed(core_id, manual)
         }
-        fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> { self.inner.set_allocated(core_id, allocated) }
+        fn set_allocated(&self, core_id: u32, allocated: bool) -> Result<()> {
+            self.inner.set_allocated(core_id, allocated)
+        }
     }
 
     /// An Active allocation bound to an idle worker must not have its engine
@@ -3305,7 +3807,10 @@ mod tests {
         let inner = crate::thread_worker::ThreadWorkerManager::new();
         let _master = inner.take_master_rx();
         inner.set_worker_filter(1, &[], true).unwrap();
-        let wm = Arc::new(CountingThreadWorkers { inner, starts: Default::default() });
+        let wm = Arc::new(CountingThreadWorkers {
+            inner,
+            starts: Default::default(),
+        });
         let filter = vec![0x01; 32];
         let prover = ProverInfo {
             public_key: vec![],
@@ -3317,7 +3822,11 @@ mod tests {
             seniority: 0,
             delegate_address: vec![],
         };
-        let alloc = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::with_prover(prover)), vec![0xAAu8; 32]);
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::with_prover(prover)),
+            vec![0xAAu8; 32],
+        );
         alloc.on_new_frame(100).unwrap();
         assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
         for frame in 101..104 {
@@ -3364,20 +3873,28 @@ mod tests {
         let filter = vec![0x01; 32];
         for initially_bound in [false, true] {
             let wm = Arc::new(MockWorkerManager::new());
-            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] })
+                .unwrap();
             let mut recovering = make_alloc(filter.clone());
             recovering.epoch = 0;
-            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![recovering.clone()])));
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                recovering.clone(),
+            ])));
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
             for frame in [720, 725, 1439] {
                 allocator.on_new_frame(frame).unwrap();
                 assert_eq!(wm.range_workers().unwrap()[0].filter, filter);
-                assert_eq!(recovering.effective_status(frame), EffectiveStatus::ExpiredEpoch,
-                    "capacity recovery must not make stale proofs valid");
+                assert_eq!(
+                    recovering.effective_status(frame),
+                    EffectiveStatus::ExpiredEpoch,
+                    "capacity recovery must not make stale proofs valid"
+                );
             }
             allocator.on_new_frame(1440).unwrap();
-            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
-                "an unrenewed registration cannot reserve capacity indefinitely");
+            assert!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                "an unrenewed registration cannot reserve capacity indefinitely"
+            );
         }
     }
 
@@ -3387,23 +3904,40 @@ mod tests {
         let filter = vec![0x01; 32];
         for initially_bound in [false, true] {
             let wm = Arc::new(MockWorkerManager::new());
-            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] })
+                .unwrap();
             let mut renewing = make_alloc(filter.clone());
             renewing.epoch = 0;
-            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![renewing.clone()])));
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                renewing.clone()
+            ])));
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-            let renewal = allocator.submission_attempts
-                .begin(std::slice::from_ref(&filter), 1400, crate::submission_attempts::OpKind::Confirm).unwrap();
+            let renewal = allocator
+                .submission_attempts
+                .begin(
+                    std::slice::from_ref(&filter),
+                    1400,
+                    crate::submission_attempts::OpKind::Confirm,
+                )
+                .unwrap();
             for frame in [1440, 2160, 2900] {
                 allocator.on_new_frame(frame).unwrap();
-                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
-                    "a renewal still in preparation keeps its worker");
-                assert_eq!(renewing.effective_status(frame), EffectiveStatus::ExpiredEpoch);
+                assert_eq!(
+                    wm.range_workers().unwrap()[0].filter,
+                    filter,
+                    "a renewal still in preparation keeps its worker"
+                );
+                assert_eq!(
+                    renewing.effective_status(frame),
+                    EffectiveStatus::ExpiredEpoch
+                );
             }
             drop(renewal);
             allocator.on_new_frame(2901).unwrap();
-            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
-                "a failed renewal no longer reserves the worker");
+            assert!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                "a failed renewal no longer reserves the worker"
+            );
         }
     }
 
@@ -3419,16 +3953,23 @@ mod tests {
         for (kind, kept) in [(OpKind::Confirm, true), (OpKind::Leave, false)] {
             for initially_bound in [false, true] {
                 let wm = Arc::new(MockWorkerManager::new());
-                wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+                wm.allocate_worker(1, if initially_bound { &filter } else { &[] })
+                    .unwrap();
                 let mut lapsed = make_alloc(filter.clone());
                 lapsed.epoch = 0;
                 let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
                 let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
                 allocator.note_renewals_offered();
-                let running = allocator.submission_attempts.begin(std::slice::from_ref(&filter), 1440, kind).unwrap();
+                let running = allocator
+                    .submission_attempts
+                    .begin(std::slice::from_ref(&filter), 1440, kind)
+                    .unwrap();
                 allocator.on_new_frame(1441).unwrap();
-                assert_eq!(wm.range_workers().unwrap()[0].filter == filter, kept,
-                    "{kind:?} in flight, initially_bound={initially_bound}");
+                assert_eq!(
+                    wm.range_workers().unwrap()[0].filter == filter,
+                    kept,
+                    "{kind:?} in flight, initially_bound={initially_bound}"
+                );
                 drop(running);
             }
         }
@@ -3452,15 +3993,29 @@ mod tests {
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
             for frame in [3 * e, 3 * e + 1] {
                 allocator.on_new_frame(frame).unwrap();
-                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
-                    "renewals not decided yet; renewing={renewing}");
+                assert_eq!(
+                    wm.range_workers().unwrap()[0].filter,
+                    filter,
+                    "renewals not decided yet; renewing={renewing}"
+                );
             }
-            let renewal = renewing.then(|| allocator.submission_attempts
-                .begin(std::slice::from_ref(&filter), 3 * e + 1, crate::submission_attempts::OpKind::Confirm).unwrap());
+            let renewal = renewing.then(|| {
+                allocator
+                    .submission_attempts
+                    .begin(
+                        std::slice::from_ref(&filter),
+                        3 * e + 1,
+                        crate::submission_attempts::OpKind::Confirm,
+                    )
+                    .unwrap()
+            });
             allocator.note_renewals_offered();
             allocator.on_new_frame(3 * e + 2).unwrap();
-            assert_eq!(wm.range_workers().unwrap()[0].filter.is_empty(), !renewing,
-                "renewing={renewing}");
+            assert_eq!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                !renewing,
+                "renewing={renewing}"
+            );
             drop(renewal);
         }
 
@@ -3471,7 +4026,10 @@ mod tests {
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
         allocator.on_new_frame(3 * e).unwrap();
-        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "an unbound lapsed seat is not bound");
+        assert!(
+            wm.range_workers().unwrap()[0].filter.is_empty(),
+            "an unbound lapsed seat is not bound"
+        );
     }
 
     /// Sets this thread's leaver currency frame, and unsets it when dropped.
@@ -3491,10 +4049,17 @@ mod tests {
     /// A seat registered for `epoch` on filter `[byte; 32]`, and one left
     /// at `leave_frame`.
     fn lapsed(byte: u8, epoch: u64) -> ProverAllocationInfo {
-        ProverAllocationInfo { epoch, ..make_alloc(vec![byte; 32]) }
+        ProverAllocationInfo {
+            epoch,
+            ..make_alloc(vec![byte; 32])
+        }
     }
     fn left(byte: u8, epoch: u64, leave_frame: u64) -> ProverAllocationInfo {
-        ProverAllocationInfo { status: ProverStatus::Leaving, leave_frame_number: leave_frame, ..lapsed(byte, epoch) }
+        ProverAllocationInfo {
+            status: ProverStatus::Leaving,
+            leave_frame_number: leave_frame,
+            ..lapsed(byte, epoch)
+        }
     }
 
     /// The recovery gate withholds archive recovery from exactly the seats
@@ -3512,29 +4077,65 @@ mod tests {
         let e = epoch_length_frames();
         let frame = 20 * e + 5;
         let allocations = vec![
-            lapsed(1, 20), lapsed(2, 19), lapsed(3, 2), lapsed(4, 2), lapsed(5, 2),
-            left(6, 2, 20 * e + 1), left(7, 20, 20 * e + 1),
+            lapsed(1, 20),
+            lapsed(2, 19),
+            lapsed(3, 2),
+            lapsed(4, 2),
+            lapsed(5, 2),
+            left(6, 2, 20 * e + 1),
+            left(7, 20, 20 * e + 1),
         ];
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[5; 32]).unwrap();
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(allocations)));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        let renewal = allocator.submission_attempts
-            .begin(&[vec![4; 32]], frame, crate::submission_attempts::OpKind::Confirm).unwrap();
+        let renewal = allocator
+            .submission_attempts
+            .begin(
+                &[vec![4; 32]],
+                frame,
+                crate::submission_attempts::OpKind::Confirm,
+            )
+            .unwrap();
         allocator.on_new_frame(frame).unwrap();
-        assert_eq!(wm.range_workers().unwrap()[0].filter, vec![5; 32], "kept until renewals are decided");
-        let gate = |byte: u8| allocator.given_up_seat(&[byte; 32], frame).map(|seat| seat.cause);
+        assert_eq!(
+            wm.range_workers().unwrap()[0].filter,
+            vec![5; 32],
+            "kept until renewals are decided"
+        );
+        let gate = |byte: u8| {
+            allocator
+                .given_up_seat(&[byte; 32], frame)
+                .map(|seat| seat.cause)
+        };
         let expected = [
-            (1, None), (2, None), (3, Some(GivenUp::Lapsed)), (4, None), (5, None),
-            (6, Some(GivenUp::LeftLapsed)), (7, None), (8, None),
+            (1, None),
+            (2, None),
+            (3, Some(GivenUp::Lapsed)),
+            (4, None),
+            (5, None),
+            (6, Some(GivenUp::LeftLapsed)),
+            (7, None),
+            (8, None),
         ];
         for (byte, cause) in expected {
             assert_eq!(gate(byte), cause, "seat {byte}");
         }
-        assert_eq!(allocator.given_up_seat(&[3; 32], frame),
-            Some(GivenUpSeat { cause: GivenUp::Lapsed, frame, allocation_epoch: 2, current_epoch: 20 }));
+        assert_eq!(
+            allocator.given_up_seat(&[3; 32], frame),
+            Some(GivenUpSeat {
+                cause: GivenUp::Lapsed,
+                frame,
+                allocation_epoch: 2,
+                current_epoch: 20
+            })
+        );
         allocator.note_renewals_offered();
-        assert_eq!(gate(5), Some(GivenUp::Lapsed), "renewals decided without it");
+        assert_eq!(
+            gate(5),
+            Some(GivenUp::Lapsed),
+            "renewals decided without it"
+        );
         drop(renewal);
     }
 
@@ -3551,21 +4152,43 @@ mod tests {
         let idle = |wm: &MockWorkerManager| wm.range_workers().unwrap()[0].filter.is_empty();
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(3, 1274)])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(
+            3, 1274,
+        )])));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        assert!(!allocator.startup_reconcile(stored, now - 18 * epoch_ms, now).unwrap(), "the stored head is stale");
+        assert!(
+            !allocator
+                .startup_reconcile(stored, now - 18 * epoch_ms, now)
+                .unwrap(),
+            "the stored head is stale"
+        );
         assert!(idle(&wm), "nothing is bound off the stored head");
         allocator.on_new_frame(current).unwrap();
         assert!(idle(&wm), "at a current frame the lapsed seat is not bound");
-        assert_eq!(allocator.given_up_seat(&[3; 32], current).map(|seat| seat.cause), Some(GivenUp::Lapsed));
+        assert_eq!(
+            allocator
+                .given_up_seat(&[3; 32], current)
+                .map(|seat| seat.cause),
+            Some(GivenUp::Lapsed)
+        );
 
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[]).unwrap();
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(4, 1292)])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(
+            4, 1292,
+        )])));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        assert!(allocator.startup_reconcile(current, now - 60_000, now).unwrap(), "a current head is used at once");
+        assert!(
+            allocator
+                .startup_reconcile(current, now - 60_000, now)
+                .unwrap(),
+            "a current head is used at once"
+        );
         assert_eq!(wm.range_workers().unwrap()[0].filter, vec![4; 32]);
-        assert!(stored_head_current(now - epoch_ms, now) && !stored_head_current(now - epoch_ms - 1, now));
+        assert!(
+            stored_head_current(now - epoch_ms, now)
+                && !stored_head_current(now - epoch_ms - 1, now)
+        );
     }
 
     /// The gate judges at the frame the latest reconcile ran at, which the
@@ -3576,21 +4199,45 @@ mod tests {
     fn the_recovery_gate_judges_at_the_reconciled_frame_not_the_head() {
         let e = epoch_length_frames();
         let wm = Arc::new(MockWorkerManager::new());
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(3, 20)])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed(
+            3, 20,
+        )])));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        let frame = |allocator: &WorkerAllocator| allocator.reconciled_frame.load(std::sync::atomic::Ordering::Relaxed);
+        let frame = |allocator: &WorkerAllocator| {
+            allocator
+                .reconciled_frame
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         allocator.on_new_frame(20 * e + 5).unwrap();
         // Execution, and so the reconcile, stays in epoch 20 while the head
         // passes the boundaries of epochs 21 and 22.
         let head = 22 * e + 5;
-        assert_eq!(allocator.given_up_seat(&[3; 32], head).map(|seat| seat.cause), Some(GivenUp::Lapsed),
-            "judged at the head, the seat would read lapsed");
-        assert_eq!(allocator.given_up_seat(&[3; 32], frame(&allocator)), None, "current at the reconciled frame");
+        assert_eq!(
+            allocator
+                .given_up_seat(&[3; 32], head)
+                .map(|seat| seat.cause),
+            Some(GivenUp::Lapsed),
+            "judged at the head, the seat would read lapsed"
+        );
+        assert_eq!(
+            allocator.given_up_seat(&[3; 32], frame(&allocator)),
+            None,
+            "current at the reconciled frame"
+        );
         allocator.on_new_frame(head).unwrap();
         assert_eq!(frame(&allocator), head);
         allocator.on_new_frame(21 * e).unwrap();
-        assert_eq!(frame(&allocator), head, "an older reconcile frame does not move it back");
-        assert_eq!(allocator.given_up_seat(&[3; 32], frame(&allocator)).map(|seat| seat.cause), Some(GivenUp::Lapsed));
+        assert_eq!(
+            frame(&allocator),
+            head,
+            "an older reconcile frame does not move it back"
+        );
+        assert_eq!(
+            allocator
+                .given_up_seat(&[3; 32], frame(&allocator))
+                .map(|seat| seat.cause),
+            Some(GivenUp::Lapsed)
+        );
     }
 
     /// Before the first reconcile finds this prover registered, the gate
@@ -3606,14 +4253,26 @@ mod tests {
         let wm = Arc::new(MockWorkerManager::new());
         wm.allocate_worker(1, &[3; 32]).unwrap();
         let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
-            lapsed(3, 2), lapsed(4, 2), left(6, 2, 20 * e + 1),
+            lapsed(3, 2),
+            lapsed(4, 2),
+            left(6, 2, 20 * e + 1),
         ])));
         let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        let gate = |byte: u8| allocator.given_up_seat(&[byte; 32], frame).map(|seat| seat.cause);
-        assert_eq!((gate(3), gate(4), gate(6)), (None, None, Some(GivenUp::LeftLapsed)));
+        let gate = |byte: u8| {
+            allocator
+                .given_up_seat(&[byte; 32], frame)
+                .map(|seat| seat.cause)
+        };
+        assert_eq!(
+            (gate(3), gate(4), gate(6)),
+            (None, None, Some(GivenUp::LeftLapsed))
+        );
         allocator.on_new_frame(frame).unwrap();
-        assert_eq!((gate(3), gate(4)), (None, Some(GivenUp::Lapsed)),
-            "the seat served at this start waits for the renewal decision; the other is given up");
+        assert_eq!(
+            (gate(3), gate(4)),
+            (None, Some(GivenUp::Lapsed)),
+            "the seat served at this start waits for the renewal decision; the other is given up"
+        );
     }
 
     /// A seat left after its registration lapsed keeps its worker while its
@@ -3625,19 +4284,32 @@ mod tests {
     fn a_seat_left_after_it_lapsed_keeps_its_worker_while_its_committee_seats_it() {
         let e = epoch_length_frames();
         let frame = 20 * e + 5;
-        for (currency, epoch, keeps) in [(None, 18, true), (Some(0), 19, true), (Some(0), 18, false)] {
+        for (currency, epoch, keeps) in
+            [(None, 18, true), (Some(0), 19, true), (Some(0), 18, false)]
+        {
             let _currency = LeaverCurrency::at(currency);
             for initially_bound in [false, true] {
                 let wm = Arc::new(MockWorkerManager::new());
-                wm.allocate_worker(1, if initially_bound { &[6; 32] } else { &[] }).unwrap();
-                let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![left(6, epoch, 20 * e + 1)])));
+                wm.allocate_worker(1, if initially_bound { &[6; 32] } else { &[] })
+                    .unwrap();
+                let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![left(
+                    6,
+                    epoch,
+                    20 * e + 1,
+                )])));
                 let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
                 allocator.on_new_frame(frame).unwrap();
                 let worker = wm.range_workers().unwrap().remove(0);
-                let case = format!("currency={currency:?}, epoch={epoch}, initially_bound={initially_bound}");
+                let case = format!(
+                    "currency={currency:?}, epoch={epoch}, initially_bound={initially_bound}"
+                );
                 assert_eq!(worker.filter == [6; 32], keeps, "{case}");
                 assert_eq!(worker.allocated, keeps, "{case}");
-                assert_eq!(allocator.given_up_seat(&[6; 32], frame).is_none(), keeps, "{case}");
+                assert_eq!(
+                    allocator.given_up_seat(&[6; 32], frame).is_none(),
+                    keeps,
+                    "{case}"
+                );
             }
         }
     }
@@ -3648,23 +4320,34 @@ mod tests {
         let filter = vec![0x01; 32];
         for initially_bound in [false, true] {
             let wm = Arc::new(MockWorkerManager::new());
-            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] })
+                .unwrap();
             let mut recovering = make_alloc(filter.clone());
             recovering.epoch = 0;
             recovering.leave_frame_number = 10;
             recovering.leave_reject_frame_number = 721;
-            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![recovering.clone()])));
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                recovering.clone(),
+            ])));
             let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
             for frame in [725, 1439] {
                 allocator.on_new_frame(frame).unwrap();
-                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
-                    "renewal needs its worker even before registration lands");
-                assert_eq!(recovering.effective_status(frame), EffectiveStatus::ExpiredEpoch,
-                    "worker recovery must not fake a valid storage epoch");
+                assert_eq!(
+                    wm.range_workers().unwrap()[0].filter,
+                    filter,
+                    "renewal needs its worker even before registration lands"
+                );
+                assert_eq!(
+                    recovering.effective_status(frame),
+                    EffectiveStatus::ExpiredEpoch,
+                    "worker recovery must not fake a valid storage epoch"
+                );
             }
             allocator.on_new_frame(1440).unwrap();
-            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
-                "failed renewal cannot reserve the worker beyond the rejection epoch");
+            assert!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                "failed renewal cannot reserve the worker beyond the rejection epoch"
+            );
         }
     }
 
@@ -3701,8 +4384,10 @@ mod tests {
 
         let workers = wm.range_workers().unwrap();
         assert_eq!(workers.len(), 1);
-        assert_eq!(workers[0].filter, live_filter,
-            "the stale epoch binding must yield its only worker to the live allocation");
+        assert_eq!(
+            workers[0].filter, live_filter,
+            "the stale epoch binding must yield its only worker to the live allocation"
+        );
     }
 
     /// Releases are mode-agnostic, and the lifecycle joins auto workers
@@ -3730,18 +4415,30 @@ mod tests {
 
         let (wm, alloc) = setup(vec![stale.clone()]);
         let logged = reconcile_logged(&alloc, frame);
-        assert!(wm.range_workers().unwrap()[0].filter.is_empty(), "the lapsed seat frees its worker");
+        assert!(
+            wm.range_workers().unwrap()[0].filter.is_empty(),
+            "the lapsed seat frees its worker"
+        );
         assert_eq!(logged.matches(LOST).count(), 1, "{logged}");
-        assert!(logged.contains("missed_epoch_renewal") && logged.contains("core_id=1"), "{logged}");
+        assert!(
+            logged.contains("missed_epoch_renewal") && logged.contains("core_id=1"),
+            "{logged}"
+        );
         let logged = reconcile_logged(&alloc, frame + 1);
-        assert!(!logged.contains(LOST), "an idle worker is reported on the transition only: {logged}");
+        assert!(
+            !logged.contains(LOST),
+            "an idle worker is reported on the transition only: {logged}"
+        );
 
         let mut live = make_alloc(live_filter.clone());
         live.epoch = quil_types::consensus::epoch_for_frame(frame);
         let (wm, alloc) = setup(vec![stale.clone(), live]);
         let logged = reconcile_logged(&alloc, frame);
         assert_eq!(wm.range_workers().unwrap()[0].filter, live_filter);
-        assert!(!logged.contains(LOST), "a worker rebound in the same pass is not idle: {logged}");
+        assert!(
+            !logged.contains(LOST),
+            "a worker rebound in the same pass is not idle: {logged}"
+        );
 
         let mut departed = make_alloc(stale_filter.clone());
         departed.status = ProverStatus::Kicked;
@@ -3749,7 +4446,10 @@ mod tests {
         departed.leave_confirm_frame_number = 800;
         let (_, alloc) = setup(vec![departed]);
         let logged = reconcile_logged(&alloc, frame);
-        assert!(!logged.contains(LOST) && logged.contains(LEFT) && logged.contains("leave_confirmed"), "{logged}");
+        assert!(
+            !logged.contains(LOST) && logged.contains(LEFT) && logged.contains("leave_confirmed"),
+            "{logged}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -3879,7 +4579,11 @@ mod tests {
 
     #[test]
     fn halt_risk_priority_never_preempts_serving_or_paused_allocations() {
-        for status in [ProverStatus::Active, ProverStatus::Paused, ProverStatus::Leaving] {
+        for status in [
+            ProverStatus::Active,
+            ProverStatus::Paused,
+            ProverStatus::Leaving,
+        ] {
             let frame = 10_000;
             let filters = vec![vec![0x01; 32], vec![0x02; 32]];
             let wm = Arc::new(MockWorkerManager::new());
@@ -3889,10 +4593,13 @@ mod tests {
             prover.allocations[0].leave_frame_number = frame;
             let registry = Arc::new(TestProverRegistry::with_prover(prover));
             let allocator = WorkerAllocator::new(wm.clone(), registry, vec![0xAA; 32]);
-            allocator.publish_allocation_priority(frame, vec![
-                (filters[0].clone(), false, 1.into()),
-                (filters[1].clone(), true, 9_000.into()),
-            ]);
+            allocator.publish_allocation_priority(
+                frame,
+                vec![
+                    (filters[0].clone(), false, 1.into()),
+                    (filters[1].clone(), true, 9_000.into()),
+                ],
+            );
             allocator.on_new_frame(frame).unwrap();
             assert_eq!(bound_filters(&wm), vec![filters[0].clone()], "{status:?}");
         }
@@ -3911,10 +4618,13 @@ mod tests {
         prover.allocations[1].epoch = u64::MAX;
         let registry = Arc::new(TestProverRegistry::with_prover(prover));
         let allocator = WorkerAllocator::new(wm.clone(), registry, vec![0xAA; 32]);
-        allocator.publish_allocation_priority(frame, vec![
-            (filters[0].clone(), false, 1.into()),
-            (filters[1].clone(), true, 9_000.into()),
-        ]);
+        allocator.publish_allocation_priority(
+            frame,
+            vec![
+                (filters[0].clone(), false, 1.into()),
+                (filters[1].clone(), true, 9_000.into()),
+            ],
+        );
         allocator.on_new_frame(frame).unwrap();
         assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
         let departure = (quil_types::consensus::epoch_for_frame(frame) + 1)
@@ -4020,24 +4730,38 @@ mod tests {
         let filter = vec![0x01; 32];
         let frame = 720;
         let evidence = AllocationPriorityEvidence {
-            frame_number: frame, active: 3, joining: 20, paused: 1, leaving: 7,
-            scoring_ring: 0, ring_source: "current_committee",
-            ring_member_count: Some(3), ring_target_frame: Some(frame),
-            size_bytes: 1000, data_shards: 2, difficulty: 100,
-            world_bytes_input: "123".into(), world_bytes_source: "registry_count_proxy",
-            allocation_epoch: Some(1), stored_ring: Some(0),
-            allocation_status: Some("Active".into()), allocation_raw_status: Some("Active".into()),
-            join_confirm_frame: Some(1), leave_frame: Some(0),
-            leave_confirm_frame: Some(0), leave_reject_frame: Some(0),
+            frame_number: frame,
+            active: 3,
+            joining: 20,
+            paused: 1,
+            leaving: 7,
+            scoring_ring: 0,
+            ring_source: "current_committee",
+            ring_member_count: Some(3),
+            ring_target_frame: Some(frame),
+            size_bytes: 1000,
+            data_shards: 2,
+            difficulty: 100,
+            world_bytes_input: "123".into(),
+            world_bytes_source: "registry_count_proxy",
+            allocation_epoch: Some(1),
+            stored_ring: Some(0),
+            allocation_status: Some("Active".into()),
+            allocation_raw_status: Some("Active".into()),
+            join_confirm_frame: Some(1),
+            leave_frame: Some(0),
+            leave_confirm_frame: Some(0),
+            leave_reject_frame: Some(0),
         };
-        allocator.publish_allocation_priority_with_evidence(frame,
+        allocator.publish_allocation_priority_with_evidence(
+            frame,
             vec![(filter.clone(), true, 10.into())],
-            HashMap::from([(filter.clone(), evidence)]));
+            HashMap::from([(filter.clone(), evidence)]),
+        );
         let PriorityState::Fresh(captured) = allocator.allocation_priority_state(frame + 1) else {
             panic!("expected usable snapshot");
         };
-        allocator.publish_allocation_priority(frame + 1,
-            vec![(filter.clone(), false, 20.into())]);
+        allocator.publish_allocation_priority(frame + 1, vec![(filter.clone(), false, 20.into())]);
         let old = serde_json::to_value(captured[&filter].evidence.as_ref().unwrap()).unwrap();
         assert_eq!(old["frame_number"], frame);
         assert_eq!(old["active"], 3);
@@ -4049,7 +4773,10 @@ mod tests {
             panic!("expected replacement snapshot");
         };
         assert!(!current[&filter].halt_risk);
-        assert!(current[&filter].evidence.is_none(), "missing provenance must remain unknown");
+        assert!(
+            current[&filter].evidence.is_none(),
+            "missing provenance must remain unknown"
+        );
     }
 
     #[test]
@@ -4060,7 +4787,10 @@ mod tests {
         let frame = 10_000u64;
 
         assert!(
-            matches!(alloc.allocation_priority_state(frame), PriorityState::Missing),
+            matches!(
+                alloc.allocation_priority_state(frame),
+                PriorityState::Missing
+            ),
             "a node whose lifecycle has never evaluated reports Missing, not Stale"
         );
 
@@ -4076,12 +4806,13 @@ mod tests {
             _ => panic!("an out-of-date ranking must report Stale with its age"),
         }
 
-        alloc.publish_allocation_priority(
-            frame + 1,
-            vec![(vec![0x01; 32], false, BigInt::from(5))],
-        );
+        alloc
+            .publish_allocation_priority(frame + 1, vec![(vec![0x01; 32], false, BigInt::from(5))]);
         assert!(
-            matches!(alloc.allocation_priority_state(frame), PriorityState::Fresh(_)),
+            matches!(
+                alloc.allocation_priority_state(frame),
+                PriorityState::Fresh(_)
+            ),
             "a ranking stamped a frame ahead is still fresh — reconciles run \
              from three sources whose frame numbers interleave"
         );
@@ -4112,7 +4843,12 @@ mod tests {
         publish(frame);
         alloc.on_new_frame(frame).unwrap();
         assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
-        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), frame);
+        assert_eq!(
+            alloc
+                .last_priority_review_frame
+                .load(std::sync::atomic::Ordering::Relaxed),
+            frame
+        );
 
         // Immediately after, pretend the best shard collapsed so the
         // ranking now prefers a different one. The cooldown must hold.
@@ -4131,7 +4867,12 @@ mod tests {
             "a second rebind within SURPLUS_REVIEW_INTERVAL_FRAMES must be deferred"
         );
 
-        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), frame);
+        assert_eq!(
+            alloc
+                .last_priority_review_frame
+                .load(std::sync::atomic::Ordering::Relaxed),
+            frame
+        );
 
         // A later review still must not move the serving worker.
         let later = frame + SURPLUS_REVIEW_INTERVAL_FRAMES + 1;
@@ -4145,7 +4886,12 @@ mod tests {
         );
         alloc.on_new_frame(later).unwrap();
         assert_eq!(bound_filters(&wm), vec![filters[0].clone()]);
-        assert_eq!(alloc.last_priority_review_frame.load(std::sync::atomic::Ordering::Relaxed), later);
+        assert_eq!(
+            alloc
+                .last_priority_review_frame
+                .load(std::sync::atomic::Ordering::Relaxed),
+            later
+        );
     }
 
     #[test]
@@ -4199,11 +4945,7 @@ mod tests {
         wm.allocate_worker(3, &[]).unwrap();
 
         // Index 0 -> core 1, index 1 -> core 2, index 2 (empty) -> skip.
-        let cfg = vec![
-            "0xaabbccdd".into(),
-            "11223344".into(),
-            "".into(),
-        ];
+        let cfg = vec!["0xaabbccdd".into(), "11223344".into(), "".into()];
 
         let stats = apply_config_worker_filters(&wm, &cfg);
         assert_eq!(stats.applied, 2);
@@ -4290,11 +5032,7 @@ mod tests {
         wm.allocate_worker(2, &[]).unwrap();
         wm.allocate_worker(3, &[]).unwrap();
 
-        let cfg = vec![
-            "0xab".into(),
-            "0XCD".into(),
-            "ef".into(),
-        ];
+        let cfg = vec!["0xab".into(), "0XCD".into(), "ef".into()];
         let stats = apply_config_worker_filters(&wm, &cfg);
         assert_eq!(stats.applied, 3);
 
@@ -4323,39 +5061,76 @@ mod tests {
     fn payload_eviction_waits_for_settled_bindings_and_protects_live_scopes() {
         use quil_types::store::{PendingShardChange, ShardChangeKind};
         let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
-        let filter = |app: u8, tail: u8| { let mut f = vec![app; 32]; f.extend([0, 1, tail]); f };
+        let filter = |app: u8, tail: u8| {
+            let mut f = vec![app; 32];
+            f.extend([0, 1, tail]);
+            f
+        };
         let wm = Arc::new(MockWorkerManager::new());
         wm.add_with_filter(1, filter(7, 0x00));
         wm.add_with_filter(2, filter(7, 0x80));
-        wm.add(WorkerInfo { pending_filter_frame: 5, ..find_worker(&wm, 2) });
+        wm.add(WorkerInfo {
+            pending_filter_frame: 5,
+            ..find_worker(&wm, 2)
+        });
         wm.add_with_filter(3, Vec::new());
         let reg = Arc::new(TestProverRegistry::new());
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
         let t0 = std::time::Instant::now();
         alloc.schedule_payload_eviction(t0 + minutes(120)).unwrap();
-        assert!(wm.evictions().is_empty(), "unknown staged changes must not evict");
+        assert!(
+            wm.evictions().is_empty(),
+            "unknown staged changes must not evict"
+        );
 
         let staged = vec![
-            PendingShardChange { kind: ShardChangeKind::Merge, parent: vec![7; 32], children: vec![filter(7, 0x00), filter(7, 0x80)], effective_epoch: 9, proposed_frame: 1 },
-            PendingShardChange { kind: ShardChangeKind::Split, parent: filter(8, 0x00), children: vec![], effective_epoch: 9, proposed_frame: 1 },
+            PendingShardChange {
+                kind: ShardChangeKind::Merge,
+                parent: vec![7; 32],
+                children: vec![filter(7, 0x00), filter(7, 0x80)],
+                effective_epoch: 9,
+                proposed_frame: 1,
+            },
+            PendingShardChange {
+                kind: ShardChangeKind::Split,
+                parent: filter(8, 0x00),
+                children: vec![],
+                effective_epoch: 9,
+                proposed_frame: 1,
+            },
         ];
         alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
         alloc.schedule_payload_eviction(t0).unwrap();
         alloc.schedule_payload_eviction(t0 + minutes(29)).unwrap();
-        assert!(wm.evictions().is_empty(), "an unsettled binding must not evict");
+        assert!(
+            wm.evictions().is_empty(),
+            "an unsettled binding must not evict"
+        );
         alloc.schedule_payload_eviction(t0 + minutes(30)).unwrap();
         let mut expected = vec![filter(7, 0x00), filter(7, 0x80), vec![7; 32]];
         expected.sort();
-        assert_eq!(wm.evictions(), vec![(1, expected)], "pending joins and idle workers never evict");
+        assert_eq!(
+            wm.evictions(),
+            vec![(1, expected)],
+            "pending joins and idle workers never evict"
+        );
         alloc.schedule_payload_eviction(t0 + minutes(89)).unwrap();
         assert_eq!(wm.evictions().len(), 1);
         alloc.schedule_payload_eviction(t0 + minutes(90)).unwrap();
-        assert_eq!(wm.evictions().len(), 2, "settled bindings repeat on their interval");
+        assert_eq!(
+            wm.evictions().len(),
+            2,
+            "settled bindings repeat on their interval"
+        );
 
         wm.add_with_filter(1, filter(7, 0xc0));
         alloc.schedule_payload_eviction(t0 + minutes(100)).unwrap();
         alloc.schedule_payload_eviction(t0 + minutes(129)).unwrap();
-        assert_eq!(wm.evictions().len(), 2, "a rebind restarts the settle period");
+        assert_eq!(
+            wm.evictions().len(),
+            2,
+            "a rebind restarts the settle period"
+        );
         alloc.schedule_payload_eviction(t0 + minutes(130)).unwrap();
         assert_eq!(wm.evictions().len(), 3);
         assert!(wm.evictions()[2].1.contains(&filter(7, 0xc0)));
@@ -4366,22 +5141,39 @@ mod tests {
     #[test]
     fn payload_eviction_ignores_staged_changes_of_shards_nobody_holds() {
         use quil_types::store::{PendingShardChange, ShardChangeKind};
-        let filter = |tail: u8| { let mut f = vec![7; 32]; f.extend([0, 1, tail]); f };
+        let filter = |tail: u8| {
+            let mut f = vec![7; 32];
+            f.extend([0, 1, tail]);
+            f
+        };
         let wm = Arc::new(MockWorkerManager::new());
         wm.add_with_filter(1, filter(0x00));
         let mut prover = prover_with_active(&[filter(0x60), filter(0x40)], 100);
         prover.allocations[1].status = ProverStatus::Historic;
         let reg = Arc::new(TestProverRegistry::with_provers(vec![prover]));
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
-        let split = |parent: u8| PendingShardChange { kind: ShardChangeKind::Split, parent: filter(parent),
-            children: vec![filter(parent + 1), filter(parent + 2)], effective_epoch: 9, proposed_frame: 1 };
+        let split = |parent: u8| PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: filter(parent),
+            children: vec![filter(parent + 1), filter(parent + 2)],
+            effective_epoch: 9,
+            proposed_frame: 1,
+        };
         let staged = vec![split(0x40), split(0x60)];
         alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
         let t0 = std::time::Instant::now();
         alloc.schedule_payload_eviction(t0).unwrap();
-        alloc.schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE).unwrap();
-        assert_eq!(wm.evictions(), vec![(1, vec![filter(0x00), filter(0x60), filter(0x61), filter(0x62)])],
-            "a change of shards nobody holds protects nothing");
+        alloc
+            .schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE)
+            .unwrap();
+        assert_eq!(
+            wm.evictions(),
+            vec![(
+                1,
+                vec![filter(0x00), filter(0x60), filter(0x61), filter(0x62)]
+            )],
+            "a change of shards nobody holds protects nothing"
+        );
     }
 
     /// Joins that land are announced once per batch with the epoch their
@@ -4393,12 +5185,19 @@ mod tests {
             #[derive(Clone, Default)]
             struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
             impl std::io::Write for Lines {
-                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().write(bytes) }
-                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().write(bytes)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
             let lines = Lines::default();
             let writer = lines.clone();
-            let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
             tracing::subscriber::with_default(subscriber, || alloc.on_new_frame(frame).unwrap());
             let bytes = lines.0.lock().unwrap().clone();
             String::from_utf8(bytes).unwrap()
@@ -4414,10 +5213,17 @@ mod tests {
         for core in 1..=3u32 {
             wm.allocate_worker(core, &[]).unwrap();
         }
-        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![joining(1, e + 2), joining(2, e + 3)])));
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            joining(1, e + 2),
+            joining(2, e + 3),
+        ])));
         let alloc = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAAu8; 32]);
         let logged = reconcile_log(&alloc, e + 29);
-        assert_eq!(logged.matches("joins landed in the registry").count(), 1, "{logged}");
+        assert_eq!(
+            logged.matches("joins landed in the registry").count(),
+            1,
+            "{logged}"
+        );
         for field in [
             "allocations=2".to_string(),
             format!("join_frames={}..{}", e + 2, e + 3),
@@ -4428,13 +5234,29 @@ mod tests {
             assert!(logged.contains(&field), "{field}: {logged}");
         }
         assert_eq!(bound_cores(&wm), vec![1, 2]);
-        assert!(!reconcile_log(&alloc, e + 30).contains("joins landed"), "announced once");
+        assert!(
+            !reconcile_log(&alloc, e + 30).contains("joins landed"),
+            "announced once"
+        );
 
         let mut confirmed = joining(1, e + 2);
-        (confirmed.status, confirmed.join_confirm_frame_number, confirmed.epoch) = (ProverStatus::Active, 2 * e + 8, 3);
+        (
+            confirmed.status,
+            confirmed.join_confirm_frame_number,
+            confirmed.epoch,
+        ) = (ProverStatus::Active, 2 * e + 8, 3);
         reg.set_prover(prover_with(vec![confirmed, joining(2, e + 3)]));
         let logged = reconcile_log(&alloc, 2 * e + 9);
-        assert_eq!(logged.matches("join confirmed — starting consensus engine").count(), 1, "{logged}");
-        assert!(logged.contains(&format!("activation_frame={}", 3 * e)), "{logged}");
+        assert_eq!(
+            logged
+                .matches("join confirmed — starting consensus engine")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(
+            logged.contains(&format!("activation_frame={}", 3 * e)),
+            "{logged}"
+        );
     }
 }

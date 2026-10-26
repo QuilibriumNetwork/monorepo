@@ -17,10 +17,7 @@ pub fn register_execution_metrics() {
         "execution_request_duration_seconds",
         "Execution request latency in seconds"
     );
-    describe_counter!(
-        "execution_errors_total",
-        "Total execution errors"
-    );
+    describe_counter!("execution_errors_total", "Total execution errors");
 }
 
 /// Map a routed engine name to a bounded-cardinality `&'static str` label.

@@ -80,7 +80,9 @@ impl SubmitRetryQueue {
             pending.push_back((bytes, Instant::now()));
             let mut total: usize = pending.iter().map(|(b, _)| b.len()).sum();
             while pending.len() > RETRY_MAX_MESSAGES || total > RETRY_MAX_BYTES {
-                let Some((dropped, _)) = pending.pop_front() else { break };
+                let Some((dropped, _)) = pending.pop_front() else {
+                    break;
+                };
                 total -= dropped.len();
                 warn!("prover submission retry queue full — dropping its oldest message");
             }
@@ -109,7 +111,8 @@ fn retryable(error: &quil_rpc::archive_client::ArchiveClientError) -> bool {
     match error {
         quil_rpc::archive_client::ArchiveClientError::Rpc(status) => {
             status.code() == tonic::Code::ResourceExhausted
-                || (status.code() == tonic::Code::InvalidArgument && status.message().contains("rank buffer full"))
+                || (status.code() == tonic::Code::InvalidArgument
+                    && status.message().contains("rank buffer full"))
         }
         _ => false,
     }
@@ -131,14 +134,19 @@ where
                 let before = pending.len();
                 pending.retain(|(_, queued)| queued.elapsed() < timing.give_up);
                 if pending.len() < before {
-                    warn!(given_up = before - pending.len(), "prover submissions still refused by every archive — giving up");
+                    warn!(
+                        given_up = before - pending.len(),
+                        "prover submissions still refused by every archive — giving up"
+                    );
                 }
                 pending.front().map(|(bytes, _)| bytes.clone())
             };
             let Some(bytes) = next else {
                 // Stop, unless a message was queued while this one ended.
                 queue.running.store(false, Ordering::Release);
-                if queue.pending.lock().unwrap().is_empty() || queue.running.swap(true, Ordering::AcqRel) {
+                if queue.pending.lock().unwrap().is_empty()
+                    || queue.running.swap(true, Ordering::AcqRel)
+                {
                     return;
                 }
                 continue;
@@ -166,7 +174,9 @@ async fn submit_to_archives(
     seed: Option<Vec<u8>>,
     bytes: Vec<u8>,
 ) -> (usize, Delivery) {
-    let Some(seed) = seed else { return (0, Delivery::default()) };
+    let Some(seed) = seed else {
+        return (0, Delivery::default());
+    };
     let archive_addrs = pool.get_all().await;
     let archives = archive_addrs.len();
     let submit = move |stream_addr: String, bytes: Vec<u8>| {
@@ -178,7 +188,11 @@ async fn submit_to_archives(
                     Err(e) => {
                         debug!(addr = %stream_addr, error = %e, "prover bundle submit rejected by archive");
                         let retry = retryable(&e);
-                        Err((stream_addr, format!("submit rejected: {}", refusal_reason(&e)), retry))
+                        Err((
+                            stream_addr,
+                            format!("submit rejected: {}", refusal_reason(&e)),
+                            retry,
+                        ))
                     }
                 },
                 Err(e) => {
@@ -188,7 +202,10 @@ async fn submit_to_archives(
             }
         }
     };
-    (archives, fan_out_to_archives(archive_addrs, bytes, submit).await)
+    (
+        archives,
+        fan_out_to_archives(archive_addrs, bytes, submit).await,
+    )
 }
 
 #[async_trait]
@@ -280,9 +297,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
                 );
                 return Ok(header);
             }
-            tracing::warn!(
-                "all candidate archives timed out — falling back to local clock store",
-            );
+            tracing::warn!("all candidate archives timed out — falling back to local clock store",);
         }
         let f = self
             .clock_store
@@ -317,7 +332,9 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             if !publish_bs {
                 return Ok(());
             }
-            bs_handle.publish(GLOBAL_PROVER_BITMASK.to_vec(), bs_bytes).await
+            bs_handle
+                .publish(GLOBAL_PROVER_BITMASK.to_vec(), bs_bytes)
+                .await
         };
 
         let ((archive_count, delivery), bs_result) = tokio::join!(grpc_future, bs_future);
@@ -330,15 +347,23 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             }
         }
 
-        let outcome = combine_publish_outcome(archive_count, grpc_ok_count, publish_bs.then_some(&bs_result));
+        let outcome = combine_publish_outcome(
+            archive_count,
+            grpc_ok_count,
+            publish_bs.then_some(&bs_result),
+        );
         // Every archive refused it for now: resend it later.
         let queued = outcome.is_err() && delivery.retry > 0;
         if queued && self.retry_queue.push(bundle_bytes) {
             let (pool, seed) = (self.archive_pool.clone(), self.falcon_signing_key.clone());
-            tokio::spawn(run_retries(self.retry_queue.clone(), RETRY_TIMING, move |bytes| {
-                let (pool, seed) = (pool.clone(), seed.clone());
-                async move { submit_to_archives(&pool, seed, bytes).await.1 }
-            }));
+            tokio::spawn(run_retries(
+                self.retry_queue.clone(),
+                RETRY_TIMING,
+                move |bytes| {
+                    let (pool, seed) = (pool.clone(), seed.clone());
+                    async move { submit_to_archives(&pool, seed, bytes).await.1 }
+                },
+            ));
         }
         if archive_count > 0 && grpc_ok_count == 0 {
             if queued {
@@ -351,8 +376,7 @@ impl ProverMessageTransport for ProdProverMessageTransport {
             } else {
                 warn!(
                     archive_count,
-                    publish_bs,
-                    "no archive accepted submission — message likely dropped"
+                    publish_bs, "no archive accepted submission — message likely dropped"
                 );
             }
         }
@@ -361,7 +385,9 @@ impl ProverMessageTransport for ProdProverMessageTransport {
         }
 
         match outcome {
-            Err(QuilError::P2p(message)) if queued => Err(QuilError::P2p(format!("{message}; queued to retry"))),
+            Err(QuilError::P2p(message)) if queued => {
+                Err(QuilError::P2p(format!("{message}; queued to retry")))
+            }
             outcome => outcome,
         }
     }
@@ -418,7 +444,9 @@ where
         // Parallel fan-out: each handle's result is awaited below, so
         // panics surface as JoinError and per-archive failures are
         // logged individually. This is the correct use of bare spawn.
-        handles.push(tokio::spawn(async move { submit(stream_addr, bytes).await }));
+        handles.push(tokio::spawn(
+            async move { submit(stream_addr, bytes).await },
+        ));
     }
     let mut delivery = Delivery::default();
     let mut refused = Vec::new();
@@ -452,7 +480,10 @@ where
                 continue;
             }
             let now = Instant::now();
-            let summary = archive_refusals().lock().unwrap_or_else(|p| p.into_inner()).note(now, &addr);
+            let summary = archive_refusals()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note(now, &addr);
             if let Some((refusals, secs)) = summary {
                 info!(
                     scope = "peer",
@@ -499,7 +530,8 @@ impl ArchiveRefusals {
 }
 
 fn archive_refusals() -> &'static std::sync::Mutex<ArchiveRefusals> {
-    static REFUSALS: std::sync::OnceLock<std::sync::Mutex<ArchiveRefusals>> = std::sync::OnceLock::new();
+    static REFUSALS: std::sync::OnceLock<std::sync::Mutex<ArchiveRefusals>> =
+        std::sync::OnceLock::new();
     REFUSALS.get_or_init(Default::default)
 }
 
@@ -507,7 +539,9 @@ fn archive_refusals() -> &'static std::sync::Mutex<ArchiveRefusals> {
 /// the archive's message.
 fn refusal_reason(error: &quil_rpc::archive_client::ArchiveClientError) -> String {
     match error {
-        quil_rpc::archive_client::ArchiveClientError::Rpc(status) => format!("{:?}: {}", status.code(), status.message()),
+        quil_rpc::archive_client::ArchiveClientError::Rpc(status) => {
+            format!("{:?}: {}", status.code(), status.message())
+        }
         other => other.to_string(),
     }
 }
@@ -526,7 +560,11 @@ fn describe_bundle(bundle: &[u8]) -> String {
         .flatten()
         .map(|request| match request.inner_type_prefix {
             TYPE_FRAME_HEADER => match FrameHeader::from_canonical_bytes(&request.inner_bytes) {
-                Ok(header) => format!("frame header {}@{}", hex::encode(&header.address), header.frame_number),
+                Ok(header) => format!(
+                    "frame header {}@{}",
+                    hex::encode(&header.address),
+                    header.frame_number
+                ),
                 Err(_) => "frame header".to_string(),
             },
             prefix => format!("request type {prefix:#06x}"),
@@ -537,11 +575,15 @@ fn describe_bundle(bundle: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{combine_publish_outcome, describe_bundle, fan_out_to_archives, refusal_reason, retryable, run_retries, ArchiveRefusals, Delivery, RetryTiming, SubmitRetryQueue, ARCHIVE_REFUSAL_EVERY};
-    use std::time::Duration;
+    use super::{
+        combine_publish_outcome, describe_bundle, fan_out_to_archives, refusal_reason, retryable,
+        run_retries, ArchiveRefusals, Delivery, RetryTiming, SubmitRetryQueue,
+        ARCHIVE_REFUSAL_EVERY,
+    };
     use quil_types::error::QuilError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn publish_errors_distinguish_skipped_and_failed_paths() {
@@ -551,7 +593,9 @@ mod tests {
         let absent = combine_publish_outcome(0, 0, None).unwrap_err().to_string();
         assert!(absent.contains("no archives discovered; BlossomSub publish disabled"));
         let failed = Err(QuilError::P2p("topic mesh unavailable".into()));
-        let attempted = combine_publish_outcome(7, 0, Some(&failed)).unwrap_err().to_string();
+        let attempted = combine_publish_outcome(7, 0, Some(&failed))
+            .unwrap_err()
+            .to_string();
         assert!(attempted.contains("no archive accepted submission; BlossomSub publish failed:"));
         assert!(attempted.contains("topic mesh unavailable"));
         assert!(!attempted.contains("publish disabled"));
@@ -586,7 +630,9 @@ mod tests {
             "5.6.7.8:8336".to_string(),
             "9.10.11.12:8336".to_string(),
         ];
-        let ok = fan_out_to_archives(addrs, vec![0xAA; 16], submit).await.accepted;
+        let ok = fan_out_to_archives(addrs, vec![0xAA; 16], submit)
+            .await
+            .accepted;
         assert_eq!(ok, 3, "expected 3 successful submissions");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -625,10 +671,15 @@ mod tests {
 
     #[tokio::test]
     async fn publish_prover_message_empty_archive_list() {
-        let submit =
-            move |addr: String, _bytes: Vec<u8>| async move { Ok::<String, (String, String, bool)>(addr) };
+        let submit = move |addr: String, _bytes: Vec<u8>| async move {
+            Ok::<String, (String, String, bool)>(addr)
+        };
         let ok = fan_out_to_archives(vec![], vec![], submit).await;
-        assert_eq!(ok, Delivery::default(), "expected 0 successful submissions with empty list");
+        assert_eq!(
+            ok,
+            Delivery::default(),
+            "expected 0 successful submissions with empty list"
+        );
     }
 
     #[tokio::test]
@@ -640,20 +691,31 @@ mod tests {
                 _ => Err((addr, "invalid".to_string(), false)),
             }
         };
-        let delivery = fan_out_to_archives(vec!["a".into(), "b".into(), "c".into()], vec![], submit).await;
-        assert_eq!(delivery, Delivery { accepted: 1, retry: 1 });
+        let delivery =
+            fan_out_to_archives(vec!["a".into(), "b".into(), "c".into()], vec![], submit).await;
+        assert_eq!(
+            delivery,
+            Delivery {
+                accepted: 1,
+                retry: 1
+            }
+        );
     }
 
     #[test]
     fn a_full_or_unverifiable_mempool_asks_for_a_retry() {
         use quil_rpc::archive_client::ArchiveClientError;
         let rpc = |status: tonic::Status| ArchiveClientError::Rpc(status);
-        assert!(retryable(&rpc(tonic::Status::resource_exhausted("submit rejected: shard frame verification unavailable"))));
+        assert!(retryable(&rpc(tonic::Status::resource_exhausted(
+            "submit rejected: shard frame verification unavailable"
+        ))));
         // Archives from before the change refused a full mempool this way.
         assert!(retryable(&rpc(tonic::Status::invalid_argument(
             "submit rejected: message collector rejected: rank buffer full (rank 0, executed 0, head 880560)"
         ))));
-        assert!(!retryable(&rpc(tonic::Status::invalid_argument("submit rejected: shard frame failed verification"))));
+        assert!(!retryable(&rpc(tonic::Status::invalid_argument(
+            "submit rejected: shard frame failed verification"
+        ))));
         assert!(!retryable(&ArchiveClientError::MissingField("data")));
     }
 
@@ -666,7 +728,10 @@ mod tests {
     #[tokio::test]
     async fn queued_submissions_are_resent_oldest_first_until_accepted() {
         let queue = Arc::new(SubmitRetryQueue::default());
-        assert!(queue.push(b"one".to_vec()), "the first push starts the worker");
+        assert!(
+            queue.push(b"one".to_vec()),
+            "the first push starts the worker"
+        );
         assert!(!queue.push(b"two".to_vec()));
         assert!(!queue.push(b"one".to_vec()), "queued once");
         assert_eq!(queue.len(), 2);
@@ -678,54 +743,120 @@ mod tests {
                 let mut log = log.lock().unwrap();
                 log.push(bytes);
                 // Archives are full for the first two rounds.
-                if log.len() <= 2 { Delivery { accepted: 0, retry: 5 } } else { Delivery { accepted: 1, retry: 0 } }
+                if log.len() <= 2 {
+                    Delivery {
+                        accepted: 0,
+                        retry: 5,
+                    }
+                } else {
+                    Delivery {
+                        accepted: 1,
+                        retry: 0,
+                    }
+                }
             }
         })
         .await;
         let sent = sent.lock().unwrap().clone();
-        assert_eq!(sent, vec![b"one".to_vec(), b"one".to_vec(), b"one".to_vec(), b"two".to_vec()],
-            "a round ends at the first message still refused");
+        assert_eq!(
+            sent,
+            vec![
+                b"one".to_vec(),
+                b"one".to_vec(),
+                b"one".to_vec(),
+                b"two".to_vec()
+            ],
+            "a round ends at the first message still refused"
+        );
         assert_eq!(queue.len(), 0);
-        assert!(queue.push(b"three".to_vec()), "an emptied queue's worker has stopped");
+        assert!(
+            queue.push(b"three".to_vec()),
+            "an emptied queue's worker has stopped"
+        );
     }
 
     #[tokio::test]
     async fn a_refusal_for_good_or_an_old_message_is_dropped() {
         let queue = Arc::new(SubmitRetryQueue::default());
         queue.push(b"invalid".to_vec());
-        run_retries(queue.clone(), FAST, |_| async { Delivery { accepted: 0, retry: 0 } }).await;
+        run_retries(queue.clone(), FAST, |_| async {
+            Delivery {
+                accepted: 0,
+                retry: 0,
+            }
+        })
+        .await;
         assert_eq!(queue.len(), 0);
         queue.push(b"stale".to_vec());
-        let expired = RetryTiming { give_up: Duration::ZERO, ..FAST };
-        run_retries(queue.clone(), expired, |_| async { unreachable!("an expired message is not sent") }).await;
+        let expired = RetryTiming {
+            give_up: Duration::ZERO,
+            ..FAST
+        };
+        run_retries(queue.clone(), expired, |_| async {
+            unreachable!("an expired message is not sent")
+        })
+        .await;
         assert_eq!(queue.len(), 0);
     }
 
     #[test]
     fn failure_lines_name_the_request() {
         use quil_execution::global_intrinsic::frame_header::FrameHeader;
-        let header = FrameHeader { address: vec![7; 4], frame_number: 9, ..Default::default() }.to_canonical_bytes().unwrap();
+        let header = FrameHeader {
+            address: vec![7; 4],
+            frame_number: 9,
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         let bundle = crate::master_node::reward_proofs::prover_bundle(header).unwrap();
         assert_eq!(describe_bundle(&bundle), "frame header 07070707@9");
-        let mut join = quil_execution::global_intrinsic::TYPE_PROVER_JOIN.to_be_bytes().to_vec();
+        let mut join = quil_execution::global_intrinsic::TYPE_PROVER_JOIN
+            .to_be_bytes()
+            .to_vec();
         join.extend_from_slice(b"join");
         let bundle = crate::master_node::reward_proofs::prover_bundle(join).unwrap();
-        assert_eq!(describe_bundle(&bundle), format!("request type {:#06x}", quil_execution::global_intrinsic::TYPE_PROVER_JOIN));
+        assert_eq!(
+            describe_bundle(&bundle),
+            format!(
+                "request type {:#06x}",
+                quil_execution::global_intrinsic::TYPE_PROVER_JOIN
+            )
+        );
         assert_eq!(describe_bundle(b"junk"), "undecodable bundle");
-        let refused = quil_rpc::archive_client::ArchiveClientError::Rpc(tonic::Status::invalid_argument("rank buffer full"));
-        assert_eq!(refusal_reason(&refused), "InvalidArgument: rank buffer full");
+        let refused = quil_rpc::archive_client::ArchiveClientError::Rpc(
+            tonic::Status::invalid_argument("rank buffer full"),
+        );
+        assert_eq!(
+            refusal_reason(&refused),
+            "InvalidArgument: rank buffer full"
+        );
     }
 
     #[test]
     fn an_archive_refusing_what_another_accepted_is_summarized_every_interval() {
         let mut refusals = ArchiveRefusals::default();
         let t = std::time::Instant::now();
-        assert_eq!(refusals.note(t, "a:8340"), Some((1, 0)), "its first refusal logs at once");
+        assert_eq!(
+            refusals.note(t, "a:8340"),
+            Some((1, 0)),
+            "its first refusal logs at once"
+        );
         for n in 1..=5 {
             assert_eq!(refusals.note(t + Duration::from_secs(n), "a:8340"), None);
         }
-        assert_eq!(refusals.note(t + Duration::from_secs(2), "b:8340"), Some((1, 0)), "archives are counted apart");
-        assert_eq!(refusals.note(t + ARCHIVE_REFUSAL_EVERY, "a:8340"), Some((6, 600)));
-        assert_eq!(refusals.note(t + ARCHIVE_REFUSAL_EVERY + Duration::from_secs(1), "a:8340"), None);
+        assert_eq!(
+            refusals.note(t + Duration::from_secs(2), "b:8340"),
+            Some((1, 0)),
+            "archives are counted apart"
+        );
+        assert_eq!(
+            refusals.note(t + ARCHIVE_REFUSAL_EVERY, "a:8340"),
+            Some((6, 600))
+        );
+        assert_eq!(
+            refusals.note(t + ARCHIVE_REFUSAL_EVERY + Duration::from_secs(1), "a:8340"),
+            None
+        );
     }
 }

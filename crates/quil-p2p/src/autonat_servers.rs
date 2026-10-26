@@ -280,11 +280,19 @@ mod tests {
 
     impl Net {
         fn new() -> Self {
-            Self { servers: ProbeServers::new(routable, true, true), next_conn: 0 }
+            Self {
+                servers: ProbeServers::new(routable, true, true),
+                next_conn: 0,
+            }
         }
 
         /// Connect `peer` from `ip` and report its identify.
-        fn identified(&mut self, peer: PeerId, ip: &str, serves: bool) -> (ConnectionId, Vec<ServerChange>) {
+        fn identified(
+            &mut self,
+            peer: PeerId,
+            ip: &str,
+            serves: bool,
+        ) -> (ConnectionId, Vec<ServerChange>) {
             let conn = self.connect(peer, ip);
             (conn, self.servers.on_identify(conn, peer, serves))
         }
@@ -309,7 +317,10 @@ mod tests {
         // Repeated identify (push) changes nothing.
         assert!(net.servers.on_identify(conn, peer, true).is_empty());
         // A peer that stops serving AutoNAT is dropped.
-        assert_eq!(net.servers.on_identify(conn, peer, false), vec![Remove(peer)]);
+        assert_eq!(
+            net.servers.on_identify(conn, peer, false),
+            vec![Remove(peer)]
+        );
         assert_eq!(net.servers.count(), 0);
     }
 
@@ -318,21 +329,36 @@ mod tests {
     fn one_server_per_remote_ip() {
         let mut net = Net::new();
         let first = PeerId::random();
-        assert_eq!(net.identified(first, "198.51.100.7", true).1, vec![Add(first)]);
+        assert_eq!(
+            net.identified(first, "198.51.100.7", true).1,
+            vec![Add(first)]
+        );
         for _ in 0..150 {
-            assert!(net.identified(PeerId::random(), "198.51.100.7", true).1.is_empty());
+            assert!(net
+                .identified(PeerId::random(), "198.51.100.7", true)
+                .1
+                .is_empty());
         }
         let other = PeerId::random();
-        assert_eq!(net.identified(other, "203.0.113.9", true).1, vec![Add(other)]);
+        assert_eq!(
+            net.identified(other, "203.0.113.9", true).1,
+            vec![Add(other)]
+        );
         assert_eq!(net.servers.count(), 2);
-        assert_eq!(net.servers.ip_of_server(&first), Some("198.51.100.7".parse().unwrap()));
+        assert_eq!(
+            net.servers.ip_of_server(&first),
+            Some("198.51.100.7".parse().unwrap())
+        );
     }
 
     #[test]
     fn non_routable_remote_ips_give_no_server() {
         let mut net = Net::new();
         for ip in ["10.1.2.3", "127.0.0.1", "192.168.1.20"] {
-            assert!(net.identified(PeerId::random(), ip, true).1.is_empty(), "{ip}");
+            assert!(
+                net.identified(PeerId::random(), ip, true).1.is_empty(),
+                "{ip}"
+            );
         }
     }
 
@@ -347,8 +373,14 @@ mod tests {
         assert!(changes.is_empty());
         // Another connection of A remains: nothing changes.
         assert!(net.servers.on_connection_closed(conn_a, a, 1).is_empty());
-        assert_eq!(net.servers.on_connection_closed(conn_a2, a, 0), vec![Remove(a), Add(b)]);
-        assert_eq!(net.servers.on_connection_closed(conn_b, b, 0), vec![Remove(b)]);
+        assert_eq!(
+            net.servers.on_connection_closed(conn_a2, a, 0),
+            vec![Remove(a), Add(b)]
+        );
+        assert_eq!(
+            net.servers.on_connection_closed(conn_b, b, 0),
+            vec![Remove(b)]
+        );
         assert_eq!(net.servers.count(), 0);
     }
 
@@ -358,7 +390,9 @@ mod tests {
     fn configured_peers_hold_their_ip_while_they_serve() {
         let mut net = Net::new();
         let archive = PeerId::random();
-        let addr: Multiaddr = format!("/ip4/192.0.2.10/tcp/8336/p2p/{archive}").parse().unwrap();
+        let addr: Multiaddr = format!("/ip4/192.0.2.10/tcp/8336/p2p/{archive}")
+            .parse()
+            .unwrap();
         assert!(net.servers.pin(archive, &addr).is_empty());
         assert_eq!(net.servers.count(), 1);
         let peer = PeerId::random();
@@ -366,7 +400,10 @@ mod tests {
         let (conn, changes) = net.identified(archive, "192.0.2.10", true);
         assert!(changes.is_empty());
         // A configured peer stays a server when disconnected.
-        assert!(net.servers.on_connection_closed(conn, archive, 0).is_empty());
+        assert!(net
+            .servers
+            .on_connection_closed(conn, archive, 0)
+            .is_empty());
         let conn = net.connect(archive, "192.0.2.10");
         assert_eq!(
             net.servers.on_identify(conn, archive, false),
@@ -386,8 +423,14 @@ mod tests {
         assert!(net.servers.pin(archive, &addr).is_empty());
         let remote: Multiaddr = "/ip4/192.0.2.10/tcp/8336".parse().unwrap();
         let conn = ConnectionId::new_unchecked(1_000);
-        assert_eq!(net.servers.on_connection(conn, archive, &remote), vec![Remove(peer)]);
-        assert_eq!(net.servers.ip_of_server(&archive), Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(
+            net.servers.on_connection(conn, archive, &remote),
+            vec![Remove(peer)]
+        );
+        assert_eq!(
+            net.servers.ip_of_server(&archive),
+            Some("192.0.2.10".parse().unwrap())
+        );
         assert_eq!(net.servers.count(), 1);
     }
 
@@ -396,19 +439,37 @@ mod tests {
     fn ipv6_servers_count_by_their_slash_64() {
         let mut net = Net::new();
         let first = PeerId::random();
-        assert_eq!(net.identified(first, "2001:db8:1:2::1", true).1, vec![Add(first)]);
-        assert!(net.identified(PeerId::random(), "2001:db8:1:2:ffff::9", true).1.is_empty());
+        assert_eq!(
+            net.identified(first, "2001:db8:1:2::1", true).1,
+            vec![Add(first)]
+        );
+        assert!(net
+            .identified(PeerId::random(), "2001:db8:1:2:ffff::9", true)
+            .1
+            .is_empty());
         let other = PeerId::random();
-        assert_eq!(net.identified(other, "2001:db8:1:3::1", true).1, vec![Add(other)]);
-        assert_eq!(net.servers.ip_of_server(&first), Some("2001:db8:1:2::".parse().unwrap()));
+        assert_eq!(
+            net.identified(other, "2001:db8:1:3::1", true).1,
+            vec![Add(other)]
+        );
+        assert_eq!(
+            net.servers.ip_of_server(&first),
+            Some("2001:db8:1:2::".parse().unwrap())
+        );
     }
 
     /// A server dials back over the family it sees us on: peers on a family
     /// this node does not listen on would only report dial errors.
     #[test]
     fn servers_of_an_unlistened_family_are_not_registered() {
-        let mut net = Net { servers: ProbeServers::new(routable, true, false), next_conn: 0 };
-        assert!(net.identified(PeerId::random(), "2001:db8:1:2::1", true).1.is_empty());
+        let mut net = Net {
+            servers: ProbeServers::new(routable, true, false),
+            next_conn: 0,
+        };
+        assert!(net
+            .identified(PeerId::random(), "2001:db8:1:2::1", true)
+            .1
+            .is_empty());
         let v4 = PeerId::random();
         assert_eq!(net.identified(v4, "198.51.100.7", true).1, vec![Add(v4)]);
         let archive = PeerId::random();
@@ -423,6 +484,12 @@ mod tests {
         let config = autonat_config();
         assert!(!config.use_connected);
         let defaults = libp2p::autonat::Config::default();
-        assert_eq!(config, libp2p::autonat::Config { use_connected: false, ..defaults });
+        assert_eq!(
+            config,
+            libp2p::autonat::Config {
+                use_connected: false,
+                ..defaults
+            }
+        );
     }
 }

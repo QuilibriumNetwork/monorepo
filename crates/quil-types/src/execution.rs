@@ -59,7 +59,10 @@ impl ShardPath {
     /// A shard whose filter could not be decoded. It is treated as covering
     /// only part of the application, so nothing that needs the whole of it
     /// runs there.
-    pub const UNKNOWN: Self = Self { bits: 0, len: u8::MAX };
+    pub const UNKNOWN: Self = Self {
+        bits: 0,
+        len: u8::MAX,
+    };
     /// Longest path a shard can carry.
     pub const MAX_BITS: usize = 64;
 
@@ -68,10 +71,21 @@ impl ShardPath {
         if bits.len() > Self::MAX_BITS {
             return Self::UNKNOWN;
         }
-        let packed = bits.iter().enumerate().fold(0u64, |acc, (i, bit)| {
-            if *bit { acc | (1u64 << (63 - i)) } else { acc }
-        });
-        Self { bits: packed, len: bits.len() as u8 }
+        let packed =
+            bits.iter().enumerate().fold(
+                0u64,
+                |acc, (i, bit)| {
+                    if *bit {
+                        acc | (1u64 << (63 - i))
+                    } else {
+                        acc
+                    }
+                },
+            );
+        Self {
+            bits: packed,
+            len: bits.len() as u8,
+        }
     }
 
     /// Whether the shard holds the whole application.
@@ -97,7 +111,11 @@ impl ShardPath {
             return (len == u8::MAX && bits == 0).then_some(Self::UNKNOWN);
         }
         // Only the named bits may be set: one path, one encoding.
-        let used = if len == 0 { 0 } else { u64::MAX << (64 - u32::from(len)) };
+        let used = if len == 0 {
+            0
+        } else {
+            u64::MAX << (64 - u32::from(len))
+        };
         (bits & !used == 0).then_some(Self { bits, len })
     }
 
@@ -121,7 +139,11 @@ impl ShardPath {
         if usize::from(self.len) > Self::MAX_BITS {
             return None;
         }
-        Some((0..usize::from(self.len)).map(|i| self.bits & (1u64 << (63 - i)) != 0).collect())
+        Some(
+            (0..usize::from(self.len))
+                .map(|i| self.bits & (1u64 << (63 - i)) != 0)
+                .collect(),
+        )
     }
 }
 
@@ -134,8 +156,16 @@ mod shard_path_bytes_tests {
         let address = [0b1011_0000u8, 0xff];
         assert!(ShardPath::WHOLE.covers(&address));
         assert!(!ShardPath::UNKNOWN.covers(&address));
-        let partition = [vec![false], vec![true, false, false], vec![true, false, true], vec![true, true]];
-        let covering: Vec<_> = partition.iter().filter(|bits| ShardPath::from_bits(bits).covers(&address)).collect();
+        let partition = [
+            vec![false],
+            vec![true, false, false],
+            vec![true, false, true],
+            vec![true, true],
+        ];
+        let covering: Vec<_> = partition
+            .iter()
+            .filter(|bits| ShardPath::from_bits(bits).covers(&address))
+            .collect();
         assert_eq!(covering, vec![&vec![true, false, true]]);
         // A path longer than the address cannot be decided, so it does not cover.
         assert!(!ShardPath::from_bits(&[true; 9]).covers(&[0xff]));
@@ -146,12 +176,23 @@ mod shard_path_bytes_tests {
     /// writes is accepted back.
     #[test]
     fn a_shard_path_round_trips_and_rejects_other_encodings() {
-        for bits in [vec![], vec![false], vec![true], vec![true, false, true, true, false, true]] {
+        for bits in [
+            vec![],
+            vec![false],
+            vec![true],
+            vec![true, false, true, true, false, true],
+        ] {
             let path = ShardPath::from_bits(&bits);
             assert_eq!(ShardPath::from_bytes(&path.to_bytes()), Some(path));
         }
-        assert_eq!(ShardPath::from_bytes(&ShardPath::WHOLE.to_bytes()), Some(ShardPath::WHOLE));
-        assert_eq!(ShardPath::from_bytes(&ShardPath::UNKNOWN.to_bytes()), Some(ShardPath::UNKNOWN));
+        assert_eq!(
+            ShardPath::from_bytes(&ShardPath::WHOLE.to_bytes()),
+            Some(ShardPath::WHOLE)
+        );
+        assert_eq!(
+            ShardPath::from_bytes(&ShardPath::UNKNOWN.to_bytes()),
+            Some(ShardPath::UNKNOWN)
+        );
         // Bits below the path's length are not part of it.
         let mut noncanonical = ShardPath::from_bits(&[true, false]).to_bytes();
         noncanonical[8] |= 1;
@@ -213,12 +254,7 @@ pub trait ShardExecutionEngine: Send + Sync {
     fn get_name(&self) -> &str;
 
     /// Validate a message before processing.
-    fn validate_message(
-        &self,
-        frame_number: u64,
-        address: &[u8],
-        message: &[u8],
-    ) -> Result<()>;
+    fn validate_message(&self, frame_number: u64, address: &[u8], message: &[u8]) -> Result<()>;
 
     /// Process a message against current state.
     fn process_message(
@@ -250,12 +286,7 @@ pub trait ShardExecutionEngine: Send + Sync {
     ) -> Result<proto::global::MessageRequest>;
 
     /// Lock addresses for cross-shard transaction processing.
-    fn lock(
-        &self,
-        frame_number: u64,
-        address: &[u8],
-        message: &[u8],
-    ) -> Result<Vec<Vec<u8>>>;
+    fn lock(&self, frame_number: u64, address: &[u8], message: &[u8]) -> Result<Vec<Vec<u8>>>;
 
     /// Release any locks held by the engine.
     fn unlock(&self) -> Result<()>;
@@ -294,7 +325,10 @@ mod shard_path_tests {
         // not tell apart from the whole application.
         assert!(!ShardPath::from_bits(&[false]).is_whole());
         // Leading zero bits are part of the path, not padding.
-        assert_ne!(ShardPath::from_bits(&[false]), ShardPath::from_bits(&[false, false]));
+        assert_ne!(
+            ShardPath::from_bits(&[false]),
+            ShardPath::from_bits(&[false, false])
+        );
         // Too long to hold, or undecodable: partial, never whole.
         assert_eq!(ShardPath::from_bits(&[true; 65]), ShardPath::UNKNOWN);
         assert!(!ShardPath::UNKNOWN.is_whole());

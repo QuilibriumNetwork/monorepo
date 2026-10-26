@@ -77,7 +77,11 @@ impl HashReplica {
         };
         let (cap, used) = take(rest)?;
         let (registration_root, used2) = take(&rest[used..])?;
-        Some(Self { cap, registration_root, replica: rest[used + used2..].to_vec() })
+        Some(Self {
+            cap,
+            registration_root,
+            replica: rest[used + used2..].to_vec(),
+        })
     }
 }
 
@@ -105,7 +109,14 @@ impl ReplicaStore {
     /// Persist a hash-proof epoch's leaf: the replica with the Merkle cap that,
     /// with it, opens any node (`quil_crypto::storage_proof::MerkleCap`), and
     /// the registration root it was registered with.
-    pub fn put_hash(&self, epoch: u64, leaf_id: &[u8], replica: &[u8], cap: &[u8], registration_root: &[u8]) -> Result<()> {
+    pub fn put_hash(
+        &self,
+        epoch: u64,
+        leaf_id: &[u8],
+        replica: &[u8],
+        cap: &[u8],
+        registration_root: &[u8],
+    ) -> Result<()> {
         let mut value = Vec::with_capacity(9 + cap.len() + registration_root.len() + replica.len());
         value.push(HASH_REPLICA_TAG);
         value.extend_from_slice(&(cap.len() as u32).to_be_bytes());
@@ -119,7 +130,10 @@ impl ReplicaStore {
     /// A hash-proof epoch's leaf as [`Self::put_hash`] stored it, or `None`
     /// (also for a replica stored without its cap).
     pub fn get_hash(&self, epoch: u64, leaf_id: &[u8]) -> Result<Option<HashReplica>> {
-        Ok(self.db.get(&replica_key(epoch, leaf_id))?.and_then(|value| HashReplica::decode(&value)))
+        Ok(self
+            .db
+            .get(&replica_key(epoch, leaf_id))?
+            .and_then(|value| HashReplica::decode(&value)))
     }
 
     /// Record the leaf prefixes of shard `filter` as snapshotted for `epoch`'s
@@ -138,12 +152,18 @@ impl ReplicaStore {
 
     /// The leaf prefixes [`Self::put_partition`] recorded, or `None`.
     pub fn get_partition(&self, epoch: u64, filter: &[u8]) -> Result<Option<Vec<Vec<u32>>>> {
-        let Some(value) = self.db.get(&meta_key(PARTITION, epoch, filter))? else { return Ok(None) };
-        let mut words = value.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+        let Some(value) = self.db.get(&meta_key(PARTITION, epoch, filter))? else {
+            return Ok(None);
+        };
+        let mut words = value
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
         let count = words.next().unwrap_or(0);
         let mut prefixes = Vec::with_capacity(count as usize);
         for _ in 0..count {
-            let Some(len) = words.next() else { return Ok(None) };
+            let Some(len) = words.next() else {
+                return Ok(None);
+            };
             let prefix: Vec<u32> = words.by_ref().take(len as usize).collect();
             if prefix.len() != len as usize {
                 return Ok(None);
@@ -156,7 +176,8 @@ impl ReplicaStore {
     /// Record the snapshot sources (encoded) shard `filter`'s leaves for
     /// `epoch` were read from.
     pub fn put_snapshot_sources(&self, epoch: u64, filter: &[u8], sources: &[u8]) -> Result<()> {
-        self.db.set(&meta_key(SNAPSHOT_SOURCES, epoch, filter), sources)
+        self.db
+            .set(&meta_key(SNAPSHOT_SOURCES, epoch, filter), sources)
     }
 
     /// What [`Self::put_snapshot_sources`] recorded, or `None`.
@@ -181,18 +202,15 @@ impl ReplicaStore {
         // delete_range is [lo, hi): epochs 0..keep_from.
         self.db.delete_range(&lo, &hi)?;
         for kind in [PARTITION, SNAPSHOT_SOURCES] {
-            self.db.delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
+            self.db
+                .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
         }
         Ok(())
     }
 
     /// Iterate `(leaf_id, replica)` for every leaf stored under `epoch`. Used by
     /// the per-frame producer to answer challenges for the active epoch.
-    pub fn for_each_in_epoch(
-        &self,
-        epoch: u64,
-        mut f: impl FnMut(Vec<u8>, Vec<u8>),
-    ) -> Result<()> {
+    pub fn for_each_in_epoch(&self, epoch: u64, mut f: impl FnMut(Vec<u8>, Vec<u8>)) -> Result<()> {
         let (lo, hi) = epoch_bounds(epoch);
         let mut iter = self.db.new_iter(&lo, &hi)?;
         let prefix_len = 1 + 8; // STORAGE_REPLICA + epoch
@@ -225,7 +243,10 @@ mod tests {
         let leaf = b"leaf-a";
         assert_eq!(s.get(3, leaf).unwrap(), None);
         s.put(3, leaf, b"replica-bytes").unwrap();
-        assert_eq!(s.get(3, leaf).unwrap().as_deref(), Some(&b"replica-bytes"[..]));
+        assert_eq!(
+            s.get(3, leaf).unwrap().as_deref(),
+            Some(&b"replica-bytes"[..])
+        );
         s.delete(3, leaf).unwrap();
         assert_eq!(s.get(3, leaf).unwrap(), None);
     }
@@ -233,10 +254,16 @@ mod tests {
     #[test]
     fn a_hash_replica_round_trips_and_a_plain_one_is_not_read_as_one() {
         let s = store();
-        s.put_hash(5, b"leaf", b"replica", b"cap-bytes", &[7u8; 96]).unwrap();
-        assert_eq!(s.get_hash(5, b"leaf").unwrap(), Some(HashReplica {
-            replica: b"replica".to_vec(), cap: b"cap-bytes".to_vec(), registration_root: vec![7u8; 96],
-        }));
+        s.put_hash(5, b"leaf", b"replica", b"cap-bytes", &[7u8; 96])
+            .unwrap();
+        assert_eq!(
+            s.get_hash(5, b"leaf").unwrap(),
+            Some(HashReplica {
+                replica: b"replica".to_vec(),
+                cap: b"cap-bytes".to_vec(),
+                registration_root: vec![7u8; 96],
+            })
+        );
         s.put(6, b"leaf", b"plain").unwrap();
         assert_eq!(s.get_hash(6, b"leaf").unwrap(), None);
         s.evict_below_epoch(6).unwrap();
@@ -251,8 +278,15 @@ mod tests {
         s.put_snapshot_sources(5, b"filter", b"sources").unwrap();
         s.put(5, b"filter", b"replica").unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), Some(prefixes));
-        assert_eq!(s.get_snapshot_sources(5, b"filter").unwrap().as_deref(), Some(&b"sources"[..]));
-        assert_eq!(s.get(5, b"filter").unwrap().as_deref(), Some(&b"replica"[..]), "beside, not over, the replica");
+        assert_eq!(
+            s.get_snapshot_sources(5, b"filter").unwrap().as_deref(),
+            Some(&b"sources"[..])
+        );
+        assert_eq!(
+            s.get(5, b"filter").unwrap().as_deref(),
+            Some(&b"replica"[..]),
+            "beside, not over, the replica"
+        );
         assert_eq!(s.get_partition(6, b"filter").unwrap(), None);
         s.evict_below_epoch(6).unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), None);

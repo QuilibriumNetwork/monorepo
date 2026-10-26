@@ -8,7 +8,6 @@ use quil_types::consensus::{
     epoch_for_frame, epoch_length_frames, AllocationPhase, EffectiveStatus, ProverAllocationInfo,
 };
 
-
 /// Whether `allocation` holds one of this node's allocation slots at `frame`
 /// for the configured worker count, bound to a worker or not: Active,
 /// Paused, Activating, or Leaving with its leave not yet confirmed. A
@@ -16,8 +15,12 @@ use quil_types::consensus::{
 /// is counted only with `departing`; a join not yet confirmed holds none.
 pub fn holds_seat(allocation: &ProverAllocationInfo, frame: u64, departing: bool) -> bool {
     match allocation.phase(frame) {
-        Some(AllocationPhase::Active | AllocationPhase::Paused | AllocationPhase::Activating
-            | AllocationPhase::Leaving) => true,
+        Some(
+            AllocationPhase::Active
+            | AllocationPhase::Paused
+            | AllocationPhase::Activating
+            | AllocationPhase::Leaving,
+        ) => true,
         Some(AllocationPhase::Departing) => departing,
         Some(AllocationPhase::Joining) | None => false,
     }
@@ -66,16 +69,26 @@ impl DrainSeat {
         selected: bool,
     ) -> Self {
         if filter.is_empty() {
-            return if pending_join { DrainSeat::Joining } else { DrainSeat::Idle };
+            return if pending_join {
+                DrainSeat::Joining
+            } else {
+                DrainSeat::Idle
+            };
         }
         let Some(allocation) = allocation else {
-            return if pending_join { DrainSeat::Joining } else { DrainSeat::Other };
+            return if pending_join {
+                DrainSeat::Joining
+            } else {
+                DrainSeat::Other
+            };
         };
         match allocation.effective_status(frame) {
             EffectiveStatus::Joining => DrainSeat::Joining,
-            EffectiveStatus::Leaving if allocation.leave_confirm_frame_number > 0 => DrainSeat::Departing {
-                departs_epoch: epoch_for_frame(allocation.leave_confirm_frame_number) + 1,
-            },
+            EffectiveStatus::Leaving if allocation.leave_confirm_frame_number > 0 => {
+                DrainSeat::Departing {
+                    departs_epoch: epoch_for_frame(allocation.leave_confirm_frame_number) + 1,
+                }
+            }
             EffectiveStatus::Leaving => DrainSeat::Leaving {
                 departs_epoch: epoch_for_frame(allocation.leave_frame_number) + 2,
             },
@@ -96,9 +109,13 @@ impl DrainSeat {
         match self {
             DrainSeat::Idle => "idle, retires at the next lifecycle tick".into(),
             DrainSeat::Joining => "joining".into(),
-            DrainSeat::Leaving { departs_epoch } => format!("leaving, departs at epoch {departs_epoch} once confirmed"),
+            DrainSeat::Leaving { departs_epoch } => {
+                format!("leaving, departs at epoch {departs_epoch} once confirmed")
+            }
             DrainSeat::Departing { departs_epoch } => format!("departing at epoch {departs_epoch}"),
-            DrainSeat::Proposed { since } => format!("leave proposed at frame {since}, not in the registry yet"),
+            DrainSeat::Proposed { since } => {
+                format!("leave proposed at frame {since}, not in the registry yet")
+            }
             DrainSeat::Shielded { active } => format!("shielded ({active} active provers)"),
             DrainSeat::Selected => "selected for the surplus leave".into(),
             DrainSeat::Kept => "kept, not surplus".into(),
@@ -111,7 +128,9 @@ impl DrainSeat {
     /// proposed leave that lands in its epoch departs two epochs on.
     pub(crate) fn departs_epoch(self) -> Option<u64> {
         match self {
-            DrainSeat::Leaving { departs_epoch } | DrainSeat::Departing { departs_epoch } => Some(departs_epoch),
+            DrainSeat::Leaving { departs_epoch } | DrainSeat::Departing { departs_epoch } => {
+                Some(departs_epoch)
+            }
             DrainSeat::Proposed { since } => Some(epoch_for_frame(since) + 2),
             _ => None,
         }
@@ -139,15 +158,34 @@ pub(crate) struct DrainSummary {
 
 impl DrainSummary {
     pub(crate) fn log(&self, frame: u64) {
-        let count = |pred: fn(&DrainSeat) -> bool| self.seats.iter().filter(|(_, _, seat)| pred(seat)).count();
-        let leaving = count(|seat| matches!(seat, DrainSeat::Leaving { .. } | DrainSeat::Departing { .. }));
+        let count = |pred: fn(&DrainSeat) -> bool| {
+            self.seats.iter().filter(|(_, _, seat)| pred(seat)).count()
+        };
+        let leaving = count(|seat| {
+            matches!(
+                seat,
+                DrainSeat::Leaving { .. } | DrainSeat::Departing { .. }
+            )
+        });
         let proposed = count(|seat| matches!(seat, DrainSeat::Proposed { .. }));
         let held = count(|seat| matches!(seat, DrainSeat::Shielded { .. }));
-        let seats: Vec<String> = self.seats.iter().map(|(core_id, filter, seat)| {
-            let filter = if filter.is_empty() { "-".to_string() } else { hex::encode(filter) };
-            format!("core {core_id} {filter}: {}", seat.describe())
-        }).collect();
-        let last_departure_epoch = self.seats.iter().filter_map(|(_, _, seat)| seat.departs_epoch()).max();
+        let seats: Vec<String> = self
+            .seats
+            .iter()
+            .map(|(core_id, filter, seat)| {
+                let filter = if filter.is_empty() {
+                    "-".to_string()
+                } else {
+                    hex::encode(filter)
+                };
+                format!("core {core_id} {filter}: {}", seat.describe())
+            })
+            .collect();
+        let last_departure_epoch = self
+            .seats
+            .iter()
+            .filter_map(|(_, _, seat)| seat.departs_epoch())
+            .max();
         tracing::info!(
             frame,
             epoch = epoch_for_frame(frame),
@@ -170,8 +208,17 @@ impl DrainSummary {
              surplus, or none is) and stays until it departs; a joining seat drains once its join is confirmed \
              or expires"
         );
-        let stalled: Vec<String> = self.seats.iter().filter(|(_, _, seat)| seat.stalled(frame))
-            .map(|(core_id, filter, seat)| format!("core {core_id} {}: {}", hex::encode(filter), seat.describe()))
+        let stalled: Vec<String> = self
+            .seats
+            .iter()
+            .filter(|(_, _, seat)| seat.stalled(frame))
+            .map(|(core_id, filter, seat)| {
+                format!(
+                    "core {core_id} {}: {}",
+                    hex::encode(filter),
+                    seat.describe()
+                )
+            })
             .collect();
         if !stalled.is_empty() {
             tracing::warn!(

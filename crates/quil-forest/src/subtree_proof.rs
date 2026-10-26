@@ -33,7 +33,9 @@ impl CompactProof {
     /// From a proof of [`crate::Forest::shard_phase_get_with_proof_raw`].
     pub fn of(proof: &SparseMerkleProof<Sha256>) -> Self {
         Self {
-            leaf: proof.leaf().map(|leaf| (leaf.key_bytes(), leaf.value_hash_bytes())),
+            leaf: proof
+                .leaf()
+                .map(|leaf| (leaf.key_bytes(), leaf.value_hash_bytes())),
             siblings: proof.sibling_hashes(),
         }
     }
@@ -58,9 +60,10 @@ impl CompactProof {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (leaf, rest) = match bytes.split_first()? {
             (0, rest) => (None, rest),
-            (1, rest) if rest.len() >= 64 => {
-                (Some((rest[..32].try_into().ok()?, rest[32..64].try_into().ok()?)), &rest[64..])
-            }
+            (1, rest) if rest.len() >= 64 => (
+                Some((rest[..32].try_into().ok()?, rest[32..64].try_into().ok()?)),
+                &rest[64..],
+            ),
             _ => return None,
         };
         let count = u16::from_be_bytes(rest.get(..2)?.try_into().ok()?) as usize;
@@ -68,7 +71,10 @@ impl CompactProof {
         if count > 256 || rest.len() != 32 * count {
             return None;
         }
-        let siblings = rest.chunks_exact(32).map(|sibling| sibling.try_into().expect("32 bytes")).collect();
+        let siblings = rest
+            .chunks_exact(32)
+            .map(|sibling| sibling.try_into().expect("32 bytes"))
+            .collect();
         Some(Self { leaf, siblings })
     }
 }
@@ -97,12 +103,21 @@ pub fn subtree_root(proof: &CompactProof, key: &[u8; 32], depth: usize) -> Optio
             return None;
         }
     }
-    let at_leaf = proof.leaf.as_ref().map_or(EMPTY_ROOT, |(leaf_key, value_hash)| leaf_hash(leaf_key, value_hash));
+    let at_leaf = proof
+        .leaf
+        .as_ref()
+        .map_or(EMPTY_ROOT, |(leaf_key, value_hash)| {
+            leaf_hash(leaf_key, value_hash)
+        });
     Some(if depth >= siblings.len() {
         // At or below where the proof ends, the region holds its one leaf
         // if that leaf shares the subtree's bits, else nothing.
         match &proof.leaf {
-            Some((leaf_key, _)) if depth == siblings.len() || common_prefix_bits(leaf_key, key) >= depth => at_leaf,
+            Some((leaf_key, _))
+                if depth == siblings.len() || common_prefix_bits(leaf_key, key) >= depth =>
+            {
+                at_leaf
+            }
             _ => EMPTY_ROOT,
         }
     } else {
@@ -155,26 +170,49 @@ mod tests {
         let mut shards = std::collections::BTreeMap::new();
         let leaves: Vec<(Vec<u8>, Vec<u8>)> = keys
             .iter()
-            .map(|key| (key.to_vec(), quil_tries::vertex_leaf_value(&[key[0]; 12]).unwrap()))
+            .map(|key| {
+                (
+                    key.to_vec(),
+                    quil_tries::vertex_leaf_value(&[key[0]; 12]).unwrap(),
+                )
+            })
             .collect();
         shards.insert(Vec::new(), [leaves, Vec::new(), Vec::new(), Vec::new()]);
         forest.commit_app_shards(&app, 1, 0, shards).unwrap();
         let mut probes = keys.clone();
         probes.extend([[0x20u8; 32], [0x9Au8; 32], [0xC3u8; 32]]);
         for probe in &probes {
-            let (value, proof) = forest.shard_phase_get_with_proof_raw(&app, Phase::VertexAdds, 1, probe).unwrap();
+            let (value, proof) = forest
+                .shard_phase_get_with_proof_raw(&app, Phase::VertexAdds, 1, probe)
+                .unwrap();
             let proof = CompactProof::of(&proof);
-            assert_eq!(CompactProof::from_bytes(&proof.to_bytes()), Some(proof.clone()));
+            assert_eq!(
+                CompactProof::from_bytes(&proof.to_bytes()),
+                Some(proof.clone())
+            );
             for depth in 0..=12 {
-                let bits: Vec<bool> = (0..depth).map(|i| probe[i / 8] & (0x80 >> (i % 8)) != 0).collect();
-                let expected = forest.app_subtree_root(&app, Phase::VertexAdds, 1, &bits).unwrap();
+                let bits: Vec<bool> = (0..depth)
+                    .map(|i| probe[i / 8] & (0x80 >> (i % 8)) != 0)
+                    .collect();
+                let expected = forest
+                    .app_subtree_root(&app, Phase::VertexAdds, 1, &bits)
+                    .unwrap();
                 let root = subtree_root(&proof, probe, depth).unwrap();
-                assert!(same_root(&root, &expected), "probe {:02x} depth {depth}: {:?} vs {:?}", probe[0], root, expected);
+                assert!(
+                    same_root(&root, &expected),
+                    "probe {:02x} depth {depth}: {:?} vs {:?}",
+                    probe[0],
+                    root,
+                    expected
+                );
             }
             match (&value, &proof.leaf) {
                 (Some(value), Some((key, value_hash))) => {
                     assert_eq!(key, probe);
-                    assert_eq!(*value_hash, <Sha256 as sha2::Digest>::digest(value).as_slice());
+                    assert_eq!(
+                        *value_hash,
+                        <Sha256 as sha2::Digest>::digest(value).as_slice()
+                    );
                 }
                 (None, Some((key, _))) => assert_ne!(key, probe),
                 (None, None) => {}
@@ -183,8 +221,15 @@ mod tests {
             let mut forged = proof.clone();
             if let Some(sibling) = forged.siblings.first_mut() {
                 sibling[0] ^= 1;
-                assert!(!same_root(&subtree_root(&forged, probe, 0).unwrap(),
-                    &forest.app_subtree_root(&app, Phase::VertexAdds, 1, &[]).unwrap()), "a changed sibling");
+                assert!(
+                    !same_root(
+                        &subtree_root(&forged, probe, 0).unwrap(),
+                        &forest
+                            .app_subtree_root(&app, Phase::VertexAdds, 1, &[])
+                            .unwrap()
+                    ),
+                    "a changed sibling"
+                );
             }
         }
     }

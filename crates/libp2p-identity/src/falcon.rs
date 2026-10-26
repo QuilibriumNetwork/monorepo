@@ -9,9 +9,9 @@
 //! verifying key; `PrivateKey.Data` carries the 1281-byte encoded signing key.
 
 use fn_dsa::{
-    sign_key_size, signature_size, vrfy_key_size, KeyPairGenerator,
-    KeyPairGeneratorStandard, SigningKey, SigningKeyStandard, VerifyingKey,
-    VerifyingKeyStandard, DOMAIN_NONE, FN_DSA_LOGN_512, HASH_ID_RAW,
+    sign_key_size, signature_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard,
+    SigningKey, SigningKeyStandard, VerifyingKey, VerifyingKeyStandard, DOMAIN_NONE,
+    FN_DSA_LOGN_512, HASH_ID_RAW,
 };
 
 use crate::error::{DecodingError, SigningError};
@@ -45,7 +45,12 @@ impl Keypair {
         let mut kg = KeyPairGeneratorStandard::default();
         let mut signing_key = vec![0u8; sign_key_size(LOGN)];
         let mut vrfy_key = vec![0u8; vrfy_key_size(LOGN)];
-        kg.keygen(LOGN, &mut rand::thread_rng(), &mut signing_key, &mut vrfy_key);
+        kg.keygen(
+            LOGN,
+            &mut rand::thread_rng(),
+            &mut signing_key,
+            &mut vrfy_key,
+        );
         Self {
             signing_key,
             public: PublicKey { bytes: vrfy_key },
@@ -76,7 +81,13 @@ impl Keypair {
         let mut sk = SigningKeyStandard::decode(&self.signing_key)
             .ok_or_else(|| SigningError::new("Falcon signing key decode failed"))?;
         let mut sig = vec![0u8; signature_size(sk.get_logn())];
-        sk.sign(&mut rand::thread_rng(), &DOMAIN_NONE, &HASH_ID_RAW, msg, &mut sig);
+        sk.sign(
+            &mut rand::thread_rng(),
+            &DOMAIN_NONE,
+            &HASH_ID_RAW,
+            msg,
+            &mut sig,
+        );
         Ok(sig)
     }
 

@@ -73,8 +73,12 @@ pub fn escrow_bytes(context: &[u8; 32]) -> Result<u64> {
         refund: [0; FALCON_PUBLIC_BYTES],
         refund_after_global_frame: 0,
     };
-    let recovery = EscrowRecoveryMemo { owner: [0; IDENTITY_BYTES], ciphertext: [0; MEMO_BYTES] };
-    let (_, tree) = super::escrow::create_escrow(context, 0, &placeholder_output()?, &policy, &recovery)?;
+    let recovery = EscrowRecoveryMemo {
+        owner: [0; IDENTITY_BYTES],
+        ciphertext: [0; MEMO_BYTES],
+    };
+    let (_, tree) =
+        super::escrow::create_escrow(context, 0, &placeholder_output()?, &policy, &recovery)?;
     serialized(&tree)
 }
 
@@ -86,7 +90,11 @@ pub fn shape_growth(context: &[u8; 32], shape: Shape) -> Result<u64> {
     let markers = marker_bytes()?
         .checked_mul(shape.markers as u64)
         .ok_or_else(|| QuilError::InvalidArgument("cost overflow".into()))?;
-    let escrow = if shape.escrow { escrow_bytes(context)? } else { 0 };
+    let escrow = if shape.escrow {
+        escrow_bytes(context)?
+    } else {
+        0
+    };
     coins
         .checked_add(markers)
         .and_then(|sum| sum.checked_add(escrow))
@@ -102,41 +110,86 @@ pub fn shape(bytes: &[u8]) -> Result<([u8; 32], Shape)> {
     let context = parameter_context(&network, &application);
     let shape = match u32::from_be_bytes(bytes[..4].try_into().unwrap()) {
         0x0512 => {
-            let s = Transfer::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
-            Shape { coins: s.outputs.len(), markers: s.images.len(), escrow: false }
+            let s = Transfer::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement;
+            Shape {
+                coins: s.outputs.len(),
+                markers: s.images.len(),
+                escrow: false,
+            }
         }
         0x0513 if &bytes[4..12] == custom_mint::VERSION => {
-            let s = CustomMint::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
+            let s = CustomMint::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement;
             // The receipt marker, plus the entitlement's consumption marker
             // under the proof basis.
-            Shape { coins: s.outputs.len(), markers: 1 + usize::from(!s.entitlement_proof.is_empty()), escrow: false }
+            Shape {
+                coins: s.outputs.len(),
+                markers: 1 + usize::from(!s.entitlement_proof.is_empty()),
+                escrow: false,
+            }
         }
         0x0513 => {
-            let s = Mint::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
-            Shape { coins: s.outputs.len(), markers: 1, escrow: false }
+            let s = Mint::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement;
+            Shape {
+                coins: s.outputs.len(),
+                markers: 1,
+                escrow: false,
+            }
         }
         0x0514 => {
-            let s = PendingCreate::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
+            let s = PendingCreate::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement;
             // One of the funding outputs is the escrow; the rest are change coins.
             let change = s.funding.outputs.len().saturating_sub(1);
-            Shape { coins: change, markers: s.funding.images.len(), escrow: true }
+            Shape {
+                coins: change,
+                markers: s.funding.images.len(),
+                escrow: true,
+            }
         }
         0x0515 => {
-            let s = PendingClaim::decode(bytes, &network, &application).map_err(|_| invalid())?.statement;
-            Shape { coins: s.outputs.len(), markers: 1, escrow: false }
+            let s = PendingClaim::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement;
+            Shape {
+                coins: s.outputs.len(),
+                markers: 1,
+                escrow: false,
+            }
         }
         // One consumed marker per legacy source.
         0x0516 => {
             let s = AnyShield::decode(bytes, &network, &application).map_err(|_| invalid())?;
-            Shape { coins: s.outputs().len(), markers: s.sources().len(), escrow: false }
+            Shape {
+                coins: s.outputs().len(),
+                markers: s.sources().len(),
+                escrow: false,
+            }
         }
         0x0517 => {
             let c = MintClaim::decode(bytes, &network, &application).map_err(|_| invalid())?;
-            Shape { coins: c.outputs.len(), markers: 1, escrow: false }
+            Shape {
+                coins: c.outputs.len(),
+                markers: 1,
+                escrow: false,
+            }
         }
         0x0518 => {
-            let s = Settlement::decode(bytes, &network, &application).map_err(|_| invalid())?.statement.funding;
-            Shape { coins: s.outputs.len(), markers: s.images.len(), escrow: false }
+            let s = Settlement::decode(bytes, &network, &application)
+                .map_err(|_| invalid())?
+                .statement
+                .funding;
+            Shape {
+                coins: s.outputs.len(),
+                markers: s.images.len(),
+                escrow: false,
+            }
         }
         _ => return Err(invalid()),
     };
@@ -179,12 +232,34 @@ mod tests {
         assert!(marker > 0 && marker < 128);
         assert!(escrow > coin);
         // A different context changes addresses, not record sizes.
-        assert_eq!(coin, coin_bytes(&parameter_context(&[3; 32], &[4; 32])).unwrap());
         assert_eq!(
-            shape_growth(&context, Shape { coins: 2, markers: 4, escrow: true }).unwrap(),
+            coin,
+            coin_bytes(&parameter_context(&[3; 32], &[4; 32])).unwrap()
+        );
+        assert_eq!(
+            shape_growth(
+                &context,
+                Shape {
+                    coins: 2,
+                    markers: 4,
+                    escrow: true
+                }
+            )
+            .unwrap(),
             2 * coin + 4 * marker + escrow
         );
-        assert_eq!(shape_growth(&context, Shape { coins: 0, markers: 0, escrow: false }).unwrap(), 0);
+        assert_eq!(
+            shape_growth(
+                &context,
+                Shape {
+                    coins: 0,
+                    markers: 0,
+                    escrow: false
+                }
+            )
+            .unwrap(),
+            0
+        );
     }
 
     /// A batch shield pays one consumed marker per source, beside its coins.
@@ -199,18 +274,43 @@ mod tests {
         let opening = AmountOpening::from_seed(&context, &[3; 32]);
         let mut proof = vec![0; 64];
         proof[..8].copy_from_slice(b"QPF6\0\0\0\0");
-        let sources: Vec<ShieldSource> = (1..=5u8).map(|i| ShieldSource { address: [i; 32], amount: 100 }).collect();
+        let sources: Vec<ShieldSource> = (1..=5u8)
+            .map(|i| ShieldSource {
+                address: [i; 32],
+                amount: 100,
+            })
+            .collect();
         let bytes = BatchShield {
             statement: BatchShieldStatement {
-                network, application, owner_public_key: [4; 57], sources, fee: 1,
-                outputs: vec![Output { commitment: CommitmentKey::derive(&context).commit(499, &opening), owner: [6; IDENTITY_BYTES], memo: [7; MEMO_BYTES] }],
+                network,
+                application,
+                owner_public_key: [4; 57],
+                sources,
+                fee: 1,
+                outputs: vec![Output {
+                    commitment: CommitmentKey::derive(&context).commit(499, &opening),
+                    owner: [6; IDENTITY_BYTES],
+                    memo: [7; MEMO_BYTES],
+                }],
             },
             signature: [8; 114],
             proof,
-        }.encode().unwrap();
+        }
+        .encode()
+        .unwrap();
         let (priced_context, priced) = shape(&bytes).unwrap();
         assert_eq!(priced_context, context);
-        assert_eq!(priced, Shape { coins: 1, markers: 5, escrow: false });
-        assert_eq!(state_growth(&bytes).unwrap(), coin_bytes(&context).unwrap() + 5 * marker_bytes().unwrap());
+        assert_eq!(
+            priced,
+            Shape {
+                coins: 1,
+                markers: 5,
+                escrow: false
+            }
+        );
+        assert_eq!(
+            state_growth(&bytes).unwrap(),
+            coin_bytes(&context).unwrap() + 5 * marker_bytes().unwrap()
+        );
     }
 }

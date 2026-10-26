@@ -1,9 +1,9 @@
-pub mod types;
+pub mod ast;
 pub mod circuit;
 pub mod circuits;
-pub mod mpa;
-pub mod lexer;
-pub mod ast;
-pub mod ssa;
-pub mod parser;
 pub mod compiler;
+pub mod lexer;
+pub mod mpa;
+pub mod parser;
+pub mod ssa;
+pub mod types;

@@ -147,8 +147,16 @@ where
     // 1. PQNoise pqxx handshake (forward secrecy via ephemeral sntrup761 KEM).
     let static_kem = Sntrup761::genkey()
         .map_err(|e| PqNoiseError::Handshake(format!("sntrup761 keygen: {:?}", e)))?;
-    let mut hs = Handshake::new(noise_pqxx(), &[], initiator, Some(static_kem), None, None, None)
-        .map_err(|e| PqNoiseError::Handshake(format!("{:?}", e)))?;
+    let mut hs = Handshake::new(
+        noise_pqxx(),
+        &[],
+        initiator,
+        Some(static_kem),
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| PqNoiseError::Handshake(format!("{:?}", e)))?;
 
     let mut buf = vec![0u8; clatter::constants::MAX_MESSAGE_LEN];
     let mut my_turn = initiator;
@@ -230,7 +238,10 @@ fn sign_self_verified(
     mut sign: impl FnMut(&[u8]) -> Result<Vec<u8>, PqNoiseError>,
     verify: impl Fn(&[u8], &[u8]) -> bool,
 ) -> Result<Vec<u8>, PqNoiseError> {
-    let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("unnamed")
+        .to_string();
     for attempt in 1..=ID_SIG_ATTEMPTS {
         let sig = sign(msg)?;
         if verify(msg, &sig) {
@@ -496,7 +507,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PqOutput<T> {
 
         if this.send_offset > 0 {
             ready!(io.as_mut().poll_ready(cx))?;
-            io.as_mut().start_send(&this.send_buffer[..this.send_offset])?;
+            io.as_mut()
+                .start_send(&this.send_buffer[..this.send_offset])?;
             this.send_offset = 0;
         }
         io.as_mut().poll_flush(cx)
@@ -588,7 +600,10 @@ mod tests {
             public.verify(m, s)
         })
         .unwrap();
-        assert!(public.verify(b"msg", &sig), "the rescued signature must verify");
+        assert!(
+            public.verify(b"msg", &sig),
+            "the rescued signature must verify"
+        );
         assert_eq!(calls.get(), 2);
     }
 
@@ -601,8 +616,13 @@ mod tests {
             public.verify(m, s)
         })
         .unwrap_err();
-        assert!(matches!(err, PqNoiseError::SelfVerification { attempts: 3, .. }), "{err}");
-        assert!(err.to_string().contains("our own Falcon signature failed self-verification"));
+        assert!(
+            matches!(err, PqNoiseError::SelfVerification { attempts: 3, .. }),
+            "{err}"
+        );
+        assert!(err
+            .to_string()
+            .contains("our own Falcon signature failed self-verification"));
         assert_eq!(calls.get(), ID_SIG_ATTEMPTS);
     }
 }

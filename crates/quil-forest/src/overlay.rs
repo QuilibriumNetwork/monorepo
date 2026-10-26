@@ -15,8 +15,8 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Result};
@@ -90,7 +90,10 @@ pub struct ExecutionViewAdmission {
 /// Views held when no policy is configured: generous for one per worker core
 /// plus the GLOBAL paths, small enough to stop a leak.
 fn default_max_views() -> usize {
-    std::thread::available_parallelism().map_or(16, |n| n.get()).saturating_mul(4).max(64)
+    std::thread::available_parallelism()
+        .map_or(16, |n| n.get())
+        .saturating_mul(4)
+        .max(64)
 }
 
 /// A private parent is released once canonical execution passes it, and a
@@ -99,10 +102,16 @@ fn default_max_views() -> usize {
 pub const DEFAULT_EXECUTION_VIEW_MAX_AGE: Duration = Duration::from_secs(600);
 
 static PROCESS_ADMISSION: LazyLock<Arc<ExecutionViewAdmission>> = LazyLock::new(|| {
-    let setting = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0);
+    let setting = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    };
     ExecutionViewAdmission::new(
         setting("QUIL_EXECUTION_VIEW_MAX").map_or_else(default_max_views, |v| v as usize),
-        setting("QUIL_EXECUTION_VIEW_MAX_AGE_SECS").map_or(DEFAULT_EXECUTION_VIEW_MAX_AGE, Duration::from_secs),
+        setting("QUIL_EXECUTION_VIEW_MAX_AGE_SECS")
+            .map_or(DEFAULT_EXECUTION_VIEW_MAX_AGE, Duration::from_secs),
     )
 });
 
@@ -126,7 +135,10 @@ impl ExecutionViewAdmission {
     /// expire under the new age.
     pub fn set_policy(&self, max_views: usize, max_age: Duration) {
         self.max_views.store(max_views, Ordering::Release);
-        self.max_age_ms.store(max_age.as_millis().min(u64::MAX as u128) as u64, Ordering::Release);
+        self.max_age_ms.store(
+            max_age.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
     }
 
     pub fn active(&self) -> usize {
@@ -149,13 +161,18 @@ impl ExecutionViewAdmission {
             view.drop_idle_iterators();
         }
         let max_age = self.max_age();
-        views.iter().filter(|view| view.captured.elapsed() > max_age && view.release()).count()
+        views
+            .iter()
+            .filter(|view| view.captured.elapsed() > max_age && view.release())
+            .count()
     }
 
     fn acquire(&self) -> Result<()> {
         let limit = self.max_views.load(Ordering::Acquire);
         self.active
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1).filter(|next| *next <= limit))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(1).filter(|next| *next <= limit)
+            })
             .map(|_| ())
             .map_err(|_| anyhow::anyhow!("execution view admission limit ({limit} held views)"))
     }
@@ -227,13 +244,20 @@ impl PinnedSnapshot {
             #[cfg(test)]
             iterators_created: AtomicUsize::new(0),
         });
-        admission.live.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::downgrade(&view));
+        admission
+            .live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::downgrade(&view));
         Ok(view)
     }
 
     /// The pinned view for one read, released first if it outlived its age.
     fn view(&self) -> Result<HeldView<'_>> {
-        let held = self.snapshot.lock().map_err(|_| anyhow::anyhow!("execution view lock poisoned"))?;
+        let held = self
+            .snapshot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution view lock poisoned"))?;
         ensure!(held.is_some(), "execution view expired and was released");
         if self.captured.elapsed() > self.admission.max_age() {
             drop(held);
@@ -245,23 +269,42 @@ impl PinnedSnapshot {
 
     /// A parked iterator with exactly these bounds, else a new one. The caller
     /// holds `view` and parks the iterator again before dropping it.
-    fn take_iterator(&self, view: &HeldView<'_>, lower: &[u8], upper: &[u8]) -> Result<ParkedIterator> {
-        let mut parked = self.iterators.lock().map_err(|_| anyhow::anyhow!("execution view lock poisoned"))?;
-        if let Some(index) = parked.iter().position(|p| p.lower == lower && p.upper == upper) {
+    fn take_iterator(
+        &self,
+        view: &HeldView<'_>,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Result<ParkedIterator> {
+        let mut parked = self
+            .iterators
+            .lock()
+            .map_err(|_| anyhow::anyhow!("execution view lock poisoned"))?;
+        if let Some(index) = parked
+            .iter()
+            .position(|p| p.lower == lower && p.upper == upper)
+        {
             return Ok(parked.swap_remove(index));
         }
         drop(parked);
         let mut options = rocksdb::ReadOptions::default();
         options.set_iterate_lower_bound(lower.to_vec());
         options.set_iterate_upper_bound(upper.to_vec());
-        let iterator = view.as_ref().expect("view() holds the snapshot").raw_iterator_opt(options);
+        let iterator = view
+            .as_ref()
+            .expect("view() holds the snapshot")
+            .raw_iterator_opt(options);
         #[cfg(test)]
         self.iterators_created.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the iterator reads through the DB, which `_db` keeps alive
         // and which drops after `iterators`, and through the snapshot, which
         // `release` takes only after emptying `iterators`.
         let iterator = unsafe { std::mem::transmute(iterator) };
-        Ok(ParkedIterator { lower: lower.to_vec(), upper: upper.to_vec(), parked_at: Instant::now(), iterator })
+        Ok(ParkedIterator {
+            lower: lower.to_vec(),
+            upper: upper.to_vec(),
+            parked_at: Instant::now(),
+            iterator,
+        })
     }
 
     /// Keep a healthy iterator for the next step. The caller still holds the
@@ -277,7 +320,9 @@ impl PinnedSnapshot {
         iterator.parked_at = Instant::now();
         let mut parked = self.iterators.lock().unwrap_or_else(|p| p.into_inner());
         let evicted = if parked.len() >= MAX_PARKED_ITERATORS {
-            (0..parked.len()).min_by_key(|&i| parked[i].parked_at).map(|oldest| parked.swap_remove(oldest))
+            (0..parked.len())
+                .min_by_key(|&i| parked[i].parked_at)
+                .map(|oldest| parked.swap_remove(oldest))
         } else {
             None
         };
@@ -300,7 +345,10 @@ impl PinnedSnapshot {
         let released = {
             let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
             // Parked iterators pin table files and refer to the snapshot.
-            self.iterators.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            self.iterators
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
             snapshot.take()
         };
         let held = released.is_some();
@@ -492,15 +540,19 @@ struct ForkPermit(Arc<ForkAdmission>);
 impl ForkAdmission {
     fn acquire(self: &Arc<Self>, limit: usize) -> Result<ForkPermit> {
         let limit = limit.min(self.limit);
-        self.active.try_update(Ordering::AcqRel, Ordering::Acquire,
-            |n| n.checked_add(1).filter(|next| *next <= limit))
+        self.active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(1).filter(|next| *next <= limit)
+            })
             .map_err(|_| anyhow::anyhow!("overlay descendant branch limit"))?;
         Ok(ForkPermit(self.clone()))
     }
 }
 
 impl Drop for ForkPermit {
-    fn drop(&mut self) { self.0.active.fetch_sub(1, Ordering::AcqRel); }
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One mutable execution branch. Clones of its Arc share that branch; they do
@@ -540,7 +592,10 @@ impl PreparedOverlayCommit {
         self.generation
     }
 
-    pub fn commit(self, destination: &crate::CoordinatedDb) -> Result<(), crate::DatabaseCommitError> {
+    pub fn commit(
+        self,
+        destination: &crate::CoordinatedDb,
+    ) -> Result<(), crate::DatabaseCommitError> {
         self.commit_locked(&mut destination.lock_writes()?)
     }
 
@@ -548,7 +603,10 @@ impl PreparedOverlayCommit {
     /// Any intervening general write rejects this plan before publication, as
     /// does a disjoint write (for example a clock candidate) to a prefix this
     /// branch touched. The owner must recapture/re-execute on conflict.
-    pub fn commit_locked(self, guard: &mut crate::DatabaseWriteGuard<'_>) -> Result<(), crate::DatabaseCommitError> {
+    pub fn commit_locked(
+        self,
+        guard: &mut crate::DatabaseWriteGuard<'_>,
+    ) -> Result<(), crate::DatabaseCommitError> {
         guard.commit_execution(&self.database, self.sequence, &self.touched, self.batch)
     }
 }
@@ -575,7 +633,10 @@ impl ExecutionOverlay {
                 cursors: 0,
                 touched: crate::KeyPrefixSet::default(),
             }),
-            family: Arc::new(ForkAdmission { active: AtomicUsize::new(0), limit: limits.max_cursors }),
+            family: Arc::new(ForkAdmission {
+                active: AtomicUsize::new(0),
+                limit: limits.max_cursors,
+            }),
             _fork_permit: None,
         })
     }
@@ -586,20 +647,31 @@ impl ExecutionOverlay {
     /// Abandoning the returned plan makes no durable changes.
     pub fn prepare_commit(&self) -> Result<PreparedOverlayCommit> {
         self.observe((|| {
-            ensure!(self.execution_healthy(), "failed execution overlay cannot publish");
+            ensure!(
+                self.execution_healthy(),
+                "failed execution overlay cannot publish"
+            );
             let mut inner = self.lock_inner()?;
-            let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            let base = inner
+                .base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
             let mut batch = rocksdb::WriteBatch::default();
             // Points override range tombstones in the delta, including a put
             // following a delete range. Preserve that ordering in RocksDB.
-            for (start, end) in &inner.delta.ranges { batch.delete_range(start, end); }
+            for (start, end) in &inner.delta.ranges {
+                batch.delete_range(start, end);
+            }
             for (key, value) in &inner.delta.points {
                 match value {
                     Some(value) => batch.put(key, value.as_ref()),
                     None => batch.delete(key),
                 }
             }
-            ensure!(self.execution_healthy(), "failed execution overlay cannot publish");
+            ensure!(
+                self.execution_healthy(),
+                "failed execution overlay cannot publish"
+            );
             let plan = PreparedOverlayCommit {
                 database: base._db.clone(),
                 sequence: base.sequence,
@@ -618,27 +690,44 @@ impl ExecutionOverlay {
     /// Deltas are shared until a write, without layering reads through parents.
     /// The snapshot family's descendant limit also applies across generations.
     pub fn fork(&self, limits: OverlayLimits) -> Result<Self> {
-        ensure!(limits.max_delta_bytes <= self.limits.max_delta_bytes
-            && limits.max_delta_entries <= self.limits.max_delta_entries
-            && limits.max_record_bytes <= self.limits.max_record_bytes
-            && limits.max_read_bytes <= self.limits.max_read_bytes
-            && limits.max_read_operations <= self.limits.max_read_operations
-            && limits.max_cursors <= self.limits.max_cursors,
-            "overlay fork cannot increase resource limits");
+        ensure!(
+            limits.max_delta_bytes <= self.limits.max_delta_bytes
+                && limits.max_delta_entries <= self.limits.max_delta_entries
+                && limits.max_record_bytes <= self.limits.max_record_bytes
+                && limits.max_read_bytes <= self.limits.max_read_bytes
+                && limits.max_read_operations <= self.limits.max_read_operations
+                && limits.max_cursors <= self.limits.max_cursors,
+            "overlay fork cannot increase resource limits"
+        );
         let inner = self.lock_inner()?;
-        let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
-        ensure!(inner.delta.bytes <= limits.max_delta_bytes, "inherited overlay delta byte limit");
-        ensure!(inner.delta.entries() <= limits.max_delta_entries, "inherited overlay delta entry limit");
+        let base = inner
+            .base
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+        ensure!(
+            inner.delta.bytes <= limits.max_delta_bytes,
+            "inherited overlay delta byte limit"
+        );
+        ensure!(
+            inner.delta.entries() <= limits.max_delta_entries,
+            "inherited overlay delta entry limit"
+        );
         let mut reads = ReadBudget::default();
         for (key, value) in &inner.delta.points {
             reads.operation(limits)?;
-            ensure!(key.len().saturating_add(value.as_ref().map_or(0, |v| v.len())) <= limits.max_record_bytes,
-                "inherited overlay record byte limit");
+            ensure!(
+                key.len()
+                    .saturating_add(value.as_ref().map_or(0, |v| v.len()))
+                    <= limits.max_record_bytes,
+                "inherited overlay record byte limit"
+            );
         }
         for (start, end) in &inner.delta.ranges {
             reads.operation(limits)?;
-            ensure!(start.len().saturating_add(end.len()) <= limits.max_record_bytes,
-                "inherited overlay range byte limit");
+            ensure!(
+                start.len().saturating_add(end.len()) <= limits.max_record_bytes,
+                "inherited overlay range byte limit"
+            );
         }
         let permit = self.family.acquire(self.limits.max_cursors)?;
         Ok(Self {
@@ -652,7 +741,8 @@ impl ExecutionOverlay {
                 cursors: 0,
                 touched: inner.touched.clone(),
             }),
-            family: self.family.clone(), _fork_permit: Some(permit),
+            family: self.family.clone(),
+            _fork_permit: Some(permit),
         })
     }
 
@@ -672,7 +762,10 @@ impl ExecutionOverlay {
             cursors: inner.cursors,
             descendant_branches: self.family.active.load(Ordering::Acquire),
             closed: inner.base.as_ref().is_none_or(|base| {
-                base.snapshot.lock().unwrap_or_else(|p| p.into_inner()).is_none()
+                base.snapshot
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_none()
             }),
         }
     }
@@ -722,13 +815,20 @@ impl ExecutionOverlay {
     /// deleted range reaches into one of them, whose keys cannot be listed.
     pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
         let inner = self.lock_cleanup();
-        if inner.delta.ranges.iter().any(|(start, end)| crate::database::range_meets(prefixes, start, end)) {
+        if inner
+            .delta
+            .ranges
+            .iter()
+            .any(|(start, end)| crate::database::range_meets(prefixes, start, end))
+        {
             return None;
         }
         let mut keys = Vec::new();
         for prefix in prefixes {
             keys.extend(
-                inner.delta.points
+                inner
+                    .delta
+                    .points
                     .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
                     .take_while(|(key, _)| key.starts_with(prefix))
                     .map(|(key, _)| key.clone()),
@@ -750,9 +850,15 @@ impl ExecutionOverlay {
     /// a closed or failed branch must be discarded by its execution owner.
     pub fn ensure_readable(&self) -> Result<()> {
         self.observe((|| {
-            ensure!(self.execution_healthy(), "failed execution overlay cannot be reused");
+            ensure!(
+                self.execution_healthy(),
+                "failed execution overlay cannot be reused"
+            );
             let inner = self.lock_inner()?;
-            let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            let base = inner
+                .base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
             drop(base.view()?);
             Ok(())
         })())
@@ -764,7 +870,9 @@ impl ExecutionOverlay {
     }
 
     fn observe<T>(&self, result: Result<T>) -> Result<T> {
-        if result.is_err() { self.record_execution_failure(); }
+        if result.is_err() {
+            self.record_execution_failure();
+        }
         result
     }
 
@@ -857,7 +965,11 @@ impl ExecutionOverlay {
         );
         let mut inner = self.lock_inner()?;
         let Inner {
-            base, delta, reads, touched, ..
+            base,
+            delta,
+            reads,
+            touched,
+            ..
         } = &mut *inner;
         touched.mark_key(key);
         let delta = captured.unwrap_or(delta);
@@ -883,7 +995,10 @@ impl ExecutionOverlay {
         // decompresses index blocks from disk on every read of a large store.
         let options = rocksdb::ReadOptions::default();
         let view = base.view()?;
-        let value = view.as_ref().expect("view() holds the snapshot").get_pinned_opt(key, options)?;
+        let value = view
+            .as_ref()
+            .expect("view() holds the snapshot")
+            .get_pinned_opt(key, options)?;
         match value {
             Some(value) => {
                 reads.record(key, &value, self.limits)?;
@@ -1209,7 +1324,13 @@ fn step_back(
     floor: Option<&(Option<Vec<u8>>, Option<Vec<u8>>)>,
 ) -> bool {
     // Whether `key` lies above every key the step may land on.
-    let beyond = |key: &[u8]| if inclusive { key > target } else { key >= target };
+    let beyond = |key: &[u8]| {
+        if inclusive {
+            key > target
+        } else {
+            key >= target
+        }
+    };
     if beyond(lower) {
         return false;
     }
@@ -1412,7 +1533,8 @@ mod tests {
         assert!(catch_unwind(AssertUnwindSafe(|| {
             let _guard = overlay.inner.lock().unwrap();
             panic!("injected storage panic");
-        })).is_err());
+        }))
+        .is_err());
         let read = catch_unwind(AssertUnwindSafe(|| overlay.get(b"a")));
         // Collect each cleanup result before asserting: a failing destructor
         // must not cause another destructor to panic during test unwinding.
@@ -1421,7 +1543,10 @@ mod tests {
         let view_dropped = catch_unwind(AssertUnwindSafe(|| drop(view)));
         assert!(closed.is_ok(), "closing poisoned storage must not panic");
         assert!(cursor_dropped.is_ok() && view_dropped.is_ok());
-        assert!(matches!(read, Ok(Err(_))), "poisoned reads must return an error");
+        assert!(
+            matches!(read, Ok(Err(_))),
+            "poisoned reads must return an error"
+        );
         assert!(!overlay.execution_healthy());
         assert!(overlay.stats().closed);
         assert_eq!(overlay.stats().cursors, 0);
@@ -1433,7 +1558,10 @@ mod tests {
         assert_eq!(child.get(b"a").unwrap(), Some(b"value".to_vec()));
         assert_eq!(db.latest_sequence_number(), sequence);
         drop(child);
-        assert_eq!(db.property_int_value("rocksdb.num-snapshots").unwrap(), Some(0));
+        assert_eq!(
+            db.property_int_value("rocksdb.num-snapshots").unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1444,31 +1572,50 @@ mod tests {
         db.put(b"huge", [0; 1024]).unwrap();
         let sequence = db.latest_sequence_number();
         for failure in 0..6 {
-            let budget = OverlayLimits { max_record_bytes: 32, max_cursors: 1, ..limits() };
+            let budget = OverlayLimits {
+                max_record_bytes: 32,
+                max_cursors: 1,
+                ..limits()
+            };
             let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), budget).unwrap());
             assert!(overlay.execution_healthy());
             match failure {
-                0 => { assert!(overlay.get(b"huge").is_err()); },
+                0 => {
+                    assert!(overlay.get(b"huge").is_err());
+                }
                 1 => {
                     let view = overlay.read_view().unwrap();
                     assert!(view.get(b"huge").is_err());
-                },
+                }
                 2 => {
                     let mut cursor = overlay.cursor(b"a", b"z").unwrap();
                     cursor.seek(b"a").unwrap();
                     assert!(cursor.next().is_err());
                     assert!(!cursor.valid());
-                },
+                }
                 3 => {
                     let _view = overlay.read_view().unwrap();
                     assert!(overlay.read_view().is_err());
-                },
-                4 => { assert!(overlay.cursor(b"z", b"a").is_err()); },
-                _ => { assert!(overlay.apply(&[OverlayMutation::Put(b"b".to_vec(), vec![0; 33])]).is_err()); },
+                }
+                4 => {
+                    assert!(overlay.cursor(b"z", b"a").is_err());
+                }
+                _ => {
+                    assert!(overlay
+                        .apply(&[OverlayMutation::Put(b"b".to_vec(), vec![0; 33])])
+                        .is_err());
+                }
             }
             assert!(!overlay.execution_healthy());
-            assert_eq!(overlay.get(b"a").unwrap(), Some(b"value".to_vec()), "inspection remains possible");
-            assert!(!overlay.execution_healthy(), "successful reads cannot clear failure evidence");
+            assert_eq!(
+                overlay.get(b"a").unwrap(),
+                Some(b"value".to_vec()),
+                "inspection remains possible"
+            );
+            assert!(
+                !overlay.execution_healthy(),
+                "successful reads cannot clear failure evidence"
+            );
             assert!(!overlay.fork(budget).unwrap().execution_healthy());
             assert_eq!(overlay.stats().delta_entries, 0);
         }
@@ -1538,11 +1685,17 @@ mod tests {
         let before = cache.get_usage();
         assert!(overlay.get(&10_000u32.to_be_bytes()).unwrap().is_some());
         let after_get = cache.get_usage();
-        assert!(after_get > before, "a branch point read must cache the block it read");
+        assert!(
+            after_get > before,
+            "a branch point read must cache the block it read"
+        );
         let mut cursor = overlay.cursor(&[0; 4], &[0xff; 4]).unwrap();
         cursor.seek(&19_000u32.to_be_bytes()).unwrap();
         assert!(cursor.valid());
-        assert!(cache.get_usage() > after_get, "a branch seek must cache the blocks it read");
+        assert!(
+            cache.get_usage() > after_get,
+            "a branch seek must cache the blocks it read"
+        );
     }
 
     /// Stepping through fresh cursors, as the store adapter does for every
@@ -1560,7 +1713,10 @@ mod tests {
         overlay
             .apply(&[
                 OverlayMutation::Delete(7u16.to_be_bytes().to_vec()),
-                OverlayMutation::DeleteRange(100u16.to_be_bytes().to_vec(), 200u16.to_be_bytes().to_vec()),
+                OverlayMutation::DeleteRange(
+                    100u16.to_be_bytes().to_vec(),
+                    200u16.to_be_bytes().to_vec(),
+                ),
                 OverlayMutation::Put(150u16.to_be_bytes().to_vec(), b"branch".to_vec()),
             ])
             .unwrap();
@@ -1600,19 +1756,40 @@ mod tests {
 
         // A capture's sweep drops iterators left idle, which pin memtables.
         ExecutionViewAdmission::process().release_expired();
-        assert_eq!(base.iterators.lock().unwrap().len(), 1, "a recently used iterator stays parked");
+        assert_eq!(
+            base.iterators.lock().unwrap().len(),
+            1,
+            "a recently used iterator stays parked"
+        );
         base.iterators.lock().unwrap()[0].parked_at -= MAX_PARKED_IDLE + Duration::from_secs(1);
         ExecutionViewAdmission::process().release_expired();
-        assert!(base.iterators.lock().unwrap().is_empty(), "an idle iterator is dropped");
-        assert_eq!(step(None, false), expected.first().cloned(), "a step after the sweep reopens one");
+        assert!(
+            base.iterators.lock().unwrap().is_empty(),
+            "an idle iterator is dropped"
+        );
+        assert_eq!(
+            step(None, false),
+            expected.first().cloned(),
+            "a step after the sweep reopens one"
+        );
         assert_eq!(base.iterators_created.load(Ordering::Relaxed), 2);
 
         base.release();
-        assert!(base.iterators.lock().unwrap().is_empty(), "release drops parked iterators");
-        assert!(overlay.cursor(&[0, 0], &[0xff, 0xff]).unwrap().seek(&[0, 0]).is_err());
+        assert!(
+            base.iterators.lock().unwrap().is_empty(),
+            "release drops parked iterators"
+        );
+        assert!(overlay
+            .cursor(&[0, 0], &[0xff, 0xff])
+            .unwrap()
+            .seek(&[0, 0])
+            .is_err());
         drop(base);
         overlay.close();
-        assert_eq!(db.property_int_value("rocksdb.num-snapshots").unwrap(), Some(0));
+        assert_eq!(
+            db.property_int_value("rocksdb.num-snapshots").unwrap(),
+            Some(0)
+        );
     }
 
     /// Cursors bounded to one key's range, as JMT value reads are, park
@@ -1629,7 +1806,9 @@ mod tests {
         let overlay = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
         for i in 0..MAX_PARKED_ITERATORS as u16 {
             let key = i.to_be_bytes();
-            let mut cursor = overlay.cursor(&key, &[key.as_slice(), &[0]].concat()).unwrap();
+            let mut cursor = overlay
+                .cursor(&key, &[key.as_slice(), &[0]].concat())
+                .unwrap();
             cursor.seek(&key).unwrap();
             assert_eq!(cursor.key(), Some(key.as_slice()));
         }
@@ -1647,13 +1826,18 @@ mod tests {
                     cursor.next().unwrap();
                 }
             }
-            let Some(key) = cursor.key().map(<[u8]>::to_vec) else { break };
+            let Some(key) = cursor.key().map(<[u8]>::to_vec) else {
+                break;
+            };
             seen.push(key.clone());
             from = Some(key);
         }
         assert_eq!(seen.len(), 64);
-        assert_eq!(base.iterators_created.load(Ordering::Relaxed), created + 1,
-            "the scan builds one iterator, not one per step");
+        assert_eq!(
+            base.iterators_created.load(Ordering::Relaxed),
+            created + 1,
+            "the scan builds one iterator, not one per step"
+        );
         assert_eq!(base.iterators.lock().unwrap().len(), MAX_PARKED_ITERATORS);
         drop(base);
         overlay.close();
@@ -1683,9 +1867,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             overlay.written_keys_under(&prefixes),
-            Some(vec![vec![0x40, 0x01, 1], vec![0x40, 0x01, 2], vec![0x41, 7]])
+            Some(vec![
+                vec![0x40, 0x01, 1],
+                vec![0x40, 0x01, 2],
+                vec![0x41, 7]
+            ])
         );
-        overlay.apply(&[OverlayMutation::DeleteRange(vec![0x41, 0], vec![0x41, 5])]).unwrap();
+        overlay
+            .apply(&[OverlayMutation::DeleteRange(vec![0x41, 0], vec![0x41, 5])])
+            .unwrap();
         assert_eq!(overlay.written_keys_under(&prefixes), None);
     }
 
@@ -1705,7 +1895,11 @@ mod tests {
             sequence: db.latest_sequence_number(),
             watched,
         };
-        let scan = quil_types::store::ScanPoint { database: db.instance(), from: point.sequence, to: point.sequence };
+        let scan = quil_types::store::ScanPoint {
+            database: db.instance(),
+            from: point.sequence,
+            to: point.sequence,
+        };
         assert_eq!(overlay.capture_point(), Some(point));
         overlay
             .apply(&[
@@ -1713,18 +1907,37 @@ mod tests {
                 OverlayMutation::DeleteRange(vec![0x30], vec![0x40, 0x01]),
             ])
             .unwrap();
-        assert_eq!(overlay.capture_point(), Some(point), "writes outside the watched keys");
+        assert_eq!(
+            overlay.capture_point(),
+            Some(point),
+            "writes outside the watched keys"
+        );
         let before = overlay.read_view().unwrap();
         assert_eq!(before.scan_point(), Some(scan));
         let generation = overlay.delta_generation();
-        overlay.apply(&[OverlayMutation::Delete(vec![0x40, 0x01, 9])]).unwrap();
+        overlay
+            .apply(&[OverlayMutation::Delete(vec![0x40, 0x01, 9])])
+            .unwrap();
         assert_ne!(overlay.delta_generation(), generation);
         assert_eq!(overlay.capture_point(), None);
         assert_eq!(overlay.read_view().unwrap().scan_point(), None);
-        assert_eq!(before.scan_point(), Some(scan), "an earlier view keeps its generation");
+        assert_eq!(
+            before.scan_point(),
+            Some(scan),
+            "an earlier view keeps its generation"
+        );
         let ranged = ExecutionOverlay::capture(db.clone(), limits()).unwrap();
-        ranged.apply(&[OverlayMutation::DeleteRange(vec![0x40], vec![0x40, 0x01, 0])]).unwrap();
-        assert_eq!(ranged.capture_point(), None, "a range reaching the watched keys");
+        ranged
+            .apply(&[OverlayMutation::DeleteRange(
+                vec![0x40],
+                vec![0x40, 0x01, 0],
+            )])
+            .unwrap();
+        assert_eq!(
+            ranged.capture_point(),
+            None,
+            "a range reaching the watched keys"
+        );
         drop(before);
         overlay.close();
         assert_eq!(overlay.capture_point(), None);
@@ -1818,13 +2031,18 @@ mod tests {
                 cursor.seek_for_prev(&k).unwrap();
                 assert_eq!(
                     cursor.key(),
-                    expected.range(..=k.clone()).next_back().map(|(k, _)| k.as_slice())
+                    expected
+                        .range(..=k.clone())
+                        .next_back()
+                        .map(|(k, _)| k.as_slice())
                 );
                 drop(cursor);
                 // A floor-guarded cursor over a few keys reads the same in
                 // reverse, whatever its delta deleted below them.
                 let view = overlay.read_view().unwrap();
-                let upper = (u16::from_be_bytes([k[0], k[1]]) + 5).to_be_bytes().to_vec();
+                let upper = (u16::from_be_bytes([k[0], k[1]]) + 5)
+                    .to_be_bytes()
+                    .to_vec();
                 let mut guarded = view.floor_guarded_cursor(&k, &upper).unwrap();
                 guarded.seek_for_prev(&upper).unwrap();
                 let mut seen = Vec::new();
@@ -1833,7 +2051,10 @@ mod tests {
                     guarded.prev().unwrap();
                 }
                 seen.reverse();
-                let window: Vec<_> = expected.range(k.clone()..upper.clone()).map(|(k, _)| k.clone()).collect();
+                let window: Vec<_> = expected
+                    .range(k.clone()..upper.clone())
+                    .map(|(k, _)| k.clone())
+                    .collect();
                 assert_eq!(seen, window);
             }
         }
@@ -1855,7 +2076,8 @@ mod tests {
                 max_read_operations: 32,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         overlay
             .apply(&[
                 OverlayMutation::DeleteRange(
@@ -1894,7 +2116,8 @@ mod tests {
                 max_cursors: 1,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             db.property_int_value("rocksdb.num-snapshots").unwrap(),
             Some(1)
@@ -1911,9 +2134,15 @@ mod tests {
             Some(b"new".as_slice())
         );
         drop(db);
-        assert!(rocksdb::DB::open_default(dir.path()).is_err(), "snapshot keeps the DB open");
+        assert!(
+            rocksdb::DB::open_default(dir.path()).is_err(),
+            "snapshot keeps the DB open"
+        );
         overlay.close();
-        drop(rocksdb::DB::open_default(dir.path()).expect("close releases the DB even with a cursor"));
+        drop(
+            rocksdb::DB::open_default(dir.path())
+                .expect("close releases the DB even with a cursor"),
+        );
         assert!(old.seek(b"a").is_err());
         assert!(!old.valid(), "failed seek clears the earlier result");
         assert!(overlay.get(b"a").is_err());
@@ -1940,7 +2169,8 @@ mod tests {
                 max_record_bytes: 8,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         overlay
             .apply(&[OverlayMutation::Put(b"a".to_vec(), b"old".to_vec())])
             .unwrap();
@@ -1994,7 +2224,8 @@ mod tests {
                 max_record_bytes: 32,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert!(overlay.get(b"huge").is_err());
         let mut cursor = overlay.cursor(b"a", b"z").unwrap();
         cursor.seek(b"a").unwrap();
@@ -2008,7 +2239,8 @@ mod tests {
                 max_read_bytes: 6,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(overlay.get(b"a").unwrap(), Some(b"value".to_vec()));
         // The refusal says how far over the cap the branch went.
         assert_eq!(
@@ -2022,7 +2254,8 @@ mod tests {
                 max_read_operations: 1,
                 ..limits()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(overlay.get(b"absent").unwrap(), None);
         assert!(overlay.get(b"absent").is_err());
     }

@@ -9,9 +9,13 @@ fn check_capture_state(
     state: &Option<Arc<crate::hypergraph_state::HypergraphState>>,
     crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
 ) -> Result<()> {
-    let state = state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("capture requires stateful engines".into()))?;
+    let state = state.as_ref().ok_or_else(|| {
+        QuilError::ExecutionUnavailable("capture requires stateful engines".into())
+    })?;
     if !Arc::ptr_eq(state.crdt(), crdt) || state.changeset_len() != 0 {
-        return Err(QuilError::ExecutionUnavailable("capture engine state mismatch or unfinished message".into()));
+        return Err(QuilError::ExecutionUnavailable(
+            "capture engine state mismatch or unfinished message".into(),
+        ));
     }
     Ok(())
 }
@@ -56,12 +60,26 @@ fn fork_state(
 }
 
 impl GlobalExecutionEngine {
-    pub(crate) fn check_execution_capture(&self, crdt: &Arc<quil_hypergraph::HypergraphCrdt>, identity: &quil_types::store::BackingStoreIdentity) -> Result<()> {
+    pub(crate) fn check_execution_capture(
+        &self,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        identity: &quil_types::store::BackingStoreIdentity,
+    ) -> Result<()> {
         check_capture_state(&self.state, crdt)?;
-        if !self.crdt.as_ref().is_some_and(|source| Arc::ptr_eq(source, crdt)) {
-            return Err(QuilError::ExecutionUnavailable("global capture CRDT mismatch".into()));
+        if !self
+            .crdt
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, crdt))
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "global capture CRDT mismatch".into(),
+            ));
         }
-        self.intrinsic.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("global capture requires intrinsic".into()))?
+        self.intrinsic
+            .as_ref()
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable("global capture requires intrinsic".into())
+            })?
             .check_execution_capture(crdt, identity)
     }
 
@@ -80,7 +98,12 @@ impl GlobalExecutionEngine {
 }
 
 impl TokenExecutionEngine {
-    pub(crate) fn check_execution_capture(&self, crdt: &Arc<quil_hypergraph::HypergraphCrdt>, identity: &quil_types::store::BackingStoreIdentity, anchor: Option<&quil_types::store::BackingStoreIdentity>) -> Result<()> {
+    pub(crate) fn check_execution_capture(
+        &self,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        identity: &quil_types::store::BackingStoreIdentity,
+        anchor: Option<&quil_types::store::BackingStoreIdentity>,
+    ) -> Result<()> {
         check_capture_state(&self.state, crdt)?;
         check_capture_clock(self.clock_store.as_ref(), identity, anchor)
     }
@@ -111,9 +134,16 @@ impl TokenExecutionEngine {
 }
 
 impl ComputeExecutionEngine {
-    pub(crate) fn check_execution_capture(&self, crdt: &Arc<quil_hypergraph::HypergraphCrdt>, identity: &quil_types::store::BackingStoreIdentity, anchor: Option<&quil_types::store::BackingStoreIdentity>) -> Result<()> {
+    pub(crate) fn check_execution_capture(
+        &self,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        identity: &quil_types::store::BackingStoreIdentity,
+        anchor: Option<&quil_types::store::BackingStoreIdentity>,
+    ) -> Result<()> {
         check_capture_state(&self.state, crdt)?;
-        if let Some(clock) = &self.global_clock { check_capture_clock(clock.as_ref(), identity, anchor)?; }
+        if let Some(clock) = &self.global_clock {
+            check_capture_clock(clock.as_ref(), identity, anchor)?;
+        }
         Ok(())
     }
 
@@ -132,9 +162,16 @@ impl ComputeExecutionEngine {
 }
 
 impl HypergraphExecutionEngine {
-    pub(crate) fn check_execution_capture(&self, crdt: &Arc<quil_hypergraph::HypergraphCrdt>, identity: &quil_types::store::BackingStoreIdentity, anchor: Option<&quil_types::store::BackingStoreIdentity>) -> Result<()> {
+    pub(crate) fn check_execution_capture(
+        &self,
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        identity: &quil_types::store::BackingStoreIdentity,
+        anchor: Option<&quil_types::store::BackingStoreIdentity>,
+    ) -> Result<()> {
         check_capture_state(&self.state, crdt)?;
-        if let Some(clock) = &self.global_clock { check_capture_clock(clock.as_ref(), identity, anchor)?; }
+        if let Some(clock) = &self.global_clock {
+            check_capture_clock(clock.as_ref(), identity, anchor)?;
+        }
         Ok(())
     }
 

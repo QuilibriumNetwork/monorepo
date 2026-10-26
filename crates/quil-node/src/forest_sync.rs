@@ -29,7 +29,8 @@ async fn tree_sync_turn(
     shard_id: &[u8],
 ) -> tokio::sync::OwnedMutexGuard<()> {
     type Turns = std::collections::HashMap<(usize, Vec<u8>), Arc<tokio::sync::Mutex<()>>>;
-    static TURNS: std::sync::LazyLock<std::sync::Mutex<Turns>> = std::sync::LazyLock::new(Default::default);
+    static TURNS: std::sync::LazyLock<std::sync::Mutex<Turns>> =
+        std::sync::LazyLock::new(Default::default);
     // Keyed by store as well: a scratch tree (historical committees) never
     // waits on the node's own.
     let key = (Arc::as_ptr(crdt) as usize, shard_id.to_vec());
@@ -49,7 +50,9 @@ pub(crate) fn is_empty_phase_root(root: &[u8]) -> bool {
 }
 
 pub(crate) fn phase_anchor(root: &[u8]) -> Result<Option<[u8; 32]>> {
-    if root.is_empty() { return Ok(None); }
+    if root.is_empty() {
+        return Ok(None);
+    }
     root.try_into().map(Some).map_err(|_| {
         QuilError::InvalidArgument("phase anchor must contain exactly 32 bytes".into())
     })
@@ -58,28 +61,47 @@ pub(crate) fn phase_anchor(root: &[u8]) -> Result<Option<[u8; 32]>> {
 #[async_trait::async_trait]
 trait PhaseSourceLookup {
     async fn head(&mut self, shard: &[u8], phase: u32) -> Result<Option<(u64, Vec<u8>)>>;
-    async fn resolve(&mut self, shard: &[u8], phase: u32, root: &[u8; 32])
-        -> Result<Option<(u64, u64)>>;
+    async fn resolve(
+        &mut self,
+        shard: &[u8],
+        phase: u32,
+        root: &[u8; 32],
+    ) -> Result<Option<(u64, u64)>>;
 }
 
 #[async_trait::async_trait]
 impl PhaseSourceLookup for ArchiveClient {
     async fn head(&mut self, shard: &[u8], phase: u32) -> Result<Option<(u64, Vec<u8>)>> {
-        quil_rpc::forest_sync_reader::forest_head(self, shard.to_vec(), phase).await
+        quil_rpc::forest_sync_reader::forest_head(self, shard.to_vec(), phase)
+            .await
             .map_err(|e| QuilError::Internal(format!("get_forest_head: {e}")))
     }
 
-    async fn resolve(&mut self, shard: &[u8], phase: u32, root: &[u8; 32])
-        -> Result<Option<(u64, u64)>> {
-        quil_rpc::forest_sync_reader::resolve_forest_root(self, shard.to_vec(), phase, root.to_vec()).await
-            .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))
+    async fn resolve(
+        &mut self,
+        shard: &[u8],
+        phase: u32,
+        root: &[u8; 32],
+    ) -> Result<Option<(u64, u64)>> {
+        quil_rpc::forest_sync_reader::resolve_forest_root(
+            self,
+            shard.to_vec(),
+            phase,
+            root.to_vec(),
+        )
+        .await
+        .map_err(|e| QuilError::Internal(format!("resolve_root: {e}")))
     }
 }
 
 #[derive(Debug, PartialEq)]
 enum PhaseSource {
     Empty,
-    Tree { version: u64, root: [u8; 32], global_frame: u64 },
+    Tree {
+        version: u64,
+        root: [u8; 32],
+        global_frame: u64,
+    },
 }
 
 /// Resolve a committed root independently of the peer's advancing live head.
@@ -93,20 +115,32 @@ async fn resolve_phase_source(
     expected: &[u8],
 ) -> Result<Option<PhaseSource>> {
     let empty_local = || -> Result<Option<PhaseSource>> {
-        Ok(is_empty_phase_root(&crdt.current_forest_phase_root(shard, phase as usize)?)
-            .then_some(PhaseSource::Empty))
+        Ok(
+            is_empty_phase_root(&crdt.current_forest_phase_root(shard, phase as usize)?)
+                .then_some(PhaseSource::Empty),
+        )
     };
     if let Some(anchor) = phase_anchor(expected)? {
-        if is_empty_phase_root(&anchor) { return empty_local(); }
+        if is_empty_phase_root(&anchor) {
+            return empty_local();
+        }
         if let Some((version, global_frame)) = source.resolve(shard, phase, &anchor).await? {
-            return Ok(Some(PhaseSource::Tree { version, root: anchor, global_frame }));
+            return Ok(Some(PhaseSource::Tree {
+                version,
+                root: anchor,
+                global_frame,
+            }));
         }
         // Phase 0 also supplies the frame cursor, so a root match without a
         // retained root-to-frame mapping is insufficient for that phase.
         if phase != 0 {
             if let Some((version, root)) = source.head(shard, phase).await? {
                 if root.as_slice() == anchor {
-                    return Ok(Some(PhaseSource::Tree { version, root: anchor, global_frame: 0 }));
+                    return Ok(Some(PhaseSource::Tree {
+                        version,
+                        root: anchor,
+                        global_frame: 0,
+                    }));
                 }
             }
         }
@@ -115,10 +149,13 @@ async fn resolve_phase_source(
     match source.head(shard, phase).await? {
         None => empty_local(),
         Some((version, root)) => {
-            let root = phase_anchor(&root)?.ok_or_else(|| {
-                QuilError::InvalidArgument("peer forest head has no root".into())
-            })?;
-            Ok(Some(PhaseSource::Tree { version, root, global_frame: 0 }))
+            let root = phase_anchor(&root)?
+                .ok_or_else(|| QuilError::InvalidArgument("peer forest head has no root".into()))?;
+            Ok(Some(PhaseSource::Tree {
+                version,
+                root,
+                global_frame: 0,
+            }))
         }
     }
 }
@@ -142,7 +179,10 @@ pub(crate) fn app_shard_key(shard_id: &[u8]) -> Option<ShardKey> {
     }
     let mut l2 = [0u8; 32];
     l2.copy_from_slice(&shard_id[..32]);
-    Some(ShardKey { l1: get_bloom_filter_indices(&l2, 256, 3), l2 })
+    Some(ShardKey {
+        l1: get_bloom_filter_indices(&l2, 256, 3),
+        l2,
+    })
 }
 
 /// Fetch the readable blobs for `leaves` (`None`: a removal, which needs
@@ -186,19 +226,31 @@ async fn fetch_sync_blobs(
     }
     if !wanted.is_empty() {
         let shard_bytes: Vec<u8> = shard.l1.iter().copied().chain(shard.l2).collect();
-        let fetched = fetch_remote_blobs(client, &shard_bytes, phase, source_version, &wanted).await?;
+        let fetched =
+            fetch_remote_blobs(client, &shard_bytes, phase, source_version, &wanted).await?;
         for ((i, vertex_id), blob) in wanted.into_iter().zip(fetched) {
-            let blob = blob.ok_or_else(|| QuilError::ExecutionUnavailable(format!(
-                "peer did not serve blob {} at phase {phase}, version {source_version}", hex::encode(&vertex_id),
-            )))?;
-            let leaf = leaves[i].1.as_deref().expect("only leaves with values are fetched");
+            let blob = blob.ok_or_else(|| {
+                QuilError::ExecutionUnavailable(format!(
+                    "peer did not serve blob {} at phase {phase}, version {source_version}",
+                    hex::encode(&vertex_id),
+                ))
+            })?;
+            let leaf = leaves[i]
+                .1
+                .as_deref()
+                .expect("only leaves with values are fetched");
             if !sync_blob_matches(phase as usize, leaf, &blob)? {
-                return Err(QuilError::InvalidArgument("peer served a blob not bound to its authenticated leaf".into()));
+                return Err(QuilError::InvalidArgument(
+                    "peer served a blob not bound to its authenticated leaf".into(),
+                ));
             }
             blobs[i] = Some(blob);
         }
     }
-    Ok(blobs.into_iter().map(|blob| blob.expect("every blob resolved")).collect())
+    Ok(blobs
+        .into_iter()
+        .map(|blob| blob.expect("every blob resolved"))
+        .collect())
 }
 
 async fn fetch_remote_blobs(
@@ -209,20 +261,31 @@ async fn fetch_remote_blobs(
     wanted: &[(usize, Vec<u8>)],
 ) -> Result<Vec<Option<Vec<u8>>>> {
     use quil_rpc::forest_sync_reader::{fetch_in_batches, retry_forest_read};
-    let keys: Vec<(Vec<u8>, u64)> = wanted.iter().map(|(_, id)| (id.clone(), source_version)).collect();
+    let keys: Vec<(Vec<u8>, u64)> = wanted
+        .iter()
+        .map(|(_, id)| (id.clone(), source_version))
+        .collect();
     let batched = fetch_in_batches(keys.clone(), |chunk: Vec<(Vec<u8>, u64)>| {
         let (mut client, shard_bytes) = (client.clone(), shard_bytes.to_vec());
         async move { client.get_vertex_blobs(shard_bytes, phase, chunk).await }
-    }).await;
+    })
+    .await;
     match batched {
         Ok(blobs) => Ok(blobs),
         Err(e) if e.is_unimplemented() => {
             let mut blobs = Vec::with_capacity(keys.len());
             for (id, version) in keys {
                 let blob = retry_forest_read(|| {
-                    let (mut client, shard_bytes, id) = (client.clone(), shard_bytes.to_vec(), id.clone());
-                    async move { client.get_vertex_blob_at(shard_bytes, phase, id, version).await }
-                }).await.map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?;
+                    let (mut client, shard_bytes, id) =
+                        (client.clone(), shard_bytes.to_vec(), id.clone());
+                    async move {
+                        client
+                            .get_vertex_blob_at(shard_bytes, phase, id, version)
+                            .await
+                    }
+                })
+                .await
+                .map_err(|e| QuilError::Internal(format!("get_vertex_blob: {e}")))?;
                 blobs.push(blob);
             }
             Ok(blobs)
@@ -261,9 +324,22 @@ async fn sync_phase_data(
     let (client, store, shard) = (client.clone(), crdt.clone(), shard_id.to_vec());
     let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
         let (mut client, store, shard) = (client.clone(), store.clone(), shard.clone());
-        async move { fetch_sync_blobs(&mut client, &store, &shard, phase, source_version, &leaves).await }
+        async move {
+            fetch_sync_blobs(&mut client, &store, &shard, phase, source_version, &leaves).await
+        }
     };
-    install_phase(crdt, shard_id, filter, phase, source_version, bit_path, anchor, remote, fetch).await
+    install_phase(
+        crdt,
+        shard_id,
+        filter,
+        phase,
+        source_version,
+        bit_path,
+        anchor,
+        remote,
+        fetch,
+    )
+    .await
 }
 
 /// [`sync_phase_data`] from `source`, whose blobs `fetch` supplies for the
@@ -294,16 +370,26 @@ where
     F: FnMut(Vec<([u8; 32], Option<Vec<u8>>)>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Vec<u8>>>>,
 {
-    use quil_hypergraph::crdt::{
-        sync_blob_matches, sync_phase_advanced, sync_staged_writes, MAX_SYNC_CHUNK_BYTES, MAX_SYNC_CHUNK_LEAVES,
-    };
     use quil_engine::worker_execution::{recovery_turn_spent, turn_spent_error};
+    use quil_hypergraph::crdt::{
+        sync_blob_matches, sync_phase_advanced, sync_staged_writes, MAX_SYNC_CHUNK_BYTES,
+        MAX_SYNC_CHUNK_LEAVES,
+    };
     let c = crdt.clone();
     let sid = shard_id.to_vec();
     let started = std::time::Instant::now();
     let mut plan = tokio::task::spawn_blocking(move || {
-        c.prepare_phase_sync(&source, source_version, &sid, phase as usize, &bit_path, anchor)
-    }).await.map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
+        c.prepare_phase_sync(
+            &source,
+            source_version,
+            &sid,
+            phase as usize,
+            &bit_path,
+            anchor,
+        )
+    })
+    .await
+    .map_err(|e| QuilError::Internal(format!("sync preparation task: {e}")))??;
     let filter = hex::encode(filter);
     let mut planned = plan.remaining().len();
     // A worker's recovery reports its progress; other syncs report nothing.
@@ -344,15 +430,22 @@ where
                     None => 0,
                     Some(leaf) if sync_blob_matches(phase as usize, leaf, &[])? => 0,
                     Some(leaf) => {
-                        let (_, size) = quil_tries::split_vertex_leaf(leaf)
-                            .ok_or_else(|| QuilError::InvalidArgument("malformed synced vertex leaf".into()))?;
-                        usize::try_from(size).map_err(|_| QuilError::InvalidArgument("synced blob too large".into()))?
+                        let (_, size) = quil_tries::split_vertex_leaf(leaf).ok_or_else(|| {
+                            QuilError::InvalidArgument("malformed synced vertex leaf".into())
+                        })?;
+                        usize::try_from(size).map_err(|_| {
+                            QuilError::InvalidArgument("synced blob too large".into())
+                        })?
                     }
                 };
                 if size > MAX_SYNC_CHUNK_BYTES {
-                    return Err(QuilError::ExecutionUnavailable("synced blob exceeds the transfer limit".into()));
+                    return Err(QuilError::ExecutionUnavailable(
+                        "synced blob exceeds the transfer limit".into(),
+                    ));
                 }
-                if take > 0 && bytes + size > MAX_SYNC_CHUNK_BYTES { break; }
+                if take > 0 && bytes + size > MAX_SYNC_CHUNK_BYTES {
+                    break;
+                }
                 bytes += size;
                 take += 1;
             }
@@ -362,7 +455,9 @@ where
             let (returned, applied) = tokio::task::spawn_blocking(move || {
                 let applied = c.apply_sync_chunk(&mut plan, &blobs);
                 (plan, applied)
-            }).await.map_err(|e| QuilError::Internal(format!("sync installation task: {e}")))?;
+            })
+            .await
+            .map_err(|e| QuilError::Internal(format!("sync installation task: {e}")))?;
             plan = returned;
             match applied {
                 Ok(()) => {
@@ -398,7 +493,9 @@ where
         let (returned, finished) = tokio::task::spawn_blocking(move || {
             let finished = c.finish_phase_sync(&plan);
             (plan, finished)
-        }).await.map_err(|e| QuilError::Internal(format!("sync completion task: {e}")))?;
+        })
+        .await
+        .map_err(|e| QuilError::Internal(format!("sync completion task: {e}")))?;
         plan = returned;
         match finished {
             Err(e) if sync_phase_advanced(&e) && rebases < MAX_SYNC_REBASES => {
@@ -427,7 +524,9 @@ async fn rebase(
     tokio::task::spawn_blocking(move || {
         c.rebase_phase_sync(&mut plan)?;
         Ok::<_, QuilError>(plan)
-    }).await.map_err(|e| QuilError::Internal(format!("sync rebase task: {e}")))?
+    })
+    .await
+    .map_err(|e| QuilError::Internal(format!("sync rebase task: {e}")))?
 }
 
 /// Sync one complete phase, authenticating the remote root and installing
@@ -441,8 +540,18 @@ pub async fn sync_one_phase(
     source_version: u64,
     remote_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    sync_phase_data(client, handle, crdt, shard_id, shard_id, phase, source_version, Vec::new(),
-        remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot)).await
+    sync_phase_data(
+        client,
+        handle,
+        crdt,
+        shard_id,
+        shard_id,
+        phase,
+        source_version,
+        Vec::new(),
+        remote_root.map(quil_forest::SubtreeSyncAnchor::AppRoot),
+    )
+    .await
 }
 
 /// Pull only the covered subtree of shard `filter` from a unified
@@ -460,8 +569,18 @@ pub async fn sync_subtree_one_phase(
     bit_path: Vec<bool>,
     pinned_subtree_root: Option<[u8; 32]>,
 ) -> Result<[u8; 32]> {
-    sync_phase_data(client, handle, crdt, app, filter, phase, source_version, bit_path,
-        pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot)).await
+    sync_phase_data(
+        client,
+        handle,
+        crdt,
+        app,
+        filter,
+        phase,
+        source_version,
+        bit_path,
+        pinned_subtree_root.map(quil_forest::SubtreeSyncAnchor::SubtreeRoot),
+    )
+    .await
 }
 
 /// Sync a SINGLE-shard forest tree (all four phases + blobs) from `addr`,
@@ -528,7 +647,9 @@ async fn sync_shard_phases(
     expected: [&[u8]; 4],
     pinned_only: bool,
 ) -> Result<Option<u64>> {
-    for root in expected { phase_anchor(root)?; }
+    for root in expected {
+        phase_anchor(root)?;
+    }
     let mut client = ArchiveClient::connect_mtls(addr, falcon_signing_key)
         .await
         .map_err(|e| QuilError::Internal(format!("archive connect: {e}")))?;
@@ -545,7 +666,9 @@ pub(crate) async fn sync_shard_phases_on(
     expected: [&[u8]; 4],
     pinned_only: bool,
 ) -> Result<Option<u64>> {
-    for root in expected { phase_anchor(root)?; }
+    for root in expected {
+        phase_anchor(root)?;
+    }
     let _turn = tree_sync_turn(&crdt, shard_id).await;
     let mut client = client.clone();
     let handle = tokio::runtime::Handle::current();
@@ -557,18 +680,33 @@ pub(crate) async fn sync_shard_phases_on(
         if pinned_only && exp.is_empty() {
             continue;
         }
-        let Some(source) = resolve_phase_source(&mut client, &crdt, shard_id, phase, exp).await? else {
+        let Some(source) = resolve_phase_source(&mut client, &crdt, shard_id, phase, exp).await?
+        else {
             warn!(phase, shard = %hex::encode(shard_id), anchor = %hex::encode(exp),
                 "phase cannot reach its anchor: source unavailable or empty source with stale local data");
             return Ok(None);
         };
-        let PhaseSource::Tree { version: source_version, root: remote_root, global_frame } = source else {
+        let PhaseSource::Tree {
+            version: source_version,
+            root: remote_root,
+            global_frame,
+        } = source
+        else {
             continue;
         };
-        if phase == 0 { pinned_frame = global_frame; }
-        let got =
-            sync_one_phase(&mut client, &handle, &crdt, shard_id, phase, source_version, Some(remote_root))
-                .await?;
+        if phase == 0 {
+            pinned_frame = global_frame;
+        }
+        let got = sync_one_phase(
+            &mut client,
+            &handle,
+            &crdt,
+            shard_id,
+            phase,
+            source_version,
+            Some(remote_root),
+        )
+        .await?;
         if !exp.is_empty() {
             if got.as_slice() != exp {
                 warn!(
@@ -659,7 +797,8 @@ mod tests {
     /// An in-memory tree.
     fn memory_crdt() -> Arc<quil_hypergraph::HypergraphCrdt> {
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            Arc::new(quil_hypergraph::testing::MemStore::new()), Arc::new(quil_hypergraph::testing::StubProver),
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_hypergraph::testing::StubProver),
         ));
         crdt.set_unified_tree(true);
         crdt
@@ -672,12 +811,22 @@ mod tests {
 
     /// A tree of `app` holding `count` vertices, committed: its phase-0
     /// version and root.
-    fn source_of(app: [u8; 32], count: u16) -> (Arc<quil_hypergraph::HypergraphCrdt>, u64, [u8; 32]) {
+    fn source_of(
+        app: [u8; 32],
+        count: u16,
+    ) -> (Arc<quil_hypergraph::HypergraphCrdt>, u64, [u8; 32]) {
         let source = memory_crdt();
         for i in 0..count {
             let mut address = [0x5a; 32];
             address[..2].copy_from_slice(&i.to_be_bytes());
-            source.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: address }, &blob_of(&address))
+            source
+                .add_vertex(
+                    &quil_hypergraph::Location {
+                        app_address: app,
+                        data_address: address,
+                    },
+                    &blob_of(&address),
+                )
                 .unwrap();
         }
         source.commit(1).unwrap();
@@ -688,17 +837,35 @@ mod tests {
     /// Install phase 0 of `app` from `source` into `target`, counting the
     /// leaves whose blobs it fetched.
     async fn install_from(
-        source: &Arc<quil_hypergraph::HypergraphCrdt>, target: &Arc<quil_hypergraph::HypergraphCrdt>,
-        app: [u8; 32], version: u64, root: [u8; 32], fetched: &Arc<std::sync::atomic::AtomicUsize>,
+        source: &Arc<quil_hypergraph::HypergraphCrdt>,
+        target: &Arc<quil_hypergraph::HypergraphCrdt>,
+        app: [u8; 32],
+        version: u64,
+        root: [u8; 32],
+        fetched: &Arc<std::sync::atomic::AtomicUsize>,
     ) -> Result<[u8; 32]> {
-        let reader = quil_hypergraph::testing::CrdtTreeReader { source: source.clone(), shard_id: app.to_vec(), phase: 0 };
+        let reader = quil_hypergraph::testing::CrdtTreeReader {
+            source: source.clone(),
+            shard_id: app.to_vec(),
+            phase: 0,
+        };
         let fetched = fetched.clone();
         let fetch = move |leaves: Vec<([u8; 32], Option<Vec<u8>>)>| {
             fetched.fetch_add(leaves.len(), std::sync::atomic::Ordering::SeqCst);
             async move { Ok::<_, QuilError>(leaves.iter().map(|(key, _)| blob_of(key)).collect()) }
         };
-        install_phase(target, &app, &app, 0, version, Vec::new(),
-            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)), reader, fetch).await
+        install_phase(
+            target,
+            &app,
+            &app,
+            0,
+            version,
+            Vec::new(),
+            Some(quil_forest::SubtreeSyncAnchor::AppRoot(root)),
+            reader,
+            fetch,
+        )
+        .await
     }
 
     /// A recovery whose turn is spent hands it back only inside a phase,
@@ -708,7 +875,9 @@ mod tests {
     /// from the installed chunks.
     #[tokio::test]
     async fn a_spent_turn_is_handed_back_inside_a_phase_with_its_scope_incomplete() {
-        use quil_engine::worker_execution::{recovery_installed, turn_spent, with_recovery_turn, SharedWorkerExecution};
+        use quil_engine::worker_execution::{
+            recovery_installed, turn_spent, with_recovery_turn, SharedWorkerExecution,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
         let spent = std::time::Duration::from_secs(3600);
         let execution = SharedWorkerExecution::default();
@@ -722,7 +891,8 @@ mod tests {
         let installed = with_recovery_turn(&execution, spent, async {
             recovery_installed(1);
             install_from(&source, &target, small, version, root, &fetched).await
-        }).await;
+        })
+        .await;
         assert_eq!(installed.unwrap(), root, "a phase boundary is no hand-back");
         assert!(!target.sync_incomplete(&small, &[]).unwrap());
 
@@ -734,14 +904,34 @@ mod tests {
         let handed_back = with_recovery_turn(&execution, spent, async {
             recovery_installed(1);
             install_from(&source, &target, large, version, root, &fetched).await
-        }).await;
-        assert!(handed_back.as_ref().is_err_and(turn_spent), "{handed_back:?}");
-        assert_eq!(fetched.load(Ordering::SeqCst), 1_024, "a chunk of the phase is installed first");
-        assert!(target.sync_incomplete(&large, &[]).unwrap(), "the partial scope stays marked incomplete");
+        })
+        .await;
+        assert!(
+            handed_back.as_ref().is_err_and(turn_spent),
+            "{handed_back:?}"
+        );
+        assert_eq!(
+            fetched.load(Ordering::SeqCst),
+            1_024,
+            "a chunk of the phase is installed first"
+        );
+        assert!(
+            target.sync_incomplete(&large, &[]).unwrap(),
+            "the partial scope stays marked incomplete"
+        );
 
         // The next sync plans only the rest and completes the scope.
-        assert_eq!(install_from(&source, &target, large, version, root, &fetched).await.unwrap(), root);
-        assert_eq!(fetched.load(Ordering::SeqCst), 1_100, "no leaf fetched twice");
+        assert_eq!(
+            install_from(&source, &target, large, version, root, &fetched)
+                .await
+                .unwrap(),
+            root
+        );
+        assert_eq!(
+            fetched.load(Ordering::SeqCst),
+            1_100,
+            "no leaf fetched twice"
+        );
         assert!(!target.sync_incomplete(&large, &[]).unwrap());
     }
 
@@ -749,7 +939,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
         let crdt = crate::master_node::worker_manager::build_thread_worker_hypergraph(
-            &db, Arc::new(quil_tries::ShaInclusionProver), false,
+            &db,
+            Arc::new(quil_tries::ShaInclusionProver),
+            false,
         );
         (dir, crdt)
     }
@@ -764,18 +956,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(quil_store::RocksDb::open(dir.path()).unwrap());
         let crdt = crate::master_node::worker_manager::build_thread_worker_hypergraph(
-            &db, Arc::new(quil_tries::ShaInclusionProver), false,
+            &db,
+            Arc::new(quil_tries::ShaInclusionProver),
+            false,
         );
         let app = [0xffu8; 32];
         for byte in [1u8, 2, 3] {
-            crdt.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: [byte; 32] }, &[byte; 48]).unwrap();
+            crdt.add_vertex(
+                &quil_hypergraph::Location {
+                    app_address: app,
+                    data_address: [byte; 32],
+                },
+                &[byte; 48],
+            )
+            .unwrap();
         }
         crdt.commit(9).unwrap();
         let (version, root) = crdt.serve_forest_head(&app, 0).unwrap();
         let store = quil_store::RocksHypergraphStore::new(db.inner());
         let index = |root: &[u8; 32]| {
             let txn = store.new_transaction(false).unwrap();
-            store.put_root_version(txn.as_ref(), "vertex", "adds", &app, root, version, 77).unwrap();
+            store
+                .put_root_version(txn.as_ref(), "vertex", "adds", &app, root, version, 77)
+                .unwrap();
             txn.commit().unwrap();
         };
         let stale = [0x5a; 32];
@@ -790,38 +993,96 @@ mod tests {
     #[tokio::test]
     async fn committed_phase_resolves_history_even_when_peer_head_has_advanced() {
         let (_dir, crdt) = fixture();
-        let mut peer = Peer { head: Some((40, vec![9; 32])), resolved: Some((12, 81)), head_calls: 0, resolve_calls: 0 };
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32]).await.unwrap(),
-            Some(PhaseSource::Tree { version: 12, root: [7; 32], global_frame: 81 }));
+        let mut peer = Peer {
+            head: Some((40, vec![9; 32])),
+            resolved: Some((12, 81)),
+            head_calls: 0,
+            resolve_calls: 0,
+        };
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Tree {
+                version: 12,
+                root: [7; 32],
+                global_frame: 81
+            })
+        );
         assert_eq!((peer.resolve_calls, peer.head_calls), (1, 0));
 
         // A matching live root alone cannot fabricate the phase-0 frame cursor.
         peer.resolved = None;
         peer.head = Some((40, vec![7; 32]));
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32]).await.unwrap(), None);
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &[4; 32], 0, &[7; 32])
+                .await
+                .unwrap(),
+            None
+        );
         // An unchanged auxiliary root needs no separate frame cursor.
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32]).await.unwrap(),
-            Some(PhaseSource::Tree { version: 40, root: [7; 32], global_frame: 0 }));
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Tree {
+                version: 40,
+                root: [7; 32],
+                global_frame: 0
+            })
+        );
         peer.head = Some((40, vec![9; 32]));
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32]).await.unwrap(), None);
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &[4; 32], 2, &[7; 32])
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn empty_or_absent_source_cannot_hide_stale_local_phase_data() {
         let (_dir, crdt) = fixture();
         let app = [5; 32];
-        let mut peer = Peer { head: None, resolved: None, head_calls: 0, resolve_calls: 0 };
+        let mut peer = Peer {
+            head: None,
+            resolved: None,
+            head_calls: 0,
+            resolve_calls: 0,
+        };
         for root in [[0; 32], EMPTY_PHASE_ROOT] {
-            assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &root).await.unwrap(), Some(PhaseSource::Empty));
+            assert_eq!(
+                resolve_phase_source(&mut peer, &crdt, &app, 0, &root)
+                    .await
+                    .unwrap(),
+                Some(PhaseSource::Empty)
+            );
         }
         assert_eq!((peer.head_calls, peer.resolve_calls), (0, 0));
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &[]).await.unwrap(), Some(PhaseSource::Empty));
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &app, 0, &[])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Empty)
+        );
 
-        crdt.add_vertex(&quil_hypergraph::Location { app_address: app, data_address: [1; 32] }, b"stale").unwrap();
+        crdt.add_vertex(
+            &quil_hypergraph::Location {
+                app_address: app,
+                data_address: [1; 32],
+            },
+            b"stale",
+        )
+        .unwrap();
         crdt.commit(1).unwrap();
         let before = crdt.current_forest_phase_root(&app, 0).unwrap();
         for root in [Vec::new(), vec![0; 32], EMPTY_PHASE_ROOT.to_vec()] {
-            assert_eq!(resolve_phase_source(&mut peer, &crdt, &app, 0, &root).await.unwrap(), None);
+            assert_eq!(
+                resolve_phase_source(&mut peer, &crdt, &app, 0, &root)
+                    .await
+                    .unwrap(),
+                None
+            );
             assert_eq!(crdt.current_forest_phase_root(&app, 0).unwrap(), before);
         }
     }
@@ -829,19 +1090,38 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_is_distinct_from_empty_or_malformed_commitments() {
         let (_dir, crdt) = fixture();
-        let mut peer = Peer { head: Some((0, vec![8; 32])), resolved: None, head_calls: 0, resolve_calls: 0 };
+        let mut peer = Peer {
+            head: Some((0, vec![8; 32])),
+            resolved: None,
+            head_calls: 0,
+            resolve_calls: 0,
+        };
         assert_eq!(phase_anchor(&[]).unwrap(), None);
         assert!(!is_empty_phase_root(&[]));
-        assert_eq!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[]).await.unwrap(),
-            Some(PhaseSource::Tree { version: 0, root: [8; 32], global_frame: 0 }));
+        assert_eq!(
+            resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[])
+                .await
+                .unwrap(),
+            Some(PhaseSource::Tree {
+                version: 0,
+                root: [8; 32],
+                global_frame: 0
+            })
+        );
         for size in [1, 16, 31, 33, 64] {
-            assert!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &vec![0; size]).await.is_err());
+            assert!(
+                resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &vec![0; size])
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(peer.resolve_calls, 0);
         assert_eq!(peer.head_calls, 1);
         for root in [vec![], vec![0; 31]] {
             peer.head = Some((0, root));
-            assert!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[]).await.is_err());
+            assert!(resolve_phase_source(&mut peer, &crdt, &[3; 32], 0, &[])
+                .await
+                .is_err());
         }
         let mut forged = EMPTY_PHASE_ROOT;
         forged[31] ^= 1;

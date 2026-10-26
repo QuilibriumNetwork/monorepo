@@ -139,7 +139,10 @@ fn cron_disable() -> anyhow::Result<()> {
         println!("Auto-update is not enabled");
         return Ok(());
     }
-    let kept: Vec<&str> = current.lines().filter(|l| !l.contains(CRON_MARKER)).collect();
+    let kept: Vec<&str> = current
+        .lines()
+        .filter(|l| !l.contains(CRON_MARKER))
+        .collect();
     write_crontab(&(kept.join("\n") + "\n"))?;
     println!("Auto-update disabled");
     Ok(())

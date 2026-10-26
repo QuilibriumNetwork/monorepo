@@ -8,9 +8,11 @@
 //! frontier yet) reconstructs from all live coins; `full_rebuild_root` remains
 //! available as a cross-check (`QUIL_ACCUMULATOR_VERIFY=1` runs it on every
 //! publication and fails on divergence).
-use super::state::{decode_snapshot_coin, read_local, write_local, SnapshotLimits, FRONTIER_ADDRESS, ROOT_ADDRESS};
-use quil_lattice_ct::confidential::relation::membership::{IDENTITY_BYTES, NODE_BYTES};
+use super::state::{
+    decode_snapshot_coin, read_local, write_local, SnapshotLimits, FRONTIER_ADDRESS, ROOT_ADDRESS,
+};
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+use quil_lattice_ct::confidential::relation::membership::{IDENTITY_BYTES, NODE_BYTES};
 use quil_lattice_ct::confidential::{
     coin_tree::{CoinRecord, Frontier, RootRecord, ROOT_RECORD_BYTES},
     relation::membership::Node,
@@ -116,7 +118,10 @@ impl History {
 pub(crate) fn publish_history(existing: Option<&[u8]>, current: RootRecord) -> Result<Vec<u8>> {
     let mut history = match existing {
         Some(bytes) => History::decode(bytes, &current.context)?,
-        None => History { current: current.clone(), digests: Vec::new() },
+        None => History {
+            current: current.clone(),
+            digests: Vec::new(),
+        },
     };
     history.publish(current)?;
     history.encode()
@@ -137,12 +142,21 @@ fn id_digest(id: &[u8; ID_BYTES]) -> [u8; 32] {
 
 /// Whether an encoded root history retains the root whose [`root_digest`] this
 /// is. At most `HISTORY_LIMIT` digests are computed.
-pub(crate) fn history_retains_digest(bytes: &[u8], context: &[u8; 32], digest: &[u8; 32]) -> Result<bool> {
+pub(crate) fn history_retains_digest(
+    bytes: &[u8],
+    context: &[u8; 32],
+    digest: &[u8; 32],
+) -> Result<bool> {
     Ok(History::decode(bytes, context)?.digests.contains(digest))
 }
 
 /// Whether an encoded root history retains `root` at `depth`.
-pub(crate) fn history_retains(bytes: &[u8], context: &[u8; 32], depth: u8, root: &Node) -> Result<bool> {
+pub(crate) fn history_retains(
+    bytes: &[u8],
+    context: &[u8; 32],
+    depth: u8,
+    root: &Node,
+) -> Result<bool> {
     let history = History::decode(bytes, context)?;
     Ok(history.digests.contains(&root_digest(context, depth, root)))
 }
@@ -308,7 +322,10 @@ impl BlockSummary {
     }
 
     pub fn roots(&self) -> Vec<(u64, Node)> {
-        self.blocks.iter().map(|(block, _, root)| (*block, root.clone())).collect()
+        self.blocks
+            .iter()
+            .map(|(block, _, root)| (*block, root.clone()))
+            .collect()
     }
 }
 
@@ -318,7 +335,9 @@ impl BlockSummary {
 pub fn block_summary(state: &HypergraphState, application: &[u8; 32]) -> Result<BlockSummary> {
     match super::summary_tree::legacy_summary(state, application)? {
         Some(flat) => Ok(flat),
-        None => Ok(BlockSummary { blocks: super::summary_tree::entries(state, application)? }),
+        None => Ok(BlockSummary {
+            blocks: super::summary_tree::entries(state, application)?,
+        }),
     }
 }
 
@@ -346,7 +365,9 @@ pub fn rebuild_block_summary(
 ) -> Result<()> {
     let context = parameter_context(network, application);
     let disc = vertex_adds_discriminator()?;
-    let summary = block_summary_from_records(&context, shard, |address| state.get(application, address, &disc))?;
+    let summary = block_summary_from_records(&context, shard, |address| {
+        state.get(application, address, &disc)
+    })?;
     let flat = read_local(state, application, &super::state::BLOCK_SUMMARY_ADDRESS)?;
     // Empty non-token applications acquire no token metadata just because
     // their shard synced. An existing summary/root still needs correction
@@ -362,20 +383,38 @@ pub fn rebuild_block_summary(
     // executes at the same frame, converts. (While these records sat in the
     // tree, a member-local conversion changed one member's committed state;
     // they are node-local now, and the single conversion point stays.)
-    if flat.as_ref().is_some_and(|flat| flat.as_slice() != super::summary_tree::MOVED) {
+    if flat
+        .as_ref()
+        .is_some_and(|flat| flat.as_slice() != super::summary_tree::MOVED)
+    {
         let bytes = summary.encode();
         if flat.as_deref() != Some(bytes.as_slice()) {
-            write_local(state, application, &super::state::BLOCK_SUMMARY_ADDRESS, bytes);
+            write_local(
+                state,
+                application,
+                &super::state::BLOCK_SUMMARY_ADDRESS,
+                bytes,
+            );
         }
         let shape = super::coin_blocks::shape(block_width(state, application)?)?;
-        let root = quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(&context, shape, &summary.roots())
-            .map_err(|_| invalid())?;
+        let root = quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(
+            &context,
+            shape,
+            &summary.roots(),
+        )
+        .map_err(|_| invalid())?;
         publish_root(state, network, application, root, summary.coins())?;
         return Ok(());
     }
     let tree = super::summary_tree::SummaryTree::new(state, &context, application);
     tree.replace(&summary.blocks)?;
-    publish_root(state, network, application, tree.root()?, super::summary_tree::top(state, application)?.map_or(0, |top| top.coins))?;
+    publish_root(
+        state,
+        network,
+        application,
+        tree.root()?,
+        super::summary_tree::top(state, application)?.map_or(0, |top| top.coins),
+    )?;
     Ok(())
 }
 
@@ -391,22 +430,29 @@ pub(crate) fn block_summary_from_records(
     let depth = usize::from(super::coin_blocks::SUBTREE_BITS);
     for block in super::coin_blocks::owned_blocks(shard, super::coin_blocks::MAX_BLOCK_BITS) {
         let frontier = read(&block_record_address(BLOCK_FRONTIER_TAG, block))?
-            .map(|bytes| Frontier::decode(&bytes, context, depth).map_err(|_| invalid())).transpose()?;
+            .map(|bytes| Frontier::decode(&bytes, context, depth).map_err(|_| invalid()))
+            .transpose()?;
         let root = read(&block_record_address(BLOCK_ROOT_TAG, block))?
-            .map(|bytes| Node::from_bytes(&bytes).map_err(|_| invalid())).transpose()?;
+            .map(|bytes| Node::from_bytes(&bytes).map_err(|_| invalid()))
+            .transpose()?;
         match (frontier, root) {
             (None, None) => {}
             (Some(frontier), Some(root)) => {
-                let reconstructed = frontier.root_at_depth(depth)
-                    .map_err(|_| invalid())?;
+                let reconstructed = frontier.root_at_depth(depth).map_err(|_| invalid())?;
                 if reconstructed.root != root {
-                    return Err(QuilError::ExecutionUnavailable("coin block frontier/root mismatch during summary recovery".into()));
+                    return Err(QuilError::ExecutionUnavailable(
+                        "coin block frontier/root mismatch during summary recovery".into(),
+                    ));
                 }
                 if frontier.count() > 0 {
                     summary.put(block, frontier.count(), root)?;
                 }
             }
-            _ => return Err(QuilError::ExecutionUnavailable("incomplete coin block during summary recovery".into())),
+            _ => {
+                return Err(QuilError::ExecutionUnavailable(
+                    "incomplete coin block during summary recovery".into(),
+                ))
+            }
         }
     }
     Ok(summary)
@@ -442,8 +488,12 @@ pub fn fold_application_root(
     let width = block_width(state, application)?;
     let shape = super::coin_blocks::shape(width)?;
     match super::summary_tree::legacy_summary(state, application)? {
-        Some(flat) => quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(&context, shape, &flat.roots())
-            .map_err(|_| invalid()),
+        Some(flat) => quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(
+            &context,
+            shape,
+            &flat.roots(),
+        )
+        .map_err(|_| invalid()),
         None => super::summary_tree::SummaryTree::new(state, &context, application).root(),
     }
 }
@@ -489,9 +539,11 @@ pub fn block_count(
     limits: SnapshotLimits,
 ) -> Result<u64> {
     let context = parameter_context(network, application);
-    Ok(load_block_frontier(state, &context, application, block, limits)?
-        .map(|frontier| frontier.count())
-        .unwrap_or(0))
+    Ok(
+        load_block_frontier(state, &context, application, block, limits)?
+            .map(|frontier| frontier.count())
+            .unwrap_or(0),
+    )
 }
 
 /// Leaf index for the next coin staged into `block`: the block's own count,
@@ -577,8 +629,10 @@ pub fn full_rebuild_root(
     // The independent cross-check of the per-block fold: build the whole tree
     // from every live coin and take its root. The two must agree, which is the
     // property `sharded_tree` proves and this recomputes over real state.
-    let tree = quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree::build(&context, shape, &records)
-        .map_err(|_| invalid())?;
+    let tree = quil_lattice_ct::confidential::sharded_tree::ShardedCoinTree::build(
+        &context, shape, &records,
+    )
+    .map_err(|_| invalid())?;
     tree.root_at_depth(shape.depth()).map_err(|_| invalid())
 }
 
@@ -646,7 +700,11 @@ pub fn refresh_root(
         by_block.entry(block).or_default().push(record);
     }
 
-    let held = if bootstrap { 0 } else { held.map_or(0, |top| top.coins) };
+    let held = if bootstrap {
+        0
+    } else {
+        held.map_or(0, |top| top.coins)
+    };
     // Load each touched block's frontier and separate the genuinely new coins:
     // a changeset may be refreshed several times, so coins already folded into
     // a block appear again in `pending_vertex_adds` and must not be recounted.
@@ -687,13 +745,12 @@ pub fn refresh_root(
                 .append(&record.owner, &record.commitment)
                 .map_err(|_| invalid())?;
         }
-        let root = frontier
-            .root_at_depth(subtree)
-            .map_err(|_| invalid())?;
+        let root = frontier.root_at_depth(subtree).map_err(|_| invalid())?;
         let encoded = frontier.encode();
         let frontier_address =
             super::state::block_record_address(super::state::BLOCK_FRONTIER_TAG, block);
-        if state.get(application, &frontier_address, &disc)?.as_deref() != Some(encoded.as_slice()) {
+        if state.get(application, &frontier_address, &disc)?.as_deref() != Some(encoded.as_slice())
+        {
             state.set(application, &frontier_address, &disc, 0, encoded)?;
         }
         let root_address = super::state::block_record_address(super::state::BLOCK_ROOT_TAG, block);
@@ -763,7 +820,9 @@ mod tests {
     /// unchanged, and a converted store is rebuilt as a tree with the same root.
     #[test]
     fn a_rebuild_keeps_a_flat_summary_flat() {
-        use super::super::state::{block_record_address, BLOCK_FRONTIER_TAG, BLOCK_ROOT_TAG, BLOCK_SUMMARY_ADDRESS};
+        use super::super::state::{
+            block_record_address, BLOCK_FRONTIER_TAG, BLOCK_ROOT_TAG, BLOCK_SUMMARY_ADDRESS,
+        };
         use super::super::summary_tree::{self, MOVED};
         use quil_lattice_ct::confidential::{AmountOpening, CommitmentKey};
         let state = mem_state();
@@ -776,32 +835,79 @@ mod tests {
         for (seed, width, path) in [(1u8, 6u8, 0u64), (2, 6, 9), (3, 7, 100)] {
             let block = super::super::coin_blocks::block_id(width, path).unwrap();
             let mut frontier = Frontier::new(&context, depth).unwrap();
-            let commitment = key.commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32]));
-            frontier.append(&[seed; IDENTITY_BYTES], &commitment).unwrap();
+            let commitment = key.commit(
+                u128::from(seed),
+                &AmountOpening::from_seed(&context, &[seed; 32]),
+            );
+            frontier
+                .append(&[seed; IDENTITY_BYTES], &commitment)
+                .unwrap();
             let root = frontier.root_at_depth(depth).unwrap().root;
-            state.set(&application, &block_record_address(BLOCK_FRONTIER_TAG, block), &disc, 0, frontier.encode()).unwrap();
-            state.set(&application, &block_record_address(BLOCK_ROOT_TAG, block), &disc, 0, root.to_bytes().to_vec()).unwrap();
+            state
+                .set(
+                    &application,
+                    &block_record_address(BLOCK_FRONTIER_TAG, block),
+                    &disc,
+                    0,
+                    frontier.encode(),
+                )
+                .unwrap();
+            state
+                .set(
+                    &application,
+                    &block_record_address(BLOCK_ROOT_TAG, block),
+                    &disc,
+                    0,
+                    root.to_bytes().to_vec(),
+                )
+                .unwrap();
             flat.put(block, 1, root).unwrap();
         }
-        state.set(&application, &BLOCK_SUMMARY_ADDRESS, &disc, 0, flat.encode()).unwrap();
+        state
+            .set(
+                &application,
+                &BLOCK_SUMMARY_ADDRESS,
+                &disc,
+                0,
+                flat.encode(),
+            )
+            .unwrap();
         state.commit().unwrap();
         state.abort();
 
         rebuild_block_summary(&state, &network, &application, &[]).unwrap();
-        assert_eq!(super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS).unwrap(), Some(flat.encode()),
-            "a rebuild leaves a flat summary flat");
+        assert_eq!(
+            super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS).unwrap(),
+            Some(flat.encode()),
+            "a rebuild leaves a flat summary flat"
+        );
         assert!(summary_tree::top(&state, &application).unwrap().is_none());
         let root = fold_application_root(&state, &network, &application).unwrap();
         state.commit().unwrap();
         state.abort();
 
-        summary_tree::SummaryTree::new(&state, &context, &application).upgrade().unwrap();
+        summary_tree::SummaryTree::new(&state, &context, &application)
+            .upgrade()
+            .unwrap();
         state.commit().unwrap();
         state.abort();
         rebuild_block_summary(&state, &network, &application, &[]).unwrap();
-        assert_eq!(super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS).unwrap().as_deref(), Some(MOVED.as_slice()));
-        assert_eq!(summary_tree::top(&state, &application).unwrap().map(|top| top.coins), Some(3));
-        assert_eq!(fold_application_root(&state, &network, &application).unwrap(), root);
+        assert_eq!(
+            super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS)
+                .unwrap()
+                .as_deref(),
+            Some(MOVED.as_slice())
+        );
+        assert_eq!(
+            summary_tree::top(&state, &application)
+                .unwrap()
+                .map(|top| top.coins),
+            Some(3)
+        );
+        assert_eq!(
+            fold_application_root(&state, &network, &application).unwrap(),
+            root
+        );
     }
 
     /// A store written before the summary tree holds a flat summary. Its first
@@ -815,19 +921,43 @@ mod tests {
         let state = mem_state();
         let (network, application) = ([21u8; 32], [22u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = SnapshotLimits { max_coins: 64, max_depth: 32, max_nodes: 1 << 16 };
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         let key = CommitmentKey::derive(&context);
         // One changeset's coins share the positions staged so far.
         let stage = |seed: u8, staged: &mut BTreeMap<_, _>| {
             let output = Output {
                 owner: [seed; IDENTITY_BYTES],
-                commitment: key.commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: key.commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
                 memo: [seed; 1115],
             };
-            let (address, tree) =
-                stage_coin(&state, &network, &application, &context, 1, &output, staged, limits).unwrap();
-            state.set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+            let (address, tree) = stage_coin(
+                &state,
+                &network,
+                &application,
+                &context,
+                1,
+                &output,
+                staged,
+                limits,
+            )
+            .unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
         };
         let mut staged = BTreeMap::new();
         for seed in 1..=6 {
@@ -836,8 +966,18 @@ mod tests {
         refresh_root(&state, &network, &application, limits).unwrap();
         // The same state in its pre-tree form.
         let flat = block_summary(&state, &application).unwrap();
-        SummaryTree::new(&state, &context, &application).replace(&[]).unwrap();
-        state.set(&application, &BLOCK_SUMMARY_ADDRESS, &disc, 0, flat.encode()).unwrap();
+        SummaryTree::new(&state, &context, &application)
+            .replace(&[])
+            .unwrap();
+        state
+            .set(
+                &application,
+                &BLOCK_SUMMARY_ADDRESS,
+                &disc,
+                0,
+                flat.encode(),
+            )
+            .unwrap();
         state.commit().unwrap();
         state.abort();
         assert!(summary_tree::top(&state, &application).unwrap().is_none());
@@ -848,11 +988,27 @@ mod tests {
             stage(seed, &mut staged);
         }
         let published = refresh_root(&state, &network, &application, limits).unwrap();
-        assert_eq!(super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS).unwrap().as_deref(), Some(MOVED.as_slice()));
-        assert_eq!(published, full_rebuild_root(&state, &network, &application, limits).unwrap());
+        assert_eq!(
+            super::super::state::read_local(&state, &application, &BLOCK_SUMMARY_ADDRESS)
+                .unwrap()
+                .as_deref(),
+            Some(MOVED.as_slice())
+        );
+        assert_eq!(
+            published,
+            full_rebuild_root(&state, &network, &application, limits).unwrap()
+        );
         assert_eq!(published.coins, 9);
-        assert_eq!(summary_tree::top(&state, &application).unwrap().map(|top| top.coins), Some(9));
-        assert_eq!(fold_application_root(&state, &network, &application).unwrap(), published.root);
+        assert_eq!(
+            summary_tree::top(&state, &application)
+                .unwrap()
+                .map(|top| top.coins),
+            Some(9)
+        );
+        assert_eq!(
+            fold_application_root(&state, &network, &application).unwrap(),
+            published.root
+        );
     }
 
     /// Blocks advance independently: each keeps its own count, so the shard
@@ -862,10 +1018,17 @@ mod tests {
     fn blocks_count_independently_and_positions_never_collide() {
         let state = mem_state();
         let (network, application) = ([3u8; 32], [4u8; 32]);
-        let limits = SnapshotLimits { max_coins: 1024, max_depth: 32, max_nodes: 1 << 16 };
+        let limits = SnapshotLimits {
+            max_coins: 1024,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
         let width = block_width(&state, &application).unwrap();
-        assert_eq!(width, super::super::coin_blocks::INITIAL_BLOCK_BITS,
-            "an application with no committed width starts at the initial one");
+        assert_eq!(
+            width,
+            super::super::coin_blocks::INITIAL_BLOCK_BITS,
+            "an application with no committed width starts at the initial one"
+        );
 
         // Nothing staged yet: every block starts empty, and each block's first
         // position is its own, not a shared counter.
@@ -875,10 +1038,17 @@ mod tests {
             .map(|path| super::super::coin_blocks::block_id(width, *path).unwrap())
             .collect();
         for block in ids {
-            assert_eq!(block_count(&state, &network, &application, block, limits).unwrap(), 0);
-            let position = next_block_position(&state, &network, &application, block, limits).unwrap();
+            assert_eq!(
+                block_count(&state, &network, &application, block, limits).unwrap(),
+                0
+            );
+            let position =
+                next_block_position(&state, &network, &application, block, limits).unwrap();
             assert_eq!(super::super::coin_blocks::locate(position), (block, 0));
-            assert!(seen.insert(position), "block {block} must not reuse another block's position");
+            assert!(
+                seen.insert(position),
+                "block {block} must not reuse another block's position"
+            );
         }
 
         // A block wider than the committed width does not exist yet, and is
@@ -895,7 +1065,8 @@ mod tests {
         let shape = super::super::coin_blocks::shape(width).unwrap();
         assert_eq!(
             empty,
-            quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(&context, shape, &[]).unwrap()
+            quil_lattice_ct::confidential::sharded_tree::fold_subtree_roots(&context, shape, &[])
+                .unwrap()
         );
         // And no block has a root yet.
         let first = super::super::coin_blocks::block_id(width, 0).unwrap();
@@ -930,8 +1101,15 @@ mod tests {
         }
         assert_eq!(history.digests.len(), HISTORY_LIMIT);
         let bytes = history.encode().unwrap();
-        assert_eq!(History::decode(&bytes, &[1; 32]).unwrap().digests, history.digests);
-        assert!(bytes.len() < 12 * 1024, "a full history fits a scan page: {} bytes", bytes.len());
+        assert_eq!(
+            History::decode(&bytes, &[1; 32]).unwrap().digests,
+            history.digests
+        );
+        assert!(
+            bytes.len() < 12 * 1024,
+            "a full history fits a scan page: {} bytes",
+            bytes.len()
+        );
         history.digests[0] = history.digests[1];
         assert!(history.encode().is_err());
     }
@@ -942,7 +1120,10 @@ mod tests {
     fn a_history_of_root_ids_reads_as_digests_and_is_rewritten() {
         let context = [1; 32];
         let root = |i: u8| RootRecord {
-            context, depth: 1, coins: 0, root: Node::from_identity_bytes(&[i; IDENTITY_BYTES]).unwrap(),
+            context,
+            depth: 1,
+            coins: 0,
+            root: Node::from_identity_bytes(&[i; IDENTITY_BYTES]).unwrap(),
         };
         let mut legacy = VERSION_IDS.to_vec();
         legacy.extend_from_slice(&root(3).encode().unwrap());
@@ -952,7 +1133,12 @@ mod tests {
         }
         for i in 1..=3u8 {
             assert!(history_retains(&legacy, &context, 1, &root(i).root).unwrap());
-            assert!(history_retains_digest(&legacy, &context, &root_digest(&context, 1, &root(i).root)).unwrap());
+            assert!(history_retains_digest(
+                &legacy,
+                &context,
+                &root_digest(&context, 1, &root(i).root)
+            )
+            .unwrap());
         }
         assert!(!history_retains(&legacy, &context, 1, &root(4).root).unwrap());
         let rewritten = publish_history(Some(&legacy), root(4)).unwrap();
@@ -966,11 +1152,17 @@ mod tests {
         let again = publish_history(Some(&rewritten), root(2)).unwrap();
         let history = History::decode(&again, &context).unwrap();
         assert_eq!(history.digests.len(), 4);
-        assert_eq!(history.digests.last(), Some(&root_digest(&context, 1, &root(2).root)));
+        assert_eq!(
+            history.digests.last(),
+            Some(&root_digest(&context, 1, &root(2).root))
+        );
         let mut wrong_last = legacy.clone();
         let tail = wrong_last.len() - ID_BYTES;
         wrong_last[tail..].copy_from_slice(&root_id(&context, 1, &root(9).root));
-        assert!(History::decode(&wrong_last, &context).is_err(), "the last id must be the current root's");
+        assert!(
+            History::decode(&wrong_last, &context).is_err(),
+            "the last id must be the current root's"
+        );
     }
 
     /// The accumulator's own records are node-local: a publication writes no
@@ -988,7 +1180,11 @@ mod tests {
         let network = [1; 32];
         let application = [2; 32];
         let context = parameter_context(&network, &application);
-        let limits = SnapshotLimits { max_coins: 4, max_depth: 3, max_nodes: 16 };
+        let limits = SnapshotLimits {
+            max_coins: 4,
+            max_depth: 3,
+            max_nodes: 16,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_hypergraph::testing::MemStore::new()),
@@ -1001,19 +1197,53 @@ mod tests {
             commitment: key.commit(123, &AmountOpening::from_seed(&context, &[1; 32])),
             memo: [0; 1115],
         };
-        let (address, tree) =
-            stage_coin(&state, &network, &application, &context, 1, &output, &mut BTreeMap::new(), limits).unwrap();
-        state.set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+        let (address, tree) = stage_coin(
+            &state,
+            &network,
+            &application,
+            &context,
+            1,
+            &output,
+            &mut BTreeMap::new(),
+            limits,
+        )
+        .unwrap();
+        state
+            .set(
+                &application,
+                &address,
+                &disc,
+                1,
+                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+            )
+            .unwrap();
         let published = refresh_root(&state, &network, &application, limits).unwrap();
         state.commit().unwrap();
 
         let next = HypergraphState::new(crdt.clone());
         for address in [ROOT_ADDRESS, node_address(LEVELS, 0)] {
-            assert_eq!(next.get(&application, &address, &disc).unwrap(), None, "no vertex in the tree");
+            assert_eq!(
+                next.get(&application, &address, &disc).unwrap(),
+                None,
+                "no vertex in the tree"
+            );
         }
-        assert_eq!(read_current(&next, &network, &application).unwrap(), Some(published.clone()));
-        assert!(accepts_root(&next, &network, &application, published.depth, &published.root).unwrap());
-        assert_eq!(top(&next, &application).unwrap().map(|node| node.coins), Some(1));
+        assert_eq!(
+            read_current(&next, &network, &application).unwrap(),
+            Some(published.clone())
+        );
+        assert!(accepts_root(
+            &next,
+            &network,
+            &application,
+            published.depth,
+            &published.root
+        )
+        .unwrap());
+        assert_eq!(
+            top(&next, &application).unwrap().map(|node| node.coins),
+            Some(1)
+        );
 
         // An earlier build's copy in the tree: read in place, then superseded
         // by the next publication without being rewritten.
@@ -1021,15 +1251,47 @@ mod tests {
             Arc::new(quil_hypergraph::testing::MemStore::new()),
             Arc::new(NoopInclusionProver),
         )));
-        let history = next.get_record(&super::super::state::local_record_key(&application, &ROOT_ADDRESS)).unwrap().unwrap();
-        legacy.set(&application, &ROOT_ADDRESS, &disc, 1, history.clone()).unwrap();
-        legacy.set(&application, &SHAPE_ADDRESS, &disc, 1, vec![super::super::coin_blocks::INITIAL_BLOCK_BITS]).unwrap();
+        let history = next
+            .get_record(&super::super::state::local_record_key(
+                &application,
+                &ROOT_ADDRESS,
+            ))
+            .unwrap()
+            .unwrap();
+        legacy
+            .set(&application, &ROOT_ADDRESS, &disc, 1, history.clone())
+            .unwrap();
+        legacy
+            .set(
+                &application,
+                &SHAPE_ADDRESS,
+                &disc,
+                1,
+                vec![super::super::coin_blocks::INITIAL_BLOCK_BITS],
+            )
+            .unwrap();
         legacy.commit().unwrap();
-        assert_eq!(read_current(&legacy, &network, &application).unwrap(), Some(published));
-        assert_eq!(block_width(&legacy, &application).unwrap(), super::super::coin_blocks::INITIAL_BLOCK_BITS);
+        assert_eq!(
+            read_current(&legacy, &network, &application).unwrap(),
+            Some(published)
+        );
+        assert_eq!(
+            block_width(&legacy, &application).unwrap(),
+            super::super::coin_blocks::INITIAL_BLOCK_BITS
+        );
         publish_root(&legacy, &network, &application, Node::zero(), 0).unwrap();
-        assert_eq!(read_current(&legacy, &network, &application).unwrap().unwrap().coins, 0);
-        assert_eq!(legacy.get(&application, &ROOT_ADDRESS, &disc).unwrap(), Some(history), "the tree copy is not rewritten");
+        assert_eq!(
+            read_current(&legacy, &network, &application)
+                .unwrap()
+                .unwrap()
+                .coins,
+            0
+        );
+        assert_eq!(
+            legacy.get(&application, &ROOT_ADDRESS, &disc).unwrap(),
+            Some(history),
+            "the tree copy is not rewritten"
+        );
     }
 
     #[test]
@@ -1052,7 +1314,16 @@ mod tests {
         };
         let disc = vertex_adds_discriminator().unwrap();
         assert!(!accepts_root(&state, &network, &application, 1, &Node::zero()).unwrap());
-        assert!(next_position(&state, &network, &application, SnapshotLimits { max_depth: 0, ..limits }).is_err());
+        assert!(next_position(
+            &state,
+            &network,
+            &application,
+            SnapshotLimits {
+                max_depth: 0,
+                ..limits
+            }
+        )
+        .is_err());
         let key = CommitmentKey::derive(&context);
         // Adapters assign positions from `next_position`; the fixture does the same.
         // Stage the way every adapter does: identity first, then the block its
@@ -1065,10 +1336,20 @@ mod tests {
             };
             let mut staged = BTreeMap::new();
             let (address, tree) = stage_coin(
-                &state, &network, &application, &context, 1, &output, &mut staged, limits,
+                &state,
+                &network,
+                &application,
+                &context,
+                1,
+                &output,
+                &mut staged,
+                limits,
             )
             .unwrap();
-            let position = super::super::state::read_coin(&tree, &context).unwrap().unwrap().position;
+            let position = super::super::state::read_coin(&tree, &context)
+                .unwrap()
+                .unwrap()
+                .position;
             let blob = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
             state.set(&application, &address, &disc, 1, blob).unwrap();
             position
@@ -1083,11 +1364,22 @@ mod tests {
         // The frontier written is the BLOCK's, not one shared by the
         // application: that is what lets each shard advance on its own.
         let first_block = super::super::coin_blocks::locate(first_position).0;
-        let frontier_address =
-            super::super::state::block_record_address(super::super::state::BLOCK_FRONTIER_TAG, first_block);
-        assert!(state.get(&application, &frontier_address, &disc).unwrap().is_some());
-        assert_eq!(block_count(&state, &network, &application, first_block, limits).unwrap(), 1);
-        assert_eq!(full_rebuild_root(&state, &network, &application, limits).unwrap(), first);
+        let frontier_address = super::super::state::block_record_address(
+            super::super::state::BLOCK_FRONTIER_TAG,
+            first_block,
+        );
+        assert!(state
+            .get(&application, &frontier_address, &disc)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            block_count(&state, &network, &application, first_block, limits).unwrap(),
+            1
+        );
+        assert_eq!(
+            full_rebuild_root(&state, &network, &application, limits).unwrap(),
+            first
+        );
         let saved = state.changeset_len();
         refresh_root(&state, &network, &application, limits).unwrap();
         assert_eq!(state.changeset_len(), saved);
@@ -1095,14 +1387,20 @@ mod tests {
         // Incremental publication appends only the new coin, matching a rebuild.
         let second = refresh_root(&state, &network, &application, limits).unwrap();
         assert_eq!(second.coins, 2);
-        assert_eq!(full_rebuild_root(&state, &network, &application, limits).unwrap(), second);
+        assert_eq!(
+            full_rebuild_root(&state, &network, &application, limits).unwrap(),
+            second
+        );
         assert!(accepts_root(&state, &network, &application, first.depth, &first.root).unwrap());
         state.rollback_to(saved);
         assert_eq!(
             read_current(&state, &network, &application).unwrap(),
             Some(first.clone())
         );
-        assert_eq!(block_count(&state, &network, &application, first_block, limits).unwrap(), 1);
+        assert_eq!(
+            block_count(&state, &network, &application, first_block, limits).unwrap(),
+            1
+        );
         assert!(!accepts_root(&state, &network, &application, second.depth, &second.root).unwrap());
         state.commit().unwrap();
         state.abort();
@@ -1129,11 +1427,28 @@ mod tests {
         )
         .unwrap();
         let (address, tree) = create_coin(&context, 1, &stray, gapped).unwrap();
-        state.set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
+        state
+            .set(
+                &application,
+                &address,
+                &disc,
+                1,
+                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+            )
+            .unwrap();
         assert!(refresh_root(&state, &network, &application, limits).is_err());
         state.rollback_to(saved);
         // The coin cap applies to the running total.
-        assert!(refresh_root(&state, &network, &application, SnapshotLimits { max_coins: 1, ..limits }).is_err());
+        assert!(refresh_root(
+            &state,
+            &network,
+            &application,
+            SnapshotLimits {
+                max_coins: 1,
+                ..limits
+            }
+        )
+        .is_err());
         state.commit().unwrap();
         state.abort();
         state.crdt().commit(1).unwrap();
@@ -1159,10 +1474,17 @@ mod tests {
                 block_count(&state, &network, &application, block, limits).unwrap(),
                 "a staged coin takes its own block's next index"
             );
-            let wide = SnapshotLimits { max_coins: 8, max_nodes: 32, ..limits };
+            let wide = SnapshotLimits {
+                max_coins: 8,
+                max_nodes: 32,
+                ..limits
+            };
             let root = refresh_root(&state, &network, &application, wide).unwrap();
             assert_eq!(root.coins, expected + 1);
-            assert_eq!(full_rebuild_root(&state, &network, &application, wide).unwrap(), root);
+            assert_eq!(
+                full_rebuild_root(&state, &network, &application, wide).unwrap(),
+                root
+            );
         }
     }
 
@@ -1180,21 +1502,46 @@ mod tests {
         let state = mem_state();
         let (network, application) = ([21u8; 32], [22u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = SnapshotLimits { max_coins: 64, max_depth: 32, max_nodes: 1 << 16 };
+        let limits = SnapshotLimits {
+            max_coins: 64,
+            max_depth: 32,
+            max_nodes: 1 << 16,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         let key = CommitmentKey::derive(&context);
         let stage = |seed: u8| {
             let output = Output {
                 owner: [seed; IDENTITY_BYTES],
-                commitment: key.commit(u128::from(seed), &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: key.commit(
+                    u128::from(seed),
+                    &AmountOpening::from_seed(&context, &[seed; 32]),
+                ),
                 memo: [0; 1115],
             };
             let mut staged = BTreeMap::new();
-            let (address, tree) =
-                stage_coin(&state, &network, &application, &context, 1, &output, &mut staged, limits).unwrap();
-            let position = super::super::state::read_coin(&tree, &context).unwrap().unwrap().position;
+            let (address, tree) = stage_coin(
+                &state,
+                &network,
+                &application,
+                &context,
+                1,
+                &output,
+                &mut staged,
+                limits,
+            )
+            .unwrap();
+            let position = super::super::state::read_coin(&tree, &context)
+                .unwrap()
+                .unwrap()
+                .position;
             state
-                .set(&application, &address, &disc, 1, quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap())
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    1,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
                 .unwrap();
             (address, position)
         };
@@ -1210,7 +1557,13 @@ mod tests {
 
         // Widen by one level. Nothing else changes.
         state
-            .set(&application, &super::super::state::SHAPE_ADDRESS, &disc, 1, vec![narrow + 1])
+            .set(
+                &application,
+                &super::super::state::SHAPE_ADDRESS,
+                &disc,
+                1,
+                vec![narrow + 1],
+            )
             .unwrap();
         assert_eq!(block_width(&state, &application).unwrap(), narrow + 1);
 
@@ -1227,26 +1580,40 @@ mod tests {
                 super::super::coin_blocks::block_for_address(narrow, address).unwrap(),
                 block
             );
-            assert!(super::super::coin_blocks::is_allocated_width(narrow + 1, block));
+            assert!(super::super::coin_blocks::is_allocated_width(
+                narrow + 1,
+                block
+            ));
         }
-        assert_eq!(read_current(&state, &network, &application).unwrap(), Some(first.clone()));
+        assert_eq!(
+            read_current(&state, &network, &application).unwrap(),
+            Some(first.clone())
+        );
 
         // New coins take blocks of the wider space, and the incremental root
         // still equals a rebuild over every live coin — old and new together.
         for seed in 10..14u8 {
             let (_, position) = stage(seed);
             assert_eq!(
-                super::super::coin_blocks::creation_width(super::super::coin_blocks::locate(position).0),
+                super::super::coin_blocks::creation_width(
+                    super::super::coin_blocks::locate(position).0
+                ),
                 narrow + 1,
                 "a coin staged after the widening uses the wider space"
             );
             let root = refresh_root(&state, &network, &application, limits).unwrap();
-            assert_eq!(full_rebuild_root(&state, &network, &application, limits).unwrap(), root);
+            assert_eq!(
+                full_rebuild_root(&state, &network, &application, limits).unwrap(),
+                root
+            );
             // Widening does not reshape the tree, so the depth never moves.
             assert_eq!(root.depth, first.depth);
         }
         assert_eq!(
-            read_current(&state, &network, &application).unwrap().unwrap().coins,
+            read_current(&state, &network, &application)
+                .unwrap()
+                .unwrap()
+                .coins,
             (before.len() + 4) as u64
         );
     }

@@ -165,8 +165,8 @@ struct FixtureFile {
 fn build_fixtures() -> FixtureFile {
     let peer_pubkey =
         quil_crypto::Ed448Signer::derive_public(&PEER_SEED).expect("derive peer pubkey");
-    let signer = quil_crypto::Ed448Signer::from_bytes(&PEER_SEED, &peer_pubkey)
-        .expect("build Ed448 signer");
+    let signer =
+        quil_crypto::Ed448Signer::from_bytes(&PEER_SEED, &peer_pubkey).expect("build Ed448 signer");
 
     let global_domain: Vec<u8> = vec![0xFF; 32];
     // Auth prefix that Go's `SignWithDomain` prepends to the body
@@ -186,10 +186,9 @@ fn build_fixtures() -> FixtureFile {
 
     let mut operations = Vec::new();
     for (name, bundle) in entries {
-        let canonical = quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(
-            &bundle,
-        )
-        .expect("canonicalize");
+        let canonical =
+            quil_execution::message_envelope::proto_message_bundle_to_canonical_bytes(&bundle)
+                .expect("canonicalize");
         let outer_sig = signer
             .sign_with_domain(&canonical, &auth_prefix)
             .expect("Ed448 sign");
@@ -227,9 +226,7 @@ fn dump_rust_fixtures() {
     let json = serde_json::to_string_pretty(&out).expect("serialize");
     let path = std::env::var("RUST_FIXTURE_OUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::temp_dir().join("quil_cross_language_fixtures_rust.json")
-        });
+        .unwrap_or_else(|_| std::env::temp_dir().join("quil_cross_language_fixtures_rust.json"));
     fs::write(&path, &json).expect("write fixture file");
     eprintln!("wrote Rust fixtures to {}", path.display());
 }
@@ -294,5 +291,10 @@ fn rust_matches_go_fixtures_when_present() {
             ));
         }
     }
-    assert!(diffs.is_empty(), "{} divergence(s):\n{}", diffs.len(), diffs.join("\n\n"));
+    assert!(
+        diffs.is_empty(),
+        "{} divergence(s):\n{}",
+        diffs.len(),
+        diffs.join("\n\n")
+    );
 }

@@ -132,7 +132,11 @@ impl ServerStats {
             return "none".to_string();
         }
         counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        counts.iter().map(|(r, n)| format!("{r}={n}")).collect::<Vec<_>>().join(" ")
+        counts
+            .iter()
+            .map(|(r, n)| format!("{r}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn refuse(&mut self, reason: &'static str) {
@@ -157,7 +161,16 @@ pub(crate) fn start_dial_back<R, C>(
         .allocate_new_port()
         .build();
     let dial = opts.connection_id();
-    ongoing.insert(peer, OngoingInbound { probe_id, request_id, addrs, dial, channel });
+    ongoing.insert(
+        peer,
+        OngoingInbound {
+            probe_id,
+            request_id,
+            addrs,
+            dial,
+            channel,
+        },
+    );
     opts
 }
 
@@ -201,7 +214,9 @@ pub(crate) fn dial_back_failure(
     }
     Some(match error {
         DialError::Transport(errors)
-            if errors.iter().all(|(_, e)| matches!(e, TransportError::MultiaddrNotSupported(_))) =>
+            if errors
+                .iter()
+                .all(|(_, e)| matches!(e, TransportError::MultiaddrNotSupported(_))) =>
         {
             (ResponseError::DialRefused, "unsupported_transport")
         }
@@ -369,7 +384,9 @@ impl AsServer<'_> {
             "Dial-back to peer succeeded"
         );
 
-        let OngoingInbound { probe_id, channel, .. } = self.ongoing_inbound.remove(peer).unwrap();
+        let OngoingInbound {
+            probe_id, channel, ..
+        } = self.ongoing_inbound.remove(peer).unwrap();
         self.stats.served += 1;
         let response = DialResponse {
             result: Ok(address.clone()),
@@ -394,8 +411,13 @@ impl AsServer<'_> {
         // QUILIBRIUM: only the dial-back's own failure answers the probe,
         // and only a dial that failed to reach the client is a `DialError`
         // (see `dial_back_failure`).
-        let (OngoingInbound { probe_id, channel, .. }, response_error, reason) =
-            take_failed_dial_back(&mut *self.ongoing_inbound, peer, connection_id, error)?;
+        let (
+            OngoingInbound {
+                probe_id, channel, ..
+            },
+            response_error,
+            reason,
+        ) = take_failed_dial_back(&mut *self.ongoing_inbound, peer, connection_id, error)?;
         match response_error {
             ResponseError::DialError => self.stats.failed += 1,
             _ => self.stats.refuse(reason),
@@ -574,18 +596,36 @@ mod test {
         assert_eq!(dial_back_failure(dial, other, &unreached()), None);
         assert_eq!(dial_back_failure(dial, other, &denied()), None);
         assert_eq!(
-            dial_back_failure(dial, other, &DialError::DialPeerConditionFalse(PeerCondition::Disconnected)),
+            dial_back_failure(
+                dial,
+                other,
+                &DialError::DialPeerConditionFalse(PeerCondition::Disconnected)
+            ),
             None
         );
 
         // This server refused, gave up or could not attempt its dial-back.
         for (error, reason) in [
             (denied(), "denied"),
-            (DialError::DialPeerConditionFalse(PeerCondition::Always), "peer_condition"),
+            (
+                DialError::DialPeerConditionFalse(PeerCondition::Always),
+                "peer_condition",
+            ),
             (DialError::Aborted, "aborted"),
             (DialError::NoAddresses, "no_addresses"),
-            (DialError::LocalPeerId { address: addr.clone() }, "local_peer"),
-            (DialError::Transport(vec![(addr.clone(), unsupported()), (addr.clone(), unsupported())]), "unsupported_transport"),
+            (
+                DialError::LocalPeerId {
+                    address: addr.clone(),
+                },
+                "local_peer",
+            ),
+            (
+                DialError::Transport(vec![
+                    (addr.clone(), unsupported()),
+                    (addr.clone(), unsupported()),
+                ]),
+                "unsupported_transport",
+            ),
         ] {
             assert_eq!(
                 dial_back_failure(dial, dial, &error),
@@ -596,11 +636,26 @@ mod test {
 
         // The dial-back reached none of the addresses, or another peer; one
         // supported address that failed is enough.
-        assert_eq!(dial_back_failure(dial, dial, &unreached()), Some((ResponseError::DialError, "unreachable")));
-        let mixed = DialError::Transport(vec![(addr.clone(), unsupported()), (addr.clone(), refused())]);
-        assert_eq!(dial_back_failure(dial, dial, &mixed), Some((ResponseError::DialError, "unreachable")));
-        let wrong_peer = DialError::WrongPeerId { obtained: PeerId::random(), address: addr.clone() };
-        assert_eq!(dial_back_failure(dial, dial, &wrong_peer), Some((ResponseError::DialError, "wrong_peer")));
+        assert_eq!(
+            dial_back_failure(dial, dial, &unreached()),
+            Some((ResponseError::DialError, "unreachable"))
+        );
+        let mixed = DialError::Transport(vec![
+            (addr.clone(), unsupported()),
+            (addr.clone(), refused()),
+        ]);
+        assert_eq!(
+            dial_back_failure(dial, dial, &mixed),
+            Some((ResponseError::DialError, "unreachable"))
+        );
+        let wrong_peer = DialError::WrongPeerId {
+            obtained: PeerId::random(),
+            address: addr.clone(),
+        };
+        assert_eq!(
+            dial_back_failure(dial, dial, &wrong_peer),
+            Some((ResponseError::DialError, "wrong_peer"))
+        );
     }
 
     /// QUILIBRIUM: the request is recorded under the connection id of the
@@ -611,7 +666,14 @@ mod test {
         let mut ongoing: HashMap<PeerId, OngoingInbound<(), &str>> = HashMap::new();
         let peer = PeerId::random();
         let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
-        let opts = start_dial_back(&mut ongoing, peer, ProbeId(3), (), vec![addr.clone()], "channel");
+        let opts = start_dial_back(
+            &mut ongoing,
+            peer,
+            ProbeId(3),
+            (),
+            vec![addr.clone()],
+            "channel",
+        );
         let dial = opts.connection_id();
         assert_eq!(ongoing[&peer].dial, dial);
         assert_eq!(ongoing[&peer].addrs, vec![addr.clone()]);
@@ -626,8 +688,11 @@ mod test {
         assert!(take_failed_dial_back(&mut ongoing, PeerId::random(), dial, &unreached).is_none());
         assert_eq!(ongoing[&peer].dial, dial);
 
-        let denied = DialError::Denied { cause: ConnectionDenied::new(std::io::Error::other("limit")) };
-        let (request, answer, reason) = take_failed_dial_back(&mut ongoing, peer, dial, &denied).unwrap();
+        let denied = DialError::Denied {
+            cause: ConnectionDenied::new(std::io::Error::other("limit")),
+        };
+        let (request, answer, reason) =
+            take_failed_dial_back(&mut ongoing, peer, dial, &denied).unwrap();
         assert_eq!((request.probe_id, request.channel), (ProbeId(3), "channel"));
         assert_eq!((answer, reason), (ResponseError::DialRefused, "denied"));
         assert!(ongoing.is_empty());
@@ -647,7 +712,10 @@ mod test {
         assert!(!stats.is_empty());
         assert_eq!(stats.refused_by_reason(), "denied=2 throttled=1");
         assert_eq!(refusal_reason("too many dials for peer"), "throttled");
-        assert_eq!(refusal_reason("no dialable addresses"), "no_dialable_address");
+        assert_eq!(
+            refusal_reason("no dialable addresses"),
+            "no_dialable_address"
+        );
     }
 
     fn random_ip<'a>() -> Protocol<'a> {

@@ -161,7 +161,9 @@ where
         // the resulting secret key also shifts by the same amount.
         // Note that the tweak depends only on public data.
         let new_poly_point = self.poly_point + tweak;
-        let new_pk = (C::ProjectivePoint::from(crate::generator::<C>()) * tweak + C::ProjectivePoint::from(self.pk)).to_affine();
+        let new_pk = (C::ProjectivePoint::from(crate::generator::<C>()) * tweak
+            + C::ProjectivePoint::from(self.pk))
+        .to_affine();
 
         if new_pk == crate::identity::<C>() {
             return Err(ErrorDeriv::new(
@@ -407,7 +409,8 @@ mod tests {
 
         let path = "m/0/1/2/3";
 
-        let mut derived_parties: Vec<Party<C>> = Vec::with_capacity(parameters.share_count as usize);
+        let mut derived_parties: Vec<Party<C>> =
+            Vec::with_capacity(parameters.share_count as usize);
         for i in 0..parameters.share_count {
             let result = parties[i as usize].derive_from_path(path);
             match result {

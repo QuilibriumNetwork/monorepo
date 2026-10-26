@@ -7,8 +7,8 @@ use quil_types::proto::keys as keys_pb;
 
 use super::config::{ComputeConfiguration, ComputeDeploy, ComputeUpdate};
 use super::ops::{
-    Application, CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation,
-    ExecutionResult, StateTransition,
+    Application, CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation, ExecutionResult,
+    StateTransition,
 };
 
 // =====================================================================
@@ -40,7 +40,10 @@ pub fn compute_deploy_from_proto(p: &pb::ComputeDeploy) -> Result<ComputeDeploy>
         Some(c) => compute_config_from_proto(c).to_canonical_bytes()?,
         None => Vec::new(),
     };
-    Ok(ComputeDeploy { config, rdf_schema: p.rdf_schema.clone() })
+    Ok(ComputeDeploy {
+        config,
+        rdf_schema: p.rdf_schema.clone(),
+    })
 }
 
 pub fn compute_deploy_to_proto(d: &ComputeDeploy) -> Result<pb::ComputeDeploy> {
@@ -51,7 +54,10 @@ pub fn compute_deploy_to_proto(d: &ComputeDeploy) -> Result<pb::ComputeDeploy> {
     } else {
         None
     };
-    Ok(pb::ComputeDeploy { config, rdf_schema: d.rdf_schema.clone() })
+    Ok(pb::ComputeDeploy {
+        config,
+        rdf_schema: d.rdf_schema.clone(),
+    })
 }
 
 pub fn compute_update_from_proto(p: &pb::ComputeUpdate) -> Result<ComputeUpdate> {
@@ -65,7 +71,11 @@ pub fn compute_update_from_proto(p: &pb::ComputeUpdate) -> Result<ComputeUpdate>
         Some(s) => s.signature.clone(),
         None => Vec::new(),
     };
-    Ok(ComputeUpdate { config, rdf_schema: p.rdf_schema.clone(), public_key_signature_bls48581: sig })
+    Ok(ComputeUpdate {
+        config,
+        rdf_schema: p.rdf_schema.clone(),
+        public_key_signature_bls48581: sig,
+    })
 }
 
 pub fn compute_update_to_proto(u: &ComputeUpdate) -> Result<pb::ComputeUpdate> {
@@ -103,8 +113,16 @@ pub fn code_deployment_from_proto(p: &pb::CodeDeployment) -> CodeDeployment {
     }
     CodeDeployment {
         circuit: p.circuit.clone(),
-        input_types: p.input_types.iter().map(|s| s.as_bytes().to_vec()).collect(),
-        output_types: p.output_types.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        input_types: p
+            .input_types
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
+        output_types: p
+            .output_types
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
         domain,
     }
 }
@@ -112,8 +130,16 @@ pub fn code_deployment_from_proto(p: &pb::CodeDeployment) -> CodeDeployment {
 pub fn code_deployment_to_proto(d: &CodeDeployment) -> pb::CodeDeployment {
     pb::CodeDeployment {
         circuit: d.circuit.clone(),
-        input_types: d.input_types.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect(),
-        output_types: d.output_types.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect(),
+        input_types: d
+            .input_types
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect(),
+        output_types: d
+            .output_types
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect(),
         domain: d.domain.to_vec(),
     }
 }
@@ -152,7 +178,9 @@ pub fn execute_operation_to_proto(o: &ExecuteOperation) -> Result<pb::ExecuteOpe
     let application = if o.application.is_empty() {
         None
     } else {
-        Some(application_to_proto(&Application::from_canonical_bytes(&o.application)?))
+        Some(application_to_proto(&Application::from_canonical_bytes(
+            &o.application,
+        )?))
     };
     Ok(pb::ExecuteOperation {
         application,
@@ -167,10 +195,16 @@ pub fn execute_operation_to_proto(o: &ExecuteOperation) -> Result<pb::ExecuteOpe
 
 pub fn code_execute_from_proto(p: &pb::CodeExecute) -> Result<CodeExecute> {
     let mut domain = [0u8; 32];
-    if p.domain.len() >= 32 { domain.copy_from_slice(&p.domain[..32]); }
+    if p.domain.len() >= 32 {
+        domain.copy_from_slice(&p.domain[..32]);
+    }
     let mut rendezvous = [0u8; 32];
-    if p.rendezvous.len() >= 32 { rendezvous.copy_from_slice(&p.rendezvous[..32]); }
-    let ops: Vec<Vec<u8>> = p.execute_operations.iter()
+    if p.rendezvous.len() >= 32 {
+        rendezvous.copy_from_slice(&p.rendezvous[..32]);
+    }
+    let ops: Vec<Vec<u8>> = p
+        .execute_operations
+        .iter()
         .map(|o| execute_operation_from_proto(o))
         .collect::<Result<Vec<_>>>()?
         .iter()
@@ -178,7 +212,9 @@ pub fn code_execute_from_proto(p: &pb::CodeExecute) -> Result<CodeExecute> {
         .collect::<Result<Vec<_>>>()?;
     Ok(CodeExecute {
         proof_of_payment: p.proof_of_payment.clone(),
-        domain, rendezvous, execute_operations: ops,
+        domain,
+        rendezvous,
+        execute_operations: ops,
     })
 }
 
@@ -211,25 +247,37 @@ pub fn execution_result_from_proto(p: &pb::ExecutionResult) -> ExecutionResult {
 
 pub fn state_transition_from_proto(p: &pb::StateTransition) -> StateTransition {
     let mut domain = [0u8; 32];
-    if p.domain.len() >= 32 { domain.copy_from_slice(&p.domain[..32]); }
+    if p.domain.len() >= 32 {
+        domain.copy_from_slice(&p.domain[..32]);
+    }
     StateTransition {
-        domain, address: p.address.clone(),
-        old_value: p.old_value.clone(), new_value: p.new_value.clone(),
+        domain,
+        address: p.address.clone(),
+        old_value: p.old_value.clone(),
+        new_value: p.new_value.clone(),
         proof: p.proof.clone(),
     }
 }
 
 pub fn code_finalize_from_proto(p: &pb::CodeFinalize) -> Result<CodeFinalize> {
     let mut rendezvous = [0u8; 32];
-    if p.rendezvous.len() >= 32 { rendezvous.copy_from_slice(&p.rendezvous[..32]); }
-    let results: Vec<Vec<u8>> = p.results.iter()
+    if p.rendezvous.len() >= 32 {
+        rendezvous.copy_from_slice(&p.rendezvous[..32]);
+    }
+    let results: Vec<Vec<u8>> = p
+        .results
+        .iter()
         .map(|r| execution_result_from_proto(r).to_canonical_bytes())
         .collect::<Result<Vec<_>>>()?;
-    let state_changes: Vec<Vec<u8>> = p.state_changes.iter()
+    let state_changes: Vec<Vec<u8>> = p
+        .state_changes
+        .iter()
         .map(|s| state_transition_from_proto(s).to_canonical_bytes())
         .collect::<Result<Vec<_>>>()?;
     Ok(CodeFinalize {
-        rendezvous, results, state_changes,
+        rendezvous,
+        results,
+        state_changes,
         proof_of_execution: p.proof_of_execution.clone(),
         message_output: p.message_output.clone(),
     })
@@ -258,12 +306,20 @@ pub fn code_finalize_to_proto(f: &CodeFinalize) -> Result<pb::CodeFinalize> {
     let results: Vec<pb::ExecutionResult> = f
         .results
         .iter()
-        .map(|b| Ok(execution_result_to_proto(&ExecutionResult::from_canonical_bytes(b)?)))
+        .map(|b| {
+            Ok(execution_result_to_proto(
+                &ExecutionResult::from_canonical_bytes(b)?,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
     let state_changes: Vec<pb::StateTransition> = f
         .state_changes
         .iter()
-        .map(|b| Ok(state_transition_to_proto(&StateTransition::from_canonical_bytes(b)?)))
+        .map(|b| {
+            Ok(state_transition_to_proto(
+                &StateTransition::from_canonical_bytes(b)?,
+            ))
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(pb::CodeFinalize {
         rendezvous: f.rendezvous.to_vec(),

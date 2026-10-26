@@ -60,17 +60,20 @@ fn fork_preserves_global_verification_reward_and_reset_configuration() {
         1,
         "the intrinsic must not retain a writable primary DB handle"
     );
-    let overlay = Arc::new(quil_forest::ExecutionOverlay::capture(
-        db.inner(),
-        quil_forest::OverlayLimits {
-            max_delta_bytes: 1 << 20,
-            max_delta_entries: 1000,
-            max_record_bytes: 1 << 16,
-            max_read_bytes: 1 << 20,
-            max_read_operations: 1000,
-            max_cursors: 8,
-        },
-    ).unwrap());
+    let overlay = Arc::new(
+        quil_forest::ExecutionOverlay::capture(
+            db.inner(),
+            quil_forest::OverlayLimits {
+                max_delta_bytes: 1 << 20,
+                max_delta_entries: 1000,
+                max_record_bytes: 1 << 16,
+                max_read_bytes: 1 << 20,
+                max_read_operations: 1000,
+                max_cursors: 8,
+            },
+        )
+        .unwrap(),
+    );
     let target = crate::manager::ExecutionForkContext {
         crdt: memory_crdt(),
         clock_store: Arc::new(crate::testing::NoopClockStore),

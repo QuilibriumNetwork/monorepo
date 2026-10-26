@@ -195,8 +195,7 @@ pub fn build_create_payload(
     eph_public_key: &[u8],
     ct_static: &[u8],
 ) -> Vec<u8> {
-    let mut p =
-        Vec::with_capacity(6 + next_hop.len() + eph_public_key.len() + ct_static.len());
+    let mut p = Vec::with_capacity(6 + next_hop.len() + eph_public_key.len() + ct_static.len());
     p.extend_from_slice(&outbound_circ_id.to_be_bytes());
     p.extend_from_slice(&(next_hop.len() as u16).to_be_bytes());
     p.extend_from_slice(next_hop);
@@ -312,7 +311,7 @@ mod tests {
     #[test]
     fn short_and_overflowing_cells_are_none() {
         assert!(parse_cell(&[0xA0, 0x00]).is_none()); // < 3 bytes
-        // declares 10-byte payload but only 2 present
+                                                      // declares 10-byte payload but only 2 present
         assert!(parse_cell(&[0xA0, 0x00, 0x0A, 0x01, 0x02]).is_none());
     }
 
@@ -374,8 +373,14 @@ mod tests {
 
     #[test]
     fn confirmation_is_deterministic_and_secret_dependent() {
-        assert_eq!(created_confirmation(b"secretA"), created_confirmation(b"secretA"));
-        assert_ne!(created_confirmation(b"secretA"), created_confirmation(b"secretB"));
+        assert_eq!(
+            created_confirmation(b"secretA"),
+            created_confirmation(b"secretA")
+        );
+        assert_ne!(
+            created_confirmation(b"secretA"),
+            created_confirmation(b"secretB")
+        );
     }
 
     #[test]

@@ -57,7 +57,11 @@ fn main() {
         let out = format!("{out_dir}/frame_{n}.bin");
         match std::fs::File::create(&out).and_then(|mut f| f.write_all(&canonical)) {
             Ok(()) => {
-                eprintln!("wrote {out} ({} bytes, {} bundles)", canonical.len(), frame.requests.len());
+                eprintln!(
+                    "wrote {out} ({} bytes, {} bundles)",
+                    canonical.len(),
+                    frame.requests.len()
+                );
                 ok += 1;
             }
             Err(e) => {

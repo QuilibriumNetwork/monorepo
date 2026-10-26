@@ -18,16 +18,19 @@
 //! Occupancy is per shard rather than a dense prefix: within a shard, coins
 //! fill `0..count` of its range, and every index above that — and every shard
 //! with no coins — is the canonical zero node for its level.
+use super::coin_tree::{AuthPath, CoinRecord, TreeError};
 use super::relation::membership::{MembershipKey, Node, MAX_DEPTH};
 use super::AmountCommitment;
-use super::coin_tree::{AuthPath, CoinRecord, TreeError};
 
 /// Split a position into `(shard, local)`.
 pub fn split_position(position: u64, subtree_bits: u8) -> (u64, u64) {
     if subtree_bits >= 64 {
         return (0, position);
     }
-    (position >> subtree_bits, position & ((1u64 << subtree_bits) - 1))
+    (
+        position >> subtree_bits,
+        position & ((1u64 << subtree_bits) - 1),
+    )
 }
 
 /// Compose a position from a shard and its local leaf index.
@@ -89,8 +92,7 @@ pub fn subtree_root(
         if local >= (1u64 << shape.subtree_bits) {
             return Err(TreeError::Position);
         }
-        let owner =
-            Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
+        let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
         leaves.push((local, key.leaf(&owner, &coin.commitment)));
     }
     fold_level(&key, &zeros, leaves, usize::from(shape.subtree_bits))
@@ -113,17 +115,24 @@ pub fn fold_sparse_auth_path(
     if top_level == 0 || top_level > MAX_DEPTH || mine.0 >= top_level {
         return Err(TreeError::Depth);
     }
-    if !nodes.iter().any(|(level, index, _)| (*level, *index) == mine) {
+    if !nodes
+        .iter()
+        .any(|(level, index, _)| (*level, *index) == mine)
+    {
         return Err(TreeError::MissingCoin);
     }
     let key = MembershipKey::derive(context);
     let zeros = zero_nodes(&key, top_level);
-    let mut placed: std::collections::BTreeMap<usize, Vec<(u64, Node)>> = std::collections::BTreeMap::new();
+    let mut placed: std::collections::BTreeMap<usize, Vec<(u64, Node)>> =
+        std::collections::BTreeMap::new();
     for (level, index, node) in nodes {
         if *level >= top_level || *index >= (1u64 << (top_level - level)) {
             return Err(TreeError::Position);
         }
-        placed.entry(*level).or_default().push((*index, node.clone()));
+        placed
+            .entry(*level)
+            .or_default()
+            .push((*index, node.clone()));
     }
     let start = *placed.keys().next().expect("mine is placed");
     let mut carried: Vec<(u64, Node)> = Vec::new();
@@ -182,7 +191,10 @@ fn fold_once(
 }
 
 /// Sorted, duplicate-free sparse level, as every fold requires.
-fn sorted_level(mut nodes: Vec<(u64, Node)>, shards: Option<u64>) -> Result<Vec<(u64, Node)>, TreeError> {
+fn sorted_level(
+    mut nodes: Vec<(u64, Node)>,
+    shards: Option<u64>,
+) -> Result<Vec<(u64, Node)>, TreeError> {
     nodes.sort_unstable_by_key(|(index, _)| *index);
     if nodes.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(TreeError::Position);
@@ -297,12 +309,16 @@ pub fn fold_sparse(
     }
     let key = MembershipKey::derive(context);
     let zeros = zero_nodes(&key, top_level);
-    let mut placed: std::collections::BTreeMap<usize, Vec<(u64, Node)>> = std::collections::BTreeMap::new();
+    let mut placed: std::collections::BTreeMap<usize, Vec<(u64, Node)>> =
+        std::collections::BTreeMap::new();
     for (level, index, node) in nodes {
         if *level >= top_level || *index >= (1u64 << (top_level - level)) {
             return Err(TreeError::Position);
         }
-        placed.entry(*level).or_default().push((*index, node.clone()));
+        placed
+            .entry(*level)
+            .or_default()
+            .push((*index, node.clone()));
     }
     let Some(&start) = placed.keys().next() else {
         return Ok(zeros[top_level].clone());
@@ -355,8 +371,7 @@ impl ShardedCoinTree {
             if shard >= shape.shards() {
                 return Err(TreeError::Position);
             }
-            let owner =
-                Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
+            let owner = Node::from_identity_bytes(&coin.owner).map_err(|_| TreeError::Encoding)?;
             leaves.push((coin.position, key.leaf(&owner, &coin.commitment)));
             index.push((coin.address, coin.position));
         }
@@ -394,7 +409,14 @@ impl ShardedCoinTree {
             }
             levels.push(next);
         }
-        Ok(Self { context: *context, key, zeros, shape, levels, index })
+        Ok(Self {
+            context: *context,
+            key,
+            zeros,
+            shape,
+            levels,
+            index,
+        })
     }
 
     pub fn shape(&self) -> Shape {
@@ -426,7 +448,11 @@ impl ShardedCoinTree {
     }
 
     /// [`Self::auth_path`] with the caller's expected depth checked.
-    pub fn auth_path_at_depth(&self, address: &[u8; 32], depth: usize) -> Result<AuthPath, TreeError> {
+    pub fn auth_path_at_depth(
+        &self,
+        address: &[u8; 32],
+        depth: usize,
+    ) -> Result<AuthPath, TreeError> {
         if depth != self.shape.depth() {
             return Err(TreeError::Depth);
         }
@@ -488,7 +514,11 @@ impl ShardedCoinTree {
         let key = MembershipKey::derive(context);
         let mut node = key.leaf(owner, commitment);
         for (sibling, right) in path.siblings.iter().zip(&path.right) {
-            node = if *right { key.parent(sibling, &node) } else { key.parent(&node, sibling) };
+            node = if *right {
+                key.parent(sibling, &node)
+            } else {
+                key.parent(&node, sibling)
+            };
         }
         Ok(node)
     }
@@ -497,16 +527,16 @@ impl ShardedCoinTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::confidential::{
-        relation::membership::IDENTITY_BYTES, AmountOpening, CommitmentKey,
-    };
+    use crate::confidential::{relation::membership::IDENTITY_BYTES, AmountOpening, CommitmentKey};
 
     fn coin(context: &[u8; 32], seed: u8, position: u64) -> CoinRecord {
         CoinRecord {
             address: [seed; 32],
             owner: [seed; IDENTITY_BYTES],
-            commitment: CommitmentKey::derive(context)
-                .commit(u128::from(seed), &AmountOpening::from_seed(context, &[seed; 32])),
+            commitment: CommitmentKey::derive(context).commit(
+                u128::from(seed),
+                &AmountOpening::from_seed(context, &[seed; 32]),
+            ),
             position,
         }
     }
@@ -517,7 +547,10 @@ mod tests {
     #[test]
     fn folding_per_shard_roots_equals_building_the_whole_tree() {
         let context = [7u8; 32];
-        let shape = Shape { shard_bits: 3, subtree_bits: 4 };
+        let shape = Shape {
+            shard_bits: 3,
+            subtree_bits: 4,
+        };
         // Three of eight shards hold coins; the rest are empty.
         let mut all = Vec::new();
         let mut per_shard: Vec<(u64, Vec<CoinRecord>)> = Vec::new();
@@ -536,11 +569,17 @@ mod tests {
             .iter()
             .map(|(shard, coins)| (*shard, subtree_root(&context, shape, coins).unwrap()))
             .collect();
-        assert_eq!(fold_subtree_roots(&context, shape, &roots).unwrap(), whole.root());
+        assert_eq!(
+            fold_subtree_roots(&context, shape, &roots).unwrap(),
+            whole.root()
+        );
         // Omitting an empty shard is the same as folding it as zero.
         let mut with_empty = roots.clone();
         with_empty.push((7, subtree_root(&context, shape, &[]).unwrap()));
-        assert_eq!(fold_subtree_roots(&context, shape, &with_empty).unwrap(), whole.root());
+        assert_eq!(
+            fold_subtree_roots(&context, shape, &with_empty).unwrap(),
+            whole.root()
+        );
     }
 
     /// A coin in one shard proves against the APPLICATION root, so inputs
@@ -548,12 +587,19 @@ mod tests {
     #[test]
     fn a_path_from_any_shard_verifies_against_the_application_root() {
         let context = [9u8; 32];
-        let shape = Shape { shard_bits: 2, subtree_bits: 3 };
+        let shape = Shape {
+            shard_bits: 2,
+            subtree_bits: 3,
+        };
         let coins: Vec<CoinRecord> = [(0u64, 0u64), (0, 1), (1, 0), (3, 4)]
             .iter()
             .enumerate()
             .map(|(i, (shard, local))| {
-                coin(&context, i as u8 + 1, position_of(*shard, *local, shape.subtree_bits).unwrap())
+                coin(
+                    &context,
+                    i as u8 + 1,
+                    position_of(*shard, *local, shape.subtree_bits).unwrap(),
+                )
             })
             .collect();
         let tree = ShardedCoinTree::build(&context, shape, &coins).unwrap();
@@ -565,7 +611,8 @@ mod tests {
             assert_eq!(
                 ShardedCoinTree::root_from_path(&context, &owner, &c.commitment, &path).unwrap(),
                 root,
-                "coin at position {} must prove against the application root", c.position
+                "coin at position {} must prove against the application root",
+                c.position
             );
         }
         // A coin that is not in the tree has no path.
@@ -578,7 +625,10 @@ mod tests {
     #[test]
     fn a_shard_path_plus_the_public_fold_equals_the_whole_tree_path() {
         let context = [11u8; 32];
-        let shape = Shape { shard_bits: 3, subtree_bits: 4 };
+        let shape = Shape {
+            shard_bits: 3,
+            subtree_bits: 4,
+        };
         let mut all = Vec::new();
         let mut per_shard: Vec<(u64, Vec<CoinRecord>)> = Vec::new();
         for (shard, count) in [(1u64, 2usize), (4, 3), (6, 1)] {
@@ -600,7 +650,10 @@ mod tests {
             // The shard's own subtree, built from its coins alone.
             let local_tree = ShardedCoinTree::build(
                 &context,
-                Shape { shard_bits: 0, subtree_bits: shape.subtree_bits },
+                Shape {
+                    shard_bits: 0,
+                    subtree_bits: shape.subtree_bits,
+                },
                 &coins
                     .iter()
                     .map(|c| CoinRecord {
@@ -620,7 +673,8 @@ mod tests {
                 assert_eq!(path.siblings, whole.auth_path(&c.address).unwrap().siblings);
                 let owner = Node::from_identity_bytes(&c.owner).unwrap();
                 assert_eq!(
-                    ShardedCoinTree::root_from_path(&context, &owner, &c.commitment, &path).unwrap(),
+                    ShardedCoinTree::root_from_path(&context, &owner, &c.commitment, &path)
+                        .unwrap(),
                     whole.root(),
                 );
             }
@@ -634,7 +688,10 @@ mod tests {
     #[test]
     fn subtree_roots_from_mixed_depths_fold_to_the_whole_tree_root() {
         let context = [13u8; 32];
-        let shape = Shape { shard_bits: 3, subtree_bits: 4 };
+        let shape = Shape {
+            shard_bits: 3,
+            subtree_bits: 4,
+        };
         let key = MembershipKey::derive(&context);
         let mut all = Vec::new();
         let mut leaves: Vec<(u64, Node)> = Vec::new();
@@ -655,7 +712,10 @@ mod tests {
             .iter()
             .map(|shard| (4, *shard, whole.node(4, *shard)))
             .collect();
-        assert_eq!(fold_sparse(&context, depth, &per_shard).unwrap(), whole.root());
+        assert_eq!(
+            fold_sparse(&context, depth, &per_shard).unwrap(),
+            whole.root()
+        );
         // A shard holding shards 0..=1 reports ONE node at level 5; another
         // reports shards 4..=7 as one node at level 6. Mixed depths, same root.
         let mixed = vec![(5, 0, whole.node(5, 0)), (6, 1, whole.node(6, 1))];
@@ -663,7 +723,10 @@ mod tests {
         // Raw leaves fold to it too, and nothing at all folds to the zero root.
         let raw: Vec<(usize, u64, Node)> = leaves.iter().map(|(p, n)| (0, *p, n.clone())).collect();
         assert_eq!(fold_sparse(&context, depth, &raw).unwrap(), whole.root());
-        assert_eq!(fold_sparse(&context, depth, &[]).unwrap(), zero_nodes(&key, depth)[depth]);
+        assert_eq!(
+            fold_sparse(&context, depth, &[]).unwrap(),
+            zero_nodes(&key, depth)[depth]
+        );
         // A subtree root, relative to its own position, folds from its leaves.
         let shard5: Vec<(usize, u64, Node)> = leaves
             .iter()
@@ -672,8 +735,18 @@ mod tests {
             .collect();
         assert_eq!(fold_sparse(&context, 4, &shard5).unwrap(), whole.node(4, 5));
         // Overlap: a node inside another reported subtree, or a repeat.
-        assert!(fold_sparse(&context, depth, &[(5, 0, whole.node(5, 0)), (4, 1, whole.node(4, 1))]).is_err());
-        assert!(fold_sparse(&context, depth, &[(4, 2, whole.node(4, 2)), (4, 2, whole.node(4, 2))]).is_err());
+        assert!(fold_sparse(
+            &context,
+            depth,
+            &[(5, 0, whole.node(5, 0)), (4, 1, whole.node(4, 1))]
+        )
+        .is_err());
+        assert!(fold_sparse(
+            &context,
+            depth,
+            &[(4, 2, whole.node(4, 2)), (4, 2, whole.node(4, 2))]
+        )
+        .is_err());
         // Out of range: past the top, or an index the level cannot hold.
         assert!(fold_sparse(&context, depth, &[(depth, 0, whole.root())]).is_err());
         assert!(fold_sparse(&context, depth, &[(6, 4, whole.node(6, 1))]).is_err());
@@ -681,7 +754,10 @@ mod tests {
 
     #[test]
     fn positions_partition_by_shard_and_reject_overflow() {
-        let shape = Shape { shard_bits: 2, subtree_bits: 3 };
+        let shape = Shape {
+            shard_bits: 2,
+            subtree_bits: 3,
+        };
         assert_eq!(position_of(3, 7, shape.subtree_bits).unwrap(), 31);
         assert_eq!(split_position(31, shape.subtree_bits), (3, 7));
         // A local index beyond the subtree, or a shard beyond the shape.
@@ -691,7 +767,10 @@ mod tests {
         assert!(ShardedCoinTree::build(&context, shape, &[beyond]).is_err());
         // An empty application still has a well-defined root.
         let empty = ShardedCoinTree::build(&context, shape, &[]).unwrap();
-        assert_eq!(fold_subtree_roots(&context, shape, &[]).unwrap(), empty.root());
+        assert_eq!(
+            fold_subtree_roots(&context, shape, &[]).unwrap(),
+            empty.root()
+        );
     }
 
     /// A shard's path to the application root, over what every shard reports:
@@ -702,7 +781,10 @@ mod tests {
         let context = [3u8; 32];
         let key = MembershipKey::derive(&context);
         let top = 8;
-        let node = |seed: u8| Node::from_bytes(&[seed; crate::confidential::relation::membership::NODE_BYTES]).unwrap();
+        let node = |seed: u8| {
+            Node::from_bytes(&[seed; crate::confidential::relation::membership::NODE_BYTES])
+                .unwrap()
+        };
         // Three shards at mixed depths, as reports come in after a split.
         let nodes = vec![(5usize, 1u64, node(1)), (5, 3, node(2)), (4, 0, node(3))];
         let root = fold_sparse(&context, top, &nodes).unwrap();
@@ -712,14 +794,20 @@ mod tests {
             let mut folded = subtree.clone();
             let mut at = *index;
             for (sibling, right) in path.siblings.iter().zip(&path.right) {
-                folded = if *right { key.parent(sibling, &folded) } else { key.parent(&folded, sibling) };
+                folded = if *right {
+                    key.parent(sibling, &folded)
+                } else {
+                    key.parent(&folded, sibling)
+                };
                 assert_eq!(*right, at & 1 != 0);
                 at >>= 1;
             }
             assert_eq!(folded, root, "level {level} index {index}");
         }
         // A subtree nobody reported has no path.
-        assert!(matches!(fold_sparse_auth_path(&context, top, &nodes, (5, 2)), Err(TreeError::MissingCoin)));
+        assert!(matches!(
+            fold_sparse_auth_path(&context, top, &nodes, (5, 2)),
+            Err(TreeError::MissingCoin)
+        ));
     }
-
 }

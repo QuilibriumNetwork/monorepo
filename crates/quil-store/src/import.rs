@@ -63,14 +63,13 @@ pub fn import_database(
 ) -> Result<ImportResult> {
     let file = std::fs::File::open(export_path)
         .map_err(|e| QuilError::Store(format!("failed to open export file: {}", e)))?;
-    let file_size = file.metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file); // 4MB buffer
 
     // Read and verify header
     let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)
+    reader
+        .read_exact(&mut magic)
         .map_err(|e| QuilError::Store(format!("failed to read magic: {}", e)))?;
     if &magic != MAGIC {
         return Err(QuilError::Store(format!(
@@ -113,7 +112,8 @@ pub fn import_database(
             )));
         }
         let mut key = vec![0u8; key_len as usize];
-        reader.read_exact(&mut key)
+        reader
+            .read_exact(&mut key)
             .map_err(|e| QuilError::Store(format!("failed to read key {}: {}", i, e)))?;
 
         // Read value
@@ -125,7 +125,8 @@ pub fn import_database(
             )));
         }
         let mut value = vec![0u8; value_len as usize];
-        reader.read_exact(&mut value)
+        reader
+            .read_exact(&mut value)
             .map_err(|e| QuilError::Store(format!("failed to read value {}: {}", i, e)))?;
 
         // Add to batch
@@ -137,8 +138,9 @@ pub fn import_database(
         // For 775GB databases with billions of entries, we keep
         // batches small (10K entries ≈ 10MB) to avoid OOM.
         if batch_count >= WRITE_BATCH_SIZE {
-            db.write(batch)
-                .map_err(|e| QuilError::Store(format!("batch write failed at entry {}: {}", imported, e)))?;
+            db.write(batch).map_err(|e| {
+                QuilError::Store(format!("batch write failed at entry {}: {}", imported, e))
+            })?;
             imported += batch_count as u64;
             batch = rocksdb::WriteBatch::default();
             batch_count = 0;
@@ -217,7 +219,8 @@ pub fn import_from_reader<R: Read>(
 
     // Read and verify header
     let mut magic = [0u8; 4];
-    reader.read_exact(&mut magic)
+    reader
+        .read_exact(&mut magic)
         .map_err(|e| QuilError::Store(format!("failed to read magic: {}", e)))?;
     if &magic != MAGIC {
         return Err(QuilError::Store(format!(
@@ -246,21 +249,25 @@ pub fn import_from_reader<R: Read>(
         let key_len = read_u32(&mut reader)?;
         if key_len > MAX_ENTRY_SIZE {
             return Err(QuilError::Store(format!(
-                "entry {} key_len {} exceeds max", i, key_len
+                "entry {} key_len {} exceeds max",
+                i, key_len
             )));
         }
         let mut key = vec![0u8; key_len as usize];
-        reader.read_exact(&mut key)
+        reader
+            .read_exact(&mut key)
             .map_err(|e| QuilError::Store(format!("read key {}: {}", i, e)))?;
 
         let value_len = read_u32(&mut reader)?;
         if value_len > MAX_ENTRY_SIZE {
             return Err(QuilError::Store(format!(
-                "entry {} value_len {} exceeds max", i, value_len
+                "entry {} value_len {} exceeds max",
+                i, value_len
             )));
         }
         let mut value = vec![0u8; value_len as usize];
-        reader.read_exact(&mut value)
+        reader
+            .read_exact(&mut value)
             .map_err(|e| QuilError::Store(format!("read value {}: {}", i, e)))?;
 
         batch.put(&key, &value);
@@ -277,10 +284,13 @@ pub fn import_from_reader<R: Read>(
             if imported % PROGRESS_INTERVAL == 0 {
                 let pct = if entry_count > 0 {
                     (imported as f64 / entry_count as f64) * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let data_gb = data_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                 info!(
-                    imported, total = entry_count,
+                    imported,
+                    total = entry_count,
                     pct = format!("{:.1}%", pct),
                     data_gb = format!("{:.2}", data_gb),
                     "streaming import progress"
@@ -329,7 +339,10 @@ pub fn validate_export_file(path: &Path) -> Result<u64> {
         .map_err(|e| QuilError::Store(format!("failed to read version: {}", e)))?;
     let version = u32::from_be_bytes(buf);
     if version != FORMAT_VERSION {
-        return Err(QuilError::Store(format!("unsupported version: {}", version)));
+        return Err(QuilError::Store(format!(
+            "unsupported version: {}",
+            version
+        )));
     }
 
     let mut buf = [0u8; 8];
@@ -345,7 +358,8 @@ pub fn validate_export_file(path: &Path) -> Result<u64> {
 fn verify_file_checksum(path: &Path) -> Result<bool> {
     let file = std::fs::File::open(path)
         .map_err(|e| QuilError::Store(format!("reopen for checksum: {}", e)))?;
-    let file_size = file.metadata()
+    let file_size = file
+        .metadata()
         .map_err(|e| QuilError::Store(format!("stat: {}", e)))?
         .len();
 
@@ -363,7 +377,8 @@ fn verify_file_checksum(path: &Path) -> Result<bool> {
     let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
     while remaining > 0 {
         let to_read = (remaining as usize).min(buf.len());
-        let n = reader.read(&mut buf[..to_read])
+        let n = reader
+            .read(&mut buf[..to_read])
             .map_err(|e| QuilError::Store(format!("read for checksum: {}", e)))?;
         if n == 0 {
             break;
@@ -376,7 +391,8 @@ fn verify_file_checksum(path: &Path) -> Result<bool> {
 
     // Read the stored checksum (last 32 bytes)
     let mut stored = [0u8; 32];
-    reader.read_exact(&mut stored)
+    reader
+        .read_exact(&mut stored)
         .map_err(|e| QuilError::Store(format!("read stored checksum: {}", e)))?;
 
     Ok(computed.as_slice() == stored)
@@ -442,7 +458,11 @@ mod tests {
     fn validate_export_file_bad_magic() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("bad.qmig");
-        std::fs::write(&path, b"BAAD\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        std::fs::write(
+            &path,
+            b"BAAD\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
         assert!(validate_export_file(&path).is_err());
     }
 
@@ -496,9 +516,7 @@ mod tests {
         let export_path = tmp.path().join("large.qmig");
 
         let big_value = vec![0xAAu8; 1024 * 1024]; // 1MB value
-        let entries: Vec<(&[u8], &[u8])> = vec![
-            (b"big", &big_value),
-        ];
+        let entries: Vec<(&[u8], &[u8])> = vec![(b"big", &big_value)];
         write_export_file(&export_path, &entries);
 
         let db_path = tmp.path().join("testdb");

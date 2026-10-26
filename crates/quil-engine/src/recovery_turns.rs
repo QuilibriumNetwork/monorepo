@@ -151,7 +151,8 @@ impl<T> Waiter<T> {
         if self.priority.reanchor.load(Ordering::Relaxed) {
             return 0;
         }
-        let first = self.priority.blocked.load(Ordering::Relaxed) || self.priority.lagging.load(Ordering::Relaxed);
+        let first = self.priority.blocked.load(Ordering::Relaxed)
+            || self.priority.lagging.load(Ordering::Relaxed);
         match (self.priority.replay, first) {
             (true, true) => 0,
             (true, false) => 1,
@@ -177,12 +178,25 @@ struct TurnQueue<T> {
 
 impl<T> TurnQueue<T> {
     const fn new(turns: usize) -> Self {
-        Self { free: turns, next_id: 0, next_ticket: 0, bypassed: 0, after_resumed: false, waiters: VecDeque::new() }
+        Self {
+            free: turns,
+            next_id: 0,
+            next_ticket: 0,
+            bypassed: 0,
+            after_resumed: false,
+            waiters: VecDeque::new(),
+        }
     }
 
     /// A new arrival: [`Self::take_or_requeue`] without a ticket.
     #[cfg(test)]
-    fn take_or_queue(&mut self, priority: Priority, core: u32, now: Instant, grant: T) -> Result<(), u64> {
+    fn take_or_queue(
+        &mut self,
+        priority: Priority,
+        core: u32,
+        now: Instant,
+        grant: T,
+    ) -> Result<(), u64> {
         self.take_or_requeue(priority, core, None, now, grant).1
     }
 
@@ -190,7 +204,12 @@ impl<T> TurnQueue<T> {
     /// place of `ticket` when it has one, and return its id. Also returns
     /// its ticket: `ticket`, or a new one after every other.
     fn take_or_requeue(
-        &mut self, priority: Priority, core: u32, ticket: Option<u64>, now: Instant, grant: T,
+        &mut self,
+        priority: Priority,
+        core: u32,
+        ticket: Option<u64>,
+        now: Instant,
+        grant: T,
     ) -> (u64, Result<(), u64>) {
         let resumed = ticket.is_some();
         let ticket = ticket.unwrap_or_else(|| {
@@ -203,8 +222,23 @@ impl<T> TurnQueue<T> {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let at = self.waiters.iter().position(|w| w.ticket > ticket).unwrap_or(self.waiters.len());
-        self.waiters.insert(at, Waiter { id, ticket, resumed, priority, core, since: now, grant });
+        let at = self
+            .waiters
+            .iter()
+            .position(|w| w.ticket > ticket)
+            .unwrap_or(self.waiters.len());
+        self.waiters.insert(
+            at,
+            Waiter {
+                id,
+                ticket,
+                resumed,
+                priority,
+                core,
+                since: now,
+                grant,
+            },
+        );
         (ticket, Err(id))
     }
 
@@ -229,8 +263,12 @@ impl<T> TurnQueue<T> {
         let eligible = |w: &Waiter<T>| !(skip_resumed && w.resumed);
         let first = self.waiters.iter().position(eligible).unwrap_or(0);
         let pick = if self.bypassed < PRIORITY_RUN {
-            self.waiters.iter().enumerate().filter(|(_, w)| eligible(*w))
-                .min_by_key(|(_, w)| w.rank()).map_or(first, |(at, _)| at)
+            self.waiters
+                .iter()
+                .enumerate()
+                .filter(|(_, w)| eligible(*w))
+                .min_by_key(|(_, w)| w.rank())
+                .map_or(first, |(at, _)| at)
         } else {
             first
         };
@@ -242,7 +280,9 @@ impl<T> TurnQueue<T> {
 
     /// Withdraw waiter `id`; false when it already got its turn.
     fn withdraw(&mut self, id: u64) -> bool {
-        let Some(at) = self.waiters.iter().position(|w| w.id == id) else { return false };
+        let Some(at) = self.waiters.iter().position(|w| w.id == id) else {
+            return false;
+        };
         self.waiters.remove(at);
         true
     }
@@ -252,9 +292,18 @@ impl<T> TurnQueue<T> {
     fn load(&self, now: Instant) -> QueueLoad {
         QueueLoad {
             waiting: self.waiters.len(),
-            blocked_successors: self.waiters.iter().filter(|w| w.priority.blocked.load(Ordering::Relaxed)).count(),
+            blocked_successors: self
+                .waiters
+                .iter()
+                .filter(|w| w.priority.blocked.load(Ordering::Relaxed))
+                .count(),
             replays: self.waiters.iter().filter(|w| w.priority.replay).count(),
-            longest_wait: self.waiters.iter().map(|w| now.saturating_duration_since(w.since)).max().unwrap_or_default(),
+            longest_wait: self
+                .waiters
+                .iter()
+                .map(|w| now.saturating_duration_since(w.since))
+                .max()
+                .unwrap_or_default(),
             front_core: self.waiters.front().map(|w| w.core),
         }
     }
@@ -291,24 +340,34 @@ struct Saturation {
 
 impl Saturation {
     const fn new() -> Self {
-        Self { since: None, warned: None }
+        Self {
+            since: None,
+            warned: None,
+        }
     }
 
     fn observe(&mut self, now: Instant, load: QueueLoad) -> Option<SaturationLog> {
         if load.waiting == 0 {
             let since = self.since.take();
             return self.warned.take().map(|_| SaturationLog::Cleared {
-                duration: since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since)),
+                duration: since
+                    .map_or(Duration::ZERO, |since| now.saturating_duration_since(since)),
             });
         }
-        let since = *self.since.get_or_insert_with(|| now.checked_sub(load.longest_wait).unwrap_or(now));
+        let since = *self
+            .since
+            .get_or_insert_with(|| now.checked_sub(load.longest_wait).unwrap_or(now));
         if load.longest_wait < SATURATED_AFTER
-            || self.warned.is_some_and(|at| now.saturating_duration_since(at) < SATURATED_REPEAT)
+            || self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < SATURATED_REPEAT)
         {
             return None;
         }
         self.warned = Some(now);
-        Some(SaturationLog::Saturated { duration: now.saturating_duration_since(since) })
+        Some(SaturationLog::Saturated {
+            duration: now.saturating_duration_since(since),
+        })
     }
 }
 
@@ -343,7 +402,11 @@ impl Holder {
             core: self.core,
             filter: hex::encode(&self.filter),
             kind: self.execution.turn().kind,
-            phase: if recovery.phase.is_empty() { "none".into() } else { recovery.phase },
+            phase: if recovery.phase.is_empty() {
+                "none".into()
+            } else {
+                recovery.phase
+            },
             held: now.saturating_duration_since(self.since),
             installed: recovery.installed_leaves,
             planned: recovery.planned_leaves,
@@ -366,8 +429,17 @@ struct HolderView {
 
 impl std::fmt::Display for HolderView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "core {} {} {} held {}s leaves {}/{} filter {}", self.core, self.kind.as_str(), self.phase,
-            self.held.as_secs(), self.installed, self.planned, self.filter)
+        write!(
+            f,
+            "core {} {} {} held {}s leaves {}/{} filter {}",
+            self.core,
+            self.kind.as_str(),
+            self.phase,
+            self.held.as_secs(),
+            self.installed,
+            self.planned,
+            self.filter
+        )
     }
 }
 
@@ -394,16 +466,26 @@ impl State {
         let load = self.queue.load(now);
         let mut overruns = Vec::new();
         if load.waiting > 0 {
-            for holder in self.holders.iter_mut().filter(|holder| !holder.warned
-                && now.saturating_duration_since(holder.since) >= overdue_after(holder.execution.turn().kind))
-            {
+            for holder in self.holders.iter_mut().filter(|holder| {
+                !holder.warned
+                    && now.saturating_duration_since(holder.since)
+                        >= overdue_after(holder.execution.turn().kind)
+            }) {
                 holder.warned = true;
                 overruns.push((holder.view(now), load.waiting));
             }
         }
-        let saturation = self.saturation.observe(now, load)
-            .map(|logged| (logged, load, self.holders.iter().map(|holder| holder.view(now)).collect()));
-        Logged { saturation, overruns }
+        let saturation = self.saturation.observe(now, load).map(|logged| {
+            (
+                logged,
+                load,
+                self.holders.iter().map(|holder| holder.view(now)).collect(),
+            )
+        });
+        Logged {
+            saturation,
+            overruns,
+        }
     }
 }
 
@@ -432,7 +514,11 @@ impl Drop for Turn<'_> {
     fn drop(&mut self) {
         let holder = {
             let mut state = self.turns.lock();
-            state.holders.iter().position(|holder| holder.id == self.id).map(|at| state.holders.swap_remove(at))
+            state
+                .holders
+                .iter()
+                .position(|holder| holder.id == self.id)
+                .map(|at| state.holders.swap_remove(at))
         };
         if let Some(holder) = holder {
             let view = holder.view(Instant::now());
@@ -485,7 +571,10 @@ impl RecoveryTurns {
         Self {
             turns,
             state: Mutex::new(State {
-                queue: TurnQueue::new(turns), saturation: Saturation::new(), holders: Vec::new(), next_holder: 0,
+                queue: TurnQueue::new(turns),
+                saturation: Saturation::new(),
+                holders: Vec::new(),
+                next_holder: 0,
             }),
         }
     }
@@ -514,14 +603,29 @@ impl RecoveryTurns {
         let (mut queued, logged, ticket) = {
             let mut state = self.lock();
             let now = Instant::now();
-            match state.queue.take_or_requeue(priority, claim.core, claim.ticket, now, grant) {
+            match state
+                .queue
+                .take_or_requeue(priority, claim.core, claim.ticket, now, grant)
+            {
                 (ticket, Ok(())) => return self.hold(&mut state, claim, ticket, now),
-                (ticket, Err(id)) => (Queued { turns: self, id, granted, taken: false }, state.observe(now), ticket),
+                (ticket, Err(id)) => (
+                    Queued {
+                        turns: self,
+                        id,
+                        granted,
+                        taken: false,
+                    },
+                    state.observe(now),
+                    ticket,
+                ),
             }
         };
         self.log(logged);
         // The sender is dropped only after it granted the turn.
-        while tokio::time::timeout(SATURATION_TICK, &mut queued.granted).await.is_err() {
+        while tokio::time::timeout(SATURATION_TICK, &mut queued.granted)
+            .await
+            .is_err()
+        {
             let logged = self.lock().observe(Instant::now());
             self.log(logged);
         }
@@ -532,12 +636,29 @@ impl RecoveryTurns {
 
     /// Record `claim`'s worker as a holder from `now`.
     fn hold(&self, state: &mut State, claim: Claim, ticket: u64, now: Instant) -> Turn<'_> {
-        let Claim { core, filter, kind, execution, .. } = claim;
+        let Claim {
+            core,
+            filter,
+            kind,
+            execution,
+            ..
+        } = claim;
         execution.hold_turn(kind, now);
         let id = state.next_holder;
         state.next_holder += 1;
-        state.holders.push(Holder { id, core, filter, execution, since: now, warned: false });
-        Turn { turns: self, id, ticket }
+        state.holders.push(Holder {
+            id,
+            core,
+            filter,
+            execution,
+            since: now,
+            warned: false,
+        });
+        Turn {
+            turns: self,
+            id,
+            ticket,
+        }
     }
 
     fn release(&self) {
@@ -582,8 +703,10 @@ impl RecoveryTurns {
                     failing' warnings check those first, otherwise it ends as the queue drains",
                 "archive recovery turns saturated"),
             Some((SaturationLog::Cleared { duration }, _, _)) => tracing::info!(
-                permits = self.turns, saturated_secs = duration.as_secs(),
-                "archive recovery turns no longer saturated"),
+                permits = self.turns,
+                saturated_secs = duration.as_secs(),
+                "archive recovery turns no longer saturated"
+            ),
             None => {}
         }
     }
@@ -596,25 +719,45 @@ mod tests {
     const MINUTE: Duration = Duration::from_secs(60);
 
     fn waiter(blocked: bool, replay: bool) -> Priority {
-        Priority { blocked: Arc::new(AtomicBool::new(blocked)), reanchor: Arc::default(), lagging: Arc::default(), replay }
+        Priority {
+            blocked: Arc::new(AtomicBool::new(blocked)),
+            reanchor: Arc::default(),
+            lagging: Arc::default(),
+            replay,
+        }
     }
 
     /// A lagging voter's replay.
     fn lagging() -> Priority {
-        Priority { lagging: Arc::new(AtomicBool::new(true)), ..waiter(false, true) }
+        Priority {
+            lagging: Arc::new(AtomicBool::new(true)),
+            ..waiter(false, true)
+        }
     }
 
     fn claim(core: u32, blocked: bool) -> Claim {
         let execution = SharedWorkerExecution::default();
         execution.set_successor_blocked(blocked);
-        Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Install, execution, ticket: None }
+        Claim {
+            core,
+            filter: vec![core as u8; 32],
+            kind: RecoveryKind::Install,
+            execution,
+            ticket: None,
+        }
     }
 
     /// A worker's replay claim; `lagging` sets its lagging-voter flag.
     fn replay_claim(core: u32, lagging: bool) -> Claim {
         let execution = SharedWorkerExecution::default();
         execution.set_lagging_voter(lagging);
-        Claim { core, filter: vec![core as u8; 32], kind: RecoveryKind::Replay, execution, ticket: None }
+        Claim {
+            core,
+            filter: vec![core as u8; 32],
+            kind: RecoveryKind::Replay,
+            execution,
+            ticket: None,
+        }
     }
 
     /// A worker's lagging-voter flag, read when a turn frees up, takes it
@@ -648,12 +791,24 @@ mod tests {
     fn a_successor_blocked_after_it_queued_takes_the_next_turn() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(2);
-        assert_eq!(queue.take_or_queue(waiter(false, false), 1, now, "a"), Ok(()));
-        assert_eq!(queue.take_or_queue(waiter(false, false), 2, now, "b"), Ok(()));
+        assert_eq!(
+            queue.take_or_queue(waiter(false, false), 1, now, "a"),
+            Ok(())
+        );
+        assert_eq!(
+            queue.take_or_queue(waiter(false, false), 2, now, "b"),
+            Ok(())
+        );
         let later = waiter(false, false);
-        queue.take_or_queue(waiter(false, false), 3, now, "c").unwrap_err();
-        queue.take_or_queue(later.clone(), 4, now, "blocked later").unwrap_err();
-        queue.take_or_queue(waiter(true, false), 5, now, "blocked").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, false), 3, now, "c")
+            .unwrap_err();
+        queue
+            .take_or_queue(later.clone(), 4, now, "blocked later")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(true, false), 5, now, "blocked")
+            .unwrap_err();
         assert_eq!(queue.load(now).blocked_successors, 1);
         later.blocked.store(true, Ordering::Relaxed);
         assert_eq!(queue.load(now).blocked_successors, 2);
@@ -661,8 +816,13 @@ mod tests {
         assert_eq!(order, ["blocked later", "blocked", "c"]);
         // Once nobody waits, a released turn is free again.
         assert_eq!(queue.free, 1);
-        assert_eq!(queue.take_or_queue(waiter(true, false), 6, now, "e"), Ok(()));
-        queue.take_or_queue(waiter(true, false), 7, now, "f").unwrap_err();
+        assert_eq!(
+            queue.take_or_queue(waiter(true, false), 6, now, "e"),
+            Ok(())
+        );
+        queue
+            .take_or_queue(waiter(true, false), 7, now, "f")
+            .unwrap_err();
     }
 
     /// Blocked successors take at most [`PRIORITY_RUN`] turns in a row past
@@ -671,9 +831,13 @@ mod tests {
     fn blocked_successors_do_not_starve_the_longest_waiter() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(0);
-        queue.take_or_queue(waiter(false, false), 1, now, "regular").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, false), 1, now, "regular")
+            .unwrap_err();
         for name in ["b1", "b2", "b3", "b4"] {
-            queue.take_or_queue(waiter(true, false), 2, now, name).unwrap_err();
+            queue
+                .take_or_queue(waiter(true, false), 2, now, name)
+                .unwrap_err();
         }
         let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
         assert_eq!(order, ["b1", "b2", "regular", "b3", "b4"]);
@@ -686,14 +850,33 @@ mod tests {
     fn replays_go_before_checkpoint_installs() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(0);
-        queue.take_or_queue(waiter(true, false), 1, now, "blocked install").unwrap_err();
-        queue.take_or_queue(waiter(false, false), 2, now, "install").unwrap_err();
-        queue.take_or_queue(waiter(false, true), 3, now, "replay").unwrap_err();
-        queue.take_or_queue(waiter(true, true), 4, now, "blocked replay").unwrap_err();
-        queue.take_or_queue(waiter(false, true), 5, now, "replay 2").unwrap_err();
+        queue
+            .take_or_queue(waiter(true, false), 1, now, "blocked install")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(false, false), 2, now, "install")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 3, now, "replay")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(true, true), 4, now, "blocked replay")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 5, now, "replay 2")
+            .unwrap_err();
         assert_eq!(queue.load(now).replays, 3);
         let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
-        assert_eq!(order, ["blocked replay", "replay", "blocked install", "replay 2", "install"]);
+        assert_eq!(
+            order,
+            [
+                "blocked replay",
+                "replay",
+                "blocked install",
+                "replay 2",
+                "install"
+            ]
+        );
     }
 
     /// A worker whose shard owes a re-anchor goes first, as a blocked
@@ -705,11 +888,17 @@ mod tests {
     fn an_owed_reanchor_keeps_the_first_rank() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(0);
-        queue.take_or_queue(waiter(false, true), 1, now, "replay").unwrap_err();
-        queue.take_or_queue(waiter(true, false), 2, now, "blocked install").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 1, now, "replay")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(true, false), 2, now, "blocked install")
+            .unwrap_err();
         let reanchor = waiter(false, true);
         reanchor.reanchor.store(true, Ordering::Relaxed);
-        queue.take_or_queue(reanchor, 3, now, "re-anchor").unwrap_err();
+        queue
+            .take_or_queue(reanchor, 3, now, "re-anchor")
+            .unwrap_err();
         assert_eq!(queue.next(), Some("re-anchor"));
         assert_eq!(queue.next(), Some("replay"));
     }
@@ -726,18 +915,35 @@ mod tests {
         let (long2, taken) = queue.take_or_requeue(waiter(false, false), 2, None, now, "long 2");
         assert_eq!(taken, Ok(()));
         for (core, name) in [(3, "s1"), (4, "s2"), (5, "s3"), (6, "s4")] {
-            queue.take_or_queue(waiter(false, false), core, now, name).unwrap_err();
+            queue
+                .take_or_queue(waiter(false, false), core, now, name)
+                .unwrap_err();
         }
         // Long 1 hands its turn back, then queues again in its first place.
         assert_eq!(queue.next(), Some("s1"));
-        let (ticket, _) = queue.take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 again");
+        let (ticket, _) =
+            queue.take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 again");
         assert_eq!(ticket, long1);
-        assert_eq!(queue.waiters.front().map(|w| w.core), Some(1), "it keeps its place");
+        assert_eq!(
+            queue.waiters.front().map(|w| w.core),
+            Some(1),
+            "it keeps its place"
+        );
         assert_eq!(queue.next(), Some("long 1 again"));
-        queue.take_or_requeue(waiter(false, false), 2, Some(long2), now, "long 2 again").1.unwrap_err();
-        assert_eq!(queue.next(), Some("s2"), "after a resumed recovery's turn another waiter's");
+        queue
+            .take_or_requeue(waiter(false, false), 2, Some(long2), now, "long 2 again")
+            .1
+            .unwrap_err();
+        assert_eq!(
+            queue.next(),
+            Some("s2"),
+            "after a resumed recovery's turn another waiter's"
+        );
         assert_eq!(queue.next(), Some("long 2 again"));
-        queue.take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 third").1.unwrap_err();
+        queue
+            .take_or_requeue(waiter(false, false), 1, Some(long1), now, "long 1 third")
+            .1
+            .unwrap_err();
         assert_eq!(queue.next(), Some("s3"));
         assert_eq!(queue.next(), Some("long 1 third"));
         assert_eq!(queue.next(), Some("s4"));
@@ -750,7 +956,10 @@ mod tests {
     fn only_a_blocked_successor_holds_its_turn_and_only_within_the_budget() {
         let blocked = Arc::new(AtomicBool::new(true));
         assert!(holds_turn(&[&*blocked], Duration::ZERO));
-        assert!(holds_turn(&[&*blocked], BLOCKED_TURN_BUDGET - Duration::from_millis(1)));
+        assert!(holds_turn(
+            &[&*blocked],
+            BLOCKED_TURN_BUDGET - Duration::from_millis(1)
+        ));
         assert!(!holds_turn(&[&*blocked], BLOCKED_TURN_BUDGET));
         blocked.store(false, Ordering::Relaxed);
         assert!(!holds_turn(&[&*blocked], Duration::ZERO));
@@ -765,18 +974,33 @@ mod tests {
     fn a_lagging_voter_goes_before_replays_and_installs() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(0);
-        queue.take_or_queue(waiter(false, false), 1, now, "install").unwrap_err();
-        queue.take_or_queue(waiter(false, true), 2, now, "replay").unwrap_err();
-        queue.take_or_queue(waiter(true, false), 3, now, "blocked install").unwrap_err();
-        queue.take_or_queue(lagging(), 4, now, "lagging voter").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, false), 1, now, "install")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 2, now, "replay")
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(true, false), 3, now, "blocked install")
+            .unwrap_err();
+        queue
+            .take_or_queue(lagging(), 4, now, "lagging voter")
+            .unwrap_err();
         let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
-        assert_eq!(order, ["lagging voter", "replay", "install", "blocked install"]);
+        assert_eq!(
+            order,
+            ["lagging voter", "replay", "install", "blocked install"]
+        );
         // Once it caught up it is a replay like any other.
         let mut queue = TurnQueue::new(0);
         let caught_up = lagging();
         caught_up.lagging.store(false, Ordering::Relaxed);
-        queue.take_or_queue(waiter(false, true), 5, now, "replay 2").unwrap_err();
-        queue.take_or_queue(caught_up, 6, now, "caught up").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 5, now, "replay 2")
+            .unwrap_err();
+        queue
+            .take_or_queue(caught_up, 6, now, "caught up")
+            .unwrap_err();
         let order: Vec<_> = std::iter::from_fn(|| queue.next()).collect();
         assert_eq!(order, ["replay 2", "caught up"]);
     }
@@ -787,7 +1011,9 @@ mod tests {
     fn lagging_voters_do_not_starve_the_longest_waiter() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(0);
-        queue.take_or_queue(waiter(false, true), 1, now, "replay").unwrap_err();
+        queue
+            .take_or_queue(waiter(false, true), 1, now, "replay")
+            .unwrap_err();
         for (core, name) in [(2, "l1"), (3, "l2"), (4, "l3"), (5, "l4")] {
             queue.take_or_queue(lagging(), core, now, name).unwrap_err();
         }
@@ -804,12 +1030,24 @@ mod tests {
         let (l1, _) = queue.take_or_requeue(lagging(), 1, None, now, "l1");
         let (l2, _) = queue.take_or_requeue(lagging(), 2, None, now, "l2");
         for (core, name) in [(3, "s1"), (4, "s2")] {
-            queue.take_or_queue(waiter(false, false), core, now, name).unwrap_err();
+            queue
+                .take_or_queue(waiter(false, false), core, now, name)
+                .unwrap_err();
         }
-        queue.take_or_requeue(lagging(), 1, Some(l1), now, "l1 again").1.unwrap_err();
-        queue.take_or_requeue(lagging(), 2, Some(l2), now, "l2 again").1.unwrap_err();
+        queue
+            .take_or_requeue(lagging(), 1, Some(l1), now, "l1 again")
+            .1
+            .unwrap_err();
+        queue
+            .take_or_requeue(lagging(), 2, Some(l2), now, "l2 again")
+            .1
+            .unwrap_err();
         assert_eq!(queue.next(), Some("l1 again"));
-        assert_eq!(queue.next(), Some("s1"), "after a resumed recovery's turn another waiter's");
+        assert_eq!(
+            queue.next(),
+            Some("s1"),
+            "after a resumed recovery's turn another waiter's"
+        );
         assert_eq!(queue.next(), Some("l2 again"));
         assert_eq!(queue.next(), Some("s2"));
         assert_eq!(queue.next(), None);
@@ -819,12 +1057,25 @@ mod tests {
     fn a_withdrawn_waiter_leaves_the_queue() {
         let now = Instant::now();
         let mut queue = TurnQueue::new(1);
-        queue.take_or_queue(waiter(false, false), 1, now, 1).unwrap();
-        let id = queue.take_or_queue(waiter(false, false), 2, now, 2).unwrap_err();
-        queue.take_or_queue(waiter(true, false), 3, now + MINUTE, 3).unwrap_err();
-        assert_eq!(queue.load(now + MINUTE * 2), QueueLoad {
-            waiting: 2, blocked_successors: 1, replays: 0, longest_wait: MINUTE * 2, front_core: Some(2),
-        });
+        queue
+            .take_or_queue(waiter(false, false), 1, now, 1)
+            .unwrap();
+        let id = queue
+            .take_or_queue(waiter(false, false), 2, now, 2)
+            .unwrap_err();
+        queue
+            .take_or_queue(waiter(true, false), 3, now + MINUTE, 3)
+            .unwrap_err();
+        assert_eq!(
+            queue.load(now + MINUTE * 2),
+            QueueLoad {
+                waiting: 2,
+                blocked_successors: 1,
+                replays: 0,
+                longest_wait: MINUTE * 2,
+                front_core: Some(2),
+            }
+        );
         assert!(queue.withdraw(id));
         assert!(!queue.withdraw(id));
         assert_eq!(queue.next(), Some(3));
@@ -835,21 +1086,53 @@ mod tests {
     #[test]
     fn saturation_warns_at_a_bounded_rate_and_names_its_end() {
         let start = Instant::now();
-        let load = |waiting, longest_wait| QueueLoad { waiting, blocked_successors: 0, replays: 0, longest_wait, front_core: None };
+        let load = |waiting, longest_wait| QueueLoad {
+            waiting,
+            blocked_successors: 0,
+            replays: 0,
+            longest_wait,
+            front_core: None,
+        };
         let mut saturation = Saturation::new();
         assert_eq!(saturation.observe(start, load(1, Duration::ZERO)), None);
-        assert_eq!(saturation.observe(start + MINUTE / 2, load(0, Duration::ZERO)), None, "brief waits are not named");
-        assert_eq!(saturation.observe(start + MINUTE, load(3, Duration::ZERO)), None);
-        assert_eq!(saturation.observe(start + MINUTE * 2, load(3, MINUTE)),
-            Some(SaturationLog::Saturated { duration: MINUTE }));
-        assert_eq!(saturation.observe(start + MINUTE * 11, load(9, MINUTE * 10)), None);
-        assert_eq!(saturation.observe(start + MINUTE * 12, load(9, MINUTE * 11)),
-            Some(SaturationLog::Saturated { duration: MINUTE * 11 }));
-        assert_eq!(saturation.observe(start + MINUTE * 13, load(0, Duration::ZERO)),
-            Some(SaturationLog::Cleared { duration: MINUTE * 12 }));
-        assert_eq!(saturation.observe(start + MINUTE * 14, load(0, Duration::ZERO)), None);
-        assert_eq!(saturation.observe(start + MINUTE * 15, load(1, MINUTE)),
-            Some(SaturationLog::Saturated { duration: MINUTE }), "a later saturation warns afresh");
+        assert_eq!(
+            saturation.observe(start + MINUTE / 2, load(0, Duration::ZERO)),
+            None,
+            "brief waits are not named"
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE, load(3, Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 2, load(3, MINUTE)),
+            Some(SaturationLog::Saturated { duration: MINUTE })
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 11, load(9, MINUTE * 10)),
+            None
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 12, load(9, MINUTE * 11)),
+            Some(SaturationLog::Saturated {
+                duration: MINUTE * 11
+            })
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 13, load(0, Duration::ZERO)),
+            Some(SaturationLog::Cleared {
+                duration: MINUTE * 12
+            })
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 14, load(0, Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            saturation.observe(start + MINUTE * 15, load(1, MINUTE)),
+            Some(SaturationLog::Saturated { duration: MINUTE }),
+            "a later saturation warns afresh"
+        );
     }
 
     /// With every turn taken, a blocked successor that queued last runs
@@ -882,8 +1165,18 @@ mod tests {
         blocked.await.unwrap();
         assert_eq!(*order.lock().unwrap(), ["blocked", "regular"]);
         let state = turns.lock();
-        assert_eq!((state.queue.free, state.queue.waiters.len(), state.holders.len()), (1, 0, 0));
-        assert!(state.saturation.since.is_none(), "the drained queue ends the period");
+        assert_eq!(
+            (
+                state.queue.free,
+                state.queue.waiters.len(),
+                state.holders.len()
+            ),
+            (1, 0, 0)
+        );
+        assert!(
+            state.saturation.since.is_none(),
+            "the drained queue ends the period"
+        );
     }
 
     /// A waiter dropped after its turn was granted, before it ran, passes
@@ -909,7 +1202,10 @@ mod tests {
         assert_eq!(turns.lock().queue.waiters.len(), 1);
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(5), second).await.expect("the turn passed on").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the turn passed on")
+            .unwrap();
         assert_eq!(*ran.lock().unwrap(), ["second"]);
         let state = turns.lock();
         assert_eq!((state.queue.free, state.queue.waiters.len()), (1, 0));
@@ -934,18 +1230,42 @@ mod tests {
         assert!(matches!(log, SaturationLog::Saturated { .. }));
         assert_eq!((load.waiting, load.front_core), (1, Some(9)));
         assert_eq!(holders.len(), 1);
-        assert_eq!((holders[0].core, holders[0].kind, holders[0].filter.as_str()), (7, RecoveryKind::Install, hex::encode([7u8; 32]).as_str()));
-        assert!(holders[0].to_string().starts_with("core 7 install none held 60s leaves 0/0 filter 0707"), "{}", holders[0]);
+        assert_eq!(
+            (holders[0].core, holders[0].kind, holders[0].filter.as_str()),
+            (7, RecoveryKind::Install, hex::encode([7u8; 32]).as_str())
+        );
+        assert!(
+            holders[0]
+                .to_string()
+                .starts_with("core 7 install none held 60s leaves 0/0 filter 0707"),
+            "{}",
+            holders[0]
+        );
         assert!(logged.overruns.is_empty());
-        assert!(turns.lock().observe(start + MAX_TURN_HOLD).overruns.is_empty(),
-            "an install hands its turn back at its next chunk boundary past the limit");
+        assert!(
+            turns
+                .lock()
+                .observe(start + MAX_TURN_HOLD)
+                .overruns
+                .is_empty(),
+            "an install hands its turn back at its next chunk boundary past the limit"
+        );
         let late = start + MAX_TURN_HOLD * 2;
         let overruns = turns.lock().observe(late).overruns;
         assert_eq!(overruns.len(), 1, "warned at twice the limit");
-        assert_eq!((overruns[0].0.core, overruns[0].0.held, overruns[0].1), (7, MAX_TURN_HOLD * 2, 1));
-        assert!(turns.lock().observe(late + MINUTE).overruns.is_empty(), "warned once per turn");
+        assert_eq!(
+            (overruns[0].0.core, overruns[0].0.held, overruns[0].1),
+            (7, MAX_TURN_HOLD * 2, 1)
+        );
+        assert!(
+            turns.lock().observe(late + MINUTE).overruns.is_empty(),
+            "warned once per turn"
+        );
         drop(held);
-        assert!(execution.turn().since.is_none(), "a released turn is no longer held");
+        assert!(
+            execution.turn().since.is_none(),
+            "a released turn is no longer held"
+        );
         waiting.await.unwrap();
         assert!(turns.lock().holders.is_empty());
     }

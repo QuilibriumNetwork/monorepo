@@ -77,7 +77,9 @@ pub(crate) fn init(
         quil_store::RocksDb::open(&db_path)?
     };
     let db_arc = Arc::new(db);
-    db_arc.inner().register_store(quil_forest::StoreRole::Master);
+    db_arc
+        .inner()
+        .register_store(quil_forest::StoreRole::Master);
     info!(
         path = %db_path.display(),
         block_cache_mb = db_arc.health().block_cache_capacity / (1024 * 1024),
@@ -103,8 +105,7 @@ pub(crate) fn init(
     // materialize hot path, and the uncompacted tombstones make it cost seconds
     // even with 0 live entries. Cheap (2-byte prefix).
     shards_store_concrete.compact_pending_changes();
-    let shards_store: Arc<dyn quil_types::store::ShardsStore> =
-        Arc::new(shards_store_concrete);
+    let shards_store: Arc<dyn quil_types::store::ShardsStore> = Arc::new(shards_store_concrete);
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
     // Check latest stored frame

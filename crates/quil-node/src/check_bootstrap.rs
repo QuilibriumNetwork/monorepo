@@ -57,7 +57,8 @@ pub fn run_check_bootstrap(db_path: &Path, config: &quil_config::Config) -> anyh
     println!("  selector      : {}", hex::encode(&selector));
 
     // 2. Is the candidate key physically present in the store?
-    let cand_key = quil_store::encoding::clock_global_frame_candidate_key(qc.frame_number, &selector);
+    let cand_key =
+        quil_store::encoding::clock_global_frame_candidate_key(qc.frame_number, &selector);
     let cand_present = inner
         .get(&cand_key)
         .map_err(|e| anyhow::anyhow!("raw get candidate key: {e}"))?;
@@ -65,7 +66,9 @@ pub fn run_check_bootstrap(db_path: &Path, config: &quil_config::Config) -> anyh
     println!("  key           : {}", hex::encode(&cand_key));
     match &cand_present {
         Some(v) => println!("  present       : YES ({} bytes)", v.len()),
-        None => println!("  present       : NO  (bootstrap will silently fall back — clock.rs:556)"),
+        None => {
+            println!("  present       : NO  (bootstrap will silently fall back — clock.rs:556)")
+        }
     }
 
     // 3. Replay the exact bootstrap lookup and key the forks root the way
@@ -78,7 +81,10 @@ pub fn run_check_bootstrap(db_path: &Path, config: &quil_config::Config) -> anyh
             let fnum = h.map(|h| h.frame_number).unwrap_or(0);
             let rank = h.map(|h| h.rank).unwrap_or(0);
             let output = h.map(|h| h.output.as_slice()).unwrap_or(&[]);
-            println!("  returned frame: frame_number={fnum} rank={rank} output_len={}", output.len());
+            println!(
+                "  returned frame: frame_number={fnum} rank={rank} output_len={}",
+                output.len()
+            );
             let id = poseidon_hex(output);
             println!("  Poseidon(output) [forks-root identity] : {id}");
             Some(id)
@@ -93,10 +99,17 @@ pub fn run_check_bootstrap(db_path: &Path, config: &quil_config::Config) -> anyh
     println!("\n[canonical frame  get_global_clock_frame(frame)]");
     match clock.get_global_clock_frame(qc.frame_number) {
         Ok(frame) => {
-            let output = frame.header.as_ref().map(|h| h.output.as_slice()).unwrap_or(&[]);
+            let output = frame
+                .header
+                .as_ref()
+                .map(|h| h.output.as_slice())
+                .unwrap_or(&[]);
             println!("  Poseidon(output): {}", poseidon_hex(output));
         }
-        Err(e) => println!("  ERROR         : {e} (no canonical frame at {})", qc.frame_number),
+        Err(e) => println!(
+            "  ERROR         : {e} (no canonical frame at {})",
+            qc.frame_number
+        ),
     }
 
     // 5. Any candidates physically near the head (helps locate the real
@@ -134,7 +147,9 @@ pub fn run_check_bootstrap(db_path: &Path, config: &quil_config::Config) -> anyh
             println!("    forks-root identity = {id}");
             println!("    QC selector         = {}", hex::encode(&selector));
             if cand_present.is_some() {
-                println!("  Candidate key IS present but its output does not hash to the selector —");
+                println!(
+                    "  Candidate key IS present but its output does not hash to the selector —"
+                );
                 println!("  the stored candidate is wrong/corrupt for this selector.");
             } else {
                 println!("  Candidate key is ABSENT — the bootstrap silently fell back to the");

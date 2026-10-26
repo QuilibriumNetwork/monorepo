@@ -12,15 +12,13 @@
 pub mod cell;
 pub mod node;
 pub mod originator;
-pub mod router;
 pub mod relay;
+pub mod router;
 
 use std::sync::Arc;
 
 use pqcrypto_ntruprime::sntrup761;
-use pqcrypto_traits::kem::{
-    Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _,
-};
+use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SecretKey as _, SharedSecret as _};
 
 /// sntrup761 onion key byte lengths.
 pub const ONION_PUBLIC_KEY_LEN: usize = sntrup761::public_key_bytes();
@@ -165,62 +163,69 @@ pub fn drive_relay(
     use relay::RelayAction;
     spawn_expiry_sweeper(&relay);
     let send_transport = Arc::clone(&transport);
-    transport.set_on_receive(Arc::new(move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
-        let relay = Arc::clone(&relay);
-        let out = Arc::clone(&send_transport);
-        let on_data = on_data.clone();
-        let src = src_peer.to_vec();
-        let cell = cell.to_vec();
-        // Relay work touches the async circuit table (tokio Mutex); the transport
-        // calls this callback from within its runtime, so spawn.
-        tokio::spawn(async move {
-            match cell::parse_cell(&cell) {
-                // A peer opens a circuit hop through us → establish + CREATED.
-                Some((cell::CMD_CREATE, _)) => {
-                    if let Some(created) = relay.handle_create_cell(&src, circ_id, &cell).await {
-                        dial_and_send(&out, &src, circ_id, created).await;
-                    } else {
-                        tracing::trace!(circ_id, "onion CREATE rejected");
-                    }
-                }
-                // The next hop answered a CREATE we issued during EXTEND → wrap it
-                // as EXTENDED and relay it back toward the originator.
-                Some((cell::CMD_CREATED, payload)) => {
-                    if let Some((up_peer, up_circ, up_cell)) =
-                        relay.handle_link_created(circ_id, payload).await
-                    {
-                        dial_and_send(&out, &up_peer, up_circ, up_cell).await;
-                    }
-                }
-                // A layered onion cell.
-                Some((cell::CMD_RELAY, ct)) => {
-                    if relay.is_forward_circ(&src, circ_id).await {
-                        match relay.handle_relay_forward(&src, circ_id, ct).await {
-                            RelayAction::Forward { peer, circ_id: oc, cell } => {
-                                dial_and_send(&out, &peer, oc, cell).await;
-                            }
-                            RelayAction::Deliver { payload } => {
-                                if let Some(cb) = on_data {
-                                    cb(&src, circ_id, payload);
-                                }
-                            }
-                            RelayAction::None => {}
+    transport.set_on_receive(Arc::new(
+        move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
+            let relay = Arc::clone(&relay);
+            let out = Arc::clone(&send_transport);
+            let on_data = on_data.clone();
+            let src = src_peer.to_vec();
+            let cell = cell.to_vec();
+            // Relay work touches the async circuit table (tokio Mutex); the transport
+            // calls this callback from within its runtime, so spawn.
+            tokio::spawn(async move {
+                match cell::parse_cell(&cell) {
+                    // A peer opens a circuit hop through us → establish + CREATED.
+                    Some((cell::CMD_CREATE, _)) => {
+                        if let Some(created) = relay.handle_create_cell(&src, circ_id, &cell).await
+                        {
+                            dial_and_send(&out, &src, circ_id, created).await;
+                        } else {
+                            tracing::trace!(circ_id, "onion CREATE rejected");
                         }
-                    } else if relay.is_down_circ(circ_id).await {
-                        // Backward data from the next hop → add our layer, send up.
+                    }
+                    // The next hop answered a CREATE we issued during EXTEND → wrap it
+                    // as EXTENDED and relay it back toward the originator.
+                    Some((cell::CMD_CREATED, payload)) => {
                         if let Some((up_peer, up_circ, up_cell)) =
-                            relay.handle_relay_backward(circ_id, ct).await
+                            relay.handle_link_created(circ_id, payload).await
                         {
                             dial_and_send(&out, &up_peer, up_circ, up_cell).await;
                         }
-                    } else {
-                        tracing::trace!(circ_id, "onion RELAY cell for unknown circuit");
                     }
+                    // A layered onion cell.
+                    Some((cell::CMD_RELAY, ct)) => {
+                        if relay.is_forward_circ(&src, circ_id).await {
+                            match relay.handle_relay_forward(&src, circ_id, ct).await {
+                                RelayAction::Forward {
+                                    peer,
+                                    circ_id: oc,
+                                    cell,
+                                } => {
+                                    dial_and_send(&out, &peer, oc, cell).await;
+                                }
+                                RelayAction::Deliver { payload } => {
+                                    if let Some(cb) = on_data {
+                                        cb(&src, circ_id, payload);
+                                    }
+                                }
+                                RelayAction::None => {}
+                            }
+                        } else if relay.is_down_circ(circ_id).await {
+                            // Backward data from the next hop → add our layer, send up.
+                            if let Some((up_peer, up_circ, up_cell)) =
+                                relay.handle_relay_backward(circ_id, ct).await
+                            {
+                                dial_and_send(&out, &up_peer, up_circ, up_cell).await;
+                            }
+                        } else {
+                            tracing::trace!(circ_id, "onion RELAY cell for unknown circuit");
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        });
-    }));
+            });
+        },
+    ));
 }
 
 /// Onion cell types matching Go's `onion/constants.go`.
@@ -258,7 +263,10 @@ mod tests {
 
     impl Transport for MockTransport {
         fn send(&self, peer_id: &[u8], circ_id: u32, cell: Vec<u8>) -> Result<(), TransportError> {
-            self.sent.lock().unwrap().push((peer_id.to_vec(), circ_id, cell));
+            self.sent
+                .lock()
+                .unwrap()
+                .push((peer_id.to_vec(), circ_id, cell));
             Ok(())
         }
         fn set_on_receive(&self, cb: OnReceive) {
@@ -292,7 +300,13 @@ mod tests {
             cell::CMD_CREATE,
             &cell::build_create_payload(outbound, next, &eph_pub, &ct_static),
         );
-        FsInit { cell, ss_static, eph_sec, eph_pub, ct_static }
+        FsInit {
+            cell,
+            ss_static,
+            eph_sec,
+            eph_pub,
+            ct_static,
+        }
     }
 
     /// Initiator side: derive + verify the hop secret from a CREATED payload.
@@ -306,7 +320,11 @@ mod tests {
             &init.ct_static,
             ct_eph,
         );
-        assert_eq!(conf, cell::created_confirmation(&hop), "confirmation must match");
+        assert_eq!(
+            conf,
+            cell::created_confirmation(&hop),
+            "confirmation must match"
+        );
         hop.to_vec()
     }
 
@@ -380,7 +398,7 @@ mod tests {
         let got = delivered.lock().unwrap().clone().unwrap();
         assert_eq!(got.0, 1); // circuit id
         assert_eq!(got.1, b"hi exit"); // payload, with the seq stripped
-        // Exit does not forward anything onward.
+                                       // Exit does not forward anything onward.
         assert!(transport.sent.lock().unwrap().is_empty());
 
         // REPLAY GUARD: re-sending the exact same cell (seq 1) is dropped.

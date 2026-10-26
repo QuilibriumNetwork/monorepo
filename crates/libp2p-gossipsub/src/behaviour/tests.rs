@@ -6864,7 +6864,10 @@ fn test_quilibrium_caches_only_subscribed_messages_and_keeps_their_data() {
         .config
         .message_id(&gs.data_transform.inbound_transform(raw.clone()).unwrap());
     gs.handle_received_message(raw.clone(), &peers[0]);
-    assert_eq!(gs.mcache.get(&id).map(|cached| &cached.data), Some(&raw.data));
+    assert_eq!(
+        gs.mcache.get(&id).map(|cached| &cached.data),
+        Some(&raw.data)
+    );
     assert_eq!(delivered(&gs, &id), 1);
     match gs.events.iter().find_map(|event| match event {
         ToSwarm::GenerateEvent(Event::Message { message, .. }) => Some(message),
@@ -6876,20 +6879,36 @@ fn test_quilibrium_caches_only_subscribed_messages_and_keeps_their_data() {
 
     gs.handle_received_message(raw.clone(), &peers[1]);
     assert_eq!(delivered(&gs, &id), 1, "a duplicate is not delivered again");
-    assert_eq!(gs.mcache.get(&id).map(|cached| &cached.data), Some(&raw.data));
+    assert_eq!(
+        gs.mcache.get(&id).map(|cached| &cached.data),
+        Some(&raw.data)
+    );
 
     let elsewhere = message(TopicHash::from_raw("not subscribed"), vec![6; 64]);
-    let elsewhere_id = gs
-        .config
-        .message_id(&gs.data_transform.inbound_transform(elsewhere.clone()).unwrap());
+    let elsewhere_id = gs.config.message_id(
+        &gs.data_transform
+            .inbound_transform(elsewhere.clone())
+            .unwrap(),
+    );
     gs.handle_received_message(elsewhere, &peers[0]);
-    assert!(gs.mcache.get(&elsewhere_id).is_none(), "never validated, so not cached");
-    assert!(gs.duplicate_cache.contains(&elsewhere_id), "still deduplicated");
+    assert!(
+        gs.mcache.get(&elsewhere_id).is_none(),
+        "never validated, so not cached"
+    );
+    assert!(
+        gs.duplicate_cache.contains(&elsewhere_id),
+        "still deduplicated"
+    );
     assert_eq!(delivered(&gs, &elsewhere_id), 0);
 
     let published = vec![9u8; 512];
-    let published_id = gs.publish(topic_hashes[0].clone(), published.clone()).unwrap();
-    assert_eq!(gs.mcache.get(&published_id).map(|cached| &cached.data), Some(&published));
+    let published_id = gs
+        .publish(topic_hashes[0].clone(), published.clone())
+        .unwrap();
+    assert_eq!(
+        gs.mcache.get(&published_id).map(|cached| &cached.data),
+        Some(&published)
+    );
     assert_eq!(
         published_id,
         gs.config.message_id(&Message {

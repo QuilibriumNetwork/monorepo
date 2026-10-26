@@ -27,7 +27,13 @@ pub(crate) struct ActivationWatch {
 
 impl ActivationWatch {
     fn new(cell: &'static str, fallback: &'static str, enabled: bool) -> Self {
-        Self { cell, fallback, enabled, waiting: AtomicBool::new(false), since: Mutex::new(None) }
+        Self {
+            cell,
+            fallback,
+            enabled,
+            waiting: AtomicBool::new(false),
+            since: Mutex::new(None),
+        }
     }
 
     /// Records one read of the cell: `is_set` is whether it held a value.
@@ -47,7 +53,11 @@ impl ActivationWatch {
                  (expected wait, no action needed)",
             );
         } else if self.waiting.swap(false, Ordering::AcqRel) {
-            let waited = self.since.lock().unwrap_or_else(|e| e.into_inner()).take()
+            let waited = self
+                .since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
                 .map_or(0, |since| since.elapsed().as_secs());
             info!(
                 cell = self.cell, frame = frame.unwrap_or(0), waited_secs = waited,
@@ -73,7 +83,11 @@ impl ActivationWaits {
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             cw_router: ActivationWatch::new("cw_router", "legacy gossip dispatch", enabled),
-            global_finalization: ActivationWatch::new("global_finalization", "canonical clock write first", enabled),
+            global_finalization: ActivationWatch::new(
+                "global_finalization",
+                "canonical clock write first",
+                enabled,
+            ),
         }
     }
 }

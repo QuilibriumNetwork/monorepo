@@ -8,12 +8,12 @@
 use quil_types::crypto::Signer;
 use quil_types::error::Result;
 
-use quil_execution::global_intrinsic::prover_join::ProverJoin;
-use quil_execution::global_intrinsic::seniority_merge::SeniorityMerge;
-use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject};
-use quil_execution::global_intrinsic::prover_filter_ops::ProverLeave;
-use quil_execution::global_intrinsic::sig_with_pop::SignatureWithPop;
 use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+use quil_execution::global_intrinsic::prover_filter_ops::ProverLeave;
+use quil_execution::global_intrinsic::prover_join::ProverJoin;
+use quil_execution::global_intrinsic::prover_ops::{ProverConfirm, ProverReject};
+use quil_execution::global_intrinsic::seniority_merge::SeniorityMerge;
+use quil_execution::global_intrinsic::sig_with_pop::SignatureWithPop;
 use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
 /// Build a signed ProverJoin wrapped in a MessageBundle.
@@ -93,7 +93,8 @@ pub fn build_confirm_bundle_with_leaf_roots(
     leaf_roots: &[quil_execution::global_intrinsic::leaf_root_registration::ConfirmLeafRoots],
 ) -> Result<Vec<u8>> {
     // This build's release, from the confirm release frame.
-    let release = quil_execution::global_intrinsic::prover_release::release_for_confirm(frame_number);
+    let release =
+        quil_execution::global_intrinsic::prover_release::release_for_confirm(frame_number);
     let msg = quil_execution::global_intrinsic::prover_verify::confirm_signing_message(
         filters,
         frame_number,
@@ -130,7 +131,9 @@ pub fn build_reject_bundle(
     prover_address: &[u8],
 ) -> Result<Vec<u8>> {
     let mut msg = Vec::new();
-    for f in filters { msg.extend_from_slice(f); }
+    for f in filters {
+        msg.extend_from_slice(f);
+    }
     msg.extend_from_slice(&frame_number.to_be_bytes());
 
     let mut dp = quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS.to_vec();
@@ -291,8 +294,8 @@ mod tests {
     /// CanonicalMessageRequest envelope). Asserts there is exactly one
     /// request and returns the inner payload bytes.
     fn decode_single_inner(bundle_bytes: &[u8]) -> Vec<u8> {
-        let bundle = CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
-            .expect("bundle decodes");
+        let bundle =
+            CanonicalMessageBundle::from_canonical_bytes(bundle_bytes).expect("bundle decodes");
         assert_eq!(bundle.requests.len(), 1, "exactly one request expected");
         let req = bundle.requests[0].as_ref().expect("request present");
         req.inner_bytes.clone()
@@ -349,7 +352,13 @@ mod tests {
         let proof = vec![0x09u8; 32];
 
         let bytes = build_join_bundle(
-            &filters, frame_number, &pk, signer.as_ref(), &address, &proof, Vec::new(),
+            &filters,
+            frame_number,
+            &pk,
+            signer.as_ref(),
+            &address,
+            &proof,
+            Vec::new(),
         )
         .unwrap();
         let inner = decode_single_inner(&bytes);
@@ -397,7 +406,10 @@ mod tests {
         let inner = decode_single_inner(&bytes);
         let join = ProverJoin::from_canonical_bytes(&inner).unwrap();
         assert_eq!(join.merge_targets.len(), 1);
-        assert_eq!(join.merge_targets[0].key_type, quil_types::crypto::KeyType::Ed448 as u32);
+        assert_eq!(
+            join.merge_targets[0].key_type,
+            quil_types::crypto::KeyType::Ed448 as u32
+        );
         assert_eq!(join.merge_targets[0].prover_public_key, vec![0xBBu8; 57]);
     }
 
@@ -480,13 +492,17 @@ mod tests {
 
     #[test]
     fn confirm_bundle_carries_this_builds_release_only_from_the_release_frame() {
-        use quil_execution::global_intrinsic::prover_release::{set_confirm_release_frame_for_thread, Release};
+        use quil_execution::global_intrinsic::prover_release::{
+            set_confirm_release_frame_for_thread, Release,
+        };
         let (signer, _pk) = bls_keypair();
         let filters = vec![vec![0x05u8; 32]];
         let address = vec![0x42u8; 32];
         let decode = |frame_number| {
-            let bytes = build_confirm_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
-            ProverConfirm::from_canonical_bytes(&decode_single_inner(&bytes)).expect("confirm decodes")
+            let bytes =
+                build_confirm_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+            ProverConfirm::from_canonical_bytes(&decode_single_inner(&bytes))
+                .expect("confirm decodes")
         };
         set_confirm_release_frame_for_thread(None);
         assert_eq!(decode(779).release, None);
@@ -503,8 +519,7 @@ mod tests {
         let frame_number = 4242u64;
         let address = vec![0x11u8; 32];
 
-        let bytes =
-            build_reject_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let bytes = build_reject_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
         let inner = decode_single_inner(&bytes);
         let reject = ProverReject::from_canonical_bytes(&inner).expect("reject decodes");
         assert_eq!(reject.filters, filters);
@@ -520,8 +535,7 @@ mod tests {
         let frame_number = 314u64;
         let address = vec![0x21u8; 32];
 
-        let bytes =
-            build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let bytes = build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
         let inner = decode_single_inner(&bytes);
         let leave = ProverLeave::from_canonical_bytes(&inner).expect("leave decodes");
         assert_eq!(leave.filters, filters);
@@ -571,8 +585,7 @@ mod tests {
         let frame_number = 777u64;
         let address = vec![0x42u8; 32];
 
-        let bytes =
-            build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
+        let bytes = build_leave_bundle(&filters, frame_number, signer.as_ref(), &address).unwrap();
         let inner = decode_single_inner(&bytes);
         let leave = ProverLeave::from_canonical_bytes(&inner).unwrap();
         let sig = leave.public_key_signature_bls48581.unwrap();
@@ -622,9 +635,7 @@ mod tests {
 
         let mut sign_input = Vec::from(b"PROVER_JOIN_MERGE" as &[u8]);
         sign_input.extend_from_slice(&bls_pubkey);
-        assert!(pub_key
-            .verify(&sign_input, &m.signature, None)
-            .is_ok());
+        assert!(pub_key.verify(&sign_input, &m.signature, None).is_ok());
     }
 
     #[test]
@@ -664,10 +675,9 @@ mod tests {
         let frame_number = 6000u64;
         let address = vec![0x77u8; 32];
 
-        let bytes = build_shard_merge_bundle(
-            &left, &right, frame_number, signer.as_ref(), &address,
-        )
-        .unwrap();
+        let bytes =
+            build_shard_merge_bundle(&left, &right, frame_number, signer.as_ref(), &address)
+                .unwrap();
         let inner = decode_single_inner(&bytes);
         assert_eq!(&inner[0..4], &0x031Fu32.to_be_bytes());
 
@@ -687,10 +697,14 @@ mod tests {
     #[test]
     fn shard_split_and_merge_have_distinct_type_prefixes() {
         let (signer, _pk) = bls_keypair();
-        let split = build_shard_split_bundle(&[0x01u8; 32], 1, signer.as_ref(), &[0x02u8; 32])
-            .unwrap();
+        let split =
+            build_shard_split_bundle(&[0x01u8; 32], 1, signer.as_ref(), &[0x02u8; 32]).unwrap();
         let merge = build_shard_merge_bundle(
-            &[0x01u8; 32], &[0x03u8; 32], 1, signer.as_ref(), &[0x02u8; 32],
+            &[0x01u8; 32],
+            &[0x03u8; 32],
+            1,
+            signer.as_ref(),
+            &[0x02u8; 32],
         )
         .unwrap();
         let split_inner = decode_single_inner(&split);

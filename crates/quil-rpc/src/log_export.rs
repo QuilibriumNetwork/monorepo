@@ -87,7 +87,13 @@ pub struct RecordReader {
 
 impl RecordReader {
     pub fn new(sources: Vec<(String, Box<dyn BufRead>)>) -> Self {
-        RecordReader { sources: sources.into(), pending: None, last_ts: None, lines_read: 0, errors: Vec::new() }
+        RecordReader {
+            sources: sources.into(),
+            pending: None,
+            last_ts: None,
+            lines_read: 0,
+            errors: Vec::new(),
+        }
     }
 
     fn read_line(&mut self) -> Option<String> {
@@ -121,7 +127,11 @@ impl RecordReader {
             if let Some(ts) = redact::parse_log_timestamp(&line) {
                 self.last_ts = Some(ts);
                 let level = line.split('\t').nth(1).map_or(2, level_rank);
-                let record = Record { ts: Some(ts), level, lines: vec![line] };
+                let record = Record {
+                    ts: Some(ts),
+                    level,
+                    lines: vec![line],
+                };
                 if let Some(previous) = self.pending.replace(record) {
                     return Some(previous);
                 }
@@ -129,7 +139,11 @@ impl RecordReader {
                 if let Some(record) = self.pending.as_mut() {
                     record.lines.push(line);
                 } else {
-                    self.pending = Some(Record { ts: self.last_ts, level: 2, lines: vec![line] });
+                    self.pending = Some(Record {
+                        ts: self.last_ts,
+                        level: 2,
+                        lines: vec![line],
+                    });
                 }
             }
         }
@@ -147,7 +161,11 @@ pub struct Merger {
 impl Merger {
     pub fn new(readers: Vec<RecordReader>) -> Self {
         let heads = readers.iter().map(|_| None).collect();
-        Merger { readers, heads, primed: false }
+        Merger {
+            readers,
+            heads,
+            primed: false,
+        }
     }
 
     /// Physical lines read from every stream.
@@ -157,7 +175,10 @@ impl Merger {
 
     /// Errors of every stream.
     pub fn errors(&self) -> Vec<String> {
-        self.readers.iter().flat_map(|r| r.errors.iter().cloned()).collect()
+        self.readers
+            .iter()
+            .flat_map(|r| r.errors.iter().cloned())
+            .collect()
     }
 }
 
@@ -218,7 +239,10 @@ impl Selection {
                 self.filters.iter().any(|f| lower.contains(f.as_str()))
             });
         let match_ok = self.matches.is_empty()
-            || record.lines.iter().any(|l| self.matches.iter().any(|m| l.contains(m.as_str())));
+            || record
+                .lines
+                .iter()
+                .any(|l| self.matches.iter().any(|m| l.contains(m.as_str())));
         filter_ok && match_ok
     }
 }
@@ -256,7 +280,11 @@ impl std::error::Error for Cancelled {}
 /// I/O error of the export.
 pub fn is_cancelled(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.is::<Cancelled>() || cause.downcast_ref::<io::Error>().and_then(|io| io.get_ref()).is_some_and(|e| e.is::<Cancelled>())
+        cause.is::<Cancelled>()
+            || cause
+                .downcast_ref::<io::Error>()
+                .and_then(|io| io.get_ref())
+                .is_some_and(|e| e.is::<Cancelled>())
     })
 }
 
@@ -273,7 +301,9 @@ pub fn export_records(
     let mut redacted_samples = Vec::new();
     let mut plain_samples = Vec::new();
     for record in records {
-        if stats.records_read % CANCEL_CHECK_RECORDS == 0 && cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        if stats.records_read % CANCEL_CHECK_RECORDS == 0
+            && cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+        {
             return Err(io::Error::other(Cancelled));
         }
         stats.records_read += 1;
@@ -326,7 +356,12 @@ pub fn parse_log_file_name(name: &str) -> Option<LogFile> {
         n.parse().ok()
     };
     if let Some(base) = name.strip_suffix(".log") {
-        return Some(LogFile { name: name.to_string(), core: core_of(base)?, rotated: None, gz: false });
+        return Some(LogFile {
+            name: name.to_string(),
+            core: core_of(base)?,
+            rotated: None,
+            gz: false,
+        });
     }
     if !is_rotated_log(name) {
         return None;
@@ -340,7 +375,12 @@ pub fn parse_log_file_name(name: &str) -> Option<LogFile> {
         Some((ts, n)) => (ts, n.parse().ok()?),
         None => (suffix, 0),
     };
-    Some(LogFile { name: name.to_string(), core: core_of(base)?, rotated: Some((ts.to_string(), number)), gz })
+    Some(LogFile {
+        name: name.to_string(),
+        core: core_of(base)?,
+        rotated: Some((ts.to_string(), number)),
+        gz,
+    })
 }
 
 /// Unix seconds of a rotation timestamp `YYYYMMDDTHHMMSS`, read as UTC.
@@ -348,7 +388,15 @@ fn parse_rotation_ts(ts: &str) -> Option<i64> {
     if ts.len() != 15 || !ts.is_ascii() || ts.as_bytes()[8] != b'T' {
         return None;
     }
-    let iso = format!("{}-{}-{}T{}:{}:{}Z", &ts[0..4], &ts[4..6], &ts[6..8], &ts[9..11], &ts[11..13], &ts[13..15]);
+    let iso = format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &ts[0..4],
+        &ts[4..6],
+        &ts[6..8],
+        &ts[9..11],
+        &ts[11..13],
+        &ts[13..15]
+    );
     redact::parse_rfc3339_utc(&iso)
 }
 
@@ -372,12 +420,17 @@ pub fn select_log_files(names: &[String], since: i64, until: i64) -> Vec<Vec<Log
             (Some(_), None) => std::cmp::Ordering::Less,
             (Some(x), Some(y)) => x.cmp(y).then(a.gz.cmp(&b.gz)),
         });
-        files.dedup_by(|later, earlier| later.rotated.is_some() && later.rotated == earlier.rotated);
+        files
+            .dedup_by(|later, earlier| later.rotated.is_some() && later.rotated == earlier.rotated);
         let mut selected = Vec::new();
         let mut previous_end: Option<i64> = None;
         for file in files {
-            let end = file.rotated.as_ref().and_then(|(ts, _)| parse_rotation_ts(ts));
-            let ends_before = file.rotated.is_some() && end.is_some_and(|e| e + ROTATION_TZ_SLACK_SECS < since);
+            let end = file
+                .rotated
+                .as_ref()
+                .and_then(|(ts, _)| parse_rotation_ts(ts));
+            let ends_before =
+                file.rotated.is_some() && end.is_some_and(|e| e + ROTATION_TZ_SLACK_SECS < since);
             let starts_after = previous_end.is_some_and(|s| s - ROTATION_TZ_SLACK_SECS > until);
             if end.is_some() {
                 previous_end = end;
@@ -398,8 +451,11 @@ pub fn select_log_files(names: &[String], since: i64, until: i64) -> Vec<Vec<Log
 fn open_log_file(dir: &Path, file: &LogFile) -> io::Result<Box<dyn BufRead>> {
     let open = |name: &str, gz: bool| -> io::Result<Box<dyn BufRead>> {
         let f = File::open(dir.join(name))?;
-        let reader: Box<dyn BufRead> =
-            if gz { Box::new(BufReader::new(MultiGzDecoder::new(f))) } else { Box::new(BufReader::new(f)) };
+        let reader: Box<dyn BufRead> = if gz {
+            Box::new(BufReader::new(MultiGzDecoder::new(f)))
+        } else {
+            Box::new(BufReader::new(f))
+        };
         Ok(reader)
     };
     match open(&file.name, file.gz) {
@@ -413,9 +469,15 @@ fn open_log_file(dir: &Path, file: &LogFile) -> io::Result<Box<dyn BufRead>> {
 /// Record readers (one per core) over the log files in `dir` that may hold
 /// lines of the window, and the names of the files they read; a file that
 /// does not open is a read error of its core.
-pub fn file_readers(dir: &Path, since: i64, until: i64) -> anyhow::Result<(Vec<RecordReader>, Vec<String>)> {
+pub fn file_readers(
+    dir: &Path,
+    since: i64,
+    until: i64,
+) -> anyhow::Result<(Vec<RecordReader>, Vec<String>)> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("read {}: {e}", dir.display()))?
+    {
         if let Ok(name) = entry?.file_name().into_string() {
             names.push(name);
         }
@@ -447,7 +509,9 @@ pub fn is_rotated_log(name: &str) -> bool {
     let Some((base, suffix)) = name.split_once(".log.") else {
         return false;
     };
-    let worker = base.strip_prefix("worker-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let worker = base
+        .strip_prefix("worker-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     (base == "master" || worker) && !suffix.is_empty()
 }
 
@@ -462,8 +526,9 @@ pub fn parse_when(s: &str, now: i64) -> anyhow::Result<i64> {
             }
         }
     }
-    redact::parse_rfc3339_utc(s)
-        .ok_or_else(|| anyhow::anyhow!("{s}: expected UTC RFC 3339 (2026-10-17T16:00:00Z) or a time ago (2h, 90m)"))
+    redact::parse_rfc3339_utc(s).ok_or_else(|| {
+        anyhow::anyhow!("{s}: expected UTC RFC 3339 (2026-10-17T16:00:00Z) or a time ago (2h, 90m)")
+    })
 }
 
 /// `YYYYMMDDTHHMMSSZ` of UTC Unix seconds, for file names.
@@ -552,11 +617,23 @@ pub fn manifest(
 
 /// The preview printed before writing; `destination` says where the bundle
 /// goes.
-pub fn preview(manifest: &serde_json::Value, stats: &ExportStats, destination: &str, map_path: &Path) -> String {
+pub fn preview(
+    manifest: &serde_json::Value,
+    stats: &ExportStats,
+    destination: &str,
+    map_path: &Path,
+) -> String {
     let mut s = String::new();
     let w = &manifest["window"];
-    s.push_str(&format!("Window: {} .. {} (UTC)\n", w["since"].as_str().unwrap_or(""), w["until"].as_str().unwrap_or("")));
-    if let Some(filters) = manifest["selection"]["filters"].as_array().filter(|f| !f.is_empty()) {
+    s.push_str(&format!(
+        "Window: {} .. {} (UTC)\n",
+        w["since"].as_str().unwrap_or(""),
+        w["until"].as_str().unwrap_or("")
+    ));
+    if let Some(filters) = manifest["selection"]["filters"]
+        .as_array()
+        .filter(|f| !f.is_empty())
+    {
         s.push_str("Shard filters (their lines, plus every warn and error line):\n");
         for filter in filters {
             s.push_str(&format!("  {}\n", filter.as_str().unwrap_or("")));
@@ -568,7 +645,10 @@ pub fn preview(manifest: &serde_json::Value, stats: &ExportStats, destination: &
             let n = src["files"].as_array().map_or(0, |a| a.len());
             s.push_str(&format!("Source: {n} log file(s)\n"));
         }
-        _ => s.push_str(&format!("Source: journal of {}\n", src["unit"].as_str().unwrap_or(""))),
+        _ => s.push_str(&format!(
+            "Source: journal of {}\n",
+            src["unit"].as_str().unwrap_or("")
+        )),
     }
     let l = &manifest["lines"];
     s.push_str(&format!("Lines: {} read, {} kept\n", l["read"], l["kept"]));
@@ -585,12 +665,20 @@ pub fn preview(manifest: &serde_json::Value, stats: &ExportStats, destination: &
     }
     let unparseable = r["unparseable_json"].as_u64().unwrap_or(0);
     if unparseable > 0 {
-        s.push_str(&format!("Lines without parseable JSON fields: {unparseable} (redacted as text)\n"));
+        s.push_str(&format!(
+            "Lines without parseable JSON fields: {unparseable} (redacted as text)\n"
+        ));
     }
     if let Some(errors) = manifest["read_errors"].as_array().filter(|a| !a.is_empty()) {
-        s.push_str(&format!("Unreadable sources (partly skipped): {}\n", errors.len()));
+        s.push_str(&format!(
+            "Unreadable sources (partly skipped): {}\n",
+            errors.len()
+        ));
     }
-    s.push_str(&format!("Sample of {} redacted line(s):\n", stats.samples.len()));
+    s.push_str(&format!(
+        "Sample of {} redacted line(s):\n",
+        stats.samples.len()
+    ));
     for line in &stats.samples {
         s.push_str("  ");
         s.push_str(line);
@@ -600,7 +688,10 @@ pub fn preview(manifest: &serde_json::Value, stats: &ExportStats, destination: &
     s.push('\n');
     s.push_str(destination);
     s.push('\n');
-    s.push_str(&format!("Token map (original values; keep private, never share it): {}\n", map_path.display()));
+    s.push_str(&format!(
+        "Token map (original values; keep private, never share it): {}\n",
+        map_path.display()
+    ));
     s
 }
 
@@ -611,14 +702,24 @@ pub fn home_users(paths: &[PathBuf]) -> Vec<String> {
     let cwd = std::env::current_dir().ok();
     let mut users: Vec<String> = paths
         .iter()
-        .filter_map(|path| if path.is_absolute() { Some(path.clone()) } else { cwd.as_ref().map(|cwd| cwd.join(path)) })
+        .filter_map(|path| {
+            if path.is_absolute() {
+                Some(path.clone())
+            } else {
+                cwd.as_ref().map(|cwd| cwd.join(path))
+            }
+        })
         .filter_map(|path| {
             let mut parts = path.components().filter_map(|c| match c {
                 std::path::Component::Normal(part) => part.to_str().map(str::to_string),
                 _ => None,
             });
             match (parts.next()?.as_str(), parts.next()?) {
-                ("home" | "Users", name) if !matches!(name.as_str(), "root" | "Shared" | "shared") => Some(name),
+                ("home" | "Users", name)
+                    if !matches!(name.as_str(), "root" | "Shared" | "shared") =>
+                {
+                    Some(name)
+                }
                 _ => None,
             }
         })
@@ -648,7 +749,10 @@ fn local_literals(home_paths: &[PathBuf]) -> Vec<(&'static str, String)> {
             out.push(("host", host));
         }
     }
-    let mut users: Vec<String> = ["USER", "LOGNAME"].iter().filter_map(|v| std::env::var(v).ok()).collect();
+    let mut users: Vec<String> = ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .collect();
     if let Some(home) = std::env::var_os("HOME") {
         if let Some(name) = Path::new(&home).file_name().and_then(|n| n.to_str()) {
             users.push(name.to_string());
@@ -659,12 +763,21 @@ fn local_literals(home_paths: &[PathBuf]) -> Vec<(&'static str, String)> {
     users.extend(home_users(&paths));
     users.sort();
     users.dedup();
-    out.extend(users.into_iter().filter(|u| !u.is_empty()).map(|u| ("user", u)));
+    out.extend(
+        users
+            .into_iter()
+            .filter(|u| !u.is_empty())
+            .map(|u| ("user", u)),
+    );
     out
 }
 
 /// Write the token map of the export `about`, readable by the owner only.
-pub fn write_token_map(path: &Path, about: &str, map: &BTreeMap<String, String>) -> anyhow::Result<()> {
+pub fn write_token_map(
+    path: &Path,
+    about: &str,
+    map: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -672,8 +785,13 @@ pub fn write_token_map(path: &Path, about: &str, map: &BTreeMap<String, String>)
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
-    writeln!(f, "# Token map of {about}: original values. PRIVATE: do not share this file.")?;
+    let mut f = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    writeln!(
+        f,
+        "# Token map of {about}: original values. PRIVATE: do not share this file."
+    )?;
     for (token, value) in map {
         writeln!(f, "{token}\t{value}")?;
     }
@@ -727,15 +845,28 @@ pub fn produce<W: Write>(
     opts.literals = local_literals(options.home_paths);
     let mut redactor = Redactor::new(salt, opts);
 
-    let hashing = HashingWriter { inner: out, hasher: Sha256::new(), bytes: 0 };
+    let hashing = HashingWriter {
+        inner: out,
+        hasher: Sha256::new(),
+        bytes: 0,
+    };
     let mut gz = GzEncoder::new(hashing, Compression::default());
     let mut merger = Merger::new(readers);
-    let mut stats = export_records(merger.by_ref(), selection, &mut redactor, &mut gz, options.cancel)?;
+    let mut stats = export_records(
+        merger.by_ref(),
+        selection,
+        &mut redactor,
+        &mut gz,
+        options.cancel,
+    )?;
     stats.lines_read = merger.lines_read();
     stats.read_errors = merger.errors();
     let mut hashing = gz.finish()?;
     hashing.flush()?;
-    let log = LogDigest { sha256: hex::encode(hashing.hasher.finalize()), bytes: hashing.bytes };
+    let log = LogDigest {
+        sha256: hex::encode(hashing.hasher.finalize()),
+        bytes: hashing.bytes,
+    };
     if let Some(mut c) = child {
         let status = c.wait()?;
         if !status.success() {
@@ -743,14 +874,26 @@ pub fn produce<W: Write>(
         }
     }
     let manifest = manifest(selection, source, &stats, &redactor, keep_self, &log);
-    Ok(Export { out: hashing.inner, manifest, stats, log, token_map: redactor.token_map().clone() })
+    Ok(Export {
+        out: hashing.inner,
+        manifest,
+        stats,
+        log,
+        token_map: redactor.token_map().clone(),
+    })
 }
 
 /// The bundle's `manifest.json` and `SHA256SUMS`.
-pub fn bundle_texts(manifest: &serde_json::Value, log: &LogDigest) -> anyhow::Result<(String, String)> {
+pub fn bundle_texts(
+    manifest: &serde_json::Value,
+    log: &LogDigest,
+) -> anyhow::Result<(String, String)> {
     let manifest_text = serde_json::to_string_pretty(manifest)? + "\n";
     let manifest_sha = hex::encode(Sha256::digest(manifest_text.as_bytes()));
-    let sums = format!("{}  {BUNDLE_LOG}\n{manifest_sha}  manifest.json\n", log.sha256);
+    let sums = format!(
+        "{}  {BUNDLE_LOG}\n{manifest_sha}  manifest.json\n",
+        log.sha256
+    );
     Ok((manifest_text, sums))
 }
 
@@ -788,7 +931,8 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qclient-log-export-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("qclient-log-export-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -814,7 +958,11 @@ mod tests {
         let mut redactor = Redactor::new([1; 32], RedactOptions::default());
         let mut merger = Merger::new(vec![reader(text)]);
         export_records(merger.by_ref(), selection, &mut redactor, &mut out, None).unwrap();
-        String::from_utf8(out).unwrap().lines().map(|l| message_of(l).to_string()).collect()
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| message_of(l).to_string())
+            .collect()
     }
 
     /// A rotated `.gz` and the live file of each core are read in order and
@@ -827,9 +975,15 @@ mod tests {
         let c = r#"{"coreId":0}"#;
         write_gz(
             &dir.join("master.log.20261017T120000.gz"),
-            &lines(&[node_line("11:00:00", "info", "m1", c), node_line("11:30:00", "info", "m2", c)]),
+            &lines(&[
+                node_line("11:00:00", "info", "m1", c),
+                node_line("11:30:00", "info", "m2", c),
+            ]),
         );
-        write_gz(&dir.join("master.log.20261001T000000.gz"), "2026-09-30T23:00:00Z\tinfo\tx.rs:1\told\t{}\n");
+        write_gz(
+            &dir.join("master.log.20261001T000000.gz"),
+            "2026-09-30T23:00:00Z\tinfo\tx.rs:1\told\t{}\n",
+        );
         std::fs::write(
             dir.join("master.log"),
             lines(&[
@@ -841,19 +995,55 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.join("worker-1.log.20261017T121500"),
-            lines(&[node_line("11:15:00", "info", "w1", c), node_line("12:05:00", "info", "w2", c), "  w2 detail".to_string()]),
+            lines(&[
+                node_line("11:15:00", "info", "w1", c),
+                node_line("12:05:00", "info", "w2", c),
+                "  w2 detail".to_string(),
+            ]),
         )
         .unwrap();
-        write_gz(&dir.join("worker-1.log.20261017T121500.gz"), &lines(&[node_line("11:16:00", "info", "partial", c)]));
-        std::fs::write(dir.join("worker-1.log"), lines(&[node_line("12:20:00", "info", "w-tie", c)])).unwrap();
+        write_gz(
+            &dir.join("worker-1.log.20261017T121500.gz"),
+            &lines(&[node_line("11:16:00", "info", "partial", c)]),
+        );
+        std::fs::write(
+            dir.join("worker-1.log"),
+            lines(&[node_line("12:20:00", "info", "w-tie", c)]),
+        )
+        .unwrap();
         std::fs::write(dir.join("notes.txt"), "not a log\n").unwrap();
 
-        let (readers, names) = file_readers(&dir, ts("2026-10-17T10:00:00Z"), ts("2026-10-17T13:00:00Z")).unwrap();
-        assert_eq!(names, ["master.log.20261017T120000.gz", "master.log", "worker-1.log.20261017T121500", "worker-1.log"]);
+        let (readers, names) =
+            file_readers(&dir, ts("2026-10-17T10:00:00Z"), ts("2026-10-17T13:00:00Z")).unwrap();
+        assert_eq!(
+            names,
+            [
+                "master.log.20261017T120000.gz",
+                "master.log",
+                "worker-1.log.20261017T121500",
+                "worker-1.log"
+            ]
+        );
         let mut merger = Merger::new(readers);
-        let got: Vec<String> =
-            merger.by_ref().flat_map(|r| r.lines).map(|l| message_of(&l).to_string()).collect();
-        assert_eq!(got, ["m1", "w1", "m2", "w2", "  w2 detail", "m4", "m-tie", "w-tie", "m6"]);
+        let got: Vec<String> = merger
+            .by_ref()
+            .flat_map(|r| r.lines)
+            .map(|l| message_of(&l).to_string())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "m1",
+                "w1",
+                "m2",
+                "w2",
+                "  w2 detail",
+                "m4",
+                "m-tie",
+                "w-tie",
+                "m6"
+            ]
+        );
         assert_eq!(merger.lines_read(), 9);
         assert!(merger.errors().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
@@ -876,37 +1066,87 @@ mod tests {
         // Window ending well before the 2026-10-12 rotation: the files
         // rotated later started on 10-12 or 10-13, so only the oldest one
         // (start unknown) may hold window lines.
-        let sel = select_log_files(&names, ts("2026-10-09T00:00:00Z"), ts("2026-10-10T00:00:00Z"));
-        let picked: Vec<Vec<&str>> = sel.iter().map(|core| core.iter().map(|f| f.name.as_str()).collect()).collect();
-        assert_eq!(picked, [vec!["master.log.20261012T000000"], vec!["worker-2.log.20261011T000000.gz"]]);
+        let sel = select_log_files(
+            &names,
+            ts("2026-10-09T00:00:00Z"),
+            ts("2026-10-10T00:00:00Z"),
+        );
+        let picked: Vec<Vec<&str>> = sel
+            .iter()
+            .map(|core| core.iter().map(|f| f.name.as_str()).collect())
+            .collect();
+        assert_eq!(
+            picked,
+            [
+                vec!["master.log.20261012T000000"],
+                vec!["worker-2.log.20261011T000000.gz"]
+            ]
+        );
         // Window after the worker's only rotation ended: it is skipped.
-        let all = select_log_files(&names, ts("2026-10-12T00:00:00Z"), ts("2026-10-13T00:00:00Z"));
-        assert_eq!(all[0].iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), [
-            "master.log.20261012T000000",
-            "master.log.20261012T000000.1.gz",
-            "master.log.20261013T000000",
-            "master.log",
-        ]);
+        let all = select_log_files(
+            &names,
+            ts("2026-10-12T00:00:00Z"),
+            ts("2026-10-13T00:00:00Z"),
+        );
+        assert_eq!(
+            all[0].iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            [
+                "master.log.20261012T000000",
+                "master.log.20261012T000000.1.gz",
+                "master.log.20261013T000000",
+                "master.log",
+            ]
+        );
         assert_eq!(all.len(), 1);
     }
 
     #[test]
     fn selection_keeps_matches_and_warnings_as_context() {
         let text = lines(&[
-            node_line("12:00:00", "info", "with filter", &format!(r#"{{"coreId":1,"filter":"{FILTER}"}}"#)),
-            node_line("12:00:01", "info", "prover confirmation published", r#"{"coreId":0}"#),
+            node_line(
+                "12:00:00",
+                "info",
+                "with filter",
+                &format!(r#"{{"coreId":1,"filter":"{FILTER}"}}"#),
+            ),
+            node_line(
+                "12:00:01",
+                "info",
+                "prover confirmation published",
+                r#"{"coreId":0}"#,
+            ),
             node_line("12:00:02", "warn", "duty outage", r#"{"coreId":0}"#),
             node_line("12:00:03", "debug", "noise", r#"{"coreId":0}"#),
             "2026-10-16T12:00:00Z\terror\tx.rs:1\tbefore the window\t{}".to_string(),
         ]);
         assert_eq!(exported(&text, &whole_day()).len(), 4);
-        let by_filter = Selection { filters: vec![FILTER.to_string()], ..whole_day() };
+        let by_filter = Selection {
+            filters: vec![FILTER.to_string()],
+            ..whole_day()
+        };
         assert_eq!(exported(&text, &by_filter), ["with filter", "duty outage"]);
-        let upper = lines(&[node_line("12:00:00", "info", "upper", &format!(r#"{{"coreId":1,"filter":"{}"}}"#, FILTER.to_ascii_uppercase()))]);
+        let upper = lines(&[node_line(
+            "12:00:00",
+            "info",
+            "upper",
+            &format!(
+                r#"{{"coreId":1,"filter":"{}"}}"#,
+                FILTER.to_ascii_uppercase()
+            ),
+        )]);
         assert_eq!(exported(&upper, &by_filter), ["upper"]);
-        let by_match = Selection { matches: vec!["confirmation".to_string()], ..whole_day() };
-        assert_eq!(exported(&text, &by_match), ["prover confirmation published", "duty outage"]);
-        let warn = Selection { min_level: WARN_RANK, ..whole_day() };
+        let by_match = Selection {
+            matches: vec!["confirmation".to_string()],
+            ..whole_day()
+        };
+        assert_eq!(
+            exported(&text, &by_match),
+            ["prover confirmation published", "duty outage"]
+        );
+        let warn = Selection {
+            min_level: WARN_RANK,
+            ..whole_day()
+        };
         assert_eq!(exported(&text, &warn), ["duty outage"]);
     }
 
@@ -915,25 +1155,56 @@ mod tests {
     #[test]
     fn manifest_counts_match_redactions() {
         let text = lines(&[
-            node_line("12:00:00", "info", "dialing 192.0.2.10:8340", r#"{"coreId":0}"#),
-            node_line("12:00:01", "info", "P2P identity ready", &format!(r#"{{"coreId":0,"peer_id":"{QM}"}}"#)),
+            node_line(
+                "12:00:00",
+                "info",
+                "dialing 192.0.2.10:8340",
+                r#"{"coreId":0}"#,
+            ),
+            node_line(
+                "12:00:01",
+                "info",
+                "P2P identity ready",
+                &format!(r#"{{"coreId":0,"peer_id":"{QM}"}}"#),
+            ),
             node_line(
                 "12:00:02",
                 "warn",
                 "sync failed",
-                &format!(r#"{{"coreId":1,"error":"open /home/alice/quil/node/.config/store: denied via /ip4/198.51.100.7/udp/8336/p2p/{QM}"}}"#),
+                &format!(
+                    r#"{{"coreId":1,"error":"open /home/alice/quil/node/.config/store: denied via /ip4/198.51.100.7/udp/8336/p2p/{QM}"}}"#
+                ),
             ),
             "  at /home/alice/quil/src/main.rs:12".to_string(),
-            node_line("12:00:03", "info", "reward", r#"{"balance":"1.5","coreId":0,"delta":"0.5"}"#),
-            node_line("12:00:04", "info", "truncated", r#"{"addr":"[2001:db8::1]:8336","new_balance":7"#),
-            node_line("12:00:05", "info", "signer FalconPublicKey([1, 2, 3]) on examplehost", r#"{"coreId":0}"#),
+            node_line(
+                "12:00:03",
+                "info",
+                "reward",
+                r#"{"balance":"1.5","coreId":0,"delta":"0.5"}"#,
+            ),
+            node_line(
+                "12:00:04",
+                "info",
+                "truncated",
+                r#"{"addr":"[2001:db8::1]:8336","new_balance":7"#,
+            ),
+            node_line(
+                "12:00:05",
+                "info",
+                "signer FalconPublicKey([1, 2, 3]) on examplehost",
+                r#"{"coreId":0}"#,
+            ),
         ]);
         let salt = [9u8; 32];
-        let opts = RedactOptions { literals: vec![("host", "examplehost".to_string())], ..RedactOptions::default() };
+        let opts = RedactOptions {
+            literals: vec![("host", "examplehost".to_string())],
+            ..RedactOptions::default()
+        };
         let mut redactor = Redactor::new(salt, opts);
         let mut out = Vec::new();
         let mut merger = Merger::new(vec![reader(&text)]);
-        let mut stats = export_records(merger.by_ref(), &whole_day(), &mut redactor, &mut out, None).unwrap();
+        let mut stats =
+            export_records(merger.by_ref(), &whole_day(), &mut redactor, &mut out, None).unwrap();
         stats.lines_read = merger.lines_read();
         let out = String::from_utf8(out).unwrap();
 
@@ -946,16 +1217,34 @@ mod tests {
         if removed > 0 {
             found.insert("balance".to_string(), removed);
         }
-        let expected: BTreeMap<String, u64> =
-            [("balance", 3), ("host", 1), ("ip4", 2), ("ip6", 1), ("key", 1), ("path", 2), ("self:peer", 2)]
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect();
+        let expected: BTreeMap<String, u64> = [
+            ("balance", 3),
+            ("host", 1),
+            ("ip4", 2),
+            ("ip6", 1),
+            ("key", 1),
+            ("path", 2),
+            ("self:peer", 2),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
         assert_eq!(found, expected, "{out}");
 
-        let log = LogDigest { sha256: "00".repeat(32), bytes: out.len() as u64 };
-        let m = manifest(&whole_day(), &SourceInfo::Files(vec!["master.log".to_string()]), &stats, &redactor, false, &log);
-        let counts: BTreeMap<String, u64> = serde_json::from_value(m["redaction"]["counts"].clone()).unwrap();
+        let log = LogDigest {
+            sha256: "00".repeat(32),
+            bytes: out.len() as u64,
+        };
+        let m = manifest(
+            &whole_day(),
+            &SourceInfo::Files(vec!["master.log".to_string()]),
+            &stats,
+            &redactor,
+            false,
+            &log,
+        );
+        let counts: BTreeMap<String, u64> =
+            serde_json::from_value(m["redaction"]["counts"].clone()).unwrap();
         assert_eq!(counts, expected);
         assert_eq!(m["redaction"]["unparseable_json"], 1);
         // Every input line is read and, inside the window, kept.
@@ -966,8 +1255,17 @@ mod tests {
 
         let manifest_text = m.to_string();
         for value in [
-            "192.0.2.10", "198.51.100.7", QM, "/home/alice", "alice", "\"1.5\"", "\"0.5\"", "\"new_balance\":7", "2001:db8::1",
-            "examplehost", "1, 2, 3",
+            "192.0.2.10",
+            "198.51.100.7",
+            QM,
+            "/home/alice",
+            "alice",
+            "\"1.5\"",
+            "\"0.5\"",
+            "\"new_balance\":7",
+            "2001:db8::1",
+            "examplehost",
+            "1, 2, 3",
         ] {
             assert!(!out.contains(value), "{value} survived in:\n{out}");
             assert!(!manifest_text.contains(value), "{value} in the manifest");
@@ -981,7 +1279,10 @@ mod tests {
         let now = ts("2026-10-17T18:00:00Z");
         assert_eq!(parse_when("2h", now).unwrap(), ts("2026-10-17T16:00:00Z"));
         assert_eq!(parse_when("90m", now).unwrap(), ts("2026-10-17T16:30:00Z"));
-        assert_eq!(parse_when("2026-10-17T12:00:00Z", now).unwrap(), ts("2026-10-17T12:00:00Z"));
+        assert_eq!(
+            parse_when("2026-10-17T12:00:00Z", now).unwrap(),
+            ts("2026-10-17T12:00:00Z")
+        );
         assert!(parse_when("yesterday", now).is_err());
         assert!(parse_when("h", now).is_err());
         assert_eq!(compact_ts(now), "20261017T180000Z");
@@ -990,15 +1291,32 @@ mod tests {
     /// An export stops at its cancel flag, between records.
     #[test]
     fn a_cancelled_export_stops() {
-        let text = lines(&(0..2000).map(|n| node_line("12:00:00", "info", &format!("line {n}"), "{}")).collect::<Vec<_>>());
+        let text = lines(
+            &(0..2000)
+                .map(|n| node_line("12:00:00", "info", &format!("line {n}"), "{}"))
+                .collect::<Vec<_>>(),
+        );
         let cancel = AtomicBool::new(false);
         let mut redactor = Redactor::new([1; 32], RedactOptions::default());
         let mut out = Vec::new();
-        let all = export_records(Merger::new(vec![reader(&text)]), &whole_day(), &mut redactor, &mut out, Some(&cancel)).unwrap();
+        let all = export_records(
+            Merger::new(vec![reader(&text)]),
+            &whole_day(),
+            &mut redactor,
+            &mut out,
+            Some(&cancel),
+        )
+        .unwrap();
         assert_eq!(all.lines_kept, 2000);
         cancel.store(true, Ordering::Relaxed);
-        let error = export_records(Merger::new(vec![reader(&text)]), &whole_day(), &mut redactor, &mut Vec::new(), Some(&cancel))
-            .unwrap_err();
+        let error = export_records(
+            Merger::new(vec![reader(&text)]),
+            &whole_day(),
+            &mut redactor,
+            &mut Vec::new(),
+            Some(&cancel),
+        )
+        .unwrap_err();
         assert!(is_cancelled(&anyhow::Error::from(error)));
         assert!(!is_cancelled(&anyhow::anyhow!("disk full")));
     }
@@ -1007,21 +1325,63 @@ mod tests {
     /// directories of its config and log paths name users to tokenize.
     #[test]
     fn home_directories_name_users_to_redact() {
-        let paths = [PathBuf::from("/Users/alice/quil/.config"), PathBuf::from("/home/bob/node/.log"), PathBuf::from("/root/quil"),
-            PathBuf::from("/Users/Shared/quil"), PathBuf::from("/opt/quil"), PathBuf::from("/home")];
+        let paths = [
+            PathBuf::from("/Users/alice/quil/.config"),
+            PathBuf::from("/home/bob/node/.log"),
+            PathBuf::from("/root/quil"),
+            PathBuf::from("/Users/Shared/quil"),
+            PathBuf::from("/opt/quil"),
+            PathBuf::from("/home"),
+        ];
         assert_eq!(home_users(&paths), ["alice", "bob"]);
-        let users: Vec<String> = local_literals(&paths).into_iter().filter(|(class, _)| *class == "user").map(|(_, u)| u).collect();
-        assert!(users.contains(&"alice".to_string()) && users.contains(&"bob".to_string()), "{users:?}");
+        let users: Vec<String> = local_literals(&paths)
+            .into_iter()
+            .filter(|(class, _)| *class == "user")
+            .map(|(_, u)| u)
+            .collect();
+        assert!(
+            users.contains(&"alice".to_string()) && users.contains(&"bob".to_string()),
+            "{users:?}"
+        );
         let dir = test_dir("home-users");
-        std::fs::write(dir.join("master.log"), lines(&[node_line("12:00:00", "info", "started by alice in quil", "{}")])).unwrap();
-        let (readers, names) = file_readers(&dir, ts("2026-10-17T00:00:00Z"), ts("2026-10-17T23:59:59Z")).unwrap();
+        std::fs::write(
+            dir.join("master.log"),
+            lines(&[node_line(
+                "12:00:00",
+                "info",
+                "started by alice in quil",
+                "{}",
+            )]),
+        )
+        .unwrap();
+        let (readers, names) =
+            file_readers(&dir, ts("2026-10-17T00:00:00Z"), ts("2026-10-17T23:59:59Z")).unwrap();
         let home = [PathBuf::from("/Users/alice/quil")];
-        let options = ExportOptions { salt: Some([3; 32]), home_paths: &home, ..ExportOptions::default() };
-        let export = produce(readers, None, &SourceInfo::Files(names), &whole_day(), Vec::new(), &options).unwrap();
+        let options = ExportOptions {
+            salt: Some([3; 32]),
+            home_paths: &home,
+            ..ExportOptions::default()
+        };
+        let export = produce(
+            readers,
+            None,
+            &SourceInfo::Files(names),
+            &whole_day(),
+            Vec::new(),
+            &options,
+        )
+        .unwrap();
         let mut text = String::new();
-        io::Read::read_to_string(&mut flate2::read::GzDecoder::new(export.out.as_slice()), &mut text).unwrap();
+        io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(export.out.as_slice()),
+            &mut text,
+        )
+        .unwrap();
         assert!(!text.contains("alice") && text.contains("user#"), "{text}");
-        assert_eq!(export.token_map.values().filter(|v| *v == "alice").count(), 1);
+        assert_eq!(
+            export.token_map.values().filter(|v| *v == "alice").count(),
+            1
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

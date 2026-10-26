@@ -73,7 +73,10 @@ pub async fn run_test_prover_sync(
     println!("endpoints: {}", endpoints.join(", "));
 
     let prover_shard = [0xffu8; 32];
-    let prover_key = quil_types::store::ShardKey { l1: [0u8; 3], l2: prover_shard };
+    let prover_key = quil_types::store::ShardKey {
+        l1: [0u8; 3],
+        l2: prover_shard,
+    };
     let mut any_match = false;
 
     for addr in &endpoints {

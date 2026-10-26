@@ -4,6 +4,7 @@
 //! record one-time consumption of the statement's receipt. The amount relation
 //! proves only that the outputs open to exactly the public `amount`; it
 //! carries no QUIL fee because custom-token units are not QUIL gas.
+use super::relation::membership::IDENTITY_BYTES;
 use super::{
     relation::{CompiledAmountRelation, PublicAmountRelation},
     transfer::{
@@ -11,7 +12,6 @@ use super::{
     },
     AmountCommitment, AmountOpening, CommitmentKey, COMMITMENT_BYTES, MAX_PRIVATE_COINS,
 };
-use super::relation::membership::IDENTITY_BYTES;
 
 const PREFIX: [u8; 4] = 0x0513u32.to_be_bytes();
 /// Distinguishes custom issuance from the reward mint (`QCT3MT`) sharing 0x0513.
@@ -80,7 +80,9 @@ impl CustomMintStatement {
         {
             return Err(TransferError::Noncanonical);
         }
-        let len = HEADER_BYTES + self.authority_public_key.len() + self.entitlement_proof.len()
+        let len = HEADER_BYTES
+            + self.authority_public_key.len()
+            + self.entitlement_proof.len()
             + self.outputs.len() * OUTPUT_BYTES;
         if len + 2 + MAX_AUTHORITY_SIGNATURE_BYTES + 4 + 40 >= MAX_TRANSACTION_BYTES {
             return Err(TransferError::Length);
@@ -106,7 +108,10 @@ impl CustomMintStatement {
         Ok(bytes)
     }
 
-    pub fn public_relation(&self, max_outputs: usize) -> Result<PublicAmountRelation, TransferError> {
+    pub fn public_relation(
+        &self,
+        max_outputs: usize,
+    ) -> Result<PublicAmountRelation, TransferError> {
         if self.outputs.len() > max_outputs {
             return Err(TransferError::ResourceLimit);
         }
@@ -264,9 +269,17 @@ mod tests {
         let outputs = amounts
             .iter()
             .zip(&openings)
-            .map(|(&a, r)| Output { commitment: key.commit(a, r), owner: [5; IDENTITY_BYTES], memo: [6; MEMO_BYTES] })
+            .map(|(&a, r)| Output {
+                commitment: key.commit(a, r),
+                owner: [5; IDENTITY_BYTES],
+                memo: [6; MEMO_BYTES],
+            })
             .collect();
-        let signature = if authority.is_empty() { Vec::new() } else { vec![7; 666] };
+        let signature = if authority.is_empty() {
+            Vec::new()
+        } else {
+            vec![7; 666]
+        };
         // Framing/size fixture only: neither the signature nor the proof bytes
         // are valid cryptographic authorizations.
         let mut proof = vec![0; 149_928];
@@ -299,14 +312,37 @@ mod tests {
         assert!(tx.statement.public_relation(2).is_ok());
         assert!(tx.statement.public_relation(1).is_err());
         let bytes = tx.encode().unwrap();
-        assert_eq!(bytes.len(), 4 + 8 + 32 + 32 + 4 + 2 + 897 + 32 + 16 + 2 + 2 + 2 * OUTPUT_BYTES + 2 + 666 + 4 + 149_928);
+        assert_eq!(
+            bytes.len(),
+            4 + 8
+                + 32
+                + 32
+                + 4
+                + 2
+                + 897
+                + 32
+                + 16
+                + 2
+                + 2
+                + 2 * OUTPUT_BYTES
+                + 2
+                + 666
+                + 4
+                + 149_928
+        );
         // An entitlement proof rides in the statement and binds the context.
         let mut entitled = tx.clone();
         entitled.statement.entitlement_proof = vec![1; 33 * 3];
-        assert_ne!(entitled.statement.context_bytes().unwrap(), tx.statement.context_bytes().unwrap());
+        assert_ne!(
+            entitled.statement.context_bytes().unwrap(),
+            tx.statement.context_bytes().unwrap()
+        );
         let entitled_bytes = entitled.encode().unwrap();
         assert_eq!(entitled_bytes.len(), bytes.len() + 33 * 3);
-        assert_eq!(CustomMint::decode(&entitled_bytes, &[1; 32], &[2; 32]).unwrap(), entitled);
+        assert_eq!(
+            CustomMint::decode(&entitled_bytes, &[1; 32], &[2; 32]).unwrap(),
+            entitled
+        );
         // A proof must be whole levels, bounded, and carried by an authorized
         // statement (a permissionless mint proves nothing).
         for proof in [vec![1; 32], vec![1; MAX_ENTITLEMENT_PROOF_BYTES + 33]] {

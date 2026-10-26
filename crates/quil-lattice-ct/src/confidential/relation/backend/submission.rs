@@ -128,7 +128,10 @@ impl CompiledAmountRelation {
         }
         for row in &self.exact_ring {
             let (terms, rhs) = row.emitted();
-            let terms: Vec<_> = terms.into_iter().map(|(c, i)| (c, self.resolve(i, auxiliary))).collect();
+            let terms: Vec<_> = terms
+                .into_iter()
+                .map(|(c, i)| (c, self.resolve(i, auxiliary)))
+                .collect();
             sink.linear(&terms, &rhs).map_err(SubmissionError::Sink)?;
         }
         for (statement, base) in plans.iter().zip(&bases) {
@@ -149,15 +152,21 @@ impl CompiledAmountRelation {
             }
         }
         for row in self.native_membership_rows() {
-            let terms: Vec<_> = row.terms.into_iter().map(|(c, i)| (c, self.resolve(i, auxiliary))).collect();
-            sink.linear(&terms, &row.rhs).map_err(SubmissionError::Sink)?;
+            let terms: Vec<_> = row
+                .terms
+                .into_iter()
+                .map(|(c, i)| (c, self.resolve(i, auxiliary)))
+                .collect();
+            sink.linear(&terms, &row.rhs)
+                .map_err(SubmissionError::Sink)?;
         }
         debug_assert_eq!(
             next,
             expected.original_binary_polynomials + expected.auxiliary_binary_polynomials
         );
         for row in self.selection_backend_rows() {
-            sink.selection(self.resolve_selection(row, auxiliary)).map_err(SubmissionError::Sink)?;
+            sink.selection(self.resolve_selection(row, auxiliary))
+                .map_err(SubmissionError::Sink)?;
         }
         sink.finish(expected).map_err(SubmissionError::Sink)?;
         Ok(expected)
@@ -169,7 +178,14 @@ impl CompiledAmountRelation {
             terms: row
                 .terms
                 .iter()
-                .map(|&(w, z, o, s)| (w, self.resolve(z, auxiliary), self.resolve(o, auxiliary), self.resolve(s, auxiliary)))
+                .map(|&(w, z, o, s)| {
+                    (
+                        w,
+                        self.resolve(z, auxiliary),
+                        self.resolve(o, auxiliary),
+                        self.resolve(s, auxiliary),
+                    )
+                })
                 .collect(),
         }
     }
@@ -182,7 +198,8 @@ impl CompiledAmountRelation {
         self.scalar_backend_plan()
             .map_err(SubmissionError::Scalar)?;
         for row in &self.exact_ring {
-            row.checked_interval(self.binary.len()).map_err(SubmissionError::Lift)?;
+            row.checked_interval(self.binary.len())
+                .map_err(SubmissionError::Lift)?;
         }
         let mut counts = SubmissionCounts {
             original_binary_polynomials: self.binary.len(),
@@ -276,15 +293,16 @@ impl CompiledAmountRelation {
                 .checked_add(lift.auxiliary_polynomials())
                 .ok_or(SubmissionError::IndexOverflow)?;
             lift.visit_private_auxiliary(|index, coefficients| {
-                    sink.binary(base + index, coefficients)
-                })
-                .map_err(SubmissionError::Sink)?;
+                sink.binary(base + index, coefficients)
+            })
+            .map_err(SubmissionError::Sink)?;
         }
         let auxiliary = next - self.binary.len();
         counts.auxiliary_binary_polynomials = auxiliary;
         for (k, p) in self.short.iter().enumerate() {
             let coefficients = Zeroizing::new(p.c.iter().map(|&v| v as i64).collect::<Vec<_>>());
-            sink.short(next + k, &coefficients).map_err(SubmissionError::Sink)?;
+            sink.short(next + k, &coefficients)
+                .map_err(SubmissionError::Sink)?;
         }
         for row in scalar.rows() {
             sink.scalar(row).map_err(SubmissionError::Sink)?;
@@ -292,7 +310,10 @@ impl CompiledAmountRelation {
         }
         for row in &self.exact_ring {
             let (terms, rhs) = row.emitted();
-            let terms: Vec<_> = terms.into_iter().map(|(c, i)| (c, self.resolve(i, auxiliary))).collect();
+            let terms: Vec<_> = terms
+                .into_iter()
+                .map(|(c, i)| (c, self.resolve(i, auxiliary)))
+                .collect();
             sink.linear(&terms, &rhs).map_err(SubmissionError::Sink)?;
             counts.linear_equations += 1;
         }
@@ -315,12 +336,18 @@ impl CompiledAmountRelation {
             }
         }
         for row in self.native_membership_rows() {
-            let terms: Vec<_> = row.terms.into_iter().map(|(c, i)| (c, self.resolve(i, auxiliary))).collect();
-            sink.linear(&terms, &row.rhs).map_err(SubmissionError::Sink)?;
+            let terms: Vec<_> = row
+                .terms
+                .into_iter()
+                .map(|(c, i)| (c, self.resolve(i, auxiliary)))
+                .collect();
+            sink.linear(&terms, &row.rhs)
+                .map_err(SubmissionError::Sink)?;
             counts.linear_equations += 1;
         }
         for row in self.selection_backend_rows() {
-            sink.selection(self.resolve_selection(row, auxiliary)).map_err(SubmissionError::Sink)?;
+            sink.selection(self.resolve_selection(row, auxiliary))
+                .map_err(SubmissionError::Sink)?;
             counts.selection_equations += 1;
         }
         assert_eq!(
@@ -359,13 +386,17 @@ mod tests {
             assert_eq!((p, d), (PROOF_MODULUS, Poly::D));
             assert!(counts.original_binary_polynomials > 0);
             assert_eq!(short_normsq.len(), counts.short_polynomials);
-            for n in short_normsq { Digest::update(&mut self.public_digest, n.to_le_bytes()); }
+            for n in short_normsq {
+                Digest::update(&mut self.public_digest, n.to_le_bytes());
+            }
             Digest::update(&mut self.public_digest, p.to_le_bytes());
             Digest::update(&mut self.public_digest, (d as u64).to_le_bytes());
             Ok(())
         }
         fn short(&mut self, index: usize, coefficients: &[i64]) -> Result<(), Self::Error> {
-            if index != self.next || coefficients.len() != Poly::D { return Err("short order"); }
+            if index != self.next || coefficients.len() != Poly::D {
+                return Err("short order");
+            }
             Digest::update(&mut self.public_digest, b"short");
             Digest::update(&mut self.public_digest, (index as u64).to_le_bytes());
             self.next += 1;
@@ -428,14 +459,18 @@ mod tests {
             Digest::update(&mut self.public_digest, (row.selector as u64).to_le_bytes());
             for (w, z, o, s) in &row.terms {
                 Digest::update(&mut self.public_digest, w.to_le_bytes());
-                for i in [z, o, s] { Digest::update(&mut self.public_digest, (*i as u64).to_le_bytes()); }
+                for i in [z, o, s] {
+                    Digest::update(&mut self.public_digest, (*i as u64).to_le_bytes());
+                }
             }
             Ok(())
         }
         fn finish(&mut self, counts: SubmissionCounts) -> Result<(), Self::Error> {
             assert_eq!(
                 self.next,
-                counts.original_binary_polynomials + counts.auxiliary_binary_polynomials + counts.short_polynomials
+                counts.original_binary_polynomials
+                    + counts.auxiliary_binary_polynomials
+                    + counts.short_polynomials
             );
             assert_eq!(
                 (self.scalar, self.linear),
@@ -449,7 +484,13 @@ mod tests {
 
     impl StatementSink for Sink {
         type Error = &'static str;
-        fn begin(&mut self, p: i128, d: usize, c: SubmissionCounts, n: &[u64]) -> Result<(), Self::Error> {
+        fn begin(
+            &mut self,
+            p: i128,
+            d: usize,
+            c: SubmissionCounts,
+            n: &[u64],
+        ) -> Result<(), Self::Error> {
             RelationSink::begin(self, p, d, c, n)
         }
         fn binary_domain(&mut self, index: usize) -> Result<(), Self::Error> {
@@ -526,7 +567,10 @@ mod tests {
         // Ownership is now three linear identity rows per input; no Boolean
         // hash circuits remain, so the scalar statement is small.
         assert!(counts.scalar_equations < 1_000);
-        assert!(relation.membership_shape().hash_ring_equations >= 3 * membership::IDENTITY_RANK + 2 * membership::NODE_RANK);
+        assert!(
+            relation.membership_shape().hash_ring_equations
+                >= 3 * membership::IDENTITY_RANK + 2 * membership::NODE_RANK
+        );
         let mut portable = super::super::portable::PortableWitnessChecker::default();
         assert_eq!(
             relation.submit_private_relation(&mut portable).unwrap(),
@@ -602,7 +646,10 @@ mod tests {
                 0,
                 0,
                 root.clone(),
-                [membership::Node::from_identity_bytes(&[9; membership::IDENTITY_BYTES]).unwrap()],
+                [
+                    membership::Node::from_identity_bytes(&[9; membership::IDENTITY_BYTES])
+                        .unwrap(),
+                ],
             ),
         ] {
             let altered = PublicAmountRelation::compile_with_membership(
@@ -641,13 +688,26 @@ mod tests {
     #[test]
     fn exact_canonical_rows_preserve_domains_and_public_private_submission() {
         let mut relation = CompiledAmountRelation {
-            binary: Vec::new(), short: Vec::new(), short_bound: Vec::new(), ring: Vec::new(), exact_ring: Vec::new(),
-            scalar: Vec::new(), input_commitment_planes: Vec::new(),
+            binary: Vec::new(),
+            short: Vec::new(),
+            short_bound: Vec::new(),
+            ring: Vec::new(),
+            exact_ring: Vec::new(),
+            scalar: Vec::new(),
+            input_commitment_planes: Vec::new(),
             membership: membership::MembershipConstraints::default(),
         };
-        let values = Poly { c: (0..Poly::D).map(|i| {
-            if i % 2 == 0 { i as u64 } else { Poly::Q - 1 - i as u64 }
-        }).collect() };
+        let values = Poly {
+            c: (0..Poly::D)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        i as u64
+                    } else {
+                        Poly::Q - 1 - i as u64
+                    }
+                })
+                .collect(),
+        };
         let handles = relation.canonical_residue(&values);
         assert!(relation.validate_local_witness());
         let mut private = Sink::default();
@@ -667,15 +727,29 @@ mod tests {
         assert!(relation.submit_private_relation(&mut checker).is_err());
 
         // Public emission requires no assignment, and preserves exact i64 coefficients.
-        for p in &mut relation.binary { p.c.clear(); }
+        for p in &mut relation.binary {
+            p.c.clear();
+        }
         let mut public = Sink::default();
-        assert_eq!(relation.submit_public_statement(&mut public).unwrap(), counts);
-        assert_eq!(private.public_digest.finalize(), public.public_digest.finalize());
+        assert_eq!(
+            relation.submit_public_statement(&mut public).unwrap(),
+            counts
+        );
+        assert_eq!(
+            private.public_digest.finalize(),
+            public.public_digest.finalize()
+        );
 
         relation.exact_ring[0].terms[0].0 = PROOF_MODULUS as i64;
-        assert!(matches!(relation.backend_submission_counts(), Err(SubmissionError::Lift(LiftError::ResidualMayWrap))));
+        assert!(matches!(
+            relation.backend_submission_counts(),
+            Err(SubmissionError::Lift(LiftError::ResidualMayWrap))
+        ));
         relation.exact_ring[0].terms[0] = (1, relation.binary.len());
-        assert!(matches!(relation.backend_submission_counts(), Err(SubmissionError::Lift(LiftError::InvalidShape))));
+        assert!(matches!(
+            relation.backend_submission_counts(),
+            Err(SubmissionError::Lift(LiftError::InvalidShape))
+        ));
     }
 
     #[test]

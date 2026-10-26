@@ -500,7 +500,11 @@ mod tests {
         let sent = probe_addresses(me, listen.iter(), long.iter());
         let len = encoded_len(me, sent.clone());
         assert!(len <= MAX_MESSAGE_LEN, "{len} bytes");
-        assert!(sent.len() > 1 && sent.len() < MAX_PROBE_ADDRESSES, "{}", sent.len());
+        assert!(
+            sent.len() > 1 && sent.len() < MAX_PROBE_ADDRESSES,
+            "{}",
+            sent.len()
+        );
         assert_eq!(sent[0], listen[0]);
     }
 }

@@ -56,45 +56,80 @@ mod consensus_parent {
         }
 
         fn prove_next_state(
-            &self, rank: u64, _: &[u8], prior_frame_number: u64, prior_state: &Identity,
+            &self,
+            rank: u64,
+            _: &[u8],
+            prior_frame_number: u64,
+            prior_state: &Identity,
         ) -> Result<State<GlobalState>> {
-            self.calls.lock().push((prior_frame_number, prior_state.clone()));
+            self.calls
+                .lock()
+                .push((prior_frame_number, prior_state.clone()));
             let state = GlobalState::new(
-                prior_frame_number + 1, rank + self.rank_offset, 1, 1, vec![3; 516],
-                self.parent_override.clone().unwrap_or_else(|| prior_state.clone()),
-                vec![0; 32], vec![0; 32],
-                quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
+                prior_frame_number + 1,
+                rank + self.rank_offset,
+                1,
+                1,
+                vec![3; 516],
+                self.parent_override
+                    .clone()
+                    .unwrap_or_else(|| prior_state.clone()),
+                vec![0; 32],
+                vec![0; 32],
+                quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
                 Vec::new(),
             );
             Ok(State {
-                rank, identifier: state.compute_identity(), proposer_id: vec![0; 32],
-                parent_qc_identity: prior_state.clone(), parent_qc_rank: 0,
-                parent_quorum_certificate: None, timestamp: 1, state,
+                rank,
+                identifier: state.compute_identity(),
+                proposer_id: vec![0; 32],
+                parent_qc_identity: prior_state.clone(),
+                parent_qc_rank: 0,
+                parent_quorum_certificate: None,
+                timestamp: 1,
+                state,
             })
         }
     }
 
     fn seam(leader: Arc<RecordingLeader>, clock: Arc<InMemoryClockStore>) -> GlobalSeamProposer {
         GlobalSeamProposer::new(
-            leader, Arc::new(GlobalFrameVerifier::new(Arc::new(StubFrameProver))),
-            Vec::new(), clock, None,
+            leader,
+            Arc::new(GlobalFrameVerifier::new(Arc::new(StubFrameProver))),
+            Vec::new(),
+            clock,
+            None,
         )
     }
 
     #[test]
     fn global_vote_requires_the_selected_view_and_parent() {
-        let proposer = seam(Arc::new(RecordingLeader::default()), Arc::new(InMemoryClockStore::new()));
+        let proposer = seam(
+            Arc::new(RecordingLeader::default()),
+            Arc::new(InMemoryClockStore::new()),
+        );
         let parent = digest_from_identity([7; 32]);
         let frame = gpb::GlobalFrame {
             header: Some(gpb::GlobalFrameHeader {
-                frame_number: 1, rank: 43, parent_selector: parent.as_ref().to_vec(),
+                frame_number: 1,
+                rank: 43,
+                parent_selector: parent.as_ref().to_vec(),
                 output: vec![3; 516],
-                requests_root: quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
+                requests_root: quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
                 ..Default::default()
             }),
             requests: Vec::new(),
         };
-        let digest = digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap());
+        let digest = digest_from_identity(
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
+                .unwrap(),
+        );
         let bytes = encode_global_frame(&frame).unwrap();
         assert!(proposer.verify(43, parent, digest, Some(bytes.clone())));
         assert!(!proposer.verify(44, parent, digest, Some(bytes.clone())));
@@ -105,15 +140,25 @@ mod consensus_parent {
     fn global_restart_resolves_only_the_selected_clock_head() {
         let clock = Arc::new(InMemoryClockStore::new());
         let output = vec![4; 516];
-        let parent = digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap());
+        let parent =
+            digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap());
         clock.seed_frame(gpb::GlobalFrame {
-            header: Some(gpb::GlobalFrameHeader { frame_number: 19, output, ..Default::default() }),
+            header: Some(gpb::GlobalFrameHeader {
+                frame_number: 19,
+                output,
+                ..Default::default()
+            }),
             requests: Vec::new(),
         });
         let leader = Arc::new(RecordingLeader::default());
         let proposer = seam(leader.clone(), clock);
-        assert!(proposer.propose(43, digest_from_identity([8; 32])).is_none());
-        assert!(leader.calls.lock().is_empty(), "an unrelated head cannot replace the parent");
+        assert!(proposer
+            .propose(43, digest_from_identity([8; 32]))
+            .is_none());
+        assert!(
+            leader.calls.lock().is_empty(),
+            "an unrelated head cannot replace the parent"
+        );
         assert!(proposer.propose(43, parent).is_some());
         assert_eq!(*leader.calls.lock(), vec![(19, parent.as_ref().to_vec())]);
     }
@@ -122,8 +167,14 @@ mod consensus_parent {
     fn global_proposal_rejects_a_changed_parent_or_view() {
         let parent = digest_from_identity([7; 32]);
         for leader in [
-            RecordingLeader { parent_override: Some(vec![8; 32]), ..Default::default() },
-            RecordingLeader { rank_offset: 1, ..Default::default() },
+            RecordingLeader {
+                parent_override: Some(vec![8; 32]),
+                ..Default::default()
+            },
+            RecordingLeader {
+                rank_offset: 1,
+                ..Default::default()
+            },
         ] {
             let proposer = seam(Arc::new(leader), Arc::new(InMemoryClockStore::new()));
             proposer.note_frame(parent, 0);
@@ -139,79 +190,176 @@ mod consensus_parent {
         let proposer = seam(leader.clone(), clock.clone());
         let head = gpb::GlobalFrame {
             header: Some(gpb::GlobalFrameHeader {
-                frame_number: 18, output: vec![4; 516],
-                requests_root: quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
+                frame_number: 18,
+                output: vec![4; 516],
+                requests_root: quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
                 ..Default::default()
-            }), requests: Vec::new(),
+            }),
+            requests: Vec::new(),
         };
-        let head_digest = digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&head.header.as_ref().unwrap().output).unwrap());
+        let head_digest = digest_from_identity(
+            quil_crypto::poseidon::hash_bytes_to_32(&head.header.as_ref().unwrap().output).unwrap(),
+        );
         clock.seed_frame(head);
         let (candidate, bytes) = proposer.propose(43, head_digest).unwrap();
-        assert_eq!(clock.get_global_clock_frame_candidate(19, candidate.as_ref()).unwrap().header.unwrap().rank, 43,
-            "a proposal must be durable before Simplex can vote");
+        assert_eq!(
+            clock
+                .get_global_clock_frame_candidate(19, candidate.as_ref())
+                .unwrap()
+                .header
+                .unwrap()
+                .rank,
+            43,
+            "a proposal must be durable before Simplex can vote"
+        );
         let restarted = seam(leader.clone(), clock.clone());
         let store = BlockStore::new();
-        assert_eq!(restarted.recover_pending(&store).unwrap(), vec![(19, candidate, bytes.clone())]);
-        assert_eq!(store.get_with_verification(&candidate), Some((bytes, false)));
+        assert_eq!(
+            restarted.recover_pending(&store).unwrap(),
+            vec![(19, candidate, bytes.clone())]
+        );
+        assert_eq!(
+            store.get_with_verification(&candidate),
+            Some((bytes, false))
+        );
         assert!(restarted.propose(1043, candidate).is_some());
-        assert_eq!(leader.calls.lock().last().unwrap(), &(19, candidate.as_ref().to_vec()));
-        assert_eq!(clock.get_latest_global_clock_frame().unwrap().header.unwrap().frame_number, 18);
-        assert!(restarted.propose_retry().is_some(), "missing parents must not spin through views");
+        assert_eq!(
+            leader.calls.lock().last().unwrap(),
+            &(19, candidate.as_ref().to_vec())
+        );
+        assert_eq!(
+            clock
+                .get_latest_global_clock_frame()
+                .unwrap()
+                .header
+                .unwrap()
+                .frame_number,
+            18
+        );
+        assert!(
+            restarted.propose_retry().is_some(),
+            "missing parents must not spin through views"
+        );
     }
 
     #[test]
     fn global_restart_skips_a_corrupt_candidate_body() {
         use quil_cw_consensus::adapters::BlockStore;
         let clock = Arc::new(InMemoryClockStore::new());
-        clock.seed_frame(gpb::GlobalFrame { header: Some(gpb::GlobalFrameHeader { output: vec![4;516], ..Default::default() }), requests: Vec::new() });
-        let mut frame = gpb::GlobalFrame { header: Some(gpb::GlobalFrameHeader {
-            frame_number: 1, output: vec![3;516],
-            requests_root: quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
-            ..Default::default()
-        }), requests: Vec::new() };
+        clock.seed_frame(gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                output: vec![4; 516],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        });
+        let mut frame = gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                frame_number: 1,
+                output: vec![3; 516],
+                requests_root: quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
         frame.requests.push(gpb::MessageBundle::default());
         let txn = clock.new_transaction(false).unwrap();
-        clock.put_global_clock_frame_candidate(&frame, txn.as_ref()).unwrap();
+        clock
+            .put_global_clock_frame_candidate(&frame, txn.as_ref())
+            .unwrap();
         let store = BlockStore::new();
-        let recovered = seam(Arc::new(RecordingLeader::default()), clock).recover_pending(&store).unwrap();
+        let recovered = seam(Arc::new(RecordingLeader::default()), clock)
+            .recover_pending(&store)
+            .unwrap();
         assert!(recovered.is_empty());
-        let digest = digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap());
-        assert!(store.get(&digest).is_none(), "a corrupt body is never restored");
+        let digest = digest_from_identity(
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
+                .unwrap(),
+        );
+        assert!(
+            store.get(&digest).is_none(),
+            "a corrupt body is never restored"
+        );
     }
 
     #[test]
     fn global_restart_bounds_an_oversized_unresolved_tail() {
         use quil_cw_consensus::adapters::BlockStore;
         let clock = Arc::new(InMemoryClockStore::new());
-        clock.seed_frame(gpb::GlobalFrame { header: Some(gpb::GlobalFrameHeader { output: vec![0xaa; 516], ..Default::default() }), requests: Vec::new() });
+        clock.seed_frame(gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                output: vec![0xaa; 516],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        });
         let txn = clock.new_transaction(false).unwrap();
         for n in 1..=65 {
-            clock.put_global_clock_frame_candidate(&gpb::GlobalFrame {
-                header: Some(gpb::GlobalFrameHeader {
-                    frame_number: n, output: vec![n as u8;516],
-                    requests_root: quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
-                    ..Default::default()
-                }),
-                requests: Vec::new(),
-            }, txn.as_ref()).unwrap();
+            clock
+                .put_global_clock_frame_candidate(
+                    &gpb::GlobalFrame {
+                        header: Some(gpb::GlobalFrameHeader {
+                            frame_number: n,
+                            output: vec![n as u8; 516],
+                            requests_root:
+                                quil_engine::leader_provider::compute_global_requests_root(
+                                    &[],
+                                    &quil_tries::ShaInclusionProver,
+                                ),
+                            ..Default::default()
+                        }),
+                        requests: Vec::new(),
+                    },
+                    txn.as_ref(),
+                )
+                .unwrap();
         }
         // Activation proceeds with the lowest heights; the rest are fetched later.
-        let recovered = seam(Arc::new(RecordingLeader::default()), clock).recover_pending(&BlockStore::new()).unwrap();
-        assert_eq!(recovered.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), (1..=64).collect::<Vec<_>>());
+        let recovered = seam(Arc::new(RecordingLeader::default()), clock)
+            .recover_pending(&BlockStore::new())
+            .unwrap();
+        assert_eq!(
+            recovered.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+            (1..=64).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn global_peer_parent_is_persisted_only_after_selection_and_body_validation() {
         use quil_cw_consensus::adapters::BlockStore;
         let clock = Arc::new(InMemoryClockStore::new());
-        let head = gpb::GlobalFrame { header: Some(gpb::GlobalFrameHeader { frame_number: 18, output: vec![4;516], ..Default::default() }), requests: Vec::new() };
+        let head = gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                frame_number: 18,
+                output: vec![4; 516],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
         clock.seed_frame(head);
-        let frame = gpb::GlobalFrame { header: Some(gpb::GlobalFrameHeader {
-            frame_number: 19, output: vec![3;516], rank: 43,
-            requests_root: quil_engine::leader_provider::compute_global_requests_root(&[], &quil_tries::ShaInclusionProver),
-            ..Default::default()
-        }), requests: Vec::new() };
-        let digest = digest_from_identity(quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output).unwrap());
+        let frame = gpb::GlobalFrame {
+            header: Some(gpb::GlobalFrameHeader {
+                frame_number: 19,
+                output: vec![3; 516],
+                rank: 43,
+                requests_root: quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+        let digest = digest_from_identity(
+            quil_crypto::poseidon::hash_bytes_to_32(&frame.header.as_ref().unwrap().output)
+                .unwrap(),
+        );
         let store = BlockStore::new();
         let leader = Arc::new(RecordingLeader::default());
         let proposer = seam(leader.clone(), clock.clone()).with_block_store(store.clone());
@@ -221,12 +369,29 @@ mod consensus_parent {
         store.put(digest, encode_global_frame(&corrupt).unwrap());
         assert!(proposer.propose(1443, digest).is_none());
         assert!(leader.calls.lock().is_empty());
-        assert!(clock.get_global_clock_frame_candidate(19, digest.as_ref()).is_err());
+        assert!(clock
+            .get_global_clock_frame_candidate(19, digest.as_ref())
+            .is_err());
         store.put(digest, encode_global_frame(&frame).unwrap());
-        assert!(clock.get_global_clock_frame_candidate(19, digest.as_ref()).is_err());
+        assert!(clock
+            .get_global_clock_frame_candidate(19, digest.as_ref())
+            .is_err());
         assert!(proposer.propose(1443, digest).is_some());
-        assert_eq!(clock.get_global_clock_frame_candidate(19, digest.as_ref()).unwrap(), frame);
-        assert_eq!(clock.get_latest_global_clock_frame().unwrap().header.unwrap().frame_number, 18);
+        assert_eq!(
+            clock
+                .get_global_clock_frame_candidate(19, digest.as_ref())
+                .unwrap(),
+            frame
+        );
+        assert_eq!(
+            clock
+                .get_latest_global_clock_frame()
+                .unwrap()
+                .header
+                .unwrap()
+                .frame_number,
+            18
+        );
     }
 }
 
@@ -345,30 +510,64 @@ async fn a_new_legacy_committee_continues_from_the_head_its_predecessor_certifie
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let head = loop {
         let frames = old.workers[0].full_frames.lock().clone();
-        if let Some(frame) = frames.iter()
+        if let Some(frame) = frames
+            .iter()
             .map(|bytes| gpb::AppShardFrame::decode(bytes.as_slice()).unwrap())
-            .find(|frame| frame.header.as_ref().is_some_and(|header| header.frame_number == 1))
+            .find(|frame| {
+                frame
+                    .header
+                    .as_ref()
+                    .is_some_and(|header| header.frame_number == 1)
+            })
         {
             break frame;
         }
-        assert!(std::time::Instant::now() < deadline, "the old committee never certified frame 1");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old committee never certified frame 1"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
     let committee = vec![old.workers[0].prover.bls_pubkey.clone()];
     old.shutdown().await;
     let head_header = head.header.clone().unwrap();
-    assert!(head_header.public_key_signature_bls48581.is_some(), "the head carries its certificate");
+    assert!(
+        head_header.public_key_signature_bls48581.is_some(),
+        "the head carries its certificate"
+    );
 
-    let new = AppShardHarness::build_cw_from_head(3, HeadSeed { frame: head, committee }).await;
+    let new = AppShardHarness::build_cw_from_head(
+        3,
+        HeadSeed {
+            frame: head,
+            committee,
+        },
+    )
+    .await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
-        let chains: Vec<std::collections::BTreeMap<u64, gpb::FrameHeader>> = new.workers.iter().map(|worker| {
-            worker.full_frames.lock().iter().map(|bytes| {
-                let header = gpb::AppShardFrame::decode(bytes.as_slice()).unwrap().header.unwrap();
-                (header.frame_number, header)
-            }).collect()
-        }).collect();
-        if chains.iter().all(|chain| chain.contains_key(&2) && chain.contains_key(&3)) {
+        let chains: Vec<std::collections::BTreeMap<u64, gpb::FrameHeader>> = new
+            .workers
+            .iter()
+            .map(|worker| {
+                worker
+                    .full_frames
+                    .lock()
+                    .iter()
+                    .map(|bytes| {
+                        let header = gpb::AppShardFrame::decode(bytes.as_slice())
+                            .unwrap()
+                            .header
+                            .unwrap();
+                        (header.frame_number, header)
+                    })
+                    .collect()
+            })
+            .collect();
+        if chains
+            .iter()
+            .all(|chain| chain.contains_key(&2) && chain.contains_key(&3))
+        {
             for chain in &chains {
                 let mut parent = head_header.clone();
                 for n in 2..=3 {
@@ -378,15 +577,23 @@ async fn a_new_legacy_committee_continues_from_the_head_its_predecessor_certifie
                         quil_crypto::poseidon::hash_bytes_to_32(&parent.output).unwrap(),
                         "frame {n} does not extend the adopted head's chain",
                     );
-                    assert_eq!(header.output, chains[0][&n].output, "members finalized different frame {n}");
+                    assert_eq!(
+                        header.output, chains[0][&n].output,
+                        "members finalized different frame {n}"
+                    );
                     parent = header.clone();
                 }
             }
             break;
         }
-        assert!(std::time::Instant::now() < deadline,
+        assert!(
+            std::time::Instant::now() < deadline,
             "the new committee did not finalize frames 2 and 3 on the adopted head: {:?}",
-            chains.iter().map(|chain| chain.keys().copied().collect::<Vec<_>>()).collect::<Vec<_>>());
+            chains
+                .iter()
+                .map(|chain| chain.keys().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     new.shutdown().await;
@@ -398,14 +605,26 @@ async fn assert_deterministic_app_chain(harness: &AppShardHarness, timeout: std:
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let chains: Vec<BTreeMap<u64, gpb::FrameHeader>> = harness.workers.iter().map(|worker| {
-            worker.full_frames.lock().iter().map(|bytes| {
-                let frame = gpb::AppShardFrame::decode(bytes.as_slice()).unwrap();
-                let header = frame.header.expect("finalized frame has a header");
-                (header.frame_number, header)
-            }).collect()
-        }).collect();
-        if chains.iter().all(|chain| (1..=3).all(|n| chain.contains_key(&n))) {
+        let chains: Vec<BTreeMap<u64, gpb::FrameHeader>> = harness
+            .workers
+            .iter()
+            .map(|worker| {
+                worker
+                    .full_frames
+                    .lock()
+                    .iter()
+                    .map(|bytes| {
+                        let frame = gpb::AppShardFrame::decode(bytes.as_slice()).unwrap();
+                        let header = frame.header.expect("finalized frame has a header");
+                        (header.frame_number, header)
+                    })
+                    .collect()
+            })
+            .collect();
+        if chains
+            .iter()
+            .all(|chain| (1..=3).all(|n| chain.contains_key(&n)))
+        {
             for chain in &chains {
                 let mut parent = quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap();
                 for n in 1..=3 {
@@ -413,18 +632,31 @@ async fn assert_deterministic_app_chain(harness: &AppShardHarness, timeout: std:
                     // The wire field retains its 516-byte width, but carries
                     // a deterministic 32-byte digest followed by zero padding.
                     assert_eq!(header.output.len(), 516);
-                    assert!(header.output[32..].iter().all(|byte| *byte == 0),
-                        "app output must contain a padded digest, not a VDF proof");
-                    assert_eq!(header.parent_selector, parent, "incorrect app parent at frame {n}");
-                    assert_eq!(header.output, chains[0][&n].output, "workers finalized different frame {n}");
+                    assert!(
+                        header.output[32..].iter().all(|byte| *byte == 0),
+                        "app output must contain a padded digest, not a VDF proof"
+                    );
+                    assert_eq!(
+                        header.parent_selector, parent,
+                        "incorrect app parent at frame {n}"
+                    );
+                    assert_eq!(
+                        header.output, chains[0][&n].output,
+                        "workers finalized different frame {n}"
+                    );
                     parent = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
                 }
             }
             return;
         }
-        assert!(std::time::Instant::now() < deadline,
+        assert!(
+            std::time::Instant::now() < deadline,
             "not all workers finalized app frames 1..=3: {:?}",
-            chains.iter().map(|chain| chain.keys().copied().collect::<Vec<_>>()).collect::<Vec<_>>());
+            chains
+                .iter()
+                .map(|chain| chain.keys().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
@@ -513,9 +745,8 @@ async fn worker_active_storage_attestation() {
         let filter: Vec<u8> = vec![0x55; 32];
         let epoch = quil_types::consensus::epoch_for_frame(1000);
         let rocks = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
-        let rs = quil_store::replica_store::ReplicaStore::new(
-            rocks as Arc<dyn quil_types::store::KvDb>,
-        );
+        let rs =
+            quil_store::replica_store::ReplicaStore::new(rocks as Arc<dyn quil_types::store::KvDb>);
         for p in &provers {
             let roots = quil_engine::app_shard_metadata::compute_storage_confirm(
                 &storage.crdt,
@@ -699,8 +930,9 @@ async fn worker_carries_real_dispatch_message_in_shard_frame() {
             break;
         }
     }
-    let leader_idx = leader_idx
-        .expect("no worker produced a FullFrameProduced event within 90s — frame production stalled");
+    let leader_idx = leader_idx.expect(
+        "no worker produced a FullFrameProduced event within 90s — frame production stalled",
+    );
     eprintln!("leader is worker {}", leader_idx);
 
     // Give the leader an extra tick to finish encoding the proposal.
@@ -969,7 +1201,8 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
     //    allocation on the chosen filter.
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     let joiner_info = archive
         .prover_registry
@@ -993,7 +1226,6 @@ async fn tier2_non_archive_join_lands_in_archive_registry() {
         provers_on_filter,
     );
 }
-
 
 // =====================================================================
 // Tier 2 — adversarial tests (real BLS verifier)
@@ -1022,9 +1254,8 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
 
     // Real BLS verifier — DefaultKeyManager dispatches to
     // FalconKeyConstructor::verify_signature_raw.
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(),
-    );
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -1130,7 +1361,8 @@ async fn tier2_adversarial_forged_join_signature_rejected() {
     // Step 4: archive should have REJECTED the tampered request.
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let joiner_info = archive
         .prover_registry
         .read(|r| r.get_prover_info(&joiner.address).cloned());
@@ -1173,9 +1405,8 @@ async fn tier2_adversarial_premature_confirm_rejected() {
 
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(),
-    );
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -1230,7 +1461,8 @@ async fn tier2_adversarial_premature_confirm_rejected() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let pre_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -1306,7 +1538,8 @@ async fn tier2_adversarial_premature_confirm_rejected() {
     // Verify allocation is still Joining.
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let post_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -1360,9 +1593,8 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
 
     let genesis_provers: Vec<TestProver> = (0..3).map(|_| TestProver::generate()).collect();
     let seed_hex = build_genesis_seed_hex(&genesis_provers);
-    let real_km: Arc<dyn quil_types::crypto::KeyManager> = Arc::new(
-        quil_crypto::DefaultKeyManager::new(),
-    );
+    let real_km: Arc<dyn quil_types::crypto::KeyManager> =
+        Arc::new(quil_crypto::DefaultKeyManager::new());
     let archive = build_tier2_archive_rig_with_key_manager(
         genesis_provers[0].clone(),
         &genesis_provers,
@@ -1416,7 +1648,8 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // Confirm victim's allocation is Joining.
     let pre_status = archive.prover_registry.read(|r| {
@@ -1497,7 +1730,8 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
     // 3. Verify the victim's allocation is STILL Joining.
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let post_status = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&victim.address).expect("victim").clone();
         info.allocations
@@ -1598,7 +1832,8 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
     }
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     // The PoMW reward needs a non-zero shard `state_size`. Seed ~1 MiB of
     // committed data on the worker's shard so `shard_metadata_for_address`
@@ -1611,7 +1846,10 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
         archive
             .crdt
             .add_vertex(
-                &quil_hypergraph::Location { app_address: app, data_address: [0x01; 32] },
+                &quil_hypergraph::Location {
+                    app_address: app,
+                    data_address: [0x01; 32],
+                },
                 &vec![0xEEu8; 1 << 20],
             )
             .unwrap();
@@ -1697,7 +1935,9 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
     // The fix's payoff (the missing reward leg): the participating worker
     // prover received a NON-ZERO reward through the real frame-header
     // materialize path. Before the per-shard-size fix this was always 0.
-    use quil_execution::global_intrinsic::materialize::{prover_address_from_pubkey, reward_address};
+    use quil_execution::global_intrinsic::materialize::{
+        prover_address_from_pubkey, reward_address,
+    };
     let prover_addr = prover_address_from_pubkey(&worker_pubkey).unwrap();
     let reward_addr = reward_address(&prover_addr).unwrap();
     let reward_loc = quil_hypergraph::Location {
@@ -1709,8 +1949,9 @@ async fn tier2_shard_coverage_reaches_archive_materializer() {
         .get_vertex_data(&reward_loc)
         .expect("worker prover reward vertex must exist after coverage materialize");
     let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-    let bal_bytes = quil_execution::global_schema::read_field(&tree, "reward:ProverReward", "Balance")
-        .unwrap_or_default();
+    let bal_bytes =
+        quil_execution::global_schema::read_field(&tree, "reward:ProverReward", "Balance")
+            .unwrap_or_default();
     let balance = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bal_bytes);
     assert!(
         balance > num_bigint::BigInt::from(0),
@@ -1861,7 +2102,8 @@ async fn self_coverage_composite_loopback() {
     .expect("seed self-coverage prover as Active on shard filter");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     let proto_bundles: Vec<quil_types::proto::global::MessageBundle> = inbox_snapshot
         .iter()
@@ -2001,15 +2243,26 @@ async fn tier2_storage_audit_evicts_cheating_member() {
     )
     .expect("seed cheating prover Active on shard filter");
     let anchor = gpb::GlobalFrame {
-        header: Some(gpb::GlobalFrameHeader { frame_number: 1000, output: anchor_output.clone(), ..Default::default() }),
+        header: Some(gpb::GlobalFrameHeader {
+            frame_number: 1000,
+            output: anchor_output.clone(),
+            ..Default::default()
+        }),
         ..Default::default()
     };
-    let txn = archive.clock_store.new_transaction(false).expect("clock transaction");
-    archive.clock_store.put_global_clock_frame(&anchor, txn.as_ref()).expect("seed audit anchor");
+    let txn = archive
+        .clock_store
+        .new_transaction(false)
+        .expect("clock transaction");
+    archive
+        .clock_store
+        .put_global_clock_frame(&anchor, txn.as_ref())
+        .expect("seed audit anchor");
     txn.commit().expect("commit audit anchor");
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
 
     let before = archive
         .prover_registry
@@ -2039,7 +2292,8 @@ async fn tier2_storage_audit_evicts_cheating_member() {
 
     archive
         .prover_registry
-        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
+        .refresh_from_store(archive.hg_store.as_ref())
+        .unwrap();
     let after = archive
         .prover_registry
         .read(|r| r.get_prover_info(&prover.address).cloned())
@@ -2126,11 +2380,12 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             }));
 
         let deps = quil_engine::app_engine::AppEngineDeps {
-        delivery_frame_source: None,
+            delivery_frame_source: None,
             clock_store: clock_store as Arc<dyn ClockStore>,
             global_anchor_store: None,
             global_hypergraph: None,
-            storage_source_hypergraph: None, topology: None,
+            storage_source_hypergraph: None,
+            topology: None,
             prover_registry: registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             frame_prover: frame_prover.clone(),
             message_collector,
@@ -2151,7 +2406,12 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
             ),
             kv_db: None,
             app_consensus_cw: false,
-            db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
+            db_config: quil_config::DbConfig {
+                path: String::new(),
+                worker_path_prefix: String::new(),
+                worker_paths: vec![],
+                ..Default::default()
+            }, // ephemeral journal in tests
             unified_cutover_hook: None,
         };
 
@@ -2160,11 +2420,8 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
         let bls_signer = prover_for_spawn.signer_clone();
         let sk = bls_signer.private_key().to_vec();
         let pk = bls_signer.public_key().to_vec();
-        let factory: std::sync::Arc<
-            dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync,
-        > = std::sync::Arc::new(move || {
-            Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk))
-        });
+        let factory: std::sync::Arc<dyn Fn() -> Box<dyn quil_types::crypto::Signer> + Send + Sync> =
+            std::sync::Arc::new(move || Box::new(quil_crypto::FalconSigner::from_bytes(&sk, &pk)));
         let exit_log = event_log_clone.clone();
         let join = tokio::spawn(async move {
             engine.run(factory).await;
@@ -2250,7 +2507,12 @@ async fn tier2_allocator_spawns_real_engine_on_confirm() {
     // run-loop.
     let engine = handles[0].1.clone();
     // The phases a started host reports (`SharedWorkerExecution::consensus_phase`).
-    let running = || matches!(engine.execution().state.as_str(), "serving" | "syncing" | "closing");
+    let running = || {
+        matches!(
+            engine.execution().state.as_str(),
+            "serving" | "syncing" | "closing"
+        )
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

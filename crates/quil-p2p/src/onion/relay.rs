@@ -191,7 +191,10 @@ impl OnionRelay {
                 tracing::debug!("onion CREATE rejected: circuit table full");
                 return None;
             }
-            let per_peer = entries.keys().filter(|(p, _)| p.as_slice() == src_peer).count();
+            let per_peer = entries
+                .keys()
+                .filter(|(p, _)| p.as_slice() == src_peer)
+                .count();
             if per_peer >= MAX_RELAY_CIRCUITS_PER_PEER {
                 tracing::debug!("onion CREATE rejected: per-peer circuit cap reached");
                 return None;
@@ -339,7 +342,9 @@ impl OnionRelay {
                 };
                 // DEFENSE: refuse to extend to ourselves or a non-network peer.
                 if !self.next_hop_allowed(next_peer) {
-                    tracing::debug!("onion EXTEND rejected: next hop is self or not a network peer");
+                    tracing::debug!(
+                        "onion EXTEND rejected: next hop is self or not a network peer"
+                    );
                     return RelayAction::None;
                 }
                 let down_circ = self.next_down_circ.fetch_add(1, Ordering::Relaxed);
@@ -505,15 +510,22 @@ mod tests {
 
         // EXTEND to self / a non-network peer → rejected.
         assert!(matches!(
-            relay.handle_relay_forward(b"up", 1, &mk_extend(b"me")).await,
+            relay
+                .handle_relay_forward(b"up", 1, &mk_extend(b"me"))
+                .await,
             RelayAction::None
         ));
         assert!(matches!(
-            relay.handle_relay_forward(b"up", 1, &mk_extend(b"stranger")).await,
+            relay
+                .handle_relay_forward(b"up", 1, &mk_extend(b"stranger"))
+                .await,
             RelayAction::None
         ));
         // EXTEND to a valid network peer → forwarded as a CREATE.
-        match relay.handle_relay_forward(b"up", 1, &mk_extend(b"good-peer")).await {
+        match relay
+            .handle_relay_forward(b"up", 1, &mk_extend(b"good-peer"))
+            .await
+        {
             RelayAction::Forward { peer, cell: c, .. } => {
                 assert_eq!(peer, b"good-peer");
                 assert_eq!(cell::parse_cell(&c).unwrap().0, cell::CMD_CREATE);
@@ -523,7 +535,9 @@ mod tests {
         // EXTEND-once: a SECOND EXTEND on the now-extended circuit is rejected
         // (a replayed EXTEND must not spawn a duplicate downstream circuit).
         assert!(matches!(
-            relay.handle_relay_forward(b"up", 1, &mk_extend(b"good-peer")).await,
+            relay
+                .handle_relay_forward(b"up", 1, &mk_extend(b"good-peer"))
+                .await,
             RelayAction::None
         ));
     }
@@ -534,7 +548,13 @@ mod tests {
     async fn sweep_expired_tears_down_idle_circuits() {
         let relay = OnionRelay::new();
         relay
-            .register_with_peers(1, 0, b"secret-32-bytes-longenough!!!!!".to_vec(), b"up".to_vec(), Vec::new())
+            .register_with_peers(
+                1,
+                0,
+                b"secret-32-bytes-longenough!!!!!".to_vec(),
+                b"up".to_vec(),
+                Vec::new(),
+            )
             .await;
         assert_eq!(relay.active_relays().await, 1);
         // A long idle window keeps it.
@@ -555,10 +575,22 @@ mod tests {
         let secret_b = b"peerB-secret-32-bytes-long!!!!!";
         // Both peers use circ id 1.
         relay
-            .register_with_peers(1, 0, secret_a.to_vec(), b"peerA".to_vec(), b"exitA".to_vec())
+            .register_with_peers(
+                1,
+                0,
+                secret_a.to_vec(),
+                b"peerA".to_vec(),
+                b"exitA".to_vec(),
+            )
             .await;
         relay
-            .register_with_peers(1, 0, secret_b.to_vec(), b"peerB".to_vec(), b"exitB".to_vec())
+            .register_with_peers(
+                1,
+                0,
+                secret_b.to_vec(),
+                b"peerB".to_vec(),
+                b"exitB".to_vec(),
+            )
             .await;
 
         // Both circuits coexist (no clobber).
@@ -568,12 +600,22 @@ mod tests {
 
         // A FORWARD cell from peerA (keyed by peerA's secret) routes to exitA;
         // the same circ id from peerB routes to exitB with peerB's key.
-        let cell_a = encrypt_layer(secret_a, LAYER_FORWARD, &cell::build_forward_inner(b"inner-a")).unwrap();
+        let cell_a = encrypt_layer(
+            secret_a,
+            LAYER_FORWARD,
+            &cell::build_forward_inner(b"inner-a"),
+        )
+        .unwrap();
         match relay.handle_relay_forward(b"peerA", 1, &cell_a).await {
             RelayAction::Forward { peer, .. } => assert_eq!(peer, b"exitA"),
             other => panic!("expected Forward to exitA, got {:?}", other),
         }
-        let cell_b = encrypt_layer(secret_b, LAYER_FORWARD, &cell::build_forward_inner(b"inner-b")).unwrap();
+        let cell_b = encrypt_layer(
+            secret_b,
+            LAYER_FORWARD,
+            &cell::build_forward_inner(b"inner-b"),
+        )
+        .unwrap();
         match relay.handle_relay_forward(b"peerB", 1, &cell_b).await {
             RelayAction::Forward { peer, .. } => assert_eq!(peer, b"exitB"),
             other => panic!("expected Forward to exitB, got {:?}", other),

@@ -102,7 +102,10 @@ fn shard_scoped_proof_composes_leaf_to_shard_to_app_root() {
     assert_eq!(h, app_root, "(1) replayed fold reaches the app root");
     // (2) the shard commitment IS a waypoint on the leaf's authentication path.
     let split = waypoint.expect("(2) shard_x_root must appear as a fold waypoint");
-    println!("(2) shard_x_root is a waypoint after {} intra-shard siblings", split + 1);
+    println!(
+        "(2) shard_x_root is a waypoint after {} intra-shard siblings",
+        split + 1
+    );
 
     // (3) co-path: fold shard_x_root up the REMAINING siblings → app root, with no
     //     tree and no intra-shard leaves. This is what a syncing shard prover does
@@ -116,7 +119,10 @@ fn shard_scoped_proof_composes_leaf_to_shard_to_app_root() {
             SparseMerkleProof::<Sha256>::combine(hc, *sib)
         };
     }
-    assert_eq!(hc, app_root, "(3) shard_root + co-path folds to the app root");
+    assert_eq!(
+        hc, app_root,
+        "(3) shard_root + co-path folds to the app root"
+    );
     let copath_len = n - (split + 1);
     println!("(3) co-path has {copath_len} siblings: shard_root → app_root — SPIKE #3 PASSES");
 }

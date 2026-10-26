@@ -71,7 +71,10 @@ pub(super) fn format_legacy_coins(result: anyhow::Result<Option<(u128, usize, us
 
 /// The `token balance` line for confidential coins: `(total, coins)`, or
 /// `None` when the node answers that the application has no coin root yet.
-pub(super) fn format_confidential_coins(result: anyhow::Result<Option<(u128, usize)>>, quil: bool) -> String {
+pub(super) fn format_confidential_coins(
+    result: anyhow::Result<Option<(u128, usize)>>,
+    quil: bool,
+) -> String {
     match result {
         Ok(Some((total, coins))) => format!(
             "Confidential coins: {total} base units across {coins} coins reported unspent by the configured node (not a finalized balance)"

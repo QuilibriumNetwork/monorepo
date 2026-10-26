@@ -40,7 +40,11 @@ impl fmt::Display for StoreRole {
 pub fn describe_stores(roles: &[StoreRole]) -> String {
     fn close(run: &mut Option<(u32, u32)>, parts: &mut Vec<String>) {
         if let Some((first, last)) = run.take() {
-            parts.push(if first == last { format!("worker {first}") } else { format!("workers {first}-{last}") });
+            parts.push(if first == last {
+                format!("worker {first}")
+            } else {
+                format!("workers {first}-{last}")
+            });
         }
     }
     let mut roles = roles.to_vec();
@@ -51,7 +55,9 @@ pub fn describe_stores(roles: &[StoreRole]) -> String {
         match role {
             StoreRole::Master => parts.push("master".to_string()),
             StoreRole::Worker(core) => match run {
-                Some((first, last)) if u32::checked_add(last, 1) == Some(core) => run = Some((first, core)),
+                Some((first, last)) if u32::checked_add(last, 1) == Some(core) => {
+                    run = Some((first, core))
+                }
                 _ => {
                     close(&mut run, &mut parts);
                     run = Some((core, core));
@@ -100,7 +106,8 @@ impl FsUsage {
 
     /// The fuller of space and inodes: running out of either stops writes.
     pub fn used_percent(&self) -> u8 {
-        self.bytes_used_percent().max(self.inodes_used_percent().unwrap_or(0))
+        self.bytes_used_percent()
+            .max(self.inodes_used_percent().unwrap_or(0))
     }
 
     pub fn free_mb(&self) -> u64 {
@@ -121,13 +128,19 @@ pub fn fs_usage(path: &Path) -> Option<FsUsage> {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
-    let unit = if stat.f_frsize > 0 { stat.f_frsize as u64 } else { stat.f_bsize as u64 };
+    let unit = if stat.f_frsize > 0 {
+        stat.f_frsize as u64
+    } else {
+        stat.f_bsize as u64
+    };
     let (blocks, files) = (stat.f_blocks as u64, stat.f_files as u64);
     Some(FsUsage {
         device,
         total_bytes: blocks.saturating_mul(unit),
         free_bytes: (stat.f_bavail as u64).saturating_mul(unit),
-        used_bytes: blocks.saturating_sub(stat.f_bfree as u64).saturating_mul(unit),
+        used_bytes: blocks
+            .saturating_sub(stat.f_bfree as u64)
+            .saturating_mul(unit),
         total_inodes: files,
         free_inodes: stat.f_favail as u64,
         used_inodes: files.saturating_sub(stat.f_ffree as u64),
@@ -175,17 +188,23 @@ pub const FLOOR_FREE_INODES: u64 = 10_000;
 
 /// Whether `usage` is below the floor where the stores stop writing.
 pub fn below_floor(usage: &FsUsage) -> bool {
-    usage.free_bytes < FLOOR_FREE_BYTES || (usage.total_inodes > 0 && usage.free_inodes < FLOOR_FREE_INODES)
+    usage.free_bytes < FLOOR_FREE_BYTES
+        || (usage.total_inodes > 0 && usage.free_inodes < FLOOR_FREE_INODES)
 }
 
 /// Whether `usage` leaves room to reopen a stopped store: twice the floor.
 pub fn has_headroom(usage: &FsUsage) -> bool {
-    usage.free_bytes >= 2 * FLOOR_FREE_BYTES && (usage.total_inodes == 0 || usage.free_inodes >= 2 * FLOOR_FREE_INODES)
+    usage.free_bytes >= 2 * FLOOR_FREE_BYTES
+        && (usage.total_inodes == 0 || usage.free_inodes >= 2 * FLOOR_FREE_INODES)
 }
 
 /// The headroom [`has_headroom`] requires, for log lines.
 pub fn headroom_text() -> String {
-    format!("{} MiB and {} inodes free", 2 * FLOOR_FREE_BYTES >> 20, 2 * FLOOR_FREE_INODES)
+    format!(
+        "{} MiB and {} inodes free",
+        2 * FLOOR_FREE_BYTES >> 20,
+        2 * FLOOR_FREE_INODES
+    )
 }
 
 /// What a process reserves next to its stopped store before it exits to
@@ -201,7 +220,10 @@ pub const REOPEN_RESERVE_BYTES: u64 = 256 << 20;
 pub fn can_reserve(dir: &Path, bytes: u64) -> Option<bool> {
     use std::os::unix::io::AsRawFd;
     // Removed when dropped, also when the reservation fails.
-    let Ok(file) = tempfile::Builder::new().prefix(".reserve-").tempfile_in(dir) else {
+    let Ok(file) = tempfile::Builder::new()
+        .prefix(".reserve-")
+        .tempfile_in(dir)
+    else {
         return Some(false);
     };
     let length = libc::off_t::try_from(bytes).ok()?;
@@ -312,7 +334,13 @@ impl StoreState {
         let usage = fs_usage(&self.path);
         let no_room = usage.is_some_and(|usage| !has_headroom(&usage));
         report_failed_write(self.role(), &cause, no_room, usage);
-        *failure = Some(WriteFailure { cause, no_room, since: now, refused: 0, last_logged: now });
+        *failure = Some(WriteFailure {
+            cause,
+            no_room,
+            since: now,
+            refused: 0,
+            last_logged: now,
+        });
     }
 
     /// [`Self::latch`] without its line, for a caller that reports a group
@@ -325,13 +353,24 @@ impl StoreState {
         if failure.is_some() {
             return false;
         }
-        *failure = Some(WriteFailure { cause, no_room: true, since: now, refused: 0, last_logged: now });
+        *failure = Some(WriteFailure {
+            cause,
+            no_room: true,
+            since: now,
+            refused: 0,
+            last_logged: now,
+        });
         true
     }
 
     /// Count one refused write.
     pub(crate) fn refuse(&self) {
-        if let Some(failure) = self.failure.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+        if let Some(failure) = self
+            .failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
             failure.refused += 1;
         }
     }
@@ -344,7 +383,12 @@ impl StoreState {
         let failure = failure.as_mut().filter(|_| self.is_latched())?;
         failure.due(now).then(|| {
             let failed_secs = now.saturating_duration_since(failure.since).as_secs();
-            (error_class(&failure.cause), failure.no_room, failed_secs, failure.refused)
+            (
+                error_class(&failure.cause),
+                failure.no_room,
+                failed_secs,
+                failure.refused,
+            )
         })
     }
 
@@ -423,10 +467,17 @@ fn next_step(class: &str, no_room: bool, role: Option<StoreRole>) -> String {
 }
 
 fn master_in_process() -> bool {
-    open_stores().iter().any(|store| store.role() == Some(StoreRole::Master))
+    open_stores()
+        .iter()
+        .any(|store| store.role() == Some(StoreRole::Master))
 }
 
-fn report_failed_write(role: Option<StoreRole>, cause: &str, no_room: bool, usage: Option<FsUsage>) {
+fn report_failed_write(
+    role: Option<StoreRole>,
+    cause: &str,
+    no_room: bool,
+    usage: Option<FsUsage>,
+) {
     let store = store_name(role);
     let class = error_class(cause);
     tracing::error!(
@@ -477,34 +528,52 @@ static STORES: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
 
 /// Name a database as one of this node's stores. A database is registered
 /// once; a later call keeps its first role.
-pub(crate) fn register(state: &Arc<StoreState>, database: Weak<DatabaseInner>, role: StoreRole) -> bool {
+pub(crate) fn register(
+    state: &Arc<StoreState>,
+    database: Weak<DatabaseInner>,
+    role: StoreRole,
+) -> bool {
     if state.role.set(role).is_err() {
         return false;
     }
     let mut stores = STORES.lock().unwrap_or_else(PoisonError::into_inner);
     stores.retain(|store| store.database.strong_count() > 0);
-    stores.push(Registered { state: state.clone(), database });
+    stores.push(Registered {
+        state: state.clone(),
+        database,
+    });
     true
 }
 
 /// This process's registered stores that are still open.
 fn open_stores() -> Vec<Arc<StoreState>> {
-    open_databases().into_iter().map(|(state, _)| state).collect()
+    open_databases()
+        .into_iter()
+        .map(|(state, _)| state)
+        .collect()
 }
 
 fn open_databases() -> Vec<(Arc<StoreState>, Weak<DatabaseInner>)> {
     let mut stores = STORES.lock().unwrap_or_else(PoisonError::into_inner);
     stores.retain(|store| store.database.strong_count() > 0);
-    stores.iter().map(|store| (store.state.clone(), store.database.clone())).collect()
+    stores
+        .iter()
+        .map(|store| (store.state.clone(), store.database.clone()))
+        .collect()
 }
 
 /// The error class of the open store of `role` that stopped writing, and
 /// whether its filesystem showed no room then; `None` until both are known.
 pub fn store_failure(role: StoreRole) -> Option<(&'static str, bool)> {
-    open_stores().into_iter().find(|store| store.role() == Some(role) && store.is_latched()).and_then(|store| {
-        let failure = store.failure.lock().unwrap_or_else(PoisonError::into_inner);
-        failure.as_ref().map(|failure| (error_class(&failure.cause), failure.no_room))
-    })
+    open_stores()
+        .into_iter()
+        .find(|store| store.role() == Some(role) && store.is_latched())
+        .and_then(|store| {
+            let failure = store.failure.lock().unwrap_or_else(PoisonError::into_inner);
+            failure
+                .as_ref()
+                .map(|failure| (error_class(&failure.cause), failure.no_room))
+        })
 }
 
 /// Whether this process has an open store of `role`.
@@ -515,7 +584,10 @@ pub fn store_open(role: StoreRole) -> bool {
 /// The directory of this process's open store of `role`, to watch its
 /// filesystem once the store has closed; never logged.
 pub fn store_path(role: StoreRole) -> Option<PathBuf> {
-    open_stores().iter().find(|store| store.role() == Some(role)).map(|store| store.path.clone())
+    open_stores()
+        .iter()
+        .find(|store| store.role() == Some(role))
+        .map(|store| store.path.clone())
 }
 
 static HELD: Mutex<BTreeSet<StoreRole>> = Mutex::new(BTreeSet::new());
@@ -523,27 +595,39 @@ static HELD: Mutex<BTreeSet<StoreRole>> = Mutex::new(BTreeSet::new());
 /// Mark the store of `role` as stopped for its recovery, until
 /// [`release_store`]: its worker reads as stopped by it.
 pub fn hold_store(role: StoreRole) {
-    HELD.lock().unwrap_or_else(PoisonError::into_inner).insert(role);
+    HELD.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(role);
 }
 
 pub fn release_store(role: StoreRole) {
-    HELD.lock().unwrap_or_else(PoisonError::into_inner).remove(&role);
+    HELD.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&role);
 }
 
 /// Whether the store of `role` is held stopped for its recovery.
 pub fn store_held(role: StoreRole) -> bool {
-    HELD.lock().unwrap_or_else(PoisonError::into_inner).contains(&role)
+    HELD.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&role)
 }
 
 /// Whether this process's open store of `role` refuses writes after a
 /// failed write.
 pub fn store_latched(role: StoreRole) -> bool {
-    open_stores().iter().any(|store| store.role() == Some(role) && store.is_latched())
+    open_stores()
+        .iter()
+        .any(|store| store.role() == Some(role) && store.is_latched())
 }
 
 /// The roles of this process's open stores that refuse writes.
 pub fn latched_stores() -> Vec<StoreRole> {
-    open_stores().iter().filter(|store| store.is_latched()).filter_map(|store| store.role()).collect()
+    open_stores()
+        .iter()
+        .filter(|store| store.is_latched())
+        .filter_map(|store| store.role())
+        .collect()
 }
 
 /// How full a store's filesystem may get before the operator hears of it
@@ -558,7 +642,11 @@ pub struct DiskThresholds {
 
 impl Default for DiskThresholds {
     fn default() -> Self {
-        Self { notice: 70, warn: 90, terminate: 95 }
+        Self {
+            notice: 70,
+            warn: 90,
+            terminate: 95,
+        }
     }
 }
 
@@ -585,7 +673,11 @@ impl DiskLevel {
 impl DiskThresholds {
     /// Percentages from 1 to 100 with notice <= warn < terminate.
     pub fn new(notice: i32, warn: i32, terminate: i32) -> Result<Self, String> {
-        let percent = |value: i32| u8::try_from(value).ok().filter(|value| (1..=100).contains(value));
+        let percent = |value: i32| {
+            u8::try_from(value)
+                .ok()
+                .filter(|value| (1..=100).contains(value))
+        };
         match (percent(notice), percent(warn), percent(terminate)) {
             (Some(notice), Some(warn), Some(terminate)) if notice <= warn && warn < terminate => {
                 Ok(Self { notice, warn, terminate })
@@ -662,7 +754,10 @@ pub struct StorageWatch {
 
 impl StorageWatch {
     pub fn new(thresholds: DiskThresholds) -> Self {
-        Self { thresholds, filesystems: BTreeMap::new() }
+        Self {
+            thresholds,
+            filesystems: BTreeMap::new(),
+        }
     }
 
     pub fn thresholds(&self) -> DiskThresholds {
@@ -676,17 +771,20 @@ impl StorageWatch {
         // level, so its next reading is no new transition.
         let mut filesystems: BTreeMap<u64, (Vec<StoreRole>, FsUsage)> = BTreeMap::new();
         for (role, usage) in stores {
-            let entry = filesystems.entry(usage.device).or_insert_with(|| (Vec::new(), *usage));
+            let entry = filesystems
+                .entry(usage.device)
+                .or_insert_with(|| (Vec::new(), *usage));
             entry.0.push(*role);
             entry.1 = *usage;
         }
         let mut reports = Vec::new();
         for (device, (mut roles, usage)) in filesystems {
             roles.sort();
-            let watched = self
-                .filesystems
-                .entry(device)
-                .or_insert(Watched { level: DiskLevel::Normal, since: now, last_logged: now });
+            let watched = self.filesystems.entry(device).or_insert(Watched {
+                level: DiskLevel::Normal,
+                since: now,
+                last_logged: now,
+            });
             let from = watched.level;
             let level = self.thresholds.level(usage.used_percent(), from);
             let held_secs = now.saturating_duration_since(watched.since).as_secs();
@@ -694,7 +792,9 @@ impl StorageWatch {
                 DiskChange::Raised
             } else if level < from {
                 DiskChange::Lowered
-            } else if level >= DiskLevel::Warn && now.saturating_duration_since(watched.last_logged) >= DISK_REPEAT {
+            } else if level >= DiskLevel::Warn
+                && now.saturating_duration_since(watched.last_logged) >= DISK_REPEAT
+            {
                 DiskChange::Holding
             } else {
                 continue;
@@ -704,7 +804,14 @@ impl StorageWatch {
                 watched.since = now;
             }
             watched.last_logged = now;
-            reports.push(DiskReport { change, level, from, stores: roles, usage, held_secs });
+            reports.push(DiskReport {
+                change,
+                level,
+                from,
+                stores: roles,
+                usage,
+                held_secs,
+            });
         }
         reports
     }
@@ -714,7 +821,11 @@ impl StorageWatch {
 pub fn log_disk_report(report: &DiskReport, thresholds: &DiskThresholds) {
     let stores = describe_stores(&report.stores);
     let used = report.usage.used_percent();
-    let threshold = thresholds.threshold(if report.change == DiskChange::Lowered { report.from } else { report.level });
+    let threshold = thresholds.threshold(if report.change == DiskChange::Lowered {
+        report.from
+    } else {
+        report.level
+    });
     let (floor_mb, floor_inodes) = (FLOOR_FREE_BYTES >> 20, FLOOR_FREE_INODES);
     macro_rules! disk_line {
         ($level:ident, $($message:tt)+) => {
@@ -759,23 +870,39 @@ pub fn log_disk_report(report: &DiskReport, thresholds: &DiskThresholds) {
 /// stop writing, as after a failed write, so they are recovered like one
 /// instead of running into ENOSPC. `probe` reads a store's filesystem
 /// ([`fs_usage`] outside tests).
-pub fn check_stores(watch: &mut StorageWatch, now: Instant, probe: &dyn Fn(&Path) -> Option<FsUsage>) -> Vec<DiskReport> {
+pub fn check_stores(
+    watch: &mut StorageWatch,
+    now: Instant,
+    probe: &dyn Fn(&Path) -> Option<FsUsage>,
+) -> Vec<DiskReport> {
     let mut usages = Vec::new();
     // Due reminders by filesystem (None: unreadable), class and whether the
     // store is the master's (its next step differs): roles, longest failure,
     // refused writes and the filesystem's usage.
-    let mut due: BTreeMap<(Option<u64>, &'static str, bool, bool), (Vec<StoreRole>, u64, u64, Option<FsUsage>)> =
-        BTreeMap::new();
+    let mut due: BTreeMap<
+        (Option<u64>, &'static str, bool, bool),
+        (Vec<StoreRole>, u64, u64, Option<FsUsage>),
+    > = BTreeMap::new();
     // Stores to stop at the floor, by filesystem.
-    let mut floor: BTreeMap<u64, (Vec<(StoreRole, Weak<DatabaseInner>)>, FsUsage)> = BTreeMap::new();
+    let mut floor: BTreeMap<u64, (Vec<(StoreRole, Weak<DatabaseInner>)>, FsUsage)> =
+        BTreeMap::new();
     for (store, database) in open_databases() {
         let Some(role) = store.role() else { continue };
         let usage = probe(&store.path);
         if let Some(usage) = usage.filter(|usage| below_floor(usage) && !store.is_latched()) {
-            floor.entry(usage.device).or_insert_with(|| (Vec::new(), usage)).0.push((role, database));
+            floor
+                .entry(usage.device)
+                .or_insert_with(|| (Vec::new(), usage))
+                .0
+                .push((role, database));
         }
         if let Some((class, no_room, failed_secs, refused)) = store.reminder(now) {
-            let key = (usage.map(|usage| usage.device), class, no_room, role == StoreRole::Master);
+            let key = (
+                usage.map(|usage| usage.device),
+                class,
+                no_room,
+                role == StoreRole::Master,
+            );
             let entry = due.entry(key).or_insert((Vec::new(), 0, 0, usage));
             entry.0.push(role);
             entry.1 = entry.1.max(failed_secs);
@@ -809,8 +936,15 @@ pub fn check_stores(watch: &mut StorageWatch, now: Instant, probe: &dyn Fn(&Path
             continue;
         }
         let stores = describe_stores(&roles);
-        let next =
-            next_step("FLOOR", true, roles.iter().find(|role| **role == StoreRole::Master).or(roles.first()).copied());
+        let next = next_step(
+            "FLOOR",
+            true,
+            roles
+                .iter()
+                .find(|role| **role == StoreRole::Master)
+                .or(roles.first())
+                .copied(),
+        );
         tracing::error!(
             scope = "this node",
             stores = %stores,
@@ -871,7 +1005,10 @@ mod tests {
     fn logged(run: impl FnOnce()) -> String {
         let lines = Lines::default();
         let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         tracing::subscriber::with_default(subscriber, run);
         let bytes = lines.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
@@ -885,7 +1022,9 @@ mod tests {
     /// database under a directory of that name fails, naming the path.
     fn rocksdb_error(dir: &Path, name: &str) -> rocksdb::Error {
         let missing = dir.join(name);
-        rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), &missing, false).err().expect("no database")
+        rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), &missing, false)
+            .err()
+            .expect("no database")
     }
 
     /// A store's first failed write is reported once, naming the store, the
@@ -896,30 +1035,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open(dir.path());
         assert!(db.register_store(StoreRole::Worker(7_001)));
-        assert!(!db.register_store(StoreRole::Master), "a store keeps its first role");
+        assert!(
+            !db.register_store(StoreRole::Master),
+            "a store keeps its first role"
+        );
         db.fail_next_write(rocksdb_error(dir.path(), "No space left on device"));
         let lines = logged(|| {
-            assert!(matches!(db.put([1], b"v"), Err(DatabaseCommitError::Storage(_))), "the write's own error");
-            assert!(matches!(db.put([2], b"v"), Err(DatabaseCommitError::PriorWriteFailed)));
+            assert!(
+                matches!(db.put([1], b"v"), Err(DatabaseCommitError::Storage(_))),
+                "the write's own error"
+            );
+            assert!(matches!(
+                db.put([2], b"v"),
+                Err(DatabaseCommitError::PriorWriteFailed)
+            ));
             assert!(db.lock_writes().is_err());
         });
         assert_eq!(lines.matches("store write failed").count(), 1, "{lines}");
         assert!(!lines.contains("still refuses"), "{lines}");
-        assert!(lines.contains("worker 7001 store refuses further writes"), "{lines}");
+        assert!(
+            lines.contains("worker 7001 store refuses further writes"),
+            "{lines}"
+        );
         // The action depends on whether the test's filesystem shows room.
-        assert!(lines.contains("ENOSPC") && (lines.contains("its disk is full") || lines.contains("shows room")),
-            "{lines}");
-        for field in ["free_mb=", "free_inodes=", "used_pct=", "first_error=IO error: "] {
+        assert!(
+            lines.contains("ENOSPC")
+                && (lines.contains("its disk is full") || lines.contains("shows room")),
+            "{lines}"
+        );
+        for field in [
+            "free_mb=",
+            "free_inodes=",
+            "used_pct=",
+            "first_error=IO error: ",
+        ] {
             assert!(lines.contains(field), "{field}: {lines}");
         }
         assert!(lines.contains("<path>"), "{lines}");
-        assert!(!lines.contains(&dir.path().display().to_string()), "the path leaked: {lines}");
+        assert!(
+            !lines.contains(&dir.path().display().to_string()),
+            "the path leaked: {lines}"
+        );
         assert!(db.write_failed());
         assert!(store_latched(StoreRole::Worker(7_001)));
         assert!(latched_stores().contains(&StoreRole::Worker(7_001)));
         assert!(!store_latched(StoreRole::Worker(7_002)));
         drop(db);
-        assert!(!store_latched(StoreRole::Worker(7_001)), "a closed store is not reported");
+        assert!(
+            !store_latched(StoreRole::Worker(7_001)),
+            "a closed store is not reported"
+        );
     }
 
     /// While stores refuse writes, the watch repeats their report once per
@@ -941,9 +1106,19 @@ mod tests {
                 assert!(db.put([key], b"v").is_err());
             }
         });
-        assert_eq!(first.matches("store write failed").count(), 2, "one line per store's failure: {first}");
-        assert!(!first.contains("still refuse"), "refused writes log nothing: {first}");
-        assert!(first.contains("EIO") && first.contains("check the disk"), "{first}");
+        assert_eq!(
+            first.matches("store write failed").count(),
+            2,
+            "one line per store's failure: {first}"
+        );
+        assert!(
+            !first.contains("still refuse"),
+            "refused writes log nothing: {first}"
+        );
+        assert!(
+            first.contains("EIO") && first.contains("check the disk"),
+            "{first}"
+        );
         let start = Instant::now();
         let mut watch = StorageWatch::new(DiskThresholds::default());
         let probe = |_: &Path| -> Option<FsUsage> { Some(usage(7_010, 50, 1)) };
@@ -952,12 +1127,30 @@ mod tests {
         });
         assert!(!early.contains("worker 7011"), "{early}");
         let due = logged(|| {
-            check_stores(&mut watch, start + FAILED_WRITE_REPEAT + Duration::from_secs(5), &probe);
-            check_stores(&mut watch, start + FAILED_WRITE_REPEAT + Duration::from_secs(65), &probe);
+            check_stores(
+                &mut watch,
+                start + FAILED_WRITE_REPEAT + Duration::from_secs(5),
+                &probe,
+            );
+            check_stores(
+                &mut watch,
+                start + FAILED_WRITE_REPEAT + Duration::from_secs(65),
+                &probe,
+            );
         });
-        assert_eq!(due.matches("still refuse writes").count(), 1, "one line per filesystem: {due}");
-        assert!(due.contains("workers 7011-7012 store(s) have refused 50 writes"), "{due}");
-        assert!(due.contains("failed_secs=") && due.contains("free_mb=51200"), "{due}");
+        assert_eq!(
+            due.matches("still refuse writes").count(),
+            1,
+            "one line per filesystem: {due}"
+        );
+        assert!(
+            due.contains("workers 7011-7012 store(s) have refused 50 writes"),
+            "{due}"
+        );
+        assert!(
+            due.contains("failed_secs=") && due.contains("free_mb=51200"),
+            "{due}"
+        );
     }
 
     fn usage(device: u64, used: u64, inodes_used: u64) -> FsUsage {
@@ -981,37 +1174,107 @@ mod tests {
         let t0 = Instant::now();
         let at = |secs: u64| t0 + Duration::from_secs(secs);
         let stores = |usage: FsUsage| {
-            [StoreRole::Worker(4), StoreRole::Master, StoreRole::Worker(2), StoreRole::Worker(1)].map(|role| (role, usage))
+            [
+                StoreRole::Worker(4),
+                StoreRole::Master,
+                StoreRole::Worker(2),
+                StoreRole::Worker(1),
+            ]
+            .map(|role| (role, usage))
         };
         let changes = |reports: Vec<DiskReport>| -> Vec<(DiskChange, DiskLevel, DiskLevel, u64)> {
-            reports.iter().map(|r| (r.change, r.from, r.level, r.held_secs)).collect()
+            reports
+                .iter()
+                .map(|r| (r.change, r.from, r.level, r.held_secs))
+                .collect()
         };
         assert!(watch.observe(&stores(usage(1, 50, 1)), at(0)).is_empty());
         let notice = watch.observe(&stores(usage(1, 70, 1)), at(60));
-        assert_eq!(describe_stores(&notice[0].stores), "master, workers 1-2, worker 4");
-        assert_eq!(changes(notice), [(DiskChange::Raised, DiskLevel::Normal, DiskLevel::Notice, 60)]);
-        assert!(watch.observe(&stores(usage(1, 80, 1)), at(60 + 3_600)).is_empty(), "notice is not repeated");
-        assert_eq!(changes(watch.observe(&stores(usage(1, 91, 1)), at(4_000))),
-            [(DiskChange::Raised, DiskLevel::Notice, DiskLevel::Warn, 4_000 - 60)]);
-        assert!(watch.observe(&stores(usage(1, 91, 1)), at(4_300)).is_empty());
-        assert_eq!(changes(watch.observe(&stores(usage(1, 92, 1)), at(4_600))),
-            [(DiskChange::Holding, DiskLevel::Warn, DiskLevel::Warn, 600)]);
-        assert_eq!(changes(watch.observe(&stores(usage(1, 96, 1)), at(4_700))),
-            [(DiskChange::Raised, DiskLevel::Warn, DiskLevel::Terminate, 700)]);
-        assert!(watch.observe(&stores(usage(1, 94, 1)), at(4_760)).is_empty(), "a point of hysteresis");
-        assert!(watch.observe(&[], at(4_770)).is_empty(), "an unreadable filesystem changes nothing");
-        assert!(watch.observe(&stores(usage(1, 96, 1)), at(4_780)).is_empty(), "and keeps its level");
-        assert_eq!(changes(watch.observe(&stores(usage(1, 80, 1)), at(4_800))),
-            [(DiskChange::Lowered, DiskLevel::Terminate, DiskLevel::Notice, 100)]);
+        assert_eq!(
+            describe_stores(&notice[0].stores),
+            "master, workers 1-2, worker 4"
+        );
+        assert_eq!(
+            changes(notice),
+            [(DiskChange::Raised, DiskLevel::Normal, DiskLevel::Notice, 60)]
+        );
+        assert!(
+            watch
+                .observe(&stores(usage(1, 80, 1)), at(60 + 3_600))
+                .is_empty(),
+            "notice is not repeated"
+        );
+        assert_eq!(
+            changes(watch.observe(&stores(usage(1, 91, 1)), at(4_000))),
+            [(
+                DiskChange::Raised,
+                DiskLevel::Notice,
+                DiskLevel::Warn,
+                4_000 - 60
+            )]
+        );
+        assert!(watch
+            .observe(&stores(usage(1, 91, 1)), at(4_300))
+            .is_empty());
+        assert_eq!(
+            changes(watch.observe(&stores(usage(1, 92, 1)), at(4_600))),
+            [(DiskChange::Holding, DiskLevel::Warn, DiskLevel::Warn, 600)]
+        );
+        assert_eq!(
+            changes(watch.observe(&stores(usage(1, 96, 1)), at(4_700))),
+            [(
+                DiskChange::Raised,
+                DiskLevel::Warn,
+                DiskLevel::Terminate,
+                700
+            )]
+        );
+        assert!(
+            watch
+                .observe(&stores(usage(1, 94, 1)), at(4_760))
+                .is_empty(),
+            "a point of hysteresis"
+        );
+        assert!(
+            watch.observe(&[], at(4_770)).is_empty(),
+            "an unreadable filesystem changes nothing"
+        );
+        assert!(
+            watch
+                .observe(&stores(usage(1, 96, 1)), at(4_780))
+                .is_empty(),
+            "and keeps its level"
+        );
+        assert_eq!(
+            changes(watch.observe(&stores(usage(1, 80, 1)), at(4_800))),
+            [(
+                DiskChange::Lowered,
+                DiskLevel::Terminate,
+                DiskLevel::Notice,
+                100
+            )]
+        );
         // Inodes count as much as space; another filesystem is its own report.
-        let mixed = [(StoreRole::Master, usage(1, 80, 1)), (StoreRole::Worker(9), usage(2, 10, 92))];
+        let mixed = [
+            (StoreRole::Master, usage(1, 80, 1)),
+            (StoreRole::Worker(9), usage(2, 10, 92)),
+        ];
         let reports = watch.observe(&mixed, at(4_900));
         assert_eq!(reports.len(), 1);
-        assert_eq!((reports[0].stores.as_slice(), reports[0].level), ([StoreRole::Worker(9)].as_slice(), DiskLevel::Warn));
+        assert_eq!(
+            (reports[0].stores.as_slice(), reports[0].level),
+            ([StoreRole::Worker(9)].as_slice(), DiskLevel::Warn)
+        );
         assert_eq!(reports[0].usage.inodes_used_percent(), Some(92));
         let lines = logged(|| log_disk_report(&reports[0], &watch.thresholds()));
-        assert!(lines.contains("WARN") && lines.contains("store disk nearly full: 92%"), "{lines}");
-        assert!(lines.contains("worker 9 store(s)") && lines.contains("inodes_used_pct=92"), "{lines}");
+        assert!(
+            lines.contains("WARN") && lines.contains("store disk nearly full: 92%"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("worker 9 store(s)") && lines.contains("inodes_used_pct=92"),
+            "{lines}"
+        );
     }
 
     fn free(device: u64, free_gib: u64) -> FsUsage {
@@ -1039,7 +1302,8 @@ mod tests {
         full_b.register_store(StoreRole::Worker(7_023));
         let (roomy_path, full_path) = (roomy.path().to_path_buf(), full.path().to_path_buf());
         let probe = move |path: &Path| -> Option<FsUsage> {
-            (path == roomy_path.as_path()).then(|| free(70_021, 10))
+            (path == roomy_path.as_path())
+                .then(|| free(70_021, 10))
                 .or_else(|| path.starts_with(&full_path).then(|| free(70_022, 1)))
         };
         let mut watch = StorageWatch::new(DiskThresholds::default());
@@ -1047,28 +1311,74 @@ mod tests {
             check_stores(&mut watch, Instant::now(), &probe);
             check_stores(&mut watch, Instant::now(), &probe);
         });
-        assert!(!roomy_db.write_failed() && roomy_db.put([1], b"v").is_ok(), "99% used, 10 GiB free: {lines}");
+        assert!(
+            !roomy_db.write_failed() && roomy_db.put([1], b"v").is_ok(),
+            "99% used, 10 GiB free: {lines}"
+        );
         assert!(full_a.write_failed() && full_b.write_failed(), "{lines}");
-        assert!(matches!(full_a.put([1], b"v"), Err(DatabaseCommitError::PriorWriteFailed)));
-        assert_eq!(lines.matches("store writes stopped").count(), 1, "one line per filesystem: {lines}");
-        assert!(lines.contains("workers 7022-7023 store(s) fell below the floor (2048 MiB or 10000 inodes free)"),
-            "{lines}");
-        assert!(lines.contains("this process exits once the disk has 4096 MiB and 20000 inodes free"), "{lines}");
-        assert!(!lines.contains("store write failed"), "no write failed: {lines}");
-        assert!(lines.contains("store disk usage at the terminate level: 99%"), "the percentage only reports: {lines}");
-        assert!(store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_some());
+        assert!(matches!(
+            full_a.put([1], b"v"),
+            Err(DatabaseCommitError::PriorWriteFailed)
+        ));
+        assert_eq!(
+            lines.matches("store writes stopped").count(),
+            1,
+            "one line per filesystem: {lines}"
+        );
+        assert!(
+            lines.contains(
+                "workers 7022-7023 store(s) fell below the floor (2048 MiB or 10000 inodes free)"
+            ),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("this process exits once the disk has 4096 MiB and 20000 inodes free"),
+            "{lines}"
+        );
+        assert!(
+            !lines.contains("store write failed"),
+            "no write failed: {lines}"
+        );
+        assert!(
+            lines.contains("store disk usage at the terminate level: 99%"),
+            "the percentage only reports: {lines}"
+        );
+        assert!(
+            store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_some()
+        );
         drop(full_a);
-        assert!(!store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_none());
+        assert!(
+            !store_open(StoreRole::Worker(7_022)) && store_path(StoreRole::Worker(7_022)).is_none()
+        );
     }
 
     #[test]
     fn the_floor_and_the_headroom_are_absolute() {
         assert!(below_floor(&free(1, 1)) && !below_floor(&free(1, 2)));
-        assert!(below_floor(&FsUsage { free_inodes: 9_999, ..free(1, 500) }), "inodes count too");
+        assert!(
+            below_floor(&FsUsage {
+                free_inodes: 9_999,
+                ..free(1, 500)
+            }),
+            "inodes count too"
+        );
         assert!(!has_headroom(&free(1, 3)) && has_headroom(&free(1, 4)));
-        assert!(!has_headroom(&FsUsage { free_inodes: 19_999, ..free(1, 500) }));
-        assert!(has_headroom(&FsUsage { total_inodes: 0, free_inodes: 0, ..free(1, 5) }), "no inode count");
-        assert_eq!(error_class("free space fell below the floor: 1 MiB"), "FLOOR");
+        assert!(!has_headroom(&FsUsage {
+            free_inodes: 19_999,
+            ..free(1, 500)
+        }));
+        assert!(
+            has_headroom(&FsUsage {
+                total_inodes: 0,
+                free_inodes: 0,
+                ..free(1, 5)
+            }),
+            "no inode count"
+        );
+        assert_eq!(
+            error_class("free space fell below the floor: 1 MiB"),
+            "FLOOR"
+        );
         assert!(space_class("FLOOR"));
     }
 
@@ -1084,10 +1394,26 @@ mod tests {
 
     #[test]
     fn thresholds_must_be_ordered_percentages() {
-        assert_eq!(DiskThresholds::new(70, 90, 95), Ok(DiskThresholds::default()));
-        assert_eq!(DiskThresholds::new(80, 80, 100).map(|t| t.terminate), Ok(100));
-        for (notice, warn, terminate) in [(0, 90, 95), (90, 70, 95), (70, 96, 95), (70, 95, 95), (70, 90, 101), (-1, 90, 95)] {
-            assert!(DiskThresholds::new(notice, warn, terminate).is_err(), "{notice} {warn} {terminate}");
+        assert_eq!(
+            DiskThresholds::new(70, 90, 95),
+            Ok(DiskThresholds::default())
+        );
+        assert_eq!(
+            DiskThresholds::new(80, 80, 100).map(|t| t.terminate),
+            Ok(100)
+        );
+        for (notice, warn, terminate) in [
+            (0, 90, 95),
+            (90, 70, 95),
+            (70, 96, 95),
+            (70, 95, 95),
+            (70, 90, 101),
+            (-1, 90, 95),
+        ] {
+            assert!(
+                DiskThresholds::new(notice, warn, terminate).is_err(),
+                "{notice} {warn} {terminate}"
+            );
         }
     }
 
@@ -1100,7 +1426,10 @@ mod tests {
             "IO error: No space left on device: While appending to file: <path>: No space left on device");
         let eio = "IO error: While open a file for appending: worker-store/3/000005.log: Input/output error";
         assert_eq!(error_class(eio), "EIO");
-        assert_eq!(redact_paths(eio), "IO error: While open a file for appending: <path>: Input/output error");
+        assert_eq!(
+            redact_paths(eio),
+            "IO error: While open a file for appending: <path>: Input/output error"
+        );
         assert_eq!(error_class("IO error: Disk quota exceeded"), "EDQUOT");
         assert_eq!(error_class("IO error: Storage full"), "ENOSPC");
         assert_eq!(error_class("Corruption: bad block"), "other");
@@ -1111,7 +1440,10 @@ mod tests {
     fn a_store_filesystem_is_read_without_privileges() {
         let dir = tempfile::tempdir().unwrap();
         let usage = fs_usage(dir.path()).expect("statvfs of a temporary directory");
-        assert!(usage.total_bytes > 0 && usage.used_bytes <= usage.total_bytes, "{usage:?}");
+        assert!(
+            usage.total_bytes > 0 && usage.used_bytes <= usage.total_bytes,
+            "{usage:?}"
+        );
         assert!(usage.used_percent() <= 100);
         assert!(fs_usage(&dir.path().join("missing")).is_none());
     }
@@ -1122,8 +1454,15 @@ mod tests {
     fn a_reservation_next_to_a_store_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         assert_ne!(can_reserve(dir.path(), 1 << 20), Some(false));
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the reservation is removed");
-        assert_eq!(can_reserve(&dir.path().join("missing"), 1 << 20), Some(false));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the reservation is removed"
+        );
+        assert_eq!(
+            can_reserve(&dir.path().join("missing"), 1 << 20),
+            Some(false)
+        );
     }
 
     /// A space error on a filesystem that showed room is reopened by an
@@ -1132,9 +1471,13 @@ mod tests {
     #[test]
     fn a_process_store_names_what_its_exit_waits_for() {
         let master = Some(StoreRole::Master);
-        assert!(next_step("ENOSPC", true, master).starts_with("this process exits once the disk has 4096 MiB"));
+        assert!(next_step("ENOSPC", true, master)
+            .starts_with("this process exits once the disk has 4096 MiB"));
         let reserve = next_step("EDQUOT", false, master);
-        assert!(reserve.contains("and 256 MiB can be reserved next to the store"), "{reserve}");
+        assert!(
+            reserve.contains("and 256 MiB can be reserved next to the store"),
+            "{reserve}"
+        );
         assert_eq!(next_step("EIO", true, master), "then restart the node");
     }
 }

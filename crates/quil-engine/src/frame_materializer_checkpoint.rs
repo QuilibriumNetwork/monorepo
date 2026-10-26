@@ -143,8 +143,11 @@ pub(super) fn read_completed(
         // state. Refusing on it wedges reconciled archives (GLOBAL halts once
         // two of four have reconciled); instead the certified head serves
         // as the base, and its next certified child authenticates the state.
-        tracing::warn!(cursor, receipt = checkpoint.frame_number,
-            "GLOBAL execution receipt no longer matches the prover tree; treating it as absent");
+        tracing::warn!(
+            cursor,
+            receipt = checkpoint.frame_number,
+            "GLOBAL execution receipt no longer matches the prover tree; treating it as absent"
+        );
         return Ok(None);
     }
     Ok(Some(checkpoint))
@@ -207,9 +210,13 @@ impl FrameMaterializer {
         let txn = self.hypergraph_store.new_transaction(false)?;
         let pending_key = quil_store::encoding::global_execution_pending_key();
         let resolved = (|| -> Result<Option<(UnfinishedExecution, u64)>> {
-            let Some(pending) = txn.get(&pending_key)? else { return Ok(None) };
+            let Some(pending) = txn.get(&pending_key)? else {
+                return Ok(None);
+            };
             let Some(marked) = GlobalExecutionCheckpoint::decode(&pending)? else {
-                return Err(unavailable("unfinished GLOBAL execution marker has a retired encoding"));
+                return Err(unavailable(
+                    "unfinished GLOBAL execution marker has a retired encoding",
+                ));
             };
             let frame = marked.frame_number;
             if self.hypergraph.has_staged_mutations() {
@@ -261,7 +268,8 @@ impl FrameMaterializer {
         }
         txn.delete(&pending_key)?;
         txn.commit()?;
-        self.last_materialized_frame.fetch_max(cursor, Ordering::SeqCst);
+        self.last_materialized_frame
+            .fetch_max(cursor, Ordering::SeqCst);
         warn!(
             frame, cursor, receipt_kept = receipt_holds, ?outcome,
             "recovered unfinished GLOBAL execution; the next certified frame authenticates the state"

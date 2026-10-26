@@ -80,12 +80,7 @@ impl Generator {
     }
 
     /// Emit a unary instruction.
-    pub fn emit_unary(
-        &mut self,
-        op: Opcode,
-        operand: ValueId,
-        result_type: Info,
-    ) -> ValueId {
+    pub fn emit_unary(&mut self, op: Opcode, operand: ValueId, result_type: Info) -> ValueId {
         let out = self.new_value("", result_type.clone());
         let instr = Instr::new(op)
             .with_out(out)

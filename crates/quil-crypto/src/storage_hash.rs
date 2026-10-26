@@ -94,7 +94,12 @@ impl Absorber {
         let mut state = [F::ZERO; WIDTH];
         state[RATE] = felt(domain as u32);
         state[RATE + 1] = felt(length as u32);
-        Self { state, position: 0, remaining: length, permuted: false }
+        Self {
+            state,
+            position: 0,
+            remaining: length,
+            permuted: false,
+        }
     }
 
     pub fn absorb(&mut self, value: F) {
@@ -229,13 +234,18 @@ mod tests {
     #[test]
     fn a_node_packs_thirty_bytes_reversibly() {
         for seed in 0u8..8 {
-            let bytes: Vec<u8> = (0..30).map(|i| (i as u8).wrapping_mul(97).wrapping_add(seed)).collect();
+            let bytes: Vec<u8> = (0..30)
+                .map(|i| (i as u8).wrapping_mul(97).wrapping_add(seed))
+                .collect();
             let node = pack_node(&bytes);
             assert!(node.iter().all(|v| v.as_canonical_u32() < 1 << 30));
             assert_eq!(unpack_node(&node).unwrap().as_slice(), bytes.as_slice());
         }
         assert_eq!(pack_node(&[]), ZERO);
-        assert_eq!(unpack_node(&pack_node(&[0xFF; 7])).unwrap()[..8], [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]);
+        assert_eq!(
+            unpack_node(&pack_node(&[0xFF; 7])).unwrap()[..8],
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]
+        );
     }
 
     #[test]
@@ -252,20 +262,36 @@ mod tests {
     fn domains_and_lengths_separate_hashes() {
         let a: Digest = std::array::from_fn(|i| felt(i as u32 + 1));
         let b: Digest = std::array::from_fn(|i| felt(i as u32 + 100));
-        assert_ne!(compress(&a, &b, Domain::Node), compress(&a, &b, Domain::Column));
-        assert_ne!(compress(&a, &b, Domain::Node), compress(&b, &a, Domain::Node));
+        assert_ne!(
+            compress(&a, &b, Domain::Node),
+            compress(&a, &b, Domain::Column)
+        );
+        assert_ne!(
+            compress(&a, &b, Domain::Node),
+            compress(&b, &a, Domain::Node)
+        );
         let input: Vec<F> = a.iter().chain(&b).copied().collect();
-        assert_ne!(sponge(Domain::Label, &input), sponge(Domain::Label, &input[..15]));
+        assert_ne!(
+            sponge(Domain::Label, &input),
+            sponge(Domain::Label, &input[..15])
+        );
         assert_ne!(sponge(Domain::Label, &input), sponge(Domain::Root, &input));
         let mut padded = input.clone();
         padded.push(F::ZERO);
-        assert_ne!(sponge(Domain::Label, &input), sponge(Domain::Label, &padded), "length is bound");
+        assert_ne!(
+            sponge(Domain::Label, &input),
+            sponge(Domain::Label, &padded),
+            "length is bound"
+        );
         // The incremental absorber is the one-shot sponge.
         let mut absorber = Absorber::new(Domain::Label, 40);
         for i in 0..40u32 {
             absorber.absorb(felt(i));
         }
-        assert_eq!(absorber.finish(), sponge(Domain::Label, &(0..40).map(felt).collect::<Vec<_>>()));
+        assert_eq!(
+            absorber.finish(),
+            sponge(Domain::Label, &(0..40).map(felt).collect::<Vec<_>>())
+        );
         assert_ne!(sponge(Domain::Empty, &[]), ZERO);
     }
 }

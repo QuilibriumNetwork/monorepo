@@ -175,23 +175,44 @@ fn resolve_flint() -> (String, String) {
         let src_dir = format!("{root}/src");
         // `create_dir_all` is idempotent; remove any stale symlink
         // before re-creating so we always point at the current src/.
-        std::fs::create_dir_all(&shim_root)
-            .unwrap_or_else(|e| panic!("create_dir_all {shim_root}: {e}", e = e, shim_root = shim_root));
+        std::fs::create_dir_all(&shim_root).unwrap_or_else(|e| {
+            panic!(
+                "create_dir_all {shim_root}: {e}",
+                e = e,
+                shim_root = shim_root
+            )
+        });
         if Path::new(&shim_dir).exists() || Path::new(&shim_dir).is_symlink() {
-            std::fs::remove_file(&shim_dir).or_else(|_| std::fs::remove_dir_all(&shim_dir))
-                .unwrap_or_else(|e| panic!("remove stale shim {shim_dir}: {e}", e = e, shim_dir = shim_dir));
+            std::fs::remove_file(&shim_dir)
+                .or_else(|_| std::fs::remove_dir_all(&shim_dir))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "remove stale shim {shim_dir}: {e}",
+                        e = e,
+                        shim_dir = shim_dir
+                    )
+                });
         }
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&src_dir, &shim_dir)
-            .unwrap_or_else(|e| panic!("symlink {src_dir} -> {shim_dir}: {e}", e = e, shim_dir = shim_dir, src_dir = src_dir));
+        std::os::unix::fs::symlink(&src_dir, &shim_dir).unwrap_or_else(|e| {
+            panic!(
+                "symlink {src_dir} -> {shim_dir}: {e}",
+                e = e,
+                shim_dir = shim_dir,
+                src_dir = src_dir
+            )
+        });
         return (root, shim_root);
     }
 
-    panic!("FLINT at {root} contains neither lib/libflint.a (install-prefix \
+    panic!(
+        "FLINT at {root} contains neither lib/libflint.a (install-prefix \
          layout) nor libflint.a (in-tree source-build layout). Set \
          FLINT_DIR to a directory containing one of those, e.g. a \
          flint source tree where `./configure --enable-static` then \
-         `make` has been run.", root = root);
+         `make` has been run.",
+        root = root
+    );
 }
 
 /// Resolve a Homebrew-installed library's root directory. Checks
@@ -208,12 +229,21 @@ fn resolve_lib_root(pkg: &str, env_var: &str) -> String {
     let out = Command::new("brew").args(["--prefix", pkg]).output();
     match out {
         Ok(o) if o.status.success() => {
-            let s = String::from_utf8(o.stdout)
-                .unwrap_or_else(|e| panic!("brew --prefix {pkg}: utf8 decode failed: {e}", e = e, pkg = pkg));
+            let s = String::from_utf8(o.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "brew --prefix {pkg}: utf8 decode failed: {e}",
+                    e = e,
+                    pkg = pkg
+                )
+            });
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                panic!("brew --prefix {pkg} returned empty; install with `brew install {pkg}` \
-                     or set {env_var} to the install root containing lib/lib{pkg}.a", env_var = env_var, pkg = pkg);
+                panic!(
+                    "brew --prefix {pkg} returned empty; install with `brew install {pkg}` \
+                     or set {env_var} to the install root containing lib/lib{pkg}.a",
+                    env_var = env_var,
+                    pkg = pkg
+                );
             }
             trimmed.to_string()
         }
@@ -223,8 +253,13 @@ fn resolve_lib_root(pkg: &str, env_var: &str) -> String {
             o.status.code(),
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => panic!("could not invoke `brew --prefix {pkg}`: {e}; install Homebrew and run \
+        Err(e) => panic!(
+            "could not invoke `brew --prefix {pkg}`: {e}; install Homebrew and run \
              `brew install {pkg}`, or set {env_var} to the install root containing \
-             lib/lib{pkg}.a", e = e, env_var = env_var, pkg = pkg),
+             lib/lib{pkg}.a",
+            e = e,
+            env_var = env_var,
+            pkg = pkg
+        ),
     }
 }

@@ -59,7 +59,8 @@ pub fn canonical_witnesses(
 ) -> Result<Witnesses> {
     use quil_lattice_ct::confidential::sharded_tree;
     let context = quil_lattice_ct::confidential::transfer::parameter_context(network, application);
-    let unavailable = |what: &str| QuilError::ExecutionUnavailable(format!("canonical witness: {what}"));
+    let unavailable =
+        |what: &str| QuilError::ExecutionUnavailable(format!("canonical witness: {what}"));
     let reported = super::global_accumulator::subtrees(global, application)?;
     if reported.is_empty() {
         return Err(unavailable("the application has no canonical root yet"));
@@ -75,21 +76,38 @@ pub fn canonical_witnesses(
     let root = sharded_tree::fold_sparse(&context, depth, &nodes)
         .map_err(|e| unavailable(&format!("fold: {e:?}")))?;
     let coins = reported.iter().try_fold(0u64, |total, (_, _, coins, _)| {
-        total.checked_add(*coins).ok_or_else(|| unavailable("coin count overflow"))
+        total
+            .checked_add(*coins)
+            .ok_or_else(|| unavailable("coin count overflow"))
     })?;
-    let canonical = RootRecord { context, depth: super::coin_blocks::DEPTH, coins, root };
+    let canonical = RootRecord {
+        context,
+        depth: super::coin_blocks::DEPTH,
+        coins,
+        root,
+    };
 
     // The subtree a coin sits under is the one whose shard owns its block —
     // a property of the coin, not of whoever serves the witness. An archive
     // holding every shard answers for all of them; a shard answers for its
     // own, which is the only part of the application it has.
-    let subtree_of = |position: u64| -> Result<((usize, u64), quil_lattice_ct::confidential::relation::membership::Node)> {
+    let subtree_of = |position: u64| -> Result<(
+        (usize, u64),
+        quil_lattice_ct::confidential::relation::membership::Node,
+    )> {
         let (block, _) = super::coin_blocks::locate(position);
         let width = super::coin_blocks::creation_width(block);
         reported
             .iter()
-            .find(|(at_width, at, _, _)| *at_width == width && super::coin_blocks::shard_owns_block(at, block))
-            .map(|(width, shard, _, root)| Ok::<_, QuilError>((super::shard_accumulator::subtree_position(*width, shard)?, root.clone())))
+            .find(|(at_width, at, _, _)| {
+                *at_width == width && super::coin_blocks::shard_owns_block(at, block)
+            })
+            .map(|(width, shard, _, root)| {
+                Ok::<_, QuilError>((
+                    super::shard_accumulator::subtree_position(*width, shard)?,
+                    root.clone(),
+                ))
+            })
             .transpose()?
             .ok_or_else(|| unavailable("no shard has reported the subtree this coin is in"))
     };
@@ -105,7 +123,12 @@ pub fn canonical_witnesses(
             Some(blob) => {
                 let mut store_key = application.to_vec();
                 store_key.extend_from_slice(address);
-                match super::state::decode_stored_snapshot_coin(&context, application, &store_key, &blob)? {
+                match super::state::decode_stored_snapshot_coin(
+                    &context,
+                    application,
+                    &store_key,
+                    &blob,
+                )? {
                     None => coins.push((*address, None)),
                     Some(coin) => coins.push((*address, Some(coin.record(*address)))),
                 }
@@ -119,7 +142,13 @@ pub fn canonical_witnesses(
     let mut last = unavailable("this shard has not reported its coins yet; retry");
     for local_root in local_roots {
         if local_root.context != context
-            || !roots::accepts_root(local, network, application, local_root.depth, &local_root.root)?
+            || !roots::accepts_root(
+                local,
+                network,
+                application,
+                local_root.depth,
+                &local_root.root,
+            )?
         {
             continue;
         }
@@ -127,7 +156,10 @@ pub fn canonical_witnesses(
         let mut matches = true;
         for (address, record) in &coins {
             let Some(record) = record else {
-                witnesses.push(CoinWitness { address: *address, path: None });
+                witnesses.push(CoinWitness {
+                    address: *address,
+                    path: None,
+                });
                 continue;
             };
             let (mine, reported_subtree) = subtree_of(record.position)?;
@@ -137,17 +169,27 @@ pub fn canonical_witnesses(
                 Ok(path) if path.siblings.len() == depth => path,
                 // A coin newer than this root, or a root the index no longer
                 // serves: try an older one.
-                _ => { matches = false; break }
+                _ => {
+                    matches = false;
+                    break;
+                }
             };
             path.siblings.truncate(mine.0);
             path.right.truncate(mine.0);
             // The path so far must reach exactly the subtree the reports folded
             // in. It does not while a report is behind the coins asked for.
-            let owner = quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(&record.owner)
+            let owner =
+                quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(
+                    &record.owner,
+                )
                 .map_err(|_| unavailable("stored coin owner"))?;
             let mut node = key.leaf(&owner, &record.commitment);
             for (sibling, right) in path.siblings.iter().zip(&path.right) {
-                node = if *right { key.parent(sibling, &node) } else { key.parent(&node, sibling) };
+                node = if *right {
+                    key.parent(sibling, &node)
+                } else {
+                    key.parent(&node, sibling)
+                };
             }
             if node != reported_subtree {
                 matches = false;
@@ -155,10 +197,16 @@ pub fn canonical_witnesses(
             }
             path.siblings.extend(fold.siblings);
             path.right.extend(fold.right);
-            witnesses.push(CoinWitness { address: *address, path: Some(path) });
+            witnesses.push(CoinWitness {
+                address: *address,
+                path: Some(path),
+            });
         }
         if matches {
-            return Ok(Witnesses { root: canonical, coins: witnesses });
+            return Ok(Witnesses {
+                root: canonical,
+                coins: witnesses,
+            });
         }
         last = unavailable("this shard's report is behind the coins asked for; retry");
     }
@@ -216,11 +264,7 @@ pub fn committed_witnesses(
         let path = match tree.auth_path(address) {
             Ok(path) => Some(path),
             Err(quil_lattice_ct::confidential::coin_tree::TreeError::MissingCoin) => None,
-            Err(e) => {
-                return Err(QuilError::Internal(format!(
-                    "coin witness path: {e:?}"
-                )))
-            }
+            Err(e) => return Err(QuilError::Internal(format!("coin witness path: {e:?}"))),
         };
         coins.push(CoinWitness {
             address: *address,
@@ -233,18 +277,32 @@ pub fn committed_witnesses(
 /// Point-read witness serving against a retained canonical root. The index
 /// is local and untrusted; absence of an indexed node never means no coin.
 pub fn indexed_witnesses(
-    state: &HypergraphState, network: &[u8; 32], application: &[u8; 32],
-    addresses: &[[u8; 32]], root: RootRecord,
+    state: &HypergraphState,
+    network: &[u8; 32],
+    application: &[u8; 32],
+    addresses: &[[u8; 32]],
+    root: RootRecord,
     index: &super::witness_index::LocalWitnessIndex,
 ) -> Result<Witnesses> {
     use crate::hypergraph_state::vertex_adds_discriminator;
-    let unavailable = || QuilError::ExecutionUnavailable("coin witness index unavailable or stale; retry after synchronization".into());
-    if addresses.is_empty() || addresses.len() > 4 || addresses.len() > MAX_PRIVATE_COINS
-        || addresses.iter().collect::<BTreeSet<_>>().len() != addresses.len() {
-        return Err(QuilError::InvalidArgument("coin witness: invalid address count or duplicates".into()));
+    let unavailable = || {
+        QuilError::ExecutionUnavailable(
+            "coin witness index unavailable or stale; retry after synchronization".into(),
+        )
+    };
+    if addresses.is_empty()
+        || addresses.len() > 4
+        || addresses.len() > MAX_PRIVATE_COINS
+        || addresses.iter().collect::<BTreeSet<_>>().len() != addresses.len()
+    {
+        return Err(QuilError::InvalidArgument(
+            "coin witness: invalid address count or duplicates".into(),
+        ));
     }
     let context = quil_lattice_ct::confidential::transfer::parameter_context(network, application);
-    if root.context != context || !roots::accepts_root(state, network, application, root.depth, &root.root)? {
+    if root.context != context
+        || !roots::accepts_root(state, network, application, root.depth, &root.root)?
+    {
         return Err(unavailable());
     }
     let disc = vertex_adds_discriminator()?;
@@ -253,9 +311,13 @@ pub fn indexed_witnesses(
         let path = match state.get(application, address, &disc)? {
             None => None,
             Some(blob) => {
-                if blob.len() > 64 * 1024 { return Err(unavailable()); }
-                let mut key = application.to_vec(); key.extend_from_slice(address);
-                match super::state::decode_stored_snapshot_coin(&context, application, &key, &blob)? {
+                if blob.len() > 64 * 1024 {
+                    return Err(unavailable());
+                }
+                let mut key = application.to_vec();
+                key.extend_from_slice(address);
+                match super::state::decode_stored_snapshot_coin(&context, application, &key, &blob)?
+                {
                     None => None,
                     // Whether the coin is in the tree at this root is the
                     // index's answer to give: positions are block-partitioned,
@@ -264,9 +326,14 @@ pub fn indexed_witnesses(
                 }
             }
         };
-        coins.push(CoinWitness { address: *address, path });
+        coins.push(CoinWitness {
+            address: *address,
+            path,
+        });
     }
-    if !roots::accepts_root(state, network, application, root.depth, &root.root)? { return Err(unavailable()); }
+    if !roots::accepts_root(state, network, application, root.depth, &root.root)? {
+        return Err(unavailable());
+    }
     Ok(Witnesses { root, coins })
 }
 
@@ -289,16 +356,23 @@ mod tests {
     /// enter into it.
     #[test]
     fn a_canonical_witness_proves_against_the_root_every_shard_folds_into() {
-        use quil_lattice_ct::confidential::{coin_tree::CoinRecord, relation::membership::MembershipKey};
+        use quil_lattice_ct::confidential::{
+            coin_tree::CoinRecord, relation::membership::MembershipKey,
+        };
         let directory = tempfile::tempdir().unwrap();
-        let db: Arc<dyn quil_types::store::KvDb> = Arc::new(quil_store::RocksDb::open(directory.path()).unwrap());
+        let db: Arc<dyn quil_types::store::KvDb> =
+            Arc::new(quil_store::RocksDb::open(directory.path()).unwrap());
         let state = HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
             Arc::new(quil_hypergraph::testing::MemStore::new()),
             Arc::new(NoopInclusionProver),
         )));
         let (network, application) = ([1u8; 32], [2u8; 32]);
         let context = parameter_context(&network, &application);
-        let limits = SnapshotLimits { max_coins: 8, max_depth: 32, max_nodes: 1 << 12 };
+        let limits = SnapshotLimits {
+            max_coins: 8,
+            max_depth: 32,
+            max_nodes: 1 << 12,
+        };
         let disc = vertex_adds_discriminator().unwrap();
         // A coin address is a Poseidon image, which always begins `00`, so a
         // split on the first bits puts every coin in one child. Shards that
@@ -316,19 +390,34 @@ mod tests {
             }
             let output = Output {
                 owner: [seed | 1; IDENTITY_BYTES],
-                commitment: CommitmentKey::derive(&context).commit(5, &AmountOpening::from_seed(&context, &[seed; 32])),
+                commitment: CommitmentKey::derive(&context)
+                    .commit(5, &AmountOpening::from_seed(&context, &[seed; 32])),
                 memo: [0; 1115],
             };
             let (address, tree) = roots::stage_coin(
-                &state, &network, &application, &context, 0, &output, &mut staged, limits,
-            ).unwrap();
+                &state,
+                &network,
+                &application,
+                &context,
+                0,
+                &output,
+                &mut staged,
+                limits,
+            )
+            .unwrap();
             let block = super::super::coin_blocks::block_for_address(width, &address).unwrap();
             let wanted = match (
                 super::super::coin_blocks::shard_owns_block(&left, block),
                 super::super::coin_blocks::shard_owns_block(&right, block),
             ) {
-                (true, _) if !have_left => { have_left = true; true }
-                (_, true) if !have_right => { have_right = true; true }
+                (true, _) if !have_left => {
+                    have_left = true;
+                    true
+                }
+                (_, true) if !have_right => {
+                    have_right = true;
+                    true
+                }
                 _ => false,
             };
             if !wanted {
@@ -336,15 +425,30 @@ mod tests {
                 staged.entry(block).and_modify(|placed| *placed -= 1);
                 continue;
             }
-            state.set(&application, &address, &disc, 0,
-                quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap()).unwrap();
-            let stored = super::super::state::read_coin(&tree, &context).unwrap().unwrap();
+            state
+                .set(
+                    &application,
+                    &address,
+                    &disc,
+                    0,
+                    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap(),
+                )
+                .unwrap();
+            let stored = super::super::state::read_coin(&tree, &context)
+                .unwrap()
+                .unwrap();
             records.push(CoinRecord {
-                address, position: stored.position, owner: output.owner, commitment: output.commitment.clone(),
+                address,
+                position: stored.position,
+                owner: output.owner,
+                commitment: output.commitment.clone(),
             });
             addresses.push(address);
         }
-        assert!(have_left && have_right, "fixture needs a coin in each shard");
+        assert!(
+            have_left && have_right,
+            "fixture needs a coin in each shard"
+        );
         let local_root = roots::refresh_root(&state, &network, &application, limits).unwrap();
         state.commit().unwrap();
         state.abort();
@@ -353,40 +457,92 @@ mod tests {
         // Both shards report what this state holds of them, as their headers do.
         let filter = |shard: &[bool]| quil_forest::encode_shard_bit_path(&application, shard);
         for shard in [&left, &right] {
-            let report = super::super::shard_accumulator::shard_report(&state, &network, &application, shard, false)
-                .unwrap().expect("each shard holds a coin");
-            super::super::global_accumulator::materialize_report(&state, 10, &filter(shard), &report.encode().unwrap()).unwrap();
+            let report = super::super::shard_accumulator::shard_report(
+                &state,
+                &network,
+                &application,
+                shard,
+                false,
+            )
+            .unwrap()
+            .expect("each shard holds a coin");
+            super::super::global_accumulator::materialize_report(
+                &state,
+                10,
+                &filter(shard),
+                &report.encode().unwrap(),
+            )
+            .unwrap();
         }
 
-        let mut index = super::super::witness_index::LocalWitnessIndex::for_root(db.clone(), &local_root, 32).unwrap();
-        let empty = roots::refresh_root(&HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
-            Arc::new(quil_hypergraph::testing::MemStore::new()), Arc::new(NoopInclusionProver)))),
-            &network, &application, limits).unwrap();
+        let mut index =
+            super::super::witness_index::LocalWitnessIndex::for_root(db.clone(), &local_root, 32)
+                .unwrap();
+        let empty = roots::refresh_root(
+            &HypergraphState::new(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(NoopInclusionProver),
+            ))),
+            &network,
+            &application,
+            limits,
+        )
+        .unwrap();
         index.append(&empty, &local_root, &records).unwrap();
 
         let witnesses = canonical_witnesses(
-            &state, &state, &network, &application, &addresses, &[local_root.clone()], &index,
-        ).unwrap();
+            &state,
+            &state,
+            &network,
+            &application,
+            &addresses,
+            &[local_root.clone()],
+            &index,
+        )
+        .unwrap();
         assert_eq!(witnesses.root.depth, super::super::coin_blocks::DEPTH);
         assert_eq!(witnesses.root.coins, local_root.coins);
         let key = MembershipKey::derive(&context);
         let mut subtrees = std::collections::BTreeSet::new();
         for record in &records {
-            let witness = witnesses.coins.iter().find(|w| w.address == record.address).unwrap();
+            let witness = witnesses
+                .coins
+                .iter()
+                .find(|w| w.address == record.address)
+                .unwrap();
             let path = witness.path.as_ref().expect("the state holds the coin");
-            assert_eq!(path.siblings.len(), usize::from(super::super::coin_blocks::DEPTH));
+            assert_eq!(
+                path.siblings.len(),
+                usize::from(super::super::coin_blocks::DEPTH)
+            );
             let (block, _) = super::super::coin_blocks::locate(record.position);
             subtrees.insert(super::super::coin_blocks::shard_owns_block(&left, block));
             let mut node = key.leaf(
-                &quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(&record.owner).unwrap(),
+                &quil_lattice_ct::confidential::relation::membership::Node::from_identity_bytes(
+                    &record.owner,
+                )
+                .unwrap(),
                 &record.commitment,
             );
             for (sibling, right) in path.siblings.iter().zip(&path.right) {
-                node = if *right { key.parent(sibling, &node) } else { key.parent(&node, sibling) };
+                node = if *right {
+                    key.parent(sibling, &node)
+                } else {
+                    key.parent(&node, sibling)
+                };
             }
-            assert_eq!(node, witnesses.root.root, "coin {}", hex::encode(record.address));
+            assert_eq!(
+                node,
+                witnesses.root.root,
+                "coin {}",
+                hex::encode(record.address)
+            );
         }
-        assert_eq!(subtrees.len(), 2, "the coins came from both shards' subtrees");
+        assert_eq!(
+            subtrees.len(),
+            2,
+            "the coins came from both shards' subtrees"
+        );
     }
 
     #[test]
@@ -419,7 +575,14 @@ mod tests {
                 memo: [0; 1115],
             };
             let (address, tree) = roots::stage_coin(
-                &state, &network, &application, &context, 0, &output, &mut staged, limits.snapshot,
+                &state,
+                &network,
+                &application,
+                &context,
+                0,
+                &output,
+                &mut staged,
+                limits.snapshot,
             )
             .unwrap();
             state
@@ -441,8 +604,7 @@ mod tests {
             committed_witnesses(&state, &network, &application, &addresses, limits),
             Err(QuilError::NotFound(_))
         ));
-        let root =
-            roots::refresh_root(&state, &network, &application, limits.snapshot).unwrap();
+        let root = roots::refresh_root(&state, &network, &application, limits.snapshot).unwrap();
         addresses.push([0; 32]);
         let response =
             committed_witnesses(&state, &network, &application, &addresses, limits).unwrap();

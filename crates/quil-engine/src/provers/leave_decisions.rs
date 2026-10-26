@@ -36,53 +36,92 @@ impl LeaveDecisions {
             None => Vec::new(),
             Some(bytes) => {
                 if bytes.len() > 1_048_576 {
-                    return Err(QuilError::Store("leave decision journal exceeds size limit".into()));
+                    return Err(QuilError::Store(
+                        "leave decision journal exceeds size limit".into(),
+                    ));
                 }
-                let journal: Journal = serde_json::from_slice(&bytes)
-                    .map_err(|e| QuilError::Store(format!("invalid leave decision journal: {e}")))?;
-                if journal.version != 1 || journal.rejections.len() > 4096
-                    || journal.rejections.iter().any(|r| r.filter.is_empty() || r.filter.len() > 256
-                        || r.decision_epoch != quil_types::consensus::epoch_for_frame(r.leave_frame) + 1)
+                let journal: Journal = serde_json::from_slice(&bytes).map_err(|e| {
+                    QuilError::Store(format!("invalid leave decision journal: {e}"))
+                })?;
+                if journal.version != 1
+                    || journal.rejections.len() > 4096
+                    || journal.rejections.iter().any(|r| {
+                        r.filter.is_empty()
+                            || r.filter.len() > 256
+                            || r.decision_epoch
+                                != quil_types::consensus::epoch_for_frame(r.leave_frame) + 1
+                    })
                 {
-                    return Err(QuilError::Store("invalid leave decision journal records".into()));
+                    return Err(QuilError::Store(
+                        "invalid leave decision journal records".into(),
+                    ));
                 }
                 journal.rejections
             }
         };
-        let mut state = self.0.lock().map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
         state.rejections = rejections;
         state.store = Some((db, key));
         Ok(())
     }
 
     pub(crate) fn rejected(&self, filter: &[u8], leave_frame: u64, frame: u64) -> Result<bool> {
-        let state = self.0.lock().map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
+        let state = self
+            .0
+            .lock()
+            .map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        Ok(state.rejections.iter().any(|r| r.filter == filter && r.leave_frame == leave_frame
-            && r.decision_epoch == epoch))
+        Ok(state.rejections.iter().any(|r| {
+            r.filter == filter && r.leave_frame == leave_frame && r.decision_epoch == epoch
+        }))
     }
 
     /// Persist accepted plan decisions before dispatch. A failed write or WAL
     /// sync returns an error without changing memory or allowing publication.
     pub(crate) fn commit(&self, rejected: &[(Vec<u8>, u64)], frame: u64) -> Result<()> {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let mut state = self.0.lock().map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
-        let mut next: Vec<Rejection> = state.rejections.iter()
-            .filter(|r| r.decision_epoch >= epoch).cloned().collect();
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| QuilError::Internal("leave decision lock poisoned".into()))?;
+        let mut next: Vec<Rejection> = state
+            .rejections
+            .iter()
+            .filter(|r| r.decision_epoch >= epoch)
+            .cloned()
+            .collect();
         for (filter, leave_frame) in rejected {
-            let record = Rejection { filter: filter.clone(), leave_frame: *leave_frame, decision_epoch: epoch };
-            if !next.contains(&record) { next.push(record); }
+            let record = Rejection {
+                filter: filter.clone(),
+                leave_frame: *leave_frame,
+                decision_epoch: epoch,
+            };
+            if !next.contains(&record) {
+                next.push(record);
+            }
         }
-        if next == state.rejections { return Ok(()); }
+        if next == state.rejections {
+            return Ok(());
+        }
         if next.len() > 4096 {
             return Err(QuilError::Store("too many pending leave decisions".into()));
         }
         if let Some((db, key)) = &state.store {
-            let bytes = serde_json::to_vec(&Journal { version: 1, rejections: next.clone() })
-                .map_err(|e| QuilError::Store(e.to_string()))?;
+            let bytes = serde_json::to_vec(&Journal {
+                version: 1,
+                rejections: next.clone(),
+            })
+            .map_err(|e| QuilError::Store(e.to_string()))?;
             let inner = db.inner();
-            inner.put(key, bytes).map_err(|e| QuilError::Store(e.to_string()))?;
-            inner.flush_wal(true).map_err(|e| QuilError::Store(e.to_string()))?;
+            inner
+                .put(key, bytes)
+                .map_err(|e| QuilError::Store(e.to_string()))?;
+            inner
+                .flush_wal(true)
+                .map_err(|e| QuilError::Store(e.to_string()))?;
         }
         state.rejections = next;
         Ok(())
@@ -95,8 +134,11 @@ mod tests {
 
     fn directory() -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!("leave-decisions-{}-{}", std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+        std::env::temp_dir().join(format!(
+            "leave-decisions-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     #[test]
@@ -127,7 +169,12 @@ mod tests {
         let path = directory();
         drop(quil_store::RocksDb::open(&path).unwrap());
         let decisions = LeaveDecisions::default();
-        decisions.attach(Arc::new(quil_store::RocksDb::open_for_read_only(&path).unwrap()), &[7; 32]).unwrap();
+        decisions
+            .attach(
+                Arc::new(quil_store::RocksDb::open_for_read_only(&path).unwrap()),
+                &[7; 32],
+            )
+            .unwrap();
         assert!(decisions.commit(&[(vec![1], 90)], 800).is_err());
         assert!(!decisions.rejected(&[1], 90, 800).unwrap());
         drop(decisions);

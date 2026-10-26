@@ -27,41 +27,41 @@ mod release_check;
 
 mod util;
 
-mod direct_global_consensus_publisher;
 mod cw_consensus_bridge;
+mod direct_global_consensus_publisher;
 
 mod dht_node;
 
-mod worker_node;
-#[cfg(feature = "confidential-tokens")]
-mod witness_index;
 #[cfg(feature = "confidential-tokens")]
 mod legacy_index;
+#[cfg(feature = "confidential-tokens")]
+mod witness_index;
+mod worker_node;
 
 #[cfg(feature = "native-proof")]
 mod proof_worker;
 
-mod diagnostic;
+mod adopt_prover_root;
 mod check_bootstrap;
 mod check_submit;
-mod fork_ladder;
-mod verify_migration;
-mod forest_migration;
-mod storage_history;
+mod coin_receipt_repair;
 mod consensus_settings;
+mod diagnostic;
 mod dry_run_reset;
 mod dump_shard_state;
+mod forest_migration;
+mod fork_ladder;
 mod gen0_preflight;
-mod reclaim_legacy_forest;
-mod test_prover_sync;
-mod query_shards;
-mod adopt_prover_root;
-mod unified_consolidation;
 mod legacy_migration;
-mod coin_receipt_repair;
+mod query_shards;
+mod reclaim_legacy_forest;
+mod storage_history;
+mod test_prover_sync;
+mod unified_consolidation;
+mod verify_migration;
 
-mod master_node;
 mod clock_retention;
+mod master_node;
 
 mod mem_stats;
 mod storage_watch;
@@ -387,7 +387,9 @@ fn main() -> anyhow::Result<ExitCode> {
     #[cfg(feature = "native-proof")]
     if std::env::args().nth(1).as_deref() == Some(proof_worker::WORKER_MODE_ARG) {
         let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(quil_lattice_ct::confidential::relation::backend::worker_request::run_worker(&args));
+        std::process::exit(
+            quil_lattice_ct::confidential::relation::backend::worker_request::run_worker(&args),
+        );
     }
     node_main()
 }
@@ -448,11 +450,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // `--metrics` (Go parity): dial the RUNNING node's gRPC GetMetrics and
     // print the full prometheus snapshot (optionally `--metrics-filter`).
     if args.metrics {
-        return match diagnostic::print_metrics_from_node(
-            &config,
-            args.metrics_filter.as_deref(),
-        )
-        .await
+        return match diagnostic::print_metrics_from_node(&config, args.metrics_filter.as_deref())
+            .await
         {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
@@ -505,8 +504,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         fkm.set_peer_priv_key_hex(&cfg.p2p.peer_priv_key);
         fkm.ensure_standard_keys()?;
         use quil_keys::KeyManager as _;
-        let bls_pubkey =
-            fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
+        let bls_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
         // The consensus committee identity IS the proving key: prover and
         // commonware-simplex committee roles share one Falcon-512 key. Emit it
         // under CONSENSUS_PUBKEY (equal to BLS_PUBKEY) so genesis tooling can
@@ -534,8 +532,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // or starting the node. Used to bootstrap a node's consensus identity for a
     // committee list.
     if args.generate_keys {
-        let keys_path =
-            quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)?;
+        let keys_path = quil_keys::resolve_keystore_path(&config.key.key_store_file, &args.config)?;
         let proving_key_id = if config.engine.proving_key_id.is_empty() {
             "default-proving-key".to_string()
         } else {
@@ -565,14 +562,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // while our exposition also appends the p2p `prometheus-client`
     // families (blossomsub_* / libp2p_*) via
     // `rpc_metrics::extra_metrics_render` — one endpoint, both stacks.
-    let prometheus_http_addr: Option<std::net::SocketAddr> =
-        args.prometheus_server.as_ref().and_then(|addr| {
-            match addr.parse::<std::net::SocketAddr>() {
-                Ok(sock) => Some(sock),
-                Err(e) => {
-                    warn!(addr = %addr, error = %e, "invalid prometheus address, no HTTP listener");
-                    None
-                }
+    let prometheus_http_addr: Option<std::net::SocketAddr> = args
+        .prometheus_server
+        .as_ref()
+        .and_then(|addr| match addr.parse::<std::net::SocketAddr>() {
+            Ok(sock) => Some(sock),
+            Err(e) => {
+                warn!(addr = %addr, error = %e, "invalid prometheus address, no HTTP listener");
+                None
             }
         });
     let metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle> = {
@@ -607,8 +604,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // Build the supervisor that owns every long-running task in the
     // binary. Each spawned task is joined, so panics or task errors
     // propagate up to `sup.run()` instead of being silently swallowed.
-    let mut sup = Supervisor::<anyhow::Error>::new()
-        .with_shutdown_timeout(Duration::from_secs(10));
+    let mut sup = Supervisor::<anyhow::Error>::new().with_shutdown_timeout(Duration::from_secs(10));
 
     // Metrics upkeep: the recorder's histogram buckets need periodic
     // run_upkeep() to evict old samples. Missing this results in
@@ -751,60 +747,76 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     // Before any shard engine runs: shard frames anchored below this frame
     // relay nothing, as the mainnet build that made them did.
-    let release_from = quil_execution::token_intrinsic::global_commit::init_orphan_replacement_frame(args.network);
-    info!(release_activation_frame = release_from, "release activation frame");
-    let relay_from = quil_execution::token_intrinsic::global_commit::init_relay_activation_frame(args.network);
+    let release_from =
+        quil_execution::token_intrinsic::global_commit::init_orphan_replacement_frame(args.network);
+    info!(
+        release_activation_frame = release_from,
+        "release activation frame"
+    );
+    let relay_from =
+        quil_execution::token_intrinsic::global_commit::init_relay_activation_frame(args.network);
     info!(
         relay_activation_frame = %if relay_from == u64::MAX { "never (release frame unset)".to_string() } else { relay_from.to_string() },
         "application shard relay records"
     );
-    let seal_drain_from = quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
+    let seal_drain_from =
+        quil_execution::global_intrinsic::handoff::init_seal_drain_frame(args.network);
     info!(
         seal_drain_frame = %if seal_drain_from == u64::MAX { "never".to_string() } else { seal_drain_from.to_string() },
         "committee handoff seals carrying their drain headers"
     );
-    let seal_recovery_from = quil_execution::global_intrinsic::handoff::init_seal_recovery_frame(args.network);
+    let seal_recovery_from =
+        quil_execution::global_intrinsic::handoff::init_seal_recovery_frame(args.network);
     info!(
         seal_recovery_frame = %if seal_recovery_from == u64::MAX { "never".to_string() } else { seal_recovery_from.to_string() },
         "committee handoff partial drains and base re-seals"
     );
-    let seal_checkpoint_drain_from = quil_execution::global_intrinsic::handoff::init_seal_checkpoint_drain_frame(args.network);
+    let seal_checkpoint_drain_from =
+        quil_execution::global_intrinsic::handoff::init_seal_checkpoint_drain_frame(args.network);
     info!(
         seal_checkpoint_drain_frame = %if seal_checkpoint_drain_from == u64::MAX { "never".to_string() } else { seal_checkpoint_drain_from.to_string() },
         "committee handoff drains of checkpoint frames certified only by their seal"
     );
-    let session_leader_no_drain_from = quil_engine::shard_drain::init_session_leader_no_drain_frame(args.network);
+    let session_leader_no_drain_from =
+        quil_engine::shard_drain::init_session_leader_no_drain_frame(args.network);
     info!(
         session_leader_no_drain_frame = %if session_leader_no_drain_from == u64::MAX { "never".to_string() } else { session_leader_no_drain_from.to_string() },
         "committee session leaders proposing content on shards a frozen grid names retired"
     );
     let fenced_successor_eligibility_from =
-        quil_execution::global_intrinsic::handoff::init_fenced_successor_eligibility_frame(args.network);
+        quil_execution::global_intrinsic::handoff::init_fenced_successor_eligibility_frame(
+            args.network,
+        );
     info!(
         fenced_successor_eligibility_frame = %if fenced_successor_eligibility_from == u64::MAX { "never".to_string() } else { fenced_successor_eligibility_from.to_string() },
         "committee handoff fenced membership successors from current eligibility"
     );
-    let presence_report_from = quil_execution::global_intrinsic::handoff::init_presence_report_frame(args.network);
+    let presence_report_from =
+        quil_execution::global_intrinsic::handoff::init_presence_report_frame(args.network);
     info!(
         presence_report_frame = %if presence_report_from == u64::MAX { "never".to_string() } else { presence_report_from.to_string() },
         "committee presence reports validated"
     );
-    let presence_credit_from = quil_execution::global_intrinsic::handoff::init_presence_credit_frame(args.network);
+    let presence_credit_from =
+        quil_execution::global_intrinsic::handoff::init_presence_credit_frame(args.network);
     info!(
         presence_credit_frame = %if presence_credit_from == u64::MAX { "never".to_string() } else { presence_credit_from.to_string() },
         "committee presence reports recorded and credited as activity"
     );
-    let presence_exclusion_from = quil_execution::global_intrinsic::handoff::init_presence_exclusion_frame(args.network);
+    let presence_exclusion_from =
+        quil_execution::global_intrinsic::handoff::init_presence_exclusion_frame(args.network);
     info!(
         presence_exclusion_frame = %if presence_exclusion_from == u64::MAX { "never".to_string() } else { presence_exclusion_from.to_string() },
         "committee successors leaving out members recorded absent from a stalled session"
     );
-    let early_fence_from = quil_execution::global_intrinsic::handoff::init_early_fence_frame(args.network);
+    let early_fence_from =
+        quil_execution::global_intrinsic::handoff::init_early_fence_frame(args.network);
     info!(
         early_fence_frame = %if early_fence_from == u64::MAX { "never".to_string() } else { early_fence_from.to_string() },
         "committee handoff fences of unsealed closing sessions one epoch after their request"
     );
-    let leaver_currency_from = quil_execution::prover_registry::init_leaver_currency_frame(args.network);
+    let leaver_currency_from =
+        quil_execution::prover_registry::init_leaver_currency_frame(args.network);
     info!(
         leaver_currency_frame = %if leaver_currency_from == u64::MAX { "never".to_string() } else { leaver_currency_from.to_string() },
         "committees counting a leaving allocation only if it was current when it left"
@@ -826,13 +838,21 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         },
         "committee sessions seating only provers that recorded the minimum release, from each step's frame"
     );
-    let batch_shields_from = quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
+    let batch_shields_from =
+        quil_execution::token_intrinsic::global_commit::init_batch_shield_frame(args.network);
     info!(
         batch_shield_frame = %if batch_shields_from == u64::MAX { "never".to_string() } else { batch_shields_from.to_string() },
         "batch shields and shield source coverage"
     );
-    if let Some(frame) = quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(args.network) {
-        tracing::warn!(pre_registration_frame = frame, "QUIL_PRE_REGISTRATION_FRAME override active (test networks only)");
+    if let Some(frame) =
+        quil_execution::global_intrinsic::leaf_root_registration::init_pre_registration_frame(
+            args.network,
+        )
+    {
+        tracing::warn!(
+            pre_registration_frame = frame,
+            "QUIL_PRE_REGISTRATION_FRAME override active (test networks only)"
+        );
     }
 
     // Verify the binary against `.dgst` + per-signatory `.dgst.sig.N`
@@ -916,7 +936,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref store) = args.prover_shard_dump {
         consensus_settings::initialize(args.network);
-        let show = match args.prover_shard_show.iter().map(hex::decode).collect::<Result<Vec<_>, _>>() {
+        let show = match args
+            .prover_shard_show
+            .iter()
+            .map(hex::decode)
+            .collect::<Result<Vec<_>, _>>()
+        {
             Ok(show) => show,
             Err(e) => {
                 eprintln!("--prover-shard-show: {e}");
@@ -924,7 +949,13 @@ async fn node_main() -> anyhow::Result<ExitCode> {
             }
         };
         let mut out = std::io::BufWriter::new(std::io::stdout());
-        return match gen0_preflight::prover_shard_dump(store, args.network, args.gen0_preflight_live, &show, &mut out) {
+        return match gen0_preflight::prover_shard_dump(
+            store,
+            args.network,
+            args.gen0_preflight_live,
+            &show,
+            &mut out,
+        ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -935,7 +966,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref store) = args.global_frame_history {
         consensus_settings::initialize(args.network);
-        let records = match args.prover_shard_show.iter().map(hex::decode).collect::<Result<Vec<_>, _>>() {
+        let records = match args
+            .prover_shard_show
+            .iter()
+            .map(hex::decode)
+            .collect::<Result<Vec<_>, _>>()
+        {
             Ok(records) => records,
             Err(e) => {
                 eprintln!("--prover-shard-show: {e}");
@@ -943,7 +979,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
             }
         };
         let mut out = std::io::BufWriter::new(std::io::stdout());
-        return match gen0_preflight::global_frame_history(store, args.network, args.gen0_preflight_live, args.history_from, &records, &mut out) {
+        return match gen0_preflight::global_frame_history(
+            store,
+            args.network,
+            args.gen0_preflight_live,
+            args.history_from,
+            &records,
+            &mut out,
+        ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -954,7 +997,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
 
     if let Some(ref store) = args.global_halt_report {
         consensus_settings::initialize(args.network);
-        return match gen0_preflight::global_halt_report(store, args.network, args.gen0_preflight_live, &mut std::io::stdout()) {
+        return match gen0_preflight::global_halt_report(
+            store,
+            args.network,
+            args.gen0_preflight_live,
+            &mut std::io::stdout(),
+        ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -967,7 +1015,12 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         // The node's epoch length and handoff policy for this network, so the
         // preflight judges the registering epoch by the epochs GLOBAL uses.
         consensus_settings::initialize(args.network);
-        let resume_after = match args.gen0_preflight_resume_after.as_deref().map(hex::decode).transpose() {
+        let resume_after = match args
+            .gen0_preflight_resume_after
+            .as_deref()
+            .map(hex::decode)
+            .transpose()
+        {
             Ok(filter) => filter,
             Err(e) => {
                 eprintln!("--gen0-preflight-resume-after: {e}");
@@ -1030,7 +1083,14 @@ async fn node_main() -> anyhow::Result<ExitCode> {
             commit: args.adopt_commit,
             any_frame: args.adopt_any_frame,
         };
-        return match adopt_prover_root::run_adopt_prover_root(adopt, &config, &args.config, args.network).await {
+        return match adopt_prover_root::run_adopt_prover_root(
+            adopt,
+            &config,
+            &args.config,
+            args.network,
+        )
+        .await
+        {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -1057,7 +1117,8 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     }
 
     if let Some(ref archive_addr) = args.query_prover_root {
-        return match query_shards::run_query_prover_root(archive_addr, &config, &args.config).await {
+        return match query_shards::run_query_prover_root(archive_addr, &config, &args.config).await
+        {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 eprintln!("{e}");
@@ -1223,8 +1284,7 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         }
         ShutdownReason::JoinError(name, e) => {
             error!(task = %name, error = %e, "supervised task join failed");
-            Err(anyhow::Error::from(e)
-                .context(format!("supervised task {name:?} join failed")))
+            Err(anyhow::Error::from(e).context(format!("supervised task {name:?} join failed")))
         }
     };
 
@@ -1253,11 +1313,20 @@ mod startup_tests {
         const CHILD: &str = "QUIL_TEST_COLD_CLUSTER_TLS";
         if std::env::var_os(CHILD).is_none() {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "startup_tests::cluster_tls_initializes_provider_in_fresh_process", "--nocapture"])
+                .args([
+                    "--exact",
+                    "startup_tests::cluster_tls_initializes_provider_in_fresh_process",
+                    "--nocapture",
+                ])
                 .env(CHILD, "1")
-                .output().unwrap();
-            assert!(result.status.success(), "cold TLS startup failed:\n{}\n{}",
-                String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "cold TLS startup failed:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
             return;
         }
         // A previous TLS test must not mask the production startup ordering.
@@ -1268,12 +1337,19 @@ mod startup_tests {
         let identity = tonic::transport::Identity::from_pem(cert.leaf_cert_pem, cert.leaf_key_pem);
         let ca = tonic::transport::Certificate::from_pem(cert.ca_cert_pem);
         tonic::transport::Endpoint::from_static("https://127.0.0.1:1")
-            .tls_config(tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(ca.clone()).identity(identity.clone()).domain_name("quil-worker"))
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(ca.clone())
+                    .identity(identity.clone())
+                    .domain_name("quil-worker"),
+            )
             .unwrap();
         tonic::transport::Server::builder()
-            .tls_config(tonic::transport::ServerTlsConfig::new()
-                .client_ca_root(ca).identity(identity))
+            .tls_config(
+                tonic::transport::ServerTlsConfig::new()
+                    .client_ca_root(ca)
+                    .identity(identity),
+            )
             .unwrap();
     }
 }

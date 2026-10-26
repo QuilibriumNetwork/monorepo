@@ -1,10 +1,7 @@
 //! Bounded QUIL reward witnesses checked against a canonical global frame.
 #[cfg(test)]
 use crate::hypergraph_state::vertex_adds_discriminator;
-use crate::{
-    domains, global_schema,
-    hypergraph_state::HypergraphState,
-};
+use crate::{domains, global_schema, hypergraph_state::HypergraphState};
 use quil_types::{
     error::{QuilError, Result},
     store::{ClockStore, RewardWitnessData},
@@ -92,7 +89,11 @@ pub fn newest_retained_global_root(
         let header = if number == latest.frame_number {
             latest.clone()
         } else {
-            match clock.get_global_clock_frame(number).ok().and_then(|frame| frame.header) {
+            match clock
+                .get_global_clock_frame(number)
+                .ok()
+                .and_then(|frame| frame.header)
+            {
                 Some(header) => header,
                 None => continue,
             }
@@ -302,7 +303,10 @@ mod tests {
 pub fn derive_pomw_addressing(
     tx_domain: &[u8],
     owner_prover_address: &[u8],
-) -> Result<(/* prover_root_domain */ [u8; 32], /* leaf_owner_address */ [u8; 32])> {
+) -> Result<(
+    /* prover_root_domain */ [u8; 32],
+    /* leaf_owner_address */ [u8; 32],
+)> {
     if tx_domain.len() != 32 {
         return Err(QuilError::InvalidArgument(format!(
             "pomw: tx domain must be 32 bytes, got {}",

@@ -21,24 +21,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-
 use quil_types::error::{QuilError, Result};
 
 use quil_execution::global_engine::{
-    TYPE_PROVER_JOIN, TYPE_PROVER_LEAVE,
-    TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME, TYPE_PROVER_CONFIRM,
-    TYPE_PROVER_REJECT, TYPE_PROVER_KICK, TYPE_PROVER_UPDATE,
-    TYPE_FRAME_HEADER, TYPE_SENIORITY_MERGE, TYPE_SHARD_SPLIT,
-    TYPE_SHARD_MERGE,
+    TYPE_FRAME_HEADER, TYPE_PROVER_CONFIRM, TYPE_PROVER_JOIN, TYPE_PROVER_KICK, TYPE_PROVER_LEAVE,
+    TYPE_PROVER_PAUSE, TYPE_PROVER_REJECT, TYPE_PROVER_RESUME, TYPE_PROVER_UPDATE,
+    TYPE_SENIORITY_MERGE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
 use quil_execution::global_intrinsic::consensus_types::{
-    TYPE_GLOBAL_PROPOSAL, TYPE_APP_SHARD_PROPOSAL,
-    TYPE_QUORUM_CERTIFICATE, TYPE_TIMEOUT_STATE, TYPE_TIMEOUT_CERTIFICATE,
+    TYPE_APP_SHARD_PROPOSAL, TYPE_GLOBAL_PROPOSAL, TYPE_QUORUM_CERTIFICATE,
+    TYPE_TIMEOUT_CERTIFICATE, TYPE_TIMEOUT_STATE,
 };
 use quil_execution::hypergraph_engine::is_hypergraph_type_prefix;
 use quil_execution::message_envelope::{
-    CanonicalMessageRequest,
-    TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
+    CanonicalMessageRequest, TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST,
 };
 
 /// Classification of an incoming message for routing purposes.
@@ -100,19 +96,30 @@ pub fn classify_message(data: &[u8]) -> Result<MessageRoute> {
 
 fn classify_inner_type(tp: u32) -> Result<MessageRoute> {
     // Consensus messages
-    if matches!(tp,
-        TYPE_GLOBAL_PROPOSAL | TYPE_APP_SHARD_PROPOSAL |
-        TYPE_QUORUM_CERTIFICATE | TYPE_TIMEOUT_STATE |
-        TYPE_TIMEOUT_CERTIFICATE | TYPE_PROPOSAL_VOTE
+    if matches!(
+        tp,
+        TYPE_GLOBAL_PROPOSAL
+            | TYPE_APP_SHARD_PROPOSAL
+            | TYPE_QUORUM_CERTIFICATE
+            | TYPE_TIMEOUT_STATE
+            | TYPE_TIMEOUT_CERTIFICATE
+            | TYPE_PROPOSAL_VOTE
     ) {
         return Ok(MessageRoute::Consensus);
     }
 
     // Global prover ops
-    if matches!(tp,
-        TYPE_PROVER_JOIN | TYPE_PROVER_LEAVE | TYPE_PROVER_PAUSE |
-        TYPE_PROVER_RESUME | TYPE_PROVER_CONFIRM | TYPE_PROVER_REJECT |
-        TYPE_PROVER_KICK | TYPE_PROVER_UPDATE | TYPE_SENIORITY_MERGE
+    if matches!(
+        tp,
+        TYPE_PROVER_JOIN
+            | TYPE_PROVER_LEAVE
+            | TYPE_PROVER_PAUSE
+            | TYPE_PROVER_RESUME
+            | TYPE_PROVER_CONFIRM
+            | TYPE_PROVER_REJECT
+            | TYPE_PROVER_KICK
+            | TYPE_PROVER_UPDATE
+            | TYPE_SENIORITY_MERGE
     ) {
         return Ok(MessageRoute::GlobalProverOp);
     }
@@ -431,7 +438,11 @@ pub fn validator_global_consensus() -> TopicValidator {
             cw::TIMEOUT_STATE_TYPE => cw::TimeoutState::from_canonical_bytes(data).is_ok(),
             _ => return Reject("cons_bad_type"),
         };
-        if decoded { Accept } else { Reject("cons_decode_failed") }
+        if decoded {
+            Accept
+        } else {
+            Reject("cons_decode_failed")
+        }
     })
 }
 
@@ -442,7 +453,10 @@ mod tests {
     #[test]
     fn classify_prover_join() {
         let bytes = TYPE_PROVER_JOIN.to_be_bytes();
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::GlobalProverOp);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::GlobalProverOp
+        );
     }
 
     #[test]
@@ -460,13 +474,19 @@ mod tests {
     #[test]
     fn classify_frame_header() {
         let bytes = TYPE_FRAME_HEADER.to_be_bytes();
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::ShardManagement);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::ShardManagement
+        );
     }
 
     #[test]
     fn classify_vertex_add() {
         let bytes = 0x0404u32.to_be_bytes(); // TYPE_VERTEX_ADD
-        assert_eq!(classify_message(&bytes).unwrap(), MessageRoute::HypergraphOp);
+        assert_eq!(
+            classify_message(&bytes).unwrap(),
+            MessageRoute::HypergraphOp
+        );
     }
 
     #[test]
@@ -543,7 +563,10 @@ mod tests {
             bitmasks::GLOBAL_PEER_INFO.to_vec(),
             validator_global_peer_info(),
         );
-        let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+        let outcome = r.route(
+            bitmasks::GLOBAL_PEER_INFO,
+            &[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00],
+        );
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));
         assert!(!outcome.should_dispatch());
     }
@@ -568,7 +591,7 @@ mod tests {
             ..Default::default()
         };
         let pubkey = vec![0xBB; 57]; // 57 == Ed448 pubkey length
-        let sig = vec![0xCC; 114];   // 114 == Ed448 signature length
+        let sig = vec![0xCC; 114]; // 114 == Ed448 signature length
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
@@ -611,7 +634,11 @@ mod tests {
         let bytes = quil_p2p::encode_canonical_peer_info(&info, &pubkey_bytes, &sig);
 
         let outcome = r.route(bitmasks::GLOBAL_PEER_INFO, &bytes);
-        assert_eq!(outcome, RouteOutcome::Accepted, "well-formed PeerInfo must be accepted");
+        assert_eq!(
+            outcome,
+            RouteOutcome::Accepted,
+            "well-formed PeerInfo must be accepted"
+        );
         assert!(outcome.should_dispatch());
     }
 
@@ -639,10 +666,7 @@ mod tests {
     #[test]
     fn router_global_prover_validator_accepts_known_op() {
         let r = MessageRouter::new();
-        r.register_validator(
-            bitmasks::GLOBAL_PROVER.to_vec(),
-            validator_global_prover(),
-        );
+        r.register_validator(bitmasks::GLOBAL_PROVER.to_vec(), validator_global_prover());
         // ProverJoin type prefix as the leading 4 bytes is enough for
         // the validator (it checks the prefix only, since the prover
         // op decoders live in another crate and we don't want to drag
@@ -655,10 +679,7 @@ mod tests {
     #[test]
     fn router_global_prover_validator_rejects_garbage() {
         let r = MessageRouter::new();
-        r.register_validator(
-            bitmasks::GLOBAL_PROVER.to_vec(),
-            validator_global_prover(),
-        );
+        r.register_validator(bitmasks::GLOBAL_PROVER.to_vec(), validator_global_prover());
         // 0xFFFFFFFF isn't any known prover op type.
         let outcome = r.route(bitmasks::GLOBAL_PROVER, &[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(matches!(outcome, RouteOutcome::Rejected(_)));

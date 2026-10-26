@@ -186,8 +186,7 @@ mod tests {
             max_nodes: 4,
         };
         let root =
-            super::super::roots::refresh_root(&state, &network, &application, limits)
-                .unwrap();
+            super::super::roots::refresh_root(&state, &network, &application, limits).unwrap();
         assert_eq!(root.coins, 0);
         let occupied = marker_address(&network, &application, &[8; IDENTITY_BYTES]).unwrap();
         state

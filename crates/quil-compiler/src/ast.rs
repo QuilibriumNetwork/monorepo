@@ -222,20 +222,11 @@ pub enum Stmt {
         values: Vec<Expr>,
     },
     /// Expression statement.
-    ExprStmt {
-        loc: Point,
-        expr: Expr,
-    },
+    ExprStmt { loc: Point, expr: Expr },
     /// Increment (++).
-    Increment {
-        loc: Point,
-        expr: Expr,
-    },
+    Increment { loc: Point, expr: Expr },
     /// Decrement (--).
-    Decrement {
-        loc: Point,
-        expr: Expr,
-    },
+    Decrement { loc: Point, expr: Expr },
     /// Compound assignment (+=, -=, etc.).
     CompoundAssign {
         loc: Point,
@@ -268,15 +259,9 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     /// Return.
-    Return {
-        loc: Point,
-        values: Vec<Expr>,
-    },
+    Return { loc: Point, values: Vec<Expr> },
     /// Block.
-    Block {
-        loc: Point,
-        body: Vec<Stmt>,
-    },
+    Block { loc: Point, body: Vec<Stmt> },
 }
 
 impl Stmt {

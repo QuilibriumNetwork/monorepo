@@ -85,10 +85,9 @@ pub fn global_engine_cost(_message: &[u8]) -> BigInt {
 // Re-export type-prefix constants from the canonical-bytes modules
 // where they are defined alongside their structs.
 pub use crate::global_intrinsic::{
-    TYPE_PROVER_JOIN, TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE,
-    TYPE_PROVER_RESUME, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT,
-    TYPE_PROVER_KICK, TYPE_PROVER_UPDATE, TYPE_SENIORITY_MERGE,
-    TYPE_SHARD_SPLIT, TYPE_SHARD_MERGE, TYPE_FRAME_HEADER,
+    TYPE_FRAME_HEADER, TYPE_PROVER_CONFIRM, TYPE_PROVER_JOIN, TYPE_PROVER_KICK, TYPE_PROVER_LEAVE,
+    TYPE_PROVER_PAUSE, TYPE_PROVER_REJECT, TYPE_PROVER_RESUME, TYPE_PROVER_UPDATE,
+    TYPE_SENIORITY_MERGE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
 
 pub use crate::global_intrinsic::handoff::{TYPE_COMMITTEE_HANDOFF, TYPE_PRESENCE_REPORT};
@@ -414,8 +413,7 @@ mod tests {
     #[test]
     fn all_global_kinds_have_distinct_labels() {
         use std::collections::HashSet;
-        let labels: HashSet<&str> =
-            MessageKindGlobal::all().iter().map(|k| k.label()).collect();
+        let labels: HashSet<&str> = MessageKindGlobal::all().iter().map(|k| k.label()).collect();
         assert_eq!(labels.len(), 15);
     }
 
@@ -430,13 +428,13 @@ mod tests {
         assert_eq!(MessageKindGlobal::ProverKick.label(), "prover_kick");
         assert_eq!(MessageKindGlobal::ProverUpdate.label(), "prover_update");
         assert_eq!(MessageKindGlobal::Shard.label(), "shard");
-        assert_eq!(
-            MessageKindGlobal::SeniorityMerge.label(),
-            "seniority_merge"
-        );
+        assert_eq!(MessageKindGlobal::SeniorityMerge.label(), "seniority_merge");
         assert_eq!(MessageKindGlobal::ShardSplit.label(), "shard_split");
         assert_eq!(MessageKindGlobal::ShardMerge.label(), "shard_merge");
-        assert_eq!(MessageKindGlobal::CommitteeHandoff.label(), "committee_handoff");
+        assert_eq!(
+            MessageKindGlobal::CommitteeHandoff.label(),
+            "committee_handoff"
+        );
         assert_eq!(MessageKindGlobal::PresenceReport.label(), "presence_report");
     }
 

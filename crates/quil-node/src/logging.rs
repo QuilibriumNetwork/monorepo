@@ -20,8 +20,8 @@ use tracing_subscriber::fmt::{
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 
 // Worker threads are pinned to one OS thread; a thread-local
 // `core_id` covers every event the worker emits between `.await`
@@ -186,7 +186,13 @@ where
                 // possible; keep the module target as the prefix so
                 // users can grep e.g. `quil_node/main.rs`.
                 let short = short_caller(file);
-                write!(writer, "{}/{}:{}\t", target.split("::").next().unwrap_or(target), short, line)?;
+                write!(
+                    writer,
+                    "{}/{}:{}\t",
+                    target.split("::").next().unwrap_or(target),
+                    short,
+                    line
+                )?;
             }
             (_, Some(line)) => write!(writer, "{}:{}\t", target, line)?,
             _ => write!(writer, "{}\t", target)?,
@@ -226,7 +232,9 @@ where
                             if !key.is_empty() && !fields.contains_key(&key) {
                                 fields.insert(
                                     key,
-                                    serde_json::Value::String(v.trim().trim_matches('"').to_string()),
+                                    serde_json::Value::String(
+                                        v.trim().trim_matches('"').to_string(),
+                                    ),
                                 );
                             }
                         }
@@ -235,8 +243,7 @@ where
             }
         }
 
-        let json = serde_json::to_string(&fields)
-            .unwrap_or_else(|_| "{}".to_string());
+        let json = serde_json::to_string(&fields).unwrap_or_else(|_| "{}".to_string());
         writeln!(writer, "{}", json)?;
         Ok(())
     }
@@ -283,10 +290,8 @@ impl tracing::field::Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(cleaned);
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::String(cleaned),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::Value::String(cleaned));
         }
     }
 
@@ -305,15 +310,14 @@ impl tracing::field::Visit for FieldCollector {
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.fields.insert(
-            field.name().to_string(),
-            serde_json::Value::Bool(value),
-        );
+        self.fields
+            .insert(field.name().to_string(), serde_json::Value::Bool(value));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
         if let Some(n) = serde_json::Number::from_f64(value) {
-            self.fields.insert(field.name().to_string(), serde_json::Value::Number(n));
+            self.fields
+                .insert(field.name().to_string(), serde_json::Value::Number(n));
         }
     }
 }
@@ -370,8 +374,7 @@ pub fn build_env_filter(
         directives.push(c.to_string());
     }
     let joined = directives.join(",");
-    EnvFilter::try_new(&joined)
-        .unwrap_or_else(|_| EnvFilter::new(base))
+    EnvFilter::try_new(&joined).unwrap_or_else(|_| EnvFilter::new(base))
 }
 
 /// `master.log` for `core_id=0`, `worker-N.log` otherwise.
@@ -421,12 +424,7 @@ pub fn init_logging(
     let filename = log_filename_for_core(core_id);
     let log_path = dir.join(&filename);
 
-    let rotate = build_rotating(
-        log_path.as_path(),
-        max_size,
-        max_backups,
-        compress,
-    );
+    let rotate = build_rotating(log_path.as_path(), max_size, max_backups, compress);
 
     let (non_blocking, guard) = tracing_appender::non_blocking(rotate);
     hold_guard(guard);
@@ -451,9 +449,13 @@ pub fn init_logging(
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer.with_filter(
-            cfg.stderr_level().parse().unwrap_or(tracing_subscriber::filter::LevelFilter::WARN),
-        ))
+        .with(
+            stderr_layer.with_filter(
+                cfg.stderr_level()
+                    .parse()
+                    .unwrap_or(tracing_subscriber::filter::LevelFilter::WARN),
+            ),
+        )
         .with(file_layer)
         .init();
     // Master appender is held by `PER_CORE_FILES`; its guard lives in
@@ -515,21 +517,13 @@ fn spawn_log_reaper(dir: std::path::PathBuf, base: &str, max_age: i32, max_backu
         .ok();
 }
 
-fn reap_once(
-    dir: &Path,
-    base: &str,
-    max_age: i32,
-    max_backups: i32,
-) -> std::io::Result<()> {
+fn reap_once(dir: &Path, base: &str, max_age: i32, max_backups: i32) -> std::io::Result<()> {
     use std::time::SystemTime;
     let read = std::fs::read_dir(dir)?;
     let mut entries: Vec<(std::path::PathBuf, SystemTime)> = Vec::new();
     for e in read.flatten() {
         let path = e.path();
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         // Skip the live file; only reap rotated suffixed files.
         if !name.starts_with(base) || name == base {
             continue;

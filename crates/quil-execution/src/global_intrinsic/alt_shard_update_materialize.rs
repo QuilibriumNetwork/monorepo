@@ -197,14 +197,28 @@ mod tests {
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
 
     struct RejectAll;
     impl KeyManager for RejectAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
             Ok(false)
         }
     }

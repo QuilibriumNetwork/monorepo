@@ -3,7 +3,8 @@
 use quil_lattice_ct::confidential::{
     relation::{
         membership::{
-            InputPath, MembershipKey, MembershipStatement, Node, NoteSecrets, RecipientSecret, IDENTITY_BYTES, NODE_BYTES,
+            InputPath, MembershipKey, MembershipStatement, Node, NoteSecrets, RecipientSecret,
+            IDENTITY_BYTES, NODE_BYTES,
         },
         CompiledAmountRelation, PublicAmountRelation,
     },

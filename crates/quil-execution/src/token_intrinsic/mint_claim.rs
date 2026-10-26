@@ -54,5 +54,4 @@ pub fn verify_from_clock(
     Ok(VerifiedMintClaim { claim })
 }
 
-impl VerifiedMintClaim {
-}
+impl VerifiedMintClaim {}

@@ -23,14 +23,8 @@ pub fn register_engine_metrics() {
         "engine_frame_number",
         "Current frame number being processed"
     );
-    describe_gauge!(
-        "engine_current_rank",
-        "Current consensus rank of this node"
-    );
-    describe_gauge!(
-        "engine_difficulty",
-        "Current mining / VDF difficulty"
-    );
+    describe_gauge!("engine_current_rank", "Current consensus rank of this node");
+    describe_gauge!("engine_difficulty", "Current mining / VDF difficulty");
     describe_gauge!(
         "engine_pending_messages",
         "Number of messages waiting to be processed"
@@ -53,10 +47,7 @@ pub fn register_engine_metrics() {
         "engine_proposals_received_total",
         "Total number of proposals received from peers"
     );
-    describe_counter!(
-        "engine_votes_total",
-        "Total number of votes produced"
-    );
+    describe_counter!("engine_votes_total", "Total number of votes produced");
     describe_counter!(
         "engine_votes_received_total",
         "Total number of standalone votes received from peers"
@@ -147,10 +138,7 @@ pub fn register_engine_metrics() {
         "engine_grpc_submits_duplicate_total",
         "Inbound gRPC submit_global_message calls deduplicated (already delivered)"
     );
-    describe_histogram!(
-        "engine_vdf_prove_seconds",
-        "VDF proof computation duration"
-    );
+    describe_histogram!("engine_vdf_prove_seconds", "VDF proof computation duration");
     describe_histogram!(
         "engine_archive_submit_seconds",
         "Round-trip duration of an outbound archive submit"

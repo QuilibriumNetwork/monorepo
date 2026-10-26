@@ -224,7 +224,10 @@ mod tests {
             listen_grpc_multiaddr: String::new(),
         };
         assert!(!opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("127.0.0.1:8337".to_string(), false));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("127.0.0.1:8337".to_string(), false)
+        );
     }
 
     #[test]
@@ -246,7 +249,10 @@ mod tests {
             listen_grpc_multiaddr: String::new(),
         };
         assert!(opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("example.com:9000".to_string(), true));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("example.com:9000".to_string(), true)
+        );
     }
 
     #[test]
@@ -257,7 +263,10 @@ mod tests {
             listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/8337".into(),
         };
         assert!(opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("example.com:9000".to_string(), true));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("example.com:9000".to_string(), true)
+        );
     }
 
     #[test]
@@ -268,6 +277,9 @@ mod tests {
             listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/8337".into(),
         };
         assert!(!opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("127.0.0.1:8337".to_string(), false));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("127.0.0.1:8337".to_string(), false)
+        );
     }
 }

@@ -58,7 +58,12 @@ pub struct SettlementClaim {
 /// settlement funds: the settlement's own receipt on its network, the
 /// consuming application, and the bundle's context. The signature authorizes
 /// exactly this settlement for exactly this bundle.
-pub fn claimant_message(network: &[u8; 32], application: &[u8; 32], receipt: &[u8; 32], context: &[u8; 32]) -> Vec<u8> {
+pub fn claimant_message(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    receipt: &[u8; 32],
+    context: &[u8; 32],
+) -> Vec<u8> {
     let mut bytes = b"quil/settlement/claimant-authorization/v1\0".to_vec();
     bytes.extend_from_slice(network);
     bytes.extend_from_slice(application);
@@ -69,10 +74,13 @@ pub fn claimant_message(network: &[u8; 32], application: &[u8; 32], receipt: &[u
 
 impl SettlementClaim {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.forest_proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES || self.settlement == 0 {
+        if self.forest_proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES
+            || self.settlement == 0
+        {
             return Err(invalid("oversized proof or zero settlement"));
         }
-        if self.claimant_public_key.len() > quil_lattice_ct::confidential::settlement::MAX_CLAIMANT_KEY_BYTES
+        if self.claimant_public_key.len()
+            > quil_lattice_ct::confidential::settlement::MAX_CLAIMANT_KEY_BYTES
             || self.claimant_signature.len() > MAX_CLAIMANT_SIGNATURE_BYTES
         {
             return Err(invalid("oversized claimant"));
@@ -100,14 +108,18 @@ impl SettlementClaim {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < FIXED_BYTES || bytes[..4] != TYPE_SETTLEMENT_CLAIM.to_be_bytes() || &bytes[4..12] != VERSION {
+        if bytes.len() < FIXED_BYTES
+            || bytes[..4] != TYPE_SETTLEMENT_CLAIM.to_be_bytes()
+            || &bytes[4..12] != VERSION
+        {
             return Err(invalid("invalid envelope"));
         }
         let array = |at: usize| -> [u8; 32] { bytes[at..at + 32].try_into().unwrap() };
         let claimant_key_type = u32::from_le_bytes(bytes[244..248].try_into().unwrap());
         let key_len = u16::from_le_bytes(bytes[248..250].try_into().unwrap()) as usize;
         let signature_len = u16::from_le_bytes(bytes[250..252].try_into().unwrap()) as usize;
-        let proof_len = u32::from_le_bytes(bytes[FIXED_BYTES - 4..FIXED_BYTES].try_into().unwrap()) as usize;
+        let proof_len =
+            u32::from_le_bytes(bytes[FIXED_BYTES - 4..FIXED_BYTES].try_into().unwrap()) as usize;
         if proof_len > super::reward_witness::MAX_REWARD_PROOF_BYTES
             || key_len > quil_lattice_ct::confidential::settlement::MAX_CLAIMANT_KEY_BYTES
             || signature_len > MAX_CLAIMANT_SIGNATURE_BYTES
@@ -146,7 +158,8 @@ impl SettlementClaim {
         // absent claimant carries neither a type nor a signature.
         if (claim.context == [0; 32]) != claim.is_prefunded()
             || (claim.is_prefunded() && claim.claimant_signature.is_empty())
-            || (!claim.is_prefunded() && (claim.claimant_key_type != 0 || !claim.claimant_signature.is_empty()))
+            || (!claim.is_prefunded()
+                && (claim.claimant_key_type != 0 || !claim.claimant_signature.is_empty()))
         {
             return Err(invalid("a claim binds either a context or a claimant"));
         }
@@ -169,7 +182,10 @@ impl SettlementClaim {
             payment_address: self.payment_address,
             payment: self.payment,
             claimant: if self.is_prefunded() {
-                settlement_record::claimant_address(self.claimant_key_type, &self.claimant_public_key)?
+                settlement_record::claimant_address(
+                    self.claimant_key_type,
+                    &self.claimant_public_key,
+                )?
             } else {
                 [0; 32]
             },
@@ -245,8 +261,8 @@ pub fn bundle_context(bundle: &CanonicalMessageBundle) -> Result<[u8; 32]> {
 /// here.
 pub fn request_cost(request: &CanonicalMessageRequest) -> Result<u64> {
     use crate::hypergraph_intrinsic::canonical::{
-        TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
-        TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
+        TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT,
+        TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
     };
     let bytes = &request.inner_bytes;
     Ok(match request.inner_type_prefix {
@@ -257,7 +273,9 @@ pub fn request_cost(request: &CanonicalMessageRequest) -> Result<u64> {
             crate::prover_registry::vertex_tree_to_blob(&tree).len() as u64
         }
         TYPE_HYPEREDGE_ADD => match crate::hypergraph_intrinsic::dispatch::decode_message(bytes)? {
-            crate::hypergraph_intrinsic::dispatch::DispatchedMessage::HyperedgeAdd(add) => add.value.len() as u64,
+            crate::hypergraph_intrinsic::dispatch::DispatchedMessage::HyperedgeAdd(add) => {
+                add.value.len() as u64
+            }
             _ => return Err(invalid("malformed hyperedge add")),
         },
         TYPE_VERTEX_REMOVE => crate::hypergraph_intrinsic::VERTEX_REMOVE_COST as u64,
@@ -268,10 +286,14 @@ pub fn request_cost(request: &CanonicalMessageRequest) -> Result<u64> {
         // engine compute the same charge from the same function; the token
         // engine's `extra_cost` covers only its confidential operations.
         crate::token_intrinsic::TYPE_TOKEN_DEPLOY => {
-            crate::token_intrinsic::TokenDeploy::from_canonical_bytes(bytes)?.config.len() as u64
+            crate::token_intrinsic::TokenDeploy::from_canonical_bytes(bytes)?
+                .config
+                .len() as u64
         }
         crate::token_intrinsic::TYPE_TOKEN_UPDATE => {
-            crate::token_intrinsic::TokenUpdate::from_canonical_bytes(bytes)?.config.len() as u64
+            crate::token_intrinsic::TokenUpdate::from_canonical_bytes(bytes)?
+                .config
+                .len() as u64
         }
         tp if crate::compute_engine::is_compute_type_prefix(tp) => bytes.len() as u64,
         TYPE_SETTLEMENT_CLAIM => marker_record()?.len() as u64,
@@ -283,12 +305,25 @@ pub fn request_cost(request: &CanonicalMessageRequest) -> Result<u64> {
 /// consumption marker of a claim.
 pub fn message_cost(message: &[u8]) -> Result<u64> {
     use crate::message_envelope::{TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
-    let add = |total: u64, cost: u64| total.checked_add(cost).ok_or_else(|| invalid("cost overflow"));
-    match message.get(..4).map(|p| u32::from_be_bytes(p.try_into().unwrap())) {
-        Some(TYPE_MESSAGE_REQUEST) => request_cost(&CanonicalMessageRequest::from_canonical_bytes(message)?),
+    let add = |total: u64, cost: u64| {
+        total
+            .checked_add(cost)
+            .ok_or_else(|| invalid("cost overflow"))
+    };
+    match message
+        .get(..4)
+        .map(|p| u32::from_be_bytes(p.try_into().unwrap()))
+    {
+        Some(TYPE_MESSAGE_REQUEST) => {
+            request_cost(&CanonicalMessageRequest::from_canonical_bytes(message)?)
+        }
         Some(TYPE_MESSAGE_BUNDLE) => {
             let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-            bundle.requests.iter().flatten().try_fold(0u64, |total, r| add(total, request_cost(r)?))
+            bundle
+                .requests
+                .iter()
+                .flatten()
+                .try_fold(0u64, |total, r| add(total, request_cost(r)?))
         }
         _ => Ok(0),
     }
@@ -322,12 +357,21 @@ pub struct AdmittedClaim {
 /// consumption marker. Returns the consumed claim, or `None` when the message
 /// grows no state at a nonzero price and carries no claim. Must run before the
 /// message's own writes, in the same changeset.
-pub fn admit_paid_message(payment: &PaymentContext<'_>, address: &[u8], message: &[u8]) -> Result<Option<AdmittedClaim>> {
+pub fn admit_paid_message(
+    payment: &PaymentContext<'_>,
+    address: &[u8],
+    message: &[u8],
+) -> Result<Option<AdmittedClaim>> {
     use crate::message_envelope::{TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
-    let bundle = match message.get(..4).map(|p| u32::from_be_bytes(p.try_into().unwrap())) {
+    let bundle = match message
+        .get(..4)
+        .map(|p| u32::from_be_bytes(p.try_into().unwrap()))
+    {
         Some(TYPE_MESSAGE_BUNDLE) => CanonicalMessageBundle::from_canonical_bytes(message)?,
         Some(TYPE_MESSAGE_REQUEST) => CanonicalMessageBundle {
-            requests: vec![Some(CanonicalMessageRequest::from_canonical_bytes(message)?)],
+            requests: vec![Some(CanonicalMessageRequest::from_canonical_bytes(
+                message,
+            )?)],
             timestamp: 0,
         },
         _ => return Ok(None),
@@ -337,7 +381,11 @@ pub fn admit_paid_message(payment: &PaymentContext<'_>, address: &[u8], message:
 
 /// Whether a bundle opens with a settlement claim.
 pub fn has_claim(bundle: &CanonicalMessageBundle) -> bool {
-    bundle.requests.first().and_then(|r| r.as_ref()).is_some_and(|r| r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM)
+    bundle
+        .requests
+        .first()
+        .and_then(|r| r.as_ref())
+        .is_some_and(|r| r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM)
 }
 
 /// [`admit_paid_message`] over a decoded bundle, with `extra_cost` bytes of
@@ -348,16 +396,28 @@ pub fn admit_bundle(
     bundle: &CanonicalMessageBundle,
     extra_cost: u64,
 ) -> Result<Option<AdmittedClaim>> {
-    let claim_at: Vec<usize> = bundle.requests.iter().enumerate()
-        .filter(|(_, r)| r.as_ref().is_some_and(|r| r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM))
+    let claim_at: Vec<usize> = bundle
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.as_ref()
+                .is_some_and(|r| r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM)
+        })
         .map(|(i, _)| i)
         .collect();
     if claim_at.iter().any(|&i| i != 0) {
         return Err(invalid("a claim must be the bundle's first and only claim"));
     }
-    let cost = bundle.requests.iter().flatten().try_fold(extra_cost, |total, r| {
-        total.checked_add(request_cost(r)?).ok_or_else(|| invalid("cost overflow"))
-    })?;
+    let cost = bundle
+        .requests
+        .iter()
+        .flatten()
+        .try_fold(extra_cost, |total, r| {
+            total
+                .checked_add(request_cost(r)?)
+                .ok_or_else(|| invalid("cost overflow"))
+        })?;
     if payment.multiplier.sign() == num_bigint::Sign::Minus {
         return Err(invalid("negative fee multiplier"));
     }
@@ -394,27 +454,50 @@ pub fn admit_bundle(
     // the same record fund every bundle that cites it, so it is refused
     // outright rather than silently admitted unconsumed.
     let state = payment.state.ok_or_else(|| {
-        QuilError::ExecutionUnavailable("settlement claim requires application state to record consumption".into())
+        QuilError::ExecutionUnavailable(
+            "settlement claim requires application state to record consumption".into(),
+        )
     })?;
 
     let bound = payment.global_bound.ok_or_else(|| {
-        QuilError::ExecutionUnavailable("settlement claim requires a finalized global anchor".into())
+        QuilError::ExecutionUnavailable(
+            "settlement claim requires a finalized global anchor".into(),
+        )
     })?;
     let clock = payment.clock.ok_or_else(|| {
         QuilError::ExecutionUnavailable("settlement claim requires the global clock store".into())
     })?;
-    let root = super::mint_authorization::clock_reward_root(clock, claim.cited_global_frame, bound)?;
+    let root =
+        super::mint_authorization::clock_reward_root(clock, claim.cited_global_frame, bound)?;
     if root != claim.global_root {
         return Err(invalid("global root mismatch"));
     }
-    settlement_record::verify_membership(&claim.network, &claim.entry()?, &root, &claim.forest_proof)?;
+    settlement_record::verify_membership(
+        &claim.network,
+        &claim.entry()?,
+        &root,
+        &claim.forest_proof,
+    )?;
 
     let disc = vertex_adds_discriminator()?;
-    if state.get(&claim.application, &marker, &disc)?.is_some_and(|blob| !blob.is_empty()) {
+    if state
+        .get(&claim.application, &marker, &disc)?
+        .is_some_and(|blob| !blob.is_empty())
+    {
         return Err(invalid("settlement already consumed"));
     }
-    state.set(&claim.application, &marker, &disc, payment.frame_number, marker_record()?)?;
-    Ok(Some(AdmittedClaim { settlement: claim.settlement, payment_address: claim.payment_address, payment: claim.payment }))
+    state.set(
+        &claim.application,
+        &marker,
+        &disc,
+        payment.frame_number,
+        marker_record()?,
+    )?;
+    Ok(Some(AdmittedClaim {
+        settlement: claim.settlement,
+        payment_address: claim.payment_address,
+        payment: claim.payment,
+    }))
 }
 
 /// The settlement amount a successfully executed message consumed (its
@@ -423,13 +506,28 @@ pub fn message_settlement_amount(message: &[u8]) -> u128 {
     use crate::message_envelope::{TYPE_MESSAGE_BUNDLE, TYPE_MESSAGE_REQUEST};
     let of = |r: &CanonicalMessageRequest| {
         (r.inner_type_prefix == TYPE_SETTLEMENT_CLAIM)
-            .then(|| SettlementClaim::decode(&r.inner_bytes).map(|c| c.settlement).unwrap_or(0))
+            .then(|| {
+                SettlementClaim::decode(&r.inner_bytes)
+                    .map(|c| c.settlement)
+                    .unwrap_or(0)
+            })
             .unwrap_or(0)
     };
-    match message.get(..4).map(|p| u32::from_be_bytes(p.try_into().unwrap())) {
-        Some(TYPE_MESSAGE_REQUEST) => CanonicalMessageRequest::from_canonical_bytes(message).map(|r| of(&r)).unwrap_or(0),
+    match message
+        .get(..4)
+        .map(|p| u32::from_be_bytes(p.try_into().unwrap()))
+    {
+        Some(TYPE_MESSAGE_REQUEST) => CanonicalMessageRequest::from_canonical_bytes(message)
+            .map(|r| of(&r))
+            .unwrap_or(0),
         Some(TYPE_MESSAGE_BUNDLE) => CanonicalMessageBundle::from_canonical_bytes(message)
-            .map(|b| b.requests.iter().flatten().map(of).fold(0u128, u128::saturating_add))
+            .map(|b| {
+                b.requests
+                    .iter()
+                    .flatten()
+                    .map(of)
+                    .fold(0u128, u128::saturating_add)
+            })
             .unwrap_or(0),
         _ => 0,
     }
@@ -441,9 +539,18 @@ mod tests {
 
     fn claim() -> SettlementClaim {
         SettlementClaim {
-            network: [1; 32], application: [2; 32], cited_global_frame: 77, global_root: [3; 32],
-            receipt: [4; 32], settlement: 9_000, context: [5; 32], payment_address: [0; 32], payment: 0,
-            claimant_key_type: 0, claimant_public_key: Vec::new(), claimant_signature: Vec::new(),
+            network: [1; 32],
+            application: [2; 32],
+            cited_global_frame: 77,
+            global_root: [3; 32],
+            receipt: [4; 32],
+            settlement: 9_000,
+            context: [5; 32],
+            payment_address: [0; 32],
+            payment: 0,
+            claimant_key_type: 0,
+            claimant_public_key: Vec::new(),
+            claimant_signature: Vec::new(),
             forest_proof: vec![6; 40],
         }
     }
@@ -461,10 +568,20 @@ mod tests {
         version[11] ^= 1;
         assert!(SettlementClaim::decode(&version).is_err());
         for destination in [crate::domains::QUIL_TOKEN, crate::domains::GLOBAL] {
-            let bad = SettlementClaim { application: destination, ..claim() }.encode().unwrap();
+            let bad = SettlementClaim {
+                application: destination,
+                ..claim()
+            }
+            .encode()
+            .unwrap();
             assert!(SettlementClaim::decode(&bad).is_err());
         }
-        assert!(SettlementClaim { settlement: 0, ..claim() }.encode().is_err());
+        assert!(SettlementClaim {
+            settlement: 0,
+            ..claim()
+        }
+        .encode()
+        .is_err());
         assert_eq!(c.entry().unwrap().destination, c.application);
     }
 
@@ -482,12 +599,19 @@ mod tests {
         use quil_types::crypto::Signer;
         let base = claim();
         let (signer, key_type, public_key) = claimant_signer();
-        let signature = signer.sign_with_domain(
-            &claimant_message(&base.network, &base.application, &base.receipt, context),
-            &parameter_context(&base.network, &base.application),
-        ).unwrap();
-        SettlementClaim { context: [0; 32], claimant_key_type: key_type, claimant_public_key: public_key,
-            claimant_signature: signature, ..base }
+        let signature = signer
+            .sign_with_domain(
+                &claimant_message(&base.network, &base.application, &base.receipt, context),
+                &parameter_context(&base.network, &base.application),
+            )
+            .unwrap();
+        SettlementClaim {
+            context: [0; 32],
+            claimant_key_type: key_type,
+            claimant_public_key: public_key,
+            claimant_signature: signature,
+            ..base
+        }
     }
 
     #[test]
@@ -500,37 +624,88 @@ mod tests {
         // The record it asserts carries the claimant's address, not a context.
         let entry = c.entry().unwrap();
         assert_eq!(entry.context, [0; 32]);
-        assert_eq!(entry.claimant,
-            settlement_record::claimant_address(c.claimant_key_type, &c.claimant_public_key).unwrap());
+        assert_eq!(
+            entry.claimant,
+            settlement_record::claimant_address(c.claimant_key_type, &c.claimant_public_key)
+                .unwrap()
+        );
         c.check_binding(&context).unwrap();
         // Another bundle, another settlement, another destination, another key
         // or a tampered signature: none are authorized.
         assert!(c.check_binding(&[0x78; 32]).is_err());
-        assert!(SettlementClaim { receipt: [0x40; 32], ..c.clone() }.check_binding(&context).is_err());
-        assert!(SettlementClaim { application: [0x41; 32], ..c.clone() }.check_binding(&context).is_err());
-        assert!(SettlementClaim { network: [0x42; 32], ..c.clone() }.check_binding(&context).is_err());
+        assert!(SettlementClaim {
+            receipt: [0x40; 32],
+            ..c.clone()
+        }
+        .check_binding(&context)
+        .is_err());
+        assert!(SettlementClaim {
+            application: [0x41; 32],
+            ..c.clone()
+        }
+        .check_binding(&context)
+        .is_err());
+        assert!(SettlementClaim {
+            network: [0x42; 32],
+            ..c.clone()
+        }
+        .check_binding(&context)
+        .is_err());
         let (_, key_type, other_key) = claimant_signer();
-        assert!(SettlementClaim { claimant_key_type: key_type, claimant_public_key: other_key, ..c.clone() }
-            .check_binding(&context).is_err());
+        assert!(SettlementClaim {
+            claimant_key_type: key_type,
+            claimant_public_key: other_key,
+            ..c.clone()
+        }
+        .check_binding(&context)
+        .is_err());
         let mut tampered = c.claimant_signature.clone();
         tampered[0] ^= 1;
-        assert!(SettlementClaim { claimant_signature: tampered, ..c.clone() }.check_binding(&context).is_err());
+        assert!(SettlementClaim {
+            claimant_signature: tampered,
+            ..c.clone()
+        }
+        .check_binding(&context)
+        .is_err());
         // Both bindings, or neither, never decode.
         for bad in [
-            SettlementClaim { context, ..c.clone() },
-            SettlementClaim { claimant_signature: Vec::new(), ..c.clone() },
-            SettlementClaim { context: [0; 32], claimant_public_key: Vec::new(), claimant_signature: Vec::new(),
-                claimant_key_type: 0, ..c.clone() },
+            SettlementClaim {
+                context,
+                ..c.clone()
+            },
+            SettlementClaim {
+                claimant_signature: Vec::new(),
+                ..c.clone()
+            },
+            SettlementClaim {
+                context: [0; 32],
+                claimant_public_key: Vec::new(),
+                claimant_signature: Vec::new(),
+                claimant_key_type: 0,
+                ..c.clone()
+            },
             // A context-bound claim carrying a claimant's leftovers.
-            SettlementClaim { claimant_signature: vec![1; 666], ..claim() },
-            SettlementClaim { claimant_key_type: 8, ..claim() },
+            SettlementClaim {
+                claimant_signature: vec![1; 666],
+                ..claim()
+            },
+            SettlementClaim {
+                claimant_key_type: 8,
+                ..claim()
+            },
         ] {
             assert!(SettlementClaim::decode(&bad.encode().unwrap()).is_err());
         }
         // A classical claimant is refused as a key type, never verified.
-        let classical = SettlementClaim { claimant_key_type: quil_types::crypto::KeyType::Ed448 as u32, ..c.clone() };
+        let classical = SettlementClaim {
+            claimant_key_type: quil_types::crypto::KeyType::Ed448 as u32,
+            ..c.clone()
+        };
         let error = classical.check_binding(&context).unwrap_err();
-        assert!(error.to_string().contains("claimant did not authorize"), "{error}");
+        assert!(
+            error.to_string().contains("claimant did not authorize"),
+            "{error}"
+        );
         // A context-bound claim carries no claimant and is checked by equality.
         let bound = claim();
         assert!(!bound.is_prefunded());
@@ -546,20 +721,43 @@ mod tests {
     #[test]
     fn a_token_deploy_is_priced_by_its_configuration() {
         let config = vec![7u8; 2_048];
-        let deploy = crate::token_intrinsic::TokenDeploy { config: config.clone(), rdf_schema: Vec::new() }
-            .to_canonical_bytes().unwrap();
+        let deploy = crate::token_intrinsic::TokenDeploy {
+            config: config.clone(),
+            rdf_schema: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
         let request = CanonicalMessageRequest::wrap(deploy).unwrap();
-        assert_eq!(request.inner_type_prefix, crate::token_intrinsic::TYPE_TOKEN_DEPLOY);
+        assert_eq!(
+            request.inner_type_prefix,
+            crate::token_intrinsic::TYPE_TOKEN_DEPLOY
+        );
         assert_eq!(request_cost(&request).unwrap(), config.len() as u64);
-        let update = crate::token_intrinsic::TokenUpdate { config: config.clone(), ..Default::default() }
-            .to_canonical_bytes().unwrap();
+        let update = crate::token_intrinsic::TokenUpdate {
+            config: config.clone(),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap();
         let update = CanonicalMessageRequest::wrap(update).unwrap();
         assert_eq!(request_cost(&update).unwrap(), config.len() as u64);
         // The whole bundle's charge is the marker plus the configuration.
-        let bundle = CanonicalMessageBundle { requests: vec![None, Some(request)], timestamp: 1 };
-        let cost = bundle.requests.iter().flatten()
-            .try_fold(marker_record().unwrap().len() as u64, |t, r| request_cost(r).map(|c| t + c)).unwrap();
-        assert_eq!(cost, marker_record().unwrap().len() as u64 + config.len() as u64);
+        let bundle = CanonicalMessageBundle {
+            requests: vec![None, Some(request)],
+            timestamp: 1,
+        };
+        let cost = bundle
+            .requests
+            .iter()
+            .flatten()
+            .try_fold(marker_record().unwrap().len() as u64, |t, r| {
+                request_cost(r).map(|c| t + c)
+            })
+            .unwrap();
+        assert_eq!(
+            cost,
+            marker_record().unwrap().len() as u64 + config.len() as u64
+        );
     }
 
     #[test]
@@ -567,93 +765,212 @@ mod tests {
         let marker = marker_record().unwrap();
         assert!(is_consumption_marker(&marker));
         assert!(!is_consumption_marker(&[]));
-        let chunk_tree = crate::hypergraph_intrinsic::encrypted_to_vertex_tree(&[vec![7u8; 64]]).unwrap();
-        assert!(!is_consumption_marker(&crate::prover_registry::vertex_tree_to_blob(&chunk_tree)));
-        assert_ne!(consumption_marker(&[1; 32], &[2; 32]).unwrap(), consumption_marker(&[3; 32], &[2; 32]).unwrap());
+        let chunk_tree =
+            crate::hypergraph_intrinsic::encrypted_to_vertex_tree(&[vec![7u8; 64]]).unwrap();
+        assert!(!is_consumption_marker(
+            &crate::prover_registry::vertex_tree_to_blob(&chunk_tree)
+        ));
+        assert_ne!(
+            consumption_marker(&[1; 32], &[2; 32]).unwrap(),
+            consumption_marker(&[3; 32], &[2; 32]).unwrap()
+        );
     }
 
     fn request(tp: u32, len: usize) -> Option<CanonicalMessageRequest> {
         let mut inner = tp.to_be_bytes().to_vec();
         inner.resize(len, 0xAB);
-        Some(CanonicalMessageRequest { inner_type_prefix: tp, inner_bytes: inner })
+        Some(CanonicalMessageRequest {
+            inner_type_prefix: tp,
+            inner_bytes: inner,
+        })
     }
 
     #[test]
     fn unpaid_state_growth_is_rejected_and_free_messages_pass() {
         let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
-        let bundle = CanonicalMessageBundle { requests: vec![request(compute, 100)], timestamp: 1 };
+        let bundle = CanonicalMessageBundle {
+            requests: vec![request(compute, 100)],
+            timestamp: 1,
+        };
         let bytes = bundle.to_canonical_bytes().unwrap();
         assert_eq!(message_cost(&bytes).unwrap(), 100);
         let payment = |multiplier: &BigInt| -> Result<Option<AdmittedClaim>> {
-            admit_paid_message(&PaymentContext {
-                state: None, clock: None, global_bound: Some(10), frame_number: 11, multiplier,
-                shard: quil_types::execution::ShardPath::WHOLE,
-            }, &[2; 32], &bytes)
+            admit_paid_message(
+                &PaymentContext {
+                    state: None,
+                    clock: None,
+                    global_bound: Some(10),
+                    frame_number: 11,
+                    multiplier,
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                },
+                &[2; 32],
+                &bytes,
+            )
         };
         assert!(payment(&BigInt::from(1)).is_err());
         assert_eq!(payment(&BigInt::from(0)).unwrap(), None);
 
         // A claim anywhere but first is refused before any verification.
         let mut late = bundle.clone();
-        late.requests.push(Some(CanonicalMessageRequest { inner_type_prefix: TYPE_SETTLEMENT_CLAIM, inner_bytes: claim().encode().unwrap() }));
+        late.requests.push(Some(CanonicalMessageRequest {
+            inner_type_prefix: TYPE_SETTLEMENT_CLAIM,
+            inner_bytes: claim().encode().unwrap(),
+        }));
         let late = late.to_canonical_bytes().unwrap();
-        let error = admit_paid_message(&PaymentContext {
-            state: None, clock: None, global_bound: Some(10), frame_number: 11, multiplier: &BigInt::from(0),
-            shard: quil_types::execution::ShardPath::WHOLE,
-        }, &[2; 32], &late).unwrap_err();
+        let error = admit_paid_message(
+            &PaymentContext {
+                state: None,
+                clock: None,
+                global_bound: Some(10),
+                frame_number: 11,
+                multiplier: &BigInt::from(0),
+                shard: quil_types::execution::ShardPath::WHOLE,
+            },
+            &[2; 32],
+            &late,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("first"));
     }
 
     #[test]
     fn claim_must_bind_destination_context_and_amount_before_proof_work() {
         let compute = crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY;
-        let rest = CanonicalMessageBundle { requests: vec![None, request(compute, 100)], timestamp: 5 };
+        let rest = CanonicalMessageBundle {
+            requests: vec![None, request(compute, 100)],
+            timestamp: 5,
+        };
         let context = bundle_context(&rest).unwrap();
         let build = |c: SettlementClaim| {
             let mut bundle = rest.clone();
-            bundle.requests[0] = Some(CanonicalMessageRequest { inner_type_prefix: TYPE_SETTLEMENT_CLAIM, inner_bytes: c.encode().unwrap() });
+            bundle.requests[0] = Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_SETTLEMENT_CLAIM,
+                inner_bytes: c.encode().unwrap(),
+            });
             bundle.to_canonical_bytes().unwrap()
         };
         let marker_cost = marker_record().unwrap().len() as u128;
-        let admit = |bytes: &[u8], address: &[u8]| admit_paid_message(&PaymentContext {
-            state: None, clock: None, global_bound: Some(10), frame_number: 11, multiplier: &BigInt::from(2),
-            shard: quil_types::execution::ShardPath::WHOLE,
-        }, address, bytes);
+        let admit = |bytes: &[u8], address: &[u8]| {
+            admit_paid_message(
+                &PaymentContext {
+                    state: None,
+                    clock: None,
+                    global_bound: Some(10),
+                    frame_number: 11,
+                    multiplier: &BigInt::from(2),
+                    shard: quil_types::execution::ShardPath::WHOLE,
+                },
+                address,
+                bytes,
+            )
+        };
         let exact = 2 * (100 + marker_cost);
         // Wrong destination, wrong context, underpaid: deterministic rejections.
-        assert!(admit(&build(SettlementClaim { context, settlement: exact, ..claim() }), &[9; 32]).unwrap_err().to_string().contains("destination"));
-        assert!(admit(&build(SettlementClaim { settlement: exact, ..claim() }), &[2; 32]).unwrap_err().to_string().contains("context"));
-        assert!(admit(&build(SettlementClaim { context, settlement: exact - 1, ..claim() }), &[2; 32]).unwrap_err().to_string().contains("below"));
+        assert!(admit(
+            &build(SettlementClaim {
+                context,
+                settlement: exact,
+                ..claim()
+            }),
+            &[9; 32]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("destination"));
+        assert!(admit(
+            &build(SettlementClaim {
+                settlement: exact,
+                ..claim()
+            }),
+            &[2; 32]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("context"));
+        assert!(admit(
+            &build(SettlementClaim {
+                context,
+                settlement: exact - 1,
+                ..claim()
+            }),
+            &[2; 32]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("below"));
         // A well-bound claim then needs somewhere to record consumption. A
         // record funds ONE bundle, so a claim admitted where no marker can be
         // written would fund every bundle citing it: that is refused, not
         // quietly allowed through.
-        let error = admit(&build(SettlementClaim { context, settlement: exact, ..claim() }), &[2; 32]).unwrap_err();
+        let error = admit(
+            &build(SettlementClaim {
+                context,
+                settlement: exact,
+                ..claim()
+            }),
+            &[2; 32],
+        )
+        .unwrap_err();
         assert!(error.is_execution_unavailable());
         assert!(error.to_string().contains("record consumption"), "{error}");
         // The consumed amount is readable from the executed message.
-        assert_eq!(message_settlement_amount(&build(SettlementClaim { context, settlement: exact, ..claim() })), exact);
+        assert_eq!(
+            message_settlement_amount(&build(SettlementClaim {
+                context,
+                settlement: exact,
+                ..claim()
+            })),
+            exact
+        );
         // The shards of an application partition its addresses, so exactly one
         // of them holds this claim's consumption marker. That shard admits the
         // claim (and then fails the same way the whole application does here,
         // for want of state); its sibling refuses deterministically.
-        let good = build(SettlementClaim { context, settlement: exact, ..claim() });
+        let good = build(SettlementClaim {
+            context,
+            settlement: exact,
+            ..claim()
+        });
         let marker = consumption_marker(&claim().application, &claim().receipt).unwrap();
         let owner = marker[0] & 0x80 != 0;
-        let on = |bit: bool| admit_paid_message(&PaymentContext {
-            state: None, clock: None, global_bound: Some(10), frame_number: 11, multiplier: &BigInt::from(2),
-            shard: quil_types::execution::ShardPath::from_bits(&[bit]),
-        }, &[2; 32], &good).unwrap_err();
+        let on = |bit: bool| {
+            admit_paid_message(
+                &PaymentContext {
+                    state: None,
+                    clock: None,
+                    global_bound: Some(10),
+                    frame_number: 11,
+                    multiplier: &BigInt::from(2),
+                    shard: quil_types::execution::ShardPath::from_bits(&[bit]),
+                },
+                &[2; 32],
+                &good,
+            )
+            .unwrap_err()
+        };
         let error = on(!owner);
         assert!(matches!(error, QuilError::InvalidArgument(_)), "{error}");
         assert!(error.to_string().contains("another shard"), "{error}");
         let error = on(owner);
-        assert!(error.is_execution_unavailable() && error.to_string().contains("record consumption"), "{error}");
+        assert!(
+            error.is_execution_unavailable() && error.to_string().contains("record consumption"),
+            "{error}"
+        );
         // A shard whose filter could not be decoded owns nothing.
-        let error = admit_paid_message(&PaymentContext {
-            state: None, clock: None, global_bound: Some(10), frame_number: 11, multiplier: &BigInt::from(2),
-            shard: quil_types::execution::ShardPath::UNKNOWN,
-        }, &[2; 32], &good).unwrap_err();
+        let error = admit_paid_message(
+            &PaymentContext {
+                state: None,
+                clock: None,
+                global_bound: Some(10),
+                frame_number: 11,
+                multiplier: &BigInt::from(2),
+                shard: quil_types::execution::ShardPath::UNKNOWN,
+            },
+            &[2; 32],
+            &good,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("another shard"), "{error}");
     }
 }

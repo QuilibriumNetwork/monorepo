@@ -27,7 +27,10 @@ use crate::rewards::fee_multiplier_for_cost;
 
 #[path = "frame_materializer_branch.rs"]
 mod execution_branch;
-pub use execution_branch::{CanonicalAttempt, MaterializerBranch, MaterializerBranchLimits, MaterializerMetadataUsage, TentativeFrameResult};
+pub use execution_branch::{
+    CanonicalAttempt, MaterializerBranch, MaterializerBranchLimits, MaterializerMetadataUsage,
+    TentativeFrameResult,
+};
 #[path = "frame_materializer_checkpoint.rs"]
 mod execution_checkpoint;
 pub use execution_checkpoint::{GlobalExecutionCheckpoint, UnfinishedExecution};
@@ -393,10 +396,7 @@ impl FrameMaterializer {
     /// this, the materializer can only mark candidates via the
     /// read-only trait method and leaves prover/allocation vertices
     /// unchanged — diverging from Go's `EvictInactiveProvers`.
-    pub fn with_eviction_registry(
-        mut self,
-        registry: Arc<ConcreteProverRegistry>,
-    ) -> Self {
+    pub fn with_eviction_registry(mut self, registry: Arc<ConcreteProverRegistry>) -> Self {
         self.eviction_registry = Some(registry);
         self
     }
@@ -412,10 +412,7 @@ impl FrameMaterializer {
     }
 
     /// Wire the at-cutover prover-tree reset hook (see `prover_tree_reset`).
-    pub fn with_prover_tree_reset(
-        mut self,
-        hook: Arc<dyn Fn(u64) -> bool + Send + Sync>,
-    ) -> Self {
+    pub fn with_prover_tree_reset(mut self, hook: Arc<dyn Fn(u64) -> bool + Send + Sync>) -> Self {
         self.prover_tree_reset = Some(hook);
         self.global_maintenance = None;
         self
@@ -423,7 +420,10 @@ impl FrameMaterializer {
 
     /// Bind immutable maintenance configuration, with no captured database
     /// handles. Replaces the older opaque callbacks.
-    pub fn with_global_maintenance(mut self, policy: crate::frame_maintenance::GlobalMaintenance) -> Self {
+    pub fn with_global_maintenance(
+        mut self,
+        policy: crate::frame_maintenance::GlobalMaintenance,
+    ) -> Self {
         self.global_maintenance = Some(policy);
         self.unified_cutover_consolidate = None;
         self.prover_tree_reset = None;
@@ -436,8 +436,12 @@ impl FrameMaterializer {
         &self,
         frame: &quil_types::proto::global::GlobalFrame,
     ) -> Result<MaterializeResult> {
-        let _execution = self.frame_execution.lock().map_err(|_| QuilError::ExecutionUnavailable("materializer frame lock poisoned".into()))?;
-        let header = frame.header.as_ref()
+        let _execution = self.frame_execution.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("materializer frame lock poisoned".into())
+        })?;
+        let header = frame
+            .header
+            .as_ref()
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
         let frame_number = header.frame_number;
 
@@ -446,7 +450,10 @@ impl FrameMaterializer {
         let last = self.last_materialized_frame.load(Ordering::SeqCst);
         if frame_number <= last {
             self.verify_execution_replay(frame, last)?;
-            debug!(frame = frame_number, last, "frame already materialized, skipping");
+            debug!(
+                frame = frame_number,
+                last, "frame already materialized, skipping"
+            );
             return Ok(MaterializeResult {
                 processed: 0,
                 skipped: 0,
@@ -468,8 +475,7 @@ impl FrameMaterializer {
         if frame_number > last + 1 {
             debug!(
                 frame = frame_number,
-                last,
-                "refusing to materialize ahead of the cursor (gap) — catch-up required"
+                last, "refusing to materialize ahead of the cursor (gap) — catch-up required"
             );
             return Ok(MaterializeResult {
                 processed: 0,
@@ -511,7 +517,9 @@ impl FrameMaterializer {
         if self.tentative_execution {
             let parent = self.hypergraph.current_forest_phase_root(&[0xff; 32], 0)?;
             if header.prover_tree_commitment.as_slice() != parent {
-                return Err(QuilError::ExecutionUnavailable("tentative parent prover root mismatch".into()));
+                return Err(QuilError::ExecutionUnavailable(
+                    "tentative parent prover root mismatch".into(),
+                ));
             }
         }
         self.apply_bound_maintenance(&forest_guard, frame_number)?;
@@ -525,13 +533,18 @@ impl FrameMaterializer {
         struct ClearPreverified<'a>(Option<&'a Arc<dyn quil_types::crypto::FrameProver>>);
         impl Drop for ClearPreverified<'_> {
             fn drop(&mut self) {
-                if let Some(prover) = self.0 { prover.clear_bls_preverified(); }
+                if let Some(prover) = self.0 {
+                    prover.clear_bls_preverified();
+                }
             }
         }
         let _preverified = ClearPreverified(self.frame_prover.as_ref());
         if mat_stage_timing {
-            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: forest lock acquired (this delta = lock-wait)");
+            info!(
+                frame = frame_number,
+                ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: forest lock acquired (this delta = lock-wait)"
+            );
         }
 
         // ── 2.1.0.25 frozen-era recovery (see FROZEN_ERA_RECOVERY_* doc) ──
@@ -557,7 +570,9 @@ impl FrameMaterializer {
                     .clock_store
                     .put_global_clock_frame_outcomes(frame_number, &outcomes)
                 {
-                    if self.tentative_execution { return Err(e); }
+                    if self.tentative_execution {
+                        return Err(e);
+                    }
                     warn!(frame = frame_number, error = %e, "frozen-era: persist outcomes failed");
                 }
             }
@@ -581,11 +596,15 @@ impl FrameMaterializer {
             // end-of-frame-N root. Without this the recovered fleet would decline
             // every proposal (parent never "materialized") and stay halted.
             {
-                let global_shard =
-                    quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+                let global_shard = quil_types::store::ShardKey {
+                    l1: [0u8; 3],
+                    l2: [0xffu8; 32],
+                };
                 let frozen_root =
-                    self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
-                self.hypergraph.record_prover_root(frame_number, frozen_root);
+                    self.hypergraph
+                        .compute_shard_root("vertex", "adds", &global_shard);
+                self.hypergraph
+                    .record_prover_root(frame_number, frozen_root);
             }
             // Advance the durable cursor. No CRDT mutation was staged (no
             // execution), so this only moves the cursor — the forest is untouched.
@@ -600,14 +619,19 @@ impl FrameMaterializer {
             if let Some(cf) = &self.current_frame {
                 cf.materialize(frame_number);
             }
-            self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
+            self.last_materialized_frame
+                .store(frame_number, Ordering::SeqCst);
             return Ok(MaterializeResult {
                 processed: 0,
                 skipped: outcomes.len(),
                 prover_root_matched: true,
                 local_prover_root: if self.tentative_execution {
-                    self.hypergraph.current_forest_phase_root(&[0xff; 32], 0)?.to_vec()
-                } else { Vec::new() },
+                    self.hypergraph
+                        .current_forest_phase_root(&[0xff; 32], 0)?
+                        .to_vec()
+                } else {
+                    Vec::new()
+                },
                 finalized_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
@@ -638,36 +662,38 @@ impl FrameMaterializer {
         // check (treat as matched) so the local replay runs at full speed and the
         // shard tracks the cursor, letting it reach the head cleanly. At/near the
         // head the check runs normally and can reconcile a genuine divergence.
-        let prover_root_matched = if self.tentative_execution { true } else {
-        let record_head = self
-            .clock_store
-            .get_latest_global_clock_frame()
-            .ok()
-            .and_then(|f| f.header.map(|h| h.frame_number))
-            .unwrap_or(frame_number);
-        const PROVER_ROOT_CHECK_MARGIN: u64 = 4;
-        if frame_number.saturating_add(PROVER_ROOT_CHECK_MARGIN) >= record_head {
-            // The header's `prover_tree_commitment` is the PARENT (N-1)
-            // prover-shard root — the deterministic post-materialize-(N-1) value
-            // the leader binds in via `prover_root_at(N-1)`. Compare our OWN
-            // recorded N-1 root, which every node reproduces identically. This is
-            // NOT a live forest read: a live read races the async materializer /
-            // prover-sync forward to N (or beyond) and forks the check against the
-            // header's N-1 commitment — the prover-root-mismatch storm. Fall back
-            // to a live read only before N-1 has been recorded (fresh node).
-            let local_root = self
-                .hypergraph
-                .prover_root_at(frame_number.saturating_sub(1))
-                .unwrap_or_else(|| self.read_local_prover_root());
-            self.verify_prover_root(
-                frame_number,
-                &header.prover_tree_commitment,
-                &local_root,
-                &header.prover,
-            )
-        } else {
+        let prover_root_matched = if self.tentative_execution {
             true
-        }
+        } else {
+            let record_head = self
+                .clock_store
+                .get_latest_global_clock_frame()
+                .ok()
+                .and_then(|f| f.header.map(|h| h.frame_number))
+                .unwrap_or(frame_number);
+            const PROVER_ROOT_CHECK_MARGIN: u64 = 4;
+            if frame_number.saturating_add(PROVER_ROOT_CHECK_MARGIN) >= record_head {
+                // The header's `prover_tree_commitment` is the PARENT (N-1)
+                // prover-shard root — the deterministic post-materialize-(N-1) value
+                // the leader binds in via `prover_root_at(N-1)`. Compare our OWN
+                // recorded N-1 root, which every node reproduces identically. This is
+                // NOT a live forest read: a live read races the async materializer /
+                // prover-sync forward to N (or beyond) and forks the check against the
+                // header's N-1 commitment — the prover-root-mismatch storm. Fall back
+                // to a live read only before N-1 has been recorded (fresh node).
+                let local_root = self
+                    .hypergraph
+                    .prover_root_at(frame_number.saturating_sub(1))
+                    .unwrap_or_else(|| self.read_local_prover_root());
+                self.verify_prover_root(
+                    frame_number,
+                    &header.prover_tree_commitment,
+                    &local_root,
+                    &header.prover,
+                )
+            } else {
+                true
+            }
         };
 
         // 3. Process frame requests through execution manager.
@@ -695,8 +721,11 @@ impl FrameMaterializer {
         let world_size: u64 = if header.world_state_size != 0 {
             header.world_state_size
         } else {
-            self.hypergraph.total_size().to_u64().ok_or_else(||
-                quil_types::error::QuilError::ExecutionUnavailable("world size exceeds fee pricing range".into()))?
+            self.hypergraph.total_size().to_u64().ok_or_else(|| {
+                quil_types::error::QuilError::ExecutionUnavailable(
+                    "world size exceeds fee pricing range".into(),
+                )
+            })?
         };
         let pricing_network = self.execution_manager.pricing_network();
         let difficulty: u64 = header.difficulty as u64;
@@ -707,7 +736,9 @@ impl FrameMaterializer {
         // executes prover/shard-admin ops and skips everything else —
         // app-shard data txs are owned by their shard's own consensus.
         let uncovered_shard_tx_active = frame_number
-            >= quil_execution::token_intrinsic::constants::global_uncovered_shard_tx_frame(pricing_network);
+            >= quil_execution::token_intrinsic::constants::global_uncovered_shard_tx_frame(
+                pricing_network,
+            );
         let mut processed = 0usize;
         let mut skipped = 0usize;
         // Proof-bound QUIL fees of the token operations this frame executed in
@@ -740,7 +771,9 @@ impl FrameMaterializer {
                 .iter()
                 .flat_map(|b| b.requests.iter())
                 .filter_map(|r| match r.request.as_ref() {
-                    Some(quil_types::proto::global::message_request::Request::Shard(fh)) => Some(fh),
+                    Some(quil_types::proto::global::message_request::Request::Shard(fh)) => {
+                        Some(fh)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -776,12 +809,18 @@ impl FrameMaterializer {
                     b.requests.iter().any(|r| {
                         matches!(
                             r.request,
-                            Some(quil_types::proto::global::message_request::Request::Shard(_))
+                            Some(quil_types::proto::global::message_request::Request::Shard(
+                                _
+                            ))
                         )
                     })
                 })
                 .filter_map(|b| {
-                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(b, Some(frame_number)).ok()
+                    crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                        b,
+                        Some(frame_number),
+                    )
+                    .ok()
                 })
                 .collect();
             if fh_bytes.len() >= 2 {
@@ -790,7 +829,9 @@ impl FrameMaterializer {
                     .unwrap_or(4)
                     .min(fh_bytes.len());
                 let chunk = fh_bytes.len().div_ceil(threads);
-                let out = std::sync::Mutex::new(Vec::<(Vec<u8>, Result<()>)>::with_capacity(fh_bytes.len()));
+                let out = std::sync::Mutex::new(Vec::<(Vec<u8>, Result<()>)>::with_capacity(
+                    fh_bytes.len(),
+                ));
                 std::thread::scope(|s| {
                     for c in fh_bytes.chunks(chunk) {
                         let out = &out;
@@ -819,8 +860,12 @@ impl FrameMaterializer {
         {
             let mut routed = Vec::new();
             for bundle in &frame.requests {
-                let address = self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
-                if let Ok(bytes) = crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number)) {
+                let address =
+                    self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
+                if let Ok(bytes) = crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                    bundle,
+                    Some(frame_number),
+                ) {
                     routed.push((address, bytes));
                 }
             }
@@ -844,7 +889,12 @@ impl FrameMaterializer {
                 "under 10 ms".to_string()
             };
             let entry = execution_us.entry(kind).or_insert((0, 0, 0, 0));
-            *entry = (entry.0 + 1, entry.1 + validate_us, entry.2 + process_us, entry.3.max(total));
+            *entry = (
+                entry.0 + 1,
+                entry.1 + validate_us,
+                entry.2 + process_us,
+                entry.3.max(total),
+            );
         };
         for bundle in &frame.requests {
             // Per-bundle routing address. Default: the global engine
@@ -859,26 +909,31 @@ impl FrameMaterializer {
             // global engine, owns them). Coverage is read from the
             // (consensus-deterministic) prover registry, so all nodes
             // agree on the venue for every bundle.
-            let route_addr = self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
+            let route_addr =
+                self.materialization_route(bundle, uncovered_shard_tx_active, frame_number)?;
             // Re-encode the proto bundle as canonical bytes.
             // The frame's number decides which presence encodings its body
             // may carry, on every node and after any restart alike.
-            let bundle_bytes = match crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(bundle, Some(frame_number)) {
-                Ok(b) => b,
-                Err(e) => {
-                    info!(
-                        frame = frame_number,
-                        error = %e,
-                        "skipping bundle that failed canonical encoding"
-                    );
-                    skipped += 1;
-                    outcomes.push(RequestOutcome {
-                        status: RequestStatus::Skipped,
-                        error: format!("canonical encode failed: {e}"),
-                    });
-                    continue;
-                }
-            };
+            let bundle_bytes =
+                match crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                    bundle,
+                    Some(frame_number),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        info!(
+                            frame = frame_number,
+                            error = %e,
+                            "skipping bundle that failed canonical encoding"
+                        );
+                        skipped += 1;
+                        outcomes.push(RequestOutcome {
+                            status: RequestStatus::Skipped,
+                            error: format!("canonical encode failed: {e}"),
+                        });
+                        continue;
+                    }
+                };
             if bundle_bytes.len() < 4 {
                 info!(
                     frame = frame_number,
@@ -905,17 +960,25 @@ impl FrameMaterializer {
 
             // Keep cost failures and checked arithmetic aligned with app
             // materialization and the frame processor. Never price an error as zero.
-            let fee_multiplier = match self.execution_manager.get_cost(&bundle_bytes)
-                .and_then(|cost| fee_multiplier_for_cost(pricing_network, difficulty, world_size, &cost, 1)) {
-                Ok(fee) => fee,
-                Err(e) if e.is_execution_unavailable() => return Err(e),
-                Err(e) => {
-                    skipped += 1;
-                    prover_ops.record(&bundle_bytes, false);
-                    outcomes.push(RequestOutcome { status: RequestStatus::Skipped, error: format!("invalid fee cost: {e}") });
-                    continue;
-                }
-            };
+            let fee_multiplier =
+                match self
+                    .execution_manager
+                    .get_cost(&bundle_bytes)
+                    .and_then(|cost| {
+                        fee_multiplier_for_cost(pricing_network, difficulty, world_size, &cost, 1)
+                    }) {
+                    Ok(fee) => fee,
+                    Err(e) if e.is_execution_unavailable() => return Err(e),
+                    Err(e) => {
+                        skipped += 1;
+                        prover_ops.record(&bundle_bytes, false);
+                        outcomes.push(RequestOutcome {
+                            status: RequestStatus::Skipped,
+                            error: format!("invalid fee cost: {e}"),
+                        });
+                        continue;
+                    }
+                };
 
             // Signature verification gate.
             //
@@ -955,7 +1018,9 @@ impl FrameMaterializer {
                 ) {
                     Ok(()) => None,
                     Err(e) => {
-                        if e.is_execution_unavailable() { return Err(e); }
+                        if e.is_execution_unavailable() {
+                            return Err(e);
+                        }
                         info!(
                             frame = frame_number,
                             request_type = format!("0x{:08x}", request_type),
@@ -990,22 +1055,33 @@ impl FrameMaterializer {
                 &route_addr,
                 &bundle_bytes,
             );
-            record_execution(&bundle_bytes, validate_us, process_started.elapsed().as_micros() as u64);
+            record_execution(
+                &bundle_bytes,
+                validate_us,
+                process_started.elapsed().as_micros() as u64,
+            );
             prover_ops.record(&bundle_bytes, result.is_ok());
             match result {
                 Ok(_) => {
                     processed += 1;
-                    let fees = self.execution_manager.message_token_fees(&route_addr, &bundle_bytes);
-                    global_fee_total = global_fee_total.saturating_add(
-                        if self.tentative_execution { fees? } else { fees.unwrap_or(0) },
-                    );
+                    let fees = self
+                        .execution_manager
+                        .message_token_fees(&route_addr, &bundle_bytes);
+                    global_fee_total =
+                        global_fee_total.saturating_add(if self.tentative_execution {
+                            fees?
+                        } else {
+                            fees.unwrap_or(0)
+                        });
                     outcomes.push(RequestOutcome {
                         status: RequestStatus::Succeeded,
                         error: String::new(),
                     });
                 }
                 Err(e) => {
-                    if e.is_execution_unavailable() { return Err(e); }
+                    if e.is_execution_unavailable() {
+                        return Err(e);
+                    }
                     info!(
                         frame = frame_number,
                         request_type = format!("0x{:08x}", request_type),
@@ -1055,7 +1131,9 @@ impl FrameMaterializer {
                 .clock_store
                 .put_global_clock_frame_outcomes(frame_number, &outcomes)
             {
-                if self.tentative_execution { return Err(e); }
+                if self.tentative_execution {
+                    return Err(e);
+                }
                 warn!(frame = frame_number, error = %e, "failed to persist frame request outcomes");
             }
         }
@@ -1100,18 +1178,27 @@ impl FrameMaterializer {
         // the flip was never triggered at the due frame. Its reassignment writes
         // ride the same `commit_frame_with_global_cursor` batch below.
         if mat_stage_timing {
-            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: process_message loop done (delta from lock = request execution only)");
+            info!(
+                frame = frame_number,
+                ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: process_message loop done (delta from lock = request execution only)"
+            );
         }
         // Global-venue fees → the global frame's prover. Deterministic (every
         // node executes the same bundles) and guarded per frame, so it rides
         // the same commit batch as the frame's other reward mutations.
         if global_fee_total > 0 {
-            match self
-                .execution_manager
-                .credit_global_frame_fees(frame_number, &header.prover, global_fee_total)
-            {
-                Ok(credited) => info!(frame = frame_number, fee_total = global_fee_total, credited, "global frame fees credited to the frame prover"),
+            match self.execution_manager.credit_global_frame_fees(
+                frame_number,
+                &header.prover,
+                global_fee_total,
+            ) {
+                Ok(credited) => info!(
+                    frame = frame_number,
+                    fee_total = global_fee_total,
+                    credited,
+                    "global frame fees credited to the frame prover"
+                ),
                 Err(e) => {
                     error!(frame = frame_number, error = %e, "global frame fee credit failed — aborting materialize");
                     return Err(e);
@@ -1137,28 +1224,49 @@ impl FrameMaterializer {
             return Err(e);
         }
         if mat_stage_timing {
-            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)");
+            info!(
+                frame = frame_number,
+                ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)"
+            );
         }
         // Quote the actual pricing inputs only when this frame's routing rule
         // permits global QUIL execution. Covered applications require their
         // own executor's snapshot, not the archive's world size.
         let quote_eligible = if uncovered_shard_tx_active {
-            let eligible = self.prover_registry
+            let eligible = self
+                .prover_registry
                 .get_active_provers(&quil_execution::domains::QUIL_TOKEN, frame_number)
-                .map(|provers| quil_execution::token_intrinsic::constants::shard_is_globally_executed(
-                    pricing_network, provers.len() as u64));
-            if self.tentative_execution { eligible? } else { eligible.unwrap_or(false) }
-        } else { false };
+                .map(|provers| {
+                    quil_execution::token_intrinsic::constants::shard_is_globally_executed(
+                        pricing_network,
+                        provers.len() as u64,
+                    )
+                });
+            if self.tentative_execution {
+                eligible?
+            } else {
+                eligible.unwrap_or(false)
+            }
+        } else {
+            false
+        };
         let quote = if quote_eligible {
             Some(quil_execution::pricing::GlobalQuilFeeSnapshot {
-                frame_number, difficulty, world_state_bytes: world_size,
+                frame_number,
+                difficulty,
+                world_state_bytes: world_size,
             })
-        } else { None };
-        self.execution_manager.publish_global_quil_fee_snapshot(quote);
+        } else {
+            None
+        };
+        self.execution_manager
+            .publish_global_quil_fee_snapshot(quote);
         self.execution_manager.publish_global_venue_fee_snapshot(
             quil_execution::pricing::GlobalQuilFeeSnapshot {
-                frame_number, difficulty, world_state_bytes: world_size,
+                frame_number,
+                difficulty,
+                world_state_bytes: world_size,
             },
         );
 
@@ -1186,10 +1294,15 @@ impl FrameMaterializer {
         // No-op (just a grid read + compare) when nothing changed.
         let prefix_changes = if self.tentative_execution {
             self.execution_manager.try_refresh_shard_prefixes()?
-        } else { self.execution_manager.refresh_shard_prefixes() };
+        } else {
+            self.execution_manager.refresh_shard_prefixes()
+        };
         if prefix_changes > 0 {
-            info!(frame = frame_number, apps = prefix_changes,
-                "MAT stage: shard grid changed — re-partitioned CRDT prefixes + size buckets");
+            info!(
+                frame = frame_number,
+                apps = prefix_changes,
+                "MAT stage: shard grid changed — re-partitioned CRDT prefixes + size buckets"
+            );
         }
         // Run the expensive registry refresh + eviction census INLINE only at
         // epoch boundaries (and the first frame after boot). `refresh_from_store`
@@ -1200,14 +1313,18 @@ impl FrameMaterializer {
         // epoch-fresh via the recv-loop (`message_loop`) and archive poller
         // (`archive_sync`) refreshers, which already run on this same cadence.
         let cur_eviction_epoch = quil_types::consensus::epoch_for_frame(frame_number);
-        let mut run_eviction_pass = self.last_eviction_pass_epoch.load(Ordering::SeqCst)
-            != cur_eviction_epoch;
+        let mut run_eviction_pass =
+            self.last_eviction_pass_epoch.load(Ordering::SeqCst) != cur_eviction_epoch;
         if run_eviction_pass {
             if let Some(eviction_reg) = self.eviction_registry.as_ref() {
                 match eviction_reg.refresh_from_store(self.hypergraph_store.as_ref()) {
-                    Ok(()) => self.last_eviction_pass_epoch.store(cur_eviction_epoch, Ordering::SeqCst),
+                    Ok(()) => self
+                        .last_eviction_pass_epoch
+                        .store(cur_eviction_epoch, Ordering::SeqCst),
                     Err(error) => {
-                        if self.tentative_execution { return Err(error); }
+                        if self.tentative_execution {
+                            return Err(error);
+                        }
                         // The state/cursor batch is already committed. Retain the
                         // prior cache, retry its refresh on the next frame and
                         // never evict from an incomplete or stale census.
@@ -1220,7 +1337,9 @@ impl FrameMaterializer {
 
         // 6. Prune orphan joins from prover registry
         if let Err(e) = self.prover_registry.prune_orphan_joins(frame_number) {
-            if self.tentative_execution { return Err(e); }
+            if self.tentative_execution {
+                return Err(e);
+            }
             warn!(frame = frame_number, error = %e, "prune orphan joins failed");
         }
 
@@ -1244,10 +1363,8 @@ impl FrameMaterializer {
                 // nothing to protect, so its low coverage must not gate
                 // eviction. Sizes come from a consensus-deterministic source
                 // (the shards store) so every archive computes the same set.
-                let mut effective_halt =
-                    self.coverage_halt_durations.lock().unwrap().clone();
-                let raw_max_count =
-                    effective_halt.values().filter(|&&d| d == u64::MAX).count();
+                let mut effective_halt = self.coverage_halt_durations.lock().unwrap().clone();
+                let raw_max_count = effective_halt.values().filter(|&&d| d == u64::MAX).count();
                 let mut sizes_loaded = 0usize;
                 let mut sizes_was_empty = true;
                 if let Some(sizes_fn) = self.shard_size_source.as_ref() {
@@ -1344,7 +1461,9 @@ impl FrameMaterializer {
                     let stalled = scan
                         .stalled
                         .iter()
-                        .map(|(filter, active, fresh)| format!("{}:{active}/{fresh}", hex::encode(filter)))
+                        .map(|(filter, active, fresh)| {
+                            format!("{}:{active}/{fresh}", hex::encode(filter))
+                        })
                         .collect::<Vec<_>>()
                         .join(",");
                     info!(
@@ -1380,7 +1499,9 @@ impl FrameMaterializer {
                             Ok(evicted) => {
                                 if !evicted.is_empty() {
                                     if let Err(e) = state.commit() {
-                                        if self.tentative_execution { return Err(e); }
+                                        if self.tentative_execution {
+                                            return Err(e);
+                                        }
                                         warn!(frame = frame_number, error = %e, "eviction commit failed");
                                     } else {
                                         // Persist the eviction durably. `commit_frame`
@@ -1399,22 +1520,33 @@ impl FrameMaterializer {
                                         // shard summaries reflect the kicks.
                                         let global_addr =
                                             quil_execution::global_schema::GLOBAL_INTRINSIC_ADDRESS;
-                                        if let Err(e) = self
-                                            .hypergraph
-                                            .invalidate_domain_shard_commit(frame_number, &global_addr)
+                                        if let Err(e) =
+                                            self.hypergraph.invalidate_domain_shard_commit(
+                                                frame_number,
+                                                &global_addr,
+                                            )
                                         {
-                                            if self.tentative_execution { return Err(e); }
+                                            if self.tentative_execution {
+                                                return Err(e);
+                                            }
                                             warn!(frame = frame_number, error = %e, "eviction: invalidate shard commit failed");
                                         }
                                         if let Err(e) =
                                             self.execution_manager.commit_frame(frame_number)
                                         {
-                                            if self.tentative_execution { return Err(e); }
+                                            if self.tentative_execution {
+                                                return Err(e);
+                                            }
                                             warn!(frame = frame_number, error = %e, "eviction re-commit (flush) failed");
                                         }
-                                        if let Err(error) = eviction_reg.refresh_from_store(self.hypergraph_store.as_ref()) {
-                                            if self.tentative_execution { return Err(error); }
-                                            self.last_eviction_pass_epoch.store(u64::MAX, Ordering::SeqCst);
+                                        if let Err(error) = eviction_reg
+                                            .refresh_from_store(self.hypergraph_store.as_ref())
+                                        {
+                                            if self.tentative_execution {
+                                                return Err(error);
+                                            }
+                                            self.last_eviction_pass_epoch
+                                                .store(u64::MAX, Ordering::SeqCst);
                                             warn!(frame = frame_number, %error, "post-eviction registry refresh failed; will retry");
                                         } else {
                                             // Persistence probe: after the flush+refresh the
@@ -1430,7 +1562,9 @@ impl FrameMaterializer {
                                             );
                                             let still_present = recheck
                                                 .iter()
-                                                .filter(|a| evicted.iter().any(|e| e.same_allocation(a)))
+                                                .filter(|a| {
+                                                    evicted.iter().any(|e| e.same_allocation(a))
+                                                })
                                                 .count();
                                             let provers = evicted
                                                 .iter()
@@ -1455,7 +1589,9 @@ impl FrameMaterializer {
                                 }
                             }
                             Err(e) => {
-                                if self.tentative_execution { return Err(e); }
+                                if self.tentative_execution {
+                                    return Err(e);
+                                }
                                 warn!(frame = frame_number, error = %e, "eviction (mutating) failed");
                             }
                         }
@@ -1492,35 +1628,52 @@ impl FrameMaterializer {
 
         // 7. Persist alt shard updates
         if let Err(e) = self.persist_alt_shard_updates(frame_number, frame) {
-            if self.tentative_execution { return Err(e); }
+            if self.tentative_execution {
+                return Err(e);
+            }
             warn!(frame = frame_number, error = %e, "persist alt shard updates failed");
         }
         if mat_stage_timing {
-            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: eviction + persist_alt done (delta = eviction scan + alt-shard)");
+            info!(
+                frame = frame_number,
+                ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: eviction + persist_alt done (delta = eviction scan + alt-shard)"
+            );
         }
 
         // 8. Compute post-materialization prover root
         let post_root = if self.tentative_execution {
             self.hypergraph.commit(frame_number + 1)?;
-            self.hypergraph.current_forest_phase_root(&[0xff; 32], 0)?.to_vec()
-        } else { self.compute_local_prover_root(frame_number + 1) };
+            self.hypergraph
+                .current_forest_phase_root(&[0xff; 32], 0)?
+                .to_vec()
+        } else {
+            self.compute_local_prover_root(frame_number + 1)
+        };
         if mat_stage_timing {
-            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
-                "MAT stage: compute_local_prover_root done (delta = the SECOND full commit(N+1))");
+            info!(
+                frame = frame_number,
+                ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: compute_local_prover_root done (delta = the SECOND full commit(N+1))"
+            );
         }
 
         self.finish_execution_checkpoint(execution_checkpoint)?;
 
         // 9. Update state
-        self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
+        self.last_materialized_frame
+            .store(frame_number, Ordering::SeqCst);
 
         // Capture this frame's prover-shard root the moment materialization of
         // it completes (forest reflects exactly `frame_number`). The verify for
         // the NEXT frame reads `[frame_number]` from here rather than doing a live
         // read that a concurrent materialize path can race forward.
         {
-            let mroot = if self.tentative_execution { post_root.clone() } else { self.read_local_prover_root() };
+            let mroot = if self.tentative_execution {
+                post_root.clone()
+            } else {
+                self.read_local_prover_root()
+            };
             // Record this frame's deterministic post-state prover root so the
             // leader can bind `prover_root_at(N)` as frame N+1's PARENT commitment
             // and every follower can cross-check its own N-1 root — neither reading
@@ -1536,10 +1689,7 @@ impl FrameMaterializer {
 
         info!(
             frame = frame_number,
-            processed,
-            skipped,
-            prover_root_matched,
-            "frame materialized"
+            processed, skipped, prover_root_matched, "frame materialized"
         );
         // A branch executes a frame once per proposal, vote and finalization;
         // its publication logs the tally that counts.
@@ -1578,7 +1728,10 @@ impl FrameMaterializer {
     /// job on the post-apply path); use this only for the pre-apply verify.
     pub fn read_local_prover_root(&self) -> Vec<u8> {
         use quil_types::store::ShardKey;
-        let global_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let global_shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
         let root = self
             .hypergraph
             .compute_shard_root("vertex", "adds", &global_shard);
@@ -1665,13 +1818,11 @@ impl FrameMaterializer {
         }
 
         if local == expected {
-            debug!(
-                frame = frame_number,
-                "prover root verified"
-            );
+            debug!(frame = frame_number, "prover root verified");
             self.prover_root_synced.store(true, Ordering::Relaxed);
             self.prover_root_mismatch.store(false, Ordering::Relaxed);
-            self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
+            self.prover_root_verified_frame
+                .store(frame_number, Ordering::Relaxed);
             true
         } else {
             warn!(
@@ -1699,7 +1850,8 @@ impl FrameMaterializer {
         self.prover_root_synced.store(synced, Ordering::Relaxed);
         if synced {
             self.prover_root_mismatch.store(false, Ordering::Relaxed);
-            self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
+            self.prover_root_verified_frame
+                .store(frame_number, Ordering::Relaxed);
         }
     }
 
@@ -1739,9 +1891,11 @@ impl FrameMaterializer {
     /// Trigger an asynchronous prover HyperSync to reconcile state.
     /// Runs in the background; updates prover_root_synced on completion.
     fn trigger_prover_hypersync(&self) {
-        if !self.prover_sync_in_progress.compare_exchange(
-            false, true, Ordering::SeqCst, Ordering::SeqCst
-        ).is_ok() {
+        if !self
+            .prover_sync_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             debug!("prover sync already in progress, skipping");
             return;
         }
@@ -1774,22 +1928,38 @@ impl FrameMaterializer {
     /// nodes agree on the venue for a given bundle at a given frame. This
     /// gates the uncovered-shard global execution path.
     fn materialization_route(
-        &self, bundle: &quil_types::proto::global::MessageBundle,
-        uncovered_active: bool, frame_number: u64,
+        &self,
+        bundle: &quil_types::proto::global::MessageBundle,
+        uncovered_active: bool,
+        frame_number: u64,
     ) -> Result<Vec<u8>> {
         if !self.tentative_execution {
-            return Ok(bundle_global_route(bundle, uncovered_active,
-                |domain| self.shard_is_uncovered(domain, frame_number)));
+            return Ok(bundle_global_route(bundle, uncovered_active, |domain| {
+                self.shard_is_uncovered(domain, frame_number)
+            }));
         }
         let mut failure = None;
         let route = bundle_global_route(bundle, uncovered_active, |domain| {
-            match self.prover_registry.get_active_provers(domain, frame_number) {
-                Ok(provers) => quil_execution::token_intrinsic::constants::shard_is_globally_executed(
-                    self.execution_manager.pricing_network(), provers.len() as u64),
-                Err(error) => { failure = Some(error); false },
+            match self
+                .prover_registry
+                .get_active_provers(domain, frame_number)
+            {
+                Ok(provers) => {
+                    quil_execution::token_intrinsic::constants::shard_is_globally_executed(
+                        self.execution_manager.pricing_network(),
+                        provers.len() as u64,
+                    )
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
             }
         });
-        match failure { Some(error) => Err(error), None => Ok(route) }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(route),
+        }
     }
 
     fn shard_is_uncovered(&self, domain: &[u8], frame_number: u64) -> bool {
@@ -1801,16 +1971,15 @@ impl FrameMaterializer {
         // Exactly when the shard cannot produce its own frames, so no bundle
         // executes in both venues.
         quil_execution::token_intrinsic::constants::shard_is_globally_executed(
-            self.execution_manager.pricing_network(), active as u64)
+            self.execution_manager.pricing_network(),
+            active as u64,
+        )
     }
 
     /// Update coverage halt durations. Called by the coverage
     /// monitor; keys are raw filter bytes (matching the monitor's
     /// `check()` return type).
-    pub fn set_coverage_halt_durations(
-        &self,
-        durations: std::collections::HashMap<Vec<u8>, u64>,
-    ) {
+    pub fn set_coverage_halt_durations(&self, durations: std::collections::HashMap<Vec<u8>, u64>) {
         *self.coverage_halt_durations.lock().unwrap() = durations;
     }
 
@@ -1923,7 +2092,10 @@ impl FrameMaterializer {
                 .unwrap_or(true);
             if ok && reset_ok {
                 self.hypergraph.set_unified_tree(true);
-                info!(frame = frame_number, "unified app-tree commitment ACTIVATED at cutover");
+                info!(
+                    frame = frame_number,
+                    "unified app-tree commitment ACTIVATED at cutover"
+                );
             } else {
                 error!(
                     frame = frame_number,
@@ -1942,8 +2114,7 @@ impl FrameMaterializer {
         // side (wipe + rebuild from the genesis committee) rides HERE because the
         // put-only forest can't propagate a wipe through sync. The hook self-gates
         // on the v2 marker (exactly-once); `None` (regulars use the recv path) no-ops.
-        if frame_number
-            == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
+        if frame_number == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
         {
             let reset_ok = self
                 .prover_tree_reset
@@ -1951,9 +2122,15 @@ impl FrameMaterializer {
                 .map(|h| h(frame_number))
                 .unwrap_or(true);
             if reset_ok {
-                info!(frame = frame_number, "grid-reset v2: prover-tree wiped + rebuilt (grid reset via execution engine)");
+                info!(
+                    frame = frame_number,
+                    "grid-reset v2: prover-tree wiped + rebuilt (grid reset via execution engine)"
+                );
             } else {
-                error!(frame = frame_number, "grid-reset v2: prover-tree reset FAILED");
+                error!(
+                    frame = frame_number,
+                    "grid-reset v2: prover-tree reset FAILED"
+                );
             }
         }
 
@@ -1972,9 +2149,15 @@ impl FrameMaterializer {
                 .map(|h| h(frame_number))
                 .unwrap_or(true);
             if reset_ok {
-                info!(frame = frame_number, "prover-reset v3: prover-tree wiped + rebuilt");
+                info!(
+                    frame = frame_number,
+                    "prover-reset v3: prover-tree wiped + rebuilt"
+                );
             } else {
-                error!(frame = frame_number, "prover-reset v3: prover-tree reset FAILED");
+                error!(
+                    frame = frame_number,
+                    "prover-reset v3: prover-tree reset FAILED"
+                );
             }
         }
 
@@ -1994,46 +2177,103 @@ impl FrameMaterializer {
                 .map(|h| h(frame_number))
                 .unwrap_or(true);
             if reset_ok {
-                info!(frame = frame_number, "prover-reset v4/v5: prover-tree wiped + rebuilt");
+                info!(
+                    frame = frame_number,
+                    "prover-reset v4/v5: prover-tree wiped + rebuilt"
+                );
             } else {
-                error!(frame = frame_number, "prover-reset v4/v5: prover-tree reset FAILED");
+                error!(
+                    frame = frame_number,
+                    "prover-reset v4/v5: prover-tree reset FAILED"
+                );
             }
         }
-
     }
 
-    fn apply_bound_maintenance(&self, guard: &quil_hypergraph::ForestWriteGuard<'_>, frame: u64) -> Result<()> {
+    fn apply_bound_maintenance(
+        &self,
+        guard: &quil_hypergraph::ForestWriteGuard<'_>,
+        frame: u64,
+    ) -> Result<()> {
         use quil_execution::global_intrinsic::materialize as m;
         let Some(policy) = &self.global_maintenance else {
-            if self.tentative_execution && ((frame >= m::unified_tree_cutover_frame() && !self.hypergraph.unified_tree())
-                || [m::quil_grid_reset_v2_frame(), m::quil_prover_reset_v3_frame(),
-                    m::quil_prover_reset_v4_frame(), m::quil_prover_reset_v5_frame()].contains(&frame)) {
-                return Err(QuilError::ExecutionUnavailable("tentative maintenance requires a bound policy".into()));
+            if self.tentative_execution
+                && ((frame >= m::unified_tree_cutover_frame() && !self.hypergraph.unified_tree())
+                    || [
+                        m::quil_grid_reset_v2_frame(),
+                        m::quil_prover_reset_v3_frame(),
+                        m::quil_prover_reset_v4_frame(),
+                        m::quil_prover_reset_v5_frame(),
+                    ]
+                    .contains(&frame))
+            {
+                return Err(QuilError::ExecutionUnavailable(
+                    "tentative maintenance requires a bound policy".into(),
+                ));
             }
             return Ok(());
         };
-        let consolidate = frame >= m::unified_tree_cutover_frame() && !self.hypergraph.unified_tree();
-        let reset = consolidate || [m::quil_grid_reset_v2_frame(), m::quil_prover_reset_v3_frame(),
-            m::quil_prover_reset_v4_frame(), m::quil_prover_reset_v5_frame()].contains(&frame);
-        if !reset { return Ok(()); }
-        let registry = self.prover_registry.as_any()
+        let consolidate =
+            frame >= m::unified_tree_cutover_frame() && !self.hypergraph.unified_tree();
+        let reset = consolidate
+            || [
+                m::quil_grid_reset_v2_frame(),
+                m::quil_prover_reset_v3_frame(),
+                m::quil_prover_reset_v4_frame(),
+                m::quil_prover_reset_v5_frame(),
+            ]
+            .contains(&frame);
+        if !reset {
+            return Ok(());
+        }
+        let registry = self
+            .prover_registry
+            .as_any()
             .and_then(|value| value.downcast_ref::<ConcreteProverRegistry>())
-            .ok_or_else(|| QuilError::ExecutionUnavailable("bound reset requires a refreshable prover registry".into()))?;
-        if self.eviction_registry.as_ref().is_some_and(|eviction| !registry.shares_cache_with(eviction)) {
-            return Err(QuilError::ExecutionUnavailable("bound reset has inconsistent registry caches".into()));
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable(
+                    "bound reset requires a refreshable prover registry".into(),
+                )
+            })?;
+        if self
+            .eviction_registry
+            .as_ref()
+            .is_some_and(|eviction| !registry.shares_cache_with(eviction))
+        {
+            return Err(QuilError::ExecutionUnavailable(
+                "bound reset has inconsistent registry caches".into(),
+            ));
         }
         if consolidate {
-            let shards = self.execution_manager.shards_store().ok_or_else(|| QuilError::ExecutionUnavailable("consolidation requires bound shard metadata".into()))?;
-            policy.consolidate(&self.hypergraph, self.hypergraph_store.as_ref(), shards.as_ref(), guard, frame)?;
+            let shards = self.execution_manager.shards_store().ok_or_else(|| {
+                QuilError::ExecutionUnavailable(
+                    "consolidation requires bound shard metadata".into(),
+                )
+            })?;
+            policy.consolidate(
+                &self.hypergraph,
+                self.hypergraph_store.as_ref(),
+                shards.as_ref(),
+                guard,
+                frame,
+            )?;
         }
-        policy.reset(&self.hypergraph, self.hypergraph_store.as_ref(), guard, frame)?;
+        policy.reset(
+            &self.hypergraph,
+            self.hypergraph_store.as_ref(),
+            guard,
+            frame,
+        )?;
         // Reset changes allocations even inside an already-refreshed epoch.
         // Routing this frame and reconstructing a child must see the same set.
         // Refresh even if a durable reset marker makes the reset itself a no-op:
         // a prior attempt may have failed between writing that marker and here.
         registry.refresh_from_store(self.hypergraph_store.as_ref())?;
-        self.last_eviction_pass_epoch.store(u64::MAX, Ordering::SeqCst);
-        if consolidate { self.hypergraph.set_unified_tree(true); }
+        self.last_eviction_pass_epoch
+            .store(u64::MAX, Ordering::SeqCst);
+        if consolidate {
+            self.hypergraph.set_unified_tree(true);
+        }
         Ok(())
     }
 
@@ -2093,7 +2333,9 @@ impl FrameMaterializer {
         };
         // Rows of another store cannot be listed; reading them all for every
         // frame would cost more than the staleness this removes.
-        if self.hypergraph_store.backing_store_identity() != self.hypergraph.backing_store_identity() {
+        if self.hypergraph_store.backing_store_identity()
+            != self.hypergraph.backing_store_identity()
+        {
             return;
         }
         let caught_up = registry.catch_up(self.hypergraph_store.as_ref(), |database, sequence| {
@@ -2106,12 +2348,18 @@ impl FrameMaterializer {
                 }
                 let failures = self.registry_catch_up_failures.swap(0, Ordering::Relaxed);
                 if failures > 0 {
-                    info!(frame = frame_number, failures, "prover registry catch-up recovered");
+                    info!(
+                        frame = frame_number,
+                        failures, "prover registry catch-up recovered"
+                    );
                 }
             }
             // The first failure, then one line per 100 in a row.
             Err(error) => {
-                let failures = self.registry_catch_up_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                let failures = self
+                    .registry_catch_up_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 if failures % 100 == 1 {
                     warn!(
                         frame = frame_number,
@@ -2141,8 +2389,13 @@ impl FrameMaterializer {
             return;
         }
         let _forest_guard = self.hypergraph.lock_forest_writes();
-        let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
-        let root = self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
+        let global_shard = quil_types::store::ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let root = self
+            .hypergraph
+            .compute_shard_root("vertex", "adds", &global_shard);
         self.hypergraph.record_prover_root(frame, root);
     }
 
@@ -2156,7 +2409,9 @@ impl FrameMaterializer {
     /// supply. Errors (leaving the caller to halt) if recovery is disabled or the
     /// frame is outside the frozen range — a real hole there. Idempotent.
     pub fn frozen_era_skip(&self, frame_number: u64) -> Result<()> {
-        let _execution = self.frame_execution.lock().map_err(|_| QuilError::ExecutionUnavailable("materializer frame lock poisoned".into()))?;
+        let _execution = self.frame_execution.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("materializer frame lock poisoned".into())
+        })?;
         self.ensure_no_pending_execution()?;
         if !self.frozen_era_recovery_enabled
             || !(FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF).contains(&frame_number)
@@ -2169,15 +2424,22 @@ impl FrameMaterializer {
             return Ok(());
         }
         let _forest_guard = self.hypergraph.lock_forest_writes();
-        let global_shard = quil_types::store::ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
-        let frozen_root = self.hypergraph.compute_shard_root("vertex", "adds", &global_shard);
-        self.hypergraph.record_prover_root(frame_number, frozen_root);
+        let global_shard = quil_types::store::ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let frozen_root = self
+            .hypergraph
+            .compute_shard_root("vertex", "adds", &global_shard);
+        self.hypergraph
+            .record_prover_root(frame_number, frozen_root);
         self.execution_manager
             .commit_frame_with_global_cursor(frame_number)?;
         if let Some(cf) = &self.current_frame {
             cf.materialize(frame_number);
         }
-        self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
+        self.last_materialized_frame
+            .store(frame_number, Ordering::SeqCst);
         warn!(
             frame = frame_number,
             "frozen-era recovery: SKIPPED missing frame record (no-op, cursor advanced)"
@@ -2223,7 +2485,10 @@ impl FrameMaterializer {
     /// The shared `CurrentFrame` advertises the seeded cursor too: unseeded,
     /// a restarted node reported "executed 0" until it executed another frame.
     pub fn seed_cursor(&self, m: u64) {
-        let _execution = self.frame_execution.lock().expect("materializer frame lock poisoned");
+        let _execution = self
+            .frame_execution
+            .lock()
+            .expect("materializer frame lock poisoned");
         self.last_materialized_frame.fetch_max(m, Ordering::SeqCst);
         if let Some(cf) = &self.current_frame {
             cf.materialize(m);
@@ -2256,9 +2521,7 @@ impl FrameMaterializer {
 /// shard's own frame (where the frame's app_address IS the target). There is
 /// no per-op target for the global frame to route an update by; this is a
 /// message-format constraint, identical in Go.
-fn bundle_deploy_base_domain(
-    bundle: &quil_types::proto::global::MessageBundle,
-) -> Option<Vec<u8>> {
+fn bundle_deploy_base_domain(bundle: &quil_types::proto::global::MessageBundle) -> Option<Vec<u8>> {
     use quil_types::proto::global::message_request::Request;
     for req in &bundle.requests {
         let Some(r) = &req.request else { continue };
@@ -2289,27 +2552,40 @@ fn bundle_global_route(
 ) -> Vec<u8> {
     // A reward authorization mutates GLOBAL only, regardless of token-app
     // coverage. Mixed bundles cannot inherit this special routing rule.
-    if let Some(domain) = bundle_token_reward_domain(bundle) { return domain; }
+    if let Some(domain) = bundle_token_reward_domain(bundle) {
+        return domain;
+    }
     if uncovered_active {
-        if let Some(base) = bundle_deploy_base_domain(bundle) { return base; }
+        if let Some(base) = bundle_deploy_base_domain(bundle) {
+            return base;
+        }
         if let Some(domain) = bundle_target_domain(bundle) {
-            if is_uncovered(&domain) { return domain; }
+            if is_uncovered(&domain) {
+                return domain;
+            }
         }
     }
     quil_execution::domains::GLOBAL.to_vec()
 }
 
-fn bundle_token_reward_domain(bundle: &quil_types::proto::global::MessageBundle) -> Option<Vec<u8>> {
+fn bundle_token_reward_domain(
+    bundle: &quil_types::proto::global::MessageBundle,
+) -> Option<Vec<u8>> {
     use quil_types::proto::global::message_request::Request;
-    if bundle.requests.is_empty() { return None; }
+    if bundle.requests.is_empty() {
+        return None;
+    }
     for req in &bundle.requests {
-        let Some(Request::TokenOperation(token)) = &req.request else { return None; };
+        let Some(Request::TokenOperation(token)) = &req.request else {
+            return None;
+        };
         // Only the QUIL reward mint (QCT3MT) takes the global reward route;
         // custom-token issuance shares the prefix but is application state.
         if token.canonical_bytes.get(..4) != Some(0x0513u32.to_be_bytes().as_slice())
             || token.canonical_bytes.get(4..12) != Some(b"QCT3MT\0\x02".as_slice())
             || quil_execution::token_intrinsic::wire::domain(&token.canonical_bytes).ok()
-                != Some(quil_execution::domains::QUIL_TOKEN) {
+                != Some(quil_execution::domains::QUIL_TOKEN)
+        {
             return None;
         }
     }
@@ -2348,32 +2624,57 @@ mod tests {
 
     #[test]
     fn replacement_carrier_global_reward_route_is_independent_of_app_coverage() {
-        use quil_types::proto::{global::{MessageBundle, MessageRequest, message_request::Request}, token::TokenOperation};
+        use quil_types::proto::{
+            global::{message_request::Request, MessageBundle, MessageRequest},
+            token::TokenOperation,
+        };
         let operation = |prefix: u32, version: &[u8; 8], domain: &[u8; 32]| {
             let mut bytes = vec![0; 76];
             bytes[..4].copy_from_slice(&prefix.to_be_bytes());
             bytes[4..12].copy_from_slice(version);
             bytes[44..76].copy_from_slice(domain);
-            MessageRequest { request: Some(Request::TokenOperation(TokenOperation {
-                canonical_bytes: bytes,
-            })), ..Default::default() }
+            MessageRequest {
+                request: Some(Request::TokenOperation(TokenOperation {
+                    canonical_bytes: bytes,
+                })),
+                ..Default::default()
+            }
         };
         let app = quil_execution::domains::QUIL_TOKEN;
         let mint = operation(0x0513, b"QCT3MT\0\x02", &app);
-        let mut bundle = MessageBundle { requests: vec![mint.clone(), mint], ..Default::default() };
+        let mut bundle = MessageBundle {
+            requests: vec![mint.clone(), mint],
+            ..Default::default()
+        };
         for active in [false, true] {
-            assert_eq!(bundle_global_route(&bundle, active, |_| panic!("reward route must not depend on coverage")), app.to_vec());
+            assert_eq!(
+                bundle_global_route(&bundle, active, |_| panic!(
+                    "reward route must not depend on coverage"
+                )),
+                app.to_vec()
+            );
         }
-        bundle.requests.push(operation(0x0512, b"QCT3TX\0\x02", &app));
+        bundle
+            .requests
+            .push(operation(0x0512, b"QCT3TX\0\x02", &app));
         assert_eq!(bundle_token_reward_domain(&bundle), None);
-        assert_eq!(bundle_global_route(&bundle, true, |_| false), quil_execution::domains::GLOBAL.to_vec());
+        assert_eq!(
+            bundle_global_route(&bundle, true, |_| false),
+            quil_execution::domains::GLOBAL.to_vec()
+        );
         assert_eq!(bundle_global_route(&bundle, true, |_| true), app.to_vec());
         bundle.requests = vec![operation(0x0513, b"QCT3MT\0\x02", &[7; 32])];
         assert_eq!(bundle_token_reward_domain(&bundle), None);
         bundle.requests = vec![operation(0x0517, b"QCT3MC\0\x02", &app)];
         assert_eq!(bundle_token_reward_domain(&bundle), None);
-        assert_eq!(bundle_global_route(&bundle, false, |_| true), quil_execution::domains::GLOBAL.to_vec());
-        assert_eq!(bundle_global_route(&bundle, true, |_| false), quil_execution::domains::GLOBAL.to_vec());
+        assert_eq!(
+            bundle_global_route(&bundle, false, |_| true),
+            quil_execution::domains::GLOBAL.to_vec()
+        );
+        assert_eq!(
+            bundle_global_route(&bundle, true, |_| false),
+            quil_execution::domains::GLOBAL.to_vec()
+        );
         assert_eq!(bundle_global_route(&bundle, true, |_| true), app.to_vec());
         bundle.requests.clear();
         assert_eq!(bundle_token_reward_domain(&bundle), None);
@@ -2381,22 +2682,36 @@ mod tests {
 
     #[test]
     fn replacement_carrier_routes_by_embedded_application() {
-        use quil_types::proto::{global::{MessageBundle, MessageRequest, message_request::Request}, token::TokenOperation};
-        for (prefix, version) in [(0x0512u32, b"QCT3TX\0\x02"), (0x0513, b"QCT3CM\0\x02"), (0x0514, b"QCT3PE\0\x02"), (0x0515, b"QCT3PC\0\x02")] {
-        let mut bytes = vec![0; 76];
-        bytes[..4].copy_from_slice(&prefix.to_be_bytes());
-        bytes[4..12].copy_from_slice(version);
-        bytes[44..76].copy_from_slice(&quil_execution::domains::QUIL_TOKEN);
-        let bundle = |bytes| MessageBundle {
-            requests: vec![MessageRequest {
-                request: Some(Request::TokenOperation(TokenOperation { canonical_bytes: bytes })),
-                ..Default::default()
-            }], ..Default::default()
+        use quil_types::proto::{
+            global::{message_request::Request, MessageBundle, MessageRequest},
+            token::TokenOperation,
         };
-        assert_eq!(bundle_target_domain(&bundle(bytes.clone())), Some(quil_execution::domains::QUIL_TOKEN.to_vec()));
-        assert_eq!(bundle_token_reward_domain(&bundle(bytes.clone())), None);
-        bytes[4] ^= 1;
-        assert_eq!(bundle_target_domain(&bundle(bytes)), None);
+        for (prefix, version) in [
+            (0x0512u32, b"QCT3TX\0\x02"),
+            (0x0513, b"QCT3CM\0\x02"),
+            (0x0514, b"QCT3PE\0\x02"),
+            (0x0515, b"QCT3PC\0\x02"),
+        ] {
+            let mut bytes = vec![0; 76];
+            bytes[..4].copy_from_slice(&prefix.to_be_bytes());
+            bytes[4..12].copy_from_slice(version);
+            bytes[44..76].copy_from_slice(&quil_execution::domains::QUIL_TOKEN);
+            let bundle = |bytes| MessageBundle {
+                requests: vec![MessageRequest {
+                    request: Some(Request::TokenOperation(TokenOperation {
+                        canonical_bytes: bytes,
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                bundle_target_domain(&bundle(bytes.clone())),
+                Some(quil_execution::domains::QUIL_TOKEN.to_vec())
+            );
+            assert_eq!(bundle_token_reward_domain(&bundle(bytes.clone())), None);
+            bytes[4] ^= 1;
+            assert_eq!(bundle_target_domain(&bundle(bytes)), None);
         }
     }
 
@@ -2409,13 +2724,17 @@ mod tests {
         assert!(matches!(result, Err(QuilError::Store(_))));
         let result = finish_frame_header_validation(vec![
             (vec![1], Ok(())),
-            (vec![1], Err(QuilError::ExecutionUnavailable("backend stopped".into()))),
+            (
+                vec![1],
+                Err(QuilError::ExecutionUnavailable("backend stopped".into())),
+            ),
         ]);
         assert!(matches!(result, Err(QuilError::ExecutionUnavailable(_))));
         let result = finish_frame_header_validation(vec![
             (vec![1], Ok(())),
             (vec![2], Err(QuilError::InvalidSignature("invalid".into()))),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(result.get(&vec![1]), Some(&true));
         assert_eq!(result.get(&vec![2]), Some(&false));
     }
@@ -2433,21 +2752,24 @@ mod tests {
     fn bundle_target_domain_extracts_data_op_domains() {
         use quil_types::proto::global as pb;
         let mk = |req: pb::message_request::Request| pb::MessageBundle {
-            requests: vec![pb::MessageRequest { timestamp: 0, request: Some(req) }],
+            requests: vec![pb::MessageRequest {
+                timestamp: 0,
+                request: Some(req),
+            }],
             timestamp: 0,
         };
         let dom = vec![0x42u8; 32];
 
         // Token transfer → its domain.
-        let tx = pb::message_request::Request::TokenOperation(
-            test_token_carrier(&dom),
-        );
+        let tx = pb::message_request::Request::TokenOperation(test_token_carrier(&dom));
         assert_eq!(bundle_target_domain(&mk(tx)), Some(dom.clone()));
 
         // Hypergraph vertex add → its domain.
-        let va = pb::message_request::Request::VertexAdd(
-            quil_types::proto::hypergraph::VertexAdd { domain: dom.clone(), ..Default::default() },
-        );
+        let va =
+            pb::message_request::Request::VertexAdd(quil_types::proto::hypergraph::VertexAdd {
+                domain: dom.clone(),
+                ..Default::default()
+            });
         assert_eq!(bundle_target_domain(&mk(va)), Some(dom.clone()));
 
         // Prover op (Pause) → None (global path).
@@ -2459,9 +2781,7 @@ mod tests {
         assert_eq!(bundle_target_domain(&mk(pause)), None);
 
         // Non-32-byte domain → None (defensive).
-        let bad = pb::message_request::Request::TokenOperation(
-            test_token_carrier(&[1; 16]),
-        );
+        let bad = pb::message_request::Request::TokenOperation(test_token_carrier(&[1; 16]));
         assert_eq!(bundle_target_domain(&mk(bad)), None);
     }
 
@@ -2469,7 +2789,10 @@ mod tests {
     fn bundle_deploy_base_domain_routes_each_deploy_to_its_intrinsic() {
         use quil_types::proto::global as pb;
         let mk = |req: pb::message_request::Request| pb::MessageBundle {
-            requests: vec![pb::MessageRequest { timestamp: 0, request: Some(req) }],
+            requests: vec![pb::MessageRequest {
+                timestamp: 0,
+                request: Some(req),
+            }],
             timestamp: 0,
         };
 
@@ -2511,9 +2834,7 @@ mod tests {
 
         // A plain data op (transfer) → None: handled by the uncovered-shard
         // data-op path (bundle_target_domain), not the deploy path.
-        let tx = pb::message_request::Request::TokenOperation(
-            test_token_carrier(&[0x42; 32]),
-        );
+        let tx = pb::message_request::Request::TokenOperation(test_token_carrier(&[0x42; 32]));
         assert_eq!(bundle_deploy_base_domain(&mk(tx)), None);
     }
 
@@ -2521,20 +2842,35 @@ mod tests {
     fn frozen_skip_does_not_publish_materialized_progress_on_commit_failure() {
         let store = Arc::new(quil_hypergraph::testing::MemStore::new());
         let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), prover.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            prover.clone(),
+        ));
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-            prover, stubs.key_manager, crdt.clone(), stubs.circuit_compiler,
-            stubs.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), true,
+            prover,
+            stubs.key_manager,
+            crdt.clone(),
+            stubs.circuit_compiler,
+            stubs.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
         ));
         let current = CurrentFrame::new();
         let frame = FROZEN_ERA_RECOVERY_START;
         current.materialize(frame - 1);
-        let materializer = FrameMaterializer::new(manager,
+        let materializer = FrameMaterializer::new(
+            manager,
             Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
-            stubs.clock_store, crdt, store.clone(), Arc::new(crate::rewards::OptRewardIssuance),
-            vec![1; 32], true)
-            .with_current_frame(current.clone()).with_frozen_era_recovery(true);
+            stubs.clock_store,
+            crdt,
+            store.clone(),
+            Arc::new(crate::rewards::OptRewardIssuance),
+            vec![1; 32],
+            true,
+        )
+        .with_current_frame(current.clone())
+        .with_frozen_era_recovery(true);
         store.fail_commit_setup(true, false);
         assert!(materializer.frozen_era_skip(frame).is_err());
         assert_eq!(current.materialized(), frame - 1);
@@ -2549,44 +2885,72 @@ mod tests {
     fn shard_admission_refresh_requires_successful_global_commit() {
         let store = Arc::new(quil_hypergraph::testing::MemStore::new());
         let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), prover.clone()));
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            prover.clone(),
+        ));
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
         let manager = Arc::new(quil_execution::ExecutionEngineManager::new(
-            prover, stubs.key_manager, crdt.clone(), stubs.circuit_compiler,
-            stubs.clock_store.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), true,
+            prover,
+            stubs.key_manager,
+            crdt.clone(),
+            stubs.circuit_compiler,
+            stubs.clock_store.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
         ));
         let current = CurrentFrame::new();
         let calls = Arc::new(AtomicU64::new(0));
-        let materializer = FrameMaterializer::new(manager,
+        let materializer = FrameMaterializer::new(
+            manager,
             Arc::new(quil_execution::prover_registry::SharedProverRegistry::new()),
-            stubs.clock_store, crdt, store.clone(), Arc::new(crate::rewards::OptRewardIssuance),
-            vec![1; 32], true)
-            .with_current_frame(current.clone())
-            .with_shard_admission_refresh({
-                let calls = calls.clone();
-                let current = current.clone();
-                Arc::new(move || {
-                    assert_eq!(current.materialized(), 0, "admission publishes before progress");
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-            });
+            stubs.clock_store,
+            crdt,
+            store.clone(),
+            Arc::new(crate::rewards::OptRewardIssuance),
+            vec![1; 32],
+            true,
+        )
+        .with_current_frame(current.clone())
+        .with_shard_admission_refresh({
+            let calls = calls.clone();
+            let current = current.clone();
+            Arc::new(move || {
+                assert_eq!(
+                    current.materialized(),
+                    0,
+                    "admission publishes before progress"
+                );
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
         let frame = quil_types::proto::global::GlobalFrame {
             header: Some(quil_types::proto::global::GlobalFrameHeader {
-                frame_number: 1, difficulty: 200000, ..Default::default()
+                frame_number: 1,
+                difficulty: 200000,
+                ..Default::default()
             }),
             ..Default::default()
         };
         assert_eq!(calls.load(Ordering::SeqCst), 1, "startup refresh");
         store.fail_commit_setup(true, false);
         assert!(materializer.materialize(&frame).is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "no publication on commit failure");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no publication on commit failure"
+        );
         store.fail_commit_setup(false, false);
         materializer.materialize(&frame).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(current.materialized(), 1);
         materializer.materialize(&frame).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "no second publication on replay");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no second publication on replay"
+        );
     }
 
     #[test]
@@ -2595,68 +2959,136 @@ mod tests {
         let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
         let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
         let prover = Arc::new(quil_types::crypto::NoopInclusionProver);
-        let hg = Arc::new(quil_hypergraph::HypergraphCrdt::new(store.clone(), prover.clone()));
-        hg.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let hg = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            store.clone(),
+            prover.clone(),
+        ));
+        hg.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
         hg.set_unified_tree(true);
         hg.warm_sizes(&[]).unwrap();
         let stubs = quil_execution::testing::NoopExecutionCrypto::new();
         let source = quil_execution::ExecutionEngineManager::new(
-            prover, stubs.key_manager, hg.clone(), stubs.circuit_compiler,
-            clock.clone(), Arc::new(quil_execution::testing::NoopHypergraphConfigResolver), true,
+            prover,
+            stubs.key_manager,
+            hg.clone(),
+            stubs.circuit_compiler,
+            clock.clone(),
+            Arc::new(quil_execution::testing::NoopHypergraphConfigResolver),
+            true,
         );
         let sequence = db.inner().latest_sequence_number();
-        let branch = source.capture_execution_branch(quil_execution::ExecutionBranchLimits {
-            state: quil_hypergraph::ExecutionForkLimits {
-                overlay: quil_forest::OverlayLimits {
-                    max_delta_bytes: 16 << 20, max_delta_entries: 100_000,
-                    max_record_bytes: 2 << 20, max_read_bytes: 128 << 20,
-                    max_read_operations: 2_000_000, max_cursors: 128,
+        let branch = source
+            .capture_execution_branch(quil_execution::ExecutionBranchLimits {
+                state: quil_hypergraph::ExecutionForkLimits {
+                    overlay: quil_forest::OverlayLimits {
+                        max_delta_bytes: 16 << 20,
+                        max_delta_entries: 100_000,
+                        max_record_bytes: 2 << 20,
+                        max_read_bytes: 128 << 20,
+                        max_read_operations: 2_000_000,
+                        max_cursors: 128,
+                    },
+                    max_metadata_entries: 10_000,
+                    max_metadata_bytes: 4 << 20,
                 },
-                max_metadata_entries: 10_000, max_metadata_bytes: 4 << 20,
-            },
-            registry: quil_execution::RegistryLimits {
-                max_vertices: 10_000, max_record_bytes: 2 << 20, max_input_bytes: 16 << 20,
-                max_cache_entries: 100_000, max_cache_bytes: 16 << 20,
-            },
-            max_summary_rebuilds: 1000,
-        }).unwrap();
+                registry: quil_execution::RegistryLimits {
+                    max_vertices: 10_000,
+                    max_record_bytes: 2 << 20,
+                    max_input_bytes: 16 << 20,
+                    max_cache_entries: 100_000,
+                    max_cache_bytes: 16 << 20,
+                },
+                max_summary_rebuilds: 1000,
+            })
+            .unwrap();
         let manager = branch.manager().clone();
         let hg = manager.crdt();
         let clock = branch.clock_store().clone();
         let store = branch.hypergraph_store().clone();
         let registry = Arc::new(branch.registry().clone());
-        let shard = quil_types::store::ShardKey { l1: [0; 3], l2: [0xff; 32] };
+        let shard = quil_types::store::ShardKey {
+            l1: [0; 3],
+            l2: [0xff; 32],
+        };
         let txn = store.new_transaction(false).unwrap();
-        store.save_root(txn.as_ref(), "vertex", "adds", &shard, b"invalid legacy registry blob").unwrap();
+        store
+            .save_root(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                b"invalid legacy registry blob",
+            )
+            .unwrap();
         txn.commit().unwrap();
-        let materializer = FrameMaterializer::new(manager, registry.clone(), clock.clone(),
-            hg.clone(), store, Arc::new(crate::rewards::OptRewardIssuance), vec![1; 32], true)
-            .with_eviction_registry(registry.clone());
+        let materializer = FrameMaterializer::new(
+            manager,
+            registry.clone(),
+            clock.clone(),
+            hg.clone(),
+            store,
+            Arc::new(crate::rewards::OptRewardIssuance),
+            vec![1; 32],
+            true,
+        )
+        .with_eviction_registry(registry.clone());
         let frame = |number| quil_types::proto::global::GlobalFrame {
             header: Some(quil_types::proto::global::GlobalFrameHeader {
-                frame_number: number, difficulty: 200_000, output: vec![number as u8; 516], ..Default::default()
-            }), requests: vec![quil_types::proto::global::MessageBundle::default()],
+                frame_number: number,
+                difficulty: 200_000,
+                output: vec![number as u8; 516],
+                ..Default::default()
+            }),
+            requests: vec![quil_types::proto::global::MessageBundle::default()],
         };
         materializer.materialize(&frame(1)).unwrap();
         assert_eq!(materializer.last_materialized_frame(), 1);
-        assert_eq!(materializer.last_eviction_pass_epoch.load(Ordering::SeqCst), u64::MAX,
-            "failed registry read must not suppress the next refresh in this epoch");
+        assert_eq!(
+            materializer.last_eviction_pass_epoch.load(Ordering::SeqCst),
+            u64::MAX,
+            "failed registry read must not suppress the next refresh in this epoch"
+        );
         assert_eq!(registry.read(|r| r.distinct_provers()), 0);
 
-        let tree = quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(&[0xcd; 57], 0).unwrap();
-        hg.add_vertex(&quil_hypergraph::addressing::Location {
-            app_address: shard.l2, data_address: [7; 32],
-        }, &quil_execution::prover_registry::vertex_tree_to_blob(&tree)).unwrap();
+        let tree = quil_execution::global_intrinsic::materialize::create_prover_vertex_tree(
+            &[0xcd; 57],
+            0,
+        )
+        .unwrap();
+        hg.add_vertex(
+            &quil_hypergraph::addressing::Location {
+                app_address: shard.l2,
+                data_address: [7; 32],
+            },
+            &quil_execution::prover_registry::vertex_tree_to_blob(&tree),
+        )
+        .unwrap();
         materializer.materialize(&frame(2)).unwrap();
         assert_eq!(materializer.last_materialized_frame(), 2);
-        assert_eq!(materializer.last_eviction_pass_epoch.load(Ordering::SeqCst),
-            quil_types::consensus::epoch_for_frame(2));
-        assert!(registry.read(|r| r.get_prover_info(&[7; 32]).is_some()),
-            "registry reads the committed branch instead of the empty primary store");
+        assert_eq!(
+            materializer.last_eviction_pass_epoch.load(Ordering::SeqCst),
+            quil_types::consensus::epoch_for_frame(2)
+        );
+        assert!(
+            registry.read(|r| r.get_prover_info(&[7; 32]).is_some()),
+            "registry reads the committed branch instead of the empty primary store"
+        );
         use quil_types::store::ClockStore;
         for number in [1, 2] {
-            assert_eq!(clock.get_global_clock_frame_outcomes(number).unwrap().len(), 1);
-            assert!(db.inner().get(quil_store::encoding::clock_global_frame_outcomes_key(number)).unwrap().is_none());
+            assert_eq!(
+                clock.get_global_clock_frame_outcomes(number).unwrap().len(),
+                1
+            );
+            assert!(db
+                .inner()
+                .get(quil_store::encoding::clock_global_frame_outcomes_key(
+                    number
+                ))
+                .unwrap()
+                .is_none());
         }
         assert_eq!(db.inner().latest_sequence_number(), sequence);
         drop(branch);
@@ -2687,9 +3119,23 @@ mod tests {
         let mismatch = AtomicBool::new(false);
 
         // Empty expected → pass
-        assert!(verify_root_logic(1, &[], &[0xAA; 64], &synced, &verified, &mismatch));
+        assert!(verify_root_logic(
+            1,
+            &[],
+            &[0xAA; 64],
+            &synced,
+            &verified,
+            &mismatch
+        ));
         // Empty local → pass
-        assert!(verify_root_logic(1, &[0xAA; 64], &[], &synced, &verified, &mismatch));
+        assert!(verify_root_logic(
+            1,
+            &[0xAA; 64],
+            &[],
+            &synced,
+            &verified,
+            &mismatch
+        ));
         // Neither branch should flag a mismatch on an unverifiable (empty) root.
         assert!(!mismatch.load(Ordering::Relaxed));
     }
@@ -2700,7 +3146,9 @@ mod tests {
         let verified = AtomicU64::new(0);
         let mismatch = AtomicBool::new(false);
         let root = vec![0xBBu8; 64];
-        assert!(verify_root_logic(42, &root, &root, &synced, &verified, &mismatch));
+        assert!(verify_root_logic(
+            42, &root, &root, &synced, &verified, &mismatch
+        ));
         assert!(synced.load(Ordering::Relaxed));
         assert!(!mismatch.load(Ordering::Relaxed));
         assert_eq!(verified.load(Ordering::Relaxed), 42);
@@ -2713,9 +3161,14 @@ mod tests {
         let mismatch = AtomicBool::new(false);
         let expected = vec![0xAAu8; 64];
         let local = vec![0xBBu8; 64];
-        assert!(!verify_root_logic(10, &expected, &local, &synced, &verified, &mismatch));
+        assert!(!verify_root_logic(
+            10, &expected, &local, &synced, &verified, &mismatch
+        ));
         assert!(!synced.load(Ordering::Relaxed));
-        assert!(mismatch.load(Ordering::Relaxed), "a mismatch must set the recovery flag");
+        assert!(
+            mismatch.load(Ordering::Relaxed),
+            "a mismatch must set the recovery flag"
+        );
         assert_eq!(verified.load(Ordering::Relaxed), 0);
     }
 
@@ -2733,17 +3186,30 @@ mod tests {
         // Fresh: no verification has run. Not synced, but NOT a detected
         // mismatch → recovery must not fire.
         assert!(!synced.load(Ordering::Relaxed));
-        assert!(!mismatch.load(Ordering::Relaxed), "fresh node is not a detected mismatch");
+        assert!(
+            !mismatch.load(Ordering::Relaxed),
+            "fresh node is not a detected mismatch"
+        );
 
         // Divergence detected → flag set.
         let expected = vec![0x11u8; 64];
         let local = vec![0x22u8; 64];
-        assert!(!verify_root_logic(500, &expected, &local, &synced, &verified, &mismatch));
-        assert!(mismatch.load(Ordering::Relaxed), "divergence sets the recovery flag");
+        assert!(!verify_root_logic(
+            500, &expected, &local, &synced, &verified, &mismatch
+        ));
+        assert!(
+            mismatch.load(Ordering::Relaxed),
+            "divergence sets the recovery flag"
+        );
 
         // Reconcile then match → flag cleared, recovery stops.
-        assert!(verify_root_logic(501, &expected, &expected, &synced, &verified, &mismatch));
-        assert!(!mismatch.load(Ordering::Relaxed), "a match clears the recovery flag");
+        assert!(verify_root_logic(
+            501, &expected, &expected, &synced, &verified, &mismatch
+        ));
+        assert!(
+            !mismatch.load(Ordering::Relaxed),
+            "a match clears the recovery flag"
+        );
         assert!(synced.load(Ordering::Relaxed));
         assert_eq!(verified.load(Ordering::Relaxed), 501);
     }
@@ -2799,9 +3265,7 @@ mod tests {
     #[test]
     fn materializer_feeds_canonical_bytes_to_engine() {
         use crate::consensus_wire::proto_message_bundle_to_canonical_bytes;
-        use quil_execution::message_envelope::{
-            CanonicalMessageBundle, TYPE_MESSAGE_BUNDLE,
-        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, TYPE_MESSAGE_BUNDLE};
         use quil_types::proto::global as pb;
 
         // Build a proto bundle with one ProverPause request — chosen
@@ -2839,7 +3303,10 @@ mod tests {
         // fields and starts with a different leading byte.
         use prost::Message;
         let prost_bytes = proto_bundle.encode_to_vec();
-        assert_ne!(&canonical[..4], &prost_bytes.get(..4).unwrap_or(&[]).to_vec()[..]);
+        assert_ne!(
+            &canonical[..4],
+            &prost_bytes.get(..4).unwrap_or(&[]).to_vec()[..]
+        );
     }
 
     /// Verify that the integral per-cost price covers the baseline without
@@ -2853,7 +3320,14 @@ mod tests {
 
         // Case 1: cost_basis = 0 → fee = 0 (matches Go short-circuit)
         let cost_basis_zero = BigInt::zero();
-        let fee_zero = crate::rewards::fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, 50_000, 0, &cost_basis_zero, 1).unwrap();
+        let fee_zero = crate::rewards::fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            50_000,
+            0,
+            &cost_basis_zero,
+            1,
+        )
+        .unwrap();
         assert!(fee_zero.is_zero());
 
         // Case 2: cost_basis = 1024, difficulty = 50000, world = 1<<30
@@ -2863,7 +3337,14 @@ mod tests {
         let cost_u64 = 1024u64;
         let cost_basis = BigInt::from(cost_u64);
         let baseline = get_baseline_fee(difficulty, world_size, cost_u64, QUIL_TOKEN_UNITS);
-        let expected_fee = crate::rewards::fee_multiplier_for_cost(quil_execution::pricing::MAINNET_NETWORK, difficulty, world_size, &cost_basis, 1).unwrap();
+        let expected_fee = crate::rewards::fee_multiplier_for_cost(
+            quil_execution::pricing::MAINNET_NETWORK,
+            difficulty,
+            world_size,
+            &cost_basis,
+            1,
+        )
+        .unwrap();
         assert_eq!(expected_fee, BigInt::from(14));
         assert!(&expected_fee * &cost_basis >= baseline);
         assert!((&expected_fee - BigInt::from(1)) * &cost_basis < baseline);

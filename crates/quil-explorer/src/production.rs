@@ -97,7 +97,10 @@ pub struct Decoders {
 
 impl Default for Decoders {
     fn default() -> Self {
-        Self { signers: cw_signers, drains: seal_drain_headers }
+        Self {
+            signers: cw_signers,
+            drains: seal_drain_headers,
+        }
     }
 }
 
@@ -105,10 +108,15 @@ impl Default for Decoders {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signers {
     /// CW certificate: the signing committee's size and its signers.
-    Certificate { committee: usize, signed: usize },
+    Certificate {
+        committee: usize,
+        signed: usize,
+    },
     /// Legacy BLS aggregate: the bitmask's popcount; the committee size is
     /// not in the header.
-    Legacy { signed: usize },
+    Legacy {
+        signed: usize,
+    },
     Unreadable,
 }
 
@@ -281,7 +289,9 @@ impl FrameSource for StoreSource<'_> {
     }
 
     fn outcomes(&self, number: u64) -> Vec<RequestOutcome> {
-        self.0.get_global_clock_frame_outcomes(number).unwrap_or_default()
+        self.0
+            .get_global_clock_frame_outcomes(number)
+            .unwrap_or_default()
     }
 }
 
@@ -304,7 +314,8 @@ impl ProductionIndex {
     }
 
     fn next_frame(&self) -> u64 {
-        self.indexed_through.map_or(self.start, |t| t.saturating_add(1))
+        self.indexed_through
+            .map_or(self.start, |t| t.saturating_add(1))
     }
 
     /// Index frames from the next one through `head`, at most `max` of
@@ -331,7 +342,9 @@ impl ProductionIndex {
                 break;
             }
             let frame = match source.frame(n) {
-                Ok(frame) => frame.filter(|f| f.header.as_ref().is_some_and(|h| h.frame_number == n)),
+                Ok(frame) => {
+                    frame.filter(|f| f.header.as_ref().is_some_and(|h| h.frame_number == n))
+                }
                 Err(e) => {
                     out.error = Some(e.to_string());
                     break;
@@ -348,8 +361,11 @@ impl ProductionIndex {
                     out.missing.push(n);
                 }
                 Some(frame) => {
-                    let outcomes =
-                        if frame.requests.is_empty() { Vec::new() } else { source.outcomes(n) };
+                    let outcomes = if frame.requests.is_empty() {
+                        Vec::new()
+                    } else {
+                        source.outcomes(n)
+                    };
                     if !frame.requests.is_empty() && outcomes.is_empty() {
                         if !past_grace(n) {
                             out.waiting = Some(n);
@@ -373,20 +389,26 @@ impl ProductionIndex {
     /// (or a short list) leaves the uncovered headers unknown. Frames at or
     /// below `indexed_through` are ignored; skipped frames count as missing.
     pub fn apply(&mut self, frame: &GlobalFrame, outcomes: Option<&[RequestOutcome]>) -> bool {
-        let Some(header) = frame.header.as_ref() else { return false };
+        let Some(header) = frame.header.as_ref() else {
+            return false;
+        };
         let n = header.frame_number;
         if !self.begin(n) {
             return false;
         }
-        let outcomes_missing = !frame.requests.is_empty()
-            && outcomes.is_none_or(|o| o.len() < frame.requests.len());
+        let outcomes_missing =
+            !frame.requests.is_empty() && outcomes.is_none_or(|o| o.len() < frame.requests.len());
         let mut inclusions = Vec::new();
         for (i, bundle) in frame.requests.iter().enumerate() {
             let status = outcomes.and_then(|o| o.get(i)).map(|o| &o.status);
             for request in &bundle.requests {
                 match &request.request {
-                    Some(Request::Shard(shard)) => inclusions.push(self.include_shard(n, shard, status)),
-                    Some(Request::CommitteeHandoff(payload)) if status == Some(&RequestStatus::Succeeded) => {
+                    Some(Request::Shard(shard)) => {
+                        inclusions.push(self.include_shard(n, shard, status))
+                    }
+                    Some(Request::CommitteeHandoff(payload))
+                        if status == Some(&RequestStatus::Succeeded) =>
+                    {
                         for (filter, app_frame) in (self.decoders.drains)(payload) {
                             if let Some(inclusion) = self.include_drain(n, &filter, app_frame) {
                                 inclusions.push(inclusion);
@@ -439,7 +461,11 @@ impl ProductionIndex {
         let through = entry.frame;
         self.window.push_back(entry);
         self.indexed_through = Some(through);
-        while self.window.front().is_some_and(|e| e.frame.saturating_add(WINDOW_FRAMES) <= through) {
+        while self
+            .window
+            .front()
+            .is_some_and(|e| e.frame.saturating_add(WINDOW_FRAMES) <= through)
+        {
             self.window.pop_front();
         }
         self.forget_before(through.saturating_sub(REBUILD_FRAMES));
@@ -478,7 +504,12 @@ impl ProductionIndex {
         key
     }
 
-    fn include_shard(&mut self, n: u64, shard: &FrameHeader, status: Option<&RequestStatus>) -> Inclusion {
+    fn include_shard(
+        &mut self,
+        n: u64,
+        shard: &FrameHeader,
+        status: Option<&RequestStatus>,
+    ) -> Inclusion {
         let filter = self.intern(&shard.address, n);
         let reader = self.decoders.signers;
         let agg = self.shards.get_mut(&filter).expect("interned");
@@ -498,7 +529,9 @@ impl ProductionIndex {
                         rank: shard.rank,
                         signers: Signers::read(shard, reader),
                     });
-                    fee = quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&shard.fee_total);
+                    fee = quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(
+                        &shard.fee_total,
+                    );
                 }
                 (Kind::Applied { new }, fee)
             }
@@ -516,7 +549,11 @@ impl ProductionIndex {
         }
         agg.max_executed = Some(app_frame);
         agg.executed_at = n;
-        Some(Inclusion { filter, kind: Kind::Drained, fee: 0 })
+        Some(Inclusion {
+            filter,
+            kind: Kind::Drained,
+            fee: 0,
+        })
     }
 
     pub fn window_complete(&self) -> bool {
@@ -547,11 +584,21 @@ impl ProductionIndex {
         let mut shards: HashMap<Vec<u8>, ShardView> = self
             .shards
             .iter()
-            .map(|(f, agg)| (f.to_vec(), ShardView { window: WindowCounts::default(), last: agg.last }))
+            .map(|(f, agg)| {
+                (
+                    f.to_vec(),
+                    ShardView {
+                        window: WindowCounts::default(),
+                        last: agg.last,
+                    },
+                )
+            })
             .collect();
         for entry in &self.window {
             for inclusion in &entry.inclusions {
-                let Some(shard) = shards.get_mut(&*inclusion.filter) else { continue };
+                let Some(shard) = shards.get_mut(&*inclusion.filter) else {
+                    continue;
+                };
                 let w = &mut shard.window;
                 match inclusion.kind {
                     Kind::Applied { new } => {
@@ -588,7 +635,10 @@ impl ProductionIndex {
         let window: usize = self
             .window
             .iter()
-            .map(|e| std::mem::size_of::<FrameEntry>() + e.inclusions.capacity() * std::mem::size_of::<Inclusion>())
+            .map(|e| {
+                std::mem::size_of::<FrameEntry>()
+                    + e.inclusions.capacity() * std::mem::size_of::<Inclusion>()
+            })
             .sum();
         let shards: usize = self
             .shards
@@ -601,7 +651,13 @@ impl ProductionIndex {
 
 impl FrameEntry {
     fn missing(frame: u64) -> Self {
-        Self { frame, timestamp: None, missing: true, outcomes_missing: false, inclusions: Vec::new() }
+        Self {
+            frame,
+            timestamp: None,
+            missing: true,
+            outcomes_missing: false,
+            inclusions: Vec::new(),
+        }
     }
 }
 
@@ -640,7 +696,12 @@ impl Class {
 /// evidence: it makes the shard producing even in an incomplete window (a
 /// missing frame, a short index) and outranks the shard's headers of
 /// unknown outcome. The negative classes need the complete window.
-pub fn classify(window_complete: bool, applied_in_window: u64, unknown_in_window: u64, active_members: u64) -> Class {
+pub fn classify(
+    window_complete: bool,
+    applied_in_window: u64,
+    unknown_in_window: u64,
+    active_members: u64,
+) -> Class {
     if applied_in_window > 0 {
         Class::Producing
     } else if !window_complete || unknown_in_window > 0 {
@@ -696,9 +757,11 @@ const NO_STORE_GRID: &str = "the shards store holds no QUIL grid row";
 const NO_CACHE: &str = "no archive shard-info refresh has answered yet";
 const NO_CACHE_GRID: &str = "the archive shard-info cache lists no QUIL grid shard";
 /// An empty live set is a failed read, never a network without shards.
-pub const NO_LIVE: &str = "no live shard: no registry filter is on the grid and no grid shard holds data";
+pub const NO_LIVE: &str =
+    "no live shard: no registry filter is on the grid and no grid shard holds data";
 pub const NO_REGISTRY: &str = "the prover registry's shard summaries cannot be read";
-pub const NO_PROVERS: &str = "the prover registry has not been read yet: no effectively active census";
+pub const NO_PROVERS: &str =
+    "the prover registry has not been read yet: no effectively active census";
 
 /// The grid from the shards store, for an archive: its rows and the
 /// shard sizes `compute_shard_sizes` reads (lowercase hex keys).
@@ -709,31 +772,62 @@ pub fn grid_from_store(
 ) -> GridView {
     let grid = grid_filters(rows);
     if grid.is_empty() {
-        return GridView { source: GridSource::LocalStore, unavailable: Some(NO_STORE_GRID), ..Default::default() };
+        return GridView {
+            source: GridSource::LocalStore,
+            unavailable: Some(NO_STORE_GRID),
+            ..Default::default()
+        };
     }
     let live = live_filters(registry.iter().map(Vec::as_slice), sizes);
     let unavailable = live.is_empty().then_some(NO_LIVE);
-    GridView { source: GridSource::LocalStore, live, grid: Some(grid), unavailable }
+    GridView {
+        source: GridSource::LocalStore,
+        live,
+        grid: Some(grid),
+        unavailable,
+    }
 }
 
 /// The grid from the node's archive shard-info cache, for a regular node.
 /// Without an answer it is unavailable, so no inclusion reads off-grid
 /// against the genesis grid.
-pub fn grid_from_cache(registry: &[Vec<u8>], cache: Option<HashMap<Vec<u8>, (u64, u64)>>) -> GridView {
+pub fn grid_from_cache(
+    registry: &[Vec<u8>],
+    cache: Option<HashMap<Vec<u8>, (u64, u64)>>,
+) -> GridView {
     let Some(cache) = cache.filter(|c| !c.is_empty()) else {
-        return GridView { source: GridSource::ArchiveCache, live: BTreeSet::new(), grid: None, unavailable: Some(NO_CACHE) };
+        return GridView {
+            source: GridSource::ArchiveCache,
+            live: BTreeSet::new(),
+            grid: None,
+            unavailable: Some(NO_CACHE),
+        };
     };
     let grid = quil_grid(cache.keys().map(Vec::as_slice));
     if grid.is_empty() {
-        return GridView { source: GridSource::ArchiveCache, unavailable: Some(NO_CACHE_GRID), ..Default::default() };
+        return GridView {
+            source: GridSource::ArchiveCache,
+            unavailable: Some(NO_CACHE_GRID),
+            ..Default::default()
+        };
     }
     let sizes: HashMap<String, (num_bigint::BigInt, u64)> = cache
         .iter()
-        .map(|(filter, (bytes, data_shards))| (hex::encode(filter), (num_bigint::BigInt::from(*bytes), *data_shards)))
+        .map(|(filter, (bytes, data_shards))| {
+            (
+                hex::encode(filter),
+                (num_bigint::BigInt::from(*bytes), *data_shards),
+            )
+        })
         .collect();
     let live = live_filters(registry.iter().map(Vec::as_slice), &sizes);
     let unavailable = live.is_empty().then_some(NO_LIVE);
-    GridView { source: GridSource::ArchiveCache, live, grid: Some(grid), unavailable }
+    GridView {
+        source: GridSource::ArchiveCache,
+        live,
+        grid: Some(grid),
+        unavailable,
+    }
 }
 
 /// What the response combines with the index.
@@ -896,7 +990,10 @@ impl ProductionReport {
     }
 
     pub fn stats(&self) -> AppShardsStats {
-        AppShardsStats { window: self.window.clone(), summary: self.summary.clone() }
+        AppShardsStats {
+            window: self.window.clone(),
+            summary: self.summary.clone(),
+        }
     }
 
     pub(crate) fn add_stale_reason(&mut self, reason: String) {
@@ -922,7 +1019,9 @@ impl ProductionReport {
     /// with this one's index state, head and freshness. Placeholders are
     /// never served over known values.
     pub fn or_last_known(self, previous: Option<&ProductionReport>) -> ProductionReport {
-        let Some(previous) = previous.filter(|p| p.window.values_known && !self.window.values_known) else {
+        let Some(previous) =
+            previous.filter(|p| p.window.values_known && !self.window.values_known)
+        else {
             return self;
         };
         let as_of = previous.window.as_of_frame;
@@ -1007,7 +1106,9 @@ pub fn assemble(view: &IndexView, inputs: &Inputs) -> ProductionReport {
         stored_head_timestamp_ms: None,
         as_of_frame: view.indexed_through,
         as_of_timestamp_ms: view.through_timestamp_ms,
-        lag_frames: view.indexed_through.map(|t| inputs.head_frame.saturating_sub(t)),
+        lag_frames: view
+            .indexed_through
+            .map(|t| inputs.head_frame.saturating_sub(t)),
         stale: false,
         stale_reason: None,
         values_known: true,
@@ -1066,7 +1167,11 @@ pub fn assemble(view: &IndexView, inputs: &Inputs) -> ProductionReport {
         .filter(|(f, _)| !live.contains(*f))
         .map(|(_, s)| s.window.inclusions + s.window.not_applied + s.window.unknown)
         .sum();
-    let grid = inputs.grid.grid.as_ref().filter(|_| inputs.grid.unavailable.is_none());
+    let grid = inputs
+        .grid
+        .grid
+        .as_ref()
+        .filter(|_| inputs.grid.unavailable.is_none());
     let summary = Summary {
         live_shards: live.len() as u64,
         classes,
@@ -1084,7 +1189,12 @@ pub fn assemble(view: &IndexView, inputs: &Inputs) -> ProductionReport {
         grid_digest: grid.map(grid_digest),
         grid_unavailable: inputs.grid.unavailable,
     };
-    let mut report = ProductionReport { window, summary, shards, unknown_reason: None };
+    let mut report = ProductionReport {
+        window,
+        summary,
+        shards,
+        unknown_reason: None,
+    };
     match (view.waiting_frame, view.indexed_through) {
         (Some(frame), through) => report.add_stale_reason(format!(
             "the index waits for GLOBAL frame {frame}, not stored or not materialized although the head \
@@ -1118,7 +1228,8 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn new(report: ProductionReport) -> Self {
-        let mut body = serde_json::to_vec(&report.response(None, None)).unwrap_or_else(|_| b"null".to_vec());
+        let mut body =
+            serde_json::to_vec(&report.response(None, None)).unwrap_or_else(|_| b"null".to_vec());
         body.push(b'\n');
         Self { report, body }
     }
@@ -1127,7 +1238,8 @@ impl Snapshot {
 /// Whether the indexer rebuilds the snapshot: after the index view changed,
 /// or once the last build is [`SNAPSHOT_REFRESH`] old.
 pub fn snapshot_due(view_changed: bool, last_build: Option<Instant>, now: Instant) -> bool {
-    view_changed || last_build.is_none_or(|at| now.saturating_duration_since(at) >= SNAPSHOT_REFRESH)
+    view_changed
+        || last_build.is_none_or(|at| now.saturating_duration_since(at) >= SNAPSHOT_REFRESH)
 }
 
 /// Stage durations of one snapshot build.
@@ -1157,7 +1269,9 @@ fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str>
 
 /// `?class=` (any case) and `?filter=` (hex, returned lowercase) of
 /// `/shards/production`; empty values select nothing.
-pub fn parse_selection(params: &HashMap<String, String>) -> Result<(Option<Class>, Option<String>), &'static str> {
+pub fn parse_selection(
+    params: &HashMap<String, String>,
+) -> Result<(Option<Class>, Option<String>), &'static str> {
     let class = match param(params, "class") {
         None => None,
         Some(c) => Some(Class::parse(&c.to_lowercase()).ok_or("invalid class")?),
@@ -1177,7 +1291,9 @@ pub fn parse_selection(params: &HashMap<String, String>) -> Result<(Option<Class
 /// so the digests compare. Other apps' rows are left out.
 pub fn grid_filters(rows: &[quil_types::store::ShardInfo]) -> BTreeSet<Vec<u8>> {
     rows.iter()
-        .filter(|row| row.shard_key.len() == 35 && row.shard_key[3..35] == quil_execution::domains::QUIL_TOKEN)
+        .filter(|row| {
+            row.shard_key.len() == 35 && row.shard_key[3..35] == quil_execution::domains::QUIL_TOKEN
+        })
         .map(|row| quil_forest::shard_prefix_to_filter(&row.shard_key[3..35], &row.prefix))
         .filter(|filter| !filter.is_empty())
         .collect()
@@ -1222,7 +1338,11 @@ impl StallTracker {
         let beyond = waiting.filter(|&n| head >= n.saturating_add(OUTCOME_GRACE));
         match (beyond, self.current.as_mut()) {
             (Some(frame), None) => {
-                self.current = Some(Stall { frame, since: now, warned: now });
+                self.current = Some(Stall {
+                    frame,
+                    since: now,
+                    warned: now,
+                });
                 Some(StallEvent::Started { frame })
             }
             (Some(frame), Some(stall)) => {
@@ -1231,10 +1351,16 @@ impl StallTracker {
                     return None;
                 }
                 stall.warned = now;
-                Some(StallEvent::Persisting { frame, waited: now.saturating_duration_since(stall.since) })
+                Some(StallEvent::Persisting {
+                    frame,
+                    waited: now.saturating_duration_since(stall.since),
+                })
             }
             (None, Some(stall)) => {
-                let event = StallEvent::Ended { frame: stall.frame, waited: now.saturating_duration_since(stall.since) };
+                let event = StallEvent::Ended {
+                    frame: stall.frame,
+                    waited: now.saturating_duration_since(stall.since),
+                };
                 self.current = None;
                 Some(event)
             }
@@ -1301,10 +1427,14 @@ struct Tick {
 impl Indexer {
     fn tick(&mut self, state: &crate::ExplorerState, head: u64) -> Tick {
         let rebuild = self.index.is_none();
-        let index = self
-            .index
-            .get_or_insert_with(|| ProductionIndex::new(history::live_start(head), Decoders::default()));
-        let max = if rebuild { u64::MAX } else { MAX_FRAMES_PER_TICK };
+        let index = self.index.get_or_insert_with(|| {
+            ProductionIndex::new(history::live_start(head), Decoders::default())
+        });
+        let max = if rebuild {
+            u64::MAX
+        } else {
+            MAX_FRAMES_PER_TICK
+        };
         let source = StoreSource(state.clock_store.as_ref());
         // Stop at the next row frame, so the row reads the window there.
         let target = history::advance_target(index, head);
@@ -1318,7 +1448,8 @@ impl Indexer {
         if snapshot_due(view_changed, self.last_build, Instant::now()) {
             let mut view = view.take().unwrap_or_else(|| index.view());
             view.waiting_frame = self.stall.waiting_frame();
-            let (report, timings) = crate::handlers::build_production_report(state, head, &view, &mut self.sets);
+            let (report, timings) =
+                crate::handlers::build_production_report(state, head, &view, &mut self.sets);
             let live = report.summary.live_shards;
             if report.window.values_known {
                 if let Some(row) = row.as_mut() {
@@ -1326,7 +1457,11 @@ impl Indexer {
                 }
             }
             unknown = report.unknown_reason.clone().or_else(|| {
-                timings.grid_kept.map(|reason| format!("the live shard set cannot be re-read ({reason}); the previous one serves"))
+                timings.grid_kept.map(|reason| {
+                    format!(
+                        "the live shard set cannot be re-read ({reason}); the previous one serves"
+                    )
+                })
             });
             let previous = state.production_snapshot.read().clone();
             let report = report.or_last_known(previous.as_ref().map(|s| &s.report));
@@ -1353,7 +1488,12 @@ impl Indexer {
                     Ok(earliest) => {
                         let retained = state.requests_retained_from.as_ref().and_then(|f| f());
                         let first_live = history::first_exact_row(index);
-                        let plan = history::Backfill::new(first_live, earliest, retained, Decoders::default());
+                        let plan = history::Backfill::new(
+                            first_live,
+                            earliest,
+                            retained,
+                            Decoders::default(),
+                        );
                         let (floor_frame, floor) = plan.floor();
                         let held = {
                             let mut rows = state.production_history.write();
@@ -1361,19 +1501,31 @@ impl Indexer {
                             rows.set_backfill(plan.state());
                             plan.top().map_or(0, |top| rows.count(floor_frame, top))
                         };
-                        planned = Some(BackfillPlan { floor_frame, floor, top: plan.top(), held });
+                        planned = Some(BackfillPlan {
+                            floor_frame,
+                            floor,
+                            top: plan.top(),
+                            held,
+                        });
                         self.backfill = Some(plan);
                     }
                     Err(e) => {
-                        backfill = Some(history::Step { error: Some(e.to_string()), ..Default::default() });
+                        backfill = Some(history::Step {
+                            error: Some(e.to_string()),
+                            ..Default::default()
+                        });
                     }
                 }
             }
             if let Some(plan) = self.backfill.as_mut().filter(|plan| !plan.is_done()) {
                 let budget = history::budget(advance.indexed);
                 if budget > 0 {
-                    let step =
-                        plan.step(&source, budget, &mut || materialized_frame(state), &state.production_history);
+                    let step = plan.step(
+                        &source,
+                        budget,
+                        &mut || materialized_frame(state),
+                        &state.production_history,
+                    );
                     if step.completed || step.segment.is_some() {
                         state.production_history.write().set_backfill(plan.state());
                     }
@@ -1392,7 +1544,8 @@ impl Indexer {
             }
         }
         if let Some(file) = &state.history_file {
-            self.saver.save_due(file, &state.production_history, Instant::now());
+            self.saver
+                .save_due(file, &state.production_history, Instant::now());
         }
         Tick {
             rebuild,
@@ -1439,7 +1592,11 @@ impl BuildLog {
         self.count += 1;
         self.total += t.total;
         self.max = self.max.max(t.total);
-        if t.total >= SLOW_BUILD && self.last_slow.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(60)) {
+        if t.total >= SLOW_BUILD
+            && self
+                .last_slow
+                .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(60))
+        {
             self.last_slow = Some(now);
             tracing::info!(
                 total_ms = ms(t.total),
@@ -1464,7 +1621,13 @@ impl BuildLog {
                 grid_unavailable = ?t.grid_unavailable,
                 "explorer production snapshot builds",
             );
-            *self = BuildLog { since: now, count: 0, total: Duration::ZERO, max: Duration::ZERO, last_slow: self.last_slow };
+            *self = BuildLog {
+                since: now,
+                count: 0,
+                total: Duration::ZERO,
+                max: Duration::ZERO,
+                last_slow: self.last_slow,
+            };
         }
     }
 }
@@ -1472,7 +1635,9 @@ impl BuildLog {
 /// The backfill's plan, segments, completion and blocked reads (on change).
 fn log_backfill(tick: &Tick, blocked: &mut Option<String>) {
     if let Some(plan) = &tick.planned {
-        let rows = plan.top.map_or(0, |top| (top - plan.floor_frame) / history::ROW_FRAMES + 1);
+        let rows = plan
+            .top
+            .map_or(0, |top| (top - plan.floor_frame) / history::ROW_FRAMES + 1);
         tracing::info!(
             first_row = plan.floor_frame,
             last_row = ?plan.top,
@@ -1509,7 +1674,9 @@ fn log_backfill(tick: &Tick, blocked: &mut Option<String>) {
     }
     let now = match (&step.error, step.waiting) {
         (Some(e), _) => Some(format!("cannot read: {e}")),
-        (None, Some(frame)) => Some(format!("waits for frame {frame} to be stored or materialized")),
+        (None, Some(frame)) => Some(format!(
+            "waits for frame {frame} to be stored or materialized"
+        )),
         (None, None) => None,
     };
     match (&now, &*blocked) {
@@ -1548,10 +1715,16 @@ fn log_unknown(tick: &Tick, unreadable: &mut Option<Unreadable>, now: Instant) {
                  /shards/production and /stats app_shards serve the last known values flagged stale \
                  (values_known false before any); retrying",
             );
-            *unreadable = Some(Unreadable { reason: reason.clone(), since: now, warned: now });
+            *unreadable = Some(Unreadable {
+                reason: reason.clone(),
+                since: now,
+                warned: now,
+            });
         }
         (Some(reason), Some(state)) => {
-            if state.reason != *reason || now.saturating_duration_since(state.warned) >= STALL_REPEAT {
+            if state.reason != *reason
+                || now.saturating_duration_since(state.warned) >= STALL_REPEAT
+            {
                 tracing::warn!(
                     reason = %reason,
                     unreadable_s = now.saturating_duration_since(state.since).as_secs(),
@@ -1586,7 +1759,9 @@ fn log_tick(
     let advance = &tick.advance;
     if tick.rebuild {
         let (build_ms, live_shards, grid_source) =
-            tick.build.map_or((None, None, None), |(t, live)| (Some(ms(t.total)), Some(live), Some(t.grid_source)));
+            tick.build.map_or((None, None, None), |(t, live)| {
+                (Some(ms(t.total)), Some(live), Some(t.grid_source))
+            });
         tracing::info!(
             through = ?tick.through,
             frames = advance.indexed,
@@ -1677,7 +1852,11 @@ pub async fn run_indexer<E>(
     if let Some(file) = state.history_file.clone() {
         let st = state.clone();
         let restored = tokio::task::spawn_blocking(move || {
-            history::persist::restore(&file, &StoreSource(st.clock_store.as_ref()), &st.production_history)
+            history::persist::restore(
+                &file,
+                &StoreSource(st.clock_store.as_ref()),
+                &st.production_history,
+            )
         })
         .await;
         if let Err(e) = restored {
@@ -1691,15 +1870,22 @@ pub async fn run_indexer<E>(
     let mut failing: Option<String> = None;
     let mut blocked: Option<String> = None;
     let mut unreadable: Option<Unreadable> = None;
-    let mut builds =
-        BuildLog { since: Instant::now(), count: 0, total: Duration::ZERO, max: Duration::ZERO, last_slow: None };
+    let mut builds = BuildLog {
+        since: Instant::now(),
+        count: 0,
+        total: Duration::ZERO,
+        max: Duration::ZERO,
+        last_slow: None,
+    };
     loop {
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
             _ = ticker.tick() => {}
         }
-        let head = state.current_frame.load(std::sync::atomic::Ordering::Relaxed);
+        let head = state
+            .current_frame
+            .load(std::sync::atomic::Ordering::Relaxed);
         if head == 0 {
             continue;
         }
@@ -1713,10 +1899,20 @@ pub async fn run_indexer<E>(
         .await;
         match result {
             Ok((working, tick)) => {
-                log_tick(&tick, head, started.elapsed(), &mut failing, &mut blocked, &mut unreadable, &mut builds);
+                log_tick(
+                    &tick,
+                    head,
+                    started.elapsed(),
+                    &mut failing,
+                    &mut blocked,
+                    &mut unreadable,
+                    &mut builds,
+                );
                 indexer = Some(working);
             }
-            Err(e) => tracing::warn!(error = %e, "explorer production index task failed; rebuilding"),
+            Err(e) => {
+                tracing::warn!(error = %e, "explorer production index task failed; rebuilding")
+            }
         }
     }
     if let Some(file) = state.history_file.clone() {

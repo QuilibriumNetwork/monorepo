@@ -17,8 +17,9 @@ pub(crate) fn init_engines(
     storage: &StorageHandles,
     network: u8,
     archive_mode: bool,
-    #[cfg(feature = "native-proof")]
-    proof_worker: Option<&quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+    #[cfg(feature = "native-proof")] proof_worker: Option<
+        &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
+    >,
 ) -> anyhow::Result<EngineHandles> {
     // ---------------------------------------------------------------
     // 3. Create execution engines with full crypto verification
@@ -66,14 +67,22 @@ pub(crate) fn init_engines(
                     tracing::warn!(phase, version, "dropped an orphaned head marker on the GLOBAL prover tree (an old reset emptied the phase and kept its marker)");
                 }
             }
-            Err(error) => tracing::error!(%error, "could not check the GLOBAL prover tree's head markers"),
+            Err(error) => {
+                tracing::error!(%error, "could not check the GLOBAL prover tree's head markers")
+            }
         }
     }
     // Superseded tree and blob versions otherwise accumulate with every
     // commit. An archive serves history, so it prunes only when
     // `QUIL_PRUNE_RETAINED_VERSIONS=1`; other nodes unless it is `0`.
-    if let (true, Some(policy)) = (crdt.forest_is_persistent(), quil_hypergraph::RetentionPolicy::from_env(archive_mode)) {
-        tracing::info!(?policy, "retained-version pruning enabled on the global CRDT");
+    if let (true, Some(policy)) = (
+        crdt.forest_is_persistent(),
+        quil_hypergraph::RetentionPolicy::from_env(archive_mode),
+    ) {
+        tracing::info!(
+            ?policy,
+            "retained-version pruning enabled on the global CRDT"
+        );
         quil_hypergraph::spawn_retention_pruner(&crdt, policy, "master".into());
     }
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, "master");
@@ -135,10 +144,12 @@ pub(crate) fn init_engines(
     // boundary) is picked up deterministically on every node. With the size index
     // now seeded (above) AND unified pre-gated, a post-split re-partition here is
     // O(shards×depth), not a walk.
-    let populated =
-        refresh_crdt_shard_prefixes(crdt.as_ref(), storage.shards_store.as_ref());
+    let populated = refresh_crdt_shard_prefixes(crdt.as_ref(), storage.shards_store.as_ref());
     if populated > 0 {
-        info!(apps = populated, "populated CRDT shard-prefix sets from shards store");
+        info!(
+            apps = populated,
+            "populated CRDT shard-prefix sets from shards store"
+        );
     }
     // Pre-create the lazy tree for the global prover shard so the
     // first commit materializes its root. Without this, migrated
@@ -164,8 +175,7 @@ pub(crate) fn init_engines(
     // after the unified-tree flag is set) can reuse the same app list.
     let mut committed_apps: Vec<[u8; 32]> = Vec::new();
     {
-        let mut primed_keys: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        let mut primed_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let mut primed_count = 0usize;
         if let Ok(shards) = storage.shards_store.range_app_shards() {
             for s in shards {
@@ -184,7 +194,10 @@ pub(crate) fn init_engines(
                 primed_count += 1;
             }
         }
-        info!(shards = primed_count, "app shards primed in CRDT phase_sets");
+        info!(
+            shards = primed_count,
+            "app shards primed in CRDT phase_sets"
+        );
     }
     // NOTE: the per-sub-shard live-size baseline (`warm_sizes`) is seeded below,
     // AFTER the unified-tree flag is set and AFTER the size-index backfill — so
@@ -216,11 +229,17 @@ pub(crate) fn init_engines(
     // passed through `add_vertex`, so without this they'd be omitted. Steady-state
     // growth is then tracked incrementally. Runs AFTER the size-index backfill so
     // any forest recompute here reads a warm index (see the note above).
-    info!(apps = committed_apps.len(), "seeding per-sub-shard live-size baseline (one-time; persisted after)");
+    info!(
+        apps = committed_apps.len(),
+        "seeding per-sub-shard live-size baseline (one-time; persisted after)"
+    );
     if let Err(e) = crdt.warm_sizes(&committed_apps) {
         tracing::warn!(error = %e, "warm_sizes (live-size baseline) failed");
     } else {
-        info!(apps = committed_apps.len(), "seeded per-sub-shard live-size baseline");
+        info!(
+            apps = committed_apps.len(),
+            "seeded per-sub-shard live-size baseline"
+        );
     }
     // Eagerly run one commit at startup so the per-shard tree blob
     // lands at `[0x2F, vertex, adds, {l1=[0;3], l2=[0xff;32]}]`
@@ -255,14 +274,16 @@ pub(crate) fn init_engines(
     // compiler isn't wired to a real impl yet, so it stays a noop stub.
     let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
         Arc::new(quil_execution::testing::NoopCircuitCompiler);
-    let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
-        storage.clock_store.clone();
+    let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> = storage.clock_store.clone();
     // Hypergraph engine requires a config resolver: it reads each deployed
     // application's committed metadata vertex (unknown domains still resolve
     // to nothing, so their writes are rejected).
     // Write keys resolve from each deployed application's committed metadata.
-    let hypergraph_resolver: Arc<dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver> =
-        Arc::new(quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()));
+    let hypergraph_resolver: Arc<
+        dyn quil_execution::hypergraph_intrinsic::HypergraphConfigResolver,
+    > = Arc::new(
+        quil_execution::hypergraph_intrinsic::CrdtHypergraphConfigResolver::new(crdt.clone()),
+    );
     // Wire the shard stores so the global intrinsic's shard split/merge ops
     // actually record `PendingShardChange` and apply the topology flip at E+2.
     // Without these, proposed splits validate + "succeed" but never take effect,
@@ -280,7 +301,8 @@ pub(crate) fn init_engines(
     )
     .with_pricing_network(network);
     #[cfg(feature = "native-proof")]
-    let exec_manager = crate::proof_worker::install_token_worker(exec_manager, network, proof_worker)?;
+    let exec_manager =
+        crate::proof_worker::install_token_worker(exec_manager, network, proof_worker)?;
     let exec_manager = Arc::new(exec_manager);
     info!("execution engines initialized with BLS48-581 + Ed448 signature verification");
 
@@ -310,11 +332,7 @@ pub(crate) fn bootstrap_genesis(
             engines.inclusion_prover.as_ref(),
         ) {
             Ok((frame, _qc)) => {
-                let fn_ = frame
-                    .header
-                    .as_ref()
-                    .map(|h| h.frame_number)
-                    .unwrap_or(0);
+                let fn_ = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
                 info!(frame_number = fn_, "mainnet genesis ready");
             }
             Err(e) => {
@@ -342,15 +360,8 @@ pub(crate) fn bootstrap_genesis(
             engines.inclusion_prover.as_ref(),
         ) {
             Ok((frame, _qc)) => {
-                let fn_ = frame
-                    .header
-                    .as_ref()
-                    .map(|h| h.frame_number)
-                    .unwrap_or(0);
-                info!(
-                    frame_number = fn_,
-                    "testnet genesis established"
-                );
+                let fn_ = frame.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
+                info!(frame_number = fn_, "testnet genesis established");
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -409,7 +420,7 @@ pub(crate) fn refresh_crdt_shard_prefixes(
         match crdt.refresh_app_shard_prefixes(app, prefixes) {
             Ok(true) => info!(app = %hex::encode(app), ms = t.elapsed().as_millis() as u64,
                 "shard set changed (split/merge) — re-partitioned size buckets"),
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => warn!(app = %hex::encode(app), error = %e,
                 "refresh_crdt_shard_prefixes: layout unchanged after rebuild failure; will retry"),
         }

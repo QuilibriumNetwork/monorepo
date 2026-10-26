@@ -17,7 +17,10 @@ use quil_keys::FileKeyManager;
 /// Does NOT auto-create the standard keys — the client reads existing
 /// keys and creates specific ones on demand (e.g. `q-view-key` /
 /// `q-spend-key` for token balances, or via `qclient key create`).
-pub fn build_key_manager(config: &Config, config_dir: &Path) -> anyhow::Result<Arc<FileKeyManager>> {
+pub fn build_key_manager(
+    config: &Config,
+    config_dir: &Path,
+) -> anyhow::Result<Arc<FileKeyManager>> {
     let keys_path: PathBuf = if config.key.key_store_file.path.is_empty() {
         config_dir.join("keys.yml")
     } else {

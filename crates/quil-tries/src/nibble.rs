@@ -43,7 +43,11 @@ pub fn get_full_path(key: &[u8]) -> Vec<i32> {
 
 /// Extract nibbles until two keys diverge, starting at the given bit depth.
 /// Returns (common nibbles, bit depth at divergence).
-pub fn get_nibbles_until_diverge(key1: &[u8], key2: &[u8], start_depth: usize) -> (Vec<i32>, usize) {
+pub fn get_nibbles_until_diverge(
+    key1: &[u8],
+    key2: &[u8],
+    start_depth: usize,
+) -> (Vec<i32>, usize) {
     let mut nibbles = Vec::new();
     let mut depth = start_depth;
     loop {

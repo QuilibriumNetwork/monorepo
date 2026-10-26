@@ -51,54 +51,169 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         name: "prover:Prover",
         fields: &[
             // order 0 — BLS48-581 pubkey (585 bytes per schema).
-            FieldTag { name: "PublicKey",        order: 0, size: 585, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "PublicKey",
+                order: 0,
+                size: 585,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 1 — 1-byte enum {Joining=0, Active=1, Paused=2, Leaving=3, Kicked=4}.
-            FieldTag { name: "Status",           order: 1, size: 1,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Status",
+                order: 1,
+                size: 1,
+                rdf_type: RdfType::Uint,
+            },
             // order 2 — 8-byte big-endian u64.
-            FieldTag { name: "AvailableStorage", order: 2, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "AvailableStorage",
+                order: 2,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 3 — 8-byte big-endian u64.
-            FieldTag { name: "Seniority",        order: 3, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Seniority",
+                order: 3,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 4 — 8-byte big-endian u64.
-            FieldTag { name: "KickFrameNumber",  order: 4, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "KickFrameNumber",
+                order: 4,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 5 — not in the Go schema: the last frame
             // this prover accrued active-seniority for. Idempotency key so a
             // multi-shard prover (one call per allocation) or a re-materialized
             // frame accrues `SENIORITY_PER_ACTIVE_FRAME` at most once per frame.
-            FieldTag { name: "LastSeniorityFrameNumber", order: 5, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "LastSeniorityFrameNumber",
+                order: 5,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 32 — not in the Go schema: the retro seniority this prover
             // holds from the seniority succession epoch, per part of
             // `seniority_compat::retro_components` (4 retro epochs, then the
             // mainnet snapshot), 5 × u64 BE. A key's retro counts once: a merge,
             // join or succession credits only what raises a part. Order 32, key
             // 0x80: no other class has an order-32 field.
-            FieldTag { name: "RetroCredited", order: 32, size: 40, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "RetroCredited",
+                order: 32,
+                size: 40,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 33 — not in the Go schema: the retro successions moved out
             // of this prover, per part, 5 × u64 BE. Key 0x84, unique.
-            FieldTag { name: "RetroMoved", order: 33, size: 40, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "RetroMoved",
+                order: 33,
+                size: 40,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     ClassDef {
         name: "allocation:ProverAllocation",
         fields: &[
             // order 0 — pointer to the parent `prover:Prover` (Struct, 32 bytes).
-            FieldTag { name: "Prover",                  order: 0,  size: 32, rdf_type: RdfType::Other },
-            FieldTag { name: "Status",                  order: 1,  size: 1,  rdf_type: RdfType::Uint },
-            FieldTag { name: "ConfirmationFilter",      order: 2,  size: 64, rdf_type: RdfType::ByteArray },
-            FieldTag { name: "RejectionFilter",         order: 3,  size: 64, rdf_type: RdfType::ByteArray },
-            FieldTag { name: "JoinFrameNumber",         order: 4,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "LeaveFrameNumber",        order: 5,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "PauseFrameNumber",        order: 6,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "ResumeFrameNumber",       order: 7,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "KickFrameNumber",         order: 8,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "JoinConfirmFrameNumber",  order: 9,  size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "JoinRejectFrameNumber",   order: 10, size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "LeaveConfirmFrameNumber", order: 11, size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "LeaveRejectFrameNumber",  order: 12, size: 8,  rdf_type: RdfType::Uint },
-            FieldTag { name: "LastActiveFrameNumber",   order: 13, size: 8,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Prover",
+                order: 0,
+                size: 32,
+                rdf_type: RdfType::Other,
+            },
+            FieldTag {
+                name: "Status",
+                order: 1,
+                size: 1,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "ConfirmationFilter",
+                order: 2,
+                size: 64,
+                rdf_type: RdfType::ByteArray,
+            },
+            FieldTag {
+                name: "RejectionFilter",
+                order: 3,
+                size: 64,
+                rdf_type: RdfType::ByteArray,
+            },
+            FieldTag {
+                name: "JoinFrameNumber",
+                order: 4,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "LeaveFrameNumber",
+                order: 5,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "PauseFrameNumber",
+                order: 6,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "ResumeFrameNumber",
+                order: 7,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "KickFrameNumber",
+                order: 8,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "JoinConfirmFrameNumber",
+                order: 9,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "JoinRejectFrameNumber",
+                order: 10,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "LeaveConfirmFrameNumber",
+                order: 11,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "LeaveRejectFrameNumber",
+                order: 12,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
+            FieldTag {
+                name: "LastActiveFrameNumber",
+                order: 13,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 14 — not in the Go schema: the storage
             // epoch this allocation was last confirmed for. Data-shard
             // allocations are epoch-bound (see `EffectiveStatus::ExpiredEpoch`).
-            FieldTag { name: "Epoch",                   order: 14, size: 8,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Epoch",
+                order: 14,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 15 — not in the Go schema: the reward-ring index
             // this allocation sits in (`2^(ring+1)` = the shard's reward divisor).
             // Assigned by `prover_shard_update::recompute_shard_rings` from a
@@ -110,39 +225,74 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // and RECOMPACTED at a boundary (a higher prover leaves → survivors
             // shift up). Deliberately NOT sorted by live seniority, whose per-frame
             // drift is what forked the prover-tree root before the ring was stored.
-            FieldTag { name: "Ring",                    order: 15, size: 1,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Ring",
+                order: 15,
+                size: 1,
+                rdf_type: RdfType::Uint,
+            },
             // order 16 — not in the Go schema: the cohort this allocation ranks
             // in for its ring: the epoch its join confirm activated it, or the
             // epoch a split, merge or the committee-handoff flag day moved it to
             // its shard. Earlier cohorts rank first. Absent on allocations made
             // before the seniority ring rule (`prover_rings`).
-            FieldTag { name: "RingEpoch",               order: 16, size: 8,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "RingEpoch",
+                order: 16,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 17 — the prover's seniority when its join confirm
             // materialized (or at the flag day, for allocations already
             // confirmed). Ranks a cohort, most senior first; never updated.
-            FieldTag { name: "RingSeniority",           order: 17, size: 8,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "RingSeniority",
+                order: 17,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 18 — not in the Go schema: the last GLOBAL frame that
             // included an app frame this allocation signed. Written only for
             // the signers of an included app frame, from
             // `SIGNED_FRAME_ACTIVATION_FRAME`; confirms never write it, unlike
             // `LastActiveFrameNumber`. Absent before then. Key 0x48: no other
             // class has an order-18 field.
-            FieldTag { name: "LastSignedFrameNumber",   order: 18, size: 8,  rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "LastSignedFrameNumber",
+                order: 18,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 19 — not in the Go schema: the release (version, patch,
             // subpatch; `prover_release::Release`) the allocation's last confirm
             // signed. Written by confirms from `confirm_release_frame`; absent
             // before then; a confirm without a release leaves it as it is.
             // Signed by the prover's own key, but self-attested. Key 0x4C.
-            FieldTag { name: "Release",                 order: 19, size: 6,  rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Release",
+                order: 19,
+                size: 6,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     ClassDef {
         name: "reward:ProverReward",
         fields: &[
             // order 0 — 32-byte delegate address.
-            FieldTag { name: "DelegateAddress", order: 0, size: 32, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "DelegateAddress",
+                order: 0,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 1 — 32-byte big-endian u256 balance.
-            FieldTag { name: "Balance",         order: 1, size: 32, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Balance",
+                order: 1,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 2 — last frame this reward was credited, the per-frame
             // idempotency guard for `apply_reward` (mirrors prover:Prover's
             // `LastSeniorityFrameNumber`). The global frame is applied by TWO
@@ -151,7 +301,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // (not nonce-protected like token spends), so without this guard the
             // balance is credited twice and the prover-tree root forks
             // timing-dependently. FLAG-DAY: changes the reward vertex encoding.
-            FieldTag { name: "LastRewardFrameNumber", order: 2, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "LastRewardFrameNumber",
+                order: 2,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 3 — the set of shard filters ALREADY credited at
             // `LastRewardFrameNumber`, length-prefixed (`u16 BE len ‖ filter`),
             // sorted. Reset whenever the frame advances. This makes the
@@ -160,7 +315,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // global frame (matching Go's per-shard `applyReward`), while a
             // re-materialize of the SAME (frame, shard) by the archive's second
             // path still skips. Variable length.
-            FieldTag { name: "RewardedShardsBlob", order: 3, size: 512, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "RewardedShardsBlob",
+                order: 3,
+                size: 512,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     // NOTE: merge:SpentMerge is NOT in the Go GLOBAL_RDF_SCHEMA turtle.
@@ -171,7 +331,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         name: "merge:SpentMerge",
         fields: &[
             // order 0 — 32-byte prover address that consumed this merge target.
-            FieldTag { name: "ProverAddress", order: 0, size: 32, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "ProverAddress",
+                order: 0,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     // Not in the Go GLOBAL_RDF_SCHEMA.
@@ -183,19 +348,54 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         name: "leafroot:LeafRootRegistration",
         fields: &[
             // order 0 — pointer to the registering `prover:Prover` (32 bytes).
-            FieldTag { name: "Member",      order: 0, size: 32,  rdf_type: RdfType::Other },
+            FieldTag {
+                name: "Member",
+                order: 0,
+                size: 32,
+                rdf_type: RdfType::Other,
+            },
             // order 1 — the parent shard's confirmation filter (≤64 bytes).
-            FieldTag { name: "ShardFilter", order: 1, size: 64,  rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "ShardFilter",
+                order: 1,
+                size: 64,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 2 — the leaf's sub-shard prefix path, u32-BE nibbles concatenated.
-            FieldTag { name: "Prefix",      order: 2, size: 1024, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Prefix",
+                order: 2,
+                size: 1024,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 3 — replication epoch.
-            FieldTag { name: "Epoch",       order: 3, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "Epoch",
+                order: 3,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 4 — the registered KZG leaf root.
-            FieldTag { name: "LeafRoot",    order: 4, size: 128, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "LeafRoot",
+                order: 4,
+                size: 128,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 5 — leaf block count.
-            FieldTag { name: "NumBlocks",   order: 5, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "NumBlocks",
+                order: 5,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 6 — frame at which it was registered.
-            FieldTag { name: "RegistrationFrameNumber", order: 6, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "RegistrationFrameNumber",
+                order: 6,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // Epoch-aligned lifecycle: a member must hold a valid registration
             // for the epoch it is CURRENTLY proving AND pre-register the NEXT
             // epoch (it confirms one epoch ahead while still answering audits for
@@ -203,11 +403,26 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // 7..9 are the "next" (higher-epoch) slot. Two fixed slots — no
             // per-epoch address growth.
             // order 7 — next-epoch slot: replication epoch.
-            FieldTag { name: "NextEpoch",     order: 7, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "NextEpoch",
+                order: 7,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 8 — next-epoch slot: registered KZG leaf root.
-            FieldTag { name: "NextLeafRoot",  order: 8, size: 128, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "NextLeafRoot",
+                order: 8,
+                size: 128,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 9 — next-epoch slot: leaf block count.
-            FieldTag { name: "NextNumBlocks", order: 9, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "NextNumBlocks",
+                order: 9,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // THIRD ("prev") slot (orders 10..12). The storage audit is
             // anchor-lagged: for the first ~K frames of a new epoch it audits
             // openings still anchored to the PREVIOUS epoch (the app-shard frame
@@ -219,11 +434,26 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // anchor lag. Only written once a third (older) epoch is retained, so
             // 1/2-slot registrations stay byte-identical to the pre-change layout.
             // order 10 — prev-epoch slot: replication epoch.
-            FieldTag { name: "PrevEpoch",     order: 10, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "PrevEpoch",
+                order: 10,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 11 — prev-epoch slot: registered KZG leaf root.
-            FieldTag { name: "PrevLeafRoot",  order: 11, size: 128, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "PrevLeafRoot",
+                order: 11,
+                size: 128,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 12 — prev-epoch slot: leaf block count.
-            FieldTag { name: "PrevNumBlocks", order: 12, size: 8,   rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "PrevNumBlocks",
+                order: 12,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // Hash storage proofs (`quil_crypto::storage_proof`): per slot,
             // the GLOBAL frame that recorded the registration (the frame after
             // it gives the seal's challenges) and the frame its seal proof was
@@ -234,17 +464,47 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // reader probes on another class's tree (orders 18 and 19 must
             // stay unique to the allocation).
             // order 20 — current slot: frame registered.
-            FieldTag { name: "RegisteredAt",     order: 20, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "RegisteredAt",
+                order: 20,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 21 — current slot: frame sealed.
-            FieldTag { name: "SealedAt",         order: 21, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "SealedAt",
+                order: 21,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 22 — next slot: frame registered.
-            FieldTag { name: "NextRegisteredAt", order: 22, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "NextRegisteredAt",
+                order: 22,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 23 — next slot: frame sealed.
-            FieldTag { name: "NextSealedAt",     order: 23, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "NextSealedAt",
+                order: 23,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 24 — prev slot: frame registered.
-            FieldTag { name: "PrevRegisteredAt", order: 24, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "PrevRegisteredAt",
+                order: 24,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
             // order 25 — prev slot: frame sealed.
-            FieldTag { name: "PrevSealedAt",     order: 25, size: 8, rdf_type: RdfType::Uint },
+            FieldTag {
+                name: "PrevSealedAt",
+                order: 25,
+                size: 8,
+                rdf_type: RdfType::Uint,
+            },
         ],
     },
     // Not in the Go GLOBAL_RDF_SCHEMA. A member's storage seat on one shard
@@ -259,11 +519,26 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         name: "storage:StorageSeat",
         fields: &[
             // order 26 — the member's 32-byte prover address.
-            FieldTag { name: "Member",      order: 26, size: 32,   rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Member",
+                order: 26,
+                size: 32,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 27 — the shard's confirmation filter (≤64 bytes).
-            FieldTag { name: "ShardFilter", order: 27, size: 64,   rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "ShardFilter",
+                order: 27,
+                size: 64,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 28 — the epoch slots, `storage_seat::encode_slots`.
-            FieldTag { name: "Slots",       order: 28, size: 4096, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Slots",
+                order: 28,
+                size: 4096,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     // Not in the Go GLOBAL_RDF_SCHEMA. One bucket of an epoch's storage
@@ -278,7 +553,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         fields: &[
             // order 29 — the epoch (8 bytes), then the queued seat addresses,
             // 32 bytes each.
-            FieldTag { name: "Seats", order: 29, size: 1 << 20, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Seats",
+                order: 29,
+                size: 1 << 20,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
     // Not in the Go GLOBAL_RDF_SCHEMA. The certified state a shard's storage
@@ -291,9 +571,19 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
         name: "storage:StorageSnapshot",
         fields: &[
             // order 30 — the shard's confirmation filter (≤64 bytes).
-            FieldTag { name: "ShardFilter", order: 30, size: 64,  rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "ShardFilter",
+                order: 30,
+                size: 64,
+                rdf_type: RdfType::ByteArray,
+            },
             // order 31 — epoch, app frame, anchor (8 bytes each), 4 × 32-byte roots.
-            FieldTag { name: "Snapshot",    order: 31, size: 152, rdf_type: RdfType::ByteArray },
+            FieldTag {
+                name: "Snapshot",
+                order: 31,
+                size: 152,
+                rdf_type: RdfType::ByteArray,
+            },
         ],
     },
 ];
@@ -377,25 +667,22 @@ pub fn compute_type_hash(class_name: &str) -> [u8; 32] {
 /// from live mainnet on 2026-04-11 and verified to equal the output of
 /// `compute_type_hash("prover:Prover")` in a unit test.
 pub const TYPE_HASH_PROVER: [u8; 32] = [
-    0x27, 0x99, 0x01, 0x8a, 0x52, 0xe2, 0xa0, 0x68, 0x99, 0x8e, 0xd0, 0xcd, 0xad,
-    0x60, 0xe8, 0x60, 0x12, 0xf3, 0x2b, 0x8d, 0xf0, 0xd3, 0x05, 0x99, 0x9f, 0x53,
-    0x67, 0xe1, 0x09, 0x8b, 0xda, 0xec,
+    0x27, 0x99, 0x01, 0x8a, 0x52, 0xe2, 0xa0, 0x68, 0x99, 0x8e, 0xd0, 0xcd, 0xad, 0x60, 0xe8, 0x60,
+    0x12, 0xf3, 0x2b, 0x8d, 0xf0, 0xd3, 0x05, 0x99, 0x9f, 0x53, 0x67, 0xe1, 0x09, 0x8b, 0xda, 0xec,
 ];
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "allocation:ProverAllocation")`
 /// — observed from live mainnet on 2026-04-11.
 pub const TYPE_HASH_ALLOCATION: [u8; 32] = [
-    0x17, 0xfa, 0x31, 0x02, 0x82, 0x87, 0x55, 0x19, 0x78, 0xab, 0xcb, 0xc3, 0x14,
-    0x50, 0xb1, 0xb1, 0x4b, 0xe4, 0x3c, 0x09, 0xbe, 0xc9, 0x0d, 0x7d, 0x9f, 0xb0,
-    0x0e, 0xcd, 0x59, 0x56, 0xcf, 0x38,
+    0x17, 0xfa, 0x31, 0x02, 0x82, 0x87, 0x55, 0x19, 0x78, 0xab, 0xcb, 0xc3, 0x14, 0x50, 0xb1, 0xb1,
+    0x4b, 0xe4, 0x3c, 0x09, 0xbe, 0xc9, 0x0d, 0x7d, 0x9f, 0xb0, 0x0e, 0xcd, 0x59, 0x56, 0xcf, 0x38,
 ];
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "reward:ProverReward")` —
 /// observed from live mainnet on 2026-04-11.
 pub const TYPE_HASH_REWARD: [u8; 32] = [
-    0x04, 0xb1, 0x0a, 0x01, 0x84, 0x44, 0x11, 0xbb, 0x0c, 0x39, 0x0f, 0x4c, 0xd2,
-    0x62, 0x9b, 0x48, 0xcc, 0x7e, 0xf5, 0x61, 0x45, 0x5c, 0x3a, 0xda, 0xc5, 0xeb,
-    0xcb, 0xad, 0x38, 0x34, 0xbf, 0xa4,
+    0x04, 0xb1, 0x0a, 0x01, 0x84, 0x44, 0x11, 0xbb, 0x0c, 0x39, 0x0f, 0x4c, 0xd2, 0x62, 0x9b, 0x48,
+    0xcc, 0x7e, 0xf5, 0x61, 0x45, 0x5c, 0x3a, 0xda, 0xc5, 0xeb, 0xcb, 0xad, 0x38, 0x34, 0xbf, 0xa4,
 ];
 
 /// Compute `poseidon(GLOBAL_INTRINSIC_ADDRESS || "merge:SpentMerge")`
@@ -421,9 +708,18 @@ static RUNTIME_TYPE_HASHES: std::sync::LazyLock<[([u8; 32], &'static str); 5]> =
                 compute_type_hash("leafroot:LeafRootRegistration"),
                 "leafroot:LeafRootRegistration",
             ),
-            (compute_type_hash("storage:StorageSeat"), "storage:StorageSeat"),
-            (compute_type_hash("storage:StorageExpiry"), "storage:StorageExpiry"),
-            (compute_type_hash("storage:StorageSnapshot"), "storage:StorageSnapshot"),
+            (
+                compute_type_hash("storage:StorageSeat"),
+                "storage:StorageSeat",
+            ),
+            (
+                compute_type_hash("storage:StorageExpiry"),
+                "storage:StorageExpiry",
+            ),
+            (
+                compute_type_hash("storage:StorageSnapshot"),
+                "storage:StorageSnapshot",
+            ),
         ]
     });
 
@@ -588,9 +884,15 @@ mod tests {
 
         // prover:Prover keys
         assert_eq!(field_key("prover:Prover", "Status"), Some(vec![0x04]));
-        assert_eq!(field_key("prover:Prover", "AvailableStorage"), Some(vec![0x08]));
+        assert_eq!(
+            field_key("prover:Prover", "AvailableStorage"),
+            Some(vec![0x08])
+        );
         assert_eq!(field_key("prover:Prover", "Seniority"), Some(vec![0x0C]));
-        assert_eq!(field_key("prover:Prover", "KickFrameNumber"), Some(vec![0x10]));
+        assert_eq!(
+            field_key("prover:Prover", "KickFrameNumber"),
+            Some(vec![0x10])
+        );
     }
 
     #[test]
@@ -629,7 +931,13 @@ mod tests {
                     if class.name == "prover:Prover" && field.name == name {
                         continue;
                     }
-                    assert_ne!(order_to_key(field.order, GLOBAL_MAX_ORDER), vec![key], "{}.{}", class.name, field.name);
+                    assert_ne!(
+                        order_to_key(field.order, GLOBAL_MAX_ORDER),
+                        vec![key],
+                        "{}.{}",
+                        class.name,
+                        field.name
+                    );
                 }
             }
         }
@@ -644,12 +952,19 @@ mod tests {
         assert_eq!(GLOBAL_MAX_ORDER, 33, "RetroMoved (order 33) is the highest");
         assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
         assert_eq!(
-            GLOBAL_CLASSES.iter().flat_map(|c| c.fields.iter()).map(|f| f.order).max(),
+            GLOBAL_CLASSES
+                .iter()
+                .flat_map(|c| c.fields.iter())
+                .map(|f| f.order)
+                .max(),
             Some(GLOBAL_MAX_ORDER)
         );
         for class in GLOBAL_CLASSES {
             for field in class.fields {
-                assert_eq!(order_to_key(field.order, GLOBAL_MAX_ORDER), vec![(field.order as u8) << 2]);
+                assert_eq!(
+                    order_to_key(field.order, GLOBAL_MAX_ORDER),
+                    vec![(field.order as u8) << 2]
+                );
                 if class.name == cls && field.name == "Release" {
                     continue;
                 }
@@ -678,7 +993,10 @@ mod tests {
         let before = COMPUTED.with(|computed| computed.get());
         let started = std::time::Instant::now();
         for _ in 0..1_000 {
-            assert_eq!(class_for_type_hash(&leaf_root), Some("leafroot:LeafRootRegistration"));
+            assert_eq!(
+                class_for_type_hash(&leaf_root),
+                Some("leafroot:LeafRootRegistration")
+            );
             assert_eq!(class_for_type_hash(&unknown), None);
         }
         let computed = COMPUTED.with(|computed| computed.get()) - before;
@@ -689,21 +1007,38 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(type_hash_leaf_root_registration(), leaf_root);
-        assert_eq!(class_for_type_hash(&type_hash_spent_merge()), Some("merge:SpentMerge"));
+        assert_eq!(
+            class_for_type_hash(&type_hash_spent_merge()),
+            Some("merge:SpentMerge")
+        );
     }
 
     #[test]
     fn the_seal_fields_of_a_leaf_registration_share_no_other_class_key() {
         let cls = "leafroot:LeafRootRegistration";
-        let ours = ["RegisteredAt", "SealedAt", "NextRegisteredAt", "NextSealedAt", "PrevRegisteredAt", "PrevSealedAt"];
-        let keys: Vec<Vec<u8>> = ours.iter().map(|name| field_key(cls, name).unwrap()).collect();
+        let ours = [
+            "RegisteredAt",
+            "SealedAt",
+            "NextRegisteredAt",
+            "NextSealedAt",
+            "PrevRegisteredAt",
+            "PrevSealedAt",
+        ];
+        let keys: Vec<Vec<u8>> = ours
+            .iter()
+            .map(|name| field_key(cls, name).unwrap())
+            .collect();
         for class in GLOBAL_CLASSES {
             for field in class.fields {
                 if class.name == cls && ours.contains(&field.name) {
                     continue;
                 }
-                assert!(!keys.contains(&order_to_key(field.order, GLOBAL_MAX_ORDER)),
-                    "{}.{} shares a leaf registration's seal key", class.name, field.name);
+                assert!(
+                    !keys.contains(&order_to_key(field.order, GLOBAL_MAX_ORDER)),
+                    "{}.{} shares a leaf registration's seal key",
+                    class.name,
+                    field.name
+                );
             }
         }
     }
@@ -731,10 +1066,7 @@ mod tests {
             compute_type_hash("allocation:ProverAllocation"),
             TYPE_HASH_ALLOCATION
         );
-        assert_eq!(
-            compute_type_hash("reward:ProverReward"),
-            TYPE_HASH_REWARD
-        );
+        assert_eq!(compute_type_hash("reward:ProverReward"), TYPE_HASH_REWARD);
         // The runtime-computed hashes, verify round-trip
         assert_eq!(
             compute_type_hash("merge:SpentMerge"),
@@ -756,7 +1088,8 @@ mod tests {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         // Insert a pubkey at order 0 → key 0x00
         let pubkey = vec![0xAAu8; 585];
-        tree.insert(&[0x00], &pubkey, &[], &BigInt::from(585)).unwrap();
+        tree.insert(&[0x00], &pubkey, &[], &BigInt::from(585))
+            .unwrap();
         // read_field should find it
         let result = read_field(&tree, "prover:Prover", "PublicKey");
         assert_eq!(result, Some(pubkey));
@@ -779,7 +1112,8 @@ mod tests {
         use num_bigint::BigInt;
         let mut tree = quil_tries::VectorCommitmentTree::new();
         // Store the prover type hash at key [0xFF; 32]
-        tree.insert(&[0xFFu8; 32], &TYPE_HASH_PROVER, &[], &BigInt::from(32)).unwrap();
+        tree.insert(&[0xFFu8; 32], &TYPE_HASH_PROVER, &[], &BigInt::from(32))
+            .unwrap();
         assert_eq!(read_type(&tree), Some("prover:Prover"));
     }
 
@@ -787,7 +1121,8 @@ mod tests {
     fn read_type_unknown_hash_returns_none() {
         use num_bigint::BigInt;
         let mut tree = quil_tries::VectorCommitmentTree::new();
-        tree.insert(&[0xFFu8; 32], &[0x00u8; 32], &[], &BigInt::from(32)).unwrap();
+        tree.insert(&[0xFFu8; 32], &[0x00u8; 32], &[], &BigInt::from(32))
+            .unwrap();
         assert_eq!(read_type(&tree), None);
     }
 
@@ -813,9 +1148,15 @@ mod tests {
     fn write_field_overwrites_existing() {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         write_field(&mut tree, "prover:Prover", "Status", &[1u8]).unwrap();
-        assert_eq!(read_field(&tree, "prover:Prover", "Status"), Some(vec![1u8]));
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Status"),
+            Some(vec![1u8])
+        );
         write_field(&mut tree, "prover:Prover", "Status", &[2u8]).unwrap();
-        assert_eq!(read_field(&tree, "prover:Prover", "Status"), Some(vec![2u8]));
+        assert_eq!(
+            read_field(&tree, "prover:Prover", "Status"),
+            Some(vec![2u8])
+        );
     }
 
     #[test]

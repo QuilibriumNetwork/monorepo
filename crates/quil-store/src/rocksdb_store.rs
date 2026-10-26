@@ -140,12 +140,28 @@ fn archive_block_cache_for(memory: Option<u64>) -> usize {
 /// sees the host's memory but may use only its limit).
 fn memory_budget_bytes() -> Option<u64> {
     // SAFETY: sysconf reads system configuration and has no preconditions.
-    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
-    let physical = u64::try_from(pages).ok()?.checked_mul(u64::try_from(page).ok()?)?;
+    let (pages, page) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let physical = u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page).ok()?)?;
     // cgroup v2, then v1; "max" (no limit) does not parse.
-    let limit = ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u64>().ok());
+    let limit = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .find_map(|path| {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    });
     Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
 }
 
@@ -238,7 +254,9 @@ impl RocksDb {
         let migrations = crate::migration::rust_node_migrations();
         crate::migration::run_migrations(&db, &migrations)?;
 
-        Ok(Self { db: Self::coordinated(db) })
+        Ok(Self {
+            db: Self::coordinated(db),
+        })
     }
 
     /// Inspect an existing, stopped database without writes or migrations.
@@ -249,7 +267,9 @@ impl RocksDb {
         opts.set_max_open_files(64);
         let db = rocksdb::DB::open_for_read_only(&opts, path, false)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb read-only: {e}")))?;
-        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+        Ok(Self {
+            db: quil_forest::CoordinatedDb::new(db),
+        })
     }
 
     /// Open a database another process is running, read-only, as the
@@ -261,9 +281,12 @@ impl RocksDb {
     pub fn open_for_read_only_live(path: &Path) -> Result<Self> {
         let mut opts = rocksdb::Options::default();
         opts.set_max_open_files(-1);
-        let db = rocksdb::DB::open_for_read_only(&opts, path, false)
-            .map_err(|e| QuilError::Store(format!("failed to open rocksdb read-only (live): {e}")))?;
-        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+        let db = rocksdb::DB::open_for_read_only(&opts, path, false).map_err(|e| {
+            QuilError::Store(format!("failed to open rocksdb read-only (live): {e}"))
+        })?;
+        Ok(Self {
+            db: quil_forest::CoordinatedDb::new(db),
+        })
     }
 
     /// Open the database at `primary_path` as a read-only secondary
@@ -282,7 +305,9 @@ impl RocksDb {
         let db = rocksdb::DB::open_as_secondary(&opts, primary_path, secondary_path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb as secondary: {}", e)))?;
         // Skip migrations on secondary — only the primary may write.
-        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+        Ok(Self {
+            db: quil_forest::CoordinatedDb::new(db),
+        })
     }
 
     /// Open an in-memory RocksDB instance (for testing).
@@ -296,7 +321,9 @@ impl RocksDb {
         // Leak the TempDir so it's not cleaned up while DB is open.
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
-        Ok(Self { db: Self::coordinated(db) })
+        Ok(Self {
+            db: Self::coordinated(db),
+        })
     }
 
     /// A writable store watches the prover registry's keys, so execution
@@ -367,22 +394,37 @@ mod read_only_tests {
             let read_only = RocksDb::open_for_read_only(directory.path()).unwrap();
             let db = read_only.inner();
             let snapshot = db.snapshot();
-            assert_eq!(snapshot.get(b"saved").unwrap(), Some(b"checkpoint".to_vec()));
+            assert_eq!(
+                snapshot.get(b"saved").unwrap(),
+                Some(b"checkpoint".to_vec())
+            );
             assert_eq!(snapshot.iterator(rocksdb::IteratorMode::Start).count(), 1);
             assert!(db.put(b"saved", b"changed").is_err());
         }
         let reopened = rocksdb::DB::open_default(directory.path()).unwrap();
-        assert_eq!(reopened.get(b"saved").unwrap(), Some(b"checkpoint".to_vec()));
+        assert_eq!(
+            reopened.get(b"saved").unwrap(),
+            Some(b"checkpoint".to_vec())
+        );
         assert_eq!(reopened.iterator(rocksdb::IteratorMode::Start).count(), 1);
     }
 
     #[test]
     fn an_archive_block_cache_is_a_quarter_of_memory_within_bounds() {
         const GB: u64 = 1 << 30;
-        assert_eq!(archive_block_cache_for(Some(123 * GB)), (123 * GB / 4) as usize);
+        assert_eq!(
+            archive_block_cache_for(Some(123 * GB)),
+            (123 * GB / 4) as usize
+        );
         assert_eq!(archive_block_cache_for(Some(8 * GB)), (2 * GB) as usize);
-        assert_eq!(archive_block_cache_for(Some(GB / 2)), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
-        assert_eq!(archive_block_cache_for(Some(1024 * GB)), MAX_ARCHIVE_BLOCK_CACHE_BYTES);
+        assert_eq!(
+            archive_block_cache_for(Some(GB / 2)),
+            MIN_ARCHIVE_BLOCK_CACHE_BYTES
+        );
+        assert_eq!(
+            archive_block_cache_for(Some(1024 * GB)),
+            MAX_ARCHIVE_BLOCK_CACHE_BYTES
+        );
         assert_eq!(archive_block_cache_for(None), MIN_ARCHIVE_BLOCK_CACHE_BYTES);
         assert!(memory_budget_bytes().is_some_and(|bytes| bytes > 0));
     }
@@ -413,12 +455,25 @@ mod read_only_tests {
         }
         // Table properties live in the files: read them under default options.
         let reopened = rocksdb::DB::open_default(directory.path()).unwrap();
-        let properties = reopened.property_value("rocksdb.aggregated-table-properties").unwrap().unwrap();
+        let properties = reopened
+            .property_value("rocksdb.aggregated-table-properties")
+            .unwrap()
+            .unwrap();
         let partitions = properties
             .split(';')
-            .find_map(|field| field.trim().strip_prefix("# index partitions=")?.trim().parse::<u64>().ok())
+            .find_map(|field| {
+                field
+                    .trim()
+                    .strip_prefix("# index partitions=")?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .unwrap_or(0);
-        assert!(partitions > 0, "the new file has a partitioned index: {properties}");
+        assert!(
+            partitions > 0,
+            "the new file has a partitioned index: {properties}"
+        );
         assert_eq!(reopened.get(key(7)).unwrap(), Some(vec![7u8; 64]));
         assert_eq!(reopened.get(key(30_000)).unwrap(), Some(vec![9u8; 64]));
     }
@@ -524,7 +579,9 @@ impl store::Transaction for RocksTransaction {
         Ok(())
     }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// An owned iterator that holds an Arc to the DB and materializes
@@ -561,7 +618,9 @@ impl RocksIterator {
         read_opts.set_iterate_lower_bound(self.lower.clone());
         read_opts.set_iterate_upper_bound(self.upper.clone());
 
-        let iter = self.db.iterator_opt(rocksdb::IteratorMode::Start, read_opts);
+        let iter = self
+            .db
+            .iterator_opt(rocksdb::IteratorMode::Start, read_opts);
         for item in iter {
             match item {
                 Ok((k, v)) => {
@@ -628,7 +687,10 @@ impl store::Iterator for RocksIterator {
 
     fn seek_ge(&mut self, target: &[u8]) -> bool {
         self.ensure_loaded();
-        match self.entries.binary_search_by(|(k, _)| k.as_slice().cmp(target)) {
+        match self
+            .entries
+            .binary_search_by(|(k, _)| k.as_slice().cmp(target))
+        {
             Ok(idx) => {
                 self.pos = idx as i64;
                 true
@@ -642,7 +704,10 @@ impl store::Iterator for RocksIterator {
 
     fn seek_lt(&mut self, target: &[u8]) -> bool {
         self.ensure_loaded();
-        match self.entries.binary_search_by(|(k, _)| k.as_slice().cmp(target)) {
+        match self
+            .entries
+            .binary_search_by(|(k, _)| k.as_slice().cmp(target))
+        {
             Ok(idx) => {
                 self.pos = idx as i64 - 1;
                 self.valid_pos()

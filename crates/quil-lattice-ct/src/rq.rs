@@ -42,7 +42,9 @@ impl Poly {
     pub const Q: u64 = MODULUS_Q;
 
     pub fn zero() -> Self {
-        Poly { c: vec![0u64; Self::D] }
+        Poly {
+            c: vec![0u64; Self::D],
+        }
     }
 
     /// One (the constant polynomial `1`).
@@ -56,7 +58,9 @@ impl Poly {
     pub fn from_signed(coeffs: &[i64]) -> Self {
         assert_eq!(coeffs.len(), Self::D);
         let q = Self::Q as i64;
-        Poly { c: coeffs.iter().map(|&x| x.rem_euclid(q) as u64).collect() }
+        Poly {
+            c: coeffs.iter().map(|&x| x.rem_euclid(q) as u64).collect(),
+        }
     }
 
     /// The monomial `X^k` (reduced negacyclically: `X^{k+d} = −X^k`).
@@ -68,15 +72,31 @@ impl Poly {
     }
 
     pub fn add(&self, o: &Poly) -> Poly {
-        Poly { c: self.c.iter().zip(&o.c).map(|(a, b)| (a + b) % Self::Q).collect() }
+        Poly {
+            c: self
+                .c
+                .iter()
+                .zip(&o.c)
+                .map(|(a, b)| (a + b) % Self::Q)
+                .collect(),
+        }
     }
 
     pub fn sub(&self, o: &Poly) -> Poly {
-        Poly { c: self.c.iter().zip(&o.c).map(|(a, b)| (a + Self::Q - b) % Self::Q).collect() }
+        Poly {
+            c: self
+                .c
+                .iter()
+                .zip(&o.c)
+                .map(|(a, b)| (a + Self::Q - b) % Self::Q)
+                .collect(),
+        }
     }
 
     pub fn neg(&self) -> Poly {
-        Poly { c: self.c.iter().map(|a| (Self::Q - a) % Self::Q).collect() }
+        Poly {
+            c: self.c.iter().map(|a| (Self::Q - a) % Self::Q).collect(),
+        }
     }
 
     /// Negacyclic schoolbook multiplication.
@@ -98,7 +118,9 @@ impl Poly {
                 }
             }
         }
-        Poly { c: acc.iter().map(|&x| x.rem_euclid(q) as u64).collect() }
+        Poly {
+            c: acc.iter().map(|&x| x.rem_euclid(q) as u64).collect(),
+        }
     }
 
     /// Negacyclic ring multiplication via the **partial-split (t=4) block NTT**
@@ -109,7 +131,9 @@ impl Poly {
     /// `ω`-twisted convolution, then two inverse layers recombine (CRT). ~4× the
     /// full-negacyclic schoolbook. (Fully-split 256-pt NTT no longer applies.)
     pub fn mul_ntt(&self, o: &Poly) -> Poly {
-        Poly { c: blockntt::mul(&self.c, &o.c) }
+        Poly {
+            c: blockntt::mul(&self.c, &o.c),
+        }
     }
 
     /// The negacyclic automorphism `σ(a)(X) = a(X⁻¹)` in `R_q = Z_q[X]/(Xᵈ+1)`.
@@ -132,7 +156,13 @@ impl Poly {
     pub fn scalar_mul(&self, s: i64) -> Poly {
         let q = Self::Q as i128;
         let s = s as i128;
-        Poly { c: self.c.iter().map(|&a| (a as i128 * s).rem_euclid(q) as u64).collect() }
+        Poly {
+            c: self
+                .c
+                .iter()
+                .map(|&a| (a as i128 * s).rem_euclid(q) as u64)
+                .collect(),
+        }
     }
 
     /// Centered infinity norm: each coefficient mapped to `(−q/2, q/2]`, max abs.
@@ -164,11 +194,19 @@ mod blockntt {
     #[inline]
     fn addm(a: u64, b: u64) -> u64 {
         let s = a + b;
-        if (s as u128) >= Q { (s as u128 - Q) as u64 } else { s }
+        if (s as u128) >= Q {
+            (s as u128 - Q) as u64
+        } else {
+            s
+        }
     }
     #[inline]
     fn subm(a: u64, b: u64) -> u64 {
-        if a >= b { a - b } else { (a as u128 + Q - b as u128) as u64 }
+        if a >= b {
+            a - b
+        } else {
+            (a as u128 + Q - b as u128) as u64
+        }
     }
     #[inline]
     fn mulm(a: u64, b: u64) -> u64 {
@@ -176,7 +214,11 @@ mod blockntt {
     }
     #[inline]
     fn negm(a: u64) -> u64 {
-        if a == 0 { 0 } else { (Q - a as u128) as u64 }
+        if a == 0 {
+            0
+        } else {
+            (Q - a as u128) as u64
+        }
     }
 
     /// One butterfly split of a 2n-block into two n-blocks with twiddle `w`:
@@ -345,19 +387,37 @@ mod tests {
     // ring PARAMETER property (LS18 at t=4, radius ≈256 ≫ ‖c−c'‖≤2), asserted by
     // `params::tests::partial_split_modulus` — not an empirical per-NTT-slot test.
 
-
     #[test]
     fn bench_mul_ntt_vs_schoolbook() {
         use crate::arith::SplitMix64;
         use std::time::Instant;
         let mut prg = SplitMix64::new(999);
-        let mk = |prg:&mut SplitMix64| Poly { c: (0..Poly::D).map(|_| prg.uniform_below(Poly::Q as u128) as u64).collect() };
-        let a = mk(&mut prg); let b = mk(&mut prg);
+        let mk = |prg: &mut SplitMix64| Poly {
+            c: (0..Poly::D)
+                .map(|_| prg.uniform_below(Poly::Q as u128) as u64)
+                .collect(),
+        };
+        let a = mk(&mut prg);
+        let b = mk(&mut prg);
         let n = 3000;
-        let t0=Instant::now(); let mut acc=0u64; for _ in 0..n { acc=acc.wrapping_add(a.mul_ntt(&b).c[0]); } let dn=t0.elapsed();
-        let t1=Instant::now(); for _ in 0..n { acc=acc.wrapping_add(a.mul(&b).c[0]); } let ds=t1.elapsed();
-        println!("BENCH mul_ntt(block+kara)={:?}/op  schoolbook={:?}/op  speedup={:.2}x  (acc={})",
-                 dn/n, ds/n, ds.as_secs_f64()/dn.as_secs_f64(), acc);
+        let t0 = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..n {
+            acc = acc.wrapping_add(a.mul_ntt(&b).c[0]);
+        }
+        let dn = t0.elapsed();
+        let t1 = Instant::now();
+        for _ in 0..n {
+            acc = acc.wrapping_add(a.mul(&b).c[0]);
+        }
+        let ds = t1.elapsed();
+        println!(
+            "BENCH mul_ntt(block+kara)={:?}/op  schoolbook={:?}/op  speedup={:.2}x  (acc={})",
+            dn / n,
+            ds / n,
+            ds.as_secs_f64() / dn.as_secs_f64(),
+            acc
+        );
     }
 
     #[test]
@@ -366,10 +426,14 @@ mod tests {
         let mut prg = SplitMix64::new(12345);
         for _ in 0..8 {
             let a = Poly {
-                c: (0..Poly::D).map(|_| prg.uniform_below(Poly::Q as u128) as u64).collect(),
+                c: (0..Poly::D)
+                    .map(|_| prg.uniform_below(Poly::Q as u128) as u64)
+                    .collect(),
             };
             let b = Poly {
-                c: (0..Poly::D).map(|_| prg.uniform_below(Poly::Q as u128) as u64).collect(),
+                c: (0..Poly::D)
+                    .map(|_| prg.uniform_below(Poly::Q as u128) as u64)
+                    .collect(),
             };
             assert_eq!(a.mul_ntt(&b), a.mul(&b), "NTT mul must equal schoolbook");
         }

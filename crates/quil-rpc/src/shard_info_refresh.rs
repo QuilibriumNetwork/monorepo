@@ -194,7 +194,10 @@ async fn try_one_endpoint(
     shard_keys: &[Vec<u8>],
 ) -> Result<ArchiveShardInfo, ArchiveClientError> {
     let mut client = ArchiveClient::connect_mtls(endpoint, falcon_signing_key).await?;
-    let mut out = ArchiveShardInfo { endpoint: endpoint.to_string(), ..Default::default() };
+    let mut out = ArchiveShardInfo {
+        endpoint: endpoint.to_string(),
+        ..Default::default()
+    };
     let mut any_success = false;
     let mut last_err: Option<ArchiveClientError> = None;
     for shard_key in shard_keys {
@@ -252,7 +255,8 @@ fn record_shard_infos(
             out.frozen.insert(filter.clone());
         }
         out.data_shards.insert(filter.clone(), info.data_shards);
-        out.sizes.insert(filter, bigint_to_u64_saturating(&info.size));
+        out.sizes
+            .insert(filter, bigint_to_u64_saturating(&info.size));
     }
 }
 
@@ -266,7 +270,10 @@ fn build_filter(shard_key: &[u8], prefix: &[u32]) -> Option<Vec<u8>> {
         return None;
     }
     // L1 = bytes 0..3, L2 = bytes 3..35.
-    Some(quil_forest::shard_prefix_to_filter(&shard_key[3..35], prefix))
+    Some(quil_forest::shard_prefix_to_filter(
+        &shard_key[3..35],
+        prefix,
+    ))
 }
 
 /// Parse an `AppShardInfo.size` BigInt byte string into a `u64`.
@@ -292,10 +299,16 @@ mod tests {
     fn archive_refresh_retains_data_shard_counts() {
         let key = vec![0x11; 35];
         let mut found = ArchiveShardInfo::default();
-        record_shard_infos(&key, vec![quil_types::proto::global::AppShardInfo {
-            prefix: vec![0x20], size: vec![42], data_shards: 16,
-            ..Default::default()
-        }], &mut found);
+        record_shard_infos(
+            &key,
+            vec![quil_types::proto::global::AppShardInfo {
+                prefix: vec![0x20],
+                size: vec![42],
+                data_shards: 16,
+                ..Default::default()
+            }],
+            &mut found,
+        );
         let filter = build_filter(&key, &[0x20]).unwrap();
         assert_eq!(found.sizes[&filter], 42);
         assert_eq!(found.data_shards[&filter], 16);
@@ -333,25 +346,32 @@ mod tests {
         assert_eq!(bigint_to_u64_saturating(&[]), 0);
         assert_eq!(bigint_to_u64_saturating(&[0]), 0);
         assert_eq!(bigint_to_u64_saturating(&[0x12, 0x34]), 0x1234);
-        assert_eq!(
-            bigint_to_u64_saturating(&[0xFF; 8]),
-            u64::MAX,
-        );
+        assert_eq!(bigint_to_u64_saturating(&[0xFF; 8]), u64::MAX,);
     }
 
     #[test]
     fn a_reply_marks_the_shards_a_pending_change_froze() {
         let shard_key: Vec<u8> = (0u8..35).collect();
-        let info = |bits: &[bool], size: u8, pending_change: bool| quil_types::proto::global::AppShardInfo {
-            prefix: quil_forest::bit_path_to_prefix(bits),
-            size: vec![size],
-            pending_change,
-            ..Default::default()
+        let info = |bits: &[bool], size: u8, pending_change: bool| {
+            quil_types::proto::global::AppShardInfo {
+                prefix: quil_forest::bit_path_to_prefix(bits),
+                size: vec![size],
+                pending_change,
+                ..Default::default()
+            }
         };
         let mut out = ArchiveShardInfo::default();
-        record_shard_infos(&shard_key, vec![info(&[false], 7, true), info(&[true], 9, false)], &mut out);
+        record_shard_infos(
+            &shard_key,
+            vec![info(&[false], 7, true), info(&[true], 9, false)],
+            &mut out,
+        );
         let filter = |bits: &[bool]| quil_forest::encode_shard_bit_path(&shard_key[3..35], bits);
-        assert_eq!(out.sizes.get(&filter(&[false])), Some(&7), "a frozen shard still reports its size");
+        assert_eq!(
+            out.sizes.get(&filter(&[false])),
+            Some(&7),
+            "a frozen shard still reports its size"
+        );
         assert_eq!(out.sizes.get(&filter(&[true])), Some(&9));
         assert_eq!(out.frozen, HashSet::from([filter(&[false])]));
     }

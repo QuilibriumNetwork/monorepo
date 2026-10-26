@@ -110,67 +110,75 @@ impl OnionNode {
         // Excess cells are dropped — the circuit's own retransmit/timeout copes.
         const MAX_CONCURRENT_ONION_CELLS: usize = 256;
         let cell_sem_h = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ONION_CELLS));
-        transport.set_on_receive(Arc::new(move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
-            let relay = Arc::clone(&relay_h);
-            let orig = Arc::clone(&orig_h);
-            let out = Arc::clone(&out);
-            let exit = exit_handler.clone();
-            let src = src_peer.to_vec();
-            let cell = cell.to_vec();
-            let Ok(permit) = Arc::clone(&cell_sem_h).try_acquire_owned() else {
-                tracing::trace!("onion: inbound cell dropped — concurrency cap reached");
-                return;
-            };
-            tokio::spawn(async move {
-                let _permit = permit;
-                match cell::parse_cell(&cell) {
-                    // Someone opens a circuit hop through us.
-                    Some((cell::CMD_CREATE, _)) => {
-                        if let Some(created) = relay.handle_create_cell(&src, circ_id, &cell).await {
-                            dial_and_send(&out, &src, circ_id, created).await;
-                        }
-                    }
-                    Some((cell::CMD_CREATED, payload)) => {
-                        // A downstream we extended toward answered → relay it back
-                        // up as EXTENDED; otherwise it's our own first-hop reply.
-                        if relay.is_down_circ(circ_id).await {
-                            if let Some((up_peer, up_circ, up_cell)) =
-                                relay.handle_link_created(circ_id, payload).await
+        transport.set_on_receive(Arc::new(
+            move |src_peer: &[u8], circ_id: u32, cell: &[u8]| {
+                let relay = Arc::clone(&relay_h);
+                let orig = Arc::clone(&orig_h);
+                let out = Arc::clone(&out);
+                let exit = exit_handler.clone();
+                let src = src_peer.to_vec();
+                let cell = cell.to_vec();
+                let Ok(permit) = Arc::clone(&cell_sem_h).try_acquire_owned() else {
+                    tracing::trace!("onion: inbound cell dropped — concurrency cap reached");
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match cell::parse_cell(&cell) {
+                        // Someone opens a circuit hop through us.
+                        Some((cell::CMD_CREATE, _)) => {
+                            if let Some(created) =
+                                relay.handle_create_cell(&src, circ_id, &cell).await
                             {
-                                dial_and_send(&out, &up_peer, up_circ, up_cell).await;
+                                dial_and_send(&out, &src, circ_id, created).await;
                             }
-                        } else {
-                            orig.handle_created(&src, circ_id, payload);
                         }
-                    }
-                    Some((cell::CMD_RELAY, ct)) => {
-                        if relay.is_forward_circ(&src, circ_id).await {
-                            match relay.handle_relay_forward(&src, circ_id, ct).await {
-                                RelayAction::Forward { peer, circ_id: oc, cell } => {
-                                    dial_and_send(&out, &peer, oc, cell).await;
+                        Some((cell::CMD_CREATED, payload)) => {
+                            // A downstream we extended toward answered → relay it back
+                            // up as EXTENDED; otherwise it's our own first-hop reply.
+                            if relay.is_down_circ(circ_id).await {
+                                if let Some((up_peer, up_circ, up_cell)) =
+                                    relay.handle_link_created(circ_id, payload).await
+                                {
+                                    dial_and_send(&out, &up_peer, up_circ, up_cell).await;
                                 }
-                                RelayAction::Deliver { payload } => {
-                                    if let Some(cb) = &exit {
-                                        cb(&src, circ_id, payload);
+                            } else {
+                                orig.handle_created(&src, circ_id, payload);
+                            }
+                        }
+                        Some((cell::CMD_RELAY, ct)) => {
+                            if relay.is_forward_circ(&src, circ_id).await {
+                                match relay.handle_relay_forward(&src, circ_id, ct).await {
+                                    RelayAction::Forward {
+                                        peer,
+                                        circ_id: oc,
+                                        cell,
+                                    } => {
+                                        dial_and_send(&out, &peer, oc, cell).await;
                                     }
+                                    RelayAction::Deliver { payload } => {
+                                        if let Some(cb) = &exit {
+                                            cb(&src, circ_id, payload);
+                                        }
+                                    }
+                                    RelayAction::None => {}
                                 }
-                                RelayAction::None => {}
+                            } else if relay.is_down_circ(circ_id).await {
+                                if let Some((up_peer, up_circ, up_cell)) =
+                                    relay.handle_relay_backward(circ_id, ct).await
+                                {
+                                    dial_and_send(&out, &up_peer, up_circ, up_cell).await;
+                                }
+                            } else {
+                                // A backward cell for a circuit we originated.
+                                orig.handle_relay_backward(circ_id, ct);
                             }
-                        } else if relay.is_down_circ(circ_id).await {
-                            if let Some((up_peer, up_circ, up_cell)) =
-                                relay.handle_relay_backward(circ_id, ct).await
-                            {
-                                dial_and_send(&out, &up_peer, up_circ, up_cell).await;
-                            }
-                        } else {
-                            // A backward cell for a circuit we originated.
-                            orig.handle_relay_backward(circ_id, ct);
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            });
-        }));
+                });
+            },
+        ));
 
         Arc::new(Self {
             transport,
@@ -304,7 +312,11 @@ mod tests {
             }
         }
         fn set_on_receive(&self, cb: OnReceive) {
-            self.net.handlers.lock().unwrap().insert(self.self_peer.clone(), cb);
+            self.net
+                .handlers
+                .lock()
+                .unwrap()
+                .insert(self.self_peer.clone(), cb);
         }
     }
 
@@ -329,8 +341,22 @@ mod tests {
             })
         };
 
-        let _b = OnionNode::new(net.transport(b"B"), b"B".to_vec(), Some(sk_b), None, None, None);
-        let _c = OnionNode::new(net.transport(b"C"), b"C".to_vec(), Some(sk_c), None, Some(exit_c), None);
+        let _b = OnionNode::new(
+            net.transport(b"B"),
+            b"B".to_vec(),
+            Some(sk_b),
+            None,
+            None,
+            None,
+        );
+        let _c = OnionNode::new(
+            net.transport(b"C"),
+            b"C".to_vec(),
+            Some(sk_c),
+            None,
+            Some(exit_c),
+            None,
+        );
         let a = OnionNode::new(net.transport(b"A"), b"A".to_vec(), None, None, None, None);
 
         let t = std::time::Duration::from_secs(3);
@@ -351,7 +377,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(got.lock().unwrap().clone().unwrap(), b"routed via unified nodes");
+        assert_eq!(
+            got.lock().unwrap().clone().unwrap(),
+            b"routed via unified nodes"
+        );
     }
 
     /// One node is SIMULTANEOUSLY a relay/exit for an inbound circuit AND the
@@ -376,8 +405,22 @@ mod tests {
             Arc::new(move |_peer: &[u8], _c, p| *at_c.lock().unwrap() = Some(p))
         };
 
-        let b = OnionNode::new(net.transport(b"B"), b"B".to_vec(), Some(sk_b), None, Some(exit_b), None);
-        let _c = OnionNode::new(net.transport(b"C"), b"C".to_vec(), Some(sk_c), None, Some(exit_c), None);
+        let b = OnionNode::new(
+            net.transport(b"B"),
+            b"B".to_vec(),
+            Some(sk_b),
+            None,
+            Some(exit_b),
+            None,
+        );
+        let _c = OnionNode::new(
+            net.transport(b"C"),
+            b"C".to_vec(),
+            Some(sk_c),
+            None,
+            Some(exit_c),
+            None,
+        );
         let a = OnionNode::new(net.transport(b"A"), b"A".to_vec(), None, None, None, None);
 
         let t = std::time::Duration::from_secs(3);
@@ -412,7 +455,14 @@ mod tests {
     async fn defenses_reject_self_and_non_network_hops() {
         let net = Arc::new(MemNet::default());
         let (pk_b, sk_b) = onion_keypair();
-        let _b = OnionNode::new(net.transport(b"B"), b"B".to_vec(), Some(sk_b), None, None, None);
+        let _b = OnionNode::new(
+            net.transport(b"B"),
+            b"B".to_vec(),
+            Some(sk_b),
+            None,
+            None,
+            None,
+        );
 
         // A treats ONLY "B" as a valid in-network routing peer.
         let validator: PeerValidator = Arc::new(|p: &[u8]| p == b"B");
@@ -448,7 +498,14 @@ mod tests {
         let (pk_b, sk_b) = onion_keypair();
         let (pk_c, sk_c) = onion_keypair();
 
-        let _b = OnionNode::new(net.transport(b"B"), b"B".to_vec(), Some(sk_b), None, None, None);
+        let _b = OnionNode::new(
+            net.transport(b"B"),
+            b"B".to_vec(),
+            Some(sk_b),
+            None,
+            None,
+            None,
+        );
 
         // C's exit handler replies through C itself; C is shared into the handler
         // via a slot set right after construction (handler needs `c`, `c` needs
@@ -468,7 +525,14 @@ mod tests {
                 });
             })
         };
-        let c = OnionNode::new(net.transport(b"C"), b"C".to_vec(), Some(sk_c), None, Some(exit_c), None);
+        let c = OnionNode::new(
+            net.transport(b"C"),
+            b"C".to_vec(),
+            Some(sk_c),
+            None,
+            Some(exit_c),
+            None,
+        );
         *c_slot.lock().unwrap() = Some(c.clone());
 
         let reply = Arc::new(Mutex::new(None::<Vec<u8>>));
@@ -476,7 +540,14 @@ mod tests {
             let reply = reply.clone();
             Arc::new(move |_peer: &[u8], _c, p| *reply.lock().unwrap() = Some(p))
         };
-        let a = OnionNode::new(net.transport(b"A"), b"A".to_vec(), None, None, None, Some(reply_h));
+        let a = OnionNode::new(
+            net.transport(b"A"),
+            b"A".to_vec(),
+            None,
+            None,
+            None,
+            Some(reply_h),
+        );
 
         let t = std::time::Duration::from_secs(3);
         tokio::time::timeout(t, a.create_circuit(b"B", 1, &pk_b))

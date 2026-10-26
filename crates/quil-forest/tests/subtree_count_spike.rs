@@ -10,7 +10,7 @@
 //! ranges are non-empty.
 
 use jmt::mock::MockTreeStore;
-use jmt::storage::{Node, NodeKey, NibblePath, TreeReader};
+use jmt::storage::{NibblePath, Node, NodeKey, TreeReader};
 use jmt::{KeyHash, Sha256Jmt};
 
 fn key(byte0: u8, tag: u8) -> KeyHash {
@@ -31,7 +31,13 @@ fn subtree_leaf_count_partitions_and_decides_the_split_guard() {
     let mut kvs: Vec<(KeyHash, Option<Vec<u8>>)> = Vec::new();
     for b in [0x00u8, 0x01, 0x02, 0x03, 0x03] {
         // distinct tags so 0x03 contributes two DISTINCT leaves
-        kvs.push((key(b, b.wrapping_add(if b == 0x03 { kvs.len() as u8 } else { 0 })), Some(vec![0xCC, b])));
+        kvs.push((
+            key(
+                b,
+                b.wrapping_add(if b == 0x03 { kvs.len() as u8 } else { 0 }),
+            ),
+            Some(vec![0xCC, b]),
+        ));
     }
     for b in [0x04u8, 0x05] {
         kvs.push((key(b, b), Some(vec![0xDD, b])));

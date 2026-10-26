@@ -70,8 +70,7 @@ fn verify_key_registry_bindings(reg: &CanonicalKeyRegistry) -> bool {
     }
 
     // (1) Ed448 identity key signs KEY_REGISTRY || bls_pubkey.
-    let mut identity_msg =
-        Vec::with_capacity(KEY_REGISTRY_DOMAIN.len() + reg.bls_pubkey.len());
+    let mut identity_msg = Vec::with_capacity(KEY_REGISTRY_DOMAIN.len() + reg.bls_pubkey.len());
     identity_msg.extend_from_slice(KEY_REGISTRY_DOMAIN);
     identity_msg.extend_from_slice(&reg.bls_pubkey);
     if !quil_crypto::ed448_verify(
@@ -226,8 +225,9 @@ impl SignerRegistry {
                     if let Some(victim_id) = inner.order.pop_front() {
                         if let Some(victim) = inner.by_identity.remove(&victim_id) {
                             inner.by_prover.remove(&victim.bls_pubkey);
-                            let victim_peer =
-                                crate::falcon_identity::peer_id_from_falcon_pubkey(&victim.bls_pubkey);
+                            let victim_peer = crate::falcon_identity::peer_id_from_falcon_pubkey(
+                                &victim.bls_pubkey,
+                            );
                             inner.by_peer_id.remove(&victim_peer);
                         }
                     }
@@ -259,7 +259,10 @@ impl SignerRegistry {
     /// Look up the BLS G2 pubkey associated with an Ed448 identity.
     pub fn bls_pubkey_for_identity(&self, ed448_pubkey: &[u8]) -> Option<Vec<u8>> {
         let inner = self.inner.read().unwrap();
-        inner.by_identity.get(ed448_pubkey).map(|e| e.bls_pubkey.clone())
+        inner
+            .by_identity
+            .get(ed448_pubkey)
+            .map(|e| e.bls_pubkey.clone())
     }
 
     /// Look up the Ed448 identity for a given BLS G2 prover pubkey.
@@ -382,18 +385,21 @@ mod tests {
         for i in 0..5 {
             assert!(
                 reg.bls_pubkey_for_identity(&ed448_key(i)).is_none(),
-                "expected identity {} evicted from by_identity", i,
+                "expected identity {} evicted from by_identity",
+                i,
             );
             assert!(
                 reg.identity_for_prover(&bls_key(i)).is_none(),
-                "expected bls key {} evicted from by_prover", i,
+                "expected bls key {} evicted from by_prover",
+                i,
             );
         }
         // Tail entries retained.
         for i in 5..total {
             assert!(
                 reg.bls_pubkey_for_identity(&ed448_key(i as u32)).is_some(),
-                "expected identity {} retained", i,
+                "expected identity {} retained",
+                i,
             );
         }
     }
@@ -485,12 +491,11 @@ mod tests {
 
         // Ed448 identity keypair.
         let seed = [seed_byte; 57];
-        let ed_signer =
-            quil_crypto::Ed448Signer::from_bytes(&seed, &{
-                // derive the matching public key
-                quil_crypto::Ed448Signer::derive_public(&seed).unwrap()
-            })
-            .unwrap();
+        let ed_signer = quil_crypto::Ed448Signer::from_bytes(&seed, &{
+            // derive the matching public key
+            quil_crypto::Ed448Signer::derive_public(&seed).unwrap()
+        })
+        .unwrap();
         let ed448_pubkey = ed_signer.public_key().to_vec();
 
         // BLS48-581 prover keypair.

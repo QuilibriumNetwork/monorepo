@@ -221,12 +221,18 @@ mod tests {
         );
         let mut transcript = ReferenceTranscript::from_state(std::array::from_fn(|i| i as u8));
         transcript.absorb_public_polynomials(&[polynomial]);
-        assert_eq!(hex(&transcript.state()), "0c4fdaa9fbbfb24dfd581c7f9e5fa62a2e818eb8aa119f04ec79801747bdf610");
+        assert_eq!(
+            hex(&transcript.state()),
+            "0c4fdaa9fbbfb24dfd581c7f9e5fa62a2e818eb8aa119f04ec79801747bdf610"
+        );
         assert_eq!(
             hex(&transcript.derive_reference_seed()),
             "6d9666ced828cc82aab9cd7190831f02354fb67bf07ca0f1c270c54d34da2080"
         );
-        assert_eq!(hex(&transcript.state()), "95d3f9806d6842a236ca6bc40280a55bfc3f934658db95014b8dd8153a55ee1b");
+        assert_eq!(
+            hex(&transcript.state()),
+            "95d3f9806d6842a236ca6bc40280a55bfc3f934658db95014b8dd8153a55ee1b"
+        );
         let challenges = transcript.scalar_challenges_32(100_001).unwrap();
         let mut hash = Sha256::new();
         for challenge in challenges {
@@ -236,7 +242,10 @@ mod tests {
             hex(&hash.finalize()),
             "295086d29c611e25ec92f92dc5add4431d324355c959d47e67b28db1e24763e3"
         );
-        assert_eq!(hex(&transcript.state()), "306b1188d3150df2d0975796a6b5b06bcb38828fd5daf7df174263d3468a3ee9");
+        assert_eq!(
+            hex(&transcript.state()),
+            "306b1188d3150df2d0975796a6b5b06bcb38828fd5daf7df174263d3468a3ee9"
+        );
     }
     #[test]
     fn canonical_encoding_roundtrip_and_modulus_alias_rejection() {

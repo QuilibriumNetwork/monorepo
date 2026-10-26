@@ -48,11 +48,17 @@ pub fn clean_retired_keys(contents: &str) -> Result<CleanedConfig, CleanError> {
     serde_yaml::from_str::<Config>(contents).map_err(|e| CleanError::Parse(e.to_string()))?;
     let retired = retired_paths(contents);
     if retired.is_empty() {
-        return Ok(CleanedConfig { contents: contents.to_string(), keys: Vec::new() });
+        return Ok(CleanedConfig {
+            contents: contents.to_string(),
+            keys: Vec::new(),
+        });
     }
     let lines = split_lines(contents);
     let scan = scan(&lines);
-    let refuse = |key: &str, reason: &str| CleanError::Unsafe { key: key.to_string(), reason: reason.to_string() };
+    let refuse = |key: &str, reason: &str| CleanError::Unsafe {
+        key: key.to_string(),
+        reason: reason.to_string(),
+    };
     let mut commented = vec![false; lines.len()];
     let mut keys = Vec::new();
     for path in &retired {
@@ -63,19 +69,27 @@ pub fn clean_retired_keys(contents: &str) -> Result<CleanedConfig, CleanError> {
             .ok_or_else(|| refuse(path.as_str(), "it is not a plain key on a line of its own"))?;
         let last = block_end(&lines, &scan, key.line, key.indent);
         if (key.line..=last).any(|j| scan.flow_start[j]) {
-            return Err(refuse(path.as_str(), "its value is a flow collection spanning lines"));
+            return Err(refuse(
+                path.as_str(),
+                "its value is a flow collection spanning lines",
+            ));
         }
         let own_value = &lines[key.line].text[key.value_offset..];
         let properties = has_node_property(own_value)
-            || (key.line + 1..=last)
-                .any(|j| !scan.continuation[j] && has_node_property(lines[j].text.trim_start_matches(' ')));
+            || (key.line + 1..=last).any(|j| {
+                !scan.continuation[j] && has_node_property(lines[j].text.trim_start_matches(' '))
+            });
         if properties {
             return Err(refuse(path.as_str(), "it uses a YAML anchor, alias or tag"));
         }
         for j in key.line..=last {
             commented[j] = is_content(&lines[j], scan.continuation[j]);
         }
-        keys.push(CleanedKey { path: path.clone(), first_line: key.line + 1, last_line: last + 1 });
+        keys.push(CleanedKey {
+            path: path.clone(),
+            first_line: key.line + 1,
+            last_line: last + 1,
+        });
     }
     // A section left without settings becomes `{}`, as an empty mapping
     // still loads where an empty value would not.
@@ -88,13 +102,22 @@ pub fn clean_retired_keys(contents: &str) -> Result<CleanedConfig, CleanError> {
             .keys
             .iter()
             .find(|key| key.path == parent)
-            .ok_or_else(|| refuse(path.as_str(), "its section is not a plain key on a line of its own"))?;
+            .ok_or_else(|| {
+                refuse(
+                    path.as_str(),
+                    "its section is not a plain key on a line of its own",
+                )
+            })?;
         let last = block_end(&lines, &scan, section.line, section.indent);
-        let remains = (section.line + 1..=last).any(|j| !commented[j] && is_content(&lines[j], scan.continuation[j]));
+        let remains = (section.line + 1..=last)
+            .any(|j| !commented[j] && is_content(&lines[j], scan.continuation[j]));
         if !remains && !emptied.contains(&section.line) {
             let value = lines[section.line].text[section.value_offset..].trim_start();
             if !(value.is_empty() || value.starts_with('#')) {
-                return Err(refuse(path.as_str(), "it is the only setting of a section with an unusual form"));
+                return Err(refuse(
+                    path.as_str(),
+                    "it is the only setting of a section with an unusual form",
+                ));
             }
             emptied.push(section.line);
         }
@@ -107,7 +130,11 @@ pub fn clean_retired_keys(contents: &str) -> Result<CleanedConfig, CleanError> {
             out.push_str(OBSOLETE_PREFIX);
             out.push_str(&line.text[indent..]);
         } else if emptied.contains(&j) {
-            let offset = scan.keys.iter().find(|key| key.line == j).map_or(line.text.len(), |key| key.value_offset);
+            let offset = scan
+                .keys
+                .iter()
+                .find(|key| key.line == j)
+                .map_or(line.text.len(), |key| key.value_offset);
             out.push_str(&line.text[..offset]);
             out.push_str(" {}");
             out.push_str(&line.text[offset..]);
@@ -118,14 +145,18 @@ pub fn clean_retired_keys(contents: &str) -> Result<CleanedConfig, CleanError> {
     }
     verify_cleaned(contents, &out, &retired)?;
     keys.sort_by_key(|key| key.first_line);
-    Ok(CleanedConfig { contents: out, keys })
+    Ok(CleanedConfig {
+        contents: out,
+        keys,
+    })
 }
 
 /// Checks that `cleaned` loads, names no retired key and equals
 /// `original` without the `removed` key paths.
 pub fn verify_cleaned(original: &str, cleaned: &str, removed: &[String]) -> Result<(), CleanError> {
     let fail = |reason: String| CleanError::Verification(reason);
-    serde_yaml::from_str::<Config>(cleaned).map_err(|e| fail(format!("it no longer loads: {e}")))?;
+    serde_yaml::from_str::<Config>(cleaned)
+        .map_err(|e| fail(format!("it no longer loads: {e}")))?;
     if let Some(left) = retired_paths(cleaned).first() {
         return Err(fail(format!("{left} is still set")));
     }
@@ -145,7 +176,13 @@ pub fn verify_cleaned(original: &str, cleaned: &str, removed: &[String]) -> Resu
 fn retired_paths(contents: &str) -> Vec<String> {
     unused_keys(contents)
         .into_iter()
-        .filter_map(|key| if let UnusedKey::Retired(path) = key { Some(path) } else { None })
+        .filter_map(|key| {
+            if let UnusedKey::Retired(path) = key {
+                Some(path)
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -155,7 +192,9 @@ fn remove_path(value: &mut Value, path: &str) -> bool {
     };
     match path.split_once('.') {
         None => mapping.remove(path).is_some(),
-        Some((head, rest)) => mapping.get_mut(head).is_some_and(|child| remove_path(child, rest)),
+        Some((head, rest)) => mapping
+            .get_mut(head)
+            .is_some_and(|child| remove_path(child, rest)),
     }
 }
 
@@ -171,7 +210,10 @@ fn split_lines(contents: &str) -> Vec<Line<'_>> {
         .map(|piece| {
             let body = piece.strip_suffix('\n').unwrap_or(piece);
             let len = body.strip_suffix('\r').unwrap_or(body).len();
-            Line { text: &piece[..len], eol: &piece[len..] }
+            Line {
+                text: &piece[..len],
+                eol: &piece[len..],
+            }
         })
         .collect()
 }
@@ -237,7 +279,11 @@ fn scan(lines: &[Line<'_>]) -> Scan {
             Continues::Flow(depth) => {
                 continuation[j] = true;
                 let depth = depth + flow_depth(text);
-                continues = if depth > 0 { Continues::Flow(depth) } else { Continues::No };
+                continues = if depth > 0 {
+                    Continues::Flow(depth)
+                } else {
+                    Continues::No
+                };
                 continue;
             }
             Continues::Quoted(quote) => {
@@ -265,9 +311,18 @@ fn scan(lines: &[Line<'_>]) -> Scan {
             while parents.last().is_some_and(|(parent, _)| *parent >= indent) {
                 parents.pop();
             }
-            let path =
-                parents.iter().map(|(_, name)| name.as_str()).chain([key.as_str()]).collect::<Vec<_>>().join(".");
-            keys.push(KeyLine { line: j, indent, path, value_offset: text.len() - rest.len() });
+            let path = parents
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .chain([key.as_str()])
+                .collect::<Vec<_>>()
+                .join(".");
+            keys.push(KeyLine {
+                line: j,
+                indent,
+                path,
+                value_offset: text.len() - rest.len(),
+            });
             parents.push((indent, key));
             (rest, indent)
         } else {
@@ -278,7 +333,11 @@ fn scan(lines: &[Line<'_>]) -> Scan {
             flow_start[j] = true;
         }
     }
-    Scan { keys, continuation, flow_start }
+    Scan {
+        keys,
+        continuation,
+        flow_start,
+    }
 }
 
 fn continues_after(value: &str, indent: usize) -> Continues {
@@ -289,7 +348,9 @@ fn continues_after(value: &str, indent: usize) -> Continues {
             depth if depth > 0 => Continues::Flow(depth),
             _ => Continues::No,
         },
-        Some(quote @ ('"' | '\'')) if closing_quote(value, quote, 1).is_none() => Continues::Quoted(quote),
+        Some(quote @ ('"' | '\'')) if closing_quote(value, quote, 1).is_none() => {
+            Continues::Quoted(quote)
+        }
         _ => Continues::No,
     }
 }
@@ -309,7 +370,9 @@ fn block_end(lines: &[Line<'_>], scan: &Scan, start: usize, key_indent: usize) -
             continue;
         }
         let indent = lines[j].text.len() - trimmed.len();
-        if indent > key_indent || (indent == key_indent && (trimmed == "-" || trimmed.starts_with("- "))) {
+        if indent > key_indent
+            || (indent == key_indent && (trimmed == "-" || trimmed.starts_with("- ")))
+        {
             last = j;
             continue;
         }
@@ -324,7 +387,10 @@ fn parse_key(trimmed: &str) -> Option<(String, &str)> {
     let (key, after) = match trimmed.chars().next()? {
         '"' => {
             let end = closing_quote(trimmed, '"', 1)?;
-            (trimmed[1..end].replace("\\\"", "\"").replace("\\\\", "\\"), &trimmed[end + 1..])
+            (
+                trimmed[1..end].replace("\\\"", "\"").replace("\\\\", "\\"),
+                &trimmed[end + 1..],
+            )
         }
         '\'' => {
             let end = closing_quote(trimmed, '\'', 1)?;
@@ -462,9 +528,20 @@ mod tests {
     fn assert_cleans(input: &str, expected: &str, paths: &[&str]) -> CleanedConfig {
         let cleaned = clean_retired_keys(input).unwrap();
         assert_eq!(cleaned.contents, expected);
-        assert_eq!(cleaned.keys.iter().map(|key| key.path.as_str()).collect::<Vec<_>>(), paths);
+        assert_eq!(
+            cleaned
+                .keys
+                .iter()
+                .map(|key| key.path.as_str())
+                .collect::<Vec<_>>(),
+            paths
+        );
         let again = clean_retired_keys(&cleaned.contents).unwrap();
-        assert_eq!((again.contents.as_str(), again.keys.len()), (expected, 0), "a second run has nothing to clean");
+        assert_eq!(
+            (again.contents.as_str(), again.keys.len()),
+            (expected, 0),
+            "a second run has nothing to clean"
+        );
         cleaned
     }
 
@@ -526,7 +603,10 @@ listenGrpcMultiaddr: /ip4/127.0.0.1/tcp/8337
             ],
         );
         let frame_publish = &cleaned.keys[5];
-        assert_eq!((frame_publish.first_line, frame_publish.last_line), (21, 29));
+        assert_eq!(
+            (frame_publish.first_line, frame_publish.last_line),
+            (21, 29)
+        );
     }
 
     /// A config migrated from the Go node: comments, blank lines, Go
@@ -601,7 +681,10 @@ listenGrpcMultiaddr: /ip4/0.0.0.0/tcp/8337
                 "listenRESTMultiaddr",
             ],
         );
-        assert_eq!(unused_keys(&cleaned.contents), vec![UnusedKey::Unknown("p2p.reportPeerInfoInterval".into())]);
+        assert_eq!(
+            unused_keys(&cleaned.contents),
+            vec![UnusedKey::Unknown("p2p.reportPeerInfoInterval".into())]
+        );
     }
 
     /// Four-space indentation, quoted keys, block and multi-line quoted
@@ -664,7 +747,9 @@ engine:
     #[test]
     fn a_section_left_empty_becomes_an_empty_mapping() {
         let input = "key:   # keys\n  keyManagerType: file\np2p:\n  network: 1\n";
-        let expected = format!("key: {{}}   # keys\n  {OBSOLETE_PREFIX}keyManagerType: file\np2p:\n  network: 1\n");
+        let expected = format!(
+            "key: {{}}   # keys\n  {OBSOLETE_PREFIX}keyManagerType: file\np2p:\n  network: 1\n"
+        );
         assert_cleans(input, &expected, &["key.keyManagerType"]);
     }
 
@@ -672,8 +757,17 @@ engine:
     #[test]
     fn a_config_without_retired_keys_is_unchanged() {
         let input = "p2p:\n  network: 1\n  bootstrapPeer: x\nalias:\n  aliasFile: {path: a.yml}\n";
-        assert_eq!(clean_retired_keys(input).unwrap(), CleanedConfig { contents: input.to_string(), keys: Vec::new() });
-        assert!(matches!(clean_retired_keys("p2p: [unclosed"), Err(CleanError::Parse(_))));
+        assert_eq!(
+            clean_retired_keys(input).unwrap(),
+            CleanedConfig {
+                contents: input.to_string(),
+                keys: Vec::new()
+            }
+        );
+        assert!(matches!(
+            clean_retired_keys("p2p: [unclosed"),
+            Err(CleanError::Parse(_))
+        ));
     }
 
     /// YAML the line editor cannot change safely is refused, naming the key.
@@ -683,8 +777,14 @@ engine:
             ("p2p:\n  network: 1\n  d: &degree 8\n", "p2p.d"),
             ("p2p:\n  dLo: &degree 6\n  dHi: *degree\n", "p2p.dHi"),
             ("p2p:\n  d: !!int 8\n", "p2p.d"),
-            ("engine:\n  framePublish:\n    mode: &mode full\n", "engine.framePublish"),
-            ("engine:\n  syncMessageLimits: {maxRecvMsgSize: 0,\n    maxSendMsgSize: 0}\n", "engine.syncMessageLimits"),
+            (
+                "engine:\n  framePublish:\n    mode: &mode full\n",
+                "engine.framePublish",
+            ),
+            (
+                "engine:\n  syncMessageLimits: {maxRecvMsgSize: 0,\n    maxSendMsgSize: 0}\n",
+                "engine.syncMessageLimits",
+            ),
             ("p2p: {network: 1, d: 8}\n", "p2p.d"),
         ] {
             match clean_retired_keys(input) {
@@ -699,9 +799,21 @@ engine:
     fn verification_rejects_other_changes() {
         let original = "p2p:\n  network: 1\n  d: 8\n";
         let removed = vec!["p2p.d".to_string()];
-        assert_eq!(verify_cleaned(original, "p2p:\n  network: 1\n", &removed), Ok(()));
-        assert!(matches!(verify_cleaned(original, "p2p:\n  network: 2\n", &removed), Err(CleanError::Verification(_))));
-        assert!(matches!(verify_cleaned(original, original, &removed), Err(CleanError::Verification(_))));
-        assert!(matches!(verify_cleaned(original, "p2p: [", &removed), Err(CleanError::Verification(_))));
+        assert_eq!(
+            verify_cleaned(original, "p2p:\n  network: 1\n", &removed),
+            Ok(())
+        );
+        assert!(matches!(
+            verify_cleaned(original, "p2p:\n  network: 2\n", &removed),
+            Err(CleanError::Verification(_))
+        ));
+        assert!(matches!(
+            verify_cleaned(original, original, &removed),
+            Err(CleanError::Verification(_))
+        ));
+        assert!(matches!(
+            verify_cleaned(original, "p2p: [", &removed),
+            Err(CleanError::Verification(_))
+        ));
     }
 }

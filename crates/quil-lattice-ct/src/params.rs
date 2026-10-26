@@ -130,7 +130,11 @@ mod tests {
 
     #[test]
     fn limb_decomposition_covers_the_amount_width() {
-        assert_eq!(LIMB_COUNT * LIMB_BASE_BITS, AMOUNT_BITS, "limbs must tile the amount width");
+        assert_eq!(
+            LIMB_COUNT * LIMB_BASE_BITS,
+            AMOUNT_BITS,
+            "limbs must tile the amount width"
+        );
         assert_eq!(LIMB_COUNT, 4);
     }
 
@@ -157,14 +161,21 @@ mod tests {
         // lemma caps soundness at ~2^-28. We require ord_512(q) = 64 → X^256+1 factors
         // into t=4 degree-64 irreducibles, giving the LS18 invertibility margin.
         let m = 2 * RING_DEGREE_D as u64; // 512
-        assert_ne!((MODULUS_Q - 1) % m, 0, "q must NOT be fully-split (≡1 mod 2d)");
+        assert_ne!(
+            (MODULUS_Q - 1) % m,
+            0,
+            "q must NOT be fully-split (≡1 mod 2d)"
+        );
         let mut ord = 1u64;
         let mut x = MODULUS_Q % m;
         while x != 1 {
             x = x * (MODULUS_Q % m) % m;
             ord += 1;
         }
-        assert_eq!(ord, 64, "ord_512(q) must be 64 (t = 256/64 = 4 partial split)");
+        assert_eq!(
+            ord, 64,
+            "ord_512(q) must be 64 (t = 256/64 = 4 partial split)"
+        );
         // q ≡ 1 mod 8 keeps a future radix-2 block NTT possible.
         assert_eq!((MODULUS_Q - 1) % 8, 0, "q ≡ 1 mod 8 for a future block NTT");
     }
@@ -173,11 +184,23 @@ mod tests {
     fn estimator_clears_the_128bit_target() {
         // Both assumptions must clear 128-bit core-SVP (classical AND quantum).
         let (lwe_c, lwe_q) = SECURITY_BITS_LWE;
-        assert!(lwe_c >= 128 && lwe_q >= 128, "M-LWE must clear 128-bit both models");
-        assert!(SECURITY_BITS_SIS_LOWER >= 128, "M-SIS floor must clear 128-bit");
+        assert!(
+            lwe_c >= 128 && lwe_q >= 128,
+            "M-LWE must clear 128-bit both models"
+        );
+        assert!(
+            SECURITY_BITS_SIS_LOWER >= 128,
+            "M-SIS floor must clear 128-bit"
+        );
         // Modulus must exceed both the amount limb-sum and the soundness slack.
-        assert!(MODULUS_Q as u128 > (MAX_IO as u128) << LIMB_BASE_BITS, "q > per-limb sum");
-        assert!((MODULUS_Q as u128) > (1u128 << 20), "q > ~2^20 extracted-norm slack");
+        assert!(
+            MODULUS_Q as u128 > (MAX_IO as u128) << LIMB_BASE_BITS,
+            "q > per-limb sum"
+        );
+        assert!(
+            (MODULUS_Q as u128) > (1u128 << 20),
+            "q > ~2^20 extracted-norm slack"
+        );
     }
 
     #[test]
@@ -185,6 +208,9 @@ mod tests {
         // One ring challenge must already exceed the 128-bit soundness target,
         // so the ring form needs no parallel repetition (unlike the reference's
         // 16 rounds of a 3-element challenge).
-        assert!(CHALLENGE_ENTROPY_BITS >= 128, "single-shot soundness ≥ 128-bit");
+        assert!(
+            CHALLENGE_ENTROPY_BITS >= 128,
+            "single-shot soundness ≥ 128-bit"
+        );
     }
 }

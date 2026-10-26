@@ -64,10 +64,10 @@ mod tests {
         let me = quil_crypto::FalconSigner::generate();
         let my_signing = me.private_key().to_vec();
         let my_public = me.public_key().to_vec();
-        let others: Vec<quil_crypto::FalconSigner> =
-            (0..3).map(|_| quil_crypto::FalconSigner::generate()).collect();
-        let mut committee: Vec<Vec<u8>> =
-            others.iter().map(|s| s.public_key().to_vec()).collect();
+        let others: Vec<quil_crypto::FalconSigner> = (0..3)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let mut committee: Vec<Vec<u8>> = others.iter().map(|s| s.public_key().to_vec()).collect();
         committee.push(my_public.clone());
 
         let c = build_global_committee(&committee, &my_signing, &my_public, b"global")

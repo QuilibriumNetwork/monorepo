@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use quil_types::error::{QuilError, Result};
@@ -31,22 +31,32 @@ pub struct OverlayShardsStore {
 
 impl OverlayShardsStore {
     pub fn new(overlay: Arc<quil_forest::ExecutionOverlay>) -> Self {
-        Self { db: crate::overlay::OverlayDb(overlay) }
+        Self {
+            db: crate::overlay::OverlayDb(overlay),
+        }
     }
 
     fn identity(&self) -> quil_types::store::BackingStoreIdentity {
         quil_types::store::BackingStoreIdentity::of(&self.db.0)
     }
 
-    fn scan_range(&self, lower: Vec<u8>, upper: Option<Vec<u8>>) -> Result<crate::overlay::OverlayIterator> {
-        let upper = upper.ok_or_else(|| QuilError::Store("tentative shard metadata scan requires an upper bound".into()))?;
+    fn scan_range(
+        &self,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    ) -> Result<crate::overlay::OverlayIterator> {
+        let upper = upper.ok_or_else(|| {
+            QuilError::Store("tentative shard metadata scan requires an upper bound".into())
+        })?;
         Ok(self.db.range(lower, upper))
     }
 
     fn check_transaction(&self, txn: &dyn Transaction) -> Result<()> {
         // This batch cannot commit independently; the execution manager folds
         // its records into the hypergraph's frame transaction.
-        if txn.as_any().is::<ShardMetadataBatch>() { return Ok(()); }
+        if txn.as_any().is::<ShardMetadataBatch>() {
+            return Ok(());
+        }
         crate::overlay::OverlayTxn::for_store(txn, &self.db).map(|_| ())
     }
 }
@@ -60,14 +70,22 @@ impl RocksShardsStore {
         self.db.backing_store_identity()
     }
 
-    fn scan_range(&self, lower: Vec<u8>, upper: Option<Vec<u8>>) -> Result<rocksdb::DBIterator<'_>> {
+    fn scan_range(
+        &self,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    ) -> Result<rocksdb::DBIterator<'_>> {
         let mut options = rocksdb::ReadOptions::default();
         options.set_iterate_lower_bound(lower);
-        if let Some(upper) = upper { options.set_iterate_upper_bound(upper); }
+        if let Some(upper) = upper {
+            options.set_iterate_upper_bound(upper);
+        }
         Ok(self.db.iterator_opt(rocksdb::IteratorMode::Start, options))
     }
 
-    fn check_transaction(&self, _txn: &dyn Transaction) -> Result<()> { Ok(()) }
+    fn check_transaction(&self, _txn: &dyn Transaction) -> Result<()> {
+        Ok(())
+    }
 
     /// Compact the pending-shard-change keyspace to drop accumulated deletion
     /// tombstones. `all_pending_shard_changes` range-scans this narrow prefix
@@ -171,7 +189,9 @@ fn decode_pending_change(v: &[u8]) -> Result<PendingShardChange> {
     let mut i = 0usize;
     let take = |v: &[u8], i: &mut usize, n: usize| -> Result<Vec<u8>> {
         if *i + n > v.len() {
-            return Err(QuilError::Store("invalid pending shard change encoding".into()));
+            return Err(QuilError::Store(
+                "invalid pending shard change encoding".into(),
+            ));
         }
         let s = v[*i..*i + n].to_vec();
         *i += n;
@@ -193,7 +213,13 @@ fn decode_pending_change(v: &[u8]) -> Result<PendingShardChange> {
         let clen = u16::from_be_bytes(take(v, &mut i, 2)?.try_into().map_err(|_| err())?) as usize;
         children.push(take(v, &mut i, clen)?);
     }
-    Ok(PendingShardChange { kind, parent, children, effective_epoch, proposed_frame })
+    Ok(PendingShardChange {
+        kind,
+        parent,
+        children,
+        effective_epoch,
+        proposed_frame,
+    })
 }
 
 /// Execution-local shard view. Writes are returned to the execution changeset;
@@ -207,17 +233,31 @@ pub struct ShardMetadataBatch {
 
 impl ShardMetadataBatch {
     pub fn new(base: Arc<dyn ShardsStore>, earlier: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Self {
-        Self { base, earlier: earlier.into_iter().filter(|(k, _)| k.first() == Some(&SHARD)).collect(),
-            writes: Mutex::new(BTreeMap::new()) }
+        Self {
+            base,
+            earlier: earlier
+                .into_iter()
+                .filter(|(k, _)| k.first() == Some(&SHARD))
+                .collect(),
+            writes: Mutex::new(BTreeMap::new()),
+        }
     }
 
     pub fn into_records(self) -> Vec<RecordMutation> {
-        self.writes.into_inner().unwrap().into_iter()
-            .map(|(key, value)| RecordMutation { key, value }).collect()
+        self.writes
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| RecordMutation { key, value })
+            .collect()
     }
 
     fn overlay(&self, mut apply: impl FnMut(&[u8], Option<&[u8]>) -> Result<()>) -> Result<()> {
-        for (key, value) in self.earlier.iter().chain(self.writes.lock().unwrap().iter()) {
+        for (key, value) in self
+            .earlier
+            .iter()
+            .chain(self.writes.lock().unwrap().iter())
+        {
             apply(key, value.as_deref())?;
         }
         Ok(())
@@ -226,20 +266,34 @@ impl ShardMetadataBatch {
 
 impl ShardsStore for ShardMetadataBatch {
     fn range_app_shards(&self) -> Result<Vec<ShardInfo>> {
-        let mut rows: BTreeMap<_, _> = self.base.range_app_shards()?.into_iter()
-            .map(|row| (app_shard_key(&row.shard_key, &row.prefix), row)).collect();
+        let mut rows: BTreeMap<_, _> = self
+            .base
+            .range_app_shards()?
+            .into_iter()
+            .map(|row| (app_shard_key(&row.shard_key, &row.prefix), row))
+            .collect();
         self.overlay(|key, value| {
-            if !key.starts_with(&[SHARD, APP_SHARD_DATA]) { return Ok(()); }
+            if !key.starts_with(&[SHARD, APP_SHARD_DATA]) {
+                return Ok(());
+            }
             match value {
-                None => { rows.remove(key); }
+                None => {
+                    rows.remove(key);
+                }
                 Some(value) => {
                     if key.len() < 2 + SHARD_KEY_LEN {
                         return Err(QuilError::Store("invalid staged shard key".into()));
                     }
-                    rows.insert(key.to_vec(), ShardInfo {
-                        shard_key: key[2..2 + SHARD_KEY_LEN].to_vec(), prefix: decode_path(value)?,
-                        size: Vec::new(), data_shards: 0, commitment: Vec::new(),
-                    });
+                    rows.insert(
+                        key.to_vec(),
+                        ShardInfo {
+                            shard_key: key[2..2 + SHARD_KEY_LEN].to_vec(),
+                            prefix: decode_path(value)?,
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    );
                 }
             }
             Ok(())
@@ -248,144 +302,16 @@ impl ShardsStore for ShardMetadataBatch {
     }
 
     fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>> {
-        Ok(self.range_app_shards()?.into_iter()
-            .filter(|row| row.shard_key == shard_key && row.prefix.starts_with(prefix)).collect())
+        Ok(self
+            .range_app_shards()?
+            .into_iter()
+            .filter(|row| row.shard_key == shard_key && row.prefix.starts_with(prefix))
+            .collect())
     }
 
     fn put_app_shard(&self, txn: &dyn Transaction, shard: &ShardInfo) -> Result<()> {
         let key = app_shard_key(&shard.shard_key, &shard.prefix);
         txn.set(&key, &key[2 + shard.shard_key.len()..])
-    }
-
-    fn delete_app_shard(&self, txn: &dyn Transaction, shard_key: &[u8], prefix: &[u32]) -> Result<()> {
-        txn.delete(&app_shard_key(shard_key, prefix))
-    }
-
-    fn put_pending_shard_change(&self, txn: &dyn Transaction, change: &PendingShardChange) -> Result<()> {
-        txn.set(&pending_change_key(change.effective_epoch, &change.parent), &encode_pending_change(change))
-    }
-
-    fn get_pending_shard_changes(&self, effective_epoch: u64) -> Result<Vec<PendingShardChange>> {
-        Ok(self.all_pending_shard_changes()?.into_iter().filter(|c| c.effective_epoch == effective_epoch).collect())
-    }
-
-    fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
-        let mut rows: BTreeMap<_, _> = self.base.all_pending_shard_changes()?.into_iter()
-            .map(|c| (pending_change_key(c.effective_epoch, &c.parent), c)).collect();
-        self.overlay(|key, value| {
-            if !key.starts_with(&[SHARD, PENDING_SHARD_CHANGE]) { return Ok(()); }
-            match value {
-                None => { rows.remove(key); }
-                Some(value) => { rows.insert(key.to_vec(), decode_pending_change(value)?); }
-            }
-            Ok(())
-        })?;
-        Ok(rows.into_values().collect())
-    }
-
-    fn delete_pending_shard_change(&self, txn: &dyn Transaction, parent: &[u8], effective_epoch: u64) -> Result<()> {
-        txn.delete(&pending_change_key(effective_epoch, parent))
-    }
-}
-
-impl Transaction for ShardMetadataBatch {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(value) = self.writes.lock().unwrap().get(key) { return Ok(value.clone()); }
-        if let Some(value) = self.earlier.get(key) { return Ok(value.clone()); }
-        Err(QuilError::Store("read shard metadata through ShardsStore".into()))
-    }
-    fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.writes.lock().unwrap().insert(key.to_vec(), Some(value.to_vec()));
-        Ok(())
-    }
-    fn delete(&self, key: &[u8]) -> Result<()> {
-        self.writes.lock().unwrap().insert(key.to_vec(), None);
-        Ok(())
-    }
-    fn commit(self: Box<Self>) -> Result<()> {
-        Err(QuilError::Store("shard metadata must commit with its execution frame".into()))
-    }
-    fn abort(self: Box<Self>) -> Result<()> { Ok(()) }
-    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
-        Err(QuilError::Store("iterate shard metadata through ShardsStore".into()))
-    }
-    fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> {
-        Err(QuilError::Store("delete shard metadata by exact key".into()))
-    }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-}
-
-// Share the key encodings and range decoders between both backends.
-macro_rules! impl_shard_storage {
-    ($store:ty) => {
-impl ShardsStore for $store {
-    fn backing_store_identity(&self) -> Option<quil_types::store::BackingStoreIdentity> {
-        Some(self.identity())
-    }
-
-    fn range_app_shards(&self) -> Result<Vec<ShardInfo>> {
-        let lower = app_shard_key(&[0u8; SHARD_KEY_LEN], &[]);
-        let upper = app_shard_key(&[0xffu8; SHARD_KEY_LEN], &[0xffff]);
-
-        let iter = self.scan_range(lower, Some(upper))?;
-
-        let mut shards = Vec::new();
-        for item in iter {
-            let (k, v) = item.map_err(|e| QuilError::Store(format!("range app shards: {}", e)))?;
-            if k.len() < 2 + SHARD_KEY_LEN {
-                continue;
-            }
-            let shard_key = k[2..2 + SHARD_KEY_LEN].to_vec();
-            let path = decode_path(&v)?;
-            shards.push(ShardInfo {
-                shard_key,
-                prefix: path,
-                size: Vec::new(),
-                data_shards: 0,
-                commitment: Vec::new(),
-            });
-        }
-
-        Ok(shards)
-    }
-
-    fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>> {
-        // Scan every key whose byte prefix is `app_shard_key(shard_key, prefix)`
-        // — i.e. all shards under `prefix`. The upper bound is the lexicographic
-        // successor of that byte prefix, NOT `prefix ‖ 0xffff`: a deep-bifurcation
-        // shard rides a SENTINEL prefix (`0xFFFF_FFFF, …`) whose big-endian u32
-        // encoding (`FF FF FF FF …`) sorts ABOVE `0xffff` (`00 00 FF FF`), so the
-        // old bound silently excluded every deep shard. The successor bound
-        // includes them and is identical for legacy (small-valued) prefixes.
-        let lower = app_shard_key(shard_key, prefix);
-        let upper = prefix_byte_successor(&lower);
-
-        let iter = self.scan_range(lower, upper)?;
-
-        let mut shards = Vec::new();
-        for item in iter {
-            let (_k, v) =
-                item.map_err(|e| QuilError::Store(format!("get app shards: {}", e)))?;
-            let path = decode_path(&v)?;
-            shards.push(ShardInfo {
-                shard_key: shard_key.to_vec(),
-                prefix: path,
-                size: Vec::new(),
-                data_shards: 0,
-                commitment: Vec::new(),
-            });
-        }
-
-        Ok(shards)
-    }
-
-    fn put_app_shard(&self, txn: &dyn Transaction, shard: &ShardInfo) -> Result<()> {
-        self.check_transaction(txn)?;
-        let key = app_shard_key(&shard.shard_key, &shard.prefix);
-        // Value = the prefix portion of the key (everything after the 2-byte header + shard_key).
-        let value = &key[2 + shard.shard_key.len()..];
-        txn.set(&key, value)
-            .map_err(|e| QuilError::Store(format!("put app shard: {}", e)))
     }
 
     fn delete_app_shard(
@@ -394,10 +320,7 @@ impl ShardsStore for $store {
         shard_key: &[u8],
         prefix: &[u32],
     ) -> Result<()> {
-        self.check_transaction(txn)?;
-        let key = app_shard_key(shard_key, prefix);
-        txn.delete(&key)
-            .map_err(|e| QuilError::Store(format!("delete app shard: {}", e)))
+        txn.delete(&app_shard_key(shard_key, prefix))
     }
 
     fn put_pending_shard_change(
@@ -405,43 +328,42 @@ impl ShardsStore for $store {
         txn: &dyn Transaction,
         change: &PendingShardChange,
     ) -> Result<()> {
-        self.check_transaction(txn)?;
-        let key = pending_change_key(change.effective_epoch, &change.parent);
-        txn.set(&key, &encode_pending_change(change))
-            .map_err(|e| QuilError::Store(format!("put pending shard change: {}", e)))
+        txn.set(
+            &pending_change_key(change.effective_epoch, &change.parent),
+            &encode_pending_change(change),
+        )
     }
 
     fn get_pending_shard_changes(&self, effective_epoch: u64) -> Result<Vec<PendingShardChange>> {
-        // Prefix scan over a single epoch: [SHARD, PENDING, epoch BE].
-        let mut lower = vec![SHARD, PENDING_SHARD_CHANGE];
-        lower.extend_from_slice(&effective_epoch.to_be_bytes());
-        // The byte-prefix successor also includes the last u64 epoch. Numeric
-        // saturation would make both bounds equal and silently omit its rows.
-        let upper = prefix_byte_successor(&lower);
-        let iter = self.scan_range(lower, upper)?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            let (_k, v) =
-                item.map_err(|e| QuilError::Store(format!("get pending changes: {}", e)))?;
-            out.push(decode_pending_change(&v)?);
-        }
-        Ok(out)
+        Ok(self
+            .all_pending_shard_changes()?
+            .into_iter()
+            .filter(|c| c.effective_epoch == effective_epoch)
+            .collect())
     }
 
     fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
-        let lower = vec![SHARD, PENDING_SHARD_CHANGE];
-        let upper = vec![SHARD, PENDING_SHARD_CHANGE + 1];
-
-        let iter = self.scan_range(lower, Some(upper))?;
-
-        let mut out = Vec::new();
-        for item in iter {
-            let (_k, v) =
-                item.map_err(|e| QuilError::Store(format!("all pending changes: {}", e)))?;
-            out.push(decode_pending_change(&v)?);
-        }
-        Ok(out)
+        let mut rows: BTreeMap<_, _> = self
+            .base
+            .all_pending_shard_changes()?
+            .into_iter()
+            .map(|c| (pending_change_key(c.effective_epoch, &c.parent), c))
+            .collect();
+        self.overlay(|key, value| {
+            if !key.starts_with(&[SHARD, PENDING_SHARD_CHANGE]) {
+                return Ok(());
+            }
+            match value {
+                None => {
+                    rows.remove(key);
+                }
+                Some(value) => {
+                    rows.insert(key.to_vec(), decode_pending_change(value)?);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(rows.into_values().collect())
     }
 
     fn delete_pending_shard_change(
@@ -450,13 +372,201 @@ impl ShardsStore for $store {
         parent: &[u8],
         effective_epoch: u64,
     ) -> Result<()> {
-        self.check_transaction(txn)?;
-        let key = pending_change_key(effective_epoch, parent);
-        txn.delete(&key)
-            .map_err(|e| QuilError::Store(format!("delete pending shard change: {}", e)))
+        txn.delete(&pending_change_key(effective_epoch, parent))
     }
 }
 
+impl Transaction for ShardMetadataBatch {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self.writes.lock().unwrap().get(key) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = self.earlier.get(key) {
+            return Ok(value.clone());
+        }
+        Err(QuilError::Store(
+            "read shard metadata through ShardsStore".into(),
+        ))
+    }
+    fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.writes
+            .lock()
+            .unwrap()
+            .insert(key.to_vec(), Some(value.to_vec()));
+        Ok(())
+    }
+    fn delete(&self, key: &[u8]) -> Result<()> {
+        self.writes.lock().unwrap().insert(key.to_vec(), None);
+        Ok(())
+    }
+    fn commit(self: Box<Self>) -> Result<()> {
+        Err(QuilError::Store(
+            "shard metadata must commit with its execution frame".into(),
+        ))
+    }
+    fn abort(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+    fn new_iter(&self, _: &[u8], _: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
+        Err(QuilError::Store(
+            "iterate shard metadata through ShardsStore".into(),
+        ))
+    }
+    fn delete_range(&self, _: &[u8], _: &[u8]) -> Result<()> {
+        Err(QuilError::Store(
+            "delete shard metadata by exact key".into(),
+        ))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// Share the key encodings and range decoders between both backends.
+macro_rules! impl_shard_storage {
+    ($store:ty) => {
+        impl ShardsStore for $store {
+            fn backing_store_identity(&self) -> Option<quil_types::store::BackingStoreIdentity> {
+                Some(self.identity())
+            }
+
+            fn range_app_shards(&self) -> Result<Vec<ShardInfo>> {
+                let lower = app_shard_key(&[0u8; SHARD_KEY_LEN], &[]);
+                let upper = app_shard_key(&[0xffu8; SHARD_KEY_LEN], &[0xffff]);
+
+                let iter = self.scan_range(lower, Some(upper))?;
+
+                let mut shards = Vec::new();
+                for item in iter {
+                    let (k, v) =
+                        item.map_err(|e| QuilError::Store(format!("range app shards: {}", e)))?;
+                    if k.len() < 2 + SHARD_KEY_LEN {
+                        continue;
+                    }
+                    let shard_key = k[2..2 + SHARD_KEY_LEN].to_vec();
+                    let path = decode_path(&v)?;
+                    shards.push(ShardInfo {
+                        shard_key,
+                        prefix: path,
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    });
+                }
+
+                Ok(shards)
+            }
+
+            fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>> {
+                // Scan every key whose byte prefix is `app_shard_key(shard_key, prefix)`
+                // — i.e. all shards under `prefix`. The upper bound is the lexicographic
+                // successor of that byte prefix, NOT `prefix ‖ 0xffff`: a deep-bifurcation
+                // shard rides a SENTINEL prefix (`0xFFFF_FFFF, …`) whose big-endian u32
+                // encoding (`FF FF FF FF …`) sorts ABOVE `0xffff` (`00 00 FF FF`), so the
+                // old bound silently excluded every deep shard. The successor bound
+                // includes them and is identical for legacy (small-valued) prefixes.
+                let lower = app_shard_key(shard_key, prefix);
+                let upper = prefix_byte_successor(&lower);
+
+                let iter = self.scan_range(lower, upper)?;
+
+                let mut shards = Vec::new();
+                for item in iter {
+                    let (_k, v) =
+                        item.map_err(|e| QuilError::Store(format!("get app shards: {}", e)))?;
+                    let path = decode_path(&v)?;
+                    shards.push(ShardInfo {
+                        shard_key: shard_key.to_vec(),
+                        prefix: path,
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    });
+                }
+
+                Ok(shards)
+            }
+
+            fn put_app_shard(&self, txn: &dyn Transaction, shard: &ShardInfo) -> Result<()> {
+                self.check_transaction(txn)?;
+                let key = app_shard_key(&shard.shard_key, &shard.prefix);
+                // Value = the prefix portion of the key (everything after the 2-byte header + shard_key).
+                let value = &key[2 + shard.shard_key.len()..];
+                txn.set(&key, value)
+                    .map_err(|e| QuilError::Store(format!("put app shard: {}", e)))
+            }
+
+            fn delete_app_shard(
+                &self,
+                txn: &dyn Transaction,
+                shard_key: &[u8],
+                prefix: &[u32],
+            ) -> Result<()> {
+                self.check_transaction(txn)?;
+                let key = app_shard_key(shard_key, prefix);
+                txn.delete(&key)
+                    .map_err(|e| QuilError::Store(format!("delete app shard: {}", e)))
+            }
+
+            fn put_pending_shard_change(
+                &self,
+                txn: &dyn Transaction,
+                change: &PendingShardChange,
+            ) -> Result<()> {
+                self.check_transaction(txn)?;
+                let key = pending_change_key(change.effective_epoch, &change.parent);
+                txn.set(&key, &encode_pending_change(change))
+                    .map_err(|e| QuilError::Store(format!("put pending shard change: {}", e)))
+            }
+
+            fn get_pending_shard_changes(
+                &self,
+                effective_epoch: u64,
+            ) -> Result<Vec<PendingShardChange>> {
+                // Prefix scan over a single epoch: [SHARD, PENDING, epoch BE].
+                let mut lower = vec![SHARD, PENDING_SHARD_CHANGE];
+                lower.extend_from_slice(&effective_epoch.to_be_bytes());
+                // The byte-prefix successor also includes the last u64 epoch. Numeric
+                // saturation would make both bounds equal and silently omit its rows.
+                let upper = prefix_byte_successor(&lower);
+                let iter = self.scan_range(lower, upper)?;
+
+                let mut out = Vec::new();
+                for item in iter {
+                    let (_k, v) =
+                        item.map_err(|e| QuilError::Store(format!("get pending changes: {}", e)))?;
+                    out.push(decode_pending_change(&v)?);
+                }
+                Ok(out)
+            }
+
+            fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
+                let lower = vec![SHARD, PENDING_SHARD_CHANGE];
+                let upper = vec![SHARD, PENDING_SHARD_CHANGE + 1];
+
+                let iter = self.scan_range(lower, Some(upper))?;
+
+                let mut out = Vec::new();
+                for item in iter {
+                    let (_k, v) =
+                        item.map_err(|e| QuilError::Store(format!("all pending changes: {}", e)))?;
+                    out.push(decode_pending_change(&v)?);
+                }
+                Ok(out)
+            }
+
+            fn delete_pending_shard_change(
+                &self,
+                txn: &dyn Transaction,
+                parent: &[u8],
+                effective_epoch: u64,
+            ) -> Result<()> {
+                self.check_transaction(txn)?;
+                let key = pending_change_key(effective_epoch, parent);
+                txn.delete(&key)
+                    .map_err(|e| QuilError::Store(format!("delete pending shard change: {}", e)))
+            }
+        }
     };
 }
 impl_shard_storage!(RocksShardsStore);
@@ -540,9 +650,15 @@ mod tests {
         };
 
         let txn = db.new_batch(false).expect("new batch");
-        store.put_app_shard(txn.as_ref(), &legacy).expect("put legacy");
-        store.put_app_shard(txn.as_ref(), &deep0).expect("put deep0");
-        store.put_app_shard(txn.as_ref(), &deep1).expect("put deep1");
+        store
+            .put_app_shard(txn.as_ref(), &legacy)
+            .expect("put legacy");
+        store
+            .put_app_shard(txn.as_ref(), &deep0)
+            .expect("put deep0");
+        store
+            .put_app_shard(txn.as_ref(), &deep1)
+            .expect("put deep1");
         txn.commit().expect("commit");
 
         let mut got: Vec<Vec<u32>> = store
@@ -552,7 +668,11 @@ mod tests {
             .map(|s| s.prefix)
             .collect();
         got.sort();
-        let mut want = vec![vec![5u32], vec![0xFFFF_FFFFu32, 0, 0, 0], vec![0xFFFF_FFFFu32, 0, 0, 1]];
+        let mut want = vec![
+            vec![5u32],
+            vec![0xFFFF_FFFFu32, 0, 0, 0],
+            vec![0xFFFF_FFFFu32, 0, 0, 1],
+        ];
         want.sort();
         assert_eq!(got, want, "sentinel bit-path shards must be enumerated too");
     }
@@ -579,8 +699,12 @@ mod tests {
         };
 
         let txn = db.new_batch(false).expect("new batch");
-        store.put_pending_shard_change(txn.as_ref(), &split).expect("put split");
-        store.put_pending_shard_change(txn.as_ref(), &merge).expect("put merge");
+        store
+            .put_pending_shard_change(txn.as_ref(), &split)
+            .expect("put split");
+        store
+            .put_pending_shard_change(txn.as_ref(), &merge)
+            .expect("put merge");
         txn.commit().expect("commit");
 
         // Filter by effective epoch.
@@ -588,7 +712,10 @@ mod tests {
         assert_eq!(e7, vec![split.clone()], "epoch 7 holds only the split");
         let e9 = store.get_pending_shard_changes(9).expect("get e9");
         assert_eq!(e9, vec![merge.clone()], "epoch 9 holds only the merge");
-        assert!(store.get_pending_shard_changes(8).expect("get e8").is_empty());
+        assert!(store
+            .get_pending_shard_changes(8)
+            .expect("get e8")
+            .is_empty());
 
         // All pending (join-freeze lookup) + affects_shard.
         let all = store.all_pending_shard_changes().expect("all");
@@ -599,10 +726,21 @@ mod tests {
 
         // Delete the applied split.
         let txn = db.new_batch(false).expect("new batch");
-        store.delete_pending_shard_change(txn.as_ref(), &parent_a, 7).expect("delete");
+        store
+            .delete_pending_shard_change(txn.as_ref(), &parent_a, 7)
+            .expect("delete");
         txn.commit().expect("commit");
-        assert!(store.get_pending_shard_changes(7).expect("get e7 post-delete").is_empty());
-        assert_eq!(store.all_pending_shard_changes().expect("all post-delete").len(), 1);
+        assert!(store
+            .get_pending_shard_changes(7)
+            .expect("get e7 post-delete")
+            .is_empty());
+        assert_eq!(
+            store
+                .all_pending_shard_changes()
+                .expect("all post-delete")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -618,10 +756,14 @@ mod tests {
             proposed_frame: 720,
         };
         let txn = db.new_batch(false).expect("new batch");
-        store.put_pending_shard_change(txn.as_ref(), &change).expect("put");
+        store
+            .put_pending_shard_change(txn.as_ref(), &change)
+            .expect("put");
         txn.commit().expect("commit");
-        assert!(store.range_app_shards().expect("range").is_empty(),
-            "pending changes must not leak into the live shard enumeration");
+        assert!(
+            store.range_app_shards().expect("range").is_empty(),
+            "pending changes must not leak into the live shard enumeration"
+        );
     }
 
     #[test]
@@ -750,9 +892,7 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         // Query with no prefix should return all three
-        let all = store
-            .get_app_shards(&shard_key, &[])
-            .expect("get all");
+        let all = store.get_app_shards(&shard_key, &[]).expect("get all");
         assert_eq!(all.len(), 3);
     }
 
@@ -767,9 +907,7 @@ mod tests {
     fn test_get_empty() {
         let (_db, store) = test_db();
         let shard_key = make_shard_key();
-        let results = store
-            .get_app_shards(&shard_key, &[])
-            .expect("get empty");
+        let results = store.get_app_shards(&shard_key, &[]).expect("get empty");
         assert!(results.is_empty());
     }
 
@@ -777,31 +915,63 @@ mod tests {
     fn staged_metadata_has_ordered_reads_without_publishing_to_the_store() {
         let (db, store) = test_db();
         let store: Arc<dyn ShardsStore> = Arc::new(store);
-        let root = ShardInfo { shard_key: make_shard_key(), prefix: vec![], size: vec![],
-            data_shards: 0, commitment: vec![] };
+        let root = ShardInfo {
+            shard_key: make_shard_key(),
+            prefix: vec![],
+            size: vec![],
+            data_shards: 0,
+            commitment: vec![],
+        };
         let txn = db.new_batch(false).unwrap();
         store.put_app_shard(txn.as_ref(), &root).unwrap();
         txn.commit().unwrap();
         let first = ShardMetadataBatch::new(store.clone(), BTreeMap::new());
-        first.delete_app_shard(&first, &root.shard_key, &root.prefix).unwrap();
-        let child = ShardInfo { prefix: vec![0xffff_ffff, 1], ..root.clone() };
+        first
+            .delete_app_shard(&first, &root.shard_key, &root.prefix)
+            .unwrap();
+        let child = ShardInfo {
+            prefix: vec![0xffff_ffff, 1],
+            ..root.clone()
+        };
         first.put_app_shard(&first, &child).unwrap();
-        let change = PendingShardChange { kind: ShardChangeKind::Split, parent: vec![1; 32],
-            children: vec![vec![2; 32]], effective_epoch: 8, proposed_frame: 12 };
+        let change = PendingShardChange {
+            kind: ShardChangeKind::Split,
+            parent: vec![1; 32],
+            children: vec![vec![2; 32]],
+            effective_epoch: 8,
+            proposed_frame: 12,
+        };
         first.put_pending_shard_change(&first, &change).unwrap();
-        assert_eq!(first.get_app_shards(&root.shard_key, &[]).unwrap()[0].prefix, child.prefix);
-        assert_eq!(first.get_pending_shard_changes(8).unwrap(), vec![change.clone()]);
+        assert_eq!(
+            first.get_app_shards(&root.shard_key, &[]).unwrap()[0].prefix,
+            child.prefix
+        );
+        assert_eq!(
+            first.get_pending_shard_changes(8).unwrap(),
+            vec![change.clone()]
+        );
         assert!(store.range_app_shards().unwrap()[0].prefix.is_empty());
         assert!(store.all_pending_shard_changes().unwrap().is_empty());
 
-        let earlier = first.into_records().into_iter().map(|r| (r.key, r.value)).collect();
+        let earlier = first
+            .into_records()
+            .into_iter()
+            .map(|r| (r.key, r.value))
+            .collect();
         let second = ShardMetadataBatch::new(store.clone(), earlier);
-        second.delete_pending_shard_change(&second, &change.parent, change.effective_epoch).unwrap();
-        second.delete_app_shard(&second, &child.shard_key, &child.prefix).unwrap();
+        second
+            .delete_pending_shard_change(&second, &change.parent, change.effective_epoch)
+            .unwrap();
+        second
+            .delete_app_shard(&second, &child.shard_key, &child.prefix)
+            .unwrap();
         second.put_app_shard(&second, &root).unwrap();
         assert!(second.all_pending_shard_changes().unwrap().is_empty());
         assert!(second.range_app_shards().unwrap()[0].prefix.is_empty());
-        assert!(Box::new(second).commit().is_err(), "standalone commit must be refused");
+        assert!(
+            Box::new(second).commit().is_err(),
+            "standalone commit must be refused"
+        );
         assert!(store.all_pending_shard_changes().unwrap().is_empty());
         assert!(store.range_app_shards().unwrap()[0].prefix.is_empty());
     }

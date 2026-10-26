@@ -41,8 +41,8 @@ use num_traits::Zero;
 use quil_types::error::{QuilError, Result};
 
 use super::canonical::{
-    TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT,
-    TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
+    TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
+    TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
 };
 use super::types::{
     HyperedgeAdd, HyperedgeRemove, HypergraphDeploy, HypergraphUpdate, VertexAdd, VertexRemove,
@@ -223,9 +223,7 @@ pub fn decode_and_validate(input: &[u8]) -> Result<DispatchedMessage> {
 /// `(reads, writes)` pair without retaining the decoded message.
 /// Mirrors the control flow in Go's `tryLock*` helpers — they each
 /// decode, call GetReadAddresses/GetWriteAddresses, and return.
-pub fn lock_addresses_for_input(
-    input: &[u8],
-) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+pub fn lock_addresses_for_input(input: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
     let msg = decode_message(input)?;
     msg.lock_addresses()
 }
@@ -238,10 +236,7 @@ pub fn lock_addresses_for_input(
 /// the proof list embedded in `data`; hyperedge-add cost is derived
 /// from the atom count under the extrinsic tree, which we don't
 /// decode here — callers thread an `atom_count_hint` in.
-pub fn dispatch_cost(
-    msg: &DispatchedMessage,
-    hyperedge_atom_count_hint: u64,
-) -> Result<BigInt> {
+pub fn dispatch_cost(msg: &DispatchedMessage, hyperedge_atom_count_hint: u64) -> Result<BigInt> {
     match msg {
         DispatchedMessage::VertexAdd(v) => v.get_cost(),
         DispatchedMessage::VertexRemove(v) => Ok(v.get_cost()),
@@ -531,7 +526,10 @@ pub fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
     // Prefix / BASE declarations
     let has_prefix = text.lines().any(|l| {
         let t = l.trim_start();
-        t.starts_with("@prefix") || t.starts_with("PREFIX") || t.starts_with("BASE") || t.starts_with("@base")
+        t.starts_with("@prefix")
+            || t.starts_with("PREFIX")
+            || t.starts_with("BASE")
+            || t.starts_with("@base")
     });
     if !has_prefix {
         return Err(QuilError::InvalidArgument(
@@ -557,15 +555,15 @@ pub fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
             let trimmed = occurrence.trim_start();
             if trimmed.is_empty() {
                 return Err(QuilError::InvalidArgument(format!(
-                    "hypergraph deploy: RDF schema has unterminated qcl:{}", label
+                    "hypergraph deploy: RDF schema has unterminated qcl:{}",
+                    label
                 )));
             }
-            let token: String = trimmed.chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let token: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
             if token.is_empty() {
                 return Err(QuilError::InvalidArgument(format!(
-                    "hypergraph deploy: RDF schema qcl:{} not followed by integer", label
+                    "hypergraph deploy: RDF schema qcl:{} not followed by integer",
+                    label
                 )));
             }
             if token.parse::<u64>().is_err() {
@@ -679,14 +677,10 @@ pub fn validate_rdf_schema_evolution(old_schema: &[u8], new_schema: &[u8]) -> Re
         return Ok(());
     }
     let old_text = std::str::from_utf8(old_schema).map_err(|_| {
-        QuilError::InvalidArgument(
-            "hypergraph update: prior RDF schema is not valid UTF-8".into(),
-        )
+        QuilError::InvalidArgument("hypergraph update: prior RDF schema is not valid UTF-8".into())
     })?;
     let new_text = std::str::from_utf8(new_schema).map_err(|_| {
-        QuilError::InvalidArgument(
-            "hypergraph update: new RDF schema is not valid UTF-8".into(),
-        )
+        QuilError::InvalidArgument("hypergraph update: new RDF schema is not valid UTF-8".into())
     })?;
     let old_parsed = crate::turtle::parse_turtle_schema(old_text).map_err(|e| {
         QuilError::InvalidArgument(format!(
@@ -748,24 +742,18 @@ pub fn validate_rdf_schema_evolution(old_schema: &[u8], new_schema: &[u8]) -> Re
 /// when the input isn't a deploy/update message (caller should try
 /// other kinds). Use this from execution engines that may see a mix
 /// of deploy and mutate traffic on the same channel.
-pub fn try_decode_deploy_or_update(
-    input: &[u8],
-) -> Result<Option<DispatchedDeployOrUpdate>> {
+pub fn try_decode_deploy_or_update(input: &[u8]) -> Result<Option<DispatchedDeployOrUpdate>> {
     if input.len() < 4 {
         return Ok(None);
     }
     let prefix = u32::from_be_bytes(input[..4].try_into().unwrap());
     match prefix {
-        TYPE_HYPERGRAPH_DEPLOYMENT => {
-            Ok(Some(DispatchedDeployOrUpdate::Deploy(
-                decode_and_validate_deploy(input)?,
-            )))
-        }
-        TYPE_HYPERGRAPH_UPDATE => {
-            Ok(Some(DispatchedDeployOrUpdate::Update(
-                decode_and_validate_update(input)?,
-            )))
-        }
+        TYPE_HYPERGRAPH_DEPLOYMENT => Ok(Some(DispatchedDeployOrUpdate::Deploy(
+            decode_and_validate_deploy(input)?,
+        ))),
+        TYPE_HYPERGRAPH_UPDATE => Ok(Some(DispatchedDeployOrUpdate::Update(
+            decode_and_validate_update(input)?,
+        ))),
         _ => Ok(None),
     }
 }
@@ -837,10 +825,7 @@ mod tests {
 
     #[test]
     fn all_message_kinds_have_distinct_type_prefixes() {
-        let ids: HashSet<u32> = MessageKind::all()
-            .iter()
-            .map(|k| k.type_prefix())
-            .collect();
+        let ids: HashSet<u32> = MessageKind::all().iter().map(|k| k.type_prefix()).collect();
         assert_eq!(ids.len(), 4);
     }
 
@@ -929,15 +914,11 @@ mod tests {
             ),
             (
                 MessageKind::VertexRemove,
-                make_vertex_remove(0x03, 0x04)
-                    .to_canonical_bytes()
-                    .unwrap(),
+                make_vertex_remove(0x03, 0x04).to_canonical_bytes().unwrap(),
             ),
             (
                 MessageKind::HyperedgeAdd,
-                make_hyperedge_add(0x05, 0x06)
-                    .to_canonical_bytes()
-                    .unwrap(),
+                make_hyperedge_add(0x05, 0x06).to_canonical_bytes().unwrap(),
             ),
             (
                 MessageKind::HyperedgeRemove,
@@ -971,22 +952,16 @@ mod tests {
 
     #[test]
     fn dispatched_message_domain_reads_from_variant() {
-        let va = decode_message(
-            &make_vertex_add(0xAA, 0xBB).to_canonical_bytes().unwrap(),
-        )
-        .unwrap();
+        let va =
+            decode_message(&make_vertex_add(0xAA, 0xBB).to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(va.domain(), &[0xAAu8; 32][..]);
 
-        let vr = decode_message(
-            &make_vertex_remove(0xCC, 0xDD).to_canonical_bytes().unwrap(),
-        )
-        .unwrap();
+        let vr =
+            decode_message(&make_vertex_remove(0xCC, 0xDD).to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(vr.domain(), &[0xCCu8; 32][..]);
 
-        let ha = decode_message(
-            &make_hyperedge_add(0xEE, 0xFF).to_canonical_bytes().unwrap(),
-        )
-        .unwrap();
+        let ha =
+            decode_message(&make_hyperedge_add(0xEE, 0xFF).to_canonical_bytes().unwrap()).unwrap();
         assert_eq!(ha.domain(), &[0xEEu8; 32][..]);
 
         let hr = decode_message(
@@ -1032,16 +1007,13 @@ mod tests {
 
     #[test]
     fn dispatch_cost_for_vertex_remove_is_constant_64() {
-        let msg =
-            DispatchedMessage::VertexRemove(make_vertex_remove(0x00, 0x00));
+        let msg = DispatchedMessage::VertexRemove(make_vertex_remove(0x00, 0x00));
         assert_eq!(dispatch_cost(&msg, 0).unwrap(), BigInt::from(64));
     }
 
     #[test]
     fn dispatch_cost_for_hyperedge_remove_is_constant_64() {
-        let msg = DispatchedMessage::HyperedgeRemove(make_hyperedge_remove(
-            0x00, 0x01,
-        ));
+        let msg = DispatchedMessage::HyperedgeRemove(make_hyperedge_remove(0x00, 0x01));
         assert_eq!(dispatch_cost(&msg, 0).unwrap(), BigInt::from(64));
     }
 
@@ -1065,38 +1037,26 @@ mod tests {
 
     #[test]
     fn fee_check_passes_when_fee_paid_at_least_cost_times_multiplier() {
-        assert!(check_sufficient_fee(
-            &BigInt::from(100),
-            &BigInt::from(10),
-            &BigInt::from(10)
-        )
-        .is_ok());
-        assert!(check_sufficient_fee(
-            &BigInt::from(101),
-            &BigInt::from(10),
-            &BigInt::from(10)
-        )
-        .is_ok());
+        assert!(
+            check_sufficient_fee(&BigInt::from(100), &BigInt::from(10), &BigInt::from(10)).is_ok()
+        );
+        assert!(
+            check_sufficient_fee(&BigInt::from(101), &BigInt::from(10), &BigInt::from(10)).is_ok()
+        );
     }
 
     #[test]
     fn fee_check_fails_when_fee_paid_is_below_required() {
-        assert!(check_sufficient_fee(
-            &BigInt::from(99),
-            &BigInt::from(10),
-            &BigInt::from(10)
-        )
-        .is_err());
+        assert!(
+            check_sufficient_fee(&BigInt::from(99), &BigInt::from(10), &BigInt::from(10)).is_err()
+        );
     }
 
     #[test]
     fn fee_check_passes_with_zero_cost_any_fee() {
-        assert!(check_sufficient_fee(
-            &BigInt::from(0),
-            &BigInt::from(0),
-            &BigInt::from(100)
-        )
-        .is_ok());
+        assert!(
+            check_sufficient_fee(&BigInt::from(0), &BigInt::from(0), &BigInt::from(100)).is_ok()
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1178,10 +1138,7 @@ mod tests {
         let s = HypergraphLockState::new();
         s.try_lock_addresses(&[], &[vec![0xAAu8; 8]]).unwrap();
         // Try to lock two addresses, one of which conflicts.
-        let result = s.try_lock_addresses(
-            &[],
-            &[vec![0xBBu8; 8], vec![0xAAu8; 8]],
-        );
+        let result = s.try_lock_addresses(&[], &[vec![0xBBu8; 8], vec![0xAAu8; 8]]);
         assert!(result.is_err());
         // Bb should NOT be locked (Go rolls back by returning before mutating).
         assert!(!s.is_locked_for_write(&[0xBBu8; 8]));
@@ -1286,7 +1243,10 @@ mod tests {
                 | crate::token_intrinsic::constants::ACCEPTABLE
                 | crate::token_intrinsic::constants::EXPIRABLE) as u32,
         );
-        assert!(validate_rdf_schema_bytes(quil.as_bytes()).is_ok(), "quil accept");
+        assert!(
+            validate_rdf_schema_bytes(quil.as_bytes()).is_ok(),
+            "quil accept"
+        );
         let parsed = crate::turtle::parse_turtle_schema(&quil).unwrap();
         let nclasses = parsed.classes.len();
         let nfields: usize = parsed.classes.values().map(|c| c.fields.len()).sum();

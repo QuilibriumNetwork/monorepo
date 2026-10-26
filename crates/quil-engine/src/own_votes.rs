@@ -50,9 +50,13 @@ pub(crate) const WARN_REPEAT: Duration = Duration::from_secs(30 * 60);
 pub struct SentVotes(Arc<AtomicU64>);
 
 impl SentVotes {
-    pub(crate) fn note(&self) { self.0.fetch_add(1, Ordering::Relaxed); }
+    pub(crate) fn note(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 
-    pub(crate) fn get(&self) -> u64 { self.0.load(Ordering::Relaxed) }
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// What [`OwnVotes`] has to log.
@@ -62,7 +66,11 @@ pub(crate) enum OwnVotesLog {
     Silent { silent: Duration, repeat: bool },
     /// A silence that was warned about ended after `silent`, `how`; this
     /// member was at index `member` of that host's session.
-    Ended { silent: Duration, how: &'static str, member: Option<usize> },
+    Ended {
+        silent: Duration,
+        how: &'static str,
+        member: Option<usize>,
+    },
 }
 
 /// The report fields of [`OwnVotes::report`].
@@ -102,15 +110,31 @@ impl OwnVotes {
     /// A session host started at `now` (`now_ms` on the wall clock),
     /// counting its votes in `sent`, with this member at index `me`. Ends the
     /// previous host's silence.
-    pub fn restart(&mut self, sent: SentVotes, me: Option<usize>, now: Instant, now_ms: u64) -> Option<OwnVotesLog> {
+    pub fn restart(
+        &mut self,
+        sent: SentVotes,
+        me: Option<usize>,
+        now: Instant,
+        now_ms: u64,
+    ) -> Option<OwnVotesLog> {
         let ended = self.stop("its consensus host restarted");
-        *self = Self { sent: Some(sent), me, host_started_unix_ms: now_ms, checked: Some(now), ..Self::default() };
+        *self = Self {
+            sent: Some(sent),
+            me,
+            host_started_unix_ms: now_ms,
+            checked: Some(now),
+            ..Self::default()
+        };
         ended
     }
 
     /// No session host runs any more.
     pub fn stop(&mut self, how: &'static str) -> Option<OwnVotesLog> {
-        let ended = self.warned.take().map(|_| OwnVotesLog::Ended { silent: self.silent, how, member: self.me });
+        let ended = self.warned.take().map(|_| OwnVotesLog::Ended {
+            silent: self.silent,
+            how,
+            member: self.me,
+        });
         *self = Self::default();
         ended
     }
@@ -126,16 +150,26 @@ impl OwnVotes {
     }
 
     /// This member's index in the running host's session.
-    pub fn member(&self) -> Option<usize> { self.me }
+    pub fn member(&self) -> Option<usize> {
+        self.me
+    }
 
     /// The report fields. A host this member is not seated in casts no
     /// votes, so its count says nothing: `own` is `None` then.
     pub fn report(&self) -> VotesReport {
         VotesReport {
-            own: self.sent.as_ref().filter(|_| self.me.is_some()).map(SentVotes::get),
+            own: self
+                .sent
+                .as_ref()
+                .filter(|_| self.me.is_some())
+                .map(SentVotes::get),
             peer: self.peer_votes,
             last_peer_vote_unix_ms: self.last_peer_vote.map_or(0, |(_, ms)| ms),
-            host_started_unix_ms: if self.sent.is_some() { self.host_started_unix_ms } else { 0 },
+            host_started_unix_ms: if self.sent.is_some() {
+                self.host_started_unix_ms
+            } else {
+                0
+            },
             silent_ms: self.silent.as_millis() as u64,
         }
     }
@@ -150,9 +184,15 @@ impl OwnVotes {
         let previous = self.checked.replace(now);
         if sent > 0 {
             let silent = std::mem::take(&mut self.silent);
-            return self.warned.take().map(|_| OwnVotesLog::Ended { silent, how: "it sent a vote", member: self.me });
+            return self.warned.take().map(|_| OwnVotesLog::Ended {
+                silent,
+                how: "it sent a vote",
+                member: self.me,
+            });
         }
-        let peers_voting = self.last_peer_vote.is_some_and(|(at, _)| now.saturating_duration_since(at) <= PEERS_VOTING);
+        let peers_voting = self
+            .last_peer_vote
+            .is_some_and(|(at, _)| now.saturating_duration_since(at) <= PEERS_VOTING);
         if !peers_voting {
             return None;
         }
@@ -167,7 +207,10 @@ impl OwnVotes {
             return None;
         }
         let repeat = self.warned.replace(now).is_some();
-        Some(OwnVotesLog::Silent { silent: self.silent, repeat })
+        Some(OwnVotesLog::Silent {
+            silent: self.silent,
+            repeat,
+        })
     }
 }
 
@@ -187,7 +230,13 @@ mod tests {
     /// Each minute from `from` (in minutes after `start`) through `to`: the
     /// other members vote (when `others` is set) and the silence is checked;
     /// what was logged, at which minute.
-    fn minutes(votes: &mut OwnVotes, start: Instant, from: u32, to: u32, others: bool) -> Vec<(u32, OwnVotesLog)> {
+    fn minutes(
+        votes: &mut OwnVotes,
+        start: Instant,
+        from: u32,
+        to: u32,
+        others: bool,
+    ) -> Vec<(u32, OwnVotesLog)> {
         let mut logged = Vec::new();
         for minute in from..=to {
             let now = start + MINUTE * minute;
@@ -208,16 +257,44 @@ mod tests {
     fn silence_while_others_vote_is_warned_with_a_bounded_repeat_and_its_end() {
         let start = Instant::now();
         let (mut votes, sent) = running(start);
-        assert_eq!(votes.report(), VotesReport { own: Some(0), host_started_unix_ms: 5_000, ..Default::default() });
-        let silent = |minutes, repeat| OwnVotesLog::Silent { silent: MINUTE * minutes, repeat };
+        assert_eq!(
+            votes.report(),
+            VotesReport {
+                own: Some(0),
+                host_started_unix_ms: 5_000,
+                ..Default::default()
+            }
+        );
+        let silent = |minutes, repeat| OwnVotesLog::Silent {
+            silent: MINUTE * minutes,
+            repeat,
+        };
         let logged = minutes(&mut votes, start, 1, 75, true);
-        assert_eq!(logged, vec![(10, silent(10, false)), (40, silent(40, true)), (70, silent(70, true))]);
+        assert_eq!(
+            logged,
+            vec![
+                (10, silent(10, false)),
+                (40, silent(40, true)),
+                (70, silent(70, true))
+            ]
+        );
         let report = votes.report();
-        assert_eq!((report.own, report.peer, report.last_peer_vote_unix_ms, report.silent_ms),
-            (Some(0), 75, 1, 75 * 60_000));
+        assert_eq!(
+            (
+                report.own,
+                report.peer,
+                report.last_peer_vote_unix_ms,
+                report.silent_ms
+            ),
+            (Some(0), 75, 1, 75 * 60_000)
+        );
 
         sent.note();
-        let ended = OwnVotesLog::Ended { silent: MINUTE * 75, how: "it sent a vote", member: Some(0) };
+        let ended = OwnVotesLog::Ended {
+            silent: MINUTE * 75,
+            how: "it sent a vote",
+            member: Some(0),
+        };
         assert_eq!(votes.check(start + MINUTE * 76), Some(ended));
         assert_eq!(votes.check(start + MINUTE * 200), None, "logged once");
         assert_eq!(votes.report().own, Some(1));
@@ -232,11 +309,23 @@ mod tests {
         let (mut votes, _sent) = running(start);
         assert_eq!(minutes(&mut votes, start, 1, 10, true).len(), 1);
         // The others' last vote stays within the window for two minutes.
-        assert!(minutes(&mut votes, start, 11, 100, false).is_empty(), "no repeat while the others are silent");
+        assert!(
+            minutes(&mut votes, start, 11, 100, false).is_empty(),
+            "no repeat while the others are silent"
+        );
         assert_eq!(votes.report().silent_ms, 12 * 60_000);
         let logged = minutes(&mut votes, start, 101, 102, true);
-        assert_eq!(logged, vec![(101, OwnVotesLog::Silent { silent: MINUTE * 13, repeat: true })],
-            "the repeat is due; the gap was not counted beyond the vote window");
+        assert_eq!(
+            logged,
+            vec![(
+                101,
+                OwnVotesLog::Silent {
+                    silent: MINUTE * 13,
+                    repeat: true
+                }
+            )],
+            "the repeat is due; the gap was not counted beyond the vote window"
+        );
     }
 
     /// A member that votes, a silence nobody else breaks (an outage), this
@@ -247,13 +336,23 @@ mod tests {
         let (mut votes, _sent) = running(start);
         votes.received(0, VOTE_CHANNEL, start, 1);
         votes.received(1, 1, start, 1);
-        assert_eq!(votes.report().peer, 0, "own and certificate messages are not votes received");
-        assert!(minutes(&mut votes, start, 1, 60, false).is_empty(), "nobody votes");
+        assert_eq!(
+            votes.report().peer,
+            0,
+            "own and certificate messages are not votes received"
+        );
+        assert!(
+            minutes(&mut votes, start, 1, 60, false).is_empty(),
+            "nobody votes"
+        );
         assert_eq!(votes.report().silent_ms, 0);
 
         let (mut votes, sent) = running(start);
         sent.note();
-        assert!(minutes(&mut votes, start, 1, 60, true).is_empty(), "a member that voted once, as a nullify in a stalled view");
+        assert!(
+            minutes(&mut votes, start, 1, 60, true).is_empty(),
+            "a member that voted once, as a nullify in a stalled view"
+        );
         assert_eq!(votes.report().silent_ms, 0);
     }
 
@@ -264,21 +363,45 @@ mod tests {
         let start = Instant::now();
         let mut unseated = OwnVotes::default();
         unseated.restart(SentVotes::default(), None, start, 5_000);
-        assert_eq!(unseated.report().own, None, "a host that does not seat this member reports no votes");
-        assert!(minutes(&mut unseated, start, 1, 30, true).is_empty(), "nor is it warned about");
+        assert_eq!(
+            unseated.report().own,
+            None,
+            "a host that does not seat this member reports no votes"
+        );
+        assert!(
+            minutes(&mut unseated, start, 1, 30, true).is_empty(),
+            "nor is it warned about"
+        );
 
         let (mut votes, _) = running(start);
         assert_eq!(minutes(&mut votes, start, 1, 11, true).len(), 1);
         let ended = votes.restart(SentVotes::default(), Some(0), start + MINUTE * 12, 9_000);
-        let restarted = OwnVotesLog::Ended { silent: MINUTE * 11, how: "its consensus host restarted", member: Some(0) };
+        let restarted = OwnVotesLog::Ended {
+            silent: MINUTE * 11,
+            how: "its consensus host restarted",
+            member: Some(0),
+        };
         assert_eq!(ended, Some(restarted));
-        assert_eq!(votes.report(), VotesReport { own: Some(0), host_started_unix_ms: 9_000, ..Default::default() });
+        assert_eq!(
+            votes.report(),
+            VotesReport {
+                own: Some(0),
+                host_started_unix_ms: 9_000,
+                ..Default::default()
+            }
+        );
 
         assert_eq!(minutes(&mut votes, start, 13, 23, true).len(), 1);
-        assert!(matches!(votes.stop("stopped"), Some(OwnVotesLog::Ended { .. })));
+        assert!(matches!(
+            votes.stop("stopped"),
+            Some(OwnVotesLog::Ended { .. })
+        ));
         votes.received(1, VOTE_CHANNEL, start + MINUTE * 25, 1);
         assert_eq!(votes.report(), VotesReport::default());
         assert!(votes.check(start + MINUTE * 60).is_none());
-        assert!(votes.stop("stopped").is_none(), "nothing warned, nothing ended");
+        assert!(
+            votes.stop("stopped").is_none(),
+            "nothing warned, nothing ended"
+        );
     }
 }

@@ -12,8 +12,8 @@
 //! versions keep their in-scope reads, but no longer read the dropped subtrees.
 use anyhow::Result;
 use jmt::storage::{
-    Child, Children, Node, NodeBatch, NodeKey, NibblePath, StaleNodeIndex, StaleNodeIndexBatch, TreeReader,
-    TreeUpdateBatch,
+    Child, Children, NibblePath, Node, NodeBatch, NodeKey, StaleNodeIndex, StaleNodeIndexBatch,
+    TreeReader, TreeUpdateBatch,
 };
 
 use crate::forest::TreeStore;
@@ -29,9 +29,15 @@ enum Scope {
 /// A path is inside a kept scope when the scope prefixes it, an ancestor when
 /// it prefixes a scope, and outside otherwise.
 fn scope_of(bits: &[bool], keep: &[Vec<bool>]) -> Scope {
-    if keep.iter().any(|k| bits.len() >= k.len() && bits[..k.len()] == k[..]) {
+    if keep
+        .iter()
+        .any(|k| bits.len() >= k.len() && bits[..k.len()] == k[..])
+    {
         Scope::Inside
-    } else if keep.iter().any(|k| k[..bits.len().min(k.len())] == bits[..bits.len().min(k.len())]) {
+    } else if keep
+        .iter()
+        .any(|k| k[..bits.len().min(k.len())] == bits[..bits.len().min(k.len())])
+    {
         Scope::Ancestor
     } else {
         Scope::Outside
@@ -39,7 +45,9 @@ fn scope_of(bits: &[bool], keep: &[Vec<bool>]) -> Scope {
 }
 
 fn key_bits(key: &[u8; 32]) -> Vec<bool> {
-    (0..256).map(|i| key[i / 8] >> (7 - i % 8) & 1 == 1).collect()
+    (0..256)
+        .map(|i| key[i / 8] >> (7 - i % 8) & 1 == 1)
+        .collect()
 }
 
 fn path_bits(path: &NibblePath) -> Vec<bool> {
@@ -54,8 +62,12 @@ enum Rebuilt {
 
 fn child_of(node: &Node) -> Child {
     match node {
-        Node::Leaf(leaf) => Child::new(leaf.hash::<sha2::Sha256>(), 0, jmt::storage::NodeType::Leaf),
-        Node::Internal(internal) => Child::new(internal.hash::<sha2::Sha256>(), 0, internal.node_type()),
+        Node::Leaf(leaf) => {
+            Child::new(leaf.hash::<sha2::Sha256>(), 0, jmt::storage::NodeType::Leaf)
+        }
+        Node::Internal(internal) => {
+            Child::new(internal.hash::<sha2::Sha256>(), 0, internal.node_type())
+        }
         Node::Null => unreachable!("a null node is never a child"),
     }
 }
@@ -70,8 +82,9 @@ struct Rebuild<'a> {
 
 impl Rebuild<'_> {
     fn node(&mut self, key: &NodeKey) -> Result<Rebuilt> {
-        let node = self.reader.get_node_option(key)?
-            .ok_or_else(|| anyhow::anyhow!("forest node at version {} is missing", key.version()))?;
+        let node = self.reader.get_node_option(key)?.ok_or_else(|| {
+            anyhow::anyhow!("forest node at version {} is missing", key.version())
+        })?;
         let internal = match node {
             Node::Null => return Ok(Rebuilt::Same),
             Node::Leaf(leaf) => {
@@ -114,12 +127,20 @@ impl Rebuild<'_> {
         if !changed {
             return Ok(Rebuilt::Same);
         }
-        self.stale.insert(StaleNodeIndex { stale_since_version: self.version, node_key: key.clone() });
+        self.stale.insert(StaleNodeIndex {
+            stale_since_version: self.version,
+            node_key: key.clone(),
+        });
         if children.num_children() == 0 {
             return Ok(Rebuilt::Gone);
         }
         let only_leaf = (children.num_children() == 1)
-            .then(|| children.iter().next().map(|(nibble, child)| (nibble, child.clone())))
+            .then(|| {
+                children
+                    .iter()
+                    .next()
+                    .map(|(nibble, child)| (nibble, child.clone()))
+            })
             .flatten()
             .filter(|(_, child)| child.is_leaf());
         if let Some((nibble, child)) = only_leaf {
@@ -128,16 +149,23 @@ impl Rebuild<'_> {
                 return Ok(Rebuilt::New(fresh.swap_remove(position).1));
             }
             let old = key.gen_child_node_key(child.version, nibble);
-            let leaf = self.reader.get_node_option(&old)?
-                .ok_or_else(|| anyhow::anyhow!("forest leaf at version {} is missing", old.version()))?;
-            self.stale.insert(StaleNodeIndex { stale_since_version: self.version, node_key: old });
+            let leaf = self.reader.get_node_option(&old)?.ok_or_else(|| {
+                anyhow::anyhow!("forest leaf at version {} is missing", old.version())
+            })?;
+            self.stale.insert(StaleNodeIndex {
+                stale_since_version: self.version,
+                node_key: old,
+            });
             return Ok(Rebuilt::New(leaf));
         }
         let here = NodeKey::new(self.version, key.nibble_path().clone());
         for (nibble, node) in fresh {
-            self.batch.insert_node(here.gen_child_node_key(self.version, nibble), node);
+            self.batch
+                .insert_node(here.gen_child_node_key(self.version, nibble), node);
         }
-        Ok(Rebuilt::New(Node::Internal(jmt::storage::InternalNode::new(children))))
+        Ok(Rebuilt::New(Node::Internal(
+            jmt::storage::InternalNode::new(children),
+        )))
     }
 }
 
@@ -214,12 +242,26 @@ impl Forest {
         version: u64,
         keep: &[Vec<bool>],
     ) -> Result<Option<([u8; 32], Vec<(Vec<u8>, Vec<u8>)>)>> {
-        anyhow::ensure!(version > head, "a confinement commit needs a version above the head");
-        anyhow::ensure!(!keep.is_empty(), "confinement needs at least one kept scope");
+        anyhow::ensure!(
+            version > head,
+            "a confinement commit needs a version above the head"
+        );
+        anyhow::ensure!(
+            !keep.is_empty(),
+            "confinement needs at least one kept scope"
+        );
         let reader = self.store(&TreeId::shard_phase(app, phase));
-        let TreeStore::Rocks(store) = &reader else { return Ok(None) };
+        let TreeStore::Rocks(store) = &reader else {
+            return Ok(None);
+        };
         let root_key = NodeKey::new(head, NibblePath::new(vec![]));
-        let mut rebuild = Rebuild { reader: &reader, keep, version, batch: NodeBatch::default(), stale: Default::default() };
+        let mut rebuild = Rebuild {
+            reader: &reader,
+            keep,
+            version,
+            batch: NodeBatch::default(),
+            stale: Default::default(),
+        };
         let root = match rebuild.node(&root_key)? {
             Rebuilt::Same => return Ok(None),
             Rebuilt::Gone => Node::Null,
@@ -232,7 +274,11 @@ impl Forest {
         };
         let mut batch = rebuild.batch;
         batch.insert_node(NodeKey::new(version, NibblePath::new(vec![])), root);
-        let update = TreeUpdateBatch { node_batch: batch, stale_node_index_batch: rebuild.stale, node_stats: Vec::new() };
+        let update = TreeUpdateBatch {
+            node_batch: batch,
+            stale_node_index_batch: rebuild.stale,
+            node_stats: Vec::new(),
+        };
         Ok(Some((hash, store.update_puts(&update)?)))
     }
 
@@ -250,14 +296,27 @@ impl Forest {
         cursor: Option<Vec<u8>>,
         scan_budget: usize,
     ) -> Result<ScopeDeletion> {
-        anyhow::ensure!(!keep.is_empty(), "scope deletion needs at least one kept scope");
-        let staged = self.stage_scope_confinement(app, phase, head, head.saturating_add(1), keep)?;
-        anyhow::ensure!(staged.is_none(), "the head still reaches subtrees outside the kept scopes");
+        anyhow::ensure!(
+            !keep.is_empty(),
+            "scope deletion needs at least one kept scope"
+        );
+        let staged =
+            self.stage_scope_confinement(app, phase, head, head.saturating_add(1), keep)?;
+        anyhow::ensure!(
+            staged.is_none(),
+            "the head still reaches subtrees outside the kept scopes"
+        );
         let reader = self.store(&TreeId::shard_phase(app, phase));
-        let TreeStore::Rocks(store) = &reader else { return Ok(ScopeDeletion::default()) };
+        let TreeStore::Rocks(store) = &reader else {
+            return Ok(ScopeDeletion::default());
+        };
         let outside = |path: &NibblePath| scope_of(&path_bits(path), keep) == Scope::Outside;
         let (nodes, cursor) = store.delete_nodes_where(&outside, cursor, scan_budget)?;
-        let mut deletion = ScopeDeletion { nodes, cursor, ..Default::default() };
+        let mut deletion = ScopeDeletion {
+            nodes,
+            cursor,
+            ..Default::default()
+        };
         if deletion.cursor.is_none() {
             deletion.stale_records = store.delete_stale_where(&outside)?;
             let ranges = outside_key_ranges(keep);
@@ -296,8 +355,10 @@ mod tests {
         b[0] = 0x80;
         let mut c = [0u8; 32];
         c[0] = 0xc0;
-        assert_eq!(outside_key_ranges(&[bits(0x40, 2), bits(0xc0, 2)]),
-            vec![(None, Some(a)), (Some(b), Some(c))]);
+        assert_eq!(
+            outside_key_ranges(&[bits(0x40, 2), bits(0xc0, 2)]),
+            vec![(None, Some(a)), (Some(b), Some(c))]
+        );
         assert_eq!(scope_of(&bits(0x40, 1), &[bits(0x40, 2)]), Scope::Ancestor);
         assert_eq!(scope_of(&bits(0x40, 4), &[bits(0x40, 2)]), Scope::Inside);
         assert_eq!(scope_of(&bits(0x80, 4), &[bits(0x40, 2)]), Scope::Outside);
@@ -325,7 +386,9 @@ mod tests {
 
     fn fresh_root(leaves: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
         let (_dir, _db, forest) = open();
-        forest.commit_shard_phase_raw(&APP, PHASE, 0, leaves.to_vec()).unwrap();
+        forest
+            .commit_shard_phase_raw(&APP, PHASE, 0, leaves.to_vec())
+            .unwrap();
         forest.shard_phase_root(&APP, PHASE, 0).unwrap().unwrap()
     }
 
@@ -337,8 +400,11 @@ mod tests {
         it.seek(&prefix);
         let mut count = 0;
         while it.valid() && it.key().is_some_and(|k| k.starts_with(&prefix)) {
-            let node_key = borsh::from_slice::<NodeKey>(&it.key().unwrap()[prefix.len()..]).unwrap();
-            if scope_of(&path_bits(node_key.nibble_path()), keep) == Scope::Outside { count += 1; }
+            let node_key =
+                borsh::from_slice::<NodeKey>(&it.key().unwrap()[prefix.len()..]).unwrap();
+            if scope_of(&path_bits(node_key.nibble_path()), keep) == Scope::Outside {
+                count += 1;
+            }
             it.next();
         }
         count
@@ -353,35 +419,83 @@ mod tests {
     fn confinement_matches_a_tree_of_only_the_kept_leaves() {
         let (_dir, db, forest) = open();
         let keep = vec![bits(0x04, 6)];
-        let all: Vec<_> = [(0x05, 1), (0x06, 2), (0x07, 3), (0x01, 4), (0x09, 5), (0x81, 6), (0xc1, 7)]
-            .into_iter().map(|(first, last)| (key(first, last), vec![first, last])).collect();
-        forest.commit_shard_phase_raw(&APP, PHASE, 0, all.clone()).unwrap();
+        let all: Vec<_> = [
+            (0x05, 1),
+            (0x06, 2),
+            (0x07, 3),
+            (0x01, 4),
+            (0x09, 5),
+            (0x81, 6),
+            (0xc1, 7),
+        ]
+        .into_iter()
+        .map(|(first, last)| (key(first, last), vec![first, last]))
+        .collect();
+        forest
+            .commit_shard_phase_raw(&APP, PHASE, 0, all.clone())
+            .unwrap();
         // History outside the scope, and an in-scope change at the head.
-        forest.commit_shard_phase_raw(&APP, PHASE, 1, vec![(key(0x81, 6), vec![9]), (key(0x06, 2), vec![8])]).unwrap();
+        forest
+            .commit_shard_phase_raw(
+                &APP,
+                PHASE,
+                1,
+                vec![(key(0x81, 6), vec![9]), (key(0x06, 2), vec![8])],
+            )
+            .unwrap();
         let kept_before = forest.app_subtree_root(&APP, PHASE, 1, &keep[0]).unwrap();
-        assert!(forest.delete_outside_scope(&APP, PHASE, 1, &keep, None, 100).is_err(),
-            "deletion refuses while the head reaches dropped subtrees");
+        assert!(
+            forest
+                .delete_outside_scope(&APP, PHASE, 1, &keep, None, 100)
+                .is_err(),
+            "deletion refuses while the head reaches dropped subtrees"
+        );
 
-        let (root, puts) = forest.stage_scope_confinement(&APP, PHASE, 1, 2, &keep).unwrap().unwrap();
+        let (root, puts) = forest
+            .stage_scope_confinement(&APP, PHASE, 1, 2, &keep)
+            .unwrap()
+            .unwrap();
         apply(&db, puts);
-        let kept: Vec<_> = vec![(key(0x05, 1), vec![5, 1]), (key(0x06, 2), vec![8]), (key(0x07, 3), vec![7, 3])];
+        let kept: Vec<_> = vec![
+            (key(0x05, 1), vec![5, 1]),
+            (key(0x06, 2), vec![8]),
+            (key(0x07, 3), vec![7, 3]),
+        ];
         assert_eq!(root, fresh_root(&kept));
-        assert_eq!(forest.shard_phase_root(&APP, PHASE, 2).unwrap().unwrap(), root);
-        assert_eq!(forest.app_subtree_root(&APP, PHASE, 2, &keep[0]).unwrap(), kept_before);
+        assert_eq!(
+            forest.shard_phase_root(&APP, PHASE, 2).unwrap().unwrap(),
+            root
+        );
+        assert_eq!(
+            forest.app_subtree_root(&APP, PHASE, 2, &keep[0]).unwrap(),
+            kept_before
+        );
         let (_fresh_dir, _, fresh) = open();
-        fresh.commit_shard_phase_raw(&APP, PHASE, 0, kept.clone()).unwrap();
+        fresh
+            .commit_shard_phase_raw(&APP, PHASE, 0, kept.clone())
+            .unwrap();
         for path in [bits(0x80, 1), bits(0x00, 4), bits(0x08, 5), Vec::new()] {
-            assert_eq!(forest.app_subtree_root(&APP, PHASE, 2, &path).unwrap(),
-                fresh.app_subtree_root(&APP, PHASE, 0, &path).unwrap());
+            assert_eq!(
+                forest.app_subtree_root(&APP, PHASE, 2, &path).unwrap(),
+                fresh.app_subtree_root(&APP, PHASE, 0, &path).unwrap()
+            );
         }
-        assert!(forest.stage_scope_confinement(&APP, PHASE, 2, 3, &keep).unwrap().is_none(), "a repeat finds nothing");
+        assert!(
+            forest
+                .stage_scope_confinement(&APP, PHASE, 2, 3, &keep)
+                .unwrap()
+                .is_none(),
+            "a repeat finds nothing"
+        );
         assert!(outside_nodes(&db, &keep) > 0);
 
         // A small budget resumes the sweep across calls.
         let mut cursor = None;
         let mut calls = 0;
         loop {
-            let deletion = forest.delete_outside_scope(&APP, PHASE, 2, &keep, cursor, 2).unwrap();
+            let deletion = forest
+                .delete_outside_scope(&APP, PHASE, 2, &keep, cursor, 2)
+                .unwrap();
             calls += 1;
             cursor = deletion.cursor;
             if cursor.is_none() {
@@ -393,39 +507,80 @@ mod tests {
         assert_eq!(outside_nodes(&db, &keep), 0);
         let reader = forest.shard_phase_reader(&APP, PHASE);
         let hash = |k: Vec<u8>| crate::KeyHash(k.try_into().unwrap());
-        assert_eq!(reader.get_value_option(2, hash(key(0x05, 1))).unwrap(), Some(vec![5, 1]));
-        assert_eq!(reader.get_value_option(2, hash(key(0x81, 6))).unwrap(), None);
-        assert_eq!(reader.get_value_option(2, hash(key(0x01, 4))).unwrap(), None);
+        assert_eq!(
+            reader.get_value_option(2, hash(key(0x05, 1))).unwrap(),
+            Some(vec![5, 1])
+        );
+        assert_eq!(
+            reader.get_value_option(2, hash(key(0x81, 6))).unwrap(),
+            None
+        );
+        assert_eq!(
+            reader.get_value_option(2, hash(key(0x01, 4))).unwrap(),
+            None
+        );
         // In-scope reads of an older version still work.
-        assert_eq!(forest.app_subtree_root(&APP, PHASE, 1, &keep[0]).unwrap(), kept_before);
-        assert_eq!(forest.app_subtree_root(&APP, PHASE, 2, &keep[0]).unwrap(), kept_before);
+        assert_eq!(
+            forest.app_subtree_root(&APP, PHASE, 1, &keep[0]).unwrap(),
+            kept_before
+        );
+        assert_eq!(
+            forest.app_subtree_root(&APP, PHASE, 2, &keep[0]).unwrap(),
+            kept_before
+        );
 
         // Later commits build exactly as on a store that only held the scope.
-        forest.commit_shard_phase_raw(&APP, PHASE, 3, vec![(key(0x05, 1), vec![1])]).unwrap();
+        forest
+            .commit_shard_phase_raw(&APP, PHASE, 3, vec![(key(0x05, 1), vec![1])])
+            .unwrap();
         let mut expected = kept.clone();
         expected[0].1 = vec![1];
-        assert_eq!(forest.shard_phase_root(&APP, PHASE, 3).unwrap().unwrap(), fresh_root(&expected));
+        assert_eq!(
+            forest.shard_phase_root(&APP, PHASE, 3).unwrap().unwrap(),
+            fresh_root(&expected)
+        );
     }
 
     #[test]
     fn a_lone_kept_leaf_moves_up_and_an_unkept_tree_empties() {
         let (_dir, db, forest) = open();
-        let leaves = vec![(key(0x41, 1), vec![1]), (key(0x81, 2), vec![2]), (key(0x82, 3), vec![3])];
-        forest.commit_shard_phase_raw(&APP, PHASE, 0, leaves.clone()).unwrap();
+        let leaves = vec![
+            (key(0x41, 1), vec![1]),
+            (key(0x81, 2), vec![2]),
+            (key(0x82, 3), vec![3]),
+        ];
+        forest
+            .commit_shard_phase_raw(&APP, PHASE, 0, leaves.clone())
+            .unwrap();
         let keep = vec![bits(0x40, 2)];
-        let (root, puts) = forest.stage_scope_confinement(&APP, PHASE, 0, 1, &keep).unwrap().unwrap();
+        let (root, puts) = forest
+            .stage_scope_confinement(&APP, PHASE, 0, 1, &keep)
+            .unwrap()
+            .unwrap();
         apply(&db, puts);
         assert_eq!(root, fresh_root(&leaves[..1]));
-        assert_eq!(forest.app_subtree_root(&APP, PHASE, 1, &keep[0]).unwrap(),
-            forest.app_subtree_root(&APP, PHASE, 0, &keep[0]).unwrap());
+        assert_eq!(
+            forest.app_subtree_root(&APP, PHASE, 1, &keep[0]).unwrap(),
+            forest.app_subtree_root(&APP, PHASE, 0, &keep[0]).unwrap()
+        );
 
         let (_dir, db, forest) = open();
-        forest.commit_shard_phase_raw(&APP, PHASE, 0, leaves[1..].to_vec()).unwrap();
-        let (root, puts) = forest.stage_scope_confinement(&APP, PHASE, 0, 1, &keep).unwrap().unwrap();
+        forest
+            .commit_shard_phase_raw(&APP, PHASE, 0, leaves[1..].to_vec())
+            .unwrap();
+        let (root, puts) = forest
+            .stage_scope_confinement(&APP, PHASE, 0, 1, &keep)
+            .unwrap()
+            .unwrap();
         apply(&db, puts);
         assert_eq!(root, *b"SPARSE_MERKLE_PLACEHOLDER_HASH__");
-        assert_eq!(forest.shard_phase_root(&APP, PHASE, 1).unwrap().unwrap(), root);
-        forest.delete_outside_scope(&APP, PHASE, 1, &keep, None, 100).unwrap();
+        assert_eq!(
+            forest.shard_phase_root(&APP, PHASE, 1).unwrap().unwrap(),
+            root
+        );
+        forest
+            .delete_outside_scope(&APP, PHASE, 1, &keep, None, 100)
+            .unwrap();
         assert_eq!(outside_nodes(&db, &keep), 0);
     }
 }
