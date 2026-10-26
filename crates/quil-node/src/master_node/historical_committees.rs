@@ -324,7 +324,15 @@ impl HistoricalCommittees {
                 };
                 let frame = read
                     .map_err(|e| QuilError::ExecutionUnavailable(format!("archive read: {e}")))?;
-                let accepted = self.anchor_accepted(number, &frame, &mut client).await;
+                // A whole frame is stored as whole and served onward, so its
+                // body must be the one its header commits.
+                let accepted = if !header_only
+                    && !quil_engine::frame_validator::archive_global_body_authenticated(&frame)
+                {
+                    Err("served a request body that does not match its requests_root".to_string())
+                } else {
+                    self.anchor_accepted(number, &frame, &mut client).await
+                };
                 Ok::<_, QuilError>((frame, accepted))
             })
             .await
@@ -1029,5 +1037,19 @@ mod tests {
         assert_eq!(anchor.header, linked(40, false).header);
         assert_eq!(read_whole(), 1, "its certified child, as a header");
         assert_eq!(clock.get_global_frame(40).unwrap(), anchor);
+    }
+
+    /// From the GLOBAL sync authentication frame on, an anchor read whole is
+    /// stored only with the request body its header commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_whole_anchor_whose_body_its_header_does_not_commit_is_not_stored() {
+        // The test body runs on this thread; the anchor fetch is awaited here.
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(Some(0));
+        let whole = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (service, clock, _stores) = anchor_service(BundledArchive(whole)).await;
+        let error = service.global_anchor(40).await.unwrap_err().to_string();
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+        assert!(error.contains("requests_root"), "{error}");
+        assert!(clock.get_global_frame(40).is_err());
     }
 }

@@ -145,6 +145,35 @@ static CONNECT_OUTAGES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, quil_engine::outage::Outage>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The identity each archive endpoint this node knows the peer of must
+/// present: the mainnet genesis archives' static endpoints, and configured
+/// endpoints that name their peer. A PQNoise dial to such an endpoint that
+/// answers as anyone else fails, so neither the endpoint nor the network
+/// path to it can stand in for the archive it names. Other endpoints dial
+/// as before.
+static ARCHIVE_PEERS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, quil_p2p::PeerId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Pin `endpoint` (`host:port`, as the pool dials it) to `peer`: every later
+/// PQNoise dial to it must reach that identity. A later pin replaces an
+/// earlier one.
+pub fn pin_archive_peer(endpoint: &str, peer: quil_p2p::PeerId) {
+    ARCHIVE_PEERS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(endpoint.to_string(), peer);
+}
+
+/// The identity pinned for `endpoint` ([`pin_archive_peer`]), if any.
+pub fn pinned_archive_peer(endpoint: &str) -> Option<quil_p2p::PeerId> {
+    ARCHIVE_PEERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(endpoint)
+        .copied()
+}
+
 /// Record one connection attempt to `addr`; returns the transition to log.
 fn connect_outage(addr: &str, ok: bool) -> Option<quil_engine::outage::OutageEvent> {
     let now = std::time::Instant::now();
@@ -291,7 +320,7 @@ impl ArchiveClient {
         addr: &str,
         connector: QuilPqNoiseConnector,
     ) -> Result<Self, ArchiveClientError> {
-        Self::dial_pq(addr, connector, dials_off_this_thread()).await
+        Self::dial_pq(addr, connector.pinned_for(addr), dials_off_this_thread()).await
     }
 
     /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
@@ -1264,6 +1293,15 @@ impl QuilPqNoiseConnector {
         self.refused_peer = Some(peer);
         self
     }
+
+    /// Expect the identity pinned for `addr` ([`pin_archive_peer`]) unless
+    /// this connector already expects one.
+    fn pinned_for(self, addr: &str) -> Self {
+        match (self.expected_peer, pinned_archive_peer(addr)) {
+            (None, Some(peer)) => self.with_expected_peer(peer),
+            _ => self,
+        }
+    }
 }
 
 impl Service<Uri> for QuilPqNoiseConnector {
@@ -1510,6 +1548,79 @@ mod tests {
             super::connect_outage(b, true),
             Some(OutageEvent::Ended { failures: 1, .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod pinned_archive_tests {
+    use super::*;
+
+    /// A dial to an endpoint pinned to an archive's identity reaches only
+    /// that identity; an endpoint without a pin, and a connector that
+    /// already expects a peer, are unchanged.
+    #[tokio::test]
+    async fn a_pinned_archive_endpoint_must_answer_as_its_archive() {
+        for pinned_to_server in [true, false] {
+            let peer_of = |key: &[u8]| {
+                quil_p2p::Keypair::falcon_from_bytes(key)
+                    .unwrap()
+                    .public()
+                    .to_peer_id()
+            };
+            let server_key = quil_p2p::generate_falcon_signing_key();
+            let server = peer_of(&server_key);
+            let other = peer_of(&quil_p2p::generate_falcon_signing_key());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handshake = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let _ = crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await;
+            });
+            let endpoint = address.to_string();
+            pin_archive_peer(&endpoint, if pinned_to_server { server } else { other });
+            let mut connector = QuilPqNoiseConnector::new(quil_p2p::generate_falcon_signing_key())
+                .pinned_for(&endpoint);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), pinned_to_server);
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("identity does not match"),
+                    "{error}"
+                );
+            }
+            let _ = handshake.await;
+            // A later test in this process may listen on the same port.
+            ARCHIVE_PEERS.write().unwrap().remove(&endpoint);
+        }
+        let key = quil_p2p::generate_falcon_signing_key();
+        assert_eq!(
+            QuilPqNoiseConnector::new(key.clone())
+                .pinned_for("192.0.2.1:8340")
+                .expected_peer,
+            None
+        );
+        let explicit = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let pinned = quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id();
+        pin_archive_peer("192.0.2.2:8340", pinned);
+        assert_eq!(pinned_archive_peer("192.0.2.2:8340"), Some(pinned));
+        assert_eq!(
+            QuilPqNoiseConnector::new(key)
+                .with_expected_peer(explicit)
+                .pinned_for("192.0.2.2:8340")
+                .expected_peer,
+            Some(explicit)
+        );
     }
 }
 

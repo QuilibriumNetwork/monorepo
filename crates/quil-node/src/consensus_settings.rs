@@ -67,6 +67,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_ANCHORED_ISSUANCE_EPOCH override active (localnet only)"
         );
     }
+    let sync_authentication = quil_types::consensus::init_global_sync_authentication_frame(network);
+    if network != 0 && sync_authentication != u64::MAX {
+        tracing::warn!(
+            frame = sync_authentication,
+            "QUIL_GLOBAL_SYNC_AUTHENTICATION_FRAME override active (localnet only)"
+        );
+    }
     if network != 0 && frames != quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES {
         tracing::warn!(
             frames,

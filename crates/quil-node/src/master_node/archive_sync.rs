@@ -386,13 +386,39 @@ fn execution_stalled_behind(previous: u64, executed: u64, canonical: u64) -> boo
     executed == previous && canonical > executed
 }
 
-/// Genesis-prover allowlist + VDF/BLS gate for an archive-sourced global
-/// frame. This is the SAME check the gossip `GLOBAL_FRAME` handler runs
-/// (`message_loop.rs`): the frame's `prover` must be a known genesis prover
-/// AND the VDF proof + BLS signature must verify. Returns `true` to accept,
-/// `false` to drop. VDF verification is panic-contained because the
-/// classgroup code can panic on malformed output.
+/// [`archive_header_is_valid`] and, from the GLOBAL sync authentication
+/// frame on ([`quil_types::consensus::global_sync_authenticated_at`]), a
+/// request body that hashes to the header's `requests_root`: the check for
+/// every archive-sourced frame this node stores whole or executes (the
+/// poller, record and hole backfill, the state jump). Archives serve only
+/// whole frames, so a frame of the finalized chain passes.
 fn archive_frame_is_valid(
+    frame: &quil_types::proto::global::GlobalFrame,
+    genesis_prover_addrs: &std::collections::HashSet<Vec<u8>>,
+    frame_validator: &quil_engine::frame_validator::GlobalFrameVerifier,
+) -> bool {
+    if !archive_header_is_valid(frame, genesis_prover_addrs, frame_validator) {
+        return false;
+    }
+    if quil_engine::frame_validator::archive_global_body_authenticated(frame) {
+        return true;
+    }
+    debug!(
+        frame = frame.header.as_ref().map_or(0, |h| h.frame_number),
+        "archive frame: request body does not match its requests_root — dropping"
+    );
+    false
+}
+
+/// Genesis-prover allowlist + VDF/BLS gate for an archive-sourced global
+/// frame header. This is the SAME check the gossip `GLOBAL_FRAME` handler
+/// runs (`message_loop.rs`): the frame's `prover` must be a known genesis
+/// prover AND the VDF proof + signature must verify (from the sync
+/// authentication frame on, a signature only as a committee certificate).
+/// It does not look at the body, so it also serves header-only reads.
+/// Returns `true` to accept, `false` to drop. VDF verification is
+/// panic-contained because the classgroup code can panic on malformed output.
+fn archive_header_is_valid(
     frame: &quil_types::proto::global::GlobalFrame,
     genesis_prover_addrs: &std::collections::HashSet<Vec<u8>>,
     frame_validator: &quil_engine::frame_validator::GlobalFrameVerifier,
@@ -443,8 +469,10 @@ fn archive_frame_is_valid(
 }
 
 /// Whether a VALIDATED global frame carries a certificate of its own: a
-/// commonware finalization certificate that verifies against the committee, or
-/// a legacy aggregate signature (which `archive_frame_is_valid` verified).
+/// commonware finalization certificate that verifies against the committee, or,
+/// below the GLOBAL sync authentication frame only, a legacy aggregate
+/// signature (which `archive_frame_is_valid` verified against the key the
+/// frame carries, so from that frame on it certifies nothing).
 /// Genesis carries none. Anything else passed validation on its publicly
 /// computable VDF and allowlisted prover alone, which a proposal from a view
 /// that was then nullified also does; it is on the finalized chain only if a
@@ -458,6 +486,9 @@ pub(crate) fn frame_self_certified(
     };
     if header.frame_number == 0 {
         return true;
+    }
+    if quil_types::consensus::global_sync_authenticated_at(header.frame_number) {
+        return frame_validator.verify_global_finalization_cert(header);
     }
     let Some(signature) = header.public_key_signature_bls48581.as_ref() else {
         return false;
@@ -1951,12 +1982,22 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                 archive_frame_is_valid(frame, &addrs, &verifier)
             })
         };
+        // Historical committees and GLOBAL anchors read headers only below
+        // the request-retention boundary, so their check cannot bind a body;
+        // an anchor fetched whole has its body bound before it is stored.
+        let header_validate: quil_rpc::frame_sync::FrameValidator = {
+            let addrs = genesis_prover_addrs.clone();
+            let verifier = frame_verifier.clone();
+            Arc::new(move |frame: &quil_types::proto::global::GlobalFrame| {
+                archive_header_is_valid(frame, &addrs, &verifier)
+            })
+        };
         let _ = historical_committees.set(Arc::new(
             super::historical_committees::HistoricalCommittees::new(
                 archive_pool.clone(),
                 seed.clone(),
                 clock_store.clone(),
-                frame_validate.clone(),
+                header_validate,
                 frame_verifier.clone(),
                 inclusion_prover.clone(),
                 cw_storage_dir.join("historical-prover-tree"),
@@ -2844,6 +2885,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             break;
                                         }
                                     };
+                                    // A stored record whose body is not the one its
+                                    // header commits is never executed.
+                                    if !quil_engine::frame_validator::archive_global_body_authenticated(&frame) {
+                                        warn!(
+                                            frame = n,
+                                            scope = "this node",
+                                            action = "report it with this line: the stored GLOBAL record must be replaced from an archive",
+                                            "startup re-materialize: stored GLOBAL record's requests do not match its requests_root — stopping"
+                                        );
+                                        break;
+                                    }
                                     // Its application frames first, as in the live
                                     // worker, which continues from here if they are
                                     // not yet available.
@@ -3484,6 +3536,17 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: ArchiveSyncAr
                                             }
                                         };
                                         let frame_number = next;
+                                        // Never execute a body its header does not
+                                        // commit; retried, and warned, once a minute.
+                                        if !quil_engine::frame_validator::archive_global_body_authenticated(&frame) {
+                                            warn!(
+                                                frame = frame_number,
+                                                scope = "this node",
+                                                action = "report it with this line: the stored GLOBAL record must be replaced from an archive",
+                                                "GLOBAL execution waits: the stored record's requests do not match its requests_root"
+                                            );
+                                            break Ok(Some(std::time::Duration::from_secs(60)));
+                                        }
                                         // The application frames this frame rewards
                                         // must be ingested first, on every path.
                                         if let Some(ingest) = ingest.as_ref() {
@@ -4780,6 +4843,176 @@ mod validation_tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Accepts every GLOBAL VDF: the checks after it are under test.
+    struct AnyGlobalVdf;
+    impl quil_types::crypto::FrameProver for AnyGlobalVdf {
+        fn prove_frame_header(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: i64,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<quil_types::proto::global::FrameHeader> {
+            Err(quil_types::error::QuilError::Internal("stub".into()))
+        }
+        fn prove_global_frame_header(
+            &self,
+            _: &quil_types::proto::global::GlobalFrameHeader,
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: u64,
+            _: &dyn quil_types::crypto::Signer,
+            _: i64,
+            _: u32,
+            _: u8,
+        ) -> quil_types::error::Result<quil_types::proto::global::GlobalFrameHeader> {
+            Err(quil_types::error::QuilError::Internal("stub".into()))
+        }
+        fn verify_global_frame_header(
+            &self,
+            _: &quil_types::proto::global::GlobalFrameHeader,
+        ) -> quil_types::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn calculate_multi_proof(
+            &self,
+            _: &[u8; 32],
+            _: u32,
+            _: &[&[u8]],
+            _: u32,
+        ) -> quil_types::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn verify_multi_proof(
+            &self,
+            _: &[u8; 32],
+            _: u32,
+            _: &[&[u8]],
+            _: &[&[u8]],
+        ) -> quil_types::error::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Schedule the GLOBAL sync authentication at frame 907,920 for this test
+    /// process, as a localnet does: through its setting, read when the
+    /// consensus settings initialize. A build without the rule ignores it.
+    fn schedule_sync_authentication_at_907920() {
+        std::env::set_var("QUIL_GLOBAL_SYNC_AUTHENTICATION_FRAME", "907920");
+        crate::consensus_settings::initialize(1);
+    }
+
+    /// An unsigned GLOBAL frame from an allowlisted prover whose header
+    /// commits an empty request body, carrying `requests`.
+    fn allowlisted_frame(
+        frame_number: u64,
+        requests: Vec<quil_types::proto::global::MessageBundle>,
+    ) -> (quil_types::proto::global::GlobalFrame, HashSet<Vec<u8>>) {
+        let prover = vec![0xAA; 32];
+        let frame = quil_types::proto::global::GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number,
+                output: vec![7; 516],
+                prover: prover.clone(),
+                requests_root: quil_engine::leader_provider::compute_global_requests_root(
+                    &[],
+                    &quil_tries::ShaInclusionProver,
+                ),
+                ..Default::default()
+            }),
+            requests,
+        };
+        (frame, HashSet::from([prover]))
+    }
+
+    fn any_vdf_verifier() -> quil_engine::frame_validator::GlobalFrameVerifier {
+        quil_engine::frame_validator::GlobalFrameVerifier::with_bls(
+            Arc::new(AnyGlobalVdf),
+            Arc::new(quil_crypto::FalconKeyConstructor),
+        )
+        .with_global_committee(vec![vec![4; 897]])
+    }
+
+    /// An archive (or whoever answers for one) serves a GLOBAL frame above
+    /// the sync authentication frame (907,920) with a request body
+    /// other than the one its header commits. Every path that stores or
+    /// executes such a frame takes `archive_frame_is_valid`'s word for it.
+    #[test]
+    fn reproduces_an_archive_frame_body_not_bound_to_requests_root() {
+        schedule_sync_authentication_at_907920();
+        let (frame, addrs) = allowlisted_frame(
+            907_920,
+            vec![quil_types::proto::global::MessageBundle::default()],
+        );
+        assert!(
+            !archive_frame_is_valid(&frame, &addrs, &any_vdf_verifier()),
+            "GLOBAL frame 907920 from an archive was accepted with a request body that does not hash to its requests_root"
+        );
+    }
+
+    /// An archive serves a GLOBAL frame above the sync
+    /// authentication frame with no committee certificate, but with a
+    /// signature and the key to check it against. The state jump pins its
+    /// whole state to a frame that certifies itself, and the poller stores
+    /// such a frame as finalized.
+    #[test]
+    fn reproduces_a_frame_carried_key_self_certifying_an_archive_frame() {
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        schedule_sync_authentication_at_907920();
+        let (mut frame, _) = allowlisted_frame(907_920, Vec::new());
+        frame.header.as_mut().unwrap().public_key_signature_bls48581 =
+            Some(Bls48581AggregateSignature {
+                public_key: Some(Bls48581g2PublicKey {
+                    key_value: vec![1; 8],
+                }),
+                signature: vec![2; 8],
+                bitmask: Vec::new(),
+            });
+        assert!(
+            !frame_self_certified(&frame, &any_vdf_verifier()),
+            "GLOBAL frame 907920 counted as finalized on a signature and key it carries itself"
+        );
+    }
+
+    /// An archive serves a GLOBAL frame above the sync authentication frame
+    /// with no committee certificate, signed by its own key and carrying that
+    /// key. The VDF is publicly computable, so the signature is the only
+    /// authentication, and a key the frame supplies proves nothing.
+    #[test]
+    fn reproduces_an_archive_frame_accepted_on_a_key_it_carries() {
+        use quil_types::crypto::BlsConstructor as _;
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        schedule_sync_authentication_at_907920();
+        let (signer, public_key) = quil_crypto::FalconKeyConstructor.new_key().unwrap();
+        let (mut frame, addrs) = allowlisted_frame(907_920, Vec::new());
+        let header = frame.header.as_mut().unwrap();
+        header.rank = 7;
+        let mut message = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .unwrap()
+            .to_vec();
+        message.extend_from_slice(&header.rank.to_be_bytes());
+        header.public_key_signature_bls48581 = Some(Bls48581AggregateSignature {
+            public_key: Some(Bls48581g2PublicKey {
+                key_value: public_key,
+            }),
+            signature: signer.sign_with_domain(&message, b"global").unwrap(),
+            bitmask: Vec::new(),
+        });
+        assert!(
+            !archive_frame_is_valid(&frame, &addrs, &any_vdf_verifier()),
+            "GLOBAL frame 907920 from an archive was accepted on its VDF and a signature by a key the frame itself carries"
+        );
+    }
+
     fn reassigned_worker_fixture(
         public_key: Vec<u8>,
     ) -> (
@@ -5511,6 +5744,39 @@ mod validation_tests {
             !frame_self_certified(&frame(5, Some(aggregate(vec![], forged))), &committee),
             "with a committee, a commonware certificate must verify"
         );
+    }
+
+    /// From the GLOBAL sync authentication frame on, only a committee
+    /// certificate certifies a frame by itself; below it a legacy aggregate
+    /// still does, as before.
+    #[test]
+    fn a_legacy_aggregate_certifies_a_frame_only_below_the_sync_authentication_frame() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let frame = |number: u64| GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![7; 516],
+                public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                    public_key: Some(Bls48581g2PublicKey {
+                        key_value: vec![1; 8],
+                    }),
+                    signature: vec![2; 8],
+                    bitmask: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+        let v = verifier().with_global_committee(vec![vec![4; 897]]);
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(Some(10));
+        let below = frame_self_certified(&frame(9), &v);
+        let from = frame_self_certified(&frame(10), &v);
+        let genesis = frame_self_certified(&frame(0), &v);
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+        assert!(below, "the earlier behaviour below the activation");
+        assert!(!from, "a key the frame carries certifies nothing");
+        assert!(genesis, "genesis carries no certificate");
     }
 
     /// A record hole is filled only with the chain the canonical record above

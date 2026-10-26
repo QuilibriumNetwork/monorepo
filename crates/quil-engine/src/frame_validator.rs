@@ -177,6 +177,21 @@ pub fn global_frame_body_matches_requests_root(
     recomputed == header.requests_root
 }
 
+/// Whether an archive-sourced GLOBAL `frame` carries the body its header
+/// commits: from [`quil_types::consensus::global_sync_authentication_frame`]
+/// on, its requests must hash to `requests_root` before it is stored or
+/// executed; below it the earlier, unchecked behaviour holds. An archive
+/// serves only whole frames (a frame whose requests it pruned is refused),
+/// so a whole frame of the finalized chain always passes. A headerless
+/// frame never does.
+pub fn archive_global_body_authenticated(frame: &GlobalFrame) -> bool {
+    let Some(header) = frame.header.as_ref() else {
+        return false;
+    };
+    !quil_types::consensus::global_sync_authenticated_at(header.frame_number)
+        || global_frame_body_matches_requests_root(header, &frame.requests)
+}
+
 /// How often, at most, the newer-committee upgrade warning repeats.
 const NEWER_COMMITTEE_WARN_SECS: u64 = 600;
 
@@ -447,6 +462,29 @@ impl GlobalFrameVerifier {
                 );
                 return Ok(true);
             }
+        }
+
+        // From the sync authentication frame on, only the committee's
+        // finalization certificate authenticates a frame. Any other signature
+        // could only be checked against a key the frame carries itself, which
+        // whoever built the frame chose. Commonware frames carry a certificate
+        // or no signature at all; one without is uncertified, as before.
+        if quil_types::consensus::global_sync_authenticated_at(header.frame_number)
+            && header
+                .public_key_signature_bls48581
+                .as_ref()
+                .is_some_and(|s| {
+                    !s.signature.is_empty()
+                        && quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature)
+                            .is_none()
+                })
+        {
+            warn!(
+                frame = header.frame_number,
+                scope = "peer",
+                "GLOBAL frame carries a signature that is not a committee certificate: refused"
+            );
+            return Ok(false);
         }
 
         // Verify BLS aggregate signature if verifier is configured
@@ -2526,6 +2564,62 @@ mod tests {
             ..header.clone()
         };
         assert!(!v.verify_global_requests_root(&bad_header, &[]));
+    }
+
+    /// From the sync authentication frame on, a frame without any signature
+    /// (a commonware proposal, or an ancestor finalized through a
+    /// descendant) still validates on its VDF: callers treat it as
+    /// uncertified.
+    #[test]
+    fn an_unsigned_frame_still_validates_from_the_sync_authentication_frame() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        )
+        .with_global_committee(vec![vec![0x09u8; 897]]);
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: 907_920,
+                output: vec![0x01u8; 516],
+                prover: vec![0x01u8; 32],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(Some(907_920));
+        let valid = v.validate(&frame).unwrap();
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+        assert!(valid);
+    }
+
+    #[test]
+    fn an_archive_frame_body_must_match_its_requests_root_from_the_activation() {
+        use quil_types::proto::global::MessageBundle;
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(Some(100));
+        let empty_root = crate::leader_provider::compute_global_requests_root(
+            &[],
+            &quil_tries::ShaInclusionProver,
+        );
+        let frame = |number: u64, requests: Vec<MessageBundle>| GlobalFrame {
+            header: Some(quil_types::proto::global::GlobalFrameHeader {
+                frame_number: number,
+                requests_root: empty_root.clone(),
+                ..Default::default()
+            }),
+            requests,
+        };
+        assert!(archive_global_body_authenticated(&frame(100, Vec::new())));
+        assert!(
+            !archive_global_body_authenticated(&frame(100, vec![MessageBundle::default()])),
+            "a body swapped under the header is refused"
+        );
+        assert!(
+            archive_global_body_authenticated(&frame(99, vec![MessageBundle::default()])),
+            "below the activation the earlier behaviour holds"
+        );
+        assert!(!archive_global_body_authenticated(&GlobalFrame::default()));
+        quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
     }
 
     // ---- test stubs ----
