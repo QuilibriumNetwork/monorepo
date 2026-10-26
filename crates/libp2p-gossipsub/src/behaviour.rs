@@ -43,8 +43,8 @@ use libp2p_identity::{Keypair, PeerId};
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, FromSwarm},
     dial_opts::DialOpts,
-    ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, THandler, THandlerInEvent,
-    THandlerOutEvent, ToSwarm,
+    CloseConnection, ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 #[cfg(feature = "metrics")]
 use prometheus_client::registry::Registry;
@@ -349,6 +349,9 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     /// Tracks the numbers of failed messages per peer-id.
     failed_messages: HashMap<PeerId, FailedMessages>,
 
+    /// QUILIBRIUM: since when each peer has failed messages at every heartbeat.
+    slow_since: HashMap<PeerId, Instant>,
+
     /// Tracks recently sent `IWANT` messages and checks if peers respond to them.
     gossip_promises: GossipPromises,
 
@@ -375,6 +378,17 @@ pub struct UnsentRpcStats {
 /// dropped RPC scores -1000, below any usual graylist threshold, until the penalty decays.
 /// No honest peer sends such an RPC.
 const REJECTED_RPC_PENALTY: usize = 10;
+
+/// QUILIBRIUM: how long a peer may have messages refused by its full queues, or
+/// dropped there unsent, at every heartbeat before its connections are closed.
+/// Nothing else frees what is queued for a peer that stops reading its stream.
+const SLOW_PEER_DISCONNECT_AFTER: Duration = Duration::from_secs(60);
+
+/// QUILIBRIUM: the most messages a peer's priority queue may hold before its
+/// connections are closed. The queue is unbounded, as control messages must not
+/// be refused, and holds at most `connection_handler_queue_len / 2` publishes;
+/// a peer that stops reading while it sends GRAFTs fills it with our PRUNEs.
+const MAX_PRIORITY_QUEUE_LEN: usize = 10_000;
 
 impl<D, F> Behaviour<D, F>
 where
@@ -490,6 +504,7 @@ where
             subscription_filter,
             data_transform,
             failed_messages: Default::default(),
+            slow_since: HashMap::new(),
             gossip_promises: Default::default(),
             rejected_rpcs: RejectedRpcStats::default(),
             unsent_rpcs: UnsentRpcStats::default(),
@@ -1485,7 +1500,10 @@ where
 
         // For each topic, if a peer has grafted us, then we necessarily must be in their mesh
         // and they must be subscribed to the topic. Ensure we have recorded the mapping.
-        for topic in &topics {
+        // QUILIBRIUM: only for topics we are subscribed to. The others are pruned below, and a
+        // GRAFT is not a subscription: recording its topics let a peer grow its entry past the
+        // subscription filter.
+        for topic in topics.iter().filter(|topic| self.mesh.contains_key(*topic)) {
             if connected_peer.topics.insert(topic.clone()) {
                 #[cfg(feature = "metrics")]
                 if let Some(m) = self.metrics.as_mut() {
@@ -1913,9 +1931,18 @@ where
         // Calculate the message id on the transformed data.
         let msg_id = self.config.message_id(&message);
 
+        // Check the validity of the message
+        // Peers get penalized if this message is invalid. We don't add it to the duplicate cache
+        // and instead continually penalize peers that repeatedly send this message.
+        if !self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
+            return;
+        }
+
         // Broadcast IDONTWANT messages
         // QUILIBRIUM: only for the first copy. A duplicate's IDONTWANT would
-        // repeat, to every mesh peer, the one the first copy already sent.
+        // repeat, to every mesh peer, the one the first copy already sent. And
+        // only once the copy passed `message_is_valid`, so that a refused copy
+        // does not suppress the ones that follow.
         if raw_protobuf_len > self.config.idontwant_message_size_threshold()
             && !self.duplicate_cache.contains(&msg_id)
         {
@@ -1939,13 +1966,6 @@ where
                     }),
                 );
             }
-        }
-
-        // Check the validity of the message
-        // Peers get penalized if this message is invalid. We don't add it to the duplicate cache
-        // and instead continually penalize peers that repeatedly send this message.
-        if !self.message_is_valid(&msg_id, &mut raw_message, propagation_source) {
-            return;
         }
 
         if !self.duplicate_cache.insert(msg_id.clone()) {
@@ -2681,6 +2701,11 @@ where
         self.mcache.shift();
 
         // Report expired messages
+        // QUILIBRIUM: and close the connections of a peer that has not read its
+        // stream for `SLOW_PEER_DISCONNECT_AFTER`, or whose priority queue grew
+        // past `MAX_PRIORITY_QUEUE_LEN`.
+        let now = Instant::now();
+        let mut slow_since = HashMap::with_capacity(self.failed_messages.len());
         for (peer_id, failed_messages) in self.failed_messages.drain() {
             tracing::debug!("Peer couldn't consume messages: {:?}", failed_messages);
             self.events
@@ -2688,8 +2713,33 @@ where
                     peer_id,
                     failed_messages,
                 }));
+            let since = self.slow_since.get(&peer_id).copied().unwrap_or(now);
+            slow_since.insert(peer_id, since);
         }
         self.failed_messages.shrink_to_fit();
+        self.slow_since = slow_since;
+        let stalled: Vec<PeerId> = self
+            .connected_peers
+            .iter()
+            .filter(|(peer_id, peer)| {
+                peer.sender.priority_len() > MAX_PRIORITY_QUEUE_LEN
+                    || self.slow_since.get(*peer_id).is_some_and(|since| {
+                        now.saturating_duration_since(*since) >= SLOW_PEER_DISCONNECT_AFTER
+                    })
+            })
+            .map(|(peer_id, _)| *peer_id)
+            .collect();
+        for peer_id in stalled {
+            tracing::warn!(
+                peer=%peer_id,
+                "Closing gossipsub connections of a peer that does not read its stream"
+            );
+            self.slow_since.remove(&peer_id);
+            self.events.push_back(ToSwarm::CloseConnection {
+                peer_id,
+                connection: CloseConnection::All,
+            });
+        }
 
         // Flush stale IDONTWANTs.
         for peer in self.connected_peers.values_mut() {
@@ -3502,6 +3552,21 @@ where
                 {
                     tracing::debug!(peer=%propagation_source, "RPC Dropped from greylisted peer");
                     return;
+                }
+
+                // QUILIBRIUM: a message signed with a refused key type is
+                // dropped without penalty (see `ValidationError::RefusedKeyType`),
+                // and the promises of its id are released, so its advertisers are
+                // not penalised for an IWANT answered with it either.
+                let (refused, invalid_messages): (Vec<_>, Vec<_>) = invalid_messages
+                    .into_iter()
+                    .partition(|(_, error)| *error == ValidationError::RefusedKeyType);
+                for (raw_message, _) in refused {
+                    if let Ok(message) = self.data_transform.inbound_transform(raw_message) {
+                        let msg_id = self.config.message_id(&message);
+                        self.gossip_promises
+                            .reject_message(&msg_id, &RejectReason::ValidationIgnored);
+                    }
                 }
 
                 // Handle any invalid messages from this peer

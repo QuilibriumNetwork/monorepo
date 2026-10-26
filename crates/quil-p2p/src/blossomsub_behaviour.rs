@@ -55,7 +55,42 @@ use libp2p::{Multiaddr, PeerId};
 use crate::protocol::pb;
 
 /// The concrete stock gossipsub behaviour we wrap.
-type Inner = gossipsub::Behaviour;
+type Inner = gossipsub::Behaviour<gossipsub::IdentityTransform, SubscriptionLimit>;
+
+/// How peers' subscriptions are bounded, see [`subscription_filter`].
+type SubscriptionLimit = gossipsub::MaxCountSubscriptionFilter<TopicLengthLimit>;
+
+/// The most topics one peer may be subscribed to, as far as this node records.
+/// A node subscribes to a few global topics and five per shard it serves, so
+/// this covers some 1,600 shards. Without a bound, every connected peer could
+/// make the node hold any number of topics for it.
+const MAX_PEER_TOPICS: usize = 8192;
+
+/// The longest topic a peer may subscribe to: the hex of a 64-byte bitmask
+/// (the node's bitmasks have at most 35 bytes).
+const MAX_TOPIC_LEN: usize = 128;
+
+/// Refuses topics longer than [`MAX_TOPIC_LEN`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TopicLengthLimit;
+
+impl gossipsub::TopicSubscriptionFilter for TopicLengthLimit {
+    fn can_subscribe(&mut self, topic_hash: &gossipsub::TopicHash) -> bool {
+        topic_hash.as_str().len() <= MAX_TOPIC_LEN
+    }
+}
+
+/// The subscription filter of the gossip behaviour: at most
+/// [`MAX_PEER_TOPICS`] topics per peer, each at most [`MAX_TOPIC_LEN`] long. A
+/// change past the limit is dropped with the rest of its RPC; the node sends
+/// one subscription change per RPC.
+fn subscription_filter() -> SubscriptionLimit {
+    gossipsub::MaxCountSubscriptionFilter {
+        filter: TopicLengthLimit,
+        max_subscribed_topics: MAX_PEER_TOPICS,
+        max_subscriptions_per_request: 1024,
+    }
+}
 
 /// Result of a per-bitmask message validator. Mirrors the historical
 /// `blossomsub::ValidationResult` so `node.rs`'s validators are unchanged;
@@ -166,9 +201,10 @@ impl BlossomSubBehaviour {
         // `inner` with the real key.
         let placeholder = Keypair::generate_ed25519();
         let traffic: Arc<crate::gossip_traffic::GossipTraffic> = Default::default();
-        let inner = Inner::new(
+        let inner = Inner::new_with_subscription_filter(
             gossipsub::MessageAuthenticity::Signed(placeholder),
             config.clone(),
+            subscription_filter(),
         )
         .expect("valid gossipsub config")
         .with_traffic_observer(traffic.clone());
@@ -216,9 +252,10 @@ impl BlossomSubBehaviour {
         let inner = if !self.metrics_registered {
             let mut guard = self.metrics_registry.lock().unwrap();
             let sub = guard.sub_registry_with_prefix("gossipsub");
-            let inner = Inner::new(
+            let inner = Inner::new_with_subscription_filter(
                 gossipsub::MessageAuthenticity::Signed(keypair),
                 self.config.clone(),
+                subscription_filter(),
             )
             .expect("valid gossipsub config")
             .with_metrics(sub, gossipsub::MetricsConfig::default())
@@ -227,9 +264,10 @@ impl BlossomSubBehaviour {
             self.metrics_registered = true;
             inner
         } else {
-            Inner::new(
+            Inner::new_with_subscription_filter(
                 gossipsub::MessageAuthenticity::Signed(keypair),
                 self.config.clone(),
+                subscription_filter(),
             )
             .expect("valid gossipsub config")
             .with_traffic_observer(self.traffic.clone())
@@ -242,12 +280,11 @@ impl BlossomSubBehaviour {
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
-        //  (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO — a `Reject` from
-        //      the graduated staleness validator (only fires on >5-min-stale
-        //      PeerInfo/KeyRegistry, which an honest relayer never forwards)
-        //      accrues a QUADRATIC penalty, so a sustained stale/replay flood
-        //      graylists the offending peer while a one-off aged message does
-        //      not.
+        //  (2) topic P₄ (invalid-message) on every subscribed topic — a
+        //      `Reject` from a validator, or a message the codec refuses (bad
+        //      signature, size), accrues a QUADRATIC penalty, so a sustained
+        //      flood of invalid messages graylists the offending peer while a
+        //      one-off does not.
         // Every other topic-score term is ZEROED (see `build_peer_score`).
         let (score_params, thresholds) = build_peer_score();
         if let Err(e) = self.inner.with_peer_score(score_params, thresholds) {
@@ -257,6 +294,9 @@ impl BlossomSubBehaviour {
         // rebind (defensive; in practice none exist yet).
         for bitmask in self.subscriptions.clone() {
             let _ = self.inner.subscribe(&topic_for(&bitmask));
+            let _ = self
+                .inner
+                .set_topic_params(topic_for(&bitmask), invalid_message_topic_params());
         }
         for peer in self.direct_peers.clone() {
             self.inner.add_explicit_peer(&peer);
@@ -323,10 +363,14 @@ impl BlossomSubBehaviour {
         }
     }
 
-    /// Subscribe to a bitmask.
+    /// Subscribe to a bitmask. Its topic gets the invalid-message penalty
+    /// ([`invalid_message_topic_params`]) once scoring is on.
     pub fn subscribe(&mut self, bitmask: Vec<u8>) {
         match self.inner.subscribe(&topic_for(&bitmask)) {
             Ok(_) => {
+                let _ = self
+                    .inner
+                    .set_topic_params(topic_for(&bitmask), invalid_message_topic_params());
                 self.subscriptions.insert(bitmask);
             }
             Err(e) => {
@@ -957,32 +1001,40 @@ impl NetworkBehaviour for BlossomSubBehaviour {
     }
 }
 
-/// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
-/// per-network protocol id and setting the BlossomSub message id
-/// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
-/// (`mesh_peers_per_subnet`) are dropped; `mcache_max_bytes` maps onto the
-/// vendored crate's message-cache byte budget.
+/// The score parameters of every subscribed topic: only P₄, the invalid-message
+/// penalty (weight × counter²). A `Reject` from a validator, or a message the
+/// codec refuses (bad signature, oversized), counts one. The counter keeps 90 %
+/// a second (it kept 50 %, which forgot a flood within seconds): a one-off stays
+/// above every threshold, three put the sender below the graylist threshold and
+/// keep it below the gossip threshold for some seconds, and a sustained stream
+/// keeps it graylisted. The delivery terms (P₁–P₃, P₃b) stay zero: they punish
+/// honest peers for WAN delivery variance and made meshes flap; whether small
+/// positive P₂/P₃ would help defend meshes needs measurement first.
+fn invalid_message_topic_params() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        time_in_mesh_weight: 0.0,
+        first_message_deliveries_weight: 0.0,
+        mesh_message_deliveries_weight: 0.0,
+        mesh_failure_penalty_weight: 0.0,
+        invalid_message_deliveries_weight: -50.0,
+        invalid_message_deliveries_decay: 0.9,
+        ..Default::default()
+    }
+}
+
 /// Peer-score config. Two channels are active: (1) the application score
 /// (`set_application_score`, driven by the node — peer_authenticator + per-source
-/// drop-rate penalties); (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO, so
-/// a `Reject` from the graduated staleness validator (fires ONLY on >5-min-stale
-/// PeerInfo/KeyRegistry, which an honest relayer never forwards) accrues a
-/// QUADRATIC penalty — a sustained stale/replay flood graylists the peer while a
-/// one-off aged message does not. Every honest-peer-affecting topic term
-/// (time-in-mesh, first/mesh deliveries, mesh-failure) is ZEROED: those punish
-/// peers for normal WAN delivery variance and cause mesh flapping.
+/// drop-rate penalties); (2) topic P₄ (invalid-message,
+/// [`invalid_message_topic_params`]) on GLOBAL_FRAME and GLOBAL_PEER_INFO here,
+/// and on every other topic as it is subscribed. Every honest-peer-affecting
+/// topic term (time-in-mesh, first/mesh deliveries, mesh-failure) is ZEROED:
+/// those punish peers for normal WAN delivery variance and cause mesh flapping.
 fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
-    let mut pi_topic = gossipsub::TopicScoreParams::default();
-    pi_topic.topic_weight = 1.0;
-    pi_topic.time_in_mesh_weight = 0.0;
-    pi_topic.first_message_deliveries_weight = 0.0;
-    pi_topic.mesh_message_deliveries_weight = 0.0;
-    pi_topic.mesh_failure_penalty_weight = 0.0;
-    pi_topic.invalid_message_deliveries_weight = -50.0; // P₄ = weight × counter²
-    pi_topic.invalid_message_deliveries_decay = 0.5; // ~halves each decay_interval → recovers
-                                                     // Keep `PeerScoreParams::default()` for everything else — notably
-                                                     // `app_specific_weight` (the existing `set_application_score` channel),
-                                                     // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
+    let pi_topic = invalid_message_topic_params();
+    // Keep `PeerScoreParams::default()` for everything else — notably
+    // `app_specific_weight` (the existing `set_application_score` channel),
+    // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
     let mut score_params = gossipsub::PeerScoreParams::default();
     // GLOBAL_FRAME `[0,0]`: the gate `Reject`s only a wrong type prefix, which
     // every build rejects, so an honest relay never forwards one; copies of
@@ -1012,6 +1064,10 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
     (score_params, thresholds)
 }
 
+/// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
+/// per-network protocol id and setting the BlossomSub message id
+/// (`[0x01] ++ SHA256(data)`); `mcache_max_bytes` maps onto the vendored
+/// crate's message-cache byte budget.
 fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Config {
     let mut builder = gossipsub::ConfigBuilder::default();
     builder
@@ -1198,6 +1254,27 @@ mod propagation_tests {
         assert_eq!(frame.mesh_message_deliveries_weight, 0.0);
     }
 
+    /// A message the codec or a validator refuses on a shard topic must
+    /// count against its sender's score, as it does on the global topics:
+    /// unscored, invalid messages there cost the sender nothing.
+    #[test]
+    fn reproduces_unscored_invalid_messages_on_shard_topics() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        let keypair = Keypair::generate_ed25519();
+        behaviour.set_signing_identity(keypair.public().to_peer_id(), keypair);
+        let shard_topic = vec![0x01; 33];
+        behaviour.subscribe(shard_topic.clone());
+
+        let penalty = behaviour
+            .inner
+            .get_topic_params(&topic_for(&shard_topic))
+            .map_or(0.0, |params| params.invalid_message_deliveries_weight);
+        assert!(
+            penalty < 0.0,
+            "a subscribed shard topic carries no invalid-message penalty"
+        );
+    }
+
     /// The registered validator sees the signed author of a message.
     #[test]
     fn authored_validators_see_the_author() {
@@ -1220,6 +1297,20 @@ mod propagation_tests {
         assert_eq!(one(&forwarder, None, b""), ValidationResult::Ignore);
         let two = &behaviour.validators[&vec![2]];
         assert_eq!(two(&forwarder, None, b""), ValidationResult::Reject);
+    }
+
+    /// A peer's subscriptions are bounded in number and topic length.
+    #[test]
+    fn peer_subscriptions_are_bounded() {
+        use gossipsub::TopicSubscriptionFilter as _;
+        let mut filter = subscription_filter();
+        assert_eq!(filter.max_subscribed_topics, MAX_PEER_TOPICS);
+        assert_eq!(filter.max_subscriptions_per_request, 1024);
+        let longest = gossipsub::TopicHash::from_raw("0".repeat(MAX_TOPIC_LEN));
+        let longer = gossipsub::TopicHash::from_raw("0".repeat(MAX_TOPIC_LEN + 1));
+        assert!(filter.can_subscribe(&topic_for(&[0xff; 35]).hash()));
+        assert!(filter.can_subscribe(&longest));
+        assert!(!filter.can_subscribe(&longer));
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {

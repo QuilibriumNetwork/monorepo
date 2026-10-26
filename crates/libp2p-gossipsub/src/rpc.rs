@@ -32,12 +32,33 @@ use futures::{stream::Peekable, Stream, StreamExt};
 
 use crate::types::RpcOut;
 
+/// QUILIBRIUM: the most message bytes (published and forwarded messages) one
+/// peer's queues may hold. The queues were bounded by count only, so a peer
+/// that stopped reading could hold thousands of messages of up to the frame
+/// size each, released only on disconnect. A message is always queued when
+/// none is, so the largest message still goes out.
+pub(crate) const MAX_QUEUED_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// QUILIBRIUM: the bytes `rpc` holds towards [`MAX_QUEUED_MESSAGE_BYTES`].
+fn queued_bytes(rpc: &RpcOut) -> usize {
+    match rpc {
+        RpcOut::Publish { message, .. } | RpcOut::Forward { message, .. } => {
+            message.data.len()
+                + message.signature.as_ref().map_or(0, Vec::len)
+                + message.key.as_ref().map_or(0, Vec::len)
+        }
+        _ => 0,
+    }
+}
+
 /// `RpcOut` sender that is priority aware.
 #[derive(Debug)]
 pub(crate) struct Sender {
     /// Capacity of the priority channel for `Publish` messages.
     priority_cap: usize,
     len: Arc<AtomicUsize>,
+    /// QUILIBRIUM: message bytes queued, shared with the receivers.
+    bytes: Arc<AtomicUsize>,
     pub(crate) priority_sender: async_channel::Sender<RpcOut>,
     pub(crate) non_priority_sender: async_channel::Sender<RpcOut>,
     priority_receiver: async_channel::Receiver<RpcOut>,
@@ -57,6 +78,7 @@ impl Sender {
         Sender {
             priority_cap: cap / 2,
             len,
+            bytes: Arc::new(AtomicUsize::new(0)),
             priority_sender,
             non_priority_sender,
             priority_receiver,
@@ -68,6 +90,7 @@ impl Sender {
     pub(crate) fn new_receiver(&self) -> Receiver {
         Receiver {
             priority_queue_len: self.len.clone(),
+            queued_bytes: self.bytes.clone(),
             priority: Box::pin(self.priority_receiver.clone().peekable()),
             non_priority: Box::pin(self.non_priority_receiver.clone().peekable()),
         }
@@ -75,6 +98,12 @@ impl Sender {
 
     #[allow(clippy::result_large_err)]
     pub(crate) fn send_message(&self, rpc: RpcOut) -> Result<(), RpcOut> {
+        // QUILIBRIUM: refuse a message past the byte budget, as a full queue.
+        let bytes = queued_bytes(&rpc);
+        let queued = self.bytes.load(Ordering::Relaxed);
+        if bytes > 0 && queued > 0 && queued.saturating_add(bytes) > MAX_QUEUED_MESSAGE_BYTES {
+            return Err(rpc);
+        }
         if let RpcOut::Publish { .. } = rpc {
             // Update number of publish message in queue.
             let len = self.len.load(Ordering::Relaxed);
@@ -100,7 +129,19 @@ impl Sender {
                 &self.non_priority_sender
             }
         };
-        sender.try_send(rpc).map_err(|err| err.into_inner())
+        // QUILIBRIUM: counted before it is queued, so the receiver never
+        // releases bytes that were not added.
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        sender.try_send(rpc).map_err(|err| {
+            self.bytes.fetch_sub(bytes, Ordering::Relaxed);
+            err.into_inner()
+        })
+    }
+
+    /// QUILIBRIUM: the number of messages in the priority queue (control
+    /// messages and publishes).
+    pub(crate) fn priority_len(&self) -> usize {
+        self.priority_sender.len()
     }
 
     /// Returns the current size of the priority queue.
@@ -121,6 +162,8 @@ impl Sender {
 pub struct Receiver {
     /// The maximum length of the priority queue.
     pub(crate) priority_queue_len: Arc<AtomicUsize>,
+    /// QUILIBRIUM: message bytes queued, shared with the sender.
+    pub(crate) queued_bytes: Arc<AtomicUsize>,
     /// The priority queue receiver.
     pub(crate) priority: Pin<Box<Peekable<async_channel::Receiver<RpcOut>>>>,
     /// The non priority queue receiver.
@@ -128,6 +171,12 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// QUILIBRIUM: releases the bytes of a message leaving the queues.
+    fn release(&self, rpc: &RpcOut) {
+        self.queued_bytes
+            .fetch_sub(queued_bytes(rpc), Ordering::Relaxed);
+    }
+
     // Peek the next message in the queues and return it if its timeout has elapsed.
     // Returns `None` if there aren't any more messages on the stream or none is stale.
     pub(crate) fn poll_stale(&mut self, cx: &mut Context<'_>) -> Poll<Option<RpcOut>> {
@@ -141,6 +190,7 @@ impl Receiver {
                     // Return the message.
                     let dropped = futures::ready!(self.priority.poll_next_unpin(cx))
                         .expect("There should be a message");
+                    self.release(&dropped);
                     return Poll::Ready(Some(dropped));
                 }
                 Poll::Ready(None)
@@ -157,6 +207,7 @@ impl Receiver {
                     // Return the message.
                     let dropped = futures::ready!(self.non_priority.poll_next_unpin(cx))
                         .expect("There should be a message");
+                    self.release(&dropped);
                     return Poll::Ready(Some(dropped));
                 }
                 Poll::Ready(None)
@@ -194,20 +245,84 @@ impl Stream for Receiver {
             if let Some(RpcOut::Publish { .. }) = rpc {
                 self.priority_queue_len.fetch_sub(1, Ordering::Relaxed);
             }
+            if let Some(rpc) = &rpc {
+                self.release(rpc);
+            }
             return Poll::Ready(rpc);
         }
         // Then we poll the non priority.
-        Pin::new(&mut self.non_priority).poll_next(cx)
+        let rpc = futures::ready!(Pin::new(&mut self.non_priority).poll_next(cx));
+        if let Some(rpc) = &rpc {
+            self.release(rpc);
+        }
+        Poll::Ready(rpc)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_timer::Delay;
+
     use super::*;
     use crate::{
-        types::{Graft, IDontWant},
+        types::{Graft, IDontWant, RawMessage},
         MessageId, TopicHash,
     };
+
+    fn forward(len: usize) -> RpcOut {
+        RpcOut::Forward {
+            message: RawMessage {
+                source: None,
+                data: vec![0; len],
+                sequence_number: None,
+                topic: TopicHash::from_raw("topic"),
+                signature: None,
+                key: None,
+                validated: true,
+            },
+            timeout: Delay::new(Duration::from_secs(60)),
+        }
+    }
+
+    /// QUILIBRIUM: a message is queued when none is, whatever its size; bytes
+    /// leave the budget as their messages leave the queue; control messages
+    /// are not counted.
+    #[test]
+    fn queued_message_bytes_are_released_on_receipt() {
+        let sender = Sender::new(100);
+        let mut receiver = sender.new_receiver();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        sender
+            .send_message(forward(MAX_QUEUED_MESSAGE_BYTES + 1))
+            .unwrap();
+        assert!(sender.send_message(forward(1)).is_err());
+        sender
+            .send_message(RpcOut::Graft(Graft {
+                topic_hash: TopicHash::from_raw("topic"),
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            Pin::new(&mut receiver).poll_next(&mut cx),
+            Poll::Ready(Some(RpcOut::Graft(_)))
+        ));
+        assert!(matches!(
+            Pin::new(&mut receiver).poll_next(&mut cx),
+            Poll::Ready(Some(RpcOut::Forward { .. }))
+        ));
+        assert_eq!(sender.bytes.load(Ordering::Relaxed), 0);
+        sender
+            .send_message(forward(MAX_QUEUED_MESSAGE_BYTES / 2))
+            .unwrap();
+        sender
+            .send_message(forward(MAX_QUEUED_MESSAGE_BYTES / 2))
+            .unwrap();
+        assert!(sender.send_message(forward(1)).is_err());
+    }
 
     /// QUILIBRIUM: IDONTWANT goes on the priority queue until that queue holds
     /// `priority_cap` messages, then on the bounded queue.
@@ -229,5 +344,34 @@ mod tests {
 
         assert_eq!(sender.priority_sender.len(), 2);
         assert_eq!(sender.non_priority_sender.len(), 1);
+    }
+
+    /// The queues of a peer that reads nothing must not hold messages without
+    /// bound: they were bounded by message count, at up to the frame size each.
+    #[test]
+    fn reproduces_unbounded_queued_message_bytes() {
+        const MIB: usize = 1024 * 1024;
+        let forward = || RpcOut::Forward {
+            message: crate::types::RawMessage {
+                source: None,
+                data: vec![0; 48 * MIB],
+                sequence_number: None,
+                topic: TopicHash::from_raw("topic"),
+                signature: None,
+                key: None,
+                validated: true,
+            },
+            timeout: futures_timer::Delay::new(std::time::Duration::from_secs(60)),
+        };
+        let sender = Sender::new(100);
+        let _receiver = sender.new_receiver();
+        let queued = (0..4)
+            .filter(|_| sender.send_message(forward()).is_ok())
+            .count();
+        assert!(
+            queued * 48 <= 64,
+            "{queued} forwards of 48 MiB ({} MiB) were queued for a peer that reads nothing",
+            queued * 48
+        );
     }
 }

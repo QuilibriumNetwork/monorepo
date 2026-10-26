@@ -599,6 +599,7 @@ fn test_join() {
                 peer_id,
                 Receiver {
                     priority_queue_len: c.priority_queue_len,
+                    queued_bytes: c.queued_bytes,
                     priority: c.priority,
                     non_priority: c.non_priority,
                 },
@@ -1176,6 +1177,7 @@ fn test_handle_iwant_msg_cached_shifted() {
                 peer_id,
                 Receiver {
                     priority_queue_len: c.priority_queue_len,
+                    queued_bytes: c.queued_bytes,
                     priority: c.priority,
                     non_priority: c.non_priority,
                 },
@@ -1481,6 +1483,7 @@ fn count_control_msgs(
             peer_id,
             Receiver {
                 priority_queue_len: c.priority_queue_len,
+                queued_bytes: c.queued_bytes,
                 priority: c.priority,
                 non_priority: c.non_priority,
             },
@@ -1506,6 +1509,7 @@ fn flush_events<D: DataTransform, F: TopicSubscriptionFilter>(
             peer_id,
             Receiver {
                 priority_queue_len: c.priority_queue_len,
+                queued_bytes: c.queued_bytes,
                 priority: c.priority,
                 non_priority: c.non_priority,
             },
@@ -5459,6 +5463,105 @@ fn sends_idontwant_for_the_first_copy_only() {
     assert_eq!(duplicates, 0, "a duplicate must not send IDONTWANT again");
 }
 
+/// QUILIBRIUM: a peer whose messages have failed at every heartbeat for
+/// `SLOW_PEER_DISCONNECT_AFTER` has its connections closed; a peer whose
+/// messages failed in one heartbeat only does not.
+#[test]
+fn stalled_peer_connections_are_closed() {
+    let (mut gs, peers, _receivers, _topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let failed = || FailedMessages {
+        publish: 0,
+        forward: 1,
+        priority: 0,
+        non_priority: 1,
+        timeout: 0,
+    };
+    let long_ago = Instant::now()
+        .checked_sub(SLOW_PEER_DISCONNECT_AFTER + Duration::from_secs(1))
+        .unwrap();
+    gs.slow_since.insert(peers[0], long_ago);
+    gs.failed_messages.insert(peers[0], failed());
+    gs.failed_messages.insert(peers[1], failed());
+    gs.events.clear();
+
+    gs.heartbeat();
+
+    let closed: Vec<PeerId> = gs
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ToSwarm::CloseConnection { peer_id, .. } => Some(*peer_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![peers[0]]);
+    assert!(gs.slow_since.contains_key(&peers[1]));
+    assert!(!gs.slow_since.contains_key(&peers[0]));
+}
+
+/// QUILIBRIUM: a message signed with a refused key type costs its forwarder
+/// nothing, unlike an invalid signature, and releases the promises of its id.
+#[test]
+fn refused_key_types_are_dropped_without_penalty() {
+    let (mut gs, peers, _receivers, topic_hashes) = inject_nodes1()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .scoring(Some((
+            PeerScoreParams::default(),
+            PeerScoreThresholds::default(),
+        )))
+        .create_network();
+    // The id the behaviour computes for the refused message (by default its
+    // source and sequence number).
+    let author = PeerId::random();
+    let message = || RawMessage {
+        source: Some(author),
+        data: vec![5; 8],
+        sequence_number: Some(7),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: false,
+    };
+    let msg_id = gs.config.message_id(&Message {
+        source: Some(author),
+        data: vec![5; 8],
+        sequence_number: Some(7),
+        topic: topic_hashes[0].clone(),
+    });
+    gs.gossip_promises.add_promise(
+        peers[1],
+        &[msg_id.clone()],
+        Instant::now() + Duration::from_secs(60),
+    );
+    let deliver = |gs: &mut Behaviour, peer: PeerId, error: ValidationError| {
+        gs.on_connection_handler_event(
+            peer,
+            ConnectionId::new_unchecked(0),
+            HandlerEvent::Message {
+                rpc: Rpc {
+                    messages: vec![],
+                    subscriptions: vec![],
+                    control_msgs: vec![],
+                },
+                invalid_messages: vec![(message(), error)],
+            },
+        );
+    };
+
+    deliver(&mut gs, peers[0], ValidationError::InvalidSignature);
+    deliver(&mut gs, peers[1], ValidationError::RefusedKeyType);
+
+    assert!(gs.peer_score(&peers[0]).unwrap() < 0.0);
+    assert_eq!(gs.peer_score(&peers[1]), Some(0.0));
+    assert!(gs.gossip_promises.peers_for_message(&msg_id).is_empty());
+}
+
 /// QUILIBRIUM: IDONTWANT goes on the priority queue, ahead of queued forwards.
 #[test]
 fn sends_idontwant_with_priority() {
@@ -7061,4 +7164,62 @@ fn rpc_for_a_disconnected_peer_is_counted_not_queued() {
     let receiver = receivers.remove(&peers[1]).unwrap();
     let queued = receiver.priority.get_ref().len() + receiver.non_priority.get_ref().len();
     assert!(queued > 0, "the connected peer's RPC was not queued");
+}
+
+/// A copy of a large message that the behaviour refuses (here: its author is
+/// blacklisted) must not make the node tell its mesh it already has the
+/// message, or the genuine copies that follow are withheld from it.
+#[test]
+fn reproduces_idontwant_for_a_refused_copy() {
+    let (mut gs, peers, receivers, topic_hashes) = inject_nodes1()
+        .peer_no(5)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let author = PeerId::random();
+    gs.blacklist_peer(&author);
+    let message = RawMessage {
+        source: Some(author),
+        data: vec![12u8; 1024],
+        sequence_number: Some(0),
+        topic: topic_hashes[0].clone(),
+        signature: None,
+        key: None,
+        validated: true,
+    };
+
+    gs.handle_received_message(message, &peers[1]);
+
+    let (idontwants, _) =
+        count_control_msgs(receivers, |_, rpc| matches!(rpc, RpcOut::IDontWant(_)));
+    assert_eq!(
+        idontwants, 0,
+        "a refused copy sent {idontwants} IDONTWANTs for its message id"
+    );
+}
+
+/// A GRAFT is not a subscription and is not filtered like one, so the topics
+/// it names that the node does not serve must not be recorded for the peer.
+#[test]
+fn reproduces_graft_topics_recorded_without_subscription() {
+    let (mut gs, peers, _receivers, _topic_hashes) = inject_nodes1()
+        .peer_no(1)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .create_network();
+    let before = gs.connected_peers[&peers[0]].topics.len();
+    let grafted: Vec<TopicHash> = (0..1000)
+        .map(|i| TopicHash::from_raw(format!("unsubscribed-{i}")))
+        .collect();
+
+    gs.handle_graft(&peers[0], grafted);
+
+    let recorded = gs.connected_peers[&peers[0]].topics.len() - before;
+    assert_eq!(
+        recorded, 0,
+        "a GRAFT recorded {recorded} topics the node is not subscribed to for its sender"
+    );
 }

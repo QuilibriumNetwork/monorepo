@@ -2088,47 +2088,113 @@ fn probe_context(
     }
 }
 
-/// Returns `true` if the multiaddr's IP component is publicly routable
-/// (not loopback, link-local, or private). Identify shares all listen
-/// addresses including localhost/private — we must drop those before adding
-/// them to Kademlia/dial, otherwise we generate thousands of useless dials
-/// against our own machine and rate-limit ourselves out of the network.
+/// Returns `true` if every IP component of the multiaddr is publicly routable
+/// (not loopback, link-local, private, shared or reserved) and it names no host
+/// by DNS. Identify shares all listen addresses including localhost/private —
+/// we must drop those before adding them to Kademlia/dial, otherwise we
+/// generate thousands of useless dials against our own machine and rate-limit
+/// ourselves out of the network. The addresses are the peer's to choose: every
+/// IP component is checked, as the transport dials the last one (a public one
+/// in front would hide a loopback one behind it), and a DNS name can resolve to
+/// any address, so it is refused (configured bootstrap and direct peers are
+/// dialled without this filter).
 pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    let mut has_ip = false;
     for proto in addr.iter() {
-        match proto {
-            Protocol::Ip4(ip) => {
-                if ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_private()
-                    || ip == Ipv4Addr::UNSPECIFIED
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                    || ip.is_multicast()
-                {
-                    return false;
-                }
-                return true;
-            }
-            Protocol::Ip6(ip) => {
-                if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
-                    || ip == Ipv6Addr::UNSPECIFIED
-                    // unique-local fc00::/7
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00
-                    // link-local fe80::/10
-                    || (ip.segments()[0] & 0xffc0) == 0xfe80
-                {
-                    return false;
-                }
-                return true;
-            }
+        let routable = match proto {
+            Protocol::Ip4(ip) => ipv4_routable(ip),
+            Protocol::Ip6(ip) => ipv6_routable(ip),
             Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
-                return true;
+                false
             }
             _ => continue,
+        };
+        if !routable {
+            return false;
+        }
+        has_ip = true;
+    }
+    has_ip
+}
+
+/// Whether `ip` is a globally routable IPv4 address.
+fn ipv4_routable(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_private()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        // "This network", 0.0.0.0/8.
+        || a == 0
+        // Shared address space (carrier-grade NAT), 100.64.0.0/10.
+        || (a == 100 && (b & 0xc0) == 64)
+        // IETF protocol assignments, 192.0.0.0/24.
+        || (a == 192 && b == 0 && c == 0)
+        // Benchmarking, 198.18.0.0/15.
+        || (a == 198 && (b & 0xfe) == 18)
+        // Reserved, 240.0.0.0/4.
+        || a >= 240)
+}
+
+/// Whether `ip` is a globally routable IPv6 address; an IPv4-mapped address
+/// is judged as the IPv4 address it maps.
+fn ipv6_routable(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return ipv4_routable(v4);
+    }
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        // unique-local fc00::/7
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        // link-local fe80::/10
+        || (ip.segments()[0] & 0xffc0) == 0xfe80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routable(addr: &str) -> bool {
+        is_routable(&addr.parse().unwrap())
+    }
+
+    /// Public addresses of every transport the node dials are routable.
+    #[test]
+    fn public_addresses_are_routable() {
+        assert!(routable("/ip4/8.8.8.8/tcp/8336"));
+        assert!(routable("/ip4/8.8.8.8/udp/8336/quic-v1"));
+        assert!(routable(&format!(
+            "/ip4/8.8.8.8/tcp/8336/p2p/{}",
+            PeerId::random()
+        )));
+        assert!(routable("/ip6/2606:4700::1111/tcp/8336"));
+        assert!(routable("/ip4/100.128.0.1/tcp/8336"));
+    }
+
+    /// Local, shared, reserved and mapped-local addresses are not.
+    #[test]
+    fn local_shared_and_reserved_addresses_are_not_routable() {
+        for addr in [
+            "/ip4/127.0.0.1/tcp/8337",
+            "/ip4/10.0.0.1/tcp/8336",
+            "/ip4/100.64.0.1/tcp/8336",
+            "/ip4/100.127.255.254/tcp/8336",
+            "/ip4/192.0.0.8/tcp/8336",
+            "/ip4/198.18.0.1/tcp/8336",
+            "/ip4/240.0.0.1/tcp/8336",
+            "/ip4/0.1.2.3/tcp/8336",
+            "/ip6/::1/tcp/8336",
+            "/ip6/::ffff:127.0.0.1/tcp/8337",
+            "/ip6/fd00::1/tcp/8336",
+            "/tcp/8336",
+        ] {
+            assert!(!routable(addr), "{addr} counted as routable");
         }
     }
-    false
 }
 
 /// The text of a refused publish. A refusal because every recipient's send
