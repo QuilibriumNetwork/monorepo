@@ -831,6 +831,10 @@ impl GlobalIntrinsic {
                 // 3. Different outputs (the actual equivocation)
                 // 4. Both carry BLS signatures
                 //
+                // From the signed-slot epoch (`kick_signed_slot_active`)
+                // 2 and 3 compare what the votes sign instead: the same
+                // address and non-zero rank, different `Poseidon(output)`.
+                //
                 // When the full cryptographic deps are installed
                 // (BLS constructor + hypergraph + inclusion prover +
                 // clock store + frame prover), we run the full chain:

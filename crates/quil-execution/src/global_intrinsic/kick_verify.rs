@@ -2,7 +2,9 @@
 //! `global_prover_kick.go:472-644` (`verifyEquivocation`).
 //!
 //! Verifies that two conflicting frames at the same frame number with
-//! different outputs constitute a valid equivocation by a prover.
+//! different outputs constitute a valid equivocation by a prover. From
+//! [`quil_types::consensus::kick_signed_slot_active`] the frames must instead
+//! be votes for the same signed slot ([`verify_signed_slot_equivocation`]).
 
 use quil_types::error::{QuilError, Result};
 
@@ -31,6 +33,11 @@ use super::frame_header::{
 /// runtime dependencies (FrameProver, BlsConstructor, ProverRegistry)
 /// that are injected at a higher level. This function performs the
 /// structural checks that can be done without those dependencies.
+///
+/// The rule GLOBAL applies before the signed-slot epoch. The vote signature
+/// does not cover `frame_number`, and outputs that differ can share the
+/// signed `Poseidon(output)`, so passing it does not show that the signer
+/// voted twice in one slot; [`verify_signed_slot_equivocation`] replaces it.
 pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
     // Both frames must be at least 4 bytes
     if kick.conflicting_frame_1.len() < 4 || kick.conflicting_frame_2.len() < 4 {
@@ -66,11 +73,93 @@ pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
     }
 }
 
+/// Whether a `ProverKick` processed in GLOBAL frame `frame_number` carries
+/// conflicting frames that count as an equivocation: from
+/// [`quil_types::consensus::kick_signed_slot_active`] two votes for the same
+/// signed slot ([`verify_signed_slot_equivocation`]), before it the legacy
+/// [`verify_equivocation_structural`] rule, unchanged.
+pub fn verify_kick_equivocation(kick: &ProverKick, frame_number: u64) -> Result<bool> {
+    if quil_types::consensus::kick_signed_slot_active(frame_number) {
+        Ok(verify_signed_slot_equivocation(kick))
+    } else {
+        verify_equivocation_structural(kick)
+    }
+}
+
+/// What a conflicting frame's vote signature covers. A legacy vote signs
+/// `address ‖ Poseidon(output) ‖ rank` under `"appshard" ‖ address` for an
+/// app shard and `Poseidon(output) ‖ rank` under `"global"` for GLOBAL
+/// (`FrameProver::verify_frame_header_signature` and
+/// `verify_global_header_signature`). Every other header field, the frame
+/// number included, is unsigned and anyone can rewrite it.
+struct SignedVote {
+    frame_type: u32,
+    /// The shard address; empty for GLOBAL.
+    address: Vec<u8>,
+    /// The consensus slot the vote is for.
+    rank: u64,
+    /// `Poseidon(output)`, the signed frame identity.
+    identity: [u8; 32],
+}
+
+/// The signed vote of one conflicting frame, decoded with the canonical
+/// frame codec; `None` when the frame does not decode or carries no
+/// signature.
+fn signed_vote(frame_bytes: &[u8]) -> Option<SignedVote> {
+    let frame_type = u32::from_be_bytes(frame_bytes.get(..4)?.try_into().ok()?);
+    let (address, rank, output, signature) = if frame_type == GLOBAL_FRAME_HEADER_TYPE {
+        let h = super::frame_header::GlobalFrameHeader::from_canonical_bytes(frame_bytes).ok()?;
+        (
+            Vec::new(),
+            h.rank,
+            h.output,
+            h.public_key_signature_bls48581,
+        )
+    } else if frame_type == FRAME_HEADER_TYPE {
+        let h = super::frame_header::FrameHeader::from_canonical_bytes(frame_bytes).ok()?;
+        (h.address, h.rank, h.output, h.public_key_signature_bls48581)
+    } else {
+        return None;
+    };
+    if signature.is_empty() {
+        return None;
+    }
+    let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).ok()?;
+    Some(SignedVote {
+        frame_type,
+        address,
+        rank,
+        identity,
+    })
+}
+
+/// Whether a `ProverKick`'s conflicting frames are two votes for one signed
+/// slot with different signed contents: the same frame type, shard address
+/// and rank, over different frame identities. Only these fields are signed,
+/// so this is what a pair of valid signatures can prove; the frame numbers
+/// and raw outputs are not compared. Rank 0 is the genesis slot, which
+/// provers sign again whenever a chain restarts from genesis, so votes there
+/// prove nothing. The signatures themselves and the kicked prover's bits
+/// are checked by [`verify_prover_kick_full`].
+pub fn verify_signed_slot_equivocation(kick: &ProverKick) -> bool {
+    let (Some(first), Some(second)) = (
+        signed_vote(&kick.conflicting_frame_1),
+        signed_vote(&kick.conflicting_frame_2),
+    ) else {
+        return false;
+    };
+    first.frame_type == second.frame_type
+        && first.address == second.address
+        && first.rank != 0
+        && first.rank == second.rank
+        && first.identity != second.identity
+}
+
 /// Full ProverKick verification. Ports Go `ProverKick.Verify` at
 /// `global_prover_kick.go:391-469`.
 ///
 /// Runs:
-/// 1. Structural equivocation check (`verify_equivocation_structural`).
+/// 1. Equivocation check (`verify_kick_equivocation`).
 /// 2. BLS aggregate signature verify on both conflicting frames.
 /// 3. Traversal-proof check against the prover tree at `frame N-1`
 /// (loaded from the `ClockStore`).
@@ -95,8 +184,9 @@ pub fn verify_prover_kick_full(
     inclusion_prover: &dyn quil_types::crypto::InclusionProver,
     prover_registry: Option<&dyn quil_types::consensus::ProverRegistry>,
 ) -> Result<()> {
-    // 1. Structural checks on the two conflicting frames.
-    if !verify_equivocation_structural(kick)? {
+    // 1. The two conflicting frames must be an equivocation: by signed
+    //    slot from the activation epoch, structurally before it.
+    if !verify_kick_equivocation(kick, frame_number)? {
         return Err(QuilError::InvalidArgument(
             "prover kick: no equivocation detected".into(),
         ));
@@ -1169,5 +1259,231 @@ mod tests {
         // Missing bit in second frame → reject.
         let no_bit = vec![0x00u8, 0x00u8];
         assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &no_bit, &reg, 0).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_equivocation: signed-slot rule
+    // -----------------------------------------------------------------
+
+    use crate::global_intrinsic::frame_header::GlobalFrameHeader;
+    use crate::hypergraph_intrinsic::canonical::Bls48581G2PublicKey;
+    use quil_types::crypto::Signer;
+
+    /// A GLOBAL frame number inside any activation epoch the tests set.
+    const KICK_FRAME: u64 = 100;
+
+    fn one_signer_aggregate(signer: &quil_crypto::FalconSigner, signature: Vec<u8>) -> Vec<u8> {
+        AggregateSignature {
+            signature,
+            public_key: Some(Bls48581G2PublicKey {
+                key_value: signer.public_key().to_vec(),
+            }),
+            bitmask: vec![0b1],
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A GLOBAL frame carrying `signer`'s vote: `Poseidon(output) ‖ rank`
+    /// under `"global"`.
+    fn voted_global_frame(
+        signer: &quil_crypto::FalconSigner,
+        frame_number: u64,
+        rank: u64,
+        output: Vec<u8>,
+    ) -> GlobalFrameHeader {
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap();
+        let payload = [identity.as_slice(), &rank.to_be_bytes()].concat();
+        let signature = signer.sign_with_domain(&payload, b"global").unwrap();
+        GlobalFrameHeader {
+            frame_number,
+            rank,
+            output,
+            public_key_signature_bls48581: one_signer_aggregate(signer, signature),
+            ..Default::default()
+        }
+    }
+
+    /// An app frame carrying `signer`'s vote: `address ‖ Poseidon(output) ‖
+    /// rank` under `"appshard" ‖ address`.
+    fn voted_app_frame(
+        signer: &quil_crypto::FalconSigner,
+        address: &[u8],
+        rank: u64,
+        output: Vec<u8>,
+    ) -> Vec<u8> {
+        let identity = quil_crypto::poseidon::hash_bytes_to_32(&output).unwrap();
+        let payload = [address, identity.as_slice(), &rank.to_be_bytes()].concat();
+        let domain = [b"appshard".as_slice(), address].concat();
+        let signature = signer.sign_with_domain(&payload, &domain).unwrap();
+        FrameHeader {
+            address: address.to_vec(),
+            frame_number: 42,
+            rank,
+            output,
+            public_key_signature_bls48581: one_signer_aggregate(signer, signature),
+            ..Default::default()
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn kick_between(frame_1: Vec<u8>, frame_2: Vec<u8>) -> ProverKick {
+        ProverKick {
+            conflicting_frame_1: frame_1,
+            conflicting_frame_2: frame_2,
+            ..kick_for_pubkey(vec![0x55u8; 585])
+        }
+    }
+
+    /// Both frames carry a valid vote signature, as GLOBAL checks them.
+    fn assert_votes_verify(kick: &ProverKick) {
+        let prover = quil_crypto::WesolowskiFrameProver::new(2048);
+        let bls = quil_crypto::FalconKeyConstructor;
+        for frame in [&kick.conflicting_frame_1, &kick.conflicting_frame_2] {
+            let tp = u32::from_be_bytes(frame[..4].try_into().unwrap());
+            verify_conflicting_frame_bls(frame, tp, &prover, &bls).unwrap();
+        }
+    }
+
+    /// Two honest GLOBAL votes from consecutive frames, the second relabelled
+    /// to the first's frame number. The frame number is unsigned, so both
+    /// signatures still verify and the legacy rule calls it equivocation;
+    /// the signed-slot rule sees two ranks and rejects it.
+    #[test]
+    fn signed_slot_rejects_honest_votes_relabelled_to_one_frame_number() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let first = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut second = voted_global_frame(&signer, KICK_FRAME + 1, 8, vec![0x02; 516]);
+        second.frame_number = KICK_FRAME;
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            second.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(u64::MAX));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// One honest GLOBAL vote and a copy whose output gains a zero byte. The
+    /// Poseidon sponge pads the last chunk with zeros, so both outputs have
+    /// the signed identity and the one signature verifies on both frames.
+    #[test]
+    fn signed_slot_rejects_one_vote_with_a_padded_output() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let vote = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut padded = vote.clone();
+        padded.output.push(0);
+        assert_eq!(
+            quil_crypto::poseidon::hash_bytes_to_32(&vote.output).unwrap(),
+            quil_crypto::poseidon::hash_bytes_to_32(&padded.output).unwrap()
+        );
+        let kick = kick_between(
+            vote.to_canonical_bytes().unwrap(),
+            padded.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(u64::MAX));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// Two GLOBAL votes for different frames in one rank are equivocation,
+    /// whatever frame numbers the headers carry.
+    #[test]
+    fn signed_slot_accepts_two_global_votes_in_one_rank() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let first = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let second = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x02; 516]);
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            second.to_canonical_bytes().unwrap(),
+        );
+        assert_votes_verify(&kick);
+
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        let mut renumbered = second;
+        renumbered.frame_number = KICK_FRAME + 5;
+        let kick = kick_between(
+            first.to_canonical_bytes().unwrap(),
+            renumbered.to_canonical_bytes().unwrap(),
+        );
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// Two app votes for different frames in one rank of one shard are
+    /// equivocation; the same ranks on different shards, different ranks on
+    /// one shard, or the genesis rank are not.
+    #[test]
+    fn signed_slot_accepts_two_app_votes_in_one_rank_of_one_shard() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let shard = [0x22u8; 32];
+        let other_shard = [0x33u8; 32];
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+
+        let kick = kick_between(
+            voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+            voted_app_frame(&signer, &shard, 7, vec![0x02; 516]),
+        );
+        assert_votes_verify(&kick);
+        assert!(verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+
+        for (frame_1, frame_2) in [
+            (
+                voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+                voted_app_frame(&signer, &other_shard, 7, vec![0x02; 516]),
+            ),
+            (
+                voted_app_frame(&signer, &shard, 7, vec![0x01; 516]),
+                voted_app_frame(&signer, &shard, 8, vec![0x02; 516]),
+            ),
+            (
+                voted_app_frame(&signer, &shard, 0, vec![0x01; 516]),
+                voted_app_frame(&signer, &shard, 0, vec![0x02; 516]),
+            ),
+        ] {
+            let kick = kick_between(frame_1, frame_2);
+            assert_votes_verify(&kick);
+            assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        }
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
+    }
+
+    /// An unsigned frame, a GLOBAL frame against an app frame, and a frame
+    /// the canonical codec cannot decode are no evidence.
+    #[test]
+    fn signed_slot_rejects_unsigned_mixed_or_undecodable_frames() {
+        let signer = quil_crypto::FalconSigner::generate();
+        let voted = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x01; 516]);
+        let mut unsigned = voted_global_frame(&signer, KICK_FRAME, 7, vec![0x02; 516]);
+        unsigned.public_key_signature_bls48581 = Vec::new();
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(Some(0));
+        for (frame_1, frame_2) in [
+            (
+                voted.to_canonical_bytes().unwrap(),
+                unsigned.to_canonical_bytes().unwrap(),
+            ),
+            (
+                voted.to_canonical_bytes().unwrap(),
+                voted_app_frame(&signer, &[], 7, vec![0x02; 516]),
+            ),
+            (
+                make_global_frame_bytes(KICK_FRAME, &[0x01; 516]),
+                make_global_frame_bytes(KICK_FRAME, &[0x02; 516]),
+            ),
+        ] {
+            let kick = kick_between(frame_1, frame_2);
+            assert!(!verify_kick_equivocation(&kick, KICK_FRAME).unwrap());
+        }
+        quil_types::consensus::set_kick_signed_slot_epoch_for_thread(None);
     }
 }

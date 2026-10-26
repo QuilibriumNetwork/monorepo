@@ -30,6 +30,13 @@ pub(crate) fn initialize(network: u8) {
             "QUIL_SENIORITY_SUCCESSION_EPOCH override active (localnet only)"
         );
     }
+    let kick_epoch = quil_types::consensus::init_kick_signed_slot_epoch(network);
+    if network != 0 && kick_epoch != u64::MAX {
+        tracing::warn!(
+            epoch = kick_epoch,
+            "QUIL_KICK_SIGNED_SLOT_EPOCH override active (localnet only)"
+        );
+    }
     if network != 0 && frames != quil_types::consensus::TESTNET_EPOCH_LENGTH_FRAMES {
         tracing::warn!(
             frames,

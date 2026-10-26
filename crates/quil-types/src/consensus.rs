@@ -473,6 +473,65 @@ pub fn set_seniority_succession_epoch_for_thread(epoch: Option<u64>) {
     SENIORITY_SUCCESSION_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a `ProverKick` counts as equivocation evidence only
+/// when its two conflicting frames carry votes for the same signed slot:
+/// the same shard address and the same non-zero rank, over different signed
+/// frame identities (`Poseidon(output)`). A legacy vote signs
+/// `address ‖ Poseidon(output) ‖ rank`, not the frame number, so before this
+/// epoch two votes from different ranks, or one vote with a re-encoded
+/// output, pass for an equivocation. Consensus-affecting: every archive must
+/// run a build with it before then. `None` until scheduled;
+/// `QUIL_KICK_SIGNED_SLOT_EPOCH` elsewhere, never by default.
+pub const MAINNET_KICK_SIGNED_SLOT_EPOCH: Option<u64> = None;
+
+static KICK_SIGNED_SLOT_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static KICK_SIGNED_SLOT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn kick_signed_slot_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_KICK_SIGNED_SLOT_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's signed-slot kick epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_kick_signed_slot_epoch(network: u8) -> u64 {
+    *KICK_SIGNED_SLOT_EPOCH.get_or_init(|| {
+        kick_signed_slot_epoch_for(
+            network,
+            std::env::var("QUIL_KICK_SIGNED_SLOT_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_kick_signed_slot_epoch`]; the mainnet epoch in a
+/// process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn kick_signed_slot_epoch() -> u64 {
+    if let Some(epoch) = KICK_SIGNED_SLOT_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *KICK_SIGNED_SLOT_EPOCH.get_or_init(|| kick_signed_slot_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` checks `ProverKick` evidence by signed slot.
+pub fn kick_signed_slot_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= kick_signed_slot_epoch()
+}
+
+/// Set the signed-slot kick epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_kick_signed_slot_epoch_for_thread(epoch: Option<u64>) {
+    KICK_SIGNED_SLOT_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -2020,6 +2079,37 @@ mod committee_handoff_policy_tests {
             (9, LegacyHistory::Discard)
         );
         assert_ne!(drill.chain_id, mainnet.chain_id);
+    }
+}
+
+#[cfg(test)]
+mod kick_signed_slot_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_kick_signed_slot_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::kick_signed_slot_epoch_for(0, setting),
+                super::MAINNET_KICK_SIGNED_SLOT_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::kick_signed_slot_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::kick_signed_slot_epoch_for(1, Some("bad")), u64::MAX);
+        assert_eq!(super::kick_signed_slot_epoch_for(1, None), u64::MAX);
+    }
+
+    #[test]
+    fn kick_signed_slot_rule_starts_at_the_first_frame_of_its_epoch() {
+        super::set_kick_signed_slot_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::kick_signed_slot_active(u64::MAX - 1));
+        super::set_kick_signed_slot_epoch_for_thread(Some(10));
+        let first = 10 * super::epoch_length_frames();
+        assert!(!super::kick_signed_slot_active(first - 1));
+        assert!(super::kick_signed_slot_active(first));
+        super::set_kick_signed_slot_epoch_for_thread(None);
+        assert_eq!(
+            super::kick_signed_slot_epoch(),
+            super::MAINNET_KICK_SIGNED_SLOT_EPOCH.unwrap_or(u64::MAX)
+        );
     }
 }
 
