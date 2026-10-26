@@ -44,29 +44,46 @@ const P2P_SIGNING_PREFIX: [u8; 21] = *b"libp2p-tls-handshake:";
 // Similarly, hash functions with an output length less than 256 bits MUST NOT be used.
 static P2P_SIGNATURE_ALGORITHM: &rcgen::SignatureAlgorithm = &rcgen::PKCS_ECDSA_P256_SHA256;
 
+/// QUILIBRIUM: a new certificate key, with its libp2p extension, for every
+/// handshake. The certificate key signs the handshake with ECDSA P-256,
+/// which a quantum computer could break. Anyone can fetch a node's
+/// certificate by dialing it, so a key kept for the process lifetime would
+/// let whoever breaks it impersonate the node over QUIC until it restarts;
+/// a key used for one handshake is worthless once that handshake is over.
+/// The libp2p TLS spec allows a new key and certificate for every
+/// connection attempt. If generating one fails, the certificate made at
+/// construction serves instead.
 #[derive(Debug)]
-pub(crate) struct AlwaysResolvesCert(Arc<rustls::sign::CertifiedKey>);
+pub(crate) struct FreshCertResolver {
+    identity: identity::Keypair,
+    fallback: Arc<rustls::sign::CertifiedKey>,
+}
 
-impl AlwaysResolvesCert {
-    pub(crate) fn new(
-        cert: rustls::pki_types::CertificateDer<'static>,
-        key: &rustls::pki_types::PrivateKeyDer<'_>,
-    ) -> Result<Self, rustls::Error> {
-        let certified_key = rustls::sign::CertifiedKey::new(
-            vec![cert],
-            rustls::crypto::ring::sign::any_ecdsa_type(key)?,
-        );
-        Ok(Self(Arc::new(certified_key)))
+impl FreshCertResolver {
+    pub(crate) fn new(identity: &identity::Keypair) -> Result<Self, GenError> {
+        Ok(Self { identity: identity.clone(), fallback: certified_key(identity)? })
+    }
+
+    fn fresh(&self) -> Arc<rustls::sign::CertifiedKey> {
+        certified_key(&self.identity).unwrap_or_else(|_| Arc::clone(&self.fallback))
     }
 }
 
-impl rustls::client::ResolvesClientCert for AlwaysResolvesCert {
+/// A new certificate for `identity`, with its signing key.
+fn certified_key(identity: &identity::Keypair) -> Result<Arc<rustls::sign::CertifiedKey>, GenError> {
+    let (cert, key) = generate(identity)?;
+    let signing_key = rustls::crypto::ring::sign::any_ecdsa_type(&key)
+        .expect("a generated certificate key is valid ECDSA DER; qed");
+    Ok(Arc::new(rustls::sign::CertifiedKey::new(vec![cert], signing_key)))
+}
+
+impl rustls::client::ResolvesClientCert for FreshCertResolver {
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(Arc::clone(&self.0))
+        Some(self.fresh())
     }
 
     fn has_certs(&self) -> bool {
@@ -74,12 +91,12 @@ impl rustls::client::ResolvesClientCert for AlwaysResolvesCert {
     }
 }
 
-impl rustls::server::ResolvesServerCert for AlwaysResolvesCert {
+impl rustls::server::ResolvesServerCert for FreshCertResolver {
     fn resolve(
         &self,
         _client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(Arc::clone(&self.0))
+        Some(self.fresh())
     }
 }
 
@@ -483,6 +500,24 @@ impl P2pCertificate<'_> {
         }
 
         Err(webpki::Error::UnsupportedSignatureAlgorithm)
+    }
+}
+
+#[cfg(test)]
+mod fresh_cert_tests {
+    use super::*;
+
+    /// QUILIBRIUM: every handshake gets a new certificate key, and each
+    /// certificate binds the same host key.
+    #[test]
+    fn every_handshake_gets_a_new_certificate_key() {
+        let host = identity::Keypair::generate_ed25519();
+        let resolver = FreshCertResolver::new(&host).unwrap();
+        let (first, second) = (resolver.fresh(), resolver.fresh());
+        assert_ne!(first.cert[0], second.cert[0]);
+        for key in [first, second, Arc::clone(&resolver.fallback)] {
+            assert_eq!(parse(&key.cert[0]).unwrap().peer_id(), host.public().to_peer_id());
+        }
     }
 }
 
