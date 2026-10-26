@@ -1249,6 +1249,30 @@ impl RemoteWorkerManager {
         }
     }
 
+    /// Each standalone worker's core and its channel for a diagnostics log
+    /// export, or why it has none: not connected, or a channel without mTLS,
+    /// which never carries log lines.
+    pub fn log_export_channels(&self) -> Vec<(u32, std::result::Result<Channel, tonic::Status>)> {
+        let Ok(workers) = self.workers.lock() else {
+            return Vec::new();
+        };
+        let mut channels: Vec<_> = workers
+            .values()
+            .map(|w| {
+                let channel = match (&w.channel, self.client_tls.is_some()) {
+                    (Some(channel), true) => Ok(channel.clone()),
+                    (Some(_), false) => Err(tonic::Status::failed_precondition(
+                        "the worker channel has no mTLS; log lines are not sent over it",
+                    )),
+                    (None, _) => Err(tonic::Status::unavailable(NOT_CONNECTED)),
+                };
+                (w.core_id, channel)
+            })
+            .collect();
+        channels.sort_by_key(|(core, _)| *core);
+        channels
+    }
+
     /// Number of registered workers.
     pub fn worker_count(&self) -> usize {
         self.workers.lock().unwrap().len()
@@ -1882,6 +1906,13 @@ mod fee_relay_tests {
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for SnapshotServer {
+        type ExportLogsStream = tonic::codegen::BoxStream<node::ExportWorkerLogsChunk>;
+        async fn export_logs(
+            &self,
+            _: tonic::Request<node::ExportWorkerLogsRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ExportLogsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test server"))
+        }
         async fn deliver_shard_consensus(
             &self,
             _: tonic::Request<node::DeliverShardConsensusRequest>,
@@ -2481,6 +2512,13 @@ mod fee_relay_tests {
     }
     #[tonic::async_trait]
     impl node::data_ipc_service_server::DataIpcService for AssignedWorker {
+        type ExportLogsStream = tonic::codegen::BoxStream<node::ExportWorkerLogsChunk>;
+        async fn export_logs(
+            &self,
+            _: tonic::Request<node::ExportWorkerLogsRequest>,
+        ) -> std::result::Result<tonic::Response<Self::ExportLogsStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test server"))
+        }
         async fn deliver_shard_consensus(
             &self,
             _: tonic::Request<node::DeliverShardConsensusRequest>,
@@ -2963,5 +3001,46 @@ mod fee_relay_tests {
         );
         assert_eq!(manager.respawn_state(1), (false, 0));
         stop_serving(stop, serving).await;
+    }
+}
+
+#[cfg(test)]
+mod log_export_channel_tests {
+    use super::*;
+
+    /// Log lines travel only over a connected worker channel with mTLS: a
+    /// channel without it is refused as a precondition, a worker not
+    /// connected is unavailable.
+    #[tokio::test]
+    async fn log_exports_use_only_connected_mtls_channels() {
+        let pem = || ("ca".to_string(), "leaf".to_string(), "key".to_string());
+        for (tls, expected) in [
+            (Some(pem()), None),
+            (None, Some(tonic::Code::FailedPrecondition)),
+        ] {
+            let manager = RemoteWorkerManager::new(
+                vec![
+                    (2, "http://127.0.0.1:2".into()),
+                    (1, "http://127.0.0.1:1".into()),
+                ],
+                String::new(),
+                tls,
+            );
+            manager.workers.lock().unwrap().get_mut(&1).unwrap().channel =
+                Some(tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+            let channels = manager.log_export_channels();
+            assert_eq!(
+                channels.iter().map(|(core, _)| *core).collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(
+                channels[0].1.as_ref().err().map(|status| status.code()),
+                expected
+            );
+            assert_eq!(
+                channels[1].1.as_ref().unwrap_err().code(),
+                tonic::Code::Unavailable
+            );
+        }
     }
 }

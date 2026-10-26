@@ -11,6 +11,7 @@ use quil_lifecycle::{ShutdownReason, Supervisor};
 pub(crate) async fn start(
     mut sup: Supervisor<anyhow::Error>,
     config: &quil_config::Config,
+    config_dir: &std::path::Path,
     core_id: u32,
     parent_process: u32,
 ) -> anyhow::Result<ShutdownReason<anyhow::Error>> {
@@ -345,6 +346,26 @@ pub(crate) async fn start(
     // worker never emits a storage attestation and its shard reward is withheld.
     .with_kv_db(db_arc.clone() as Arc<dyn quil_types::store::KvDb>)
     .with_registry_refresh(registry_refresh);
+
+    // The master collects this worker's own log lines into the diagnostics
+    // log bundles it approves, over the worker channel (`ExportLogs`); its
+    // host and user names travel along for the master's redactor.
+    {
+        let log_dir = config.logger.log_dir(config_dir);
+        let home_paths: Vec<PathBuf> = std::iter::once(config_dir.to_path_buf())
+            .chain(log_dir.clone())
+            .collect();
+        worker_node = worker_node.with_log_export(Arc::new(
+            move |request: quil_types::proto::node::ExportWorkerLogsRequest| {
+                quil_rpc::log_export::worker::spawn_export(
+                    log_dir.clone(),
+                    core_id,
+                    request,
+                    home_paths.clone(),
+                )
+            },
+        ));
+    }
 
     // Wire the prover-tree syncer so the worker can sync the global
     // prover tree from the master at startup and before materializing

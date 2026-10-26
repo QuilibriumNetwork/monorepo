@@ -3657,12 +3657,25 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
         // peer consents to sending it these logs, so the node approves its
         // requests itself, one export at a time off the async runtime.
         let (log_request_service, log_operator_service) = {
-            let requests = Arc::new(quil_rpc::diagnostics_logs::LogRequests::with_approval(
-                &config.diagnostics.log_requests,
-                peer_id,
-                diagnostics_spool,
-                diagnostics_auto,
-            ));
+            // Standalone workers write their logs on their own hosts: the
+            // node collects their lines over the worker channels (mTLS
+            // only) into the bundles it approves.
+            let standalone_workers = remote_fee_workers.clone();
+            let worker_logs = quil_rpc::diagnostics_logs::workers::DataIpcWorkers::new(move || {
+                standalone_workers
+                    .get()
+                    .map(|manager| manager.log_export_channels())
+                    .unwrap_or_default()
+            });
+            let requests = Arc::new(
+                quil_rpc::diagnostics_logs::LogRequests::with_approval(
+                    &config.diagnostics.log_requests,
+                    peer_id,
+                    diagnostics_spool,
+                    diagnostics_auto,
+                )
+                .with_worker_logs(Arc::new(worker_logs)),
+            );
             if requests.automatic() {
                 let requests = requests.clone();
                 sup.spawn("diagnostics-log-approval", move |token| async move {

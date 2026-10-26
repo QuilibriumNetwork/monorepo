@@ -700,6 +700,61 @@ service DataIPCService {
   // `keep`, as a thread worker does. The worker revalidates its binding and
   // runs the removal after answering.
   rpc EvictPayload(EvictPayloadRequest) returns (EvictPayloadResponse);
+  // ExportLogs streams this worker's own log lines (its worker-N.log and
+  // that file's rotations) of a window to the master, which redacts them
+  // with its own lines into a diagnostics log bundle. The first message
+  // carries the summary; the lines follow, oldest first.
+  rpc ExportLogs(ExportWorkerLogsRequest) returns (stream ExportWorkerLogsChunk);
+}
+
+message ExportWorkerLogsRequest {
+  // UTC Unix seconds, inclusive; at most a day apart.
+  uint64 since_unix = 1;
+  uint64 until_unix = 2;
+  // Full shard filters: lines mentioning none of them are left out, except
+  // warnings and errors. Empty keeps every line.
+  repeated bytes filters = 3;
+  // Texts a kept line must contain, except warnings and errors.
+  repeated string matches = 4;
+  // Lowest level rank kept: 0 trace, 1 debug, 2 info, 3 warn, 4 error.
+  uint32 min_level = 5;
+  // The most line bytes to send: past it, the oldest records are left out.
+  uint64 max_bytes = 6;
+  // SHA-256 of the first line of the master's own worker-N.log of this
+  // core, when it has one. A worker whose own file starts with the same
+  // line writes the master's log directory: it answers same_files and sends
+  // no lines.
+  bytes master_head = 7;
+}
+
+message ExportWorkerLogsSummary {
+  // The worker writes the master's log directory (see master_head).
+  bool same_files = 1;
+  // The worker writes no log files (logger.path is none).
+  bool no_log_files = 2;
+  // The log files read, and those that failed (`<name>: <error>`).
+  repeated string files = 3;
+  repeated string read_errors = 4;
+  uint64 lines_read = 5;
+  uint64 records_read = 6;
+  // Records sent, and the selected records left out as the oldest past
+  // max_bytes, with their bytes.
+  uint64 records_kept = 7;
+  uint64 records_dropped = 8;
+  uint64 bytes_dropped = 9;
+  // Line bytes that follow.
+  uint64 line_bytes = 10;
+  // The worker host's name and its users' names, for the master to
+  // tokenize in these lines as it does its own.
+  repeated string hosts = 11;
+  repeated string users = 12;
+}
+
+message ExportWorkerLogsChunk {
+  // Set on the first message only.
+  ExportWorkerLogsSummary summary = 1;
+  // Newline-separated log lines; a line may continue in the next message.
+  bytes lines = 2;
 }
 
 message EvictPayloadRequest {

@@ -10,12 +10,15 @@
 //! `.diagnostics/token-maps`.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use super::workers::{self, WorkerLog};
 use crate::log_export::{
     self, Cancelled, Export, ExportOptions, RecordReader, Selection, SourceInfo, BUNDLE_LOG,
 };
@@ -341,34 +344,101 @@ pub fn build_automatic(
     cancel: &AtomicBool,
     salt: Option<[u8; 32]>,
 ) -> anyhow::Result<AutoBundle> {
+    build_automatic_with_workers(auto, request, &[], max, now_secs, cancel, salt)
+}
+
+/// The lines of a standalone worker from `start` on, as a log source.
+struct WorkerLines {
+    lines: Arc<[u8]>,
+    start: usize,
+}
+
+impl AsRef<[u8]> for WorkerLines {
+    fn as_ref(&self) -> &[u8] {
+        &self.lines[self.start..]
+    }
+}
+
+/// [`build_automatic`] with the lines of this node's standalone workers
+/// (`workers`, [`workers::collect`]), redacted with this node's own and
+/// described in the manifest's `workers`. When the bundle would exceed
+/// `max`, it is built again from the newest quarter of each worker's lines,
+/// then from none, and the manifest records what was left out.
+pub fn build_automatic_with_workers(
+    auto: &AutoApproval,
+    request: &AutoRequest,
+    workers: &[WorkerLog],
+    max: usize,
+    now_secs: i64,
+    cancel: &AtomicBool,
+    salt: Option<[u8; 32]>,
+) -> anyhow::Result<AutoBundle> {
     let selection = request_selection(request.since_unix, request.until_unix, &request.filters)?;
-    let (readers, names) =
-        log_export::file_readers(&auto.log_dir, selection.since, selection.until)?;
-    anyhow::ensure!(
-        !names.is_empty(),
-        "no node log files in {}",
-        auto.log_dir.display()
-    );
-    let source = SourceInfo::Files(names);
     let home_paths = [auto.log_dir.clone(), auto.token_maps.clone()];
-    let options = ExportOptions {
-        salt,
-        home_paths: &home_paths,
-        cancel: Some(cancel),
-        ..ExportOptions::default()
+    let literals = workers::literals(workers);
+    let steps = if workers.iter().any(|log| !log.lines.is_empty()) {
+        3
+    } else {
+        1
     };
-    let export = request_export(
-        readers,
-        None,
-        &source,
-        &selection,
-        &request.id,
-        &request.requester,
-        Approval::Automatic,
-        max,
-        &options,
-    )?;
-    let sealed = seal_export(export, &request.id, &request.recipient_kem_public_key, max)?;
+    let mut step = 0;
+    let sealed = loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let (mut readers, names) =
+            log_export::file_readers(&auto.log_dir, selection.since, selection.until)?;
+        anyhow::ensure!(
+            !names.is_empty(),
+            "no node log files in {}",
+            auto.log_dir.display()
+        );
+        let mut trimmed = Vec::with_capacity(workers.len());
+        for log in workers {
+            let start = workers::kept_from(&log.lines, step);
+            trimmed.push(start as u64);
+            if start < log.lines.len() {
+                let lines: Box<dyn BufRead> = Box::new(Cursor::new(WorkerLines {
+                    lines: log.lines.clone(),
+                    start,
+                }));
+                readers.push(RecordReader::new(vec![(
+                    format!("standalone worker {}", log.core),
+                    lines,
+                )]));
+            }
+        }
+        let source = SourceInfo::Files(names);
+        let options = ExportOptions {
+            salt,
+            home_paths: &home_paths,
+            cancel: Some(cancel),
+            literals: &literals,
+            ..ExportOptions::default()
+        };
+        let built = request_export(
+            readers,
+            None,
+            &source,
+            &selection,
+            &request.id,
+            &request.requester,
+            Approval::Automatic,
+            max,
+            &options,
+        )
+        .and_then(|mut export| {
+            if !workers.is_empty() {
+                export.manifest["workers"] = workers::manifest(workers, &trimmed);
+            }
+            seal_export(export, &request.id, &request.recipient_kem_public_key, max)
+        });
+        match built {
+            Ok(sealed) => break sealed,
+            Err(error) if is_too_large(&error) && step + 1 < steps => step += 1,
+            Err(error) => return Err(error),
+        }
+    };
     if cancel.load(Ordering::Relaxed) {
         return Err(Cancelled.into());
     }
@@ -626,5 +696,208 @@ mod tests {
             maps_before,
             "no token map of a cancelled export"
         );
+    }
+
+    fn worker_log(core: u32, lines: String) -> WorkerLog {
+        WorkerLog {
+            core,
+            status: workers::WorkerStatus::Collected,
+            summary: Some(quil_types::proto::node::ExportWorkerLogsSummary {
+                files: vec![format!("worker-{core}.log")],
+                line_bytes: lines.len() as u64,
+                hosts: vec!["workerhost".into()],
+                users: vec!["workeruser".into()],
+                ..Default::default()
+            }),
+            lines: Arc::from(lines.into_bytes()),
+            detail: None,
+        }
+    }
+
+    fn info_line(time: &str, message: &str, fields: &str) -> String {
+        format!("2026-10-14T{time}Z\tinfo\tquil_node/src/main.rs:7\t{message}\t{fields}\n")
+    }
+
+    /// A node with `master` in its log directory, and a request for its
+    /// 12:00-14:00 window sealed to `kem`.
+    fn node_with(master: &str, kem: &[u8]) -> (tempfile::TempDir, AutoApproval, AutoRequest) {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("master.log"), master).unwrap();
+        let auto = AutoApproval {
+            log_dir,
+            token_maps: dir.path().join("maps"),
+        };
+        let request = AutoRequest {
+            id: vec![0x3f; 16],
+            requester: "…Ab12cd".into(),
+            since_unix: 1_791_979_200,
+            until_unix: 1_791_986_400,
+            filters: Vec::new(),
+            recipient_kem_public_key: kem.to_vec(),
+        };
+        (dir, auto, request)
+    }
+
+    /// The bundle's log text and manifest.
+    fn opened(
+        built: &AutoBundle,
+        kem: &quil_crypto::Sntrup761KeyPair,
+    ) -> (String, serde_json::Value) {
+        let files = unpack_bundle(
+            &quil_crypto::seal::open(&built.sealed, &kem.secret, &[0x3f; 16]).unwrap(),
+        )
+        .unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(files[0].as_slice()),
+            &mut text,
+        )
+        .unwrap();
+        (text, serde_json::from_slice(&files[1]).unwrap())
+    }
+
+    /// A standalone worker's lines join this node's in time order and are
+    /// redacted by the same redactor: an address both hosts logged gets one
+    /// token, and the worker's host and user names are hidden. The manifest
+    /// records each worker's outcome, the unreachable one too.
+    #[test]
+    fn standalone_workers_lines_join_the_bundle_redacted_once() {
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let master = [
+            info_line("12:10:00", "dialing 192.0.2.10:8340", r#"{"coreId":0}"#),
+            info_line("12:30:00", "master later", r#"{"coreId":0}"#),
+        ]
+        .concat();
+        let (_dir, auto, request) = node_with(&master, &kem.public);
+        let logs = vec![
+            worker_log(
+                2,
+                info_line(
+                    "12:20:00",
+                    "dialing 192.0.2.10:8340 from workerhost as workeruser",
+                    r#"{"coreId":2}"#,
+                ),
+            ),
+            WorkerLog {
+                core: 3,
+                status: workers::WorkerStatus::Unreachable(
+                    tonic::Code::Unavailable.description().to_string(),
+                ),
+                summary: None,
+                lines: Arc::from(Vec::new()),
+                detail: None,
+            },
+        ];
+        let built = build_automatic_with_workers(
+            &auto,
+            &request,
+            &logs,
+            1 << 20,
+            1_791_986_400,
+            &AtomicBool::new(false),
+            Some([5; 32]),
+        )
+        .unwrap();
+        let (text, manifest) = opened(&built, &kem);
+        let messages: Vec<&str> = text
+            .lines()
+            .map(|line| line.split('\t').nth(3).unwrap_or(line))
+            .collect();
+        assert_eq!(messages.len(), 3, "{text}");
+        assert!(
+            messages[1].starts_with("dialing ") && messages[2] == "master later",
+            "{text}"
+        );
+        assert!(
+            !text.contains("192.0.2.10")
+                && !text.contains("workerhost")
+                && !text.contains("workeruser"),
+            "{text}"
+        );
+        let map: BTreeMap<String, String> = std::fs::read_to_string(&built.token_map)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(t, v)| (t.to_string(), v.to_string()))
+            .collect();
+        let address: Vec<&String> = map
+            .iter()
+            .filter(|(_, value)| value.contains("192.0.2.10"))
+            .map(|(token, _)| token)
+            .collect();
+        assert_eq!(address.len(), 1, "{map:?}");
+        assert_eq!(text.matches(address[0].as_str()).count(), 2, "{text}");
+        assert!(map.values().any(|value| value == "workerhost"), "{map:?}");
+        assert_eq!(manifest["lines"]["kept"], 3);
+        assert_eq!(manifest["workers"][0]["status"], "collected");
+        assert_eq!(manifest["workers"][1]["status"], "unreachable");
+        assert_eq!(manifest["workers"].as_array().unwrap().len(), 2);
+    }
+
+    /// A bundle over its cap with a worker's lines is built again from the
+    /// newest quarter of them, and the manifest says how much was left out;
+    /// one over its cap without them is refused as before.
+    #[test]
+    fn a_bundle_over_its_cap_keeps_the_newest_worker_lines() {
+        let kem = quil_crypto::Sntrup761KeyPair::generate();
+        let master = info_line("12:05:00", "master", r#"{"coreId":0}"#);
+        let (_dir, auto, request) = node_with(&master, &kem.public);
+        let words = |seed: u32| -> String {
+            Sha256::digest(seed.to_le_bytes())
+                .iter()
+                .map(|byte| char::from(b'a' + byte % 26))
+                .collect()
+        };
+        let lines: String = (0..600u32)
+            .map(|i| {
+                info_line(
+                    &format!("12:{:02}:{:02}", 10 + i / 60, i % 60),
+                    &format!(
+                        "w{i} {} {} {}",
+                        words(3 * i),
+                        words(3 * i + 1),
+                        words(3 * i + 2)
+                    ),
+                    r#"{"coreId":2}"#,
+                )
+            })
+            .collect();
+        let mut now = 1_791_986_400;
+        let mut build = |logs: &[WorkerLog], max: usize| {
+            now += 1;
+            build_automatic_with_workers(
+                &auto,
+                &request,
+                logs,
+                max,
+                now,
+                &AtomicBool::new(false),
+                Some([5; 32]),
+            )
+        };
+        let logs = vec![worker_log(2, lines.clone())];
+        let full = build(&logs, 1 << 22).unwrap().sealed.len();
+        let start = workers::kept_from(lines.as_bytes(), 1);
+        let quarter = build(&[worker_log(2, lines[start..].to_string())], 1 << 22)
+            .unwrap()
+            .sealed
+            .len();
+        assert!(full > quarter + 8000, "{full} against {quarter}");
+        let built = build(&logs, quarter + 2000).unwrap();
+        let (text, manifest) = opened(&built, &kem);
+        assert!(
+            text.contains("\tw599 ") && !text.contains("\tw0 ") && text.contains("\tmaster\t"),
+            "{text}"
+        );
+        assert_eq!(manifest["workers"][0]["status"], "truncated");
+        assert_eq!(
+            manifest["workers"][0]["left_out_for_bundle_cap"]["bytes"],
+            start as u64
+        );
+        let refused = build(&logs, 200).unwrap_err();
+        assert!(is_too_large(&refused), "{refused:#}");
     }
 }

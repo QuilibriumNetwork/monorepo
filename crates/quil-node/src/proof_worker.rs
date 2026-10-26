@@ -205,8 +205,14 @@ mod tests {
             .join("absent-worker")
             .to_string_lossy()
             .into_owned();
-        let result =
-            crate::worker_node::start(quil_lifecycle::Supervisor::new(), &config, 1, 0).await;
+        let result = crate::worker_node::start(
+            quil_lifecycle::Supervisor::new(),
+            &config,
+            directory.path(),
+            1,
+            0,
+        )
+        .await;
         assert!(result.is_err());
         assert!(!store.exists());
     }
