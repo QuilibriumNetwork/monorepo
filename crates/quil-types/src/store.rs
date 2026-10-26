@@ -1189,9 +1189,10 @@ pub trait HypergraphStore: Send + Sync {
     }
 
     /// Delete every stored version of `vertex_key`'s blob from `first` on,
-    /// staged into `txn`. A shard rewind uses it for removals made after the
-    /// state it restores: any removes-phase blob hides its vertex, so a newer
-    /// empty one cannot undo a removal. Default: unsupported.
+    /// staged into `txn`; from 0, its unversioned (pre-versioning) blob too.
+    /// A shard rewind uses it for removals made after the state it restores:
+    /// any removes-phase blob hides its vertex, so a newer empty one cannot
+    /// undo a removal. Default: unsupported.
     fn delete_vertex_underlying_versions_from(
         &self,
         _txn: &dyn Transaction,
