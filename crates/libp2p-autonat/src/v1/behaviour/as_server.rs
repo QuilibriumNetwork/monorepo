@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     num::NonZeroU8,
 };
 
@@ -116,6 +116,15 @@ pub struct ServerStats {
     pub refused: BTreeMap<&'static str, u32>,
     /// Requests whose exchange failed while their dial-back was pending.
     pub request_failures: u32,
+    /// The clients behind `served`.
+    pub served_clients: BTreeSet<PeerId>,
+    /// The clients behind `failed`, with their failures.
+    pub failed_clients: BTreeMap<PeerId, u32>,
+    /// `failed` by the first address the dial-back tried (transport and
+    /// port class, see `address_class`).
+    pub failed_by_address: BTreeMap<&'static str, u32>,
+    /// `failed` by why the dial-back failed (see `dial_error_class`).
+    pub failed_by_error: BTreeMap<&'static str, u32>,
 }
 
 impl ServerStats {
@@ -127,20 +136,142 @@ impl ServerStats {
     /// The refusals by reason, most frequent first (`denied=3
     /// throttled=1`), or `none`.
     pub fn refused_by_reason(&self) -> String {
-        let mut counts: Vec<(&str, u32)> = self.refused.iter().map(|(r, n)| (*r, *n)).collect();
-        if counts.is_empty() {
-            return "none".to_string();
-        }
-        counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        counts
+        by_count(self.refused.iter().map(|(r, n)| (r.to_string(), *n)))
+    }
+
+    /// The failures by the first address tried (`tcp:default=3
+    /// quic:ephemeral=1`), or `none`.
+    pub fn failed_by_address(&self) -> String {
+        by_count(
+            self.failed_by_address
+                .iter()
+                .map(|(c, n)| (c.to_string(), *n)),
+        )
+    }
+
+    /// The failures by why the dial-back failed (`timeout=3 refused=1`), or
+    /// `none`.
+    pub fn failed_by_error(&self) -> String {
+        by_count(
+            self.failed_by_error
+                .iter()
+                .map(|(c, n)| (c.to_string(), *n)),
+        )
+    }
+
+    /// The `limit` clients with the most failures, by the last six
+    /// characters of their peer ID (`…a1b2c3=4`), or `none`.
+    pub fn top_failed_clients(&self, limit: usize) -> String {
+        let tail = |peer: &PeerId| {
+            let id = peer.to_base58();
+            format!("…{}", &id[id.len().saturating_sub(6)..])
+        };
+        let mut counts: Vec<(String, u32)> = self
+            .failed_clients
             .iter()
-            .map(|(r, n)| format!("{r}={n}"))
-            .collect::<Vec<_>>()
-            .join(" ")
+            .map(|(p, n)| (tail(p), *n))
+            .collect();
+        counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        counts.truncate(limit);
+        by_count(counts.into_iter())
     }
 
     fn refuse(&mut self, reason: &'static str) {
         *self.refused.entry(reason).or_default() += 1;
+    }
+
+    fn serve(&mut self, client: PeerId) {
+        self.served += 1;
+        self.served_clients.insert(client);
+    }
+
+    fn fail(&mut self, client: PeerId, addrs: &[Multiaddr], error: &DialError) {
+        self.failed += 1;
+        *self.failed_clients.entry(client).or_default() += 1;
+        let address = addrs.first().map_or("none", address_class);
+        *self.failed_by_address.entry(address).or_default() += 1;
+        *self
+            .failed_by_error
+            .entry(dial_error_class(error))
+            .or_default() += 1;
+    }
+}
+
+/// QUILIBRIUM: `name=count` pairs, most frequent first, or `none`.
+fn by_count(counts: impl Iterator<Item = (String, u32)>) -> String {
+    let mut counts: Vec<(String, u32)> = counts.collect();
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    counts
+        .iter()
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// QUILIBRIUM: the transport and port class of a dial-back address, for the
+/// operator summary: `default` is the node's default port 8336, `worker`
+/// the remote worker range 25000–25999, `ephemeral` a port from 32768 up
+/// (an outbound connection's source port, which nothing listens on), and
+/// `other` any other port, such as a configured listen port.
+pub(crate) fn address_class(addr: &Multiaddr) -> &'static str {
+    let (mut tcp, mut udp, mut quic) = (None, None, false);
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Tcp(port) => tcp = Some(port),
+            Protocol::Udp(port) => udp = Some(port),
+            Protocol::QuicV1 | Protocol::Quic => quic = true,
+            _ => {}
+        }
+    }
+    let (quic, port) = match (tcp, udp) {
+        (Some(port), _) => (false, port),
+        (None, Some(port)) if quic => (true, port),
+        _ => return "other",
+    };
+    match (quic, port) {
+        (false, 8336) => "tcp:default",
+        (false, 25000..=25999) => "tcp:worker",
+        (false, 32768..) => "tcp:ephemeral",
+        (false, _) => "tcp:other",
+        (true, 8336) => "quic:default",
+        (true, 25000..=25999) => "quic:worker",
+        (true, 32768..) => "quic:ephemeral",
+        (true, _) => "quic:other",
+    }
+}
+
+/// QUILIBRIUM: why a dial-back reached none of the client's addresses, from
+/// the last address it tried: `refused` (nothing listens there, or a
+/// firewall rejects), `timeout` (no answer: a firewall drops, or NAT),
+/// `reset` (the connection broke during the handshake), `no_route`,
+/// `wrong_peer` (another node answered), or `other` (e.g. a failed
+/// handshake upgrade).
+pub(crate) fn dial_error_class(error: &DialError) -> &'static str {
+    use std::io::ErrorKind;
+    let DialError::Transport(errors) = error else {
+        return match error {
+            DialError::WrongPeerId { .. } => "wrong_peer",
+            _ => "other",
+        };
+    };
+    let last = errors.iter().rev().find_map(|(_, error)| match error {
+        TransportError::Other(error) => Some(error.kind()),
+        TransportError::MultiaddrNotSupported(_) => None,
+    });
+    match last {
+        Some(ErrorKind::ConnectionRefused) => "refused",
+        Some(ErrorKind::TimedOut) => "timeout",
+        Some(
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::BrokenPipe,
+        ) => "reset",
+        Some(ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable) => "no_route",
+        _ => "other",
     }
 }
 
@@ -387,7 +518,7 @@ impl AsServer<'_> {
         let OngoingInbound {
             probe_id, channel, ..
         } = self.ongoing_inbound.remove(peer).unwrap();
-        self.stats.served += 1;
+        self.stats.serve(*peer);
         let response = DialResponse {
             result: Ok(address.clone()),
             status_text: None,
@@ -413,13 +544,16 @@ impl AsServer<'_> {
         // (see `dial_back_failure`).
         let (
             OngoingInbound {
-                probe_id, channel, ..
+                probe_id,
+                channel,
+                addrs,
+                ..
             },
             response_error,
             reason,
         ) = take_failed_dial_back(&mut *self.ongoing_inbound, peer, connection_id, error)?;
         match response_error {
-            ResponseError::DialError => self.stats.failed += 1,
+            ResponseError::DialError => self.stats.fail(peer, &addrs, error),
             _ => self.stats.refuse(reason),
         }
 
@@ -716,6 +850,114 @@ mod test {
             refusal_reason("no dialable addresses"),
             "no_dialable_address"
         );
+    }
+
+    /// QUILIBRIUM: a failed dial-back is counted by client, by the class of
+    /// the first address tried and by why it failed; the summary names the
+    /// clients that failed most, by peer ID tail.
+    #[test]
+    fn server_stats_describe_failed_dial_backs() {
+        let io = |kind| TransportError::Other(std::io::Error::new(kind, "dial"));
+        let unreached =
+            |addr: &Multiaddr, kind| DialError::Transport(vec![(addr.clone(), io(kind))]);
+        let default: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let ephemeral: Multiaddr = "/ip4/203.0.113.8/tcp/51234".parse().unwrap();
+        let quic: Multiaddr = "/ip4/203.0.113.9/udp/8336/quic-v1".parse().unwrap();
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+
+        let mut stats = ServerStats::default();
+        assert_eq!(stats.failed_by_address(), "none");
+        assert_eq!(stats.failed_by_error(), "none");
+        assert_eq!(stats.top_failed_clients(3), "none");
+        stats.fail(
+            a,
+            &[ephemeral.clone(), default.clone()],
+            &unreached(&default, std::io::ErrorKind::TimedOut),
+        );
+        stats.fail(
+            a,
+            &[ephemeral.clone()],
+            &unreached(&ephemeral, std::io::ErrorKind::TimedOut),
+        );
+        stats.fail(
+            b,
+            &[quic.clone()],
+            &unreached(&quic, std::io::ErrorKind::ConnectionRefused),
+        );
+        stats.serve(c);
+        stats.serve(c);
+
+        assert_eq!((stats.failed, stats.served), (3, 2));
+        assert_eq!(
+            (stats.failed_clients.len(), stats.served_clients.len()),
+            (2, 1)
+        );
+        assert_eq!(stats.failed_by_address(), "tcp:ephemeral=2 quic:default=1");
+        assert_eq!(stats.failed_by_error(), "timeout=2 refused=1");
+        let a_id = a.to_base58();
+        assert_eq!(
+            stats.top_failed_clients(1),
+            format!("…{}=2", &a_id[a_id.len() - 6..])
+        );
+        assert_eq!(stats.top_failed_clients(3).split(' ').count(), 2);
+    }
+
+    /// QUILIBRIUM: addresses are classed by transport and port, dial errors
+    /// by the last supported address tried.
+    #[test]
+    fn dial_backs_are_classed_by_address_and_error() {
+        for (addr, class) in [
+            ("/ip4/203.0.113.7/tcp/8336", "tcp:default"),
+            ("/ip4/203.0.113.7/tcp/25003", "tcp:worker"),
+            ("/ip4/203.0.113.7/tcp/40000", "tcp:ephemeral"),
+            (
+                "/ip4/203.0.113.7/tcp/9336/p2p/QmP9NNzAzRjCL8gdQBkKHwyBCWJGVb3jPrQzTveYdU24kH",
+                "tcp:other",
+            ),
+            ("/ip4/203.0.113.7/udp/8336/quic-v1", "quic:default"),
+            ("/ip4/203.0.113.7/udp/61000/quic-v1", "quic:ephemeral"),
+            ("/ip4/203.0.113.7/udp/8336", "other"),
+        ] {
+            assert_eq!(address_class(&addr.parse().unwrap()), class, "{addr}");
+        }
+        let addr: Multiaddr = "/ip4/203.0.113.7/tcp/8336".parse().unwrap();
+        let io = |kind| {
+            (
+                addr.clone(),
+                TransportError::Other(std::io::Error::new(kind, "dial")),
+            )
+        };
+        let unsupported = || {
+            (
+                addr.clone(),
+                TransportError::MultiaddrNotSupported(addr.clone()),
+            )
+        };
+        use std::io::ErrorKind::*;
+        for (errors, class) in [
+            (vec![io(ConnectionRefused)], "refused"),
+            (
+                vec![io(ConnectionRefused), io(TimedOut), unsupported()],
+                "timeout",
+            ),
+            (vec![io(ConnectionReset)], "reset"),
+            (vec![io(UnexpectedEof)], "reset"),
+            (vec![io(HostUnreachable)], "no_route"),
+            (vec![io(Other)], "other"),
+            (vec![unsupported()], "other"),
+        ] {
+            let shown = format!("{errors:?}");
+            assert_eq!(
+                dial_error_class(&DialError::Transport(errors)),
+                class,
+                "{shown}"
+            );
+        }
+        let wrong_peer = DialError::WrongPeerId {
+            obtained: PeerId::random(),
+            address: addr.clone(),
+        };
+        assert_eq!(dial_error_class(&wrong_peer), "wrong_peer");
     }
 
     fn random_ip<'a>() -> Protocol<'a> {
