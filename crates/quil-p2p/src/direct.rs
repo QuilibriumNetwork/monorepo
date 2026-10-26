@@ -15,11 +15,13 @@
 //! so senders go straight to gossip. Only already-connected peers are used:
 //! no dial, so delivery never waits on NAT traversal.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use libp2p::StreamProtocol;
+use libp2p::{PeerId, StreamProtocol};
 
 /// Largest bitmask a direct message may name.
 pub const MAX_DIRECT_BITMASK: usize = 256;
@@ -29,6 +31,59 @@ pub const MAX_DIRECT_DATA: usize = 8 * 1024 * 1024;
 pub const DIRECT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a peer that lacks the protocol is not asked again.
 pub const UNSUPPORTED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Direct messages one peer may deliver per second, sustained.
+pub const DIRECT_PEER_RATE: f64 = 500.0;
+/// Direct messages one peer may deliver in a burst.
+pub const DIRECT_PEER_BURST: f64 = 1000.0;
+/// Free slots of the receive queue that direct messages leave to gossip and
+/// the node's own messages.
+pub const DIRECT_QUEUE_RESERVE: usize = 1024;
+/// The most peers whose budgets [`DirectAdmission`] tracks at once.
+const MAX_TRACKED_PEERS: usize = 1024;
+
+/// Admission of inbound direct messages to the receive queue they share with
+/// gossip. Direct messages bypass gossip's duplicate check and scoring, so
+/// without a bound one peer could fill that queue and gossip would be dropped:
+/// each peer gets a token bucket ([`DIRECT_PEER_RATE`], [`DIRECT_PEER_BURST`]),
+/// and a direct message is refused while the queue has
+/// [`DIRECT_QUEUE_RESERVE`] free slots or fewer. A refused message is answered
+/// as refused, and its sender falls back to gossip.
+#[derive(Debug, Default)]
+pub struct DirectAdmission {
+    /// Each peer's tokens and when they were last counted.
+    peers: HashMap<PeerId, (f64, Instant)>,
+}
+
+impl DirectAdmission {
+    /// Whether to admit a direct message from `peer` while the receive queue
+    /// has `free_slots` free, at `now`; an admitted message spends a token.
+    pub fn admit(&mut self, peer: PeerId, free_slots: usize, now: Instant) -> bool {
+        if free_slots <= DIRECT_QUEUE_RESERVE {
+            return false;
+        }
+        let refill = |tokens: f64, at: Instant| {
+            let elapsed = now.saturating_duration_since(at).as_secs_f64();
+            (tokens + elapsed * DIRECT_PEER_RATE).min(DIRECT_PEER_BURST)
+        };
+        if self.peers.len() >= MAX_TRACKED_PEERS && !self.peers.contains_key(&peer) {
+            // A peer whose bucket refilled is no different from a new one.
+            self.peers
+                .retain(|_, (tokens, at)| refill(*tokens, *at) < DIRECT_PEER_BURST);
+            if self.peers.len() >= MAX_TRACKED_PEERS {
+                return false;
+            }
+        }
+        let (tokens, at) = self.peers.entry(peer).or_insert((DIRECT_PEER_BURST, now));
+        *tokens = refill(*tokens, *at);
+        *at = now;
+        if *tokens < 1.0 {
+            return false;
+        }
+        *tokens -= 1.0;
+        true
+    }
+}
 
 /// The direct-delivery protocol on `network`.
 pub fn direct_protocol(network: u8) -> StreamProtocol {
@@ -346,6 +401,46 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    /// A peer's direct messages are admitted up to its burst, then at its
+    /// rate; other peers keep their own budgets; nothing is admitted into
+    /// the share of the receive queue kept for gossip.
+    #[test]
+    fn direct_admission_is_bounded_per_peer_and_keeps_a_gossip_reserve() {
+        let mut admission = DirectAdmission::default();
+        let start = Instant::now();
+        let (one, two) = (PeerId::random(), PeerId::random());
+        let free = DIRECT_QUEUE_RESERVE + 1;
+        let burst = DIRECT_PEER_BURST as usize;
+        let admitted = (0..burst + 10)
+            .filter(|_| admission.admit(one, free, start))
+            .count();
+        assert_eq!(admitted, burst);
+        assert!(admission.admit(two, free, start));
+        let later = start + std::time::Duration::from_secs(1);
+        let refilled = DIRECT_PEER_RATE as usize;
+        let admitted = (0..refilled + 10)
+            .filter(|_| admission.admit(one, free, later))
+            .count();
+        assert_eq!(admitted, refilled);
+        assert!(!admission.admit(two, DIRECT_QUEUE_RESERVE, later));
+    }
+
+    /// Tracking is bounded: past the limit, peers with full buckets are
+    /// forgotten, and a new peer is refused while every tracked one is busy.
+    #[test]
+    fn direct_admission_tracks_a_bounded_number_of_peers() {
+        let mut admission = DirectAdmission::default();
+        let start = Instant::now();
+        let free = DIRECT_QUEUE_RESERVE + 1;
+        for _ in 0..MAX_TRACKED_PEERS {
+            assert!(admission.admit(PeerId::random(), free, start));
+        }
+        assert!(!admission.admit(PeerId::random(), free, start));
+        let later = start + std::time::Duration::from_secs(1);
+        assert!(admission.admit(PeerId::random(), free, later));
+        assert_eq!(admission.peers.len(), 1);
     }
 
     #[test]

@@ -119,6 +119,10 @@ impl ValidationResult {
 /// message is signed) and data.
 type Validator = Arc<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync>;
 
+/// The validator of bitmasks without one of their own: forwarding peer,
+/// bitmask and data.
+type FallbackValidator = Arc<dyn Fn(&PeerId, &[u8], &[u8]) -> ValidationResult + Send + Sync>;
+
 /// Events emitted by the behaviour to the swarm. Identical in shape to the
 /// historical `BlossomSubEvent` so `node.rs`'s match arms are unchanged.
 #[derive(Debug)]
@@ -160,6 +164,9 @@ pub struct BlossomSubBehaviour {
     peer_subscriptions: HashMap<PeerId, HashSet<Vec<u8>>>,
     /// Per-bitmask validators, run on the receive path before delivery.
     validators: HashMap<Vec<u8>, Validator>,
+    /// Validator of the bitmasks without one in `validators` (the shard
+    /// topics, which come and go with the shards served).
+    fallback_validator: Option<FallbackValidator>,
     /// Local peer id (author of outgoing messages).
     local_peer_id: Option<PeerId>,
     /// Application-level score overrides (source of truth for the getter).
@@ -217,6 +224,7 @@ impl BlossomSubBehaviour {
             connected_peers: HashMap::new(),
             peer_subscriptions: HashMap::new(),
             validators: HashMap::new(),
+            fallback_validator: None,
             local_peer_id: None,
             application_scores: HashMap::new(),
             pending_events: VecDeque::new(),
@@ -331,6 +339,16 @@ impl BlossomSubBehaviour {
         validator: impl Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync + 'static,
     ) {
         self.validators.insert(bitmask, Arc::new(validator));
+    }
+
+    /// Register the validator of every bitmask without a validator of its own
+    /// (see [`register_validator`](Self::register_validator)). It also gets
+    /// the bitmask, and runs on the receive path before delivery/forwarding.
+    pub fn register_fallback_validator(
+        &mut self,
+        validator: impl Fn(&PeerId, &[u8], &[u8]) -> ValidationResult + Send + Sync + 'static,
+    ) {
+        self.fallback_validator = Some(Arc::new(validator));
     }
 
     /// Install a per-(source, target) forward filter. **Unsupported on stock
@@ -937,12 +955,14 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         let bitmask = bitmask_from_topic(&message.topic);
                         // `validate_messages()` is on, so we must report an
                         // outcome for every message before it is forwarded.
-                        let outcome = match self.validators.get(&bitmask) {
-                            Some(v) => {
-                                v(&propagation_source, message.source.as_ref(), &message.data)
-                            }
-                            None => ValidationResult::Accept,
-                        };
+                        let outcome =
+                            match (self.validators.get(&bitmask), &self.fallback_validator) {
+                                (Some(v), _) => {
+                                    v(&propagation_source, message.source.as_ref(), &message.data)
+                                }
+                                (None, Some(v)) => v(&propagation_source, &bitmask, &message.data),
+                                (None, None) => ValidationResult::Accept,
+                            };
                         let _ = self.inner.report_message_validation_result(
                             &message_id,
                             &propagation_source,
@@ -1297,6 +1317,27 @@ mod propagation_tests {
         assert_eq!(one(&forwarder, None, b""), ValidationResult::Ignore);
         let two = &behaviour.validators[&vec![2]];
         assert_eq!(two(&forwarder, None, b""), ValidationResult::Reject);
+    }
+
+    /// Bitmasks without a validator of their own go to the fallback, with
+    /// their bitmask; those with one never do.
+    #[test]
+    fn the_fallback_validator_sees_unregistered_bitmasks() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        behaviour.register_validator(vec![1], |_, _| ValidationResult::Accept);
+        behaviour.register_fallback_validator(|_, bitmask, data| {
+            if bitmask == [2] && data == b"ok" {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Ignore
+            }
+        });
+        let fallback = behaviour.fallback_validator.clone().unwrap();
+        let peer = PeerId::random();
+        assert!(behaviour.validators.contains_key(&vec![1]));
+        assert_eq!(fallback(&peer, &[2], b"ok"), ValidationResult::Accept);
+        assert_eq!(fallback(&peer, &[2], b"no"), ValidationResult::Ignore);
+        assert_eq!(fallback(&peer, &[3], b"ok"), ValidationResult::Ignore);
     }
 
     /// A peer's subscriptions are bounded in number and topic length.

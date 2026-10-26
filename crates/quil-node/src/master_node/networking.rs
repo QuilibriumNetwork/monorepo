@@ -133,6 +133,34 @@ pub(crate) async fn init(
         for len in [32usize, 33, 34, 35] {
             p2p_handle.subscribe(vec![0xFFu8; len]).await;
         }
+        // Mesh-level checks on the archive-only global topics: a prover
+        // message must be a prover operation, bundle or request (the receive
+        // loop's own check), and GLOBAL_CONSENSUS carries nothing any release
+        // reads.
+        // Refused messages are ignored, not rejected: releases before these
+        // checks forward them, and penalising those relays would cut them off
+        // the mesh.
+        let prover_check = quil_engine::message_router::validator_global_prover();
+        p2p_handle
+            .register_gossip_validator(
+                quil_engine::bitmasks::GLOBAL_PROVER.to_vec(),
+                Box::new(move |_peer: &quil_p2p::PeerId, data: &[u8]| {
+                    if prover_check(data).is_accept() {
+                        quil_p2p::ValidationResult::Accept
+                    } else {
+                        quil_p2p::ValidationResult::Ignore
+                    }
+                }),
+            )
+            .await;
+        p2p_handle
+            .register_gossip_validator(
+                quil_engine::bitmasks::GLOBAL_CONSENSUS.to_vec(),
+                Box::new(|_peer: &quil_p2p::PeerId, _data: &[u8]| {
+                    quil_p2p::ValidationResult::Ignore
+                }),
+            )
+            .await;
     }
     p2p_handle
         .subscribe(quil_engine::bitmasks::GLOBAL_PEER_INFO.to_vec())
@@ -151,6 +179,15 @@ pub(crate) async fn init(
     // Forward only alerts the receive loop can verify.
     p2p_handle
         .register_global_alert_validator(quil_engine::bitmasks::GLOBAL_ALERT.to_vec())
+        .await;
+    // Topics without a validator of their own: the shard topics, subscribed as
+    // shards come and go.
+    p2p_handle
+        .register_fallback_validator(Box::new(
+            |_peer: &quil_p2p::PeerId, bitmask: &[u8], data: &[u8]| {
+                shard_gossip_verdict(bitmask, data)
+            },
+        ))
         .await;
     if archive_mode {
         info!("subscribed to all global + bulk shard bitmasks (archive mode)");
@@ -175,4 +212,61 @@ pub(crate) async fn init(
         consensus_loopback_rx,
         listen_addr,
     })
+}
+
+/// The mesh verdict on a message of a topic without a validator of its own.
+/// On a shard CW topic (`0x01 ‖ appFilter`) a transmission must split into one
+/// of the CW channels with a payload
+/// ([`quil_engine::bitmasks::shard_cw_split_payload`]): the receive loop drops
+/// anything else unread, so it is not forwarded either. It is ignored, not
+/// rejected: releases before this check forward such messages. Messages of
+/// other topics are accepted, as before.
+pub(crate) fn shard_gossip_verdict(bitmask: &[u8], data: &[u8]) -> quil_p2p::ValidationResult {
+    let shard_cw_topic = bitmask.len() == 33 && bitmask[0] == 0x01;
+    if !shard_cw_topic {
+        return quil_p2p::ValidationResult::Accept;
+    }
+    match quil_engine::bitmasks::shard_cw_split_payload(data) {
+        Some((channel, cw_bytes))
+            if channel <= quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL
+                && !cw_bytes.is_empty() =>
+        {
+            quil_p2p::ValidationResult::Accept
+        }
+        _ => quil_p2p::ValidationResult::Ignore,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_p2p::ValidationResult::{Accept, Ignore};
+
+    /// Shard CW transmissions of every framing a release sends are forwarded;
+    /// malformed ones and unknown channels are dropped without penalty, and
+    /// other topics are unaffected.
+    #[test]
+    fn shard_cw_transmissions_are_checked_at_the_mesh() {
+        let filter = [7u8; 32];
+        let topic = quil_engine::bitmasks::shard_cw_bitmask(&filter);
+        let vote = b"vote bytes";
+        for channel in 0..=quil_engine::cw_app_seams::CW_APP_BLOCK_CHANNEL {
+            let framed = quil_engine::bitmasks::shard_cw_frame_payload(channel, vote);
+            assert_eq!(shard_gossip_verdict(&topic, &framed), Accept);
+            let addressed =
+                quil_engine::bitmasks::shard_cw_frame_for(channel, vote, &[vec![1; 897]]);
+            assert_eq!(shard_gossip_verdict(&topic, &addressed), Accept);
+            let mut legacy = vec![channel as u8];
+            legacy.extend_from_slice(vote);
+            assert_eq!(shard_gossip_verdict(&topic, &legacy), Accept);
+        }
+        let unknown = quil_engine::bitmasks::shard_cw_frame_payload(4, vote);
+        assert_eq!(shard_gossip_verdict(&topic, &unknown), Ignore);
+        assert_eq!(shard_gossip_verdict(&topic, &[]), Ignore);
+        assert_eq!(shard_gossip_verdict(&topic, &[0x80, 1, 2]), Ignore);
+        assert_eq!(shard_gossip_verdict(&topic, &[0]), Ignore);
+        let frame_topic = quil_engine::bitmasks::shard_frame_bitmask(&filter);
+        assert_eq!(shard_gossip_verdict(&frame_topic, &[]), Accept);
+        assert_eq!(shard_gossip_verdict(&[0x01; 33], b"anything"), Ignore);
+    }
 }

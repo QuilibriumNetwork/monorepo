@@ -653,6 +653,9 @@ impl P2PNode {
             let mut direct_unsupported: std::collections::HashMap<PeerId, std::time::Instant> =
                 std::collections::HashMap::new();
             let mut direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            // Per-peer budgets of inbound direct messages, and the receive
+            // queue's share kept for gossip ([`crate::direct::DirectAdmission`]).
+            let mut direct_admission = crate::direct::DirectAdmission::default();
             let mut bootstrapped = false;
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1158,6 +1161,7 @@ impl P2PNode {
                                             // Delivered as a gossip message on its bitmask would
                                             // be, from the authenticated connection's peer.
                                             let accepted = direct_allowed.contains(&request.bitmask)
+                                                && direct_admission.admit(peer, msg_tx.capacity(), std::time::Instant::now())
                                                 && msg_tx.try_send(ReceivedMessage {
                                                     bitmask: request.bitmask,
                                                     data: request.data,
@@ -1284,6 +1288,12 @@ impl P2PNode {
                                     .behaviour_mut()
                                     .blossomsub
                                     .register_authored_validator(bitmask, validator);
+                            }
+                            Some(P2PCommand::RegisterFallbackValidator { validator }) => {
+                                swarm
+                                    .behaviour_mut()
+                                    .blossomsub
+                                    .register_fallback_validator(validator);
                             }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
@@ -1540,19 +1550,12 @@ impl P2PHandle {
     }
 
     /// Mesh-level gate for GLOBAL_ALERT: only an alert the receive loop can
-    /// verify is forwarded ([`crate::peer_info::global_alert_well_formed`];
-    /// the Ed448 signature itself is verified there). Anything else is
-    /// dropped without penalty until strict validation, rejected after.
+    /// verify is forwarded ([`global_alert_verdict`]; the Ed448 signature
+    /// itself is verified there).
     pub async fn register_global_alert_validator(&self, bitmask: Vec<u8>) {
         let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
             Box::new(|_peer, data| {
-                if crate::peer_info::global_alert_well_formed(data) {
-                    crate::ValidationResult::Accept
-                } else if crate::peer_info::strict_peer_info_validation() {
-                    crate::ValidationResult::Reject
-                } else {
-                    crate::ValidationResult::Ignore
-                }
+                global_alert_verdict(data, crate::peer_info::strict_peer_info_validation())
             });
         let _ = self
             .cmd_tx
@@ -1587,6 +1590,36 @@ impl P2PHandle {
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterAuthoredValidator { bitmask, validator })
+            .await;
+    }
+
+    /// Register a mesh-level validator on `bitmask`. Like the validators
+    /// above, it runs in the gossip poll thread BEFORE a message is delivered
+    /// to the app recv loop or forwarded to the mesh, so it must stay cheap.
+    /// `Ignore` drops a message without penalising its forwarder; `Reject`
+    /// also penalises it, so it is only for messages no release forwards.
+    pub async fn register_gossip_validator(
+        &self,
+        bitmask: Vec<u8>,
+        validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
+    /// Register the mesh-level validator of every bitmask without a validator
+    /// of its own (the shard topics, which come and go with the shards this
+    /// node serves). It gets the forwarding peer, the bitmask and the data;
+    /// see [`register_gossip_validator`](Self::register_gossip_validator).
+    pub async fn register_fallback_validator(
+        &self,
+        validator: Box<dyn Fn(&PeerId, &[u8], &[u8]) -> crate::ValidationResult + Send + Sync>,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterFallbackValidator { validator })
             .await;
     }
 
@@ -1897,6 +1930,11 @@ enum P2PCommand {
         validator:
             Box<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> crate::ValidationResult + Send + Sync>,
     },
+    /// Register the validator of every bitmask without one of its own; it
+    /// gets the forwarding peer, the bitmask and the data.
+    RegisterFallbackValidator {
+        validator: Box<dyn Fn(&PeerId, &[u8], &[u8]) -> crate::ValidationResult + Send + Sync>,
+    },
     Publish {
         bitmask: Vec<u8>,
         data: Vec<u8>,
@@ -1967,6 +2005,29 @@ struct NodeBehaviour {
     autonat: libp2p::autonat::Behaviour,
     /// Point-to-point delivery to a connected peer; see [`crate::direct`].
     direct: libp2p::request_response::Behaviour<crate::direct::DirectCodec>,
+}
+
+/// The mesh verdict on a GLOBAL_ALERT: `Accept` for an alert of exactly the
+/// canonical layout ([`crate::peer_info::global_alert_well_formed`] with no
+/// trailing bytes). One that is not well formed is dropped without penalty
+/// until strict validation, rejected after. Trailing bytes are dropped without
+/// penalty in any case: releases before this check forward such copies (the
+/// signature does not cover them, so they replay a genuine alert under a new
+/// message id), and penalising those relays would cut them off the mesh.
+pub(crate) fn global_alert_verdict(data: &[u8], strict: bool) -> crate::ValidationResult {
+    if !crate::peer_info::global_alert_well_formed(data) {
+        return if strict {
+            crate::ValidationResult::Reject
+        } else {
+            crate::ValidationResult::Ignore
+        };
+    }
+    let msg_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    if data.len() == 8 + msg_len + 4 + 114 {
+        crate::ValidationResult::Accept
+    } else {
+        crate::ValidationResult::Ignore
+    }
 }
 
 /// Compute the BlossomSub message ID: `[0x01, SHA256(data)...]` —
@@ -2173,6 +2234,28 @@ mod tests {
         )));
         assert!(routable("/ip6/2606:4700::1111/tcp/8336"));
         assert!(routable("/ip4/100.128.0.1/tcp/8336"));
+    }
+
+    /// Only an alert of exactly the canonical layout is forwarded; trailing
+    /// bytes are dropped without penalty, also under strict validation.
+    #[test]
+    fn global_alerts_with_trailing_bytes_are_ignored() {
+        use crate::ValidationResult::{Accept, Ignore, Reject};
+        let message = b"maintenance at 12:00 UTC";
+        let mut alert = 0x0911u32.to_be_bytes().to_vec();
+        alert.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        alert.extend_from_slice(message);
+        alert.extend_from_slice(&114u32.to_be_bytes());
+        alert.extend_from_slice(&[7; 114]);
+        assert_eq!(global_alert_verdict(&alert, false), Accept);
+        assert_eq!(global_alert_verdict(&alert, true), Accept);
+        let mut trailing = alert.clone();
+        trailing.push(0);
+        assert_eq!(global_alert_verdict(&trailing, false), Ignore);
+        assert_eq!(global_alert_verdict(&trailing, true), Ignore);
+        let truncated = &alert[..alert.len() - 1];
+        assert_eq!(global_alert_verdict(truncated, false), Ignore);
+        assert_eq!(global_alert_verdict(truncated, true), Reject);
     }
 
     /// Local, shared, reserved and mapped-local addresses are not.
