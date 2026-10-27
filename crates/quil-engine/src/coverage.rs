@@ -498,6 +498,61 @@ pub fn build_shard_inventory(
 ) -> Vec<ShardCoverageEntry> {
     let get_sizes =
         crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone(), sizes.clone());
+    shard_inventory(
+        shards_store.as_ref(),
+        prover_registry,
+        frame_number,
+        get_sizes,
+    )
+}
+
+/// The coverage monitor's inventory for this node. An archive's grid follows
+/// every split, and its latent shards report committed deliveries, so it
+/// sizes them with `sizes`. A regular node's grid stays the 64-way genesis
+/// grid: a row with no live shard beneath it covers only latent shards, and
+/// an output committed anywhere in it gave the row a nominal size with no
+/// provers, whose halt stopped every app shard of the node. A regular node
+/// sizes its rows by its own data only.
+pub fn shard_inventory_provider(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn quil_types::store::ShardsStore>,
+    prover_registry: Arc<dyn ProverRegistry>,
+    sizes: std::sync::Arc<crate::shard_info::CommittedShardSizes>,
+    archive_mode: bool,
+) -> ShardInventoryProvider {
+    Arc::new(move |frame_number: u64| {
+        if archive_mode {
+            build_shard_inventory(
+                crdt.clone(),
+                shards_store.clone(),
+                prover_registry.as_ref(),
+                frame_number,
+                &sizes,
+            )
+        } else {
+            let get_sizes = crate::shard_info::local_app_shard_measured_sizes(
+                crdt.clone(),
+                shards_store.clone(),
+            );
+            shard_inventory(
+                shards_store.as_ref(),
+                prover_registry.as_ref(),
+                frame_number,
+                get_sizes,
+            )
+        }
+    })
+}
+
+fn shard_inventory(
+    shards_store: &dyn quil_types::store::ShardsStore,
+    prover_registry: &dyn ProverRegistry,
+    frame_number: u64,
+    get_sizes: impl Fn(
+        &[u8],
+        &quil_types::store::ShardInfo,
+    ) -> quil_types::error::Result<Vec<crate::shard_info::ShardSizeEntry>>,
+) -> Vec<ShardCoverageEntry> {
     let mut out: Vec<ShardCoverageEntry> = Vec::new();
     let Ok(shards) = shards_store.range_app_shards() else {
         return out;
@@ -746,8 +801,8 @@ impl CoverageMonitor {
             };
 
         let mut any_halted = false;
-        let mut currently_halted: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        // Halted filter -> (active, size, streak), for the transition log.
+        let mut currently_halted: HashMap<Vec<u8>, (u64, u64, u64)> = HashMap::new();
 
         for entry in &inventory {
             // Zero-size shards have no data to protect — no halt
@@ -781,14 +836,8 @@ impl CoverageMonitor {
                 };
                 if streak.count >= effective_grace {
                     any_halted = true;
-                    currently_halted.insert(entry.filter.clone());
-                    tracing::debug!(
-                        filter = hex::encode(&entry.filter),
-                        active,
-                        size = entry.size,
-                        streak = streak.count,
-                        "COVERAGE HALT — shard below threshold"
-                    );
+                    currently_halted
+                        .insert(entry.filter.clone(), (active, entry.size, streak.count));
                 }
             } else {
                 // Recovered — clear streak
@@ -811,8 +860,19 @@ impl CoverageMonitor {
         {
             let mut emitted = self.emitted_halted.lock().unwrap();
             // Newly-halted filters.
-            for filter in &currently_halted {
+            for (filter, (active, size, streak)) in &currently_halted {
                 if !emitted.contains(filter) {
+                    tracing::warn!(
+                        filter = hex::encode(filter),
+                        active,
+                        halt_threshold = self.thresholds.halt_threshold,
+                        size,
+                        streak,
+                        frame = frame_number,
+                        "coverage halt: in this node's coverage view the shard holds data \
+                         with too few active provers for the whole grace window; this node's \
+                         app shards stop producing until it recovers"
+                    );
                     self.event_distributor.publish(ControlEvent {
                         event_type: ControlEventType::CoverageHalt,
                         data: ControlEventData::Coverage {
@@ -827,10 +887,15 @@ impl CoverageMonitor {
             // Filters that were halted but no longer are.
             let cleared: Vec<Vec<u8>> = emitted
                 .iter()
-                .filter(|f| !currently_halted.contains(*f))
+                .filter(|f| !currently_halted.contains_key(*f))
                 .cloned()
                 .collect();
             for filter in cleared {
+                tracing::info!(
+                    filter = hex::encode(&filter),
+                    frame = frame_number,
+                    "coverage halt cleared; this node's app shards resume"
+                );
                 self.event_distributor.publish(ControlEvent {
                     event_type: ControlEventType::CoverageResume,
                     data: ControlEventData::Coverage {
@@ -2945,5 +3010,162 @@ mod tests {
         let thresholds = CoverageThresholds::mainnet();
         let out = compute_shard_halt_durations(&t, &[], &thresholds);
         assert_eq!(out.get(&b"shard-ghost".to_vec()), Some(&1));
+    }
+
+    // =================================================================
+    // A regular node's frozen genesis grid
+    // =================================================================
+
+    /// The mainnet 64-row genesis grid of one application, as a regular node
+    /// keeps it, with one output committed by GLOBAL into a block of row
+    /// `111111`, beneath which no shard is live. The registry's only live
+    /// shard is a 7-bit child of row `000000`.
+    struct GenesisGrid {
+        _dbs: [quil_store::RocksDb; 2],
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        shards: Arc<dyn quil_types::store::ShardsStore>,
+        registry: Arc<dyn ProverRegistry>,
+        row_with_delivery: Vec<u8>,
+    }
+
+    fn genesis_grid() -> GenesisGrid {
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_execution::token_intrinsic::global_commit::{commit_entry, Outcome, SpendEntry};
+        use quil_types::store::{KvDb, ShardsStore};
+
+        let app = [7u8; 32];
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let mut output = [9u8; 32];
+        output[0] = 0b1111_1100;
+        let entry = SpendEntry {
+            kind: 0x0512,
+            tx_id: [1; 32],
+            source_frame: 40,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[2; 32]],
+            outputs: vec![output],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: None,
+        };
+        let state = HypergraphState::new(crdt.clone());
+        let outcome = commit_entry(
+            &state,
+            5,
+            &app,
+            &entry,
+            quil_types::execution::ShardPath::WHOLE,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+        state.commit().unwrap();
+
+        let grid_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let shards: Arc<dyn ShardsStore> =
+            Arc::new(quil_store::RocksShardsStore::new(grid_db.inner()));
+        let mut shard_key =
+            quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        shard_key.extend_from_slice(&app);
+        let txn = grid_db.new_batch(false).unwrap();
+        for prefix in quil_forest::genesis_grid_prefixes(0) {
+            shards
+                .put_app_shard(
+                    txn.as_ref(),
+                    &quil_types::store::ShardInfo {
+                        shard_key: shard_key.clone(),
+                        prefix,
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        GenesisGrid {
+            _dbs: [db, grid_db],
+            crdt,
+            shards,
+            registry: Arc::new(HotShardRegistry {
+                filter: quil_forest::encode_shard_bit_path(&app, &[false; 7]),
+                active: 4,
+            }),
+            row_with_delivery: quil_forest::encode_shard_bit_path(&app, &[true; 6]),
+        }
+    }
+
+    /// The filters a monitor fed by `provider` halts over a full grace window.
+    fn coverage_halts(grid: &GenesisGrid, provider: ShardInventoryProvider) -> Vec<Vec<u8>> {
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        let monitor = CoverageMonitor::new(
+            grid.registry.clone(),
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        monitor.set_shard_inventory_provider(provider);
+        for offset in 0..=DEFAULT_HALT_GRACE_FRAMES {
+            monitor.check(1_000_000 + offset);
+        }
+        let events = dist.0.lock().unwrap();
+        let halts = events
+            .iter()
+            .filter_map(|e| match (&e.event_type, &e.data) {
+                (
+                    quil_types::consensus::ControlEventType::CoverageHalt,
+                    quil_types::consensus::ControlEventData::Coverage { filter, .. },
+                ) => Some(filter.clone()),
+                _ => None,
+            })
+            .collect();
+        halts
+    }
+
+    // An output committed into a latent region gave a regular node's genesis
+    // row a nominal size with no provers; its halt stopped every app shard of
+    // every regular node.
+    #[test]
+    fn a_regular_node_does_not_halt_on_a_delivery_into_its_genesis_grid() {
+        let grid = genesis_grid();
+        let halts = coverage_halts(&grid, installed_inventory(&grid, false));
+        assert!(
+            halts.is_empty(),
+            "a regular node entered a coverage halt, stopping its app shards, on \
+             genesis rows {:?} (the row holding the committed delivery is {})",
+            halts.iter().map(hex::encode).collect::<Vec<_>>(),
+            hex::encode(&grid.row_with_delivery),
+        );
+    }
+
+    #[test]
+    fn an_archive_still_halts_on_a_delivery_into_an_unstaffed_shard() {
+        let grid = genesis_grid();
+        assert_eq!(
+            coverage_halts(&grid, installed_inventory(&grid, true)),
+            vec![grid.row_with_delivery.clone()],
+        );
+    }
+
+    /// The inventory `master_node` installs, given the node's archive mode.
+    fn installed_inventory(grid: &GenesisGrid, archive_mode: bool) -> ShardInventoryProvider {
+        super::shard_inventory_provider(
+            grid.crdt.clone(),
+            grid.shards.clone(),
+            grid.registry.clone(),
+            Arc::new(crate::shard_info::CommittedShardSizes::default()),
+            archive_mode,
+        )
     }
 }
