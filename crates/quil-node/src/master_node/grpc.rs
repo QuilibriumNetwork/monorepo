@@ -1973,7 +1973,7 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
                 if quil_engine::storage_epoch_batch::is_seat_message(&request) {
                     let message = quil_engine::storage_epoch_batch::SeatMessage::from_bytes(&request)
                         .map_err(|error| error.to_string())?;
-                    // Called from the storage job thread, outside the runtime.
+                    // Called from a storage job's thread, outside the runtime.
                     let (transport, halt, runtime) = (transport.clone(), halt.clone(), tokio::runtime::Handle::current());
                     let publish: quil_engine::storage_epoch_batch::Publish = Arc::new(move |proof: Vec<u8>| {
                         if halt.any_halted() {

@@ -3144,6 +3144,85 @@ impl AppConsensusEngine {
         )
     }
 
+    /// Hash storage proofs (decided 2026-10-26): label the leaves this member
+    /// will register for its seat's next snapshot during the epoch before it
+    /// (`crate::storage_labels`), so the snapshot only adds the data. A lane
+    /// of its own (`crate::storage_jobs`): labelling the epoch after next must
+    /// never hold up the seat's encode of the next. A snapshot already
+    /// encoded needs none.
+    fn label_storage_ahead(&self, global_frame_number: u64) {
+        use quil_types::consensus::{
+            epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame,
+        };
+        let Some(store) = crate::storage_labels::installed() else {
+            return;
+        };
+        let current = epoch_for_frame(global_frame_number);
+        let epoch = if global_frame_number < storage_snapshot_frame(current + 1) {
+            current + 1
+        } else {
+            current + 2
+        };
+        if !hash_storage_proofs_at(epoch) {
+            return;
+        }
+        let (Some(crdt), Some(kv)) = (self.hypergraph.clone(), self.kv_db.clone()) else {
+            return;
+        };
+        let Ok(member) = <[u8; 32]>::try_from(self.local_prover_address.as_slice()) else {
+            return;
+        };
+        // The next epoch's registration, once sealed, needs its labels no
+        // more: free their disk before the epoch after fills it.
+        if let Ok(Some(sealed)) =
+            self.prover_registry
+                .get_storage_seat_slot(&member, &self.filter, current + 1)
+        {
+            if sealed.sealed_at.is_some() {
+                for prefix in &sealed.leaves {
+                    store.forget(
+                        current + 1,
+                        &member,
+                        &quil_execution::global_intrinsic::leaf_id_bytes(&self.filter, prefix),
+                    );
+                }
+            }
+        }
+        if crate::storage_labels::precomputed(&member, &self.filter, epoch) {
+            return;
+        }
+        let replicas = quil_store::replica_store::ReplicaStore::new(kv);
+        if !matches!(replicas.get_partition(epoch, &self.filter), Ok(None)) {
+            return;
+        }
+        // Only a member that will register this shard: an archive executes
+        // every shard and registers none.
+        let holds_seat = self
+            .prover_registry
+            .get_prover_info(&self.local_prover_address)
+            .ok()
+            .flatten()
+            .is_some_and(|info| {
+                info.allocations.iter().any(|a| {
+                    a.confirmation_filter == self.filter
+                        && matches!(
+                            a.effective_status(global_frame_number),
+                            quil_types::consensus::EffectiveStatus::Active
+                                | quil_types::consensus::EffectiveStatus::Joining
+                        )
+                })
+            });
+        if !holds_seat {
+            return;
+        }
+        let filter = self.filter.clone();
+        let key = [b"labels".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
+        let lane = [b"labels ".as_slice(), &self.filter].concat();
+        crate::storage_snapshot::request(&lane, key, "storage labels", move || {
+            crate::storage_labels::precompute(store, &crdt, &member, &filter, epoch)
+        });
+    }
+
     /// Hash storage proofs (decided 2026-10-21): this member's epoch proof
     /// for its seat on the shard, during the epoch after the one it settles.
     /// It seals the registration for the epoch after next once GLOBAL has
@@ -3156,6 +3235,7 @@ impl AppConsensusEngine {
         use quil_types::consensus::{
             epoch_for_frame, hash_storage_proofs_at, storage_snapshot_frame,
         };
+        self.label_storage_ahead(global_frame_number);
         let current = epoch_for_frame(global_frame_number);
         let (epoch, seal_epoch) = (current.saturating_sub(1), current + 1);
         if !hash_storage_proofs_at(epoch) && !hash_storage_proofs_at(seal_epoch) {
@@ -3326,7 +3406,8 @@ impl AppConsensusEngine {
                     frames: slot.frames,
                     accumulator: slot.accumulator,
                 });
-        crate::storage_snapshot::spawn("epoch proof part", move || {
+        let lane = filter.clone();
+        crate::storage_jobs::spawn(&lane, "epoch proof part", move || {
             let prove = |seals: bool, settles: bool| -> quil_types::error::Result<()> {
                 let withdraw = |error: quil_types::error::QuilError| {
                     use crate::storage_epoch_batch::{SeatKey, SeatMessage};

@@ -557,10 +557,54 @@ pub fn compute_storage_confirm(
 /// GLOBAL frames after an epoch's snapshot frame within which a renewal waits
 /// for the member's snapshot of it to be encoded; past them a member without
 /// one renews without a registration (its seat stays, its frames that epoch
-/// are unattested). A third of an epoch, 240 frames on mainnet. Decided
-/// 2026-10-20.
+/// are unattested). Four ninths of an epoch, 320 frames on mainnet: the most
+/// that leaves a seat which labels its leaves at the snapshot as long again to
+/// label them for its seal before the epoch begins (decided 2026-10-26). A
+/// seat whose leaves were labelled ahead (`crate::storage_labels`) needs
+/// neither.
 pub fn storage_snapshot_grace() -> u64 {
-    quil_types::consensus::epoch_length_frames() / 3
+    quil_types::consensus::epoch_length_frames() * 4 / 9
+}
+
+/// Ask for the snapshot of each of a seat's `filters` (its shard, then the
+/// shards a change creates from it) that `member` has not encoded for
+/// `epoch` and whose `snapshots` sources are known, to encode in the
+/// background in the seat's lane (`crate::storage_jobs`). A renewal asks for
+/// every seat's before it waits on any, so they encode side by side.
+pub fn request_storage_snapshots(
+    crdt: &std::sync::Arc<HypergraphCrdt>,
+    replica_store: &quil_store::replica_store::ReplicaStore,
+    filters: &[Vec<u8>],
+    member: &[u8],
+    epoch: u64,
+    snapshots: &[(
+        Vec<u8>,
+        Vec<quil_execution::global_intrinsic::storage_snapshot::Source>,
+    )],
+) -> quil_types::error::Result<()> {
+    let Some(seat) = filters.first() else {
+        return Ok(());
+    };
+    if !quil_types::consensus::hash_storage_proofs_at(epoch) {
+        return Ok(());
+    }
+    for filter in filters {
+        let Some((_, sources)) = snapshots.iter().find(|(shard, _)| shard == filter) else {
+            continue;
+        };
+        if replica_store.get_partition(epoch, filter)?.is_none() {
+            crate::storage_snapshot::request_member(
+                crdt.clone(),
+                replica_store.clone(),
+                member.to_vec(),
+                seat,
+                filter.clone(),
+                epoch,
+                sources.clone(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A hash-proof epoch's registrations: the leaves the member's snapshot for
@@ -587,27 +631,15 @@ fn snapshot_storage_confirm(
         ConfirmLeafRoots, LeafRootEntry,
     };
     let unavailable = |what: String| quil_types::error::QuilError::ExecutionUnavailable(what);
+    request_storage_snapshots(crdt, replica_store, filters, member, epoch, snapshots)?;
     let mut all = Vec::with_capacity(filters.len());
     for (index, filter) in filters.iter().enumerate() {
         let Some(prefixes) = replica_store.get_partition(epoch, filter)? else {
             // The bound shard (first) waits for its snapshot; a shard a
             // recorded change creates from it waits only while its sources are
             // known, rather than hold the renewal up for one never recorded.
-            let sources = snapshots
-                .iter()
-                .find(|(shard, _)| shard == filter)
-                .map(|(_, sources)| sources);
-            if let Some(sources) = sources {
-                crate::storage_snapshot::request_member(
-                    crdt.clone(),
-                    replica_store.clone(),
-                    member.to_vec(),
-                    filter.clone(),
-                    epoch,
-                    sources.clone(),
-                );
-            }
-            if (index == 0 || sources.is_some())
+            let sources = snapshots.iter().any(|(shard, _)| shard == filter);
+            if (index == 0 || sources)
                 && frame_number
                     < quil_types::consensus::storage_snapshot_frame(epoch)
                         + storage_snapshot_grace()
@@ -1683,6 +1715,79 @@ mod tests {
             |m: &[u8], l: &[u8]| registry.get(&(m.to_vec(), l.to_vec())).cloned(),
         );
         assert!(failed.is_empty(), "{failed:?}");
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A renewal's request encodes the seat's snapshot in the background, in
+    /// the seat's lane of `crate::storage_jobs`, recording each leaf's node
+    /// count beside its partition; before hash storage proofs it asks for none.
+    #[test]
+    fn a_requested_snapshot_encodes_in_the_background_with_its_node_counts() {
+        use quil_execution::global_intrinsic::leaf_id_bytes;
+        use quil_hypergraph::Location;
+        use std::time::{Duration, Instant};
+        let (_db, crdt) = seed_test_crdt(true);
+        let app = 0x56u8;
+        let filter = vec![app; 32];
+        for d in 0u8..3 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: [app; 32],
+                    data_address: [d; 32],
+                },
+                &vec![d.wrapping_add(5); 256],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let replica_store = quil_store::replica_store::ReplicaStore::new(Arc::new(
+            quil_store::RocksDb::open_in_memory().unwrap(),
+        ));
+        let member = vec![0xC3u8; 32];
+        let epoch = 7u64;
+        let source = crate::storage_snapshot::current_source(&crdt, &filter, epoch);
+        let snapshots = vec![(filter.clone(), vec![source])];
+        let request = || {
+            request_storage_snapshots(
+                &crdt,
+                &replica_store,
+                std::slice::from_ref(&filter),
+                &member,
+                epoch,
+                &snapshots,
+            )
+            .unwrap()
+        };
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch + 1));
+        request();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(replica_store.get_partition(epoch, &filter).unwrap(), None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+        request();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let prefixes = loop {
+            if let Some(prefixes) = replica_store.get_partition(epoch, &filter).unwrap() {
+                break prefixes;
+            }
+            assert!(Instant::now() < deadline, "the snapshot was not encoded");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let nodes = replica_store
+            .get_leaf_nodes(epoch, &filter)
+            .unwrap()
+            .expect("node counts beside the partition");
+        assert_eq!(nodes.len(), prefixes.len());
+        assert!(!prefixes.is_empty());
+        for (prefix, n) in prefixes.iter().zip(&nodes) {
+            let stored = replica_store
+                .get_hash(epoch, &leaf_id_bytes(&filter, prefix))
+                .unwrap()
+                .expect("the leaf's replica");
+            assert_eq!(
+                stored.replica.len() as u64,
+                n * quil_crypto::storage_proof::NODE_BYTES as u64
+            );
+        }
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 

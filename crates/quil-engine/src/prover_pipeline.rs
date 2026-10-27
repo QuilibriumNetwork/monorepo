@@ -2045,6 +2045,33 @@ impl ProverPipeline {
             }
             None => HashMap::new(),
         };
+        // Ask for the snapshot of every seat this node encodes before
+        // preparing any: the confirm stops at the first seat not encoded yet,
+        // and the seats encode side by side (`crate::storage_jobs`).
+        if quil_types::consensus::hash_storage_proofs_at(epoch) {
+            for (filter, targets) in confirm_encoding_plan(filters, &changes, epoch) {
+                if stopped.contains(&filter) || answers.contains_key(&filter) {
+                    continue;
+                }
+                let worker = local.get(&filter).cloned().flatten();
+                let (filter_crdt, filter_replicas) = match worker.as_ref() {
+                    Some((worker_crdt, worker_replicas)) => (worker_crdt, worker_replicas),
+                    None => (crdt, replica_store),
+                };
+                let (encoded, snapshots) = sources(&filter, &targets);
+                if let Err(error) = crate::app_shard_metadata::request_storage_snapshots(
+                    filter_crdt,
+                    filter_replicas,
+                    &encoded,
+                    &self.prover_address,
+                    epoch,
+                    &snapshots,
+                ) {
+                    warn!(epoch, filter = %hex::encode(&filter), %error,
+                        "storage snapshot not requested; the seat asks again when prepared");
+                }
+            }
+        }
         prepare_confirm(
             filters,
             &changes,

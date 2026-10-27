@@ -6394,6 +6394,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha3 0.10.8",
+ "sysinfo",
  "thiserror 2.0.12",
  "tokio",
  "tokio-util",

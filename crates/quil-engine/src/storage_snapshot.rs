@@ -22,8 +22,10 @@
 //! first two bits with zeros, so a whole-shard leaf held only the addresses
 //! starting `00` (found 2026-10-22; KZG epochs keep it).
 //!
-//! Capturing reads, encodes and hashes the leaves on one background thread
-//! ([`request`]), so neither frame execution nor a confirm waits on it.
+//! Capturing reads, encodes and hashes the leaves in the background
+//! ([`request`]), so neither frame execution nor a confirm waits on it: in
+//! the seat's lane of `crate::storage_jobs`, beside the other seats' as the
+//! node's memory allows.
 
 use std::sync::Arc;
 
@@ -32,7 +34,7 @@ use quil_hypergraph::HypergraphCrdt;
 use quil_store::replica_store::ReplicaStore;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
-use tracing::{info, warn};
+use tracing::info;
 
 use quil_execution::global_intrinsic::storage_binding::{
     self as binding, Entry, LeafBinding, LeafClaim,
@@ -46,7 +48,7 @@ pub struct Synced {
 }
 
 /// Sync the subtree of shard `filter` (`app`, `bits`) pinned to `roots` from
-/// a node that retains it. Called from the snapshot thread.
+/// a node that retains it. Called from a storage job's thread.
 pub type RemoteSnapshot =
     dyn Fn(&[u8], &[u8; 32], &[bool], &[[u8; 32]; 4]) -> Result<Synced> + Send + Sync;
 
@@ -86,9 +88,9 @@ pub struct Captured {
 }
 
 /// `filter`'s snapshot as of `crdt`'s committed state: its current roots, as
-/// GLOBAL would record them from a header proposed now (tests).
-#[cfg(test)]
-pub(crate) fn current_source(crdt: &HypergraphCrdt, filter: &[u8], epoch: u64) -> Source {
+/// GLOBAL would record them from a header proposed now. What a member labels
+/// its leaves ahead from (`crate::storage_labels::precompute`).
+pub fn current_source(crdt: &HypergraphCrdt, filter: &[u8], epoch: u64) -> Source {
     const PHASES: [(&str, &str); 4] = [
         ("vertex", "adds"),
         ("vertex", "removes"),
@@ -360,37 +362,95 @@ impl Captured {
         binding::prove(claim, &entries, &proof_of).map_err(QuilError::InvalidArgument)
     }
 
-    /// Each leaf's prefix, id and data.
-    fn for_each_leaf(&self, mut f: impl FnMut(&[u32], &[u8], Vec<u8>) -> Result<()>) -> Result<()> {
-        for prefix in &self.prefixes {
-            let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&self.filter, prefix);
-            f(prefix, &leaf_id, self.leaf_data(prefix)?)?;
-        }
-        Ok(())
+    /// The summed size of the vertices and hyperedges added under a leaf:
+    /// its data less the index ([`Self::leaf_data`]).
+    pub fn leaf_size(&self, prefix: &[u32]) -> Result<u128> {
+        self.size(&self.leaf_bits(prefix)?)
     }
+}
+
+/// Peak bytes encoding a leaf of `nodes` nodes holds.
+pub(crate) fn encoding_bytes(nodes: u64) -> u64 {
+    quil_crypto::storage_proof::labelling_peak_bytes(nodes, &quil_crypto::sdr::SdrParams::default())
+}
+
+/// The data bytes of a leaf whose entries' values come to `size` bytes,
+/// before it is read: a quarter more for the index, whose size the values'
+/// does not tell.
+fn estimated_leaf_bytes(size: u128) -> u64 {
+    let size = u64::try_from(size).unwrap_or(u64::MAX);
+    size.saturating_add(size / 4)
+}
+
+/// Peak bytes reading the data of a leaf whose values come to `size` holds:
+/// its entries, then its data, about two and a half times the data.
+pub(crate) fn leaf_read_bytes(size: u128) -> u64 {
+    estimated_leaf_bytes(size).saturating_mul(5) / 2
 }
 
 /// A member's sink: encode each leaf into its replica for `member` and store it
 /// with its cap and registration root, then the partition, which marks the
-/// epoch's leaves ready for the renewal to register.
+/// epoch's leaves ready for the renewal to register. The leaves encode side by
+/// side, each once the memory it takes is free (`crate::storage_jobs`), from
+/// the labels kept ahead for it when they fit its data (`crate::storage_labels`):
+/// otherwise it is labelled now, its labels kept for its seal.
 pub fn encode_member(captured: &Captured, member: &[u8], replicas: &ReplicaStore) -> Result<()> {
+    use quil_crypto::storage_proof::{data_node_count, padded_nodes_allowed};
     let params = quil_crypto::sdr::SdrParams::default();
-    captured.for_each_leaf(|_, leaf_id, data| {
-        let key = quil_crypto::sdr::replica_key(member, leaf_id, captured.epoch);
-        let encoded = quil_crypto::storage_proof::encode_leaf(&data, &key, &params);
+    let store = crate::storage_labels::installed();
+    let encoded = crate::storage_jobs::for_each_parallel(&captured.prefixes, |prefix| {
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&captured.filter, prefix);
+        let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
+            estimated_leaf_bytes(captured.leaf_size(prefix)?),
+        )));
+        let data = captured.leaf_data(prefix)?;
+        let exact = data_node_count(data.len() as u64);
+        let ahead = store.and_then(|store| {
+            store.find(captured.epoch, member, &leaf_id, |n| {
+                padded_nodes_allowed(exact, n)
+            })
+        });
+        memory.resize(encoding_bytes(ahead.as_ref().map_or(exact, |kept| kept.n)));
+        let from_kept = ahead.and_then(|kept| {
+            use quil_crypto::storage_proof::LabelSource as _;
+            let last = kept.last_layer()?;
+            quil_crypto::storage_proof::encode_with_labels(&data, kept.n, &last, kept.comm_c).ok()
+        });
+        let ahead = from_kept.is_some();
+        let encoded = match (from_kept, store) {
+            (Some(encoded), _) => encoded,
+            (None, Some(store)) => {
+                let (comm_c, last) =
+                    store.label(captured.epoch, member, &leaf_id, exact, &params)?;
+                quil_crypto::storage_proof::encode_with_labels(&data, exact, &last, comm_c)
+                    .map_err(QuilError::Internal)?
+            }
+            (None, None) => quil_crypto::storage_proof::encode_leaf(
+                &data,
+                &quil_crypto::sdr::replica_key(member, &leaf_id, captured.epoch),
+                &params,
+            ),
+        };
+        drop(data);
         replicas.put_hash(
             captured.epoch,
-            leaf_id,
+            &leaf_id,
             &encoded.replica,
             &encoded.replica_cap.to_bytes(),
             &encoded.registration_root(),
-        )
+        )?;
+        Ok((encoded.n, ahead))
     })?;
+    info!(epoch = captured.epoch, filter = %hex::encode(&captured.filter), leaves = encoded.len(),
+        labelled_ahead = encoded.iter().filter(|(_, ahead)| *ahead).count(),
+        nodes = encoded.iter().map(|(n, _)| n).sum::<u64>(), "storage snapshot leaves encoded");
+    let nodes: Vec<u64> = encoded.iter().map(|(n, _)| *n).collect();
     let plan = quil_execution::global_intrinsic::storage_snapshot::encode_plan(&[(
         captured.filter.clone(),
         captured.plan.clone(),
     )]);
     replicas.put_snapshot_sources(captured.epoch, &captured.filter, &plan)?;
+    replicas.put_leaf_nodes(captured.epoch, &captured.filter, &nodes)?;
     replicas.put_partition(captured.epoch, &captured.filter, &captured.prefixes)
 }
 
@@ -451,17 +511,20 @@ pub fn captured_for(
 }
 
 /// Capture `filter`'s snapshot for `epoch` from `sources` and encode
-/// `member`'s replicas of it into `replicas`, in the background ([`request`]).
+/// `member`'s replicas of it into `replicas`, in the background ([`request`]),
+/// in the lane of the seat whose shard is `seat` (its own, or the one a
+/// change creates `filter` from).
 pub fn request_member(
     crdt: Arc<HypergraphCrdt>,
     replicas: ReplicaStore,
     member: Vec<u8>,
+    seat: &[u8],
     filter: Vec<u8>,
     epoch: u64,
     sources: Vec<Source>,
 ) {
     let key = [b"member".as_slice(), &member, &filter, &epoch.to_be_bytes()].concat();
-    request(key, "member", move || {
+    request(seat, key, "member", move || {
         let captured = capture_at(&crdt, &filter, epoch, &sources)?;
         info!(epoch, leaves = captured.prefixes.len(), filter = %hex::encode(&filter),
             "storage snapshot taken for the epoch's registration");
@@ -624,6 +687,49 @@ pub fn chained_beacons(
         .collect()
 }
 
+/// Peak bytes preparing a seat's part holds ([`prepare_member_seat`]): the
+/// replicas it seals (`sealed`: their epoch and leaves) and settles, all
+/// loaded at once, and relabelling its largest sealed leaf. A leaf whose node
+/// count was not recorded counts as a full one.
+fn seat_part_bytes(
+    replicas: &ReplicaStore,
+    filter: &[u8],
+    sealed: Option<(u64, &[Vec<u32>])>,
+    settled: Option<(u64, &[Vec<u32>])>,
+) -> Result<u64> {
+    let full =
+        quil_crypto::storage_proof::data_node_count(crate::app_shard_metadata::LEAF_MAX_BYTES);
+    let nodes = |epoch: u64, leaves: &[Vec<u32>]| -> Result<Vec<u64>> {
+        let recorded: std::collections::HashMap<Vec<u32>, u64> = match (
+            replicas.get_partition(epoch, filter)?,
+            replicas.get_leaf_nodes(epoch, filter)?,
+        ) {
+            (Some(prefixes), Some(nodes)) if prefixes.len() == nodes.len() => {
+                prefixes.into_iter().zip(nodes).collect()
+            }
+            _ => Default::default(),
+        };
+        Ok(leaves
+            .iter()
+            .map(|leaf| recorded.get(leaf).copied().unwrap_or(full))
+            .collect())
+    };
+    let node_bytes = quil_crypto::storage_proof::NODE_BYTES as u64;
+    let (mut loaded, mut relabel) = (0u64, 0u64);
+    if let Some((epoch, leaves)) = sealed {
+        for n in nodes(epoch, leaves)? {
+            loaded = loaded.saturating_add(n.saturating_mul(node_bytes));
+            relabel = relabel.max(encoding_bytes(n));
+        }
+    }
+    if let Some((epoch, leaves)) = settled {
+        for n in nodes(epoch, leaves)? {
+            loaded = loaded.saturating_add(n.saturating_mul(node_bytes));
+        }
+    }
+    Ok(loaded.saturating_add(relabel))
+}
+
 /// A seat's part of its member's epoch proof, from this member's replicas
 /// (`storage_epoch_batch`): sealing its registration `seal` for `epoch + 2`
 /// (with the output of the GLOBAL frame after it, the beacon, and the
@@ -632,7 +738,7 @@ pub fn chained_beacons(
 /// beacons from [`chained_beacons`]). Each frame's root is recomputed from the
 /// replicas, as the member committed it, and the chain must match GLOBAL's.
 /// Preparing relabels each sealed leaf at its challenges, so it runs in the
-/// background.
+/// background, once the memory it takes is free (`crate::storage_jobs`).
 pub fn prepare_member_seat(
     replicas: &ReplicaStore,
     member: &[u8; 32],
@@ -645,6 +751,12 @@ pub fn prepare_member_seat(
         self as epoch_proof, SeatClaim, SeatProof,
     };
     use quil_types::error::QuilError;
+    let _memory = crate::storage_jobs::reserve(seat_part_bytes(
+        replicas,
+        filter,
+        seal.map(|(slot, _, _)| (epoch + 2, slot.leaves.as_slice())),
+        settle.map(|(slot, _)| (epoch, slot.leaves.as_slice())),
+    )?);
     let mut claim = SeatClaim {
         seal_epoch: epoch + 2,
         settle_epoch: epoch,
@@ -739,8 +851,31 @@ pub fn prepare_member_seat(
         .as_ref()
         .map(HeldReplicas::replicas)
         .unwrap_or_default();
-    let witness = epoch_proof::prepare(member, &claim, &sealed_refs, &held_refs)
-        .map_err(QuilError::InvalidArgument)?;
+    // The labels kept when each sealed leaf was labelled, opened instead of
+    // labelling it again.
+    let kept: Vec<Option<crate::storage_labels::Kept>> = claim
+        .seals
+        .iter()
+        .map(|leaf| {
+            crate::storage_labels::installed()?
+                .find(claim.seal_epoch, member, &leaf.leaf_id, |n| n == leaf.n)
+        })
+        .collect();
+    if !kept.is_empty() {
+        info!(epoch = claim.seal_epoch, filter = %hex::encode(filter), sealed = kept.len(),
+            from_kept_labels = kept.iter().filter(|kept| kept.is_some()).count(),
+            "storage seal opens the labels kept for its leaves");
+    }
+    let labels: Vec<Option<&dyn quil_crypto::storage_proof::LabelSource>> = kept
+        .iter()
+        .map(|kept| {
+            kept.as_ref()
+                .map(|kept| kept as &dyn quil_crypto::storage_proof::LabelSource)
+        })
+        .collect();
+    let witness =
+        epoch_proof::prepare_with_labels(member, &claim, &sealed_refs, &held_refs, &labels)
+            .map_err(QuilError::InvalidArgument)?;
     Ok(crate::storage_epoch_batch::PreparedSeat {
         member: *member,
         part: SeatProof {
@@ -757,15 +892,15 @@ pub fn prepare_member_seat(
     })
 }
 
-type Job = Box<dyn FnOnce() + Send>;
-
 /// Seconds a failed snapshot waits before it is tried again.
 const SNAPSHOT_RETRY_SECS: u64 = 60;
 
-/// Run the snapshot job for `key` ([`spawn`]) unless one is queued or
-/// running, or the last failed less than [`SNAPSHOT_RETRY_SECS`] ago. A job
-/// that succeeds leaves its record behind, so its caller stops asking.
+/// Run the snapshot job for `key` in `lane` (`crate::storage_jobs::spawn`)
+/// unless one is queued or running, or the last failed less than
+/// [`SNAPSHOT_RETRY_SECS`] ago. A job that succeeds leaves its record behind,
+/// so its caller stops asking.
 pub fn request(
+    lane: &[u8],
     key: Vec<u8>,
     label: &'static str,
     job: impl FnOnce() -> Result<()> + Send + 'static,
@@ -785,8 +920,9 @@ pub fn request(
         }
         jobs.insert(key.clone(), None);
     }
-    spawn(label, move || {
-        let result = job();
+    crate::storage_jobs::spawn(lane, label, move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+            .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
         if let Ok(mut jobs) = state.lock() {
             match &result {
                 Ok(()) => {
@@ -799,42 +935,6 @@ pub fn request(
         }
         result
     });
-}
-
-/// Run snapshot jobs one at a time on a thread of their own: an archive may
-/// take every shard's snapshot within minutes, and each job holds a leaf's
-/// data and tree in memory.
-pub fn spawn(label: &'static str, job: impl FnOnce() -> Result<()> + Send + 'static) {
-    static QUEUE: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> =
-        std::sync::OnceLock::new();
-    let queue = QUEUE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("storage-snapshots".into())
-            .spawn(move || {
-                for job in rx {
-                    job();
-                }
-            })
-            .expect("storage snapshot thread");
-        std::sync::Mutex::new(tx)
-    });
-    let job: Job = Box::new(move || {
-        let started = std::time::Instant::now();
-        match job() {
-            Ok(()) => info!(
-                label,
-                seconds = started.elapsed().as_secs_f64(),
-                "storage snapshot job done"
-            ),
-            Err(error) => {
-                warn!(label, %error, "storage snapshot job failed; it is tried again when next needed")
-            }
-        }
-    });
-    if let Ok(sender) = queue.lock() {
-        let _ = sender.send(job);
-    }
 }
 
 #[cfg(test)]
@@ -1507,6 +1607,155 @@ mod tests {
             Some(1002 + seal_retry_frames())
         );
         assert_eq!(epoch_proof_sent_at(&member, &app, epoch + 1), None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+    /// A seat labelled ahead registers its leaf at the count it was labelled
+    /// at, though its data grew a little since; GLOBAL's binding check takes
+    /// the padded count, and the seal opened from the kept labels verifies as
+    /// GLOBAL checks it. A seat not labelled ahead keeps its labels at its
+    /// exact count.
+    #[test]
+    fn a_seat_labelled_ahead_registers_padded_and_seals_from_its_kept_labels() {
+        use crate::storage_epoch_batch::PreparedSeat;
+        use quil_crypto::storage_proof::{
+            data_node_count, max_padded_nodes, padded_nodes_allowed, parse_registration_root,
+            NODE_BYTES,
+        };
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            EpochClaim, StorageEpochProof,
+        };
+        crate::storage_labels::install(
+            std::env::temp_dir().join(format!("quil-labels-tests-{}", std::process::id())),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let crdt = test_crdt();
+        let app = [0x7Bu8; 32];
+        let add = |from: u8, to: u8| {
+            for d in from..to {
+                crdt.add_vertex(
+                    &Location {
+                        app_address: app,
+                        data_address: address(d.wrapping_mul(5), d),
+                    },
+                    &vec![d; 300],
+                )
+                .unwrap();
+            }
+        };
+        add(0, 30);
+        crdt.commit(1).unwrap();
+        let epoch = 6;
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
+        let member = [0x5Fu8; 32];
+        assert!(!crate::storage_labels::precomputed(&member, &app, epoch));
+        crate::storage_labels::precompute(store, &crdt, &member, &app, epoch).unwrap();
+        assert!(crate::storage_labels::precomputed(&member, &app, epoch));
+        // The data grows a little before the snapshot.
+        add(30, 31);
+        crdt.commit(2).unwrap();
+        let captured =
+            capture_at(&crdt, &app, epoch, &[current_source(&crdt, &app, epoch)]).unwrap();
+        assert_eq!(captured.prefixes.len(), 1);
+        let prefix = captured.prefixes[0].clone();
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&app, &prefix);
+        let data = captured.leaf_data(&prefix).unwrap();
+        let exact = data_node_count(data.len() as u64);
+        let kept = store.find(epoch, &member, &leaf_id, |_| true).unwrap();
+        assert!(kept.n > exact && padded_nodes_allowed(exact, kept.n));
+
+        let replicas = ReplicaStore::new(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        encode_member(&captured, &member, &replicas).unwrap();
+        let stored = replicas.get_hash(epoch, &leaf_id).unwrap().unwrap();
+        assert_eq!(
+            stored.replica.len() as u64,
+            kept.n * NODE_BYTES as u64,
+            "registered at the count labelled ahead"
+        );
+        assert_eq!(
+            replicas.get_leaf_nodes(epoch, &app).unwrap(),
+            Some(vec![kept.n])
+        );
+        let whole = quil_crypto::storage_proof::encode_leaf_at(
+            &data,
+            &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+            &quil_crypto::sdr::SdrParams::default(),
+            kept.n,
+            &mut |_, _| {},
+        );
+        assert_eq!(stored.registration_root, whole.registration_root());
+
+        // GLOBAL's binding check takes the padded count, and no count past
+        // the bound.
+        let registered = parse_registration_root(&stored.registration_root).unwrap();
+        let beacon = [0x5Cu8; 32];
+        let claim = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                registered.comm_d,
+                kept.n,
+            )
+            .unwrap();
+        let proved = captured.prove_binding(&claim).unwrap();
+        assert_eq!(binding::verify(&claim, &proved), Ok(()));
+        let beyond = captured
+            .claim(
+                &prefix,
+                &leaf_id,
+                &member,
+                &beacon,
+                registered.comm_d,
+                max_padded_nodes(exact) + 1,
+            )
+            .unwrap();
+        assert!(binding::verify(&beyond, &proved).is_err());
+        assert!(captured.prove_binding(&beyond).is_err());
+
+        // The seal, opened from the kept labels.
+        let sealing = quil_types::consensus::StorageSeatSlot {
+            epoch,
+            leaves: vec![prefix.clone()],
+            registered_at: 900,
+            sealed_at: None,
+            frames: 0,
+            accumulator: [0; 32],
+            chained: vec![],
+            open: true,
+        };
+        let beacon_output = vec![0x78u8; 516];
+        let seat = prepare_member_seat(
+            &replicas,
+            &member,
+            &app,
+            epoch - 2,
+            Some((&sealing, &beacon_output, &captured)),
+            None,
+        )
+        .unwrap();
+        let seat = PreparedSeat::from_bytes(&seat.to_bytes()).unwrap();
+        let claim = EpochClaim {
+            member,
+            seats: vec![seat.claim.clone()],
+        };
+        let bytes = crate::storage_epoch_batch::prove(vec![seat]).unwrap();
+        assert_eq!(
+            claim.verify(
+                &StorageEpochProof::from_canonical_bytes(&bytes)
+                    .unwrap()
+                    .proof
+            ),
+            Ok(())
+        );
+
+        // Not labelled ahead: labelled at the snapshot, at its exact count,
+        // and kept for the seal.
+        let other = [0x60u8; 32];
+        encode_member(&captured, &other, &replicas).unwrap();
+        assert!(store
+            .find(epoch, &other, &leaf_id, |n| n == exact)
+            .is_some());
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 }

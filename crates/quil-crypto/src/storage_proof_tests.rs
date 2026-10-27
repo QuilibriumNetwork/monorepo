@@ -626,3 +626,120 @@ fn bls48581_stays_confined_to_the_kzg_storage_proofs() {
         "direct bls48581 calls outside the KZG storage proofs: {offenders:?}"
     );
 }
+
+/// Labels kept in memory, as a member keeps them on disk.
+struct Kept {
+    layers: Vec<Vec<hash::Digest>>,
+    columns: Vec<hash::Digest>,
+}
+
+impl Kept {
+    fn label(n: u64, key: &[u8]) -> (Self, Node) {
+        let mut layers = Vec::new();
+        let (_, columns) = label_leaf(n, key, &params(), &mut |_, layer| {
+            layers.push(layer.to_vec())
+        });
+        let comm_c = MerkleTree::from_digests(columns.clone()).commitment(Tree::Column);
+        (Self { layers, columns }, comm_c)
+    }
+}
+
+impl LabelSource for Kept {
+    fn label(&self, layer: usize, v: u64) -> Option<Node> {
+        Some(hash::to_bytes(self.layers.get(layer)?.get(v as usize)?))
+    }
+    fn columns(&self) -> Option<Vec<hash::Digest>> {
+        Some(self.columns.clone())
+    }
+    fn last_layer(&self) -> Option<Vec<hash::Digest>> {
+        self.layers.last().cloned()
+    }
+}
+
+/// Labels do not depend on the data, so a leaf labelled ahead at a padded
+/// count and given its data later is the leaf encoded whole at that count.
+#[test]
+fn a_leaf_from_labels_kept_ahead_is_the_leaf_encoded_whole() {
+    let m = member(4);
+    let key = sdr::replica_key(&m, LEAF, EPOCH);
+    let leaf = data(3_000, 7);
+    let exact = data_node_count(leaf.len() as u64);
+    let n = precompute_nodes(exact);
+    assert!(padded_nodes_allowed(exact, n));
+    let mut streamed = Vec::new();
+    let whole = encode_leaf_at(&leaf, &key, &params(), n, &mut |layer, labels| {
+        streamed.push((layer, labels.len()))
+    });
+    assert_eq!(whole.n, n);
+    assert_eq!(
+        streamed,
+        (0..params().layers)
+            .map(|l| (l, n as usize))
+            .collect::<Vec<_>>()
+    );
+    let (kept, comm_c) = Kept::label(n, &key);
+    let ahead = encode_with_labels(&leaf, n, kept.layers.last().unwrap(), comm_c).unwrap();
+    assert_eq!(ahead.replica, whole.replica);
+    assert_eq!(
+        (ahead.comm_d, ahead.comm_c, ahead.comm_r),
+        (whole.comm_d, whole.comm_c, whole.comm_r)
+    );
+    assert_eq!(ahead.replica_cap, whole.replica_cap);
+    assert!(
+        encode_with_labels(&data(200_000, 7), n, kept.layers.last().unwrap(), comm_c).is_err(),
+        "data larger than the labels"
+    );
+}
+
+/// A seal opened from kept labels is the relabelled seal, verifies at a
+/// padded count, and refuses labels that are not the registration's.
+#[test]
+fn a_seal_from_kept_labels_is_the_relabelled_seal() {
+    let m = member(5);
+    let key = sdr::replica_key(&m, LEAF, EPOCH);
+    let leaf = data(2_000, 9);
+    let n = precompute_nodes(data_node_count(leaf.len() as u64));
+    let (kept, comm_c) = Kept::label(n, &key);
+    let encoded = encode_with_labels(&leaf, n, kept.layers.last().unwrap(), comm_c).unwrap();
+    let beacon = [3u8; 32];
+    let statement = statement(&m, &encoded, &beacon);
+    let relabelled = prove_seal(&encoded.replica, &statement, &params(), 16).unwrap();
+    let opened =
+        prove_seal_with_labels(&encoded.replica, &statement, &params(), 16, &kept).unwrap();
+    assert_eq!(opened, relabelled);
+    verify_seal(&statement, &opened, &params(), 16).unwrap();
+
+    let mut wrong = Kept {
+        layers: kept.layers.clone(),
+        columns: kept.columns.clone(),
+    };
+    let challenged = seal_challenges(&statement, 1)[0] as usize;
+    wrong.layers[3][challenged] = hash::add(&wrong.layers[3][challenged], &[hash::felt(1); 8]);
+    assert!(
+        prove_seal_with_labels(&encoded.replica, &statement, &params(), 16, &wrong).is_err(),
+        "a label that is not its column's"
+    );
+    let (other, _) = Kept::label(n, &sdr::replica_key(&member(6), LEAF, EPOCH));
+    assert!(
+        prove_seal_with_labels(&encoded.replica, &statement, &params(), 16, &other).is_err(),
+        "another member's labels"
+    );
+}
+
+/// A count labelled ahead stays registrable while the data changes by a few
+/// percent, and a registration never pads past an eighth and the floor.
+#[test]
+fn a_count_labelled_ahead_stays_registrable_while_the_data_changes_a_little() {
+    for exact in [2u64, 100, 4_096, 1_000_000, 35_791_394] {
+        let n = precompute_nodes(exact);
+        let grown = exact + exact / 16;
+        let shrunk = exact - exact / 20;
+        assert!(padded_nodes_allowed(grown, n), "grown {exact}");
+        assert!(padded_nodes_allowed(shrunk.max(1), n), "shrunk {exact}");
+        assert!(!padded_nodes_allowed(n + 1, n), "data past the labels");
+    }
+    assert!(padded_nodes_allowed(10, 10));
+    assert!(!padded_nodes_allowed(10, 9));
+    assert!(padded_nodes_allowed(800, 800 + 100 + PAD_FLOOR_NODES));
+    assert!(!padded_nodes_allowed(800, 800 + 101 + PAD_FLOOR_NODES));
+}

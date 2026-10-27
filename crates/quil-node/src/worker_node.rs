@@ -411,6 +411,9 @@ pub(crate) async fn start(
                 crate::prover_tree_syncer_prod::snapshot_scratch_dir(&db_path),
                 tokio::runtime::Handle::current(),
             ));
+            quil_engine::storage_labels::install(
+                crate::prover_tree_syncer_prod::storage_labels_dir(&db_path),
+            );
             let syncer: Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer> = prod_syncer;
             let delivery_syncer = syncer.clone();
             worker_node = worker_node

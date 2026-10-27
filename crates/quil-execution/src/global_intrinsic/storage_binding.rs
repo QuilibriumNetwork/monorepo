@@ -24,7 +24,7 @@
 //! not authenticated), every epoch it is sealed.
 
 use quil_crypto::storage_hash::{self, DATA_BYTES_PER_NODE};
-use quil_crypto::storage_proof::{verify_path, Node, Tree, MIN_NODES};
+use quil_crypto::storage_proof::{padded_nodes_allowed, verify_path, Node, Tree, MIN_NODES};
 use quil_forest::subtree_proof::{same_root, subtree_root, CompactProof};
 use sha3::{Digest as _, Sha3_256};
 
@@ -339,7 +339,7 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
     if entries == 0 {
         if !binding.last.is_empty()
             || !binding.records.is_empty()
-            || claim.n != node_count(header_count, 0, 0)
+            || !padded_nodes_allowed(node_count(header_count, 0, 0), claim.n)
         {
             return fail("an empty leaf's size");
         }
@@ -348,7 +348,8 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
             return fail("the last record");
         }
         let last = open_record(&binding.last, entries - 1)?;
-        if claim.n != node_count(header_count, entries, last.offset + last.len as u64) {
+        let exact = node_count(header_count, entries, last.offset + last.len as u64);
+        if !padded_nodes_allowed(exact, claim.n) {
             return fail("the node count is not the index's");
         }
         if binding.records.len() != BINDING_SAMPLES {
@@ -456,7 +457,13 @@ pub fn prove(
 ) -> Result<LeafBinding, String> {
     use quil_crypto::storage_proof::{data_nodes, MerkleTree, NODE_BYTES};
     let data = leaf_data(claim.filter, claim.prefix, entries);
-    let nodes = data_nodes(&data);
+    let mut nodes = data_nodes(&data);
+    // A registration may pad the data with zero nodes (decided 2026-10-26).
+    let exact = (nodes.len() / NODE_BYTES) as u64;
+    if !padded_nodes_allowed(exact, claim.n) {
+        return fail("the registration is not this snapshot's data");
+    }
+    nodes.resize(claim.n as usize * NODE_BYTES, 0);
     let tree = MerkleTree::from_nodes(&nodes).ok_or("storage binding: no data tree")?;
     if tree.commitment(Tree::Data) != claim.comm_d || tree.n() != claim.n {
         return fail("the registration is not this snapshot's data");

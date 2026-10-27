@@ -415,6 +415,19 @@ pub fn prepare(
     sealed: &[&[u8]],
     held: &[HeldReplica],
 ) -> std::result::Result<SeatWitness, String> {
+    prepare_with_labels(member, seat, sealed, held, &[])
+}
+
+/// [`prepare`], opening each sealed leaf whose labels the member kept
+/// (`labels[i]` for `seat.seals[i]`) from them instead of relabelling it; a
+/// leaf whose kept labels are not its registration's is relabelled.
+pub fn prepare_with_labels(
+    member: &[u8; 32],
+    seat: &SeatClaim,
+    sealed: &[&[u8]],
+    held: &[HeldReplica],
+    labels: &[Option<&dyn quil_crypto::storage_proof::LabelSource>],
+) -> std::result::Result<SeatWitness, String> {
     if sealed.len() != seat.seals.len() || held.len() != seat.held.len() {
         return Err("a replica for every leaf of the claim".into());
     }
@@ -423,7 +436,8 @@ pub fn prepare(
         .seals
         .iter()
         .zip(sealed)
-        .map(|(leaf, replica)| {
+        .enumerate()
+        .map(|(i, (leaf, replica))| {
             let statement = quil_crypto::storage_proof::SealStatement {
                 member,
                 leaf_id: &leaf.leaf_id,
@@ -432,12 +446,21 @@ pub fn prepare(
                 registered: leaf.registered,
                 beacon: &leaf.beacon,
             };
-            quil_crypto::storage_proof::prove_seal(
-                replica,
-                &statement,
-                &params,
-                quil_types::consensus::STORAGE_SEAL_CHALLENGES,
-            )
+            let count = quil_types::consensus::STORAGE_SEAL_CHALLENGES;
+            labels
+                .get(i)
+                .copied()
+                .flatten()
+                .and_then(|labels| {
+                    quil_crypto::storage_proof::prove_seal_with_labels(
+                        replica, &statement, &params, count, labels,
+                    )
+                    .ok()
+                })
+                .map_or_else(
+                    || quil_crypto::storage_proof::prove_seal(replica, &statement, &params, count),
+                    Ok,
+                )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut opened = Vec::new();

@@ -45,6 +45,9 @@ const PARTITION: u8 = 0x01;
 /// A member's snapshot sources of one shard for an epoch, by filter: what it
 /// read its registration's data from, to read it again for the seal.
 const SNAPSHOT_SOURCES: u8 = 0x03;
+/// The node count of each leaf of a member's partition, by filter: what its
+/// replicas take in memory, known before they are read.
+const LEAF_NODES: u8 = 0x04;
 
 fn meta_key(kind: u8, epoch: u64, id: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(11 + id.len());
@@ -185,6 +188,28 @@ impl ReplicaStore {
         self.db.get(&meta_key(SNAPSHOT_SOURCES, epoch, filter))
     }
 
+    /// Record the node count of each leaf of shard `filter`'s partition for
+    /// `epoch`, in the partition's order.
+    pub fn put_leaf_nodes(&self, epoch: u64, filter: &[u8], nodes: &[u64]) -> Result<()> {
+        let value: Vec<u8> = nodes.iter().flat_map(|n| n.to_be_bytes()).collect();
+        self.db.set(&meta_key(LEAF_NODES, epoch, filter), &value)
+    }
+
+    /// What [`Self::put_leaf_nodes`] recorded, or `None` (also for a partition
+    /// stored before the counts were).
+    pub fn get_leaf_nodes(&self, epoch: u64, filter: &[u8]) -> Result<Option<Vec<u64>>> {
+        Ok(self
+            .db
+            .get(&meta_key(LEAF_NODES, epoch, filter))?
+            .filter(|value| value.len() % 8 == 0)
+            .map(|value| {
+                value
+                    .chunks_exact(8)
+                    .map(|n| u64::from_be_bytes(n.try_into().expect("8 bytes")))
+                    .collect()
+            }))
+    }
+
     /// Remove one replica.
     pub fn delete(&self, epoch: u64, leaf_id: &[u8]) -> Result<()> {
         self.db.delete(&replica_key(epoch, leaf_id))
@@ -201,7 +226,7 @@ impl ReplicaStore {
         hi.extend_from_slice(&keep_from.to_be_bytes());
         // delete_range is [lo, hi): epochs 0..keep_from.
         self.db.delete_range(&lo, &hi)?;
-        for kind in [PARTITION, SNAPSHOT_SOURCES] {
+        for kind in [PARTITION, SNAPSHOT_SOURCES, LEAF_NODES] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
         }
@@ -276,8 +301,14 @@ mod tests {
         let prefixes = vec![vec![], vec![3, 1], vec![63]];
         s.put_partition(5, b"filter", &prefixes).unwrap();
         s.put_snapshot_sources(5, b"filter", b"sources").unwrap();
+        assert_eq!(s.get_leaf_nodes(5, b"filter").unwrap(), None);
+        s.put_leaf_nodes(5, b"filter", &[2, 1 << 30, 7]).unwrap();
         s.put(5, b"filter", b"replica").unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), Some(prefixes));
+        assert_eq!(
+            s.get_leaf_nodes(5, b"filter").unwrap(),
+            Some(vec![2, 1 << 30, 7])
+        );
         assert_eq!(
             s.get_snapshot_sources(5, b"filter").unwrap().as_deref(),
             Some(&b"sources"[..])
@@ -291,6 +322,7 @@ mod tests {
         s.evict_below_epoch(6).unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), None);
         assert_eq!(s.get_snapshot_sources(5, b"filter").unwrap(), None);
+        assert_eq!(s.get_leaf_nodes(5, b"filter").unwrap(), None);
     }
 
     #[test]

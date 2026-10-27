@@ -460,7 +460,7 @@ fn worker_global_submissions(
         quil_execution::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF.to_be_bytes();
     let presence_prefix =
         quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes();
-    // Storage epoch proof parts are handed over from the storage job thread,
+    // Storage epoch proof parts are handed over from a storage job's thread,
     // outside the runtime.
     let runtime = tokio::runtime::Handle::try_current().ok();
     Arc::new(move |canonical: Vec<u8>| {

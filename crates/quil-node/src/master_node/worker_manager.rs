@@ -981,6 +981,9 @@ pub(crate) fn init(
                             ),
                         );
                     }
+                    quil_engine::storage_labels::install(
+                        crate::prover_tree_syncer_prod::storage_labels_dir(&path),
+                    );
                     syncer as Arc<dyn quil_engine::prover_tree_syncer::ProverTreeSyncer>
                 });
             // (B) Unified-cutover consolidation hook bound to THIS worker's

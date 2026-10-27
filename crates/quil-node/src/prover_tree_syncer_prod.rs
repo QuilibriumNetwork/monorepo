@@ -2077,6 +2077,14 @@ struct ScratchDir(std::path::PathBuf);
 
 /// Where storage snapshot sources are synced for the store at `db_path`: a
 /// sibling of it, never inside a database's own directory.
+/// Where a node keeps the hash storage proof labels it computes ahead
+/// (`quil_engine::storage_labels`): one directory beside its workers' stores
+/// (`db_path` is one of them), whichever worker installs it and across
+/// restarts, so labels a node keeps are always found and evicted.
+pub fn storage_labels_dir(db_path: &std::path::Path) -> std::path::PathBuf {
+    db_path.parent().unwrap_or(db_path).join("storage-labels")
+}
+
 pub fn snapshot_scratch_dir(db_path: &std::path::Path) -> std::path::PathBuf {
     let name = db_path
         .file_name()

@@ -861,8 +861,11 @@ pub const STORAGE_SEAL_BYTES_PER_FRAME: usize = 4 << 20;
 /// proofs) instead of KZG over BLS48-581, which is not post-quantum. Members
 /// register for an epoch during the one before it, so the first hash
 /// registrations land in the epoch before this one. Consensus-affecting:
-/// every archive and prover must run a build with it before then.
-pub const MAINNET_HASH_STORAGE_PROOF_EPOCH: Option<u64> = Some(1311);
+/// every archive and prover must run a build with it before then. Mainnet
+/// epoch 1314 (frame 946,080; its snapshot at 945,376), after the other
+/// epoch-1311 cutovers but seniority succession, which shares it (decided
+/// 2026-10-26).
+pub const MAINNET_HASH_STORAGE_PROOF_EPOCH: Option<u64> = Some(1314);
 
 static HASH_STORAGE_PROOF_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -2722,16 +2725,16 @@ mod hash_storage_proof_epoch_tests {
         assert_eq!(super::hash_storage_proof_epoch_for(1, None), u64::MAX);
     }
 
-    /// Mainnet's first hash-proof epoch begins at GLOBAL frame 943,920, and
+    /// Mainnet's first hash-proof epoch begins at GLOBAL frame 946,080, and
     /// its snapshot and registrations come in the epoch before.
     #[test]
-    fn mainnet_hash_storage_proofs_begin_at_frame_943920() {
+    fn mainnet_hash_storage_proofs_begin_at_frame_946080() {
         let epoch = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
-        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 943_920);
-        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 943_200);
+        assert_eq!(epoch * super::EPOCH_LENGTH_FRAMES, 946_080);
+        assert_eq!((epoch - 1) * super::EPOCH_LENGTH_FRAMES, 945_360);
         assert_eq!(
             (epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET,
-            943_216
+            945_376
         );
     }
 }

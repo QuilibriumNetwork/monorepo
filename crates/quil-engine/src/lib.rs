@@ -64,6 +64,8 @@ pub mod shard_rebalancer;
 pub mod spawn_gate;
 pub mod storage_epoch_batch;
 pub mod storage_history;
+pub mod storage_jobs;
+pub mod storage_labels;
 pub mod storage_snapshot;
 pub mod thread_worker;
 pub mod time_reel;

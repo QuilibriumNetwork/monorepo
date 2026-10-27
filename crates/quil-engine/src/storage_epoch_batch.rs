@@ -824,10 +824,19 @@ fn watch(member: [u8; 32]) {
     }
 }
 
-/// Prove `seats` on the storage job thread and publish the proof.
+/// Bytes proving holds per sealed leaf, and at least.
+const PROVING_BYTES_PER_SEALED_LEAF: u64 = 400 << 20;
+
+/// Prove `seats` as a storage job (`crate::storage_jobs`), once the memory
+/// proving takes is free, and publish the proof.
 fn prove_and_publish(seats: Vec<PreparedSeat>, publish: Publish) {
     note_proved(&seats);
-    crate::storage_snapshot::spawn("member epoch proof", move || {
+    let lane = crate::storage_jobs::EPOCH_PROOF_LANE;
+    crate::storage_jobs::spawn(lane, "member epoch proof", move || {
+        let sealed_leaves = seats.iter().map(|seat| seat.claim.seals.len() as u64);
+        let _memory = crate::storage_jobs::reserve(
+            PROVING_BYTES_PER_SEALED_LEAF.saturating_mul(sealed_leaves.sum::<u64>().max(1)),
+        );
         let started = Instant::now();
         let member = seats
             .first()

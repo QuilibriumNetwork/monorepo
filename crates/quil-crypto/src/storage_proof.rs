@@ -447,29 +447,136 @@ fn check_params(params: &SdrParams) {
     );
 }
 
+/// Nodes a leaf of `bytes` data bytes takes ([`data_nodes`]).
+pub fn data_node_count(bytes: u64) -> u64 {
+    bytes
+        .div_ceil(hash::DATA_BYTES_PER_NODE as u64)
+        .max(MIN_NODES as u64)
+}
+
+/// Bytes [`encode_leaf`] or [`prove_seal`] holds at its peak for a leaf of
+/// `n` nodes: the leaf's nodes six times over (its data or replica as given
+/// and as digests, the column digests, two label layers, and the trees built
+/// after) and the parent table.
+pub fn labelling_peak_bytes(n: u64, params: &SdrParams) -> u64 {
+    let parents = 4 * (params.drg_degree.max(1) + params.expander_degree);
+    n.saturating_mul((6 * NODE_BYTES + parents) as u64)
+}
+
+/// Nodes a registration may pad a leaf's data with, with zeros, beyond its
+/// own ([`data_node_count`]): an eighth of them and this many more. A member
+/// labels a leaf ahead of its snapshot ([`label_leaf`]) at a count it picks
+/// then ([`precompute_nodes`]), so the data may have grown or shrunk a little
+/// by the snapshot (decided 2026-10-26).
+pub const PAD_FLOOR_NODES: u64 = 4096;
+
+/// The most nodes a leaf whose data takes `exact` may register.
+pub fn max_padded_nodes(exact: u64) -> u64 {
+    exact
+        .saturating_add(exact / 8)
+        .saturating_add(PAD_FLOOR_NODES)
+}
+
+/// Whether a leaf whose data takes `exact` nodes may register `n`.
+pub fn padded_nodes_allowed(exact: u64, n: u64) -> bool {
+    exact <= n && n <= max_padded_nodes(exact) && n < MAX_NODES
+}
+
+/// The node count to label a leaf at ahead of its snapshot, its data taking
+/// `exact` nodes now: registrable for data that grows by up to a sixteenth or
+/// shrinks by up to about a twentieth by then.
+pub fn precompute_nodes(exact: u64) -> u64 {
+    exact + exact / 16 + PAD_FLOOR_NODES / 2
+}
+
 /// Encode `data` into the replica keyed by `key`
 /// ([`sdr::replica_key`]`(member, leaf_id, epoch)`) and commit to it.
 pub fn encode_leaf(data: &[u8], key: &[u8], params: &SdrParams) -> EncodedLeaf {
-    check_params(params);
-    let data = packed_data(data);
-    let n = data.len();
-    assert!((n as u64) < MAX_NODES, "a leaf of {n} nodes is too large");
+    let n = data_node_count(data.len() as u64);
+    encode_leaf_at(data, key, params, n, &mut |_, _| {})
+}
+
+/// [`encode_leaf`] at `n` nodes, the data zero-padded to them, handing each
+/// finished layer to `on_layer` (to keep for the seal,
+/// [`prove_seal_with_labels`]).
+pub fn encode_leaf_at(
+    data: &[u8],
+    key: &[u8],
+    params: &SdrParams,
+    n: u64,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+) -> EncodedLeaf {
+    let mut data = packed_data(data);
+    assert!(
+        n as usize >= data.len(),
+        "a leaf of {} nodes encoded at {n}",
+        data.len()
+    );
+    data.resize(n as usize, hash::ZERO);
     let comm_d = MerkleTree::from_digests(data.clone()).commitment(Tree::Data);
+    let (last, columns) = label_leaf(n, key, params, on_layer);
+    let comm_c = MerkleTree::from_digests(columns).commitment(Tree::Column);
+    assemble(data, &last, comm_d, comm_c)
+}
+
+/// A leaf's labels, which depend on its key and node count alone, never on
+/// its data: each finished layer goes to `on_layer`; returns the last layer
+/// and every node's column digest.
+pub fn label_leaf(
+    n: u64,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[Digest]),
+) -> (Vec<Digest>, Vec<Digest>) {
+    check_params(params);
+    assert!(
+        (MIN_NODES as u64..MAX_NODES).contains(&n),
+        "a leaf of {n} nodes"
+    );
+    let n = n as usize;
     let mut columns = vec![hash::ZERO; n];
-    let last = label_layers(n, &hash::key_digest(key), params, &mut |_, layer| {
-        fold_layer(&mut columns, layer)
+    let last = label_layers(n, &hash::key_digest(key), params, &mut |index, layer| {
+        fold_layer(&mut columns, layer);
+        on_layer(index, layer);
     });
+    (last, columns)
+}
+
+/// [`encode_leaf_at`] from the leaf's labels at `n` nodes ([`label_leaf`],
+/// keyed alike): its `last` layer and column commitment. What is left is the
+/// data's part: its tree, the replica and the replica's tree.
+pub fn encode_with_labels(
+    data: &[u8],
+    n: u64,
+    last: &[Digest],
+    comm_c: Node,
+) -> Result<EncodedLeaf, String> {
+    let mut data = packed_data(data);
+    if n >= MAX_NODES || (n as usize) < data.len() || last.len() as u64 != n {
+        return Err(format!(
+            "labels of {} nodes at {n} for data of {}",
+            last.len(),
+            data.len()
+        ));
+    }
+    data.resize(n as usize, hash::ZERO);
+    let comm_d = MerkleTree::from_digests(data.clone()).commitment(Tree::Data);
+    Ok(assemble(data, last, comm_d, comm_c))
+}
+
+/// The replica, `data + last`, with its tree.
+fn assemble(data: Vec<Digest>, last: &[Digest], comm_d: Node, comm_c: Node) -> EncodedLeaf {
+    let n = data.len() as u64;
     let replica: Vec<Digest> = data
         .par_iter()
         .zip(last.par_iter())
         .map(|(d, l)| hash::add(d, l))
         .collect();
-    drop((data, last));
-    let comm_c = MerkleTree::from_digests(columns).commitment(Tree::Column);
+    drop(data);
     let replica_bytes = hash::digests_to_bytes(&replica);
     let replica_tree = MerkleTree::from_digests(replica);
     EncodedLeaf {
-        n: n as u64,
+        n,
         comm_d,
         comm_c,
         comm_r: replica_tree.commitment(Tree::Replica),
@@ -594,102 +701,189 @@ pub fn prove_seal(
     params: &SdrParams,
     count: usize,
 ) -> Result<SealProof, String> {
-    check_params(params);
-    let n = statement.n as usize;
-    if n < MIN_NODES || statement.n >= MAX_NODES || replica.len() != n * NODE_BYTES {
-        return Err(format!(
-            "replica is {} bytes, the registration has {n} nodes",
-            replica.len()
-        ));
-    }
-    let replica =
-        hash::digests_from_bytes(replica).ok_or("the replica holds a non-canonical node")?;
+    let mut seal = Seal::new(replica, statement, params, count)?;
     let key = hash::key_digest(&sdr::replica_key(
         statement.member,
         statement.leaf_id,
         statement.epoch,
     ));
-    let challenges = seal_challenges(statement, count);
-    let parents: Vec<(Vec<u64>, Vec<u64>)> = challenges
-        .iter()
-        .map(|&j| parents_of(j, statement.n, params))
-        .collect();
-    let mut kept: std::collections::BTreeMap<u64, Vec<Node>> = std::collections::BTreeMap::new();
-    for (j, (same_layer, layer_below)) in challenges.iter().zip(&parents) {
-        for v in std::iter::once(j).chain(same_layer).chain(layer_below) {
-            kept.entry(*v).or_default();
-        }
-    }
-    let mut columns = vec![hash::ZERO; n];
-    let last = label_layers(n, &key, params, &mut |_, layer| {
+    let mut columns = vec![hash::ZERO; seal.replica.len()];
+    let last = label_layers(seal.replica.len(), &key, params, &mut |_, layer| {
         fold_layer(&mut columns, layer);
-        for (v, labels) in kept.iter_mut() {
+        for (v, labels) in seal.kept.iter_mut() {
             labels.push(hash::to_bytes(&layer[*v as usize]));
         }
     });
-    let column_tree = MerkleTree::from_digests(columns);
-    if column_tree.commitment(Tree::Column) != statement.registered.comm_c {
-        return Err("the registered column commitment is not this replica's labelling".into());
-    }
-    let column = |v: u64| ColumnOpening {
-        labels: kept[&v].clone(),
-        path: column_tree.path(v),
-    };
-    let column_openings: Vec<(ColumnOpening, Vec<ColumnOpening>)> = challenges
-        .iter()
-        .zip(&parents)
-        .map(|(&j, (same_layer, layer_below))| {
-            (
-                column(j),
-                same_layer
-                    .iter()
-                    .chain(layer_below)
-                    .map(|&p| column(p))
-                    .collect(),
-            )
-        })
-        .collect();
-    drop(column_tree);
+    seal.finish(statement, columns, last)
+}
 
-    let data: Vec<Digest> = replica
-        .par_iter()
-        .zip(last.par_iter())
-        .map(|(r, l)| hash::sub(r, l))
-        .collect();
-    drop(last);
-    let data_tree = MerkleTree::from_digests(data);
-    if data_tree.commitment(Tree::Data) != statement.registered.comm_d {
-        return Err("the registered data commitment is not this replica's data".into());
-    }
-    let data_openings: Vec<(Node, Vec<Node>)> = challenges
-        .iter()
-        .map(|&j| {
-            (
-                hash::to_bytes(&data_tree.levels[0][j as usize]),
-                data_tree.path(j),
-            )
-        })
-        .collect();
-    drop(data_tree);
+/// Labels a member kept when it labelled a leaf ([`label_leaf`]), which a
+/// seal opens instead of labelling the leaf again.
+pub trait LabelSource {
+    /// Node `v`'s label on `layer`.
+    fn label(&self, layer: usize, v: u64) -> Option<Node>;
+    /// Every node's column digest.
+    fn columns(&self) -> Option<Vec<Digest>>;
+    /// The last layer.
+    fn last_layer(&self) -> Option<Vec<Digest>>;
+}
 
-    let replica_tree = MerkleTree::from_digests(replica);
-    if replica_tree.commitment(Tree::Replica) != statement.registered.comm_r {
-        return Err("the registered replica commitment is not this replica".into());
+/// [`prove_seal`] from the labels kept when the leaf was labelled, with no
+/// labelling. Fails, as it does, when they are not the registration's.
+pub fn prove_seal_with_labels(
+    replica: &[u8],
+    statement: &SealStatement,
+    params: &SdrParams,
+    count: usize,
+    labels: &dyn LabelSource,
+) -> Result<SealProof, String> {
+    let mut seal = Seal::new(replica, statement, params, count)?;
+    let n = seal.replica.len();
+    let columns = labels
+        .columns()
+        .filter(|columns| columns.len() == n)
+        .ok_or("no kept column digests for the leaf")?;
+    for (v, kept) in seal.kept.iter_mut() {
+        for layer in 0..params.layers {
+            kept.push(
+                labels
+                    .label(layer, *v)
+                    .ok_or("a kept label is missing or not canonical")?,
+            );
+        }
+        if column_digest(kept) != Some(hash::to_bytes(&columns[*v as usize])) {
+            return Err("the kept labels are not the kept columns'".into());
+        }
     }
-    let openings = challenges
-        .iter()
-        .zip(data_openings)
-        .zip(column_openings)
-        .map(|((&j, (data, data_path)), (column, parents))| SealOpening {
-            data,
-            data_path,
-            replica: hash::to_bytes(&replica_tree.levels[0][j as usize]),
-            replica_path: replica_tree.path(j),
-            column,
+    let last = labels
+        .last_layer()
+        .filter(|last| last.len() == n)
+        .ok_or("no kept last layer for the leaf")?;
+    seal.finish(statement, columns, last)
+}
+
+/// A seal proof being made: the replica, the challenges and their parents,
+/// and the labels kept for each node they name.
+struct Seal {
+    replica: Vec<Digest>,
+    challenges: Vec<u64>,
+    parents: Vec<(Vec<u64>, Vec<u64>)>,
+    kept: std::collections::BTreeMap<u64, Vec<Node>>,
+}
+
+impl Seal {
+    fn new(
+        replica: &[u8],
+        statement: &SealStatement,
+        params: &SdrParams,
+        count: usize,
+    ) -> Result<Self, String> {
+        check_params(params);
+        let n = statement.n as usize;
+        if n < MIN_NODES || statement.n >= MAX_NODES || replica.len() != n * NODE_BYTES {
+            return Err(format!(
+                "replica is {} bytes, the registration has {n} nodes",
+                replica.len()
+            ));
+        }
+        let replica =
+            hash::digests_from_bytes(replica).ok_or("the replica holds a non-canonical node")?;
+        let challenges = seal_challenges(statement, count);
+        let parents: Vec<(Vec<u64>, Vec<u64>)> = challenges
+            .iter()
+            .map(|&j| parents_of(j, statement.n, params))
+            .collect();
+        let mut kept = std::collections::BTreeMap::new();
+        for (j, (same_layer, layer_below)) in challenges.iter().zip(&parents) {
+            for v in std::iter::once(j).chain(same_layer).chain(layer_below) {
+                kept.entry(*v).or_insert_with(Vec::new);
+            }
+        }
+        Ok(Self {
+            replica,
+            challenges,
             parents,
+            kept,
         })
-        .collect();
-    Ok(SealProof { openings })
+    }
+
+    /// The proof, from every node's column digest and the last layer.
+    fn finish(
+        self,
+        statement: &SealStatement,
+        columns: Vec<Digest>,
+        last: Vec<Digest>,
+    ) -> Result<SealProof, String> {
+        let Self {
+            replica,
+            challenges,
+            parents,
+            kept,
+        } = self;
+        let column_tree = MerkleTree::from_digests(columns);
+        if column_tree.commitment(Tree::Column) != statement.registered.comm_c {
+            return Err("the registered column commitment is not this replica's labelling".into());
+        }
+        let column = |v: u64| ColumnOpening {
+            labels: kept[&v].clone(),
+            path: column_tree.path(v),
+        };
+        let column_openings: Vec<(ColumnOpening, Vec<ColumnOpening>)> = challenges
+            .iter()
+            .zip(&parents)
+            .map(|(&j, (same_layer, layer_below))| {
+                (
+                    column(j),
+                    same_layer
+                        .iter()
+                        .chain(layer_below)
+                        .map(|&p| column(p))
+                        .collect(),
+                )
+            })
+            .collect();
+        drop(column_tree);
+
+        let data: Vec<Digest> = replica
+            .par_iter()
+            .zip(last.par_iter())
+            .map(|(r, l)| hash::sub(r, l))
+            .collect();
+        drop(last);
+        let data_tree = MerkleTree::from_digests(data);
+        if data_tree.commitment(Tree::Data) != statement.registered.comm_d {
+            return Err("the registered data commitment is not this replica's data".into());
+        }
+        let data_openings: Vec<(Node, Vec<Node>)> = challenges
+            .iter()
+            .map(|&j| {
+                (
+                    hash::to_bytes(&data_tree.levels[0][j as usize]),
+                    data_tree.path(j),
+                )
+            })
+            .collect();
+        drop(data_tree);
+
+        let replica_tree = MerkleTree::from_digests(replica);
+        if replica_tree.commitment(Tree::Replica) != statement.registered.comm_r {
+            return Err("the registered replica commitment is not this replica".into());
+        }
+        let openings = challenges
+            .iter()
+            .zip(data_openings)
+            .zip(column_openings)
+            .map(|((&j, (data, data_path)), (column, parents))| SealOpening {
+                data,
+                data_path,
+                replica: hash::to_bytes(&replica_tree.levels[0][j as usize]),
+                replica_path: replica_tree.path(j),
+                column,
+                parents,
+            })
+            .collect();
+        Ok(SealProof { openings })
+    }
 }
 
 /// Check a seal proof: every challenged node's data, replica and column open
