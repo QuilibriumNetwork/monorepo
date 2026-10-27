@@ -94,8 +94,24 @@ async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
     let channel = endpoint(addr, tls)?
         .connect()
         .await
-        .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("connect {addr}: {}", with_causes(&e)))?;
     Ok(channel)
+}
+
+/// An error with its causes: tonic's own message is only "transport error",
+/// and the cause says what failed (e.g. "Connection refused").
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let text = next.to_string();
+        if !message.ends_with(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = next.source();
+    }
+    message
 }
 
 /// Connect and return a `NodeServiceClient` with 100 MiB limits.
@@ -219,6 +235,25 @@ mod tests {
             assert_eq!(is_local_multiaddr(ma).unwrap(), local, "{ma}");
         }
         assert!(is_local_multiaddr("127.0.0.1:8337").is_err());
+    }
+
+    /// A refused connection names its cause, not only "transport error".
+    #[tokio::test]
+    async fn a_failed_connection_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let opts = ConnectOpts {
+            public_rpc: false,
+            custom_rpc: String::new(),
+            listen_grpc_multiaddr: format!("/ip4/127.0.0.1/tcp/{port}"),
+        };
+        let error = connect_channel(&opts).await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("connect 127.0.0.1:{port}: transport error: ")),
+            "{error}"
+        );
+        assert!(error.len() > format!("connect 127.0.0.1:{port}: transport error: ").len());
     }
 
     #[test]

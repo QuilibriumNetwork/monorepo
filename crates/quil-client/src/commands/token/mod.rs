@@ -28,9 +28,11 @@ pub struct TokenCommonArgs {
     /// Use public RPC for token operations.
     #[arg(long = "public-rpc", global = true, default_value_t = false)]
     pub public_rpc: bool,
-    /// Path to the node config directory.
-    #[arg(long = "config", global = true, default_value = "")]
-    pub config: String,
+    /// Path to the node config directory, the one holding config.yml
+    /// (default: the default node config). A directory without config.yml is
+    /// refused. `token legacy` takes it more than once, after `legacy`.
+    #[arg(long = "config", global = true, value_name = "DIR", action = clap::ArgAction::Append)]
+    pub config: Vec<String>,
     /// Read wallet state (coins, escrows, witnesses) and other applications'
     /// fee quotes from this node's gRPC multiaddr instead of the configured
     /// node. QUIL fee quotes and submissions still go to the configured node,
@@ -80,6 +82,128 @@ fn max_fee_from_env() -> anyhow::Result<u128> {
     }
 }
 
+impl TokenCommonArgs {
+    /// The one `--config` of a command other than `token legacy` (empty: the
+    /// default node config).
+    fn single_config(&self) -> anyhow::Result<&str> {
+        match self.config.as_slice() {
+            [] => Ok(""),
+            [one] => Ok(one.as_str()),
+            several => anyhow::bail!(
+                "--config is given {} times; only `token legacy` reads several node configs",
+                several.len()
+            ),
+        }
+    }
+}
+
+/// Where the node a command reads from was named, for errors that say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeSource {
+    /// `--read-rpc`.
+    ReadRpc,
+    /// `listenGrpcMultiaddr` of the node config in this directory.
+    Config(PathBuf),
+    /// No node config names one: the node's default listener.
+    Default,
+}
+
+/// A node to read from, and where it was named.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadNode {
+    pub opts: ConnectOpts,
+    pub source: NodeSource,
+}
+
+impl ReadNode {
+    /// The node as an operator would look it up: its address, then where
+    /// that address came from.
+    pub(crate) fn describe(&self) -> String {
+        if self.opts.is_light_node() {
+            return if self.opts.custom_rpc.is_empty() {
+                format!(
+                    "the public RPC {} (--public-rpc, or publicRpc in the qclient config)",
+                    crate::rpc::PUBLIC_RPC_ADDR
+                )
+            } else {
+                format!("{} (customRpc in the qclient config)", self.opts.custom_rpc)
+            };
+        }
+        let multiaddr = self.multiaddr();
+        match &self.source {
+            NodeSource::ReadRpc => format!("{multiaddr} (--read-rpc)"),
+            NodeSource::Config(dir) if self.opts.listen_grpc_multiaddr.is_empty() => format!(
+                "{multiaddr} (the node default: {} sets no listenGrpcMultiaddr)",
+                dir.join("config.yml").display()
+            ),
+            NodeSource::Config(dir) => format!(
+                "{multiaddr} (listenGrpcMultiaddr in {})",
+                dir.join("config.yml").display()
+            ),
+            NodeSource::Default => format!("{multiaddr} (the node default; no node config found)"),
+        }
+    }
+
+    /// The gRPC multiaddr dialed, for a node that is not a public RPC.
+    pub(crate) fn multiaddr(&self) -> &str {
+        if self.opts.listen_grpc_multiaddr.is_empty() {
+            quil_config::DEFAULT_LISTEN_GRPC_MULTIADDR
+        } else {
+            &self.opts.listen_grpc_multiaddr
+        }
+    }
+
+    /// One key per distinct endpoint, so a command dials each node once.
+    pub(crate) fn endpoint_key(&self) -> String {
+        if self.opts.is_light_node() {
+            format!("rpc:{}", self.opts.custom_rpc)
+        } else {
+            format!("grpc:{}", self.multiaddr())
+        }
+    }
+
+    /// What the operator can do when this node does not answer. `default`
+    /// is the default node config's listener, suggested when it differs.
+    fn remedy(&self, default: Option<&str>) -> String {
+        if self.opts.is_light_node() {
+            return "Check this host's network access, or read through a running node with \
+                    --read-rpc <its listenGrpcMultiaddr>"
+                .into();
+        }
+        let mut remedy = match self.source {
+            NodeSource::ReadRpc => "Check that a node runs and listens there: a node's address is \
+                 listenGrpcMultiaddr in its own config.yml"
+                .to_string(),
+            _ => "Is that node running? Pass --read-rpc <multiaddr of a running node>: a \
+                  node's address is listenGrpcMultiaddr in its own config.yml"
+                .to_string(),
+        };
+        if let Some(default) = default.filter(|default| *default != self.multiaddr()) {
+            remedy.push_str(&format!(" (the default node config has {default})"));
+        }
+        remedy
+    }
+
+    /// Connect, or say which node did not answer, where it was named and
+    /// what to do about it.
+    pub(crate) async fn connect(
+        &self,
+        default: Option<&str>,
+    ) -> anyhow::Result<
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    > {
+        crate::rpc::connect_node_service(&self.opts)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot reach the node at {}: {error:#}. {}",
+                    self.describe(),
+                    self.remedy(default)
+                )
+            })
+    }
+}
+
 /// Connection options for `--read-rpc`. The read connection is plaintext h2,
 /// so a host other than this one is dialed only with `--insecure-read-rpc`.
 fn read_rpc_opts(multiaddr: &str, insecure: bool) -> anyhow::Result<ConnectOpts> {
@@ -121,8 +245,18 @@ pub enum TokenCommand {
     Balance,
     /// Lists all coins under control of the managing account.
     Coins,
-    /// Lists this identity's legacy (pre-2.1) coins and their unshielded total.
-    Legacy,
+    /// Lists legacy (pre-2.1) coins, their unshielded total and shield readiness.
+    ///
+    /// Identities: the node config (--config, repeatable after `legacy`;
+    /// default: the default node config), every node under --configs-under,
+    /// and Ed448 public keys, peer IDs or owner addresses given without any
+    /// config. Only config.yml's Ed448 public key is read, never keys.yml.
+    /// Coins are read from --read-rpc, else the public RPC (--public-rpc),
+    /// else each config's listenGrpcMultiaddr; identities given without a
+    /// config ask the default node config's node, else the node default
+    /// /ip4/127.0.0.1/tcp/8337.
+    #[command(after_long_help = legacy::AFTER_HELP)]
+    Legacy(legacy::LegacyArgs),
     /// Transfer a confidential amount to a recipient address (`confidential-address`).
     Transfer {
         /// Recipient QCT3 address.
@@ -153,7 +287,14 @@ pub enum TokenCommand {
         fee: Option<u128>,
     },
     /// Shield every unshielded legacy coin of this identity, in batches of up
-    /// to 96 legacy coins from one shard each (active from GLOBAL frame 864,000).
+    /// to 96 legacy coins from one shard each.
+    ///
+    /// On mainnet, where every legacy coin came from the migration, shields
+    /// are admitted from GLOBAL frame 943,920 (the first frame of epoch 1311),
+    /// when admission starts matching owners in their migrated form; earlier
+    /// shields are refused ("source owner mismatch"), so this command refuses
+    /// to start before the node's GLOBAL head reaches it. Batches themselves
+    /// are admitted from frame 864,000. `token legacy` shows the plan.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
@@ -320,7 +461,6 @@ pub enum TokenCommand {
 /// Resolved per-invocation token context (Go `TokenCmd.PersistentPreRun`).
 pub struct TokenCtx {
     pub node_config: Config,
-    #[allow(dead_code)]
     pub config_dir: PathBuf,
     pub key_manager: Arc<FileKeyManager>,
     pub connect_opts: ConnectOpts,
@@ -354,7 +494,20 @@ impl TokenCtx {
     ) -> anyhow::Result<
         quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
-        crate::rpc::connect_node_service(&self.connect_opts).await
+        // Read options differ from the submission's only by --read-rpc.
+        let read_rpc = self.connect_opts.listen_grpc_multiaddr
+            != self.submit_opts.listen_grpc_multiaddr
+            || self.connect_opts.is_light_node() != self.submit_opts.is_light_node();
+        ReadNode {
+            opts: self.connect_opts.clone(),
+            source: if read_rpc {
+                NodeSource::ReadRpc
+            } else {
+                NodeSource::Config(self.config_dir.clone())
+            },
+        }
+        .connect(None)
+        .await
     }
 
     /// Connect to the configured node for an authenticated submission.
@@ -363,13 +516,18 @@ impl TokenCtx {
     ) -> anyhow::Result<
         quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
-        crate::rpc::connect_node_service(&self.submit_opts).await
+        ReadNode {
+            opts: self.submit_opts.clone(),
+            source: NodeSource::Config(self.config_dir.clone()),
+        }
+        .connect(None)
+        .await
     }
 
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
         let ctx = Context::load(global)?;
         println!("Loading node config...");
-        let (node_config, config_dir) = ctx.load_node_config(&common.config)?;
+        let (node_config, config_dir) = ctx.load_node_config(common.single_config()?)?;
 
         // The Ed448 identity is kept ONLY for the legacy coin address
         // (`poseidon(ed448 peerId)`, `legacy_address()` below). The peer id we
@@ -459,7 +617,7 @@ pub(crate) async fn pay_for_bundle(
 ) -> anyhow::Result<(Vec<u8>, bool)> {
     let common = TokenCommonArgs {
         public_rpc: false,
-        config: String::new(),
+        config: Vec::new(),
         read_rpc: None,
         insecure_read_rpc: false,
         max_fee: max_fee_from_env()?,
@@ -469,8 +627,23 @@ pub(crate) async fn pay_for_bundle(
 }
 
 pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
+    // Legacy coins are listed by public key alone: no keystore, and possibly
+    // several identities.
+    if let TokenCommand::Legacy(listing) = &args.command {
+        return legacy::run(global, &args.common, &application(args)?, listing).await;
+    }
     let tc = TokenCtx::load(global, &args.common)?;
     run_with_context(&tc, args).await
+}
+
+/// The `--application` identifier (default: QUIL).
+fn application(args: &TokenArgs) -> anyhow::Result<[u8; 32]> {
+    match &args.application {
+        None => Ok(quil_execution::domains::QUIL_TOKEN),
+        Some(application) => hex::decode(application)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("application must be exactly 32 bytes")),
+    }
 }
 
 /// Shared command dispatch after configuration and keys have been loaded.
@@ -812,9 +985,9 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
-        TokenCommand::Legacy => {
+        TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
-            legacy::run(tc, &application).await
+            legacy::run_loaded(tc, &application, listing).await
         }
         _ => anyhow::bail!(
             "this build does not include support for this confidential token operation"
@@ -958,6 +1131,173 @@ mod tests {
             );
         }
         assert!(read_rpc_opts("not-a-multiaddr", false).is_err());
+    }
+
+    /// `token legacy` takes several identities and output switches; every
+    /// other command still reads exactly one config.
+    #[test]
+    fn token_legacy_takes_identities_and_other_commands_one_config() {
+        let owner = format!("0x{}", hex::encode([3; 32]));
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "legacy",
+            "--config",
+            "one/.config",
+            "--config",
+            "two/.config",
+            "--configs-under",
+            "nodes",
+            "--ed448-pub",
+            "00",
+            "--peer-id",
+            "QmPeer",
+            "--owner",
+            &owner,
+            "--summary",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.token.common.config, ["one/.config", "two/.config"]);
+        let TokenCommand::Legacy(listing) = &parsed.token.command else {
+            panic!("not the legacy command");
+        };
+        assert_eq!(listing.configs_under, [PathBuf::from("nodes")]);
+        assert_eq!(
+            (
+                &listing.ed448_pub[..],
+                &listing.peer_id[..],
+                &listing.owner[..]
+            ),
+            (
+                &["00".to_string()][..],
+                &["QmPeer".to_string()][..],
+                &[owner][..]
+            )
+        );
+        assert!(listing.summary && listing.json);
+        // Nothing given: the default config, per-coin text.
+        let TokenCommand::Legacy(plain) = TokenCli::try_parse_from(["token", "legacy"])
+            .unwrap()
+            .token
+            .command
+        else {
+            panic!("not the legacy command");
+        };
+        assert!(!plain.summary && !plain.json && plain.ed448_pub.is_empty());
+
+        // The output switches belong to `legacy` alone.
+        assert!(TokenCli::try_parse_from(["token", "balance", "--summary"]).is_err());
+        assert!(TokenCli::try_parse_from(["token", "balance", "--json"]).is_err());
+        let once = TokenCli::try_parse_from(["token", "--config", "one", "balance"]).unwrap();
+        assert_eq!(once.token.common.single_config().unwrap(), "one");
+        let none = TokenCli::try_parse_from(["token", "balance"]).unwrap();
+        assert_eq!(none.token.common.single_config().unwrap(), "");
+        let twice =
+            TokenCli::try_parse_from(["token", "balance", "--config", "a", "--config", "b"])
+                .unwrap();
+        let error = twice.token.common.single_config().unwrap_err().to_string();
+        assert!(error.contains("only `token legacy`"), "{error}");
+    }
+
+    /// `token legacy --help` documents its JSON schema, and `shield-all`'s
+    /// help names the frame mainnet admits shields of migrated coins from.
+    #[test]
+    fn token_help_documents_the_legacy_schema_and_the_shield_frame() {
+        use clap::CommandFactory;
+        let mut command = TokenCli::command();
+        let legacy = command
+            .find_subcommand_mut("legacy")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(legacy.contains(legacy::JSON_SCHEMA), "{legacy}");
+        assert!(legacy.contains("--configs-under"), "{legacy}");
+        #[cfg(feature = "native-proof")]
+        {
+            let shield_all = command
+                .find_subcommand_mut("shield-all")
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            use quil_execution::token_intrinsic::legacy_migration::MAINNET_MIGRATED_OWNER_FRAME;
+            assert_eq!(
+                MAINNET_MIGRATED_OWNER_FRAME, 943_920,
+                "update the shield-all help"
+            );
+            assert!(shield_all.contains("943,920"), "{shield_all}");
+        }
+    }
+
+    /// An unreachable node is named with where its address came from and
+    /// what to do, not only as a transport error.
+    #[tokio::test]
+    async fn an_unreachable_node_is_named_with_its_source_and_the_fix() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let config_dir = PathBuf::from("old-node").join(".config");
+        let node = ReadNode {
+            opts: ConnectOpts {
+                public_rpc: false,
+                custom_rpc: String::new(),
+                listen_grpc_multiaddr: dead.clone(),
+            },
+            source: NodeSource::Config(config_dir.clone()),
+        };
+        let error = node
+            .connect(Some("/ip4/127.0.0.1/tcp/8888"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("cannot reach the node at {dead}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "(listenGrpcMultiaddr in {})",
+                config_dir.join("config.yml").display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("Pass --read-rpc"), "{error}");
+        assert!(
+            error.contains("(the default node config has /ip4/127.0.0.1/tcp/8888)"),
+            "{error}"
+        );
+        // The default node config's own listener is not suggested back.
+        let error = node
+            .connect(Some(dead.as_str()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("the default node config has"), "{error}");
+
+        let read = ReadNode {
+            source: NodeSource::ReadRpc,
+            ..node.clone()
+        };
+        assert_eq!(read.describe(), format!("{dead} (--read-rpc)"));
+        let default = ReadNode {
+            opts: ConnectOpts::default(),
+            source: NodeSource::Default,
+        };
+        assert_eq!(
+            default.describe(),
+            "/ip4/127.0.0.1/tcp/8337 (the node default; no node config found)"
+        );
+        let public = ReadNode {
+            opts: ConnectOpts {
+                public_rpc: true,
+                ..ConnectOpts::default()
+            },
+            source: NodeSource::Default,
+        };
+        assert!(public.describe().starts_with("the public RPC"));
+        assert_ne!(public.endpoint_key(), default.endpoint_key());
     }
 
     #[test]

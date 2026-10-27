@@ -2841,26 +2841,38 @@ pub(super) async fn run_balance(
     }
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application_id)?);
-    let client = tc.connect().await?;
+    // An unreachable node or a keystore without wallet keys (a pre-2.1 node's)
+    // fails only the lines that need them; the unreachable node's own error,
+    // which names it and the fix, ends the output.
+    let client = tc.connect().await;
+    let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
     if quil {
-        let legacy = super::legacy::unshielded(tc, &client, &application_id).await;
+        let legacy = match &client {
+            Ok(client) => super::legacy::unshielded(tc, client, &application_id).await,
+            Err(_) => Err(unreachable()),
+        };
         if legacy.is_err() {
             failed.push("legacy coins");
         }
         println!("{}", super::balance::format_legacy_coins(legacy));
     }
-    let confidential = match wallet
-        .scan_unspent_or_rootless(&client, max_pages, max_coins)
-        .await
-    {
-        Ok(Some(coins)) => coins
-            .iter()
-            .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
-            .map(|total| Some((total, coins.len())))
-            .ok_or_else(|| anyhow::anyhow!("balance overflows u128")),
-        Ok(None) => Ok(None),
-        Err(error) => Err(error),
+    let confidential = match &client {
+        Err(_) => Err(unreachable()),
+        Ok(client) => match RecipientWallet::load(tc, &network, &application_id) {
+            Err(error) => Err(error),
+            Ok(wallet) => match std::sync::Arc::new(wallet)
+                .scan_unspent_or_rootless(client, max_pages, max_coins)
+                .await
+            {
+                Ok(Some(coins)) => coins
+                    .iter()
+                    .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
+                    .map(|total| Some((total, coins.len())))
+                    .ok_or_else(|| anyhow::anyhow!("balance overflows u128")),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error),
+            },
+        },
     };
     if confidential.is_err() {
         failed.push("confidential coins");
@@ -2869,11 +2881,11 @@ pub(super) async fn run_balance(
         "{}",
         super::balance::format_confidential_coins(confidential, quil)
     );
-    anyhow::ensure!(
-        failed.is_empty(),
-        "balance incomplete: {} unavailable",
-        failed.join(", ")
-    );
+    let incomplete = || format!("balance incomplete: {} unavailable", failed.join(", "));
+    if let Err(error) = client {
+        return Err(error.context(incomplete()));
+    }
+    anyhow::ensure!(failed.is_empty(), "{}", incomplete());
     Ok(())
 }
 
@@ -4062,6 +4074,7 @@ pub(super) async fn run_shield(
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
+    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, false).await?;
     let bytes = wallet
         .clone()
         .create_shield(
@@ -4092,22 +4105,13 @@ pub(super) fn shield_batches(
     Vec<[u8; 32]>,
 ) {
     use quil_lattice_ct::confidential::shield::ShieldSource;
-    let covers = |path: &[bool], address: &[u8; 32]| {
-        path.iter()
-            .enumerate()
-            .all(|(i, bit)| (address[i / 8] & (0x80 >> (i % 8)) != 0) == *bit)
-    };
     coins.sort();
     coins.dedup_by_key(|(address, _)| *address);
     let mut groups: std::collections::BTreeMap<Vec<bool>, Vec<ShieldSource>> =
         std::collections::BTreeMap::new();
     let mut uncovered = Vec::new();
     for (address, amount) in coins {
-        match shards
-            .iter()
-            .filter(|path| covers(path, &address))
-            .max_by_key(|path| path.len())
-        {
+        match super::legacy::deepest_shard(shards, &address) {
             Some(path) => groups
                 .entry(path.clone())
                 .or_default()
@@ -4125,29 +4129,6 @@ pub(super) fn shield_batches(
         })
         .collect();
     (batches, uncovered)
-}
-
-/// The bit paths of `application`'s live shards (any active prover).
-#[cfg(feature = "native-proof")]
-async fn live_shard_paths(
-    client: &mut quil_types::proto::node::node_service_client::NodeServiceClient<
-        tonic::transport::Channel,
-    >,
-    application: &[u8; 32],
-) -> anyhow::Result<Vec<Vec<bool>>> {
-    let shards = client
-        .get_shard_info(quil_types::proto::node::GetShardInfoRequest { include_all: true })
-        .await
-        .map_err(|e| anyhow::anyhow!("shard list: {}", e.message()))?
-        .into_inner()
-        .shards;
-    Ok(shards
-        .iter()
-        .filter(|shard| shard.filter.starts_with(application) && shard.active_provers > 0)
-        .filter_map(|shard| {
-            quil_forest::decode_shard_filter_or_root(&shard.filter, 32).map(|(_, bits)| bits)
-        })
-        .collect())
 }
 
 /// Legacy coins this wallet submitted in a batch shield within the last hour:
@@ -4216,8 +4197,8 @@ pub(super) async fn run_shield_all(
     let coins: Vec<([u8; 32], u128)> = super::legacy::list(tc, &client, &application)
         .await?
         .into_iter()
-        .filter(|(address, _, shielded)| !shielded && !pending.contains(address))
-        .map(|(address, amount, _)| (address, amount))
+        .filter(|coin| !coin.shielded && !pending.contains(&coin.address))
+        .map(|coin| (coin.address, coin.amount))
         .collect();
     if coins.is_empty() {
         println!(
@@ -4230,7 +4211,8 @@ pub(super) async fn run_shield_all(
         );
         return Ok(());
     }
-    let shards = live_shard_paths(&mut client, &application).await?;
+    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, true).await?;
+    let shards = super::legacy::live_shard_paths(&client, &application).await?;
     let (batches, uncovered) = shield_batches(coins, &shards, max_per_batch);
     if !uncovered.is_empty() {
         println!(

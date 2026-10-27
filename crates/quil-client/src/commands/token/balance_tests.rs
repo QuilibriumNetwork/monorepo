@@ -180,6 +180,8 @@ fn balance_lines_show_a_missing_root_as_no_coins_and_failures_with_their_reason(
         "Confidential coins: none exist in this application yet (no root published)"
     );
     assert_eq!(format_confidential_coins(Ok(Some((25, 2))), true),
+        "Confidential QUIL coins: 0.000000003125 QUIL (25 base units) across 2 coins reported unspent by the configured node (not a finalized balance)");
+    assert_eq!(format_confidential_coins(Ok(Some((25, 2))), false),
         "Confidential coins: 25 base units across 2 coins reported unspent by the configured node (not a finalized balance)");
     let refusal =
         "no node serving application 01 answered this node: 1 peer declined: 1x dial failed";
@@ -189,11 +191,21 @@ fn balance_lines_show_a_missing_root_as_no_coins_and_failures_with_their_reason(
     );
     assert_eq!(
         format_legacy_coins(Ok(Some((7, 2, 1)))),
-        "Unshielded legacy coins: 7 base units across 2 coins (1 already shielded)"
+        "Unshielded legacy coins: 0.000000000875 QUIL (7 base units) across 2 coins (1 already shielded)"
     );
     assert_eq!(
         format_legacy_coins(Ok(None)),
         "Unshielded legacy coins: none (this node has no Ed448 identity)"
+    );
+    // An empty listing is an answer, apart from "unavailable".
+    assert_eq!(
+        format_legacy_coins(Ok(Some((0, 0, 0)))),
+        "Unshielded legacy coins: none (the listing has no coin under this identity's key or \
+         peer-id owner)"
+    );
+    assert_eq!(
+        format_legacy_coins(Ok(Some((0, 0, 3)))),
+        "Unshielded legacy coins: none left (3 already shielded)"
     );
     assert_eq!(
         format_legacy_coins(Err(anyhow::anyhow!(
