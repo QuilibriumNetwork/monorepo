@@ -10,22 +10,50 @@ use quil_types::thread_probe::{self, Section};
 
 use crate::encoding;
 
-/// Finalized global frames retained by an enabled archive cache.
+/// Finalized global frames retained by an enabled frame cache.
 pub const GLOBAL_FRAME_CACHE_CAPACITY: usize = 720;
-/// Encoded bytes the cache may retain. A frame carries its request bundles,
-/// and a confidential token operation is about 200 KB, so an entry bound alone
-/// lets a busy epoch hold gigabytes. When the budget binds, the OLDEST frames
-/// go first and fewer than 720 stay resident; the newest frame always stays.
+/// Bytes an archive's cache may hold (see [`held_size`]). A frame carries its
+/// request bundles, and a confidential token operation is about 200 KB, so an
+/// entry bound alone lets a busy epoch hold gigabytes. When the budget binds,
+/// the OLDEST frames go first and fewer than 720 stay resident; the newest
+/// frame always stays.
 pub const GLOBAL_FRAME_CACHE_MAX_BYTES: usize = 512 << 20;
+/// Bytes a regular node's cache may hold. Peers sync history from archives;
+/// a regular node's own readers follow the head and read older frames from
+/// the store. Frames of committee handoffs (~875 KiB each, Oct27) filled the
+/// archive budget on every node; this keeps the newest ~70 such frames,
+/// about 15 minutes of them.
+pub const REGULAR_GLOBAL_FRAME_CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// Heap a cached frame holds: its encoded bytes, which its byte fields
+/// dominate, plus the decoded bundles and requests, which the encoding does
+/// not count. Allocator size classes add up to a few percent more.
+fn held_size(frame: &global::GlobalFrame) -> usize {
+    let requests: usize = frame.requests.iter().map(|b| b.requests.capacity()).sum();
+    frame.encoded_len()
+        + std::mem::size_of::<global::GlobalFrame>()
+        + frame.requests.capacity() * std::mem::size_of::<global::MessageBundle>()
+        + requests * std::mem::size_of::<global::MessageRequest>()
+}
+
+/// What the cache holds now, for the master's memory snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlobalFrameCacheStats {
+    pub frames: usize,
+    pub held_bytes: usize,
+    pub budget_bytes: usize,
+}
 
 #[derive(Default)]
 struct GlobalFrameCache {
     enabled: bool,
     generation: u64,
-    /// Frame and its encoded size, which is what `bytes` sums.
+    /// Frame and its held size, which is what `bytes` sums.
     frames: BTreeMap<u64, (Arc<global::GlobalFrame>, usize)>,
     bytes: usize,
     max_bytes: Option<usize>,
+    /// Since when the byte budget, not the frame bound, sets what stays.
+    binding_since: Option<std::time::Instant>,
 }
 
 impl GlobalFrameCache {
@@ -46,6 +74,20 @@ impl GlobalFrameCache {
             .map(|(frame, _)| frame.clone())
     }
 
+    fn budget(&self) -> usize {
+        self.max_bytes.unwrap_or(GLOBAL_FRAME_CACHE_MAX_BYTES)
+    }
+
+    /// Whether a frame read from the store would stay once inserted: while
+    /// the budget binds, only frames newer than the oldest one held do.
+    fn admits(&self, frame_number: u64) -> bool {
+        (self.binding_since.is_none() && self.frames.len() < GLOBAL_FRAME_CACHE_CAPACITY)
+            || self
+                .frames
+                .first_key_value()
+                .is_none_or(|(oldest, _)| frame_number > *oldest)
+    }
+
     fn insert(&mut self, frame: Arc<global::GlobalFrame>) {
         if !self.enabled {
             return;
@@ -53,18 +95,65 @@ impl GlobalFrameCache {
         let Some(header) = frame.header.as_ref() else {
             return;
         };
-        let size = frame.encoded_len();
-        if let Some((_, replaced)) = self.frames.insert(header.frame_number, (frame, size)) {
+        let frame_number = header.frame_number;
+        let size = held_size(&frame);
+        if let Some((_, replaced)) = self.frames.insert(frame_number, (frame, size)) {
             self.bytes -= replaced;
         }
         self.bytes += size;
-        let budget = self.max_bytes.unwrap_or(GLOBAL_FRAME_CACHE_MAX_BYTES);
+        let budget = self.budget();
+        let mut by_bytes = false;
         while self.frames.len() > GLOBAL_FRAME_CACHE_CAPACITY
             || (self.bytes > budget && self.frames.len() > 1)
         {
+            by_bytes |= self.frames.len() <= GLOBAL_FRAME_CACHE_CAPACITY;
             if let Some((_, (_, evicted))) = self.frames.pop_first() {
                 self.bytes -= evicted;
             }
+        }
+        self.note_binding(by_bytes || self.bytes > budget, frame_number, size);
+    }
+
+    /// Log when the byte budget starts to set what stays and when it stops:
+    /// once the frame bound takes over again, or the cache falls to half
+    /// its budget (after an invalidation), so a run of frames near the
+    /// budget does not flap.
+    fn note_binding(&mut self, binds: bool, frame_number: u64, size: usize) {
+        let budget = self.budget();
+        match self.binding_since {
+            None if binds => {
+                self.binding_since = Some(std::time::Instant::now());
+                tracing::info!(
+                    scope = "this node",
+                    frames = self.frames.len(),
+                    oldest = self.frames.first_key_value().map(|(n, _)| *n),
+                    frame = frame_number,
+                    frame_kib = size >> 10,
+                    held_mb = self.bytes >> 20,
+                    budget_mb = budget >> 20,
+                    "GLOBAL frame cache byte budget binding: recent frames are large, so \
+                     fewer than 720 stay in memory and older ones are read from the \
+                     store. Expected while GLOBAL frames carry large requests; no action \
+                     needed (QUIL_GLOBAL_FRAME_CACHE_MB sets the budget)"
+                );
+            }
+            Some(since)
+                if !binds
+                    && (self.frames.len() >= GLOBAL_FRAME_CACHE_CAPACITY
+                        || self.bytes <= budget / 2) =>
+            {
+                self.binding_since = None;
+                tracing::info!(
+                    scope = "this node",
+                    frames = self.frames.len(),
+                    held_mb = self.bytes >> 20,
+                    budget_mb = budget >> 20,
+                    binding_secs = since.elapsed().as_secs(),
+                    "GLOBAL frame cache byte budget no longer binding: the frames held \
+                     fit within it again"
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -140,7 +229,37 @@ impl RocksClockStore {
         }
     }
 
-    /// Enable archive retention and restore the latest 720 stored frames.
+    /// Cap the frame cache at `GLOBAL_FRAME_CACHE_MAX_BYTES` on an archive,
+    /// which serves frame history to every node, else at
+    /// `REGULAR_GLOBAL_FRAME_CACHE_MAX_BYTES`; `QUIL_GLOBAL_FRAME_CACHE_MB`
+    /// overrides either. Call before [`Self::warm_global_frame_cache`].
+    /// Returns the budget in bytes.
+    pub fn set_global_frame_cache_budget(&self, archive: bool) -> usize {
+        let default = if archive {
+            GLOBAL_FRAME_CACHE_MAX_BYTES
+        } else {
+            REGULAR_GLOBAL_FRAME_CACHE_MAX_BYTES
+        };
+        let budget = std::env::var("QUIL_GLOBAL_FRAME_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(default, |mb| mb.saturating_mul(1024 * 1024));
+        self.global_memory.write_cache().max_bytes = Some(budget);
+        budget
+    }
+
+    /// Frames and bytes the cache holds, and its byte budget.
+    pub fn global_frame_cache_stats(&self) -> GlobalFrameCacheStats {
+        let cache = self.global_memory.read_cache();
+        GlobalFrameCacheStats {
+            frames: cache.frames.len(),
+            held_bytes: cache.bytes,
+            budget_bytes: cache.budget(),
+        }
+    }
+
+    /// Enable frame retention and restore up to the latest 720 stored frames,
+    /// as many as the byte budget keeps.
     /// Run on a blocking worker at startup. Live commits populate the same
     /// cache; candidates and aborted transactions never enter it.
     pub fn warm_global_frame_cache(&self) -> Result<usize> {
@@ -167,6 +286,10 @@ impl RocksClockStore {
             it.status().map_err(|e| QuilError::Store(e.to_string()))?;
         }
         for n in numbers {
+            // Descending: once the budget keeps no older frame, stop reading.
+            if !self.global_memory.read_cache().admits(n) {
+                break;
+            }
             match self.get_global_frame(n) {
                 Ok(_) | Err(QuilError::NotFound(_)) => {}
                 Err(e) => return Err(e),
@@ -192,14 +315,23 @@ impl RocksClockStore {
             return Ok((*frame).clone());
         }
         let _load = self.global_memory.lock_load(frame_number);
-        let (generation, cached) = {
+        let (generation, cached, admits) = {
             let cache = self.global_memory.read_cache();
-            (cache.generation, cache.get(frame_number))
+            (
+                cache.generation,
+                cache.get(frame_number),
+                cache.admits(frame_number),
+            )
         };
         if let Some(frame) = cached {
             return Ok((*frame).clone());
         }
+        // A miss reads the store, which holds every frame the cache dropped.
         let frame = self.read_global_frame(frame_number)?;
+        // An older frame than the cache keeps would be evicted at once.
+        if !admits {
+            return Ok(frame);
+        }
         let cached = Arc::new(frame.clone());
         let mut cache = self.global_memory.write_cache();
         if cache.generation == generation {
@@ -992,7 +1124,7 @@ mod tests {
     fn archive_cache_byte_budget_evicts_oldest_and_tracks_every_removal() {
         let s = test_db();
         s.warm_global_frame_cache().unwrap();
-        let size = cached_frame(1).encoded_len();
+        let size = held_size(&cached_frame(1));
         // Room for three frames and part of a fourth.
         s.global_memory.cache.write().unwrap().max_bytes = Some(size * 3 + size / 2);
         for n in 1..=6 {
@@ -1081,6 +1213,154 @@ mod tests {
             .unwrap()
             .frames
             .is_empty());
+    }
+
+    /// A frame carrying one committee handoff of `kib` KiB.
+    fn handoff_frame(n: u64, kib: usize) -> global::GlobalFrame {
+        use quil_types::proto::global::message_request::Request;
+        global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                ..Default::default()
+            }),
+            requests: vec![global::MessageBundle {
+                requests: vec![global::MessageRequest {
+                    request: Some(Request::CommitteeHandoff(vec![n as u8; kib << 10])),
+                    timestamp: n as i64,
+                }],
+                timestamp: n as i64,
+            }],
+        }
+    }
+
+    fn cached_numbers(s: &RocksClockStore) -> Vec<u64> {
+        s.global_memory
+            .cache
+            .read()
+            .unwrap()
+            .frames
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn cache_budget_defaults_by_role() {
+        if std::env::var_os("QUIL_GLOBAL_FRAME_CACHE_MB").is_some() {
+            return;
+        }
+        let s = test_db();
+        assert_eq!(
+            s.set_global_frame_cache_budget(true),
+            GLOBAL_FRAME_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            s.set_global_frame_cache_budget(false),
+            REGULAR_GLOBAL_FRAME_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            s.global_frame_cache_stats().budget_bytes,
+            REGULAR_GLOBAL_FRAME_CACHE_MAX_BYTES
+        );
+    }
+
+    /// Large request bodies past the budget: the cache holds only the newest
+    /// frames within it, live and after a restart, and every evicted frame is
+    /// still served whole from the store without re-entering the cache.
+    #[test]
+    fn cache_budget_bounds_large_frames_and_store_serves_evicted_ones() {
+        let s = test_db();
+        s.warm_global_frame_cache().unwrap();
+        let big = held_size(&handoff_frame(1, 96));
+        assert!(big > 96 << 10, "the body is counted");
+        let budget = 8 * big + big / 2;
+        s.global_memory.cache.write().unwrap().max_bytes = Some(budget);
+        for n in 1..=40 {
+            s.put_global_frame(&handoff_frame(n, 96), None).unwrap();
+            let stats = s.global_frame_cache_stats();
+            assert!(stats.held_bytes <= budget, "frame {n}: {stats:?}");
+        }
+        let stats = s.global_frame_cache_stats();
+        assert_eq!((stats.frames, stats.held_bytes), (8, 8 * big));
+        assert_eq!(cached_numbers(&s), (33..=40).collect::<Vec<_>>());
+        for n in [1, 20, 32] {
+            assert_eq!(s.get_global_frame(n).unwrap(), handoff_frame(n, 96));
+            assert_eq!(
+                s.get_global_frame_header(n).unwrap(),
+                handoff_frame(n, 96).header.unwrap()
+            );
+        }
+        assert_eq!(cached_numbers(&s), (33..=40).collect::<Vec<_>>());
+        assert_eq!(s.get_global_frame(40).unwrap(), handoff_frame(40, 96));
+
+        // A restart restores the newest frames the budget keeps, then stops.
+        let reopened = RocksClockStore::new(s.db.clone());
+        reopened.global_memory.cache.write().unwrap().max_bytes = Some(budget);
+        assert_eq!(reopened.warm_global_frame_cache().unwrap(), 8);
+        assert_eq!(cached_numbers(&reopened), (33..=40).collect::<Vec<_>>());
+        assert_eq!(reopened.get_global_frame(5).unwrap(), handoff_frame(5, 96));
+    }
+
+    /// The budget starts binding when large frames leave fewer than 720
+    /// resident and stops once the frame bound sets what stays again, or the
+    /// cache falls to half its budget after an invalidation. Small frames
+    /// arriving while it binds do not flap it.
+    #[test]
+    fn cache_budget_binding_starts_and_stops_once_per_transition() {
+        let s = test_db();
+        s.warm_global_frame_cache().unwrap();
+        let small = held_size(&cached_frame(1));
+        // Large frames each hold about as much as 720 small ones.
+        let kib = (GLOBAL_FRAME_CACHE_CAPACITY * small / 1024).max(64);
+        let big = held_size(&handoff_frame(1, kib));
+        s.global_memory.cache.write().unwrap().max_bytes = Some(4 * big + big / 2);
+        let binding = |s: &RocksClockStore| {
+            s.global_memory
+                .cache
+                .read()
+                .unwrap()
+                .binding_since
+                .is_some()
+        };
+
+        for n in 1..=4 {
+            s.put_global_frame(&handoff_frame(n, kib), None).unwrap();
+            assert!(!binding(&s), "frame {n} fits");
+        }
+        s.put_global_frame(&handoff_frame(5, kib), None).unwrap();
+        assert!(
+            binding(&s),
+            "the fifth large frame evicts the first by bytes"
+        );
+        assert_eq!(cached_numbers(&s), vec![2, 3, 4, 5]);
+
+        // Small frames until the cache holds 720 again: one transition back.
+        let mut transitions = 0;
+        for n in 6..=760 {
+            let before = binding(&s);
+            s.put_global_frame(&cached_frame(n), None).unwrap();
+            transitions += usize::from(before != binding(&s));
+        }
+        assert_eq!(transitions, 1, "binding stops once and stays stopped");
+        assert!(!binding(&s));
+        assert_eq!(
+            s.global_frame_cache_stats().frames,
+            GLOBAL_FRAME_CACHE_CAPACITY
+        );
+
+        // Large frames again bind it; an invalidation alone does not end
+        // that, the next frame held under half the budget does.
+        for n in 761..=770 {
+            s.put_global_frame(&handoff_frame(n, kib), None).unwrap();
+            if binding(&s) {
+                break;
+            }
+        }
+        assert!(binding(&s));
+        s.global_memory.cache.write().unwrap().invalidate();
+        assert!(binding(&s));
+        s.put_global_frame(&cached_frame(771), None).unwrap();
+        assert!(!binding(&s));
     }
 
     #[test]
