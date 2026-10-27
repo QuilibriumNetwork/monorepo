@@ -60,6 +60,7 @@ mod recovery_turns;
 pub mod remote_worker;
 pub mod resolver_traffic;
 pub mod rewards;
+mod seal_follow;
 pub mod shard_info;
 pub mod shard_rebalancer;
 pub mod spawn_gate;
