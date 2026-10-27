@@ -9,8 +9,9 @@
 //! Equal votes: the elector is `RoundRobin` and the quorum is count-based via
 //! the Falcon scheme — no seniority weighting anywhere.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use commonware_consensus::simplex::{elector::RoundRobin, Config, Engine, Floor, ForwardingPolicy};
 use commonware_consensus::types::{Epoch, View, ViewDelta};
@@ -225,6 +226,118 @@ where
 // Node hosting: run the engine on a dedicated commonware tokio runtime thread.
 // ---------------------------------------------------------------------------
 
+/// The consensus hosts of this process ([`spawn_global_host`]), so that it
+/// can stop them before it exits ([`stop_hosts`], [`wait_for_hosts`]). A
+/// host drops its engine when it stops, and with it the last handles of the
+/// stores its actors use; nothing else stops a host when the node's own
+/// runtime ends. A host still doing so while the process exits runs
+/// RocksDB's close under its C++ static teardown, which aborts the process
+/// ("pthread lock: Invalid argument").
+pub(crate) struct Hosts {
+    state: Mutex<HostsState>,
+    ended: Condvar,
+}
+
+struct HostsState {
+    stopping: bool,
+    next: u64,
+    /// Each running host's id and shutdown flag.
+    running: Vec<(u64, Arc<AtomicBool>)>,
+}
+
+static HOSTS: Hosts = Hosts::new();
+
+/// Lists a host in [`Hosts`] until its thread drops it, after its runtime
+/// and every actor of its engine are gone.
+pub(crate) struct Registration {
+    hosts: &'static Hosts,
+    id: u64,
+}
+
+impl Hosts {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(HostsState {
+                stopping: false,
+                next: 0,
+                running: Vec::new(),
+            }),
+            ended: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, HostsState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// List a host about to start, or refuse it (setting its flag) once
+    /// the process is stopping.
+    pub(crate) fn register(&'static self, shutdown: &Arc<AtomicBool>) -> Option<Registration> {
+        let mut state = self.state();
+        if state.stopping {
+            shutdown.store(true, Ordering::Release);
+            return None;
+        }
+        let id = state.next;
+        state.next += 1;
+        state.running.push((id, shutdown.clone()));
+        Some(Registration { hosts: self, id })
+    }
+
+    /// Ask every host to stop and refuse new ones; returns how many were
+    /// running. Does not wait.
+    pub(crate) fn stop(&self) -> usize {
+        let mut state = self.state();
+        state.stopping = true;
+        for (_, shutdown) in &state.running {
+            shutdown.store(true, Ordering::Release);
+        }
+        state.running.len()
+    }
+
+    /// Wait up to `grace` for the hosts to end; returns how many still run.
+    pub(crate) fn wait(&self, grace: Duration) -> usize {
+        let deadline = Instant::now() + grace;
+        let mut state = self.state();
+        while !state.running.is_empty() {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .ended
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.running.len()
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.hosts.state().running.retain(|(id, _)| *id != self.id);
+        self.hosts.ended.notify_all();
+    }
+}
+
+/// Ask every consensus host of this process to stop, and refuse hosts
+/// started later (they return at once, with their flag set). Does not
+/// wait: see [`wait_for_hosts`]. Call it once the process is stopping.
+/// Returns how many hosts were running.
+pub fn stop_hosts() -> usize {
+    HOSTS.stop()
+}
+
+/// Wait up to `grace` for the consensus hosts to end after [`stop_hosts`]:
+/// a host ends once its runtime and every actor of its engine, with the
+/// store handles they hold, are dropped. Returns how many still run.
+pub fn wait_for_hosts(grace: Duration) -> usize {
+    HOSTS.wait(grace)
+}
+
 /// The node's handle to a hosted global-consensus engine. The engine runs on a
 /// dedicated OS thread (a commonware tokio runtime cannot nest inside the node's
 /// tokio runtime), and the node communicates with it purely over channels:
@@ -242,7 +355,8 @@ pub struct GlobalHostHandle {
 
 /// Spawn the global-consensus engine on its own commonware tokio runtime thread
 /// and return the node's channel handle. Non-blocking: the engine runs on the
-/// spawned thread; the node drives I/O over the returned channels.
+/// spawned thread; the node drives I/O over the returned channels. The host
+/// is listed for [`stop_hosts`] until its thread returns.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_global_host<Pr, Sk, Fin>(
     scheme: SimplexFalconScheme,
@@ -259,9 +373,10 @@ pub fn spawn_global_host<Pr, Sk, Fin>(
     // from `Floor::Genesis` every launch; acceptable only for tests or callers
     // that intentionally don't persist.
     storage_directory: Option<std::path::PathBuf>,
-    // Optional cooperative shutdown flag. `None` → the engine runs until the
-    // process exits or an actor stops. `Some(flag)` → the host thread polls it
-    // and, once set, stops the engine and drains its work before returning.
+    // Optional cooperative shutdown flag. The host thread polls it and, once
+    // set, stops the engine and drains its work before returning. `None` →
+    // a flag of its own, which only [`stop_hosts`] sets: the engine runs
+    // until an actor stops or the process stops it.
     // GLOBAL supervision uses this on shutdown; app-shard consensus also uses
     // it to rebuild a dynamic committee after joining the old instance.
     shutdown: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -269,6 +384,39 @@ pub fn spawn_global_host<Pr, Sk, Fin>(
 // NOTE: `store` is supplied by the caller (not created here) so the node can
 // hold a clone and insert peer-delivered frame bytes into it — followers must
 // populate their BlockStore from inbound blocks or `verify` can never succeed.
+where
+    Pr: GlobalProposer,
+    Sk: FrameSink,
+    Fin: FrameFinalizer,
+{
+    spawn_host_in(
+        &HOSTS,
+        scheme,
+        peers,
+        proposer,
+        sink,
+        finalizer,
+        store,
+        params,
+        storage_directory,
+        shutdown,
+    )
+}
+
+/// [`spawn_global_host`], listing the host in `hosts`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_host_in<Pr, Sk, Fin>(
+    hosts: &'static Hosts,
+    scheme: SimplexFalconScheme,
+    peers: Arc<[FalconPublicKey]>,
+    proposer: Arc<Pr>,
+    sink: Arc<Sk>,
+    finalizer: Arc<Fin>,
+    store: BlockStore,
+    params: GlobalEngineParams,
+    storage_directory: Option<std::path::PathBuf>,
+    shutdown: Option<Arc<AtomicBool>>,
+) -> GlobalHostHandle
 where
     Pr: GlobalProposer,
     Sk: FrameSink,
@@ -298,7 +446,13 @@ where
     let (s1, r1) = (ch1.sender, ch1.receiver);
     let (s2, r2) = (ch2.sender, ch2.receiver);
 
+    let shutdown = shutdown.unwrap_or_default();
+    let registration = hosts.register(&shutdown);
     let thread = std::thread::spawn(move || {
+        // Released last, once the runtime and the engine's actors are gone.
+        let Some(_registration) = registration else {
+            return;
+        };
         let cfg = match storage_directory {
             Some(dir) => {
                 let removed = remove_torn_blobs(&dir);
@@ -335,12 +489,9 @@ where
             loop {
                 // Poll the flag (cw_tokio is tokio-backed, so tokio::time works
                 // in this runtime); on set, fall through and drop the engine
-                // handle to stop this instance. Without a shutdown flag, run
-                // until the engine exits or the process stops.
-                if shutdown
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-                {
+                // handle to stop this instance. The owner sets it, or
+                // `stop_hosts` when the process stops.
+                if shutdown.load(Ordering::Acquire) {
                     break;
                 }
                 tokio::select! {
@@ -354,10 +505,7 @@ where
             if let Some(outcome) = stopped {
                 // The owner may ask for a stop while the engine is already
                 // returning: closing its inputs also ends the engine.
-                if shutdown
-                    .as_ref()
-                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-                {
+                if shutdown.load(Ordering::Acquire) {
                     tracing::info!(
                         ?outcome,
                         "consensus engine stopped on request; host exiting"
@@ -431,5 +579,176 @@ mod torn_blob_tests {
         assert!(!partition.join("torn").exists() && !partition.join("empty").exists());
         assert!(partition.join("fresh").exists() && partition.join("damaged").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod host_registry_tests {
+    use super::*;
+    use crate::adapters::Recipients;
+    use crate::falcon_base::FalconPrivateKey;
+    use commonware_cryptography::{Hasher as _, Signer as _};
+    use commonware_math::algebra::Random as _;
+    use std::sync::mpsc;
+
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "quil-host-registry-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Proposer;
+    impl GlobalProposer for Proposer {
+        fn propose(&self, view: u64, parent: Digest) -> Option<(Digest, Vec<u8>)> {
+            let mut hash = Sha256::default();
+            hash.update(&view.to_be_bytes());
+            hash.update(parent.as_ref());
+            let digest = hash.finalize();
+            Some((digest, digest.as_ref().to_vec()))
+        }
+
+        fn verify(
+            &self,
+            view: u64,
+            parent: Digest,
+            digest: Digest,
+            bytes: Option<Vec<u8>>,
+        ) -> bool {
+            let (expected, body) = self.propose(view, parent).unwrap();
+            digest == expected && bytes.as_deref() == Some(body.as_slice())
+        }
+    }
+
+    struct Sink;
+    impl FrameSink for Sink {
+        fn broadcast(&self, _: Digest, _: Vec<u8>, _: Recipients<FalconPublicKey>) {}
+    }
+
+    /// Stands in for the store handle a host's reporter holds: records
+    /// when the engine's last reference to it is dropped.
+    struct Finalizer {
+        finalized: Mutex<mpsc::Sender<u64>>,
+        released: Arc<AtomicBool>,
+    }
+    impl FrameFinalizer for Finalizer {
+        fn on_notarized(&self, _: u64, _: Digest, _: Option<Vec<u8>>) {}
+        fn on_finalized(
+            &self,
+            view: u64,
+            _: Digest,
+            _: Option<Vec<u8>>,
+            _: Option<Vec<u8>>,
+            _: bool,
+        ) {
+            let _ = self.finalized.lock().unwrap().send(view);
+        }
+    }
+    impl Drop for Finalizer {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A one-member host listed in `hosts`; returns its handle, the views
+    /// it finalizes and whether its finalizer was dropped.
+    fn spawn(
+        hosts: &'static Hosts,
+        directory: &Directory,
+    ) -> (GlobalHostHandle, mpsc::Receiver<u64>, Arc<AtomicBool>) {
+        let key = FalconPrivateKey::random(commonware_utils::test_rng());
+        let peers: Arc<[FalconPublicKey]> = vec![key.public_key()].into();
+        let set = peers.to_vec().try_into().unwrap();
+        let scheme = SimplexFalconScheme::signer(b"host-registry", set, key).unwrap();
+        let (tx, finalized) = mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let handle = spawn_host_in(
+            hosts,
+            scheme,
+            peers,
+            Arc::new(Proposer),
+            Arc::new(Sink),
+            Arc::new(Finalizer {
+                finalized: Mutex::new(tx),
+                released: released.clone(),
+            }),
+            BlockStore::new(),
+            GlobalEngineParams::new(
+                "registry",
+                1,
+                crate::adapters::digest_from_identity([0; 32]),
+            ),
+            Some(directory.0.clone()),
+            None,
+        );
+        (handle, finalized, released)
+    }
+
+    #[test]
+    fn a_stop_waits_until_the_host_dropped_its_engine() {
+        let hosts: &'static Hosts = Box::leak(Box::new(Hosts::new()));
+        let directory = Directory::new();
+        let (handle, finalized, released) = spawn(hosts, &directory);
+        // Running: it finalizes views.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while finalized.recv_timeout(Duration::from_secs(20)).unwrap() < 2 {
+            assert!(Instant::now() < deadline, "the host did not finalize");
+        }
+        assert_eq!(hosts.stop(), 1);
+        let started = Instant::now();
+        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
+        // The node exits once the wait returns: by then the engine's actors,
+        // and every store handle they held, must be gone.
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the host's finalizer outlived the wait"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        handle.thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_host_started_once_stopping_does_not_run() {
+        let hosts: &'static Hosts = Box::leak(Box::new(Hosts::new()));
+        let directory = Directory::new();
+        assert_eq!(hosts.stop(), 0);
+        let (handle, finalized, released) = spawn(hosts, &directory);
+        handle.thread.join().unwrap();
+        assert!(released.load(Ordering::SeqCst));
+        assert!(finalized.try_recv().is_err());
+        assert_eq!(hosts.wait(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn a_wait_returns_the_hosts_still_running() {
+        let hosts: &'static Hosts = Box::leak(Box::new(Hosts::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let registration = hosts.register(&shutdown).unwrap();
+        assert_eq!(hosts.stop(), 1);
+        assert!(shutdown.load(Ordering::Acquire));
+        let started = Instant::now();
+        assert_eq!(hosts.wait(Duration::from_millis(100)), 1);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(registration);
+        });
+        assert_eq!(hosts.wait(Duration::from_secs(10)), 0);
+        release.join().unwrap();
+        let refused = Arc::new(AtomicBool::new(false));
+        assert!(hosts.register(&refused).is_none());
+        assert!(refused.load(Ordering::Acquire));
     }
 }

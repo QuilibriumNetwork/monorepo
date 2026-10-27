@@ -2692,9 +2692,11 @@ async fn monitor_parent_process(parent_pid: u32, cancel: CancellationToken) {
                         "parent process died, shutting down worker"
                     );
                     cancel.cancel();
-                    // Give a moment for cleanup, then force exit
+                    // Give a moment for cleanup, then force exit, skipping
+                    // the teardown that aborts under a storage job still
+                    // using a store (`storage_jobs::exit_now`).
                     tokio::time::sleep(Duration::from_secs(2)).await;
-                    std::process::exit(1);
+                    crate::storage_jobs::exit_now(1);
                 }
             }
             _ = cancel.cancelled() => return,
