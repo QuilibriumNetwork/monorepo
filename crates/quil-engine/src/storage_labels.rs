@@ -13,18 +13,61 @@
 //!
 //! A leaf's labels take eleven times its replica on disk, plus its column
 //! digests, until its epoch begins: a registration is sealed before then.
+//! So a leaf is labelled and kept only while the labels' filesystem has room
+//! for them (decided 2026-10-27): [`DISK_MARGIN`] times their bytes above a
+//! floor ([`disk_floor`]), beside what the leaves being labelled have still
+//! to write, checked before a leaf starts and before each of its writes. A
+//! leaf refused room is labelled where it is needed instead, as by a process
+//! that keeps no labels, and leaves nothing on disk.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use quil_crypto::sdr::SdrParams;
 use quil_crypto::storage_hash::{self as hash, Digest};
 use quil_crypto::storage_proof::{LabelSource, Node, NODE_BYTES};
+use quil_forest::storage_health::FsUsage;
 use quil_hypergraph::HypergraphCrdt;
 use quil_types::error::{QuilError, Result};
 use tracing::info;
+
+/// Percent of the labels' filesystem that labels leave free, unless
+/// [`DISK_FLOOR_MIN_BYTES`] is more. The stores sharing the filesystem stop
+/// writing far below it (`quil_forest::storage_health::FLOOR_FREE_BYTES`).
+pub const DISK_FLOOR_PERCENT: u64 = 10;
+
+/// The least free space labels leave on their filesystem, however small it is.
+pub const DISK_FLOOR_MIN_BYTES: u64 = 8 << 30;
+
+/// A leaf is labelled and kept only with this many times its labels' bytes
+/// free above the floor: room for whatever else writes to the filesystem
+/// meanwhile, the stores and the logs among them.
+pub const DISK_MARGIN: u64 = 2;
+
+/// How long a shard whose leaves were refused room waits before it is
+/// labelled ahead again: the labels of the epoch before free their room once
+/// their registration is sealed.
+const REFUSED_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// The free space labels leave on a filesystem of `total_bytes`.
+pub fn disk_floor(total_bytes: u64) -> u64 {
+    (total_bytes / 100 * DISK_FLOOR_PERCENT).max(DISK_FLOOR_MIN_BYTES)
+}
+
+/// Bytes a leaf's labels at `n` nodes take on disk: every layer, and a
+/// column digest per node.
+pub fn label_bytes(n: u64) -> u64 {
+    n.saturating_mul(((SdrParams::default().layers + 1) * NODE_BYTES) as u64)
+}
+
+/// Reads the size and free space of the filesystem holding a path:
+/// `statvfs` (`quil_forest::storage_health::fs_usage`), or a test's own.
+pub type SpaceSource = Box<dyn Fn(&Path) -> Option<FsUsage> + Send + Sync>;
 
 static STORE: OnceLock<LabelStore> = OnceLock::new();
 
@@ -32,6 +75,42 @@ static STORE: OnceLock<LabelStore> = OnceLock::new();
 /// that never calls it labels nothing ahead and relabels for its seals.
 pub fn install(dir: PathBuf) {
     let _ = STORE.set(LabelStore::new(dir));
+}
+
+/// [`install`], reading free space from `space`.
+#[cfg(test)]
+pub(crate) fn install_with_space(dir: PathBuf, space: SpaceSource) {
+    let _ = STORE.set(LabelStore::with_space(dir, space));
+}
+
+/// A filesystem of 1 PiB, all of it free.
+#[cfg(test)]
+pub(crate) fn ample_space() -> SpaceSource {
+    Box::new(|_| {
+        Some(FsUsage {
+            total_bytes: 1 << 50,
+            free_bytes: 1 << 50,
+            ..FsUsage::default()
+        })
+    })
+}
+
+/// The regular files under `dir`, at any depth.
+#[cfg(test)]
+pub(crate) fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 /// This process's label store, once installed.
@@ -52,11 +131,145 @@ fn io(what: &str, path: &Path, error: std::io::Error) -> QuilError {
 /// the column commitment.
 pub struct LabelStore {
     dir: PathBuf,
+    space: SpaceSource,
+    /// Bytes the leaves being labelled have still to write.
+    pending: Mutex<u64>,
+    /// Leaves refused room, by epoch and stage, each logged once.
+    refused: Mutex<HashSet<(u64, PathBuf, Stage)>>,
+    /// The epoch before which labels were last removed ([`Self::sweep`]).
+    swept: AtomicU64,
+}
+
+/// Room a leaf's labels were refused: the free bytes they needed, beside
+/// the leaves being labelled and above the floor, and the free bytes there
+/// were, if known.
+#[derive(Debug, Clone, Copy)]
+struct Shortfall {
+    needed: u64,
+    free: Option<u64>,
 }
 
 impl LabelStore {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self::with_space(dir, Box::new(quil_forest::storage_health::fs_usage))
+    }
+
+    /// A store reading its filesystem's free space from `space`.
+    pub fn with_space(dir: PathBuf, space: SpaceSource) -> Self {
+        Self {
+            dir,
+            space,
+            pending: Mutex::new(0),
+            refused: Mutex::new(HashSet::new()),
+            swept: AtomicU64::new(0),
+        }
+    }
+
+    fn pending(&self) -> MutexGuard<'_, u64> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the labels' filesystem has room for `bytes` beside the
+    /// `pending` bytes the leaves being labelled have still to write, above
+    /// the floor. Free space that cannot be read leaves no room.
+    fn room(&self, pending: u64, bytes: u64) -> std::result::Result<(), Shortfall> {
+        // The directory is made at the first label: until then its nearest
+        // existing parent is on the filesystem it will be on.
+        let usage = self.dir.ancestors().find_map(|dir| (self.space)(dir));
+        let needed = pending.saturating_add(bytes);
+        match usage {
+            Some(usage) => {
+                let needed = needed.saturating_add(disk_floor(usage.total_bytes));
+                if usage.free_bytes >= needed {
+                    Ok(())
+                } else {
+                    Err(Shortfall {
+                        needed,
+                        free: Some(usage.free_bytes),
+                    })
+                }
+            }
+            None => Err(Shortfall { needed, free: None }),
+        }
+    }
+
+    /// Admit `member`'s leaf `leaf_id` for `epoch` at `n` nodes to be
+    /// labelled and kept ([`Admitted::label`]) when its filesystem has room:
+    /// [`DISK_MARGIN`] times its [`label_bytes`]. What an earlier attempt at
+    /// that count left is removed first. `None` when refused, logged once a
+    /// leaf, epoch and stage: the leaf is then labelled where it is needed, as by a
+    /// process that keeps no labels.
+    pub fn admit(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        leaf_id: &[u8],
+        n: u64,
+        stage: Stage,
+    ) -> Option<Admitted<'_>> {
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        for path in paths(&dir, n) {
+            let _ = fs::remove_file(path);
+        }
+        let bytes = label_bytes(n);
+        let mut pending = self.pending();
+        match self.room(*pending, bytes.saturating_mul(DISK_MARGIN)) {
+            Ok(()) => {
+                *pending = pending.saturating_add(bytes);
+                Some(Admitted {
+                    store: self,
+                    dir,
+                    epoch,
+                    member: member.to_vec(),
+                    leaf_id: leaf_id.to_vec(),
+                    n,
+                    stage,
+                    remaining: bytes,
+                })
+            }
+            Err(shortfall) => {
+                drop(pending);
+                self.refuse(epoch, &dir, leaf_id, n, stage, shortfall);
+                None
+            }
+        }
+    }
+
+    /// Log, once a leaf, epoch and stage, that this node keeps no labels for
+    /// it.
+    fn refuse(
+        &self,
+        epoch: u64,
+        dir: &Path,
+        leaf_id: &[u8],
+        n: u64,
+        stage: Stage,
+        shortfall: Shortfall,
+    ) {
+        let first = self
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((epoch, dir.to_path_buf(), stage));
+        if !first {
+            return;
+        }
+        let (leaf, bytes) = (hex::encode(leaf_id), label_bytes(n));
+        let free = shortfall
+            .free
+            .map_or_else(|| "unknown".to_string(), |free| free.to_string());
+        match stage {
+            Stage::Ahead => info!(epoch, leaf = %leaf, label_bytes = bytes,
+                needed_bytes = shortfall.needed, free_bytes = %free,
+                "storage labels not computed ahead: too little free disk space on this node; \
+                 the leaf's snapshot labels it instead (about an hour per GiB on a core), and a \
+                 snapshot not encoded within the renewal's grace renews without a registration, \
+                 so the seat's frames that epoch forgo their storage reward"),
+            Stage::Snapshot => info!(epoch, leaf = %leaf, label_bytes = bytes,
+                needed_bytes = shortfall.needed, free_bytes = %free,
+                "storage labels not kept at the snapshot: too little free disk space on this \
+                 node; the leaf's seal labels it again, as without labels kept"),
+        }
     }
 
     fn leaf_dir(&self, epoch: u64, member: &[u8], leaf_id: &[u8]) -> PathBuf {
@@ -68,63 +281,6 @@ impl LabelStore {
         self.dir
             .join(epoch.to_string())
             .join(hex::encode(h.finalize()))
-    }
-
-    /// Label `member`'s leaf `leaf_id` for `epoch` at `n` nodes and keep its
-    /// layers. Returns its column commitment and last layer.
-    pub fn label(
-        &self,
-        epoch: u64,
-        member: &[u8],
-        leaf_id: &[u8],
-        n: u64,
-        params: &SdrParams,
-    ) -> Result<(Node, Vec<Digest>)> {
-        let dir = self.leaf_dir(epoch, member, leaf_id);
-        fs::create_dir_all(&dir).map_err(|e| io("create", &dir, e))?;
-        let [layers_path, columns_path, ready_path] = paths(&dir, n);
-        let _ = fs::remove_file(&ready_path);
-        let result = (|| {
-            let file = File::create(&layers_path).map_err(|e| io("create", &layers_path, e))?;
-            let mut writer = BufWriter::with_capacity(1 << 22, file);
-            let mut failure = None;
-            let key = quil_crypto::sdr::replica_key(member, leaf_id, epoch);
-            let (last, columns) =
-                quil_crypto::storage_proof::label_leaf(n, &key, params, &mut |_, layer| {
-                    if failure.is_none() {
-                        failure = write_digests(&mut writer, layer).err();
-                    }
-                });
-            if let Some(error) = failure {
-                return Err(io("write", &layers_path, error));
-            }
-            writer
-                .into_inner()
-                .map_err(|e| io("write", &layers_path, e.into_error()))?
-                .sync_all()
-                .map_err(|e| io("sync", &layers_path, e))?;
-            let mut writer = BufWriter::with_capacity(
-                1 << 22,
-                File::create(&columns_path).map_err(|e| io("create", &columns_path, e))?,
-            );
-            write_digests(&mut writer, &columns).map_err(|e| io("write", &columns_path, e))?;
-            let comm_c = quil_crypto::storage_proof::MerkleTree::from_digests(columns)
-                .commitment(quil_crypto::storage_proof::Tree::Column);
-            writer
-                .into_inner()
-                .map_err(|e| io("write", &columns_path, e.into_error()))?
-                .sync_all()
-                .map_err(|e| io("sync", &columns_path, e))?;
-            let staged = dir.join(format!("{n}.ready.tmp"));
-            fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
-            fs::rename(&staged, &ready_path).map_err(|e| io("rename", &ready_path, e))?;
-            Ok((comm_c, last))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&layers_path);
-            let _ = fs::remove_file(&columns_path);
-        }
-        result
     }
 
     /// The labels kept for `member`'s leaf `leaf_id` for `epoch` at a node
@@ -172,8 +328,21 @@ impl LabelStore {
         }
     }
 
+    /// Remove the labels of epochs before `current`, once an epoch: their
+    /// registrations were sealed before they began. Labels a crash, a
+    /// restart or a lost seat left behind go with them.
+    pub fn sweep(&self, current: u64) {
+        if self.swept.fetch_max(current, Ordering::Relaxed) < current {
+            self.evict_before(current);
+        }
+    }
+
     /// Remove the labels of every epoch before `epoch`.
     pub fn evict_before(&self, epoch: u64) {
+        self.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(e, _, _)| *e >= epoch);
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
@@ -187,6 +356,151 @@ impl LabelStore {
                 let _ = fs::remove_dir_all(entry.path());
             }
         }
+    }
+}
+
+/// When a leaf is labelled: ahead of its snapshot, or at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    Ahead,
+    Snapshot,
+}
+
+/// A leaf admitted to be labelled and kept ([`LabelStore::admit`]): what it
+/// has still to write counts against its filesystem's room until it is
+/// labelled or dropped.
+pub struct Admitted<'a> {
+    store: &'a LabelStore,
+    dir: PathBuf,
+    epoch: u64,
+    member: Vec<u8>,
+    leaf_id: Vec<u8>,
+    n: u64,
+    stage: Stage,
+    remaining: u64,
+}
+
+/// A labelled leaf ([`Admitted::label`]): its column commitment and last
+/// layer, and whether its layers are kept for its seal.
+pub struct Labelled {
+    pub comm_c: Node,
+    pub last: Vec<Digest>,
+    pub kept: bool,
+}
+
+impl Admitted<'_> {
+    /// Whether the filesystem still has room for what this leaf and the
+    /// others being labelled have still to write.
+    fn room(&self) -> std::result::Result<(), Shortfall> {
+        let pending = self.store.pending();
+        self.store.room(*pending, 0)
+    }
+
+    /// `bytes` of this leaf's are written: they count as free space no more.
+    fn wrote(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.remaining);
+        self.remaining -= bytes;
+        let mut pending = self.store.pending();
+        *pending = pending.saturating_sub(bytes);
+    }
+
+    /// Label the leaf at its count and keep its layers while the filesystem
+    /// has room for them, checked before each layer and the columns are
+    /// written. A leaf that runs out of room is labelled to the end but not
+    /// kept: its files are removed and the refusal logged as
+    /// [`LabelStore::admit`] logs one.
+    pub fn label(mut self, params: &SdrParams) -> Result<Labelled> {
+        let paths = paths(&self.dir, self.n);
+        let result = self.write(params, &paths);
+        if !matches!(result, Ok(Labelled { kept: true, .. })) {
+            let [layers, columns, _] = &paths;
+            let _ = fs::remove_file(layers);
+            let _ = fs::remove_file(columns);
+            let _ = fs::remove_file(self.dir.join(format!("{}.ready.tmp", self.n)));
+        }
+        result
+    }
+
+    fn write(&mut self, params: &SdrParams, paths: &[PathBuf; 3]) -> Result<Labelled> {
+        let [layers_path, columns_path, ready_path] = paths;
+        fs::create_dir_all(&self.dir).map_err(|e| io("create", &self.dir, e))?;
+        let file = File::create(layers_path).map_err(|e| io("create", layers_path, e))?;
+        let mut writer = Some(BufWriter::with_capacity(1 << 22, file));
+        let (mut failure, mut shortfall) = (None, None);
+        let key = quil_crypto::sdr::replica_key(&self.member, &self.leaf_id, self.epoch);
+        let (last, columns) =
+            quil_crypto::storage_proof::label_leaf(self.n, &key, params, &mut |_, layer| {
+                if writer.is_none() {
+                    return;
+                }
+                if let Err(short) = self.room() {
+                    // Out of room: the rest is labelled, not written.
+                    shortfall = Some(short);
+                    writer = None;
+                    return;
+                }
+                match writer.as_mut().map(|writer| write_digests(writer, layer)) {
+                    Some(Ok(())) => self.wrote((layer.len() * NODE_BYTES) as u64),
+                    Some(Err(error)) => {
+                        failure = Some(error);
+                        writer = None;
+                    }
+                    None => {}
+                }
+            });
+        if let Some(error) = failure {
+            return Err(io("write", layers_path, error));
+        }
+        let commitment = |columns: Vec<Digest>| {
+            quil_crypto::storage_proof::MerkleTree::from_digests(columns)
+                .commitment(quil_crypto::storage_proof::Tree::Column)
+        };
+        if let Some(writer) = writer {
+            writer
+                .into_inner()
+                .map_err(|e| io("write", layers_path, e.into_error()))?
+                .sync_all()
+                .map_err(|e| io("sync", layers_path, e))?;
+            shortfall = self.room().err();
+        }
+        if let Some(shortfall) = shortfall {
+            let (epoch, n, stage) = (self.epoch, self.n, self.stage);
+            self.store
+                .refuse(epoch, &self.dir, &self.leaf_id, n, stage, shortfall);
+            return Ok(Labelled {
+                comm_c: commitment(columns),
+                last,
+                kept: false,
+            });
+        }
+        let mut writer = BufWriter::with_capacity(
+            1 << 22,
+            File::create(columns_path).map_err(|e| io("create", columns_path, e))?,
+        );
+        write_digests(&mut writer, &columns).map_err(|e| io("write", columns_path, e))?;
+        writer
+            .into_inner()
+            .map_err(|e| io("write", columns_path, e.into_error()))?
+            .sync_all()
+            .map_err(|e| io("sync", columns_path, e))?;
+        self.wrote((columns.len() * NODE_BYTES) as u64);
+        let comm_c = commitment(columns);
+        let staged = self.dir.join(format!("{}.ready.tmp", self.n));
+        fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
+        fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
+        Ok(Labelled {
+            comm_c,
+            last,
+            kept: true,
+        })
+    }
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let remaining = std::mem::take(&mut self.remaining);
+        let mut pending = self.store.pending();
+        *pending = pending.saturating_sub(remaining);
     }
 }
 
@@ -241,26 +555,33 @@ impl LabelSource for Kept {
     }
 }
 
-type Precomputed = std::collections::HashSet<(Vec<u8>, Vec<u8>, u64)>;
+/// Shards labelled ahead, by member, shard and epoch, with when for one
+/// whose leaves were refused room.
+type Precomputed = HashMap<(Vec<u8>, Vec<u8>, u64), Option<Instant>>;
 
-fn precomputed_set() -> std::sync::MutexGuard<'static, Precomputed> {
+fn precomputed_set() -> MutexGuard<'static, Precomputed> {
     static DONE: OnceLock<Mutex<Precomputed>> = OnceLock::new();
     DONE.get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Whether this process labelled `member`'s leaves of `filter` for `epoch`
-/// ahead ([`precompute`]), so it need not again.
+/// ahead ([`precompute`]), so it need not again. A shard whose leaves were
+/// refused room is labelled ahead again after [`REFUSED_RETRY`].
 pub fn precomputed(member: &[u8], filter: &[u8], epoch: u64) -> bool {
-    precomputed_set().contains(&(member.to_vec(), filter.to_vec(), epoch))
+    precomputed_set()
+        .get(&(member.to_vec(), filter.to_vec(), epoch))
+        .is_some_and(|refused| refused.is_none_or(|at| at.elapsed() < REFUSED_RETRY))
 }
 
 /// Label ahead the leaves `member` will register for `epoch` on shard
 /// `filter`: the leaves of the shard's data in `crdt` now, each at
 /// `precompute_nodes` of its node count, side by side
 /// (`storage_jobs::for_each_parallel`). A leaf already labelled at a count
-/// its data allows is left. Removes the labels of epochs that have begun.
+/// its data allows is left, and one its filesystem has no room for is not
+/// labelled ([`LabelStore::admit`]). Removes the labels of epochs that have
+/// begun.
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -286,21 +607,27 @@ pub fn precompute(
             .find(epoch, member, &leaf_id, |n| padded_nodes_allowed(exact, n))
             .is_some()
         {
-            return Ok(0);
+            return Ok(Some(0));
         }
         let n = precompute_nodes(exact);
+        let Some(admitted) = store.admit(epoch, member, &leaf_id, n, Stage::Ahead) else {
+            return Ok(None);
+        };
         let _memory = crate::storage_jobs::reserve(crate::storage_snapshot::encoding_bytes(n));
-        store.label(epoch, member, &leaf_id, n, &params)?;
-        Ok(n)
+        Ok(admitted.label(&params)?.kept.then_some(n))
     })?;
+    let refused = labelled.iter().filter(|n| n.is_none()).count();
     {
         let mut done = precomputed_set();
-        done.retain(|(_, _, e)| e.saturating_add(2) >= epoch);
-        done.insert((member.to_vec(), filter.to_vec(), epoch));
+        done.retain(|(_, _, e), _| e.saturating_add(2) >= epoch);
+        done.insert(
+            (member.to_vec(), filter.to_vec(), epoch),
+            (refused > 0).then(Instant::now),
+        );
     }
     info!(epoch, filter = %hex::encode(filter), leaves = labelled.len(),
-        labelled = labelled.iter().filter(|&&n| n > 0).count(),
-        nodes = labelled.iter().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
+        labelled = labelled.iter().filter(|n| n.is_some_and(|n| n > 0)).count(), refused,
+        nodes = labelled.iter().flatten().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
         "storage labels computed ahead of the epoch's snapshot");
     Ok(())
 }
@@ -309,15 +636,42 @@ pub fn precompute(
 mod tests {
     use super::*;
 
+    /// The test filesystem's size: its floor is 10 GiB.
+    const TOTAL: u64 = 100 << 30;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("quil-labels-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A filesystem of [`TOTAL`] bytes with `free` of them free.
+    fn space(free: &Arc<AtomicU64>) -> SpaceSource {
+        let free = free.clone();
+        Box::new(move |_| {
+            Some(FsUsage {
+                total_bytes: TOTAL,
+                free_bytes: free.load(Ordering::SeqCst),
+                ..FsUsage::default()
+            })
+        })
+    }
+
+    fn keep(store: &LabelStore, epoch: u64, member: &[u8], leaf: &[u8], n: u64) -> Labelled {
+        let admitted = store.admit(epoch, member, leaf, n, Stage::Ahead).unwrap();
+        let labelled = admitted.label(&SdrParams::default()).unwrap();
+        assert!(labelled.kept);
+        labelled
+    }
+
     #[test]
     fn kept_labels_are_the_leaf_labelling_and_go_when_their_epoch_has() {
-        let dir = std::env::temp_dir().join(format!("quil-labels-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let store = LabelStore::new(dir.clone());
+        let dir = temp_dir("test");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
         let params = SdrParams::default();
         let (member, leaf) = ([7u8; 32], b"leaf".as_slice());
         let n = 3_000u64;
-        let (comm_c, last) = store.label(9, &member, leaf, n, &params).unwrap();
+        let Labelled { comm_c, last, .. } = keep(&store, 9, &member, leaf, n);
         let mut layers = Vec::new();
         let key = quil_crypto::sdr::replica_key(&member, leaf, 9);
         let (expected_last, columns) =
@@ -341,12 +695,157 @@ mod tests {
         assert!(store.find(10, &member, leaf, |_| true).is_none());
         store.evict_before(9);
         assert!(store.find(9, &member, leaf, |_| true).is_some());
-        store.label(9, &member, b"other", 64, &params).unwrap();
+        keep(&store, 9, &member, b"other", 64);
         store.forget(9, &member, leaf);
         assert!(store.find(9, &member, leaf, |_| true).is_none());
         assert!(store.find(9, &member, b"other", |_| true).is_some());
         store.evict_before(10);
         assert!(store.find(9, &member, leaf, |_| true).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A leaf is labelled and kept only with [`DISK_MARGIN`] times its
+    /// labels free above the floor, beside what the leaves being labelled
+    /// have still to write; a refused leaf leaves no files, not even those an
+    /// earlier attempt left.
+    #[test]
+    fn a_leaf_is_kept_only_with_room_for_its_labels_above_the_floor() {
+        assert_eq!(disk_floor(TOTAL), 10 << 30);
+        assert_eq!(disk_floor(20 << 30), DISK_FLOOR_MIN_BYTES);
+        let dir = temp_dir("room");
+        let free = Arc::new(AtomicU64::new(0));
+        let store = LabelStore::with_space(dir.clone(), space(&free));
+        let (member, n) = ([7u8; 32], 3_000u64);
+        let bytes = label_bytes(n);
+        assert_eq!(bytes, n * 12 * NODE_BYTES as u64);
+        let enough = disk_floor(TOTAL) + DISK_MARGIN * bytes;
+        // What a crash left of an attempt at the count.
+        let leaf_dir = store.leaf_dir(9, &member, b"leaf");
+        fs::create_dir_all(&leaf_dir).unwrap();
+        fs::write(leaf_dir.join(format!("{n}.layers")), [1u8; 64]).unwrap();
+
+        free.store(enough - 1, Ordering::SeqCst);
+        assert!(store.admit(9, &member, b"leaf", n, Stage::Ahead).is_none());
+        assert_eq!(
+            files_under(&dir),
+            Vec::<PathBuf>::new(),
+            "a refused leaf leaves no files"
+        );
+        assert!(store.admit(9, &member, b"leaf", n, Stage::Ahead).is_none());
+        assert_eq!(
+            store.refused.lock().unwrap().len(),
+            1,
+            "logged once a leaf, epoch and stage"
+        );
+
+        free.store(enough, Ordering::SeqCst);
+        let admitted = store
+            .admit(9, &member, b"leaf", n, Stage::Ahead)
+            .expect("room");
+        assert!(
+            store.admit(9, &member, b"other", n, Stage::Ahead).is_none(),
+            "what the first has still to write is not room"
+        );
+        free.store(enough + bytes, Ordering::SeqCst);
+        drop(
+            store
+                .admit(9, &member, b"other", n, Stage::Ahead)
+                .expect("room for both"),
+        );
+        assert_eq!(
+            *store.pending(),
+            bytes,
+            "a dropped admission frees its room"
+        );
+        assert!(admitted.label(&SdrParams::default()).unwrap().kept);
+        assert_eq!(*store.pending(), 0);
+        assert!(store
+            .find(9, &member, b"leaf", |count| count == n)
+            .is_some());
+
+        let unknown = LabelStore::with_space(dir.clone(), Box::new(|_| None));
+        assert!(
+            unknown
+                .admit(9, &member, b"third", n, Stage::Snapshot)
+                .is_none(),
+            "free space unknown"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A leaf that runs out of room while it is labelled is labelled to the
+    /// end, for its caller to encode from, but not kept: none of its files
+    /// remain.
+    #[test]
+    fn a_leaf_out_of_room_midway_is_labelled_but_leaves_no_files() {
+        let dir = temp_dir("midway");
+        let reads = Arc::new(AtomicU64::new(0));
+        // Room for the admission and the first three layers, then none.
+        let space: SpaceSource = {
+            let reads = reads.clone();
+            Box::new(move |_| {
+                let read = reads.fetch_add(1, Ordering::SeqCst);
+                Some(FsUsage {
+                    total_bytes: TOTAL,
+                    free_bytes: if read < 4 { TOTAL } else { 0 },
+                    ..FsUsage::default()
+                })
+            })
+        };
+        let store = LabelStore::with_space(dir.clone(), space);
+        let params = SdrParams::default();
+        let (member, leaf, n) = ([7u8; 32], b"leaf".as_slice(), 3_000u64);
+        let admitted = store.admit(9, &member, leaf, n, Stage::Snapshot).unwrap();
+        let labelled = admitted.label(&params).unwrap();
+        assert!(!labelled.kept);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            5,
+            "no writes once out of room"
+        );
+        let key = quil_crypto::sdr::replica_key(&member, leaf, 9);
+        let (last, columns) =
+            quil_crypto::storage_proof::label_leaf(n, &key, &params, &mut |_, _| {});
+        assert_eq!(labelled.last, last);
+        assert_eq!(
+            labelled.comm_c,
+            quil_crypto::storage_proof::MerkleTree::from_digests(columns)
+                .commitment(quil_crypto::storage_proof::Tree::Column)
+        );
+        assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+        assert!(store.find(9, &member, leaf, |_| true).is_none());
+        assert_eq!(*store.pending(), 0);
+        assert_eq!(store.refused.lock().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The labels of epochs before the current one go at its first sweep,
+    /// with what a crash left of them, and only then.
+    #[test]
+    fn a_sweep_removes_earlier_epochs_labels_once_an_epoch() {
+        let dir = temp_dir("sweep");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let member = [7u8; 32];
+        for epoch in [7, 8, 9] {
+            keep(&store, epoch, &member, b"leaf", 64);
+        }
+        let crashed = store.leaf_dir(7, &member, b"crashed");
+        fs::create_dir_all(&crashed).unwrap();
+        fs::write(crashed.join("64.layers"), [1u8; 64]).unwrap();
+        store.sweep(8);
+        assert!(!crashed.exists());
+        assert!(store.find(7, &member, b"leaf", |_| true).is_none());
+        assert!(store.find(8, &member, b"leaf", |_| true).is_some());
+        keep(&store, 7, &member, b"leaf", 64);
+        store.sweep(8);
+        assert!(
+            store.find(7, &member, b"leaf", |_| true).is_some(),
+            "once an epoch"
+        );
+        store.sweep(9);
+        assert!(store.find(7, &member, b"leaf", |_| true).is_none());
+        assert!(store.find(8, &member, b"leaf", |_| true).is_none());
+        assert!(store.find(9, &member, b"leaf", |_| true).is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 }
