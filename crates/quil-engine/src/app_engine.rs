@@ -16562,6 +16562,12 @@ mod tests {
         engine.handle_global_frame_message(
             &crate::consensus_wire::encode_global_frame(&frame).unwrap(),
         );
+        // The settlement's proof part runs on a storage job thread reading
+        // the engine's store; the test must not end while it runs.
+        assert!(
+            crate::storage_jobs::wait_lane_idle(&engine.filter, Duration::from_secs(30)),
+            "the settlement's proof part job finishes"
+        );
         let announced = published.lock().unwrap().iter().any(|bytes| {
             matches!(
                 SeatMessage::from_bytes(bytes),
