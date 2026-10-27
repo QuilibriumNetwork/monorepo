@@ -158,7 +158,7 @@ fn log(frame: u64, report: Option<Report>) {
         shards = report.shards,
         by_shard = %report.by_shard,
         unlisted_shards = report.unlisted_shards,
-        scope = "none",
+        scope = "remote peers",
         action = "none: expected while closing committees drain sealed sessions in parts; each member \
             resubmits from its own view of GLOBAL, and a copy built before GLOBAL executed another \
             member's copy of the same part carries only executed headers; the next copy carries the \
