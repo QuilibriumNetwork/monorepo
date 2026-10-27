@@ -552,6 +552,12 @@ pub(crate) const ENGINE_STOPPED_WHILE_QUEUED: &str =
 /// (`WorkerAllocator::gives_up`), so nothing needs its shard state.
 pub(crate) const SEAT_GIVEN_UP: &str = "this node gives up the worker's seat";
 
+/// Why a recovery attempted nothing: its attempts keep stopping at a shard
+/// frame no archive serves, and the next one waits
+/// ([`crate::worker_execution::ArchiveGapPacing`]).
+pub(crate) const ARCHIVE_GAP_HELD: &str =
+    "the recovery's attempts stop at a shard frame no archive serves; the next one is backed off";
+
 /// The owning actor authenticates and installs a checkpoint. A recovery task
 /// keeps this exact target through completion, even if a worker is reassigned.
 #[async_trait]
@@ -1152,6 +1158,10 @@ fn yielded(result: Result<ShardRecoveryProgress>) -> Result<ShardRecoveryProgres
 /// A recovery for a seat this node gives up reads no archive
 /// ([`SEAT_GIVEN_UP`]): it asks `given_up` before each attempt and again
 /// once its turn is granted, which it then hands on unused.
+///
+/// A recovery whose attempts keep stopping at a shard frame no archive
+/// serves waits out its back-off before it queues for a turn
+/// ([`ARCHIVE_GAP_HELD`], [`archive_gap_held`]); its place is kept.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover_in_turns(
     turns: &crate::recovery_turns::RecoveryTurns,
@@ -1172,6 +1182,14 @@ pub(crate) async fn recover_in_turns(
                 execution.keep_replay_ticket(filter, ticket);
             }
             return Ok(ShardRecoveryProgress::Deferred(SEAT_GIVEN_UP));
+        }
+        if archive_gap_held(execution, filter, target).await {
+            if let Some(ticket) = ticket {
+                execution.keep_replay_ticket(filter, ticket);
+            }
+            tracing::debug!(core, filter = %hex::encode(filter), reason = ARCHIVE_GAP_HELD,
+                "archive recovery held back");
+            return Ok(ShardRecoveryProgress::Deferred(ARCHIVE_GAP_HELD));
         }
         let local = lineage().inspect_err(|error| {
             tracing::warn!(core, filter = %hex::encode(filter), %error,
@@ -1242,6 +1260,29 @@ pub(crate) async fn recover_in_turns(
             return result;
         }
     }
+}
+
+/// Whether the recovery of `filter` for `target`, the worker whose record
+/// is `execution`, waits rather than attempts now: its attempts keep
+/// stopping at a shard frame no archive serves
+/// ([`crate::worker_execution::ArchiveGapPacing`]). Asked before a recovery
+/// queues for a turn, so a held one reads no archive and leaves the node's
+/// turns to others. GLOBAL's committed tip is read only while a hold runs.
+pub(crate) async fn archive_gap_held(
+    execution: &crate::worker_execution::SharedWorkerExecution,
+    filter: &[u8],
+    target: &dyn ShardRecoveryTarget,
+) -> bool {
+    if !execution.archive_gap_holding(filter) {
+        return false;
+    }
+    let committed = target.committed_tip().await;
+    execution.archive_gap_hold(
+        filter,
+        target.materialized(),
+        committed,
+        tokio::time::Instant::now(),
+    )
 }
 
 /// Why a re-anchor at the session fence installed nothing.
@@ -1397,6 +1438,60 @@ pub(crate) struct ShardReplay {
     /// The highest tip an archive reported; `None` when none had a frame.
     pub archive_tip: Option<u64>,
     pub target: u64,
+}
+
+/// How the error of a replay stopped at a shard frame no archive serves
+/// begins, for the frame itself and for a certified descendant the frame
+/// before it needs ([`missing_frame`], read back by [`archive_gap`]).
+const MISSING_SHARD_FRAME: &str = "archive replay is missing shard frame ";
+const MISSING_DESCENDANT_FRAME: &str = "archive replay is missing descendant frame ";
+
+/// A shard frame that no archive serves and that could not be rebuilt from
+/// a header GLOBAL carried, at which a replay stopped, with the highest
+/// archive tip that replay found and the committed tip of the session it
+/// read (0: unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArchiveGap {
+    pub frame: u64,
+    pub archive_tip: Option<u64>,
+    pub committed: u64,
+}
+
+/// The error of a replay stopped at `gap` for `why`; `descendant`: the
+/// frame is a certified descendant the frame before it needs.
+fn missing_frame(gap: ArchiveGap, descendant: bool, why: String) -> quil_types::error::QuilError {
+    let ArchiveGap {
+        frame,
+        archive_tip,
+        committed,
+    } = gap;
+    let prefix = match descendant {
+        true => MISSING_DESCENDANT_FRAME,
+        false => MISSING_SHARD_FRAME,
+    };
+    quil_types::error::QuilError::ExecutionUnavailable(format!(
+        "{prefix}{frame} (archive tip {archive_tip:?}, committed {committed}): {why}"
+    ))
+}
+
+/// The shard frame no archive serves at which a recovery attempt failing
+/// with `error` stopped ([`missing_frame`]); `None` for any other failure.
+pub(crate) fn archive_gap(error: &str) -> Option<ArchiveGap> {
+    let rest = [MISSING_SHARD_FRAME, MISSING_DESCENDANT_FRAME]
+        .iter()
+        .find_map(|prefix| error.find(prefix).map(|at| &error[at + prefix.len()..]))?;
+    let (frame, rest) = rest.split_once(" (archive tip ")?;
+    let (archive_tip, rest) = rest.split_once(", committed ")?;
+    let (committed, _) = rest.split_once("):")?;
+    let archive_tip = match archive_tip {
+        "None" => None,
+        tip => Some(tip.strip_prefix("Some(")?.strip_suffix(')')?.parse().ok()?),
+    };
+    Some(ArchiveGap {
+        frame: frame.parse().ok()?,
+        archive_tip,
+        committed: committed.parse().ok()?,
+    })
 }
 
 /// A frame of `filter` from the first of `attempts` archive requests that has
@@ -1737,11 +1832,15 @@ where
                 Some(frame) => frame,
                 None => {
                     let ceiling = ceiling.filter(|_| next < tip_height);
-                    let (frame, copy) = rebuild_from_carried_header(syncer, filter, next, anchor, ceiling, verify).await.map_err(|why| {
-                        QuilError::ExecutionUnavailable(format!(
-                            "archive replay is missing shard frame {next} (archive tip {archive_tip:?}, committed {committed}): {why}"
-                        ))
-                    })?;
+                    let gap = ArchiveGap {
+                        frame: next,
+                        archive_tip,
+                        committed,
+                    };
+                    let (frame, copy) =
+                        rebuild_from_carried_header(syncer, filter, next, anchor, ceiling, verify)
+                            .await
+                            .map_err(|why| missing_frame(gap, false, why))?;
                     rebuilt.push((next, copy));
                     frame
                 }
@@ -1803,9 +1902,12 @@ where
                             )
                             .await
                             .map_err(|why| {
-                                QuilError::ExecutionUnavailable(format!(
-                                    "archive replay is missing descendant frame {number}: {why}"
-                                ))
+                                let gap = ArchiveGap {
+                                    frame: number,
+                                    archive_tip,
+                                    committed,
+                                };
+                                missing_frame(gap, true, why)
                             })?;
                             rebuilt.push((number, copy));
                             child
@@ -6040,5 +6142,231 @@ mod tests {
         assert_eq!(target.materialized(), 129);
         let recovery = worker.snapshot().recovery.unwrap();
         assert_eq!(recovery.consecutive_failures, 1);
+    }
+
+    /// An archive serving the shard's frames through `tip` except
+    /// `missing`, each anchored to the GLOBAL frame 1000 above its number,
+    /// whose GLOBAL frames carry no header of the missing one: a frame no
+    /// archive served below a predecessor's seal (2026-10-27). Counts its
+    /// frame reads.
+    struct GapArchive {
+        tip: AtomicU64,
+        missing: u64,
+        reads: AtomicU64,
+    }
+
+    fn gap_frame(number: u64) -> AppShardFrame {
+        let mut frame = frame(number);
+        frame.header.as_mut().unwrap().global_frame_number = 1000 + number;
+        frame
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for GapArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> {
+            unreachable!()
+        }
+        async fn get_app_shard_frame(
+            &self,
+            _: &[u8],
+            number: u64,
+        ) -> Result<Option<AppShardFrame>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let number = match number {
+                0 => self.tip.load(Ordering::SeqCst),
+                number => number,
+            };
+            Ok((number != self.missing).then(|| gap_frame(number)))
+        }
+    }
+
+    /// A worker materialized through `cursor` whose session GLOBAL has
+    /// executed through `committed`.
+    struct GapTarget {
+        cursor: AtomicU64,
+        committed: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for GapTarget {
+        fn materialized(&self) -> u64 {
+            self.cursor.load(Ordering::SeqCst)
+        }
+        async fn replay(&self, frame: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+            let number = frame.header.unwrap().frame_number;
+            self.cursor.store(number, Ordering::SeqCst);
+            Ok(number)
+        }
+        async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> {
+            unreachable!("a worker with a lineage replays")
+        }
+        async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+            unreachable!("a worker with a lineage replays")
+        }
+        fn inherited(&self) {
+            unreachable!("a worker with a lineage replays")
+        }
+        async fn committed_tip(&self) -> Option<u64> {
+            Some(self.committed.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Recovery of the worker's shard, requested as its engine requests it
+    /// while its successor session cannot start: at every start retry, 10 s
+    /// apart, for `secs`, each once the one before it has ended.
+    async fn request_recovery_every_10s(
+        turns: &crate::recovery_turns::RecoveryTurns,
+        archive: &GapArchive,
+        target: &GapTarget,
+        execution: &crate::worker_execution::SharedWorkerExecution,
+        secs: u64,
+    ) {
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while tokio::time::Instant::now() < until {
+            let _ = recover_in_turns(
+                turns,
+                archive,
+                &[5; 32],
+                1,
+                target,
+                execution,
+                || Ok(Some(gap_frame(target.materialized()))),
+                || false,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    }
+
+    /// A recovery whose attempts stop at a shard frame no archive serves,
+    /// requested at each 10 s start retry of its engine, backs off rather
+    /// than reading the archives and taking a recovery turn every time: at
+    /// most 6 attempts in 5 minutes, where it made one per request (30).
+    #[tokio::test(start_paused = true)]
+    async fn a_recovery_stopped_at_a_frame_no_archive_serves_backs_off() {
+        use crate::recovery_turns::RecoveryTurns;
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let archive = GapArchive {
+            tip: 200.into(),
+            missing: 170,
+            reads: 0.into(),
+        };
+        let target = GapTarget {
+            cursor: 169.into(),
+            committed: 200.into(),
+        };
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        request_recovery_every_10s(turns, &archive, &target, &execution, 300).await;
+        let recovery = execution.snapshot().recovery.unwrap();
+        assert!(
+            recovery.last_error.contains(
+                "archive replay is missing shard frame 170 (archive tip Some(200), committed 200): \
+                 no GLOBAL frame "
+            ),
+            "{}",
+            recovery.last_error
+        );
+        assert_eq!(target.materialized(), 169);
+        let reads = archive.reads.load(Ordering::SeqCst);
+        assert!(
+            recovery.attempts <= 6,
+            "futile recovery not backed off: {} attempts and {reads} archive frame reads in 300 s, \
+             every one stopped at frame 170, which no archive serves",
+            recovery.attempts
+        );
+    }
+
+    /// The back-off of a recovery stopped at a frame no archive serves ends
+    /// at once when GLOBAL's committed tip of the session moves, and when an
+    /// attempt finds a higher archive tip: the request after it attempts
+    /// again rather than waiting twice as long.
+    #[tokio::test(start_paused = true)]
+    async fn an_archive_gap_backoff_ends_when_the_committed_or_an_archive_tip_moves() {
+        use crate::recovery_turns::RecoveryTurns;
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let archive = GapArchive {
+            tip: 200.into(),
+            missing: 170,
+            reads: 0.into(),
+        };
+        let target = GapTarget {
+            cursor: 169.into(),
+            committed: 200.into(),
+        };
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        let attempts = || execution.snapshot().recovery.map_or(0, |r| r.attempts);
+        // Attempts at 0, 10, 40, 100 and 220 s; held until 460 s.
+        request_recovery_every_10s(turns, &archive, &target, &execution, 300).await;
+        assert_eq!(attempts(), 5);
+        assert!(execution.archive_gap_holding(&[5; 32]));
+        // GLOBAL executed another frame of the session: the request at 300 s
+        // attempts at once, a new streak's first failure, retried at 310 s,
+        // which backs off until 340 s.
+        target.committed.store(201, Ordering::SeqCst);
+        request_recovery_every_10s(turns, &archive, &target, &execution, 20).await;
+        assert_eq!(attempts(), 7);
+        request_recovery_every_10s(turns, &archive, &target, &execution, 20).await;
+        assert_eq!(attempts(), 7, "held at 320 and 330 s");
+        // An archive's tip moved while it was held: the attempt at 340 s
+        // finds it and starts a new streak, retried at 350 s; without the
+        // new tip, 350 s would wait for 400 s.
+        archive.tip.store(210, Ordering::SeqCst);
+        request_recovery_every_10s(turns, &archive, &target, &execution, 20).await;
+        assert_eq!(attempts(), 9);
+        let recovery = execution.snapshot().recovery.unwrap();
+        assert!(
+            recovery
+                .last_error
+                .contains("missing shard frame 170 (archive tip Some(210), committed 201)"),
+            "{}",
+            recovery.last_error
+        );
+        assert!(execution.archive_gap_holding(&[5; 32]));
+    }
+
+    /// The frame, archive tip and committed tip of a replay stopped at a
+    /// frame no archive serves read back from its error, as it reaches the
+    /// worker's record, and only from that error.
+    #[test]
+    fn an_archive_gap_reads_back_from_its_error() {
+        let gap = ArchiveGap {
+            frame: 20784,
+            archive_tip: Some(20982),
+            committed: 20982,
+        };
+        let why = "no GLOBAL frame 940838..=941050 carries its header";
+        for descendant in [false, true] {
+            let error = missing_frame(gap, descendant, why.into()).to_string();
+            assert_eq!(archive_gap(&error), Some(gap), "{error}");
+            assert_eq!(
+                crate::worker_execution::failure_class(&error),
+                "archive_state"
+            );
+        }
+        assert_eq!(
+            archive_gap(
+                "execution unavailable: archive replay is missing shard frame 20784 (archive tip \
+                 Some(20982), committed 20982): no GLOBAL frame 940838..=941050 carries its header"
+            ),
+            Some(gap)
+        );
+        let unknown = ArchiveGap {
+            archive_tip: None,
+            committed: 0,
+            ..gap
+        };
+        let nested = "a frame (archive tip Some(1), committed 2): elsewhere";
+        assert_eq!(
+            archive_gap(&missing_frame(unknown, false, nested.into()).to_string()),
+            Some(unknown)
+        );
+        for other in [
+            "execution unavailable: archive replay has no certified descendant within its target",
+            "execution unavailable: archive replay is missing shard frame 8",
+            SEALED_STATE_UNAVAILABLE,
+            REANCHOR_UNAVAILABLE,
+        ] {
+            assert_eq!(archive_gap(other), None, "{other}");
+        }
     }
 }

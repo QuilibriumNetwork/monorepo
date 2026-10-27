@@ -1030,6 +1030,13 @@ impl WorkerOnlyNode {
                                             let release = ReleaseSync { filters: syncing_filters.clone(), filter: filter.clone() };
                                             tokio::spawn(async move {
                                                 let _release = release;
+                                                // Attempts that keep stopping at a shard
+                                                // frame no archive serves back off.
+                                                if crate::prover_tree_syncer::archive_gap_held(
+                                                    target.execution_record(), &filter, &target,
+                                                ).await {
+                                                    return;
+                                                }
                                                 tokio::select! {
                                                     biased;
                                                     _ = cancel.cancelled() => {},

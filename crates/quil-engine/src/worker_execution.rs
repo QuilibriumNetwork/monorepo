@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::prover_tree_syncer::{ReplayTurn, ShardRecoveryProgress};
+use crate::prover_tree_syncer::{ArchiveGap, ReplayTurn, ShardRecoveryProgress};
 use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
 
 tokio::task_local! {
@@ -157,6 +157,9 @@ pub struct SharedWorkerExecution {
     /// The queue place of this worker's last replay, kept while it ended
     /// behind its target: `(filter, ticket)`.
     replay_ticket: Arc<Mutex<Option<(Vec<u8>, u64)>>>,
+    /// The pacing of recoveries whose attempts stop at a shard frame no
+    /// archive serves, by shard.
+    archive_gaps: Arc<Mutex<HashMap<Vec<u8>, ArchiveGapPacing>>>,
 }
 
 /// An archive recovery turn as its holder's recovery sees it
@@ -280,6 +283,44 @@ impl SharedWorkerExecution {
             .take()
             .filter(|(kept, _)| kept == filter)
             .map(|(_, ticket)| ticket)
+    }
+
+    /// Whether a back-off paces `filter`'s recovery ([`ArchiveGapPacing`]).
+    pub(crate) fn archive_gap_holding(&self, filter: &[u8]) -> bool {
+        self.archive_gaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(filter)
+            .is_some_and(ArchiveGapPacing::holding)
+    }
+
+    /// Whether `filter`'s recovery waits at `now`, its worker materialized
+    /// through `materialized` and GLOBAL's committed tip of the session
+    /// `committed` (`None`: unknown, which ends no hold). A hold whose frame
+    /// may be obtainable now ends, logged if its start was.
+    pub(crate) fn archive_gap_hold(
+        &self,
+        filter: &[u8],
+        materialized: u64,
+        committed: Option<u64>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let (held, ended) = {
+            let mut gaps = self
+                .archive_gaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = gaps.remove(filter);
+            let decided = ArchiveGapPacing::hold(&mut slot, materialized, committed, now);
+            if let Some(pacing) = slot {
+                gaps.insert(filter.to_vec(), pacing);
+            }
+            decided
+        };
+        if let Some(ended) = ended {
+            log_archive_gap(&hex::encode(filter), ended, None);
+        }
+        held
     }
 
     /// This worker's recovery holds a turn from `since`, to do `kind`.
@@ -543,6 +584,31 @@ impl SharedWorkerExecution {
                 && streak.first_failure_due(now);
             (logged, streak.classes(), failed_before, first_failure)
         };
+        // An attempt stopped at a shard frame no archive serves backs off the
+        // next while it stops there again.
+        let (gap_log, held_back, retry_in) = {
+            let gap = failure
+                .as_deref()
+                .and_then(crate::prover_tree_syncer::archive_gap);
+            let mut gaps = self
+                .archive_gaps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = gaps.remove(filter);
+            let logged = ArchiveGapPacing::attempted(
+                &mut slot,
+                gap,
+                failure.is_some(),
+                tokio::time::Instant::now(),
+            );
+            let (held, retry_in) = slot.as_ref().map_or((0, Duration::ZERO), |pacing| {
+                (pacing.held, pacing.retry_in())
+            });
+            if let Some(pacing) = slot {
+                gaps.insert(filter.to_vec(), pacing);
+            }
+            (logged, held, retry_in)
+        };
         note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
         let filter = hex::encode(filter);
         match failure {
@@ -559,6 +625,9 @@ impl SharedWorkerExecution {
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
                         "archive recovery succeeded after a failure streak");
+                }
+                if let Some(gap_log) = gap_log {
+                    log_archive_gap(&filter, gap_log, None);
                 }
             }
             Some(error) => {
@@ -581,7 +650,11 @@ impl SharedWorkerExecution {
                     tracing::warn!(%filter, consecutive_failures = failures, failing_secs = duration.as_secs(),
                         classes = %classes, last_class = class, last_error = %error, last_source = source,
                         longest_permit_wait_secs = ended.longest_permit_wait_ms / 1000,
+                        held_back, retry_in_secs = retry_in.as_secs(),
                         scope, action, "archive recovery failing; it retries (installed leaves are kept)");
+                }
+                if let Some(gap_log) = gap_log {
+                    log_archive_gap(&filter, gap_log, Some(error.as_str()));
                 }
             }
         }
@@ -599,6 +672,223 @@ const STREAK_REPEAT: Duration = Duration::from_secs(10 * 60);
 
 /// The class of a failure that found no archive at all.
 pub(crate) const NO_ARCHIVE: &str = "no_archive_known";
+
+/// The first back-off of a recovery whose attempts stop again at the same
+/// shard frame no archive serves ([`ArchiveGapPacing`]); each later one
+/// waits twice as long, up to [`ARCHIVE_GAP_HOLD_MAX`].
+pub(crate) const ARCHIVE_GAP_HOLD: Duration = Duration::from_secs(30);
+
+/// The longest back-off between such attempts: about 6 an hour, where the
+/// engine's start retry made one every 10 to 25 s.
+pub(crate) const ARCHIVE_GAP_HOLD_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Paces the recovery of one shard whose attempts stop at a shard frame no
+/// archive serves and no GLOBAL frame searched carries the header of
+/// ([`ArchiveGap`]). A successor member below its predecessor's seal asks
+/// for recovery at every start retry of its engine; on 2026-10-27, 147
+/// seats on 12 nodes failed so on an unchanged frame 1,000 to 2,500 times
+/// in a row, one attempt every 10 to 25 s, each reading about 7 archive
+/// frames and taking one of its node's recovery turns. A first such failure
+/// is retried as before; once another stops at the same frame, the next
+/// attempt waits [`ARCHIVE_GAP_HOLD`], doubling to [`ARCHIVE_GAP_HOLD_MAX`],
+/// before it queues for a turn. The back-off ends as soon as its frame may
+/// be obtainable: the worker materialized it, GLOBAL's committed tip of the
+/// session moved (for a frame above that tip: reached it), or an attempt
+/// found a higher archive tip, stopped at another frame or ended otherwise.
+/// A frame above GLOBAL's committed tip waits for that tip, but still on the
+/// same schedule: an archive may serve it first, which only an attempt sees.
+#[derive(Debug)]
+pub(crate) struct ArchiveGapPacing {
+    gap: ArchiveGap,
+    /// The highest archive tip its attempts found: archives answer with
+    /// different tips, and only a higher one ends the back-off.
+    archive_tip: Option<u64>,
+    /// Consecutive attempts that stopped at it.
+    failures: u64,
+    /// Until when the next attempt waits, and that back-off's length.
+    hold: Option<(tokio::time::Instant, Duration)>,
+    /// Recovery requests held back since it began.
+    held: u64,
+    /// Its back-off was logged.
+    logged: bool,
+}
+
+/// What an [`ArchiveGapPacing`] change logs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveGapLog {
+    /// The first back-off of an attempt streak stopped at `gap`.
+    Holding {
+        gap: ArchiveGap,
+        failures: u64,
+        retry_in: Duration,
+    },
+    /// The end of a logged back-off, for `reason`.
+    Ended {
+        gap: ArchiveGap,
+        failures: u64,
+        held: u64,
+        reason: &'static str,
+    },
+}
+
+impl ArchiveGapPacing {
+    fn new(gap: ArchiveGap) -> Self {
+        Self {
+            gap,
+            archive_tip: gap.archive_tip,
+            failures: 1,
+            hold: None,
+            held: 0,
+            logged: false,
+        }
+    }
+
+    /// Whether a back-off runs: the next attempt may have to wait.
+    fn holding(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    /// The current back-off's length; zero while none runs.
+    fn retry_in(&self) -> Duration {
+        self.hold.map_or(Duration::ZERO, |(_, length)| length)
+    }
+
+    /// Whether GLOBAL's committed tip `committed` may have made its frame
+    /// obtainable: for a frame above the committed tip it read, once the
+    /// tip reached it; otherwise once the tip moved.
+    fn committed_moved(&self, committed: u64) -> Option<&'static str> {
+        match self.gap.frame > self.gap.committed {
+            true => {
+                (committed >= self.gap.frame).then_some("GLOBAL's committed tip reached the frame")
+            }
+            false => (committed != self.gap.committed)
+                .then_some("GLOBAL's committed tip of the session moved"),
+        }
+    }
+
+    fn ended(self, reason: &'static str) -> Option<ArchiveGapLog> {
+        self.logged.then_some(ArchiveGapLog::Ended {
+            gap: self.gap,
+            failures: self.failures,
+            held: self.held,
+            reason,
+        })
+    }
+
+    /// An attempt of the shard's recovery paced by `slot` ended at `now`,
+    /// stopped at `gap` (`None`: it ended otherwise, `failed` or not).
+    pub(crate) fn attempted(
+        slot: &mut Option<Self>,
+        gap: Option<ArchiveGap>,
+        failed: bool,
+        now: tokio::time::Instant,
+    ) -> Option<ArchiveGapLog> {
+        let Some(gap) = gap else {
+            let reason = match failed {
+                true => "an attempt failed otherwise",
+                false => "an attempt succeeded",
+            };
+            return slot.take().and_then(|pacing| pacing.ended(reason));
+        };
+        let Some(mut pacing) = slot.take() else {
+            *slot = Some(Self::new(gap));
+            return None;
+        };
+        let reason = if gap.frame != pacing.gap.frame {
+            Some("an attempt stopped at another frame")
+        } else if gap.archive_tip > pacing.archive_tip {
+            Some("an archive's tip advanced")
+        } else if gap.committed != pacing.gap.committed {
+            pacing.committed_moved(gap.committed)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            *slot = Some(Self::new(gap));
+            return pacing.ended(reason);
+        }
+        pacing.gap = gap;
+        pacing.failures += 1;
+        let length = pacing.hold.map_or(ARCHIVE_GAP_HOLD, |(_, length)| {
+            (length * 2).min(ARCHIVE_GAP_HOLD_MAX)
+        });
+        pacing.hold = Some((now + length, length));
+        let log =
+            (!std::mem::replace(&mut pacing.logged, true)).then_some(ArchiveGapLog::Holding {
+                gap,
+                failures: pacing.failures,
+                retry_in: length,
+            });
+        *slot = Some(pacing);
+        log
+    }
+
+    /// Whether the shard's next attempt, paced by `slot`, waits at `now`,
+    /// its worker materialized through `materialized` and GLOBAL's
+    /// committed tip `committed` (`None`: unknown); with the end of a
+    /// back-off whose frame may be obtainable now, if it was logged.
+    pub(crate) fn hold(
+        slot: &mut Option<Self>,
+        materialized: u64,
+        committed: Option<u64>,
+        now: tokio::time::Instant,
+    ) -> (bool, Option<ArchiveGapLog>) {
+        let Some(pacing) = slot.as_mut() else {
+            return (false, None);
+        };
+        let Some((until, _)) = pacing.hold else {
+            return (false, None);
+        };
+        let reason = match materialized >= pacing.gap.frame {
+            true => Some("this worker materialized the frame"),
+            false => committed.and_then(|committed| pacing.committed_moved(committed)),
+        };
+        if let Some(reason) = reason {
+            return (false, slot.take().and_then(|pacing| pacing.ended(reason)));
+        }
+        if now >= until {
+            return (false, None);
+        }
+        pacing.held += 1;
+        (true, None)
+    }
+}
+
+/// Log `log`, a change of the back-off of `filter`'s recovery; `error`: the
+/// failure of the attempt that started it.
+fn log_archive_gap(filter: &str, log: ArchiveGapLog, error: Option<&str>) {
+    match log {
+        ArchiveGapLog::Holding {
+            gap,
+            failures,
+            retry_in,
+        } => {
+            let archive_tip = gap
+                .archive_tip
+                .map_or_else(|| "none".to_string(), |tip| tip.to_string());
+            let action = match gap.frame > gap.committed {
+                true => "nothing to do on this node: GLOBAL has not executed this frame yet, so no GLOBAL \
+                    frame carries its header; the back-off ends once GLOBAL's committed tip reaches it, an \
+                    archive serves it or this worker materializes it",
+                false => "nothing to do on this node: an archive-side gap; the back-off ends once an archive \
+                    serves the frame, an archive's tip or GLOBAL's committed tip moves, or this worker \
+                    materializes it",
+            };
+            tracing::info!(%filter, missing_frame = gap.frame, %archive_tip, committed_tip = gap.committed,
+                failures, retry_in_secs = retry_in.as_secs(), max_retry_secs = ARCHIVE_GAP_HOLD_MAX.as_secs(),
+                last_error = error.unwrap_or("none"), scope = "archive", action,
+                "archive recovery backing off: its attempts stop at a shard frame no archive serves; it \
+                retries after the back-off, which doubles to its maximum, and takes no recovery turn meanwhile");
+        }
+        ArchiveGapLog::Ended {
+            gap,
+            failures,
+            held,
+            reason,
+        } => tracing::info!(%filter, missing_frame = gap.frame, failures, held_back = held, reason,
+            "archive recovery back-off for a shard frame no archive serves ended"),
+    }
+}
 
 /// A run of failed archive recovery attempts, from the first failure to the
 /// first success.
@@ -1540,5 +1830,120 @@ mod tests",
             .map(|args| args[0])
             .collect();
         assert_eq!(phases, RECOVERY_PHASES.into_iter().collect::<BTreeSet<_>>());
+    }
+
+    /// A recovery stopped again at the same frame no archive serves backs
+    /// off 30 s, doubling to 10 min, and logs that once per streak; another
+    /// archive's lower tip continues the streak. The back-off ends when the
+    /// worker materializes the frame, GLOBAL's committed tip moves, or an
+    /// attempt finds a higher archive tip or ends otherwise. A frame above
+    /// the committed tip waits for that tip to reach it, not merely move.
+    #[test]
+    fn an_archive_gap_backoff_doubles_to_its_maximum_and_ends_when_its_frame_may_be_obtainable() {
+        let start = tokio::time::Instant::now();
+        let secs = Duration::from_secs;
+        let gap = |frame, archive_tip, committed| ArchiveGap {
+            frame,
+            archive_tip,
+            committed,
+        };
+        let stopped = gap(170, Some(200), 200);
+        let mut slot = None;
+        assert_eq!(
+            ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start),
+            None
+        );
+        assert_eq!(
+            ArchiveGapPacing::hold(&mut slot, 169, Some(200), start),
+            (false, None),
+            "a first failure is retried as before"
+        );
+        let (mut at, mut lengths) = (start, Vec::new());
+        for _ in 0..7 {
+            let log = ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, at);
+            let length = slot.as_ref().unwrap().retry_in();
+            match lengths.is_empty() {
+                true => assert_eq!(
+                    log,
+                    Some(ArchiveGapLog::Holding {
+                        gap: stopped,
+                        failures: 2,
+                        retry_in: secs(30)
+                    })
+                ),
+                false => assert_eq!(log, None, "logged once per streak"),
+            }
+            assert!(ArchiveGapPacing::hold(&mut slot, 169, Some(200), at + length - secs(1)).0);
+            assert!(
+                !ArchiveGapPacing::hold(&mut slot, 169, None, at + length).0,
+                "an unknown committed tip ends nothing; the back-off runs out"
+            );
+            lengths.push(length.as_secs());
+            at += length;
+        }
+        assert_eq!(lengths, [30, 60, 120, 240, 480, 600, 600]);
+        ArchiveGapPacing::attempted(&mut slot, Some(gap(170, Some(190), 200)), true, at);
+        assert_eq!(
+            slot.as_ref().unwrap().retry_in(),
+            secs(600),
+            "a lower archive tip"
+        );
+        assert_eq!(
+            ArchiveGapPacing::hold(&mut slot, 170, Some(200), at),
+            (
+                false,
+                Some(ArchiveGapLog::Ended {
+                    gap: gap(170, Some(190), 200),
+                    failures: 9,
+                    held: 7,
+                    reason: "this worker materialized the frame"
+                })
+            )
+        );
+        assert!(slot.is_none());
+
+        // GLOBAL's committed tip moves.
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        let (held, ended) = ArchiveGapPacing::hold(&mut slot, 169, Some(201), start);
+        assert!(!held && slot.is_none());
+        assert!(matches!(ended, Some(ArchiveGapLog::Ended { reason, .. })
+                if reason == "GLOBAL's committed tip of the session moved"));
+        // An attempt finds a higher archive tip: a new streak, not held.
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(stopped), true, start);
+        let ended =
+            ArchiveGapPacing::attempted(&mut slot, Some(gap(170, Some(210), 200)), true, start);
+        assert!(matches!(ended, Some(ArchiveGapLog::Ended { reason, .. })
+                if reason == "an archive's tip advanced"));
+        assert!(!slot.as_ref().unwrap().holding());
+        // Another failure class or a success ends a streak; one not backed
+        // off yet logs nothing.
+        assert_eq!(
+            ArchiveGapPacing::attempted(&mut slot, None, true, start),
+            None
+        );
+        assert!(slot.is_none());
+
+        // A frame above GLOBAL's committed tip.
+        let above = gap(18393, Some(18400), 17781);
+        ArchiveGapPacing::attempted(&mut slot, Some(above), true, start);
+        ArchiveGapPacing::attempted(&mut slot, Some(above), true, start);
+        assert!(
+            ArchiveGapPacing::hold(&mut slot, 18392, Some(17790), start).0,
+            "the committed tip moved, still below the frame"
+        );
+        ArchiveGapPacing::attempted(&mut slot, Some(gap(18393, Some(18400), 17790)), true, start);
+        assert_eq!(
+            slot.as_ref().unwrap().retry_in(),
+            secs(60),
+            "the streak goes on"
+        );
+        let (held, ended) = ArchiveGapPacing::hold(&mut slot, 18392, Some(18393), start);
+        assert!(!held && slot.is_none());
+        assert!(
+            matches!(ended, Some(ArchiveGapLog::Ended { reason, failures: 3, .. })
+                if reason == "GLOBAL's committed tip reached the frame")
+        );
     }
 }
