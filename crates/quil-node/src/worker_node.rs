@@ -67,8 +67,8 @@ pub(crate) async fn start(
         crate::storage_watch::exit_when_store_reopenable(quil_forest::StoreRole::Worker(core_id))
     });
     let db_arc = Arc::new(db);
-    let clock_store: Arc<dyn quil_types::store::ClockStore> =
-        Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
+    let rocks_clock = Arc::new(quil_store::RocksClockStore::new(db_arc.inner()));
+    let clock_store: Arc<dyn quil_types::store::ClockStore> = rocks_clock.clone();
     let hg_store = Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
 
     // Per-worker crypto + CRDT + execution engines. Each worker
@@ -114,6 +114,15 @@ pub(crate) async fn start(
     }
     crate::clock_retention::apply_snapshot_pin_limit(&crdt, "worker");
     crate::clock_retention::spawn_staged_cleanup(&db_arc.inner(), "worker".into());
+    // This store keeps the master's GLOBAL stream for the committee anchor; it
+    // executes no GLOBAL frame and serves no history, even under an archive
+    // master, so the regular node's request-body prune applies. Stores written
+    // before headers-only kept every body; the first pass removes them.
+    crate::clock_retention::spawn_request_pruner_for_core(
+        &rocks_clock,
+        format!("worker-{core_id}"),
+        core_id,
+    );
     // Same crypto setup as the master node — bulletproof is real;
     // Decaf / circuit compiler are still noop stubs pending production
     // impls. See the master block earlier in this file for rationale.

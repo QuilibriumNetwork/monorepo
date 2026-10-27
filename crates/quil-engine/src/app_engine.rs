@@ -9921,9 +9921,17 @@ impl AppConsensusEngine {
         // The master path stores its own frames; this feeds the worker's copy.
         // (No-op-txn direct write; global frames use a distinct key prefix from
         // the shard chain, so there's no collision with the worker's own frames.)
+        // Only the header is stored: every reader of a worker's GLOBAL frames
+        // (anchor, beacons, world size, reward root, frame validation) takes
+        // the header, and the request bodies stay with the master, which
+        // prunes them. Only a standalone worker receives these messages.
+        let header_only = quil_types::proto::global::GlobalFrame {
+            header: global_frame.header,
+            requests: Vec::new(),
+        };
         if let Err(e) = self
             .clock_store
-            .put_global_clock_frame(&global_frame, &AppNoopTxn)
+            .put_global_clock_frame(&header_only, &AppNoopTxn)
         {
             debug!(core_id = self.core_id, error = %e, "worker: store global frame for anchor failed");
         }
@@ -16579,6 +16587,71 @@ mod tests {
             announced,
             "a settlement due on a running, stalled committee is prepared from a GLOBAL frame"
         );
+    }
+
+    /// A standalone worker stores each GLOBAL frame its master streams, for its
+    /// committee anchor. It keeps only the header: every reader of the
+    /// worker's GLOBAL frames takes the header, and the master, which prunes
+    /// the request bodies, keeps them. Storing the bodies too grew each worker
+    /// store by gigabytes.
+    #[tokio::test]
+    async fn reproduces_worker_keeping_global_request_bodies() {
+        use quil_store::encoding::clock_global_frame_request_key;
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader, MessageBundle};
+        let (mut engine, _handle, _events) =
+            test_engine(Arc::new(crate::test_support::TestProverRegistry::new()));
+        // A standalone worker's engine: its own store is its anchor store.
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock: Arc<dyn ClockStore> = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        engine.clock_store = clock.clone();
+        engine.global_anchor_store = clock.clone();
+        const BUNDLES: u16 = 3;
+        let number = 40;
+        let frame = GlobalFrame {
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![9; 32],
+                prover_tree_commitment: vec![4; 32],
+                world_state_size: 77,
+                ..Default::default()
+            }),
+            requests: (0..BUNDLES)
+                .map(|i| MessageBundle {
+                    timestamp: i64::from(i) + 1,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let wire = crate::consensus_wire::encode_global_frame(&frame).unwrap();
+        let sent = crate::consensus_wire::decode_global_frame(&wire).unwrap();
+        assert_eq!(sent.requests.len(), usize::from(BUNDLES), "bodies sent");
+        engine.handle_global_frame_message(&wire);
+
+        let kept: Vec<u16> = (0..BUNDLES)
+            .filter(|&i| {
+                let key = clock_global_frame_request_key(number, i);
+                db.inner().get(key).unwrap().is_some()
+            })
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "kept {} of {BUNDLES} request bodies of GLOBAL frame {number}: {kept:?}",
+            kept.len()
+        );
+        // The header stays readable by the worker's readers.
+        let stored = clock.get_global_clock_frame(number).unwrap();
+        assert_eq!(stored.header, sent.header);
+        assert!(stored.requests.is_empty());
+        let header = clock.get_global_clock_frame_header(number).unwrap();
+        assert_eq!(Some(header), sent.header);
+        let latest = clock.get_latest_global_clock_frame().unwrap();
+        assert_eq!(latest.header, sent.header);
+        let anchor = resolve_global_anchor(clock.as_ref());
+        assert_eq!(anchor, (number, vec![9; 32]));
+        let world_size = certified_world_size(clock.as_ref(), number).unwrap();
+        assert_eq!(world_size, 77);
+        // The frame still synced the shard's frame number.
+        assert_eq!(engine.shard_frame_number, number - 1);
     }
 
     /// This node's prover (`test_engine`'s), allocated to the engine's shard

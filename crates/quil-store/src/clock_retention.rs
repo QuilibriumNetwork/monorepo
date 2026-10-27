@@ -257,7 +257,7 @@ impl RocksClockStore {
                 frames: 0,
             });
         }
-        let _writes = self.global_memory.writes.lock().unwrap();
+        let writes = self.global_memory.writes.lock().unwrap();
         let mut batch = quil_forest::DisjointBatch::new(encoding::GLOBAL_REQUEST_PREFIXES);
         let start = encoding::clock_global_frame_request_key(0, 0);
         let end = encoding::clock_global_frame_request_key(limit, 0);
@@ -276,6 +276,9 @@ impl RocksClockStore {
         cache.frames.retain(|n, _| *n >= limit);
         cache.bytes = cache.frames.values().map(|(_, size)| *size).sum();
         drop(cache);
+        // Writers may go on while the range compacts: no key at or above
+        // `limit` is in it, and a body written back below it goes next pass.
+        drop(writes);
         // Reclaim the space now rather than at some later compaction.
         let first = encoding::clock_global_frame_request_key(previous, 0);
         self.db.compact_range(Some(&first), Some(&end));
