@@ -596,6 +596,21 @@ service NodeService {
   rpc ListLegacyCoins(quilibrium.node.global.pb.ListLegacyCoinsRequest) returns (quilibrium.node.global.pb.ListLegacyCoinsResponse);
   rpc GetProverRewardWitness(GetProverRewardWitnessRequest) returns (GetProverRewardWitnessResponse);
   rpc GetMintAuthorizationWitness(GetMintAuthorizationWitnessRequest) returns (GetMintAuthorizationWitnessResponse);
+  rpc GetRetroSeniority(GetRetroSeniorityRequest) returns (GetRetroSeniorityResponse);
+}
+
+// The premainnet retro seniority of Ed448 peer public keys, from the tables
+// the node's GLOBAL execution uses, so a client need not carry them.
+message GetRetroSeniorityRequest {
+  repeated bytes public_keys = 1; // 57-byte Ed448 peer keys, at most 64
+}
+message RetroSeniority {
+  // The key's value in each of the four retro epochs, then in the mainnet
+  // snapshot at frame 244200; zero where it has none.
+  repeated uint64 parts = 1;
+}
+message GetRetroSeniorityResponse {
+  repeated RetroSeniority keys = 1; // in request order
 }
 
 message GetProverRewardWitnessRequest {

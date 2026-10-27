@@ -108,6 +108,11 @@ const COIN_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Coin reads waiting for a worker beyond which more are refused at once.
 const MAX_COIN_READ_WAITERS: usize = 128;
 
+/// Keys one retro seniority request may name; a merge names a handful.
+const MAX_RETRO_SENIORITY_KEYS: usize = 32;
+/// Each key scans the four retro tables, so lookups run one at a time.
+static RETRO_SENIORITY_WORKER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// A worker slot from `workers`, waiting briefly in a bounded queue when all
 /// are busy.
 async fn coin_read_permit(
@@ -1199,6 +1204,41 @@ impl NodeService for NodeRpcServer {
             forest_proof: witness.forest_proof,
             cited_frame: witness.cited_frame,
             global_root: witness.global_root,
+        }))
+    }
+
+    async fn get_retro_seniority(
+        &self,
+        request: Request<node::GetRetroSeniorityRequest>,
+    ) -> Result<Response<node::GetRetroSeniorityResponse>, Status> {
+        let keys = request.into_inner().public_keys;
+        if keys.len() > MAX_RETRO_SENIORITY_KEYS {
+            return Err(Status::invalid_argument(format!(
+                "at most {MAX_RETRO_SENIORITY_KEYS} keys per request"
+            )));
+        }
+        let _permit = RETRO_SENIORITY_WORKER
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("retro seniority worker closed"))?;
+        let parts = tokio::task::spawn_blocking(move || {
+            keys.iter()
+                .map(|key| {
+                    quil_execution::global_intrinsic::seniority_succession::retro_parts(
+                        std::slice::from_ref(key),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| Status::internal("retro seniority worker failed"))?;
+        Ok(Response::new(node::GetRetroSeniorityResponse {
+            keys: parts
+                .into_iter()
+                .map(|parts| node::RetroSeniority {
+                    parts: parts.to_vec(),
+                })
+                .collect(),
         }))
     }
 
@@ -2962,5 +3002,46 @@ mod frame_cadence_rpc_tests {
             .unwrap()
             .into_inner();
         assert!(legacy.frame_cadence.is_none());
+    }
+}
+
+#[cfg(test)]
+mod retro_seniority_tests {
+    use super::*;
+    use node::node_service_server::NodeService;
+
+    #[tokio::test]
+    async fn answers_each_key_in_request_order() {
+        let keys = vec![vec![1u8; 57], vec![2u8; 57], vec![3u8; 10]];
+        let response = NodeRpcServer::new()
+            .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                public_keys: keys.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let expected: Vec<Vec<u64>> = keys
+            .iter()
+            .map(|key| {
+                quil_execution::global_intrinsic::seniority_succession::retro_parts(
+                    std::slice::from_ref(key),
+                )
+                .to_vec()
+            })
+            .collect();
+        let parts: Vec<Vec<u64>> = response.keys.into_iter().map(|k| k.parts).collect();
+        assert_eq!(parts, expected);
+        assert!(parts.iter().all(|p| p.len() == 5));
+    }
+
+    #[tokio::test]
+    async fn refuses_more_keys_than_a_merge_names() {
+        let error = NodeRpcServer::new()
+            .get_retro_seniority(Request::new(node::GetRetroSeniorityRequest {
+                public_keys: vec![vec![1u8; 57]; MAX_RETRO_SENIORITY_KEYS + 1],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 }
