@@ -1885,11 +1885,18 @@ pub(crate) fn spawn_all(sup: &mut Supervisor<anyhow::Error>, args: GrpcArgs) -> 
     };
 
     // Retain finalized frames at the store so consensus, proposal assembly,
-    // and RPC all use the same 720-frame window. Restore on a blocking worker;
-    // the store publishes new entries only after successful transaction commit.
+    // and RPC all use the same 720-frame window, within a byte budget that is
+    // smaller on a regular node: archives serve frame history to every node.
+    // Restore on a blocking worker; the store publishes new entries only
+    // after successful transaction commit.
+    let cache_budget = clock_store.set_global_frame_cache_budget(archive_mode);
     let warm_clock = clock_store.clone();
     tokio::task::spawn_blocking(move || match warm_clock.warm_global_frame_cache() {
-        Ok(frames) => info!(frames, "restored finalized global frame cache"),
+        Ok(frames) => info!(
+            frames,
+            budget_mb = cache_budget >> 20,
+            "restored finalized global frame cache"
+        ),
         Err(error) => {
             warn!(%error, "global frame cache restore incomplete; reads will fill misses")
         }

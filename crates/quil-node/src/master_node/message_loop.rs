@@ -700,6 +700,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                     );
                     let proc_mem = crate::mem_stats::process_memory();
                     let host_mem = crate::mem_stats::host_memory();
+                    let global_frames = clock_store_recv.global_frame_cache_stats();
                     info!(
                         rss_mb = proc_mem
                             .map(|m| crate::mem_stats::fmt_mb(m.rss_bytes))
@@ -733,6 +734,11 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         app_engine_message_spillover = sizes.app_engine_message_spillover,
                         app_engine_proposal_cache = sizes.app_engine_proposal_cache,
                         app_engine_pending_certified_parents = sizes.app_engine_pending_certified_parents,
+                        // Finalized GLOBAL frames cached with their request
+                        // bundles, the heap they hold and its byte budget.
+                        global_frame_cache = global_frames.frames,
+                        global_frame_cache_mb = %crate::mem_stats::fmt_mb(global_frames.held_bytes as u64),
+                        global_frame_cache_budget_mb = %crate::mem_stats::fmt_mb(global_frames.budget_bytes as u64),
                         // Pinned RocksDB views of live execution branches in
                         // this process; each retains superseded versions on disk.
                         execution_views_held = quil_forest::ExecutionViewAdmission::process().active(),
