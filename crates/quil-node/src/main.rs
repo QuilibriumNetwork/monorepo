@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -394,8 +395,16 @@ fn main() -> anyhow::Result<ExitCode> {
             quil_lattice_ct::confidential::relation::backend::worker_request::run_worker(&args),
         );
     }
-    node_main()
+    let result = node_main();
+    if NODE_STARTED.load(Ordering::Acquire) {
+        exit_node(&result);
+    }
+    result
 }
+
+/// Set when `node_main` hands off to a node mode (master, worker, DHT-only),
+/// whose run ends in [`exit_node`]. The diagnostic commands return normally.
+static NODE_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn node_main() -> anyhow::Result<ExitCode> {
@@ -1218,10 +1227,11 @@ async fn node_main() -> anyhow::Result<ExitCode> {
     // Hand off to the chosen node mode. It owns `sup` for its lifetime,
     // registers its subsystems, runs the supervisor, and returns the
     // `ShutdownReason` for `main` to translate into an exit code.
+    NODE_STARTED.store(true, Ordering::Release);
     let reason = match (args.core, args.dht_only) {
         (_, true) => {
             info!("starting in DHT-only mode");
-            dht_node::start(sup, &config).await?
+            dht_node::start(sup, &config).await
         }
         (0, false) => {
             // Archive mode comes from --archive OR engine.archiveMode.
@@ -1235,11 +1245,18 @@ async fn node_main() -> anyhow::Result<ExitCode> {
                 args.network,
                 metrics_handle.clone(),
             )
-            .await?
+            .await
         }
         (core_id, false) => {
             info!(core_id, "starting as worker node");
-            worker_node::start(sup, &config, &args.config, core_id, args.parent_process).await?
+            worker_node::start(sup, &config, &args.config, core_id, args.parent_process).await
+        }
+    };
+    let reason = match reason {
+        Ok(reason) => reason,
+        Err(error) => {
+            stop_detached_work();
+            return Err(error);
         }
     };
 
@@ -1273,7 +1290,9 @@ async fn node_main() -> anyhow::Result<ExitCode> {
                     SHUTDOWN_GRACE.as_secs(),
                     code,
                 );
-                std::process::exit(code);
+                // Skipping the teardown that aborts under a thread still
+                // using a store (`storage_jobs::exit_now`).
+                quil_engine::storage_jobs::exit_now(code);
             });
     }
 
@@ -1305,12 +1324,81 @@ async fn node_main() -> anyhow::Result<ExitCode> {
         }
     };
 
+    stop_detached_work();
+
     // Drop the file appender guards, blocking until their writer threads
     // drain. Without this the error! lines above — the only record of WHY
     // the node died — race process exit and routinely lose.
     logging::shutdown_logging();
 
     result
+}
+
+/// How long a stopping node waits for the work it runs on threads of their
+/// own to stop, within the shutdown watchdog's grace: a storage job stops
+/// between leaves, and a leaf can take minutes; a consensus host stops
+/// within a second or two.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// Stop the work that runs on threads of its own and holds store handles:
+/// the storage jobs (`quil_engine::storage_jobs`) and the consensus hosts
+/// (`quil_cw_consensus::engine_host`, GLOBAL on a committee member and app
+/// shards on a worker). The node's runtime ending does not stop them, and
+/// one that drops the last handle of a store while the process exits runs
+/// RocksDB's close under its static teardown: an abort ("pthread lock:
+/// Invalid argument"). Whatever outlives [`STOP_GRACE`] is cut short by
+/// [`exit_node`].
+fn stop_detached_work() {
+    let started = Instant::now();
+    let hosts = quil_cw_consensus::engine_host::stop_hosts();
+    let jobs = quil_engine::storage_jobs::shut_down(STOP_GRACE);
+    let hosts_left = quil_cw_consensus::engine_host::wait_for_hosts(
+        STOP_GRACE.saturating_sub(started.elapsed()),
+    );
+    if hosts > 0 && hosts_left == 0 {
+        info!(
+            hosts,
+            seconds = format!("{:.2}", started.elapsed().as_secs_f64()),
+            "consensus hosts stopped before exit"
+        );
+    }
+    if hosts_left > 0 {
+        warn!(
+            hosts = hosts_left,
+            grace_secs = STOP_GRACE.as_secs(),
+            "consensus hosts still running at exit; the node exits without waiting for them, and their journals and stores recover at the next start (no action needed)"
+        );
+    }
+    if !jobs.is_empty() {
+        warn!(
+            jobs = %jobs.join(", "),
+            grace_secs = STOP_GRACE.as_secs(),
+            "storage jobs still running at exit; the node exits without closing its stores, which replay their write-ahead log at the next start (no action needed; the jobs run again when next needed)"
+        );
+    }
+}
+
+/// End a node run (every return of `node_main` past its hand-off to a node
+/// mode) without the process's exit handlers and static destructors.
+/// `node_main` has stopped its own detached work and its runtime has ended,
+/// but threads of the node's own (cleanup loops, work past [`STOP_GRACE`])
+/// and RocksDB's background threads may still use the stores, and `exit`
+/// would tear RocksDB's statics down under them (an abort). Skipping that
+/// loses nothing: the RocksDB in use (8.10) neither flushes memtables (the
+/// node never writes without the write-ahead log) nor syncs the log when it
+/// closes a store, so the next start replays the same log either way.
+fn exit_node(result: &anyhow::Result<ExitCode>) -> ! {
+    logging::shutdown_logging();
+    // Every successful return of a node mode is SUCCESS.
+    let code = match result {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            1
+        }
+    };
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    quil_engine::storage_jobs::exit_now(code)
 }
 
 /// Tonic's cluster channels can be the first TLS users in either process.

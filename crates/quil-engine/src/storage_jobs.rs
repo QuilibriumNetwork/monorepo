@@ -16,8 +16,12 @@
 //! Labelling a leaf is one chain of hashes, a core's work for about an hour
 //! per GiB. With one job at a time for the whole node, a node's later seats
 //! missed their renewal's grace.
+//!
+//! A stopping node stops its jobs ([`shut_down`]) before it exits: they use
+//! its stores, which exit tears down under a thread still using them.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -37,63 +41,184 @@ const RECHECK: Duration = Duration::from_secs(5);
 
 type Job = Box<dyn FnOnce() + Send>;
 
-fn lanes() -> MutexGuard<'static, HashMap<Vec<u8>, VecDeque<Job>>> {
-    static LANES: OnceLock<Mutex<HashMap<Vec<u8>, VecDeque<Job>>>> = OnceLock::new();
-    LANES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+/// A lane's running job and the jobs queued behind it, by label.
+struct Lane {
+    running: &'static str,
+    queued: VecDeque<(&'static str, Job)>,
+}
+
+/// The node's lanes ([`spawn`]), and whether it is stopping ([`shut_down`]).
+#[derive(Default)]
+struct Jobs {
+    lanes: Mutex<HashMap<Vec<u8>, Lane>>,
+    /// Notified whenever a lane empties.
+    idle: Condvar,
+    stopping: AtomicBool,
+    /// Whether a job not started for the stop has been logged.
+    refused: AtomicBool,
+}
+
+fn jobs() -> &'static Jobs {
+    static JOBS: OnceLock<Jobs> = OnceLock::new();
+    JOBS.get_or_init(Default::default)
 }
 
 /// Run `job` in `lane`, after the jobs queued there before it, on a thread
 /// the lane keeps while it has jobs. A job that fails or panics is logged;
-/// its caller asks again when it next needs it.
+/// its caller asks again when it next needs it. Once the node is stopping
+/// ([`shut_down`]) the job is dropped.
 pub fn spawn(lane: &[u8], label: &'static str, job: impl FnOnce() -> Result<()> + Send + 'static) {
-    let shown = hex::encode(lane);
-    let job: Job = Box::new(move || {
-        let started = Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-            .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
-        match result {
-            Ok(()) => info!(
-                label,
-                lane = %shown,
-                seconds = started.elapsed().as_secs_f64(),
-                "storage snapshot job done"
-            ),
-            Err(error) => {
-                warn!(label, lane = %shown, %error, "storage snapshot job failed; it is tried again when next needed")
-            }
-        }
-    });
-    {
-        let mut lanes = lanes();
-        if let Some(queued) = lanes.get_mut(lane) {
-            queued.push_back(job);
-            return;
-        }
-        lanes.insert(lane.to_vec(), VecDeque::new());
-    }
-    let owned = lane.to_vec();
-    if let Err(error) = std::thread::Builder::new()
-        .name("storage-jobs".into())
-        .spawn(move || run_lane(owned, job))
-    {
-        lanes().remove(lane);
-        warn!(label, lane = %hex::encode(lane), %error, "storage job thread not started; the lane's jobs are dropped");
-    }
+    jobs().spawn(lane, label, job)
 }
 
-/// Run `first`, then the lane's queued jobs in order, until none is left.
-fn run_lane(lane: Vec<u8>, first: Job) {
-    let mut next = Some(first);
-    while let Some(job) = next {
-        job();
-        let mut lanes = lanes();
-        next = lanes.get_mut(&lane).and_then(VecDeque::pop_front);
-        if next.is_none() {
-            lanes.remove(&lane);
+/// Stop the jobs before the process exits: drop the queued ones and any
+/// spawned later, and wait up to `grace` for the running ones to end (one
+/// working through a seat's leaves stops at the next, [`for_each_parallel`]).
+/// Returns the labels of the jobs still running, one per lane.
+pub fn shut_down(grace: Duration) -> Vec<&'static str> {
+    jobs().shut_down(grace)
+}
+
+/// Exit the process with `code` at once, skipping the exit handlers and
+/// static destructors: RocksDB's, run under a thread still using a store
+/// (a storage job, say), abort the process. The stores replay their
+/// write-ahead log at the next start. Flush the logs first.
+pub fn exit_now(code: i32) -> ! {
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code);
+}
+
+impl Jobs {
+    fn lanes(&self) -> MutexGuard<'_, HashMap<Vec<u8>, Lane>> {
+        self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    fn spawn(
+        &'static self,
+        lane: &[u8],
+        label: &'static str,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) {
+        let shown = hex::encode(lane);
+        let job: Job = Box::new(move || {
+            let started = Instant::now();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                .unwrap_or_else(|_| Err(QuilError::Internal("the job panicked".into())));
+            match result {
+                Ok(()) => info!(
+                    label,
+                    lane = %shown,
+                    seconds = started.elapsed().as_secs_f64(),
+                    "storage snapshot job done"
+                ),
+                Err(error) if self.stopping() => {
+                    info!(label, lane = %shown, %error, "storage snapshot job stopped with the node")
+                }
+                Err(error) => {
+                    warn!(label, lane = %shown, %error, "storage snapshot job failed; it is tried again when next needed")
+                }
+            }
+        });
+        {
+            let mut lanes = self.lanes();
+            // Under the lock: the stop empties the queues under it.
+            if self.stopping() {
+                drop(lanes);
+                if !self.refused.swap(true, Ordering::SeqCst) {
+                    info!(label, lane = %hex::encode(lane), "storage job not started: the node is stopping; later ones are not either");
+                }
+                return;
+            }
+            if let Some(entry) = lanes.get_mut(lane) {
+                entry.queued.push_back((label, job));
+                return;
+            }
+            let entry = Lane {
+                running: label,
+                queued: VecDeque::new(),
+            };
+            lanes.insert(lane.to_vec(), entry);
         }
+        let owned = lane.to_vec();
+        if let Err(error) = std::thread::Builder::new()
+            .name("storage-jobs".into())
+            .spawn(move || self.run_lane(owned, job))
+        {
+            self.lanes().remove(lane);
+            self.idle.notify_all();
+            warn!(label, lane = %hex::encode(lane), %error, "storage job thread not started; the lane's jobs are dropped");
+        }
+    }
+
+    /// Run `first`, then the lane's queued jobs in order, until none is left
+    /// or the node is stopping.
+    fn run_lane(&self, lane: Vec<u8>, first: Job) {
+        let mut next = Some(first);
+        while let Some(job) = next {
+            job();
+            let mut lanes = self.lanes();
+            // A stopping node takes no queued job.
+            let entry = lanes.get_mut(&lane).filter(|_| !self.stopping());
+            next = entry.and_then(|entry| {
+                let (label, job) = entry.queued.pop_front()?;
+                entry.running = label;
+                Some(job)
+            });
+            if next.is_none() {
+                lanes.remove(&lane);
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    /// [`shut_down`].
+    fn shut_down(&self, grace: Duration) -> Vec<&'static str> {
+        let started = Instant::now();
+        let deadline = started + grace;
+        self.stopping.store(true, Ordering::SeqCst);
+        let (running, queued) = {
+            let mut lanes = self.lanes();
+            let queued: Vec<(&'static str, Job)> = lanes
+                .values_mut()
+                .flat_map(|lane| std::mem::take(&mut lane.queued))
+                .collect();
+            (lanes.len(), queued)
+        };
+        // Dropped here, not under the lock: a job's store may close as it
+        // drops.
+        let dropped = queued.len();
+        drop(queued);
+        let mut lanes = self.lanes();
+        while !lanes.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            lanes = self
+                .idle
+                .wait_timeout(lanes, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        let still: Vec<&'static str> = lanes.values().map(|lane| lane.running).collect();
+        drop(lanes);
+        if still.is_empty() {
+            info!(
+                running,
+                dropped,
+                seconds = started.elapsed().as_secs_f64(),
+                "storage jobs stopped before exit"
+            );
+        }
+        still
     }
 }
 
@@ -103,7 +228,7 @@ fn run_lane(lane: Vec<u8>, first: Job) {
 #[cfg(test)]
 pub(crate) fn wait_lane_idle(lane: &[u8], timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while lanes().contains_key(lane) {
+    while jobs().lanes().contains_key(lane) {
         if Instant::now() >= deadline {
             return false;
         }
@@ -129,12 +254,13 @@ pub fn job_slots() -> usize {
 /// Run `work` on each of `items`, on as many threads as jobs may hold
 /// memory at once ([`job_slots`]), each item reserving its own ([`reserve`]):
 /// the leaves of one seat side by side. Returns each item's result in order;
-/// after a failure, items not started yet are not run.
+/// after a failure, or once the node is stopping ([`shut_down`]), items not
+/// started yet are not run.
 pub fn for_each_parallel<T: Sync, R: Send>(
     items: &[T],
     work: impl Fn(&T) -> Result<R> + Sync,
 ) -> Result<Vec<R>> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let results: Mutex<Vec<Option<Result<R>>>> =
@@ -143,7 +269,7 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         for _ in 0..job_slots().min(items.len()) {
             scope.spawn(|| loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= items.len() || failed.load(Ordering::Relaxed) {
+                if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
                     break;
                 }
                 let result = work(&items[index]);
@@ -158,6 +284,11 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     for result in results.into_inner().unwrap_or_else(PoisonError::into_inner) {
         match result {
             Some(result) => out.push(result?),
+            None if jobs().stopping() => {
+                return Err(QuilError::ExecutionUnavailable(
+                    "the node is stopping".into(),
+                ))
+            }
             None => {
                 return Err(QuilError::ExecutionUnavailable(
                     "a storage job stopped at an earlier failure".into(),
@@ -526,5 +657,78 @@ mod tests {
             Ok(())
         });
         assert!(ran.recv_timeout(SOON).is_ok());
+    }
+
+    /// Lanes of their own, so a test's stop leaves the node's running.
+    fn own_jobs() -> &'static Jobs {
+        Box::leak(Box::new(Jobs::default()))
+    }
+
+    #[test]
+    fn a_stop_waits_for_the_running_job_and_drops_the_queued_ones() {
+        let jobs = own_jobs();
+        let (started_tx, started) = mpsc::channel();
+        let (open, gate) = mpsc::channel::<()>();
+        jobs.spawn(b"test lane", "test", move || {
+            started_tx.send(()).unwrap();
+            gate.recv().unwrap();
+            Ok(())
+        });
+        let (ran_tx, ran) = mpsc::channel::<()>();
+        jobs.spawn(b"test lane", "test", move || {
+            ran_tx.send(()).unwrap();
+            Ok(())
+        });
+        started.recv_timeout(SOON).unwrap();
+        // The running job ends once the stop has begun.
+        std::thread::spawn(move || {
+            while !jobs.stopping() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            open.send(()).unwrap();
+        });
+        assert!(jobs.shut_down(SOON).is_empty(), "every job stopped in time");
+        assert_eq!(
+            ran.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected),
+            "the queued job was dropped without running"
+        );
+    }
+
+    #[test]
+    fn a_job_spawned_once_stopping_does_not_run() {
+        let jobs = own_jobs();
+        assert!(jobs.shut_down(SOON).is_empty());
+        let (ran_tx, ran) = mpsc::channel::<()>();
+        jobs.spawn(b"test lane", "test", move || {
+            ran_tx.send(()).unwrap();
+            Ok(())
+        });
+        assert_eq!(
+            ran.recv_timeout(NOT_YET),
+            Err(mpsc::RecvTimeoutError::Disconnected),
+            "the job was dropped without running"
+        );
+        assert!(jobs.lanes().is_empty());
+    }
+
+    #[test]
+    fn a_job_longer_than_the_grace_is_left_running() {
+        let jobs = own_jobs();
+        let (open, gate) = mpsc::channel::<()>();
+        jobs.spawn(b"test lane", "long", move || {
+            let _ = gate.recv();
+            Ok(())
+        });
+        let grace = Duration::from_millis(200);
+        let started = Instant::now();
+        assert_eq!(jobs.shut_down(grace), vec!["long"]);
+        let waited = started.elapsed();
+        assert!(
+            waited >= grace && waited < SOON,
+            "the stop waits for the grace, then returns: {waited:?}"
+        );
+        drop(open);
+        assert!(jobs.shut_down(SOON).is_empty(), "the job ends once let go");
     }
 }

@@ -133,7 +133,12 @@ fn start(
                     }
                 }
                 _ = tick.tick() => {
-                    let stopping = open.iter().all(|open| !open);
+                    // A host stopped from outside, as by `engine_host::stop_hosts`
+                    // when the process exits, is not replaced either.
+                    let stopping = open.iter().all(|open| !open)
+                        || host
+                            .as_ref()
+                            .is_some_and(|host| host.shutdown.load(Ordering::Acquire));
                     if stopping {
                         if let Some(host) = &host {
                             host.shutdown.store(true, Ordering::Release);
@@ -329,6 +334,36 @@ mod tests {
         until(|| active.load(Ordering::SeqCst) == 0).await;
         assert!(flags.lock().unwrap()[0].load(Ordering::Acquire));
         assert_eq!(starts.lock().unwrap().len(), 1);
+    }
+
+    /// The process stops its consensus hosts before it exits
+    /// (`engine_host::stop_hosts` sets each host's flag); the supervisor
+    /// must not start a replacement then, which would still be running,
+    /// and dropping its stores, while the process exits.
+    #[tokio::test]
+    async fn a_host_stopped_from_outside_is_not_replaced() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let flags = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_inputs, task) = start(
+            factory(active.clone(), starts.clone(), 0, flags.clone()),
+            Arc::new(Transport(tx)),
+            policy(),
+        );
+        until(|| starts.lock().unwrap().len() == 1).await;
+        flags.lock().unwrap()[0].store(true, Ordering::Release);
+        until(|| active.load(Ordering::SeqCst) == 0).await;
+        // Several restart backoffs (30 ms) long.
+        let ended = tokio::time::timeout(Duration::from_millis(500), task).await;
+        assert_eq!(
+            starts.lock().unwrap().len(),
+            1,
+            "a stopped host was replaced"
+        );
+        ended
+            .expect("the supervisor kept running after its host was stopped")
+            .unwrap();
     }
 
     #[tokio::test]
