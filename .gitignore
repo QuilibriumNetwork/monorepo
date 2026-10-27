@@ -21,3 +21,5 @@ vdf-test*
 
 # scripts/devnet-smoke.sh
 .devnet-smoke/
+# scripts/devnet-shard-info.sh
+.devnet-shard-info/
