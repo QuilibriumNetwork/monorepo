@@ -3570,16 +3570,19 @@ impl GlobalIntrinsic {
         // Hash-proof epochs gate each participant on its own sealed
         // registration instead (`StorageFrame`, decided 2026-10-21): the
         // proposer's attestation no longer decides the committee's reward.
+        // Paused KZG epochs (`MAINNET_STORAGE_ATTESTATION_PAUSE`) withhold
+        // nothing: their proposers attach no attestation.
         // The first header of the shard at or after the next epoch's snapshot
         // frame names the state its registrations for that epoch commit to.
         super::storage_snapshot::record(state, frame_number, op)?;
         let storage_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
         let hash_storage = op.global_frame_number > 0
             && quil_types::consensus::hash_storage_proofs_at(storage_epoch);
-        let unproven_storage = !hash_storage
-            && op.global_frame_number > 0
-            && state_size_u64 > 0
-            && op.storage_attestation.is_empty();
+        let unproven_storage = storage_reward_withheld(
+            op.global_frame_number,
+            state_size_u64,
+            !op.storage_attestation.is_empty(),
+        );
         if unproven_storage {
             // Previously silent: the reward basis is zeroed here WITHOUT halting
             // or evicting, so from the operator seat the node looks healthy while
@@ -6400,6 +6403,21 @@ fn check_leave_confirm_halt_risk(
         )));
     }
     Ok(())
+}
+
+/// Whether GLOBAL withholds the reward of an app frame anchored at
+/// `global_frame_number` over a shard of `state_size` bytes for want of a
+/// storage attestation. A KZG epoch's storage frame over committed data must
+/// carry one, except in an epoch whose attestations are paused
+/// (`quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE`); hash-proof
+/// epochs gate each participant on its own sealed registration instead.
+fn storage_reward_withheld(global_frame_number: u64, state_size: u64, attested: bool) -> bool {
+    let epoch = quil_types::consensus::epoch_for_frame(global_frame_number);
+    global_frame_number > 0
+        && state_size > 0
+        && !attested
+        && !quil_types::consensus::hash_storage_proofs_at(epoch)
+        && !quil_types::consensus::storage_attestation_paused(epoch)
 }
 
 #[cfg(test)]
@@ -10389,5 +10407,80 @@ mod tests {
                 quil.to_vec()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_attestation_pause_tests {
+    use super::storage_reward_withheld;
+
+    /// The first GLOBAL frame of mainnet `epoch`, with mainnet's hash epoch
+    /// and attestation pause set for the calling thread.
+    fn mainnet_frame(epoch: u64) -> u64 {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(
+            quil_types::consensus::MAINNET_HASH_STORAGE_PROOF_EPOCH,
+        );
+        quil_types::consensus::set_storage_attestation_pause_for_thread(
+            quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE,
+        );
+        epoch * quil_types::consensus::epoch_length_frames()
+    }
+
+    fn reset() {
+        quil_types::consensus::set_storage_attestation_pause_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// GLOBAL pays an unattested frame over committed data anchored in
+    /// mainnet epochs 1311–1313, which a proposer leaves unattested there.
+    #[test]
+    fn an_unattested_frame_of_epoch_1312_keeps_its_reward() {
+        let anchors = [
+            mainnet_frame(1311),
+            mainnet_frame(1312),
+            mainnet_frame(1312) + 360,
+            mainnet_frame(1314) - 1,
+        ];
+        let withheld = anchors.map(|anchor| storage_reward_withheld(anchor, 1 << 20, false));
+        reset();
+        assert_eq!(withheld, [false; 4]);
+    }
+
+    /// Outside the pause GLOBAL withholds exactly as before: an unattested
+    /// KZG frame over committed data up to epoch 1310, nothing from the hash
+    /// epoch 1314 on.
+    #[test]
+    fn rewards_of_epochs_1310_and_1314_are_withheld_as_before() {
+        let anchors = [
+            0,
+            mainnet_frame(1309),
+            mainnet_frame(1310),
+            mainnet_frame(1311) - 1,
+            mainnet_frame(1314),
+            mainnet_frame(1315),
+        ];
+        let mut before = Vec::new();
+        let mut now = Vec::new();
+        for anchor in anchors {
+            let epoch = quil_types::consensus::epoch_for_frame(anchor);
+            let hash = quil_types::consensus::hash_storage_proofs_at(epoch);
+            for (state_size, attested) in [(1 << 20, false), (1 << 20, true), (0, false)] {
+                // The rule before the pause existed.
+                let withheld = !hash && anchor > 0 && state_size > 0 && !attested;
+                before.push((anchor, state_size, attested, withheld));
+                let withheld = storage_reward_withheld(anchor, state_size, attested);
+                now.push((anchor, state_size, attested, withheld));
+            }
+        }
+        reset();
+        assert_eq!(now, before);
+        let e1310 = mainnet_frame(1310);
+        let e1314 = mainnet_frame(1314);
+        let withheld = [
+            storage_reward_withheld(e1310, 1 << 20, false),
+            storage_reward_withheld(e1314, 1 << 20, false),
+        ];
+        reset();
+        assert_eq!(withheld, [true, false]);
     }
 }

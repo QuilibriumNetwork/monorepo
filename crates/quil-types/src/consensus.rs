@@ -940,6 +940,72 @@ pub fn set_hash_storage_proof_epoch_for_thread(epoch: Option<u64>) {
     HASH_STORAGE_PROOF_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// Mainnet epochs `[start, end)` whose app frames carry no storage
+/// attestation and lose no reward for it. Build 2.1.0.25.105 made epoch 1311
+/// the first hash-proof epoch; .106 moved it to 1314
+/// ([`MAINNET_HASH_STORAGE_PROOF_EPOCH`]) and attests 1311–1313 with KZG. A
+/// .105 member rejects every frame of those epochs that carries a KZG
+/// attestation, and a .106 archive withholds the reward of every frame a .105
+/// member leads without one, so mixed committees stall and lose rewards. In
+/// this window proposers attach none (an empty root, which every build
+/// accepts) and GLOBAL pays such frames, so both builds share committees
+/// until the hash epoch. A KZG attestation a proposer still attaches is
+/// verified and audited as before. The window ends at the hash epoch and
+/// never covers a hash-proof epoch. Consensus-affecting (reward basis):
+/// every archive must run a build with it before GLOBAL frame 943,920.
+pub const MAINNET_STORAGE_ATTESTATION_PAUSE: Option<(u64, u64)> = Some((1311, 1314));
+
+static STORAGE_ATTESTATION_PAUSE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STORAGE_ATTESTATION_PAUSE_OVERRIDE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+fn storage_attestation_pause_for(network: u8, setting: Option<&str>) -> (u64, u64) {
+    if network == 0 {
+        return MAINNET_STORAGE_ATTESTATION_PAUSE.unwrap_or((u64::MAX, u64::MAX));
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .map_or((u64::MAX, u64::MAX), |start| (start, u64::MAX))
+}
+
+/// Fix this process's storage attestation pause from its network, and return
+/// it; the first call decides. A test network pauses from
+/// `QUIL_STORAGE_ATTESTATION_PAUSE_EPOCH` up to its hash storage proof epoch.
+pub fn init_storage_attestation_pause(network: u8) -> (u64, u64) {
+    *STORAGE_ATTESTATION_PAUSE.get_or_init(|| {
+        storage_attestation_pause_for(
+            network,
+            std::env::var("QUIL_STORAGE_ATTESTATION_PAUSE_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The window fixed by [`init_storage_attestation_pause`]; mainnet's in a
+/// process that never called it.
+pub fn storage_attestation_pause() -> (u64, u64) {
+    if let Some(pause) = STORAGE_ATTESTATION_PAUSE_OVERRIDE.with(|cell| cell.get()) {
+        return pause;
+    }
+    *STORAGE_ATTESTATION_PAUSE.get_or_init(|| storage_attestation_pause_for(0, None))
+}
+
+/// Whether `epoch` is a KZG epoch whose app frames carry no storage
+/// attestation and lose no reward for it
+/// ([`MAINNET_STORAGE_ATTESTATION_PAUSE`]). Never a hash-proof epoch.
+pub fn storage_attestation_paused(epoch: u64) -> bool {
+    let (start, end) = storage_attestation_pause();
+    (start..end).contains(&epoch) && !hash_storage_proofs_at(epoch)
+}
+
+/// Set the storage attestation pause for the calling thread only (tests).
+pub fn set_storage_attestation_pause_for_thread(pause: Option<(u64, u64)>) {
+    STORAGE_ATTESTATION_PAUSE_OVERRIDE.with(|cell| cell.set(pause));
+}
+
 /// The epoch from which a vertex membership proof authenticates a field only
 /// when the field's leaf commitment binds its value. A leaf carrying a
 /// `hash_target` commits that target instead of its value, so its value is
@@ -2736,6 +2802,59 @@ mod hash_storage_proof_epoch_tests {
             (epoch - 1) * super::EPOCH_LENGTH_FRAMES + super::STORAGE_SNAPSHOT_OFFSET,
             945_376
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_attestation_pause_tests {
+    #[test]
+    fn only_a_test_network_reads_the_storage_attestation_pause_setting() {
+        let mainnet = super::MAINNET_STORAGE_ATTESTATION_PAUSE.unwrap();
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::storage_attestation_pause_for(0, setting), mainnet);
+        }
+        assert_eq!(
+            super::storage_attestation_pause_for(1, Some("4")),
+            (4, u64::MAX)
+        );
+        assert_eq!(
+            super::storage_attestation_pause_for(1, Some("bad")),
+            (u64::MAX, u64::MAX)
+        );
+        assert_eq!(
+            super::storage_attestation_pause_for(1, None),
+            (u64::MAX, u64::MAX)
+        );
+    }
+
+    /// Mainnet pauses storage attestations from GLOBAL frame 943,920, build
+    /// .105's first hash epoch, up to the hash storage proof epoch.
+    #[test]
+    fn mainnet_pauses_storage_attestations_in_epochs_1311_to_1313() {
+        let (start, end) = super::MAINNET_STORAGE_ATTESTATION_PAUSE.unwrap();
+        assert_eq!(start * super::EPOCH_LENGTH_FRAMES, 943_920);
+        assert_eq!(Some(end), super::MAINNET_HASH_STORAGE_PROOF_EPOCH);
+        super::set_hash_storage_proof_epoch_for_thread(super::MAINNET_HASH_STORAGE_PROOF_EPOCH);
+        super::set_storage_attestation_pause_for_thread(super::MAINNET_STORAGE_ATTESTATION_PAUSE);
+        let paused: Vec<u64> = (1300..1320)
+            .filter(|epoch| super::storage_attestation_paused(*epoch))
+            .collect();
+        super::set_storage_attestation_pause_for_thread(None);
+        super::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(paused, vec![1311, 1312, 1313]);
+    }
+
+    /// A test network's pause runs from its setting up to its hash epoch.
+    #[test]
+    fn the_pause_never_covers_a_hash_proof_epoch() {
+        super::set_hash_storage_proof_epoch_for_thread(Some(12));
+        super::set_storage_attestation_pause_for_thread(Some((10, u64::MAX)));
+        let paused: Vec<u64> = (0..20)
+            .filter(|epoch| super::storage_attestation_paused(*epoch))
+            .collect();
+        super::set_storage_attestation_pause_for_thread(None);
+        super::set_hash_storage_proof_epoch_for_thread(None);
+        assert_eq!(paused, vec![10, 11]);
     }
 }
 

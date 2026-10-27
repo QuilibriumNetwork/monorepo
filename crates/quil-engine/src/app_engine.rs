@@ -1096,6 +1096,50 @@ fn cw_session_parent(
     Ok((Some(header), output))
 }
 
+/// How a proposer attests its storage on an app frame anchored at GLOBAL
+/// frame `anchor_gfn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposerStorageAttestation {
+    /// No GLOBAL anchor (genesis): nothing to attest.
+    Unanchored,
+    /// A hash-proof epoch: one openings root with its beacon frame.
+    Hash,
+    /// A paused KZG epoch
+    /// (`quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE`): an empty
+    /// root, which every build accepts and GLOBAL pays.
+    Paused,
+    /// A KZG epoch: this member's openings and their 74-byte root.
+    Kzg,
+}
+
+fn proposer_storage_attestation(anchor_gfn: u64) -> ProposerStorageAttestation {
+    let epoch = quil_types::consensus::epoch_for_frame(anchor_gfn);
+    if anchor_gfn == 0 {
+        ProposerStorageAttestation::Unanchored
+    } else if quil_types::consensus::hash_storage_proofs_at(epoch) {
+        ProposerStorageAttestation::Hash
+    } else if quil_types::consensus::storage_attestation_paused(epoch) {
+        ProposerStorageAttestation::Paused
+    } else {
+        ProposerStorageAttestation::Kzg
+    }
+}
+
+/// Log, once per epoch and process, that this node's frames carry no storage
+/// attestation because the epoch's attestations are paused.
+fn note_storage_attestation_paused(epoch: u64, frame_number: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
+    if LOGGED.swap(epoch, Ordering::Relaxed) != epoch {
+        info!(
+            epoch,
+            frame = frame_number,
+            "app-shard proof: storage attestations are paused until the hash storage proof \
+             epoch; this node's frames carry none and GLOBAL withholds no reward for it"
+        );
+    }
+}
+
 impl AppLeaderProvider {
     /// The openings root this member commits in app frame `frame_number`,
     /// anchored in hash-proof epoch `epoch` with beacon `rho_n`, from its
@@ -2043,7 +2087,8 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             anchor_gfn,
         )?;
         let storage_epoch = quil_types::consensus::epoch_for_frame(anchor_gfn);
-        if storage_active && quil_types::consensus::hash_storage_proofs_at(storage_epoch) {
+        let attestation = proposer_storage_attestation(anchor_gfn);
+        if attestation == ProposerStorageAttestation::Hash {
             // Hash storage proofs (decided 2026-10-21): the frame commits one
             // root over the replica nodes a beacon chose, which this member's
             // epoch proof proves later; no openings ride the frame. The beacon
@@ -2066,7 +2111,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                         beacon_frame,
                     );
             }
-        } else if storage_active {
+        } else if attestation == ProposerStorageAttestation::Paused {
+            // Paused KZG epochs (`MAINNET_STORAGE_ATTESTATION_PAUSE`): build
+            // .105 treats them as hash epochs and rejects a frame carrying a
+            // KZG attestation, but accepts an empty root, as every build does.
+            // Replicas still retire as the KZG branch retires them.
+            if let (Some(kv), false) = (self.kv_db.as_ref(), self.private_parent) {
+                crate::app_shard_metadata::retire_unchallengeable_replicas(
+                    &quil_store::replica_store::ReplicaStore::new(kv.clone()),
+                    &self.replicas_retired_below,
+                    storage_epoch,
+                    &self.filter,
+                    frame_number,
+                );
+            }
+            note_storage_attestation_paused(storage_epoch, frame_number);
+        } else if attestation == ProposerStorageAttestation::Kzg {
             // PROPOSER SELF-ATTESTATION (CW PoRep port). Legacy Jolteon assembled
             // the committee `StorageAttestation` from every member's per-vote
             // openings at QC time. Simplex votes carry no payload, so under CW the
@@ -21502,6 +21562,68 @@ mod gossip_frame_repro_tests {
         assert_eq!(
             engine.last_materialized_frame, 2,
             "the finalized frame 2 no longer materializes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod storage_attestation_pause_tests {
+    use super::{proposer_storage_attestation, ProposerStorageAttestation};
+
+    /// The first GLOBAL frame of mainnet `epoch`, with mainnet's hash epoch
+    /// and attestation pause set for the calling thread.
+    fn mainnet_frame(epoch: u64) -> u64 {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(
+            quil_types::consensus::MAINNET_HASH_STORAGE_PROOF_EPOCH,
+        );
+        quil_types::consensus::set_storage_attestation_pause_for_thread(
+            quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE,
+        );
+        epoch * quil_types::consensus::epoch_length_frames()
+    }
+
+    fn reset() {
+        quil_types::consensus::set_storage_attestation_pause_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A proposer attaches no storage attestation to a frame anchored in
+    /// mainnet epochs 1311–1313, which build .105 rejects with a KZG one.
+    #[test]
+    fn a_frame_anchored_in_epoch_1312_carries_no_storage_attestation() {
+        let anchors = [
+            mainnet_frame(1311),
+            mainnet_frame(1312),
+            mainnet_frame(1312) + 360,
+            mainnet_frame(1314) - 1,
+        ];
+        let attestations = anchors.map(proposer_storage_attestation);
+        reset();
+        assert_eq!(attestations, [ProposerStorageAttestation::Paused; 4]);
+    }
+
+    /// Outside the pause a proposer attests as before: KZG up to epoch 1310,
+    /// hash proofs from 1314.
+    #[test]
+    fn frames_of_epochs_1310_and_1314_attest_as_before() {
+        let anchors = [
+            0,
+            mainnet_frame(1310),
+            mainnet_frame(1311) - 1,
+            mainnet_frame(1314),
+            mainnet_frame(1315),
+        ];
+        let attestations = anchors.map(proposer_storage_attestation);
+        reset();
+        assert_eq!(
+            attestations,
+            [
+                ProposerStorageAttestation::Unanchored,
+                ProposerStorageAttestation::Kzg,
+                ProposerStorageAttestation::Kzg,
+                ProposerStorageAttestation::Hash,
+                ProposerStorageAttestation::Hash,
+            ]
         );
     }
 }
